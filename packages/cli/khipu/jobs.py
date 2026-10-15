@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -985,10 +986,32 @@ def graph_plist_path() -> Path:
     return legacy
 
 
+def _installed_log_paths(plist: Path, stem: str) -> tuple[Path, Path]:
+    """Where launchd actually sends this job's output: the installed plist's
+    StandardOutPath/StandardErrorPath. The caller's environment is not the
+    job's (the desktop CLI has no KHIPU_LEGACY_LOG_DIR), so it only decides
+    when no plist is installed or it names no path."""
+    out_log, err_log = None, None
+    try:
+        with open(plist, "rb") as f:
+            data = plistlib.load(f)
+        if isinstance(data, dict):
+            if isinstance(data.get("StandardOutPath"), str):
+                out_log = Path(data["StandardOutPath"])
+            if isinstance(data.get("StandardErrorPath"), str):
+                err_log = Path(data["StandardErrorPath"])
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        pass
+    if out_log is None or err_log is None:
+        env_out, env_err = _log_paths(stem)
+        out_log, err_log = out_log or env_out, err_log or env_err
+    return out_log, err_log
+
+
 def _job_entry(name: str) -> dict[str, Any]:
     spec = _JOB_SPECS[name]
     plist = _plist_path(spec["plist"])
-    out_log, err_log = _log_paths(spec["log_stem"])
+    out_log, err_log = _installed_log_paths(plist, spec["log_stem"])
     last_run_mtime: float | None = None
     try:
         if out_log.is_file():

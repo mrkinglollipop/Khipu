@@ -470,6 +470,35 @@ class JobsMetadataTest(unittest.TestCase):
         self.assertIsNone(entry["last_run_iso"])
         self.assertIsNone(entry["last_run_source"])
 
+    def test_log_paths_come_from_the_installed_plist(self):
+        # Codex 2026-10-15: notes_watch writes no receipt, and its plist sent
+        # output to a legacy dir the desktop CLI's environment never names.
+        import plistlib
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            agents = td_path / "LaunchAgents"
+            agents.mkdir()
+            legacy = td_path / "legacy"
+            legacy.mkdir()
+            out = legacy / "khipu-notes-watch.out.log"
+            err = legacy / "khipu-notes-watch.err.log"
+            out.write_text("ran\n")
+            with open(agents / f"{jobs.PLIST_NOTES_WATCH}.plist", "wb") as f:
+                plistlib.dump({"Label": jobs.PLIST_NOTES_WATCH,
+                               "StandardOutPath": str(out),
+                               "StandardErrorPath": str(err)}, f)
+            with mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(td_path / "data")}), \
+                 mock.patch.object(jobs, "_launchagents_dir", return_value=agents), \
+                 mock.patch.object(jobs, "LOG_DIR", td_path / "logs"), \
+                 mock.patch.object(jobs, "LOG_DIR_LEGACY", None), \
+                 mock.patch.object(jobs, "_plist_loaded", return_value=True):
+                entry = jobs._job_entry("notes_watch")
+        self.assertEqual(entry["log_path"], str(out))
+        self.assertEqual(entry["err_log_path"], str(err))
+        self.assertEqual(entry["last_run_source"], "log")
+        self.assertIsNotNone(entry["last_run_iso"])
+
     def test_job_status_shape(self):
         with mock.patch.object(jobs, "_job_entry", side_effect=lambda name: {"name": name}):
             out = jobs.job_status()
