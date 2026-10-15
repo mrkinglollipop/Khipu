@@ -110,7 +110,7 @@ PY
   chmod +x "$dst"
 }
 
-for script in khipu-mcp khipu-stop-hook khipu-recall-hook khipu-prompt-recall khipu-recall-client.py khipu-aegis-capture; do
+for script in khipu-mcp khipu-stop-hook khipu-recall-hook khipu-prompt-recall khipu-recall-client.py khipu-aegis-capture khipu-delegation-hook; do
   patch_bundled_bin "$script"
 done
 

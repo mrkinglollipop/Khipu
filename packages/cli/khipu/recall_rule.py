@@ -564,7 +564,7 @@ _ROUTING_CHILD_MOST = 60.0
 _ROUTING_CHILD_GRACE = 0.05
 
 
-def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float) -> None:
+def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, moment: str = "start") -> None:
     """The forked child: write the summary's JSON to ``write_fd`` and exit.
     Never returns, and never touches the hook's stdin, stdout or stderr."""
     code = 1
@@ -588,7 +588,7 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float) 
 
         signal.signal(signal.SIGALRM, on_alarm)
         signal.setitimer(signal.ITIMER_REAL, max(0.0, deadline - time.monotonic()) + _ROUTING_CHILD_GRACE)
-        out = routing.start_push(budget)
+        out = routing.start_push(budget, moment)
         if isinstance(out, dict):
             data = memoryview(json.dumps({k: out.get(k) for k in ("text", "version", "epoch")}).encode("utf-8"))
             while data:
@@ -601,7 +601,9 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float) 
 
 
 class _RoutingAtStart:
-    def __init__(self) -> None:
+    def __init__(self, moment: str = "start") -> None:
+        # "start", or "delegation" for a subagent's start (routing_delegation).
+        self.moment = moment
         self.out: dict | None = None
         self.deadline = time.monotonic()
         self.pid: int | None = None
@@ -612,7 +614,7 @@ class _RoutingAtStart:
             from khipu import routing
 
             started = time.monotonic()
-            if not hasattr(os, "fork") or routing.push_off("start"):
+            if not hasattr(os, "fork") or routing.push_off(self.moment):
                 return self  # off: no child at all
             # One small config read; any failure means the default second.
             try:
@@ -632,7 +634,7 @@ class _RoutingAtStart:
                 os.close(write_fd)
                 raise
             if pid == 0:
-                _routing_child(write_fd, read_fd, budget, self.deadline)
+                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment)
             os.close(write_fd)
             self.pid, self.fd = pid, read_fd
         except Exception:

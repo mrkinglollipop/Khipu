@@ -63,8 +63,8 @@ class ClaudeCodePackTest(_TempHomeCase):
         out = integ.install("claude_code")
         self.assertTrue(out["detected"])
         # mcp + Stop + PreCompact + SessionEnd + SubagentStop + SessionStart recall
-        # + UserPromptSubmit recall
-        self.assertEqual(len(out["changes"]), 7)
+        # + UserPromptSubmit recall + PreToolUse and SubagentStart (routing at delegation)
+        self.assertEqual(len(out["changes"]), 9)
         s = json.loads((self.home / ".claude" / "settings.json").read_text())
         pc = [h["command"] for e in s["hooks"]["PreCompact"] for h in e["hooks"]]
         self.assertIn("python3 /me/precompact_flush.py", pc)         # legacy untouched
@@ -744,7 +744,8 @@ class CodexPackTest(_TempHomeCase):
         out = integ.install("codex")
         self.assertTrue(out["detected"])
         # mcp + Stop + PreCompact + SessionEnd + SubagentStop + SessionStart + UserPromptSubmit
-        self.assertEqual(len(out["changes"]), 7)
+        # + PreToolUse and SubagentStart (routing at delegation)
+        self.assertEqual(len(out["changes"]), 9)
         t = tomllib.loads((self.home / ".codex" / "config.toml").read_text())
         self.assertEqual(sorted(t["mcp_servers"]), ["khipu", "node_repl"])
         h = json.loads((self.home / ".codex" / "hooks.json").read_text())
@@ -981,7 +982,7 @@ class LauncherHealthTest(_TempHomeCase):
         out = integ.launcher_health()
         self.assertTrue(out["ok"])
         self.assertTrue(out["consistent"])
-        self.assertEqual(len(out["states"]), 5)
+        self.assertEqual(len(out["states"]), len(integ.LAUNCHER_NAMES))
 
     def test_a_referenced_dangling_launcher_fails_ok(self):
         (self.home / ".claude").mkdir()
@@ -1523,7 +1524,7 @@ class ClaudeHomesUninstallTest(_ClaudeHomesCase):
 class ClaudeHomesStatusTest(_ClaudeHomesCase):
     ROW_KEYS = {"path", "label", "source", "is_default", "exists", "settings_path", "mcp_paths", "linked_to",
                 "hook_stop", "hook_precompact", "hook_sessionend", "hook_subagentstop", "recall_rule",
-                "prompt_recall", "memory_tools_ok", "hooks_ok", "launcher_ok", "installed", "has_khipu"}
+                "prompt_recall", "delegation_push", "memory_tools_ok", "hooks_ok", "launcher_ok", "installed", "has_khipu"}
 
     def test_each_home_is_a_row_with_the_documented_keys(self):
         self._seed(link=True)

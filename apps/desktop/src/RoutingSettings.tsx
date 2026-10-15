@@ -1430,8 +1430,8 @@ function HoldsSection({
 // ---------------------------------------------------------------------------
 
 const HEARS: [string, string][] = [
-  ["Claude Code", "At the start and before each prompt, on every Claude account."],
-  ["Codex", "At the start and before each prompt."],
+  ["Claude Code", "At the start, before each prompt and before handing work to another agent, on every Claude account. A subagent hears the summary when it starts."],
+  ["Codex", "At the start, before each prompt and before handing work to another agent, once you approve Khipu's hooks in Codex."],
   ["Cursor", "At the start only; Cursor has no step before each prompt."],
   ["Grok Build", "When it asks Khipu."],
   ["Aegis", "When its own client asks Khipu."],
@@ -1484,6 +1484,98 @@ function SwitchRow({
         </p>
         {error}
       </div>
+    </div>
+  );
+}
+
+function dispatchScripts(cfg: RouteConfig | null): string[] | null {
+  const raw = cfg?.routing?.routing_dispatch_scripts?.value;
+  return Array.isArray(raw) && raw.every((v) => typeof v === "string") ? (raw as string[]) : null;
+}
+
+function DispatchScriptsRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
+  const names = dispatchScripts(cfg);
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState("");
+  const btn = useRef<HTMLButtonElement>(null);
+  const formId = `dispatch-${useId().replace(/:/g, "")}`;
+  const id = "dispatch-scripts";
+  const close = () => {
+    setOpen(false);
+    w.fail(id, null);
+    requestAnimationFrame(() => btn.current?.focus());
+  };
+  async function save(e: FormEvent) {
+    e.preventDefault();
+    const next = [...new Set(draft.split(",").map((t) => t.trim()).filter((t) => t !== ""))];
+    if (next.some((t) => !/^[A-Za-z0-9._-]{1,64}$/.test(t) || t === "." || t === ".." || t.startsWith("-"))) {
+      w.fail(id, "Give file names only, such as dispatch.py: letters, digits, dots, dashes and underscores, no folder.");
+      return;
+    }
+    if (next.length > 16) {
+      w.fail(id, "At most 16 scripts.");
+      return;
+    }
+    if (await w.run(id, "khipu_config_set", { key: "routing_dispatch_scripts", value: JSON.stringify(next) }, reread)) close();
+  }
+  return (
+    <div className="row-item route-limit">
+      <span className="route-limit-text">
+        <span className="route-limit-name">Your dispatch scripts</span>
+        <span className="set-help">
+          Scripts of your own that hand work to another agent. A shell command that runs one counts as handing work on,
+          like claude -p or codex exec.
+        </span>
+      </span>
+      <span className="route-val">{names == null ? "…" : names.length ? names.join(", ") : "None"}</span>
+      <button
+        ref={btn}
+        type="button"
+        className="sm"
+        aria-label="Change your dispatch scripts"
+        aria-expanded={open}
+        aria-controls={open ? formId : undefined}
+        disabled={names == null}
+        onClick={() => {
+          if (open) {
+            close();
+            return;
+          }
+          setDraft((names ?? []).join(", "));
+          w.fail(id, null);
+          setOpen(true);
+        }}
+      >
+        Change…
+      </button>
+      {open ? (
+        <form className="route-pause" id={formId} aria-label="Change your dispatch scripts" onSubmit={save} onKeyDown={escapeCloses(close)}>
+          <div className="toolbar">
+            <label htmlFor={`${formId}-names`}>File names</label>
+            <input
+              id={`${formId}-names`}
+              className="mono"
+              value={draft}
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="dispatch.py, run-job.sh…"
+              onChange={(e) => setDraft(e.target.value)}
+            />
+          </div>
+          <p className="set-help">File names only, separated by commas. Leave it empty for none.</p>
+          <WriteError w={w} id={id} say={(m) => settingWords(m, "routing_dispatch_scripts", "Your dispatch scripts")} />
+          <div className="toolbar">
+            <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
+              <Busy on={w.isBusy(id)} />
+              Save
+            </button>
+            <button type="button" className="sm link" onClick={close}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      ) : null}
     </div>
   );
 }
@@ -1595,6 +1687,24 @@ function TellingSection({
           }
           error={<WriteError w={w} id="push-prompt" />}
         />
+        <SwitchRow
+          id="route-push-delegation"
+          label="Before handing work to another agent"
+          what="Reaches an orchestrator in the middle of a long turn when it starts a subagent, a delegated task or a job such as claude -p or codex exec. It arrives with the call's result and never stops the call. A subagent hears the full summary when it starts."
+          tag={<Tag tone="ok">Delegation</Tag>}
+          checked={moment("routing_push_delegation")}
+          disabled={!cfg || w.anyBusy}
+          busy={w.isBusy("push-delegation")}
+          onChange={(next) =>
+            void w.run("push-delegation", "khipu_config_set", { key: "routing_push_delegation", value: next ? "on" : "off" }, reread)
+          }
+          error={<WriteError w={w} id="push-delegation" />}
+        />
+      </div>
+      <div className="section-body">
+        <div className="rows">
+          <DispatchScriptsRow cfg={cfg} w={w} reread={reread} />
+        </div>
       </div>
       <div className="section-body">
         <h3 className="sub-title" id="route-hear-h">

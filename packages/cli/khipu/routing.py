@@ -86,6 +86,8 @@ DOWN_REASONS = {"not_signed_in": "not signed in", "not_installed": "not installe
                 "out_of_service": "out of service"}
 EVIDENCE_MAX = 200
 NAME_MAX = 64
+DISPATCH_SCRIPTS_MOST = 16
+_SCRIPT_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # The harness names Khipu writes as a conversation's author; any other value
 # (KHIPU_HARNESS is the caller's own environment) is stored as "unknown".
 HARNESS_WORDS = {"claude_code": "Claude Code", "codex": "Codex", "aegis": "Aegis", "grok": "Grok Build",
@@ -163,6 +165,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_push_start": ("switch", True, "Tell conversations at the start and after compaction"),
     "routing_push_prompt": ("switch", True, "Tell conversations before each prompt"),
     "routing_push_delegation": ("switch", True, "Tell conversations before handing work to another agent"),
+    "routing_dispatch_scripts": ("names", [], "Your own scripts that hand work to another agent, by file name"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
     "routing_prompt_budget_ms": ("count", 50, "Time allowed before a prompt, in milliseconds"),
     "routing_start_budget_ms": ("count", 1000, "Time allowed at the start of a conversation, in milliseconds"),
@@ -326,6 +329,25 @@ def _coerce(kind: str, value, key: str):
         if not isinstance(items, list) or len(items) > 10:
             raise ValueError(f"{key} must be at most ten lengths of time, for example 10m,30m (none: [])")
         return [_coerce("duration", item, key) for item in items]
+    if kind == "names":
+        # File names only (no folder): a shell command is matched on the
+        # name of the script it runs, wherever that script lives.
+        items = value
+        if isinstance(value, str):
+            text = value.strip()
+            items = _loads(text) if text.startswith("[") else [p for p in text.split(",") if p.strip()]
+        if not isinstance(items, list) or len(items) > DISPATCH_SCRIPTS_MOST:
+            raise ValueError(f"{key} must be at most {DISPATCH_SCRIPTS_MOST} file names, for example "
+                             "dispatch.py,run-job.sh (none: [])")
+        names: list[str] = []
+        for item in items:
+            name = _short_text(item, f"{key}: a file name")
+            if not _SCRIPT_NAME.fullmatch(name) or name in (".", ".."):
+                raise ValueError(f"{key}: {name!r} must be a file name only: letters, digits, dots, dashes "
+                                 "and underscores, no folder")
+            if name not in names:
+                names.append(name)
+        return names
     if kind == "path":
         # Absolute only: a relative name would be read against whichever
         # folder each reader (the app, doctor, a hook) runs in, and the
@@ -4253,13 +4275,14 @@ def start_budget() -> float:
     return min(max(0, ms), START_BUDGET_MOST_MS) / 1000.0
 
 
-def start_push(budget: float | None = None) -> dict | None:
-    """The full summary for the session-start hook, or None when the push is
+def start_push(budget: float | None = None, moment: str = "start") -> dict | None:
+    """The full summary for the session-start hook (or, with ``moment``
+    "delegation", for a subagent at its start), or None when the push is
     off. Folds outside the routing lock and waits for it, to save the view,
     at most half of ``budget`` (then answers from an unsaved fold, as
     ``light_status`` does). The hook bounds the
     whole call and treats any exception as nothing to push."""
-    if push_off("start"):
+    if push_off(moment):
         return None
     budget = start_budget() if budget is None else budget
     return light_status(lock_wait=budget / 2, start=True)

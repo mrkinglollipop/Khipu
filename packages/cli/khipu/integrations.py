@@ -48,6 +48,11 @@ Packs:
                {type,command,timeout} entries; UserPromptSubmit exposed the same way;
                SubagentStop, K4, carries agent_transcript_path for the child transcript)
 
+  Every claude_code/codex pack above also gets hooks.PreToolUse (matched to
+  delegation tools) and hooks.SubagentStart += khipu-delegation-hook: the
+  routing push at the moment of delegation (routing truth, phase 6; Codex
+  runs it once the owner has reviewed it).
+
   Every claude_code/codex pack above also gets hooks.UserPromptSubmit +=
   khipu-prompt-recall (R1): a bounded per-prompt search, pushed the same way
   as the SessionStart recall push, so the model does not have to decide to
@@ -209,7 +214,7 @@ def _shim(name: str) -> str:
 
 LAUNCHER_NAMES = (
     "khipu-mcp", "khipu-stop-hook", "khipu-recall-hook",
-    "khipu-prompt-recall", "khipu-aegis-capture",
+    "khipu-prompt-recall", "khipu-aegis-capture", "khipu-delegation-hook",
 )
 
 
@@ -248,10 +253,12 @@ def launcher_states() -> list[dict]:
 
 
 _PACK_LAUNCHERS: dict[str, tuple[str, ...]] = {
-    "claude_code": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall"),
+    "claude_code": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
+                    "khipu-delegation-hook"),
     "cursor": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook"),
     "aegis": ("khipu-mcp", "khipu-aegis-capture"),
-    "codex": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall"),
+    "codex": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
+              "khipu-delegation-hook"),
 }
 
 
@@ -325,6 +332,59 @@ CODEX_SESSIONEND_TIMEOUT = 3
 def codex_sessionend_hook() -> str:
     """Queue-only shim invocation for Codex SessionEnd (3 s hard cap)."""
     return queue_only_stop_hook()
+
+
+# The routing push at the moment of delegation (routing truth, phase 6): one
+# launcher for PreToolUse, matched to the tools a delegation can go through
+# (the hook itself then looks at the call and stays silent for the rest), and
+# SubagentStart. PreToolUse holds the call, so its timeout is the per-prompt
+# hook's; the hook never denies, whatever happens.
+DELEGATION_MATCHER = "Agent|Task|Bash|shell|exec_command|local_shell|delegate_task"
+DELEGATION_TIMEOUT = PROMPT_RECALL_TIMEOUT
+SUBAGENT_START_TIMEOUT = 10
+DELEGATION_EVENTS = ("PreToolUse", "SubagentStart")
+CODEX_REVIEW_STEP = ("Codex runs a new or changed hook only after you review it: start Codex, and approve "
+                     "Khipu's hooks when it says hooks need review.")
+
+
+def delegation_hook() -> str:
+    return _shim("khipu-delegation-hook")
+
+
+def _is_our_delegation(cmd: Any) -> bool:
+    return _is_launcher_command(cmd, "khipu-delegation-hook")
+
+
+def _install_delegation_hooks(hooks: dict, path: Path, changes: list[str]) -> bool:
+    """Add or re-point Khipu's PreToolUse and SubagentStart entries in a
+    Claude-shaped ``hooks`` block (Claude Code's settings.json, Codex's
+    hooks.json). True when anything changed."""
+    changed = False
+    want = delegation_hook()
+    for event in DELEGATION_EVENTS:
+        entries = hooks.setdefault(event, [])
+        matcher = DELEGATION_MATCHER if event == "PreToolUse" else None
+        timeout = DELEGATION_TIMEOUT if event == "PreToolUse" else SUBAGENT_START_TIMEOUT
+        ours = [e for e in entries if any(_is_our_delegation(h.get("command")) for h in e.get("hooks", []))]
+        if not ours:
+            entry: dict[str, Any] = {"hooks": [{"type": "command", "command": want, "timeout": timeout}]}
+            if matcher:
+                entry = {"matcher": matcher, **entry}
+            entries.append(entry)
+            changes.append(f"{path}: hooks.{event} += khipu-delegation-hook")
+            changed = True
+            continue
+        for e in ours:
+            for h in e.get("hooks", []):
+                if _is_our_delegation(h.get("command")) and (h.get("command") != want or h.get("timeout") != timeout):
+                    h["command"], h["timeout"] = want, timeout
+                    changes.append(f"{path}: hooks.{event} khipu-delegation-hook -> {want} (timeout={timeout})")
+                    changed = True
+            if matcher and e.get("matcher") != matcher and len(e.get("hooks", [])) == 1:
+                e["matcher"] = matcher
+                changes.append(f"{path}: hooks.{event} khipu-delegation-hook matcher -> {matcher}")
+                changed = True
+    return changed
 
 
 # Cursor sessionStart must outlive a hub PG slice; harness session_start.sh stays at 5s.
@@ -671,6 +731,8 @@ def _claude_hooks_install(settings: Path, dry: bool, res: dict) -> None:
         res["changes"].append(
             f"{settings}: hooks.UserPromptSubmit khipu-prompt-recall -> {prompt_recall_hook()}")
         changed = True
+    if _install_delegation_hooks(hooks, settings, res["changes"]):
+        changed = True
     if changed and not dry:
         res.setdefault("backups", []).append(_backup(settings))
         _write_json(settings, s)
@@ -724,13 +786,15 @@ def _claude_mcp_uninstall(path: Path, dry: bool, res: dict) -> None:
 def _claude_hooks_uninstall(settings: Path, dry: bool, res: dict) -> None:
     s = _load_json(settings)
     changed = False
-    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit"):
+    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit",
+                  *DELEGATION_EVENTS):
         entries = s.get("hooks", {}).get(event, [])
         kept = []
         for e in entries:
             e_hooks = [h for h in e.get("hooks", [])
                        if not (_is_ours(h.get("command")) or _is_our_recall(h.get("command"))
-                               or _is_our_prompt_recall(h.get("command")))]
+                               or _is_our_prompt_recall(h.get("command"))
+                               or _is_our_delegation(h.get("command")))]
             if len(e_hooks) != len(e.get("hooks", [])):
                 changed = True
                 res["changes"].append(f"{settings}: hooks.{event} -= khipu hook")
@@ -783,7 +847,7 @@ def _claude_uninstall(dry: bool, home: str | None = None) -> dict:
 
 _CLAUDE_HOME_FLAGS_OFF = {
     "hook_stop": False, "hook_precompact": False, "hook_sessionend": False, "hook_subagentstop": False,
-    "recall_rule": "missing", "prompt_recall": "missing",
+    "recall_rule": "missing", "prompt_recall": "missing", "delegation_push": "missing",
     "memory_tools_ok": False, "hooks_ok": False, "installed": False, "launcher_ok": True,
     "has_khipu": False,
 }
@@ -819,24 +883,28 @@ def _claude_home_status(h: _homes.ClaudeHome) -> tuple[dict, dict]:
     stop, precompact = _cmd("Stop", _is_ours), _cmd("PreCompact", _is_ours)
     sessionend, subagentstop = _cmd("SessionEnd", _is_ours), _cmd("SubagentStop", _is_ours)
     rule, prompt_recall = _cmd("SessionStart", _is_our_recall), _cmd("UserPromptSubmit", _is_our_prompt_recall)
+    delegation = _cmd("PreToolUse", _is_our_delegation)
+    subagent_start = _cmd("SubagentStart", _is_our_delegation)
     launch = _pack_launchers("claude_code", {
         "khipu-mcp": mcp_cmds[0],
         "khipu-stop-hook": stop,
         "khipu-recall-hook": rule,
         "khipu-prompt-recall": prompt_recall,
+        "khipu-delegation-hook": delegation or subagent_start,
     })
     row.update(
         hook_stop=stop is not None, hook_precompact=precompact is not None,
         hook_sessionend=sessionend is not None, hook_subagentstop=subagentstop is not None,
         recall_rule="installed" if rule else "missing",
         prompt_recall="installed" if prompt_recall else "missing",
+        delegation_push="installed" if delegation and subagent_start else "missing",
         memory_tools_ok=mcp_ok, launcher_ok=launch["launcher_ok"],
     )
     row["hooks_ok"] = all((stop, precompact, sessionend, subagentstop, rule, prompt_recall))
     row["installed"] = bool(mcp_ok and stop and precompact) and launch["launcher_ok"]
     # Any Khipu entry of this home's own, however stale. A linked home's hooks
     # are the owner's, so for it only the memory tools entry counts.
-    own_hooks = any((stop, precompact, sessionend, subagentstop, rule, prompt_recall))
+    own_hooks = any((stop, precompact, sessionend, subagentstop, rule, prompt_recall, delegation, subagent_start))
     row["has_khipu"] = _claude_has_mcp(h) or (own_hooks and h.linked_to is None)
     return row, launch
 
@@ -864,6 +932,8 @@ def _claude_pack_fields(scope: list[dict]) -> dict:
         "hook_sessionend": every("hook_sessionend"), "hook_subagentstop": every("hook_subagentstop"),
         "recall_rule": "installed" if every_installed("recall_rule") else "missing",
         "prompt_recall": "installed" if every_installed("prompt_recall") else "missing",
+        # The routing push at delegation (phase 6): PreToolUse and SubagentStart.
+        "delegation_push": "installed" if every_installed("delegation_push") else "missing",
         # Khipu-native extraction rides on this same hook (session_capture);
         # "legacy" was the model-driven capture_v2 nudge, which is now only
         # a parallel writer until the soak-gated legacy removal.
@@ -1574,6 +1644,13 @@ def _codex_install(dry: bool) -> dict:
         out["changes"].append(
             f"{CODEX_HOOKS}: hooks.UserPromptSubmit khipu-prompt-recall -> {prompt_recall_hook()}")
         changed = True
+    # Routing at delegation (phase 6). Codex keeps a hook it has not seen
+    # before switched off until the owner reviews it (hooks.state.<key>
+    # .trusted_hash); Khipu never writes that trust itself, it says so.
+    if _install_delegation_hooks(hooks, CODEX_HOOKS, out["changes"]):
+        changed = True
+    if changed:
+        out["next_step"] = CODEX_REVIEW_STEP
     if changed and not dry:
         out.setdefault("backups", []).append(_backup(CODEX_HOOKS))
         _write_json(CODEX_HOOKS, h)
@@ -1595,13 +1672,15 @@ def _codex_uninstall(dry: bool) -> dict:
                 _write_toml(CODEX_TOML, new)
     h = _load_json(CODEX_HOOKS)
     changed = False
-    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit"):
+    for event in ("Stop", "PreCompact", "SessionEnd", "SubagentStop", "SessionStart", "UserPromptSubmit",
+                  *DELEGATION_EVENTS):
         entries = h.get("hooks", {}).get(event, [])
         kept = []
         for e in entries:
             e_hooks = [x for x in e.get("hooks", [])
                        if not (_is_ours(x.get("command")) or _is_our_recall(x.get("command"))
-                               or _is_our_prompt_recall(x.get("command")))]
+                               or _is_our_prompt_recall(x.get("command"))
+                               or _is_our_delegation(x.get("command")))]
             if len(e_hooks) != len(e.get("hooks", [])):
                 changed = True
                 out["changes"].append(f"{CODEX_HOOKS}: hooks.{event} -= khipu hook")
@@ -1630,6 +1709,8 @@ def _codex_status() -> dict:
             "hook_subagentstop": has("SubagentStop", _is_ours),
             "recall_rule": "installed" if has("SessionStart", _is_our_recall) else "missing",
             "prompt_recall": "installed" if has("UserPromptSubmit", _is_our_prompt_recall) else "missing",
+            "delegation_push": ("installed" if has("PreToolUse", _is_our_delegation)
+                                and has("SubagentStart", _is_our_delegation) else "missing"),
             "extract": "installed" if has("Stop", _is_ours) and has("PreCompact", _is_ours) else "missing"}
     def _cmd(ev: str, pred) -> str | None:
         for e in h.get("hooks", {}).get(ev, []):
@@ -1642,6 +1723,7 @@ def _codex_status() -> dict:
         "khipu-stop-hook": _cmd("Stop", _is_ours),
         "khipu-recall-hook": _cmd("SessionStart", _is_our_recall),
         "khipu-prompt-recall": _cmd("UserPromptSubmit", _is_our_prompt_recall),
+        "khipu-delegation-hook": _cmd("PreToolUse", _is_our_delegation) or _cmd("SubagentStart", _is_our_delegation),
     }))
     return out
 
