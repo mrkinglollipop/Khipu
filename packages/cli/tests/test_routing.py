@@ -2136,7 +2136,15 @@ def test_owner_requested_rules_are_live_pending_and_owner_can_confirm_undo_or_di
     assert added["n"] == 1 and rule["pending"] and rule["pending_kind"] == "added"
     assert "added by a Claude Code conversation at the owner's request" in routing.summary()["text"]
     delta = routing.since(start)
+    # The first write creates the record, so every account appears in the
+    # same change; the rule is the only thing besides them.
+    assert delta["entities"][0] == "rule:1" and "owner has not confirmed" in delta["lines"][0]
+    assert all(e.startswith("account:") for e in delta["entities"][1:])
+    after_add = routing.read_view()["version"]
+    routing.request_rule("Keep browser work read-only, always.", n=1, author=ME)
+    delta = routing.since(after_add)
     assert delta["entities"] == ["rule:1"] and "owner has not confirmed" in delta["lines"][0]
+    assert routing.read_view()["rules"][0]["pending_kind"] == "added"
     assert routing.doctor_block()["pending_conversation_rules"] == 1
     routing.confirm_rule(1, via="app")
     confirmed = routing.read_view()["rules"][0]
@@ -2157,16 +2165,26 @@ def test_owner_requested_rules_are_live_pending_and_owner_can_confirm_undo_or_di
     routing.confirm_rule(2, via="app")
     assert "owner has not confirmed" not in routing.summary()["text"]
     assert "it replaced: 'Original wording.'" not in routing.summary()["text"]
-    routing.request_rule("Second replacement.", n=2, author=OTHER)
+    # Confirming made "Second replacement." the owner's wording, so Undo of
+    # later unconfirmed edits (two in a row) brings that back, confirmed.
+    routing.request_rule("Third replacement.", n=2, author=OTHER)
+    routing.request_rule("Fourth replacement.", n=2, author=ME)
+    assert next(r for r in routing.read_view()["rules"] if r["n"] == 2)["prior_text"] == "Second replacement."
     routing.undo_rule_request(2, via="app")
     undone = next(r for r in routing.read_view()["rules"] if r["n"] == 2)
-    assert (undone["text"], undone["pending"], undone["confirmed"]) == ("Original wording.", False, True)
+    assert (undone["text"], undone["pending"], undone["confirmed"]) == ("Second replacement.", False, True)
+    assert routing.doctor_block()["pending_conversation_rules"] == 0
+    with pytest.raises(routing.RouteError):
+        routing.undo_rule_request(2, via="app")
 
     routing.request_rule("Temporary pending rule.", author=ME)
     routing.request_rule("Still temporary.", n=3, author=OTHER)
     assert next(r for r in routing.read_view()["rules"] if r["n"] == 3)["pending_kind"] == "added"
+    with pytest.raises(routing.RouteError):
+        routing.undo_rule_request(3, via="app")
     routing.dismiss_rule_request(3, via="app")
     assert all(r["n"] != 3 for r in routing.read_view()["rules"])
+    assert routing.doctor_block()["pending_conversation_rules"] == 0
 
 
 def test_undo_pending_seeded_rule_keeps_it_unconfirmed(home):
