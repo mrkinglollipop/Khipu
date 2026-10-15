@@ -60,10 +60,11 @@ class EncodeFrameTest(unittest.TestCase):
         self.assertIn("末尾😀", text)
         self.assertEqual(json.loads(text), {"body": "末尾😀"})
 
-    def test_a_lone_surrogate_is_written_as_its_json_escape(self):
+    def test_a_lone_surrogate_is_written_as_visible_text(self):
         raw = srv.encode_frame({"text": "a\udc80b"})
         raw.decode("utf-8")  # still valid UTF-8
-        self.assertEqual(json.loads(raw), {"text": "a\udc80b"})
+        self.assertEqual(json.loads(raw), {"text": "a\\udc80b"})  # six visible chars
+        self.assertNotIn(b"a\\udc80b", raw)  # no single-backslash JSON surrogate escape
 
 
 class StdioWireTest(unittest.TestCase):

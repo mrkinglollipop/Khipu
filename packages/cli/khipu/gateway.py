@@ -351,7 +351,7 @@ class Handler(BaseHTTPRequestHandler):
                 # liveness row — only for a caller who could already see the
                 # build stamp (loopback or bearer holder), never the public.
                 body["gateway_liveness"] = gateway_liveness()
-            self._send(200, json.dumps(body).encode())
+            self._send(200, encode_frame(body))
             return
         if self.path.rstrip("/") == "/mcp":
             self._send(405)  # no server-initiated SSE stream; allowed by the spec
@@ -411,18 +411,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             msg = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            self._send(400, json.dumps({"jsonrpc": "2.0", "id": None,
-                                        "error": {"code": -32700, "message": "parse error"}}).encode())
+            self._send(400, encode_frame({"jsonrpc": "2.0", "id": None,
+                                          "error": {"code": -32700, "message": "parse error"}}))
             return
         msgs = msg if isinstance(msg, list) else [msg]
         if not msgs:
-            self._send(400, json.dumps({"jsonrpc": "2.0", "id": None,
-                                        "error": {"code": -32600, "message": "invalid request"}}).encode())
+            self._send(400, encode_frame({"jsonrpc": "2.0", "id": None,
+                                          "error": {"code": -32600, "message": "invalid request"}}))
             return
         if len(msgs) > MAX_BATCH:
-            self._send(413, json.dumps({"jsonrpc": "2.0", "id": None,
-                                        "error": {"code": -32600,
-                                                  "message": f"batch too large (max {MAX_BATCH})"}}).encode())
+            self._send(413, encode_frame({"jsonrpc": "2.0", "id": None,
+                                          "error": {"code": -32600,
+                                                    "message": f"batch too large (max {MAX_BATCH})"}}))
             _log(f"{ip} POST /mcp 413 (batch {len(msgs)} > {MAX_BATCH})")
             return
         # Charge the rest of the batch: the first message was paid for above.

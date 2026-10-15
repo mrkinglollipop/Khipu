@@ -76,6 +76,15 @@ def _add_paths() -> None:
             sys.path.insert(0, s)
 
 
+
+def _strict_json(value, **kw) -> str:
+    """JSON the desktop's serde_json parses whatever the text holds: ASCII,
+    no lone surrogate escape (khipu.wire)."""
+    from khipu import wire
+
+    return wire.dumps(value, ensure_ascii=True, **kw)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from khipu.drift import status_payload
     from khipu.hub_snapshot import (
@@ -120,7 +129,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         data["bundle_seal"] = bundle_seal.check()
     except Exception as exc:  # noqa: BLE001
         data["bundle_seal"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    print(json.dumps(data, indent=2, default=str))
+    print(_strict_json(data, indent=2, default=str))
     return 0
 
 
@@ -458,7 +467,7 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
     }
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
                  and all(bool(local[k]) for k in LOCAL_GATES))
-    print(json.dumps(out, indent=2, default=str))
+    print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
 
 
@@ -938,7 +947,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "launchers_ok": bool(launchers.get("ok")),
         "nightly_steps_ok": local["nightly_steps_ok"],
     }
-    print(json.dumps(out, indent=2, default=str))
+    print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
 
 

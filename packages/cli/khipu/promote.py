@@ -332,9 +332,9 @@ def _run(argv: list[str], *, env: dict[str, str] | None = None, input: str | Non
     try:
         with tempfile.TemporaryDirectory(prefix="khipu-gate-cwd-") as neutral:
             return subprocess.run(argv, env=env, input=input, cwd=cwd or neutral, capture_output=True,
-                                  text=True, timeout=timeout, check=False)
+                                  encoding="utf-8", timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
-        out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         return subprocess.CompletedProcess(argv, 124, out, f"timed out after {timeout:g}s")
     except OSError as exc:
         return subprocess.CompletedProcess(argv, 127, "", f"{type(exc).__name__}: {exc}")
@@ -682,7 +682,7 @@ def _probe_answer(r: subprocess.CompletedProcess) -> bool | None:
     if r.returncode != 0:
         return None
     try:
-        out = json.loads((r.stdout or "").strip().splitlines()[-1])
+        out = json.loads((r.stdout or "").strip().split("\n")[-1])
     except (ValueError, IndexError):
         return None
     push = out.get("push") if isinstance(out, dict) else None

@@ -72,6 +72,7 @@ from pathlib import Path
 from typing import Any
 
 from khipu import t3 as _t3
+from khipu import wire
 if not hasattr(_t3, 'cache_thread'):
     # A long-lived MCP server can still hold the t3 from before the
     # deploy that added this name; t3 is stdlib-only, so reloading is safe.
@@ -2584,9 +2585,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(liveness_all(), indent=2))
         return 0
     harness = argv[1] if len(argv) >= 2 and argv[0] == "--harness" else None
-    out = hook_main(sys.stdin.read(), harness)
+    out = hook_main(wire.read_stdin(), harness)
     if os.environ.get("KHIPU_CAPTURE_PROBE") == "1" or os.environ.get("KHIPU_AEGIS_PROBE") == "1":
-        print(json.dumps(out))
+        print(wire.dumps(out, ensure_ascii=True))
     return 0
 
 

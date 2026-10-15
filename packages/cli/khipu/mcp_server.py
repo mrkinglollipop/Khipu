@@ -1747,9 +1747,12 @@ def _error(req_id, code: int, message: str) -> dict:
 def _tool_text(payload: dict, *, is_error: bool = False) -> dict:
     # Non-ASCII stays literal: escaping made a CJK body six bytes per
     # character in this text and seven once the frame was dumped again.
+    # Strict at this level too: a client parses this text as JSON in turn.
+    from khipu import wire
+
     return {
         "content": [
-            {"type": "text", "text": json.dumps(payload, indent=2, default=str, ensure_ascii=False)}
+            {"type": "text", "text": wire.dumps(payload, indent=2, default=str)}
         ],
         "isError": is_error,
     }
@@ -1758,9 +1761,11 @@ def _tool_text(payload: dict, *, is_error: bool = False) -> dict:
 def encode_frame(message) -> bytes:
     """One JSON-RPC message as UTF-8 bytes, for the stdio writer and the gateway.
 
-    A lone surrogate (text decoded with surrogateescape) cannot be UTF-8; it is
-    written as its JSON escape, which is what ensure_ascii used to produce."""
-    return json.dumps(message, default=str, ensure_ascii=False).encode("utf-8", "backslashreplace")
+    Strict JSON (khipu.wire): no lone surrogate escape, U+2028 and U+2029
+    escaped, so Foundation, serde_json and line-based readers all parse it."""
+    from khipu import wire
+
+    return wire.encode(message, default=str)
 
 
 def _write_frame(message) -> None:
