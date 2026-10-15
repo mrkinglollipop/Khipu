@@ -56,7 +56,11 @@ export const ALL_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>([
 ]);
 
 /** What this build has. */
-export const BUILD_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>([]);
+export const BUILD_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>([
+  "plans-per-account",
+  "capture-models-cards",
+  "setup-accounts-step",
+]);
 
 /** Setup steps every build has; any other step needs a capability. */
 const BASE_SETUP_STEPS = ["welcome", "database", "model", "graph", "agents", "finish"];
