@@ -509,6 +509,12 @@ def _cross_session_pairs_5min(cur) -> dict:
     if not (has_project and has_parent):
         return _metric(None, 0.01, ok=True,
                         note="episodes.project/parent_session_id not present yet (pre-0008)")
+    # Each pair once, the later episode (by ts, then id) found through the
+    # ts index within 300 s of the earlier one. The old self-join compared
+    # every pair in the window (29 s on 30 days of episodes, run by every
+    # `khipu status`, so the app's Home sat waiting and the hub was loaded);
+    # this form takes about 0.2 s. The exclusions are NULL-safe both ways
+    # round: the old form dropped a pair whose second episode had no project.
     cur.execute(
         """
         WITH recent AS (
@@ -518,14 +524,15 @@ def _cross_session_pairs_5min(cur) -> dict:
         )
         SELECT COUNT(*)
         FROM recent a
-        JOIN recent b
-          ON a.id < b.id
+        JOIN episodes b
+          ON b.ts >= a.ts
+         AND b.ts <= a.ts + interval '300 seconds'
+         AND (b.ts > a.ts OR b.id > a.id)
          AND a.session_id IS DISTINCT FROM b.session_id
-         AND abs(extract(epoch FROM (a.ts - b.ts))) <= 300
-        WHERE NOT (a.project IS NOT NULL AND a.project = b.project)
-          AND NOT (a.parent_session_id IS NOT NULL AND a.parent_session_id = b.session_id)
-          AND NOT (b.parent_session_id IS NOT NULL AND b.parent_session_id = a.session_id)
-          AND NOT (a.parent_session_id IS NOT NULL AND a.parent_session_id = b.parent_session_id)
+        WHERE (a.project IS NULL OR a.project IS DISTINCT FROM b.project)
+          AND (a.parent_session_id IS NULL OR a.parent_session_id IS DISTINCT FROM b.session_id)
+          AND (b.parent_session_id IS NULL OR b.parent_session_id IS DISTINCT FROM a.session_id)
+          AND (a.parent_session_id IS NULL OR a.parent_session_id IS DISTINCT FROM b.parent_session_id)
         """
         % RECALL_QUALITY_WINDOW_DAYS
     )
