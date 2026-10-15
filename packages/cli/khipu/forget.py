@@ -13,7 +13,8 @@ probe's cleanup, the ``khipu_forget`` MCP tool) so all of it happens:
   5. its deliverable rows → deleted
   6. its lines in every legacy log, .bak copy and retained forget backup;
      a crash-left temporary file holding one is reported, never edited
-  7. the local sqlite replica, if one exists (deleted_at + its embeddings)
+  7. the local sqlite replica, if one exists (deleted_at + its embeddings);
+     a crash-left refresh temp holding the row is reported, never edited
   8. every brief citing it → stale (migration 0025)
 
 B3 in docs/research/hindsight-plan-review-2026-09-28.md: forgetting used to
@@ -41,6 +42,13 @@ from pathlib import Path
 from typing import Any
 
 LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis")
+
+# What a forget keeps, said plainly in every result. Nothing deletes a
+# forgotten episode's row: there is no purge command and no restore command.
+KEPT = ("The hub and each Mac's local replica keep this episode's row and text, marked "
+        "forgotten (deleted_at set); search, recall and get skip it. No command purges "
+        "it yet, and no command restores it.")
+NO_ROOT_WHY = "no memory root is configured, so legacy logs could not be checked"
 
 
 def _deliverables_ready(cur) -> bool:
@@ -481,9 +489,10 @@ def _has_unidentified_records(lines: list[str]) -> bool:
 BACKUP_DIR = ".khipu-forget-backups"
 
 # Worst first: a location reports the worst state any identity pass saw.
-LOCATION_STATES = ("unreadable", "copy remains", "unidentified records", "removed", "clean")
-# States that leave a forgotten line, or a line nobody can identify, on disk.
-INCOMPLETE_STATES = frozenset(LOCATION_STATES[:3])
+LOCATION_STATES = ("unreadable", "not checked", "copy remains", "unidentified records",
+                   "removed", "clean")
+# States that leave a forgotten line, or one nobody could look at or identify.
+INCOMPLETE_STATES = frozenset(LOCATION_STATES[:4])
 
 
 def legacy_locations(memory_root: Path) -> list[tuple[str, Path]]:
@@ -680,14 +689,16 @@ def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: st
 
 
 def _merge_locations(*groups: list[dict[str, str]]) -> list[dict[str, str]]:
-    """One entry per path; the worst state any pass saw wins."""
-    merged: dict[str, dict[str, str]] = {}
+    """One entry per path (per place for an entry with no path); the worst
+    state any pass saw wins."""
+    merged: dict[Any, dict[str, Any]] = {}
     for group in groups:
         for loc in group:
-            known = merged.get(loc["path"])
+            key = loc["path"] if loc["path"] is not None else ("place", loc["place"])
+            known = merged.get(key)
             if known is None or (LOCATION_STATES.index(loc["state"])
                                  < LOCATION_STATES.index(known["state"])):
-                merged[loc["path"]] = dict(loc)
+                merged[key] = dict(loc)
     return list(merged.values())
 
 
@@ -792,6 +803,112 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
     return {"ok": not remaining, "removed": 0, "remaining": remaining, "inspected": inspected}
 
 
+def _replica_temp_remainder(episode_id: int) -> dict[str, Any]:
+    """Report, never edit, temporary replica files a crashed refresh left
+    beside the replica (``.hub_snapshot.<random>.sqlite`` and its journal
+    and WAL). Read under the refresh lock, so no live dump is mistaken for
+    a crash-left one; without the lock they are not checked."""
+    try:
+        from khipu import hub_snapshot
+
+        directory = hub_snapshot.snapshot_path().parent
+        lock = hub_snapshot._acquire_refresh_lock()
+    except Exception as exc:  # noqa: BLE001 (an unchecked place keeps the forget open)
+        return {"ok": False, "locations": [{
+            "place": "replica temp", "path": None, "state": "not checked",
+            "why": f"replica temporary files could not be checked: {type(exc).__name__}"}]}
+    if lock is None:
+        return {"ok": False, "locations": [{
+            "place": "replica temp", "path": str(directory), "state": "not checked",
+            "why": "a replica refresh is running, so its temporary files could not be checked"}]}
+    locations: list[dict[str, str]] = []
+    try:
+        try:
+            names = sorted(path.name for path in directory.iterdir())
+        except FileNotFoundError:
+            names = []
+        temps = [n for n in names if n.startswith(".hub_snapshot.")
+                 and not n.startswith(".hub_snapshot.meta.")]
+        states: dict[str, str] = {}
+        for name in temps:
+            if name.endswith(".sqlite"):
+                states[name] = _replica_temp_state(directory / name, episode_id)
+        for name in temps:
+            if name.endswith(".sqlite"):
+                state = states[name]
+            elif name.endswith((".sqlite-journal", ".sqlite-wal")):
+                # A journal or WAL holds pages that cannot be read on their own.
+                main = states.get(name.rsplit("-", 1)[0])
+                path = directory / name
+                try:
+                    empty = path.stat().st_size == 0
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    empty = False
+                state = "clean" if empty else ("copy remains" if main == "copy remains"
+                                                else "unreadable")
+            else:
+                continue
+            locations.append({"place": "replica temp", "path": str(directory / name),
+                              "state": state})
+    except OSError as exc:
+        locations.append({"place": "replica temp", "path": str(directory), "state": "unreadable",
+                          "why": f"replica folder could not be listed: {type(exc).__name__}"})
+    finally:
+        hub_snapshot._release_refresh_lock(lock)
+    return {"ok": not any(loc["state"] in INCOMPLETE_STATES for loc in locations),
+            "locations": locations}
+
+
+def _replica_temp_state(path: Path, episode_id: int) -> str:
+    """'copy remains' when the temp's episodes table has the row, 'clean' when
+    it has no such row (or no episodes table yet: the dump died before the
+    schema), 'unreadable' when sqlite cannot open or query it read-only."""
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=0.5)
+    except sqlite3.Error:
+        return "unreadable"
+    try:
+        has_table = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'episodes'").fetchone()
+        if not has_table:
+            return "clean"
+        row = con.execute("SELECT 1 FROM episodes WHERE id = ? LIMIT 1", (episode_id,)).fetchone()
+        return "copy remains" if row else "clean"
+    except sqlite3.Error:
+        return "unreadable"
+    finally:
+        con.close()
+
+
+def plain_summary(out: dict[str, Any]) -> str:
+    """The forget result in plain words: done or not, each place that still
+    holds a copy or could not be checked, and what is kept by design."""
+    eid = out.get("id")
+    if out.get("complete"):
+        lines = [f"Episode {eid} is forgotten everywhere Khipu keeps a copy."]
+    elif out.get("partial"):
+        lines = [f"Episode {eid} is not completely forgotten yet."]
+    else:
+        return str(out.get("error") or f"Episode {eid} could not be forgotten.")
+    for loc in out.get("locations") or []:
+        if loc.get("state") in INCOMPLETE_STATES:
+            lines.append("- " + (loc.get("why") or f"{loc.get('place')} {loc.get('path')}: "
+                                                   f"{loc.get('state')}"))
+    partial = out.get("partial") or []
+    if "snapshot" in partial:
+        lines.append("- this Mac's replica was not updated; it catches up at the next refresh")
+    if "outbox" in partial:
+        lines.append("- a queued capture job still holds a copy")
+    if "legacy_shared" in partial:
+        lines.append("- another live episode holds the same legacy line, so it was kept")
+    lines.append(KEPT)
+    return "\n".join(lines)
+
+
 def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> dict[str, Any]:
     """Hub + legacy file. Opens its own connection and commits."""
     from khipu.db import connect
@@ -833,12 +950,15 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
     out["legacy_file"] = (out["legacy_files"][0] if out["legacy_files"]
                           else {"file": None, "removed": 0})
     legacy_locs = _merge_locations(*(item.get("locations", []) for item in out["legacy_files"]))
-    if not out["legacy_files"] and memory_root is not None:
+    if memory_root is None:
+        legacy_locs = [{"place": "legacy logs", "path": None, "state": "not checked",
+                        "why": NO_ROOT_WHY}]
+    elif not out["legacy_files"]:
         # Nothing to erase (every identity is shared), but every location is
         # still listed, and one that cannot be read still counts.
         legacy_locs = _legacy_pass(Path(memory_root), None, None)["locations"]
-    blocked = [f"{loc['place']} {loc['path']}: {loc['state']}" for loc in legacy_locs
-               if loc["state"] in INCOMPLETE_STATES]
+    blocked = [loc.get("why") or f"{loc['place']} {loc['path']}: {loc['state']}"
+               for loc in legacy_locs if loc["state"] in INCOMPLETE_STATES]
     if (not root_resolved or blocked
             or any(str(item.get("reason") or "").startswith(("unreadable", "backup", "rewrite"))
                    for item in out["legacy_files"])):
@@ -850,8 +970,12 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
     out["outboxes"] = [_outbox_remainder(out.get("session_id"),
                                        has_merged_sources=out.get("has_merged_sources", False),
                                        source_rows=out.get("source_rows"))]
+    out["replica_temps"] = _replica_temp_remainder(episode_id)
+    if not out["replica_temps"]["ok"]:
+        partial.append("replica_temp")
     out["locations"] = _merge_locations(
-        legacy_locs, *(item.get("inspected", []) for item in out["outboxes"]))
+        legacy_locs, *(item.get("inspected", []) for item in out["outboxes"]),
+        out["replica_temps"]["locations"])
     out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
                      "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
     if not out["outbox"]["ok"]:
@@ -868,6 +992,9 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
         "legacy_backups": [item.get("backups", {}).get("remaining", []) for item in out["legacy_files"]],
         "outbox": [{key: item[key] for key in ("error", "remaining") if item.get(key)}
                    for item in out["outboxes"] if item.get("error") or item.get("remaining")],
+        "replica_temp": [loc.get("why") or f"{loc['path']}: {loc['state']}"
+                         for loc in out["replica_temps"]["locations"]
+                         if loc["state"] in INCOMPLETE_STATES],
     }
     if out.get("unidentified_sources", 0) > 0:
         out["partial_errors"]["legacy_file"] = [
@@ -879,4 +1006,6 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
     out["ok"] = out["complete"]
     if partial:
         out["error"] = "forget incomplete; remaining stores: " + ", ".join(partial)
+    out["kept"] = KEPT
+    out["message"] = plain_summary(out)
     return out

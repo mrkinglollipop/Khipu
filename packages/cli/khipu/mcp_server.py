@@ -573,12 +573,16 @@ TOOLS: list[dict] = [
         "name": "khipu_forget",
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
         "description": (
-            "Forget one episode completely: the row is tombstoned, its vectors "
-            "and the commitments it opened go with it, and its line leaves the "
-            "legacy file. Use it for a capture that was wrong, a test, or "
-            "something that should not have been remembered. Through the "
-            "HTTPS gateway only episodes captured by a cloud harness can be "
-            "forgotten; local captures are forgotten from the Mac that owns them."
+            "Forget one episode: every reader stops returning it, its vectors "
+            "and the commitments it opened go with it, and its lines leave the "
+            "legacy logs. The hub and each Mac's local replica keep its row and "
+            "text, marked forgotten; no command purges it yet, and no command "
+            "restores it. The result says plainly (message, locations) whether "
+            "the forget is complete and what still holds a copy or could not be "
+            "checked. Use it for a capture that was wrong, a test, or something "
+            "that should not have been remembered. Through the HTTPS gateway only "
+            "episodes captured by a cloud harness can be forgotten; local captures "
+            "are forgotten from the Mac that owns them."
         ),
         "inputSchema": {
             "type": "object",
@@ -1457,7 +1461,7 @@ def _tool_forget(args: dict) -> dict:
     the Mac that captured it and is forgotten there."""
     eid = _positive_id(args.get("id"), "id")
     _ensure_path()
-    from khipu.forget import LOCAL_HARNESSES, forget_everywhere
+    from khipu.forget import KEPT, LOCAL_HARNESSES, forget_everywhere, plain_summary
     from khipu.db import connect
 
     if _via_https_gateway():
@@ -1475,6 +1479,10 @@ def _tool_forget(args: dict) -> dict:
             )
     out = forget_everywhere(eid)
     out.pop("identity", None)
+    # Said plainly in every result, a partial one above all: what is kept by
+    # design, and what still holds a copy or could not be checked.
+    out.setdefault("kept", KEPT)
+    out.setdefault("message", plain_summary(out))
     if not out.get("ok"):
         raise _ToolFailure(out)
     return out

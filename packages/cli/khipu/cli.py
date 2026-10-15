@@ -2299,10 +2299,12 @@ def cmd_episode(args: argparse.Namespace) -> int:
             "error": "usage: khipu episode forget ID | khipu episode edit ID --summary TEXT",
         }))
         return 2
-    from khipu.forget import forget_everywhere
+    from khipu.forget import forget_everywhere, plain_summary
 
     out = forget_everywhere(int(args.id))
     print(json.dumps(out, default=str))
+    # The JSON is for scripts; the same result in plain words goes to stderr.
+    print(out.get("message") or plain_summary(out), file=sys.stderr)
     snapshot_ok = (out.get("snapshot") or {}).get("ok", True)
     legacy_reason = str((out.get("legacy_file") or {}).get("reason") or "")
     legacy_ok = not legacy_reason.startswith("unreadable:")

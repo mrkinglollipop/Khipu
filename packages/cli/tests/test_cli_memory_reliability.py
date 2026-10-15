@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -191,6 +193,16 @@ class EpisodeForgetCommandTest(unittest.TestCase):
     """`khipu episode forget` goes through khipu.forget (2026-09-05): row,
     vectors, the commitments it opened, and the legacy file line."""
 
+    def setUp(self):
+        # A configured, empty memory root and outbox: with no root the legacy
+        # logs go unchecked and the forget is rightly reported incomplete.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        env = mock.patch.dict(os.environ, {"KHIPU_OUTBOX": os.path.join(tmp.name, "outbox")})
+        env.start()
+        self.addCleanup(env.stop)
+
     def _script(self, *, soft: int, vectors: int):
         return _FakeCur([
             ("SELECT ts, summary, session_id FROM episodes",
@@ -202,7 +214,7 @@ class EpisodeForgetCommandTest(unittest.TestCase):
         ])
 
     def test_forget_soft_deletes_and_removes_embeddings(self):
-        with mock.patch("khipu.config.path_setting", return_value=None), \
+        with mock.patch("khipu.config.path_setting", return_value=self.root), \
              mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}):
             rc, out = _run(["episode", "forget", "42"], self._script(soft=1, vectors=3))
         self.assertEqual(rc, 0)
@@ -214,7 +226,7 @@ class EpisodeForgetCommandTest(unittest.TestCase):
         self.assertEqual(out["legacy_file"]["removed"], 0)
 
     def test_already_deleted_episode_reports_false_but_ok(self):
-        with mock.patch("khipu.config.path_setting", return_value=None), \
+        with mock.patch("khipu.config.path_setting", return_value=self.root), \
              mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot", return_value={"ok": True}):
             rc, out = _run(["episode", "forget", "42"], self._script(soft=0, vectors=0))
         self.assertEqual(rc, 0)

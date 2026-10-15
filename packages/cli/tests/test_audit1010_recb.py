@@ -320,8 +320,8 @@ def recall_rule_ceiling() -> int:
 
 class RuleDescriptionTruthTest(unittest.TestCase):
     def test_forget_text_names_current_retention_limits_and_fits_ceiling(self):
-        self.assertIn("graph-derived data", recall_rule.RULE_MD)
-        self.assertIn("closed commitments remain", recall_rule.RULE_MD)
-        self.assertIn("backup copies are retained", recall_rule.RULE_MD)
+        self.assertIn("keep\n  its text marked forgotten", recall_rule.RULE_MD)
+        self.assertIn("no command purges or restores it yet", recall_rule.RULE_MD)
+        self.assertIn("Topic graph\n  nodes stay", recall_rule.RULE_MD)
         self.assertLess(len(recall_rule.RULE_MD.strip()), recall_rule_ceiling())
 

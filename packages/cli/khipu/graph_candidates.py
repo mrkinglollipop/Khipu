@@ -490,9 +490,19 @@ def _replica_topic_recent_episodes(con, slug: str, *, seed_rank: int, seed_key: 
 
     by_slug = _episode_slug_map()
     if by_slug is not None:
+        cached = by_slug.get(slug, [])
+        # The map can be a generation behind the replica, built before an
+        # episode was forgotten: keep only ids the replica's live view still
+        # holds, or the forgotten episode's summary comes back as a candidate.
+        live: set[str] = set()
+        if cached:
+            ids = [str(eid) for _ts, eid, _summary in cached]
+            live = {str(row[0]) for row in con.execute(
+                f"SELECT CAST(id AS TEXT) FROM episodes WHERE CAST(id AS TEXT) IN "
+                f"({', '.join('?' * len(ids))})", ids).fetchall()}
         return [
             _recent_episode_row(eid, ts, summary, seed_rank=seed_rank, seed_key=seed_key)
-            for ts, eid, summary in by_slug.get(slug, [])
+            for ts, eid, summary in cached if str(eid) in live
         ]
     # A single source of truth for the slug form (unlike the hub leg, which
     # cannot call into Python mid-query): registers the SAME function

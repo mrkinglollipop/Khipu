@@ -7,6 +7,7 @@ from a build/test run — that is the orchestrator's call, not this agent's.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import tempfile
 import unittest
@@ -77,6 +78,11 @@ class RunProbeTest(unittest.TestCase):
         self._patches = [
             mock.patch("khipu.paths.data_dir", return_value=self.data_dir),
             mock.patch("khipu.paths.ensure_data_dir", return_value=self.data_dir),
+            # A configured memory root: without one the probe's cleanup forget
+            # is honestly incomplete (legacy logs not checked).
+            mock.patch("khipu.config.path_setting",
+                       side_effect=lambda key, *a, **k: self.data_dir if key == "memory_root" else None),
+            mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(self.data_dir / "outbox")}),
         ]
         for p in self._patches:
             p.start()

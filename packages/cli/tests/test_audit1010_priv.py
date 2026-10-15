@@ -571,13 +571,20 @@ class ForgetPrivacyTest(unittest.TestCase):
                      "ok": False, "error": "hub snapshot missing",
                  }), \
                  mock.patch("khipu.hub_snapshot.snapshot_path", return_value=replica), \
-                 mock.patch("khipu.config.path_setting", return_value=None), \
                  mock.patch("khipu.forget._outbox_remainder", return_value={"ok": True, "removed": 0}):
-                absent = forget.forget_everywhere(1)
+                with mock.patch("khipu.config.path_setting", return_value=Path(td)):
+                    absent = forget.forget_everywhere(1)
+                # No memory root: the legacy logs were not checked, so the
+                # forget is not complete; the absent replica is still fine.
+                with mock.patch("khipu.config.path_setting", return_value=None):
+                    unrooted = forget.forget_everywhere(1)
                 replica.write_bytes(b"private replica content")
-                existing = forget.forget_everywhere(1)
+                with mock.patch("khipu.config.path_setting", return_value=Path(td)):
+                    existing = forget.forget_everywhere(1)
         self.assertTrue(absent["ok"])
         self.assertTrue(absent["complete"])
+        self.assertFalse(unrooted["complete"])
+        self.assertEqual(unrooted["partial"], ["legacy_file"])
         self.assertFalse(existing["ok"])
         self.assertIn("snapshot", existing["partial"])
         self.assertIn("snapshot", existing["error"])

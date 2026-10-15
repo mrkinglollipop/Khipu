@@ -82,9 +82,9 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
   marked "needs the user" are the user's to do or decide, not yours; the
   moment the user says one is done, close it here instead of waiting for the
   next capture to notice. Close your own promises when you keep them.
-- `khipu_forget` tombstones the hub row; search-vector and replica/legacy
-  cleanup is best-effort. Current gaps persist: graph-derived data; closed commitments remain;
-  backup copies are retained for recovery. Gateway covers cloud captures only.
+- `khipu_forget` hides an episode from every reader. The hub and replicas keep
+  its text marked forgotten; no command purges or restores it yet. Topic graph
+  nodes stay. Its `message` names any copy left. Gateway: cloud captures only.
 - `khipu_decisions` lists decisions with their validity (standing/superseded/
   retracted/conflicts); `khipu_decisions_update` supersedes, restores,
   retracts, confirms or rejects one — supersede when a decision is reversed, never for a refinement.
