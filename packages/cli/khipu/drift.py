@@ -380,9 +380,12 @@ def status_payload(
 ) -> dict:
     with connect() as conn:
         with conn.cursor() as cur:
+            # The displayed count is live episodes, the same number the
+            # replica's status and embedding coverage report.
+            live = " WHERE deleted_at IS NULL" if _has_column(cur, "episodes", "deleted_at") else ""
             cur.execute(
-                """
-                SELECT 'episodes' AS t, COUNT(*) FROM episodes
+                f"""
+                SELECT 'episodes' AS t, COUNT(*) FROM episodes{live}
                 UNION ALL SELECT 'topics', COUNT(*) FROM topics WHERE deleted_at IS NULL
                 UNION ALL SELECT 'topics_tombstoned', COUNT(*) FROM topics WHERE deleted_at IS NOT NULL
                 UNION ALL SELECT 'nodes', COUNT(*) FROM nodes
@@ -393,6 +396,8 @@ def status_payload(
                 """
             )
             counts = {r[0]: int(r[1]) for r in cur.fetchall()}
+            # Liveness and mirror lag count every row, forgotten ones included:
+            # forgetting the newest capture must not make capture look stalled.
             cur.execute("SELECT now(), MAX(ts), MAX(ingested_at) FROM episodes")
             now_ts, max_ts, max_ing = cur.fetchone()
             # Most recently *captured* episode (by ts, not ingested_at) — its own

@@ -1524,6 +1524,65 @@ def forget_episode_in_snapshot(episode_id: int) -> dict[str, Any]:
         _release_refresh_lock(lock)
 
 
+def purge_topic_in_snapshot(slug: str) -> dict[str, Any]:
+    """Remove one purged topic from the local sqlite replica: its ``topics``
+    row (the ``topics_fts`` entry goes with it), its ``topic_revisions`` and
+    its ``memory_embeddings`` rows. ``khipu topic purge``'s replica half,
+    under the same refresh lock as ``refresh()`` and
+    ``forget_episode_in_snapshot``.
+
+    ``{"ok": True, "applicable": False}`` when this Mac has no replica (never
+    creates one). ``{"ok": False, "reason": ...}`` when the replica could not
+    be changed, so the caller never reports the topic gone from this Mac while
+    the replica still serves it. Never raises."""
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": True, "applicable": False, "reason": "this Mac has no local replica"}
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "applicable": True, "reason": "a replica refresh is in progress"}
+    try:
+        # mode=rw: a replica removed since the check above is not recreated.
+        con = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=2.0)
+        try:
+            if not {"slug"} <= _snapshot_table_columns(con, "topics"):
+                return {"ok": False, "applicable": True, "reason": "the replica has no topics table"}
+            fts_tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ('topics_fts', 'topics_fts_ad')"
+            )}
+            if "topics_fts" in fts_tables and "topics_fts_ad" not in fts_tables:
+                # An external-content index keeps a deleted row's terms
+                # unless the exact indexed values are deleted from it.
+                cols = ", ".join(_TOPIC_FTS_COLS)
+                con.execute(
+                    f"INSERT INTO topics_fts(topics_fts, rowid, {cols}) "
+                    f"SELECT 'delete', rowid, {cols} FROM topics WHERE slug = ?",
+                    (slug,),
+                )
+            embeddings = 0
+            if {"kind", "ref"} <= _snapshot_table_columns(con, "memory_embeddings"):
+                embeddings = con.execute(
+                    "DELETE FROM memory_embeddings WHERE kind = 'topic' AND ref = ?", (slug,)
+                ).rowcount
+            revisions = 0
+            if "slug" in _snapshot_table_columns(con, "topic_revisions"):
+                revisions = con.execute(
+                    "DELETE FROM topic_revisions WHERE slug = ?", (slug,)
+                ).rowcount
+            topics = con.execute("DELETE FROM topics WHERE slug = ?", (slug,)).rowcount
+            con.commit()
+        finally:
+            con.close()
+        return {
+            "ok": True, "applicable": True, "topic_removed": bool(topics),
+            "revisions_removed": revisions, "embeddings_removed": embeddings,
+        }
+    except Exception as exc:  # noqa: BLE001 - reported to the caller, never raised
+        return {"ok": False, "applicable": True, "reason": f"{type(exc).__name__}: {exc}"}
+    finally:
+        _release_refresh_lock(lock)
+
+
 def maybe_refresh(
     *, connect_timeout: int = REFRESH_CONNECT_TIMEOUT_S, force: bool = False
 ) -> dict[str, Any] | None:

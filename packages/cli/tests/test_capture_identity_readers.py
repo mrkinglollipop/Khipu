@@ -321,7 +321,7 @@ class ForgetReaderTest(unittest.TestCase):
 
     def test_a_merged_source_without_its_row_is_recovered_from_raw(self):
         # The origin row was recorded but the merged one failed open: forget
-        # must still erase the merged legacy line and report its queued copy.
+        # must still erase the merged legacy line and remove its queued copy.
         a = {"ts": "2026-10-01T09:00:00Z", "summary": "original fixture A", "harness": "codex",
              "session_id": "codex:fixtureA", "transcript_range": "0:10"}
         b = {"ts": "2026-10-01T09:02:00Z", "summary": "merged fixture B", "harness": "codex",
@@ -344,9 +344,10 @@ class ForgetReaderTest(unittest.TestCase):
             out = forget.forget_everywhere(3, memory_root=Path(td))
             left = path.read_text()
         self.assertEqual(left, "")
-        self.assertFalse(out["complete"])
-        self.assertIn("outbox", out["partial"])
-        self.assertTrue(out["remaining"][0].endswith(str(job)))
+        self.assertFalse(job.exists())
+        self.assertTrue(out["complete"], out.get("partial_errors"))
+        self.assertEqual([loc["state"] for loc in out["locations"] if loc["path"] == str(job)],
+                         ["removed"])
 
     def test_a_receipt_without_a_row_or_payload_is_unidentified(self):
         sources = [("k1", "origin", self.TS, _md5("first text"), None)]
@@ -456,7 +457,7 @@ class ForgetReaderTest(unittest.TestCase):
             self.assertEqual({p: p.read_bytes() for p in mine_path.parent.iterdir()}, before)
         self.assertFalse(out["ok"])
         self.assertEqual(len(out["remaining"]), 1)
-        self.assertTrue(out["remaining"][0].endswith(str(mine_path)))
+        self.assertIn(str(mine_path), out["remaining"][0])
 
     def test_outbox_report_without_sources_is_unchanged(self):
         with tempfile.TemporaryDirectory() as td, \

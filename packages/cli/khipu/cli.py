@@ -2232,8 +2232,11 @@ def _reembed_episode(cur, episode_id: int) -> bool:
 
     cols = ("summary", "decisions", "preferences", "topics", "people")
     verbatim_col = _episode_verbatim_select(cur)
+    # A forgotten episode's vectors were removed on purpose; an edit of its
+    # tombstone must not put them back.
     cur.execute(
-        f"SELECT {', '.join(cols)}, {verbatim_col} AS verbatim FROM episodes WHERE id = %s",
+        f"SELECT {', '.join(cols)}, {verbatim_col} AS verbatim FROM episodes "
+        f"WHERE {_episode_live_clause(cur)}id = %s",
         (episode_id,),
     )
     row = cur.fetchone()
@@ -2345,11 +2348,31 @@ def cmd_topic(args: argparse.Namespace) -> int:
             revisions_removed = cur.rowcount
             cur.execute("DELETE FROM topics WHERE slug = %s", (slug,))
         conn.commit()
+    # The hub delete is durable from here; this Mac's replica would keep
+    # serving the topic until the next full refresh unless it is purged too.
+    from khipu.hub_snapshot import purge_topic_in_snapshot
+
+    replica = purge_topic_in_snapshot(slug)
+    replica_ok = bool(replica.get("ok"))
     print(json.dumps({
-        "ok": True, "slug": slug, "revisions_removed": revisions_removed,
+        "ok": replica_ok, "slug": slug, "revisions_removed": revisions_removed,
         "embeddings_removed": embeddings_removed,
+        "hub": {"ok": True, "revisions_removed": revisions_removed,
+                "embeddings_removed": embeddings_removed},
+        "replica": replica,
     }))
-    return 0
+    if not replica_ok:
+        message = (
+            f"Purged topic {slug} from the hub, but this Mac's local replica still "
+            f"has it ({replica.get('reason')}) and can still return it. The "
+            "replica drops it at its next full refresh, which copies the hub."
+        )
+    elif not replica.get("applicable", True):
+        message = f"Purged topic {slug} from the hub. This Mac has no local replica."
+    else:
+        message = f"Purged topic {slug} from the hub and from this Mac's local replica."
+    print(message, file=sys.stderr)
+    return 0 if replica_ok else 1
 
 
 def cmd_backfill(args: argparse.Namespace) -> int:

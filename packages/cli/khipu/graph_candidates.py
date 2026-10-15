@@ -225,7 +225,12 @@ def _hub_topic_recent_episodes(cur, slug: str, *, seed_rank: int, seed_key: str)
 def _hub_episode_topics(cur, episode_id: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
     from khipu import topic_graph
 
-    cur.execute("SELECT topics FROM episodes WHERE id::text = %s", (episode_id,))
+    from khipu.db import has_columns
+
+    # A forgotten seed episode links nothing, the same as the replica leg's
+    # live view.
+    live = " AND deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
+    cur.execute(f"SELECT topics FROM episodes WHERE id::text = %s{live}", (episode_id,))
     row = cur.fetchone()
     if row is None or not row[0]:
         return []

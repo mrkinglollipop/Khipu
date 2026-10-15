@@ -16,6 +16,9 @@ probe's cleanup, the ``khipu_forget`` MCP tool) so all of it happens:
   7. the local sqlite replica, if one exists (deleted_at + its embeddings);
      a crash-left refresh temp holding the row is reported, never edited
   8. every brief citing it → stale (migration 0025)
+  9. queued capture jobs that are exact copies of its sources → removed under
+     the outbox lock; a job that is unreadable, matches only loosely, or that
+     another live episode holds is kept and reported with the reason
 
 B3 in docs/research/hindsight-plan-review-2026-09-28.md: forgetting used to
 stop at step 3 — a forgotten episode's decisions and deliverables stayed
@@ -49,6 +52,15 @@ KEPT = ("The hub and each Mac's local replica keep this episode's row and text, 
         "forgotten (deleted_at set); search, recall and get skip it. No command purges "
         "it yet, and no command restores it.")
 NO_ROOT_WHY = "no memory root is configured, so legacy logs could not be checked"
+GATEWAY_NO_ROOT_WHY = ("this server is the HTTPS gateway, a hub-only server that keeps no "
+                       "legacy logs, so there are none to check")
+# Set by the gateway itself at startup (mcp_server.mark_gateway_active). Only
+# this marker, never a missing setting, says a server keeps no legacy logs.
+GATEWAY_ACTIVE_ENV = "KHIPU_GATEWAY_ACTIVE"
+
+
+def _is_gateway() -> bool:
+    return (os.environ.get(GATEWAY_ACTIVE_ENV) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _deliverables_ready(cur) -> bool:
@@ -490,7 +502,7 @@ BACKUP_DIR = ".khipu-forget-backups"
 
 # Worst first: a location reports the worst state any identity pass saw.
 LOCATION_STATES = ("unreadable", "not checked", "copy remains", "unidentified records",
-                   "removed", "clean")
+                   "removed", "clean", "not applicable")
 # States that leave a forgotten line, or one nobody could look at or identify.
 INCOMPLETE_STATES = frozenset(LOCATION_STATES[:4])
 
@@ -702,105 +714,291 @@ def _merge_locations(*groups: list[dict[str, str]]) -> list[dict[str, str]]:
     return list(merged.values())
 
 
-def _source_copy(payload: dict[str, Any], source_rows: list[dict[str, Any]]) -> bool:
-    """Whether a queued job is a copy of one of the episode's sources: by its
-    source key, its payload hash, or the legacy identity the source row was
-    first written under (a job that never reached the hub has no row of its
-    own, but it shares the key of the row its retry would land on)."""
-    from khipu.capture_identity import payload_sha256, source_key
-
+def _job_forms(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A queued job as written and as redacted. A job queued by the legacy
+    mirror path may be unredacted while its source row was keyed after
+    redaction, so both forms are compared."""
     import copy
 
     from khipu.capture import _redact_capture_values
 
-    keys = {src["source_key"] for src in source_rows}
-    hashes = {src["payload_sha256"] for src in source_rows if src.get("payload_sha256")}
-    # A job queued by the legacy mirror path may be unredacted while its source
-    # row was keyed after redaction, so the redacted copy is compared as well.
-    redacted = _redact_capture_values(copy.deepcopy(payload))
-    for form in (payload, redacted):
-        if source_key(form) in keys or payload_sha256(form) in hashes:
-            return True
+    return payload, _redact_capture_values(copy.deepcopy(payload))
+
+
+def _job_hashes(payload: dict[str, Any]) -> set[str]:
+    """Every payload hash and source key a queued job is known by."""
+    from khipu.capture_identity import payload_sha256, source_key
+
+    out: set[str] = set()
+    for form in _job_forms(payload):
+        out.update((payload_sha256(form), source_key(form)))
+    return out
+
+
+def _job_identity(payload: dict[str, Any]) -> dict[str, Any] | None:
     summary = payload.get("summary")
     if not isinstance(summary, str):
-        return False
-    ident = {"ts": str(payload.get("ts") or ""),
-             "summary_md5": hashlib.md5(summary.encode("utf-8")).hexdigest()}
-    return any(_same_identity(ident, src) for src in source_rows if src.get("summary_md5"))
+        return None
+    try:
+        digest = hashlib.md5(summary.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return None
+    return {"ts": str(payload.get("ts") or ""), "summary_md5": digest}
+
+
+def _source_match(payload: dict[str, Any], source_rows: list[dict[str, Any]]) -> str | None:
+    """How a queued job matches the episode's sources. 'exact': its source
+    key or payload hash is a source row's (a job that never reached the hub
+    has no row of its own, but its retry lands on the row with its key).
+    'identity': it shares only the legacy (ts, summary) identity a source row
+    was first written under, which another capture can also carry. None: no
+    match."""
+    from khipu.capture_identity import payload_sha256, source_key
+
+    keys = {src["source_key"] for src in source_rows if src.get("source_key")}
+    hashes = {src["payload_sha256"] for src in source_rows if src.get("payload_sha256")}
+    for form in _job_forms(payload):
+        if source_key(form) in keys or payload_sha256(form) in hashes:
+            return "exact"
+    ident = _job_identity(payload)
+    if ident is not None and any(_same_identity(ident, src) for src in source_rows
+                                 if src.get("summary_md5")):
+        return "identity"
+    return None
+
+
+def _source_copy(payload: dict[str, Any], source_rows: list[dict[str, Any]]) -> bool:
+    """Whether a queued job is a copy of one of the episode's sources, by any match."""
+    return _source_match(payload, source_rows) is not None
+
+
+def _outbox_entries() -> list[dict[str, Any]]:
+    """Every outbox, dead and quarantine job file, and every crash-left temp
+    beside them, with its bytes and payload or the error reading it. The
+    caller holds the outbox lock: every writer writes its temp under it, so a
+    temp seen here was left by a crash."""
+    from khipu.outbox import dead_dir, outbox_dir, quarantine_dir
+
+    entries: list[dict[str, Any]] = []
+    for directory in (outbox_dir(), dead_dir(), quarantine_dir()):
+        try:
+            paths = sorted(directory.iterdir())
+        except FileNotFoundError:
+            continue
+        for path in paths:
+            # A crash in the atomic writer leaves ".<job>.<random>.tmp" holding
+            # a whole or torn job. A quarantine ".error" file (and its temp)
+            # holds only an error string.
+            if path.suffix == ".json":
+                place = "outbox job"
+            elif path.suffix == ".tmp" and ".error." not in path.name:
+                place = "outbox temp"
+            else:
+                continue
+            if not _present_file(path):
+                continue
+            entry: dict[str, Any] = {"place": place, "path": path}
+            try:
+                entry["data"] = path.read_bytes()
+                envelope = json.loads(entry["data"])
+                payload = envelope.get("payload") if isinstance(envelope, dict) else None
+                if not isinstance(payload, dict):
+                    raise ValueError("job payload is not an object")
+                entry["payload"] = payload
+            except FileNotFoundError:
+                continue  # drained or renamed since the listing
+            except (OSError, ValueError, TypeError) as exc:
+                entry["error"] = type(exc).__name__
+            entries.append(entry)
+    return entries
+
+
+def _job_owners(episode_id: int, hashes: set[str], identities: list[dict[str, Any]],
+                *, sources: bool) -> tuple[set[str], set[tuple[str, Any]]]:
+    """Which of these job hashes and legacy identities another live episode
+    holds, by the same ownership queries the legacy erase uses. Read with no
+    outbox lock held: the lock never waits on the database."""
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            owned = _owned_elsewhere(cur, episode_id, hashes, sources=sources)
+            held = _held_elsewhere(cur, episode_id, identities, sources=sources)
+    return owned, {(i["summary_md5"], _instant(i["ts"])) for i in held}
+
+
+def _classify_entries(entries: list[dict[str, Any]],
+                      source_rows: list[dict[str, Any]]) -> None:
+    """Add each readable entry's match, hashes and identity. A payload that
+    cannot be hashed (a lone surrogate an older or foreign writer left) is
+    marked unreadable on its own and never stops the other entries."""
+    for entry in entries:
+        if "payload" not in entry:
+            continue
+        try:
+            match = _source_match(entry["payload"], source_rows)
+            exact = match == "exact"
+            entry["match"] = match
+            entry["hashes"] = _job_hashes(entry["payload"]) if exact else set()
+            entry["ident"] = _job_identity(entry["payload"]) if exact else None
+        except (UnicodeError, ValueError, TypeError) as exc:
+            entry.pop("payload")
+            entry["error"] = type(exc).__name__
+
+
+def _remove_note(path: Path) -> dict[str, str] | None:
+    """Remove the quarantine note beside a removed quarantined job. The note
+    names the job and its error; one that stays is reported, not hidden."""
+    if path.parent.name != "quarantine" or path.suffix != ".json":
+        return None
+    note = path.with_suffix(".error")
+    try:
+        note.unlink(missing_ok=True)
+    except OSError as exc:
+        return {"place": "outbox note", "path": str(note), "state": "not checked",
+                "why": (f"the quarantine note {note} beside a removed job could not be "
+                        f"removed ({type(exc).__name__}), so it was kept")}
+    return None
 
 
 def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = False,
-                      source_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Report retained jobs without changing files.
+                      source_rows: list[dict[str, Any]] | None = None,
+                      episode_id: int | None = None) -> dict[str, Any]:
+    """Remove queued jobs that are exact copies of the episode's sources and
+    report every job kept, with the reason.
 
-    With the episode's source rows (a hub with 0027) the report names the
-    exact job files that are copies of this episode's sources; erasing them
-    waits for phase 3, so it still only reports. Without them (pre-0027, or
-    an episode whose source row was never recorded) any job from the same
-    session counts, as before."""
+    With the episode's source rows (a hub with 0027) a job whose source key
+    or payload hash is one of theirs is removed from the queue, the dead
+    folder, quarantine and crash-left temps, unless another live episode also
+    holds it. A job that cannot be read, or that matches only by time and
+    summary, is kept. Without source rows (pre-0027, or an episode whose
+    source row was never recorded) any job from the same session counts as a
+    copy and is kept, since nothing can tell it apart from another capture.
+    Without ``episode_id`` ownership cannot be checked, so nothing is removed."""
     remaining: list[str] = []
     inspected: list[dict[str, str]] = []
     reason = "outbox: not cleaned (capture identity needed)"
-    if source_rows:
-        reason = "outbox: copy retained (erase by source key lands in phase 3)"
-    elif has_merged_sources:
+    if not source_rows and has_merged_sources:
         return {"ok": False, "removed": 0, "remaining": [reason], "inspected": inspected}
+    removed = 0
     try:
-        from khipu.outbox import _locked_outbox, outbox_dir, dead_dir, quarantine_dir
+        from khipu.outbox import _locked_outbox
 
-        # One lock across all three directories: retry_dead() and the drain move
-        # jobs between them under the same lock, so a job cannot slip past the
-        # scan mid-move.
-        with _locked_outbox():
-            for directory in (outbox_dir(), dead_dir(), quarantine_dir()):
-                try:
-                    paths = list(directory.iterdir())
-                except FileNotFoundError:
+        if not source_rows:
+            # One lock across all three directories: retry_dead() and the drain
+            # move jobs between them under the same lock, so a job cannot slip
+            # past the scan mid-move.
+            with _locked_outbox():
+                entries = _outbox_entries()
+            for entry in entries:
+                path, place = entry["path"], entry["place"]
+                if "error" in entry:
+                    why = (f"queued capture job {path} could not be read ({entry['error']}), "
+                           "so it was kept")
+                    remaining.append(f"{reason}; {path}: {entry['error']}")
+                    inspected.append({"place": place, "path": str(path), "state": "unreadable",
+                                      "why": why})
                     continue
-                for path in paths:
-                    # A crash in the atomic writer leaves ".<job>.<random>.tmp"
-                    # holding a whole or torn job. A quarantine ".error" file
-                    # (and its temp) holds only an error string.
-                    if path.suffix == ".json":
-                        place = "outbox job"
-                    elif path.suffix == ".tmp" and ".error." not in path.name:
-                        place = "outbox temp"
-                    else:
-                        continue
-                    if not _present_file(path):
-                        continue
-                    try:
-                        envelope = json.loads(path.read_bytes())
-                        payload = envelope.get("payload") if isinstance(envelope, dict) else None
-                        if not isinstance(payload, dict):
-                            raise ValueError("job payload is not an object")
-                    except FileNotFoundError:
-                        continue  # drained or renamed since the listing
-                    except (OSError, ValueError, TypeError) as exc:
-                        remaining.append(f"{reason}; {path}: {type(exc).__name__}")
-                        inspected.append({"place": place, "path": str(path), "state": "unreadable"})
-                        continue
-                    if source_rows:
-                        copy_found = _source_copy(payload, source_rows)
-                        if copy_found:
-                            remaining.append(f"{reason}; {path}")
-                        inspected.append({"place": place, "path": str(path),
-                                          "state": "copy remains" if copy_found else "clean"})
-                        continue
-                    # Without a session id there is no way to tell this job from
-                    # the forgotten episode's capture, so any retained job counts.
-                    if not session_id or payload.get("session_id") == session_id:
-                        # A job keeps the bare reason callers already match on;
-                        # a temp is named, since nothing else lists it.
-                        remaining.append(reason if place == "outbox job" else f"{reason}; {path}")
-                        inspected.append({"place": place, "path": str(path), "state": "copy remains"})
-                        return {"ok": False, "removed": 0, "remaining": remaining,
-                                "inspected": inspected}
-                    inspected.append({"place": place, "path": str(path), "state": "clean"})
+                # Without a session id there is no way to tell this job from
+                # the forgotten episode's capture, so any retained job counts.
+                if not session_id or entry["payload"].get("session_id") == session_id:
+                    # A job keeps the bare reason callers already match on; a
+                    # temp is named, since nothing else lists it.
+                    remaining.append(reason if place == "outbox job" else f"{reason}; {path}")
+                    inspected.append({
+                        "place": place, "path": str(path), "state": "copy remains",
+                        "why": (f"queued capture job {path} is from the same session, but with no "
+                                "source rows it cannot be matched exactly, so it was kept")})
+                    return {"ok": False, "removed": 0, "remaining": remaining,
+                            "inspected": inspected}
+                inspected.append({"place": place, "path": str(path), "state": "clean"})
+            return {"ok": not remaining, "removed": 0, "remaining": remaining,
+                    "inspected": inspected}
+
+        # First pass: which jobs are exact copies, and so whose ownership to ask.
+        with _locked_outbox():
+            first = _outbox_entries()
+        _classify_entries(first, source_rows)
+        exact = [e for e in first if e.get("match") == "exact"]
+        asked: set[str] = set().union(*(e["hashes"] for e in exact))
+        asked_idents = [e["ident"] for e in exact if e["ident"]]
+        owners: tuple[set[str], set[tuple[str, Any]]] | None = None
+        owner_error = ""
+        if episode_id is None:
+            owner_error = "no episode id was given"
+        elif not exact:
+            owners = (set(), set())
+        else:
+            try:
+                owners = _job_owners(episode_id, asked, asked_idents, sources=True)
+            except Exception as exc:  # noqa: BLE001 (an unchecked job is kept, never removed)
+                owner_error = type(exc).__name__
+        asked_keys = {(i["summary_md5"], _instant(i["ts"])) for i in asked_idents}
+
+        # Second pass under the lock: the files as they are now. A job that
+        # appeared or changed since the first pass was never checked, so it stays.
+        with _locked_outbox():
+            second = _outbox_entries()
+            _classify_entries(second, source_rows)
+            for entry in second:
+                path, place = entry["path"], entry["place"]
+                state, why = "clean", None
+                note = None
+                if "error" in entry:
+                    state = "unreadable"
+                    why = (f"queued capture job {path} could not be read ({entry['error']}), "
+                           "so it was kept")
+                else:
+                    match, hashes, ident = entry["match"], entry["hashes"], entry["ident"]
+                    key = (ident["summary_md5"], _instant(ident["ts"])) if ident else None
+                    if match == "identity":
+                        state = "copy remains"
+                        why = (f"queued capture job {path} matches this episode only by time "
+                               "and summary, so it was kept")
+                    elif match == "exact" and owners is None:
+                        state = "copy remains"
+                        why = (f"queued capture job {path} could not be checked against other "
+                               f"episodes ({owner_error}), so it was kept")
+                    elif match == "exact" and (not hashes <= asked
+                                               or (key is not None and key not in asked_keys)):
+                        state = "copy remains"
+                        why = (f"queued capture job {path} changed while the forget ran, "
+                               "so it was kept")
+                    elif match == "exact" and (hashes & owners[0] or key in owners[1]):
+                        state = "copy remains"
+                        why = (f"queued capture job {path} is also held by another live "
+                               "episode, so it was kept")
+                    elif match == "exact":
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            continue
+                        except OSError as exc:
+                            state = "copy remains"
+                            why = (f"queued capture job {path} could not be removed "
+                                   f"({type(exc).__name__}), so it was kept")
+                        else:
+                            state = "removed"
+                            removed += 1
+                            note = _remove_note(path)
+                loc = {"place": place, "path": str(path), "state": state}
+                if why:
+                    loc["why"] = why
+                    remaining.append(f"outbox: {why}")
+                inspected.append(loc)
+                if note:
+                    remaining.append(f"outbox: {note['why']}")
+                    inspected.append(note)
     except Exception as exc:  # noqa: BLE001 — surface an incomplete forget
-        return {"ok": False, "removed": 0, "remaining": [*remaining, reason],
-                "error": f"{type(exc).__name__}: {exc}", "inspected": inspected}
-    return {"ok": not remaining, "removed": 0, "remaining": remaining, "inspected": inspected}
+        # Nothing has shown a copy: the outbox itself could not be looked at.
+        why = f"queued capture jobs could not be checked ({type(exc).__name__}), so the forget stays open"
+        return {"ok": False, "removed": removed,
+                "remaining": [*remaining, reason if not source_rows else f"outbox: {why}"],
+                "error": f"{type(exc).__name__}: {exc}",
+                "inspected": [*inspected, {"place": "outbox", "path": None,
+                                           "state": "not checked", "why": why}]}
+    return {"ok": not remaining, "removed": removed, "remaining": remaining,
+            "inspected": inspected}
 
 
 def _replica_temp_remainder(episode_id: int) -> dict[str, Any]:
@@ -894,14 +1092,23 @@ def plain_summary(out: dict[str, Any]) -> str:
         lines = [f"Episode {eid} is not completely forgotten yet."]
     else:
         return str(out.get("error") or f"Episode {eid} could not be forgotten.")
+    removed_jobs = int((out.get("outbox") or {}).get("removed") or 0)
+    if removed_jobs:
+        lines.append(f"- removed {removed_jobs} queued capture "
+                     f"{'job' if removed_jobs == 1 else 'jobs'} that held a copy")
+    outbox_named = False
     for loc in out.get("locations") or []:
         if loc.get("state") in INCOMPLETE_STATES:
             lines.append("- " + (loc.get("why") or f"{loc.get('place')} {loc.get('path')}: "
                                                    f"{loc.get('state')}"))
+            outbox_named = outbox_named or (str(loc.get("place")).startswith("outbox")
+                                            and bool(loc.get("why")))
+        elif loc.get("state") == "not applicable" and loc.get("why"):
+            lines.append(f"- not applicable: {loc['why']}")
     partial = out.get("partial") or []
     if "snapshot" in partial:
         lines.append("- this Mac's replica was not updated; it catches up at the next refresh")
-    if "outbox" in partial:
+    if "outbox" in partial and not outbox_named:
         lines.append("- a queued capture job still holds a copy")
     if "legacy_shared" in partial:
         lines.append("- another live episode holds the same legacy line, so it was kept")
@@ -909,8 +1116,11 @@ def plain_summary(out: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> dict[str, Any]:
-    """Hub + legacy file. Opens its own connection and commits."""
+def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
+                      gateway: bool | None = None) -> dict[str, Any]:
+    """Hub + legacy file. Opens its own connection and commits. ``gateway``
+    defaults to the marker the HTTPS gateway sets at startup: a gateway with
+    no memory root keeps no legacy logs, so they are not applicable there."""
     from khipu.db import connect
 
     root_resolved = True
@@ -943,14 +1153,19 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
     # An all-shared episode has an empty list: never fall back to its live line.
     identities = (out["legacy_identities"] if "legacy_identities" in out
                   else [out.get("identity") or {}])
-    out["legacy_files"] = [
+    no_legacy_logs = (memory_root is None and root_resolved
+                      and (_is_gateway() if gateway is None else bool(gateway)))
+    out["legacy_files"] = [] if no_legacy_logs else [
         forget_in_legacy_file(memory_root, ident.get("ts", ""), ident.get("summary_md5", ""))
         for ident in identities
     ]
     out["legacy_file"] = (out["legacy_files"][0] if out["legacy_files"]
                           else {"file": None, "removed": 0})
     legacy_locs = _merge_locations(*(item.get("locations", []) for item in out["legacy_files"]))
-    if memory_root is None:
+    if no_legacy_logs:
+        legacy_locs = [{"place": "legacy logs", "path": None, "state": "not applicable",
+                        "why": GATEWAY_NO_ROOT_WHY}]
+    elif memory_root is None:
         legacy_locs = [{"place": "legacy logs", "path": None, "state": "not checked",
                         "why": NO_ROOT_WHY}]
     elif not out["legacy_files"]:
@@ -969,7 +1184,8 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
         partial.append("legacy_file")
     out["outboxes"] = [_outbox_remainder(out.get("session_id"),
                                        has_merged_sources=out.get("has_merged_sources", False),
-                                       source_rows=out.get("source_rows"))]
+                                       source_rows=out.get("source_rows"),
+                                       episode_id=episode_id)]
     out["replica_temps"] = _replica_temp_remainder(episode_id)
     if not out["replica_temps"]["ok"]:
         partial.append("replica_temp")

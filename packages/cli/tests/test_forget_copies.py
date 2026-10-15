@@ -100,20 +100,27 @@ class ForgetCopiesTest(unittest.TestCase):
         self.assertIn("legacy_file", out["partial"])
         self.assertEqual(self.located(out, rotated)["state"], "unreadable")
 
-    def test_a_crash_left_outbox_temp_keeps_the_forget_partial(self):
+    def test_a_crash_left_outbox_temp_is_removed_when_whole_and_kept_when_torn(self):
         envelope = json.dumps({"payload": self.a, "attempts": 0})
         for rel, body in (("outbox/.capture.json.k2x9.tmp", envelope),
                           ("outbox/dead/.capture.json.k2x9.tmp", envelope),
                           ("outbox/.capture.json.k2x9.tmp", envelope[:40])):
-            with self.subTest(rel=rel, torn=len(body) < len(envelope)):
+            torn = len(body) < len(envelope)
+            with self.subTest(rel=rel, torn=torn):
                 temp = self.root / rel
                 temp.parent.mkdir(parents=True, exist_ok=True)
                 temp.write_text(body, encoding="utf-8")
                 out = run_forget(self.world, 1, self.root)
-                self.assertFalse(out["complete"])
-                self.assertIn("outbox", out["partial"])
-                self.assertTrue(any(str(temp) in item for item in out["remaining"]), out["remaining"])
-                temp.unlink()
+                if torn:
+                    self.assertFalse(out["complete"])
+                    self.assertIn("outbox", out["partial"])
+                    self.assertTrue(any(str(temp) in item for item in out["remaining"]),
+                                    out["remaining"])
+                    temp.unlink()
+                else:
+                    self.assertTrue(out["complete"], out.get("partial_errors"))
+                    self.assertFalse(temp.exists())
+                    self.assertEqual(self.located(out, temp)["state"], "removed")
 
     def test_a_readable_temp_without_the_copy_does_not_block_completion(self):
         self.put("episodes_2026.jsonl.tmp", [self.other])
