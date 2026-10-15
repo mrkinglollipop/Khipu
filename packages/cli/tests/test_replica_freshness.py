@@ -52,6 +52,7 @@ class FakeHub:
         self.deliverables: list[dict] = []
         self.vectors: list[dict] = []
         self.queries: list[str] = []
+        self.page_reads = 0
 
     def live_vectors(self) -> list[dict]:
         gone = {str(e["id"]) for e in self.episodes if e.get("deleted_at")}
@@ -99,7 +100,10 @@ class FakeCursor:
             rows = [(b, hashlib.md5("\n".join(f"{k}\t{r}\t{i}\t{c}" for k, r, i, c in sorted(keys)).encode())
                      .hexdigest()) for b, keys in by_bucket.items()]
         elif "FROM memory_embeddings" in sql and "= ANY(%s)" in sql:
-            rows = [_vec_row(v) for v in h.live_vectors() if _bucket(v) in set(p[1])]
+            h.page_reads += 1
+            after, n = tuple(p[2:6]), p[6]
+            rows = sorted((_bucket(v), *_vec_row(v)) for v in h.live_vectors() if _bucket(v) in set(p[1]))
+            rows = [r for r in rows if r[:4] > after][:n]
         elif "FROM memory_embeddings" in sql and "ORDER BY built_at, kind" in sql:
             rows = sorted((_vec_row(v) for v in h.live_vectors() if v["built_at"] and v["built_at"] > p[1]),
                           key=lambda r: (r[4], r[0], r[1], r[2]))[: p[2]]
@@ -397,11 +401,7 @@ class ReembedTest(ReplicaCase):
         self.assertEqual(out["state"], "fresh")
 
 
-class VectorManifestTest(ReplicaCase):
-    """Chunk-by-chunk reconciliation: a stale chunk beside a newer one, a
-    chunk pruned or a ref deleted on the hub with no newer build to point at
-    it, and a replica row with no build time."""
-
+class VectorCase(ReplicaCase):
     def _replica(self, *rows: tuple) -> None:
         con = sqlite3.connect(self.snap)
         con.execute("DELETE FROM memory_embeddings")
@@ -413,6 +413,13 @@ class VectorManifestTest(ReplicaCase):
     def _hub(self, *rows: tuple) -> None:
         self.hub.vectors[:] = [{"kind": k, "ref": r, "chunk_idx": i, "content_hash": c, "built_at": b}
                                for k, r, i, c, b in rows]
+
+
+
+class VectorManifestTest(VectorCase):
+    """Chunk-by-chunk reconciliation: a stale chunk beside a newer one, a
+    chunk pruned or a ref deleted on the hub with no newer build to point at
+    it, and a replica row with no build time."""
 
     def test_a_newer_chunk_does_not_mask_a_stale_one_beside_it(self) -> None:
         self._hub(("episode", "1", 0, "a", NOW - timedelta(hours=2)), ("episode", "1", 1, "b", NOW - timedelta(hours=1)))
@@ -610,3 +617,163 @@ class RecallTrustTest(ReplicaCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VectorGenerationTest(VectorCase):
+    """A replica chunk is the hub's generation only when it carries the hub's
+    own build time: the dump copies it and a catch-up gets it back from the
+    write. Ordering this Mac's clock against the hub's gave both false fresh
+    and false behind."""
+
+    def test_a_copy_stamped_later_than_the_hub_build_is_another_generation(self) -> None:
+        # A fast Mac stamped an old vector after the hub rebuilt the same text.
+        self._hub(("episode", "1", 0, "a", NOW - timedelta(minutes=90)))
+        self._replica(("episode", "1", 0, "a", _ts(NOW - timedelta(minutes=75))))
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 1)
+        self.assertEqual(out["state"], "behind")
+
+    def test_the_hub_build_time_in_another_offset_is_the_same_generation(self) -> None:
+        built = NOW - timedelta(hours=1)
+        self._hub(("episode", "1", 0, "a", built))
+        self._replica(("episode", "1", 0, "a", _ny(built).isoformat()))
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 0)
+        self.assertEqual(out["state"], "fresh")
+
+    def test_upsert_chunks_returns_the_hubs_build_time_per_row(self) -> None:
+        from khipu import embed as em
+
+        stamps = [NOW - timedelta(minutes=5), NOW - timedelta(minutes=5)]
+        cur = mock.Mock()
+        cur.fetchone.side_effect = [(s,) for s in stamps]
+        with mock.patch.object(em._profiles, "cached_spec", return_value=None):
+            got = em._upsert_chunks(cur, PROFILE, [("episode", "1", 0, "a", "h0", [0.1]),
+                                                   ("episode", "1", 1, "b", "h1", [0.2])])
+        self.assertEqual(got, stamps)
+        self.assertTrue(all("RETURNING built_at" in c.args[0] for c in cur.execute.call_args_list))
+
+    def test_the_catch_up_copies_the_hub_build_time_whatever_this_macs_clock_says(self) -> None:
+        from khipu import embed as em
+
+        hub_built = NOW - timedelta(hours=1)
+
+        class Cur:
+            rows: list = []
+
+            def execute(self, sql, params=None):
+                self.rows = [(1, "same", [], [], [], [])] if "FROM episodes e WHERE" in sql else []
+
+            def fetchall(self):
+                return list(self.rows)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class Conn:
+            def __init__(self):
+                self.cur = Cur()
+
+            def cursor(self):
+                return self.cur
+
+            def commit(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class SlowMacClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return hub_built - timedelta(minutes=1)
+
+        self._replica()
+        with mock.patch("khipu.db.connect", return_value=Conn()), \
+                mock.patch("khipu.db.has_columns", return_value=False), \
+                mock.patch.object(em, "_active_profile", return_value=PROFILE), \
+                mock.patch.object(em, "_existing_hashes_for_refs", return_value={}), \
+                mock.patch.object(em, "episode_text", return_value="same"), \
+                mock.patch.object(em, "chunk_text", return_value=["same"]), \
+                mock.patch.object(em, "_api_texts", side_effect=lambda _p, pairs: [t for _, t in pairs]), \
+                mock.patch.object(em, "embed_batch", return_value=[[1.0, 0.0]]), \
+                mock.patch.object(em, "_upsert_chunks", return_value=[hub_built]), \
+                mock.patch("datetime.datetime", SlowMacClock):
+            em.embed_recent_missing(limit=1)
+        self._hub(("episode", "1", 0, em._md5("same"), hub_built))
+        con = sqlite3.connect(self.snap)
+        (held,) = con.execute("SELECT built_at FROM memory_embeddings").fetchone()
+        con.close()
+        self.assertEqual(hs._utc(held), hub_built)
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 0)
+        self.assertEqual(out["state"], "fresh")
+
+    def test_no_replica_writer_stamps_a_vector_with_this_macs_clock(self) -> None:
+        import inspect
+
+        from khipu import embed as em
+
+        self.assertNotIn("built_at = datetime.now", inspect.getsource(em))
+
+
+class VectorBoundTest(VectorCase):
+    """Differing buckets are read in pages no further than the probe's limit;
+    a replica chunk is judged deleted on the hub only in a bucket read to its
+    end."""
+
+    def _big_bucket(self, ref: str, n: int, *, extra: bool) -> tuple[list, list]:
+        before = DUMP - timedelta(hours=1)
+        hub = [("episode", ref, i, f"h{i}", before) for i in range(n)]
+        rep = [("episode", ref, 0, "old", _ts(before))] + [("episode", ref, i, f"h{i}", _ts(before))
+                                                            for i in range(1, n)]
+        if extra:
+            rep.append(("episode", ref, n, "gone?", _ts(before)))
+        return hub, rep
+
+    def vectors(self, limit: int) -> dict:
+        return hs.measure_lag(self.hub.cursor(), limit=limit)["tables"]["vectors"]
+
+    def test_one_large_bucket_is_read_no_further_than_the_limit(self) -> None:
+        hub, rep = self._big_bucket("1", 30, extra=True)
+        self._hub(*hub)
+        self._replica(*rep)
+        v = self.vectors(10)
+        self.assertLessEqual(v["checked"], 10)
+        self.assertTrue(v["truncated"])
+        # Chunk 0 differs; the replica-only chunk 30 sits past the cut, unjudged.
+        self.assertEqual(v["missing"], 1)
+
+    def test_a_bucket_read_in_pages_to_its_end_infers_deletions(self) -> None:
+        hub, rep = self._big_bucket("1", 30, extra=True)
+        self._hub(*hub)
+        self._replica(*rep)
+        with mock.patch.object(hs, "_VEC_PAGE_ROWS", 7):
+            v = self.vectors(1000)
+        self.assertFalse(v["truncated"])
+        self.assertEqual(v["checked"], 30)
+        self.assertEqual(v["missing"], 2)
+        self.assertEqual(self.hub.page_reads, 5)
+
+    def test_buckets_before_the_cut_are_whole_and_the_rest_unjudged(self) -> None:
+        refs = sorted((f"r{i}" for i in range(40)), key=lambda r: hs._vec_bucket("episode", r))
+        small, big = refs[0], refs[-1]
+        self.assertLess(hs._vec_bucket("episode", small), hs._vec_bucket("episode", big))
+        before = DUMP - timedelta(hours=1)
+        small_hub = [("episode", small, i, f"s{i}", before) for i in range(3)]
+        small_rep = [(k, r, i, c, _ts(b)) for k, r, i, c, b in small_hub] + [("episode", small, 3, "s3", _ts(before))]
+        big_hub, big_rep = self._big_bucket(big, 20, extra=True)
+        self._hub(*small_hub, *big_hub)
+        self._replica(*small_rep, *big_rep)
+        v = self.vectors(10)
+        self.assertTrue(v["truncated"])
+        self.assertLessEqual(v["checked"], 10)
+        # The small bucket's pruned chunk and the big bucket's changed chunk 0;
+        # the big bucket's replica-only chunk is past the cut.
+        self.assertEqual(v["missing"], 2)

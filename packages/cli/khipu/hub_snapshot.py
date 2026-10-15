@@ -2001,9 +2001,11 @@ def _lag_deliverables(cur, con, since, hub_now, limit) -> dict[str, Any]:
 
 # The vector manifest is compared in buckets keyed by the first hex digits of
 # md5(kind TAB ref), so a hub-sized profile costs one row per bucket from the
-# hub when nothing differs, and only differing buckets are fetched whole.
+# hub when nothing differs, and only differing buckets are read, in pages, up
+# to the probe's row limit.
 _VEC_BUCKET_HEX = 3
 _VEC_BUCKET_BATCH = 64
+_VEC_PAGE_ROWS = 2000
 
 
 def _vec_bucket(kind: Any, ref: Any) -> str:
@@ -2035,11 +2037,15 @@ def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str
     that differ, so a chunk the replica lacks, holds with other text, or
     holds after the hub pruned or deleted it is seen whatever its age.
     Version: every hub chunk built since the dump against the replica's
-    ``built_at`` for it. A replica row written by a catch-up carries this
-    Mac's clock, taken after the hub commit, so it is never older than the
-    hub's; one older is a stale build, and one with no ``built_at`` cannot be
-    told apart from one, so it is counted ``unverified`` and the state is
-    unknown, never fresh."""
+    ``built_at`` for it. Every replica writer copies the hub's own
+    ``built_at`` (the dump reads it, a catch-up gets it back from the write),
+    so the two are one generation only when equal; any other value, earlier
+    or later, is another build. One with no ``built_at`` cannot be told
+    apart, so it is counted ``unverified`` and the state is unknown.
+
+    Bucket reads are paged and stop at ``limit`` rows, marking the result
+    truncated. A replica chunk is judged deleted on the hub only in a bucket
+    read to its end."""
     prof_cols = _pg_columns(cur, "embedding_profiles")
     if not {"id", "is_active"} <= prof_cols:
         return {"lag_seconds": None, "not_applicable": "hub has no embedding profiles"}
@@ -2087,32 +2093,54 @@ def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str
     stale: dict[tuple[str, str, int], Any] = {}
     checked = 0
     truncated = False
-    done = 0
-    while done < len(differing):
-        if checked >= limit:
-            truncated = True
-            break
-        batch = differing[done:done + _VEC_BUCKET_BATCH]
-        done += len(batch)
-        cur.execute(
-            "SELECT kind, ref, chunk_idx, content_hash, built_at FROM memory_embeddings "
-            f"WHERE profile = %s AND substr(md5({key_text}), 1, {_VEC_BUCKET_HEX}) = ANY(%s){gone}",
-            (profile, list(batch)),
-        )
-        hub_rows = [r for r in cur.fetchall() if not skip(r[0], r[1])]
-        checked += len(hub_rows)
-        hub_keys = set()
-        for kind, ref, idx, chash, built in hub_rows:
-            key = (str(kind), str(ref), int(idx))
-            hub_keys.add(key)
-            mine = replica.get(key)
-            if mine is None or mine[0] != (chash or ""):
-                when = _utc(built)
-                stale[key] = max(when, floor) if when is not None and floor is not None else (floor or when)
-        for key in (k for b in batch for k in rep_by_bucket.get(b, ())):
+    bucket_expr = f"substr(md5({key_text}), 1, {_VEC_BUCKET_HEX})"
+    page_sql = (
+        "SELECT bucket, kind, ref, chunk_idx, content_hash, built_at FROM ("
+        f"SELECT {bucket_expr} COLLATE \"C\" AS bucket, kind, ref, chunk_idx, content_hash, built_at "
+        f"FROM memory_embeddings WHERE profile = %s AND {bucket_expr} = ANY(%s){gone}) AS v "
+        "WHERE (bucket, kind, ref, chunk_idx) > (%s, %s, %s, %s) "
+        "ORDER BY bucket, kind, ref, chunk_idx LIMIT %s"
+    )
+    for start in range(0, len(differing), _VEC_BUCKET_BATCH):
+        batch = differing[start:start + _VEC_BUCKET_BATCH]
+        after: tuple[Any, ...] = ("", "", "", -1)
+        hub_keys: set[tuple[str, str, int]] = set()
+        unread: str | None = None  # first bucket not read to its end
+        upcoming = ""  # bucket of the next row not yet read
+        while True:
+            room = limit - checked
+            if room <= 0:
+                unread = upcoming
+                break
+            page = min(room, _VEC_PAGE_ROWS)
+            # One row past the page says whether the batch goes on.
+            cur.execute(page_sql, (profile, list(batch), *after, page + 1))
+            rows = cur.fetchall()
+            more = len(rows) > page
+            if more:
+                upcoming = str(rows[page][0])
+            rows = rows[:page]
+            checked += len(rows)
+            for bucket, kind, ref, idx, chash, built in rows:
+                if skip(kind, ref):
+                    continue
+                key = (str(kind), str(ref), int(idx))
+                hub_keys.add(key)
+                mine = replica.get(key)
+                if mine is None or mine[0] != (chash or ""):
+                    when = _utc(built)
+                    stale[key] = max(when, floor) if when is not None and floor is not None else (floor or when)
+            if not more:
+                break
+            after = tuple(rows[-1][:4])
+        whole = [b for b in batch if unread is None or b < unread]
+        for key in (k for b in whole for k in rep_by_bucket.get(b, ())):
             if key not in hub_keys:
                 # Pruned or deleted on the hub after the dump; when is unknown.
                 stale[key] = floor
+        if unread is not None:
+            truncated = True
+            break
 
     cur.execute(
         "SELECT kind, ref, chunk_idx, content_hash, built_at FROM memory_embeddings "
@@ -2134,7 +2162,7 @@ def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str
         held, hub_built = _utc(mine[1]), _utc(built)
         if held is None or hub_built is None:
             unverified += 1
-        elif held < hub_built:
+        elif held != hub_built:
             stale[key] = built
     out = {"lag_seconds": _lag_from(hub_now, list(stale.values())), "missing": len(stale), "profile": profile,
            "checked": checked + len(recent), "buckets_differing": len(differing), "truncated": truncated}
