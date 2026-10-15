@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu.lines import split_lines
+
 MAX_BYTES = 5 * 1024 * 1024
 LOG_NAME = "query_log.jsonl"
 ROTATED_SUFFIX = ".1"
@@ -136,7 +138,7 @@ def _observations() -> tuple[list[str], bool]:
     available = False
     for p in (path.with_name(path.name + ROTATED_SUFFIX), path):
         try:
-            lines.extend(p.read_text(encoding="utf-8").splitlines())
+            lines.extend(split_lines(p.read_text(encoding="utf-8")))
             available = True
         except FileNotFoundError:
             continue
@@ -149,7 +151,7 @@ def _read_lines(path: Path) -> list[str]:
     if not path.is_file():
         return []
     try:
-        return path.read_text(encoding="utf-8").splitlines()
+        return split_lines(path.read_text(encoding="utf-8"))
     except OSError:
         return []
 

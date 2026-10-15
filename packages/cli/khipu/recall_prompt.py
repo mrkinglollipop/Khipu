@@ -55,6 +55,7 @@ if not hasattr(_t3, 'handoff_thread'):
     # deploy that added this name; t3 is stdlib-only, so reloading is safe.
     import importlib
     importlib.reload(_t3)
+from khipu.lines import split_lines
 from khipu.t3 import handoff_thread, is_helper_session, strip_handoff
 
 # Hard wall-clock budget for the whole gated search (R1): a hook that can add
@@ -3215,7 +3216,7 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
         return {"ok": False, "available": False, "insufficient": True, "count": 0}
 
     calls: list[tuple[str, float]] = []
-    for line in raw.splitlines():
+    for line in split_lines(raw):
         m = _LOG_LINE_RE.match(line)
         if not m:
             continue
@@ -3314,7 +3315,7 @@ def prompt_routing_budget_rate(*, now: datetime | None = None, warn_pct: float =
     except OSError:
         return out
     statuses: list[str] = []
-    for line in raw.splitlines():
+    for line in split_lines(raw):
         m = _LOG_LINE_RE.match(line)
         if not m:
             continue

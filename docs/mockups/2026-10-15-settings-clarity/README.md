@@ -45,6 +45,25 @@ Files:
   new history.
 - `polish.html`: the three fixes, before and after.
 
+Phase 9 (addendum, finding and adding accounts; mock-only layout in `add-account.css`):
+
+- `add-account.html`: where Add an account starts, then the dialog's three steps and every state: choose the
+  service, service not installed, the logins Khipu found, nothing found besides what is tracked, sign in to
+  another account, sign-in in progress, sign-in failed, Grok Build (sign-in can't start from Khipu), and the
+  read before saving (Live, signed in but unreadable, not signed in, duplicate login, name already used).
+- `add-account-found.html`: Home's "Found a Claude account you use" notice, Accounts with two Found rows, Not
+  offered again, the Home notice when Track new accounts automatically is on, and the setup step listing every
+  login found with Add another account.
+- `add-account-manage.html`: rename in place, Stop tracking with its choices (priority, pause, lanes, holds) and
+  what it does not change, and two accounts that read the same login.
+- `add-account-states.html`: states added after the cradle-to-grave review: a moved folder, a folder that
+  couldn't be checked, a missing login folder, signed out with earlier figures, a plan that changed after
+  signing in again, newly tracked and not ranked, a CLI Khipu can't run, nothing installed, the Grok sign-in
+  code and no code, rename with what is and isn't updated, stopping the last account, no accounts tracked,
+  Looking…, and setup with a signed-out default login and with nothing installed. After the Codex review: Set
+  the Node folder… and Choose the CLI… (no terminal step), the CLI settings rows, a lane whose account name is
+  ambiguous, and Forget which logins conversations used.
+
 Decisions in the mock:
 
 - Folding never hides a problem: a closed group shows the count and colour of each problem in it, and Needs

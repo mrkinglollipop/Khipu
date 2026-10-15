@@ -211,12 +211,18 @@ describe("PlansCard on Home", () => {
     expect(screen.getAllByRole("meter")).toHaveLength(3);
   });
 
-  it("shows Muse's note when no turn has been observed, not 0%", async () => {
+  it("shows Muse's note when no turn has been observed, not 0% and never Live", async () => {
     render(<Home />);
     await waitFor(() => expect(screen.getByText("no turn observed yet")).toBeTruthy());
     const muse = within(rowFor("Muse"));
     expect(muse.queryByRole("meter")).toBeNull();
     expect(muse.queryByText(/0%/)).toBeNull();
+    // A read that worked but brought no figures says when it was checked,
+    // never "Live", and asks nobody to sign in.
+    expect(muse.queryByText(/Live/)).toBeNull();
+    expect(muse.getByText(/^Checked .*, no figures yet$/)).toBeTruthy();
+    expect(muse.queryByText(/Sign in/)).toBeNull();
+    expect(within(rowFor("Codex")).getByText(/^Live: read /)).toBeTruthy();
   });
 
   it("warns at 75% and alerts at 90%", async () => {
@@ -488,6 +494,7 @@ describe("PlansSettingsCard", () => {
     expect(c.getAllByText(/^resets /)).toHaveLength(3);
     expect(c.getByText(/figures from .* ago/)).toBeTruthy();
     expect(within(screen.getByRole("group", { name: "Muse" })).getByText("no turn observed yet")).toBeTruthy();
+    expect(within(screen.getByRole("group", { name: "Muse" })).queryByText(/Live/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Probe now" }));
     await waitFor(() => expect(usageCalls()).toContain("khipu_usage_refresh"));
     await act(async () => release("khipu_usage_refresh"));

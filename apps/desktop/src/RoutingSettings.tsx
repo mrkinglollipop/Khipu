@@ -577,7 +577,7 @@ function AccountRow({
   );
 }
 
-function ResetChecksSection({ data, cfg, w, reread }: { data: RouteView | null; cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
+function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteView | null; cfg: RouteConfig | null; cfgError?: string | null; w: Writer; reread: () => Promise<unknown> }) {
   const enabled = cfg?.routing?.routing_reset_check?.value === true;
   const next = (data?.accounts ?? []).filter((a) => a.next_check).map((a) => `${a.label}: ${whenLocal(a.next_check!, new Date())}`);
   return (
@@ -588,6 +588,7 @@ function ResetChecksSection({ data, cfg, w, reread }: { data: RouteView | null; 
           what="Khipu reads only an account's usage. It never sends a model turn."
           tag={<Tag>{enabled ? "On" : "Off"}</Tag>} checked={enabled} disabled={!cfg || w.anyBusy}
           busy={w.isBusy("reset-check")}
+          read={switchRead(cfg, cfgError, reread)}
           onChange={(on) => void w.run("reset-check", "khipu_config_set", { key: "routing_reset_check", value: on ? "on" : "off" }, reread)}
           error={<WriteError w={w} id="reset-check" />} />
         <div className="rows">
@@ -1839,6 +1840,47 @@ const HEARS: [string, string][] = [
   ["Cloud agents", "Not yet: they will hear it from a copy for cloud agents, in a later release."],
 ];
 
+/** Where a switch's value stands: read, still being read, or not readable.
+ *  Until it is read the switch is not drawn at all, so it never shows a
+ *  false off. */
+type SwitchRead = { state: "ready" } | { state: "reading" } | { state: "unread"; error?: string | null; retry: () => Promise<unknown> };
+
+/** A switch's read state from the read that feeds it. */
+function switchRead(value: unknown, error: string | null | undefined, retry: () => Promise<unknown>): SwitchRead {
+  if (value != null) return { state: "ready" };
+  if (error != null) return { state: "unread", error, retry };
+  return { state: "reading" };
+}
+
+/** Try again after a failed settings read, busy while it reads. */
+function UnreadNote({ id, read }: { id: string; read: Extract<SwitchRead, { state: "unread" }> }) {
+  const [retrying, setRetrying] = useState(false);
+  return (
+    <div className="toolbar">
+      <p className="set-error" role="alert" id={`${id}-unread`}>
+        Couldn't read this setting{read.error ? `: ${read.error}` : "."}
+      </p>
+      <button
+        type="button"
+        className="sm"
+        disabled={retrying}
+        aria-busy={retrying || undefined}
+        onClick={async () => {
+          setRetrying(true);
+          try {
+            await read.retry();
+          } finally {
+            setRetrying(false);
+          }
+        }}
+      >
+        <Busy on={retrying} />
+        Try again
+      </button>
+    </div>
+  );
+}
+
 function SwitchRow({
   id,
   label,
@@ -1849,6 +1891,7 @@ function SwitchRow({
   busy,
   onChange,
   error,
+  read = { state: "ready" },
 }: {
   id: string;
   label: string;
@@ -1859,7 +1902,29 @@ function SwitchRow({
   busy: boolean;
   onChange: (next: boolean) => void;
   error?: ReactNode;
+  read?: SwitchRead;
 }) {
+  if (read.state !== "ready") {
+    const reading = read.state === "reading";
+    return (
+      <div className="opt-row" aria-busy={reading || undefined} data-testid={`${id}-${read.state}`}>
+        <span className="sw-slot">
+          <Tag tone={reading ? "neutral" : "err"}>{reading ? "Reading…" : "Can't read this setting"}</Tag>
+        </span>
+        <div className="opt-text">
+          <div className="opt-title">
+            <span className="opt-name" id={`${id}-name`}>
+              {label}
+            </span>
+          </div>
+          <p id={`${id}-what`} className="opt-what">
+            {what}
+          </p>
+          {read.state === "unread" ? <UnreadNote id={id} read={read} /> : null}
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="opt-row">
       <input
@@ -1986,6 +2051,7 @@ function TellingSection({
   cfg,
   features,
   featuresError,
+  cfgError,
   w,
   reread,
   rereadFeatures,
@@ -1994,6 +2060,7 @@ function TellingSection({
   cfg: RouteConfig | null;
   features: FeaturesShape | null;
   featuresError?: string | null;
+  cfgError?: string | null;
   w: Writer;
   reread: () => Promise<unknown>;
   rereadFeatures: () => Promise<unknown>;
@@ -2004,8 +2071,13 @@ function TellingSection({
   // silent off (Codex review, finding 7). A failed read after a write also
   // counts: the switch may show a value that is no longer true, so it is
   // marked unread and held until a read succeeds.
-  const unread = featuresError != null || (!master && features != null);
-  const [retrying, setRetrying] = useState(false);
+  const masterRead: SwitchRead =
+    featuresError != null || (!master && features != null)
+      ? { state: "unread", error: featuresError, retry: rereadFeatures }
+      : !master
+        ? { state: "reading" }
+        : { state: "ready" };
+  const cfgRead = switchRead(cfg, cfgError, reread);
   const locked = master?.source === "env";
   const moment = (key: string) => cfg?.routing?.[key]?.value === true;
   const old = data?.old_switches ?? {};
@@ -2024,34 +2096,12 @@ function TellingSection({
           what="Turns all of the telling on or off. The same switch is in Optional features."
           tag={locked ? <Tag>Locked</Tag> : <Tag>Also in Optional features</Tag>}
           checked={master?.enabled === true}
-          disabled={!master || unread || locked || w.anyBusy}
+          disabled={!master || locked || w.anyBusy}
+          read={masterRead}
           busy={w.isBusy("push")}
           onChange={(next) => void w.run("push", "khipu_feature_set", { name: "routing_push", enabled: next }, rereadFeatures)}
           error={
             <>
-              {unread ? (
-                <div className="toolbar">
-                  <p className="set-error" role="alert">
-                    Couldn't read this setting{featuresError ? `: ${featuresError}` : "."}
-                  </p>
-                  <button
-                    type="button"
-                    className="sm"
-                    disabled={retrying}
-                    onClick={async () => {
-                      setRetrying(true);
-                      try {
-                        await rereadFeatures();
-                      } finally {
-                        setRetrying(false);
-                      }
-                    }}
-                  >
-                    <Busy on={retrying} />
-                    Retry
-                  </button>
-                </div>
-              ) : null}
               {locked ? (
                 <p className="opt-cost">
                   The environment variable <code>KHIPU_FEATURE_ROUTING_PUSH</code> decides this switch. Unset it to
@@ -2069,6 +2119,7 @@ function TellingSection({
           tag={<Tag tone="ok">Start</Tag>}
           checked={moment("routing_push_start")}
           disabled={!cfg || w.anyBusy}
+          read={cfgRead}
           busy={w.isBusy("push-start")}
           onChange={(next) =>
             void w.run("push-start", "khipu_config_set", { key: "routing_push_start", value: next ? "on" : "off" }, reread)
@@ -2082,6 +2133,7 @@ function TellingSection({
           tag={<Tag tone="ok">Next prompt</Tag>}
           checked={moment("routing_push_prompt")}
           disabled={!cfg || w.anyBusy}
+          read={cfgRead}
           busy={w.isBusy("push-prompt")}
           onChange={(next) =>
             void w.run("push-prompt", "khipu_config_set", { key: "routing_push_prompt", value: next ? "on" : "off" }, reread)
@@ -2095,6 +2147,7 @@ function TellingSection({
           tag={<Tag tone="ok">Delegation</Tag>}
           checked={moment("routing_push_delegation")}
           disabled={!cfg || w.anyBusy}
+          read={cfgRead}
           busy={w.isBusy("push-delegation")}
           onChange={(next) =>
             void w.run("push-delegation", "khipu_config_set", { key: "routing_push_delegation", value: next ? "on" : "off" }, reread)
@@ -2297,15 +2350,33 @@ function runnerDetail(entry: SourceEntry, r: RouteRunner | undefined, now: Date)
   return parts.join(" · ");
 }
 
+/** Whether the routing record and the settings a section needs are read. */
+type RecordRead = "ready" | "reading" | "failed";
+
+/** "Reading…" before the record is read, or that the read failed: in place of
+ *  a list's empty state, which would otherwise say "none" before anything
+ *  was read. */
+function RecordReadLine({ read, what }: { read: Exclude<RecordRead, "ready">; what: string }) {
+  return read === "reading" ? (
+    <p className="set-help" aria-busy="true" role="status">
+      <Tag>Reading…</Tag> Looking for {what}.
+    </p>
+  ) : (
+    <p className="set-error">Couldn't read {what} just now.</p>
+  );
+}
+
 function FoldersSection({
   data,
   cfg,
+  recordRead = "ready",
   w,
   now,
   reread,
 }: {
   data: RouteView | null;
   cfg: RouteConfig | null;
+  recordRead?: RecordRead;
   w: Writer;
   now: Date;
   reread: () => Promise<unknown>;
@@ -2478,6 +2549,8 @@ function FoldersSection({
               );
             })}
           </div>
+        ) : recordRead !== "ready" ? (
+          <RecordReadLine read={recordRead} what="job runner folders" />
         ) : (
           <p className="set-help">No job runner folders yet. Add one to let Khipu read a runner's limits and heartbeat.</p>
         )}
@@ -2651,11 +2724,13 @@ function LaneRow({
 function LanesSection({
   data,
   cfg,
+  recordRead = "ready",
   w,
   reread,
 }: {
   data: RouteView | null;
   cfg: RouteConfig | null;
+  recordRead?: RecordRead;
   w: Writer;
   reread: () => Promise<unknown>;
 }) {
@@ -2669,7 +2744,10 @@ function LanesSection({
     <div className="section-card">
       <div className="section-head">Which account each job lane uses</div>
       <div className="section-body">
-        {names.length ? (
+        {recordRead !== "ready" ? (
+          // Before the lane map is read every lane would look unmatched.
+          <RecordReadLine read={recordRead} what="job runner lanes" />
+        ) : names.length ? (
           names.map((name) => {
             const r = runners.find((x) => x.name === name);
             const lanes = [...new Set([...(r?.lanes ?? []), ...Object.keys(map[name] ?? {})])].sort();
@@ -2927,6 +3005,10 @@ export function RoutingSettings({ active, plans }: { active: boolean; plans?: Us
   const w = useWriter(rereadRoute);
   const now = new Date();
   const data = route.data;
+  // Folders and lanes come from both the routing record and the settings;
+  // until both are read they say so, never "none yet".
+  const recordRead: RecordRead =
+    data && config.data ? "ready" : (!data && route.error) || (!config.data && config.error) ? "failed" : "reading";
   return (
     <div className="route-settings">
       <p className="set-help set-intro">
@@ -2955,7 +3037,7 @@ export function RoutingSettings({ active, plans }: { active: boolean; plans?: Us
           <NoteSection data={data} w={w} now={now} />
           <RulesSection data={data} w={w} now={now} />
           <HoldsSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
-          <ResetChecksSection data={data} cfg={config.data} w={w} reread={rereadConfig} />
+          <ResetChecksSection data={data} cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} />
         </>
       ) : !route.error ? (
         <p className="set-help" role="status">
@@ -2967,12 +3049,13 @@ export function RoutingSettings({ active, plans }: { active: boolean; plans?: Us
         cfg={config.data}
         features={features.data}
         featuresError={features.error}
+        cfgError={config.error}
         w={w}
         reread={rereadConfig}
         rereadFeatures={features.reload}
       />
-      <FoldersSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
-      <LanesSection data={data} cfg={config.data} w={w} reread={rereadConfig} />
+      <FoldersSection data={data} cfg={config.data} recordRead={recordRead} w={w} now={now} reread={rereadConfig} />
+      <LanesSection data={data} cfg={config.data} recordRead={recordRead} w={w} reread={rereadConfig} />
       <TableSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
       {data ? <ChangesSection data={data} w={w} now={now} /> : null}
       {config.error && !config.data ? (

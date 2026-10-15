@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from khipu import profiles as _profiles
+from khipu.lines import split_lines
 from khipu.profiles import ProfileSpec, resolve_spec
 from khipu.search_text import hybrid_rerank
 from khipu.snippets import FETCH_LIMIT, LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
@@ -983,7 +984,7 @@ def _log_query_timing(profile: str, ms: float, ok: bool) -> None:
             fh.write(line + "\n")
         if path.stat().st_size < _TIMING_COUNT_BYTES:
             return
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = split_lines(path.read_text(encoding="utf-8"))
         if len(lines) > TIMING_TRIM_AT:
             tmp = path.with_suffix(".jsonl.tmp")
             tmp.write_text("\n".join(lines[-TIMING_KEEP:]) + "\n", encoding="utf-8")
@@ -1000,7 +1001,7 @@ def median_query_ms(profile: str | None = None, *, hours: float = 24.0) -> dict[
     cutoff = time.time() - hours * 3600.0
     by: dict[str, list[int]] = {}
     try:
-        for raw in _timings_path().read_text(encoding="utf-8").splitlines():
+        for raw in split_lines(_timings_path().read_text(encoding="utf-8")):
             try:
                 row = json.loads(raw)
                 if not row.get("ok") or float(row["ts"]) < cutoff:

@@ -58,6 +58,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu.lines import split_lines
+
 DEFAULT_K = 3
 
 
@@ -86,7 +88,7 @@ def load_golden(path: Path) -> list[dict[str, Any]]:
     old golden file with only ``query``/``expect``/``k``/``note`` lines keeps
     loading exactly as before.
     """
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = split_lines(path.read_text(encoding="utf-8"))
     out: list[dict[str, Any]] = []
     for i, raw in enumerate(lines, start=1):
         line = raw.strip()
@@ -574,7 +576,9 @@ def load_replay_entries(
     """
     seen: set[str] = set()
     entries: list[dict[str, Any]] = []
-    for raw in log_path.read_text(encoding="utf-8").splitlines():
+    # Strict: the queries are replayed and compared, and replacing bad bytes
+    # can merge two of them.
+    for raw in split_lines(log_path.read_text(encoding="utf-8")):
         raw = raw.strip()
         if not raw:
             continue

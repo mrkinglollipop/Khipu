@@ -31,6 +31,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from khipu.lines import read_lines, split_lines
+
 LIVE_NAME = "live"
 SLOT_NAMES = ("live-a", "live-b")
 GATE_ORDER = ("doctor", "recall", "capture", "version")
@@ -600,11 +602,28 @@ def _parse_summary(line: str) -> dict[str, Any] | None:
             "legs": legs.group("legs") if legs else None}
 
 
-def _read_tail(path: Path, max_bytes: int = REPLAY_TAIL_BYTES) -> str:
+def _read_tail(path: Path, max_bytes: int = REPLAY_TAIL_BYTES) -> list[str]:
+    """The whole lines in the last ``max_bytes`` of ``path``, each decoded as
+    strict UTF-8: the queries are compared and replayed, and replacing a bad
+    byte can merge two of them, so an undecodable line is skipped."""
     with open(path, "rb") as fh:
         size = fh.seek(0, os.SEEK_END)
-        fh.seek(max(0, size - max_bytes))
-        return fh.read().decode("utf-8", errors="replace")
+        offset = max(0, size - max_bytes)
+        before = b"\n"
+        if offset:
+            fh.seek(offset - 1)
+            before = fh.read(1)
+        fh.seek(offset)
+        data = fh.read()
+    if before != b"\n":
+        data = data.partition(b"\n")[2]  # the seek landed inside a line
+    out = []
+    for raw in data.split(b"\n"):
+        try:
+            out.append(raw.decode("utf-8").removesuffix("\r"))
+        except UnicodeDecodeError:
+            continue
+    return out
 
 
 def sample_queries(log: Path, n: int = 5, *, now: float | None = None) -> list[dict[str, Any]]:
@@ -616,11 +635,11 @@ def sample_queries(log: Path, n: int = 5, *, now: float | None = None) -> list[d
 
     now = time.time() if now is None else now
     try:
-        text = _read_tail(Path(log))
+        lines = _read_tail(Path(log))
     except OSError:
         return []
     seen: dict[str, dict[str, Any]] = {}
-    for line in text.splitlines():
+    for line in lines:
         try:
             row = json.loads(line)
         except ValueError:
@@ -700,7 +719,7 @@ def _recall_once(hook: Path, sample: dict[str, Any], session: str, *, legacy: bo
         row = None
         log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
         try:
-            for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            for line in read_lines(log):
                 row = _parse_summary(line) or row
         except OSError:
             row = None
@@ -721,7 +740,7 @@ def _probe_answer(r: subprocess.CompletedProcess) -> bool | None:
     if r.returncode != 0:
         return None
     try:
-        out = json.loads((r.stdout or "").strip().split("\n")[-1])
+        out = json.loads(split_lines((r.stdout or "").strip())[-1])
     except (ValueError, IndexError):
         return None
     push = out.get("push") if isinstance(out, dict) else None
@@ -1112,7 +1131,7 @@ def record(entry: dict[str, Any]) -> dict[str, Any]:
 
 def records() -> list[dict[str, Any]]:
     try:
-        lines = state_file().read_text(encoding="utf-8").splitlines()
+        lines = split_lines(state_file().read_text(encoding="utf-8"))
     except OSError:
         return []
     out = []

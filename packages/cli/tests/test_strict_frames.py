@@ -418,3 +418,63 @@ class CriticFollowUpTest(unittest.TestCase):
             err = p.stderr.decode("utf-8", "replace")
             self.assertEqual(p.returncode, 0, err)
             assert_strict_json_text(self, sink.read_bytes().decode("utf-8"))
+
+
+class LeftoverWritersTest(unittest.TestCase):
+    """Writers the first rounds missed: the recall client relaying a legacy
+    daemon's reply, and session_capture's --status, --drain and dry-run
+    diagnostics."""
+
+    def test_recall_client_relays_a_legacy_reply_strictly(self):
+        # An older service answers with the bare hook object, its text
+        # carrying a lone surrogate escape; the client ran under
+        # python3 -S -E -B and re-encoded it with plain json.dumps.
+        import socket
+        legacy = json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                                    "additionalContext": AWKWARD}}).encode() + b"\n"
+        with tempfile.TemporaryDirectory(prefix="kh-", dir="/tmp") as td:
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(os.path.join(td, "recall.sock"))
+            listener.listen(1)
+            listener.settimeout(20)
+
+            def serve():
+                conn, _ = listener.accept()
+                with conn:
+                    buf = b""
+                    while b"\n" not in buf:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            return
+                        buf += chunk
+                    conn.sendall(legacy)
+
+            t = threading.Thread(target=serve, daemon=True)
+            t.start()
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": td, "KHIPU_CAPTURE_HOME": td}
+            p = subprocess.run([sys.executable, "-S", "-E", "-B", str(CLI_ROOT / "bin" / "khipu-recall-client.py")],
+                               input=b'{"prompt": "x", "session_id": "s"}', capture_output=True,
+                               env=env, timeout=30)
+            t.join(10)
+            listener.close()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        assert_strict_frame(self, p.stdout.rstrip(b"\n"))
+        self.assertIn("hookSpecificOutput", json.loads(p.stdout))
+
+    def _main_stdout(self, argv, **patches):
+        from khipu import session_capture as sc
+        buf = io.StringIO()
+        with ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(sc, name, value))
+            stack.enter_context(redirect_stdout(buf))
+            self.assertEqual(sc.main(argv), 0)
+        return buf.getvalue()
+
+    def test_session_capture_status_is_strict(self):
+        out = self._main_stdout(["--status"], liveness_all=lambda: {"warnings": [{"harness": AWKWARD}]})
+        assert_strict_json_text(self, out)
+
+    def test_session_capture_drain_report_is_strict(self):
+        out = self._main_stdout(["--drain"], drain=lambda **kw: {"errors": [AWKWARD]})
+        assert_strict_json_text(self, out)

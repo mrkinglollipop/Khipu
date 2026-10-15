@@ -2722,6 +2722,14 @@ input.switch:disabled {
   border-bottom: 0;
 }
 
+/* Stands where a switch goes until its value is read (or can't be). */
+.sw-slot {
+  flex: none;
+  display: inline-flex;
+  min-width: 36px;
+  margin-top: 1px;
+}
+
 .opt-text {
   display: flex;
   flex-direction: column;

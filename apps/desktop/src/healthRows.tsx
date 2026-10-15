@@ -29,7 +29,7 @@ import {
 import type { UsageReport } from "./PlansCard";
 import { brokenChecks, lastChangeWords, quietRunners, runnerWords } from "./routing";
 import type { RouteView } from "./routing";
-import { fmtAge, fmtAgeSince } from "./time";
+import { fmtAge, fmtAgo, fmtAgoSince } from "./time";
 
 export type HealthRowStatus = "ok" | "err" | "skipped";
 
@@ -184,7 +184,7 @@ export function hubSnapshotDetail(block: HubSnapshotBlock | undefined): string |
   const parts: string[] = [];
   const state = block.state ?? "";
   if (SNAPSHOT_STATE_WORDS[state]) parts.push(SNAPSHOT_STATE_WORDS[state]);
-  if (block.age_seconds != null) parts.push(`rebuilt in full ${fmtAge(block.age_seconds)} ago`);
+  if (block.age_seconds != null) parts.push(`rebuilt in full ${fmtAgo(block.age_seconds)}`);
   if (block.reason === "snapshot_refresh_failed" && block.refresh_error?.error) {
     parts.push(`the last rebuild failed: ${block.refresh_error.error}`);
   }
@@ -213,8 +213,8 @@ export function hubSnapshotDetail(block: HubSnapshotBlock | undefined): string |
   if (state === "unknown" && was) {
     // measured_at is the database's clock; only checked_at (this Mac's) can
     // be aged against this Mac's now.
-    const ago = fmtAgeSince(last?.checked_at);
-    if (ago) parts.push(`${ago} ago it was ${was}`);
+    const ago = fmtAgoSince(last?.checked_at);
+    if (ago) parts.push(`${ago} it was ${was}`);
     else if (last?.measured_at) parts.push(`when last compared it was ${was}`);
   }
   return parts.length ? parts.join(" · ") : undefined;
