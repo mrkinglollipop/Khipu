@@ -57,6 +57,12 @@ const STEPS: { id: StepId; label: string }[] = [
   { id: "finish", label: "Finish" },
 ];
 
+/** A step id from outside (a What's new button) may name a step this build
+ * does not have yet; fall back to the first step. */
+function stepOrWelcome(id: string | undefined): StepId {
+  return STEPS.find((s) => s.id === id)?.id ?? "welcome";
+}
+
 function joinFailMessage(
   out: Record<string, unknown> | null,
   fallback: string,
@@ -178,19 +184,19 @@ export function Welcome({
   /** Jump to this step instead of the usual "welcome" start — Settings ›
    *  Database's "Connect to a server you run or another Mac…" reopens this
    *  flow at the Database step rather than restarting from step 1. */
-  initialStep?: StepId;
+  initialStep?: string;
   /** Bumped by the caller on every click so revisiting the same
    *  `initialStep` (the user backed out and clicked the Settings link again)
    *  still jumps — `initialStep` alone would not change value the second
    *  time, so nothing would tell this component to re-read it. */
   initialStepKey?: number;
 }) {
-  const [step, setStep] = useState<StepId>(initialStep ?? "welcome");
+  const [step, setStep] = useState<StepId>(stepOrWelcome(initialStep));
   const idx = STEPS.findIndex((s) => s.id === step);
   const go = (n: number) => setStep(STEPS[Math.max(0, Math.min(STEPS.length - 1, idx + n))].id);
 
   useEffect(() => {
-    if (initialStepKey) setStep(initialStep ?? "welcome");
+    if (initialStepKey) setStep(stepOrWelcome(initialStep));
     // Only the bump should retrigger this — `initialStep` alone can repeat
     // ("database" twice in a row) without a fresh navigation to react to.
     // eslint-disable-next-line react-hooks/exhaustive-deps
