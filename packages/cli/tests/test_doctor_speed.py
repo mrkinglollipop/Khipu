@@ -111,6 +111,33 @@ class IntegrityVerdictIsRememberedTest(unittest.TestCase):
         self.assertEqual(check.call_count, 2)
 
 
+    def test_a_write_during_the_check_is_not_remembered_as_checked(self):
+        # Cross-family review: the identity was read after the check, so a
+        # file changed while it was checked kept the old pass.
+        writes = []
+
+        def check_then_write(path):
+            writes.append(1)
+            con = sqlite3.connect(path)
+            con.execute("INSERT INTO nodes VALUES (?)", (f"written during check {len(writes)}",))
+            con.commit()
+            con.close()
+            return "ok"
+
+        with mock.patch.object(graph_backup, "_integrity_check", side_effect=check_then_write) as check:
+            self._health()
+            self._health()
+        self.assertEqual(check.call_count, 2)
+
+    def test_a_snapshot_with_a_wal_beside_it_is_never_remembered(self):
+        # Committed WAL pages change the database without touching the main
+        # file's size or times, so a verdict for it cannot be remembered.
+        Path(f"{self.snap}-wal").write_bytes(b"x")
+        with mock.patch.object(graph_backup, "_integrity_check", return_value="ok") as check:
+            self._health()
+            self._health()
+        self.assertEqual(check.call_count, 2)
+
 class MemoryPlannedOnceTest(unittest.TestCase):
     def test_memory_gaps_can_use_the_fingerprint_cache(self):
         plan = {("topic", "a", 0): ("h", 1)}

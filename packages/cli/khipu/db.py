@@ -78,7 +78,7 @@ def conninfo_with_local_root_cert(dsn: str) -> str:
 
     Stored DSNs are ``postgres://`` URIs. Putting ``sslrootcert=/Users/…``
     in the query string has shown up at TLS time as
-    ``root certificate file "/Users/matthewsc" does not exist`` (the first
+    ``root certificate file "/Users/<16 chars>" does not exist`` (the first
     16 chars of the path) even when ``~/.config/khipu/root.crt`` was on
     disk. Percent-encoding slashes in the URI does not survive libpq's
     decode. Keyword/value conninfo plus an overwrite from the local cert

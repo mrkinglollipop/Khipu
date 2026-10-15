@@ -282,6 +282,13 @@ def _integrity_cache_file() -> Path:
 
 
 def _file_identity(path: Path) -> dict | None:
+    """The file's identity, or None when a verdict for it must not be
+    remembered: unreadable, or with a SQLite WAL or rollback journal beside
+    it (committed WAL pages change the database without touching the main
+    file's size or times)."""
+    for suffix in ("-wal", "-journal"):
+        if Path(f"{path}{suffix}").exists():
+            return None
     try:
         st = path.stat()
         resolved = str(path.resolve())
@@ -296,9 +303,11 @@ def _file_identity(path: Path) -> dict | None:
     }
 
 
-def _remember_integrity_ok(path: Path, checked_at: datetime) -> None:
+def _remember_integrity_ok(path: Path, checked_at: datetime, before: dict | None) -> None:
+    """Remember a pass only for the identity the file had before the check
+    and still has after it: a write during the check leaves nothing."""
     ident = _file_identity(path)
-    if ident is None:
+    if ident is None or before is None or ident != before:
         return
     target = _integrity_cache_file()
     try:
@@ -342,9 +351,10 @@ def _integrity_verdict(path: Path) -> tuple[str, str]:
     remembered = _remembered_integrity_ok(path, now)
     if remembered is not None:
         return "ok", remembered
+    before = _file_identity(path)
     integrity = _integrity_check(path)
     if integrity.lower() == "ok":
-        _remember_integrity_ok(path, now)
+        _remember_integrity_ok(path, now, before)
     return integrity, now.isoformat()
 
 
@@ -401,11 +411,12 @@ def record_local(*, snapshot: Path | None = None) -> dict:
     if snap is None or not snap.is_file():
         return {"ok": False, "reason": "no snapshot found"}
 
+    before = _file_identity(snap)
     integrity = _integrity_check(snap)
     ok = integrity.lower() == "ok"
     if ok:
         # The nightly just checked the file it wrote; doctor reuses that.
-        _remember_integrity_ok(snap, _utcnow())
+        _remember_integrity_ok(snap, _utcnow(), before)
     try:
         nbytes = snap.stat().st_size
     except OSError as exc:
