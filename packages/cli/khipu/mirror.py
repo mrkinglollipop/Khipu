@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu.lines import split_lines
 from khipu.topic_graph import parse_frontmatter_links, persist_capture_graph, persist_topic_graph
 
 # ---- W5.3: status vocabulary + frontmatter date parsing --------------------
@@ -554,7 +555,7 @@ def sync_recent_episodes(memory_root: Path, *, tail_lines: int = 40) -> dict[str
         block = min(size, 256 * 1024)
         f.seek(size - block)
         raw = f.read().decode("utf-8", errors="replace")
-    lines = [ln for ln in raw.splitlines() if ln.strip()][-tail_lines:]
+    lines = [ln for ln in split_lines(raw) if ln.strip()][-tail_lines:]
     objs: list[dict[str, Any]] = []
     keys: list[tuple[str, str]] = []
     for ln in lines:

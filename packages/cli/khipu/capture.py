@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from khipu import wire
+from khipu.lines import run_text
 from khipu.config import capture_mode
 
 # ---- W1.4 ingest dedup ------------------------------------------------------
@@ -866,12 +867,9 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
     if suppress_mirror:
         env["KHIPU_MIRROR"] = "0"
     try:
-        proc = subprocess.run(
+        proc = run_text(
             [sys.executable, str(capture_v2)],
             input=wire.dumps(payload),
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
             env=env,
             timeout=300,
         )
