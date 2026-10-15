@@ -343,7 +343,8 @@ def _upsert_topic(
 
 
 def _upsert_episode(cur, payload: dict[str, Any], *,
-                    source: dict[str, Any] | None = None) -> bool:
+                    source: dict[str, Any] | None = None,
+                    origin: str | None = None) -> bool:
     """Insert one episode; no-op when the (ts, md5(summary)) identity exists.
 
     Bare ON CONFLICT DO NOTHING is unambiguous here: id is never supplied, so
@@ -354,6 +355,12 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
     phase 1), from ``source`` when the caller snapshotted it (write_pg does,
     before enrichment and ingestion rewrite the payload) or else from the
     redacted copy written to the row, never the unredacted input.
+
+    ``origin`` is the server-stamped owner (0029); the caller has already
+    checked the column exists. A payload's own ``origin`` never reaches the
+    column, and is dropped from the stored raw too. So is its own
+    ``merged_from``: merge receipts are written only by the server's merge,
+    and a planted one could pose as an identity receipt and claim this row.
     """
     # Identity columns (0008) and tags (0010) are named only when they exist.
     # Naming them unconditionally made EVERY capture raise UndefinedColumn on a
@@ -367,6 +374,8 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
         "parent_session_id", "transcript_range", "window_id",
     }
     safe = deepcopy(payload)
+    safe.pop("origin", None)
+    safe.pop("merged_from", None)
     for key, value in list(safe.items()):
         if key not in identity_keys:
             safe[key], _ = _redact_free_text(value)
@@ -415,6 +424,10 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
         cols.append("verbatim")
         vals.append("%s::jsonb")
         params.append(json.dumps(safe.get("verbatim") or {}, ensure_ascii=False))
+    if origin is not None:
+        cols.append("origin")
+        vals.append("%s")
+        params.append(origin)
     cur.execute(
         f"""
         INSERT INTO episodes
@@ -458,7 +471,13 @@ def mirror_episode(payload: dict[str, Any]) -> bool:
         return False
     with connect() as conn:
         with conn.cursor() as cur:
-            _upsert_episode(cur, payload)
+            # A live capture by this process, so it is stamped like write_pg's.
+            # The file replays below (sync_recent_episodes, reconcile) are not:
+            # synced memory files can hold another machine's captures, and an
+            # unknown origin stays NULL rather than be claimed.
+            from khipu.capture import _stamp_origin
+
+            _upsert_episode(cur, payload, origin=_stamp_origin(cur))
             cur.execute("SAVEPOINT mirror_capture_graph")
             try:
                 persist_capture_graph(cur, payload)
