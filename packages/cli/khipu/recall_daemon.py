@@ -19,6 +19,12 @@ Protocol: one JSON object per line each way, on ``<khipu_home>/recall.sock``.
       answers {"ok", "version", "pid", "started", "code_stamp", "served"}
   anything else answers {"error": "..."}
 
+Routing (phase 3b and 3c) lives in a helper this service spawns once
+(``recall_prompt.RoutingForkServer``): it forks each prompt's routing child,
+and between prompts a poll child that refolds the routing record when a
+source or the log changed or the clock reached the view's ``valid_until``.
+This process never forks itself and never folds on its own threads.
+
 The service never dies from a request: handler failures answer explicit errors.
 It does exit on purpose when the package's code changes on disk (a ``git pull``
 landed), so launchd starts the new code instead of the process serving old
@@ -306,6 +312,16 @@ class RecallService:
         self.routing_forkserver.prepare()
         return True
 
+    def keep_routing(self) -> bool:
+        """Start the routing helper again if it died after it started, so
+        the record keeps being refolded between prompts (phase 3c: the
+        helper polls the sources and the log and refolds at the view's
+        ``valid_until``; the refold runs in a child of the helper, never on
+        this process's GIL). Never waits."""
+        if self.routing_forkserver is None or self._stopping.is_set():
+            return False
+        return self.routing_forkserver.keep_alive()
+
     def close(self) -> None:
         if self.routing_forkserver is not None:
             self.routing_forkserver.close()
@@ -521,6 +537,7 @@ class RecallService:
             def watch_code():
                 while not self._stopping.wait(_ACCEPT_TICK_S):
                     self._detect_stale()
+                    self.keep_routing()
             threading.Thread(target=watch_code, daemon=True).start()
         while not self._stopping.is_set():
             try:

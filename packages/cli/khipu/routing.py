@@ -2926,7 +2926,14 @@ def doctor_block(now: datetime | None = None) -> dict:
     checks = routing_sources.rule_checks(cache, view.get("rules") or [])
     warnings += [c["text"] for c in checks if c["status"] == "broken"]
     warnings += _launch_warnings(view, routing_sources.launches(cache), cfg, now)
+    budget = prompt_budget_block(cfg)
+    if budget.get("warn"):
+        warnings.append(f"Reading the routing record before a prompt ran out of time on {budget['rate_pct']:g}% of "
+                        f"the last {budget['count']} prompts (more than {budget['warn_pct']:g}%); those prompts "
+                        "went without their routing lines until a later prompt. Raise the time allowed before "
+                        "a prompt in Settings \u2192 Routing, or see whether the Mac is busy.")
     return {"record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),
+            "prompt_budget": budget,
             "valid_until": view.get("valid_until"),
             "accounts": [{"account": e["label"], "state": e["state"], "until": e["until"], "basis": e["basis"],
                           "line": account_line(e, now)} for e in view["accounts"]],
@@ -2935,6 +2942,17 @@ def doctor_block(now: datetime | None = None) -> dict:
             "note": view.get("note") is not None, "outside_app": view.get("outside_app") or [],
             "seed_error": view.get("seed_error"), "bad_lines": view.get("bad_lines", 0),
             "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings}
+
+
+def prompt_budget_block(cfg: dict | None = None) -> dict:
+    """Doctor's per-prompt budget rate (phase 3c): the share of recent
+    prompts whose routing read ran out of ``routing_prompt_budget_ms``, read
+    from the per-prompt hook's own log, with ``routing_slow_read_pct`` as the
+    warning threshold."""
+    from khipu import recall_prompt
+
+    cfg = cfg or settings()
+    return recall_prompt.prompt_routing_budget_rate(warn_pct=float(cfg["routing_slow_read_pct"]))
 
 
 def _sources_brief(sources: dict) -> dict:
@@ -3450,13 +3468,31 @@ def prompt_budget() -> float:
     return min(max(0, ms), PROMPT_BUDGET_MOST_MS) / 1000.0
 
 
+def _take_fold_lock(fd: int) -> None:
+    """Take ``prompt-fold.lock``, waiting for another fold (a prompt's, or
+    the recall daemon's poll) no longer than this thread's ``lock_budget``:
+    a fold that ends in that time has saved the view, which ``_start_view``
+    then answers as it is. Raises ``FoldBusy`` when it does not end in time."""
+    deadline = getattr(_held, "deadline", None)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            left = (deadline - time.monotonic()) if deadline is not None else 0.0
+            if left <= 0:
+                raise FoldBusy("another prompt is refolding the routing record") from None
+            time.sleep(min(0.005, left))
+
+
 def _prompt_view(now: datetime, on_fold=None) -> dict:
     """The view for a prompt. A fresh view.json is answered as it is. When
     an input changed or ``valid_until`` has passed (the clock caused a
     change and nothing refolded yet), the record is refolded inline, as the
     session-start child does it (``_start_view``: outside the routing lock,
-    which is taken only to save). Only one prompt refolds at a time: while
-    another prompt's child holds ``prompt-fold.lock`` this raises
+    which is taken only to save). Only one fold runs at a time: while
+    another prompt's child or the recall daemon's poll holds
+    ``prompt-fold.lock`` past this thread's ``lock_budget``, this raises
     ``FoldBusy`` instead of folding the same record again. ``on_fold`` is
     called once the lock is held: the per-prompt child then lets this fold
     run on until it has saved the view, so a fold slower than a prompt's
@@ -3479,10 +3515,7 @@ def _prompt_view(now: datetime, on_fold=None) -> dict:
     folder.mkdir(parents=True, exist_ok=True)
     fd = os.open(folder / PROMPT_FOLD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise FoldBusy("another prompt is refolding the routing record") from None
+        _take_fold_lock(fd)
         if on_fold is not None:
             on_fold()
         return _start_view(now)
@@ -3613,6 +3646,53 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
         why = "the changes are no longer kept"
     out = summary(view, now=now)
     return dict(base, kind="full", text=out["text"], count=0, why=why)
+
+
+# ---- the recall daemon's poll (phase 3c) --------------------------------------------------
+#
+# The recall daemon's routing helper (``recall_prompt.routing_forkserver_main``)
+# runs this in a child it forks, never on a thread of the daemon: a refold is
+# CPU-bound Python and would hold the GIL the search needs. It looks at the
+# sources and the log every ``routing_poll_interval`` and at the view's
+# ``valid_until`` (the next change the clock alone causes), and refolds when
+# either says the view is out of date, so a prompt finds view.json fresh and
+# reads it inside its budget. One fold at a time: it takes the prompt's fold
+# lock (``prompt-fold.lock``), and a prompt that finds it held skips routing
+# for that prompt (its marker stays, so the change arrives with the next one).
+
+
+def poll_interval(cfg: dict | None = None) -> float | None:
+    """Seconds between the daemon's looks at the sources and the log
+    (``routing_poll_interval``), or None when the owner turned the look off
+    (0): the clock-driven refold at ``valid_until`` still runs."""
+    seconds = float((cfg or settings())["routing_poll_interval"])
+    return seconds if seconds > 0 else None
+
+
+def poll_refold(now: datetime | None = None, *, on_fold=None) -> dict:
+    """One poll of the record: refold and save the view when a source or the
+    log changed or ``valid_until`` has passed, else nothing. Answers
+    ``{"folded", "saved", "busy", "version", "valid_until", "interval"}``:
+    ``busy`` when a prompt is refolding it now (``FoldBusy``), ``saved``
+    false when the fold could not be saved (the routing lock was held past
+    ``LIGHT_LOCK_BUDGET``, or the data dir is read-only). ``on_fold`` is
+    called once the fold lock is held, as for a prompt (``_prompt_view``).
+    Never writes the log."""
+    with lock_budget(LIGHT_LOCK_BUDGET):
+        now = now or _now()
+        fingerprint, cfg, _known = _inputs()
+        out: dict[str, Any] = {"folded": False, "saved": True, "busy": False, "version": None,
+                               "valid_until": None, "interval": poll_interval(cfg)}
+        prev = _load_view()
+        if _fresh(prev, fingerprint, now):
+            return dict(out, version=prev["version"], valid_until=prev.get("valid_until"))
+        try:
+            view = _prompt_view(now, on_fold=on_fold)
+        except FoldBusy:
+            return dict(out, busy=True)
+    # No record on this Mac: nothing was folded or written.
+    return dict(out, folded=bool(view.get("record")), saved=view.get("saved", True) is not False,
+                version=view.get("version"), valid_until=view.get("valid_until"))
 
 
 # ---- khipu route wait --------------------------------------------------------------------

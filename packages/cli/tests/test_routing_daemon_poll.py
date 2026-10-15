@@ -1,0 +1,389 @@
+"""Routing truth, phase 3c (docs/plans/2026-10-14-routing-truth.md): the
+recall daemon keeps the routing record folded between prompts.
+
+Its routing helper (``recall_prompt.routing_forkserver_main``) forks a poll
+child that runs ``routing.poll_refold`` when a source or the log changed
+(every ``routing_poll_interval``) and when the clock reaches the view's
+``valid_until``; it never sleeps past ``valid_until``, and after the Mac
+wakes it runs everything that fell due once. Doctor's per-prompt budget
+rate and the stop-condition's replay are here too.
+
+Hermetic: a data dir and a short capture home per test; the schedule's
+tests use fake clocks; the helper's tests run the real helper process.
+"""
+from __future__ import annotations
+
+import json
+import shutil
+import tempfile
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from khipu import recall_daemon, recall_prompt, routing, routing_replay
+
+T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
+ACCOUNTS = [{"label": "Claude", "harness": "claude"}, {"label": "Codex", "harness": "codex"}]
+ME = {"kind": "conversation", "harness": "claude_code", "project": "project-a", "session": "s-one"}
+SESSION = "11111111-2222-3333-4444-555555555555"
+
+
+class Clocks:
+    """A wall clock (routing's ``_now`` and seconds since the epoch) and a
+    monotonic clock that stops while the Mac sleeps, as macOS's does."""
+
+    def __init__(self, start: datetime):
+        self.now = start
+        self.mono_s = 1000.0
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def wall(self) -> float:
+        return self.now.timestamp()
+
+    def mono(self) -> float:
+        return self.mono_s
+
+    def run(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+        self.mono_s += seconds
+
+    def sleep_mac(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)  # the monotonic clock stands still
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS, "routing_prompt_budget_ms": 1000}))
+    capture = Path(tempfile.mkdtemp(prefix="krd-", dir="/tmp"))  # AF_UNIX paths are short
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(capture))
+    monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
+    monkeypatch.delenv("ROUTING_NOW_OFF", raising=False)
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    monkeypatch.setattr(routing, "ROUTING_NOW_DISABLE_FILE", str(tmp_path / "routing_now_disable"))
+    clocks = Clocks(T0)
+    monkeypatch.setattr(routing, "_now", clocks)
+    yield {"data": data, "clocks": clocks, "capture": capture}
+    shutil.rmtree(capture, ignore_errors=True)
+
+
+def _set(home, **values) -> None:
+    path = home["data"] / "config.json"
+    config = json.loads(path.read_text())
+    config.update(values)
+    path.write_text(json.dumps(config))
+
+
+def _seen_now() -> dict:
+    view = routing.read_view()
+    assert recall_prompt.mark_routing_seen(SESSION, version=view["version"], epoch=view["epoch"],
+                                           full_at=routing._iso(routing._now()))
+    return recall_prompt.routing_marker(SESSION)
+
+
+def _schedule(home, interval: float | None = 10.0) -> recall_prompt.RefoldSchedule:
+    return recall_prompt.RefoldSchedule(interval, wall=home["clocks"].wall, mono=home["clocks"].mono)
+
+
+def _poll(schedule) -> dict:
+    """One poll as the helper's child runs it, and the schedule told."""
+    out = routing.poll_refold()
+    due = routing._parse(out.get("valid_until"))
+    schedule.ran(due.timestamp() if due else None, ok=not out["busy"] and out["saved"],
+                 interval=out["interval"])
+    return out
+
+
+# ---- the schedule ------------------------------------------------------------------------------
+
+
+def test_the_sleep_never_passes_valid_until(home):
+    clocks = home["clocks"]
+    schedule = _schedule(home, interval=10.0)
+    assert schedule.due() == ["poll"]  # a start reads the view before it waits
+    valid_until = clocks.wall() + 23.5
+    schedule.ran(valid_until)
+    for _ in range(100):
+        if schedule.due():
+            break
+        wait = schedule.sleep_for(60.0)
+        assert clocks.wall() + wait <= valid_until  # never sleeps past it
+        assert wait <= 10.0  # nor past the next poll
+        clocks.run(wait)
+        if "poll" in schedule.due():
+            schedule.ran(valid_until)
+    assert schedule.due() == ["clock"] and clocks.wall() == valid_until
+    # A valid_until nearer than the poll wins; with the poll off it is the only wait.
+    off = _schedule(home, interval=None)
+    off.ran(clocks.wall() + 3600)
+    assert off.sleep_for(7200.0) == 3600 and off.due() == []
+    off.ran(None)
+    assert off.sleep_for(7200.0) == 7200.0 and off.due() == []
+
+
+def test_a_failed_or_stale_poll_is_tried_again_soon_not_at_once(home):
+    clocks = home["clocks"]
+    schedule = _schedule(home, interval=600.0)
+    schedule.ran(clocks.wall() - 5)  # a valid_until already passed (an unsaved fold)
+    assert schedule.due() == [] and schedule.sleep_for(3600) == recall_prompt._POLL_RETRY_S
+    schedule.ran(ok=False)
+    assert schedule.sleep_for(3600) == recall_prompt._POLL_RETRY_S
+
+
+def test_a_wake_after_sleep_runs_due_work_once(home, monkeypatch):
+    clocks = home["clocks"]
+    routing.report(account="Codex", state="limited", until="1h", author=ME)
+    routing.add_hold("keep the second account for the audit", reason="keep", scope="machine", until="2h",
+                     author=ME)
+    schedule = _schedule(home, interval=10.0)
+    first = _poll(schedule)
+    assert routing._parse(first["valid_until"]) == T0 + timedelta(hours=1)
+    folds = []
+    real_fold = routing.fold
+    monkeypatch.setattr(routing, "fold", lambda *a, **k: folds.append(1) or real_fold(*a, **k))
+    # The Mac sleeps three hours: the limit's end and the hold's end both fell due.
+    clocks.sleep_mac(3 * 3600)
+    runs = []
+    for _ in range(30):  # the helper's ticks after it wakes
+        why = schedule.due()
+        if why:
+            runs.append((why, _poll(schedule)["folded"]))
+        clocks.run(min(1.0, schedule.sleep_for(1.0)) or 1.0)
+    # Once on waking for everything that fell due, then only the 10 s poll, finding the view fresh.
+    assert {"wake", "clock"} <= set(runs[0][0]) and runs[0][1]
+    assert runs[1:] and all(why == ["poll"] and not folded for why, folded in runs[1:])
+    assert len(folds) == 1  # the record was folded once
+    view = routing.read_view()
+    codex = next(a for a in view["accounts"] if a["label"] == "Codex")
+    assert codex["state"] == routing.PROBABLY_OPEN and not view["holds"]
+
+
+def test_a_clock_set_backwards_also_counts_as_a_jump(home):
+    clocks = home["clocks"]
+    schedule = _schedule(home)
+    schedule.ran(None)
+    clocks.now -= timedelta(hours=2)
+    assert "wake" in schedule.due()
+
+
+# ---- the poll ------------------------------------------------------------------------------------
+
+
+def test_a_limits_end_with_no_file_changing_reaches_the_next_prompt_as_a_change(home, monkeypatch):
+    clocks = home["clocks"]
+    _set(home, routing_poll_interval=0)  # the poll off: only the clock wakes it
+    routing.report(account="Codex", state="limited", until="1h", author=ME)
+    routing.report(account="Claude", state="open", author=ME)
+    marker = _seen_now()
+    schedule = _schedule(home, interval=None)
+    before = _poll(schedule)
+    assert not before["folded"]
+    events = routing.events_file().stat().st_mtime_ns
+    while not schedule.due():
+        clocks.run(schedule.sleep_for(3600.0))
+    assert schedule.due() == ["clock"] and clocks.now == T0 + timedelta(hours=1)
+    out = _poll(schedule)
+    assert out["folded"] and out["saved"] and out["version"] > before["version"]
+    assert routing.events_file().stat().st_mtime_ns == events  # no file changed
+    # The next prompt reads the saved view: no fold of its own.
+    monkeypatch.setattr(routing, "fold", lambda *a, **k: pytest.fail("the prompt refolded"))
+    clocks.run(5)
+    push = routing.prompt_push(marker, budget=1.0)
+    assert push["kind"] == "changes", push
+    assert "Codex: probably open: its limit was due to end at 16:00Z" in push["text"]
+
+
+def test_a_source_change_refolds(home, monkeypatch):
+    routing.report(account="Claude", state="open", author=ME)
+    first = routing.poll_refold()
+    assert not first["folded"] and first["interval"] == 10.0
+    # Another writer's line is down, but its own refold never ran.
+    with monkeypatch.context() as m:
+        m.setattr(routing, "_refold_locked", lambda *a, **k: (_ for _ in ()).throw(OSError("full disk")))
+        routing.report(account="Codex", state="limited", until="1h", author=ME)
+    assert routing._load_view()["version"] == first["version"]
+    out = routing.poll_refold()
+    assert out["folded"] and out["saved"] and out["version"] == first["version"] + 1
+    codex = next(a for a in routing._load_view()["accounts"] if a["label"] == "Codex")
+    assert codex["state"] == routing.LIMITED
+    assert not routing.poll_refold()["folded"]  # fresh now: nothing to do
+    # A changed setting is a source too.
+    home["clocks"].run(2)
+    _set(home, routing_poll_interval="30s")
+    again = routing.poll_refold()
+    assert again["folded"] and again["interval"] == 30.0
+
+
+def test_the_poll_waits_for_a_prompts_fold_and_never_folds_beside_it(home):
+    import fcntl
+
+    routing.report(account="Claude", state="open", author=ME)
+    routing.view_file().unlink()
+    lock = routing.routing_dir() / routing.PROMPT_FOLD_LOCK
+    with open(lock, "a") as fd:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # a prompt's child is folding
+        began = time.monotonic()
+        out = routing.poll_refold()
+        waited = time.monotonic() - began
+    assert out["busy"] and not out["folded"]
+    assert routing.LIGHT_LOCK_BUDGET - 0.05 <= waited < routing.LIGHT_LOCK_BUDGET + 1.0
+    assert routing.poll_refold()["folded"]
+
+
+def test_no_record_folds_and_writes_nothing(home):
+    out = routing.poll_refold()
+    assert not out["folded"] and not routing.routing_dir().exists()
+
+
+# ---- the real helper -------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def helper(home, monkeypatch):
+    """The service as ``serve`` runs it, with the push on; the helper's poll
+    child uses the real clock."""
+    home["clocks"].now = datetime.now(timezone.utc)
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
+    svc = recall_daemon.RecallService(home["capture"] / "recall.sock", stamp_fn=lambda: "fixed",
+                                      idle_check=False)
+    assert svc.bind()
+    thread = threading.Thread(target=svc.run, daemon=True)
+    thread.start()
+    yield svc
+    svc.stop()
+    thread.join(5)
+    svc.close()
+
+
+def _wait(check, seconds: float = 15.0):
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        got = check()
+        if got:
+            return got
+        time.sleep(0.05)
+    raise AssertionError("timed out")
+
+
+def test_the_helper_refolds_at_valid_until_with_no_prompt_and_never_in_the_daemon(home, monkeypatch, helper):
+    _set(home, routing_poll_interval="1h")  # only the clock can wake it
+    monkeypatch.setattr(routing, "_now", lambda: datetime.now(timezone.utc))
+    routing.report(account="Codex", state="limited", until="3s", author=ME)
+    version = routing._load_view()["version"]
+    # Any fold in this process (the daemon) fails the test; the helper's child has its own.
+    monkeypatch.setattr(routing, "fold", lambda *a, **k: pytest.fail("the daemon folded"))
+    assert helper.start_routing()
+    assert helper.routing_forkserver.wait_ready(10)
+    view = _wait(lambda: (v := routing._load_view()) and v["version"] > version and v)
+    codex = next(a for a in view["accounts"] if a["label"] == "Codex")
+    assert codex["state"] == routing.PROBABLY_OPEN
+
+
+def test_the_helper_refolds_after_a_source_change(home, monkeypatch, helper):
+    _set(home, routing_poll_interval="1s")
+    monkeypatch.setattr(routing, "_now", lambda: datetime.now(timezone.utc))
+    routing.report(account="Claude", state="open", author=ME)
+    assert helper.start_routing()
+    assert helper.routing_forkserver.wait_ready(10)
+    version = _wait(lambda: routing._load_view())["version"]
+    with monkeypatch.context() as m:
+        m.setattr(routing, "_refold_locked", lambda *a, **k: (_ for _ in ()).throw(OSError("full disk")))
+        routing.report(account="Codex", state="limited", until="1h", author=ME)
+    view = _wait(lambda: (v := routing._load_view()) and v["version"] > version and v)
+    assert next(a for a in view["accounts"] if a["label"] == "Codex")["state"] == routing.LIMITED
+
+
+def test_the_daemon_starts_a_dead_helper_again_between_prompts(home, monkeypatch, helper):
+    monkeypatch.setattr(recall_prompt, "_FORKSERVER_RESPAWN_S", 0.0)
+    assert not helper.keep_routing()  # never started (the push was off): stays unstarted
+    assert helper.start_routing()
+    assert helper.routing_forkserver.wait_ready(10)
+    proc = helper.routing_forkserver._proc
+    proc.kill()
+    proc.wait(5)
+    assert helper.keep_routing()
+    assert _wait(lambda: helper.routing_forkserver.wait_ready(0.1) and helper.routing_forkserver.spawned == 2)
+
+
+# ---- doctor: the per-prompt budget rate -----------------------------------------------------------
+
+
+def _hook_log(statuses: list[str | None], *, when: datetime | None = None) -> None:
+    when = when or datetime.now(timezone.utc)
+    path = recall_prompt._log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = when.strftime("%Y-%m-%dT%H:%M:%SZ")
+    with path.open("a") as fh:
+        for i, status in enumerate(statuses):
+            routed = f" routing={status}" if status else ""
+            fh.write(f"{stamp} [khipu-prompt-recall] session=s{i} reason=ok ms=300.0 hits=[] legs=['lexical'] "
+                     f"degraded=None{routed}\n")
+        fh.write(f"{stamp} [khipu-prompt-recall] snapshot unusable (no replica)\n")
+
+
+def test_the_budget_rate_counts_only_prompts_with_the_push_on(home):
+    _hook_log(["full", "none", "skipped:budget", None, None, "changes:2", "unsent:full"])
+    rate = recall_prompt.prompt_routing_budget_rate(warn_pct=1.0)
+    assert rate["available"] and rate["count"] == 5 and rate["skipped_budget"] == 1
+    assert rate["rate_pct"] == 20.0 and not rate["warn"]  # too few prompts to judge
+
+
+def test_doctor_warns_past_the_slow_read_threshold(home):
+    routing.report(account="Claude", state="open", author=ME)
+    home["clocks"].now = datetime.now(timezone.utc)
+    _hook_log(["none"] * 97 + ["skipped:budget"] * 3)
+    block = routing.doctor_block()
+    assert block["prompt_budget"]["rate_pct"] == 3.0 and block["prompt_budget"]["warn"]
+    assert any("ran out of time on 3% of the last 100 prompts" in w for w in block["warnings"])
+    _set(home, routing_slow_read_pct=5)
+    block = routing.doctor_block()
+    assert not block["prompt_budget"]["warn"]
+    assert not [w for w in block["warnings"] if "ran out of time" in w]
+    _set(home, routing_slow_read_pct=0)  # 0: never warn
+    assert not routing.doctor_block()["prompt_budget"]["warn"]
+
+
+def test_old_lines_are_left_out_of_the_budget_rate(home):
+    _hook_log(["skipped:budget"] * 30, when=datetime.now(timezone.utc) - timedelta(days=8))
+    _hook_log(["none"] * 25)
+    rate = recall_prompt.prompt_routing_budget_rate()
+    assert rate["count"] == 25 and rate["skipped_budget"] == 0 and not rate["warn"]
+
+
+# ---- the stop-condition's replay ------------------------------------------------------------------
+
+
+def test_the_stop_condition_is_more_than_two_timeouts_in_a_hundred():
+    assert not routing_replay.verdict(4.0, 2.0)
+    assert routing_replay.verdict(4.5, 2.0)
+    assert not routing_replay.verdict(0.0, 3.0)
+
+
+def test_the_replay_reports_timeouts_per_100_each_way_and_writes_only_its_own_dir(tmp_path, monkeypatch):
+    live = tmp_path / "live"
+    live.mkdir()
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(live))
+    monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
+    monkeypatch.delenv("KHIPU_CAPTURE_HOME", raising=False)
+    monkeypatch.setattr(routing, "ROUTING_NOW_DISABLE_FILE", str(tmp_path / "routing_now_disable"))
+    monkeypatch.setattr(routing_replay, "_SYNTH_MEDIAN_S", 0.02)
+    work = Path(tempfile.mkdtemp(prefix="krr-", dir="/tmp"))
+    try:
+        out = routing_replay.replay(8, search="synthetic", workdir=work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    assert out["on"]["prompts"] == out["off"]["prompts"] == 8
+    assert out["on"]["reasons"] == {"ok": 8} and out["off"]["reasons"] == {"ok": 8}
+    assert out["on"]["per_100"] == out["off"]["per_100"] == 0.0 and not out["stop"] and not out["enough"]
+    assert sum(out["on"]["routing"].values()) == 8 and out["off"]["routing"] == {}
+    assert list(live.iterdir()) == []  # nothing in the configured data dir
+    import os
+
+    assert "KHIPU_ISOLATED_DIR" not in os.environ and "KHIPU_CAPTURE_HOME" not in os.environ

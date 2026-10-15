@@ -28,8 +28,8 @@ can see and change all of it in the app. Khipu never decides where work goes.
 | 1b | The sources: read-only runner adapter, lane map, usage-cache source, table pointer | S–M | done 2026-10-14 (PRs #186 and #187) |
 | 2 | MCP `khipu_route` and `khipu_route_report`; `routing` in `khipu_status`; `khipu route wait` | S | done 2026-10-14 (PR #188) |
 | 3a | The full summary at session start and after compaction; kill switches; the `routing_push` feature and its app parity | S | done 2026-10-14 (PR #189) |
-| 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | built, in review (branch feat/routing-truth-3b; four Opus check rounds, then a Codex review on credits, since Grok is paused) |
-| 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | open |
+| 3b | Changes on every prompt inside their own time budget, with confirmed delivery | M | done 2026-10-15 (PR #190) |
+| 3c | The daemon refolds on change and on the clock; the promotion gate's replay covers routing | S | built, in review (branch feat/routing-truth-3c) |
 | 4 | App: Home Routing card, Settings → Routing for what phases 1a to 3c built, health row, attention items | M–L | open (mock approved 2026-10-14; needs plan usage phase 2 merged) |
 | 5 | The background check at each known reset time, with its part of the app | S | open |
 | 6 | Push at the moment of delegation, with its part of the app | S–M | open (shaped by the phase 0 hook check; the Grok Build part needs Matt's go) |
@@ -962,6 +962,20 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
   seen marker where it was, so the change arrives at the first prompt after a save succeeds. On a folder that
   stays read-only, a conversation that already has a marker gets no per-prompt changes until then; new and
   compacted conversations still get the full summary at session start.
+
+- **The daemon's poll runs only while its routing helper runs (phase 3c).** The refold between prompts runs in
+  a child of the recall daemon's routing helper, and the daemon starts the helper only when the per-prompt push
+  is on (at its start, or at the first prompt with the push on), then keeps it running. With the push off,
+  nothing polls: `khipu route`, the tools and doctor refold when they read, as before. While the poll's child
+  is folding, a prompt that also finds the view out of date waits for it within its own budget and otherwise
+  skips routing for that prompt (`routing=skipped:fold-busy`); its marker stays, so the change arrives with the
+  next prompt.
+- **The gate's replay runs the one-shot hook, not a warm daemon (phase 3c).** The promotion gate replays each
+  search through the candidate's hook with routing off and on and fails it when the routing read runs out of
+  its budget, fails, or changes the search's answer. It measures the search's milliseconds both ways on the
+  one-shot path only: the warm service runs the live code, not the candidate's. The warm-daemon measure is
+  `python -m khipu.routing_replay` (the stop-condition: at least 200 prompts each way through a warm recall
+  service with its routing helper, timeouts per 100 for each).
 
 ## Fixed limits
 

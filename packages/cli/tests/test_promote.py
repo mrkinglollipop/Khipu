@@ -398,7 +398,9 @@ def test_replay_reads_only_the_query_log_and_never_a_credential(home, monkeypatc
     assert out["ok"], out
     assert set(out) == {"ok", "ms", "detail"}
     assert "2 prompt(s) replayed" in out["detail"]
-    assert len(envs) == 4  # live and candidate, for each of the two distinct queries
+    # Live, and the candidate with routing off and on, for each of the two distinct queries.
+    assert len(envs) == 6
+    assert sorted(env["KHIPU_FEATURE_ROUTING_PUSH"] for env in envs) == ["0"] * 4 + ["1"] * 2
     for env in envs:
         assert not [k for k in env if "KEY" in k or "TOKEN" in k], env
         assert env["KHIPU_RECALL_DAEMON"] == "0"
@@ -430,6 +432,97 @@ def test_replay_refuses_an_empty_answer_where_live_had_one(home, monkeypatch):
     monkeypatch.setattr(pm, "_run", _fake_hook(lambda hook: [] if "candidate" in hook else ["episode:9"]))
     out = pm.gate_recall_replay(candidate)
     assert not out["ok"] and "empty answer where live had 1 hit" in out["detail"]
+
+
+def _routing_hook(runs: list, *, on_status="full", on_hits=("episode:3",), off_hits=("episode:3",),
+                  first_on_hits=None):
+    """A fake hook that answers with routing on (the run's environment says
+    so) as ``on_status`` and ``on_hits``; ``first_on_hits`` only the first time."""
+    def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
+        if argv[1:2] == ["-c"]:
+            runs.append(("prefold", env["PYTHONPATH"], env["KHIPU_ISOLATED_DIR"]))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        on = env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1"
+        iso = Path(env["KHIPU_ISOLATED_DIR"])
+        record = (iso / "state" / "routing" / "events.jsonl").is_file()
+        runs.append(("on" if on else "off", "/candidate/packages/" in argv[0], record))
+        hits = list(off_hits)
+        if on:
+            hits = list(first_on_hits if first_on_hits is not None and
+                        sum(1 for r in runs if r[0] == "on") == 1 else on_hits)
+        line = _summary(datetime.now(timezone.utc), "ok", hits) + (f" routing={on_status}" if on else "")
+        log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(line + "\n")
+        return subprocess.CompletedProcess(argv, 0, '{"hookSpecificOutput": {}}\n', "")
+    return fake_run
+
+
+def _one_query(home) -> Path:
+    _query_log(home).write_text(_query(datetime.now(timezone.utc) - timedelta(hours=1), "the routing gate") + "\n")
+    return _hooks(home)
+
+
+def test_replay_fails_a_candidate_whose_routing_read_is_over_budget(home, monkeypatch):
+    candidate = _one_query(home)
+    runs: list = []
+    monkeypatch.setattr(pm, "_run", _routing_hook(runs, on_status="skipped:budget"))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"]
+    assert "with routing on, its routing read ran out of its budget (routing=skipped:budget)" in out["detail"]
+    assert [r[:2] for r in runs] == [("off", False), ("off", True), ("on", True)]
+
+
+def test_replay_fails_a_candidate_whose_routing_read_fails(home, monkeypatch):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _routing_hook([], on_status="skipped:error-TypeError"))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"] and "its routing read failed (routing=skipped:error-TypeError)" in out["detail"]
+
+
+def test_replay_fails_a_candidate_whose_search_answers_differ_with_routing_on(home, monkeypatch):
+    candidate = _one_query(home)
+    runs: list = []
+    monkeypatch.setattr(pm, "_run", _routing_hook(runs, on_hits=("episode:4",)))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"]
+    assert "the search answer changed with routing on" in out["detail"]
+    # The differing pair was replayed once more before the step failed.
+    assert [r[:2] for r in runs] == [("off", False), ("off", True), ("on", True), ("off", True), ("on", True)]
+
+
+def test_replay_passes_a_search_that_differed_once_and_agrees_again(home, monkeypatch):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _routing_hook([], first_on_hits=()))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"], out
+
+
+def test_replay_reads_a_copy_of_the_live_routing_record_folded_by_the_candidate(home, monkeypatch):
+    from khipu import routing
+
+    candidate = _one_query(home)
+    live = routing.routing_dir()
+    live.mkdir(parents=True)
+    (live / "events.jsonl").write_text('{"type": "report"}\n')
+    before = (live / "events.jsonl").read_bytes()
+    runs: list = []
+    monkeypatch.setattr(pm, "_run", _routing_hook(runs))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"], out
+    assert "with routing on (routing=full)" in out["detail"]
+    prefold = [r for r in runs if r[0] == "prefold"]
+    assert len(prefold) == 1 and prefold[0][1].startswith(str(candidate / "packages" / "cli"))
+    assert "khipu-gate-recall-" in prefold[0][2]
+    assert ("on", True, True) in runs and ("off", True, False) in runs  # copied only for the routing run
+    assert (live / "events.jsonl").read_bytes() == before and sorted(p.name for p in live.iterdir()) == ["events.jsonl"]
+
+
+def test_replay_says_so_when_routing_did_not_run(home, monkeypatch):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _fake_hook(lambda hook: ["episode:3"]))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"] and "routing did not run" in out["detail"]
 
 
 def test_replay_with_nothing_to_replay_is_a_failure_not_a_pass(home):
