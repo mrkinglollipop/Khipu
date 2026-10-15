@@ -77,6 +77,7 @@ if not hasattr(_t3, 'cache_thread'):
     # deploy that added this name; t3 is stdlib-only, so reloading is safe.
     import importlib
     importlib.reload(_t3)
+from khipu.lines import split_lines
 from khipu.t3 import cache_thread, is_helper_session, strip_handoff
 
 HARNESSES = ("claude_code", "cursor", "codex", "aegis")
@@ -685,7 +686,7 @@ def land_transcript_images(
         source_roots.append(Path(raw).expanduser())
     allow_roots = _land_allow_roots(path, dest_root, source_roots)
     seen: set[str] = set()
-    for raw_line in data.decode("utf-8", "replace").splitlines():
+    for raw_line in split_lines(data):
         raw_line = raw_line.strip()
         if not raw_line:
             continue

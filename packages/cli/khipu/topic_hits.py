@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from khipu import query_log
+from khipu.lines import split_lines
 
 WINDOW_DAYS = 30
 
@@ -71,7 +72,7 @@ def _iter_topic_hits_from_text(text: str):
     ``query_log.jsonl`` line per search, each carrying up to 3 ``top`` hits
     (``khipu.query_log.log_query``). A malformed line is skipped, never
     raised — the log is append-only free text, not a contract."""
-    for line in text.splitlines():
+    for line in split_lines(text):
         if not line.strip():
             continue
         try:

@@ -31,6 +31,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from khipu.lines import read_lines, split_lines
+
 LIVE_NAME = "live"
 SLOT_NAMES = ("live-a", "live-b")
 GATE_ORDER = ("doctor", "recall", "capture", "version")
@@ -620,7 +622,7 @@ def sample_queries(log: Path, n: int = 5, *, now: float | None = None) -> list[d
     except OSError:
         return []
     seen: dict[str, dict[str, Any]] = {}
-    for line in text.splitlines():
+    for line in split_lines(text):
         try:
             row = json.loads(line)
         except ValueError:
@@ -700,7 +702,7 @@ def _recall_once(hook: Path, sample: dict[str, Any], session: str, *, legacy: bo
         row = None
         log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
         try:
-            for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            for line in read_lines(log):
                 row = _parse_summary(line) or row
         except OSError:
             row = None
@@ -721,7 +723,7 @@ def _probe_answer(r: subprocess.CompletedProcess) -> bool | None:
     if r.returncode != 0:
         return None
     try:
-        out = json.loads((r.stdout or "").strip().splitlines()[-1])
+        out = json.loads(split_lines((r.stdout or "").strip())[-1])
     except (ValueError, IndexError):
         return None
     push = out.get("push") if isinstance(out, dict) else None
@@ -1112,7 +1114,7 @@ def record(entry: dict[str, Any]) -> dict[str, Any]:
 
 def records() -> list[dict[str, Any]]:
     try:
-        lines = state_file().read_text(encoding="utf-8").splitlines()
+        lines = split_lines(state_file().read_text(encoding="utf-8"))
     except OSError:
         return []
     out = []

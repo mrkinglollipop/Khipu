@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 from khipu.db import connect
+from khipu.lines import split_lines
 
 
 def episode_files(memory_root: Path) -> list[Path]:
@@ -78,7 +79,7 @@ def _legacy_drift_errors(memory_root: Path) -> list[str]:
     rejected = 0
     for path in logs:
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = split_lines(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError) as exc:
             errors.append(f"episode log unreadable: {path.name}: {type(exc).__name__}")
             continue
@@ -616,7 +617,7 @@ def _query_log_window(days: int) -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     out = []
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in split_lines(path.read_text(encoding="utf-8")):
             line = line.strip()
             if not line:
                 continue

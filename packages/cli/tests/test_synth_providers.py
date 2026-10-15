@@ -423,6 +423,20 @@ def cli_reply(provider, argv, *, text='ab', error=False, code=0, usage=True):
     return subprocess.CompletedProcess(argv, code, '\n'.join(json.dumps(e) for e in events), 'ignored stderr')
 
 
+def test_codex_cli_event_with_a_raw_line_separator_is_one_event(monkeypatch):
+    # codex exec --json may leave U+2028 raw inside a string; splitlines()
+    # cut that event in two and the half failed to parse, failing the call.
+    monkeypatch.setattr(synth_cli, 'binary', lambda name: name)
+    def run(argv, **kw):
+        reply = cli_reply('codex-cli', argv)
+        item = json.dumps({'type': 'item.completed', 'item': {'text': 'a\u2028b'}}, ensure_ascii=False)
+        return subprocess.CompletedProcess(argv, 0, item + '\n' + reply.stdout + '\n', '')
+    with mock.patch.object(extract.subprocess, 'run', side_effect=run):
+        assert extract._generate_codex_cli('p', model_id='m', timeout=7, retries=0, caller='fixture') == 'ab'
+    row = json.loads(extract.synth_usage_path().read_text())
+    assert (row['prompt_tokens'], row['output_tokens']) == (1000, 200)
+
+
 @pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
 def test_cli_exact_argv_stdin_env_usage_budget_and_no_capture(provider, tmp_path, monkeypatch):
     monkeypatch.setattr(synth_cli, 'binary', lambda name: name)

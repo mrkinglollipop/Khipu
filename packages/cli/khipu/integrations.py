@@ -82,6 +82,7 @@ from pathlib import Path
 from typing import Any
 
 from khipu import claude_homes as _homes
+from khipu.lines import split_lines
 
 HARNESSES = ("claude_code", "cursor", "aegis", "codex", "grok_bot")
 HOME = Path.home()
@@ -2117,10 +2118,11 @@ def _probe_mcp(command: str) -> dict:
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "khipu_status", "arguments": {}}},
     )) + "\n"
     try:
-        p = subprocess.run([command], input=lines, capture_output=True, text=True, timeout=60)
+        p = subprocess.run([command], input=lines, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    frames = [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
+    frames = [json.loads(ln) for ln in split_lines(p.stdout) if ln.strip()]
     if len(frames) < 2 or "result" not in frames[1]:
         return {"ok": False, "error": (p.stderr or p.stdout)[-300:]}
     body = json.loads(frames[1]["result"]["content"][0]["text"])
