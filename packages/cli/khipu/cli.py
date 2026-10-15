@@ -3124,7 +3124,7 @@ def cmd_budget(args: argparse.Namespace) -> int:
 def cmd_migrate(args: argparse.Namespace) -> int:
     from khipu.migrate import run
 
-    out = run(dry_run=bool(args.dry_run))
+    out = run(dry_run=bool(args.dry_run), claim_local_rows=True)
     print(json.dumps(out, indent=2))
     # A pending list after a real run means a migration failed to apply.
     return 0 if args.dry_run or not out["pending"] else 1
