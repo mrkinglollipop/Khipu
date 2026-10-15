@@ -1941,3 +1941,102 @@ def test_two_processes_writing_at_once_keep_order_and_lose_or_double_nothing(hub
     assert _sql(hub, "SELECT count(*) FROM ledger_ops WHERE op_id LIKE %s OR op_id LIKE %s",
                 ("away%", "up%")) == [(4 * n,)]
     assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = 'r'") == [(landed[-1],)]
+
+
+# ---- round 10: an OSError never reorders, drops or moves a job, or hides a known result ---
+
+
+def test_a_job_that_cannot_be_read_now_keeps_its_place_and_only_a_malformed_one_is_set_aside(monkeypatch, tmp_path):
+    import errno
+
+    ledger = _offline(monkeypatch, tmp_path)
+    older = ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "1"}, op_id="older"))
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "2"}, op_id="later"))
+    sent = []
+    monkeypatch.setattr(ledger, "apply_op", lambda _c, o, **_kw: sent.append(o["op_id"]) or {"ok": True})
+    real_read, failures = Path.read_text, [1]
+
+    def read(path, *a, **kw):
+        if path == older and failures:
+            failures.pop()
+            raise OSError(errno.EIO, "synthetic: one read fails")
+        return real_read(path, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    out = ledger.drain(conn=_Conn())
+    assert out["stopped_early"] and sent == [] and [q["op_id"] for q in ledger.queued_ops()] == ["older", "later"]
+    assert not ledger._refused_dir().exists() or not list(ledger._refused_dir().iterdir())
+    older.write_text("{malformed")  # the bytes read, and are not a job: set aside whole
+    out = ledger.drain(conn=_Conn())
+    assert sent == ["later"] and (out["refused"], out["landed"]) == (1, 1)
+    assert (ledger._refused_dir() / older.name).read_text() == "{malformed"
+
+
+def test_a_new_row_keeps_its_lag_marker_when_the_sync_after_commit_cannot_read_the_markers(monkeypatch, tmp_path):
+    import errno
+
+    ledger = _offline(monkeypatch, tmp_path)
+    pending = ledger._replica_pending_path()
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    pending.write_text(json.dumps({f"{P}#older": "t"}))
+    monkeypatch.setattr(ledger, "replica_catch_up", lambda _c: {"copied": 0})
+    real_read, in_apply = Path.read_text, []
+
+    def read(path, *a, **kw):
+        if path == pending and in_apply:
+            raise OSError(errno.EIO, "synthetic: the markers cannot be read after the commit")
+        return real_read(path, *a, **kw)
+
+    def accept(conn, op, **_kw):  # the hub commits, then writes the change through
+        in_apply.append(1)
+        try:
+            ledger._replica_sync(conn, P, [op["row_id"]])
+        finally:
+            in_apply.clear()
+        return {"ok": True, "id": op["row_id"], "affected": [op["row_id"]], "line": "added new"}
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(ledger, "apply_op", accept)
+    assert ledger.write(ledger.new_op("add", P, "new", fields={"title": "N", "kind": "slice"}), conn=_Conn())["ok"]
+    assert {f"{P}#older", f"{P}#new"} <= set(json.loads(pending.read_text()))
+    view = {"vocab": ledger.default_vocab(), "rows": [_copy_row("other")], "history": [], "gone": {}, "as_of": None,
+            "offline": True}
+    monkeypatch.setattr(ledger, "_offline_view", lambda _p: view)  # the copy does not have "new" yet
+    assert ledger.write(ledger.new_op("set", P, "new", fields={"evidence": "e"}, op_id="after"))["queued"]
+    assert ledger._outcome("after") is None
+
+
+def test_a_landed_write_whose_cleanup_fails_answers_its_success_and_is_tidied_next_time(monkeypatch, tmp_path):
+    import errno
+
+    ledger = _offline(monkeypatch, tmp_path)
+    sent = []
+    monkeypatch.setattr(ledger, "apply_op", lambda _c, o, **_kw: sent.append(o["op_id"]) or {"ok": True, "line": "ok"})
+    real_unlink = Path.unlink
+
+    def unlink(path, *a, **kw):
+        if path.parent == ledger.outbox_dir() and path.suffix == ".json":
+            raise OSError(errno.EIO, "synthetic: the job cannot be removed")
+        return real_unlink(path, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    got = ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="tidy"), conn=_Conn())
+    assert got == {"ok": True, "line": "ok"} and ledger._outcome("tidy")["status"] == "landed"
+    assert [q["op_id"] for q in ledger.queued_ops()] == ["tidy"]
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    assert ledger.drain(conn=_Conn())["landed"] == 1
+    assert sent == ["tidy"] and ledger.queued_ops() == []  # removed unsent
+
+
+def test_the_nightly_reports_a_busy_ledger(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="waiting"))
+    monkeypatch.setattr(ledger, "_connect", _Conn)
+    monkeypatch.setattr(ledger, "purge_due", lambda _c: {"ok": True, "purged": 0})
+    monkeypatch.setattr(ledger, "replica_catch_up", lambda _c: {"copied": 0})
+    fd = _hold_ledger_lock(ledger)
+    try:
+        got = ledger.nightly()
+    finally:
+        os.close(fd)
+    assert got["ok"] is False and got["busy"] is True and [q["op_id"] for q in ledger.queued_ops()] == ["waiting"]

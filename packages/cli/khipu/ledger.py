@@ -853,14 +853,21 @@ def _replica_sync(conn, project: str, row_ids: list[str]) -> None:
     if not row_ids:
         return
     try:
-        with _replica_pending() as pending:
-            for row_id in row_ids:
-                key = f"{project}#{row_id}"
-                pending[key] = uuid.uuid4().hex
+        _mark_lag(project, row_ids)
     except Exception as exc:  # noqa: BLE001  (the hub write already landed)
+        # The row's own marker was written before the commit (the drain), so
+        # the offline check still leaves it to the hub.
         print(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}", file=sys.stderr)
         return
     replica_catch_up(conn)
+
+
+def _mark_lag(project: str, row_ids: list[str]) -> None:
+    """Write down that the offline copy may lag on these rows, each with a
+    fresh token; raises OSError when it cannot be written."""
+    with _replica_pending() as pending:
+        for row_id in row_ids:
+            pending[f"{project}#{row_id}"] = uuid.uuid4().hex
 
 
 def replica_catch_up(conn) -> dict[str, Any]:
@@ -1239,12 +1246,15 @@ def enqueue(op: dict[str, Any], reason: str = "") -> Path | None:
         if known is not None:
             return known[1] if known[0] == "queued" else None
         last = 0
-        for path in _outbox_jobs():
+        for path in _outbox_jobs(strict=True):
             head = path.name.split("-", 1)[0]
             if head.isdigit():
                 last = max(last, int(head))
         dst = outbox_dir() / f"{max(time.time_ns(), last + 1):020d}-{op['op_id']}.json"
-        _atomic_write(dst, {"op": op, "reason": reason[:200], "queued_at": _z(_now())})
+        try:
+            _atomic_write(dst, {"op": op, "reason": reason[:200], "queued_at": _z(_now())})
+        except OSError as exc:  # nothing was written: the temp file is removed, the line is as it was
+            raise _unreadable_error(op["op_id"], "the line") from exc
         return dst
 
 
@@ -1343,7 +1353,10 @@ def _drain_locked(conn, out: dict[str, Any], waiting: frozenset[str] = frozenset
     owned = conn is None
     try:
         _prune_outcomes()
-        jobs = _outbox_jobs()
+        try:
+            jobs = _outbox_jobs(strict=True)
+        except LedgerError as exc:
+            return {**out, "stopped_early": True, "unreadable": str(exc)[:200]}
         out["jobs"] = len(jobs)
         if not jobs:
             return out
@@ -1371,15 +1384,22 @@ def _drain_jobs(conn, jobs: list[Path], out: dict[str, Any], waiting: frozenset[
     answers = out.setdefault("answers", {})
     for path in jobs:
         try:
-            job = json.loads(path.read_text(encoding="utf-8"))
-            op = job["op"]
+            text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             continue
-        except (OSError, ValueError, KeyError, TypeError):
-            _set_aside(path)  # moved whole, its bytes kept; it never reached the hub
+        except OSError as exc:  # the bytes cannot be had now: the job keeps its place
+            raise _unreadable_error(None, f"the waiting write {path.name}") from exc
+        try:
+            job = json.loads(text)
+            op = job["op"]
+            op_id = op["op_id"]
+        except (ValueError, KeyError, TypeError):
+            try:
+                _set_aside(path)  # malformed: moved whole, its bytes kept; it never reached the hub
+            except OSError as exc:
+                raise _unreadable_error(None, f"the waiting write {path.name}") from exc
             out["refused"] += 1
             continue
-        op_id = op.get("op_id")
         try:
             known = _known(op, line=False)
         except LedgerError as exc:
@@ -1400,6 +1420,12 @@ def _drain_jobs(conn, jobs: list[Path], out: dict[str, Any], waiting: frozenset[
             out["refused"] += 1
             continue
         try:
+            # Written down before the commit: if the write-through after it
+            # fails, the offline check still leaves this row to the hub.
+            _mark_lag(op["project"], [op["row_id"]])
+        except OSError as exc:
+            raise _unreadable_error(op_id, "the rows the offline copy lags on") from exc
+        try:
             result = apply_op(conn, op, late=op_id not in waiting)
         except LedgerError as exc:
             if op_id in waiting:
@@ -1407,12 +1433,14 @@ def _drain_jobs(conn, jobs: list[Path], out: dict[str, Any], waiting: frozenset[
             if exc.reason == "op_id_reused":
                 # The hub holds another write under this id: the id is not this
                 # job's to bind here, and this write is refused under it from
-                # now on. Its own writer is told, so nothing else is kept.
+                # now on. Its own writer is told, so nothing else is kept. A
+                # cleanup that fails leaves the job for the next drain, which
+                # finds the refusal kept and sets it aside unsent.
                 _keep_rejected(op, exc)
                 if op_id in waiting:
-                    path.unlink(missing_ok=True)
+                    _tidy(path.unlink, missing_ok=True)
                 else:
-                    _refuse_job(path, {**job, "refused": str(exc), "reason_word": exc.reason})
+                    _tidy(_refuse_job, path, {**job, "refused": str(exc), "reason_word": exc.reason})
             elif _finish_job(path, job, "refused", refused=str(exc), reason_word=exc.reason) is False \
                     and op_id in waiting:
                 (_refused_dir() / path.name).unlink(missing_ok=True)  # its writer is told here
@@ -1421,7 +1449,7 @@ def _drain_jobs(conn, jobs: list[Path], out: dict[str, Any], waiting: frozenset[
         except Exception as exc:  # noqa: BLE001
             if _tables_missing(exc) and op_id in waiting:
                 # Its writer is told to migrate; the write is not kept.
-                path.unlink(missing_ok=True)
+                _tidy(path.unlink, missing_ok=True)
                 answers[op_id] = LedgerError("the ledger tables are not in the database yet; run khipu migrate",
                                              "no_tables")
             # The hub away, its tables not migrated yet, or a passing
@@ -1430,7 +1458,7 @@ def _drain_jobs(conn, jobs: list[Path], out: dict[str, Any], waiting: frozenset[
                 out["stopped_early"] = True
                 break
             if op_id in waiting:
-                path.unlink(missing_ok=True)  # nothing landed; its writer is told as it happened
+                _tidy(path.unlink, missing_ok=True)  # nothing landed; its writer is told as it happened
                 answers[op_id] = exc
                 break
             # Anything else would fail every time and hold the line for
@@ -1471,12 +1499,19 @@ def _finish_job(path: Path, job: dict[str, Any], status: str, **detail: Any) -> 
         except LedgerError as exc:
             if exc.reason == "op_unreadable":
                 raise
-            _refuse_job(path, {**job, "refused": str(exc), "reason_word": exc.reason})
+            try:
+                _refuse_job(path, {**job, "refused": str(exc), "reason_word": exc.reason})
+            except OSError as err:  # nothing durable says what became of it: it keeps its place
+                raise _unreadable_error(job["op"].get("op_id"), "the line") from err
             return False
+        # The outcome is durable now: taking the job out of the line is
+        # cleanup, and a failure leaves it for the next drain, which finds the
+        # outcome and removes the job unsent.
         if status == "refused":
-            _refuse_job(path, {**job, "refused": detail.get("refused"), "reason_word": detail.get("reason_word")})
+            _tidy(_refuse_job, path, {**job, "refused": detail.get("refused"),
+                                      "reason_word": detail.get("reason_word")})
         else:
-            path.unlink(missing_ok=True)
+            _tidy(path.unlink, missing_ok=True)
         return status != "refused"
 
 
@@ -1487,6 +1522,14 @@ def _refuse_job(path: Path, job: dict[str, Any]) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     _atomic_write(dest / path.name, job)
     path.unlink(missing_ok=True)
+
+
+def _tidy(step, *args: Any, **kw: Any) -> None:
+    """Cleanup after a durable outcome: a failure is left for the next drain."""
+    try:
+        step(*args, **kw)
+    except OSError as exc:
+        print(f"[khipu-ledger] left for the next drain: {type(exc).__name__}", file=sys.stderr)
 
 
 def _set_aside(path: Path) -> None:
@@ -2171,8 +2214,15 @@ def nightly() -> dict[str, Any]:
         drained = drain(conn)
         purged = purge_due(conn)
         replica_catch_up(conn)
-        return {"ok": not drained.get("refused"), "landed": drained["landed"], "refused": drained["refused"],
-                "purged": purged.get("purged", 0)}
+        out = {"ok": not (drained.get("refused") or drained.get("busy") or drained.get("unreadable")),
+               "landed": drained["landed"], "refused": drained["refused"], "purged": purged.get("purged", 0)}
+        if drained.get("busy"):
+            out.update(busy=True, error="a ledger write held the lock; waiting writes stay queued")
+        if drained.get("stopped_early"):
+            out["stopped_early"] = True
+        if drained.get("unreadable"):
+            out["error"] = drained["unreadable"]
+        return out
     except Exception as exc:  # noqa: BLE001  (a ledger miss cannot fail the night)
         if _tables_missing(exc):
             return {"ok": True, "skipped": "the ledger tables are not in the database yet"}
