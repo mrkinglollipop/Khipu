@@ -899,3 +899,66 @@ def test_the_replays_off_prompts_run_with_no_helper_and_its_on_prompts_with_one(
     assert all(up == on for on, up in seen), seen
     assert out["on"]["prompts"] == out["off"]["prompts"] == 8
     assert out["on"]["timeouts"] == out["off"]["timeouts"] == 0
+
+
+def test_a_request_that_logged_no_line_takes_none_of_its_sessions_lines():
+    # Codex re-check of fix round 5: sessions repeat, and matching lines to
+    # requests in order per session gave a request with no line the next
+    # request's line, so two timeouts counted as one.
+    first = {"ok": False, "error": "client: TimeoutError", "timeout": True, "ms": 1700.0,
+             "session": "replay-on-0", "rows": 0}
+    second = {"ok": True, "error": None, "timeout": False, "ms": 300.0, "session": "replay-on-0", "rows": 1}
+    rows = [{"session": "replay-on-0", "reason": "timeout>delivery deadline", "ms": 1600.0, "routing": None}]
+    assert routing_replay._summary([first, second], rows, 2)["timeouts"] == 2
+
+
+def test_a_client_failure_after_the_answer_deadline_is_a_timeout(monkeypatch):
+    # Codex re-check of fix round 5: a reset after the deadline came back as
+    # an error that was not a timeout, so a stalled daemon could count zero.
+    monkeypatch.setattr(routing_replay, "ANSWER_TIMEOUT_S", 0.05)
+
+    class Late:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def settimeout(self, _t):
+            pass
+
+        def connect(self, _p):
+            pass
+
+        def sendall(self, _b):
+            pass
+
+        def recv(self, _n):
+            time.sleep(0.1)
+            raise ConnectionResetError("reset")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(routing_replay.socket, "socket", Late)
+    asked = routing_replay._ask(Path("/nonexistent.sock"), "a prompt", "replay-on-0", True)
+    assert asked["timeout"] and asked["error"] == "client: ConnectionResetError"
+
+
+def test_routing_off_waits_until_no_fold_is_running(tmp_path, monkeypatch):
+    # Codex re-check of fix round 5: a fold outlives its stopped helper, so
+    # the prompts with routing off could share the Mac with routing work.
+    import fcntl
+
+    monkeypatch.setattr(routing, "routing_dir", lambda: tmp_path)
+    monkeypatch.setattr(recall_prompt, "_ROUTING_CHILD_MOST", 0.0)
+    fd = os.open(tmp_path / routing.PROMPT_FOLD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # a fold still running
+        try:
+            routing_replay._routing_quiet(0.2)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("routing off began while a fold was running")
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        routing_replay._routing_quiet(0.2)  # the fold ended: routing off may begin
+    finally:
+        os.close(fd)

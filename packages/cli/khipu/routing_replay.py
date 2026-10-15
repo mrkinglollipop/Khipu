@@ -159,6 +159,34 @@ def _helper_off(fs, wait: float = _HELPER_WAIT_S) -> None:
     if proc is not None:
         with contextlib.suppress(Exception):
             proc.wait(wait)
+    _routing_quiet(wait)
+
+
+def _routing_quiet(wait: float) -> None:
+    """Wait until no routing child of the helper is still at work: a fold
+    holds ``prompt-fold.lock`` (and outlives its helper by design), and a
+    reader ends within ``_ROUTING_CHILD_MOST`` of its prompt. Raises when a
+    fold is still running after ``wait``: the prompts with routing off would
+    otherwise share the Mac with routing work and hide what it costs."""
+    import fcntl
+
+    from khipu import recall_prompt, routing
+
+    time.sleep(recall_prompt._ROUTING_CHILD_MOST)
+    fd = os.open(routing.routing_dir() / routing.PROMPT_FOLD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        until = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= until:
+                    raise RuntimeError("a routing fold was still running with the helper stopped") from None
+                time.sleep(0.05)
+    finally:
+        os.close(fd)
 
 
 def _ask(path: Path, prompt: str, session: str, routing_on: bool) -> dict[str, Any]:
@@ -194,10 +222,34 @@ def _ask(path: Path, prompt: str, session: str, routing_on: bool) -> dict[str, A
         return {"ok": answer.get("ok") is True, "error": answer.get("error"), "ms": round(took * 1000, 1),
                 "session": session, "timeout": timed_out}
     except (OSError, ValueError) as exc:
+        # Any failure after the answer's deadline is a timeout, whatever its class.
         return {"ok": False, "error": f"client: {type(exc).__name__}", "session": session,
-                "timeout": isinstance(exc, TimeoutError), "ms": round((time.monotonic() - began) * 1000, 1)}
+                "timeout": isinstance(exc, TimeoutError) or time.monotonic() >= deadline,
+                "ms": round((time.monotonic() - began) * 1000, 1)}
     finally:
         sock.close()
+
+
+def _rows_now() -> int:
+    """How many summary lines the hook log holds now."""
+    from khipu import recall_prompt
+
+    path = recall_prompt._log_path()
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    return sum(1 for line in lines if recall_prompt._LOG_LINE_RE.match(line))
+
+
+def _ask_one(path: Path, prompt: str, session: str, routing_on: bool, wait: float = 2.0) -> dict[str, Any]:
+    """``_ask``, then the number of summary lines this request added (the
+    replay asks one at a time, so the lines written while it waits are this
+    request's): ``rows`` 0 when the service logged nothing for it."""
+    before = _rows_now()
+    out = _ask(path, prompt, session, routing_on)
+    until = time.monotonic() + wait
+    while _rows_now() <= before and time.monotonic() < until:
+        time.sleep(0.02)
+    out["rows"] = _rows_now() - before
+    return out
 
 
 def _log_rows(count: int, wait: float = 10.0) -> dict[str, list[dict[str, Any]]]:
@@ -285,8 +337,13 @@ def _summary(asked: list[dict[str, Any]], rows: list[dict[str, Any]], n: int) ->
     timeouts = 0
     for a in asked:
         lines = pending.get(a.get("session"))
-        row = lines.pop(0) if lines else None
-        if a.get("timeout") or (row is not None and row["reason"].startswith("timeout")):
+        # A request that logged no line (``rows`` 0, from ``_ask_one``) takes
+        # none of its session's lines: they are the later requests'.
+        mine: list[dict[str, Any]] = []
+        if lines:
+            take = a.get("rows", 1)
+            mine, lines[:] = lines[:take], lines[take:]
+        if a.get("timeout") or any(r["reason"].startswith("timeout") for r in mine):
             timeouts += 1
     # A logged timeout no request matched still counts.
     timeouts += sum(1 for lines in pending.values() for r in lines if r["reason"].startswith("timeout"))
@@ -358,7 +415,7 @@ def replay(n: int = MIN_PROMPTS, *, prompts: tuple[str, ...] | list[str] = PROMP
                         (_helper_on if routing_on else _helper_off)(fs)
                         mode = "on" if routing_on else "off"
                         for i in block:
-                            asked[routing_on].append(_ask(svc.path, texts[i], f"replay-{mode}-{i % SESSIONS}",
+                            asked[routing_on].append(_ask_one(svc.path, texts[i], f"replay-{mode}-{i % SESSIONS}",
                                                           routing_on))
                 rows = _log_rows(2 * n)
             finally:
