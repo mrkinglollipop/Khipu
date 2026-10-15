@@ -156,6 +156,8 @@ export type RuleCell = {
   text?: string | null;
   more?: number;
   why?: string | null;
+  /** What a cap or a name Khipu can't use left out of this runner's files. */
+  skipped?: { lanes?: number; fix_lanes?: number; kinds?: number; added?: number; older_added?: boolean };
 };
 
 export type RuleCheckResult = Omit<RuleResult, "rule" | "checks"> & { check: string; cells?: RuleCell[] };
@@ -166,7 +168,7 @@ export type RuleResult = {
   checks?: RuleCheckResult[];
   /** Which of Khipu's four checks gave this result. */
   check?: "fast_tier" | "paid_xai" | "grok_private" | "grok_confirm" | string;
-  result: "ok" | "broken" | "cannot_check" | "no_lane" | "no_runner" | "not_read" | "failed" | "stale" | string;
+  result: "ok" | "broken" | "cannot_check" | "no_lane" | "no_runner" | "not_read" | "failed" | "stale" | "incomplete" | string;
   /** When the check last ran on the files it judged; only for "ok". */
   at?: string | null;
   /** Lanes it judged, and lanes it is about but couldn't judge. */
@@ -626,6 +628,27 @@ const CHECK_FOR: Record<string, string> = {
 const FILE_WORDS: Record<string, string> = { settings: "settings", events: "list of added work" };
 const NOT_NOW = new Set(["not_read", "failed", "stale"]);
 
+const count = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+// What caps left out, runner by runner, so a part-read check is never a pass.
+function leftOutLine(cells: RuleCell[]): string {
+  const parts = cells
+    .filter((c) => c.outcome === "incomplete" && c.skipped)
+    .map((c) => {
+      const k = c.skipped ?? {};
+      const items = [
+        k.lanes ? count(k.lanes, "lane", "lanes") : "",
+        k.kinds ? count(k.kinds, "lane whose kind it can't name", "lanes whose kind it can't name") : "",
+        k.fix_lanes ? count(k.fix_lanes, "default fix lane", "default fix lanes") : "",
+        k.added ? count(k.added, "line of added work", "lines of added work") : "",
+        k.older_added ? "the older added work" : "",
+      ].filter(Boolean);
+      const list = items.length > 1 ? `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}` : items[0] ?? "some input";
+      return `${list} in ${c.runner}`;
+    });
+  return `Khipu left out ${parts.join("; and ") || "part of what it reads"}.`;
+}
+
 // Why a check has not run now: each runner it could not use, and each of
 // that runner's files it never read, couldn't read, or read too long ago.
 function notNowLine(cells: RuleCell[], nowMs: number): string {
@@ -669,6 +692,8 @@ function resultLine(result: RuleResult | RuleCheckResult, f: string, nowMs: numb
     case "failed":
     case "stale":
       return { text: `${by}, but not now: ${notNowLine(cells, nowMs)}`, tone: "" };
+    case "incomplete":
+      return { text: `${by}, but not fully: ${leftOutLine(cells)}`, tone: "" };
     case "cannot_check":
       return { text: `${by}, but not here: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}`, tone: "" };
     case "no_lane":

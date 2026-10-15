@@ -489,6 +489,29 @@ describe("Settings -> Routing: standing rules", () => {
     expect(three).not.toHaveTextContent("project A");
   });
 
+  // Codex review round 3: a cap that left input out is never a pass.
+  it("says a check was not fully checked and what a cap left out", async () => {
+    const read = { read: true, good_at: "2026-10-14T15:36:00Z", failed: false, since: null, stale: false };
+    answers.khipu_route_view = {
+      ...view(),
+      rule_results: [{
+        rule: 3, check: "fast_tier", result: "incomplete", at: null, lanes: 1024, unchecked: 0,
+        checks: [{ check: "fast_tier", result: "incomplete", at: null, lanes: 1024, unchecked: 0, cells: [
+          { runner: "project A", outcome: "incomplete", lanes: 1024, unchecked: 0, reads: { settings: read }, skipped: { lanes: 3 } },
+          { runner: "project B", outcome: "incomplete", lanes: 2, unchecked: 0, reads: { settings: read, events: read },
+            skipped: { lanes: 1, added: 12, older_added: true } },
+        ] }],
+      }],
+    };
+    await page();
+    const three = row("Standing rules", "3.");
+    expect(three).toHaveTextContent(
+      "Checked by Khipu, but not fully: Khipu left out 3 lanes in project A; and 1 lane, 12 lines of added work and the older added work in project B.",
+    );
+    expect(three).not.toHaveTextContent("nothing wrong found");
+    expect(screen.getByRole("button", { name: "May be broken, 0 rules" })).toBeInTheDocument();
+  });
+
   // Codex review round 2 (C): each check's line is its own, never another check's finding.
   it("keeps a broken check's finding off the rule's other check", async () => {
     const text = "A standing rule may be broken: project A's settings name a model ending in -fast for its codex lane.";

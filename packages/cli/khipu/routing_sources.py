@@ -65,6 +65,10 @@ GUESS_SECONDS = 30 * 60
 GUESS_SLACK = 5
 LINE_MAX = 200
 KEEP_LINES = {"LIMITED": 200, "ADDED": 300, "LAUNCH": 300}
+# Lanes read from one config.json. Their facts are a few short fields each
+# and the file is already bounded by JSON_MAX; a lane past this is counted
+# (``skipped``) so a rule check says it was not fully checked.
+LANES_MAX = 1024
 LAUNCH_KEEP = timedelta(days=2)
 # A heartbeat interval longer than this is not a heartbeat (the runners write
 # 20 and 30 seconds); the file is reported as out of range.
@@ -409,7 +413,8 @@ def _script_name(launch: list[str]) -> str:
 def launch_facts(model, launch) -> dict:
     """What doctor's rule checks need from a lane's launch arguments, derived
     as they are read; the arguments themselves are never kept."""
-    args = [a.strip() for a in launch[:64] if isinstance(a, str)] if isinstance(launch, list) else []
+    # Every argument: they are only scanned here, never kept.
+    args = [a.strip() for a in launch if isinstance(a, str)] if isinstance(launch, list) else []
     model = model.strip() if isinstance(model, str) else ""
     return {"fast": any(t.endswith("-fast") for t in [model, *args]),
             "model_in_launch": bool(model) and model in args,
@@ -446,10 +451,19 @@ def _parse_config(data: bytes) -> dict:
     if not isinstance(doc, dict) or not isinstance(doc.get("lanes"), dict):
         raise ValueError("no lanes")
     lanes = {}
-    for lane, spec in list(doc["lanes"].items())[:64]:
+    skipped: dict[str, int] = {}
+    items = list(doc["lanes"].items())
+    if len(items) > LANES_MAX:
+        skipped["lanes"] = len(items) - LANES_MAX
+    for lane, spec in items[:LANES_MAX]:
         lane_name = safe_name(lane)
-        if lane_name is None or not isinstance(spec, dict):
+        # A lane Khipu can't name, or whose withheld name another already
+        # took, is left out of every check: counted, never silently dropped.
+        if lane_name is None or not isinstance(spec, dict) or lane_name in lanes:
+            skipped["lanes"] = skipped.get("lanes", 0) + 1
             continue
+        if safe_name(spec.get("kind")) == WITHHELD:  # can't tell whether it is a Grok lane
+            skipped["kinds"] = skipped.get("kinds", 0) + 1
         lanes[lane_name] = {
             "kind": safe_name(spec.get("kind")), "model": safe_name(spec.get("model")),
             "confirm_lane": safe_name(spec.get("confirm_lane")),
@@ -457,8 +471,11 @@ def _parse_config(data: bytes) -> dict:
         }
     defaults = doc.get("defaults") if isinstance(doc.get("defaults"), dict) else {}
     fix = defaults.get("fix_lanes")
-    return {"lanes": lanes, "check_lane": safe_name(defaults.get("check_lane")),
-            "fix_lanes": [n for n in (safe_name(x) for x in fix[:32]) if n] if isinstance(fix, list) else []}
+    fix_lanes = [n for n in (safe_name(x) for x in fix) if n] if isinstance(fix, list) else []
+    if isinstance(fix, list) and len(fix_lanes) < len(fix):
+        skipped["fix_lanes"] = len(fix) - len(fix_lanes)
+    out = {"lanes": lanes, "check_lane": safe_name(defaults.get("check_lane")), "fix_lanes": fix_lanes}
+    return dict(out, skipped=skipped) if skipped else out
 
 
 def runner_basis(at: datetime, until: datetime) -> str:
@@ -535,11 +552,16 @@ def _parse_events(data: bytes, now: datetime, limits: dict[str, datetime] | None
             lane = safe_name(fields.get("lane"))
             if lane and now - at <= LAUNCH_KEEP:
                 out["LAUNCH"].append({"at": _iso(at), "pipeline": pipeline, "lane": lane})
+    # ADDED lines the cap drops are counted: the privacy check judges only
+    # the lines kept, so it says it was not fully checked.
+    added_dropped = 0
     for kind, cap in dict(KEEP_LINES, **(keep or {})).items():
         if cap:
+            if kind == "ADDED":
+                added_dropped = max(len(out[kind]) - cap, 0)
             out[kind] = out[kind][-cap:]
     return {"limited_lines": out["LIMITED"], "added": out["ADDED"], "launches": out["LAUNCH"],
-            "holds": holds, "first": _iso(first),
+            "holds": holds, "first": _iso(first), **({"added_dropped": added_dropped} if added_dropped else {}),
             "matched": {lane: {"until": _iso(limits[lane]), "at": _iso(at)} for lane, at in matched.items()}}
 
 
@@ -566,6 +588,10 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
                 data, mtime = read_only(path, tail=tail_bytes)
                 parsed = _parse_events(data, now, _limits((cache.get("global") or {}).get("data")),
                                        {"LIMITED": limited_lines})
+                # Lines older than the tail were never read: the privacy
+                # check over ADDED lines is not a full one.
+                if tail_bytes and os.stat(path).st_size > tail_bytes:
+                    parsed["older_cut"] = True
             else:
                 data, mtime = read_only(path)
                 parsed = _PARSERS[key](data)
@@ -1010,8 +1036,28 @@ def _check_lanes(check: str, lanes: dict) -> tuple[int, int]:
 # result: a rule's result is its worst check's, so it is "ok" only when every
 # check it asks for ran on every runner and passed.
 _CELL_ORDER = ("broken", "not_read", "failed", "stale", "no_lane", "cannot_check", "ok")
-_RESULT_ORDER = ("broken", "failed", "stale", "not_read", "no_runner", "cannot_check", "no_lane", "ok")
-_NOT_NOW = ("failed", "stale", "not_read")
+_RESULT_ORDER = ("broken", "failed", "stale", "not_read", "incomplete", "no_runner", "cannot_check", "no_lane", "ok")
+_NOT_NOW = ("failed", "stale", "not_read", "incomplete")
+
+
+def _skipped(check: str, kept: dict) -> dict:
+    """What a cap or a name Khipu can't use left out of the files this check
+    judges on one runner: lanes and default fix lanes from the settings, and
+    for the privacy check ADDED lines the line cap dropped (``added``) or
+    that lay before the tail (``older_added``)."""
+    config = (kept.get("config") or {}).get("data")
+    config = config if isinstance(config, dict) else {}
+    wanted = {"lanes"} | ({"fix_lanes"} if check == "grok_private" else set()) | \
+        ({"kinds"} if check != "fast_tier" else set())
+    out = {k: v for k, v in (config.get("skipped") or {}).items() if v and k in wanted}
+    if check == "grok_private":
+        events = (kept.get("events") or {}).get("data")
+        events = events if isinstance(events, dict) else {}
+        if events.get("added_dropped"):
+            out["added"] = events["added_dropped"]
+        if events.get("older_cut"):
+            out["older_added"] = True
+    return out
 
 
 def _read(kept: dict, now: datetime | None, stale_after: float) -> dict:
@@ -1038,6 +1084,7 @@ def _cell(check: str, runner: str, kept: dict, findings: list[dict], now, stale_
     mine = [c for c in findings if c.get("check") == check and c.get("runner") == runner]
     broken = [c for c in mine if c.get("status") == "broken"]
     config = config_kept.get("data") if reads["settings"]["read"] else {}
+    skipped = _skipped(check, kept)
     about, judged = _check_lanes(check, _config_facts(config.get("lanes")))
     if broken:
         outcome = "broken"
@@ -1047,6 +1094,8 @@ def _cell(check: str, runner: str, kept: dict, findings: list[dict], now, stale_
         outcome = "failed"
     elif any(r["stale"] for r in reads.values()):
         outcome = "stale"
+    elif skipped:
+        outcome = "incomplete"  # never a pass on part of the input
     elif not about:
         outcome = "no_lane"
     elif not judged:
@@ -1054,6 +1103,7 @@ def _cell(check: str, runner: str, kept: dict, findings: list[dict], now, stale_
     else:
         outcome = "ok"
     return {"runner": runner, "outcome": outcome, "lanes": judged, "unchecked": about - judged, "reads": reads,
+            **({"skipped": skipped} if skipped else {}),
             "text": broken[0]["text"] if broken else None, "more": max(len(broken) - 1, 0),
             "why": next((c["text"] for c in mine if c.get("status") == "cannot_check"), None)}
 

@@ -733,6 +733,64 @@ def test_a_broken_check_never_marks_another_check_of_the_same_rule(home, capsys)
     assert "paid xAI API can't be checked" in checks["paid_xai"]["why"]
 
 
+def _lane(model: str, extra: list[str] | None = None) -> dict:
+    return {"kind": "codex", "model": model, "launch": ["bash", "/runner/launch-codex.sh", model, *(extra or [])]}
+
+
+def _fast_result(home, capsys, lanes: dict) -> dict:
+    _register(home, lanes_a={name: "Codex" for name in lanes})
+    routing.add_rule("Never a -fast tier.", via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"] = lanes
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    assert routing.run_cli(_args(json=True)) == 0
+    return _results(json.loads(capsys.readouterr().out))[1]
+
+
+def test_a_fast_lane_after_the_64th_is_still_checked(home, capsys):
+    """Codex review round 3: 64 passing lanes then a -fast one read as a pass."""
+    lanes = {f"lane{i:02d}": _lane("gpt-6.1-sol") for i in range(64)}
+    lanes["lane64"] = _lane("gpt-6.1-sol-fast")
+    assert _fast_result(home, capsys, lanes)["result"] == "broken"
+
+
+def test_a_fast_launch_argument_past_the_64th_is_still_checked(home, capsys):
+    lanes = {"codex": _lane("gpt-6.1-sol", [f"--flag{i}" for i in range(70)] + ["sol-fast"])}
+    assert _fast_result(home, capsys, lanes)["result"] == "broken"
+
+
+def test_lanes_a_cap_leaves_out_mean_not_fully_checked(home, capsys, monkeypatch):
+    monkeypatch.setattr(routing_sources, "LANES_MAX", 2)
+    result = _fast_result(home, capsys, {f"lane{i}": _lane("gpt-6.1-sol") for i in range(3)})
+    assert result["result"] == "incomplete" and result["at"] is None
+    (cell,) = result["checks"][0]["cells"]
+    assert cell["outcome"] == "incomplete" and cell["skipped"] == {"lanes": 1}
+
+
+def test_lanes_whose_names_collide_are_counted_as_left_out():
+    parsed = routing_sources._parse_config(json.dumps({"lanes": {
+        "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaa": _lane("a"), "sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbbbbbbbb": _lane("b"),
+        "ok": _lane("c")}}).encode())
+    assert len(parsed["lanes"]) == 2 and parsed["skipped"] == {"lanes": 1}
+    # A kind Khipu withholds can't be told apart from a Grok lane's.
+    kinds = routing_sources._parse_config(json.dumps({"lanes": {"x": dict(_lane("a"), kind="sk-ant-api03-cccccccccccccccccccccccccc")}}).encode())
+    assert kinds["skipped"] == {"kinds": 1}
+
+
+def test_added_work_lines_the_tail_leaves_out_mean_the_privacy_check_is_not_full(home, capsys):
+    _register(home)
+    routing.add_rule("Grok never builds or fixes privacy or safety code.", via="app")
+    for i in range(40):
+        _append(home["a"], f"2026-10-14T14:59:{i % 60:02d}Z pipe-{i} ADDED branch=project-a/x stage=built "
+                           "check_lane=codex fix_lanes=second max_checks=3")
+    _set(home, routing_runner_tail_bytes=600)
+    assert routing.run_cli(_args(json=True)) == 0
+    result = _results(json.loads(capsys.readouterr().out))[1]
+    (cell,) = result["checks"][0]["cells"]
+    assert result["result"] == "incomplete" and cell["outcome"] == "incomplete"
+    assert cell["skipped"].get("older_added") is True
+
+
 def test_a_launch_while_paused_is_named(home):
     _register(home)
     routing.pause("Claude", via="app")
