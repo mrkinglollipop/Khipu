@@ -2291,7 +2291,7 @@ def test_a_reset_check_never_takes_codex_last_turn_figures_as_a_reading(home):
     assert out["outcome"] == "cannot_check"
     entry = _account(routing.read_view(home["clock"]()), "codex|")
     assert entry["state"] == "probably_open"
-    assert routing.account_line(entry, home["clock"]()).endswith("This account can't be checked without using a turn")
+    assert routing.account_line(entry, home["clock"]()).endswith("this account can't be checked without using a turn")
     # A live read is still a reading.
     _limited("Codex", home["clock"]() + timedelta(minutes=20))
     home["clock"].advance(minutes=22)
@@ -2417,3 +2417,13 @@ def test_a_sign_in_failure_before_the_reset_leaves_the_resets_check_in_place(hom
     home["clock"].now = until + timedelta(hours=1, minutes=1)
     entry = _account(routing.read_view(home["clock"]()), "muse|")
     assert routing.account_line(entry, home["clock"]()).endswith("can't be checked without using a turn")
+
+
+def test_a_reset_check_reason_reads_mid_sentence_after_the_semicolon():
+    # "its reset time passed (03:39Z); This account can't..." read wrongly in
+    # the app: the reason's first word is lower case after a semicolon,
+    # except a name.
+    assert routing._mid_sentence("This account can't be checked without using a turn") \
+        == "this account can't be checked without using a turn"
+    assert routing._mid_sentence("The Mac is busy; Khipu will try again") == "the Mac is busy; Khipu will try again"
+    assert routing._mid_sentence("Khipu could not check this account") == "Khipu could not check this account"

@@ -2283,6 +2283,15 @@ def _probe_reason(code: Any) -> str:
 
 _NOT_CONFIGURED = "Khipu can't check this account: it isn't in Settings \u2192 Models"
 _CANNOT_CHECK = "This account can't be checked without using a turn"
+
+
+def _mid_sentence(reason: str) -> str:
+    """A reset-check reason after a semicolon: its first word in lower case
+    unless it is a name ("Khipu", "Claude")."""
+    first, _, rest = reason.partition(" ")
+    if first in ("This", "The", "Another"):
+        return f"{first.lower()} {rest}" if rest else first.lower()
+    return reason
 # The words for a wait, by what it waits for: the Mac's load or another
 # usage check holding the shared lock. ``later`` is an owner's Check now that
 # nothing will try again (F8); ``out`` is the last wait run out, before any
@@ -3383,7 +3392,7 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
     elif state == PROBABLY_OPEN and until is not None:
         reset_reason = (entry.get("reset_check") or {}).get("reason")
         if reset_reason in _RESET_REASONS:
-            text = f"{label}: its reset time passed ({_clock(until, now)}); {reset_reason}"
+            text = f"{label}: its reset time passed ({_clock(until, now)}); {_mid_sentence(reset_reason)}"
         elif entry.get("configured") is False:
             text = f"{label}: probably open: its limit was due to end at {_clock(until, now)}; {_NOT_CONFIGURED}"
         elif entry.get("checkable", True):

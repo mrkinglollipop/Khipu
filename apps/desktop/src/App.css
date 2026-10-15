@@ -3175,7 +3175,9 @@ input.switch:disabled {
 .route-what .route-src { text-align: left; }
 /* A tag beside a state drops to its own line before the state's words break. */
 .route-what .route-state { flex-wrap: wrap; row-gap: 2px; }
-.route-what .route-state > span:not(.tag):not(.hdot) { flex: 0 0 auto; max-width: calc(100% - 1rem); }
+/* The state's words stay on the dot's line and wrap there; a long state used to
+   drop below its dot. */
+.route-what .route-state > span:not(.tag):not(.hdot) { flex: 1 1 12rem; min-width: 0; }
 .route-acts { display: inline-flex; gap: var(--s2); justify-content: flex-end; flex-wrap: wrap; }
 .route-pause,
 .route-confirm {
@@ -3263,6 +3265,10 @@ input.switch:disabled {
 .route-limit-name { color: var(--text); font-weight: 500; }
 .route-val { font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; }
 .route-limit .route-pause { grid-column: 1 / -1; }
+/* A row whose controls are inputs (retry times) puts them on their own line:
+   beside the name they took the whole width and squeezed it to one letter a line. */
+.route-retries > .toolbar { grid-column: 1 / -1; justify-self: start; flex-wrap: wrap; }
+.route-retries > .set-error { grid-column: 1 / -1; }
 .row-item.route-hear { display: grid; grid-template-columns: 9rem minmax(0, 1fr); column-gap: var(--s3); align-items: baseline; }
 .route-hear .route-name { font-weight: 600; color: var(--text); }
 .row-item.route-lane {

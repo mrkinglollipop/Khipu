@@ -1161,7 +1161,7 @@ function RetryTimesRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer;
   const valid = (a === "" && b === "") || (whole(a) && (b === "" || (whole(b) && Number(b) > Number(a))));
   const value = `[${[a, b].filter((t) => t !== "").join(",")}]`;
   const shown = values == null ? "…" : values.length === 0 ? "No retries" : values.map((v) => limitWords(v, "time")).join(" and ");
-  return <div className="row-item route-limit">
+  return <div className="row-item route-limit route-retries">
     <span className="route-limit-text"><span className="route-limit-name">Try again after</span><span className="set-help">Up to two retry times when the same limit remains. Leave both empty for no retries.</span></span>
     <span className="route-val">{shown}</span>
     <span className="toolbar"><label>First retry (seconds)<input aria-label="First retry in seconds" value={first} onChange={(e) => { setDirty(true); setFirst(e.target.value); }} /></label><label>Second retry (seconds)<input aria-label="Second retry in seconds" value={second} onChange={(e) => { setDirty(true); setSecond(e.target.value); }} /></label><button type="button" className="sm" disabled={!valid || w.isBusy(id)} onClick={() => void w.run(id, "khipu_config_set", { key: "routing_reset_check_retries", value }, async () => { await reread(); setDirty(false); })}><Busy on={w.isBusy(id)} />Save</button></span>
