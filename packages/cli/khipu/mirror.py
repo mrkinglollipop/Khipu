@@ -351,7 +351,8 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
 
     A new row also gets its origin row in episode_sources (capture identity
     phase 1), from ``source`` when the caller snapshotted it (write_pg does,
-    before ingestion rewrites topics, tags and scope) or else from ``payload``.
+    before enrichment and ingestion rewrite the payload) or else from the
+    redacted copy written to the row, never the unredacted input.
     """
     # Identity columns (0008) and tags (0010) are named only when they exist.
     # Naming them unconditionally made EVERY capture raise UndefinedColumn on a
@@ -431,7 +432,7 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
             if row:
                 from khipu.capture_identity import record_source, source_identity
 
-                record_source(cur, int(row[0]), "origin", source or source_identity(payload))
+                record_source(cur, int(row[0]), "origin", source or source_identity(safe))
         except Exception as exc:  # noqa: BLE001 — the episode row stays; fail-open
             _log(f"source row skipped ({type(exc).__name__}: {exc})")
     return inserted

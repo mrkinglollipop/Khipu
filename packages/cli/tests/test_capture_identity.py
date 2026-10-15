@@ -137,7 +137,7 @@ class _SourcesFakeCursor(_EpisodesFakeCursor):
             self._result = [(self.last_inserted_id,)]
 
 
-class DualWriteTest(unittest.TestCase):
+class _WritePgCase(unittest.TestCase):
     def setUp(self):
         db._TABLE_COLUMNS_CACHE.clear()
         self.addCleanup(db._TABLE_COLUMNS_CACHE.clear)
@@ -157,6 +157,8 @@ class DualWriteTest(unittest.TestCase):
                 "transcript_range": "0:100", "window_id": "w1", "part": "1/1",
                 "topics": ["Capture"], **kw}
 
+
+class DualWriteTest(_WritePgCase):
     def test_insert_records_one_origin_row_keyed_before_ingestion_rewrites(self):
         cur = _SourcesFakeCursor()
         payload = self._payload()
@@ -239,6 +241,66 @@ class DualWriteTest(unittest.TestCase):
         self.assertEqual(stmts[probe - 1], "SAVEPOINT capture_source_row")
         self.assertEqual(stmts[probe + 1], "ROLLBACK TO SAVEPOINT capture_source_row")
 
+
+SECRET = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+class SourceIdentityIsSanitizedAndStableTest(_WritePgCase):
+    """Review fixes: the source row holds only what the episode row holds
+    (redacted), and its key depends on the incoming capture alone, never on
+    hub state that enrichment reads (project inheritance, alias resolution)."""
+
+    def test_mirror_source_row_never_holds_a_secret_the_episode_masks(self):
+        from khipu.mirror import _upsert_episode
+
+        cur = _SourcesFakeCursor()
+        payload = self._payload(part=f"1/1 {SECRET}")
+        self.assertTrue(_upsert_episode(cur, payload))
+        (row,) = cur.sources.values()
+        self.assertNotIn(SECRET, row["part"])
+        self.assertEqual(row["part"], cur.episodes[cur.last_inserted_id]["raw"]["part"])
+
+    def _inherit(self, cur, payload):
+        payload["project"] = "acme/inherited"
+
+    def test_summary_only_insert_key_ignores_enrichment(self):
+        cur = _SourcesFakeCursor()
+        payload = {"ts": "2026-10-11T00:00:00Z", "summary": "gateway note", "session_id": "gw:1"}
+        expected = ci.source_identity(dict(payload))
+        with mock.patch.object(cap, "_inherit_project", side_effect=self._inherit):
+            self._write(cur, payload)
+        self.assertEqual(payload["project"], "acme/inherited")
+        self.assertEqual(list(cur.sources), [expected["source_key"]])
+        self.assertEqual(cur.sources[expected["source_key"]]["payload_sha256"],
+                         expected["payload_sha256"])
+
+    def test_summary_only_merge_key_and_receipt_ignore_enrichment(self):
+        existing = {1: {"ts": "2026-10-11T00:00:00Z", "session_id": "gw:first",
+                        "summary": "built the episode sources table today", "topics": [],
+                        "decisions": [], "preferences": [], "raw": {}, "harness": None,
+                        "repo_root": None, "project": "acme/inherited",
+                        "parent_session_id": None, "transcript_range": None, "tags": []}}
+        cur = _SourcesFakeCursor(existing)
+        payload = {"ts": "2026-10-11T00:01:00Z", "session_id": "gw:second",
+                   "summary": "built the episode sources table today"}
+        expected = ci.source_identity(dict(payload))
+        with mock.patch.object(cap, "_inherit_project", side_effect=self._inherit):
+            stats = self._write(cur, payload)
+        self.assertEqual(stats["dedup"]["action"], "merge")
+        self.assertEqual(list(cur.sources), [expected["source_key"]])
+        receipt = cur.episodes[1]["raw"]["merged_from"][0]["source_id"]
+        self.assertEqual(receipt, expected["payload_sha256"])
+
+    def test_replay_of_a_receipt_written_before_the_fix_still_matches(self):
+        payload = {"ts": "2026-10-11T00:01:00Z", "session_id": "gw:second", "summary": "note"}
+        legacy = ci.payload_sha256({**payload, "project": "acme/inherited"})
+        cur = _SourcesFakeCursor({1: {"ts": "2026-10-11T00:00:00Z", "session_id": "gw:first",
+                                      "summary": "x", "raw": {"merged_from": [{"source_id": legacy}]}}})
+        with mock.patch.object(cap, "_inherit_project", side_effect=self._inherit):
+            stats = self._write(cur, payload)
+        self.assertEqual(stats["dedup"]["action"], "skip")
+        self.assertEqual(stats["dedup"]["matched_episode"], 1)
+        self.assertEqual(cur.sources, {})
 
 if __name__ == "__main__":
     unittest.main()

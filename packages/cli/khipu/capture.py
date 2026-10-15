@@ -74,18 +74,29 @@ def _source_receipt(payload: dict[str, Any]) -> str:
     return payload_sha256(payload)
 
 
-def _dedup_exact_window(cur, payload: dict[str, Any]) -> int | None:
+def _receipts(payload: dict[str, Any], source: dict[str, Any] | None) -> list[str]:
+    """Merge receipts this capture may already be recorded under: the source
+    snapshot's (taken before enrichment, written since the capture identity
+    fix) and the enriched payload's (what older merges stored)."""
+    out = [source["payload_sha256"]] if source else []
+    legacy = _source_receipt(payload)
+    return out + [legacy] if legacy not in out else out
+
+
+def _dedup_exact_window(cur, payload: dict[str, Any], *,
+                        source: dict[str, Any] | None = None) -> int | None:
     """K3: every sibling PART of one split window shares the same (harness,
     session_id, transcript_range) — that alone would match the FIRST part
     inserted and silently skip every part after it as an "exact window"
     duplicate. window_id (+ part, carried in raw) makes each sibling its own
     identity. Pre-migration hub (no window_id column): falls back to the
     pre-K3 match, same as a payload with no window_id."""
-    cur.execute("SELECT id FROM episodes WHERE raw @> %s::jsonb LIMIT 1",
-                (json.dumps({"merged_from": [{"source_id": _source_receipt(payload)}]}),))
-    receipt = cur.fetchone()
-    if receipt:
-        return int(receipt[0])
+    for receipt_id in _receipts(payload, source):
+        cur.execute("SELECT id FROM episodes WHERE raw @> %s::jsonb LIMIT 1",
+                    (json.dumps({"merged_from": [{"source_id": receipt_id}]}),))
+        receipt = cur.fetchone()
+        if receipt:
+            return int(receipt[0])
     harness = payload.get("harness")
     session_id = payload.get("session_id")
     tr = payload.get("transcript_range")
@@ -300,7 +311,8 @@ def _append_summary(existing: str, incoming: str) -> str:
 
 
 def _merge_into_episode(
-    cur, target_id: int, payload: dict[str, Any], *, matched_via: str, score: float
+    cur, target_id: int, payload: dict[str, Any], *, matched_via: str, score: float,
+    source: dict[str, Any] | None = None,
 ) -> bool:
     """Fold a near-duplicate capture into the episode it matched.
 
@@ -334,9 +346,16 @@ def _merge_into_episode(
         return False
     topics, decisions, preferences, people, raw, target_ts, target_summary = row[:7]
     tags = row[7] if has_tags else None
-    source_id = _source_receipt(payload)
-    for source in (raw or {}).get("merged_from") or []:
-        if source.get("source_id") == source_id or source.get("payload") == payload:
+    from khipu.capture_identity import record_source, source_identity
+
+    # The receipt and the merged source row both come from the snapshot
+    # write_pg took before enrichment, so they depend on the incoming capture
+    # alone; a caller without one (tests, older paths) snapshots here.
+    source = source or source_identity(payload)
+    source_id = source["payload_sha256"]
+    receipts = set(_receipts(payload, source))
+    for prior in (raw or {}).get("merged_from") or []:
+        if prior.get("source_id") in receipts or prior.get("payload") == payload:
             return True
     new_topics = _union_json_list(topics, payload.get("topics"))
     new_decisions = _union_json_list(decisions, payload.get("decisions"))
@@ -385,9 +404,7 @@ def _merge_into_episode(
     params.append(target_id)
     cur.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id = %s", params)
 
-    from khipu.capture_identity import record_source, source_identity
-
-    record_source(cur, target_id, "merged", source_identity(payload),
+    record_source(cur, target_id, "merged", source,
                   ts=payload.get("ts"), summary=payload.get("summary"))
 
     # The merged capture's own open/closed loops belong to the target episode
@@ -479,12 +496,14 @@ def _reembed_merged_episode(ts: Any, summary: Any, merged: dict[str, Any]) -> No
         _log(f"merge re-embed failed ({type(exc).__name__}: {exc})")
 
 
-def dedup_before_insert(cur, payload: dict[str, Any]) -> dict[str, Any]:
+def dedup_before_insert(cur, payload: dict[str, Any], *,
+                        source: dict[str, Any] | None = None) -> dict[str, Any]:
     """W1.4: {'action': 'skip'|'merge'|'none', ...}. Never raises — any
-    failure in the similarity path degrades to 'none' (a normal insert)."""
+    failure in the similarity path degrades to 'none' (a normal insert).
+    ``source`` is write_pg's pre-enrichment source identity snapshot."""
     from khipu.config import float_setting
 
-    exact_id = _dedup_exact_window(cur, payload)
+    exact_id = _dedup_exact_window(cur, payload, source=source)
     if exact_id is not None:
         _log(f"dedup: exact window match episode {exact_id} — skipping insert")
         return {"action": "skip", "matched_episode": exact_id, "matched_via": "exact_window"}
@@ -499,7 +518,8 @@ def dedup_before_insert(cur, payload: dict[str, Any]) -> dict[str, Any]:
     if best is None:
         return {"action": "none"}
     target_id, score, via = best
-    if not _merge_into_episode(cur, target_id, payload, matched_via=via, score=score):
+    if not _merge_into_episode(cur, target_id, payload, matched_via=via, score=score,
+                               source=source):
         return {"action": "none"}
     _log(
         f"dedup: merged into episode {target_id} via {via} ({score:.2f}), "
@@ -619,6 +639,13 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     # before it becomes a row, a page or a vector.
     _validate_timestamp(payload)
     _redact_capture_values(payload)
+    # The source identity is snapshotted here, from the redacted payload as it
+    # arrived: before project inheritance and alias resolution read hub state
+    # into it, and before ingestion rewrites topics, tags and scope. Replaying
+    # the same capture must always produce the same key.
+    from khipu.capture_identity import source_identity
+
+    source = source_identity(payload)
     topics_written = 0
     episode_id: int | None = None
     with connect() as conn:
@@ -628,13 +655,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 from khipu.identity import _resolve_project_alias
 
                 payload["project"] = _resolve_project_alias(cur, payload["project"]) or payload["project"]
-            # The source identity is taken here, as the payload stands when a
-            # merge would record it, before ingestion rewrites topics, tags
-            # and scope below.
-            from khipu.capture_identity import source_identity
-
-            source = source_identity(payload)
-            dedup = dedup_before_insert(cur, payload)
+            dedup = dedup_before_insert(cur, payload, source=source)
             if dedup["action"] in ("skip", "merge"):
                 conn.commit()
                 if dedup["action"] == "merge":
