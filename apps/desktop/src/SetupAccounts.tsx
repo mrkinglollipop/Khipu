@@ -1,20 +1,23 @@
 /* Setup's Accounts step (docs/plans/2026-10-15-settings-clarity.md, section 5
    and phase 7; mock docs/mockups/2026-10-15-settings-clarity/setup-accounts.html).
 
-   Everything here is optional and nothing is written until Next: Skip for
-   now writes nothing, an unchanged order writes no priority, and each of the
-   three settings (which accounts are read, the priority, the telling switch)
-   is written only when the owner changed it. The writes are the same ones
-   Settings makes: `config --set usage_accounts`, `route priority set` and the
-   `routing_push` feature switch. */
+   Everything here is optional and nothing is written until Next. The owner's
+   edits are kept as operations (read or don't read account X, by identity;
+   put X just above or below the account it passed; set the telling switch), never as a copy of a list. At
+   Next, and at every retry, the account list, the priority and the switch
+   are read again, the operations are applied to what is saved now, and only
+   what then differs is written: an operation already satisfied writes
+   nothing, and a change made elsewhere while setup is open (an account
+   renamed, removed or added) is kept. Skip for now writes nothing. The
+   writes are the ones Settings makes: `config --set usage_accounts`,
+   `route priority set` and the `routing_push` feature switch. */
 
-import { useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
 import { Callout, Tag } from "./ui";
-import { callCli, useCliState } from "./settingsCli";
+import { callCli } from "./settingsCli";
 import type { FeaturesShape } from "./settingsCli";
-import { useRouting } from "./routing";
-import type { RoutePriorityEntry } from "./routing";
+import type { RoutePriority, RoutePriorityEntry, RouteView } from "./routing";
 import {
   USAGE_HARNESS_OPTIONS,
   fmtPct,
@@ -80,41 +83,152 @@ function samePriority(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((k, i) => k === b[i]);
 }
 
-function sameSet(a: Set<string>, b: Set<string>): boolean {
-  return a.size === b.size && [...a].every((k) => b.has(k));
+type ConfigRead = { usage_accounts?: AccountsStatus };
+type Read<T> = { ok: true; data: T } | { ok: false; error: string };
+
+/** A read whose answer is used only when no later read of the same thing has
+ *  started since: the first read, Check again and Next share one counter, so
+ *  an old answer arriving late never replaces a newer one. */
+function useLatestRead<T>(command: string, active: boolean) {
+  const [data, setData] = useState<T | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const seq = useRef(0);
+  const read = useCallback(async (): Promise<Read<T>> => {
+    const mine = ++seq.current;
+    setLoading(true);
+    const res = await callCli<T>(command);
+    if (mine !== seq.current) return { ok: false, error: "a newer read started" };
+    setLoading(false);
+    if (res.ok) {
+      setData(res.data);
+      setError(null);
+      return { ok: true, data: res.data };
+    }
+    setError(res.error);
+    return { ok: false, error: res.error };
+  }, [command]);
+  useEffect(() => {
+    if (active) void read();
+  }, [active, read]);
+  return { data, error, loading, read };
 }
 
-/** What the account list holds: the default (every CLI found), or the owner's
- *  own list of these accounts. */
-type SavedList = { source: "file" | "default"; ids: Set<string> };
+type StoredEntry = { label: string; harness: string; home?: string };
+/** Move up or down: `key` goes just before (-1) or after (1) `past`, the
+ *  account it passed. Relative, so an account checked again later comes back
+ *  in its place without shifting the moves around it. */
+type Move = { key: string; past: string; dir: -1 | 1 };
+
+/** The account list once the read operations are applied to `status`, the
+ *  list saved now: unchecking removes that account, checking adds it back
+ *  (as its plan row names it) only when it is missing. `changed` is false
+ *  when every operation is already satisfied. */
+export function planAccountList(
+  status: AccountsStatus,
+  readOps: Map<string, boolean>,
+  rows: UsageAccount[],
+): { list: StoredEntry[]; ids: Set<string>; changed: boolean } {
+  const uh = status.user_home ?? null;
+  const list: StoredEntry[] = status.accounts
+    .filter((e) => !e.invalid)
+    .map((e) => (e.home ? { label: e.label, harness: e.harness, home: e.home } : { label: e.label, harness: e.harness }));
+  let changed = false;
+  for (const [id, on] of readOps) {
+    const at = list.findIndex((e) => accountId(e.harness, e.home, uh) === id);
+    if (!on && at >= 0) {
+      list.splice(at, 1);
+      changed = true;
+    } else if (on && at < 0) {
+      const r = rows.find((row) => accountId(row.harness, row.home, uh) === id);
+      if (r?.harness) {
+        const label = r.account || cliTitle(r.harness);
+        list.push(r.home ? { label, harness: r.harness, home: r.home } : { label, harness: r.harness });
+        changed = true;
+      }
+    }
+  }
+  return { list, ids: new Set(list.map((e) => accountId(e.harness, e.home, uh))), changed };
+}
+
+/** The priority's entries as an account identity, compared as `khipu config`
+ *  compares logins. Labels are display names a different account may take
+ *  later, so they never match. */
+function heldIdOf(e: RoutePriorityEntry, userHome: string | null): string {
+  const [h, ...rest] = e.account.split("|");
+  return accountId(h, rest.join("|") || null, userHome);
+}
+
+/** The order shown before any move: the priority's accounts first, in its
+ *  order, then every other account in the order Khipu found them. */
+function startOrderOf(held: RoutePriorityEntry[], visible: UsageAccount[], userHome: string | null): string[] {
+  const rank = (r: UsageAccount) => {
+    const i = held.findIndex((e) => heldIdOf(e, userHome) === accountId(r.harness, r.home, userHome));
+    return i < 0 ? held.length : i;
+  };
+  return visible
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => rank(a.r) - rank(b.r) || a.i - b.i)
+    .map(({ r }) => routeKey(r));
+}
+
+function applyMoves(order: string[], moves: Move[]): string[] {
+  const out = [...order];
+  for (const m of moves) {
+    const at = out.indexOf(m.key);
+    if (at < 0 || !out.includes(m.past)) continue;
+    out.splice(at, 1);
+    const p = out.indexOf(m.past);
+    out.splice(m.dir < 0 ? p : p + 1, 0, m.key);
+  }
+  return out;
+}
+
+/** The priority to write, or null when the moves leave it as it is saved. */
+export function planPriority(
+  priority: RoutePriority | null,
+  visible: UsageAccount[],
+  moves: Move[],
+  userHome: string | null,
+): { entries: { account: string; role: string | null; until: string | null }[]; until: string | null } | null {
+  const held = priority?.entries ?? [];
+  const start = startOrderOf(held, visible, userHome);
+  const order = applyMoves(start, moves);
+  if (samePriority(order, start)) return null;
+  const byKey = new Map(visible.map((r) => [routeKey(r), r]));
+  const isRow = (e: RoutePriorityEntry, r: UsageAccount) => heldIdOf(e, userHome) === accountId(r.harness, r.home, userHome);
+  const entries = order.map((k) => {
+    const r = byKey.get(k);
+    const was = held.find((e) => r != null && isRow(e, r));
+    return { account: k, role: was?.role ?? null, until: was?.until ?? null };
+  });
+  // Priority accounts with no plan row here keep their place.
+  held.forEach((e, h) => {
+    if (visible.some((r) => isRow(e, r))) return;
+    entries.splice(Math.min(h, entries.length), 0, { account: e.account, role: e.role ?? null, until: e.until ?? null });
+  });
+  return { entries, until: priority?.until ?? null };
+}
+
+/** The found accounts the order is about: those the list will read after
+ *  Next (as saved now when the operations would leave it empty, since Next
+ *  then writes nothing), or every found one before the list is read. */
+function visibleRows(status: AccountsStatus | null, readOps: Map<string, boolean>, found: UsageAccount[]): UsageAccount[] {
+  if (!status) return found.filter((r) => readOps.get(accountId(r.harness, r.home, null)) !== false);
+  const plan = planAccountList(status, readOps, found);
+  const ids = plan.list.length ? plan.ids : planAccountList(status, new Map(), found).ids;
+  return found.filter((r) => ids.has(accountId(r.harness, r.home, status.user_home ?? null)));
+}
 
 export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean; onBack: () => void; onNext: () => void }) {
   const usage = usePlanUsage(active);
-  const cfg = useCliState<{ usage_accounts?: AccountsStatus }>("khipu_config_show", active);
-  const features = useCliState<FeaturesShape>("khipu_features_show", active);
-  const route = useRouting(active);
+  const cfg = useLatestRead<ConfigRead>("khipu_config_show", active);
+  const features = useLatestRead<FeaturesShape>("khipu_features_show", active);
+  const route = useLatestRead<RouteView>("khipu_route_view", active);
   const status = cfg.data?.usage_accounts ?? null;
   const userHome = status?.user_home ?? null;
   const now = new Date();
   const uid = useId();
-
-  // Every account the list has held while this step is open, as first read,
-  // so an account unchecked, saved and checked again can be written back;
-  // and what the list holds now: the last read, or the last write that
-  // succeeded, whichever came later.
-  const [base, setBase] = useState<{ source: "file" | "default"; entries: UsageAccountEntry[] } | null>(null);
-  const [savedList, setSavedList] = useState<SavedList | null>(null);
-  useEffect(() => {
-    if (!status) return;
-    const valid = status.accounts.filter((e) => !e.invalid);
-    const ids = new Set(valid.map((e) => accountId(e.harness, e.home, status.user_home)));
-    setSavedList({ source: status.source, ids });
-    setBase((b) => {
-      if (!b) return { source: status.source, entries: valid };
-      const have = new Set(b.entries.map((e) => accountId(e.harness, e.home, status.user_home)));
-      return { ...b, entries: [...b.entries, ...valid.filter((e) => !have.has(accountId(e.harness, e.home, status.user_home)))] };
-    });
-  }, [status]);
 
   const rows = usage.data?.accounts ?? null;
   const found = useMemo(() => (rows ?? []).filter((r) => !(r.ok === false && r.error === "not_installed")), [rows]);
@@ -128,58 +242,29 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
     .map(([, name]) => name);
   const notListed = status?.source === "file" ? absent.filter(([h]) => !notInstalled.has(h)).map(([, name]) => name) : [];
 
-  const [unread, setUnread] = useState<Set<string>>(new Set());
-  const reading = found.filter((r) => !unread.has(accountId(r.harness, r.home, userHome)));
+  // The owner's edits, as operations on whatever is saved when Next runs.
+  const [readOps, setReadOps] = useState<Map<string, boolean>>(new Map());
+  const [moves, setMoves] = useState<Move[]>([]);
+  const [tell, setTell] = useState<boolean | null>(null);
 
-  // The order starts as the priority already set (its accounts first, in its
-  // order), then every other account in the order Khipu found them.
-  const held = route.data?.priority ?? null;
-  const heldEntries: RoutePriorityEntry[] = held?.entries ?? [];
-  // A priority entry is one account by its key (`harness|login folder`),
-  // compared as `khipu config` compares logins. Labels are display names a
-  // different account may take later, so they never match.
-  const heldId = (e: RoutePriorityEntry) => {
-    const [h, ...rest] = e.account.split("|");
-    return accountId(h, rest.join("|") || null, userHome);
+  const listedIds = status ? planAccountList(status, new Map(), found).ids : null;
+  const isChecked = (r: UsageAccount) => {
+    const id = accountId(r.harness, r.home, userHome);
+    return readOps.get(id) ?? (listedIds ? listedIds.has(id) : true);
   };
-  const isRow = (e: RoutePriorityEntry, r: UsageAccount) => heldId(e) === accountId(r.harness, r.home, userHome);
-  const startOrder = useMemo(() => {
-    const rank = (r: UsageAccount) => {
-      const i = heldEntries.findIndex((e) => isRow(e, r));
-      return i < 0 ? heldEntries.length : i;
-    };
-    return found
-      .map((r, i) => ({ r, i }))
-      .sort((a, b) => rank(a.r) - rank(b.r) || a.i - b.i)
-      .map(({ r }) => routeKey(r));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [found, heldEntries, userHome]);
-  // `moved` is always an order of every account found, so an account
-  // unchecked and checked again comes back in its place; the list shown and
-  // the priority written are the accounts still read, in that order.
-  const [moved, setMoved] = useState<string[] | null>(null);
+  const listPlan = status && readOps.size ? planAccountList(status, readOps, found) : null;
+
+  const held = route.data?.priority ?? null;
+  const visible = visibleRows(status, readOps, found);
+  const order = applyMoves(startOrderOf(held?.entries ?? [], visible, userHome), moves);
   const byKey = new Map(found.map((r) => [routeKey(r), r]));
-  const full = moved
-    ? [...moved.filter((k) => byKey.has(k)), ...startOrder.filter((k) => !moved.includes(k))]
-    : startOrder;
-  const readingKeys = new Set(reading.map(routeKey));
-  const start = startOrder.filter((k) => readingKeys.has(k));
-  const order = full.filter((k) => readingKeys.has(k));
   // The order can be changed only once the priority already set has been
   // read, so a write never drops its roles, ends or accounts.
   const routeRead = route.data != null;
   const routeFailed = !routeRead && route.error != null && !route.loading;
 
-  // The order and the switch as last saved by this step, once a write of
-  // them succeeded; until then, as read.
-  const [savedOrder, setSavedOrder] = useState<string[] | null>(null);
-  const startSaved = savedOrder ? savedOrder.filter((k) => readingKeys.has(k)) : start;
-
   const master = features.data?.features?.routing_push;
-  const [tell, setTell] = useState<boolean | null>(null);
-  const [savedTell, setSavedTell] = useState<boolean | null>(null);
   const tellNow = tell ?? master?.enabled === true;
-  const tellStored = savedTell ?? master?.enabled === true;
 
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -187,89 +272,90 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
     if (!active) setErr(null);
   }, [active]);
 
-  const move = (i: number, by: number) => {
-    const a = order[i];
-    const b = order[i + by];
-    if (a == null || b == null) return;
-    const next = [...full];
-    const ia = next.indexOf(a);
-    const ib = next.indexOf(b);
-    [next[ia], next[ib]] = [next[ib], next[ia]];
-    setMoved(next);
+  const move = (i: number, by: -1 | 1) => {
+    const key = order[i];
+    const past = order[i + by];
+    if (key == null || past == null) return;
+    setMoves((m) => [...m, { key, past, dir: by < 0 ? -1 : 1 }]);
   };
 
   const checkAgain = () => {
     void usage.refresh();
-    void cfg.reload();
+    void cfg.read();
   };
 
   async function next() {
     setSaving(true);
     setErr(null);
-    // Each write is compared with what is saved now (the last read, or this
-    // step's last write that succeeded), so a retry after a partial save
-    // sends exactly what is still unsaved.
     const done: string[] = [];
-    const failed = (what: string, error: string) => {
-      console.error(`${what} failed:`, error);
-    };
+    let advanced = false;
     const say = (cant: string) =>
       setErr(
         `${done.length ? `Khipu saved ${listOf(done)}, but` : "Khipu"} couldn't ${cant}. Try Next again, or Skip for now and change it later in Settings.`,
       );
     try {
-      if (base && savedList) {
-        const keep = base.entries.filter((e) => !unread.has(accountId(e.harness, e.home, userHome)));
-        const ids = new Set(keep.map((e) => accountId(e.harness, e.home, userHome)));
-        const allBack = keep.length === base.entries.length && base.source === "default";
-        const wanted: SavedList = allBack ? { source: "default", ids } : { source: "file", ids };
-        const same = wanted.source === savedList.source && (wanted.source === "default" || sameSet(wanted.ids, savedList.ids));
-        if (!same && keep.length > 0) {
-          const value = keep.map((e) => (e.home ? { label: e.label, harness: e.harness, home: e.home } : { label: e.label, harness: e.harness }));
-          const res = allBack
-            ? await callCli("khipu_config_unset", { key: "usage_accounts" })
-            : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(value) });
+      // What is saved now, read fresh for this Next.
+      const [c, r, f] = await Promise.all([cfg.read(), route.read(), features.read()]);
+      const fresh = c.ok ? c.data.usage_accounts ?? null : null;
+      if (readOps.size) {
+        if (!fresh) {
+          console.error("khipu config show failed:", c.ok ? "no usage_accounts" : c.error);
+          say("read the account list, so which accounts to read was not saved");
+          return;
+        }
+        const plan = planAccountList(fresh, readOps, found);
+        if (plan.changed && plan.list.length) {
+          const res = await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(plan.list) });
           if (!res.ok) {
-            failed("khipu config usage_accounts", res.error);
+            console.error("khipu config --set usage_accounts failed:", res.error);
             say("save which accounts to read");
             return;
           }
-          setSavedList(wanted);
           done.push("which accounts to read");
         }
       }
-      if (routeRead && order.length > 0 && !samePriority(order, startSaved)) {
-        const entries = order.map((k) => {
-          const r = byKey.get(k);
-          const was = heldEntries.find((e) => r != null && isRow(e, r));
-          return { account: k, role: was?.role ?? null, until: was?.until ?? null };
-        });
-        // Priority accounts with no plan row here keep their place.
-        heldEntries.forEach((e, h) => {
-          if (found.some((r) => isRow(e, r))) return;
-          entries.splice(Math.min(h, entries.length), 0, { account: e.account, role: e.role ?? null, until: e.until ?? null });
-        });
-        const res = await callCli("khipu_route_priority", { action: "set", entries, until: held?.until ?? null });
-        if (!res.ok) {
-          failed("khipu route priority", res.error);
-          say("save the order");
+      if (moves.length) {
+        if (!r.ok) {
+          console.error("khipu route failed:", r.error);
+          say("read your current order, so the order was not saved");
           return;
         }
-        setSavedOrder(order);
-        done.push("the order");
+        const plan = planPriority(r.data.priority ?? null, visibleRows(fresh, readOps, found), moves, fresh?.user_home ?? null);
+        if (plan) {
+          const res = await callCli("khipu_route_priority", { action: "set", entries: plan.entries, until: plan.until });
+          if (!res.ok) {
+            console.error("khipu route priority failed:", res.error);
+            say("save the order");
+            return;
+          }
+          done.push("the order");
+        }
       }
-      if (tell != null && master && tell !== tellStored) {
-        const res = await callCli("khipu_feature_set", { name: "routing_push", enabled: tell });
-        if (!res.ok) {
-          failed("khipu feature set routing_push", res.error);
-          say("change whether conversations are told");
+      if (tell != null) {
+        const sw = f.ok ? f.data.features?.routing_push : undefined;
+        if (!sw) {
+          console.error("khipu features failed:", f.ok ? "no routing_push" : f.error);
+          say("read whether conversations are told, so that switch was not changed");
           return;
         }
-        setSavedTell(tell);
+        if (sw.source !== "env" && sw.enabled !== tell) {
+          const res = await callCli("khipu_feature_set", { name: "routing_push", enabled: tell });
+          if (!res.ok) {
+            console.error("khipu feature set routing_push failed:", res.error);
+            say("change whether conversations are told");
+            return;
+          }
+        }
       }
+      advanced = true;
       onNext();
     } finally {
       setSaving(false);
+      // After a partial save the screen shows what is saved now.
+      if (!advanced && done.length) {
+        void cfg.read();
+        void route.read();
+      }
     }
   }
 
@@ -289,7 +375,7 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         <Callout
           tone="warn"
           title="Khipu couldn't read your accounts just now"
-          action={<button type="button" className="sm" disabled={usage.refreshing} onClick={checkAgain}>Check again</button>}
+          action={<button type="button" className="sm" disabled={usage.refreshing || saving} onClick={checkAgain}>Check again</button>}
         >
           {usage.error} Nothing on this step is required.
         </Callout>
@@ -310,7 +396,7 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         <Callout
           title="No accounts found on this Mac"
           action={
-            <button type="button" className="sm" disabled={usage.refreshing} aria-busy={usage.refreshing || undefined} onClick={checkAgain}>
+            <button type="button" className="sm" disabled={usage.refreshing || saving} aria-busy={usage.refreshing || undefined} onClick={checkAgain}>
               {usage.refreshing ? <Loader2 size={14} className="spin" aria-hidden /> : null}
               Check again
             </button>
@@ -336,7 +422,7 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
                     <span className="acct-line">{line.text}</span>
                     {r.ok === false && r.error === "not_signed_in" ? (
                       <span className="acct-act">
-                        <button type="button" className="sm" disabled={usage.refreshing} aria-busy={usage.refreshing || undefined}
+                        <button type="button" className="sm" disabled={usage.refreshing || saving} aria-busy={usage.refreshing || undefined}
                           aria-label={`Check ${name} again`} onClick={checkAgain}>
                           {usage.refreshing ? <Loader2 size={14} className="spin" aria-hidden /> : null}
                           Check again
@@ -350,16 +436,11 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
                         <input
                           type="checkbox"
                           id={box}
-                          checked={!unread.has(id)}
+                          checked={isChecked(r)}
                           disabled={saving}
                           aria-describedby={`${box}-name`}
                           onChange={(e) =>
-                            setUnread((prev) => {
-                              const out = new Set(prev);
-                              if (e.target.checked) out.delete(id);
-                              else out.add(id);
-                              return out;
-                            })
+                            setReadOps((prev) => new Map(prev).set(id, e.target.checked))
                           }
                         />
                         <label htmlFor={box}>Read this account's plan</label>
@@ -374,8 +455,14 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
               );
             })}
           </ul>
-          {reading.length === 0 ? (
-            <p className="set-help">Khipu reads at least one account. With none chosen, the account list stays as it is saved now.</p>
+          {listPlan ? (
+            <p className="set-help" role="status">
+              {listPlan.list.length === 0
+                ? "With none chosen, Next leaves the account list as it is saved."
+                : listPlan.changed
+                  ? `Next saves the account list as: ${listOf(listPlan.list.map((e) => e.label))}.`
+                  : "The account list is already saved this way."}
+            </p>
           ) : null}
           {notFound.length ? (
             <p className="acct-none">

@@ -55,30 +55,84 @@ type Opts = {
   failOnce?: string[];
 };
 
-function fake(o: Opts = {}) {
+/** What the fake Khipu holds now: writes change it, and a test can change
+ *  it "elsewhere" while the step is open. */
+type World = {
+  source: "file" | "default";
+  accounts: Array<{ label: string; harness: string; home?: string | null }>;
+  priority: { entries: Array<{ account: string; label: string; role?: string | null; until?: string | null }>; until?: string | null } | null;
+  push: boolean;
+  rows: unknown[];
+};
+let world: World;
+/** Commands whose next answer is captured when asked and held until released. */
+let holding: Set<string>;
+let held: Array<() => void>;
+
+function fake(o: Opts = {}): World {
   const failing = new Set(o.failOnce ?? []);
-  invokeMock.mockImplementation(async (cmd: string) => {
-    if (o.hang) return new Promise(() => {});
-    if (failing.delete(cmd)) throw new Error(`${cmd} failed`);
+  const defaults = (o.accounts ?? ENTRIES) as World["accounts"];
+  world = {
+    source: o.source ?? "default",
+    accounts: [...defaults],
+    priority: (o.priority as World["priority"]) ?? null,
+    push: true,
+    rows: (o.rows ?? report().accounts) as unknown[],
+  };
+  holding = new Set();
+  held = [];
+  const answer = (cmd: string, args: Record<string, unknown> | undefined): string => {
     switch (cmd) {
       case "khipu_usage_refresh":
         if (o.refreshFail) throw new Error("probe failed");
-        return JSON.stringify(report(o.rows));
+        return JSON.stringify(report(world.rows));
       case "khipu_usage_status":
-        return JSON.stringify(report(o.rows));
+        return JSON.stringify(report(world.rows));
       case "khipu_config_show":
         if (o.configFailAfterFirst && calls("khipu_config_show").length > 1) throw new Error("config failed");
-        return JSON.stringify({ usage_accounts: { source: o.source ?? "default", accounts: o.accounts ?? ENTRIES, user_home: "/Users/test" } });
+        return JSON.stringify({ usage_accounts: { source: world.source, accounts: world.accounts, user_home: "/Users/test" } });
+      case "khipu_config_set":
+        world.accounts = JSON.parse(String(args?.value));
+        world.source = "file";
+        return JSON.stringify({ ok: true });
+      case "khipu_config_unset":
+        world.accounts = [...defaults];
+        world.source = "default";
+        return JSON.stringify({ ok: true });
       case "khipu_features_show":
         if (o.featuresFail) throw new Error("no");
-        return JSON.stringify({ features: { routing_push: { enabled: true, source: "default" } } });
+        return JSON.stringify({ features: { routing_push: { enabled: world.push, source: "default" } } });
+      case "khipu_feature_set":
+        world.push = args?.enabled === true;
+        return JSON.stringify({ ok: true });
       case "khipu_route_view":
         if (o.routeFail) throw new Error("route failed");
-        return JSON.stringify({ accounts: [], priority: o.priority ?? null });
+        return JSON.stringify({ accounts: [], priority: world.priority });
+      case "khipu_route_priority": {
+        const entries = (args?.entries ?? []) as Array<{ account: string; role?: string | null; until?: string | null }>;
+        world.priority = { entries: entries.map((e) => ({ ...e, label: e.account })), until: (args?.until as string | null) ?? null };
+        return JSON.stringify({ ok: true });
+      }
       default:
         return JSON.stringify({ ok: true });
     }
+  };
+  invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+    if (o.hang) return new Promise(() => {});
+    if (failing.delete(cmd)) throw new Error(`${cmd} failed`);
+    if (holding.delete(cmd)) {
+      const now = (() => {
+        try {
+          return { ok: true as const, v: answer(cmd, args) };
+        } catch (e) {
+          return { ok: false as const, e };
+        }
+      })();
+      return new Promise((resolve, reject) => held.push(() => (now.ok ? resolve(now.v) : reject(now.e))));
+    }
+    return answer(cmd, args);
   });
+  return world;
 }
 
 const WRITES = ["khipu_config_set", "khipu_config_unset", "khipu_route_priority", "khipu_feature_set"];
@@ -354,8 +408,8 @@ describe("Setup › Accounts step, review round 3", () => {
     fireEvent.click(boxes()[1]);
     fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
     await waitFor(() => expect(onNext).toHaveBeenCalled());
-    // Back to every account, as at the start: the default list again.
-    expect(calls("khipu_config_unset")).toHaveLength(1);
+    expect(calls("khipu_config_set")).toHaveLength(2);
+    expect(world.accounts.map((e) => e.harness)).toEqual(["claude", "grok", "muse", "codex"]);
   });
 
   it("a retry after a partial save sends only what is still unsaved", async () => {
@@ -384,6 +438,126 @@ describe("Setup › Accounts step, review round 3", () => {
     await waitFor(() => expect(onNext).toHaveBeenCalled());
     expect(calls("khipu_route_priority")).toHaveLength(1);
     expect(calls("khipu_feature_set")).toHaveLength(2);
+  });
+});
+
+describe("Setup › Accounts step, changes as operations on what is saved now", () => {
+  const rowOf = (h: string) => (report().accounts as Array<{ harness: string }>).find((r) => r.harness === h)!;
+  const checkAgain = () => fireEvent.click(screen.getByRole("button", { name: "Check Grok Build again" }));
+  const next = () => fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+  const box = (i: number) => screen.getAllByLabelText("Read this account's plan")[i] as HTMLInputElement;
+
+  it("an account removed elsewhere while setup is open is not written back", async () => {
+    fake();
+    const { onNext } = mount();
+    await ready();
+    world.source = "file";
+    world.accounts = ENTRIES.filter((e) => e.harness !== "codex");
+    world.rows = world.rows.filter((r) => (r as { harness: string }).harness !== "codex");
+    checkAgain();
+    await waitFor(() => expect(screen.queryAllByText("Codex")).toHaveLength(0));
+    next();
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(world.accounts.map((e) => e.harness)).toEqual(["claude", "grok", "muse"]);
+  });
+
+  it("an account renamed elsewhere keeps its new name when another account is unchecked", async () => {
+    fake();
+    const { onNext } = mount();
+    await ready();
+    world.source = "file";
+    world.accounts = ENTRIES.map((e) => (e.harness === "codex" ? { ...e, label: "Codex work" } : e));
+    world.rows = world.rows.map((r) => ((r as { harness: string }).harness === "codex" ? { ...(r as object), account: "Codex work" } : r));
+    checkAgain();
+    await screen.findAllByText("Codex work");
+    fireEvent.click(box(3));
+    next();
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(world.accounts.map((e) => e.label)).toEqual(["Claude Code", "Codex work", "Grok Build"]);
+  });
+
+  it("an account added elsewhere is kept", async () => {
+    fake();
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(box(3));
+    world.source = "file";
+    world.accounts = [...ENTRIES, { label: "Claude second", harness: "claude", home: "~/.claude-second" }];
+    next();
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(world.accounts.map((e) => e.label)).toEqual(["Claude Code", "Codex", "Grok Build", "Claude second"]);
+  });
+
+  it("an old account-list answer arriving late never undoes a retry", async () => {
+    fake({ failOnce: ["khipu_route_priority"] });
+    const { onNext } = mount();
+    await ready();
+    holding.add("khipu_config_show");
+    checkAgain();
+    fireEvent.click(box(1));
+    fireEvent.click(screen.getByRole("button", { name: "Move Muse up" }));
+    next();
+    await screen.findByText(/couldn't save the order/);
+    expect(world.accounts.map((e) => e.harness)).toEqual(["claude", "grok", "muse"]);
+    held.forEach((release) => release());
+    await waitFor(() => expect(box(1).checked).toBe(false));
+    fireEvent.click(box(1));
+    next();
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(world.accounts.map((e) => e.harness).sort()).toEqual(["claude", "codex", "grok", "muse"]);
+  });
+
+  it("a stale read never wins on screen", async () => {
+    fake();
+    mount();
+    await ready();
+    holding.add("khipu_config_show");
+    checkAgain();
+    world.source = "file";
+    world.accounts = ENTRIES.filter((e) => e.harness !== "muse");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Check Grok Build again" })).not.toBeDisabled());
+    checkAgain();
+    await waitFor(() => expect(box(3).checked).toBe(false));
+    held.forEach((release) => release());
+    await new Promise((r) => setTimeout(r, 50));
+    expect(box(3).checked).toBe(false);
+  });
+
+  it("with only an uninstalled account left, the help says what Next saves and Next does that", async () => {
+    fake({
+      source: "file",
+      accounts: ENTRIES.slice(0, 2),
+      rows: [rowOf("claude"), { harness: "codex", account: "Codex", home: null, ok: false, error: "not_installed", windows: [] }],
+    });
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(box(0));
+    expect(await screen.findByText("Next saves the account list as: Codex.")).toBeInTheDocument();
+    next();
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(world.accounts.map((e) => e.label)).toEqual(["Codex"]);
+  });
+
+  it("a retry after any partial failure converges, then writes nothing more", async () => {
+    fake({ failOnce: ["khipu_config_set", "khipu_route_priority", "khipu_feature_set"] });
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(box(1));
+    fireEvent.click(screen.getByRole("button", { name: "Move Muse up" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Tell my conversations about this" }));
+    for (const said of [/couldn't save which accounts/, /couldn't save the order/, /couldn't change whether conversations are told/]) {
+      next();
+      await screen.findByText(said);
+    }
+    next();
+    await waitFor(() => expect(onNext).toHaveBeenCalledTimes(1));
+    expect(world.accounts.map((e) => e.harness)).toEqual(["claude", "grok", "muse"]);
+    expect(world.priority?.entries.map((e) => e.account)).toEqual(["claude|", "muse|", "grok|"]);
+    expect(world.push).toBe(false);
+    const writes = WRITES.map((w) => calls(w).length);
+    next();
+    await waitFor(() => expect(onNext).toHaveBeenCalledTimes(2));
+    expect(WRITES.map((w) => calls(w).length)).toEqual(writes);
   });
 });
 
