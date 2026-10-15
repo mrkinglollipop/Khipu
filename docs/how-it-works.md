@@ -256,7 +256,7 @@ When the database is unreachable, reads fall back to a local SQLite copy (`hub_s
 How it stays fresh:
 
 1. A nightly job rebuilds it. You can also run `khipu snapshot refresh`.
-2. Between rebuilds, capture, edits, decisions and forget update it as they happen.
+2. Between rebuilds, captures, decision changes and forgets update it as they happen. Episode edits (`khipu episode edit`) and topic tombstones and purges do not: this Mac's copy keeps the old summary or the topic until its next full dump (nightly, or `khipu snapshot refresh`).
 3. `doctor` and `status` report freshness per table as fresh, behind, stale or unknown. Only stale turns `doctor` red. A stale result carries a `stale: true` flag.
 
 A scheduled incremental sync is planned.
@@ -289,7 +289,7 @@ Briefs are off by default. Turn on the `briefs` switch, then use `khipu briefs p
 
 `khipu episode forget ID` tombstones one episode. It does not erase the row: it sets `deleted_at`, and the summary and its provenance stay in the `episodes` table. Search, `khipu_get` and the episode detail view skip it. Today some recent-capture lists do not: the Activity list (`khipu activity` and the app's Activity screen), the `recent_captures` section of `khipu doctor`, `khipu status` and the full `khipu_status`, and the session-start slice when it falls back to recent captures can still show a forgotten episode's summary. A fix is planned. It also removes the episode's vectors, closes the commitments it opened (reason `forgotten`; the closed rows stay), retracts its decisions, deletes its deliverables, removes its lines from the legacy file and Khipu's own forget backups, updates the local replica, and marks briefs that cited it stale. Graph topic nodes are shared across episodes and are left alone, and database backups made before the forget still contain it. The legacy file and local replica steps can fail; capture jobs still waiting in the outbox are not removed, only reported. If anything is left, the result says `complete: false` and lists it under `partial`.
 
-`khipu episode edit ID --summary "..."` corrects an episode and re-embeds it. `khipu topic purge SLUG --yes` hard-deletes a topic that is already tombstoned. In the app, use Activity.
+`khipu episode edit ID --summary "..."` corrects an episode in the hub database and re-embeds it; the offline copy catches up at its next refresh. `khipu topic purge SLUG --yes` hard-deletes an already tombstoned topic, with its revisions and vectors, from the hub database. This Mac's offline copy keeps the topic until its next full dump (nightly, or `khipu snapshot refresh`). In the app, use Activity.
 
 ## 5. Where it runs
 

@@ -96,7 +96,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | --- | --- |
 | `capture` | Capture an episode from a JSON payload on stdin. Routed by `capture_mode`. Flags: `--payload-file`, `--mode legacy|dual|hub`. `capture now` flags a session for capture at its next Stop, whatever the cadence (`--note`, `--harness`, `--session-id`; the last two default to the most recently active local session). |
 | `episode` | `episode forget ID` soft-deletes an episode and removes its vectors. `episode edit ID --summary S` corrects it and re-embeds. |
-| `topic` | `topic purge SLUG --yes` hard-deletes a topic that is already tombstoned. |
+| `topic` | `topic purge SLUG --yes` hard-deletes an already tombstoned topic from the hub database (with its revisions and vectors). This Mac's offline copy keeps it until its next full dump. |
 | `notes` | Index per-project harness notes as topics: `reconcile` (`--dry-run`, `--changed-only`), `index` (`--project`, `--cap`, `--dry-run`, `--force`), `split PATH`, `stale` (`--project`), `supersede OLD NEW`. |
 | `reconcile` | Full sync of memory files into Postgres. |
 | `regen-memory` | Write the `MEMORY.md` sidecar from topics. `--index` rebuilds the live `MEMORY.md`. |

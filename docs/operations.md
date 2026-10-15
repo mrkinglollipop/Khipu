@@ -180,7 +180,7 @@ khipu snapshot status    # age, size, row counts
 ```
 
 - A full dump runs in the nightly job and on `khipu snapshot refresh`. Doctor and status do not dump it.
-- Between dumps, capture, edits, decisions and forgets update the copy as they happen.
+- Between dumps, captures, decision changes and forgets update the copy as they happen. Episode edits (`khipu episode edit`) and topic tombstones and purges do not: this Mac's copy keeps the old summary or the topic until its next full dump (nightly, or `khipu snapshot refresh`).
 - Doctor reports freshness per table: fresh, behind, stale or unknown. Only stale turns `hub_snapshot_ok` red. Search results from a stale copy carry `stale: true`.
 
 Planned, not built: a bounded incremental `snapshot sync` and a scheduled sync.
