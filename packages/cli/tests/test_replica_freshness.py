@@ -66,6 +66,14 @@ def _bucket(v: dict) -> str:
     return hashlib.md5(f"{v['kind']}\t{v['ref']}".encode()).hexdigest()[:3]
 
 
+def _micro(dt: datetime | None) -> str:
+    """The hub's build time as the vector digest spells it: whole
+    microseconds since the epoch."""
+    if dt is None:
+        return ""
+    return str((dt - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1))
+
+
 def _vec_row(v: dict) -> tuple:
     return (v["kind"], v["ref"], v.get("chunk_idx", 0), v.get("content_hash"),
             _ny(v["built_at"]) if v["built_at"] else None)
@@ -95,10 +103,10 @@ class FakeCursor:
         elif "FROM memory_embeddings" in sql and "GROUP BY 1" in sql:
             by_bucket: dict[str, list[tuple]] = {}
             for v in h.live_vectors():
-                key = (v["kind"], v["ref"], v.get("chunk_idx", 0), v.get("content_hash") or "")
+                key = (v["kind"], v["ref"], v.get("chunk_idx", 0), v.get("content_hash") or "", _micro(v["built_at"]))
                 by_bucket.setdefault(_bucket(v), []).append(key)
-            rows = [(b, hashlib.md5("\n".join(f"{k}\t{r}\t{i}\t{c}" for k, r, i, c in sorted(keys)).encode())
-                     .hexdigest()) for b, keys in by_bucket.items()]
+            rows = [(b, hashlib.md5("\n".join(f"{k}\t{r}\t{i}\t{c}\t{t}" for k, r, i, c, t in sorted(keys))
+                                    .encode()).hexdigest()) for b, keys in by_bucket.items()]
         elif "FROM memory_embeddings" in sql and "= ANY(%s)" in sql:
             h.page_reads += 1
             after, n = tuple(p[2:6]), p[6]
@@ -179,7 +187,7 @@ class ReplicaCase(unittest.TestCase):
         hs._dump_cursors(con, _ts(DUMP))
         con.commit()
         con.close()
-        (self.dir / "meta.json").write_text(json.dumps({"refreshed_at": _ts(DUMP)}))
+        (self.dir / "meta.json").write_text(json.dumps({"refreshed_at": _ts(DUMP), "hub_dumped_at": _ts(DUMP)}))
         self.hub = FakeHub()
         self.hub.episodes.append({"id": 1, "ingested_at": before})
         self.hub.topics.append({"slug": "alpha", "content_hash": "h1", "updated_at": before})
@@ -222,7 +230,7 @@ class InStepTest(ReplicaCase):
 
     def test_only_changes_since_the_dump_less_the_overlap_are_asked_for(self) -> None:
         lag = hs.measure_lag(self.hub.cursor())
-        self.assertEqual(lag["since"], _ts(DUMP - timedelta(seconds=hs.FRESHNESS_OVERLAP_S)))
+        self.assertEqual(hs._utc(lag["since"]), DUMP - timedelta(seconds=hs.FRESHNESS_OVERLAP_S))
 
 
 class RemoteInsertionTest(ReplicaCase):
@@ -580,15 +588,15 @@ class RecallTrustTest(ReplicaCase):
         self.assertTrue(record["in_step"])
         real_now = datetime.now(timezone.utc)
         with mock.patch.object(hs, "snapshot_health", side_effect=lambda: dict(overdue)):
-            self._write({**record, "measured_at": _ts(real_now - timedelta(minutes=5))})
+            self._write({**record, "checked_at": _ts(real_now - timedelta(minutes=5))})
             fresh, health = hs.snapshot_is_fresh()
             self.assertTrue(fresh)
             self.assertEqual(health["trusted_by"], "measurement")
-            self._write({**record, "measured_at": _ts(real_now - timedelta(seconds=hs.LAST_KNOWN_TRUST_S + 60))})
+            self._write({**record, "checked_at": _ts(real_now - timedelta(seconds=hs.LAST_KNOWN_TRUST_S + 60))})
             self.assertFalse(hs.snapshot_is_fresh()[0], "too old a measurement")
-            self._write({**record, "measured_at": _ts(real_now), "in_step": False})
+            self._write({**record, "checked_at": _ts(real_now), "in_step": False})
             self.assertFalse(hs.snapshot_is_fresh()[0], "a measurement that found a gap")
-            self._write({**record, "measured_at": _ts(real_now), "refreshed_at": _ts(DUMP - timedelta(days=1))})
+            self._write({**record, "checked_at": _ts(real_now), "refreshed_at": _ts(DUMP - timedelta(days=1))})
             self.assertFalse(hs.snapshot_is_fresh()[0], "a measurement of an earlier dump")
 
     def test_a_young_dump_measured_behind_is_not_trusted(self) -> None:
@@ -599,13 +607,13 @@ class RecallTrustTest(ReplicaCase):
         record = json.loads((self.dir / "freshness.json").read_text())
         real_now = datetime.now(timezone.utc)
         with mock.patch.object(hs, "snapshot_health", side_effect=lambda: dict(young)):
-            self._write({**record, "measured_at": _ts(real_now - timedelta(minutes=5))})
+            self._write({**record, "checked_at": _ts(real_now - timedelta(minutes=5))})
             fresh, health = hs.snapshot_is_fresh()
             self.assertFalse(fresh, "recall must not trust a replica measured as behind")
             self.assertEqual(health["distrusted_by"], "measurement")
-            self._write({**record, "measured_at": _ts(real_now - timedelta(seconds=hs.LAST_KNOWN_TRUST_S + 60))})
+            self._write({**record, "checked_at": _ts(real_now - timedelta(seconds=hs.LAST_KNOWN_TRUST_S + 60))})
             self.assertTrue(hs.snapshot_is_fresh()[0], "an old verdict gives way to the dump's age")
-            self._write({**record, "measured_at": _ts(real_now), "refreshed_at": _ts(DUMP - timedelta(days=1))})
+            self._write({**record, "checked_at": _ts(real_now), "refreshed_at": _ts(DUMP - timedelta(days=1))})
             self.assertTrue(hs.snapshot_is_fresh()[0], "a verdict on an earlier dump says nothing of this one")
 
     def test_a_young_dump_is_trusted_and_a_missing_one_never(self) -> None:
@@ -777,3 +785,159 @@ class VectorBoundTest(VectorCase):
         # The small bucket's pruned chunk and the big bucket's changed chunk 0;
         # the big bucket's replica-only chunk is past the cut.
         self.assertEqual(v["missing"], 2)
+
+
+class ClockSkewTest(VectorCase):
+    """No Mac-side time is ever compared with a hub-side one. The dump keeps
+    the hub's own clock at its start; every cutoff and floor is taken from
+    that, so a Mac clock ahead of or behind the hub's cannot hide a change."""
+
+    HUB_DUMP = DUMP - timedelta(minutes=45)  # the hub's clock when this Mac said DUMP
+
+    def _hub_dumped_at(self, when: datetime | None, *, mac: datetime = DUMP) -> None:
+        side = {"refreshed_at": _ts(mac)}
+        if when is not None:
+            side["hub_dumped_at"] = _ts(when)
+        (self.dir / "meta.json").write_text(json.dumps(side))
+        con = sqlite3.connect(self.snap)
+        con.execute("DELETE FROM snapshot_meta WHERE key LIKE 'cursor:%'")
+        hs._dump_cursors(con, _ts(mac))
+        con.commit()
+        con.close()
+
+    def test_a_rebuild_after_the_dump_is_seen_whatever_this_macs_clock_said(self) -> None:
+        # Codex round 4: the dump is stamped 10:00 by this Mac while the hub
+        # reads 09:15; the replica holds the 09:00 build and the hub rebuilds
+        # the same text at 09:30.
+        self._hub_dumped_at(self.HUB_DUMP)
+        held = DUMP - timedelta(hours=1)
+        rebuilt = DUMP - timedelta(minutes=30)
+        self._hub(("episode", "1", 0, "a", rebuilt))
+        self._replica(("episode", "1", 0, "a", _ts(held)))
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 1)
+        self.assertEqual(out["tables"]["vectors"]["lag_seconds"], (NOW - rebuilt).total_seconds())
+        self.assertEqual(out["state"], "behind")
+
+    def test_generation_evidence_is_compared_with_no_cutoff_at_all(self) -> None:
+        # A rebuild long before any cutoff still makes the bucket differ.
+        old_held, old_rebuilt = DUMP - timedelta(days=3), DUMP - timedelta(days=2)
+        self._hub(("episode", "1", 0, "a", old_rebuilt))
+        self._replica(("episode", "1", 0, "a", _ts(old_held)))
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["buckets_differing"], 1)
+        self.assertEqual(out["tables"]["vectors"]["missing"], 1)
+        self.assertFalse(any("ORDER BY built_at" in q for q in self.hub.queries))
+
+    def test_a_replica_row_with_no_build_time_is_unknown_however_old_the_hub_build(self) -> None:
+        self._hub(("episode", "1", 0, "a", DUMP - timedelta(days=2)))
+        self._replica(("episode", "1", 0, "a", None))
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["unverified"], 1)
+        self.assertEqual(out["state"], "unknown")
+        self.assertEqual(out["reason"], "version_evidence_missing")
+
+    def test_changes_after_the_hubs_dump_time_are_asked_for_in_every_table(self) -> None:
+        self._hub_dumped_at(self.HUB_DUMP)
+        after = DUMP - timedelta(minutes=30)  # after the hub's dump, before this Mac's stamp less the overlap
+        cases = {
+            "episodes": lambda: self.hub.episodes.append({"id": 2, "ingested_at": after}),
+            "tombstones": lambda: self.hub.episodes[0].update(deleted_at=after),
+            "decisions": lambda: self.hub.decisions.append({"id": 11, "created_at": after}),
+            "deliverables": lambda: self.hub.deliverables.append({"id": 5, "created_at": after}),
+        }
+        for name, change in cases.items():
+            with self.subTest(table=name):
+                self.setUp_hub()
+                change()
+                lag = hs.measure_lag(self.hub.cursor())
+                self.assertEqual(lag["tables"][name]["missing"], 1, lag["tables"][name])
+                self.assertEqual(lag["tables"][name]["lag_seconds"], (NOW - after).total_seconds())
+
+    def setUp_hub(self) -> None:
+        before = DUMP - timedelta(hours=1)
+        self.hub.episodes[:] = [{"id": 1, "ingested_at": before}]
+        self.hub.decisions[:] = [{"id": 10, "created_at": before}]
+        self.hub.deliverables[:] = []
+
+    def test_changes_with_no_hub_time_are_dated_from_the_hubs_dump_not_this_macs(self) -> None:
+        # This Mac's clock runs four hours ahead: it stamped the dump five
+        # minutes before NOW, though on the hub's clock it ran at DUMP.
+        self._hub_dumped_at(DUMP, mac=NOW - timedelta(minutes=5))
+        before = DUMP - timedelta(hours=1)
+        self._hub(("episode", "1", 0, "a", before))
+        self._replica(("episode", "1", 0, "a", _ts(before)), ("episode", "1", 1, "b", _ts(before)))
+        self.hub.topics[0].update(content_hash="h2")
+        lag = hs.measure_lag(self.hub.cursor())
+        self.assertEqual(lag["tables"]["vectors"]["lag_seconds"], (NOW - DUMP).total_seconds())
+        self.assertEqual(lag["tables"]["topics"]["lag_seconds"], (NOW - DUMP).total_seconds())
+
+    def test_a_replica_with_no_hub_dump_time_is_not_measured(self) -> None:
+        self._hub_dumped_at(None)
+        lag = hs.measure_lag(self.hub.cursor())
+        self.assertFalse(lag["measured"])
+        self.assertEqual(lag["reason"], "no hub dump time on record")
+        out = hs.snapshot_freshness(None, self.health(), lag=lag)
+        self.assertEqual(out["state"], "unknown")
+
+    def test_the_dump_records_the_hubs_clock_before_reading_any_table(self) -> None:
+        order: list[str] = []
+        hub_start = DUMP - timedelta(minutes=45)
+
+        class Cur:
+            def execute(self, sql, params=None):
+                order.append(sql)
+
+            def fetchone(self):
+                return (_ny(hub_start),)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        conn = mock.MagicMock()
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value = Cur()
+        names = ("_insert_topics", "_insert_topic_revisions", "_insert_nodes", "_insert_edges",
+                 "_insert_profiles", "_insert_memory_embeddings", "_insert_decisions", "_insert_deliverables")
+
+        def episodes(_cur, _con):
+            order.append("episodes")
+            return 0
+
+        with mock.patch.object(hs, "try_hub_connect", return_value=conn), \
+                mock.patch.object(hs, "_insert_episodes", side_effect=episodes), \
+                mock.patch.multiple(hs, **{n: mock.Mock(return_value=0) for n in names}):
+            res = hs.refresh()
+        self.assertTrue(res["ok"])
+        self.assertEqual(order[:2], ["SELECT now()", "episodes"])
+        side = json.loads((self.dir / "meta.json").read_text())
+        self.assertEqual(hs._utc(side["hub_dumped_at"]), hub_start)
+        self.assertEqual(hs._utc(res["hub_dumped_at"]), hub_start)
+
+    def test_recall_trust_ages_a_verdict_by_this_macs_clock_alone(self) -> None:
+        overdue = self.health(age_s=hs.SNAPSHOT_MAX_AGE_S + 3600)
+        hs.snapshot_freshness(None, overdue, lag=hs.measure_lag(self.hub.cursor()))
+        record = json.loads((self.dir / "meta.json").parent.joinpath("freshness.json").read_text())
+        self.assertTrue(record["in_step"])
+        real_now = datetime.now(timezone.utc)
+        # The hub's clock runs four minutes ahead of this Mac's; the check
+        # itself is older than the trust window on this Mac's clock.
+        stale_check = {**record, "measured_at": _ts(real_now + timedelta(minutes=4) - timedelta(
+            seconds=hs.LAST_KNOWN_TRUST_S - 60)), "checked_at": _ts(real_now - timedelta(
+                seconds=hs.LAST_KNOWN_TRUST_S + 60))}
+        (self.dir / "freshness.json").write_text(json.dumps(stale_check))
+        with mock.patch.object(hs, "snapshot_health", side_effect=lambda: dict(overdue)):
+            self.assertFalse(hs.snapshot_is_fresh()[0])
+            no_mac_time = {k: v for k, v in record.items() if k != "checked_at"}
+            no_mac_time["measured_at"] = _ts(real_now)
+            (self.dir / "freshness.json").write_text(json.dumps(no_mac_time))
+            self.assertFalse(hs.snapshot_is_fresh()[0], "a verdict with no time on this Mac's clock")
+
+    def test_a_decision_sync_never_stamps_its_hub_cursor_with_this_macs_clock(self) -> None:
+        import inspect
+
+        src = inspect.getsource(hs.sync_decision_changes)
+        self.assertNotIn("_utcnow_iso()", src)

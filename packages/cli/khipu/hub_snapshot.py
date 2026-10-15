@@ -785,7 +785,7 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
     out = apply_decision_changes(rows)
     if out.get("ok"):
         new_watermark = fetched[-1][-1]
-        m["last_decision_sync_at"] = _ts_text(new_watermark) or _utcnow_iso()
+        m["last_decision_sync_at"] = _ts_text(new_watermark) or since
         m["last_decision_sync_id"] = rows[-1].get("id", 0)
         try:
             _write_meta(m)
@@ -1345,6 +1345,12 @@ def refresh() -> dict[str, Any]:
             _create_schema(con)
             with try_hub_connect(connect_timeout=REFRESH_CONNECT_TIMEOUT_S) as pg:
                 with pg.cursor() as cur:
+                    # The hub's own clock at the start of the dump, before any
+                    # table is read: freshness takes every cutoff and floor
+                    # from this, never from this Mac's clock.
+                    cur.execute("SELECT now()")
+                    row = cur.fetchone()
+                    hub_dumped_at = _ts_text(_utc(row[0] if row else None))
                     counts["episodes"] = _insert_episodes(cur, con)
                     counts["topics"] = _insert_topics(cur, con)
                     counts["topic_revisions"] = _insert_topic_revisions(cur, con)
@@ -1359,6 +1365,9 @@ def refresh() -> dict[str, Any]:
             refreshed_at = _utcnow_iso()
             if _snapshot_table_columns(con, "snapshot_meta"):
                 con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('refreshed_at', ?)", (refreshed_at,))
+                if hub_dumped_at:
+                    con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('hub_dumped_at', ?)",
+                                (hub_dumped_at,))
             _apply_pending_erasures(con, dest)
             _dump_cursors(con, refreshed_at)
             con.commit()
@@ -1366,6 +1375,8 @@ def refresh() -> dict[str, Any]:
             os.replace(tmp_path, dest)
             size_bytes = dest.stat().st_size
             new_meta: dict[str, Any] = {"schema_version": SNAPSHOT_SCHEMA_VERSION, "refreshed_at": refreshed_at, "size_bytes": size_bytes, "counts": counts}
+            if hub_dumped_at:
+                new_meta["hub_dumped_at"] = hub_dumped_at
             # Read again now, not at the start: anything noted while the dump
             # ran must survive it. The decision-sync cursor is not evidence
             # about this dump, so a dump must not reset it: with the keys gone
@@ -1389,6 +1400,7 @@ def refresh() -> dict[str, Any]:
                 "ok": True,
                 "path": str(dest),
                 "refreshed_at": refreshed_at,
+                "hub_dumped_at": hub_dumped_at,
                 "size_bytes": size_bytes,
                 "counts": counts,
                 "schema_version": SNAPSHOT_SCHEMA_VERSION,
@@ -1808,10 +1820,12 @@ def _replica_latest_ingested_at() -> datetime | None:
 
 # ---- Honest freshness (replica freshness, phase 1) --------------------------
 # A table is "behind" by the age of the oldest hub change the replica does not
-# hold: the hub's now() minus that change's own timestamp, so neither clock
-# skew nor an old full dump can fake a lag. Only changes since the last full
-# dump (less an overlap for ingested_at being transaction start, not commit)
-# are compared; anything older is in the dump by construction.
+# hold: the hub's now() minus that change's own timestamp. No time from this
+# Mac's clock is ever compared with one from the hub's: the cutoff (changes
+# since the last full dump, less an overlap for ingested_at being transaction
+# start, not commit) and the floor for a change with no time of its own both
+# come from ``hub_dumped_at``, the hub's now() read at the start of the dump.
+# A replica dumped before that was recorded is not measured.
 SNAPSHOT_LAG_BEHIND_S = SNAPSHOT_BEHIND_INGEST_MAX_S
 FRESHNESS_OVERLAP_S = 10 * 60
 # Per table per measurement. The live hub saw about 3,000 decision changes and
@@ -1900,7 +1914,7 @@ def _topic_manifest_digest(pairs: Sequence[tuple[Any, Any]]) -> str | None:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
-def _lag_topics(cur, con, hub_now, reconciled_at) -> dict[str, Any]:
+def _lag_topics(cur, con, hub_now, hub_dump) -> dict[str, Any]:
     """Topics are compared whole, by ``(slug, content_hash)`` of every live
     topic: ``updated_at`` is backdated by the file mirror, so no timestamp
     cursor can see a correction. A digest first (one row from the hub); the
@@ -1925,9 +1939,10 @@ def _lag_topics(cur, con, hub_now, reconciled_at) -> dict[str, Any]:
     hub_rows = cur.fetchall()
     held = {slug: h for slug, h in replica}
     differing = [r for r in hub_rows if r[0] not in held or (held[r[0]] or "") != (r[1] or "")]
-    # A topic that differs changed after the last reconcile (else the dump
-    # would hold it), whatever its backdated updated_at says.
-    floor = _utc(reconciled_at)
+    # A topic that differs changed after the dump (else the dump would hold
+    # it), whatever its backdated updated_at says; the dump's time is the
+    # hub's own.
+    floor = _utc(hub_dump)
     stamps = []
     for r in differing:
         when = _utc(r[2])
@@ -2014,38 +2029,53 @@ def _vec_bucket(kind: Any, ref: Any) -> str:
     return hashlib.md5(f"{kind}\t{ref}".encode("utf-8")).hexdigest()[:_VEC_BUCKET_HEX]
 
 
-def _vec_manifest_digests(rows: Sequence[tuple[Any, Any, Any, Any]]) -> dict[str, str]:
-    """``(kind, ref, chunk_idx, content_hash)`` rows as one md5 per bucket,
-    the same text the hub builds with ``string_agg`` in ``_lag_vectors``
-    (byte order, as ``COLLATE "C"`` sorts)."""
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _vec_built_key(val: Any) -> str:
+    """A build time as the vector digest spells it on both sides: whole
+    microseconds since the epoch, or empty when there is none."""
+    from datetime import timedelta
+
+    when = _utc(val)
+    return "" if when is None else str((when - _EPOCH) // timedelta(microseconds=1))
+
+
+def _vec_manifest_digests(rows: Sequence[tuple[Any, Any, Any, Any, Any]]) -> dict[str, str]:
+    """``(kind, ref, chunk_idx, content_hash, built_at)`` rows as one md5 per
+    bucket, the same text the hub builds with ``string_agg`` in
+    ``_lag_vectors`` (byte order, as ``COLLATE "C"`` sorts)."""
     import hashlib
 
-    by_bucket: dict[str, list[tuple[str, str, int, str]]] = {}
-    for kind, ref, idx, chash in rows:
-        by_bucket.setdefault(_vec_bucket(kind, ref), []).append((str(kind), str(ref), int(idx), chash or ""))
+    by_bucket: dict[str, list[tuple[str, str, int, str, str]]] = {}
+    for kind, ref, idx, chash, built in rows:
+        by_bucket.setdefault(_vec_bucket(kind, ref), []).append(
+            (str(kind), str(ref), int(idx), chash or "", _vec_built_key(built)))
     return {
-        b: hashlib.md5("\n".join(f"{k}\t{r}\t{i}\t{h}" for k, r, i, h in sorted(items)).encode("utf-8")).hexdigest()
+        b: hashlib.md5("\n".join(f"{k}\t{r}\t{i}\t{h}\t{t}" for k, r, i, h, t in sorted(items))
+                       .encode("utf-8")).hexdigest()
         for b, items in by_bucket.items()
     }
 
 
-def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str, Any]:
-    """Vectors of the active profile, reconciled chunk by chunk.
+def _lag_vectors(cur, con, hub_dump, hub_now, limit, pending: set[int]) -> dict[str, Any]:
+    """Vectors of the active profile, reconciled chunk by chunk, with no
+    cutoff.
 
-    Structure: every live ``(kind, ref, chunk_idx, content_hash)`` on both
-    sides, compared by bucket digest and then chunk by chunk in the buckets
-    that differ, so a chunk the replica lacks, holds with other text, or
-    holds after the hub pruned or deleted it is seen whatever its age.
-    Version: every hub chunk built since the dump against the replica's
-    ``built_at`` for it. Every replica writer copies the hub's own
-    ``built_at`` (the dump reads it, a catch-up gets it back from the write),
-    so the two are one generation only when equal; any other value, earlier
-    or later, is another build. One with no ``built_at`` cannot be told
-    apart, so it is counted ``unverified`` and the state is unknown.
+    Every live ``(kind, ref, chunk_idx, content_hash, built_at)`` on both
+    sides is compared by bucket digest, then chunk by chunk in the buckets
+    that differ. The build time is the generation: every replica writer
+    copies the hub's own ``built_at`` (the dump reads it, a catch-up gets it
+    back from the write), so a chunk the replica lacks, holds with other
+    text, holds from another build, or holds after the hub pruned or deleted
+    it is seen whatever its age. A replica chunk with the hub's text and no
+    build time cannot be told apart, so it is counted ``unverified`` and the
+    state is unknown.
 
     Bucket reads are paged and stop at ``limit`` rows, marking the result
     truncated. A replica chunk is judged deleted on the hub only in a bucket
-    read to its end."""
+    read to its end, and dated from ``hub_dump`` (the hub's clock), as is
+    any change older than the dump."""
     prof_cols = _pg_columns(cur, "embedding_profiles")
     if not {"id", "is_active"} <= prof_cols:
         return {"lag_seconds": None, "not_applicable": "hub has no embedding profiles"}
@@ -2075,21 +2105,28 @@ def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str
             replica[(str(kind), str(ref), int(idx))] = (chash or "", built)
 
     key_text = "kind || E'\\t' || ref"
+    built_text = "COALESCE(floor(extract(epoch FROM built_at) * 1000000)::bigint::text, '')"
     cur.execute(
         f"SELECT substr(md5({key_text}), 1, {_VEC_BUCKET_HEX}) AS bucket, "
-        f"md5(string_agg({key_text} || E'\\t' || chunk_idx::text || E'\\t' || COALESCE(content_hash, ''), "
+        f"md5(string_agg({key_text} || E'\\t' || chunk_idx::text || E'\\t' || COALESCE(content_hash, '') "
+        f"|| E'\\t' || {built_text}, "
         "E'\\n' ORDER BY kind COLLATE \"C\", ref COLLATE \"C\", chunk_idx)) "
         f"FROM memory_embeddings WHERE profile = %s{gone} GROUP BY 1",
         (profile,),
     )
     hub_digests = {str(b): d for b, d in cur.fetchall()}
-    rep_digests = _vec_manifest_digests([(k, r, i, v[0]) for (k, r, i), v in replica.items()])
+    rep_digests = _vec_manifest_digests([(k, r, i, v[0], v[1]) for (k, r, i), v in replica.items()])
     rep_by_bucket: dict[str, list[tuple[str, str, int]]] = {}
     for key in replica:
         rep_by_bucket.setdefault(_vec_bucket(key[0], key[1]), []).append(key)
     differing = sorted(b for b in set(hub_digests) | set(rep_digests) if hub_digests.get(b) != rep_digests.get(b))
+    differing_set = set(differing)
+    # Where the digests agree both sides hold the same build times, so a
+    # missing one is missing on both: still no evidence of the generation.
+    unverified = sum(1 for key, (_h, built) in replica.items()
+                     if _utc(built) is None and _vec_bucket(key[0], key[1]) not in differing_set)
 
-    floor = _utc(meta().get("refreshed_at"))
+    floor = _utc(hub_dump)
     stale: dict[tuple[str, str, int], Any] = {}
     checked = 0
     truncated = False
@@ -2101,6 +2138,10 @@ def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str
         "WHERE (bucket, kind, ref, chunk_idx) > (%s, %s, %s, %s) "
         "ORDER BY bucket, kind, ref, chunk_idx LIMIT %s"
     )
+
+    def since_dump(when: datetime | None) -> datetime | None:
+        return max(when, floor) if when is not None and floor is not None else (floor or when)
+
     for start in range(0, len(differing), _VEC_BUCKET_BATCH):
         batch = differing[start:start + _VEC_BUCKET_BATCH]
         after: tuple[Any, ...] = ("", "", "", -1)
@@ -2127,9 +2168,15 @@ def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str
                 key = (str(kind), str(ref), int(idx))
                 hub_keys.add(key)
                 mine = replica.get(key)
+                hub_built = _utc(built)
                 if mine is None or mine[0] != (chash or ""):
-                    when = _utc(built)
-                    stale[key] = max(when, floor) if when is not None and floor is not None else (floor or when)
+                    stale[key] = since_dump(hub_built)
+                    continue
+                held = _utc(mine[1])
+                if held is None or hub_built is None:
+                    unverified += 1
+                elif held != hub_built:
+                    stale[key] = since_dump(hub_built)
             if not more:
                 break
             after = tuple(rows[-1][:4])
@@ -2142,30 +2189,8 @@ def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str
             truncated = True
             break
 
-    cur.execute(
-        "SELECT kind, ref, chunk_idx, content_hash, built_at FROM memory_embeddings "
-        f"WHERE profile = %s AND built_at > %s{gone} ORDER BY built_at, kind, ref, chunk_idx LIMIT %s",
-        (profile, since, limit),
-    )
-    recent = cur.fetchall()
-    truncated = truncated or len(recent) >= limit
-    unverified = 0
-    for kind, ref, idx, chash, built in recent:
-        key = (str(kind), str(ref), int(idx))
-        if skip(kind, ref) or key in stale:
-            continue
-        mine = replica.get(key)
-        if mine is None or mine[0] != (chash or ""):
-            # Outside the buckets compared (a truncated pass): judged here.
-            stale[key] = built
-            continue
-        held, hub_built = _utc(mine[1]), _utc(built)
-        if held is None or hub_built is None:
-            unverified += 1
-        elif held != hub_built:
-            stale[key] = built
     out = {"lag_seconds": _lag_from(hub_now, list(stale.values())), "missing": len(stale), "profile": profile,
-           "checked": checked + len(recent), "buckets_differing": len(differing), "truncated": truncated}
+           "checked": checked, "buckets_differing": len(differing), "truncated": truncated}
     if unverified:
         out["unverified"] = unverified
     return out
@@ -2180,26 +2205,27 @@ def measure_lag(cur, *, limit: int = FRESHNESS_PROBE_LIMIT) -> dict[str, Any]:
     path = snapshot_path()
     if not path.is_file():
         return {"measured": False, "reason": "replica missing"}
-    refreshed = _utc(meta().get("refreshed_at"))
-    if refreshed is None:
+    m = meta()
+    if _utc(m.get("refreshed_at")) is None:
         return {"measured": False, "reason": "no full dump on record"}
+    hub_dump = _utc(m.get("hub_dumped_at"))
+    if hub_dump is None:
+        return {"measured": False, "reason": "no hub dump time on record"}
     from datetime import timedelta
 
-    since = refreshed - timedelta(seconds=FRESHNESS_OVERLAP_S)
+    since = hub_dump - timedelta(seconds=FRESHNESS_OVERLAP_S)
     cur.execute("SELECT now()")
     hub_now = _utc(cur.fetchone()[0]) or datetime.now(timezone.utc)
     pending = _pending_erasure_ids(path)
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        cursors = _read_cursors(con)
-        reconciled = (cursors.get("topics") or {}).get("reconciled_at") or refreshed.isoformat()
         probes = {
             "episodes": lambda: _lag_episodes(cur, con, since, hub_now, limit),
             "tombstones": lambda: _lag_tombstones(cur, con, since, hub_now, limit, pending),
-            "topics": lambda: _lag_topics(cur, con, hub_now, reconciled),
+            "topics": lambda: _lag_topics(cur, con, hub_now, hub_dump),
             "decisions": lambda: _lag_decisions(cur, con, since, hub_now, limit),
             "deliverables": lambda: _lag_deliverables(cur, con, since, hub_now, limit),
-            "vectors": lambda: _lag_vectors(cur, con, since, hub_now, limit, pending),
+            "vectors": lambda: _lag_vectors(cur, con, hub_dump, hub_now, limit, pending),
         }
         tables: dict[str, dict[str, Any]] = {}
         failed: str | None = None
@@ -2356,6 +2382,7 @@ def snapshot_freshness(
         out["behind_ingest_seconds"] = ep if isinstance(ep, (int, float)) else None
         _write_last_known({
             "measured_at": lag.get("measured_at"),
+            "checked_at": _utcnow_iso(),
             "refreshed_at": health.get("refreshed_at"),
             "state": state,
             "lag_seconds": worst,
@@ -3430,9 +3457,10 @@ def _recent_measurement(health: Mapping[str, Any]) -> dict[str, Any] | None:
     last = _read_last_known()
     if not last or last.get("refreshed_at") != health.get("refreshed_at"):
         return None
-    measured = _utc(last.get("measured_at"))
-    # measured_at is the hub's clock: allow it a few minutes ahead of this Mac's.
-    if measured is None or not -300 <= (datetime.now(timezone.utc) - measured).total_seconds() <= LAST_KNOWN_TRUST_S:
+    # checked_at is this Mac's clock, compared only with this Mac's clock;
+    # measured_at is the hub's and never is.
+    checked = _utc(last.get("checked_at"))
+    if checked is None or not 0 <= (datetime.now(timezone.utc) - checked).total_seconds() <= LAST_KNOWN_TRUST_S:
         return None
     return last
 
