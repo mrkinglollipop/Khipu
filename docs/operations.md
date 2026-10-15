@@ -10,7 +10,7 @@ Khipu runs its upkeep as macOS LaunchAgents. A fresh install (the Database step,
 
 | Job | When | What it does |
 |---|---|---|
-| `nightly` | Daily at 02:05 | Memory upkeep: consolidation, embedding catch-up, commitment hygiene, replica refresh |
+| `nightly` | Daily at 02:05 | Memory upkeep: capture-queue drain, consolidation, notes reconcile, embedding catch-up, query-cache prune, commitment hygiene, offline-copy refresh, and topic briefs when that switch is on |
 | `graph_build` | Daily at 02:17 | Builds the graph |
 | `monthly` | 1st of the month, 09:00 | Monthly organisation pass |
 | `notes_watch` | When watched note files change (30 s throttle) | Syncs edited notes |
@@ -20,14 +20,12 @@ A sixth job, `recall_daemon`, is opt-in: `khipu jobs install recall_daemon`. It 
 
 ```bash
 khipu jobs status                      # what is installed and loaded
-khipu jobs install [NAME ...]          # render and load (default: all five)
-khipu jobs refresh [NAME ...]          # re-render jobs whose plist is stale
-khipu jobs uninstall [NAME ...]
+khipu jobs install [NAME ...]          # render and load (default: the five above)
+khipu jobs refresh [NAME ...]          # re-render installed jobs whose plist is stale
+khipu jobs uninstall [NAME ...]        # default: all six, recall_daemon included
 ```
 
 The desktop app lists the jobs under Settings, Advanced.
-
-Do not start the nightly by hand in the middle of the day. It can race with live captures.
 
 ## Doctor
 
@@ -40,26 +38,26 @@ khipu doctor --probe    # also runs a fresh end-to-end recall probe (writes, the
 khipu doctor --sample N # cap the topic drift pass
 ```
 
-`ok` is the AND of many checks, not just the nine most people look at. Every one is printed as a `*_ok` key. Checks that do not apply on this machine are listed under `not_configured`. That is not red.
+`ok` is the AND of many checks. Each is printed as a `*_ok` key. Checks that do not apply on this machine are listed under `not_configured`. That is not red.
 
 The main ones:
 
 | Check | Red when |
 |---|---|
 | `hub_ok` | The database is unreachable |
-| `drift_ok` | A file episode has no row in PostgreSQL |
+| `drift_ok` | A file episode has no row in PostgreSQL, a topic file and its row disagree, or a topic file could not be read |
 | `graph_drift_ok` | Graph nodes and edges disagree with their source |
 | `outbox_ok` | Any write is pending, any write is dead-lettered, or the oldest pending one has waited over an hour |
 | `capture_liveness_ok` | A harness's hook is erroring, its drain is failing or stuck, a queued job has waited too long, or the hook sees turns but never decides a capture is due |
 | `git_sync_ok` | The memory repo's auto-sync failed, was blocked, was left mid-flow (off `main`, or on a leftover autosync branch), or has not run since the last nightly. Judged only on the Mac that runs the sync |
-| `dsn_file_ok` | The on-disk connection string names a certificate file that does not exist |
+| `dsn_file_ok` | The on-disk connection string cannot be read, names a certificate file that does not exist, or asks for certificate verification without naming one |
 | `backup_ok` | See [Backups](#backups-and-restore) |
 | `graph_backup_ok`, `graph_offsite_ok` | See [Graph backup](#graph-backup) |
 | `hub_snapshot_ok` | The offline copy is stale. See [Snapshots](#snapshots-the-offline-copy) |
 | `jobs_ok` | An expected background job is missing or not loaded |
 | `embed_coverage_ok`, `synth_budget_ok`, `synth_provider_ok` | Embeddings, the daily call ceiling or the summariser setup need attention |
 | `recall_probe_ok`, `recall_daemon_ok`, `prompt_recall_*_ok` | Recall is slow, failing or degraded |
-| `bundle_seal_ok`, `launchers_ok` | The app bundle or a launcher does not match what is installed |
+| `bundle_seal_ok`, `launchers_ok` | The running app bundle gained a file after it was signed, or an agent's config points at a launcher that is missing or not a link |
 
 Plan usage and routing appear in the output as warnings. They never turn `ok` red. See [routing.md](routing.md).
 
@@ -71,7 +69,7 @@ Related commands:
 - `khipu reconcile` syncs files into PostgreSQL. It is safe to run again.
 - `khipu outbox status|drain|retry-dead` handles the offline write queue.
 - `khipu sessions status|liveness|drain|sweep` handles the capture queue.
-- `khipu revisions` shows conflicting topic edits (the older version is kept).
+- `khipu revisions` shows topic revisions, including edits that lost a last-write-wins conflict.
 
 ## The two queues
 
@@ -88,11 +86,11 @@ The gateway is an HTTPS MCP server for agents that cannot reach your database or
 
 What it is:
 
-- A small Python server (standard library `ThreadingHTTPServer`). MCP Streamable HTTP is `POST /mcp`. `GET /healthz` is unauthenticated and answers only `{"ok": true}`.
+- A small Python server (standard library `ThreadingHTTPServer`). MCP Streamable HTTP is `POST /mcp`. `GET /healthz` is unauthenticated and answers only `{"ok": true}` to the public. Callers on loopback and bearer-token holders also get the server version and build stamp.
 - It binds `127.0.0.1:8787` by default (`KHIPU_GATEWAY_BIND` or `--bind`). Put a TLS-terminating reverse proxy (Caddy or nginx, with a real certificate) in front of it.
 - It refuses to start unless `KHIPU_GATEWAY_TOKEN` is set and at least 24 characters. Extra labelled tokens: `KHIPU_GATEWAY_TOKENS=label:token,...`.
 - Limits: 1 MiB request body, 120 requests a minute per IP, 240 a minute per token, 10 failed auths a minute, 32 calls per JSON-RPC batch (`KHIPU_GATEWAY_MAX_BATCH`). Browser requests with an `Origin` are refused unless listed in `KHIPU_GATEWAY_ALLOWED_ORIGINS`.
-- It serves the same tools as the local MCP server, with exceptions: `khipu_usage` and `khipu_route` answer `available: false` through it, and `khipu_forget` only forgets episodes captured by cloud harnesses. Capture is accepted only in `hub` mode. See [mcp-tools.md](mcp-tools.md).
+- It serves the same tools as the local MCP server, with exceptions: `khipu_usage` and the routing tools (`khipu_route`, `khipu_route_report`, `khipu_route_rule`, `khipu_route_priority`) answer `available: false` through it, and `khipu_forget` only forgets episodes captured by cloud harnesses. Capture is accepted only in `hub` mode. See [mcp-tools.md](mcp-tools.md).
 - For library search the gateway host also needs the embedding key of every enabled library profile. A missing key drops that library's meaning leg and reports `degraded_legs`. It does not fail the search.
 
 The database is never exposed. The gateway is the only door.
@@ -129,9 +127,9 @@ For Aegis, run `khipu gateway token set` once to stage the token (it reads stdin
 `backup_ok` in doctor is red unless both of these hold:
 
 1. A successful `walg_basebackup` or `pg_dump` event was recorded in the last 36 hours.
-2. A `restore_drill` event with status ok exists.
+2. The latest `restore_drill` event has status ok.
 
-It is also red if the events table is missing or cannot be read. On a local Docker Postgres only `pg_dump` counts.
+It is also red if the events table is missing or cannot be read. On a local Docker Postgres the check looks at `pg_dump` events first.
 
 What the repo does and does not do:
 
@@ -168,9 +166,9 @@ khipu graph-backup drill          # restore into scratch; never touches the live
 ```
 
 - `graph_backup_ok` is red when the latest local snapshot is missing, empty or older than 36 hours.
-- `graph_offsite_ok` is red when no `r2:` rclone remote is configured, no successful offsite copy is recorded, or the last copy is more than 8 days old. The graph job schedules the offsite copy when it is due (every 7 days) and a drill every 8 days.
+- `graph_offsite_ok` is red when no `r2:` rclone remote is configured, no successful offsite copy is recorded, or the last copy is more than 8 days old. The graph job runs the offsite copy when it is due (every 7 days), and recording a local snapshot on the producer starts a drill when the last good one is more than 8 days old.
 
-You need an rclone remote named `r2` for the offsite part.
+You need `rclone` installed and a remote named `r2` for the offsite part.
 
 ## Snapshots, the offline copy
 
@@ -218,12 +216,12 @@ A second Mac uses the same database. You give it a join kit.
 
 On the working Mac:
 
-- App: Settings, Another Mac, "Set up another Mac", then "Save join kit...". It is disabled if the database lives only on this Mac (this-mac or local Docker), because another Mac could not reach it.
+- App: Settings, Another Mac, "Set up another Mac", then "Save join kit…". It is disabled if the database lives only on this Mac (this-mac or local Docker), because another Mac could not reach it.
 - CLI: `khipu join export --out FILE.khipujoin [--passphrase ...]`.
 
 On the new Mac:
 
-- App: Welcome, Database, "Join a Khipu I already have", then "Import join kit file...". "Find nearby Mac" uses the PIN path.
+- App: Welcome, Database, "Join a Khipu I already have", then "Import join kit file…". "Find nearby Mac" uses the PIN path.
 - CLI: `khipu join import --file FILE.khipujoin [--passphrase ...]`.
 
 Nearby pairing without a file: on the working Mac `khipu join advertise [--pin ...]` (Bonjour on the local network, TLS, 10 minutes by default); on the new Mac `khipu join receive --pin PIN`.
@@ -237,7 +235,7 @@ Notes:
 
 ## Moving the database
 
-App: Settings, Database, "Move this memory to another database...". CLI:
+App: Settings, Database, "Move this memory to another database…". CLI:
 
 ```bash
 khipu db move --dry-run --to 'postgresql://...'   # check the target, change nothing

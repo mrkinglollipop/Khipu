@@ -10,7 +10,7 @@ The left rail has six destinations:
 - **Recall**: a Search | Graph switch. Search modes are Best match (hybrid, the default), By meaning and Exact words. Graph walks what a topic or node connects to.
 - **Owed**: commitments by project, filtered Open, Closed or Stale, with snooze.
 - **Activity**: every capture, newest first. Open one to read, correct or forget it.
-- **Harnesses**: which agents are wired in and whether each is recording. Install, verify and remove per harness (Claude Code, Cursor, Aegis, Codex). Grok Bot runs in the cloud, so it has nothing local to install; its Verify probes the gateway.
+- **Harnesses**: which agents are wired in and whether each is recording. Install, verify and remove per harness (Claude Code, Cursor, Aegis, Codex). Grok Bot runs in the cloud, so it has nothing local to install; its button is Probe gateway.
 - **Settings**: ten sections, in this order: Database, Capture & models, Routing, Optional features, Embeddings, Data & backups, Another Mac, Components, Updates, Advanced.
 
 Two more views are not in the rail. The Welcome flow (six steps: Welcome, Database, Model, Graph, Agents, Finish) runs on first launch and again from Settings > Advanced > Run setup again. Conflicting edits is reached from Home or Settings > Advanced.
@@ -21,13 +21,7 @@ Download the latest Apple silicon DMG (`Khipu_<version>_aarch64.dmg`) from the [
 
 The app bundle carries the CLI and Python under `Contents/Resources/khipu`. You do not need a git clone or the `KHIPU_ROOT` environment variable. (`KHIPU_ROOT`, if set, overrides where the app looks for the CLI. Debug builds fall back to the source checkout.)
 
-**Gatekeeper and notarization**
-
-| Build | What you get |
-|---|---|
-| Notarized | Developer ID signed, Apple notarized and stapled. Opens normally. |
-| Developer ID, not notarized | Signed, no staple. If macOS blocks it, right-click **Khipu.app** and choose **Open** once. |
-| Ad-hoc or unsigned | Local dev builds only. Not for distribution. |
+**Gatekeeper.** Release builds are Developer ID signed, notarized and stapled, and open normally. If macOS blocks an older, non-notarized release, right-click **Khipu.app**, choose **Open**, and confirm once. Local development builds are not for distribution.
 
 ## Updates
 
@@ -61,7 +55,7 @@ export APPLE_API_ISSUER='ISSUER-UUID'
 ./scripts/release_macos.sh
 ```
 
-The script runs `scripts/bundle_cli.sh`, builds with Tauri, signs, notarizes with `notarytool` and staples. Without notarization credentials it prints a "Blocked" message naming the variables to set and exits nonzero. It does not publish silently.
+The script runs `scripts/bundle_cli.sh`, builds with Tauri, signs, notarizes with `notarytool` and staples. The updater signing key is read from `TAURI_SIGNING_PRIVATE_KEY_PATH` (default `~/.tauri/khipu.key`). Without notarization credentials it prints a "Blocked" message naming the variables to set and exits nonzero. It does not publish silently.
 
 Output:
 
@@ -72,7 +66,7 @@ Flags:
 
 ```bash
 ./scripts/release_macos.sh --install    # copy the build to /Applications/Khipu.app
-./scripts/release_macos.sh --publish    # create the GitHub release and verify the website
+./scripts/release_macos.sh --publish    # create the GitHub release and check the updater feed
 ```
 
 `--publish` needs:
@@ -81,7 +75,7 @@ Flags:
 - A public release repo (`KHIPU_RELEASE_REPO`, which defaults to origin). The updater fetches without authentication, so the script refuses a private repo.
 - A stapled DMG (`xcrun stapler validate`).
 
-It uploads the versioned DMG, a stable `Khipu_aarch64.dmg`, the updater tarball, its `.sig` and `latest.json`, then checks the fetched `latest.json`. It then syncs the project website and runs `scripts/verify_khipu_website.py`, which must see the new version. Set `KHIPU_SKIP_SITE=1` to skip the website step.
+It uploads the versioned DMG, a stable `Khipu_aarch64.dmg`, the updater tarball, its `.sig` and `latest.json`, then fetches the served `latest.json` and checks that it names the new version and asset. It refuses if a release for that version already exists, so bump the version first.
 
 ## Development
 

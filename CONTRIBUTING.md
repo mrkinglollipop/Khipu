@@ -28,8 +28,9 @@ employer holds rights to work you do, get their permission first.
 
 ### Contributor Licence Agreement
 
-Contributions beyond a trivial fix require a signed
-[Contributor Licence Agreement](CLA.md).
+Contributions require a signed
+[Contributor Licence Agreement](CLA.md). To sign, add your name to the table in
+`CLA.md` in your first pull request, or in one before it.
 
 This one matters here. AGPL-3.0 alone would leave every contributor holding veto
 power over any future licence change, because the maintainer cannot relicense
@@ -74,8 +75,8 @@ python3.11 -m pip install pytest ruff
 (`.python_libs` is gitignored. If you install the requirements somewhere else,
 point `PYTHONPATH` at that place in the next step.)
 
-**Run the checks.** Run these from the repo root. All of them must pass for the
-parts you changed:
+**Run the checks.** Each block starts from the repo root. All of them must pass
+for the parts you changed:
 
 ```bash
 cd packages/cli
@@ -94,6 +95,8 @@ cd apps/desktop && npm install && npm run check:setup
 ```bash
 ruff check packages/cli
 ```
+
+(The `ruff` block is the only one that does not change directory first.)
 
 The pytest command is the test oracle. Run it from `packages/cli`, under a
 temporary `HOME`, with `KHIPU_KEYCHAIN=0`. Read its exit code. Run the `cargo`

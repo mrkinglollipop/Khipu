@@ -9,7 +9,7 @@ These files pin the shape of Khipu's public payloads. Anything that reads Khipu 
 | `khipu_search.result.json` | The result of `khipu_search`, with an episode hit and a topic hit. |
 | `khipu_get.episode.json` | The result of `khipu_get` for an episode. |
 | `khipu_owed.result.json` | The result of `khipu_owed` (open commitments). |
-| `khipu_status.light.json` | The light `khipu_status` payload returned when a prompt is passed and `full` is not set. |
+| `khipu_status.light.json` | The light `khipu_status` payload returned when a prompt is passed and `full` is not set. The test checks three variants of `prior_work`: items, an empty array and null. |
 | `khipu_status.full.keys.json` | The full `khipu_status` payload, as a list of key names only. No values or types. |
 | `prompt_block.txt` | The rendered "Prior work on this topic" block the prompt hook pushes into context when recall finds matches. This is text, not JSON. |
 
@@ -26,7 +26,7 @@ For the JSON fixtures, the live payload must be a structural superset of the fix
 - `prior_work` keeps its distinction between an array, an empty array and null.
 - For `khipu_status.full.keys.json`, only the key names are checked.
 
-For `prompt_block.txt`, the rule is stricter. The rendered block must match the fixture text exactly, keep its heading and footer, and stay within the 600-character budget. Changing the wording of the fixed block fails the test.
+For `prompt_block.txt`, the rule is stricter. The test renders the block from three fixed invented hits. The result must match the fixture text exactly, keep its heading and footer, and stay within the 600-character budget. Changing the wording of the fixed block fails the test.
 
 ## Changing a payload
 

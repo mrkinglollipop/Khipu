@@ -57,7 +57,7 @@ The first time Khipu sees a transcript it starts a clock and reads from near the
 
 ### The queue and the drainer
 
-The hook inside the session only writes a job file. It calls no model and no database. A detached drainer then picks up the jobs, runs the summariser, writes to PostgreSQL, mirrors, replays the outbox and catches up embeddings. Up to four summarisers run at once.
+The hook inside the session only writes a job file. It calls no model and no database. A detached drainer then picks up the jobs, runs the summariser, writes to PostgreSQL, mirrors, replays the outbox and catches up embeddings. Up to four drainers run at once by default.
 
 A queue-drain job also runs every five minutes, so a job whose drainer was interrupted still finishes.
 
@@ -65,7 +65,7 @@ A queue-drain job also runs every five minutes, so a job whose drainer was inter
 
 Each summariser call carries at most 14,000 characters. A longer window is split on message boundaries into several parts. Each part is its own job, its own summariser call and its own episode. Nothing is dropped by default. An owner can opt in to keeping only the newest parts with `KHIPU_CAPTURE_MAX_PARTS`.
 
-Spend is bounded by a daily call ceiling per provider. The ceiling delays work. It does not drop captures. See `khipu budget status` and `khipu budget lift` (the ceiling can always be lifted).
+Spend is bounded by daily call ceilings, one each for summariser calls, memory embedding and library embedding. A ceiling delays work. It does not drop captures. See `khipu budget status` and `khipu budget lift` (the ceiling can always be lifted).
 
 ### Which model summarises
 
@@ -94,13 +94,13 @@ Every hook run stamps a heartbeat per harness. This lets Khipu tell "the hook is
 
 ### Capture identity
 
-Each episode can now record where it came from. Migration `0027_episode_sources.sql` adds an `episode_sources` table. A `source_key` is a hash of the harness, session, transcript range, window and part. When no natural key exists, a hash of the payload is used instead.
+Each episode can now record where it came from. Migration `0027_episode_sources.sql` adds an `episode_sources` table. A `source_key` is a hash of the harness, session, transcript range, window and part. When the session or transcript range is missing, a hash of the payload is used instead. Each row is an `origin` row (the capture that created the episode) or a `merged` row (a capture folded into it).
 
-Writers fill this table as they go (a fail-open dual write). Nothing reads it yet, and uniqueness is still `(ts, md5(summary))`. Moving readers and uniqueness onto `source_key` is planned.
+The migration backfills one row per existing episode. New captures and merges add rows as they go (a fail-open dual write). Nothing in the capture path reads the table yet, and uniqueness is still `(ts, md5(summary))`. Moving readers and uniqueness onto `source_key` is planned.
 
 ### Merging near-duplicates
 
-If a new capture closely matches an episode from the last five minutes, it merges into the earlier one. The match uses cosine similarity or a word-overlap fallback (setting `dedup_similarity`). The merged episode keeps receipts in its raw metadata, and the source rows are recorded in `episode_sources`.
+If a new capture closely matches an episode within five minutes of it, it merges into the earlier one. An identical window is skipped outright. Otherwise the match uses cosine similarity (setting `dedup_similarity`, default 0.92) or, as a fallback, word overlap. The merged episode keeps receipts in its raw metadata, and the source rows are recorded in `episode_sources`.
 
 ## 2. Storage: what gets written
 
@@ -172,7 +172,7 @@ Two shapes carry most of the memory:
 
 Topics carry a `content_hash` and a revision trail because they change constantly.
 
-The **graph** (`nodes` and `edges`) sits alongside as a PostgreSQL 19 SQL/PGQ property graph named `alzy_graph`. One-hop walks use native `MATCH`. Deeper walks use a recursive query in the CLI.
+The **graph** (`nodes` and `edges`) sits alongside as a PostgreSQL 19 SQL/PGQ property graph named `alzy_graph`. A one-hop walk reads the direct edges and adds a best-effort SQL/PGQ `GRAPH_TABLE` sample. Deeper walks use a recursive query.
 
 ### Other record types
 
@@ -204,9 +204,9 @@ Topics and episodes are never silently dropped. Both carry a `deleted_at` column
 
 Hooks put prior work in front of the agent before it acts.
 
-- **Session start** (Claude Code, Codex, Cursor): the recall rule plus a slice scoped to the current project (open commitments, recent episodes, linked topics), plus the routing summary. See [routing.md](routing.md).
+- **Session start** (Claude Code, Codex, Cursor): the recall rule plus a slice scoped to the current project (open commitments, recent episodes, linked topics), plus, when the `routing_push` switch is on (it is off by default), the routing summary. See [routing.md](routing.md). The slice also lists standing decisions from the last 14 days.
 - **Every prompt** (Claude Code and Codex): a bounded search on the prompt itself. It pushes at most three hits under a "Prior work on this topic" heading, capped at 600 characters. It has a 1.2 second budget, skips trivial prompts, skips hits already shown in the last three prompts, and never calls a model. It reads the local replica first and does not search libraries. If anything fails it returns nothing.
-- **Aegis** gets no push. Its hooks discard output. Aegis agents pull with `khipu_status` and `khipu_owed`.
+- **Aegis** gets no push. Its hooks run as observers and their output is discarded. Aegis agents pull with `khipu_status` and `khipu_owed`.
 - **Cursor** gets the session-start push and a project rule file, but no per-prompt hook.
 
 A warm local recall service (`khipu recall serve`) answers the per-prompt hook over a socket so each prompt skips a cold Python start. It is an optional launch job. Without it the hook uses a one-shot path.
@@ -247,7 +247,7 @@ Search returns short teasers. `khipu get` and `khipu_get` load the whole record:
 - Media: path, hash and type.
 - A library chunk, with its neighbouring chunks.
 
-Every frame Khipu writes on these paths is strict UTF-8 JSON, so odd characters in a note cannot break a reader.
+Every frame Khipu writes on these paths is strict UTF-8 JSON. U+2028 and U+2029 are escaped so line-based readers cannot cut a frame in two. In the other direction, Khipu splits its JSON Lines files and logs on LF only, so those characters inside a note cannot break one record into two.
 
 ### The offline replica
 
@@ -259,7 +259,7 @@ How it stays fresh:
 2. Between rebuilds, capture, edits, decisions and forget update it as they happen.
 3. `doctor` and `status` report freshness per table as fresh, behind, stale or unknown. Only stale turns `doctor` red. A stale result carries a `stale: true` flag.
 
-A bounded `khipu snapshot sync`, a write-ahead-log mode and a decision cursor are planned.
+A scheduled incremental sync is planned.
 
 ## 4. What Khipu tracks beyond episodes
 
@@ -273,11 +273,11 @@ Use `khipu owed` (list, `--close`, `--reopen`, `--snooze`), the Owed screen, or 
 
 Decisions are a registry with a lifecycle: supersede, restore, retract. Possible links between decisions wait as candidates until you confirm or reject them. Each decision keeps its evidence and reasons.
 
-One validity module gives each result a state: current, mixed, superseded, retracted or unknown. Topics marked superseded, retired or abandoned rank lower. They are not excluded. Use `khipu decisions` or the `khipu_decisions` tools. Automatic supersession and validity ranking are feature switches and default off.
+One validity module gives each result a state: current, mixed, superseded, retracted or unknown. Topics marked superseded, retired or abandoned rank lower. They are not excluded. Use `khipu decisions` or the `khipu_decisions` tools. Automatic supersession (`auto_supersede`) and validity ranking (`validity_ranking`) are feature switches and default off.
 
 ### Briefs
 
-A brief is a source-backed summary of a topic. Every claim cites episode ids. A claim that cites an episode that was not offered is dropped. A failed build never replaces the current brief. A brief goes stale when its sources change or a cited episode is forgotten.
+A brief is a source-backed summary of a topic. Every claim cites episode ids. Citations to episodes that were not offered are removed, and a claim left with no valid citation is dropped. A failed build never replaces the current brief. A brief goes stale when its sources change or a cited episode is forgotten.
 
 Briefs are off by default. Turn on the `briefs` switch, then use `khipu briefs plan|build|show` or `khipu_brief`.
 
@@ -344,13 +344,13 @@ flowchart LR
   class PG,GW d
 ```
 
-Five integration packs exist:
+Five integration packs exist (`claude_code`, `cursor`, `codex`, `aegis`, `grok_bot`):
 
 - **Claude Code, Cursor and Codex** run on your Mac and reach PostgreSQL directly over your private network. They need no gateway.
 - **Aegis** runs in a sandbox that cannot reach the database or the Keychain. Its hook only queues. A drain outside the sandbox does the summarising and the write. Aegis reads memory through the gateway.
 - **Grok Bot** runs on a cloud VM with no filesystem. It reaches Khipu only through the gateway.
 
-Claude accounts run inside T3 Code are wired by the Claude Code install, one set of hooks per Claude home. Search can filter by T3 thread. Stock Grok Build has no pack yet. It is planned.
+Claude accounts run inside T3 Code are wired by the Claude Code install, one set of hooks per Claude home. Search can filter by T3 thread. Stock Grok Build has no pack of its own.
 
 The database is never exposed publicly. The gateway is the only door, and it enforces a bearer token, a request body cap, rate limits per address and per token, an auth-failure throttle, a JSON-RPC batch cap, and refusal of browser origins unless allowed. Over the gateway, `khipu_capture` writes immediately (there is no hook), and usage and routing answer "not available".
 

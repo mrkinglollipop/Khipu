@@ -77,7 +77,9 @@ Hub status: table counts, latest episode time, mirror lag and recent captures. R
 | `budget_ms` | Time budget for the prior-work lookup. Default 600. |
 | `full` | With `prompt`, return the complete payload instead of the light one. |
 
-With `prompt` and no `full`, the answer is `{hub_ok, prior_work, prior_work_text, prior_work_meta, notes_freshness, contract, routing}`. `prior_work` holds up to three items and `prior_work_text` is a short Markdown block. This is the pull path for harnesses that get no pushed recall, such as Aegis and the gateway.
+With `prompt` and no `full`, the answer is `{hub_ok, prior_work, prior_work_text, prior_work_meta, notes_freshness, contract, routing}`. `prior_work` holds up to three items and `prior_work_text` is a short Markdown block. Without `prompt` (or with `full`), the answer is the complete payload: counts, recent captures, replica freshness (`hub_snapshot`, `snapshot_age_seconds`, `snapshot_state`), `pending_turns`, the capability `contract`, and `warnings` for plans nearly used up (read from the usage cache only). If the hub cannot be reached, the answer falls back to the local replica and carries `hub_error`.
+
+The prompt path is the pull path for harnesses that get no pushed recall, such as Aegis and the gateway.
 
 ### khipu_brief
 
@@ -100,12 +102,13 @@ Remember a session.
 
 Behaviour depends on where it runs:
 
-- **On a Mac with a capture hook** (`khipu-stop-hook` or `khipu-aegis-capture`) in `hub` or `dual` capture mode, it does not write. It flags the session and returns `{queued: true, captured_by: "next stop"}`. Your summary is kept as the episode's note.
+- **On a Mac where a harness runs a capture hook** (`khipu-stop-hook` or `khipu-aegis-capture`), it does not write, whatever the capture mode. It flags the session and returns `{queued: true, captured_by: "next stop"}`. Your summary is kept as the episode's note.
 - **Through the gateway**, there is no hook, so it writes at once. It is the only way a cloud session is remembered.
+- **Locally with no capture hook**, it writes only when `capture_mode` is `hub`. In any other mode the call is rejected, because nothing would act on it.
 
 ### khipu_forget
 
-Forget one episode completely. Parameter: `id` (required). The episode is tombstoned and its vectors, the commitments it opened and its legacy file line go with it. Use it for a wrong capture or a test. Over the gateway it only works on episodes from cloud harnesses.
+Forget one episode completely. Parameter: `id` (required). The episode is tombstoned, its vectors and legacy file line are removed, the commitments it opened are closed and its decisions are retracted. Use it for a wrong capture or a test. Over the gateway it only works on episodes from cloud harnesses.
 
 ## Commitments and decisions
 
@@ -215,7 +218,7 @@ Record what this conversation learned, so other conversations hear it.
 | `hold_id` | For end_hold. |
 | `name` | What this conversation calls itself. |
 
-A time you give is recorded as a guess. A hold ends after 24 hours unless `until` sets another end. Standing rules, the owner's note, pauses and clears belong to the owner and are refused here.
+A time you give is recorded as a guess. A hold ends after 24 hours unless `until` sets another end, and no hold may run longer than 7 days unless the owner changes that limit in settings. Standing rules, the owner's note, pauses and clears belong to the owner and are refused here.
 
 ### khipu_route_rule
 

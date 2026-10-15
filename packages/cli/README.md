@@ -7,15 +7,15 @@ The full command reference is in [docs/cli.md](../../docs/cli.md). For a quick l
 ## Setup
 
 ```bash
-export KHIPU_ROOT="/path/to/Khipu"   # optional; defaults to this checkout
+export KHIPU_ROOT="/path/to/Khipu"   # the repo root (Khipu itself falls back to this checkout when unset)
 export PYTHONPATH="$KHIPU_ROOT/packages/cli:$KHIPU_ROOT/.python_libs"
 
 # One-time deps. .python_libs/ is gitignored (platform-specific wheels), so a fresh
 # clone has no dependencies until this runs. Rebuild it per machine, never copy it:
-/opt/homebrew/bin/python3.11 -m pip install \
+python3.11 -m pip install \
   --target "$KHIPU_ROOT/.python_libs" -r "$KHIPU_ROOT/packages/cli/requirements.txt"
 
-# One-time DSN (password stays local, chmod 600):
+# One-time DSN, read from stdin and stored in the Keychain (never pass it as an argument):
 printf '%s' 'postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=verify-full' | python3 -m khipu secrets --set database_url
 
 python3 -m khipu migrate --dry-run   # show applied and pending schema migrations
@@ -63,7 +63,7 @@ To point Khipu at a legacy file wiki, use `python3 -m khipu config --set memory_
 | Var | Meaning |
 |---|---|
 | `KHIPU_DATABASE_URL` | Prefer over Keychain/file |
-| `KHIPU_DSN_FILE` | Default `~/.config/khipu/dsn` (fallback) |
+| `KHIPU_DSN_FILE` | The connection-string file (default: `dsn` in the data folder, `~/.config/khipu` unless moved with `khipu paths --set`) |
 | `KHIPU_KEYCHAIN` | `0` disables Keychain lookup |
 | `KHIPU_MIRROR` | `0` disables the file-to-database mirror |
 | `KHIPU_MIRROR_EMBED` | `1` enables embed-on-mirror (off by default) |

@@ -33,9 +33,12 @@ In each home's `settings.json`:
 | Stop, PreCompact, SessionEnd, SubagentStop | `khipu-stop-hook` | 20 s |
 | SessionStart | `khipu-recall-hook` | 10 s |
 | UserPromptSubmit | `khipu-prompt-recall` | 3 s |
-| PreToolUse (delegation tools and shell commands), SubagentStart | `khipu-delegation-hook` | |
+| PreToolUse (delegation tools and shell commands) | `khipu-delegation-hook` | 3 s |
+| SubagentStart | `khipu-delegation-hook` | 10 s |
 
 The MCP server (id `khipu`, launcher `khipu-mcp`) is written to `~/.claude.json` and to each home's own `.claude.json`.
+
+The delegation hook is a routing feature: it only adds context when the `routing_push` feature is on.
 
 ### Codex
 
@@ -93,9 +96,9 @@ The `khipu_capture` MCP tool does not write on a Mac where the stop hook is inst
 
 ## Capture identity
 
-Every capture is labelled with a harness and a session id of the form `<harness>:<stable id>`. The harness comes from `KHIPU_HARNESS` if set, then from Grok runner environment variables (which give `aegis`), then from the shape of the hook payload and transcript. The capture harnesses are `claude_code`, `cursor`, `codex` and `aegis`. A dispatched child session records its parent through `KHIPU_PARENT_SESSION` or `CLAUDE_CODE_HOST_SESSION_ID`.
+Every capture is labelled with a harness and a session id of the form `<harness>:<stable id>`. The harness comes from `KHIPU_HARNESS` if set, then from Grok runner environment variables (which give `aegis`), then from the shape of the hook payload and transcript. The capture harnesses are `claude_code`, `cursor`, `codex` and `aegis`; a payload Khipu cannot place is labelled `unknown`. A dispatched child session records its parent through `KHIPU_PARENT_SESSION` or `CLAUDE_CODE_HOST_SESSION_ID`.
 
-Search filters use these labels: `--harness`, `--session-id`, `--via` (capture origin, such as `t3`), and for T3 the thread id.
+Search filters use these labels: `--harness`, `--session-id` and `--via` (capture origin, such as `t3`). The `khipu_search` MCP tool also takes `t3_thread`, an exact T3 thread id.
 
 A source record table (`episode_sources`) now records where each episode came from. Each row has a source key, a hash of the harness, session id, transcript range, window and part. It is written alongside each capture. Nothing reads it yet, and episode uniqueness still works as before. Moving readers onto it is planned.
 
@@ -107,12 +110,12 @@ From the command line:
 
 ```
 khipu integrations status                 # what is present per harness
-khipu integrations install claude_code    # or cursor, codex, aegis, grok_bot, all
+khipu integrations install claude_code    # or cursor, codex, aegis, grok_bot (default: all)
 khipu integrations verify                 # MCP handshake and hook exit checks
 khipu integrations uninstall codex        # removes Khipu-owned entries only
 ```
 
-Options: `--dry-run` shows what would change; `--no-verify` skips the check after install; `--home` limits Claude Code to one home; `--project` is for Cursor and Grok Bot. Uninstall removes only entries Khipu wrote, and backups are kept.
+Options: `--dry-run` (install and uninstall) shows what would change; `--no-verify` (install) skips the check after install; `--home` (install, verify and uninstall) limits Claude Code to one home; `--project` is for Cursor and Grok Bot. Uninstall removes only entries Khipu wrote, and backups are kept. Uninstalling Grok Bot needs `--project`.
 
 To repair a broken harness, run `khipu integrations status`, then install it again. Install is safe to repeat. Check recording with `khipu sessions liveness` (exits 2 if a harness has not been recorded) and `khipu doctor`. See [operations](operations.md) and [CLI reference](cli.md).
 

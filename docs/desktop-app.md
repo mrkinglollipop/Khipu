@@ -67,7 +67,7 @@ Khipu keeps the follow-ups, blockers, questions and promises it finds in your se
 
 - mark it done,
 - reopen it,
-- snooze it until a date or a window such as one week (a Snooze until dialog asks which).
+- snooze it (a Snooze until dialog offers a week, two weeks or a month).
 
 A snoozed item does not go stale while the snooze lasts.
 
@@ -76,7 +76,7 @@ A snoozed item does not go stale while the snooze lasts.
 Every capture, newest first, grouped by day. Open one to read it. Two owner actions are on each episode:
 
 - **Edit summary.** Corrects the text. Khipu re-embeds it so search follows the fix.
-- **Forget episode.** Removes it from memory. A confirmation dialog comes first.
+- **Forget.** Removes it from memory. A confirmation dialog comes first. (An episode opened in Recall has the same Forget button.)
 
 ## Harnesses
 
@@ -90,9 +90,11 @@ There is one card per harness:
 - Codex
 - Grok Bot (cloud)
 
-Each card shows whether the integration is installed and whether captures are arriving. Each card offers install, verify and remove. Remove asks for confirmation.
+Each card shows whether the integration is installed and whether captures are arriving. The local cards offer install (or reinstall), verify and remove. Remove asks for confirmation. The Claude Code card lists each Claude config home Khipu found, and Install or Remove can act on one home.
 
-If T3 Code settings exist on this Mac, a read-only T3 card also appears. T3 Code is not a separate pack. Claude accounts run inside it are covered by the Claude Code install. Khipu only reads T3's settings and never writes them.
+Grok Bot runs in the cloud, so its card has nothing to install here. Its button is **Probe gateway**, which checks the connection. The setup is one per repo, or once in the Cursor cloud-agent settings, and the token lives in Cursor cloud secrets, never in a repo.
+
+If T3 Code settings exist on this Mac, a read-only T3 card also appears. It shows whether thread lookup works and how many captures were linked to a T3 thread today, and has a Search T3 captures button that opens Recall filtered to that source. T3 Code is not a separate pack. Claude accounts run inside it are covered by the Claude Code install. Khipu only reads T3's settings and thread records and never writes them.
 
 What each pack installs is in [integrations.md](integrations.md).
 
@@ -103,11 +105,11 @@ Settings has ten sections. Database is open first.
 | Section | What it holds |
 | --- | --- |
 | Database | The connection state and where it is stored. Buttons: Recheck connection, connect to a server you run or another Mac (opens the setup step), and Move this memory to another database. |
-| Capture & models | How captures are stored. The capture rule (after 5 turns or 20 minutes, shown read-only). Capture tuning. Models, including the session-summary provider. Keys. The summariser daily budget. The Plans card. |
+| Capture & models | The capture rule (after 5 turns or 20 minutes, shown read-only). How captures are stored. Models, including the session-summary provider. The summariser daily budget. The Plans card. Keys (Gemini, and an optional key for a local endpoint). |
 | Routing | Accounts, your note, standing rules, holds, reset checks, what conversations are told, job runner folders, the lane map, and recent changes. Described in [routing.md](routing.md). |
 | Optional features | Switches for Search and memory, the Local recall service, Routing, and a group of options marked "Measured, not recommended". |
-| Embeddings | Embedding profiles, libraries (folders of notes that become a search space), and indexing jobs. |
-| Data & backups | The data folder, Backup, Restore, older file locations, and path overrides. |
+| Embeddings | Embedding models (profiles) with an Add a model action, libraries (folders of .txt and .md files that become a search space), and the progress of indexing jobs. |
+| Data & backups | The data folder, older file locations (path overrides), Backup and Restore. |
 | Another Mac | The gateway address, and Set up another Mac (Save join kit). |
 | Components | App and CLI version, the database and graph builder components, and What feeds the graph. |
 | Updates | Installed version and Check for updates. |
@@ -123,13 +125,13 @@ Settings has ten sections. Database is open first.
 
 The choice is locked, with a note, when the `KHIPU_CAPTURE_MODE` environment variable is set. It matches `khipu config --set-capture-mode`.
 
-The session-summary provider can be Gemini (the default), Claude Haiku with an API key, Claude on your own login, ChatGPT on your own login (Codex), or a local OpenAI-compatible endpoint. API keys go to the login Keychain. A key check makes one cheap call and shows "Key works" with the model name when it passes.
+The session-summary provider can be Gemini Flash (the default), Claude Haiku, OpenAI or OpenRouter with an API key, Claude on your own login (`claude -p`), ChatGPT on your own login (`codex`), or a local OpenAI-compatible endpoint. API keys go to the login Keychain. For a provider other than Gemini, a setting chooses what happens if it fails: retry that window on Gemini Flash, or wait and retry later. A key check makes one cheap call and shows "Key works" with the model name when it passes.
 
-Summaries are the only place transcript text leaves your Mac for a model, and it goes to the provider you pick. Secrets such as API keys and tokens are masked before a transcript is sent.
+Session summaries send transcript text to the provider you pick (a local endpoint keeps it on your Mac). The search index sends text to the embedding model you choose under Embeddings. API keys, tokens, private keys and passwords in connection strings are masked before a transcript reaches the summariser and before any capture is stored.
 
 ### Plans and signing in again
 
-The Plans card lists subscription accounts. You can refresh or probe, add accounts (up to 32) and remove them. A Sign in again button starts the login for Claude and Codex accounts. Grok and Muse accounts say to sign in from their own CLI.
+The Plans card lists subscription accounts. **Probe now** reads their headroom again. You can add accounts (up to 32) and remove them. A Sign in again button starts the login for Claude and Codex accounts. Grok and Muse accounts say to sign in from their own CLI.
 
 ### Another Mac
 
@@ -145,7 +147,7 @@ Save is disabled when the database lives only on this Mac, because another Mac c
 
 ### Data & backups
 
-Backup zips the Mac-local data folder. Restore reads a zip or folder back in. By default a restore merges and skips what already exists. These are the app forms of `khipu backup-local` and `khipu import-local`. Database backups and health checks are covered in [operations.md](operations.md).
+Backup zips the Mac-local data folder. Restore reads a zip or folder back into it: files with the same name are overwritten, and other files already there are kept. These are the app forms of `khipu backup-local` and `khipu import-local --replace`. (On the command line, `khipu import-local` without `--replace` skips files that already exist.) Database backups and health checks are covered in [operations.md](operations.md).
 
 ### Components
 
@@ -181,14 +183,14 @@ When the same topic is edited in two places, the newest edit wins and the older 
 The app puts a full-color icon in the menu bar. Left-click shows and focuses the window. The menu has three items:
 
 - **Show Khipu**
-- **Run doctor...** (shows the window and refreshes the tooltip from `khipu doctor`)
+- **Run doctor…** (shows the window and refreshes the tooltip from `khipu doctor`)
 - **Quit**
 
-The tooltip starts as "Khipu - starting...". It then shows the doctor result (OK, WARN, NOT RECORDING, or doctor unavailable). If doctor fails it falls back to `khipu status`. When an update is waiting, the update tooltip replaces the health one.
+The tooltip starts as "Khipu · starting…". It then shows the doctor result (OK, WARN, NOT RECORDING, or doctor unavailable). If doctor fails it falls back to `khipu status`. When an update is waiting, the update tooltip replaces the health one.
 
 ## Updates
 
-The app checks GitHub Releases once at launch. The check only looks. It never downloads, installs or restarts. If a newer version exists, the tray tooltip reads "Khipu - update vX available".
+The app checks GitHub Releases once at launch. The check only looks. It never downloads, installs or restarts. If a newer version exists, the tray tooltip reads "Khipu · update vX available".
 
 To install, open **Settings > Updates** and click **Check for updates**. The app downloads the build, checks its signature, installs it and relaunches. Nothing installs unless you click.
 

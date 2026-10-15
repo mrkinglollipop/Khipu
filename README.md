@@ -50,7 +50,7 @@ Requires macOS 12 or later on Apple silicon.
 2. Open the DMG and drag **Khipu.app** to **Applications**.
 3. Launch Khipu.
 
-The app checks GitHub Releases at launch. Install an update from Settings, then Updates, then Check for updates. If macOS blocks an older, non-notarized release, right-click **Khipu.app** and choose **Open** once.
+The app checks GitHub Releases at launch. Install an update from Settings, then Updates, then Check for updates. If macOS blocks a release that is not notarized, right-click **Khipu.app** and choose **Open** once.
 
 ## First run
 

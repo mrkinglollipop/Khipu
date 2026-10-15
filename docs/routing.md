@@ -48,6 +48,8 @@ A runner's lane maps to an account through the lane map (`routing_lane_map`). A 
 
 A hold is a short note that work should wait: "machine busy", "disk low", "keep", "outage" or "other". A hold can cover one account, one machine, or everything.
 
+These are the defaults. Each is a setting you can change or switch off.
+
 - Hold text is capped at 300 characters.
 - A hold set by a conversation lasts 24 hours unless it says otherwise, and never more than 7 days.
 - An owner hold is set by you and asks for typed confirmation. A reminder comes after 90 days.
@@ -94,7 +96,7 @@ Either one starts that CLI's own login in its own login folder. A browser opens.
 
 ### Reset checks
 
-When an account's known limit time passes, Khipu can check whether it really reopened. The check is on by default. It waits 2 minutes after the reset, then retries at 10 and 30 minutes. If the machine is busy (load above 75), it waits up to 5 minutes, up to 3 times. A check costs no model turn. Muse and unreadable accounts say "This account can't be checked without using a turn".
+When an account's known limit time passes, Khipu can check whether it really reopened. The check is on by default. By default it waits 2 minutes after the reset, then retries at 10 and 30 minutes. If the machine is busy (load above 75), it waits up to 5 minutes, up to 3 times. All of these are settings. A check costs no model turn. Muse and unreadable accounts say "This account can't be checked without using a turn".
 
 Settings > Routing has a switch for this and a **Check now** button per account. On the command line: `khipu route check ACCOUNT`.
 
@@ -102,7 +104,7 @@ Settings > Routing has a switch for this and a **Check now** button per account.
 
 ### MCP tools
 
-Five tools, all local only. Through the HTTPS gateway they answer `available: false`. See [MCP tools](mcp-tools.md) for the full list.
+Five tools, all local only. Through the HTTPS gateway each answers `available: false`. See [MCP tools](mcp-tools.md) for the full list.
 
 | Tool | What it does |
 | --- | --- |
@@ -126,15 +128,15 @@ Agents do not have to ask. When the `routing_push` feature is on, Khipu puts rou
 | `routing_push_prompt` | Before each prompt. |
 | `routing_push_delegation` | Before handing work to another agent. |
 
-`routing_push` itself is off until you turn it on (Settings > Optional features, or `khipu features --set NAME VALUE`). Setting `ROUTING_NOW_OFF=1` in the environment also bypasses the push.
+`routing_push` itself is off until you turn it on (Settings > Optional features, or `khipu features --set NAME VALUE`). Setting `ROUTING_NOW_OFF=1` in the environment, or creating the file `/tmp/.routing_now_disable`, also bypasses the push.
 
 What the agent sees:
 
-- **Session start**: a block headed "Routing at HH:MMZ" with the full summary (rules, accounts, holds, pace).
+- **Session start**: a block headed "Routing at HH:MMZ" with the full summary (rules, accounts, holds, pace). It has a time budget of 1 second by default.
 - **Each prompt**: only what changed since that session last saw the record, headed "Routing changes at HH:MMZ". The prompt update is capped at 400 characters and a 50 ms budget. The full summary is sent again when the session is 20 versions behind or 6 hours old. A session only counts a change as seen once it was really delivered.
 - **Delegation**: a hook watches the moment an agent hands work to another one (agent and task calls, `delegate_task`, and shell commands that start `claude -p`, `codex exec`, `grok` or `muse exec`, plus any dispatch scripts you name in settings). It adds the same changes block. Calls made inside a subagent get nothing. A subagent gets the full summary when it starts (Claude Code).
 
-The hooks never deny or alter a call. The delegation context arrives alongside the tool result, after the call. They are installed by `khipu integrations install` for Claude Code and Codex. Cursor gets no per-prompt or delegation hook. Aegis refuses these hooks. See [Integrations](integrations.md).
+The hooks never deny or alter a call. The delegation context arrives alongside the tool result, after the call. They are installed by `khipu integrations install` for Claude Code and Codex (Codex runs them only after you approve Khipu's hooks in Codex). Cursor hears routing at session start only: it gets no per-prompt or delegation hook. Aegis refuses these hooks; it, Grok Build and cloud agents hear routing only when they ask. See [Integrations](integrations.md).
 
 A background helper in the warm recall service polls the sources every 10 seconds and refreshes the record on change and on the clock. It stops when the push is switched off.
 

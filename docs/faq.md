@@ -13,7 +13,7 @@ Only to your own PostgreSQL server and the model providers you configure.
 Nothing goes to the maintainer. There is no telemetry.
 
 **Is my memory locked in?**
-No. It is ordinary tables in your own PostgreSQL, such as `episodes`, `topics`, `nodes` and `edges`. `khipu regen-memory` can write topics back out as markdown at any time. `khipu backup-local` zips the Mac-local data folder, and `khipu import-local` restores it.
+No. It is ordinary tables in your own PostgreSQL, such as `episodes`, `topics`, `nodes` and `edges`. `khipu regen-memory` can write topics back out as markdown (a `MEMORY.from-khipu.md` file) at any time. `khipu backup-local` zips the Mac-local data folder, and `khipu import-local` restores it.
 
 **Can I delete something Khipu remembered?**
 Yes. `khipu episode forget ID` removes an episode and its vectors. It also closes the commitments the episode opened, retracts its decisions, and updates the local offline copy. `khipu episode edit ID --summary "..."` corrects a summary and re-embeds it. `khipu topic purge SLUG --yes` hard-deletes a topic that is already tombstoned. In the desktop app, open a capture under Activity to correct or forget it. Agents can forget through the `forget` MCP tool. See [mcp-tools.md](mcp-tools.md).
@@ -21,7 +21,7 @@ Yes. `khipu episode forget ID` removes an episode and its vectors. It also close
 ## Database
 
 **Do I have to run PostgreSQL 19? It is a beta.**
-Yes, for now. SQL/PGQ property graphs arrived in 19 and the graph layer uses them. The Database step checks for version 19 or later and for the `vector` extension. For a new local database, the app uses a local image if you have one, then tries to pull the published image, and builds from the Dockerfile in `ops/docker/` if the pull fails. See [setup.md](setup.md).
+Yes, for now. SQL/PGQ property graphs arrived in 19 and the graph layer uses them. The Database step checks for version 19 or later and for the `vector` extension. For a new local database, the app uses a local image if you have one, then tries to pull the published image, and builds from the Dockerfile in `ops/docker/` if the pull fails (the published image is a private package, so the pull is often refused). See [setup.md](setup.md).
 
 **Why is the database "private network only"? Can I just open a port?**
 Please do not. Khipu assumes the database is reachable only from your own machines (Tailscale, WireGuard, an SSH tunnel). The gateway is the only part meant to face the internet, and it exists so the database never has to. See [operations.md](operations.md).
@@ -91,7 +91,7 @@ No. It reports each account's state and plan headroom, and the choice stays with
 It checks GitHub Releases at launch and flags a new version in the menu-bar tooltip. It never downloads or installs on its own. To install, go to Settings > Updates > Check for updates. See [desktop-app.md](desktop-app.md).
 
 **Can I run this on Linux or Windows?**
-The desktop app is macOS only (macOS 12 or later, Apple silicon), and so is the Keychain integration. The CLI is plain Python. I have not checked it on Linux or Windows. If you try, set `KHIPU_KEYCHAIN=0` and pass settings through the environment, for example `KHIPU_DATABASE_URL`, instead of the Keychain. Scheduled jobs use macOS LaunchAgents.
+The desktop app is macOS only (macOS 12 or later, Apple silicon), and so is the Keychain integration. The CLI is plain Python, but it has not been tested on Linux or Windows. If you try, set `KHIPU_KEYCHAIN=0` and pass settings through the environment, for example `KHIPU_DATABASE_URL`, instead of the Keychain. Scheduled jobs use macOS LaunchAgents.
 
 **How do I change capture mode?**
 Capture mode is `legacy`, `dual` or `hub`, and `dual` is the default. Change it in Settings > Capture & models ("Files only", "Files and Khipu", "Khipu only"), or run `khipu config --set-capture-mode`. The app control is locked when `KHIPU_CAPTURE_MODE` is set in the environment.

@@ -8,7 +8,7 @@ Related pages: [How it works](how-it-works.md), [Desktop app](desktop-app.md), [
 
 ## Install the desktop app
 
-1. Download the latest `Khipu_*.dmg` from the [GitHub releases page](https://github.com/mrkinglollipop/Khipu/releases/latest), or from [kinglollipop.com/khipu/download](https://kinglollipop.com/khipu/download).
+1. Download the latest `Khipu_*.dmg` from the [GitHub releases page](https://github.com/mrkinglollipop/Khipu/releases/latest).
 2. Open the DMG and drag **Khipu.app** to **Applications**.
 3. Launch **Khipu**. The first launch opens **Welcome**, a six-step walkthrough: Welcome, Database, Model, Graph, Agents, Finish.
 
@@ -29,7 +29,7 @@ You can reopen Welcome later from Settings, Advanced, **Run setup again**.
 
 The app checks GitHub Releases when it launches. If a newer version exists, the menu-bar tooltip says so. Nothing downloads or installs on its own. To install, go to Settings, Updates, **Check for updates**.
 
-If macOS blocks an older, non-notarized release, right-click **Khipu.app**, choose **Open**, and confirm once.
+If macOS blocks a release that is not notarized, right-click **Khipu.app**, choose **Open**, and confirm once.
 
 More detail: [Desktop app](desktop-app.md) and [`apps/desktop/README.md`](../apps/desktop/README.md).
 
@@ -37,7 +37,7 @@ More detail: [Desktop app](desktop-app.md) and [`apps/desktop/README.md`](../app
 
 The Database step offers three choices. Each one makes the schema current and schedules the background upkeep jobs: nightly (02:05), graph (02:17), monthly (the 1st, 09:00), a notes watcher, and a capture-queue drain every five minutes. The warm recall service is a sixth job and is opt-in. Details are in [Operations](operations.md).
 
-The last stage is a memory round trip: write a test memory, find it by search, and show the time it took. The round trip is skipped if capture mode is "Files only" or no model key is set.
+The last stage is a memory round trip: write a test memory, find it by search, and show the time it took. The round trip is skipped if capture mode is "Files only" or no embedding key is set.
 
 ### Join a Khipu I already have
 
@@ -53,7 +53,7 @@ The import checks that the live episode, topic and node counts are not zero when
 
 Pick this when nobody has Khipu yet. It needs [Docker Desktop](https://docs.docker.com/desktop/setup/install/mac-install/) (or OrbStack or Colima). The app notices when Docker is installed and turns the button on.
 
-The app uses a local Postgres image if one exists, then tries to pull the published image, then builds it from the bundled Dockerfile. The proof is that a backup was taken and test-restored.
+The app uses a local Postgres image if one exists, then tries to pull the published image, then builds it from the bundled Dockerfile. The published image is a private package, so on most Macs the pull is refused and the build runs. The proof is that a backup was taken and test-restored.
 
 This database lives on this Mac's disk only. Another Mac cannot reach it directly.
 
@@ -87,7 +87,7 @@ For key-based choices, the key is proven with one cheap real call when you save 
 
 ## Moving your memory to another database
 
-Go to Settings, **Database**, then **Move this memory to another database...**. Point it at the target, which can be a new local database or a server. It checks the target first without changing anything. After you confirm, it copies every table, verifies that the row counts match, and then switches over. The old database is left untouched.
+Go to Settings, **Database**, then **Move this memory to another database...**. Point it at the target, which can be a new local database or a server. It checks the target first and copies nothing until you confirm. After you confirm, it copies every table, verifies that the row counts match, and then switches over. The old database is left untouched.
 
 Afterward, any other Mac needs a fresh join kit from the new database.
 
@@ -117,7 +117,7 @@ khipu integrations verify  claude_code     # proves it by exercising it
 
 Then `khipu doctor` should be green. Anything it could not check is named under `not_configured`, which is normal on a fresh install. `khipu doctor --quick` checks only imports, config, secrets, jobs and the summariser, with no network.
 
-To run the database setup pipeline from the CLI, use `khipu db preflight` and `khipu db connect` (flags: `--dsn`, `--use-stored`, `--root-crt`, `--no-jobs`, `--no-prove`).
+To run the database setup pipeline from the CLI, use `khipu db connect` (flags: `--dsn`, `--use-stored`, `--root-crt`, `--no-jobs`, `--no-prove`). `khipu db preflight --dsn DSN` runs only the checks: it does not store the connection, install jobs or run the round trip, but it may still update the server's schema and privileges.
 
 ### Build the desktop app locally
 
@@ -125,7 +125,7 @@ To run the database setup pipeline from the CLI, use `khipu db preflight` and `k
 cd apps/desktop && npm install && npm run tauri dev
 ```
 
-This needs Rust and the Xcode command-line tools. The app bundles the CLI from a generated, git-ignored `khipu-resources/` folder made by `scripts/bundle_cli.sh`. Run that script first if the build asks for it. Release builds are covered in [`apps/desktop/README.md`](../apps/desktop/README.md).
+This needs Rust and the Xcode command-line tools. The app bundles the CLI from a generated, git-ignored `khipu-resources/` folder made by `apps/desktop/scripts/bundle_cli.sh`. Run that script first if the build asks for it. Release builds are covered in [`apps/desktop/README.md`](../apps/desktop/README.md).
 
 ### Cloud agents (Grok Bot, Cursor cloud): optional
 
@@ -140,7 +140,7 @@ docker run -d --name khipu-gateway --network host \
   khipu/gateway
 ```
 
-The gateway listens on `127.0.0.1:8787` only. Put a TLS-terminating reverse proxy (Caddy or nginx, with a real certificate) in front. It refuses to start if the token is missing or shorter than 24 characters. The token is the only credential a cloud agent holds. Postgres stays private. If you use library search through the gateway, the gateway host also needs the embedding key for each enabled library profile.
+The gateway listens on `127.0.0.1:8787` by default (`KHIPU_GATEWAY_BIND` changes it). Put a TLS-terminating reverse proxy (Caddy or nginx, with a real certificate) in front. It refuses to start if the token is missing or shorter than 24 characters. The token is the only credential a cloud agent holds. Postgres stays private. If you use library search through the gateway, the gateway host also needs the embedding key for each enabled library profile.
 
 Then, on your Mac:
 

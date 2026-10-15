@@ -11,18 +11,18 @@ cd packages/cli
 python3 -m khipu <command>
 ```
 
-To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
+Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 55 top-level commands. The sections below cover all of them.
+There are 57 top-level commands. The sections below cover all of them.
 
 ## Health and status
 
 | Command | What it does |
 | --- | --- |
-| `status` | Row counts in Postgres. `--sample N` (0 skips the file walk), `--drift` adds drift samples. |
+| `status` | Row counts in Postgres. `--sample N` (default 0, which skips the file walk), `--drift` adds drift samples. |
 | `doctor` | The single health command. Exits 0 only when `ok` is true, otherwise 2. |
 | `activity` | Recent capture episodes. `--limit`, `--show ID`. |
-| `revisions` | Topic revisions and conflicting edits (the older loser of a last-write-wins). `--slug`, `--show ID`. |
+| `revisions` | Topic revisions, including edits that lost a last-write-wins conflict. `--slug`, `--show ID`. |
 | `secrets` | Shows whether the database address and model keys are present (Keychain, environment or file). Never prints values. |
 | `git-sync` | Reports whether the memory-tree git auto-sync is alive. Exits 2 if red. |
 | `features` | Shows feature switches. `--set NAME VALUE` changes one. |
@@ -32,11 +32,12 @@ There are 55 top-level commands. The sections below cover all of them.
 - `--quick`: checks imports, config, secret presence, jobs and the summariser only. No hub, no network. It is the first step of the promotion gate.
 - `--probe`: runs a fresh end-to-end recall probe. It writes a nonce episode, then soft-deletes it.
 - `--sample N`: caps the topic drift pass.
-- `--harness`, `--memory-root`: scope the check.
+- `--harness`: the harness label the probe records (default `$KHIPU_HARNESS`, or `doctor`).
+- `--memory-root`: the file wiki to check for drift.
 
 `doctor` prints every `*_ok` check and a `not_configured` list. Plan usage and routing appear as warnings and never gate `ok`.
 
-`secrets` has one subcommand, `verify` (`--gemini`, `--openai` or `--all`, `--json`), which proves a model key works with one cheap call. `secrets --set ACCOUNT` stores a secret read from stdin.
+`secrets` has one subcommand, `verify` (`--gemini`, `--openai` or `--all`, `--json`), which proves a model key works with one cheap call. `secrets --set ACCOUNT` stores a secret read from stdin in the Keychain (accounts such as `database_url`, `gemini_api_key`, `voyage_api_key`).
 
 ## Search and recall
 
@@ -46,8 +47,8 @@ There are 55 top-level commands. The sections below cover all of them.
 | `get ID` | Load one record by id. |
 | `graph ID` | Neighbours of a graph node. `--hops`, `--limit`. |
 | `recall` | Recall tooling (warm service, logs, evaluation). |
-| `reflect QUESTION` | Answer from memory with cited evidence. Needs the `reflect` switch. |
-| `briefs` | Source-backed topic briefs. Needs the `briefs` switch to build. |
+| `reflect QUESTION` | Answer from memory with cited evidence. `--project`. Needs the `reflect` switch. |
+| `briefs` | Source-backed topic briefs: `plan` (topics whose brief is missing or stale), `build` (`--topic`, `--limit`, needs the `briefs` switch), `show SLUG`. |
 
 ### search
 
@@ -65,11 +66,11 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 
 ### recall
 
-- `recall serve`: runs the warm recall service in the foreground. Normally launchd runs it.
+- `recall serve`: runs the warm recall service in the foreground. The opt-in `recall_daemon` job runs it under launchd.
 - `recall status`: shows whether the service is up.
-- `recall log [--tail]`: shows the search query log.
-- `recall zero-results [--days]`: lists queries that found nothing.
-- `recall eval`: scores a golden set. Flags: `--golden`, `--path explicit|prompt|status|all`, `--budget-ms`, `--record`, `--compare`, `--allow-changes`, `--replay`, `--rerank on|off`, `--relevance-floor on|off`, `--sample`, `--seed`.
+- `recall log [--tail N]`: shows the search query log (default 20).
+- `recall zero-results [--days]` (default 7): lists queries that found nothing.
+- `recall eval`: scores a golden set. Flags: `--golden`, `--path explicit|prompt|status|all` (default `explicit`), `--budget-ms`, `--record`, `--compare`, `--allow-changes`, `--replay`, `--rerank on|off`, `--relevance-floor on|off`, `--sample`, `--seed`.
 
 ## Commitments and decisions
 
@@ -93,10 +94,10 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 
 | Command | What it does |
 | --- | --- |
-| `capture` | Capture an episode from a JSON payload on stdin. Routed by `capture_mode`. `capture now` flags a session for capture at its next Stop. |
+| `capture` | Capture an episode from a JSON payload on stdin. Routed by `capture_mode`. Flags: `--payload-file`, `--mode legacy|dual|hub`. `capture now` flags a session for capture at its next Stop, whatever the cadence (`--note`, `--harness`, `--session-id`; the last two default to the most recently active local session). |
 | `episode` | `episode forget ID` soft-deletes an episode and removes its vectors. `episode edit ID --summary S` corrects it and re-embeds. |
 | `topic` | `topic purge SLUG --yes` hard-deletes a topic that is already tombstoned. |
-| `notes` | Index per-project harness notes as topics: `reconcile`, `index`, `split`, `stale`, `supersede`. |
+| `notes` | Index per-project harness notes as topics: `reconcile` (`--dry-run`, `--changed-only`), `index` (`--project`, `--cap`, `--dry-run`, `--force`), `split PATH`, `stale` (`--project`), `supersede OLD NEW`. |
 | `reconcile` | Full sync of memory files into Postgres. |
 | `regen-memory` | Write the `MEMORY.md` sidecar from topics. `--index` rebuilds the live `MEMORY.md`. |
 | `topic-graph` | `topic-graph backfill` updates topic links and graph edges from topic files. |
@@ -120,14 +121,14 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 - `estimate`: size a backfill. Makes no model call.
 - `jobs`: list backfill jobs. `--clear` removes finished ones.
 - `test-key`: check an embedding provider. `--provider`, `--endpoint`, `--model`.
-- `index`: build the index for a profile. `--table memory|library`.
+- `index PROFILE`: build the vector index for a profile. `--table memory|library` (default both).
 - `status`: coverage per profile.
 - `activate PROFILE`: make a profile the active one. Refuses incomplete coverage unless `--force`.
 - `profiles list|add|delete`: `add` takes `id` as `model@dim`, plus `--provider gemini|voyage|openai-compatible`, `--model`, `--dim`, `--endpoint`, `--normalize l2|none`.
 
 ### library
 
-- `add NAME --root DIR [--profile P]`, `list`, `status NAME`, `remove NAME [--yes]`.
+- `add NAME --root DIR --profile P` (both required), `list`, `status NAME`, `remove NAME --yes`.
 - `enable`, `disable`, `set-profile NAME PROFILE`.
 - `scan NAME [--allow-rebuild]`: pick up file changes.
 - `backfill NAME`: embed documents. `--limit`, `--stale`, `--profile`, `--job`, `--job-id`.
@@ -156,10 +157,10 @@ Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `-
 
 - `check ACCOUNT`: check one account now.
 - `report`: record a state. `--state limited|open|down`, `--account` or `--runner` with `--lane`, `--until`, `--window five-hour|weekly`, `--model`, `--message`, `--seen`, `--name`, `--evidence`.
-- `hold WORDS`: hold work. `--reason machine-busy|disk-low|keep|outage|other`, `--until`, one of `--account`, `--machine`, `--all`, and `--owner`. `hold end ID` ends one.
+- `hold WORDS`: hold work (`hold end ID` ends one). `--reason machine-busy|disk-low|keep|outage|other`, `--until`, one of `--account`, `--machine`, `--all`, and `--owner`.
 - `wait ACCOUNT`: waits for the account to open. Exits 0 when open, 1 on timeout. It launches nothing. `--timeout`, `--confirmed`.
 - `sources`: lists each runner folder with its last good read.
-- Owner commands, which ask for typed confirmation on a terminal and refuse without one: `pause`, `lift`, `clear`, `note {set,end}`, `priority {show,set,confirm,undo,clear}`, `rule {add,edit,retire,restore,confirm,undo,dismiss}`.
+- Owner commands, which need a typed confirmation on a terminal (or the app's Settings, Routing) and refuse without one: `pause`, `lift`, `clear`, `note {set,end}`, `priority {set,confirm,undo,clear}`, `rule {add,edit,retire,restore,confirm,undo,dismiss}`, and `hold --owner`. `priority show` needs none. With `--at-owner-request`, a conversation can record a `priority set` or a `rule add` or `rule edit` that stays unconfirmed until the owner confirms it.
 
 ## Database, backups and other Macs
 
@@ -170,13 +171,13 @@ Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `-
 | `join` | Join kits for a second Mac: `export`, `import`, `advertise`, `receive`. |
 | `config` | Show or set hub config. |
 | `budget` | Daily call ceilings: `status`, and `lift`. |
-| `paths` | Show or set the Mac-local data folder. `--set DIR`. |
+| `paths` | Show or set the Mac-local data folder. `--set DIR` (copies the connection file and root certificate if missing). |
 | `backup-local` | Zip the Mac-local data folder. `--out PATH`. |
 | `import-local` | Restore it. `--source ZIP|DIR`. Merges and skips existing files by default; `--replace` overwrites. |
 | `snapshot` | The offline read replica: `refresh` (hub must be up), `status`. |
 | `graph-backup` | Graph snapshot backup, on the Mac that builds the graph: `record-local`, `offsite`, `status`, `drill`. |
 | `graph-sync` | Mirror the graph file into Postgres. `--dry-run`, `--check` (exits 2 on drift). |
-| `components` | Postgres and Graphify install, status and upgrades. |
+| `components` | Postgres and Graphify install, status and upgrades: `status`, `install {postgres,graphify}`, `upgrade {postgres,graphify}`, `check-remote [--full]`, `bootstrap-local-backup`, the single-purpose forms `install-local-postgres`, `install-graphify`, `upgrade-postgres` and `upgrade-graphify`, plus helpers for the app (`status-json`, `select-compat-row`). |
 
 - `db move`: `--to DSN` or `--new-local`, `--dry-run`, `--into-nonempty`. It copies and verifies before switching and never writes to the source.
 - `db connect`: `--dsn`, `--use-stored`, `--root-crt`, `--no-jobs`, `--no-prove`.
@@ -190,7 +191,7 @@ Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `-
 | --- | --- |
 | `integrations` | Per-harness packs: `install [HARNESS]`, `verify`, `uninstall`, `status`. |
 | `sessions` | Session capture queue: `drain`, `sweep`, `status`, `liveness`. |
-| `aegis` | Older name for `sessions`. Same queue, same drain. |
+| `aegis` | Older name for `sessions`. Same queue, same drain. Its `status` defaults to `--harness aegis`, where `sessions status` defaults to `all`. |
 | `gateway` | `gateway token set` and `gateway token status` for the gateway bearer token. |
 | `grok-bot-config` | Prints the account-level cloud-agent config and the secret name to add. |
 
@@ -213,15 +214,15 @@ Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `-
 
 ### jobs
 
-Job names: `nightly`, `monthly`, `graph_build`, `notes_watch`, `queue_drain`, `recall_daemon`. With no name, a command acts on the default set. A fresh install schedules the first five. `recall_daemon` is opt-in: `khipu jobs install recall_daemon`.
+Job names: `nightly`, `monthly`, `graph_build`, `notes_watch`, `queue_drain`, `recall_daemon`. `install` with no name schedules the first five (the default set). `refresh` with no name re-renders every installed job whose plist is stale and never installs a new one. `uninstall` with no name removes all six, including `recall_daemon`. `recall_daemon` is opt-in: `khipu jobs install recall_daemon`.
 
 ### promote
 
-`promote [ref]` defaults to `origin/main`. It checks the ref out in the inactive live slot, runs the gate, and flips the live link on a pass.
+`promote [ref]` defaults to `origin/main`. It checks the ref out in the inactive live slot, runs the gate (doctor, a replay of recent recall queries from the last day, one real capture, a version check), and flips the live link on a pass. The recall replay needs at least one query logged in the last day.
 
 - `--rollback`: flip back to the previous slot.
 - `--status`: show the live commit, main, and how far behind.
-- `--gate-only STEP`: run one gate step (`doctor`, `recall`, `capture`, `version`).
+- `--gate-only STEP`: run one gate step (`doctor`, `recall`, `capture`, `version`). It never flips the link.
 - `--json`: machine-readable output.
 
 Merging to main deploys nothing on a Mac that uses the live link. `promote` does.
