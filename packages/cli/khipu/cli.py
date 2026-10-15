@@ -2761,7 +2761,17 @@ def cmd_get(args: argparse.Namespace) -> int:
             return 2
         row = episode_detail(int(ident))
     else:
-        row = topic_detail(ident)
+        from khipu.text_pages import page_args
+
+        try:
+            offset, max_bytes = page_args(
+                getattr(args, "offset", None), getattr(args, "max_bytes", None))
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        if getattr(args, "all", False):
+            return _get_topic_all(ident, offset, max_bytes)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
     if row is None:
         print(json.dumps({"ok": False, "error": f"{kind} not found: {ident}"}))
         return 1
@@ -2773,6 +2783,46 @@ def cmd_get(args: argparse.Namespace) -> int:
         print("\nverbatim:")
         print(json.dumps(verbatim, indent=2, default=str))
     return 0
+
+
+def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
+    """`khipu get <topic> --all`: follow body_next_offset and write the body
+    from ``offset`` to the end on stdout, raw, one page at a time. Stops with
+    an error if the topic changes between pages (content_hash or updated_at),
+    so the output is never a splice of two versions."""
+    from khipu.activity import topic_detail
+
+    first = None
+    while True:
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
+        if row is None:
+            print(json.dumps({"ok": False, "error": f"topic not found: {ident}"}),
+                  file=sys.stderr)
+            return 1
+        version = (row.get("content_hash"), row.get("updated_at"))
+        if first is None:
+            first = version
+        elif version != first:
+            print(json.dumps({"ok": False, "error": f"topic changed while paging: {ident}"}),
+                  file=sys.stderr)
+            return 1
+        # UTF-8 bytes whatever the locale, so the output equals the stored body.
+        out = getattr(sys.stdout, "buffer", None)
+        if out is not None:
+            sys.stdout.flush()
+            out.write(row["body"].encode("utf-8"))
+            out.flush()
+        else:
+            sys.stdout.write(row["body"])
+        nxt = row.get("body_next_offset")
+        if row.get("complete") or nxt is None:
+            sys.stdout.flush()
+            return 0
+        if nxt <= offset:
+            print(json.dumps({"ok": False, "error": f"paging made no progress at {offset}"}),
+                  file=sys.stderr)
+            return 1
+        offset = nxt
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -4923,6 +4973,18 @@ def build_parser() -> argparse.ArgumentParser:
         "id", help="Episode id (digits), topic slug, or library:<name>:<doc>[#<chunk>]"
     )
     gt.add_argument("--kind", choices=("episode", "topic", "library"), default=None)
+    gt.add_argument(
+        "--offset", type=int, default=None,
+        help="Topics: UTF-8 byte offset to start the body page at (default 0)",
+    )
+    gt.add_argument(
+        "--max-bytes", dest="max_bytes", type=int, default=None,
+        help="Topics: largest body page in UTF-8 bytes (default 65536, at most 524288)",
+    )
+    gt.add_argument(
+        "--all", action="store_true",
+        help="Topics: write the whole body (from --offset) to stdout, page by page",
+    )
     gt.set_defaults(func=cmd_get)
 
     mg = sub.add_parser(

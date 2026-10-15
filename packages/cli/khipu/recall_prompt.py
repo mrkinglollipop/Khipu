@@ -390,10 +390,12 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, decided: bool = False) -> None:
+def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, decided: bool = False,
+                          moment: str = "prompt") -> None:
     """The forked child: decide whether routing is on for this prompt (the
-    switches, read from ``environ``, and the settings) unless the process
-    that started it already did (``decided``), write the time it is ready to
+    switches, read from ``environ``, and the settings; ``moment`` names
+    the push: "prompt", or "delegation" for the delegation hook) unless the
+    process that started it already did (``decided``), write the time it is ready to
     read and the read's budget (one line), then the routing answer's JSON
     (one line), to ``write_fd``, and exit. Never returns, and never touches
     the hook's stdin, stdout or stderr. ``deadline`` is the latest the hook
@@ -425,7 +427,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
         from khipu import routing
 
         routing.prompt_imports()
-        off = None if decided else routing.push_off("prompt", environ=environ)
+        off = None if decided else routing.push_off(moment, environ=environ)
         budget = 0.0
         if not off and isinstance(session_id, str) and session_id:
             try:
@@ -1427,7 +1429,8 @@ class _RoutingAtPrompt:
         self.session: str | None = None
         self.helper: RoutingForkServer | None = None
 
-    def begin(self, session_id, environ=None, forkserver: "RoutingForkServer | None" = None) -> "_RoutingAtPrompt":
+    def begin(self, session_id, environ=None, forkserver: "RoutingForkServer | None" = None,
+              moment: str = "prompt") -> "_RoutingAtPrompt":
         """Start the child. ``environ`` is the hook's environment when it is
         not this process's (``caller_environ``). ``forkserver`` (the recall
         daemon's) starts it, so this process never forks; the daemon then
@@ -1435,7 +1438,9 @@ class _RoutingAtPrompt:
         one-shot hook forks itself and only reads the feature switch: the
         rest (the other switches, the settings, the budget, the session's
         marker) is the child's, so its search never waits for routing to be
-        imported."""
+        imported. ``moment`` is the push's switch: "prompt", or "delegation"
+        for the delegation hook (``routing_delegation``), which shares this
+        read, its budget and the session's marker."""
         try:
             from khipu import features
 
@@ -1451,7 +1456,7 @@ class _RoutingAtPrompt:
             if decided:
                 from khipu import routing as _routing
 
-                if _routing.push_off("prompt", environ=env):
+                if _routing.push_off(moment, environ=env):
                     return self  # off: nothing logged, as when the push is off
             if forkserver is None and not hasattr(os, "fork"):
                 self.status = "skipped:no-fork"
@@ -1491,7 +1496,7 @@ class _RoutingAtPrompt:
                 os.close(write_fd)
                 raise
             if pid == 0:
-                _prompt_routing_child(write_fd, session_id, environ, self.cap, decided)
+                _prompt_routing_child(write_fd, session_id, environ, self.cap, decided, moment)
             os.close(write_fd)
             self.pid, self.fd = pid, read_fd
             self.status = "skipped:budget"  # until an answer arrives in time

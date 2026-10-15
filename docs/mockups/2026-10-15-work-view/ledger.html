@@ -1,0 +1,89 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Khipu Work mock: a project's ledger</title><link rel="stylesheet" href="App.css"><link rel="stylesheet" href="mock.css"></head>
+<body><div id="root"><div class="shell">
+<nav class="rail" aria-label="Primary"><div class="rail-drag"></div>
+<div class="brand"><img class="brand-icon" src="../../../apps/desktop/src/assets/khipu-icon.png" width="26" height="26" alt=""><span class="brand-name">Khipu</span></div>
+<div class="rail-nav"><div class="nav-group">
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 8 4l5 4.5V13H3z"/></svg><span class="nav-label">Home</span></button>
+<button type="button" class="nav active" aria-current="page"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M6 3v10M10 3v10"/></svg><span class="nav-label">Work</span><span class="nav-badge" aria-label="12 waiting on you, some blocking"><span class="bdot" aria-hidden="true"></span>12</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4"/><path d="m10 10 3.5 3.5"/></svg><span class="nav-label">Recall</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10M3 8h7M3 12h5"/><path d="m11 11 1.5 1.5L15 10"/></svg><span class="nav-label">Owed</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg><span class="nav-label">Activity</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z"/><path d="M8 11v3"/></svg><span class="nav-label">Harnesses</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 11h10"/><circle cx="6" cy="5" r="1.5"/><circle cx="10" cy="11" r="1.5"/></svg><span class="nav-label">Settings</span></button>
+</div></div>
+<div class="rail-foot"><div class="rail-health"><span class="hdot ok" aria-hidden="true"></span><span>All harnesses recording</span></div>
+<div class="rail-meta"><button type="button" class="rail-feedback">Feedback</button><span class="version-chip">v0.4.15</span></div></div></nav>
+<main class="main"><section class="panel">
+<header class="panel-head"><div class="panel-head-text"><h1>Atlas ledger</h1><p class="lede">Every goal, slice, review and loose end in Atlas, in the order they were added</p></div><div class="panel-head-actions"><button type="button" class="sm">Back to Work</button></div></header>
+<div class="panel-body wide">
+<div class="callout warn stripe warn"><div class="txt"><b>2 ledger changes are waiting for the database</b><span>They are saved on this Mac and reach the ledger when the database answers. What you see includes them.</span></div><div class="cta"><button type="button" class="sm">Details</button></div></div>
+<div class="lg-split">
+
+<div class="card">
+<div class="card-head"><h2 class="wk-head">1,120 rows</h2><span class="meta">&nbsp;· 19 open · 9 need you · last change 2 min ago</span></div>
+<div class="lg-filters">
+<label class="sr-only" for="lg-q">Search titles</label><input id="lg-q" type="search" placeholder="Search titles">
+<label class="sr-only" for="lg-state">State</label><select id="lg-state"><option>Any state</option><option>Open (loose ends)</option><option>Needs you</option><option>In progress</option><option>Built, not merged</option><option>Merged, not verified</option><option>Queued</option><option>Not started</option><option>Verified</option><option>Done</option><option>Dropped</option></select>
+<label class="sr-only" for="lg-kind">Kind</label><select id="lg-kind"><option>Any kind</option><option>Goal</option><option>Slice</option><option>Review</option><option>Loose end</option><option>Needs you</option><option>Train</option></select>
+<label class="sr-only" for="lg-owner">Owner</label><select id="lg-owner"><option>Anyone</option><option>You</option><option>The Atlas orchestrator</option><option>No one</option></select>
+<button type="button" class="chip" aria-pressed="false">No change for a week</button>
+<button type="button" class="chip on" aria-pressed="true">Hide finished</button>
+</div>
+<div role="list" aria-label="Atlas ledger rows">
+<div class="lg-group">GOALS</div>
+<div class="row lg-row" role="listitem"><span class="lg-id">g-sign-in</span><span class="lg-title">Sign-in rework</span><span class="lg-state"><span class="hdot run" aria-hidden="true"></span>In progress</span><span class="lg-when">today 1:12 PM</span></div>
+<div class="row lg-row" role="listitem"><span class="lg-id">g-2.4.0</span><span class="lg-title">Tester build 2.4.0</span><span class="lg-state"><span class="hdot run" aria-hidden="true"></span>In progress</span><span class="lg-when">today 10:02 AM</span></div>
+<div class="lg-group">SLICES</div>
+<div class="lg-parent">Under: Sign-in rework</div>
+<div class="row lg-row child" role="listitem"><span class="lg-id">s-3.1</span><span class="lg-title">Remember the last account on the sign-in screen</span><span class="lg-state"><span class="hdot warn" aria-hidden="true"></span>Built, not merged</span><span class="lg-when">today 3:12 PM</span></div>
+<div class="row lg-row child" role="listitem"><span class="lg-id">s-3.2</span><span class="lg-title">Fix the review findings on pull request 41</span><span class="lg-state"><span class="hdot run" aria-hidden="true"></span>In progress</span><span class="lg-when">today 3:13 PM</span></div>
+<div class="row lg-row child" role="listitem"><span class="lg-id">s-3.3</span><span class="lg-title">Offline banner</span><span class="lg-state"><span class="hdot warn" aria-hidden="true"></span>Built, not merged</span><span class="lg-when">Tue 6:40 PM</span></div>
+<div class="row lg-row child" role="listitem"><span class="lg-id">s-3.4</span><span class="lg-title">Second sign-in provider</span><span class="lg-state"><span class="hdot" aria-hidden="true"></span>Queued</span><span class="lg-when">Tue 6:41 PM</span></div>
+<div class="lg-parent">Under: Tester build 2.4.0</div>
+<div class="row lg-row child" role="listitem"><span class="lg-id">s-4.2</span><span class="lg-title">Device test run for 2.4.0</span><span class="lg-state"><span class="hdot" aria-hidden="true"></span>Queued</span><span class="lg-when">today 10:02 AM</span></div>
+<div class="lg-group">NEEDS YOU</div>
+<div class="row lg-row sel" role="listitem" aria-current="true"><span class="lg-id">n-7</span><span class="lg-title">Choose the sign-in provider for the tester build</span><span class="lg-state"><span class="hdot err" aria-hidden="true"></span>Needs you</span><span class="lg-when old">2 days</span></div>
+<div class="row lg-row" role="listitem"><span class="lg-id">n-9</span><span class="lg-title">Approve shipping 2.4.0 to testers</span><span class="lg-state"><span class="hdot err" aria-hidden="true"></span>Needs you</span><span class="lg-when">5 h</span></div>
+<div class="row lg-row" role="listitem"><span class="lg-id">n-10</span><span class="lg-title">Read the review of the welcome screen wording and say which version to keep</span><span class="lg-state"><span class="hdot err" aria-hidden="true"></span>Needs you</span><span class="lg-when">6 h</span></div>
+<div class="lg-group">LOOSE ENDS</div>
+<div class="row lg-row" role="listitem"><span class="lg-id">le-21</span><span class="lg-title">Clean up the old settings screen</span><span class="lg-state"><span class="hdot" aria-hidden="true"></span>Queued</span><span class="lg-when old">9 days</span></div>
+<div class="row lg-row" role="listitem"><span class="lg-id">le-30</span><span class="lg-title">Crash report from one tester on an older phone</span><span class="lg-state"><span class="hdot run" aria-hidden="true"></span>In progress</span><span class="lg-when">yesterday</span></div>
+<div class="row lg-row" role="listitem"><span class="lg-id">le-33</span><span class="lg-title">Parent not found: an imported row points at g-old-2</span><span class="lg-state"><span class="hdot warn" aria-hidden="true"></span>Merged, not verified</span><span class="lg-when">Oct 2</span></div>
+</div>
+<div class="row wk-more"><span class="meta">Showing 15 of 19 open rows. 1,101 finished rows are hidden.</span><button type="button" class="sm">Show the other 4</button></div>
+</div>
+
+<div class="card lg-detail">
+<div class="card-head"><h2 class="wk-head">n-7</h2><span class="spacer"></span><span class="lg-state"><span class="hdot err" aria-hidden="true"></span>Needs you</span></div>
+<p class="lg-title-full">Choose the sign-in provider for the tester build</p>
+<dl class="lg-fields">
+<dt>Kind</dt><dd>Needs you</dd>
+<dt>Under</dt><dd>Sign-in rework (g-sign-in)</dd>
+<dt>Waiting on it</dt><dd>3 slices: s-3.1, s-3.2, s-3.4</dd>
+<dt>Owner</dt><dd>You</dd>
+<dt>Evidence</dt><dd>Pull request 41 waits on this; both providers were tried in a test build</dd>
+<dt>Link</dt><dd><a href="#">github.com/example/atlas/pull/41</a></dd>
+<dt>Also in Owed</dt><dd>“Decide which sign-in provider the tester build uses”, linked by you on Tuesday</dd>
+</dl>
+<form class="lg-change" aria-label="Answer this">
+<div class="toolbar"><label for="lg-to">New state</label><select id="lg-to"><option selected>Done</option><option>Dropped</option><option>Queued</option><option>In progress</option><option>Not started</option><option>Built, not merged</option><option>Merged, not verified</option><option>Verified</option></select></div>
+<label class="sr-only" for="lg-note">Your note</label><textarea id="lg-note">Use the provider we already pay for; keep email sign-in as the fallback.</textarea>
+<div class="toolbar"><button type="button" class="sm primary">Save</button><button type="button" class="sm">Cancel</button><span class="meta">Saved as “you, in the app”. The Owed item closes too.</span></div>
+</form>
+<div class="wk-sec">HISTORY, NEWEST FIRST</div>
+<ol class="lg-hist" reversed>
+<li><span class="h-what">Evidence changed</span><span class="t2"><span class="h-old">Pull request 41 waits on this</span> → Pull request 41 waits on this; both providers were tried in a test build</span><span class="h-meta">Yesterday 4:22 PM · a Claude Code conversation in Atlas</span></li>
+<li><span class="h-what">Linked to an Owed item</span><span class="h-meta">Tue 7:02 PM · you, in the app</span></li>
+<li><span class="h-what">In progress → Needs you</span><span class="t2">“Both providers work; this is a cost and taste call.”</span><span class="h-meta">Tue 6:40 PM · the Atlas job runner</span></li>
+<li><span class="h-what">Imported from tracker.json</span><span class="h-meta">Mon 8:40 AM · you, in Settings</span></li>
+<li><span class="h-what">Not started → In progress</span><span class="h-meta">Oct 9, 11:15 AM · imported, author not recorded</span></li>
+<li><span class="h-what">Added as Not started</span><span class="t2">“seeded”</span><span class="h-meta">Oct 8, 9:03 AM · imported, author not recorded</span></li>
+</ol>
+<div class="wk-board-foot"><span class="meta">Rows are never moved. Dropped rows stay with their history; a removed row can be restored for 30 days.</span></div>
+</div>
+
+</div>
+</div>
+
+</section></main></div></div></body></html>

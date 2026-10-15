@@ -129,6 +129,8 @@ function config(extra: Record<string, unknown> = {}) {
       routing_not_refreshed_after: setting(300),
       routing_push_start: setting(true),
       routing_push_prompt: setting(true),
+      routing_push_delegation: setting(true),
+      routing_dispatch_scripts: setting([], []),
       routing_reset_check: setting(true),
       routing_reset_check_wait: setting(120),
       routing_reset_check_retries: setting([600, 1800]),
@@ -602,10 +604,10 @@ describe("Settings -> Routing: holds", () => {
 });
 
 describe("Settings -> Routing: telling conversations", () => {
-  it("has the master switch and the two moments, and no delegation switch", async () => {
+  it("has the master switch and the three moments", async () => {
     await page();
     expect(screen.getByRole("switch", { name: "Tell conversations about routing" })).toBeChecked();
-    expect(screen.queryByText(/handing work to another agent/)).toBeNull();
+    expect(screen.getByRole("switch", { name: "Before handing work to another agent" })).toBeChecked();
     expect(screen.queryByText(/Copy for cloud agents/)).toBeNull();
     expect(screen.getByText("Checking for resets")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("switch", { name: "Tell conversations about routing" }));
@@ -614,6 +616,47 @@ describe("Settings -> Routing: telling conversations", () => {
     await waitFor(() =>
       expect(calls("khipu_config_set")).toEqual([{ key: "routing_push_prompt", value: "off" }]),
     );
+  });
+
+  it("turns the push before handing work to another agent off and on", async () => {
+    answers.khipu_config_show = () =>
+      calls("khipu_config_set").length ? config({ routing_push_delegation: setting(false, true) }) : config();
+    await page();
+    const sw = screen.getByRole("switch", { name: "Before handing work to another agent" });
+    fireEvent.click(sw);
+    await waitFor(() =>
+      expect(calls("khipu_config_set")).toEqual([{ key: "routing_push_delegation", value: "off" }]),
+    );
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Before handing work to another agent" })).not.toBeChecked());
+    fireEvent.click(screen.getByRole("switch", { name: "Before handing work to another agent" }));
+    await waitFor(() => expect(calls("khipu_config_set")).toHaveLength(2));
+    expect(calls("khipu_config_set")[1]).toEqual({ key: "routing_push_delegation", value: "on" });
+  });
+
+  it("saves your dispatch scripts as file names, and refuses a folder", async () => {
+    answers.khipu_config_show = () =>
+      calls("khipu_config_set").length ? config({ routing_dispatch_scripts: setting(["dispatch.py", "run-job.sh"], []) }) : config();
+    await page();
+    const row = screen.getByText("Your dispatch scripts").closest(".row-item") as HTMLElement;
+    expect(within(row).getByText("None")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Change your dispatch scripts" }));
+    const form = screen.getByRole("form", { name: "Change your dispatch scripts" });
+    const input = within(form).getByLabelText("File names");
+    fireEvent.change(input, { target: { value: "scripts/dispatch.py" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    expect(await within(form).findByRole("alert")).toHaveTextContent(/no folder/);
+    expect(calls("khipu_config_set")).toEqual([]);
+    // A name that starts with a dash would read as an option: refused, as the CLI and Rust do.
+    fireEvent.change(input, { target: { value: "-c" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    expect(await within(form).findByRole("alert")).toHaveTextContent(/no folder/);
+    expect(calls("khipu_config_set")).toEqual([]);
+    fireEvent.change(input, { target: { value: " dispatch.py, run-job.sh,dispatch.py " } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(calls("khipu_config_set")).toEqual([{ key: "routing_dispatch_scripts", value: '["dispatch.py","run-job.sh"]' }]),
+    );
+    await waitFor(() => expect(within(row).getByText("dispatch.py, run-job.sh")).toBeInTheDocument());
   });
 
   it("locks the master switch when the environment decides it", async () => {
