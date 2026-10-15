@@ -212,7 +212,8 @@ def test_a_record_not_refreshed_says_so(home, monkeypatch):
     _record()
     old = dict(routing.read_view(), checked_at=routing._iso(T0 - timedelta(minutes=20)))
     monkeypatch.setattr(routing, "read_view", lambda now=None: old)
-    monkeypatch.setattr(routing, "_start_view", lambda now=None: old)  # the session-start child's read
+    # The session-start child's read: of the saved view, as the real one's is.
+    monkeypatch.setattr(routing, "_start_view", lambda now=None: routing._load_view() and old)
     _push_on(monkeypatch)
     lines = _routing_part(_hook(monkeypatch)).splitlines()
     assert lines[1] == "Khipu's record has not been refreshed since 14:40Z."
@@ -252,6 +253,30 @@ def test_when_routing_is_late_the_hook_does_not_wait(home, monkeypatch):
     assert out == _before_routing()
     assert took < 1.0, took
     assert recall_prompt.routing_marker(SESSION) == {}
+
+
+@pytest.mark.parametrize("change", [False, True])
+def test_a_summary_from_an_older_record_generation_is_not_pushed(home, monkeypatch, change):
+    """Codex review of the cold-start fix, at the start too: the child's
+    summary can sit in the pipe while the memory part runs, and the record
+    can change meanwhile. A summary read from a record that is no longer the
+    current one is not pushed, and the marker stays unset."""
+    import os
+
+    _record()
+    _push_on(monkeypatch)
+    at = recall_rule._RoutingAtStart().begin()
+    assert at.pid is not None
+    _pid, status = os.waitpid(at.pid, 0)
+    at.pid = None
+    assert status == 0
+    if change:
+        routing.report(account="Claude", state="limited", until="2h", author=ME)
+        assert at.text() is None
+        at.delivered(SESSION)
+        assert recall_prompt.routing_marker(SESSION) == {}
+    else:
+        assert "Claude" in at.text()
 
 
 def test_when_the_lock_is_held_the_summary_still_arrives_in_time(home, monkeypatch):

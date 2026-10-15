@@ -267,6 +267,47 @@ def test_a_passing_gate_flips_and_restarts(home, monkeypatch, tmp_path):
     assert pm.MCP_NOTE in pm.format_result(out)
 
 
+def test_precompile_never_leaves_the_previous_slots_bytecode_in_use(home, tmp_path):
+    """Codex review of the cold-start fix: two slots' versions of a module
+    with the same size and mtime second matched the timestamp pyc compiled
+    under ``live`` for the old slot, so compileall skipped it and a fresh hook
+    imported the old code. Bytecode is checked-hash and forced: a hook
+    imports the live source right after the flip, before any precompile, and
+    after it. Real compiles, real imports, as a live hook (no bytecode
+    writes)."""
+    import sys
+
+    files = []
+    for name, value in (("slot-a", "old"), ("slot-b", "new")):
+        pkg = tmp_path / name / "packages" / "cli" / "khipu"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("")
+        (pkg / "probe.py").write_text(f"VALUE = '{value}'\n")
+        files.append(pkg / "probe.py")
+    stamp = files[0].stat().st_mtime_ns
+    for f in files:
+        os.utime(f, ns=(stamp, stamp))
+    live = tmp_path / "live"
+    live.symlink_to(tmp_path / "slot-a")
+
+    def imported() -> str:
+        env = pm._code_env(live)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        r = pm._run([sys.executable, "-c", "from khipu.probe import VALUE; print(VALUE)"], env=env)
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip()
+
+    assert pm.precompile(live, python=sys.executable)["ok"]
+    assert imported() == "old"
+    swap = tmp_path / "swap"
+    swap.symlink_to(tmp_path / "slot-b")
+    os.replace(swap, live)
+    assert imported() == "new"  # the old slot's bytecode is never served, even before a precompile
+    assert pm.precompile(tmp_path / "slot-b", python=sys.executable)["ok"]
+    assert pm.precompile(live, python=sys.executable)["ok"]
+    assert imported() == "new"
+
+
 # ---- the replay ------------------------------------------------------------
 
 

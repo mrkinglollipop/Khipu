@@ -591,7 +591,7 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
         signal.setitimer(signal.ITIMER_REAL, max(0.0, deadline - time.monotonic()) + _ROUTING_CHILD_GRACE)
         out = routing.start_push(budget, moment)
         if isinstance(out, dict):
-            data = memoryview(json.dumps({k: out.get(k) for k in ("text", "version", "epoch")}).encode("utf-8"))
+            data = memoryview(json.dumps({k: out.get(k) for k in ("text", "version", "epoch", "generation")}).encode("utf-8"))
             while data:
                 data = data[os.write(write_fd, data):]
         code = 0
@@ -643,9 +643,10 @@ class _RoutingAtStart:
         return self
 
     def text(self) -> str | None:
-        """The summary's text, or None (off, failed, late or empty). Output
-        the child finished before the deadline is read even when the memory
-        part ran past it."""
+        """The summary's text, or None (off, failed, late, empty, or read
+        from a record generation that is no longer current). Output the
+        child finished before the deadline is read even when the memory part
+        ran past it."""
         if self.fd is None:
             return None
         try:
@@ -665,6 +666,10 @@ class _RoutingAtStart:
             text = out.get("text") if isinstance(out, dict) else None
             if not (isinstance(text, str) and text.strip()):
                 return None
+            from khipu import recall_prompt
+
+            if not recall_prompt._routing_generation_current(out.get("generation")):
+                return None  # the record changed since the child read it
             self.out = out
             return text
         except Exception:

@@ -246,7 +246,17 @@ def _code_env(root: Path, base: dict[str, str] | None = None) -> dict[str, str]:
 # routing child's 1 s wait. A bytecode file names its source by path, and a
 # path under the ``live`` link holds one slot's code at a time, so that path
 # is compiled right after the flip (the old slot's hooks read it until then).
-_PRECOMPILE = "import compileall, sys\nsys.exit(0 if compileall.compile_dir(sys.argv[1], quiet=1) else 1)\n"
+#
+# Every file is compiled again (``force``), with checked-hash invalidation: a
+# pyc records its source's hash, which every import checks. A timestamp pyc is
+# trusted on the source's mtime second and size alone, and two slots' versions
+# of a file can share both, so the previous slot's bytecode would be served
+# under ``live`` (and compileall would skip it as current).
+_PRECOMPILE = (
+    "import compileall, py_compile, sys\n"
+    "sys.exit(0 if compileall.compile_dir(sys.argv[1], quiet=1, force=True,"
+    " invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH) else 1)\n"
+)
 
 
 def precompile(root: Path, *, python: str | None = None, timeout: float = 300) -> dict[str, Any]:

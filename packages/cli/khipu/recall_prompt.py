@@ -248,13 +248,18 @@ def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_
     """Move the session's last-seen routing version to ``version`` once a
     block was delivered (routing truth, phases 3a and 3b). With ``full_at``
     the marker starts again from a full summary; otherwise only the version
-    moves, and never back within one epoch (two prompts of one session
-    delivered out of order). ``unrefreshed`` records that the not-refreshed
+    moves. Within one epoch nothing moves back (two prompts of one session
+    delivered out of order): a full summary older than what was heard
+    leaves the marker as it is. ``unrefreshed`` records that the not-refreshed
     line for that read was said. Waits for the session's lock at most
     ``wait``; a busy lock or a failed write records nothing (the block is
     sent again) and is never raised."""
     def change(old: dict) -> dict:
         if full_at is not None:
+            if old.get("epoch") == epoch and isinstance(old.get("version"), int) and (
+                    old["version"] > version
+                    or (old["version"] == version and _later(old.get("full_at"), full_at))):
+                return old  # a later block was heard first: an older full summary moves nothing back
             new = {"version": version, "epoch": epoch, "full_at": full_at}
         else:
             new = dict(old, epoch=epoch)
@@ -267,6 +272,14 @@ def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_
         return new
 
     return _update_routing_marker(session_id, change, wait)
+
+
+def _later(a, b) -> bool:
+    """Whether time ``a`` is after time ``b`` (both ISO; False when either is not)."""
+    try:
+        return datetime.fromisoformat(a.replace("Z", "+00:00")) > datetime.fromisoformat(b.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def mark_routing_pointer(session_id: str, *, version: int, epoch: str | None, wait: float = 0.05) -> bool:
@@ -453,7 +466,8 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
             try:
                 marker = routing_marker(session_id)
                 out = routing.prompt_push(marker, budget=budget, on_fold=fold_started)
-                answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed")}
+                answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed",
+                                                "generation")}
                 if isinstance(answer["text"], str) and len(answer["text"]) > _ROUTING_TEXT_MOST:
                     answer["text"] = answer["text"][:_ROUTING_TEXT_MOST]
                 answer["pointer_said"] = marker.get("pointer") == {"version": out.get("version"),
@@ -1416,6 +1430,27 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
         _reap_until(lambda: len(children) + len(pollers), reap, time.monotonic() + _FORKSERVER_REAP_MOST)
 
 
+def _routing_generation_current(files) -> bool:
+    """Whether every file a routing answer was read from
+    (``routing._generation``: ``[[path, stat], ...]``) still has the stat it
+    had then. An answer can sit in the pipe while the search runs, and the
+    record can change meanwhile; one read from an older generation is never
+    delivered. A stat each, never a wait."""
+    if not isinstance(files, list):
+        return False
+    for item in files:
+        if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)):
+            return False
+        try:
+            st = os.stat(item[0])
+            now = [st.st_mtime_ns, st.st_size, st.st_ino]
+        except OSError:
+            now = None
+        if now != item[1]:
+            return False
+    return True
+
+
 class _RoutingAtPrompt:
     """One prompt's routing read: ``begin`` forks the child, ``collect``
     reads its answer within the budget, ``info`` says what to add."""
@@ -1512,7 +1547,9 @@ class _RoutingAtPrompt:
         the child finished (the time on its line) within the budget, or
         before this call (while the prompt was still searching, so it costs
         the prompt nothing), is taken; one finished after both is not,
-        however early it is read (fix round 5). Once the wait is over, what is
+        however early it is read (fix round 5). Nor is one whose record
+        generation is no longer current (``_routing_generation_current``).
+        Once the wait is over, what is
         already buffered is read for at most ``_ROUTING_DRAIN_MOST`` seconds,
         and never more than ``_ROUTING_ANSWER_MOST`` bytes in all."""
         if self.fd is None:
@@ -1571,6 +1608,9 @@ class _RoutingAtPrompt:
                 cutoff = min(cutoff, limit)  # nor after the request's own deadline
             if not isinstance(done, (int, float)) or isinstance(done, bool) or done > cutoff:
                 return None  # finished after its budget: routing=skipped:budget, the marker unmoved
+            if not _routing_generation_current(out.get("generation")):
+                self.status = "skipped:stale"  # the record changed since its read: the marker unmoved
+                return None
             return out
         except Exception:
             self.status = "skipped:error"

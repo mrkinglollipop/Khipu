@@ -366,8 +366,8 @@ def test_the_order_and_the_budget_of_a_change_block(home, monkeypatch):
     assert lines[3].startswith("Hold on")
     assert len(lines) == 4
     # Over the budget: whole lines from the bottom, then where to read the rest.
-    recall_prompt.mark_routing_seen(SESSION, version=seen["version"], epoch=seen["epoch"],
-                                    full_at=seen["full_at"])
+    # The marker is set back by hand: a delivery never moves it back.
+    assert recall_prompt._update_routing_marker(SESSION, lambda _old: dict(seen), 0.05)
     _set(home, routing_prompt_chars=150)
     lines = _routing_part(_cold(monkeypatch)).splitlines()[1:]
     assert lines[0] == "Standing rule 1. Never the paid xAI API."
@@ -964,9 +964,9 @@ _STALE_BYTECODE = (
     "    src = getattr(mod, '__file__', None)\n"
     "    if name.split('.')[0] != 'khipu' or not src or not src.endswith('.py'):\n"
     "        continue\n"
-    "    st = os.stat(src)\n"
-    "    want = importlib.util.MAGIC_NUMBER + bytes(4) + (int(st.st_mtime) & 0xFFFFFFFF).to_bytes(4, 'little')"
-    " + (st.st_size & 0xFFFFFFFF).to_bytes(4, 'little')\n"
+    "    with open(src, 'rb') as f:\n"
+    "        source = f.read()\n"
+    "    want = importlib.util.MAGIC_NUMBER + (3).to_bytes(4, 'little') + importlib.util.source_hash(source)\n"
     "    try:\n"
     "        with open(importlib.util.cache_from_source(src), 'rb') as f:\n"
     "            ok = f.read(16) == want\n"
@@ -983,8 +983,9 @@ def test_the_routing_childs_modules_are_precompiled_for_a_live_hook(home, monkey
     """A live hook never writes bytecode, so a module of the code promote put
     live that nothing precompiled is compiled from source by every prompt's
     routing child (1 s and more on a loaded Mac, the child's whole wait).
-    Every khipu module the child loads has current bytecode once
-    ``promote.precompile`` ran, and the check sees the gap when it did not."""
+    Every khipu module the child loads has current, checked-hash bytecode
+    (its source's hash, checked on every import) once ``promote.precompile``
+    ran, and the check sees the gap when it did not."""
     env = _as_a_live_hook(monkeypatch, home, precompiled=precompiled)
     proc = subprocess.run([sys.executable, "-c", _STALE_BYTECODE], env=env, capture_output=True, timeout=60)
     assert proc.returncode == 0, proc.stderr.decode()
@@ -1688,7 +1689,8 @@ def test_an_answer_finished_after_the_budget_is_not_taken(home):
     still read whatever was buffered. An answer finished after both its
     budget and the moment the prompt asked for it is not taken, even when
     it is already buffered."""
-    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0}
+    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0,
+              "generation": []}
 
     def after_the_ask(_at) -> bytes:
         return json.dumps(dict(answer, done=time.monotonic() + 0.5)).encode() + b"\n"
@@ -1712,7 +1714,8 @@ def test_an_answer_finished_while_the_search_ran_is_taken(home):
     finished before the prompt asked for it cost the prompt nothing, so it
     is taken however far past the budget it finished; the wait after the
     search is still the budget's."""
-    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0}
+    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0,
+              "generation": []}
 
     def during_the_search(_at) -> bytes:
         return json.dumps(dict(answer, done=time.monotonic())).encode() + b"\n"
@@ -1726,6 +1729,73 @@ def test_an_answer_finished_while_the_search_ran_is_taken(home):
     assert at.collect() is None and at.status == "skipped:budget"
     assert time.monotonic() - began < 0.6  # waited the budget and the drain, not for the child
     writer.join(5)
+
+
+def _answered_while_the_search_ran(home, monkeypatch) -> recall_prompt._RoutingAtPrompt:
+    """A real child whose answer (80 ms of rendering on a 10 ms budget) is
+    buffered before the prompt asks for it, as after a slow search."""
+    _record()
+    _set(home, routing_prompt_budget_ms=10)
+    _push_on(monkeypatch)
+    render = routing.prompt_push
+
+    def slow(*a, **k):
+        out = render(*a, **k)
+        time.sleep(0.08)
+        return out
+
+    monkeypatch.setattr(routing, "prompt_push", slow)
+    at = recall_prompt._RoutingAtPrompt().begin(SESSION)
+    assert at.pid is not None
+    _pid, status = os.waitpid(at.pid, 0)
+    at.pid = None
+    assert status == 0
+    return at
+
+
+@pytest.mark.parametrize("change", ["none", "report", "refold"])
+def test_a_buffered_answer_from_an_older_record_generation_is_dropped(home, monkeypatch, change):
+    """Codex review of the cold-start fix: an answer buffered while the
+    search ran was taken after the record changed under it, so the prompt
+    said "Claude: open" at version 2 while the record said limited at 3. An
+    answer is taken only while the record it was read from is still the
+    current one: a conversation's report, or a fold another process saved
+    (a source change reaches prompts that way), drops it at once."""
+    at = _answered_while_the_search_ran(home, monkeypatch)
+    before = _marker()
+    if change == "report":
+        routing.report(account="Claude", state="limited", until="2h", author=ME)
+    elif change == "refold":
+        routing._save_view(routing._load_view())
+    began = time.monotonic()
+    out = at.collect()
+    assert time.monotonic() - began < 0.05  # stats, never a wait
+    if change == "none":
+        assert out is not None and out["kind"] == "full"
+        return
+    assert out is None and at.status == "skipped:stale"
+    assert _marker() == before
+
+
+def test_an_older_full_summary_never_moves_the_marker_back(home):
+    """Codex review of the cold-start fix: a late full summary at version 2,
+    delivered after version 3 was heard, rewound the marker to 2. Within one
+    epoch a full summary moves nothing back, as changes never did; a newer
+    one, or one of a new epoch, starts the marker again."""
+    at = routing._iso(T0)
+    earlier = routing._iso(T0 - timedelta(minutes=5))
+    assert recall_prompt.mark_routing_full(SESSION, version=3, epoch="e1", at=at)
+    assert recall_prompt.mark_routing_seen(SESSION, version=2, epoch="e1", full_at=earlier)
+    assert _marker() == {"version": 3, "epoch": "e1", "full_at": at}
+    assert recall_prompt.mark_routing_seen(SESSION, version=3, epoch="e1", full_at=earlier)
+    assert _marker() == {"version": 3, "epoch": "e1", "full_at": at}
+    assert recall_prompt.mark_routing_seen(SESSION, version=2, epoch="e1")
+    assert _marker()["version"] == 3
+    later = routing._iso(T0 + timedelta(minutes=5))
+    assert recall_prompt.mark_routing_seen(SESSION, version=4, epoch="e1", full_at=later)
+    assert _marker() == {"version": 4, "epoch": "e1", "full_at": later}
+    assert recall_prompt.mark_routing_seen(SESSION, version=1, epoch="e2", full_at=earlier)
+    assert _marker() == {"version": 1, "epoch": "e2", "full_at": earlier}
 
 
 def test_a_pipe_that_never_stops_is_drained_only_briefly(home):
@@ -1761,7 +1831,8 @@ def test_a_pipe_that_never_stops_is_drained_only_briefly(home):
 def test_an_answer_finished_after_the_request_deadline_is_not_taken(home):
     """Review of fix round 5: the cutoff left out the request's deadline, so
     an answer finished after it, though within the budget, was taken."""
-    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0}
+    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0,
+              "generation": []}
 
     def late(_at) -> bytes:
         return json.dumps(dict(answer, done=time.monotonic())).encode() + b"\n"

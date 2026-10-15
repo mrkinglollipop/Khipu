@@ -1020,6 +1020,9 @@ def view_file() -> Path:
 
 
 _held = threading.local()
+# The stat of the view.json this thread last read or saved (``_load_view``,
+# ``_save_view``): what a prompt's answer names as its record generation.
+_view_seen = threading.local()
 _LOCK_POLL = 0.05
 
 
@@ -2625,8 +2628,12 @@ def _load_view() -> dict | None:
     program is never copied from (its version, its changes) or answered
     from: the log is refolded instead, as when view.json is lost, and the
     version count starts again under a new epoch."""
+    _view_seen.stat = None
     try:
-        data = _loads(view_file().read_text(encoding="utf-8"))
+        with view_file().open(encoding="utf-8") as fh:
+            st = os.fstat(fh.fileno())
+            _view_seen.stat = [st.st_mtime_ns, st.st_size, st.st_ino]
+            data = _loads(fh.read())
         if not isinstance(data, dict) or data.get("schema") != SCHEMA or data.get("digest") != _digest(data):
             return None
     except (OSError, ValueError, RecursionError):
@@ -2646,7 +2653,9 @@ def _save_view(view: dict) -> None:
             json.dump(dict(view, digest=_digest(view)), fh, indent=1, sort_keys=True, ensure_ascii=False)
             fh.flush()
             os.fsync(fh.fileno())
+            st = os.fstat(fh.fileno())  # a rename keeps the inode, size and mtime
         os.replace(tmp, path)
+        _view_seen.stat = [st.st_mtime_ns, st.st_size, st.st_ino]
     except BaseException:
         if tmp is not None:
             with contextlib.suppress(OSError):
@@ -4342,12 +4351,17 @@ def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_B
     view is read as the session-start child reads it (``_start_view``)."""
     with lock_budget(lock_wait):
         now = now or _now()
+        _view_seen.stat = None
         view = _start_view(now) if start else read_view(now)
         out = summary(view, now=now)
     # The summary is the push: built from labels and names, with the
     # owner's own words whole; it holds no key and no configured path.
-    return {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
-            "about": ABOUT}
+    status = {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
+              "about": ABOUT}
+    if start:
+        # Only for the hook, which checks it and never prints it: it names files.
+        status["generation"] = _generation(view, settings())
+    return status
 
 
 # ---- the push at session start (phase 3a) ------------------------------------------------
@@ -4537,6 +4551,25 @@ def _prompt_view(now: datetime, on_fold=None) -> dict:
         return _start_view(now)
 
 
+def _generation(view: dict, cfg: dict) -> list[list]:
+    """The record generation ``view`` stands on: each file it was read
+    from, with the stat it had then (the log, the config and the rules seed
+    as its fold saw them, and view.json as this thread read or saved it).
+    The hook takes a buffered answer only while every one of them still has
+    that stat (``recall_prompt._routing_generation_current``): a stat each,
+    never a wait. A source change reaches a prompt through view.json, once a
+    fold saved it."""
+    from khipu.config import config_file
+
+    fingerprint = view.get("fingerprint") if isinstance(view.get("fingerprint"), dict) else {}
+    files = [[str(events_file()), fingerprint.get("events")], [str(config_file()), fingerprint.get("config")],
+             [str(view_file()), getattr(_view_seen, "stat", None)]]
+    seed = cfg.get("routing_rules_seed")
+    if seed:
+        files.append([str(Path(seed)), fingerprint.get("seed")])
+    return files
+
+
 def _full_reason(marker: dict | None, view: dict, now: datetime, cfg: dict) -> str | None:
     """Why this prompt gets the full summary instead of the changes, or None."""
     marker = marker if isinstance(marker, dict) else {}
@@ -4642,9 +4675,10 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
     nothing changed (fix round 5)."""
     with lock_budget(budget / 2):
         now = now or _now()
+        _view_seen.stat = None
         view = _prompt_view(now, on_fold=on_fold)
     cfg = settings()
-    base = {"version": view["version"], "epoch": view.get("epoch")}
+    base = {"version": view["version"], "epoch": view.get("epoch"), "generation": _generation(view, cfg)}
     why = _full_reason(marker, view, now, cfg)
     if why is None and view.get("unsaved_change"):
         raise PushUnsaved("the routing view changed and could not be saved")
