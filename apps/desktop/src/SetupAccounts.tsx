@@ -151,6 +151,33 @@ export function planAccountList(
   return { list, ids: new Set(list.map((e) => accountId(e.harness, e.home, uh))), changed };
 }
 
+type ListStart = { source: "file" | "default"; ids: Set<string> };
+type ListWrite = { kind: "none" } | { kind: "set"; list: StoredEntry[] } | { kind: "unset"; list: StoredEntry[] };
+
+/** What Next writes to the account list given `status`, the list saved now.
+ *  When this step turned the default list into an explicit one and the
+ *  operations now give back exactly the accounts it started with, Next goes
+ *  back to the default list (every CLI found), as at the start. */
+export function planListWrite(
+  status: AccountsStatus,
+  readOps: Map<string, boolean>,
+  rows: UsageAccount[],
+  start: ListStart | null,
+  convertedHere: boolean,
+): ListWrite {
+  const plan = planAccountList(status, readOps, rows);
+  const sameAsStart = start != null && plan.ids.size === start.ids.size && [...plan.ids].every((id) => start.ids.has(id));
+  if (convertedHere && status.source === "file" && start?.source === "default" && sameAsStart) {
+    return { kind: "unset", list: plan.list };
+  }
+  if (plan.changed && plan.list.length) return { kind: "set", list: plan.list };
+  return { kind: "none" };
+}
+
+function sameWrite(a: ListWrite | null, b: ListWrite | null): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 /** The priority's entries as an account identity, compared as `khipu config`
  *  compares logins. Labels are display names a different account may take
  *  later, so they never match. */
@@ -252,7 +279,15 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
     const id = accountId(r.harness, r.home, userHome);
     return readOps.get(id) ?? (listedIds ? listedIds.has(id) : true);
   };
+  // The list as first read, and whether this step turned the default list
+  // into an explicit one: going back to the default is then this step's to do.
+  const startList = useRef<ListStart | null>(null);
+  if (status && !startList.current) {
+    startList.current = { source: status.source, ids: planAccountList(status, new Map(), found).ids };
+  }
+  const convertedHere = useRef(false);
   const listPlan = status && readOps.size ? planAccountList(status, readOps, found) : null;
+  const listWrite = status && readOps.size ? planListWrite(status, readOps, found, startList.current, convertedHere.current) : null;
 
   const held = route.data?.priority ?? null;
   const visible = visibleRows(status, readOps, found);
@@ -287,40 +322,84 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
   async function next() {
     setSaving(true);
     setErr(null);
+    // What the screen promised when Next was pressed: the help line's list
+    // and the order shown. A fresh read that gives a different plan writes
+    // nothing; the screen then shows the new plan and Next is pressed again.
+    const promisedList = listWrite;
+    const promisedOrder = order;
     const done: string[] = [];
     let advanced = false;
     const say = (cant: string) =>
       setErr(
         `${done.length ? `Khipu saved ${listOf(done)}, but` : "Khipu"} couldn't ${cant}. Try Next again, or Skip for now and change it later in Settings.`,
       );
+    const changedElsewhere = (what: string) =>
+      setErr(
+        `${done.length ? `Khipu saved ${listOf(done)}. ` : ""}${what} changed while setup was open, so Khipu saved nothing more. ` +
+          "What is shown now is what Next will save; press Next again to save it.",
+      );
     try {
-      // What is saved now, read fresh for this Next.
-      const [c, r, f] = await Promise.all([cfg.read(), route.read(), features.read()]);
-      const fresh = c.ok ? c.data.usage_accounts ?? null : null;
+      // Each setting is read again just before it is written, never earlier.
+      let listNow: AccountsStatus | null = null;
       if (readOps.size) {
+        const c = await cfg.read();
+        const fresh = c.ok ? c.data.usage_accounts ?? null : null;
         if (!fresh) {
           console.error("khipu config show failed:", c.ok ? "no usage_accounts" : c.error);
           say("read the account list, so which accounts to read was not saved");
           return;
         }
-        const plan = planAccountList(fresh, readOps, found);
-        if (plan.changed && plan.list.length) {
-          const res = await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(plan.list) });
+        const plan = planListWrite(fresh, readOps, found, startList.current, convertedHere.current);
+        if (!sameWrite(plan, promisedList)) {
+          changedElsewhere("The account list");
+          return;
+        }
+        if (plan.kind !== "none") {
+          const res =
+            plan.kind === "unset"
+              ? await callCli("khipu_config_unset", { key: "usage_accounts" })
+              : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(plan.list) });
           if (!res.ok) {
-            console.error("khipu config --set usage_accounts failed:", res.error);
+            console.error("khipu config usage_accounts failed:", res.error);
             say("save which accounts to read");
             return;
           }
+          if (plan.kind === "set" && fresh.source === "default") convertedHere.current = true;
+          if (plan.kind === "unset") convertedHere.current = false;
           done.push("which accounts to read");
+          // Read back at once: a change made elsewhere right after this write
+          // is kept as it is, and said.
+          const after = await cfg.read();
+          const back = after.ok ? after.data.usage_accounts ?? null : null;
+          const wrote = plan.kind === "unset" ? null : JSON.stringify(plan.list);
+          if (back && back.source === "file" && wrote != null && JSON.stringify(planAccountList(back, new Map(), found).list) !== wrote) {
+            changedElsewhere("The account list");
+            return;
+          }
+          listNow = back;
+        } else {
+          listNow = fresh;
         }
       }
       if (moves.length) {
+        if (!listNow) {
+          const c = await cfg.read();
+          listNow = c.ok ? c.data.usage_accounts ?? null : null;
+        }
+        const r = await route.read();
         if (!r.ok) {
           console.error("khipu route failed:", r.error);
           say("read your current order, so the order was not saved");
           return;
         }
-        const plan = planPriority(r.data.priority ?? null, visibleRows(fresh, readOps, found), moves, fresh?.user_home ?? null);
+        const vis = visibleRows(listNow, readOps, found);
+        const uh = listNow?.user_home ?? null;
+        const freshOrder = applyMoves(startOrderOf(r.data.priority?.entries ?? [], vis, uh), moves);
+        if (!samePriority(freshOrder, promisedOrder)) {
+          changedElsewhere("Your order");
+          return;
+        }
+        const plan = planPriority(r.data.priority ?? null, vis, moves, uh);
         if (plan) {
           const res = await callCli("khipu_route_priority", { action: "set", entries: plan.entries, until: plan.until });
           if (!res.ok) {
@@ -330,8 +409,12 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
           }
           done.push("the order");
         }
+        // Saved (or already so): the moves are done and never replayed.
+        setMoves([]);
+        void route.read();
       }
       if (tell != null) {
+        const f = await features.read();
         const sw = f.ok ? f.data.features?.routing_push : undefined;
         if (!sw) {
           console.error("khipu features failed:", f.ok ? "no routing_push" : f.error);
@@ -351,11 +434,7 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
       onNext();
     } finally {
       setSaving(false);
-      // After a partial save the screen shows what is saved now.
-      if (!advanced && done.length) {
-        void cfg.read();
-        void route.read();
-      }
+      if (!advanced && done.length) void route.read();
     }
   }
 
@@ -455,13 +534,15 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
               );
             })}
           </ul>
-          {listPlan ? (
+          {listPlan && listWrite ? (
             <p className="set-help" role="status">
-              {listPlan.list.length === 0
-                ? "With none chosen, Next leaves the account list as it is saved."
-                : listPlan.changed
-                  ? `Next saves the account list as: ${listOf(listPlan.list.map((e) => e.label))}.`
-                  : "The account list is already saved this way."}
+              {listWrite.kind === "unset"
+                ? "Next goes back to reading every account Khipu finds on this Mac."
+                : listWrite.kind === "set"
+                  ? `Next saves the account list as: ${listOf(listWrite.list.map((e) => e.label))}.`
+                  : listPlan.list.length === 0
+                    ? "With none chosen, Next leaves the account list as it is saved."
+                    : "The account list is already saved this way."}
             </p>
           ) : null}
           {notFound.length ? (

@@ -408,8 +408,9 @@ describe("Setup › Accounts step, review round 3", () => {
     fireEvent.click(boxes()[1]);
     fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
     await waitFor(() => expect(onNext).toHaveBeenCalled());
-    expect(calls("khipu_config_set")).toHaveLength(2);
-    expect(world.accounts.map((e) => e.harness)).toEqual(["claude", "grok", "muse", "codex"]);
+    // Back to every account, as at the start: the default list again.
+    expect(calls("khipu_config_unset")).toHaveLength(1);
+    expect(world.source).toBe("default");
   });
 
   it("a retry after a partial save sends only what is still unsaved", async () => {
@@ -483,6 +484,8 @@ describe("Setup › Accounts step, changes as operations on what is saved now", 
     fireEvent.click(box(3));
     world.source = "file";
     world.accounts = [...ENTRIES, { label: "Claude second", harness: "claude", home: "~/.claude-second" }];
+    next();
+    await screen.findByText(/changed while setup was open/);
     next();
     await waitFor(() => expect(onNext).toHaveBeenCalled());
     expect(world.accounts.map((e) => e.label)).toEqual(["Claude Code", "Codex", "Grok Build", "Claude second"]);
@@ -558,6 +561,74 @@ describe("Setup › Accounts step, changes as operations on what is saved now", 
     next();
     await waitFor(() => expect(onNext).toHaveBeenCalledTimes(2));
     expect(WRITES.map((w) => calls(w).length)).toEqual(writes);
+  });
+});
+
+describe("Setup › Accounts step, review round 5", () => {
+  const next = () => fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+  const box = (i: number) => screen.getAllByLabelText("Read this account's plan")[i] as HTMLInputElement;
+
+  it("a retry never replays a move that was already saved", async () => {
+    fake({ failOnce: ["khipu_feature_set"] });
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(screen.getByRole("button", { name: "Move Codex up" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move Claude Code down" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Tell my conversations about this" }));
+    next();
+    await screen.findByText(/saved the order, but couldn't change whether conversations are told/);
+    expect(world.priority?.entries.map((e) => e.account)).toEqual(["codex|", "grok|", "claude|", "muse|"]);
+    next();
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(world.priority?.entries.map((e) => e.account)).toEqual(["codex|", "grok|", "claude|", "muse|"]);
+    expect(calls("khipu_route_priority")).toHaveLength(1);
+  });
+
+  it("checking every account again after a partial save goes back to the default list", async () => {
+    fake({ failOnce: ["khipu_route_priority"] });
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(box(1));
+    fireEvent.click(screen.getByRole("button", { name: "Move Muse up" }));
+    next();
+    await screen.findByText(/couldn't save the order/);
+    expect(world.source).toBe("file");
+    fireEvent.click(box(1));
+    expect(await screen.findByText(/Next goes back to reading every account Khipu finds/)).toBeInTheDocument();
+    next();
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(world.source).toBe("default");
+  });
+
+  it("changes made elsewhere while Next waits on the order are kept", async () => {
+    fake();
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(box(3));
+    fireEvent.click(screen.getByRole("button", { name: "Move Codex up" }));
+    holding.add("khipu_route_view");
+    next();
+    await waitFor(() => expect(held.length).toBe(1));
+    world.accounts = world.accounts.map((e) => (e.harness === "codex" ? { ...e, label: "Codex work" } : e));
+    world.accounts.push({ label: "Claude second", harness: "claude", home: "~/.claude-second" });
+    held.forEach((release) => release());
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(world.accounts.map((e) => e.label)).toEqual(["Claude Code", "Codex work", "Grok Build", "Claude second"]);
+  });
+
+  it("when the saved list changed after the help line was shown, Next writes nothing and shows the new plan", async () => {
+    fake();
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(box(3));
+    expect(screen.getByText("Next saves the account list as: Claude Code, Codex and Grok Build.")).toBeInTheDocument();
+    world.source = "file";
+    world.accounts = [...ENTRIES, { label: "Claude second", harness: "claude", home: "~/.claude-second" }];
+    next();
+    await screen.findByText(/changed while setup was open/);
+    expect(calls("khipu_config_set")).toHaveLength(0);
+    expect(onNext).not.toHaveBeenCalled();
+    expect(screen.getByText("Next saves the account list as: Claude Code, Codex, Grok Build and Claude second.")).toBeInTheDocument();
   });
 });
 
