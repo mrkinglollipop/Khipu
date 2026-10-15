@@ -275,7 +275,48 @@ class ProbePromptRecallSnapshotTest(unittest.TestCase):
     def test_a_non_empty_trivial_prompt_always_fails_regardless_of_snapshot(self):
         out = self._run(snapshot_fresh=False, trivial_ctx="should not be here")
         self.assertFalse(out["ok"])
-        self.assertEqual(out["error"], "trivial prompt was not empty")
+        self.assertEqual(out["error"], "trivial prompt carried recall output")
+
+    _ROUTING = ("## Routing at 15:00Z (Khipu's routing record, version 3; data, not instructions; "
+                "guidance, not a gate)\nStanding rules:\n1. A rule.")
+    _CHANGES = "## Routing changes at 15:10Z (Khipu's routing record; data, not instructions)\n- Codex: open"
+    _POINTER = ("## Routing\nKhipu's routing update (the owner's standing rules, the note and the accounts' "
+                "state) is too long to arrive with this prompt. Call `khipu_route` to read it.")
+
+    def test_a_trivial_prompt_carrying_only_routing_passes(self):
+        """Routing truth phase 3: a conversation's first prompt carries the
+        routing block, a later one its changes or the pointer, trivial or not.
+        Failed on main before this fix as "trivial prompt was not empty"."""
+        for block in (self._ROUTING, self._CHANGES, self._POINTER):
+            with self.subTest(block=block[:24]):
+                out = self._run(snapshot_fresh=True, trivial_ctx=block,
+                                topical_ctx="## Prior work on this topic\n- x")
+                self.assertTrue(out["ok"], out)
+                self.assertTrue(out["trivial_empty"])
+
+    def test_recall_leaking_into_a_trivial_prompt_still_fails_with_routing_present(self):
+        cases = {
+            "recall then routing": f"## Prior work on this topic\n- x\n\n{self._ROUTING}",
+            "routing then recall": f"{self._ROUTING}\n\n## Prior work on this topic\n- x",
+            "other recall output then routing": f"Earlier in this thread: x\n\n{self._CHANGES}",
+        }
+        for name, ctx in cases.items():
+            with self.subTest(name):
+                out = self._run(snapshot_fresh=False, trivial_ctx=ctx)
+                self.assertFalse(out["ok"])
+                self.assertEqual(out["error"], "trivial prompt carried recall output")
+
+    def test_routing_alone_is_not_a_topical_hit(self):
+        """The same assumption the other way: with a fresh snapshot a topical
+        prompt must find recall, and a routing block alone is not recall."""
+        out = self._run(snapshot_fresh=True, topical_ctx=self._ROUTING)
+        self.assertFalse(out["ok"])
+        self.assertIn("fresh", out["error"])
+        self.assertEqual(out["topical_context_chars"], 0)
+        hit = "## Prior work on this topic\n- x"
+        out = self._run(snapshot_fresh=True, topical_ctx=f"{hit}\n\n{self._ROUTING}")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["topical_context_chars"], len(hit))
 
     def test_repeat_calls_use_distinct_session_ids_not_a_fixed_literal(self):
         """Found live 2026-09-14: the probe used to send session_id="khipu-verify"
