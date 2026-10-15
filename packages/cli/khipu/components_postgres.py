@@ -380,7 +380,8 @@ def _probe_local_cluster(dsn: str, pgvector_min: str) -> dict[str, Any]:
 def _run_migrations() -> dict[str, Any]:
     from khipu.migrate import run as migrate_run
 
-    result = migrate_run(dry_run=False)
+    # A database this machine just created for itself: its rows are its own.
+    result = migrate_run(dry_run=False, claim_local_rows=True)
     pending = result.get("pending") or []
     if pending:
         return {"ok": False, "error": "migrations_pending", "pending": pending}

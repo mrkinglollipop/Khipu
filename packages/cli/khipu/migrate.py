@@ -17,6 +17,12 @@ from pathlib import Path
 
 _VERSION_RE = re.compile(r"^(\d{4}_[a-z0-9_]+)\.sql$")
 
+# A migration that names this setting gets this machine's local origin
+# (khipu/machine_identity.py) for its transaction only (0029_episode_origin).
+LOCAL_ORIGIN_SETTING = "khipu.local_origin"
+# The value that applies such a migration without claiming any existing row.
+LOCAL_ORIGIN_NONE = "none"
+
 
 def migrations_dir() -> Path:
     from khipu.paths import repo_root
@@ -58,7 +64,8 @@ def plan(cur, directory: Path | None = None) -> dict:
     }
 
 
-def run(*, dry_run: bool = False, directory: Path | None = None, conn=None) -> dict:
+def run(*, dry_run: bool = False, directory: Path | None = None, conn=None,
+        claim_local_rows: bool = False) -> dict:
     """Apply pending migrations against ``conn``, or the resolved hub when
     ``conn`` is omitted (the historical, still-default behaviour).
 
@@ -68,16 +75,25 @@ def run(*, dry_run: bool = False, directory: Path | None = None, conn=None) -> d
     run the schema stage against exactly that connection instead of
     whatever ``khipu.db.resolve_dsn()`` currently points at. The connection
     is never closed here; the caller owns its lifecycle either way.
+
+    ``claim_local_rows`` lets a backfill stamp existing local-harness rows as
+    this machine's (0029). Only the owner's own ``khipu migrate`` and a fresh
+    local database pass it: setup against an existing hub or ``khipu join
+    import`` may run on a second machine, which must not claim the first
+    machine's rows.
     """
     if conn is not None:
-        return _run_migrations(conn, dry_run=dry_run, directory=directory)
+        return _run_migrations(conn, dry_run=dry_run, directory=directory,
+                               claim_local_rows=claim_local_rows)
     from khipu.db import connect
 
     with connect() as owned_conn:
-        return _run_migrations(owned_conn, dry_run=dry_run, directory=directory)
+        return _run_migrations(owned_conn, dry_run=dry_run, directory=directory,
+                               claim_local_rows=claim_local_rows)
 
 
-def _run_migrations(conn, *, dry_run: bool, directory: Path | None) -> dict:
+def _run_migrations(conn, *, dry_run: bool, directory: Path | None,
+                    claim_local_rows: bool = False) -> dict:
     with conn.cursor() as cur:
         p = plan(cur, directory)
     pending = p.pop("_pending_paths")
@@ -92,6 +108,14 @@ def _run_migrations(conn, *, dry_run: bool, directory: Path | None) -> dict:
         # already; commit after each so a later failure cannot roll back an
         # earlier, successful migration.
         with conn.cursor() as cur:
+            if LOCAL_ORIGIN_SETTING in sql:
+                # Raises MachineIdentityError before the file runs when this
+                # machine has no readable identity.
+                from khipu.machine_identity import local_origin
+
+                value = local_origin() if claim_local_rows else LOCAL_ORIGIN_NONE
+                cur.execute("SELECT set_config(%s, %s, true)",
+                            (LOCAL_ORIGIN_SETTING, value))
             cur.execute(sql)
             # Belt and braces: the file records itself, but if a migration
             # forgets to, the runner would re-apply it forever.

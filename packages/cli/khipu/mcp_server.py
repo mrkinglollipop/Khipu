@@ -166,8 +166,12 @@ def mark_gateway_active() -> None:
 
 
 def _via_https_gateway() -> bool:
-    """True when this tools/call arrived through ``khipu.gateway`` (HTTPS)."""
-    if _GATEWAY_ACTIVE:
+    """True when this tools/call arrived through ``khipu.gateway`` (HTTPS):
+    the request carries a token label. The process-wide flag stays as the
+    fallback for threads a request starts, which do not inherit its label."""
+    from khipu.request_context import gateway_label
+
+    if gateway_label() or _GATEWAY_ACTIVE:
         return True
     return (os.environ.get(GATEWAY_ACTIVE_ENV) or "").strip().lower() in {
         "1", "true", "yes", "on",

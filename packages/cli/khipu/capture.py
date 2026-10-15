@@ -622,6 +622,29 @@ def load_payload(raw: str) -> dict[str, Any]:
     return payload
 
 
+def _stamp_origin(cur) -> str | None:
+    """The origin for a new episode row, or None to leave it unset: on a hub
+    without the column (pre-0029), and when this machine has no readable
+    identity, which is logged and never replaced by an invented id. A capture
+    is never refused for its origin."""
+    from khipu import db
+
+    if not db.has_columns(cur, "episodes", "origin"):
+        # The column list is cached per process; a long-lived server that
+        # started before `khipu migrate` must see the column without a restart.
+        db._TABLE_COLUMNS_CACHE.pop("episodes", None)
+        if not db.has_columns(cur, "episodes", "origin"):
+            return None
+    from khipu.machine_identity import MachineIdentityError
+    from khipu.request_context import request_origin
+
+    try:
+        return request_origin()
+    except MachineIdentityError as exc:
+        _log(f"origin left unset: {exc}")
+        return None
+
+
 def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
 
@@ -638,6 +661,9 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     # place a secret in a summary, decision, loop or topic page is masked
     # before it becomes a row, a page or a vector.
     _validate_timestamp(payload)
+    # Origin is stamped by the server from the request context, never taken
+    # from the caller (gateway provenance, decision 1).
+    payload.pop("origin", None)
     _redact_capture_values(payload)
     # The source identity is snapshotted here, from the redacted payload as it
     # arrived: before project inheritance and alias resolution read hub state
@@ -727,13 +753,21 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
 
             payload["scope"] = normalize_scope(payload.get("scope"))
 
-            inserted = _upsert_episode(cur, payload, source=source)
+            origin = _stamp_origin(cur)
+            inserted = _upsert_episode(cur, payload, source=source, origin=origin)
             if not inserted:
                 cur.execute(
                     "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
                     (payload["ts"], _md5_hex(payload["summary"])),
                 )
                 existing = cur.fetchone()
+                if existing and origin and origin.startswith("local:"):
+                    # An outbox replay of this machine's own capture whose row
+                    # a file-mirror sync already wrote without an origin. Only
+                    # locally: a gateway caller must never claim an unowned row
+                    # by replaying its timestamp and summary.
+                    cur.execute("UPDATE episodes SET origin = %s WHERE id = %s AND origin IS NULL",
+                                (origin, existing[0]))
                 cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
                             (existing[0] if existing else None,))
                 row = cur.fetchone()

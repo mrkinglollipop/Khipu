@@ -66,6 +66,7 @@ from khipu.mcp_server import (
     mark_gateway_active,
     take_message_error,
 )
+from khipu.request_context import gateway_request
 
 MAX_BODY = 1024 * 1024
 REQUEST_TIMEOUT_S = 15
@@ -439,7 +440,8 @@ class Handler(BaseHTTPRequestHandler):
                     params = m.get("params")
                     name = params.get("name") if isinstance(params, dict) else None
                     tool = name if isinstance(name, str) else ""
-                r = handle_message(m)
+                with gateway_request(label):
+                    r = handle_message(m)
             except KeyboardInterrupt:
                 raise
             except BaseException as exc:  # noqa: BLE001 — never let one message kill
