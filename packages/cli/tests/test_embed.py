@@ -681,6 +681,8 @@ class _BackfillCursor:
             self._result = []
         elif s.startswith("SELECT slug, title, body FROM topics"):
             self._result = self.topic_rows
+        elif s.startswith("SELECT slug FROM topics") and "FOR SHARE" in s:
+            self._result = [(slug,) for slug, _title, _body in self.topic_rows if slug in params[0]]
         elif s.startswith("INSERT INTO memory_embeddings"):
             self.inserts.append(params)
         else:

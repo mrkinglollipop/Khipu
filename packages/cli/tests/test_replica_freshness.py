@@ -725,7 +725,10 @@ class VectorGenerationTest(VectorCase):
             rows: list = []
 
             def execute(self, sql, params=None):
-                self.rows = [(1, "same", [], [], [], [])] if "FROM episodes e WHERE" in sql else []
+                if sql.startswith("SELECT id FROM episodes") and "FOR SHARE" in sql:
+                    self.rows = [(1,)] if 1 in params[0] else []
+                else:
+                    self.rows = [(1, "same", [], [], [], [])] if "FROM episodes e WHERE" in sql else []
 
             def fetchall(self):
                 return list(self.rows)

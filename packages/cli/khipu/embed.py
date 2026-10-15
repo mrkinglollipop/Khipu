@@ -1125,7 +1125,7 @@ def _upsert_media_asset(
     nbytes: int,
 ) -> str:
     cur.execute(
-        "SELECT id, sha256 FROM media_assets WHERE source_id = %s AND path = %s",
+        "SELECT id, sha256 FROM media_assets WHERE source_id = %s AND path = %s FOR UPDATE",
         (source_id, path),
     )
     row = cur.fetchone()
@@ -1445,6 +1445,31 @@ def _existing_hashes_many(cur, profiles: list[str] | None) -> dict[str, dict[tup
     for p, k, r, i, h in cur.fetchall():
         out.setdefault(p, {})[(k, r, i)] = h
     return out
+
+
+def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]]) -> set[tuple[str, str]]:
+    """Lock sources until the caller commits their vectors.
+
+    Provider calls happen before this check. Forget/purge either wins first
+    and excludes the source, or waits for the vectors and then removes them.
+    """
+    from khipu.db import has_columns
+
+    refs = set(refs)
+    live_refs = {(kind, ref) for kind, ref in refs if kind not in {"episode", "topic"}}
+    for kind, table, column in (("episode", "episodes", "id"), ("topic", "topics", "slug")):
+        wanted = sorted(ref for k, ref in refs if k == kind)
+        if not wanted:
+            continue
+        live = " AND deleted_at IS NULL" if kind == "topic" or has_columns(cur, table, "deleted_at") else ""
+        values = [int(ref) for ref in wanted] if kind == "episode" else wanted
+        cur.execute(
+            f"SELECT {column} FROM {table} WHERE {column} = ANY(%s){live} "
+            f"ORDER BY {column} FOR SHARE",
+            (values,),
+        )
+        live_refs.update((kind, str(row[0])) for row in cur.fetchall())
+    return live_refs
 
 
 def _upsert_chunks(
@@ -1821,13 +1846,16 @@ def backfill(
                         if start + BATCH < len(todo):
                             time.sleep(BACKFILL_PAUSE_S)
                         continue
+                    live_refs = _lock_live_embedding_refs(cur, ((k, r) for k, r, *_ in batch))
+                    writable = [row for row in batch if row[:2] in live_refs]
                     _upsert_chunks(
                         cur, profile,
                         [(k, r, i, chunk, h, v)
-                         for (k, r, i, chunk, h, _title), v in zip(batch, vecs)],
+                         for (k, r, i, chunk, h, _title), v in zip(batch, vecs)
+                         if (k, r) in live_refs],
                     )
                     conn.commit()
-                    stats["embedded"] += len(batch)
+                    stats["embedded"] += len(writable)
                     stats["batches"] += 1
                     if job is not None:
                         job.update(stats["embedded"], len(todo), stats["failed_chunks"])
@@ -1969,7 +1997,7 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                 vecs = embed_batch(api, profile=profile)
                 cur.execute(
                     "SELECT row_to_json(e) FROM episodes e "
-                    "WHERE e.id = %s AND e.deleted_at IS NULL",
+                    "WHERE e.id = %s AND e.deleted_at IS NULL FOR SHARE",
                     (eid,),
                 )
                 live = cur.fetchone()
@@ -3380,14 +3408,16 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 batch = todo[start : start + BATCH]
                 api = _api_texts(profile, [("", t) for _, _, _, t, _ in batch])
                 vecs = embed_batch(api, profile=profile)
+                live_refs = _lock_live_embedding_refs(cur, ((k, r) for k, r, *_ in batch))
+                writable = [(row, vec) for row, vec in zip(batch, vecs) if row[:2] in live_refs]
                 built = _upsert_chunks(cur, profile,
-                                       [(k, r, i, t, h, v) for (k, r, i, t, h), v in zip(batch, vecs)])
+                                       [(k, r, i, t, h, v) for (k, r, i, t, h), v in writable])
                 conn.commit()
-                out["chunks"] += len(batch)
+                out["chunks"] += len(writable)
                 episode_snapshot_rows.extend(
                     {"profile": profile, "kind": k, "ref": r, "chunk_idx": i,
                      "chunk_text": t, "content_hash": h, "embedding": v, "built_at": b}
-                    for (k, r, i, t, h), v, b in zip(batch, vecs, _stamps(built, len(batch)))
+                    for ((k, r, i, t, h), v), b in zip(writable, _stamps(built, len(writable)))
                 )
             for ref, indices in episode_replacements.items():
                 cur.execute(

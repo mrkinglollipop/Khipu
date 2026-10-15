@@ -194,6 +194,8 @@ class _BackfillCursor:
             self._result = []
         elif statement.startswith("SELECT slug, title, body FROM topics"):
             self._result = self.rows
+        elif statement.startswith("SELECT slug FROM topics") and "FOR SHARE" in statement:
+            self._result = [(slug,) for slug, _title, _body in self.rows if slug in params[0]]
         elif statement.startswith("DELETE FROM memory_embeddings"):
             self.rowcount = 0
         else:
@@ -807,7 +809,9 @@ class CatchupStalenessTest(unittest.TestCase):
             def __init__(self): self.result = []
             def execute(self, sql, params=None):
                 text = " ".join(sql.split())
-                if "FROM episodes e" in text and "NOT EXISTS" not in text:
+                if text.startswith("SELECT id FROM episodes") and "FOR SHARE" in text:
+                    self.result = [(7,)] if 7 in params[0] else []
+                elif "FROM episodes e" in text and "NOT EXISTS" not in text:
                     self.result = [(7, "summary", [], [], [], [])]
                 else:
                     self.result = []
@@ -946,6 +950,8 @@ class ReplicaCatchupTest(unittest.TestCase):
                         self.rows = [row]
                     if existing and "FROM episodes e" in sql and "NOT EXISTS" not in sql:
                         self.rows = [(7, "A", [], [], [], [])]
+                    if sql.startswith("SELECT id FROM episodes") and "FOR SHARE" in sql:
+                        self.rows = [(7,)] if existing and 7 in params[0] else []
                     if sql.startswith("SELECT 1 FROM topics") and "FOR SHARE" in sql:
                         self.rows = [(1,)]  # the topic is still live
                 def fetchall(self): return self.rows

@@ -904,14 +904,26 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 )
                 existing = cur.fetchone()
                 episode_id = int(existing[0]) if existing else None
-                try:
-                    _claim_unowned_episode(cur, episode_id, origin)
-                except Exception as exc:  # noqa: BLE001 - only a required claim runs SQL
-                    raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
                 cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
                             (episode_id,))
                 row = cur.fetchone()
                 target = row[0] if row else {}
+                # Legacy backfills can have only an episode key and no payload
+                # hash, so source dedup misses them even on an exact replay.
+                if target.get("deleted_at"):
+                    conn.commit()
+                    return {
+                        "episode_inserted": False,
+                        "topics_written": 0,
+                        "episode_id": episode_id,
+                        "source_key": source["source_key"],
+                        "dedup": dedup,
+                        "forgotten_source": True,
+                    }
+                try:
+                    _claim_unowned_episode(cur, episode_id, origin)
+                except Exception as exc:  # noqa: BLE001 - only a required claim runs SQL
+                    raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
                 stored_raw = target.get("raw") or {}
                 # The stored raw is not the payload as sent: ingestion adds
                 # tags, normalizes scope and rewrites fields on merge, so a
