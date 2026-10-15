@@ -200,7 +200,9 @@ def test_a_value_error_naming_a_folder_is_scrubbed(owner, monkeypatch):
 
     monkeypatch.setattr(usage, "report", fail)
     err, out = call("khipu_usage")
-    assert err and out["error"].startswith("bad folder") and _leaks(out, owner) == []
+    # The bare user name remains outside a path, so the final containment
+    # check withholds the whole value, including the otherwise safe prefix.
+    assert err and out["error"] == agent_view.WITHHELD and _leaks(out, owner) == []
 
 
 def test_gateway_status_hub_error_is_said_in_fixed_words(owner, monkeypatch):
@@ -494,6 +496,65 @@ def _random_name(rng: random.Random) -> str:
     else:
         name = word(rng.randint(5, 12))
     return ("." if rng.random() < 0.6 else "") + name
+
+
+@pytest.mark.parametrize("login,user,payload", [
+    ("/srv/Maße-Straße/.claude", "probeuser", "/srv/Maße-Straße/.claude"),
+    (".login", "probeuser", ".login"),
+    (".home", "probeuser", ".home"),
+    (".folder", "probeuser", ".folder"),
+    (".zq-private", "home", "home"),
+    (".zq-private", "login", "login"),
+    (".zq-private", "user", "user"),
+])
+def test_casefold_and_reserved_secrets_never_reach_agents(
+        tmp_path, monkeypatch, capsys, login, user, payload):
+    from khipu.config import config_file
+
+    home, _ = _setup(tmp_path, monkeypatch, user, [])
+    monkeypatch.setattr(agent_view.getpass, "getuser", lambda: user)
+    login = str(home / login) if not login.startswith("/") else login
+    config_file().write_text(json.dumps({"usage_accounts": [
+        {"label": "Work", "harness": "claude", "home": login}]}))
+    monkeypatch.setattr(usage, "_command", lambda h: "/tmp/fake-cli")
+    monkeypatch.setattr(usage, "_converse", lambda *a, **kw: [
+        {"type": "control_response", "response": {"request_id": "init", "response":
+            {"claude_code_version": payload}}},
+        {"type": "control_response", "response": {"request_id": "usage", "response":
+            {"subscription_type": payload, "rate_limits": {"model_scoped": [
+                {"display_name": payload, "utilization": 95,
+                 "resets_at": usage._iso(time.time() + 86400)}]}}}}])
+    assert usage.report(fresh=True)["accounts"][0]["plan"] == payload
+    if "Maße-Straße" in payload:
+        assert agent_view.scrub(payload + "/private-child") == "[redacted]"
+    for surface, out in _agent_surfaces(capsys).items():
+        assert all(agent_view._fold(payload) not in agent_view._fold(s)
+                   for s in _strings(out)), surface
+
+
+def test_name_matching_uses_dot_tokens_and_plain_path_components(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch, "login", [".home", ".folder", "plainroot"])
+    monkeypatch.setattr(agent_view.getpass, "getuser", lambda: "login")
+    table = agent_view._rules()
+    for text in ("read .home now", "read .folder now", "read /login/file",
+                 "read ~/plainroot/file", "plainroot/file", "login/file"):
+        assert table.names.search(text), text
+    for text in ("go home to login", "a plainroot in prose", ".homework", "plainrooted/file"):
+        assert not table.names.search(text), text
+
+
+def test_final_containment_guard_covers_fast_path_and_owner_exemption(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch, "probeuser", [".Maße-Straße"])
+    note = "Owner permits .Maße-Straße"
+    routing.set_note(note, via="app")
+    routing.add_rule(note, via="app")
+    secret = "prefixMASSE-Straßesuffix"
+    assert agent_view.scrub(secret) == agent_view.scrub("other " + secret)
+    assert "masse-strasse" not in agent_view._fold(agent_view.scrub(secret))
+    assert agent_view.scrub(note) == note
+    mixed = agent_view.scrub(note + " plus " + secret)
+    assert note in mixed
+    assert "masse-strasse" not in agent_view._fold(mixed.replace(note, ""))
 
 
 @pytest.mark.parametrize("seed", range(25))

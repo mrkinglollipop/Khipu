@@ -38,10 +38,7 @@ HOME_WORD = "the home folder"
 USER_WORD = "the user"
 FOLDER_WORD = "a folder"
 LOGIN_WORD = "a login folder"
-# Names never replaced as words: each CLI's own name (".claude" is the
-# default login, and "claude" is in every line), and the words the scrub
-# itself writes. Their paths are still replaced.
-_KEPT_NAMES = {"claude", "codex", "grok", "muse", "the", "a", "home", "folder", "user", "login"}
+WITHHELD = "[redacted]"
 # A private-looking path Khipu doesn't know: a "~/" path, or one under a
 # folder that holds people's or temp files. It ends at the first space.
 _PATHLIKE = re.compile(r"~/[^\s\"'`,;)\]}]*"
@@ -172,13 +169,14 @@ class _Table:
     """One scrub's replacements, built once per config and record version:
     ``roots`` every known path (login folders, the home folder, volumes, the
     memory root, configured folders) taken whole with the path after it;
-    ``names`` every login folder name and user name as a whole word; and the
+    ``names`` dotted folder tokens and plain names in path components; and the
     owner's words as the saved record holds them now."""
 
-    __slots__ = ("roots", "root_to", "names", "name_to", "owner")
+    __slots__ = ("roots", "root_to", "names", "name_to", "owner", "secrets")
 
     def __init__(self, roots, root_to, names, name_to, owner):
         self.roots, self.root_to, self.names, self.name_to, self.owner = roots, root_to, names, name_to, owner
+        self.secrets = tuple({r for r, _ in root_to if r != "~"} | set(name_to))
 
 
 def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
@@ -195,12 +193,15 @@ def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
             if not folder or not home:
                 continue
             raw = os.path.join(home, folder)
+            name_to.setdefault(_fold(folder), ident)
+            spelled.add(folder)
         else:
-            name = unicodedata.normalize("NFC", Path(raw.rstrip("/")).name).lstrip(".").strip()
+            folder = unicodedata.normalize("NFC", Path(raw.rstrip("/")).name).strip()
+            name = folder.lstrip(".")
             # The name as written, and as Khipu itself writes it into a
             # window's name ("weekly_<slug>", usage.parse_claude).
-            for form in (name, re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")):
-                if form and _fold(form) not in _KEPT_NAMES:
+            for form in (folder, name, re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")):
+                if form:
                     name_to.setdefault(_fold(form), ident)
                     spelled.add(form)
         for form in _forms(raw, home):
@@ -229,17 +230,22 @@ def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
         root_to.setdefault("~", HOME_WORD)
         paths.append(home)
     for user in _user_names(paths):
-        if _fold(user) not in _KEPT_NAMES:
-            name_to.setdefault(_fold(user), USER_WORD)
-            spelled.add(unicodedata.normalize("NFC", user))
+        name_to.setdefault(_fold(user), USER_WORD)
+        spelled.add(unicodedata.normalize("NFC", user))
     order = sorted(root_to, key=len, reverse=True)
     alts = "|".join(re.escape(r) for r in order)
     roots = re.compile(rf"(?:{alts})(?![^\s/\"'`,;)\]}}]){_TAIL}", re.I) if alts else None
-    # A name is a whole word: no letter or digit either side, in any script
-    # ("_" separates: a CLI's reply writes "weekly_<name>"), a leading dot
-    # included; matched in any case, as written and casefolded.
-    words = "|".join(re.escape(n) for n in sorted(set(name_to) | set(spelled), key=len, reverse=True))
-    names = re.compile(rf"(?<![^\W_])\.?(?:{words})(?![^\W_])", re.I) if words else None
+    variants = sorted(set(name_to) | spelled, key=len, reverse=True)
+    tokens = "|".join(re.escape(n) for n in variants if not n.isalnum())
+    plain = "|".join(re.escape(n) for n in variants if n.isalnum())
+    patterns = []
+    if tokens:
+        patterns.append(rf"(?<![^\W_])(?:{tokens})(?![^\W_])")
+    if plain:
+        # A bare name needs a slash before it or a following slash at the
+        # start of a relative path; ordinary prose is not a path component.
+        patterns.append(rf"(?:(?<=/)(?:{plain})(?![^\W_])|(?<![\w./~])(?:{plain})(?=/))")
+    names = re.compile("|".join(patterns), re.I) if patterns else None
     return _Table(roots, [(r, root_to[r]) for r in order], names, name_to, keep_owner_words(view))
 
 
@@ -291,8 +297,6 @@ def _scrub_text(text: str, table: _Table, keep: list[str]) -> str:
     if not text.isascii():
         text = unicodedata.normalize("NFC", text)
     pathy = "/" in text or "~" in text
-    if not pathy and (table.names is None or not table.names.search(text)):
-        return text  # nothing path-like and no known name: the usual case, kept cheap
     held = [w for w in keep if w and w in text]
     for i, word in enumerate(held):
         text = text.replace(word, f"\x00{i}\x00")
@@ -303,8 +307,17 @@ def _scrub_text(text: str, table: _Table, keep: list[str]) -> str:
                 return next((str(to) for r, to in table.root_to if found.startswith(r)), FOLDER_WORD)
             text = table.roots.sub(root, text)
         text = _PATHLIKE.sub(FOLDER_WORD, text)
+    # A later name replacement must not hide a root the path regex missed.
+    folded = _fold(text)
+    unmatched_root = pathy and any(r in folded for r, _ in table.root_to if r != "~")
     if table.names is not None:
-        text = table.names.sub(lambda m: _lookup(table.name_to, m.group(0).lstrip("."), LOGIN_WORD), text)
+        text = table.names.sub(lambda m: _lookup(table.name_to, m.group(0), LOGIN_WORD), text)
+    # Regex case-insensitivity cannot expand Unicode casefolds (ß -> ss).
+    # Check the finished value even when it contained no apparent path or
+    # token. Owner words remain masked until this fail-closed check is done.
+    folded = _fold(text)
+    if unmatched_root or any(secret in folded for secret in table.secrets):
+        text = WITHHELD + "".join(f" \x00{i}\x00" for i in range(len(held)))
     for i, word in enumerate(held):
         text = text.replace(f"\x00{i}\x00", word)
     return text
