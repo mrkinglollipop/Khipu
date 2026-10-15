@@ -957,6 +957,11 @@ fence, the author stamping, the redaction of runner lines). No -fast tier; no pa
   date. Stamping a record of one line would let a single line written ahead of the clock pin every later
   line (the mirror case above), so it is left. It cannot start once the record holds two lines, and the log
   keeps every line as written. Shown by `test_a_low_clock_run_after_a_one_line_record_keeps_the_phase_1a_handling`.
+- **A routing folder that can never be saved (phase 3b).** When the view cannot be saved (a read-only data
+  folder), a change is never taken for no change: each prompt logs `routing=skipped:unsaved` and leaves the
+  seen marker where it was, so the change arrives at the first prompt after a save succeeds. On a folder that
+  stays read-only, a conversation that already has a marker gets no per-prompt changes until then; new and
+  compacted conversations still get the full summary at session start.
 
 ## Fixed limits
 

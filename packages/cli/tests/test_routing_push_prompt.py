@@ -1514,15 +1514,19 @@ def test_a_cold_reader_ends_soon_after_its_prompt(home, monkeypatch):
     _push_on(monkeypatch)
     pids = _count_forks(monkeypatch)
     try:
+        ended = False
         began = time.monotonic()
         _cold(monkeypatch)
         assert _last_log().endswith(" routing=skipped:budget") and len(pids) == 1
         while _alive(pids[0]) and time.monotonic() - began < 5.0:
             time.sleep(0.02)
-        assert not _alive(pids[0]), "the cold reader lived on"
+        ended = not _alive(pids[0])
+        assert ended, "the cold reader lived on"
         assert time.monotonic() - began < 1.0 + recall_prompt._ROUTING_CHILD_MOST + 0.5
     finally:
-        for pid in pids:
+        # Only a reader that is still alive is ours to kill: once it ended,
+        # the hook's reaper took it and its pid may belong to someone else.
+        for pid in pids if not ended else ():
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -1648,3 +1652,39 @@ def test_a_pipe_that_never_stops_is_drained_only_briefly(home):
     finally:
         writer.kill()
         writer.wait(5)
+
+
+def test_an_answer_finished_after_the_request_deadline_is_not_taken(home):
+    """Review of fix round 5: the cutoff left out the request's deadline, so
+    an answer finished after it, though within the budget, was taken."""
+    answer = {"kind": "full", "text": "## Routing at x", "version": 1, "epoch": "e", "count": 0}
+
+    def late(_at) -> bytes:
+        return json.dumps(dict(answer, done=time.monotonic())).encode() + b"\n"
+
+    at, writer = _fake_reader([(0.06, late)], budget=0.5)
+    limit = time.monotonic() + 0.02
+    writer.join(5)  # buffered before the prompt reads it
+    assert at.collect(limit=limit) is None and at.status == "skipped:budget"
+    at, writer = _fake_reader([(0.0, late)], budget=0.5)
+    writer.join(5)
+    out = at.collect(limit=time.monotonic() + 0.5)
+    assert out is not None and out["kind"] == "full"
+
+
+def test_a_routing_text_too_long_for_any_answer_still_sends_the_pointer(home, monkeypatch):
+    """Review of fix round 5: a text over the answer's byte cap was dropped
+    as no answer, so the pointer to khipu_route never went out."""
+    _record()
+    _push_on(monkeypatch)
+    huge = "x" * (recall_prompt._ROUTING_ANSWER_MOST + 10)
+    real = routing.prompt_push
+
+    def push(marker, **kw):
+        out = real(marker, **kw)
+        return dict(out, kind="full", text="## Routing\n" + huge)
+
+    monkeypatch.setattr(routing, "prompt_push", push)
+    out = _cold(monkeypatch)
+    assert "khipu_route" in json.dumps(out)
+    assert " routing=pointer:full" in _last_log()

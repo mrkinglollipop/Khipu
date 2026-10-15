@@ -347,6 +347,11 @@ _ROUTING_FOLD_MOST = 900.0
 # pipe that never stops being readable never holds the prompt (fix round 5).
 _ROUTING_DRAIN_MOST = 0.02
 _ROUTING_ANSWER_MOST = 2 << 20
+# The routing text a child sends is cut to this many characters. A text this
+# long can never fit the hook's output, so the prompt sends the pointer to
+# ``khipu_route`` instead, and the answer stays well under the byte cap above
+# (review of fix round 5: an uncut 2 MB answer was dropped with no pointer).
+_ROUTING_TEXT_MOST = 1 << 16
 # The longest a prompt waits for routing (``routing.PROMPT_BUDGET_MOST_MS``),
 # known here without importing routing: the hook's own process never does.
 _ROUTING_WAIT_MOST = 1.0
@@ -447,6 +452,8 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
                 marker = routing_marker(session_id)
                 out = routing.prompt_push(marker, budget=budget, on_fold=fold_started)
                 answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed")}
+                if isinstance(answer["text"], str) and len(answer["text"]) > _ROUTING_TEXT_MOST:
+                    answer["text"] = answer["text"][:_ROUTING_TEXT_MOST]
                 answer["pointer_said"] = marker.get("pointer") == {"version": out.get("version"),
                                                                    "epoch": out.get("epoch")}
                 answer["at"] = routing._iso(routing._now())
@@ -954,8 +961,10 @@ class _RoutingAtPrompt:
                 self.status = "skipped:no-answer"
                 return None
             done = out.get("done")
-            if not isinstance(done, (int, float)) or isinstance(done, bool) \
-                    or done > min(self.cap, began + self.budget):
+            cutoff = min(self.cap, began + self.budget)
+            if limit is not None:
+                cutoff = min(cutoff, limit)  # nor after the request's own deadline
+            if not isinstance(done, (int, float)) or isinstance(done, bool) or done > cutoff:
                 return None  # finished after its budget: routing=skipped:budget, the marker unmoved
             return out
         except Exception:
