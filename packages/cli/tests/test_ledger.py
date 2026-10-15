@@ -889,3 +889,189 @@ def test_offline_checks_do_not_refuse_a_row_the_copy_has_not_caught_up_with(hub,
         hs._release_refresh_lock(lock)
     _away(monkeypatch)
     assert ok("set", "b", "--state", "IN FLIGHT").splitlines()[0] == "set b: queued"
+
+
+class _ReplicaHub:
+    """A hub that holds one row at one version, for the offline-copy catch-up."""
+
+    def __init__(self, version, removed=False):
+        self.version, self.removed = version, removed
+
+    def cursor(self):
+        hub = self
+
+        class Cur:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def execute(self, query, _params=()):
+                self.query = query
+
+            def fetchone(self):
+                return ("p", False, "2026-10-15T00:00:00Z")
+
+            def fetchall(self):
+                if "FROM ledger_rows" not in self.query:
+                    return []
+                from khipu import ledger
+
+                row = {**_replica_row("r", hub.version, f"v{hub.version}"), "removed_at": None, "removed_by": None,
+                       "removed_note": ""}
+                if hub.removed:
+                    row["removed_at"] = "2026-10-15T00:00:00Z"
+                return [tuple(row[c] for c in ledger._ROW_COLS)]
+
+        return Cur()
+
+    def rollback(self):
+        pass
+
+
+def test_an_older_catch_up_never_clears_a_newer_changes_retry(monkeypatch, tmp_path):
+    from khipu import hub_snapshot as hs
+    from khipu import ledger
+
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
+    _snapshot(tmp_path)
+    monkeypatch.setattr(ledger, "_vocab", lambda *_a: {"state": [], "kind": []})
+    with ledger._replica_pending() as pending:  # a change not copied yet
+        pending["p#r"] = 1  # the old file kept counts
+    entered, release = threading.Event(), threading.Event()
+    real_write = hs.ledger_write_snapshot
+
+    def held_at_version_1(*a, **kw):
+        if a[3] and a[3][0]["version"] == 1:
+            entered.set()
+            assert release.wait(5)
+        return real_write(*a, **kw)
+
+    monkeypatch.setattr(hs, "ledger_write_snapshot", held_at_version_1)
+    older = threading.Thread(target=lambda: ledger.replica_catch_up(_ReplicaHub(1)))
+    older.start()
+    try:
+        assert entered.wait(5)
+        assert ledger.replica_catch_up(_ReplicaHub(2))["left"] == 0
+        lock = hs._acquire_refresh_lock()  # the removal's copy is skipped and must be retried
+        assert lock is not None
+        try:
+            ledger._replica_sync(_ReplicaHub(3, removed=True), "p", ["r"])
+        finally:
+            hs._release_refresh_lock(lock)
+        assert ledger.replica_pending() == 1
+    finally:
+        release.set()
+        older.join(5)
+    assert ledger.replica_pending() == 1
+    ledger.replica_catch_up(_ReplicaHub(3, removed=True))
+    assert _replica_titles() == {} and ledger.replica_pending() == 0
+
+
+def test_a_pending_copy_marker_does_not_hide_a_duplicate_queued_add(monkeypatch, tmp_path):
+    from khipu import hub_snapshot as hs
+
+    ledger = _offline(monkeypatch, tmp_path)
+    _snapshot(tmp_path)
+    assert hs.ledger_write_snapshot(P, (P, False, "2026-10-15T00:00:00Z"), ledger.default_vocab("NEEDS OWNER"),
+                                    [], [], [])["ok"]
+    with ledger._replica_pending() as pending:  # changes not copied yet
+        pending.update({f"{P}#r": "a", f"{P}#q": "b"})
+    assert ledger.write(ledger.new_op("add", P, "r", fields={"title": "first", "kind": "slice"}))["queued"]
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("add", P, "r", fields={"title": "duplicate", "kind": "slice"}))
+    assert err.value.reason == "exists"
+    # Removed by a waiting write: definite, whatever the copy holds.
+    assert ledger.write(ledger.new_op("remove", P, "r"))["queued"]
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(ledger.new_op("set", P, "r", fields={"state": "DONE"}))
+    assert err.value.reason == "not_found"
+    # Uncertain for the copy alone: the hub decides.
+    assert ledger.write(ledger.new_op("set", P, "q", fields={"state": "DONE"}))["queued"]
+
+
+def _late_setup(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    monkeypatch.setattr(ledger, "DRAIN_WAIT_S", 0.05)
+    history = []
+    row = {"row_id": "r", "state": "IN FLIGHT", "title": "t", "owner": "none", "evidence": "", "link": ""}
+    monkeypatch.setattr(ledger, "_live_row", lambda *_a: row)
+    monkeypatch.setattr(ledger, "_vocab", lambda *_a: ledger.default_vocab("NEEDS OWNER"))
+    monkeypatch.setattr(ledger, "_last_setter", lambda *_a: "a synthetic writer")
+    monkeypatch.setattr(ledger, "_history", lambda *_a, **kw: history.append(kw))
+
+    def apply(_conn, op, *, late=False):
+        if op["op_id"] == "older":
+            return {"ok": True}
+        return ledger._set(object(), op, late=late)
+
+    monkeypatch.setattr(ledger, "apply_op", apply)
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "older"}, op_id="older"))
+    return ledger, history
+
+
+def test_a_write_that_gave_up_waiting_is_kept_as_a_queued_write(monkeypatch, tmp_path):
+    import fcntl
+
+    ledger, history = _late_setup(monkeypatch, tmp_path)
+    fd = os.open(str(ledger.outbox_dir() / ".drain.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        op = ledger.new_op("set", P, "r", fields={"state": "DONE"}, if_state="NOT STARTED", op_id="waiting")
+        assert ledger.write(op, conn=object())["queued"]
+    finally:
+        os.close(fd)
+    got = ledger.drain(conn=object())
+    assert (got["landed"], got["refused"]) == (2, 0)
+    assert [h["note"] for h in history] == ["arrived late; the row had moved to IN FLIGHT"]
+
+
+def test_a_write_that_drains_its_own_line_is_refused_as_a_fresh_write(monkeypatch, tmp_path):
+    ledger, history = _late_setup(monkeypatch, tmp_path)
+    op = ledger.new_op("set", P, "r", fields={"state": "DONE"}, if_state="NOT STARTED", op_id="waiting")
+    with pytest.raises(ledger.LedgerError) as err:
+        ledger.write(op, conn=object())
+    assert err.value.reason == "moved" and history == []
+    assert ledger._outbox_jobs() == [] and not list(ledger._refused_dir().glob("*.json"))
+
+
+def test_a_write_landed_by_another_drain_answers_landed_when_the_hub_drops(monkeypatch, tmp_path):
+    import fcntl
+    import time
+
+    ledger = _offline(monkeypatch, tmp_path)
+    calls = []
+
+    def apply(_conn, op, **_kw):
+        calls.append(op["op_id"])
+        raise ledger.HubAway("synthetic: dropped after the other drain landed it")
+
+    monkeypatch.setattr(ledger, "apply_op", apply)
+    ledger.enqueue(ledger.new_op("set", P, "r1", fields={"evidence": "0"}, op_id="op0"))
+    fd = os.open(str(ledger.outbox_dir() / ".drain.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    got = {}
+    writer = threading.Thread(target=lambda: got.update(ledger.write(
+        ledger.new_op("add", P, "r1", fields={"title": "t", "kind": "slice"}, op_id="op1"), conn=object())))
+    writer.start()
+    deadline = time.monotonic() + 5
+    while not any("op1" in p.name for p in ledger._outbox_jobs()):
+        assert time.monotonic() < deadline, "the write did not join the line"
+        time.sleep(0.01)
+    for path in ledger._outbox_jobs():
+        path.unlink()  # the other drain landed both
+    os.close(fd)
+    writer.join(10)
+    assert got.get("ok") and not got.get("queued") and ledger._outbox_jobs() == []
+
+
+def test_waiting_writes_keep_their_order_when_the_clock_steps_back(monkeypatch, tmp_path):
+    import time
+
+    ledger = _offline(monkeypatch, tmp_path)
+    clock = iter([2_000_000_000_000_000_000, 1_000_000_000_000_000_000, 1_500_000_000_000_000_000])
+    monkeypatch.setattr(time, "time_ns", lambda: next(clock))
+    ids = [ledger.enqueue(ledger.new_op("set", P, "r1", fields={"evidence": str(i)}, op_id=f"op{i}")) and f"op{i}"
+           for i in range(3)]
+    assert [op["op_id"] for op in ledger.queued_ops()] == ids

@@ -751,8 +751,10 @@ def _replica_pending_path() -> Path:
 @contextmanager
 def _replica_pending():
     """The ids whose change has not reached the offline copy yet, as
-    ``{"<project>#<row id>": n}``; n grows each time the id changes again, so a
-    catch-up clears only what it actually copied. Read and written under a lock."""
+    ``{"<project>#<row id>": token}``. Each change writes a fresh random token,
+    never a count: a count restarts once its entry is cleared, so a catch-up
+    that read the old entry could clear a newer change's. A catch-up clears an
+    entry only while it still holds the token it read. Read and written under a lock."""
     from khipu.outbox import _atomic_write
 
     path = _replica_pending_path()
@@ -797,7 +799,7 @@ def _replica_sync(conn, project: str, row_ids: list[str]) -> None:
         with _replica_pending() as pending:
             for row_id in row_ids:
                 key = f"{project}#{row_id}"
-                pending[key] = int(pending.get(key) or 0) + 1
+                pending[key] = uuid.uuid4().hex
     except Exception as exc:  # noqa: BLE001  (the hub write already landed)
         print(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}", file=sys.stderr)
         return
@@ -900,19 +902,30 @@ def queued_ops() -> list[dict[str, Any]]:
     return out
 
 
-def enqueue(op: dict[str, Any], reason: str = "", *, live: bool = False) -> Path:
+def enqueue(op: dict[str, Any], reason: str = "") -> Path:
+    """Put ``op`` at the back of the line. A job's name is its place: after
+    every waiting job's, under a lock, so a clock that steps back or another
+    process enqueueing at the same moment cannot put a later write first."""
     from khipu.outbox import _atomic_write
 
     d = outbox_dir()
     d.mkdir(parents=True, exist_ok=True)
-    existing = list(d.glob(f"*-{op['op_id']}.json"))
-    if existing:
-        return existing[0]
-    dst = d / f"{time.time_ns():020d}-{op['op_id']}.json"
-    # A live job's writer is waiting for it: it lands as a fresh write would
-    # (an --if-state that no longer holds is refused, not kept as late).
-    _atomic_write(dst, {"op": op, "reason": reason[:200], "queued_at": _z(_now()), "live": live})
-    return dst
+    fd = os.open(str(d / ".enqueue.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        existing = list(d.glob(f"*-{op['op_id']}.json"))
+        if existing:
+            return existing[0]
+        last = 0
+        for path in _outbox_jobs():
+            head = path.name.split("-", 1)[0]
+            if head.isdigit():
+                last = max(last, int(head))
+        dst = d / f"{max(time.time_ns(), last + 1):020d}-{op['op_id']}.json"
+        _atomic_write(dst, {"op": op, "reason": reason[:200], "queued_at": _z(_now())})
+        return dst
+    finally:
+        os.close(fd)
 
 
 def outbox_status() -> dict[str, Any]:
@@ -970,7 +983,10 @@ def drain(conn=None) -> dict[str, Any]:
         return _drain_locked(conn, out)
 
 
-def _drain_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
+def _drain_locked(conn, out: dict[str, Any], waiting: frozenset[str] = frozenset()) -> dict[str, Any]:
+    """``waiting`` names the op this process's writer is waiting on: it lands
+    as a fresh write would (an --if-state that no longer holds is refused, and
+    the writer is told). Every other job is a queued write, whoever drains it."""
     owned = conn is None
     try:
         jobs = _outbox_jobs()
@@ -991,7 +1007,7 @@ def _drain_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
                 out["refused"] += 1
                 continue
             try:
-                result = apply_op(conn, op, late=not job.get("live"))
+                result = apply_op(conn, op, late=op.get("op_id") not in waiting)
             except LedgerError as exc:
                 _refuse_job(path, {**job, "refused": str(exc), "reason_word": exc.reason})
                 out["refused"] += 1
@@ -1055,20 +1071,26 @@ def _write_in_line(conn, op: dict[str, Any]) -> dict[str, Any]:
     this one joins the line at once (the outbox is the line, oldest first), so
     a write made later can never land before it. It then drains the line
     itself when it can, and answers as a direct write would."""
-    path = enqueue(op, reason="behind waiting writes", live=True)
+    path = enqueue(op, reason="behind waiting writes")
     deadline = time.monotonic() + DRAIN_WAIT_S
     results: dict[str, Any] = {}
-    while path.exists():
-        with _drain_lock() as got:
-            if got:
-                out = _drain_locked(conn, _drain_result())
-                results.update(out.get("results") or {})
-                if out["stopped_early"]:
-                    break
-                continue
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(0.05)
+    # From here the job is in the line: the answer can only be what became of
+    # it (landed, refused, or still queued), never a fresh offline check.
+    try:
+        while path.exists():
+            with _drain_lock() as got:
+                if got:
+                    out = _drain_locked(conn, _drain_result(), frozenset({op["op_id"]}))
+                    results.update(out.get("results") or {})
+                    if out["stopped_early"]:
+                        break
+                    continue
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+    except Exception as exc:  # noqa: BLE001
+        if not _away(exc):
+            raise
     if path.exists():
         return _queued_reply(op)
     refused = _refused_dir() / path.name
@@ -1084,7 +1106,12 @@ def _write_in_line(conn, op: dict[str, Any]) -> dict[str, Any]:
     if op["op_id"] in results:
         return results[op["op_id"]]
     # Another process's drain landed it: a retried op id returns its first result.
-    result = apply_op(conn, op)
+    try:
+        result = apply_op(conn, op)
+    except Exception as exc:  # noqa: BLE001
+        if not _away(exc):
+            raise
+        return {**_queued_reply(op), "queued": False, "line": f"{op['verb']} {op['row_id']}: landed"}
     result.pop("retried", None)
     return result
 
@@ -1113,14 +1140,15 @@ def _check_offline(op: dict[str, Any]) -> None:
             fields["state"] = _word(vocab, "state", fields["state"])
         if fields.get("kind"):
             fields["kind"] = _word(vocab, "kind", fields["kind"])
+    row_id = op["row_id"]
+    removed_in_queue = any(q.get("verb") == "remove" and q.get("row_id") == row_id for q in queued)
+    # A change that landed while the copy was busy is not in it yet: for this
+    # row the copy says nothing, so only what the waiting writes establish is
+    # checked here, and the hub decides the rest when it answers.
+    if f"{project}#{row_id}" in _pending_keys():
+        view = None
     merged = _overlay(view or {"vocab": vocab, "rows": [], "as_of": None, "offline": True}, project)
     rows = {r["row_id"]: r for r in merged["rows"]}
-    row_id = op["row_id"]
-    # A change that landed while the copy was busy is not in it yet: the copy
-    # cannot say whether this row exists, so the hub decides when it answers.
-    if f"{project}#{row_id}" in _pending_keys():
-        return
-    removed_in_queue = any(q.get("verb") == "remove" and q.get("row_id") == row_id for q in queued)
     gone = (view or {}).get("gone") or {}
     if op["verb"] == "add":
         if row_id in rows:
