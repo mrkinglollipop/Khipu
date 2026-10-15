@@ -357,7 +357,9 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
 
     ``origin`` is the server-stamped owner (0029); the caller has already
     checked the column exists. A payload's own ``origin`` never reaches the
-    column, and is dropped from the stored raw too.
+    column, and is dropped from the stored raw too. So is its own
+    ``merged_from``: merge receipts are written only by the server's merge,
+    and a planted one could pose as an identity receipt and claim this row.
     """
     # Identity columns (0008) and tags (0010) are named only when they exist.
     # Naming them unconditionally made EVERY capture raise UndefinedColumn on a
@@ -372,6 +374,7 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
     }
     safe = deepcopy(payload)
     safe.pop("origin", None)
+    safe.pop("merged_from", None)
     for key, value in list(safe.items()):
         if key not in identity_keys:
             safe[key], _ = _redact_free_text(value)

@@ -309,7 +309,7 @@ class DedupEarlyReturnClaimsTest(_OutboxOriginBase):
         payload = _window_payload(window_id="w1", part="2")
         self.assertEqual(self._drain_onto(cur, payload), "gateway:caller-a")
 
-    def test_receipt_skip_claims_for_the_queued_owner(self):
+    def test_a_receipt_from_before_match_kinds_skips_without_claiming(self):
         from khipu.capture_identity import source_identity
 
         payload = {"ts": "2026-10-15T12:00:00Z", "summary": "folded in earlier",
@@ -319,7 +319,8 @@ class DedupEarlyReturnClaimsTest(_OutboxOriginBase):
         cur = _DedupClaimCursor({"raw": {"merged_from": [{"source_id": receipt}]}})
         self._replay(_cli_drain, cur=cur)
         self.assertEqual(cur.inserts, [])
-        self.assertEqual(cur.episodes[1]["origin"], "gateway:caller-a")
+        self.assertEqual(cur.claims, [])
+        self.assertIsNone(cur.episodes[1]["origin"])
 
     def test_a_similarity_merge_never_changes_the_target_origin(self):
         # Origin is used for authorization; a text resemblance is not identity.
@@ -346,26 +347,136 @@ class DedupEarlyReturnClaimsTest(_OutboxOriginBase):
         self.assertEqual(cur.claims, [])
         self.assertIsNone(cur.episodes[1]["origin"])
 
-    def test_a_failed_claim_never_fails_the_skip_or_the_merge(self):
-        for name, cur, payload, patches in (
-                ("exact window", _DedupClaimCursor(dict(_WINDOW)), _window_payload(), None),
-                ("merge", _merge_target(), _merge_payload(), _MERGE_TEXT)):
+    def test_a_failed_required_claim_keeps_the_job_pending(self):
+        # A lock timeout (or any error) on the claim of a trusted owner must not
+        # let the outbox delete the only record of who queued the capture.
+        class LockNotAvailable(Exception):
+            pass
+
+        for name, label, owner in (("gateway caller", "caller-a", "gateway:caller-a"),
+                                   ("queuing machine", None, QUEUER)):
             with self.subTest(name):
                 for job in outbox.jobs():
                     job.unlink()
                 khipu_db._TABLE_COLUMNS_CACHE.clear()
-                self._queue(payload)
-                with mock.patch.object(cap, "_stamp_origin", side_effect=RuntimeError("probe")), \
-                        mock.patch.multiple(cap, **patches) if patches else contextlib.nullcontext():
+                cur = _DedupClaimCursor(dict(_WINDOW))
+                self._queue(_window_payload(), label=label)
+                locked = mock.patch.object(cur, "execute", side_effect=lambda sql, params=None: (
+                    (_ for _ in ()).throw(LockNotAvailable("lock timeout"))
+                    if sql.lstrip().startswith("UPDATE episodes SET origin")
+                    else _DedupClaimCursor.execute(cur, sql, params)))
+                with locked, mock.patch.object(outbox, "MAX_ATTEMPTS", 1), \
+                        mock.patch("psycopg.connect", side_effect=AssertionError("real database")), \
+                        mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
+                        mock.patch("khipu.machine_identity.local_origin", return_value=DRAINER), \
+                        mock.patch("khipu.config.path_setting", return_value=None):
+                    first = outbox.drain()
+                    second = outbox.drain()
+                for out in (first, second):
+                    self.assertEqual((out["replayed"], out["failed"], out.get("buried", 0)), (0, 1, 0))
+                self.assertEqual(len(outbox.jobs()), 1, "the job stays pending, never buried")
+                self.assertIsNone(cur.episodes[1]["origin"])
+                self.assertIn("ROLLBACK TO SAVEPOINT capture_claim", [c for c, _ in cur.calls])
+                # Once the lock clears, the retry claims for the queued owner.
+                self._replay(_cli_drain, cur=cur)
+                self.assertEqual(cur.episodes[1]["origin"], owner)
+
+    def test_a_deferred_claim_never_starves_the_jobs_behind_it(self):
+        class LockNotAvailable(Exception):
+            pass
+
+        cur = _DedupClaimCursor(dict(_WINDOW))
+        self._queue(_window_payload())
+        stuck = outbox.jobs()[0]
+        outbox.enqueue({"ts": "2026-10-15T13:00:00Z", "summary": "a later capture",
+                                           "session_id": "grokbot:later"})
+        locked = mock.patch.object(cur, "execute", side_effect=lambda sql, params=None: (
+            (_ for _ in ()).throw(LockNotAvailable("lock timeout"))
+            if sql.lstrip().startswith("UPDATE episodes SET origin")
+            else _DedupClaimCursor.execute(cur, sql, params)))
+        with locked, mock.patch("psycopg.connect", side_effect=AssertionError("real database")), \
+                mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
+                mock.patch("khipu.machine_identity.local_origin", return_value=DRAINER), \
+                mock.patch("khipu.embed.embed_on_capture", return_value={}), \
+                mock.patch("khipu.topic_graph.persist_capture_graph", return_value={}), \
+                mock.patch("khipu.config.path_setting", return_value=None), \
+                mock.patch("khipu.hygiene.classify_topics", return_value=([], [], False)):
+            first = outbox.drain(limit=1)
+            second = outbox.drain(limit=1)
+        self.assertEqual(first.get("deferred"), 1)
+        self.assertEqual(second["replayed"], 1, "the later job runs before the deferred one")
+        self.assertEqual(outbox.jobs(), [stuck])
+
+    def test_a_claim_that_is_not_required_never_blocks(self):
+        # No trusted origin (a gateway-process capture outside a request), so
+        # no claim is owed: a failing probe must not hold the job.
+        self._queue(_window_payload(), label=None, gateway_process=True)
+        cur = _DedupClaimCursor(dict(_WINDOW))
+        with mock.patch.object(cap, "_stamp_origin", side_effect=RuntimeError("probe")):
+            self._replay(_cli_drain, cur=cur)
+        self.assertEqual(cur.inserts, [])
+        self.assertIsNone(cur.episodes[1]["origin"])
+
+    def test_a_merge_never_attempts_a_claim_so_a_failing_probe_never_blocks_it(self):
+        self._queue(_merge_payload())
+        cur = _merge_target()
+        with mock.patch.object(cap, "_stamp_origin", side_effect=RuntimeError("probe")), \
+                mock.patch.multiple(cap, **_MERGE_TEXT):
+            self._replay(_cli_drain, cur=cur)
+        self.assertEqual(cur.updated_ids, [1])
+        self.assertEqual(cur.claims, [])
+
+    def test_a_similarity_receipt_never_claims_on_a_retry(self):
+        # A merge commits, then the drain dies before it deletes the job: the
+        # retry finds the merge receipt, which records a text resemblance, not
+        # an identity, so it must skip without claiming. Receipts written
+        # before receipts recorded their match count as similarity.
+        for name, label in (("gateway caller", "caller-a"), ("queuing machine", None)):
+            with self.subTest(name):
+                for job in outbox.jobs():
+                    job.unlink()
+                khipu_db._TABLE_COLUMNS_CACHE.clear()
+                cur = _merge_target()
+                self._queue(_merge_payload(), label=label)
+                jp = outbox.jobs()[0]
+                interrupted = jp.read_bytes()
+                with mock.patch.multiple(cap, **_MERGE_TEXT):
+                    self._replay(_cli_drain, cur=cur)
+                    self.assertEqual(cur.updated_ids, [1], "the first drain merged")
+                    (receipt,) = cur.episodes[1]["raw"]["merged_from"]
+                    jp.write_bytes(interrupted)
+                    self._replay(_cli_drain, cur=cur)
+                    self.assertIsNone(cur.episodes[1]["origin"])
+                    self.assertEqual(receipt.pop("match", None), "similarity")
+                    jp.write_bytes(interrupted)
                     self._replay(_cli_drain, cur=cur)
                 self.assertEqual(cur.inserts, [])
+                self.assertEqual(cur.claims, [])
                 self.assertIsNone(cur.episodes[1]["origin"])
-                if name == "merge":
-                    # A merge never attempts a claim, so there is nothing to fail.
-                    self.assertEqual(cur.updated_ids, [1])
-                else:
-                    self.assertIn("ROLLBACK TO SAVEPOINT capture_claim",
-                                  [c for c, _ in cur.calls])
+
+    def test_an_identity_receipt_still_claims_on_a_retry(self):
+        from khipu.capture_identity import source_identity
+
+        payload = {"ts": "2026-10-15T12:00:00Z", "summary": "folded in by identity",
+                   "session_id": "grokbot:review"}
+        job = self._queue(payload)
+        receipt = source_identity(dict(job["payload"]))["payload_sha256"]
+        cur = _DedupClaimCursor({"raw": {"merged_from": [{"source_id": receipt,
+                                                          "match": "identity"}]}})
+        self._replay(_cli_drain, cur=cur)
+        self.assertEqual(cur.episodes[1]["origin"], "gateway:caller-a")
+
+    def test_a_planted_receipt_in_a_payload_never_reaches_the_row(self):
+        # A file line becomes an unowned row; a merged_from it carried would
+        # pose as an identity receipt and let a matching capture claim it.
+        from khipu import mirror
+
+        cur = _OriginFakeCursor()
+        forged = {"ts": "2026-10-15T12:00:00Z", "summary": "planted", "session_id": "s1",
+                  "merged_from": [{"source_id": "0" * 64, "match": "identity"}]}
+        with mock.patch("khipu.capture_identity.record_source"):
+            self.assertTrue(mirror._upsert_episode(cur, forged))
+        self.assertNotIn("merged_from", json.loads(cur.inserts[0]["raw"]))
 
     def test_a_live_gateway_caller_never_claims_on_any_early_return(self):
         cases = (("exact window", _DedupClaimCursor(dict(_WINDOW)), _window_payload(), None),

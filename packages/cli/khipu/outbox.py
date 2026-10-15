@@ -291,6 +291,13 @@ def status() -> dict[str, Any]:
             "max_attempts": MAX_ATTEMPTS}
 
 
+def _claim_deferred(jp: Path) -> bool:
+    try:
+        return bool(json.loads(jp.read_text()).get("claim_deferred"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> dict[str, Any]:
     """Elect one replayer without blocking enqueue during external I/O.
 
@@ -307,11 +314,13 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return {**out, "busy": True}
-        js = jobs()
+        # A job whose origin claim was deferred retries after every other job,
+        # so a claim that keeps failing never starves the queue behind it.
+        js = sorted(jobs(), key=_claim_deferred)
         if limit is not None:
             js = js[:limit]
         out["jobs"] = len(js)
-        from khipu.capture import write_pg
+        from khipu.capture import ClaimDeferred, write_pg
         from khipu.embed import embed_on_capture
         from khipu.request_context import replaying
 
@@ -342,12 +351,19 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                 job["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
                 name = type(e).__name__
                 unreachable = "Operational" in name or "Connection" in name or "connect" in str(e).lower()
+                # A deferred origin claim is transient and its job holds the
+                # only record of the owner: retried, never buried.
+                deferred = isinstance(e, ClaimDeferred)
+                job["claim_deferred"] = deferred
+                if deferred:
+                    unreachable = False
+                    out["deferred"] = out.get("deferred", 0) + 1
                 with _locked_outbox():
                     try:
                         # A concurrent forget/retry owns its change. Never
                         # resurrect a removed job or overwrite a replacement.
                         if jp.read_bytes() == snapshot:
-                            if not unreachable and job["attempts"] >= MAX_ATTEMPTS:
+                            if not (unreachable or deferred) and job["attempts"] >= MAX_ATTEMPTS:
                                 _bury(jp, job)
                                 out["buried"] = out.get("buried", 0) + 1
                             else:

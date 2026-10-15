@@ -83,6 +83,37 @@ def _receipts(payload: dict[str, Any], source: dict[str, Any] | None) -> list[st
     return out + [legacy] if legacy not in out else out
 
 
+# How a merge matched its target, recorded on its receipt. Only an identity
+# match may later transfer ownership; a receipt without the field was written
+# before receipts recorded it and counts as similarity.
+MATCH_IDENTITY = "identity"
+MATCH_SIMILARITY = "similarity"
+
+
+class ClaimDeferred(RuntimeError):
+    """A required origin claim failed after its savepoint rolled back. The
+    write must be retried (the outbox keeps the job and never buries it), or
+    the queued owner, the only ownership evidence, would be discarded."""
+
+
+def _receipt_match(cur, payload: dict[str, Any],
+                   source: dict[str, Any] | None) -> tuple[int, str] | None:
+    """The episode this capture was already merged into, and how that merge
+    matched: identity only when its receipt says so."""
+    receipts = _receipts(payload, source)
+    for match in (MATCH_IDENTITY, None):
+        for receipt_id in receipts:
+            entry = {"source_id": receipt_id}
+            if match:
+                entry["match"] = match
+            cur.execute("SELECT id FROM episodes WHERE raw @> %s::jsonb LIMIT 1",
+                        (json.dumps({"merged_from": [entry]}),))
+            row = cur.fetchone()
+            if row:
+                return int(row[0]), match or MATCH_SIMILARITY
+    return None
+
+
 def _dedup_exact_window(cur, payload: dict[str, Any], *,
                         source: dict[str, Any] | None = None) -> int | None:
     """K3: every sibling PART of one split window shares the same (harness,
@@ -90,13 +121,8 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
     inserted and silently skip every part after it as an "exact window"
     duplicate. window_id (+ part, carried in raw) makes each sibling its own
     identity. Pre-migration hub (no window_id column): falls back to the
-    pre-K3 match, same as a payload with no window_id."""
-    for receipt_id in _receipts(payload, source):
-        cur.execute("SELECT id FROM episodes WHERE raw @> %s::jsonb LIMIT 1",
-                    (json.dumps({"merged_from": [{"source_id": receipt_id}]}),))
-        receipt = cur.fetchone()
-        if receipt:
-            return int(receipt[0])
+    pre-K3 match, same as a payload with no window_id. Merge receipts are
+    matched first, by ``dedup_before_insert``."""
     harness = payload.get("harness")
     session_id = payload.get("session_id")
     tr = payload.get("transcript_range")
@@ -312,7 +338,7 @@ def _append_summary(existing: str, incoming: str) -> str:
 
 def _merge_into_episode(
     cur, target_id: int, payload: dict[str, Any], *, matched_via: str, score: float,
-    source: dict[str, Any] | None = None,
+    source: dict[str, Any] | None = None, match: str = MATCH_SIMILARITY,
 ) -> bool:
     """Fold a near-duplicate capture into the episode it matched.
 
@@ -381,6 +407,7 @@ def _merge_into_episode(
         "session_id": payload.get("session_id"),
         "ts": payload.get("ts"),
         "matched_via": matched_via,
+        "match": match,
         "score": round(score, 4),
         "payload": payload,
     })
@@ -503,10 +530,17 @@ def dedup_before_insert(cur, payload: dict[str, Any], *,
     ``source`` is write_pg's pre-enrichment source identity snapshot."""
     from khipu.config import float_setting
 
+    receipt = _receipt_match(cur, payload, source)
+    if receipt is not None:
+        receipt_id, match = receipt
+        _log(f"dedup: merge receipt on episode {receipt_id} ({match}) — skipping insert")
+        return {"action": "skip", "matched_episode": receipt_id,
+                "matched_via": "receipt", "match": match}
     exact_id = _dedup_exact_window(cur, payload, source=source)
     if exact_id is not None:
         _log(f"dedup: exact window match episode {exact_id} — skipping insert")
-        return {"action": "skip", "matched_episode": exact_id, "matched_via": "exact_window"}
+        return {"action": "skip", "matched_episode": exact_id, "matched_via": "exact_window",
+                "match": MATCH_IDENTITY}
 
     candidates = _dedup_candidates(cur, payload)
     if not candidates:
@@ -525,7 +559,8 @@ def dedup_before_insert(cur, payload: dict[str, Any], *,
         f"dedup: merged into episode {target_id} via {via} ({score:.2f}), "
         f"project={payload.get('project')!r}"
     )
-    return {"action": "merge", "matched_episode": target_id, "matched_via": via, "score": score}
+    return {"action": "merge", "matched_episode": target_id, "matched_via": via, "score": score,
+            "match": MATCH_SIMILARITY}
 
 
 
@@ -645,6 +680,18 @@ def _stamp_origin(cur) -> str | None:
         return None
 
 
+def _claim_required() -> bool:
+    """True when this write carries a trusted owner that must claim the row it
+    lands on: an outbox replay whose envelope named an origin, or a capture on
+    this machine. A live gateway caller, or the gateway process outside a
+    request, never claims, so its claim can never block a write."""
+    from khipu.request_context import gateway_label, gateway_process, in_replay, request_origin
+
+    if in_replay():
+        return request_origin() is not None
+    return not gateway_label() and not gateway_process()
+
+
 def _claim_unowned_episode(cur, episode_id: int | None, origin: str | None) -> None:
     """Give an existing unowned row the owner of the capture that landed on it
     instead of inserting (a replay or an exact-window skip; never a similarity
@@ -653,11 +700,7 @@ def _claim_unowned_episode(cur, episode_id: int | None, origin: str | None) -> N
     an outbox envelope recorded when the capture was queued, may claim: a live
     gateway caller must never claim an unowned row by replaying its
     timestamp and summary, or its session window, or by matching its text."""
-    from khipu.request_context import in_replay
-
-    if episode_id is None or not origin:
-        return
-    if not (origin.startswith("local:") or in_replay()):
+    if episode_id is None or not origin or not _claim_required():
         return
     cur.execute("UPDATE episodes SET origin = %s WHERE id = %s AND origin IS NULL",
                 (origin, episode_id))
@@ -703,18 +746,22 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             if dedup["action"] in ("skip", "merge"):
                 # The job is done once this returns (the outbox deletes it),
                 # so this is the last chance to record its trusted owner. Only
-                # an identity match (a skip: exact window, window_id or merge
-                # receipt) claims; a merge is a cosine or Jaccard text match,
-                # and origin is used for authorization, so a resemblance must
-                # never transfer ownership. A failed claim must not fail the skip.
-                if dedup["action"] == "skip":
+                # an identity match (an exact window, a window_id, or a receipt
+                # of an identity merge) claims; origin is used for
+                # authorization, so a cosine or Jaccard resemblance, or a
+                # receipt of one, must never transfer ownership. A required
+                # claim that fails defers the write so the job is retried; one
+                # that is not required never blocks it.
+                if dedup.get("match") == MATCH_IDENTITY:
                     cur.execute("SAVEPOINT capture_claim")
                     try:
                         _claim_unowned_episode(cur, dedup.get("matched_episode"),
                                                _stamp_origin(cur))
-                    except Exception as exc:  # noqa: BLE001 — the row stays, unowned
+                    except Exception as exc:  # noqa: BLE001 — classified below
                         cur.execute("ROLLBACK TO SAVEPOINT capture_claim")
                         _log(f"origin claim failed ({type(exc).__name__}: {exc})")
+                        if _claim_required():
+                            raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
                     else:
                         cur.execute("RELEASE SAVEPOINT capture_claim")
                 conn.commit()
@@ -795,7 +842,10 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     (payload["ts"], _md5_hex(payload["summary"])),
                 )
                 existing = cur.fetchone()
-                _claim_unowned_episode(cur, existing[0] if existing else None, origin)
+                try:
+                    _claim_unowned_episode(cur, existing[0] if existing else None, origin)
+                except Exception as exc:  # noqa: BLE001 — only a required claim runs SQL
+                    raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
                 cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
                             (existing[0] if existing else None,))
                 row = cur.fetchone()
