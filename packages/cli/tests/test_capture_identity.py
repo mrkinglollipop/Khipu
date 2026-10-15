@@ -127,14 +127,17 @@ class _SourcesFakeCursor(_EpisodesFakeCursor):
                 self.sources[key] = row
                 self.rowcount = 1
             return
+        if s.startswith("SELECT episode_id FROM episode_sources WHERE source_key"):
+            self.calls.append((s, params))
+            row = self.sources.get(params[0])
+            self._result = [(row["episode_id"],)] if row else []
+            return
         if s.startswith("SELECT to_jsonb(e) FROM episodes e WHERE id"):
             self.calls.append((s, params))
             e = self.episodes.get(params[0])
             self._result = [(e,)] if e else []
             return
         super().execute(sql, params)
-        if s.startswith("INSERT INTO episodes") and self.rowcount:
-            self._result = [(self.last_inserted_id,)]
 
 
 class _WritePgCase(unittest.TestCase):
@@ -190,10 +193,15 @@ class DualWriteTest(_WritePgCase):
         self.assertEqual(cur.sources, before)
 
     def test_origin_key_held_by_another_episode_falls_back_to_the_episode_key(self):
+        # write_pg now skips a recorded key as a replay before inserting
+        # (phase 2), so the fallback is reached through the file mirror's
+        # insert, which has no dedup.
+        from khipu.mirror import _upsert_episode
+
         cur = _SourcesFakeCursor()
         payload = self._payload()
         cur.sources[ci.source_key(payload)] = {"episode_id": 999, "role": "origin"}
-        self._write(cur, payload)
+        self.assertTrue(_upsert_episode(cur, payload))
         self.assertIn(ci.episode_key(cur.last_inserted_id), cur.sources)
         self.assertEqual(cur.sources[ci.episode_key(cur.last_inserted_id)]["episode_id"],
                          cur.last_inserted_id)
@@ -237,7 +245,9 @@ class DualWriteTest(_WritePgCase):
         stats = self._write(cur, self._payload())
         self.assertTrue(stats["episode_inserted"])
         stmts = [s for s, _ in cur.calls]
-        probe = next(i for i, (s, p) in enumerate(cur.calls) if p == ("episode_sources",))
+        # The last probe is the dual write's; the first is the exact-window
+        # dedup's reader probe, which fails closed to the pre-0027 path.
+        probe = max(i for i, (s, p) in enumerate(cur.calls) if p == ("episode_sources",))
         self.assertEqual(stmts[probe - 1], "SAVEPOINT capture_source_row")
         self.assertEqual(stmts[probe + 1], "ROLLBACK TO SAVEPOINT capture_source_row")
 

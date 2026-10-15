@@ -106,7 +106,22 @@ def episodes_missing_in_pg(cur, keys: list[tuple[str, str]]) -> list[tuple[str, 
     Anti-join runs in PG so ts normalization uses the same ::timestamptz cast
     as the insert path. Returns the missing (ts, md5) pairs (empty = green) —
     reconcile uses the pairs to insert exactly the missing lines.
+
+    A hub with episode_sources (0027) also counts a line as present when any
+    source row, origin or merged, carries its (ts, summary_md5) as first
+    written: a merge or an edit rewrites the live summary, and matching on it
+    alone re-inserted the original line as a new episode (ARCH-10). Without
+    the table this is exactly the pre-0027 query.
     """
+    from khipu.capture_identity import sources_ready
+
+    sources_sql = ""
+    if sources_ready(cur):
+        sources_sql = """
+            AND NOT EXISTS (
+                SELECT 1 FROM episode_sources s
+                WHERE s.ts = v.ts::timestamptz AND s.summary_md5 = v.md
+            )"""
     missing: list[tuple[str, str]] = []
     # Two arrays per statement, not a VALUES list of 500 pairs: the server
     # answers 500 pairs in ~7 ms, so 35 round trips of placeholders cost 2.8 s
@@ -121,7 +136,7 @@ def episodes_missing_in_pg(cur, keys: list[tuple[str, str]]) -> list[tuple[str, 
             WHERE NOT EXISTS (
                 SELECT 1 FROM episodes e
                 WHERE e.ts = v.ts::timestamptz AND md5(e.summary) = v.md
-            )
+            )""" + sources_sql + """
             ORDER BY v.ord
             """,
             ([k[0] for k in chunk], [k[1] for k in chunk]),

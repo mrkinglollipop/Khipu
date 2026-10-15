@@ -356,6 +356,7 @@ class _EpisodesFakeCursor:
             key = (ts, hashlib.md5(summary.encode()).hexdigest())
             if key in self._existing_keys:
                 self.rowcount = 0
+                self._result = []
                 return
             eid = self.next_id
             self.next_id += 1
@@ -370,6 +371,7 @@ class _EpisodesFakeCursor:
             self._existing_keys.add(key)
             self.rowcount = 1
             self.last_inserted_id = eid
+            self._result = [(eid,)]  # RETURNING id
             return
         if s.startswith("SELECT id FROM episodes WHERE ts"):
             ts, md = params
@@ -550,7 +552,8 @@ class WritePgOrchestrationTest(unittest.TestCase):
                            side_effect=lambda c, pl, eid: opened.append((pl, eid)) or 1), \
                 mock.patch("khipu.commitments.auto_close", return_value=0), \
                 mock.patch.object(cap, "_reembed_merged_episode",
-                                  side_effect=lambda ts, sm, m: reembedded.append((ts, sm, m))), \
+                                  side_effect=lambda ts, sm, m, episode_id=None:
+                                  reembedded.append((ts, sm, m, episode_id))), \
                 mock.patch.object(cap, "_dedup_text", side_effect=lambda p: p.get("summary") or ""):
             stats = cap.write_pg(payload)
         self.assertEqual(stats["dedup"]["action"], "merge")
@@ -566,6 +569,7 @@ class WritePgOrchestrationTest(unittest.TestCase):
         self.assertEqual(reembedded[0][0], "2026-09-03T00:00:00Z")
         self.assertEqual(reembedded[0][2]["people"], ["matt", "ana"])
         self.assertEqual(reembedded[0][2]["session_id"], existing[1]["session_id"])
+        self.assertEqual(reembedded[0][3], 1, "the target is re-embedded by its id")
         self.assertEqual(reembedded[0][2]["project"], "acme/widget")
 
     def test_a_path_like_scope_is_normalised_to_null_on_insert(self):
@@ -593,16 +597,20 @@ class WritePgOrchestrationTest(unittest.TestCase):
         self.assertEqual(list(cur.episodes.values())[0]["scope"], "build")
 
     def test_merge_reembed_looks_the_target_row_up_by_its_own_identity(self):
-        """``embed_on_capture`` finds a row by (ts, md5(summary)); a merge
-        changes neither, so the TARGET's ts/summary — not the merged
-        capture's — are what must be handed to it."""
+        """The target is re-embedded by its id, and the TARGET's ts/summary,
+        not the merged capture's, are what is handed over (the legacy
+        lookup a caller without an id still falls back to)."""
         seen: list[dict] = []
-        with mock.patch("khipu.embed.embed_on_capture", side_effect=lambda p: seen.append(p)):
+        ids: list = []
+        with mock.patch("khipu.embed.embed_on_capture",
+                        side_effect=lambda p, episode_id=None: seen.append(p) or ids.append(episode_id)):
             cap._reembed_merged_episode(
                 "2026-09-03T00:00:00Z", "target summary",
                 {"summary": "ignored", "topics": ["t"], "decisions": ["d"],
                  "preferences": [], "people": []},
+                episode_id=7,
             )
+        self.assertEqual(ids, [7])
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0]["ts"], "2026-09-03T00:00:00Z")
         self.assertEqual(seen[0]["summary"], "target summary")

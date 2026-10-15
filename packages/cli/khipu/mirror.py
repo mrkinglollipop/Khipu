@@ -342,7 +342,8 @@ def _upsert_topic(
 
 
 def _upsert_episode(cur, payload: dict[str, Any], *,
-                    source: dict[str, Any] | None = None) -> bool:
+                    source: dict[str, Any] | None = None,
+                    out: dict[str, Any] | None = None) -> bool:
     """Insert one episode; no-op when the (ts, md5(summary)) identity exists.
 
     Bare ON CONFLICT DO NOTHING is unambiguous here: id is never supplied, so
@@ -353,6 +354,9 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
     phase 1), from ``source`` when the caller snapshotted it (write_pg does,
     before enrichment and ingestion rewrite the payload) or else from the
     redacted copy written to the row, never the unredacted input.
+
+    ``out``, when given, receives ``episode_id`` for a new row, so a caller
+    never re-selects the row it just wrote by the mutable summary.
     """
     # Identity columns (0008) and tags (0010) are named only when they exist.
     # Naming them unconditionally made EVERY capture raise UndefinedColumn on a
@@ -430,6 +434,8 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
         try:
             row = cur.fetchone()
             if row:
+                if out is not None:
+                    out["episode_id"] = int(row[0])
                 from khipu.capture_identity import record_source, source_identity
 
                 record_source(cur, int(row[0]), "origin", source or source_identity(safe))
@@ -570,20 +576,22 @@ def sync_recent_episodes(memory_root: Path, *, tail_lines: int = 40) -> dict[str
     stats["tail"] = len(keys)
     if not keys:
         return stats
-    inserted_payloads: list[dict[str, Any]] = []
+    inserted_payloads: list[tuple[dict[str, Any], int | None]] = []
     with connect() as conn:
         with conn.cursor() as cur:
             missing = set(episodes_missing_in_pg(cur, keys))
             for obj, key in zip(objs, keys):
-                if key in missing and _upsert_episode(cur, obj):
+                upserted: dict[str, Any] = {}
+                if key in missing and _upsert_episode(cur, obj, out=upserted):
                     stats["inserted"] += 1
-                    inserted_payloads.append(obj)
+                    inserted_payloads.append((obj, upserted.get("episode_id")))
         conn.commit()
     if inserted_payloads:
         try:
             from khipu.embed import embed_on_capture
 
-            stats["embedded"] = sum(1 for p in inserted_payloads if embed_on_capture(p))
+            stats["embedded"] = sum(1 for p, eid in inserted_payloads
+                                    if embed_on_capture(p, episode_id=eid))
         except Exception as e:  # noqa: BLE001 — vectors are fail-open
             _log(f"tail-sync embed skipped: {e}")
     return stats

@@ -1905,8 +1905,12 @@ def activate_welcome_embed(*, provider: str, profile: str | None = None) -> dict
     return activate(target, force=True)
 
 
-def embed_on_capture(payload: dict[str, Any]) -> bool:
-    """Embed one just-captured episode by identity. Fail-open; returns True on success."""
+def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) -> bool:
+    """Embed one just-captured episode. Fail-open; returns True on success.
+
+    ``episode_id`` is the row the writer reported; without one (a caller that
+    has no id, such as the legacy file mirror) the row is found by the legacy
+    (ts, md5(summary)) identity, which an edit or merge can move."""
     if os.environ.get("KHIPU_EMBED_ON_CAPTURE", "1").strip().lower() in {"0", "false", "off"}:
         return False
     try:
@@ -1920,12 +1924,19 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
         with connect() as conn:
             with conn.cursor() as cur:
                 profile = _active_profile(cur)
-                cur.execute(
-                    "SELECT row_to_json(e) FROM episodes e "
-                    "WHERE e.ts = %s::timestamptz AND md5(e.summary) = %s "
-                    "AND e.deleted_at IS NULL",
-                    (ts, _md5(summary)),
-                )
+                if episode_id is not None:
+                    cur.execute(
+                        "SELECT row_to_json(e) FROM episodes e "
+                        "WHERE e.id = %s AND e.deleted_at IS NULL",
+                        (int(episode_id),),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT row_to_json(e) FROM episodes e "
+                        "WHERE e.ts = %s::timestamptz AND md5(e.summary) = %s "
+                        "AND e.deleted_at IS NULL",
+                        (ts, _md5(summary)),
+                    )
                 row = cur.fetchone()
                 source_row = row[0] if row else None
                 if isinstance(source_row, str):

@@ -329,7 +329,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                 continue
             if stats.get("episode_inserted"):
                 try:
-                    embed_on_capture(payload)
+                    embed_on_capture(payload, episode_id=stats.get("episode_id"))
                 except Exception as e:  # noqa: BLE001 — row is durable; backfill heals vectors
                     _log(f"embed skipped for {jp.name}: {e}")
             with _locked_outbox():

@@ -1363,9 +1363,10 @@ def _tool_capture(args: dict) -> dict:
     # protocol stream for the rest of the session.
     prev_mirror = os.environ.get("KHIPU_HUB_FILE_MIRROR")
     os.environ["KHIPU_HUB_FILE_MIRROR"] = "0"
+    written: dict = {}
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            rc = capture(payload, mode="hub")
+            rc = capture(payload, mode="hub", result=written)
     finally:
         if prev_mirror is None:
             os.environ.pop("KHIPU_HUB_FILE_MIRROR", None)
@@ -1374,34 +1375,20 @@ def _tool_capture(args: dict) -> dict:
     if rc != 0:
         raise ValueError(f"khipu capture exited {rc}")
     out = {"ok": True, "mode": mode, "ts": payload["ts"]}
-    episode_id = _captured_episode_id(payload)
+    episode_id = _captured_episode_id(written)
     if episode_id is not None:
         out["episode_id"] = episode_id
     return out
 
 
-def _captured_episode_id(payload: dict) -> int | None:
-    """The row this capture landed on, by the (ts, md5(summary)) identity every
-    writer shares. Fail-open — the capture already succeeded, so an id lookup
-    failure must not turn it into a tool error."""
+def _captured_episode_id(written: dict) -> int | None:
+    """The row this capture landed on, as write_pg reported it. No lookup: the
+    (ts, md5(summary)) re-select it replaced named the wrong row once a merge
+    or edit had moved the summary. None when the write did not report one."""
     try:
-        import hashlib
-
-        from khipu.db import connect
-
-        summary = (payload.get("summary") or "").strip()
-        ts = payload.get("ts")
-        if not summary or not ts:
-            return None
-        with connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
-                    (ts, hashlib.md5(summary.encode("utf-8")).hexdigest()),
-                )
-                row = cur.fetchone()
-        return int(row[0]) if row else None
-    except Exception:  # noqa: BLE001 — best-effort enrichment only
+        episode_id = written.get("episode_id")
+        return int(episode_id) if episode_id is not None else None
+    except (TypeError, ValueError):  # best-effort enrichment only
         return None
 
 

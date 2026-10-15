@@ -77,6 +77,43 @@ def source_identity(payload: dict[str, Any]) -> dict[str, Any]:
             **fields}
 
 
+def sources_ready(cur) -> bool:
+    """Whether this hub has episode_sources (migration 0027). Every reader
+    keeps its pre-0027 path when this is False, and a failed probe is False."""
+    try:
+        from khipu.db import has_table
+
+        return has_table(cur, "episode_sources")
+    except Exception:  # noqa: BLE001 — a probe never blocks a reader
+        return False
+
+
+def episode_for_source(cur, key: str) -> int | None:
+    """The episode a source key was recorded against, tombstoned or not."""
+    cur.execute("SELECT episode_id FROM episode_sources WHERE source_key = %s", (key,))
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def sources_for_episode(cur, episode_id: int) -> list[dict[str, Any]]:
+    """Every source row of one episode (all roles), oldest first. ``ts`` is an
+    ISO string in UTC, the form the file mirror's lines carry."""
+    cur.execute(
+        "SELECT source_key, role, ts, summary_md5, payload_sha256 FROM episode_sources "
+        "WHERE episode_id = %s ORDER BY created_at, source_key",
+        (episode_id,),
+    )
+    out = []
+    for key, role, ts, summary_md5, psha in cur.fetchall():
+        if hasattr(ts, "astimezone"):
+            from datetime import timezone
+
+            ts = ts.astimezone(timezone.utc).isoformat()
+        out.append({"source_key": key, "role": role, "ts": ts,
+                    "summary_md5": summary_md5, "payload_sha256": psha})
+    return out
+
+
 _INSERT_COLS = ("source_key, episode_id, role, harness, session_id, transcript_range, "
                 "window_id, part, ts, summary_md5, payload_sha256")
 
@@ -108,8 +145,8 @@ def _insert_source(cur, key: str, episode_id: int, role: str, ident: dict[str, A
 
 def record_source(cur, episode_id: int, role: str, ident: dict[str, Any], *,
                   ts: Any = None, summary: Any = None) -> str | None:
-    """Write one episode_sources row in the caller's transaction (phase 1 dual
-    write; nothing reads the table yet). Returns the key recorded, or None when
+    """Write one episode_sources row in the caller's transaction. Returns the
+    key recorded, or None when
     the table is absent (a hub without 0027), the source is already recorded,
     or the write failed. Fail-open under its own savepoint: the episode is the
     durable part and a missing source row is never worth losing it for.

@@ -90,7 +90,17 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
     inserted and silently skip every part after it as an "exact window"
     duplicate. window_id (+ part, carried in raw) makes each sibling its own
     identity. Pre-migration hub (no window_id column): falls back to the
-    pre-K3 match, same as a payload with no window_id."""
+    pre-K3 match, same as a payload with no window_id.
+
+    A hub with episode_sources (0027) answers by the capture's source key
+    first; the receipt and column matches below stay as the pre-0027 path and
+    for sources recorded before the key existed."""
+    from khipu.capture_identity import episode_for_source, source_key, sources_ready
+
+    if sources_ready(cur):
+        recorded = episode_for_source(cur, source["source_key"] if source else source_key(payload))
+        if recorded is not None:
+            return recorded
     for receipt_id in _receipts(payload, source):
         cur.execute("SELECT id FROM episodes WHERE raw @> %s::jsonb LIMIT 1",
                     (json.dumps({"merged_from": [{"source_id": receipt_id}]}),))
@@ -480,7 +490,8 @@ def _merge_into_episode(
     return True
 
 
-def _reembed_merged_episode(ts: Any, summary: Any, merged: dict[str, Any]) -> None:
+def _reembed_merged_episode(ts: Any, summary: Any, merged: dict[str, Any], *,
+                            episode_id: int | None = None) -> None:
     """Re-embed a merged target row. Fail-open: the episode is already durable
     and `khipu embed backfill` heals any miss."""
     try:
@@ -491,7 +502,7 @@ def _reembed_merged_episode(ts: Any, summary: Any, merged: dict[str, Any]) -> No
         merged["summary"] = summary or ""
         if not merged["ts"] or not merged["summary"]:
             return
-        embed_on_capture(merged)
+        embed_on_capture(merged, episode_id=episode_id)
     except Exception as exc:  # noqa: BLE001 — vectors are additive
         _log(f"merge re-embed failed ({type(exc).__name__}: {exc})")
 
@@ -588,7 +599,8 @@ def _refresh_merged_episode(cur, episode_id: int) -> None:
                 return
             merged = dict(target.get("raw") or {})
             merged.update(target)
-            _reembed_merged_episode(target["ts"], target["summary"], merged)
+            _reembed_merged_episode(target["ts"], target["summary"], merged,
+                                    episode_id=episode_id)
     except Exception as exc:  # noqa: BLE001 — embedding is additive
         _log(f"merge refresh failed ({type(exc).__name__}: {exc})")
 
@@ -624,6 +636,12 @@ def load_payload(raw: str) -> dict[str, Any]:
 
 def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
+
+    Returns ``episode_id`` (the row this capture landed on: inserted, merged
+    into, skipped as already recorded, or already holding its legacy
+    identity), ``episode_inserted`` and ``source_key`` (the capture's key from
+    capture_identity.source_key), plus ``topics_written`` and ``dedup``.
+    Callers take the id from here; none re-selects by (ts, md5(summary)).
 
     Runs the same three steps for every writer that reaches here (the native
     extractor via session_capture.drain, the legacy capture_v2-shaped payload
@@ -664,6 +682,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     "episode_inserted": False,
                     "topics_written": 0,
                     "episode_id": dedup.get("matched_episode"),
+                    "source_key": source["source_key"],
                     "dedup": dedup,
                 }
 
@@ -727,27 +746,33 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
 
             payload["scope"] = normalize_scope(payload.get("scope"))
 
-            inserted = _upsert_episode(cur, payload, source=source)
+            upserted: dict[str, Any] = {}
+            inserted = _upsert_episode(cur, payload, source=source, out=upserted)
+            episode_id = upserted.get("episode_id")
             if not inserted:
+                # The insert hit the legacy unique key, so the row holding that
+                # key is where this capture landed (the key stays unique until
+                # phase 3 moves uniqueness to the source).
                 cur.execute(
                     "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
                     (payload["ts"], _md5_hex(payload["summary"])),
                 )
                 existing = cur.fetchone()
+                episode_id = int(existing[0]) if existing else None
                 cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
-                            (existing[0] if existing else None,))
+                            (episode_id,))
                 row = cur.fetchone()
                 target = row[0] if row else {}
-                source = target.get("raw") or {}
+                stored_raw = target.get("raw") or {}
                 # The stored raw is not the payload as sent: ingestion adds
                 # tags, normalizes scope and rewrites fields on merge, so a
                 # field-by-field comparison flags ordinary replays. Until
                 # captures carry an immutable identity this is logged only;
                 # failing the job here stranded it in the queue and turned the
                 # harness red (2026-10-11).
-                if not target or any(payload.get(k) != target.get(k, source.get(k)) for k in
+                if not target or any(payload.get(k) != target.get(k, stored_raw.get(k)) for k in
                                      ("session_id", "project", "harness", "transcript_range")) \
-                        or any(payload.get(k) and payload[k] != source.get(k) for k in
+                        or any(payload.get(k) and payload[k] != stored_raw.get(k) for k in
                                ("verbatim", "decisions", "preferences", "open_loops", "closed_loops",
                                 "decision_details", "deliverables", "window_id", "part")):
                     _log("capture replay identity differs from stored source evidence; "
@@ -763,12 +788,6 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 _log(f"topic graph mint failed ({type(exc).__name__}: {exc})")
 
             if inserted:
-                cur.execute(
-                    "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
-                    (payload.get("ts"), _md5_hex(payload.get("summary") or "")),
-                )
-                row = cur.fetchone()
-                episode_id = int(row[0]) if row else None
                 if episode_id is not None:
                     cur.execute("SAVEPOINT capture_commitments")
                     try:
@@ -841,6 +860,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
         "episode_inserted": inserted,
         "topics_written": topics_written,
         "episode_id": episode_id,
+        "source_key": source["source_key"],
         "dedup": dedup,
     }
 
@@ -889,7 +909,11 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
     return proc.returncode
 
 
-def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
+def capture(payload: dict[str, Any], *, mode: str | None = None,
+            result: dict[str, Any] | None = None) -> int:
+    """Route one capture by mode. ``result``, when given, receives write_pg's
+    stats (``episode_id``, ``episode_inserted``, ``source_key``) on a hub
+    write, so a caller that reports the episode never looks it up again."""
     mode = (mode or capture_mode()).lower()
     try:
         _validate_timestamp(payload)
@@ -930,6 +954,8 @@ def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
     # is ever double-written (the replay is the same identity upsert).
     try:
         stats = write_pg(payload)
+        if result is not None:
+            result.update(stats)
     except CaptureIdentityConflict as exc:
         _log(str(exc))
         return EX_SOFTWARE
@@ -961,7 +987,7 @@ def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
     if stats["episode_inserted"]:
         from khipu.embed import embed_on_capture
 
-        embed_on_capture(payload)
+        embed_on_capture(payload, episode_id=stats.get("episode_id"))
 
     # dual: legacy file wiki is a peer; hub: PG is the record and the file is
     # its reverse mirror (plan: "Hub owns writes ... and can reverse-mirror to

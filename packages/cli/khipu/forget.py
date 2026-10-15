@@ -84,14 +84,30 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         "summary_md5": hashlib.md5((summary or "").encode("utf-8")).hexdigest(),
     }]
     has_merged_sources = False
-    # An edited summary can still have an original legacy identity in raw.
-    # For merged episodes, raw describes a retained source, not an identity
-    # that forget can safely erase without a capture-identity contract.
+    source_rows: list[dict[str, Any]] | None = None
+    from khipu.capture_identity import sources_for_episode, sources_ready
+
+    if sources_ready(cur):
+        # Every source row, origin and merged, keeps the (ts, summary_md5) it
+        # was first written under, so each legacy line this episode ever had
+        # is named exactly, whatever edits and merges did to the live summary
+        # since (RSN-6). The live identity above stays first.
+        source_rows = sources_for_episode(cur, episode_id)
+        has_merged_sources = any(src["role"] == "merged" for src in source_rows)
+        for src in source_rows:
+            ident = {"ts": src["ts"], "summary_md5": src["summary_md5"]}
+            if (isinstance(ident["ts"], str) and ident["summary_md5"]
+                    and not any(_same_identity(ident, known) for known in legacy_identities)):
+                legacy_identities.append(ident)
+    # Pre-0027 hub (or no source row recorded): an edited summary can still have an original legacy
+    # identity in raw. For merged episodes, raw describes a retained source,
+    # not an identity that forget can safely erase without a capture-identity
+    # contract.
     try:
         cur.execute("SELECT raw FROM episodes WHERE id = %s", (episode_id,))
         raw_row = cur.fetchone()
         raw = raw_row[0] if isinstance(raw_row, tuple) and len(raw_row) == 1 else None
-        if isinstance(raw, dict):
+        if isinstance(raw, dict) and not source_rows:
             has_merged_sources = bool(raw.get("merged_from"))
             original_ts = raw.get("ts")
             original_summary = raw.get("summary")
@@ -166,7 +182,19 @@ def forget_episode(cur, episode_id: int) -> dict[str, Any]:
         "identity": legacy_identities[0],
         "legacy_identities": legacy_identities,
         "has_merged_sources": has_merged_sources,
+        "source_rows": source_rows,
     }
+
+
+def _same_identity(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Two legacy identities name the same file line: same summary md5 and the
+    same second, compared the way _line_matches compares a line."""
+    return (a.get("summary_md5") == b.get("summary_md5")
+            and _ts_key(str(a.get("ts") or "")) == _ts_key(str(b.get("ts") or "")))
+
+
+def _ts_key(ts_iso: str) -> str:
+    return ts_iso.replace("Z", "+00:00")[:19]
 
 
 def _line_matches(line: str, ts_iso: str, summary_md5: str) -> bool:
@@ -183,9 +211,7 @@ def _line_matches(line: str, ts_iso: str, summary_md5: str) -> bool:
     # The file stores what the hook minted (2026-09-05T12:20:17Z); PG returns
     # an aware datetime. Compare on the first 19 characters (to the second)
     # after normalising the zone suffix.
-    a = raw_ts.replace("Z", "+00:00")[:19]
-    b = ts_iso.replace("Z", "+00:00")[:19]
-    return a == b
+    return _ts_key(raw_ts) == _ts_key(ts_iso)
 
 
 def _has_unidentified_records(lines: list[str]) -> bool:
@@ -282,11 +308,39 @@ def forget_in_legacy_file(memory_root: Path | None, ts_iso: str, summary_md5: st
             "backups": backups, **reason}
 
 
-def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = False) -> dict[str, Any]:
-    """Report retained jobs without inferring capture identity or changing files."""
+def _source_copy(payload: dict[str, Any], source_rows: list[dict[str, Any]]) -> bool:
+    """Whether a queued job is a copy of one of the episode's sources: by its
+    source key, its payload hash, or the legacy identity the source row was
+    first written under (a job that never reached the hub has no row of its
+    own, but it shares the key of the row its retry would land on)."""
+    from khipu.capture_identity import payload_sha256, source_key
+
+    keys = {src["source_key"] for src in source_rows}
+    hashes = {src["payload_sha256"] for src in source_rows if src.get("payload_sha256")}
+    if source_key(payload) in keys or payload_sha256(payload) in hashes:
+        return True
+    summary = payload.get("summary")
+    if not isinstance(summary, str):
+        return False
+    ident = {"ts": str(payload.get("ts") or ""),
+             "summary_md5": hashlib.md5(summary.encode("utf-8")).hexdigest()}
+    return any(_same_identity(ident, src) for src in source_rows if src.get("summary_md5"))
+
+
+def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = False,
+                      source_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Report retained jobs without changing files.
+
+    With the episode's source rows (a hub with 0027) the report names the
+    exact job files that are copies of this episode's sources; erasing them
+    waits for phase 3, so it still only reports. Without them (pre-0027, or
+    an episode whose source row was never recorded) any job from the same
+    session counts, as before."""
     remaining: list[str] = []
     reason = "outbox: not cleaned (capture identity needed)"
-    if has_merged_sources:
+    if source_rows:
+        reason = "outbox: copy retained (erase by source key lands in phase 3)"
+    elif has_merged_sources:
         return {"ok": False, "removed": 0, "remaining": [reason]}
     try:
         from khipu.outbox import _locked_outbox, outbox_dir, dead_dir, quarantine_dir
@@ -310,6 +364,10 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
                             raise ValueError("job payload is not an object")
                     except (OSError, ValueError, TypeError) as exc:
                         remaining.append(f"{reason}; {path}: {type(exc).__name__}")
+                        continue
+                    if source_rows:
+                        if _source_copy(payload, source_rows):
+                            remaining.append(f"{reason}; {path}")
                         continue
                     # Without a session id there is no way to tell this job from
                     # the forgotten episode's capture, so any retained job counts.
@@ -365,7 +423,8 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None) -> di
     if any(not item.get("backups", {}).get("ok", True) for item in out["legacy_files"]):
         partial.append("legacy_backups")
     out["outboxes"] = [_outbox_remainder(out.get("session_id"),
-                                       has_merged_sources=out.get("has_merged_sources", False))]
+                                       has_merged_sources=out.get("has_merged_sources", False),
+                                       source_rows=out.get("source_rows"))]
     out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
                      "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
     if not out["outbox"]["ok"]:
