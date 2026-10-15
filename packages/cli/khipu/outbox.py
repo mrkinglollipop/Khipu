@@ -291,11 +291,16 @@ def status() -> dict[str, Any]:
             "max_attempts": MAX_ATTEMPTS}
 
 
-def _claim_deferred(jp: Path) -> bool:
+def _retry_order(jp: Path) -> tuple[bool, str, str]:
+    """Jobs never tried run first, in queue order; then failed jobs, oldest
+    attempt first; deferred origin claims last, also oldest attempt first. A
+    bounded drain therefore rotates through every retry instead of spending
+    its budget on the same failures in filename order."""
     try:
-        return bool(json.loads(jp.read_text()).get("claim_deferred"))
+        job = json.loads(jp.read_text())
+        return (bool(job.get("claim_deferred")), str(job.get("last_attempt_at") or ""), jp.name)
     except (OSError, ValueError, AttributeError):
-        return False
+        return (False, "", jp.name)
 
 
 def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> dict[str, Any]:
@@ -314,9 +319,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return {**out, "busy": True}
-        # A job whose origin claim was deferred retries after every other job,
-        # so a claim that keeps failing never starves the queue behind it.
-        js = sorted(jobs(), key=_claim_deferred)
+        js = sorted(jobs(), key=_retry_order)
         if limit is not None:
             js = js[:limit]
         out["jobs"] = len(js)
@@ -349,6 +352,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                 out["failed"] += 1
                 job["attempts"] += 1
                 job["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+                job["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
                 name = type(e).__name__
                 unreachable = "Operational" in name or "Connection" in name or "connect" in str(e).lower()
                 # A deferred origin claim is transient and its job holds the

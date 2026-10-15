@@ -407,6 +407,52 @@ class DedupEarlyReturnClaimsTest(_OutboxOriginBase):
         self.assertEqual(second["replayed"], 1, "the later job runs before the deferred one")
         self.assertEqual(outbox.jobs(), [stuck])
 
+    def test_every_deferred_claim_is_reached_by_bounded_drains(self):
+        # Two deferred claims: the first stays locked, the second's lock
+        # clears. Drains of one job each must rotate through both, not retry
+        # the first job forever in filename order.
+        class LockNotAvailable(Exception):
+            pass
+
+        other = {**_WINDOW, "session_id": "claude_code:def"}
+        cur = _DedupClaimCursor(dict(_WINDOW))
+        cur.episodes[2] = {**cur.episodes[1], **other, "ts": "2026-10-15T11:30:00Z"}
+        self._queue(_window_payload())
+        with rc.gateway_request("caller-a"):
+            outbox.enqueue({**_window_payload(), **other, "ts": "2026-10-15T12:30:00Z"})
+        locked_rows = {1, 2}
+
+        def execute(sql, params=None):
+            if sql.lstrip().startswith("UPDATE episodes SET origin") and params[1] in locked_rows:
+                raise LockNotAvailable("lock timeout")
+            return _DedupClaimCursor.execute(cur, sql, params)
+
+        with mock.patch.object(cur, "execute", side_effect=execute), \
+                mock.patch("psycopg.connect", side_effect=AssertionError("real database")), \
+                mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
+                mock.patch("khipu.machine_identity.local_origin", return_value=DRAINER), \
+                mock.patch("khipu.config.path_setting", return_value=None):
+            self.assertEqual(outbox.drain().get("deferred"), 2)
+            locked_rows.discard(2)
+            for _ in range(3):
+                outbox.drain(limit=1)
+        self.assertEqual(cur.episodes[2]["origin"], "gateway:caller-a")
+        self.assertIsNone(cur.episodes[1]["origin"])
+        self.assertEqual(len(outbox.jobs()), 1)
+
+    def test_a_failing_job_retries_after_jobs_not_yet_tried(self):
+        # Any retry, deferred or not, goes behind work that has not been tried,
+        # so a bounded drain never spends its whole budget on old failures.
+        first = outbox.enqueue({"ts": "2026-10-15T10:00:00Z", "summary": "fails", "session_id": "s"})
+        fresh = outbox.enqueue({"ts": "2026-10-15T11:00:00Z", "summary": "new", "session_id": "s"})
+        with mock.patch("khipu.capture.write_pg", side_effect=ValueError("bad row")):
+            outbox.drain(limit=1)
+        self.assertEqual(outbox._read_job(first)["attempts"], 1)
+        with mock.patch("khipu.capture.write_pg", side_effect=ValueError("bad row")):
+            outbox.drain(limit=1)
+        self.assertEqual(outbox._read_job(fresh)["attempts"], 1)
+        self.assertEqual(outbox._read_job(first)["attempts"], 1)
+
     def test_a_claim_that_is_not_required_never_blocks(self):
         # No trusted origin (a gateway-process capture outside a request), so
         # no claim is owed: a failing probe must not hold the job.
