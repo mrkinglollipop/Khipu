@@ -321,18 +321,25 @@ def _restore_file(path: Path, snapshot: bytes | None) -> None:
 
 
 def _sanitize_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    expected = payload.get("expected") or {}
+    created_at = None
+    if payload.get("created_at"):
+        try:
+            created_at = datetime.fromisoformat(payload["created_at"]).isoformat()
+        except ValueError:
+            pass
     out: dict[str, Any] = {
         "format": payload.get("format", FORMAT_VERSION),
         "capture_mode": payload.get("capture_mode"),
-        "expected": dict(payload.get("expected") or {}),
-        "created_at": payload.get("created_at"),
+        "expected": {key: expected[key] for key in _KIT_COUNT_FIELDS if key in expected},
+        "created_at": created_at,
         "has_gemini_api_key": bool(payload.get("gemini_api_key")),
         "has_openai_compat_api_key": bool(payload.get("openai_compat_api_key")),
         "has_root_crt_pem": bool(payload.get("root_crt_pem")),
     }
     gateway = payload.get("gateway_url")
     if gateway:
-        out["gateway_url"] = gateway
+        out["gateway_url"] = redact_connection_text(gateway)
     try:
         host = conninfo_to_dict(str(payload.get("database_url") or "")).get("host")
     except Exception:

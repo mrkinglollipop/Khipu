@@ -273,10 +273,11 @@ def _integrity_check(path: Path, *, timeout: int = INTEGRITY_TIMEOUT_SECONDS) ->
         )
     except subprocess.TimeoutExpired:
         return f"timeout after {timeout}s"
+    except OSError:
+        return "snapshot integrity check failed to start"
     if r.returncode != 0:
-        tail = (r.stderr or r.stdout or "").strip()
-        return f"error: {tail or r.returncode}"
-    return (r.stdout or "").strip() or "unknown"
+        return "snapshot integrity check failed"
+    return "ok" if (r.stdout or "").strip().lower() == "ok" else "snapshot integrity check failed"
 
 
 # PRAGMA integrity_check reads every page of the snapshot: on a 3.8 GB graph it
@@ -384,8 +385,8 @@ def _required_graph_tables(path: Path) -> str | None:
             }
         finally:
             con.close()
-    except sqlite3.Error as exc:
-        return f"schema probe failed: {exc}"
+    except sqlite3.Error:
+        return "schema probe failed"
     missing = sorted({"nodes", "edges"} - found)
     return f"missing required graph table(s): {', '.join(missing)}" if missing else None
 
@@ -432,15 +433,15 @@ def record_local(*, snapshot: Path | None = None) -> dict:
         _remember_integrity_ok(snap, _utcnow(), before)
     try:
         nbytes = snap.stat().st_size
-    except OSError as exc:
-        return {"ok": False, "reason": f"stat failed: {exc}"}
+    except OSError:
+        return {"ok": False, "reason": "snapshot stat failed"}
 
     try:
         embeddings = _count_embeddings(snap)
-    except sqlite3.Error as exc:
+    except sqlite3.Error:
         embeddings = -1
         ok = False
-        integrity = f"embeddings probe failed: {exc}"
+        integrity = "embeddings probe failed"
 
     detail = {
         "path": str(snap),
@@ -452,8 +453,8 @@ def record_local(*, snapshot: Path | None = None) -> dict:
 
     try:
         ev = ops_events.record("graph_snapshot", "ok" if ok else "fail", detail)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"ops_events insert failed: {exc}", **detail}
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "reason": "ops_events insert failed", **detail}
 
     out = {"ok": ok, "event": ev, **detail}
     if ok and _resolve_producer(None):
@@ -476,8 +477,8 @@ def run_offsite(
         dest_remote = (
             check_graph_backup_remote(dest_remote) if dest_remote else resolve_dest_remote()
         )
-    except ValueError as exc:
-        return {"ok": False, "reason": str(exc)}
+    except ValueError:
+        return {"ok": False, "reason": "offsite destination must be a named rclone remote"}
     resolved = resolve_rclone(rclone_bin)
     if resolved is None:
         return {
@@ -503,8 +504,8 @@ def run_offsite(
     try:
         if snap.stat().st_size <= 0:
             return {"ok": False, "reason": "latest snapshot is empty", "path": str(snap)}
-    except OSError as exc:
-        return {"ok": False, "reason": f"snapshot stat failed: {exc}", "path": str(snap)}
+    except OSError:
+        return {"ok": False, "reason": "snapshot stat failed", "path": str(snap)}
     integrity = _integrity_check(snap)
     if integrity.lower() != "ok":
         return {
@@ -531,56 +532,45 @@ def run_offsite(
 
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=3600)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        detail = {"path": str(snap), "dest": dest, "error": str(exc)}
+    except (OSError, subprocess.TimeoutExpired):
+        detail = {"path": str(snap), "dest": dest, "error": "offsite copy failed to run"}
         try:
             from khipu import ops_events
 
             ops_events.record("graph_snapshot_offsite", "fail", detail)
-        except Exception as rec_exc:  # noqa: BLE001
-            detail["ops_error"] = str(rec_exc)
-        return {"ok": False, "reason": str(exc), **detail}
+        except Exception:  # noqa: BLE001
+            detail["ops_error"] = "offsite ops_events insert failed"
+        return {"ok": False, "reason": "offsite copy failed to run", **detail}
 
     if r.returncode != 0:
         detail = {
             "path": str(snap),
             "dest": dest,
-            "stderr": (r.stderr or "")[-500:],
+            "reason": "offsite copy failed",
             "returncode": r.returncode,
         }
         try:
             from khipu import ops_events
 
             ops_events.record("graph_snapshot_offsite", "fail", detail)
-        except Exception as rec_exc:  # noqa: BLE001
-            detail["ops_error"] = str(rec_exc)
+        except Exception:  # noqa: BLE001
+            detail["ops_error"] = "offsite ops_events insert failed"
         return {"ok": False, **detail}
 
     pruned: list[str] = []
+    detail = {"path": str(snap), "dest": dest}
     try:
         pruned = _prune_remote_snapshots(dest_remote, keep=keep, rclone_bin=rclone_bin)
-    except Exception as exc:  # noqa: BLE001 — copy succeeded; prune is best-effort
-        detail = {
-            "path": str(snap),
-            "dest": dest,
-            "prune_error": str(exc),
-            "pruned": pruned,
-        }
-        from khipu import ops_events
+    except Exception:  # noqa: BLE001 — copy succeeded; prune is best-effort
+        detail["prune_error"] = "offsite prune failed"
 
-        ev = ops_events.record("graph_snapshot_offsite", "ok", detail)
-        return {
-            "ok": True,
-            "event": ev,
-            "pruned": pruned,
-            "prune_error": str(exc),
-            **detail,
-        }
-
-    detail = {"path": str(snap), "dest": dest, "pruned": pruned}
+    detail["pruned"] = pruned
     from khipu import ops_events
 
-    ev = ops_events.record("graph_snapshot_offsite", "ok", detail)
+    try:
+        ev = ops_events.record("graph_snapshot_offsite", "ok", detail)
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "ops_error": "offsite ops_events insert failed", **detail}
     return {"ok": True, "event": ev, **detail}
 
 
@@ -595,9 +585,7 @@ def _prune_remote_snapshots(
         timeout=120,
     )
     if r.returncode != 0:
-        raise RuntimeError(
-            (r.stderr or r.stdout or "").strip() or f"lsf rc={r.returncode}"
-        )
+        raise RuntimeError("offsite snapshot listing failed")
 
     names = sorted(
         [
@@ -638,8 +626,8 @@ def offsite_health(
         }
     try:
         dest = resolve_dest_remote()
-    except ValueError as exc:
-        return {"ok": False, "skipped": False, "reason": str(exc), "dest_remote": None}
+    except ValueError:
+        return {"ok": False, "skipped": False, "reason": "offsite destination must be a named rclone remote", "dest_remote": None}
 
     if not has_r2_remote():
         return {
@@ -717,8 +705,8 @@ def scratch_drill(
     temp = (dest_dir or Path("/tmp")) / f"khipu-graph-drill-{ts}.sqlite"
     try:
         shutil.copy2(snap, temp)
-    except OSError as exc:
-        return {"ok": False, "reason": f"copy failed: {exc}"}
+    except OSError:
+        return {"ok": False, "reason": "restore drill copy failed"}
 
     integrity = _integrity_check(temp)
     ok = integrity.lower() == "ok"
@@ -736,9 +724,9 @@ def scratch_drill(
                 )
         finally:
             con.close()
-    except sqlite3.Error as exc:
+    except sqlite3.Error:
         ok = False
-        integrity = f"query failed: {exc}"
+        integrity = "restore drill query failed"
 
     detail = {
         "source": str(snap),
@@ -752,8 +740,8 @@ def scratch_drill(
 
     try:
         ev = ops_events.record("graph_restore_drill", "ok" if ok else "fail", detail)
-    except Exception as exc:  # noqa: BLE001
-        detail["ops_error"] = str(exc)
+    except Exception:  # noqa: BLE001
+        detail["ops_error"] = "restore drill ops_events insert failed"
         ev = None
         ok = False
 

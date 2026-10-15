@@ -12,7 +12,7 @@ class JoinError(ValueError, RuntimeError):
     quote the faulty token, which may be the password) and is never shown."""
 
 
-_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]*@")
+_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s]*@")
 _PASSWORD_PARAM = re.compile(
     r"(?i)\b(password|passwd|pwd)(\s*=\s*)('(?:[^'\\]|\\.)*'?|[^\s&]+)"
 )
@@ -23,7 +23,7 @@ def redact_connection_text(text: str) -> str:
     patterns. For text that must carry detail."""
     from khipu.redact import redact_secrets
 
-    out = _URL_USERINFO.sub(r"\1[REDACTED]@", text or "")
+    out = _URL_USERINFO.sub(r"\1", text or "")
     out = _PASSWORD_PARAM.sub(r"\1\2[REDACTED]", out)
     return redact_secrets(out, force=True)[0]
 

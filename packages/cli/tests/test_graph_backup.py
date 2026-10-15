@@ -332,7 +332,7 @@ class RunOffsiteTest(unittest.TestCase):
             joined = " ".join(argv)
             self.assertNotIn(str(live.resolve()), joined)
 
-    def test_offsite_fail_surfaces_ops_error_when_record_raises(self):
+    def test_offsite_fail_uses_fixed_ops_error_when_record_raises(self):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             snap = d / "graph-20260819T000000Z.sqlite"
@@ -360,7 +360,8 @@ class RunOffsiteTest(unittest.TestCase):
 
             self.assertFalse(out["ok"])
             self.assertIn("ops_error", out)
-            self.assertIn("dsn down", out["ops_error"])
+            self.assertEqual("offsite ops_events insert failed", out["ops_error"])
+            self.assertNotIn("dsn down", str(out))
 
 
 class ScratchDrillTest(unittest.TestCase):

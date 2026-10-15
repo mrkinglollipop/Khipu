@@ -4051,25 +4051,27 @@ def cmd_sources(args: argparse.Namespace) -> int:
 
 def cmd_graph_backup(args: argparse.Namespace) -> int:
     from khipu import graph_backup
+    from khipu.join_errors import redact_connection_text
 
     action = getattr(args, "graph_backup_cmd", None)
-    if action == "record-local":
-        out = graph_backup.record_local()
-    elif action == "offsite":
-        out = graph_backup.run_offsite()
-    elif action == "drill":
-        out = graph_backup.scratch_drill()
-    elif action == "status":
-        out = graph_backup.status_payload()
-        print(json.dumps(out, indent=2, default=str))
-        return 0
-    else:
+    actions = {
+        "record-local": graph_backup.record_local,
+        "offsite": graph_backup.run_offsite,
+        "drill": graph_backup.scratch_drill,
+        "status": graph_backup.status_payload,
+    }
+    if action not in actions:
         print(
             json.dumps({"ok": False, "error": f"unknown graph-backup action: {action}"})
         )
         return 2
-    print(json.dumps(out, indent=2, default=str))
-    return 0 if out.get("ok", False) else 2
+    try:
+        out = actions[action]()
+    except Exception:  # noqa: BLE001 — backup failures can quote credentials
+        print(json.dumps({"ok": False, "error": f"graph backup {action} failed"}))
+        return 2
+    print(redact_connection_text(json.dumps(out, indent=2, default=str)))
+    return 0 if action == "status" or out.get("ok", False) else 2
 
 
 def cmd_import_local(args: argparse.Namespace) -> int:

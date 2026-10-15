@@ -561,7 +561,7 @@ def receive(
         header_line = _readline(tls).decode("utf-8", errors="replace").strip()
         header = json.loads(header_line) if header_line else {}
         if not header.get("ok"):
-            raise JoinError(str(header.get("error") or "nearby Mac refused the PIN")[:200])
+            raise JoinError("nearby Mac refused the pairing request; check the PIN and try again")
         nbytes = int(header.get("bytes") or 0)
         chunks: list[bytes] = []
         got = 0
