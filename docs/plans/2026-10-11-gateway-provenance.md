@@ -8,7 +8,7 @@ This page is the scope; a build session reads it first. Audit IDs: GW-6 (P0); re
 
 | Phase | What | State |
 |---|---|---|
-| 1 | `episodes.origin` column, backfill; gateway passes the token label; capture stamps it | open |
+| 1 | `episodes.origin` column, backfill; gateway passes the token label; capture stamps it | built, in review (branch feat/gateway-provenance-p1) |
 | 2 | One authorization check on every gateway mutation, dedup target and decision link | open |
 | 3 | One token label per caller (Aegis gets its own); tool descriptions tell the truth | open |
 
@@ -57,9 +57,14 @@ caller typed; it has to be assigned by the server when the row is written.
 ## Decisions
 
 1. **Origin is a server-stamped column, `episodes.origin TEXT`.** Values: `gateway:<token label>` for
-   anything written through the HTTPS gateway; `local:<host>` for the CLI and hooks on a machine (`<host>`
-   is the stable machine identity Khipu already uses for logs and checkpoints; the builder confirms which
-   one before choosing). A caller-supplied `origin` in a capture payload is dropped, not honoured.
+   anything written through the HTTPS gateway; `local:<host>` for the CLI and hooks on a machine. A
+   caller-supplied `origin` in a capture payload is dropped, not honoured.
+   Amended 2026-10-15 (owner's decision at the phase 1 blocker): `<host>` is the first 12 hex characters of
+   the sha256 of the hardware id, which is the IOPlatformUUID from `ioreg` on macOS and `/etc/machine-id` on
+   Linux (`khipu/machine_identity.py`). Why: both stay the same across a rename of the machine and a
+   reinstall of Khipu, so a backfill keyed to them never orphans rows, and the hash keeps the hardware id
+   itself out of the data. If neither is readable Khipu stops with a clear error rather than inventing an
+   id. The value is opaque, so `khipu doctor` shows a readable host name beside it (phase 3).
 2. **One rule for every gateway mutation.** A mutation through the gateway is allowed only when the target
    row's origin equals `gateway:<the calling token's label>`. `NULL` or any other origin refuses with a
    message that names the origin class, never the value. Commitments and decisions resolve ownership through
