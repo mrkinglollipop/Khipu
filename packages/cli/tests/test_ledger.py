@@ -781,3 +781,61 @@ def test_render_matches_the_trackers_board_for_the_same_rows(monkeypatch):
                                 "group; never reordered by state)")
     stamp = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\)?$", re.M)
     assert stamp.sub("TIME", ledger.render_board(view)) == stamp.sub("TIME", expected)
+
+
+def test_a_write_waiting_for_the_lock_keeps_its_place_in_line(monkeypatch, tmp_path):
+    import fcntl
+    import time
+
+    ledger = _offline(monkeypatch, tmp_path)
+
+    class Conn:
+        def close(self):
+            pass
+
+    landed, results = [], {}
+
+    def apply(_conn, op, **_kw):  # idempotent by op id, as the hub is
+        if op["op_id"] in results:
+            return {**results[op["op_id"]], "retried": True}
+        landed.append(op["op_id"])
+        results[op["op_id"]] = {"ok": True, "line": op["op_id"]}
+        return results[op["op_id"]]
+
+    monkeypatch.setattr(ledger, "_connect", Conn)
+    monkeypatch.setattr(ledger, "apply_op", apply)
+    ledger.enqueue(ledger.new_op("set", P, "r1", fields={"evidence": "0"}, op_id="op0"))
+    fd = os.open(str(ledger.outbox_dir() / ".drain.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # another process is draining op0
+    older = threading.Thread(target=lambda: ledger.write(ledger.new_op("set", P, "r1", fields={"evidence": "1"},
+                                                                       op_id="op1")))
+    older.start()
+    deadline = time.monotonic() + 5
+    while not any("op1" in p.name for p in ledger._outbox_jobs()):
+        if time.monotonic() > deadline:
+            os.close(fd)
+            older.join(10)
+            pytest.fail("a write waiting for the lock did not join the line")
+        time.sleep(0.01)
+    for path in ledger._outbox_jobs():
+        if "op0" in path.name:
+            path.unlink()  # that drain landed op0 and lets go
+    os.close(fd)
+    newer = ledger.write(ledger.new_op("set", P, "r1", fields={"evidence": "2"}, op_id="op2"))
+    older.join(10)
+    assert landed == ["op1", "op2"] and newer == {"ok": True, "line": "op2"}
+    assert ledger._outbox_jobs() == []
+
+
+@pytest.mark.parametrize("argv", [
+    ("remove", "x", "--children", SECRET_ID),
+    (SECRET_ID,),
+    ("add", "x", "--title", "t", "--kind", "slice", "--bogus", SECRET_ID),
+])
+def test_a_usage_error_masks_a_key_shaped_argument(argv):
+    from khipu import cli
+
+    err = io.StringIO()
+    with redirect_stderr(err), pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["ledger", *argv])
+    assert SECRET_ID not in err.getvalue() and "error:" in err.getvalue()

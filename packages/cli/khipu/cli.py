@@ -4047,8 +4047,18 @@ def cmd_components(args: argparse.Namespace) -> int:
     return 1
 
 
+class _Parser(argparse.ArgumentParser):
+    """Usage errors quote what was typed; a key-shaped value is masked first.
+    Subparsers inherit the class."""
+
+    def error(self, message: str):
+        from khipu.redact import redact_secrets
+
+        super().error(redact_secrets(message, force=True)[0])
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="khipu", description="Khipu memory hub CLI")
+    p = _Parser(prog="khipu", description="Khipu memory hub CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("status", help="PG counts + optional drift")

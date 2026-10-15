@@ -900,7 +900,7 @@ def queued_ops() -> list[dict[str, Any]]:
     return out
 
 
-def enqueue(op: dict[str, Any], reason: str = "") -> Path:
+def enqueue(op: dict[str, Any], reason: str = "", *, live: bool = False) -> Path:
     from khipu.outbox import _atomic_write
 
     d = outbox_dir()
@@ -909,7 +909,9 @@ def enqueue(op: dict[str, Any], reason: str = "") -> Path:
     if existing:
         return existing[0]
     dst = d / f"{time.time_ns():020d}-{op['op_id']}.json"
-    _atomic_write(dst, {"op": op, "reason": reason[:200], "queued_at": _z(_now())})
+    # A live job's writer is waiting for it: it lands as a fresh write would
+    # (an --if-state that no longer holds is refused, not kept as late).
+    _atomic_write(dst, {"op": op, "reason": reason[:200], "queued_at": _z(_now()), "live": live})
     return dst
 
 
@@ -989,7 +991,7 @@ def _drain_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
                 out["refused"] += 1
                 continue
             try:
-                apply_op(conn, op, late=True)
+                result = apply_op(conn, op, late=not job.get("live"))
             except LedgerError as exc:
                 _refuse_job(path, {**job, "refused": str(exc), "reason_word": exc.reason})
                 out["refused"] += 1
@@ -1001,6 +1003,7 @@ def _drain_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
                 raise
             path.unlink(missing_ok=True)
             out["landed"] += 1
+            out.setdefault("results", {})[op.get("op_id")] = result
         return out
     finally:
         if owned and conn is not None:
@@ -1027,15 +1030,10 @@ def write(op: dict[str, Any], *, conn=None) -> dict[str, Any]:
     try:
         if owned:
             conn = _connect()
-        if not _outbox_jobs():
-            return apply_op(conn, op)
-        # Writes waiting on this Mac go first. If they cannot all land now
-        # (another drain holds them, or the hub went away mid-drain) this one
-        # waits behind them, so an older write never lands on top of it.
-        with _drain_lock(DRAIN_WAIT_S) as got:
-            if got and not _drain_locked(conn, _drain_result())["stopped_early"]:
+        with _drain_lock() as got:
+            if got and not _outbox_jobs():
                 return apply_op(conn, op)
-        reason = "behind waiting writes"
+        return _write_in_line(conn, op)
     except LedgerError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -1049,6 +1047,49 @@ def write(op: dict[str, Any], *, conn=None) -> dict[str, Any]:
             conn.close()
     _check_offline(op)
     enqueue(op, reason=reason)
+    return _queued_reply(op)
+
+
+def _write_in_line(conn, op: dict[str, Any]) -> dict[str, Any]:
+    """Writes are waiting on this Mac, or another process is draining them:
+    this one joins the line at once (the outbox is the line, oldest first), so
+    a write made later can never land before it. It then drains the line
+    itself when it can, and answers as a direct write would."""
+    path = enqueue(op, reason="behind waiting writes", live=True)
+    deadline = time.monotonic() + DRAIN_WAIT_S
+    results: dict[str, Any] = {}
+    while path.exists():
+        with _drain_lock() as got:
+            if got:
+                out = _drain_locked(conn, _drain_result())
+                results.update(out.get("results") or {})
+                if out["stopped_early"]:
+                    break
+                continue
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    if path.exists():
+        return _queued_reply(op)
+    refused = _refused_dir() / path.name
+    if refused.exists():
+        try:
+            job = json.loads(refused.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            job = {}
+        # Its writer is told here, so it is not also kept as a refused job.
+        refused.unlink(missing_ok=True)
+        raise LedgerError(str(job.get("refused") or "the ledger refused this write"),
+                          str(job.get("reason_word") or "refused"))
+    if op["op_id"] in results:
+        return results[op["op_id"]]
+    # Another process's drain landed it: a retried op id returns its first result.
+    result = apply_op(conn, op)
+    result.pop("retried", None)
+    return result
+
+
+def _queued_reply(op: dict[str, Any]) -> dict[str, Any]:
     state = op["fields"].get("state") or (START_STATE if op["verb"] == "add" else "")
     lines = {"add": f"added {op['row_id']}: {state}", "set": f"set {op['row_id']}: queued",
              "remove": f"removed {op['row_id']}: queued"}
