@@ -60,10 +60,17 @@ class GeminiEmbedProfileTest(unittest.TestCase):
                 mock.patch.object(modelcheck, "_active_embed_profile", return_value=modelcheck.embed_mod.PROFILE_2), \
                 mock.patch.object(modelcheck.embed_mod, "embed_one", side_effect=ValueError("bad payload")), \
                 mock.patch.object(modelcheck, "_check_gemini_generate", return_value={"id": "gemini_generate", "ok": True}) as generate, \
-                mock.patch.object(modelcheck, "_check_openai_compat_generate", return_value={"id": "openai_compat_generate", "ok": True}) as openai:
+                mock.patch.object(modelcheck, "_check_openai_compat_generate", return_value={"id": "openai_compat_generate", "ok": True}) as openai, \
+                mock.patch.object(modelcheck, "_check_anthropic_models", return_value={"id": "anthropic_models", "ok": True}), \
+                mock.patch.object(modelcheck, "_check_openai_models", return_value={"id": "openai_models", "ok": True}), \
+                mock.patch.object(modelcheck, "_check_openrouter_models", return_value={"id": "openrouter_models", "ok": True}):
             result = modelcheck.check_model_keys()
         self.assertFalse(result["ok"])
-        self.assertEqual([check["id"] for check in result["checks"]], ["gemini_embed", "gemini_generate", "openai_compat_generate"])
+        self.assertEqual(
+            [check["id"] for check in result["checks"]],
+            ["gemini_embed", "gemini_generate", "openai_compat_generate",
+             "anthropic_models", "openai_models", "openrouter_models"],
+        )
         generate.assert_called_once()
         openai.assert_called_once()
 

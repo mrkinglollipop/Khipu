@@ -122,11 +122,11 @@ function mainView(): RouteView {
 
 const PLANS: UsageReport = {
   accounts: [
-    { harness: "claude", account: "Claude main", plan: "max", windows: [{ name: "five_hour", used_pct: 100, resets_at: "2026-10-14T17:52:00Z" }] },
-    { harness: "claude", account: "Claude second", plan: "max", windows: [] },
-    { harness: "codex", account: "Codex", plan: "pro", windows: [{ name: "weekly", used_pct: 58, resets_at: "2026-10-19T00:00:00Z" }] },
-    { harness: "grok", account: "Grok Build", windows: [{ name: "weekly", used_pct: 34, resets_at: "2026-10-19T23:00:00Z" }] },
-    { harness: "muse", account: "Muse", windows: [] },
+    { key: "claude|", harness: "claude", account: "Claude main", plan: "max", windows: [{ name: "five_hour", used_pct: 100, resets_at: "2026-10-14T17:52:00Z" }] },
+    { key: "claude|/logins/claude-second", harness: "claude", account: "Claude second", plan: "max", windows: [] },
+    { key: "codex|", harness: "codex", account: "Codex", plan: "pro", windows: [{ name: "weekly", used_pct: 58, resets_at: "2026-10-19T00:00:00Z" }] },
+    { key: "grok|", harness: "grok", account: "Grok Build", windows: [{ name: "weekly", used_pct: 34, resets_at: "2026-10-19T23:00:00Z" }] },
+    { key: "muse|", harness: "muse", account: "Muse", windows: [] },
   ],
 };
 
@@ -217,6 +217,20 @@ describe("Home Routing card, the main mock", () => {
     expect(summary.closest("details")).not.toHaveAttribute("open");
     expect(summary).toHaveTextContent("6 not confirmed yet");
     expect(screen.getByText("Khipu reports this; your agents decide where work goes.")).toBeInTheDocument();
+  });
+
+  it("pairs Plans rows with accounts by key, never by a reused name (review P2)", () => {
+    const v = mainView();
+    const swapped: UsageReport = {
+      accounts: [
+        { ...PLANS.accounts![2], account: "Claude main" },
+        { ...PLANS.accounts![0], account: "Codex" },
+      ],
+    };
+    const order = inPlansOrder(v.accounts!, swapped).map((a) => a.key);
+    expect(order.slice(0, 2)).toEqual(["codex|", "claude|"]);
+    expect(inPlansOrder(v.accounts!, { accounts: [{ harness: "codex", account: "Codex" }] }).map((a) => a.label))
+      .toEqual(v.accounts!.map((a) => a.label));
   });
 
   it("keeps the record's order for accounts Plans does not list", () => {

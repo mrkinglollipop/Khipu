@@ -27,13 +27,13 @@ a card on Home that stays until he closes it, each item with a Show me button.
 |---|---|---|---|
 | 0 | This scope and the mocks | S | approved by Matt 2026-10-15 |
 | 1 | Three fixes: no false "off" while loading, no "Live" beside "no turn yet", no negative ages | S | open |
-| 2 | Plans: one block per account, one failure line, paused shown, on Home and in Settings | S–M | open |
+| 2 | Plans: one block per account, one failure line, paused shown, on Home and in Settings | S–M | done (merged 2026-10-15) |
 | 3 | Routing overview: groups that fold, the Needs you list, Plans moves into Accounts | M | open |
 | 4 | Routing lists: sort and filter accounts, filter and search rules, filter recent changes | S–M | open |
 | 5 | Standing rules: "Checked by Khipu" with the check's result | S | open |
-| 6 | Capture & models: three cards and one Keys list | M | open |
-| 7 | Setup: an Accounts step | S–M | open |
-| 8 | What's new after an update (dialog and Home card), and its history in Settings → Updates | S | open |
+| 6 | Capture & models: three cards and one Keys list | M | done (merged 2026-10-15) |
+| 7 | Setup: an Accounts step | S–M | done (merged 2026-10-15) |
+| 8 | What's new after an update (dialog and Home card), and its history in Settings → Updates | S | done (merged 2026-10-15) |
 | 9 | Finding and adding accounts in the app (addendum, see "Phase 9" at the end) | M–L | approved by Matt 2026-10-15 |
 
 One PR per phase. Phase 1 goes first because it fixes things that are wrong today. Phases 2 to 6 can go in any

@@ -122,6 +122,22 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return f"This sign-in reports no plan limits. Open {name}{folder} and sign in again (/login)"
     if code == E_PENDING:
         return "Reading for the first time; ask again in a few seconds"
+    # Every other code the probes can return gets its plain cause too, so the
+    # app shows Khipu's words for every failure and never invents its own.
+    if code == E_TIMEOUT:
+        return f"{name} didn't answer in time"
+    if code == E_NO_ANSWER or (code and re.fullmatch(r"(exit|signal)_\d+", code)):
+        return f"{name} didn't answer"
+    if code == E_CLI:
+        return f"{name} reported an error when asked"
+    if code == E_BAD:
+        return f"{name} answered in a way Khipu can't read"
+    if code == E_START:
+        return f"{name} could not be started"
+    if code == E_INVALID:
+        return "This account entry is not valid"
+    if code == E_INTERNAL:
+        return "Khipu could not run the check"
     return None
 
 
@@ -1235,7 +1251,10 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
             for i, row in zip(due, merged):
                 rows[i] = dict(row, cached=False)
     now = _now()
-    for row in rows:
+    for account, row in zip(accounts, rows):
+        # The identity the routing record keys this account by, so the app
+        # matches the two by login, never by a name that may be reused.
+        row["key"] = _key(account)
         age = _age_s(row, now)
         row["stale"] = bool((not row.get("ok") and row.get("last_good_at"))
                             or (age is not None and age > max_age))
