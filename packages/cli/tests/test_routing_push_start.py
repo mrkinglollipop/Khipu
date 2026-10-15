@@ -382,6 +382,42 @@ def test_a_codex_transcript_carrying_the_summary_leaves_no_routing_text(home, mo
     _assert_no_routing(rendered, ctx)
 
 
+def _cursor_context(home, monkeypatch) -> str:
+    routing.add_rule("Never a -fast tier.", via="app")
+    routing.set_note("Codex first for builds today.", via="app")
+    _record()
+    _push_on(monkeypatch)
+    out = _hook(monkeypatch, shape="cursor")
+    return json.loads(out)["additional_context"]
+
+
+# How Cursor records session-start hook context in its agent transcript: a
+# role:user line whose text ends in a <hooks_context description="..."> block.
+CURSOR_HOOKS_OPEN = ('<hooks_context description="Additional context provided by session hooks. '
+                     "This may include project-specific information, configuration, or instructions "
+                     'from the user\'s hooks setup.">')
+
+
+def test_a_cursor_transcript_carrying_the_summary_leaves_no_routing_text(home, monkeypatch):
+    # R3-1: capture stripped <system-reminder> blocks but not Cursor's
+    # <hooks_context> block, so the summary landed in the episode as user text.
+    ctx = _cursor_context(home, monkeypatch)
+    tp = _write_jsonl(home["tmp"] / "cursor.jsonl", [
+        {"role": "user", "message": {"content": [{"type": "text", "text":
+            f"{CURSOR_HOOKS_OPEN}\n{ctx}\n</hooks_context>"}]}},
+        {"role": "user", "message": {"content": [{"type": "text", "text":
+            "<timestamp>Tuesday, Oct 14, 2026</timestamp>\n<user_query>\nShip the release notes\n</user_query>"}]}},
+        # The block can also share a line with the user's own words.
+        {"role": "user", "message": {"content": [{"type": "text", "text":
+            f"{CURSOR_HOOKS_OPEN}\n{ctx}\n</hooks_context>\n<user_query>\nand tag it\n</user_query>"}]}},
+        {"role": "assistant", "message": {"content": [{"type": "text", "text": "Shipping."}]}},
+    ])
+    msgs, _off, users = sc.read_window(tp, 0)
+    rendered = sc.render(msgs)
+    assert "Ship the release notes" in rendered and "and tag it" in rendered and users >= 1
+    _assert_no_routing(rendered, ctx)
+
+
 # ---- fix round 1 ------------------------------------------------------------------------------
 
 
@@ -608,3 +644,23 @@ def test_the_precedence_line_counts_against_the_summary_budget(home, monkeypatch
     assert lines[1].startswith("These account lines are newer than the routing table's")
     assert len(after) <= 200, (len(after), after)
     assert lines[-1].endswith("more lines: run `khipu route`")
+
+
+# ---- fix round 3 ------------------------------------------------------------------------------
+
+_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven", 8: "eight"}
+
+
+def test_the_apps_cost_line_matches_the_start_budget_setting():
+    # R3-2: the app said "at most one second", but routing_start_budget_ms is a
+    # setting that start_budget() allows up to START_BUDGET_MOST_MS. The line
+    # must name the budget, its default and its ceiling, from the code's numbers.
+    tsx = (Path(__file__).resolve().parents[3] / "apps" / "desktop" / "src" / "OptionalFeatures.tsx").read_text()
+    block = tsx[tsx.index('name: "routing_push"'):]
+    cost = block[block.index("cost:"):].split("\n", 1)[0]
+    default_s = routing.SETTINGS["routing_start_budget_ms"][1] // 1000
+    most_s = routing.START_BUDGET_MOST_MS // 1000
+    assert "at most one second" not in cost
+    assert "start budget" in cost
+    assert f"{_WORDS[default_s]} second{'s' if default_s != 1 else ''} by default" in cost
+    assert f"never more than {_WORDS[most_s]} seconds" in cost

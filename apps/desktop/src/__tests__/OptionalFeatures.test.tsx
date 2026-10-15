@@ -126,6 +126,9 @@ describe("OptionalFeatures", () => {
     const routing = screen.getByText("Routing", { selector: ".section-head" }).closest(".section-card") as HTMLElement;
     expect(within(routing).getByRole("switch", { name: /Tell conversations which accounts are open/ })).not.toBeChecked();
     expect(within(routing).getByText(/never chooses where work goes/)).toBeInTheDocument();
+    // R3-2: the start budget is a setting (up to 8 s), not a fixed second.
+    expect(within(routing).getByText(/up to the routing start budget/)).toBeInTheDocument();
+    expect(within(routing).queryByText(/at most one second/)).toBeNull();
   });
 
   it("reflects what the CLI reports as on and off", async () => {
