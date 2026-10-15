@@ -51,6 +51,7 @@ type Opts = {
   priority?: unknown;
   refreshFail?: boolean;
   source?: "file" | "default";
+  configFailAfterFirst?: boolean;
 };
 
 function fake(o: Opts = {}) {
@@ -63,6 +64,7 @@ function fake(o: Opts = {}) {
       case "khipu_usage_status":
         return JSON.stringify(report(o.rows));
       case "khipu_config_show":
+        if (o.configFailAfterFirst && calls("khipu_config_show").length > 1) throw new Error("config failed");
         return JSON.stringify({ usage_accounts: { source: o.source ?? "default", accounts: o.accounts ?? ENTRIES, user_home: "/Users/test" } });
       case "khipu_features_show":
         if (o.featuresFail) throw new Error("no");
@@ -255,6 +257,58 @@ describe("Setup › Accounts step, review fixes", () => {
       accounts: ENTRIES.slice(0, 2) });
     mount();
     await screen.findByText(/Not found on this Mac: Codex\./);
+  });
+});
+
+describe("Setup › Accounts step, review round 2", () => {
+  it("a priority entry is matched by its account, never by a label another account now has", async () => {
+    fake({
+      priority: {
+        entries: [{ account: "codex|/Users/test/.codex-old", label: "Codex", role: "reviews", until: "2099-01-01T00:00:00Z" }],
+        until: null,
+      },
+    });
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(screen.getByRole("button", { name: "Move Muse up" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    const entries = calls("khipu_route_priority")[0][1].entries;
+    expect(entries).toContainEqual({ account: "codex|/Users/test/.codex-old", role: "reviews", until: "2099-01-01T00:00:00Z" });
+    expect(entries).toContainEqual({ account: "codex|", role: null, until: null });
+  });
+
+  it("a priority entry with a tilde login folder matches its account by login folder", async () => {
+    const rows = [...report().accounts, { harness: "claude", account: "Claude second", home: "~/.claude-second", ok: true, windows: [] }];
+    fake({
+      rows,
+      accounts: [...ENTRIES, { label: "Claude second", harness: "claude", home: "~/.claude-second" }],
+      priority: { entries: [{ account: "claude|/Users/test/.claude-second", label: "Renamed", role: "builds", until: null }], until: null },
+    });
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(screen.getByRole("button", { name: "Move Codex up" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    const entries = calls("khipu_route_priority")[0][1].entries;
+    expect(entries[0]).toEqual({ account: "claude|~/.claude-second", role: "builds", until: null });
+    expect(entries).toHaveLength(5);
+  });
+
+  it("a failed Check again shows even when the last good check found no accounts", async () => {
+    fake({ rows: [], refreshFail: true });
+    mount();
+    await screen.findByText("No accounts found on this Mac");
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    expect(await screen.findByText(/last check didn't work/)).toBeInTheDocument();
+  });
+
+  it("a failed re-read of the account list says so beside the checkboxes it keeps", async () => {
+    fake({ refreshFail: true, configFailAfterFirst: true });
+    mount();
+    await ready();
+    fireEvent.click(screen.getByRole("button", { name: "Check Grok Build again" }));
+    expect(await screen.findByText(/couldn't read the account list again/)).toBeInTheDocument();
   });
 });
 

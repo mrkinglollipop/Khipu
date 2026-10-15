@@ -108,16 +108,25 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
   // order), then every other account in the order Khipu found them.
   const held = route.data?.priority ?? null;
   const heldEntries: RoutePriorityEntry[] = held?.entries ?? [];
+  // A priority entry is one account by its key (`harness|login folder`),
+  // compared as `khipu config` compares logins. Labels are display names a
+  // different account may take later, so they never match.
+  const heldId = (e: RoutePriorityEntry) => {
+    const [h, ...rest] = e.account.split("|");
+    return accountId(h, rest.join("|") || null, userHome);
+  };
+  const isRow = (e: RoutePriorityEntry, r: UsageAccount) => heldId(e) === accountId(r.harness, r.home, userHome);
   const startOrder = useMemo(() => {
     const rank = (r: UsageAccount) => {
-      const i = heldEntries.findIndex((e) => e.account === routeKey(r) || e.label === r.account);
+      const i = heldEntries.findIndex((e) => isRow(e, r));
       return i < 0 ? heldEntries.length : i;
     };
     return found
       .map((r, i) => ({ r, i }))
       .sort((a, b) => rank(a.r) - rank(b.r) || a.i - b.i)
       .map(({ r }) => routeKey(r));
-  }, [found, heldEntries]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [found, heldEntries, userHome]);
   // `moved` is always an order of every account found, so an account
   // unchecked and checked again comes back in its place; the list shown and
   // the priority written are the accounts still read, in that order.
@@ -178,12 +187,12 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
       if (routeRead && order.length > 0 && !samePriority(order, start)) {
         const entries = order.map((k) => {
           const r = byKey.get(k);
-          const was = heldEntries.find((e) => e.account === k || (r && e.label === r.account));
+          const was = heldEntries.find((e) => r != null && isRow(e, r));
           return { account: k, role: was?.role ?? null, until: was?.until ?? null };
         });
         // Priority accounts with no plan row here keep their place.
         heldEntries.forEach((e, h) => {
-          if (found.some((r) => e.account === routeKey(r) || e.label === r.account)) return;
+          if (found.some((r) => isRow(e, r))) return;
           entries.splice(Math.min(h, entries.length), 0, { account: e.account, role: e.role ?? null, until: e.until ?? null });
         });
         const res = await callCli("khipu_route_priority", { action: "set", entries, until: held?.until ?? null });
@@ -307,11 +316,6 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
               );
             })}
           </ul>
-          {usage.error ? (
-            <p className="set-error" role="alert">
-              The last check didn't work: {usage.error} The lines above are from the check before it.
-            </p>
-          ) : null}
           {reading.length === 0 ? (
             <p className="set-help">Khipu reads at least one account. With none chosen, it keeps reading every account it finds.</p>
           ) : null}
@@ -367,6 +371,16 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         </>
       )}
 
+      {!readFailed && usage.error ? (
+        <p className="set-error" role="alert">
+          The last check didn't work: {usage.error} What is shown above is from the check before it.
+        </p>
+      ) : null}
+      {status && cfg.error ? (
+        <p className="set-error" role="alert">
+          Khipu couldn't read the account list again. The checkboxes show it as it was last read.
+        </p>
+      ) : null}
       <p className="set-help">
         Khipu also works out how fast each week is being used, so your agents can spend what would otherwise expire.
       </p>
