@@ -1,4 +1,10 @@
 import "@testing-library/jest-dom/vitest";
+import { configure } from "@testing-library/react";
+
+// findBy*/waitFor poll a condition until it holds; their 1 s default is how
+// long a stuck wait lasts before it fails, and a busy machine's first render
+// of App can take longer. No test relies on a wait timing out.
+configure({ asyncUtilTimeout: 15_000 });
 
 // jsdom (as of the version this repo pins) does not implement the <dialog>
 // element's imperative API — `ui.tsx`'s <Dialog> calls `showModal()`/`close()`
