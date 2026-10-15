@@ -1745,12 +1745,36 @@ def _error(req_id, code: int, message: str) -> dict:
 
 
 def _tool_text(payload: dict, *, is_error: bool = False) -> dict:
+    # Non-ASCII stays literal: escaping made a CJK body six bytes per
+    # character in this text and seven once the frame was dumped again.
     return {
         "content": [
-            {"type": "text", "text": json.dumps(payload, indent=2, default=str)}
+            {"type": "text", "text": json.dumps(payload, indent=2, default=str, ensure_ascii=False)}
         ],
         "isError": is_error,
     }
+
+
+def encode_frame(message) -> bytes:
+    """One JSON-RPC message as UTF-8 bytes, for the stdio writer and the gateway.
+
+    A lone surrogate (text decoded with surrogateescape) cannot be UTF-8; it is
+    written as its JSON escape, which is what ensure_ascii used to produce."""
+    return json.dumps(message, default=str, ensure_ascii=False).encode("utf-8", "backslashreplace")
+
+
+def _write_frame(message) -> None:
+    # Bytes to the buffer, so the frame is UTF-8 whatever the locale says
+    # stdout's encoding is (a C locale made it ASCII).
+    out = sys.stdout
+    buffer = getattr(out, "buffer", None)
+    if buffer is None:
+        out.write(encode_frame(message).decode("utf-8") + "\n")
+        out.flush()
+        return
+    out.flush()
+    buffer.write(encode_frame(message) + b"\n")
+    buffer.flush()
 
 
 # A stdio server lives as long as its client session, and a deploy (a
@@ -1933,7 +1957,7 @@ def main() -> int:
         if size > MAX_FRAME_BYTES:
             while line and not line.endswith(newline):
                 line = stream.readline(MAX_FRAME_BYTES + 1)
-            print(json.dumps(_error(None, -32700, "frame too large")), flush=True)
+            _write_frame(_error(None, -32700, "frame too large"))
             continue
         line = line.strip()
         if not line:
@@ -1941,11 +1965,11 @@ def main() -> int:
         try:
             msg = json.loads(line)
         except (ValueError, UnicodeDecodeError):
-            print(json.dumps(_error(None, -32700, "parse error")), flush=True)
+            _write_frame(_error(None, -32700, "parse error"))
             continue
         response = handle_message(msg)
         if response is not None:
-            print(json.dumps(response, default=str), flush=True)
+            _write_frame(response)
     return 0
 
 

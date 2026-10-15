@@ -62,6 +62,7 @@ from typing import Any
 from khipu.mcp_server import (
     SERVER_NAME,
     SERVER_VERSION,
+    encode_frame,
     handle_message,
     mark_gateway_active,
     take_message_error,
@@ -466,7 +467,7 @@ class Handler(BaseHTTPRequestHandler):
             status = 202
         else:
             body = responses if isinstance(msg, list) else responses[0]
-            self._send(200, json.dumps(body, default=str).encode("utf-8"))
+            self._send(200, encode_frame(body))
             status = 200
         if errors:
             _record_liveness(label, ok=False, error=errors[0])
