@@ -53,8 +53,21 @@ class FakeHub:
         self.vectors: list[dict] = []
         self.queries: list[str] = []
 
+    def live_vectors(self) -> list[dict]:
+        gone = {str(e["id"]) for e in self.episodes if e.get("deleted_at")}
+        return [v for v in self.vectors if not (v["kind"] == "episode" and v["ref"] in gone)]
+
     def cursor(self) -> "FakeCursor":
         return FakeCursor(self)
+
+
+def _bucket(v: dict) -> str:
+    return hashlib.md5(f"{v['kind']}\t{v['ref']}".encode()).hexdigest()[:3]
+
+
+def _vec_row(v: dict) -> tuple:
+    return (v["kind"], v["ref"], v.get("chunk_idx", 0), v.get("content_hash"),
+            _ny(v["built_at"]) if v["built_at"] else None)
 
 
 class FakeCursor:
@@ -78,7 +91,19 @@ class FakeCursor:
         elif "FROM topics WHERE deleted_at >" in sql:
             rows = sorted(((t["slug"], _ny(t["deleted_at"])) for t in h.topics
                            if t.get("deleted_at") and t["deleted_at"] > p[0]), key=lambda r: r[1])[: p[1]]
-        elif "md5(string_agg" in sql:
+        elif "FROM memory_embeddings" in sql and "GROUP BY 1" in sql:
+            by_bucket: dict[str, list[tuple]] = {}
+            for v in h.live_vectors():
+                key = (v["kind"], v["ref"], v.get("chunk_idx", 0), v.get("content_hash") or "")
+                by_bucket.setdefault(_bucket(v), []).append(key)
+            rows = [(b, hashlib.md5("\n".join(f"{k}\t{r}\t{i}\t{c}" for k, r, i, c in sorted(keys)).encode())
+                     .hexdigest()) for b, keys in by_bucket.items()]
+        elif "FROM memory_embeddings" in sql and "= ANY(%s)" in sql:
+            rows = [_vec_row(v) for v in h.live_vectors() if _bucket(v) in set(p[1])]
+        elif "FROM memory_embeddings" in sql and "ORDER BY built_at, kind" in sql:
+            rows = sorted((_vec_row(v) for v in h.live_vectors() if v["built_at"] and v["built_at"] > p[1]),
+                          key=lambda r: (r[4], r[0], r[1], r[2]))[: p[2]]
+        elif "md5(string_agg" in sql and "memory_embeddings" not in sql:
             live = sorted((t["slug"], t.get("content_hash")) for t in h.topics if t.get("deleted_at") is None)
             text = "\n".join(f"{s}\t{c or ''}" for s, c in live)
             rows = [(hashlib.md5(text.encode()).hexdigest() if live else None,)]
@@ -107,6 +132,8 @@ class FakeCursor:
                     latest[key] = max(latest.get(key, v["built_at"]), v["built_at"])
             rows = sorted(((k, r, _ny(b)) for (k, r), b in latest.items()), key=lambda r: r[2])[: p[2]]
         elif "FROM memory_embeddings" in sql:
+            # The per-ref signature probe of f0ac7b6, kept so the manifest
+            # tests show what it missed.
             recent = {(v["kind"], v["ref"]) for v in h.vectors if v["built_at"] > p[2]}
             by_ref: dict[tuple, list[dict]] = {}
             for v in h.vectors:
@@ -368,6 +395,69 @@ class ReembedTest(ReplicaCase):
         out = self.measure()
         self.assertEqual(out["tables"]["vectors"]["missing"], 0)
         self.assertEqual(out["state"], "fresh")
+
+
+class VectorManifestTest(ReplicaCase):
+    """Chunk-by-chunk reconciliation: a stale chunk beside a newer one, a
+    chunk pruned or a ref deleted on the hub with no newer build to point at
+    it, and a replica row with no build time."""
+
+    def _replica(self, *rows: tuple) -> None:
+        con = sqlite3.connect(self.snap)
+        con.execute("DELETE FROM memory_embeddings")
+        con.executemany("INSERT INTO memory_embeddings (profile, kind, ref, chunk_idx, content_hash, built_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)", [(PROFILE, *r) for r in rows])
+        con.commit()
+        con.close()
+
+    def _hub(self, *rows: tuple) -> None:
+        self.hub.vectors[:] = [{"kind": k, "ref": r, "chunk_idx": i, "content_hash": c, "built_at": b}
+                               for k, r, i, c, b in rows]
+
+    def test_a_newer_chunk_does_not_mask_a_stale_one_beside_it(self) -> None:
+        self._hub(("episode", "1", 0, "a", NOW - timedelta(hours=2)), ("episode", "1", 1, "b", NOW - timedelta(hours=1)))
+        self._replica(("episode", "1", 0, "a", _ts(DUMP - timedelta(hours=1))),
+                      ("episode", "1", 1, "b", _ts(NOW - timedelta(hours=1))))
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 1)
+        self.assertEqual(out["tables"]["vectors"]["lag_seconds"], 7200.0)
+        self.assertEqual(out["state"], "behind")
+
+    def test_a_chunk_pruned_on_the_hub_is_behind_from_the_dump(self) -> None:
+        before = DUMP - timedelta(hours=1)
+        self._hub(("episode", "1", 0, "a", before))
+        self._replica(("episode", "1", 0, "a", _ts(before)), ("episode", "1", 1, "b", _ts(before)))
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 1)
+        self.assertEqual(out["tables"]["vectors"]["lag_seconds"], 4 * 3600.0)
+        self.assertEqual(out["state"], "behind")
+
+    def test_a_ref_deleted_on_the_hub_is_behind(self) -> None:
+        before = DUMP - timedelta(hours=1)
+        self._hub(("episode", "1", 0, "a", before))
+        self._replica(("episode", "1", 0, "a", _ts(before)), ("topic", "beta", 0, "t", _ts(before)))
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 1)
+        self.assertEqual(out["state"], "behind")
+
+    def test_a_replica_row_with_no_build_time_is_unknown_not_fresh(self) -> None:
+        self._hub(("episode", "1", 0, "a", NOW - timedelta(hours=1)))
+        self._replica(("episode", "1", 0, "a", None))
+        out = self.measure()
+        self.assertEqual(out["tables"]["vectors"]["missing"], 0)
+        self.assertEqual(out["tables"]["vectors"]["unverified"], 1)
+        self.assertEqual(out["state"], "unknown")
+        self.assertEqual(out["reason"], "version_evidence_missing")
+        self.assertFalse(json.loads((self.dir / "freshness.json").read_text())["in_step"])
+
+    def test_matching_manifests_fetch_no_bucket(self) -> None:
+        before = DUMP - timedelta(hours=1)
+        self._hub(("episode", "1", 0, "a", before), ("episode", "1", 1, "b", before))
+        self._replica(("episode", "1", 0, "a", _ts(before)), ("episode", "1", 1, "b", _ts(before)))
+        out = self.measure()
+        self.assertEqual(out["state"], "fresh")
+        self.assertEqual(out["tables"]["vectors"]["buckets_differing"], 0)
+        self.assertFalse(any("= ANY(%s)" in q for q in self.hub.queries))
 
 
 class CursorAndErrorEvidenceTest(ReplicaCase):

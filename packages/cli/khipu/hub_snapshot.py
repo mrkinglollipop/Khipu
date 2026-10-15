@@ -1999,17 +1999,47 @@ def _lag_deliverables(cur, con, since, hub_now, limit) -> dict[str, Any]:
             "checked": len(rows), "truncated": len(rows) >= limit}
 
 
-def _chunk_signature(chunks: Sequence[tuple[Any, Any]]) -> str:
-    """``(chunk_idx, content_hash)`` pairs as one comparable string; the hub
-    builds the same string with ``string_agg`` in ``_lag_vectors``."""
-    return ",".join(f"{int(i)}:{h or ''}" for i, h in sorted(chunks, key=lambda c: int(c[0])))
+# The vector manifest is compared in buckets keyed by the first hex digits of
+# md5(kind TAB ref), so a hub-sized profile costs one row per bucket from the
+# hub when nothing differs, and only differing buckets are fetched whole.
+_VEC_BUCKET_HEX = 3
+_VEC_BUCKET_BATCH = 64
+
+
+def _vec_bucket(kind: Any, ref: Any) -> str:
+    import hashlib
+
+    return hashlib.md5(f"{kind}\t{ref}".encode("utf-8")).hexdigest()[:_VEC_BUCKET_HEX]
+
+
+def _vec_manifest_digests(rows: Sequence[tuple[Any, Any, Any, Any]]) -> dict[str, str]:
+    """``(kind, ref, chunk_idx, content_hash)`` rows as one md5 per bucket,
+    the same text the hub builds with ``string_agg`` in ``_lag_vectors``
+    (byte order, as ``COLLATE "C"`` sorts)."""
+    import hashlib
+
+    by_bucket: dict[str, list[tuple[str, str, int, str]]] = {}
+    for kind, ref, idx, chash in rows:
+        by_bucket.setdefault(_vec_bucket(kind, ref), []).append((str(kind), str(ref), int(idx), chash or ""))
+    return {
+        b: hashlib.md5("\n".join(f"{k}\t{r}\t{i}\t{h}" for k, r, i, h in sorted(items)).encode("utf-8")).hexdigest()
+        for b, items in by_bucket.items()
+    }
 
 
 def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str, Any]:
-    """Vectors of the active profile built since the dump, per ``(kind,
-    ref)``: missing when the replica holds no chunk for the ref, a different
-    set of ``(chunk_idx, content_hash)`` (a re-embed of changed text, a
-    chunk added or dropped), or only chunks built before the hub's newest."""
+    """Vectors of the active profile, reconciled chunk by chunk.
+
+    Structure: every live ``(kind, ref, chunk_idx, content_hash)`` on both
+    sides, compared by bucket digest and then chunk by chunk in the buckets
+    that differ, so a chunk the replica lacks, holds with other text, or
+    holds after the hub pruned or deleted it is seen whatever its age.
+    Version: every hub chunk built since the dump against the replica's
+    ``built_at`` for it. A replica row written by a catch-up carries this
+    Mac's clock, taken after the hub commit, so it is never older than the
+    hub's; one older is a stale build, and one with no ``built_at`` cannot be
+    told apart from one, so it is counted ``unverified`` and the state is
+    unknown, never fresh."""
     prof_cols = _pg_columns(cur, "embedding_profiles")
     if not {"id", "is_active"} <= prof_cols:
         return {"lag_seconds": None, "not_applicable": "hub has no embedding profiles"}
@@ -2022,41 +2052,95 @@ def _lag_vectors(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str
     if "deleted_at" in _pg_columns(cur, "episodes"):
         gone = (" AND NOT (kind = 'episode' AND EXISTS (SELECT 1 FROM episodes e "
                 "WHERE e.id::text = memory_embeddings.ref AND e.deleted_at IS NOT NULL))")
-    # Every chunk of a ref with any chunk built since the dump, so the
-    # signature compares whole refs.
+
+    def skip(kind: Any, ref: Any) -> bool:
+        return kind == "episode" and str(ref).isdigit() and int(ref) in pending
+
+    rep_gone = ""
+    if "deleted_at" in _snapshot_table_columns(con, "episodes"):
+        rep_gone = (" AND NOT (kind = 'episode' AND ref IN "
+                    "(SELECT CAST(id AS TEXT) FROM main.episodes WHERE deleted_at IS NOT NULL))")
+    replica: dict[tuple[str, str, int], tuple[Any, Any]] = {}
+    for kind, ref, idx, chash, built in con.execute(
+        "SELECT kind, ref, chunk_idx, content_hash, built_at FROM main.memory_embeddings "
+        f"WHERE profile = ?{rep_gone}", (profile,),
+    ):
+        if not skip(kind, ref):
+            replica[(str(kind), str(ref), int(idx))] = (chash or "", built)
+
+    key_text = "kind || E'\\t' || ref"
     cur.execute(
-        "SELECT kind, ref, MAX(built_at) AS b, "
-        "string_agg(chunk_idx::text || ':' || COALESCE(content_hash, ''), ',' ORDER BY chunk_idx) "
-        "FROM memory_embeddings WHERE profile = %s AND (kind, ref) IN "
-        f"(SELECT kind, ref FROM memory_embeddings WHERE profile = %s AND built_at > %s){gone} "
-        "GROUP BY kind, ref ORDER BY b, kind, ref LIMIT %s",
-        (profile, profile, since, limit),
+        f"SELECT substr(md5({key_text}), 1, {_VEC_BUCKET_HEX}) AS bucket, "
+        f"md5(string_agg({key_text} || E'\\t' || chunk_idx::text || E'\\t' || COALESCE(content_hash, ''), "
+        "E'\\n' ORDER BY kind COLLATE \"C\", ref COLLATE \"C\", chunk_idx)) "
+        f"FROM memory_embeddings WHERE profile = %s{gone} GROUP BY 1",
+        (profile,),
     )
-    fetched = cur.fetchall()
-    rows = [r for r in fetched
-            if not (r[0] == "episode" and str(r[1]).isdigit() and int(r[1]) in pending)]
-    held: dict[tuple[str, str], list[tuple[Any, Any, Any]]] = {}
-    for kind in {r[0] for r in rows}:
-        refs = [str(r[1]) for r in rows if r[0] == kind]
-        for part in _chunks(refs):
-            for ref, idx, chash, built in con.execute(
-                "SELECT ref, chunk_idx, content_hash, built_at FROM main.memory_embeddings "
-                f"WHERE profile = ? AND kind = ? AND ref IN ({', '.join('?' * len(part))})",
-                [profile, kind, *part],
-            ):
-                held.setdefault((kind, str(ref)), []).append((idx, chash, built))
-    missing = []
-    for kind, ref, built, signature in rows:
-        mine = held.get((kind, str(ref)))
-        if not mine or _chunk_signature([(i, h) for i, h, _ in mine]) != (signature or ""):
-            missing.append(built)
+    hub_digests = {str(b): d for b, d in cur.fetchall()}
+    rep_digests = _vec_manifest_digests([(k, r, i, v[0]) for (k, r, i), v in replica.items()])
+    rep_by_bucket: dict[str, list[tuple[str, str, int]]] = {}
+    for key in replica:
+        rep_by_bucket.setdefault(_vec_bucket(key[0], key[1]), []).append(key)
+    differing = sorted(b for b in set(hub_digests) | set(rep_digests) if hub_digests.get(b) != rep_digests.get(b))
+
+    floor = _utc(meta().get("refreshed_at"))
+    stale: dict[tuple[str, str, int], Any] = {}
+    checked = 0
+    truncated = False
+    done = 0
+    while done < len(differing):
+        if checked >= limit:
+            truncated = True
+            break
+        batch = differing[done:done + _VEC_BUCKET_BATCH]
+        done += len(batch)
+        cur.execute(
+            "SELECT kind, ref, chunk_idx, content_hash, built_at FROM memory_embeddings "
+            f"WHERE profile = %s AND substr(md5({key_text}), 1, {_VEC_BUCKET_HEX}) = ANY(%s){gone}",
+            (profile, list(batch)),
+        )
+        hub_rows = [r for r in cur.fetchall() if not skip(r[0], r[1])]
+        checked += len(hub_rows)
+        hub_keys = set()
+        for kind, ref, idx, chash, built in hub_rows:
+            key = (str(kind), str(ref), int(idx))
+            hub_keys.add(key)
+            mine = replica.get(key)
+            if mine is None or mine[0] != (chash or ""):
+                when = _utc(built)
+                stale[key] = max(when, floor) if when is not None and floor is not None else (floor or when)
+        for key in (k for b in batch for k in rep_by_bucket.get(b, ())):
+            if key not in hub_keys:
+                # Pruned or deleted on the hub after the dump; when is unknown.
+                stale[key] = floor
+
+    cur.execute(
+        "SELECT kind, ref, chunk_idx, content_hash, built_at FROM memory_embeddings "
+        f"WHERE profile = %s AND built_at > %s{gone} ORDER BY built_at, kind, ref, chunk_idx LIMIT %s",
+        (profile, since, limit),
+    )
+    recent = cur.fetchall()
+    truncated = truncated or len(recent) >= limit
+    unverified = 0
+    for kind, ref, idx, chash, built in recent:
+        key = (str(kind), str(ref), int(idx))
+        if skip(kind, ref) or key in stale:
             continue
-        newest_held = max((d for d in (_utc(b) for _, _, b in mine) if d is not None), default=None)
-        hub_built = _utc(built)
-        if newest_held is not None and hub_built is not None and newest_held < hub_built:
-            missing.append(built)
-    return {"lag_seconds": _lag_from(hub_now, missing), "missing": len(missing), "profile": profile,
-            "checked": len(fetched), "truncated": len(fetched) >= limit}
+        mine = replica.get(key)
+        if mine is None or mine[0] != (chash or ""):
+            # Outside the buckets compared (a truncated pass): judged here.
+            stale[key] = built
+            continue
+        held, hub_built = _utc(mine[1]), _utc(built)
+        if held is None or hub_built is None:
+            unverified += 1
+        elif held < hub_built:
+            stale[key] = built
+    out = {"lag_seconds": _lag_from(hub_now, list(stale.values())), "missing": len(stale), "profile": profile,
+           "checked": checked + len(recent), "buckets_differing": len(differing), "truncated": truncated}
+    if unverified:
+        out["unverified"] = unverified
+    return out
 
 
 def measure_lag(cur, *, limit: int = FRESHNESS_PROBE_LIMIT) -> dict[str, Any]:
@@ -2228,14 +2312,16 @@ def snapshot_freshness(
         worst = max((v for v in lags if isinstance(v, (int, float))), default=0.0)
         unmeasured = [n for n, t in tables.items() if t.get("error")]
         truncated = [n for n, t in tables.items() if t.get("truncated")]
+        unverified = [n for n, t in tables.items() if t.get("unverified")]
         out["lag_seconds"] = worst
         out["measured_at"] = lag.get("measured_at")
         if state is None:
             if worst > SNAPSHOT_LAG_BEHIND_S:
                 state, reason = "behind", "snapshot_behind"
-            elif unmeasured or truncated:
+            elif unmeasured or truncated or unverified:
                 state = "unknown"
-                reason = "table_unmeasured" if unmeasured else "measurement_truncated"
+                reason = ("table_unmeasured" if unmeasured else "measurement_truncated" if truncated
+                          else "version_evidence_missing")
             else:
                 state = "fresh"
         ep = tables["episodes"].get("lag_seconds")
@@ -2245,11 +2331,12 @@ def snapshot_freshness(
             "refreshed_at": health.get("refreshed_at"),
             "state": state,
             "lag_seconds": worst,
-            "complete": not unmeasured and not truncated,
+            "complete": not unmeasured and not truncated and not unverified,
             # The hub's verdict alone, apart from this Mac's dump evidence:
             # what lets the recall lane trust an overdue dump (snapshot_is_fresh).
-            "in_step": worst <= SNAPSHOT_LAG_BEHIND_S and not unmeasured and not truncated,
-            "tables": {n: {k: t.get(k) for k in ("lag_seconds", "missing", "truncated", "error") if k in t}
+            "in_step": worst <= SNAPSHOT_LAG_BEHIND_S and not unmeasured and not truncated and not unverified,
+            "tables": {n: {k: t.get(k) for k in ("lag_seconds", "missing", "truncated", "unverified", "error")
+                           if k in t}
                        for n, t in tables.items()},
         })
     else:

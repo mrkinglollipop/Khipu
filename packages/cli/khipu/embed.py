@@ -3358,9 +3358,12 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                                [(k, r, i, t, h, v) for (k, r, i, t, h), v in zip(batch, vecs)])
                 conn.commit()
                 out["chunks"] += len(batch)
+                from datetime import datetime, timezone
+
+                built_at = datetime.now(timezone.utc).isoformat()
                 episode_snapshot_rows.extend(
                     {"profile": profile, "kind": k, "ref": r, "chunk_idx": i,
-                     "chunk_text": t, "content_hash": h, "embedding": v}
+                     "chunk_text": t, "content_hash": h, "embedding": v, "built_at": built_at}
                     for (k, r, i, t, h), v in zip(batch, vecs)
                 )
             for ref, indices in episode_replacements.items():
