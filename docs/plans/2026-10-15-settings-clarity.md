@@ -33,7 +33,7 @@ a card on Home that stays until he closes it, each item with a Show me button.
 | 5 | Standing rules: "Checked by Khipu" with the check's result | S | open |
 | 6 | Capture & models: three cards and one Keys list | M | open |
 | 7 | Setup: an Accounts step | S–M | open |
-| 8 | What's new after an update (dialog and Home card), and its history in Settings → Updates | S | open |
+| 8 | What's new after an update (dialog and Home card), and its history in Settings → Updates | S | built, in review (branch feat/clarity-whatsnew) |
 
 One PR per phase. Phase 1 goes first because it fixes things that are wrong today. Phases 2 to 6 can go in any
 order after 3, except that 4 and 5 need 3. Phases 7 and 8 go last, because they introduce what the earlier

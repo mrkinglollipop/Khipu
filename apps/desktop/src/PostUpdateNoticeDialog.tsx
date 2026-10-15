@@ -1,43 +1,38 @@
 import { useCallback, useId, useRef } from "react";
-import type { PostUpdateNotice } from "./postUpdateNotices";
+import { DIALOG_MAX_ITEMS, itemAction, type LaunchPlan, type NoticeTarget } from "./postUpdateNotices";
 import { Dialog } from "./ui";
+import "./whatsNew.css";
 
 type Props = {
-  notice: PostUpdateNotice | null;
+  plan: LaunchPlan["dialog"];
+  /** True when this Mac has no routing record or no account yet. */
+  needsRoutingSetup: boolean;
+  /** A Show me button: go to the place; the dialog closes too. */
+  onShow: (target: NoticeTarget) => void;
   onDismiss: () => void;
-  onOpenIntegrations: () => void;
-  onOpenHome: () => void;
-  onOpenSettings: (section?: PostUpdateNotice["settingsSection"]) => void;
 };
 
-/** One-time notice shown after an in-app update, when `postUpdateNotices.ts`
- * has an entry for a version the app just crossed. Native `<dialog>` +
- * showModal(), same pattern as FeedbackForm: role, modality, focus trap and
- * background inertness come from the element itself, Escape maps to the
- * `cancel` event, and focus moves to the primary action on open. */
-export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations, onOpenHome, onOpenSettings }: Props) {
+/** The one-time "What's new since X" list, shown on the first launch after an
+ * update. Native `<dialog>` + showModal() (see `ui.Dialog`): modality, focus
+ * trap and Escape come from the element. Got it, Escape and Show me all close
+ * it; none of them touches the Home card. */
+export function PostUpdateNoticeDialog({ plan, needsRoutingSetup, onShow, onDismiss }: Props) {
   const primaryRef = useRef<HTMLButtonElement>(null);
   const headingId = useId();
+  const close = useCallback(() => onDismiss(), [onDismiss]);
 
-  const close = useCallback(() => {
-    onDismiss();
-  }, [onDismiss]);
-
-  if (!notice) {
-    // Keep the <dialog> mounted (open/close transitions need the same node);
-    // render nothing inside it when there is no notice to show.
-    return (
-      <Dialog open={false} className="post-update-dialog" onCancel={close} />
-    );
+  if (!plan) {
+    // Keep the <dialog> mounted so open/close uses the same node.
+    return <Dialog open={false} className="post-update-dialog wn-dialog" onCancel={close} />;
   }
 
-  const hasAction =
-    notice.action === "integrations" || notice.action === "home" || notice.action === "settings";
+  const shown = plan.items.slice(0, DIALOG_MAX_ITEMS);
+  const more = plan.items.length - shown.length;
 
   return (
     <Dialog
       open
-      className="post-update-dialog"
+      className="post-update-dialog wn-dialog"
       ariaLabelledBy={headingId}
       initialFocusRef={primaryRef}
       onCancel={close}
@@ -45,52 +40,40 @@ export function PostUpdateNoticeDialog({ notice, onDismiss, onOpenIntegrations, 
     >
       <div className="post-update-body">
         <header className="post-update-head">
-          <h2 id={headingId}>{notice.title}</h2>
+          <h2 id={headingId}>What's new since {plan.since}</h2>
+          <p className="muted wn-sub">
+            Khipu is now version {plan.version}. This list also stays on Home until you close it there.
+          </p>
         </header>
-        <p className="muted post-update-text">{notice.body}</p>
+        <ul className="wn-list" role="list">
+          {shown.map((item) => {
+            const action = itemAction(item, needsRoutingSetup);
+            return (
+              <li className="wn-item" key={`${item.title}-${item.text}`}>
+                <div className="wn-text">
+                  <b>{item.title}</b>
+                  <span>{item.text}</span>
+                </div>
+                <button
+                  type="button"
+                  className="sm"
+                  aria-label={`${action.label}: ${item.title}`}
+                  onClick={() => {
+                    onShow(action.target);
+                    close();
+                  }}
+                >
+                  {action.label}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+        {more > 0 ? <p className="set-help wn-more">And {more} more in Settings → Updates.</p> : null}
         <div className="post-update-actions">
-          <button type="button" ref={hasAction ? undefined : primaryRef} onClick={close}>
+          <button type="button" className="primary" ref={primaryRef} onClick={close}>
             Got it
           </button>
-          {notice.action === "integrations" ? (
-            <button
-              ref={primaryRef}
-              type="button"
-              className="primary"
-              onClick={() => {
-                onOpenIntegrations();
-                close();
-              }}
-            >
-              Open Harnesses
-            </button>
-          ) : null}
-          {notice.action === "home" ? (
-            <button
-              ref={primaryRef}
-              type="button"
-              className="primary"
-              onClick={() => {
-                onOpenHome();
-                close();
-              }}
-            >
-              Open Home
-            </button>
-          ) : null}
-          {notice.action === "settings" ? (
-            <button
-              ref={primaryRef}
-              type="button"
-              className="primary"
-              onClick={() => {
-                onOpenSettings(notice.settingsSection);
-                close();
-              }}
-            >
-              Open Settings
-            </button>
-          ) : null}
         </div>
       </div>
     </Dialog>

@@ -63,11 +63,18 @@ import {
   PathOverridesCard,
 } from "./SettingsControls";
 import {
-  noticeForUpgrade,
+  planLaunch,
+  readCardState,
   readLastNoticedVersion,
+  recordVersionOnSetupFinish,
+  routingNeedsSetup,
+  writeCardState,
   writeLastNoticedVersion,
-  type PostUpdateNotice,
+  type CardState,
+  type LaunchPlan,
+  type NoticeTarget,
 } from "./postUpdateNotices";
+import { WhatsNewCard, WhatsNewHistory, revealSettingsGroup } from "./WhatsNew";
 import "./App.css";
 
 /** Six destinations, one per user job, plus the first-run flow and Revisions —
@@ -2410,7 +2417,8 @@ export default function App() {
   const [graphSourcesMsg, setGraphSourcesMsg] = useState<string | null>(null);
   const [newCodeRoot, setNewCodeRoot] = useState("");
   const [appVersion, setAppVersion] = useState<string>("…");
-  const [postUpdateNotice, setPostUpdateNotice] = useState<PostUpdateNotice | null>(null);
+  const [noticeDialog, setNoticeDialog] = useState<LaunchPlan["dialog"]>(null);
+  const [noticeCard, setNoticeCard] = useState<CardState | null>(null);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [feedbackSending, setFeedbackSending] = useState(false);
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
@@ -2451,8 +2459,22 @@ export default function App() {
   // at the Database step rather than restarting it — `welcomeInitialStepKey`
   // is bumped on every click so a second visit still jumps even when
   // `welcomeInitialStep` itself does not change value.
-  const [welcomeInitialStep, setWelcomeInitialStep] = useState<"database" | undefined>(undefined);
+  const [welcomeInitialStep, setWelcomeInitialStep] = useState<string | undefined>(undefined);
   const [welcomeInitialStepKey, setWelcomeInitialStepKey] = useState(0);
+  const needsRoutingSetup = routingNeedsSetup(routing.data);
+  const openNoticeTarget = useCallback((target: NoticeTarget) => {
+    if (target.kind === "home") setTab("home");
+    else if (target.kind === "harnesses") setTab("harnesses");
+    else if (target.kind === "settings") {
+      setSettingsSection(target.section);
+      setTab("settings");
+      if (target.group) revealSettingsGroup(target.group);
+    } else {
+      setWelcomeInitialStep(target.step);
+      setWelcomeInitialStepKey((k) => k + 1);
+      setTab("first-run");
+    }
+  }, []);
   const openDatabaseStepInFirstRun = useCallback(() => {
     setWelcomeInitialStep("database");
     setWelcomeInitialStepKey((k) => k + 1);
@@ -2869,11 +2891,12 @@ export default function App() {
     void getVersion()
       .then((v) => {
         setAppVersion(v);
-        // Show the notice for this version, if any, then remember we did —
-        // once per install, never re-shown on a later launch of the same
-        // version (see postUpdateNotices.ts).
-        const notice = noticeForUpgrade(readLastNoticedVersion(), v);
-        if (notice) setPostUpdateNotice(notice);
+        // What's new: the dialog shows once, the Home card stays until it is
+        // closed there, then remember this version (see postUpdateNotices.ts).
+        const plan = planLaunch(readLastNoticedVersion(), v, readCardState());
+        setNoticeDialog(plan.dialog);
+        setNoticeCard(plan.card);
+        writeCardState(plan.card);
         writeLastNoticedVersion(v);
       })
       .catch(() => setAppVersion("unknown"));
@@ -3556,7 +3579,11 @@ export default function App() {
               dsnOk={dsnOk}
               refreshDsn={() => refreshDsn(true)}
               runKhipu={runKhipu}
-              onFinish={() => setTab("home")}
+              onFinish={() => {
+                // Finishing setup covers what's new, so record the version.
+                recordVersionOnSetupFinish(appVersion);
+                setTab("home");
+              }}
               openIntegrations={() => setTab("harnesses")}
               initialStep={welcomeInitialStep}
               initialStepKey={welcomeInitialStepKey}
@@ -3584,6 +3611,21 @@ export default function App() {
             </button>
           </PanelHeader>
           <div className="panel-body wide">
+            {noticeCard ? (
+              <WhatsNewCard
+                card={noticeCard}
+                needsRoutingSetup={needsRoutingSetup}
+                onShow={openNoticeTarget}
+                onClose={() => {
+                  writeCardState(null);
+                  setNoticeCard(null);
+                }}
+                onSeeAll={() => {
+                  setSettingsSection("updates");
+                  setTab("settings");
+                }}
+              />
+            ) : null}
             {homeAttention.map((a) => (
               <Callout
                 key={a.key}
@@ -5882,6 +5924,13 @@ export default function App() {
                     </div>
                   </div>
                 ) : null}
+                {settingsSection === "updates" ? (
+                  <WhatsNewHistory
+                    appVersion={appVersion}
+                    needsRoutingSetup={needsRoutingSetup}
+                    onShow={openNoticeTarget}
+                  />
+                ) : null}
 
                 {settingsSection === "advanced" ? (
                   <>
@@ -5933,14 +5982,10 @@ export default function App() {
       />
 
       <PostUpdateNoticeDialog
-        notice={postUpdateNotice}
-        onDismiss={() => setPostUpdateNotice(null)}
-        onOpenIntegrations={() => setTab("harnesses")}
-        onOpenHome={() => setTab("home")}
-        onOpenSettings={(section) => {
-          setSettingsSection(section ?? "features");
-          setTab("settings");
-        }}
+        plan={noticeDialog}
+        needsRoutingSetup={needsRoutingSetup}
+        onShow={openNoticeTarget}
+        onDismiss={() => setNoticeDialog(null)}
       />
 
       {/* Forget — the one destructive write either list makes. */}
