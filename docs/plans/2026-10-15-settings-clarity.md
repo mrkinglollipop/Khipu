@@ -1037,6 +1037,25 @@ footer says "on this Mac".
 - **Order:** 9C and 9E start only after phases 3, 7 and 8 are merged and promoted; otherwise stop and ask.
 - If anything in routing is found keyed by label alone besides the lane map, stop and ask.
 
+#### Owner proofs still to run (9D)
+
+Until each proof below passes, its entry in `signin.PROVEN` stays False and the app does not offer Sign in to
+another account for that CLI (it offers only Use a login I already have). Claude Code is the only CLI turned on.
+
+- [ ] **Codex Keychain, with two scratch folders.** Make two empty scratch folders. Run `CODEX_HOME=<scratch A>
+  codex login` and sign in to account A, then `CODEX_HOME=<scratch B> codex login` and sign in to account B.
+  Then run `codex login status` under each scratch folder and under the default login. Pass: each scratch
+  folder reports its own account and the default login is unchanged. Record the Codex version. On a pass, set
+  `signin.PROVEN["codex"]` to True and add codex to the Rust `SIGN_IN_NEW_OFFERED` list. On a fail, Codex keeps
+  only Use a login I already have.
+- [ ] **Grok Build device code** (after the Grok pause lifts). With a scratch `GROK_HOME`, run `grok login
+  --device-auth` and stop at the code line (no real sign-in). Confirm `~/.grok` and `~/.grok/leader.sock` are
+  unchanged, using a stat of those two entries only. Record the real link host and the shape of the code, so
+  `signin.CODE_HOSTS` and the code shape can be confirmed before `signin.PROVEN["grok"]` turns on.
+- [ ] **Muse code sign-in.** The same shape: run its login, stop at the code line, confirm the link host and the
+  shape of the code, and confirm it asks nothing on the terminal (Khipu starts it with no terminal and no
+  input). Only then does `signin.PROVEN["muse"]` turn on.
+
 ### Proof on this Mac
 
 - **Read-only live run:** in the installed app, open Accounts, press Look for accounts now, and save screenshots

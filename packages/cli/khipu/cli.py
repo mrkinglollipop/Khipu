@@ -2050,6 +2050,41 @@ def cmd_usage(args: argparse.Namespace) -> int:
                            f"Khipu clears {'it' if n == 1 else 'them'} when {'it is' if n == 1 else 'they are'} free")
         print(json.dumps(out))
         return 0 if out["finished"] else 1
+    # Settings clarity phase 9 (9D): signing in a new account, for the app.
+    # No MCP tool reaches these (they carry folder paths and sign-in codes).
+    sign_in_new = (getattr(args, "sign_in_offers", False) or getattr(args, "sign_in_folder", False)
+                   or getattr(args, "sign_in_new", False) or getattr(args, "sign_in_status", None) is not None
+                   or getattr(args, "sign_in_cancel", None) is not None or getattr(args, "sign_in_reap", False))
+    if sign_in_new:
+        from khipu import signin
+
+        if args.sign_in_offers:
+            print(json.dumps(signin.offers(), indent=2))
+            return 0
+        if args.sign_in_reap:
+            print(json.dumps(signin.reap(), indent=2))
+            return 0
+        if args.sign_in_status is not None:
+            out = signin.status(args.sign_in_status)
+            print(json.dumps(out, indent=2))
+            return 2 if out.get("error") == signin.E_NO_ATTEMPT else 0
+        if args.sign_in_cancel is not None:
+            out = signin.cancel(args.sign_in_cancel, remove_folder=bool(args.remove_folder))
+            print(json.dumps(out, indent=2))
+            return 0 if out.get("ok") else 1
+        if not getattr(args, "harness", None):
+            print(json.dumps({"ok": False, "error": "name the CLI with --harness"}))
+            return 2
+        if args.sign_in_folder:
+            if not args.name:
+                print(json.dumps({"ok": False, "error": "name the account with --name"}))
+                return 2
+            out = signin.make_folder(args.harness, args.name)
+            print(json.dumps(out, indent=2))
+            return 0 if out.get("ok") else 2
+        out = signin.start(args.harness, getattr(args, "folder", None), again=bool(args.again))
+        print(json.dumps(out, indent=2))
+        return 0 if out.get("ok") else 1
     if getattr(args, "discover", False) or getattr(args, "check", None) is not None:
         # Settings clarity phase 9 (9A): the login folders Khipu could track.
         # A read for the app; no MCP tool starts it (it carries paths).
@@ -4723,6 +4758,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help="With --try: the login folder (~/... or a full path); none = the default login")
     us.add_argument("--forget-login-paths", action="store_true",
                     help="Clear the login folder recorded for every saved conversation")
+    us.add_argument("--sign-in-offers", action="store_true",
+                    help="Which CLIs the app may offer Sign in to another account for (JSON)")
+    us.add_argument("--sign-in-folder", action="store_true",
+                    help="With --harness H --name N: make the new login folder ~/.<cli>-<name> (JSON)")
+    us.add_argument("--name", default=None, metavar="N", help="With --sign-in-folder: the account's name")
+    us.add_argument("--sign-in-new", action="store_true",
+                    help="With --harness H and --folder F (a folder --sign-in-folder made): start that CLI's "
+                         "login and return at once with an attempt id (JSON)")
+    us.add_argument("--again", action="store_true",
+                    help="With --sign-in-new: end the running sign-in first (Start again)")
+    us.add_argument("--sign-in-status", default=None, metavar="ID", help="The sign-in attempt's state (JSON)")
+    us.add_argument("--sign-in-cancel", default=None, metavar="ID", help="Stop and cancel that sign-in (JSON)")
+    us.add_argument("--remove-folder", action="store_true",
+                    help="With --sign-in-cancel: also remove the folder Khipu made if it is still empty")
+    us.add_argument("--sign-in-reap", action="store_true",
+                    help="End a leftover sign-in Khipu started (on the app's quit)")
     us.set_defaults(func=cmd_usage)
 
     rt = sub.add_parser(

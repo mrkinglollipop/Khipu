@@ -1474,6 +1474,240 @@ async fn khipu_account_sign_in(harness: String, home: Option<String>) -> Result<
     run_khipu_cli_async(sign_in_argv(&config, &harness, home.as_deref())?).await
 }
 
+/// CLIs the new-account sign-in is offered for (docs/plans/2026-10-15-settings-clarity.md,
+/// Guardrails). Codex joins after the Keychain proof (a second `CODEX_HOME`
+/// keeps its own sign-in) and Grok Build after its device-code proof; until
+/// then the builders below refuse them whatever the webview sends.
+const SIGN_IN_NEW_OFFERED: &[&str] = &["claude"];
+const SIGN_IN_NEW_NAME_MAX: usize = 64;
+const SIGN_IN_NEW_SLUG_MAX: usize = 40;
+/// How long quitting waits for the reaper before leaving it behind.
+const SIGN_IN_REAP_WAIT: Duration = Duration::from_secs(4);
+
+/// What Khipu itself made for the sign-in in progress: the login folder the
+/// CLI returned (with its CLI) and the current attempt's id. The sign-in argv
+/// is built from these, never from webview text.
+#[derive(Default)]
+struct SignInNewState {
+    folder: Option<(String, String)>,
+    attempt: Option<String>,
+}
+
+static SIGN_IN_NEW: Mutex<SignInNewState> = Mutex::new(SignInNewState { folder: None, attempt: None });
+
+fn sign_in_state() -> std::sync::MutexGuard<'static, SignInNewState> {
+    SIGN_IN_NEW.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn sign_in_new_harness(harness: &str, offered: &[&str]) -> Result<(), String> {
+    if !["claude", "codex", "grok"].contains(&harness) || !offered.contains(&harness) {
+        return Err("Khipu can't sign in a new account for this CLI yet".to_string());
+    }
+    Ok(())
+}
+
+/// `usage --sign-in-folder --harness=H --name=N`: the CLI makes the login folder.
+fn new_folder_argv(harness: &str, name: &str, offered: &[&str]) -> Result<Vec<String>, String> {
+    sign_in_new_harness(harness, offered)?;
+    let chars = name.chars().count();
+    if name.trim().is_empty() || chars > SIGN_IN_NEW_NAME_MAX {
+        return Err(format!("The name must be 1 to {SIGN_IN_NEW_NAME_MAX} characters"));
+    }
+    if has_control(name) || name.contains('|') {
+        return Err("The name can't hold a line break, a control character or |".to_string());
+    }
+    Ok(vec![
+        "usage".to_string(),
+        "--sign-in-folder".to_string(),
+        format!("--harness={harness}"),
+        format!("--name={name}"),
+    ])
+}
+
+/// True for `~/.<cli>-<slug>`: slug starts and ends with a letter or digit,
+/// holds only `[a-z0-9-]`, and is 1 to 40 characters (a `-2` suffix included).
+fn sign_in_folder_shape(cli: &str, folder: &str) -> Option<String> {
+    let name = folder.strip_prefix("~/")?;
+    if name.contains('/') || name.contains("..") || has_control(name) {
+        return None;
+    }
+    let slug = name.strip_prefix('.')?.strip_prefix(cli)?.strip_prefix('-')?;
+    let ok_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let (first, last) = (slug.chars().next()?, slug.chars().last()?);
+    if slug.len() > SIGN_IN_NEW_SLUG_MAX || !ok_char(first) || !ok_char(last) {
+        return None;
+    }
+    if !slug.chars().all(|c| ok_char(c) || c == '-') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// `usage --sign-in-new --harness=H --folder=F [--again]`, only for a folder
+/// Khipu created for this CLI that is still a real folder directly under the
+/// home folder (not a symlink, not an escape).
+fn sign_in_new_argv(
+    harness: &str,
+    created: Option<(&str, &str)>,
+    user_home: &std::path::Path,
+    offered: &[&str],
+    again: bool,
+) -> Result<Vec<String>, String> {
+    sign_in_new_harness(harness, offered)?;
+    let (cli, folder) = created.ok_or("Name the account first, so Khipu can make its login folder")?;
+    if cli != harness {
+        return Err("That login folder belongs to another CLI".to_string());
+    }
+    let name = sign_in_folder_shape(harness, folder).ok_or("That login folder isn't one Khipu made")?;
+    let path = user_home.join(&name);
+    let meta = std::fs::symlink_metadata(&path).map_err(|_| "Khipu can't find that login folder".to_string())?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err("That login folder isn't a plain folder".to_string());
+    }
+    let parent = std::fs::canonicalize(&path).ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+    if parent.is_none() || parent != std::fs::canonicalize(user_home).ok() {
+        return Err("That login folder isn't directly in your home folder".to_string());
+    }
+    let mut argv = vec![
+        "usage".to_string(),
+        "--sign-in-new".to_string(),
+        format!("--harness={harness}"),
+        format!("--folder={folder}"),
+    ];
+    if again {
+        argv.push("--again".to_string());
+    }
+    Ok(argv)
+}
+
+/// An attempt id is exactly 16 lowercase hex characters.
+fn sign_in_attempt_id(id: &str) -> Result<&str, String> {
+    if id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        Ok(id)
+    } else {
+        Err("That isn't a sign-in Khipu started".to_string())
+    }
+}
+
+fn sign_in_status_argv(id: &str) -> Result<Vec<String>, String> {
+    Ok(vec!["usage".to_string(), format!("--sign-in-status={}", sign_in_attempt_id(id)?)])
+}
+
+/// Cancel stops only the attempt this app started.
+fn sign_in_cancel_argv(id: &str, stored_id: Option<&str>, remove_folder: bool) -> Result<Vec<String>, String> {
+    let id = sign_in_attempt_id(id)?;
+    if stored_id != Some(id) {
+        return Err("That sign-in isn't the one this window started".to_string());
+    }
+    let mut argv = vec!["usage".to_string(), format!("--sign-in-cancel={id}")];
+    if remove_folder {
+        argv.push("--remove-folder".to_string());
+    }
+    Ok(argv)
+}
+
+fn sign_in_user_home() -> Result<PathBuf, String> {
+    std::env::var("HOME").map(PathBuf::from).map_err(|_| "Khipu can't find your home folder".to_string())
+}
+
+fn sign_in_answer(raw: &str) -> Result<Value, String> {
+    serde_json::from_str(raw.trim()).map_err(|_| "Khipu gave an answer the app couldn't read".to_string())
+}
+
+/// Which CLIs the dialog may offer Sign in to another account for. The CLI
+/// says whether each is installed and proven; a CLI not in
+/// `SIGN_IN_NEW_OFFERED` is never offered here whatever the CLI answers.
+/// A non-zero CLI exit that still printed JSON reaches the webview as that JSON.
+#[tauri::command]
+async fn khipu_account_sign_in_offers() -> Result<String, String> {
+    let raw = run_khipu_cli_async(fixed_argv(&["usage", "--sign-in-offers"])).await?;
+    let mut answer = sign_in_answer(&raw)?;
+    if let Some(map) = answer.as_object_mut() {
+        for (cli, entry) in map.iter_mut() {
+            if !SIGN_IN_NEW_OFFERED.contains(&cli.as_str()) {
+                if let Some(e) = entry.as_object_mut() {
+                    e.insert("offered".to_string(), Value::Bool(false));
+                }
+            }
+        }
+    }
+    Ok(answer.to_string())
+}
+
+/// Make (or reuse) the login folder for a new account and remember it here.
+#[tauri::command]
+async fn khipu_account_new_folder(harness: String, name: String) -> Result<String, String> {
+    let argv = new_folder_argv(&harness, &name, SIGN_IN_NEW_OFFERED)?;
+    let raw = run_khipu_cli_async(argv).await?;
+    let answer = sign_in_answer(&raw)?;
+    if answer.get("ok").and_then(Value::as_bool) == Some(true) {
+        let folder = answer.get("folder").and_then(Value::as_str).unwrap_or("");
+        if sign_in_folder_shape(&harness, folder).is_none() {
+            return Err("Khipu made a login folder the app won't use".to_string());
+        }
+        let mut state = sign_in_state();
+        state.folder = Some((harness, folder.to_string()));
+        state.attempt = None;
+    }
+    Ok(raw)
+}
+
+/// Start signing in to the folder Khipu made. Returns at once with the attempt.
+#[tauri::command]
+async fn khipu_account_sign_in_new(harness: String, again: Option<bool>) -> Result<String, String> {
+    let created = sign_in_state().folder.clone();
+    let argv = sign_in_new_argv(
+        &harness,
+        created.as_ref().map(|(c, f)| (c.as_str(), f.as_str())),
+        &sign_in_user_home()?,
+        SIGN_IN_NEW_OFFERED,
+        again.unwrap_or(false),
+    )?;
+    let raw = run_khipu_cli_async(argv).await?;
+    let answer = sign_in_answer(&raw)?;
+    if answer.get("ok").and_then(Value::as_bool) == Some(true) {
+        let id = answer.pointer("/attempt/id").and_then(Value::as_str).unwrap_or("");
+        sign_in_state().attempt = Some(sign_in_attempt_id(id)?.to_string());
+    }
+    Ok(raw)
+}
+
+#[tauri::command]
+async fn khipu_account_sign_in_status() -> Result<String, String> {
+    let id = sign_in_state().attempt.clone().ok_or("No sign-in is running")?;
+    run_khipu_cli_async(sign_in_status_argv(&id)?).await
+}
+
+/// Stop this window's sign-in; `remove_folder` also removes the empty folder
+/// Khipu made for it (the CLI refuses to remove one that has signed in).
+#[tauri::command]
+async fn khipu_account_sign_in_cancel(remove_folder: Option<bool>) -> Result<String, String> {
+    let id = sign_in_state().attempt.clone().ok_or("No sign-in is running")?;
+    let argv = sign_in_cancel_argv(&id, Some(&id), remove_folder.unwrap_or(false))?;
+    let raw = run_khipu_cli_async(argv).await?;
+    if let Ok(answer) = sign_in_answer(&raw) {
+        if answer.get("ok").and_then(Value::as_bool) == Some(true) {
+            let mut state = sign_in_state();
+            state.attempt = None;
+            if answer.get("folder_removed").and_then(Value::as_bool) == Some(true) {
+                state.folder = None;
+            }
+        }
+    }
+    Ok(raw)
+}
+
+/// On quit: end a sign-in this app left running. Best effort, a few seconds.
+fn reap_sign_in_on_exit() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_khipu_cli(&fixed_argv(&["usage", "--sign-in-reap"])));
+    });
+    if let Ok(Err(e)) = rx.recv_timeout(SIGN_IN_REAP_WAIT) {
+        eprintln!("[khipu-signin] reap on quit failed: {e}");
+    }
+}
+
 #[tauri::command]
 async fn khipu_jobs_status() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(JOBS_STATUS_ARGV)).await
@@ -3088,6 +3322,11 @@ pub fn run() {
             khipu_route_hold_end,
             khipu_route_priority,
             khipu_account_sign_in,
+            khipu_account_sign_in_offers,
+            khipu_account_new_folder,
+            khipu_account_sign_in_new,
+            khipu_account_sign_in_status,
+            khipu_account_sign_in_cancel,
             khipu_jobs_status,
             khipu_job_install,
             khipu_job_uninstall,
@@ -3282,8 +3521,13 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Khipu");
+        .build(tauri::generate_context!())
+        .expect("error while building Khipu")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                reap_sign_in_on_exit();
+            }
+        });
 }
 
 #[cfg(test)]
@@ -4673,5 +4917,175 @@ mod priority_and_sign_in_tests {
         assert!(sign_in_argv(&c, "muse", None).is_err());
         assert!(sign_in_argv(&c, "--sign-in", None).is_err());
         assert!(sign_in_argv(&serde_json::json!({}), "claude", None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sign_in_new_tests {
+    use super::*;
+
+    const ALL: &[&str] = &["claude", "codex", "grok"];
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A unique scratch home under the system temp dir, removed on drop.
+    struct Home(PathBuf);
+    impl Home {
+        fn new(tag: &str) -> Home {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let p = std::env::temp_dir().join(format!("khipu-signin-{tag}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&p).unwrap();
+            Home(p)
+        }
+        fn mkdir(&self, name: &str) {
+            std::fs::create_dir(self.0.join(name)).unwrap();
+        }
+    }
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn built(h: &Home, harness: &str, folder: &str, offered: &[&str]) -> Result<Vec<String>, String> {
+        sign_in_new_argv(harness, Some((harness, folder)), &h.0, offered, false)
+    }
+
+    #[test]
+    fn production_offers_claude_only() {
+        assert_eq!(SIGN_IN_NEW_OFFERED, &["claude"]);
+    }
+
+    #[test]
+    fn claude_slug_folder_is_accepted_and_again_is_appended() {
+        let h = Home::new("ok");
+        h.mkdir(".claude-client");
+        h.mkdir(".claude-client-2");
+        assert_eq!(
+            built(&h, "claude", "~/.claude-client", SIGN_IN_NEW_OFFERED).unwrap(),
+            v(&["usage", "--sign-in-new", "--harness=claude", "--folder=~/.claude-client"])
+        );
+        assert_eq!(
+            sign_in_new_argv("claude", Some(("claude", "~/.claude-client-2")), &h.0, SIGN_IN_NEW_OFFERED, true).unwrap(),
+            v(&["usage", "--sign-in-new", "--harness=claude", "--folder=~/.claude-client-2", "--again"])
+        );
+    }
+
+    #[test]
+    fn codex_and_grok_are_refused_in_production_and_pass_only_when_offered() {
+        let h = Home::new("gate");
+        h.mkdir(".codex-lab");
+        h.mkdir(".grok-second");
+        assert!(built(&h, "codex", "~/.codex-lab", SIGN_IN_NEW_OFFERED).is_err());
+        assert!(built(&h, "grok", "~/.grok-second", SIGN_IN_NEW_OFFERED).is_err());
+        assert!(built(&h, "codex", "~/.codex-lab", &["claude", "codex"]).is_ok());
+        assert!(built(&h, "grok", "~/.grok-second", &["claude", "codex"]).is_err());
+        assert!(built(&h, "grok", "~/.grok-second", ALL).is_ok());
+    }
+
+    #[test]
+    fn muse_and_unknown_harnesses_are_refused_even_if_listed() {
+        let h = Home::new("muse");
+        h.mkdir(".muse-x");
+        assert!(built(&h, "muse", "~/.muse-x", &["claude", "muse"]).is_err());
+        assert!(built(&h, "--sign-in", "~/.claude-a", &["--sign-in"]).is_err());
+    }
+
+    #[test]
+    fn odd_folder_names_are_refused() {
+        let h = Home::new("odd");
+        h.mkdir(".claude-a");
+        let bad = [
+            "~/..claude-a", "~/.claude-..", "~/.claude-a/..", "~/x/.claude-a", "/abs/.claude-a",
+            "~/.claude-a/b", "~/.claude-a\n", "~/.claude-a\u{7}", "~/.claude-", "~/.claude--", "~/.claude--a",
+            "~/.claude-a-", "~/.claude-A", "~/.claude-a b", "~/.claude", "~/claude-a", ".claude-a", "",
+            "~/.claude-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ];
+        for f in bad {
+            assert!(built(&h, "claude", f, SIGN_IN_NEW_OFFERED).is_err(), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn longest_slug_is_forty_characters() {
+        let h = Home::new("len");
+        let slug = "a".repeat(40);
+        h.mkdir(&format!(".claude-{slug}"));
+        assert!(built(&h, "claude", &format!("~/.claude-{slug}"), SIGN_IN_NEW_OFFERED).is_ok());
+    }
+
+    #[test]
+    fn a_folder_of_another_cli_or_none_is_refused() {
+        let h = Home::new("cli");
+        h.mkdir(".claude-a");
+        h.mkdir(".codex-a");
+        assert!(sign_in_new_argv("codex", Some(("claude", "~/.claude-a")), &h.0, ALL, false).is_err());
+        assert!(sign_in_new_argv("codex", Some(("codex", "~/.claude-a")), &h.0, ALL, false).is_err());
+        assert!(built(&h, "codex", "~/.claude-a", ALL).is_err());
+        assert!(sign_in_new_argv("claude", None, &h.0, SIGN_IN_NEW_OFFERED, false).is_err());
+    }
+
+    #[test]
+    fn a_folder_that_does_not_exist_or_is_a_file_is_refused() {
+        let h = Home::new("missing");
+        assert!(built(&h, "claude", "~/.claude-gone", SIGN_IN_NEW_OFFERED).is_err());
+        std::fs::write(h.0.join(".claude-file"), b"x").unwrap();
+        assert!(built(&h, "claude", "~/.claude-file", SIGN_IN_NEW_OFFERED).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_that_points_outside_the_home_is_refused() {
+        let h = Home::new("link");
+        let outside = Home::new("outside");
+        std::os::unix::fs::symlink(&outside.0, h.0.join(".claude-a")).unwrap();
+        assert!(built(&h, "claude", "~/.claude-a", SIGN_IN_NEW_OFFERED).is_err());
+        // Even a link to another folder inside the home is not a folder Khipu made.
+        h.mkdir("real");
+        std::os::unix::fs::symlink(h.0.join("real"), h.0.join(".claude-b")).unwrap();
+        assert!(built(&h, "claude", "~/.claude-b", SIGN_IN_NEW_OFFERED).is_err());
+    }
+
+    #[test]
+    fn attempt_ids_are_sixteen_lowercase_hex() {
+        let id = "0123456789abcdef";
+        assert_eq!(sign_in_status_argv(id).unwrap(), v(&["usage", "--sign-in-status=0123456789abcdef"]));
+        for bad in ["", "0123456789abcde", "0123456789abcdef0", "0123456789ABCDEF", "0123456789abcdeg",
+                    "0123456789abcde;", "--remove-folder--x-"] {
+            assert!(sign_in_status_argv(bad).is_err(), "{bad:?}");
+            assert!(sign_in_cancel_argv(bad, Some(bad), false).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn cancel_stops_only_its_own_attempt() {
+        let mine = "0123456789abcdef";
+        let other = "fedcba9876543210";
+        assert_eq!(sign_in_cancel_argv(mine, Some(mine), false).unwrap(), v(&["usage", "--sign-in-cancel=0123456789abcdef"]));
+        assert_eq!(
+            sign_in_cancel_argv(mine, Some(mine), true).unwrap(),
+            v(&["usage", "--sign-in-cancel=0123456789abcdef", "--remove-folder"])
+        );
+        assert!(sign_in_cancel_argv(other, Some(mine), false).is_err());
+        assert!(sign_in_cancel_argv(mine, None, false).is_err());
+    }
+
+    #[test]
+    fn new_folder_name_rules() {
+        assert_eq!(
+            new_folder_argv("claude", "Claude client", SIGN_IN_NEW_OFFERED).unwrap(),
+            v(&["usage", "--sign-in-folder", "--harness=claude", "--name=Claude client"])
+        );
+        let long = "n".repeat(64);
+        assert!(new_folder_argv("claude", &long, SIGN_IN_NEW_OFFERED).is_ok());
+        for bad in ["", "   ", "a|b", "a\nb", "a\u{0}b", "a\tb"] {
+            assert!(new_folder_argv("claude", bad, SIGN_IN_NEW_OFFERED).is_err(), "{bad:?}");
+        }
+        assert!(new_folder_argv("claude", &"n".repeat(65), SIGN_IN_NEW_OFFERED).is_err());
+        assert!(new_folder_argv("codex", "x", SIGN_IN_NEW_OFFERED).is_err());
+        assert!(new_folder_argv("codex", "x", ALL).is_ok());
+        assert!(new_folder_argv("muse", "x", &["muse"]).is_err());
     }
 }
