@@ -181,6 +181,8 @@ def test_the_printed_lines_match_the_trackers_for_the_same_input(hub, monkeypatc
     assert ok("set", "s-1", "--note", "still going").strip() == "set s-1: note appended"
     lines = ok("list").splitlines()
     assert lines[0].startswith("g-1 · NOT STARTED · Ship the thing · owner=none · updated=20")
+    listed = json.loads(ok("list", "--json"))
+    assert ["NEEDS MATT", "needs"] in listed["vocab"]["state"] and [r["id"] for r in listed["rows"]][0] == "g-1"
     assert lines[-2:] == ["", "3 row(s)"]
     loose = ok("loose-ends").splitlines()
     assert loose[0] == "== IN FLIGHT (1)"
@@ -2181,3 +2183,28 @@ def test_a_queue_listing_that_fails_reports_unreadable_never_empty(monkeypatch, 
     assert ledger.nightly()["ok"] is False
     monkeypatch.setattr(os, "listdir", real_listdir)
     assert [q["op_id"] for q in ledger.queued_ops()] == ["waiting"]
+
+
+def test_the_apps_argv_shapes_parse_and_are_recorded_as_the_app(hub):
+    """The desktop's fixed argv (src-tauri lib.rs, work_command_tests): the
+    project joined to its flag, the row id after ``--``, ``--from-app``."""
+    from khipu import cli
+
+    def app(*argv):
+        args = cli.build_parser().parse_args(["ledger", *argv])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            assert args.func(args) == 0, out.getvalue()
+        return json.loads(out.getvalue())
+
+    ok("add", "n-1", "--title", "Pick a name", "--kind", "needs-owner", "--state", "NEEDS OWNER")
+    got = app("set", "--json", "--from-app", f"--project={P}", "--state=DONE", "--note=Picked.\nSecond line",
+              "--if-state=NEEDS OWNER", "--evidence=--state=DROPPED", "--", "n-1")
+    assert got["ok"] and got["state"] == "DONE"
+    row = app("get", "--json", f"--project={P}", "--", "n-1")
+    assert row["state"] == "DONE" and row["evidence"] == "--state=DROPPED"
+    assert row["history"][-1]["by"] == "you, in the app" and row["history"][-1]["note"] == "Picked.\nSecond line"
+    assert app("list", "--json", f"--project={P}")["rows"][0]["id"] == "n-1"
+    assert app("remove", "--json", "--from-app", f"--project={P}", "--note=duplicate", "--", "n-1")["ok"]
+    assert [r["id"] for r in app("removed", "--json", f"--project={P}")["removed"]] == ["n-1"]
+    assert app("restore", "--json", "--from-app", f"--project={P}", "--", "n-1")["ok"]

@@ -1086,8 +1086,11 @@ def _ledger_part(rows: list[dict], vocab: dict, now: datetime, times: list[datet
         loose_out.append(item)
     recent = [_row_out(r, vocab) for r in ordered if (now - _when(r)).total_seconds() < 86400]
     times.extend(_when(r) + timedelta(seconds=86400) for r in ordered if (now - _when(r)).total_seconds() < 86400)
+    # The project's own words and what each means, so an app can offer them
+    # (Done on a Needs you row is this project's done word, not always DONE).
     return {"rows": len(rows), "by_state": counts, "goals": goals, "loose_ends": loose_out,
-            "loose_end_count": len(loose), "changed_today": recent}
+            "loose_end_count": len(loose), "changed_today": recent,
+            "vocab": {"state": [list(w) for w in vocab["state"]], "kind": list(vocab["kind"])}}
 
 
 def _account_ref(job: dict, runner: str | None, routing_info: dict) -> dict:
