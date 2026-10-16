@@ -317,7 +317,8 @@ def test_the_mcp_tools_answer_with_labels_and_ids_never_a_login_folder(home):
     fact = next(a for a in answer["accounts"] if a["label"] == "Claude second")["plan"]
     assert fact["left_pct"] == 88 and fact["words"] == "a lot left, little time"
     with pytest.raises(routing.RouteError):
-        routing.conversation_priority([{"account": "claude|/logins/claude-second"}], owner_request="x", author=ME)
+        routing.conversation_priority([{"account": "claude|/logins/claude-second"}], owner_request="x", author=ME,
+                                      expect=routing.priority_version())
 
 
 # ---- spend pace ----------------------------------------------------------------------------

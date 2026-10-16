@@ -1441,6 +1441,16 @@ def _checked(data: dict) -> dict | None:
                 isinstance(p, list) and len(p) == 2 and all(isinstance(x, str) for x in p) for p in cuts):
             return None
         out["lanes_cut"] = [[_no_surrogates(x) for x in p] for p in cuts]
+    declines = data.get("declines")
+    if declines is not None:
+        # An account change's Not offered again changes: each an account
+        # key, and the reason or None (taken off).
+        if out["type"] != ACCOUNT_TXN or not isinstance(declines, list) or not all(
+                isinstance(d, dict) and isinstance(d.get("account"), str)
+                and (d.get("why") is None or isinstance(d["why"], str)) for d in declines):
+            return None
+        out["declines"] = [{"account": _no_surrogates(d["account"]),
+                            "why": None if d.get("why") is None else _no_surrogates(d["why"])} for d in declines]
     if "entries" in data:
         entries = _checked_entries(out["type"], data["entries"])
         if entries is None:
@@ -1488,19 +1498,25 @@ def _line_event(raw: bytes) -> dict | None:
 ACCOUNT_TXN = "account_txn"
 
 
-def _split_txns(events: list[dict]) -> tuple[list[dict], list[tuple[dict, list[dict]]]]:
+def _split_txns(events: list[dict], held: str | None = None) -> tuple[list[dict], list[tuple[dict, list[dict]]]]:
     """(the events that count, the account transactions left unfinished as
     (begin line, its lines)). An account change is one transaction
     (``accounts._commit``): its ``account_txn`` begin line and its own lines
     (each with ``txn``) go down before the config is written, and count only
     once its ``done`` line follows and no ``abort`` does. Transaction lines
-    themselves never reach the fold."""
+    themselves never reach the fold.
+
+    ``held``, the account list's version in the config now: an unfinished
+    change whose list the config already holds counts too, so a change
+    ``accounts.recover`` cannot yet finish is read as the config has it."""
     begun = {e["id"]: e for e in events if e.get("type") == ACCOUNT_TXN and e.get("state") == "begin" and e.get("id")}
     ends: dict[str, set[str]] = {}
     for e in events:
         if e.get("type") == ACCOUNT_TXN and e.get("state") in ("done", "abort") and e.get("target"):
             ends.setdefault(e["target"], set()).add(e["state"])
     done = {t for t, states in ends.items() if states == {"done"}}
+    if held is not None:
+        done |= {t for t, b in begun.items() if t not in ends and b.get("list_after") == held}
     kept = [e for e in events if e.get("type") != ACCOUNT_TXN and (e.get("txn") is None or e["txn"] in done)]
     open_ = [(b, [e for e in events if e.get("txn") == t and e.get("type") != ACCOUNT_TXN])
              for t, b in begun.items() if t not in ends]
@@ -1513,7 +1529,17 @@ def read_events() -> tuple[list[dict], int]:
     """Every event that counts (``_split_txns``) in write order with its
     place in that order (``_seq``), and how many lines could not be read."""
     events, bad = _read_all_events()
-    return _split_txns(events)[0], bad
+    return _split_txns(events, _held_list())[0], bad
+
+
+def _held_list() -> str | None:
+    """The account list's version as the config stores it now, unsettled."""
+    from khipu import config
+
+    try:
+        return config.accounts_version(config.read_config_unsettled())
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def account_txns_open() -> list[tuple[dict, list[dict]]]:
@@ -3615,7 +3641,7 @@ def _start_fold(now: datetime, *, save: bool) -> dict:
     if _fresh(prev, fingerprint, now):
         return dict(prev, checked_at=_iso(now))  # the fold it waited for saved it
     every, bad = _read_all_events()
-    events, unfinished = _split_txns(every)
+    events, unfinished = _split_txns(every, _held_list())
     if unfinished or (cfg.get("routing_rules_seed") and not any(e.get("type") == "seed_import" for e in events)):
         # An account change left unfinished is finished or rolled back
         # first, under the locks, by ``read_view``.
@@ -3654,10 +3680,13 @@ def _unsaved_view(now: datetime) -> dict:
 
 def _recover_accounts() -> None:
     """Finish or roll back an account change left unfinished
-    (``accounts.recover``) before the record is folded."""
+    (``accounts.recover``) before the record is folded. One that cannot be
+    settled yet is folded as the config holds it (``_split_txns``); every
+    account write is refused until it is."""
     from khipu import accounts
 
-    accounts.recover()
+    with contextlib.suppress(accounts.AccountsError):
+        accounts.recover()
 
 
 def read_view(now: datetime | None = None) -> dict:
@@ -3963,14 +3992,17 @@ def request_lines(events: list[dict], author: dict, owner_request: str) -> list[
             for e in events]
 
 
-def account_txn_begin(lines: list[dict], *, before: str, after: str) -> str:
+def account_txn_begin(lines: list[dict], *, before: str, after: str, declines: list[dict] | None = None) -> str:
     """Write an account change's intent (``accounts._commit``): its begin
-    line, naming the account list's version before and after, and its own
+    line, naming the account list's version before and after and the logins
+    it adds to or takes off Not offered again (``declines``), and its own
     lines, in one append. None of them counts until ``account_txn_end``
     writes ``done``. The caller holds the routing lock; nothing is written
     when this fails (a RouteError)."""
     txn = _new_id("t")
     begin = {"type": ACCOUNT_TXN, "state": "begin", "id": txn, "list_before": before, "list_after": after}
+    if declines:
+        begin["declines"] = [dict(d) for d in declines]
     lines = [begin, *(dict(line, txn=txn) for line in lines)]
     try:
         with _lock():
@@ -5657,20 +5689,23 @@ def _conversation_write(args: dict, *, author: dict, now: datetime | None = None
     return end_hold(hold_id, owner=False, author=by, via="mcp", now=now)
 
 
-def conversation_priority(entries, *, until=None, owner_request: str, author: dict,
+def conversation_priority(entries, *, until=None, owner_request: str, author: dict, expect=None,
                           now: datetime | None = None, lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
     """What MCP ``khipu_route_priority`` writes (``request_priority``), with
     a conversation's fixed messages and lock budget, answered field by field:
-    each account by its label and its id, never its key."""
+    each account by its label and its id, never its key. ``expect``, the
+    priority's version as read when the request was built, is required: a
+    request never lands on a newer priority it was not built on."""
     by = dict(author or {})
     if by.get("harness") in (None, "", SHELL):
         by["harness"] = UNKNOWN_HARNESS
     with _for_a_conversation(), lock_budget(lock_wait):
-        # khipu_route_priority carries no version: under the routing lock it
-        # can replace only the owner's priority or this conversation's own
-        # request, never another conversation's waiting one.
+        # Under the routing lock it can replace only the owner's priority, as
+        # of ``expect``, or this conversation's own request, never another
+        # conversation's waiting one.
+        _needs_version(expect)
         written = _request_priority(entries, until=until, owner_request=owner_request, author=by, via="mcp", now=now,
-                                    expect=None)
+                                    expect=expect)
         view = read_view(now)
         held = _public_priority(view, now or _now(), plan_facts(view, now or _now()))
         out = {k: written[k] for k in _WRITE_FIELDS if k in written}

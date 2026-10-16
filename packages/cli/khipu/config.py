@@ -73,6 +73,10 @@ def _settle_account_change(data: dict) -> bool:
     _held.settling = True
     try:
         accounts.recover()
+    except accounts.AccountsError:
+        # Not settled yet: the document as stored. Every account write is
+        # refused until it is (``accounts._locked``).
+        return False
     finally:
         _held.settling = False
     return True

@@ -218,27 +218,37 @@ def _locked(expect):
 _txn = threading.local()
 
 
-def _cache_ops(lines: list[dict]) -> list[tuple]:
-    """The usage cache changes an owner's change makes, from its lines: each
-    move's row follows it, then each stopped account's row goes."""
+def _cache_ops(lines: list[dict], declines=None) -> list[tuple]:
+    """The changes outside the config an owner's change makes, from its lines
+    and its begin line's ``declines``: each move's usage cache row follows
+    it, each stopped account's row goes, then each login it tracked or
+    stopped leaves or joins Not offered again."""
     owner = [line for line in lines if (line.get("written_by") or {}).get("kind") == "owner"]
     return ([("move", line["account"], line["target"]) for line in owner
              if line.get("type") == "account_move" and line.get("account") and line.get("target")]
             + [("drop", line["account"]) for line in owner
-               if line.get("type") == "account_note" and line.get("state") == "untracked" and line.get("account")])
+               if line.get("type") == "account_note" and line.get("state") == "untracked" and line.get("account")]
+            + [("decline", d["account"], d.get("why")) for d in declines or []
+               if isinstance(d, dict) and isinstance(d.get("account"), str)])
 
 
 def _apply_cache(ops: list[tuple], *, reverse: bool = False) -> None:
-    """Apply the cache changes (each can be applied again); ``reverse`` moves
-    the moved rows back (a dropped row is a cache entry, read again later)."""
+    """Apply the changes (each can be applied again); ``reverse`` moves the
+    moved rows back (a dropped row is a cache entry, read again later, and
+    Not offered again only changes what Home offers)."""
     for op in reversed(ops) if reverse else ops:
         if op[0] == "move":
             _move_row(*((op[2], op[1]) if reverse else (op[1], op[2])))
-        elif not reverse:
+        elif reverse:
+            continue
+        elif op[0] == "drop":
             _drop_row(op[1])
+        else:
+            harness, _, home = op[1].partition("|")
+            _set_declined(harness, _account_path({"harness": harness, "home": home or None}), op[2])
 
 
-def _transact(data: dict, before: dict, lines: list[dict]) -> dict:
+def _transact(data: dict, before: dict, lines: list[dict], declines: list[dict]) -> dict:
     """Commit one account change as a transaction, under the routing and
     config locks: its intent (its lines, and the account list's version
     before and after) goes into the routing record first; then the config
@@ -250,10 +260,10 @@ def _transact(data: dict, before: dict, lines: list[dict]) -> dict:
     failed = "Khipu could not save this change to its accounts, so nothing changed"
     try:
         txn = routing.account_txn_begin(lines, before=config.accounts_version(before),
-                                        after=config.accounts_version(data))
+                                        after=config.accounts_version(data), declines=declines)
     except routing.RouteError as err:
         raise AccountsError(f"{failed}: {err}", "record_failed") from None
-    ops = _cache_ops(lines)
+    ops = _cache_ops(lines, declines)
     _txn.open = True
     try:
         data[config.ACCOUNT_CHANGE_OPEN] = txn
@@ -266,7 +276,7 @@ def _transact(data: dict, before: dict, lines: list[dict]) -> dict:
         try:
             _apply_cache(ops)
             out = routing.account_txn_end(txn, "done")
-        except (OSError, routing.RouteError):
+        except (OSError, routing.RouteError, AccountsError):
             changed = dict(data)
             data.clear()
             data.update(before)
@@ -278,7 +288,7 @@ def _transact(data: dict, before: dict, lines: list[dict]) -> dict:
                 data.update(changed)
                 raise AccountsError("Khipu could not finish this change to its accounts; it finishes it the next "
                                     "time it reads them", "record_failed") from None
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(OSError, AccountsError):
                 _apply_cache(ops, reverse=True)
             _abort(txn)
             raise AccountsError(failed, "record_failed") from None
@@ -299,12 +309,22 @@ def _abort(txn: str) -> None:
         routing.account_txn_end(txn, "abort")
 
 
+UNFINISHED = ("Khipu could not finish an earlier change to its accounts ({why}), so it changes no account "
+              "until it can; nothing changed")
+
+
 def recover() -> None:
     """Finish or roll back each account change left unfinished (a process
     stopped between its steps): done when the config holds the list it
-    made, its usage cache changes applied again; else aborted, its lines
-    left out. Runs before any read of the accounts or the routing record;
-    never inside a change of this thread's own."""
+    made, its other changes applied again; else aborted, its lines left
+    out. Runs before any read of the accounts or the routing record; never
+    inside a change of this thread's own.
+
+    One it can neither finish nor roll back raises ``change_unfinished``:
+    every account write (``_locked``) is then refused, since a later change
+    would leave the config at another list and so abort the one the config
+    already holds. Until then the record counts its lines as the config
+    holds them (``routing._split_txns``)."""
     if getattr(_txn, "open", False):
         return
     try:
@@ -317,14 +337,16 @@ def recover() -> None:
                 version = config.accounts_version(data)
                 for begin, lines in unfinished:
                     if version == begin.get("list_after"):
-                        _apply_cache(_cache_ops(lines))
+                        _apply_cache(_cache_ops(lines, begin.get("declines")))
                         routing.account_txn_end(begin["id"], "done")
                     else:
                         routing.account_txn_end(begin["id"], "abort")
                 data.pop(config.ACCOUNT_CHANGE_OPEN, None)
-    except (OSError, routing.RouteError):
-        # Left for the next read; the record keeps the change out meanwhile.
-        return
+    except OSError as err:
+        raise AccountsError(UNFINISHED.format(why=f"it can't write a file it keeps: {err.strerror or err}"),
+                            "change_unfinished") from None
+    except (routing.RouteError, AccountsError) as err:
+        raise AccountsError(UNFINISHED.format(why=str(err)), "change_unfinished") from None
 
 
 def _installed_defaults() -> list[dict]:
@@ -389,8 +411,17 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
     after_list = parsed if parsed or none else _installed_defaults()
     known, after = known_of(base if confirmed is None else confirmed), known_of(after_list)
     ops = _plan(known, after, moves=owner and confirmed is None)
+    waiting = data.get("usage_accounts_request")
+    if owner and confirmed is None and isinstance(waiting, dict):
+        # Any other owner write ends a conversation's change still waiting
+        # (decision 15), and so accepts it: each account it took off that
+        # this write leaves off gets the owner's full Stop tracking, as his
+        # Confirm gives it, never a list change alone.
+        listed = {a["key"] for a in [*known, *after]}
+        taken = [a for a in known_of(_request_prior(waiting)) if a["key"] not in listed]
+        known = known + taken
+        ops += [("stop", a["key"]) for a in taken]
     old = {a["key"]: a for a in known}
-    new = {a["key"]: a for a in after}
     moves = [(op[1], op[2]) for op in ops if op[0] == "move"]
     renames = [op[1] for op in ops if op[0] == "rename"]
     stops = [op[1] for op in ops if op[0] == "stop"]
@@ -417,6 +448,15 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
                 if not lane_map[runner]:
                     lane_map.pop(runner)
             data["routing_lane_map"] = lane_map
+        waiting_lanes = routing._setting_requests(data).get("routing_lane_map") or {}
+        if not keep_lanes and stops and isinstance(waiting_lanes.get("prior"), dict):
+            # The map a waiting lane request replaced loses a stopped
+            # account's lanes too, so Undo never gives them back to it.
+            prior = waiting_lanes["prior"]
+            for runner, lane in (pair for k in stops for pair in _lanes_on(prior, k, known)):
+                prior[runner].pop(lane, None)
+                if not prior[runner]:
+                    prior.pop(runner)
     events: list[dict] = [{"type": "account_move", "account": was, "target": now} for was, now in moves]
     notes = [{"type": "account_note", "account": k, "state": "renamed", "text": old[k]["label"]}
              for k in renames if confirmed is None]
@@ -443,26 +483,28 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
     else:
         by = request.get("by") if isinstance(request.get("by"), dict) else routing.conversation_author()
         lines = routing.request_lines(events, by, str(request.get("request") or ""))
-    if lines:
-        record = _transact(data, before, lines)
+    # The owner's: a login tracked leaves Not offered again, one stopped is
+    # not offered again, as part of the same transaction.
+    declines = ([{"account": k, "why": None} for k in tracks] + [{"account": k, "why": STOPPED_WHY} for k in stops]
+                if owner else [])
+    if lines or declines:
+        record = _transact(data, before, lines, declines)
     else:
-        # No line in the record (a reorder, or a confirm): the config alone.
+        # No line in the record (a reorder): the config alone.
         config.save_config(data)
         record = {"ok": True, "ids": [], "version": None}
     return {"version": version, "repairs": repairs, "record": record, "done": done, "stop_lanes": stop_lanes,
-            "moved_lanes": moved_lanes, "owner": owner, "tracked": [new[k] for k in tracks],
-            "stopped": [old[k] for k in stops]}
+            "moved_lanes": moved_lanes, "owner": owner}
 
 
-def _settle(res: dict) -> None:
-    """After an owner's write, outside its locks: a login tracked leaves Not
-    offered again; one stopped is not offered again."""
-    if not res["owner"]:
-        return
-    for account in res["tracked"]:
-        _set_declined(account["harness"], _account_path(account), None)
-    for account in res["stopped"]:
-        _set_declined(account["harness"], _account_path(account), STOPPED_WHY)
+def _request_prior(request: dict) -> list:
+    """The list a conversation's waiting change replaced, as Undo puts it
+    back: the stored list, none after "Read no accounts", else the default
+    accounts."""
+    prior = request.get("prior")
+    if isinstance(prior, list) and prior:
+        return prior
+    return [] if request.get("prior_none") is True else _installed_defaults()
 
 
 def _canonical(raw, stored):
@@ -526,7 +568,6 @@ def save_list(raw, *, expect, via: str = "app", request: dict | None = None) -> 
         stored, base = current_list(data)
         parsed = [] if raw is None else usage.parse_usage_accounts(_canonical(raw, stored), previous=stored)
         res = _commit(data, stored, base, parsed, via=via, request=request)
-    _settle(res)
     out = {"ok": True, "version": res["version"], "lane_repairs": res["repairs"]}
     return out
 
@@ -569,8 +610,8 @@ def _drop_row(key: str) -> None:
 def _move_row(old: str, new: str) -> None:
     with _cache() as rows:
         row = rows.pop(old, None)
-        if row is not None and new not in rows:
-            rows[new] = row
+        if row is not None:
+            rows[new] = row  # the moved account's figures, never an earlier tenant's
 
 
 # ---- Not offered again ------------------------------------------------------------------
@@ -758,7 +799,6 @@ def track(entries, *, expect=None, shown_defaults=None, read: bool = True, via: 
         added = [usage._account_from_entry(e) for e in parsed[len(base):]]
         keys = [usage._key(a) for a in added]
         res = _commit(data, stored, base, parsed, via=via)
-    _settle(res)
     rows = usage.report(fresh=True, accounts=added)["accounts"] if read else []
     out = {"ok": True, "version": res["version"],
            "accounts": [{"key": k, "label": a["label"]} for k, a in zip(keys, added)],
@@ -862,7 +902,6 @@ def stop(key, *, expect=None, keep_priority: bool = False, keep_pause: bool = Fa
         parsed = usage.parse_usage_accounts(rest, previous=stored) if rest else []
         res = _commit(data, stored, base, parsed, via=via, none=not rest, view=view, keep_priority=keep_priority,
                       keep_pause=keep_pause, keep_lanes=keep_lanes, end_holds=end_holds)
-    _settle(res)
     done = res["done"]
     shown = [{"runner": r, "lane": lane} for r, lane in res["stop_lanes"].get(key, [])]
     out = {"ok": True, "version": res["version"], "key": key, "label": account["label"], "none": not rest,
@@ -950,12 +989,8 @@ def answer_request(action: str, *, expect=None, via: str = "app") -> dict:
             res = _commit(data, stored, base, prior if isinstance(prior, list) else [], via=via,
                           none=request.get("prior_none") is True)
         else:
-            prior = request.get("prior")
-            if not (isinstance(prior, list) and prior):
-                prior = [] if request.get("prior_none") is True else _installed_defaults()
             res = _commit(data, stored, base, list(stored or []), via=via, none=usage.reads_none(data),
-                          confirmed=prior)
-    _settle(res)
+                          confirmed=_request_prior(request))
     return {"ok": True, "version": res["version"], "action": action}
 
 

@@ -1399,3 +1399,121 @@ def test_undo_of_a_lane_request_follows_a_later_move(mac):
     routing.report(state="limited", runner="jobs", lane="r", until="2h", author=ME)
     states = {a["key"]: a["state"] for a in routing.read_view()["accounts"]}
     assert states[new] == "limited" and states[old] != "limited", states
+
+
+# ---- review round 8 ----------------------------------------------------------------------
+
+_TWO = [{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}]
+
+
+def _moved_mid_change(mac, monkeypatch) -> str:
+    """A move of ``claude|`` cut off after its config write, before its cache
+    and record steps; the new key."""
+    (mac["home"] / ".claude-moved").mkdir()
+
+    def stopped(*a, **kw):
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as m, pytest.raises(KeyboardInterrupt):
+        m.setattr(accounts, "_apply_cache", stopped)
+        accounts.move("claude|", "~/.claude-moved", expect=_version())
+    return _key("~/.claude-moved")
+
+
+def test_a_conversations_priority_request_needs_the_version_it_was_built_on(mac):
+    _set(usage_accounts=_TWO)
+    routing.set_priority([{"account": "claude|"}, {"account": "codex|"}], via="app", expect=routing.priority_version())
+    stale = routing.read_view()["priority"]
+    routing.set_priority([{"account": "codex|"}, {"account": "claude|"}], via="app", expect=stale["version"])
+    entries = [{"account": e["label"]} for e in stale["entries"]]
+    with pytest.raises(routing.RouteError):
+        routing.conversation_priority(entries, owner_request="keep the order I saw", author=ME,
+                                      expect=stale["version"])
+    with pytest.raises(routing.RouteError):
+        routing.conversation_priority(entries, owner_request="keep the order I saw", author=ME)
+    assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == ["codex|", "claude|"]
+
+
+def test_the_mcp_priority_tool_passes_the_version_it_read(mac, monkeypatch):
+    from khipu import mcp_server
+
+    _set(usage_accounts=_TWO)
+    seen = {}
+    monkeypatch.setattr(routing, "conversation_priority", lambda entries, **kw: seen.update(kw) or {"ok": True})
+    mcp_server._tool_route_priority({"entries": [{"account": "First"}], "owner_request": "First first"})
+    assert seen["expect"] == routing.priority_version()
+
+
+def test_undo_of_a_lane_request_never_gives_a_stopped_account_its_lanes_back(mac):
+    _set(usage_accounts=_TWO)
+    routing.set_setting("routing_lane_map", {"jobs": {"r": "claude|"}})
+    routing.set_setting("routing_lane_map", {"jobs": {"r": "codex|"}}, request={"by": ME, "request": "try Second"})
+    accounts.stop("claude|", expect=_version())
+    routing.answer_setting_request("routing_lane_map", "undo")
+    lane_map = config.load_config().get("routing_lane_map") or {}
+    assert not any(t == "claude|" for lanes in lane_map.values() for t in lanes.values()), lane_map
+
+
+def test_a_move_that_cannot_be_finished_refuses_every_account_write(mac, monkeypatch):
+    _set(usage_accounts=_TWO)
+    routing.report(state="limited", account="claude|", until="2h", author=ME)
+    routing.pause("claude|", via="app")
+    new = _moved_mid_change(mac, monkeypatch)
+
+    def refused(*a, **kw):
+        raise PermissionError(13, "usage cache write refused")
+
+    with monkeypatch.context() as m:
+        m.setattr(usage, "_save_cache", refused)
+        version = config.accounts_version()
+        with pytest.raises(usage.AccountsError) as err:
+            accounts.rename(new, "Renamed", expect=version)
+        assert err.value.code == "change_unfinished"
+        # Reads go on, as the config holds the change: its limit and pause moved.
+        states = {a["key"]: a["state"] for a in routing.read_view()["accounts"]}
+        assert states[new] == "paused" and "claude|" not in states, states
+    view = routing.read_view()
+    assert not routing.account_txns_open()
+    assert _entry(view, new)["state"] == "paused"
+
+
+def test_an_owner_write_gives_a_waiting_requested_removal_its_full_stop(mac):
+    _set(usage_accounts=_TWO)
+    routing.pause("claude|", via="app")
+    routing.set_priority([{"account": "claude|"}, {"account": "codex|"}], via="app", expect=routing.priority_version())
+    routing.set_setting("routing_lane_map", {"jobs": {"r": "claude|"}})
+    accounts.save_list([_TWO[1]], expect=_version(), request={"by": ME, "request": "remove First"})
+    accounts.rename("codex|", "Renamed second", expect=_version())
+    data = config.load_config()
+    view = routing.read_view()
+    assert "usage_accounts_request" not in data
+    assert [e["account"] for e in view["priority"]["entries"]] == ["codex|"]
+    assert data.get("routing_lane_map") == {}
+    assert [(a["key"], a["state"]) for a in view["accounts"]] == [("codex|", "unknown")]
+    assert any(e["cli"] == "claude" and e["why"] == accounts.STOPPED_WHY for e in discover.turned_down())
+
+
+def test_a_move_carries_its_figures_over_an_earlier_tenants_row(mac):
+    _set(usage_accounts=_TWO)
+    (mac["home"] / ".claude-moved").mkdir()
+    new = _key("~/.claude-moved")
+    usage._save_cache({"claude|": {"harness": "claude", "account": "First", "plan": "max", "ok": True, "windows": []},
+                       new: {"harness": "claude", "account": "Former tenant", "plan": "pro", "ok": True,
+                             "windows": []}})
+    accounts.move("claude|", "~/.claude-moved", expect=_version())
+    assert usage._load_cache()[new]["plan"] == "max" and "claude|" not in usage._load_cache()
+
+
+def test_stops_not_offered_again_is_part_of_its_transaction(mac, monkeypatch):
+    _set(usage_accounts=_TWO)
+
+    def stopped(*a, **kw):
+        raise KeyboardInterrupt  # the process ends after the config write, before Not offered again
+
+    with monkeypatch.context() as m, pytest.raises(KeyboardInterrupt):
+        m.setattr(accounts, "_set_declined", stopped)
+        accounts.stop("claude|", expect=_version())
+    assert len(routing.account_txns_open()) == 1
+    accounts.recover()
+    assert not routing.account_txns_open()
+    assert any(e["cli"] == "claude" and e["why"] == accounts.STOPPED_WHY for e in discover.turned_down())
