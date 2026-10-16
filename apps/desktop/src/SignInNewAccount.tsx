@@ -7,6 +7,7 @@
 // localStorage, never in a log.
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 import { Dialog } from "./ui";
 import { callCli } from "./settingsCli";
@@ -68,6 +69,9 @@ export function SignInNewAccount({
   onBack,
   onCancel,
   now = Date.now,
+  heading,
+  introExtra,
+  canBegin = true,
 }: {
   cli: SignInCli;
   cliName: string;
@@ -78,6 +82,12 @@ export function SignInNewAccount({
   onBack: () => void;
   onCancel: () => void;
   now?: () => number;
+  /** The parent dialog's own heading for each phase's title (its step label). */
+  heading?: (title: string, id: string) => ReactNode;
+  /** Shown under the heading before the sign-in starts (the parent's choices). */
+  introExtra?: ReactNode;
+  /** False while the parent's name can't make a folder yet. */
+  canBegin?: boolean;
 }) {
   const [phase, setPhase] = useState<Phase>("intro");
   const [attempt, setAttempt] = useState<Attempt | null>(null);
@@ -89,6 +99,7 @@ export function SignInNewAccount({
   const [tick, setTick] = useState(0);
   const [copied, setCopied] = useState(false);
   const titleId = useId();
+  const head = (title: string) => (heading ? heading(title, titleId) : <h3 id={titleId}>{title}</h3>);
   const doneRef = useRef(false);
   // The owner's Stop and cancel while start had not answered yet: Rust has no
   // attempt to stop then, so the attempt start returns is stopped at once.
@@ -242,10 +253,11 @@ export function SignInNewAccount({
   void tick;
 
   return (
-    <div className="signin-new" aria-labelledby={titleId}>
+    <div className="signin-new" aria-labelledby={heading ? undefined : titleId}>
       {phase === "intro" ? (
         <>
-          <h3 id={titleId}>{cliName}: sign in to another account</h3>
+          {head(`${cliName}: sign in to another account`)}
+          {introExtra}
           <p>
             Its login folder will be next to your other {cliName} logins. Khipu never deletes it.
           </p>
@@ -257,7 +269,7 @@ export function SignInNewAccount({
           <div className="kit-dialog-actions">
             <button type="button" onClick={onCancel}>Cancel</button>
             <button type="button" onClick={onBack}>Back</button>
-            <button type="button" className="primary" onClick={() => void begin(false)}>
+            <button type="button" className="primary" disabled={!canBegin} onClick={() => void begin(false)}>
               Open the sign-in page
             </button>
           </div>
@@ -266,7 +278,7 @@ export function SignInNewAccount({
 
       {phase === "starting" ? (
         <>
-          <h3 id={titleId}>{cliName}: signing in…</h3>
+          {head(`${cliName}: signing in…`)}
           <p role="status">
             <Loader2 size={14} className="spin" aria-hidden /> Starting the sign-in.
           </p>
@@ -275,7 +287,7 @@ export function SignInNewAccount({
 
       {phase === "waiting" && attempt ? (
         <>
-          <h3 id={titleId}>{byCode ? `${cliName}: approve the code` : `${cliName}: signing in…`}</h3>
+          {head(byCode ? `${cliName}: approve the code` : `${cliName}: signing in…`)}
           {byCode && code ? (
             <>
               <p>Open the sign-in page that {cliName} named, and enter this code:</p>
@@ -318,7 +330,7 @@ export function SignInNewAccount({
 
       {phase === "nocode" ? (
         <>
-          <h3 id={titleId}>{cliName}: sign-in didn't start</h3>
+          {head(`${cliName}: sign-in didn't start`)}
           <p><strong>{cliName} didn't show a sign-in code</strong></p>
           <p>
             Khipu waited 20 seconds for it. Nothing was saved. Start again, or sign in inside {cliName} and then
@@ -334,7 +346,7 @@ export function SignInNewAccount({
 
       {phase === "failed" ? (
         <>
-          <h3 id={titleId}>{cliName}: sign-in failed</h3>
+          {head(`${cliName}: sign-in failed`)}
           <p role="alert"><strong>The sign-in didn't finish</strong></p>
           <p>
             {problem} Nothing was saved. The empty login folder stays, so trying again uses the same one.

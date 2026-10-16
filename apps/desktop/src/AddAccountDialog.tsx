@@ -34,6 +34,8 @@ import {
 import type { Candidate, CliId, CliState, DiscoverResult, SaveProblem, Support, TryResult } from "./accountsApi";
 import { fmtPct, meterTone, resetPhrase, signInOutcome, tightestWindow, windowLabel } from "./PlansCard";
 import type { UsageAccount, UsageAccountEntry } from "./PlansCard";
+import { callCli } from "./settingsCli";
+import { SignInNewAccount } from "./SignInNewAccount";
 import "./accounts.css";
 
 // ---------------------------------------------------------------------------
@@ -241,7 +243,7 @@ export function AddAccountDialog({
   onSaved,
   onShowAccount,
   onReload,
-  canSignInNew = false,
+  canSignInNew,
 }: {
   open: boolean;
   onClose: () => void;
@@ -260,7 +262,8 @@ export function AddAccountDialog({
   onShowAccount?: (label: string) => void;
   /** Reads the account list again after a save refused for its version. */
   onReload?: () => Promise<unknown>;
-  /** 9D's new-folder sign-in is here. */
+  /** Whether Sign in to another account is offered; left out, the dialog
+   *  asks the CLI which services it is offered for. */
   canSignInNew?: boolean;
 }) {
   const uid = useId().replace(/:/g, "");
@@ -279,6 +282,9 @@ export function AddAccountDialog({
   const [said, setSaid] = useState<string | null>(null);
   const [checkingAgain, setCheckingAgain] = useState(false);
   const [checkingFolder, setCheckingFolder] = useState<string | null>(null);
+  const [way, setWay] = useState<"have" | "new">("have");
+  const [newName, setNewName] = useState("");
+  const [offers, setOffers] = useState<Record<string, { offered?: boolean }> | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const headRef = useRef<HTMLHeadingElement>(null);
@@ -305,6 +311,19 @@ export function AddAccountDialog({
     focusAfter.current = null;
     pick()?.focus();
   });
+
+  // Which services Sign in to another account is offered for (Rust refuses
+  // any other whatever the CLI says).
+  useEffect(() => {
+    if (!open || canSignInNew !== undefined || offers) return;
+    let live = true;
+    void callCli<Record<string, { offered?: boolean }>>("khipu_account_sign_in_offers").then((res) => {
+      if (live) setOffers(res.ok && res.data && typeof res.data === "object" ? res.data : {});
+    });
+    return () => {
+      live = false;
+    };
+  }, [open, canSignInNew, offers]);
 
   const clis = discovery?.clis ?? null;
   const museTracked = tracked.some((t) => t.harness === "muse" && !t.invalid);
@@ -474,6 +493,25 @@ export function AddAccountDialog({
       };
     }
   }
+
+  // A new login folder that signed in: step 3 reads and names it, as any
+  // other login (nothing is saved until Save).
+  const signedInNew = (folder: string) => {
+    if (!cli || !folder) return;
+    const made: Candidate = {
+      id: `new:${cli}:${folder}`, cli, cli_name: cliName(cli), path: folder, default: false, sources: [],
+      name: null, first_seen: null, last_checked: null, state: "signed_in", reason: null, plan: null,
+      conversations_7d: null, needs_owner_check: false, offer_on_home: false,
+    };
+    setExtra(made);
+    setChosenId(made.id);
+    setName(newName.trim());
+    setProblem(null);
+    setRead(null);
+    setSaid(null);
+    setWay("have");
+    setStep(3);
+  };
 
   const goStep3 = () => {
     if (!chosen) return;
@@ -686,34 +724,74 @@ export function AddAccountDialog({
   } else if (step === 2 && cli) {
     const svc = serviceName(cli);
     const defaultTracked = trackedHere.find((t) => !t.home);
-    body = (
+    const offeredNew = canSignInNew ?? offers?.[cli]?.offered === true;
+    const ways = (
+      <div className="aa-ways" role="radiogroup" aria-label="How to add it">
+        <div className={way === "have" || !offeredNew ? "aa-way chosen" : "aa-way"}>
+          <input type="radio" name={`${uid}-way`} id={`${uid}-w1`} checked={way === "have" || !offeredNew}
+            onChange={() => setWay("have")} />
+          <label htmlFor={`${uid}-w1`}>
+            <b>Use a login I already have</b>
+            <span>Pick one of the {svc} logins on this Mac.</span>
+          </label>
+        </div>
+        <div className={!offeredNew ? "aa-way off" : way === "new" ? "aa-way chosen" : "aa-way"}>
+          <input type="radio" name={`${uid}-way`} id={`${uid}-w2`} checked={offeredNew && way === "new"} disabled={!offeredNew}
+            onChange={() => setWay("new")} aria-describedby={offeredNew ? undefined : `${uid}-w2-coming`} />
+          <label htmlFor={`${uid}-w2`}>
+            <b>Sign in to another account</b>
+            <span>
+              {cli === "grok"
+                ? "Khipu makes a new login folder and shows you a code to approve in your browser."
+                : `Khipu makes a new login folder and opens the ${svc} sign-in page.`}
+            </span>
+            {offeredNew ? null : <span className="aa-coming" id={`${uid}-w2-coming`}>{COMING.signInNew}</span>}
+          </label>
+        </div>
+      </div>
+    );
+    if (offeredNew && way === "new") {
+      const newFieldId = `${uid}-new-name`;
+      const newErr = newName.trim() ? nameProblem(newName, false, takenNames) : null;
+      body = (
+        <SignInNewAccount
+          cli={cli}
+          cliName={cliName(cli)}
+          accountName={newName.trim()}
+          offered
+          canBegin={!!newName.trim() && !newErr}
+          heading={(title) => (
+            <h2 id={titleId} ref={headRef} tabIndex={-1}>
+              {stepLabel}
+              {title}
+            </h2>
+          )}
+          introExtra={
+            <>
+              {ways}
+              <div className="aa-field">
+                <label htmlFor={newFieldId}>Name for this account</label>
+                <input id={newFieldId} value={newName} maxLength={64} autoComplete="off" spellCheck={false}
+                  aria-invalid={newErr ? true : undefined} aria-describedby={`${newFieldId}-h`}
+                  onChange={(e) => setNewName(e.target.value)} />
+                <p className="set-help" id={`${newFieldId}-h`}>
+                  {newErr ? <span className="aa-err">{newErr}</span> : "Khipu makes the login folder from this name."}
+                </p>
+              </div>
+            </>
+          }
+          onSignedIn={signedInNew}
+          onBack={() => setWay("have")}
+          onCancel={close}
+        />
+      );
+    } else body = (
       <>
         <h2 id={titleId} ref={headRef} tabIndex={-1}>
           {stepLabel}
           {svc}: which login?
         </h2>
-        <div className="aa-ways" role="radiogroup" aria-label="How to add it">
-          <div className="aa-way chosen">
-            <input type="radio" name={`${uid}-way`} id={`${uid}-w1`} checked readOnly />
-            <label htmlFor={`${uid}-w1`}>
-              <b>Use a login I already have</b>
-              <span>Pick one of the {svc} logins on this Mac.</span>
-            </label>
-          </div>
-          <div className={canSignInNew ? "aa-way" : "aa-way off"}>
-            <input type="radio" name={`${uid}-way`} id={`${uid}-w2`} checked={false} disabled={!canSignInNew} readOnly
-              aria-describedby={`${uid}-w2-coming`} />
-            <label htmlFor={`${uid}-w2`}>
-              <b>Sign in to another account</b>
-              <span>
-                {cli === "grok"
-                  ? "Khipu makes a new login folder and shows you a code to approve in your browser."
-                  : `Khipu makes a new login folder and opens the ${svc} sign-in page.`}
-              </span>
-              <span className="aa-coming" id={`${uid}-w2-coming`}>{canSignInNew ? "" : COMING.signInNew}</span>
-            </label>
-          </div>
-        </div>
+        {ways}
         {candidates.length === 0 ? (
           <div className="empty">
             <b>No other {svc} logins found</b>
@@ -722,7 +800,8 @@ export function AddAccountDialog({
                 ? `The only ${svc} login on this Mac is the default one, and Khipu already tracks it as ${defaultTracked.label}. To add a second account, sign in to it here.`
                 : `Khipu found no ${svc} login it doesn't already track. Sign in to one in ${cliName(cli)} first, or choose its folder.`}
             </span>
-            <button type="button" className="sm" disabled aria-describedby={`${uid}-w2-coming`}>
+            <button type="button" className="sm" disabled={!offeredNew} aria-describedby={offeredNew ? undefined : `${uid}-w2-coming`}
+              onClick={() => setWay("new")}>
               Sign in to another account
             </button>
           </div>
