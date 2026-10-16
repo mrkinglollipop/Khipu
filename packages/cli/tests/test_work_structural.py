@@ -303,6 +303,42 @@ def test_every_verb_is_classified():
         ledger.require("ledger something-new")
 
 
+def test_every_owner_verb_is_reachable_by_direction():
+    """Owner direction (scope row 11 to 16): every verb that is not open to
+    any writer, and every write a writer can make as the owner, is an
+    owner-direction action, and its parser takes the owner's words."""
+    from khipu import owner_direction
+
+    for name, policy in ledger.WRITE_POLICY.items():
+        action = ledger.DIRECTION_ACTIONS.get(name)
+        assert action in owner_direction.ACTIONS, f"{name}: name its owner-direction action"
+        command, verb = name.split(" ", 1)
+        flags = {o for a in _subcommands(command)[verb]._actions for o in a.option_strings}
+        assert {"--owner-words", "--owner-turn"} <= flags, name
+
+
+def test_owner_words_the_owner_never_typed_are_refused_and_change_nothing(monkeypatch, tmp_path):
+    from khipu import owner_direction, owner_turns
+
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-one")
+    owner_turns.write_settings({"enabled": True})
+    monkeypatch.setattr(routing, "_caller", lambda: {"app": False, "chain": ["zsh"]})
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(work, "read_owed", lambda: {"items": [{"id": "42"}], "error": None})
+    out, _err = _run(["work", "same", "atlas#one", "42", "--owner-words", "one and 42 are the same"])
+    assert json.loads(out)["reason"] == "no_recorded_turn"
+    for name in ("ledger restore", "ledger purge", "work hide"):
+        with pytest.raises(ledger.LedgerError) as err:
+            ledger.require(name, owner_words="restore one in the ledger", owner_turn="0badc0de")
+        assert err.value.reason == "not_by_direction"  # no intent: nothing to check the words against
+        want = owner_direction.intent(ledger.DIRECTION_ACTIONS[name], "atlas#one")
+        with pytest.raises(ledger.LedgerError) as err:
+            ledger.require(name, owner_words="restore one in the ledger", owner_turn="0badc0de", intent=want)
+        assert err.value.reason == "no_recorded_turn"
+    assert work.read_links() == {"same": [], "not_same": []} and work.read_hidden() == {}
+
+
 # BaseException, so the commands' catch-all for unexpected errors can't
 # answer for them: each must reach the test.
 class _Guarded(BaseException):

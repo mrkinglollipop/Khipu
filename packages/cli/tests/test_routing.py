@@ -990,6 +990,45 @@ def test_owner_commands_refuse_without_a_typed_confirmation(home, capsys, monkey
         in block["warnings"]
 
 
+def test_every_owner_command_takes_the_owners_words(home):
+    """Owner direction (scope rows 1 to 10): each owner command of the
+    routing record, the account list, the routing settings and Update
+    anyway takes --owner-words and --owner-turn beside --from-app."""
+    import argparse
+
+    from khipu import cli
+
+    def sub(parser, *path):
+        for name in path:
+            parser = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices[name]
+        return parser
+
+    parser = cli.build_parser()
+    commands = [("route", c) for c in ("pause", "lift", "clear", "note", "priority", "rule", "hold")]
+    commands += [("accounts", c) for c in ("track", "rename", "stop", "move", "decline", "offer-again",
+                                            "auto-track", "request")]
+    commands += [("config",), ("owner-direction", "off"), ("owner-direction", "set"), ("owner-direction", "undo")]
+    for path in commands:
+        flags = {o for a in sub(parser, *path)._actions for o in a.option_strings}
+        assert {"--from-app", "--owner-words", "--owner-turn"} <= flags, path
+
+
+def test_owner_words_never_typed_are_refused_like_a_piped_yes(home, capsys, monkeypatch, tmp_path):
+    from khipu import owner_turns
+
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-one")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    for argv in (["route", "pause", "Codex"], ["route", "note", "set", "Codex first"],
+                 ["route", "rule", "add", "Never a -fast tier."], ["route", "rule", "confirm", "1"]):
+        rc, out = _cli(argv + ["--owner-words", "pause Codex for now"], capsys)
+        assert rc == 2 and json.loads(out)["code"] == "direction_off", argv
+    owner_turns.write_settings({"enabled": True})
+    rc, out = _cli(["route", "pause", "Codex", "--owner-words", "pause Codex for now"], capsys)
+    assert rc == 2 and json.loads(out)["code"] == "no_recorded_turn"
+    assert not routing.events_file().exists()
+
+
 def test_rule_at_owner_request_is_live_without_terminal_confirmation_but_owner_actions_are_not(home, capsys, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     rc, out = _cli(["route", "rule", "add", "--at-owner-request", "The owner asked in review.", "--",

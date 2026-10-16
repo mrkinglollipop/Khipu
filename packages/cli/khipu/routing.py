@@ -1587,7 +1587,10 @@ def _read_all_events() -> tuple[list[dict], int]:
     return events, bad
 
 
-_AUTH_OF_VIA = {"app": "app", "cli": "terminal"}
+_AUTH_OF_VIA = {"app": "app", "cli": "terminal", "direction": "direction"}
+# How the owner's own changes arrive: the app, or his words in a conversation
+# (owner direction). Anything else is outside the app (doctor warns).
+_OWNERS_OWN = ("app", "direction")
 # Lines only the owner writes; the fold counts one with no author as his.
 _OWNER_ONLY = frozenset({"pause", "lift", "clear", "dismiss", "note_set", "note_end", "rule_confirm", "rule_retire",
                          "rule_restore", "rule_undo", "rule_dismiss", "priority_confirm", "priority_undo",
@@ -2703,20 +2706,20 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # Those whose line claims the app or a terminal but did not pass the
     # CLI's owner check (``_mark_unchecked``) are also listed as unchecked.
     odd: list[tuple[str, Any]] = []
-    if note is not None and note["via"] != "app":
+    if note is not None and note["via"] not in _OWNERS_OWN:
         odd.append(("note", note["via"]))
-    if priority_out is not None and not priority_out["pending"] and priority_out["via"] != "app":
+    if priority_out is not None and not priority_out["pending"] and priority_out["via"] not in _OWNERS_OWN:
         odd.append(("priority", priority_out["via"]))
     odd += [(f"rule {r['n']}", r["via"]) for r in active_rules
-            if r["written_by"].get("kind") == "owner" and r["via"] != "app"]
+            if r["written_by"].get("kind") == "owner" and r["via"] not in _OWNERS_OWN]
     odd += [(f"pause of {e['label']}", owner["pauses"][e["key"]]["via"]) for e in entries
-            if e["state"] == PAUSED and (owner["pauses"][e["key"]]["via"] != "app")]
+            if e["state"] == PAUSED and (owner["pauses"][e["key"]]["via"] not in _OWNERS_OWN)]
     odd += [(f"clear of {e['label']}", owner["clears"][e["key"]]["via"]) for e in entries
-            if (e.get("witness") or {}).get("cleared") and owner["clears"][e["key"]]["via"] != "app"]
+            if (e.get("witness") or {}).get("cleared") and owner["clears"][e["key"]]["via"] not in _OWNERS_OWN]
     targets = {item["id"]: item for item in evidence}
     for dis in dismissals:
         item = targets.get(dis["target"])
-        if dis["via"] == "app" or item is None:
+        if dis["via"] in _OWNERS_OWN or item is None:
             continue
         mattered = (item["until"] is not None and item["until"] > now) if item["state"] == LIMITED else not (
             stale_after > 0 and (now - item["at"]).total_seconds() >= stale_after)
@@ -6362,25 +6365,36 @@ def _caller() -> dict:
     return {"app": False, "chain": chain}
 
 
-def _owner_via(args) -> str | None:
+def _owner_via(args, intent: dict | None = None) -> str | None:
     """'app' when the app itself started this ``--from-app`` call
-    (``_caller``), 'cli' after a typed confirmation on a terminal, else None
+    (``_caller``), 'direction' when ``--owner-words`` passed the owner
+    direction check for ``intent`` (``owner_direction.gate``, which raises
+    its refusal), 'cli' after a typed confirmation on a terminal, else None
     (refused). Either way how it was authorised is set for the write
-    (``_OWNER_AUTH``).
+    (``_OWNER_AUTH``), and ``intent`` is set up for the owner-actions log
+    (``owner_direction.finish`` writes it once the change is done).
 
     Same-user processes can't be told apart for certain: the check stops a
     conversation from passing ``--from-app`` itself, not one that drives the
     app's window, edits the record file or answers the prompt on a terminal
     it opens."""
+    from khipu import owner_direction
+
     if getattr(args, "from_app", False):
         caller = _caller()
         if not caller["app"]:
             return None
         _OWNER_AUTH.set({"auth": "app", "auth_chain": " < ".join(caller["chain"] + [caller["where"]])})
+        owner_direction.noted(intent, _OWNER_AUTH.get())
         return "app"
+    if getattr(args, "owner_words", None) is not None:
+        stamp = owner_direction.gate(args, intent)
+        _OWNER_AUTH.set({k: v for k, v in stamp.items() if k != "confirms"})
+        return "direction"
     if not typed_yes("This is an owner's change to the routing record. Type yes to confirm: "):
         return None
     _OWNER_AUTH.set({"auth": "terminal", "auth_chain": " < ".join(_caller()["chain"])})
+    owner_direction.noted(intent, _OWNER_AUTH.get())
     return "cli"
 
 
@@ -6542,7 +6556,7 @@ def _priority_cli(args, now: datetime) -> int:
                                      owner_request=args.at_owner_request, author=conversation_author(),
                                      via="cli", now=now, expect=getattr(args, "expect", None)))
         return 0
-    via = _owner_via(args)
+    via = _owner_via(args, _intent_or_none(_priority_intent, args, action))
     if via is None:
         _print_json({"ok": False, "error": _REFUSED})
         return 2
@@ -6557,13 +6571,101 @@ def _priority_cli(args, now: datetime) -> int:
         out = undo_priority(via=via, now=now, expect=expect)
     else:
         out = clear_priority(via=via, now=now, expect=expect)
-    _print_json(out)
+    _print_json(_finish_owner(out))
     return 0
+
+
+def _finish_owner(out: dict) -> dict:
+    from khipu import owner_direction
+
+    return owner_direction.finish(out) or out
+
+
+def _intent_or_none(build, *args) -> dict | None:
+    """An owner command's intent, or None when its arguments don't name a
+    target Khipu knows: the command itself then says why, and a direction
+    is refused (``owner_direction.gate``)."""
+    try:
+        return build(*args)
+    except (RouteError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _priority_intent(args, action: str) -> dict | None:
+    """The owner's priority change, for owner direction and the log: a set
+    names each account it orders, and keeps each role's words."""
+    from khipu import owner_direction
+
+    if action != "set":
+        return owner_direction.intent(f"route.priority.{action}", "priority")
+    entries = _priority_entries_arg(args)
+    keys, roles = [], []
+    for item in entries if isinstance(entries, list) else []:
+        item = {"account": item} if isinstance(item, str) else item
+        if isinstance(item, dict) and isinstance(item.get("account"), str):
+            keys.append(resolve_account(item["account"]))
+            if isinstance(item.get("role"), str) and item["role"].strip():
+                roles.append(item["role"])
+    return owner_direction.intent("route.priority.set", ",".join(keys), stored=roles or None)
+
+
+def _route_intent(cmd: str, args) -> dict | None:
+    """What an owner's ``khipu route`` change is about, for owner direction
+    and the owner-actions log (``owner_direction.ACTIONS``)."""
+    from khipu import owner_direction
+
+    if cmd in ("pause", "lift", "clear"):
+        facts = {"report": args.report} if cmd == "clear" and getattr(args, "report", None) else None
+        return owner_direction.intent(f"route.{cmd}", resolve_account(args.account), facts=facts)
+    if cmd == "note":
+        if args.action == "set":
+            return owner_direction.intent("route.note.set", "note", stored=[args.text or ""])
+        return owner_direction.intent("route.note.end", "note")
+    if cmd == "rule":
+        params = [str(p) for p in args.params]
+        if args.action == "add":
+            return owner_direction.intent("route.rule.add", "new", stored=[" ".join(params)])
+        if args.action == "edit":
+            return owner_direction.intent("route.rule.edit", params[0], stored=[" ".join(params[1:])]) \
+                if len(params) >= 2 else None
+        return owner_direction.intent(f"route.rule.{args.action}", params[0]) if len(params) == 1 else None
+    return None
+
+
+def _hold_intent(args, words: list[str]) -> dict | None:
+    from khipu import owner_direction
+
+    if len(words) == 2 and words[0] == "end":
+        holds = read_view().get("holds") or []
+        hold = next((h for h in holds if h["id"] == words[1]), None)
+        names = [words[1]]
+        if hold is not None:
+            scope = hold.get("scope") or {}
+            alike = [h for h in holds if h.get("owner") and h.get("scope") == scope]
+            if len(alike) == 1:
+                if scope.get("kind") == "account":
+                    names += owner_direction.account_names(scope["account"])[0]
+                elif scope.get("kind") == "machine":
+                    names += ["machine", "mac", "this mac"]
+                else:
+                    names += ["all", "everything", "all work"]
+        return owner_direction.intent("route.hold.end", words[1], names=[names])
+    if args.account:
+        target = f"account:{resolve_account(args.account)}"
+    elif args.machine:
+        target = "machine"
+    elif args.all:
+        target = "all"
+    else:
+        return None
+    return owner_direction.intent("route.hold.add", target, stored=[" ".join(words)])
 
 
 def run_cli(args) -> int:
     """``khipu route``: read the record, or write one change to it. An
     owner's change is timed after its typed confirmation, not before."""
+    from khipu import owner_direction
+
     cmd = getattr(args, "route_cmd", None)
     now = _now()
     auth = _OWNER_AUTH.set(None)
@@ -6627,22 +6729,24 @@ def run_cli(args) -> int:
             return 0
         if cmd == "hold":
             words = list(args.words)
-            owner_flag = bool(args.owner or args.from_app)
+            owner_flag = bool(args.owner or args.from_app or getattr(args, "owner_words", None) is not None)
             via = "cli"
             if owner_flag:
-                via = _owner_via(args)
+                via = _owner_via(args, _intent_or_none(_hold_intent, args, words))
                 if via is None:
                     _print_json({"ok": False, "error": _REFUSED})
                     return 2
                 now = _now()
             if len(words) == 2 and words[0] == "end":
-                _print_json(end_hold(words[1], owner=owner_flag, via=via, now=now))
+                out = end_hold(words[1], owner=owner_flag, via=via, now=now)
+                _print_json(_finish_owner(out) if owner_flag else out)
                 return 0
             if not args.reason:
                 raise RouteError("--reason is needed: machine-busy, disk-low, keep, outage or other")
             scope = "account" if args.account else "machine" if args.machine else "all" if args.all else ""
-            _print_json(add_hold(" ".join(words), reason=args.reason, scope=scope, account=args.account,
-                                 until=args.until, owner=owner_flag, via=via, now=now))
+            out = add_hold(" ".join(words), reason=args.reason, scope=scope, account=args.account,
+                           until=args.until, owner=owner_flag, via=via, now=now)
+            _print_json(_finish_owner(out) if owner_flag else out)
             return 0
         if cmd == "priority":
             return _priority_cli(args, now)
@@ -6662,7 +6766,7 @@ def run_cli(args) -> int:
                 raise RouteError("--at-owner-request is only for rule add or edit")
             _print_json(out)
             return 0
-        via = _owner_via(args)
+        via = _owner_via(args, _intent_or_none(_route_intent, cmd, args))
         if via is None:
             _print_json({"ok": False, "error": _REFUSED})
             return 2
@@ -6700,7 +6804,7 @@ def run_cli(args) -> int:
                 out = confirm_rule(params[0], via=via, now=now)
         else:
             raise RouteError(f"unknown route command {cmd!r}")
-        _print_json(out)
+        _print_json(_finish_owner(out))
         return 0
     except RouteError as err:
         refusal = {"ok": False, "error": str(err)}
@@ -6708,5 +6812,12 @@ def run_cli(args) -> int:
             refusal["code"] = err.code
         _print_json(refusal)
         return 2
+    except owner_direction.DirectionRefused as err:
+        _print_json(err.refusal())
+        return 2
+    except owner_direction.AlreadyDone as done:
+        _print_json(done.answer())
+        return 0
     finally:
+        owner_direction.noted(None, {})
         _OWNER_AUTH.reset(auth)

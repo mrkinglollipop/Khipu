@@ -98,7 +98,7 @@ def test_a_statement_timeout_from_the_hub_is_not_offline_evidence(home, monkeypa
 def _owner(monkeypatch, via: str | None = "app") -> None:
     from khipu import routing
 
-    monkeypatch.setattr(routing, "_owner_via", lambda args: via)
+    monkeypatch.setattr(routing, "_owner_via", lambda args, intent=None: via)
 
 
 def test_the_owner_override_skips_a_check_once_and_the_record_names_it(home, monkeypatch, tmp_path):
@@ -222,13 +222,17 @@ def test_every_writer_of_the_override_goes_through_the_owner_gate():
     # cli.py names the key only to route `config --set/--unset` to its branch.
     assert set(writers) <= {"cli.py"}, writers
     outside = {c for c in callers if c[0] != "promote.py"}
-    assert outside == {("cli.py", "_config_gate_override")}, outside
+    # Owner direction's Undo puts the override back as it was; it runs only
+    # from ``owner-direction undo``, after the owner gate.
+    assert outside == {("cli.py", "_config_gate_override"), ("owner_direction.py", "_undo_gate_ignore")}, outside
     import inspect
 
-    from khipu import cli
+    from khipu import cli, owner_direction
 
     body = inspect.getsource(cli._config_gate_override)
     assert body.index("_owner_only(") < body.index("set_gate_ignore(")
+    body = inspect.getsource(owner_direction.run_cli)
+    assert body.index("routing._owner_via(args, want)") < body.index("out = undo(args.id, via)")
 
 
 # ---- the hub steps and the queue ---------------------------------------------
