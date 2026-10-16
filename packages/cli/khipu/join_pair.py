@@ -32,6 +32,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from khipu.output_guard import emit_pairing_banner, guard_output
+from khipu.join_errors import JoinError
+
 SERVICE_TYPE = "_khipu-join._tcp"
 DEFAULT_TIMEOUT_S = 600
 DEFAULT_PORT = 8788
@@ -183,14 +186,15 @@ def advertise(
     port: int = DEFAULT_PORT,
     pin: str | None = None,
     on_ready: Any | None = None,
+    allow_unencrypted: bool = False,
 ) -> dict[str, Any]:
     """Export kit, advertise Bonjour, serve once over TLS. Blocks until transfer or timeout."""
     from khipu.join import export_kit
 
     pin = pin or generate_pin()
     if len(pin) != 6 or not pin.isdigit():
-        raise ValueError("PIN must be exactly 6 digits")
-    kit = export_kit(passphrase)
+        raise JoinError("PIN must be exactly 6 digits")
+    kit = export_kit(passphrase, allow_unencrypted=allow_unencrypted)
     cert_dir = _self_signed_cert_dir()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(
@@ -226,10 +230,10 @@ def advertise(
             stderr=subprocess.DEVNULL,
         )
         if dns.poll() is not None:
-            raise RuntimeError("Bonjour registration exited before becoming ready")
+            raise JoinError("Bonjour registration exited before becoming ready")
         time.sleep(0.02)
         if dns.poll() is not None:
-            raise RuntimeError("Bonjour registration exited before becoming ready")
+            raise JoinError("Bonjour registration exited before becoming ready")
         if on_ready is not None:
             on_ready()
         while time.time() < deadline and not transferred:
@@ -263,7 +267,7 @@ def advertise(
                 tls.sendall(kit)
                 transferred = True
             except Exception as exc:  # noqa: BLE001
-                error = f"{type(exc).__name__}: {exc}"
+                error = f"kit transfer failed ({type(exc).__name__})"
             finally:
                 try:
                     (tls or client).close()
@@ -421,7 +425,7 @@ def _resolve_service(
             proc.kill()
             proc.wait(timeout=2)
     if not host or not port:
-        raise RuntimeError(
+        raise JoinError(
             f"could not resolve Bonjour instance {instance!r}; "
             "try AirDrop / file import instead"
         )
@@ -497,7 +501,7 @@ def friendly_connect_error(exc: BaseException, tried: list[tuple[str, int]]) -> 
             "keep Advertise nearby running on the other Mac, or AirDrop the "
             ".khipujoin file."
         )
-    return f"Could not connect to nearby Mac ({targets}): {exc}"
+    return f"Could not connect to nearby Mac ({targets}): {type(exc).__name__}"
 
 
 def _tcp_connect(host: str, port: int, preferred_ipv4: str | None = None) -> tuple[socket.socket, str, int]:
@@ -512,7 +516,7 @@ def _tcp_connect(host: str, port: int, preferred_ipv4: str | None = None) -> tup
         except OSError as exc:
             errors.append(exc)
     last = errors[-1] if errors else RuntimeError("no connect candidates")
-    raise RuntimeError(friendly_connect_error(last, candidates)) from last
+    raise JoinError(friendly_connect_error(last, candidates)) from last
 
 
 def receive(
@@ -530,12 +534,12 @@ def receive(
 
     pin = str(pin).strip()
     if len(pin) != 6 or not pin.isdigit():
-        raise ValueError("PIN must be exactly 6 digits")
+        raise JoinError("PIN must be exactly 6 digits")
 
     if host is None or port is None:
         services = _browse_service()
         if not services:
-            raise RuntimeError(
+            raise JoinError(
                 "No nearby Khipu found. On the Mac that already works: Settings → "
                 "Set up another Mac → Advertise nearby (PIN). Stay on the same "
                 "Wi‑Fi, or AirDrop a .khipujoin file and use Import join kit file."
@@ -558,7 +562,7 @@ def receive(
         header_line = _readline(tls).decode("utf-8", errors="replace").strip()
         header = json.loads(header_line) if header_line else {}
         if not header.get("ok"):
-            raise RuntimeError(header.get("error") or "nearby Mac refused the PIN")
+            raise JoinError("nearby Mac refused the pairing request; check the PIN and try again")
         nbytes = int(header.get("bytes") or 0)
         chunks: list[bytes] = []
         got = 0
@@ -575,7 +579,7 @@ def receive(
             pass
     blob = b"".join(chunks)
     if len(blob) != nbytes:
-        raise RuntimeError(f"incomplete kit transfer ({len(blob)}/{nbytes} bytes)")
+        raise JoinError(f"incomplete kit transfer ({len(blob)}/{nbytes} bytes)")
 
     path_written: str | None = None
     if out_path is not None:
@@ -606,11 +610,13 @@ def receive(
     return result
 
 
+@guard_output
 def advertise_join_kit(
     passphrase: str,
     *,
     timeout: int = DEFAULT_TIMEOUT_S,
     pin: str | None = None,
+    allow_unencrypted: bool = False,
 ) -> dict[str, Any]:
     """CLI/Tauri entry: emit PIN on stdout, then block until transfer or timeout."""
     pin = (pin or "").strip() or generate_pin()
@@ -624,15 +630,16 @@ def advertise_join_kit(
         "ipv4": lan_ipv4(),
         "hint": (
             "On the new Mac: Join existing Khipu → enter this PIN → Find nearby Mac. "
-            "Same Wi‑Fi required. File/AirDrop works if nearby fails. Passphrase only "
-            "if you locked the kit when saving."
+            "Same Wi‑Fi required. File/AirDrop works if nearby fails. Enter the "
+            "passphrase set on this Mac, unless the kit was made unencrypted."
         ),
     }
     out = advertise(
         passphrase,
         timeout_s=timeout,
         pin=pin,
-        on_ready=lambda: print(json.dumps(banner), flush=True),
+        on_ready=lambda: emit_pairing_banner(json.dumps(banner) + "\n"),
+        allow_unencrypted=allow_unencrypted,
     )
     out["phase"] = "finished"
     return out

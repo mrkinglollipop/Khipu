@@ -109,7 +109,7 @@ Settings has ten sections. Database is open first.
 | Routing | Accounts, your note, standing rules, holds, reset checks, what conversations are told, job runner folders, the lane map, and recent changes. Described in [routing.md](routing.md). |
 | Optional features | Switches for Search and memory, the Local recall service, Routing, and a group of options marked "Measured, not recommended". |
 | Embeddings | Embedding models (profiles) with an Add a model action, libraries (folders of .txt and .md files that become a search space), and the progress of indexing jobs. |
-| Data & backups | The data folder, older file locations (path overrides), Backup and Restore. |
+| Data & backups | The data folder, older file locations (path overrides), the graph backup destination, Backup and Restore. |
 | Another Mac | The gateway address, and Set up another Mac (Save join kit). |
 | Components | App and CLI version, the database and graph builder components, and What feeds the graph. |
 | Updates | Installed version and Check for updates. |
@@ -137,7 +137,7 @@ The Plans card lists subscription accounts. **Probe now** reads their headroom a
 
 Do this on the Mac that already works:
 
-1. Optionally type a passphrase.
+1. Type a passphrase. Save and Advertise stay disabled until you do, or until you tick **I understand: make it unencrypted**, which shows a warning that anyone with the file can read the database password and API keys.
 2. Click **Save join kit** and AirDrop the `.khipujoin` file to the new Mac.
 3. On the new Mac, open Welcome, choose **Join a Khipu I already have**, and import the file.
 
@@ -148,6 +148,8 @@ Save is disabled when the database lives only on this Mac, because another Mac c
 ### Data & backups
 
 Backup zips the Mac-local data folder. Restore reads a zip or folder back into it: files with the same name are overwritten, and other files already there are kept. These are the app forms of `khipu backup-local` and `khipu import-local --replace`. (On the command line, `khipu import-local` without `--replace` skips files that already exist.) Database backups and health checks are covered in [operations.md](operations.md).
+
+**Graph backup destination** sets where the weekly off-site copy of the graph snapshot goes (the `graph_backup_remote` setting, an rclone `remote:path`, default `r2:khipu-backups/khipu-graph`). It shows the current value and whether it comes from the default, this Mac's settings or the `KHIPU_GRAPH_BACKUP_REMOTE` environment variable, which locks the field. Save checks the value first; **Use the default** removes a saved one.
 
 ### Components
 
@@ -162,7 +164,7 @@ Background jobs shows the scheduled jobs and lets you install or remove each one
 Welcome has six steps: Welcome, Database, Model, Graph, Agents and Finish. Each step checks itself, so setup can be resumed.
 
 - **Database.** Choose one:
-  - Join a Khipu I already have (import a join kit, with an optional passphrase or nearby PIN)
+  - Join a Khipu I already have (import a join kit with its passphrase, or use a nearby PIN; a kit saved unencrypted needs none)
   - Set up a new database on this Mac (needs Docker)
   - Connect to a database I already run
 

@@ -43,7 +43,7 @@ The last stage is a memory round trip: write a test memory, find it by search, a
 
 Pick this when a Mac you own already runs Khipu and you want the same memory, not a second one.
 
-1. On the working Mac, open Settings, **Another Mac**, and choose **Save join kit...**. This writes a `.khipujoin` file. You can protect it with a passphrase.
+1. On the working Mac, open Settings, **Another Mac**, and choose **Save join kit...**. Type a passphrase first: the kit holds the database password and API keys, so it is encrypted. An unencrypted kit is made only if you tick **I understand: make it unencrypted**. This writes a `.khipujoin` file. Type the same passphrase on the new Mac.
 2. Move the file to the new Mac (AirDrop works). Or use **Advertise nearby (PIN)** on the working Mac and **Find nearby Mac** on the new one, over the same Wi-Fi.
 3. On the new Mac, go to Welcome, Database, **Join a Khipu I already have**, then **Import join kit file...**.
 

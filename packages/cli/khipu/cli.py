@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from khipu.search_text import search_tokens
+from khipu.output_guard import guard_output, remember
 
 
 def _env(*names: str, default: str = "") -> str:
@@ -2962,6 +2963,19 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps({"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(path)}))
         return 0
+    if (args.set and args.set[0] == "graph_backup_remote") or args.unset == "graph_backup_remote":
+        # Where `graph-backup offsite` copies the graph snapshot (rclone
+        # remote:path); `--unset` goes back to the default.
+        from khipu.config import graph_backup_remote_status, set_graph_backup_remote
+
+        try:
+            path = set_graph_backup_remote(args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, "graph_backup_remote": graph_backup_remote_status(),
+                          "config_file": str(path)}))
+        return 0
     from khipu import ledger as _ledger
 
     if (args.set and args.set[0] in _ledger.SETTINGS) or args.unset in _ledger.SETTINGS:
@@ -3069,7 +3083,12 @@ def cmd_config(args: argparse.Namespace) -> int:
         )
         return 0
     from khipu import relevance, usage
-    from khipu.config import float_settings_status, list_setting, path_settings_status
+    from khipu.config import (
+        float_settings_status,
+        graph_backup_remote_status,
+        list_setting,
+        path_settings_status,
+    )
 
     out = {
         "capture_mode": capture_mode(),
@@ -3089,6 +3108,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "usage_accounts": usage.accounts_status(),
         "routing": _routing.settings_status(),
         "ledger": _ledger.settings_status(),
+        "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
         "config": load_config(),
     }
@@ -3268,30 +3288,78 @@ def cmd_db(args: argparse.Namespace) -> int:
     return 2
 
 
+def _add_passphrase_args(parser: argparse.ArgumentParser) -> None:
+    """A join kit passphrase never travels as a literal argument (other
+    processes can read argv): env, stdin, a file descriptor or the prompt."""
+    parser.add_argument("--passphrase", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--passphrase-stdin",
+        action="store_true",
+        help="Read the join kit passphrase from the first line of stdin "
+        "(or set KHIPU_JOIN_PASSPHRASE; a terminal asks)",
+    )
+    parser.add_argument(
+        "--passphrase-fd",
+        type=int,
+        default=None,
+        metavar="FD",
+        help="Read the join kit passphrase from the first line of this open file descriptor",
+    )
+
+
+@guard_output
 def cmd_join(args: argparse.Namespace) -> int:
     from khipu.join import (
         export_kit,
         import_kit,
-        resolve_passphrase,
         verify_live_counts,
         write_kit_file,
     )
 
+    from khipu.join import LITERAL_PASSPHRASE_REFUSAL, public_error, read_passphrase
+
+    if getattr(args, "passphrase", None) is not None:
+        print(json.dumps({"ok": False, "error": LITERAL_PASSPHRASE_REFUSAL}))
+        return 2
+    allow_unencrypted = bool(getattr(args, "allow_unencrypted", False))
     try:
-        passphrase = resolve_passphrase(getattr(args, "passphrase", None))
-    except ValueError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}))
+        passphrase = read_passphrase(
+            stdin=bool(getattr(args, "passphrase_stdin", False)),
+            fd=getattr(args, "passphrase_fd", None),
+        )
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"ok": False, "error": f"could not read the passphrase: {type(exc).__name__}"}))
+        return 2
+    remember(passphrase, "passphrase")
+    if (
+        args.join_cmd in ("export", "advertise")
+        and not passphrase
+        and not allow_unencrypted
+        and sys.stdin.isatty()
+    ):
+        import getpass
+
+        first = remember(getpass.getpass("Join kit passphrase: ").strip(), "passphrase")
+        if first and remember(getpass.getpass("Type it again: ").strip(), "passphrase") != first:
+            print(json.dumps({"ok": False, "error": "the two passphrases did not match"}))
+            return 2
+        passphrase = first
+
+    if args.join_cmd in ("export", "advertise") and not passphrase and not allow_unencrypted:
+        from khipu.join import UNENCRYPTED_REFUSAL
+
+        print(json.dumps({"ok": False, "error": UNENCRYPTED_REFUSAL}))
         return 2
 
     if args.join_cmd == "export":
         try:
-            blob = export_kit(passphrase)
+            blob = export_kit(passphrase, allow_unencrypted=allow_unencrypted)
             out_path = write_kit_file(Path(args.out), blob)
             from khipu.join import decrypt_payload
 
             payload = decrypt_payload(blob, passphrase)
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join export")}))
             return 1
         print(
             json.dumps(
@@ -3312,14 +3380,17 @@ def cmd_join(args: argparse.Namespace) -> int:
             blob = Path(args.file).expanduser().read_bytes()
             summary = import_kit(blob, passphrase)
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join import")}))
             return 1
         migrate_out: dict | None = None
         counts = verify_live_counts(summary.get("expected") or {})
         if not getattr(args, "skip_migrate_check", False) and not counts.get("error"):
             from khipu.migrate import run
 
-            migrate_out = run(dry_run=False)
+            try:
+                migrate_out = run(dry_run=False)
+            except Exception as exc:  # noqa: BLE001 — its text can quote the DSN
+                migrate_out = {"ok": False, "error": public_error(exc, "Applying migrations")}
         hub_ok = bool(counts.get("ok"))
         result = {
             "ok": True,
@@ -3346,9 +3417,10 @@ def cmd_join(args: argparse.Namespace) -> int:
                 passphrase,
                 timeout=int(getattr(args, "timeout", 600) or 600),
                 pin=getattr(args, "pin", None),
+                allow_unencrypted=allow_unencrypted,
             )
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join advertise")}))
             return 1
         print(json.dumps(out, indent=2))
         return 0 if out.get("ok") else 1
@@ -3362,7 +3434,7 @@ def cmd_join(args: argparse.Namespace) -> int:
             out_path = Path(out_arg).expanduser() if out_arg else None
             result = receive_join_kit(passphrase, pin, out_path=out_path)
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join receive")}))
             return 1
         print(json.dumps(result, indent=2))
         return 0 if result.get("kit_imported") or result.get("ok") else 2
@@ -4020,27 +4092,30 @@ def cmd_sources(args: argparse.Namespace) -> int:
         return 2
 
 
+@guard_output
 def cmd_graph_backup(args: argparse.Namespace) -> int:
     from khipu import graph_backup
+    from khipu.join_errors import redact_connection_text
 
     action = getattr(args, "graph_backup_cmd", None)
-    if action == "record-local":
-        out = graph_backup.record_local()
-    elif action == "offsite":
-        out = graph_backup.run_offsite()
-    elif action == "drill":
-        out = graph_backup.scratch_drill()
-    elif action == "status":
-        out = graph_backup.status_payload()
-        print(json.dumps(out, indent=2, default=str))
-        return 0
-    else:
+    actions = {
+        "record-local": graph_backup.record_local,
+        "offsite": graph_backup.run_offsite,
+        "drill": graph_backup.scratch_drill,
+        "status": graph_backup.status_payload,
+    }
+    if action not in actions:
         print(
             json.dumps({"ok": False, "error": f"unknown graph-backup action: {action}"})
         )
         return 2
-    print(json.dumps(out, indent=2, default=str))
-    return 0 if out.get("ok", False) else 2
+    try:
+        out = actions[action]()
+    except Exception:  # noqa: BLE001 — backup failures can quote credentials
+        print(json.dumps({"ok": False, "error": f"graph backup {action} failed"}))
+        return 2
+    print(redact_connection_text(json.dumps(out, indent=2, default=str)))
+    return 0 if action == "status" or out.get("ok", False) else 2
 
 
 def cmd_import_local(args: argparse.Namespace) -> int:
@@ -4654,7 +4729,7 @@ def build_parser() -> argparse.ArgumentParser:
     ).set_defaults(func=cmd_graph_backup)
     gbu_sub.add_parser(
         "offsite",
-        help="rclone copyto latest snapshot to r2:matt-db-backups/khipu-graph",
+        help="rclone copyto latest snapshot to graph_backup_remote (default r2:khipu-backups/khipu-graph)",
     ).set_defaults(func=cmd_graph_backup)
     gbu_sub.add_parser(
         "status", help="Local + offsite health and last ops_events"
@@ -5141,16 +5216,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     join = sub.add_parser(
         "join",
-        help="Export/import hub join kits (optional passphrase; never prints secrets)",
+        help="Export/import hub join kits (passphrase required to export; never prints secrets)",
     )
     join_sub = join.add_subparsers(dest="join_cmd", required=True)
     join_export = join_sub.add_parser(
         "export", help="Write a join kit from this Mac's Keychain/config"
     )
+    _add_passphrase_args(join_export)
     join_export.add_argument(
-        "--passphrase",
-        default=None,
-        help="Optional encryption passphrase (omit for plaintext; or KHIPU_JOIN_PASSPHRASE)",
+        "--allow-unencrypted",
+        action="store_true",
+        help="I understand: make an unencrypted kit anyone with the file can read",
     )
     join_export.add_argument(
         "--out",
@@ -5161,11 +5237,7 @@ def build_parser() -> argparse.ArgumentParser:
     join_import = join_sub.add_parser(
         "import", help="Apply a join kit's hub credentials on this Mac"
     )
-    join_import.add_argument(
-        "--passphrase",
-        default=None,
-        help="Passphrase if the kit was saved encrypted (or KHIPU_JOIN_PASSPHRASE)",
-    )
+    _add_passphrase_args(join_import)
     join_import.add_argument(
         "--file",
         required=True,
@@ -5181,10 +5253,11 @@ def build_parser() -> argparse.ArgumentParser:
         "advertise",
         help="Advertise join kit on LAN via Bonjour + TLS (macOS dns-sd)",
     )
+    _add_passphrase_args(join_advertise)
     join_advertise.add_argument(
-        "--passphrase",
-        default=None,
-        help="Optional encryption passphrase (omit for plaintext; or KHIPU_JOIN_PASSPHRASE)",
+        "--allow-unencrypted",
+        action="store_true",
+        help="I understand: make an unencrypted kit anyone with the file can read",
     )
     join_advertise.add_argument(
         "--timeout",
@@ -5202,11 +5275,7 @@ def build_parser() -> argparse.ArgumentParser:
         "receive",
         help="Find nearby Mac, send PIN, import join kit",
     )
-    join_receive.add_argument(
-        "--passphrase",
-        default=None,
-        help="Passphrase if the kit was saved encrypted (or KHIPU_JOIN_PASSPHRASE)",
-    )
+    _add_passphrase_args(join_receive)
     join_receive.add_argument(
         "--pin",
         required=True,
@@ -5234,11 +5303,13 @@ def build_parser() -> argparse.ArgumentParser:
         "summariser fallback (synth_fallback gemini|none: what a failed "
         "window does on a provider other than Gemini), the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew") '
+        "the graph backup destination (graph_backup_remote, an rclone "
+        "remote:path, default r2:khipu-backups/khipu-graph) "
         "or the plan usage accounts as JSON (usage_accounts "
         '\'[{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}]\')',
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting, a daily call ceiling, synth_fallback or usage_accounts, or "
+                     help="Remove a path setting, a daily call ceiling, synth_fallback, graph_backup_remote or usage_accounts, or "
                      "relevance.cosine_floor / "
                      "relevance.cosine_floor_by_profile.<profile> to restore its default")
     cfg.add_argument(
@@ -5649,10 +5720,21 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+@guard_output
+def _dispatch_guarded_command(args: argparse.Namespace) -> int:
+    try:
+        return int(args.func(args))
+    except Exception as exc:  # noqa: BLE001 — the final stderr printer is guarded too
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     _add_paths()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.func in (cmd_join, cmd_graph_backup):
+        return _dispatch_guarded_command(args)
     try:
         return int(args.func(args))
     except Exception as e:  # noqa: BLE001 — CLI surface
