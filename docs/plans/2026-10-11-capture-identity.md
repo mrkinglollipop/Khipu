@@ -236,3 +236,77 @@ Replica alias lookup.
   unverified. No capture/forget/outbox race or subprocess-registry test failed in this final run.
 - **Boundary:** synthetic interleavings and local subprocesses only; real PostgreSQL concurrency remains
   unverified. No live hub, commit, or push.
+
+## Durable forget: the write gate (2026-10-15)
+
+Five review rounds each found one more writer that could bring a forgotten source back after the forget
+reported itself complete. The model changes from patching writers one at a time to one gate. Every code
+path that writes an episode or its source checks `khipu/tombstones.py`: a local registry of forgotten
+source keys and payload hashes, read and written under one flock (`write_gate` holds it for many checks
+and the caller's write; `write_guard` is a thin wrapper for one payload). The registry is merge-only:
+publication, backup import and every other writer only add identities, never replace the file. Forget
+takes the hub row lock, reads the sources, publishes, then re-reads; a source that appeared in between is
+published in a further round (at most three, after which the forget reports itself incomplete). In the
+same transaction as the tombstone, forget writes the identities to the hub's `forgotten_sources` table
+(migration 0030), which hub writers read before they insert, and whose triggers refuse an insert, merge
+or un-forget that names one. A write from another Mac, or from code that predates the registry, is
+refused by the hub itself.
+
+### Inventory of write paths
+
+Pinned by `tests/test_episode_write_gate_inventory.py`: a new path fails that test until it is routed
+through the gate and added here.
+
+| Path (`packages/cli/khipu/`) | Writes | Gated by |
+| --- | --- | --- |
+| `mirror._upsert_episode` | hub episode row + origin source row | `hub_source_forgotten` before the INSERT; 0030 insert triggers |
+| `capture.write_pg` | hub (via `_upsert_episode`, `_merge_into_episode`) | `hub_source_forgotten` first thing inside the cursor |
+| `mirror.mirror_episode` | hub (via `_upsert_episode`), capture graph | the callee; a refusal skips the graph mint |
+| `mirror.sync_recent_episodes`, `mirror.reconcile_memory_root` | hub (via `_upsert_episode`) | the callee |
+| `capture._merge_into_episode` | hub merge receipt + merged source row | `hub_source_forgotten` under the target row lock; 0030 update trigger |
+| `capture_identity.record_source` / `_insert_source` | hub `episode_sources` | called only from the two gated writers above; 0030 insert trigger |
+| `capture.run_capture_v2` | legacy `episodes.jsonl` (subprocess) | `write_guard` held through the child, lock FD handed to it |
+| `outbox.enqueue`, `outbox.drain`, `outbox.retry_dead` | outbox, dead and quarantine job files | `write_guard` at each job write |
+| `session_capture.enqueue` | transcript jobs upstream of extraction | none needed: holds no episode; its results go through `write_pg` |
+| `hub_snapshot.refresh` (`_insert_episodes`) | replica, full dump | `write_gate` from `_scrub_forgotten` through `os.replace` |
+| `hub_snapshot.upsert_episode` (`_upsert_episode_unfenced`) | replica, one episode | `write_guard` held through the SQLite commit |
+| `hub_snapshot.scrub_forgotten_snapshot` | replica deletes | `write_gate` |
+| `hub_snapshot.forget_episode_in_snapshot`, `_apply_pending_erasures` | replica tombstones | erase |
+| `paths.import_local` | data folder from a backup | registry merged, never copied; jobs naming a forgotten source skipped under `write_gate`; an imported replica is scrubbed |
+| `join.import_kit` | settings and credentials | writes no episodes |
+| `ledger` import | ledger rows | writes no episodes |
+| migrations 0027, 0029, 0030 | backfills (source rows, origin, `forgotten_sources`) | 0030 backfills the forgotten identities |
+| `hygiene.apply_backfill_*`, `capture._claim_unowned_episode`, `cli._cmd_episode_edit` | project/repo_root, origin, summary on existing rows | metadata only; the edit skips forgotten rows |
+| `forget.forget_episode` | hub tombstone, `forgotten_sources` | erase |
+
+### The four holes and the test that pins each
+
+All in `tests/test_forget_write_gate.py`.
+
+1. A capture merged between forget's source read and its registry publish:
+   `test_merge_committed_after_forget_reads_sources_is_fenced`.
+2. The direct mirror and `write_pg` inserting a changed summary for a forgotten natural source:
+   `test_direct_mirror_refuses_a_forgotten_natural_source`, `test_write_pg_refuses_a_forgotten_natural_source`,
+   and, for a forget made on another Mac, `test_hub_forgotten_sources_table_refuses_a_write_this_mac_never_saw`.
+3. The full replica refresh restoring a copy under another id: `test_full_refresh_does_not_restore_forgotten_source_under_new_id`,
+   `test_full_refresh_fails_closed_on_a_corrupt_registry`.
+4. Backup import restoring a queued job, replacing the registry or restoring the replica:
+   `test_backup_import_does_not_restore_forgotten_outbox`, `test_directory_import_does_not_restore_forgotten_outbox`,
+   `test_backup_import_preserves_forgotten_registry`, `test_backup_import_adds_the_archives_forgotten_sources`,
+   `test_backup_import_refuses_a_corrupt_registry`, `test_imported_snapshot_is_scrubbed_of_forgotten_sources`.
+
+### Known boundaries
+
+- A duplicate copy of a source committed under another episode id before the forget began is a separate
+  episode. The gate keeps it out of the replica and refuses new writes of it, but it stays live on the hub
+  until it is forgotten by its own id.
+- Real PostgreSQL concurrency of the 0030 triggers is covered only by `tests/test_forgotten_sources_scratch.py`,
+  which skips without a provisioned scratch database. The SQL was exercised by hand against a throwaway
+  local PostgreSQL 16 cluster with a minimal schema (refusals, an unrelated insert, a forget holding the
+  advisory lock), not against the full migration chain.
+- Once anything is forgotten, every full refresh checks each live replica row against the registry. Rows
+  are already redacted when stored, so the scrub uses `Gate.allows_stored`, which skips re-redaction (about
+  0.75 ms per large row under load, against about 16 ms with it). The cost on the live replica is
+  estimated, not measured; it falls under the capture-path timing gate before merge.
+- An imported replica that cannot be scrubbed (a refresh holds its lock) is deleted; the next refresh
+  rebuilds it.

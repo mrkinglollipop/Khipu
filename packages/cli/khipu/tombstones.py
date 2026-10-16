@@ -65,7 +65,7 @@ def _redacted_form(payload: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def _identity_values(payload: dict[str, Any]) -> tuple[set[str], set[str]]:
+def _identity_values(payload: dict[str, Any], *, redact: bool = True) -> tuple[set[str], set[str]]:
     from khipu.capture_identity import payload_sha256, source_key
     from khipu.wire import clean
 
@@ -74,7 +74,9 @@ def _identity_values(payload: dict[str, Any]) -> tuple[set[str], set[str]]:
     # The strict wire form is what the legacy subprocess can actually persist.
     # Keep ordinary and redacted forms too, but a lone surrogate in an inbound
     # capture must not turn a valid strict-wire write into a registry outage.
-    for value in (payload, _redacted_form(payload), clean(payload), clean(_redacted_form(payload))):
+    forms = ((payload, _redacted_form(payload), clean(payload), clean(_redacted_form(payload)))
+             if redact else (payload, clean(payload)))
+    for value in forms:
         try:
             keys.add(source_key(value))
             hashes.add(payload_sha256(value))
@@ -89,13 +91,7 @@ def _empty() -> dict[str, Any]:
     return {"version": 1, "source_keys": [], "payload_hashes": [], "legacy_identities": []}
 
 
-def _read(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return _empty()
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise RegistryError(f"tombstone registry unreadable: {type(exc).__name__}") from exc
+def _validated(value: Any) -> dict[str, Any]:
     if isinstance(value, dict) and value.get("version") == 1 and "legacy_identities" not in value:
         # Registry files written during the first rollout remain readable.
         value = {**value, "legacy_identities": []}
@@ -108,6 +104,24 @@ def _read(path: Path) -> dict[str, Any]:
             or not all(isinstance(item, str) for item in value["legacy_identities"])):
         raise RegistryError("tombstone registry is corrupt")
     return value
+
+
+def _parsed(data: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise RegistryError(f"tombstone registry unreadable: {type(exc).__name__}") from exc
+    return _validated(value)
+
+
+def _read(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return _empty()
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise RegistryError(f"tombstone registry unreadable: {type(exc).__name__}") from exc
+    return _parsed(data)
 
 
 def _atomic_write(path: Path, value: dict[str, Any]) -> None:
@@ -167,26 +181,35 @@ def _borrowed_lease(path: Path, lock_path: Path) -> _LockLease | None:
 @contextmanager
 def _locked_registry() -> Iterator[tuple[Path, dict[str, Any], _LockLease]]:
     fd: int | None = None
-    lease: _LockLease | None = None
     try:
-        path = registry_path()
-        # A missing registry is the normal empty state. Any failure creating
-        # its state directory/lock is not equivalent to an empty registry.
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.is_symlink():
-            raise RegistryError("tombstone registry must not be a symlink")
-        lock_path = path.parent / f".{path.stem}.lock"
-        lease = _borrowed_lease(path, lock_path)
-        if lease is None:
-            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
-            os.fchmod(fd, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            lease = _LockLease(fd, path, lock_path, borrowed=False)
-        yield path, _read(path), lease
-    except RegistryError:
-        raise
-    except OSError as exc:
-        raise RegistryError(f"tombstone registry unavailable: {type(exc).__name__}") from exc
+        try:
+            path = registry_path()
+            # A missing registry is the normal empty state. Any failure creating
+            # its state directory/lock is not equivalent to an empty registry.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_symlink():
+                raise RegistryError("tombstone registry must not be a symlink")
+            lock_path = path.parent / f".{path.stem}.lock"
+            owned = _OWNED_WRITER_LOCK.get()
+            if owned is not None and owned.registry == path:
+                # flock is per open file description: a second open in this
+                # process would wait on the lock this context already holds.
+                lease = owned
+            else:
+                lease = _borrowed_lease(path, lock_path)
+            if lease is None:
+                fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+                os.fchmod(fd, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                lease = _LockLease(fd, path, lock_path, borrowed=False)
+            value = _read(path)
+        except RegistryError:
+            raise
+        except OSError as exc:
+            raise RegistryError(f"tombstone registry unavailable: {type(exc).__name__}") from exc
+        # The caller's own errors pass through unchanged: only the lock and
+        # the read above are registry failures.
+        yield path, value, lease
     finally:
         if fd is not None:
             try:
@@ -195,9 +218,9 @@ def _locked_registry() -> Iterator[tuple[Path, dict[str, Any], _LockLease]]:
                 os.close(fd)
 
 
-def _known(value: dict[str, Any], payload: dict[str, Any]) -> bool:
+def _known(value: dict[str, Any], payload: dict[str, Any], *, redact: bool = True) -> bool:
     try:
-        keys, hashes = _identity_values(payload)
+        keys, hashes = _identity_values(payload, redact=redact)
     except Exception as exc:  # noqa: BLE001 - identity uncertainty must block writes
         raise RegistryError(f"tombstone identity failed: {type(exc).__name__}") from exc
     from khipu.wire import clean_text
@@ -209,6 +232,45 @@ def _known(value: dict[str, Any], payload: dict[str, Any]) -> bool:
                 or legacy in set(value["legacy_identities"]))
 
 
+class Gate:
+    """One registry snapshot, valid while its ``write_gate`` is open."""
+
+    def __init__(self, value: dict[str, Any]):
+        self._value = value
+
+    def allows(self, payload: dict[str, Any]) -> bool:
+        """False for a forgotten source; ``RegistryError`` when unknowable."""
+        return not _known(self._value, payload)
+
+    def allows_stored(self, payload: dict[str, Any]) -> bool:
+        """``allows`` for a row a writer already redacted before storing it.
+        Redaction is idempotent and dominates the cost (about 20 times the
+        hashing), so a bulk scan of stored rows skips re-redacting them."""
+        return not _known(self._value, payload, redact=False)
+
+    @property
+    def empty(self) -> bool:
+        """Nothing has been forgotten, so a bulk scan can skip its checks."""
+        return not (self._value["source_keys"] or self._value["payload_hashes"]
+                    or self._value["legacy_identities"])
+
+
+@contextmanager
+def write_gate() -> Iterator[Gate]:
+    """Hold the registry flock once for many source checks and their writes.
+
+    Callers keep this open until their atomic replace or SQLite commit
+    completes, exactly as ``write_guard`` requires for a single payload.
+    """
+    with _locked_registry() as (_path, value, lease):
+        token = _OWNED_WRITER_LOCK.set(lease) if not lease.borrowed else None
+        try:
+            yield Gate(value)
+        finally:
+            if token is not None:
+                _OWNED_WRITER_LOCK.reset(token)
+
+
 @contextmanager
 def write_guard(payload: dict[str, Any]) -> Iterator[bool]:
     """Serialize the last source check and the caller's local write.
@@ -218,13 +280,8 @@ def write_guard(payload: dict[str, Any]) -> Iterator[bool]:
     ``RegistryError`` means no safe decision could be made and must abort the
     write rather than treating an unreadable registry as empty.
     """
-    with _locked_registry() as (_path, value, lease):
-        token = _OWNED_WRITER_LOCK.set(lease) if not lease.borrowed else None
-        try:
-            yield not _known(value, payload)
-        finally:
-            if token is not None:
-                _OWNED_WRITER_LOCK.reset(token)
+    with write_gate() as gate:
+        yield gate.allows(payload)
 
 
 def is_forgotten(payload: dict[str, Any]) -> bool:
@@ -306,3 +363,66 @@ def publish_identities(keys: set[str], hashes: set[str], legacy: set[str] | None
             "legacy_identities": sorted(set(current["legacy_identities"]) | legacy),
         }
         _atomic_write(path, next_value)
+
+
+def merge_registry(value: dict[str, Any]) -> None:
+    """Union another registry (a backup's) into this one; never replace it."""
+    incoming = _validated(value)
+    keys = set(incoming["source_keys"])
+    hashes = set(incoming["payload_hashes"])
+    legacy = set(incoming["legacy_identities"])
+    if not keys and not hashes and not legacy:
+        return
+    publish_identities(keys, hashes, legacy)
+
+
+def merge_registry_bytes(data: bytes) -> None:
+    merge_registry(_parsed(data))
+
+
+def _hub_identities(payload: dict[str, Any], source: dict[str, Any] | None) -> list[str]:
+    from khipu.capture_identity import source_identity
+
+    try:
+        ident = source or source_identity(payload)
+        keys, hashes = _identity_values(payload)
+    except RegistryError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - identity uncertainty must block writes
+        raise RegistryError(f"tombstone identity failed: {type(exc).__name__}") from exc
+    found = {ident.get("source_key"), ident.get("payload_sha256"), *keys, *hashes}
+    return sorted(str(item) for item in found if item)
+
+
+def hub_source_forgotten(cur, payload: dict[str, Any],
+                         source: dict[str, Any] | None = None) -> bool:
+    """Whether this Mac's registry or the hub's ``forgotten_sources`` (0030)
+    names the payload. A forget made on another Mac reaches this one only
+    through the hub table. ``RegistryError`` propagates: fail closed."""
+    if is_forgotten(payload):
+        return True
+    from khipu.db import has_table
+
+    if not has_table(cur, "forgotten_sources"):
+        return False
+    cur.execute("SELECT 1 FROM forgotten_sources WHERE identity = ANY(%s) LIMIT 1",
+                (_hub_identities(payload, source),))
+    return cur.fetchone() is not None
+
+
+def publish_hub_forget(cur, episode_id: int,
+                       source_rows: list[dict[str, Any]] | None) -> None:
+    """Record a forget's source identities in the hub, in the forget's own
+    transaction. Each identity takes the advisory lock the 0030 insert
+    triggers take, in sorted order so two forgets cannot deadlock."""
+    from khipu.db import has_table
+
+    if not has_table(cur, "forgotten_sources"):
+        return
+    identities = sorted({str(row[k]) for row in source_rows or []
+                         for k in ("source_key", "payload_sha256") if row.get(k)})
+    for identity in identities:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    ("khipu-source:" + identity,))
+        cur.execute("INSERT INTO forgotten_sources (identity, episode_id) VALUES (%s, %s) "
+                    "ON CONFLICT (identity) DO NOTHING", (identity, episode_id))

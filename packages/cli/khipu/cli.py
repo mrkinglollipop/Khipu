@@ -2329,7 +2329,10 @@ def _cmd_episode_edit(args: argparse.Namespace) -> int:
     reembedded = False
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE episodes SET summary = %s WHERE id = %s", (summary, eid))
+            # A forgotten episode is not edited: its re-embed would bring a
+            # vector back for a row every reader skips.
+            cur.execute("UPDATE episodes SET summary = %s WHERE id = %s AND deleted_at IS NULL",
+                        (summary, eid))
             updated = cur.rowcount > 0
             if updated:
                 try:

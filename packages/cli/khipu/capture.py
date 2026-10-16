@@ -400,11 +400,15 @@ def _merge_into_episode(
     topics, decisions, preferences, people, raw, target_ts, target_summary = row[:7]
     tags = row[7] if has_tags else None
     from khipu.capture_identity import record_source, source_identity
+    from khipu.tombstones import hub_source_forgotten
 
     # The receipt and the merged source row both come from the snapshot
     # write_pg took before enrichment, so they depend on the incoming capture
     # alone; a caller without one (tests, older paths) snapshots here.
     source = source or source_identity(payload)
+    # Checked under the target's row lock, which forget takes first.
+    if hub_source_forgotten(cur, payload, source):
+        return False
     source_id = source["payload_sha256"]
     receipts = set(_receipts(payload, source))
     for prior in (raw or {}).get("merged_from") or []:
@@ -735,6 +739,23 @@ def _claim_unowned_episode(cur, episode_id: int | None, origin: str | None) -> N
                 (origin, episode_id))
 
 
+def _forgotten_result(cur, payload: dict[str, Any], source: dict[str, Any], *,
+                      dedup: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The terminal outcome for a forgotten source: nothing written. The id
+    is the tombstoned row holding its legacy identity, when there is one."""
+    cur.execute("SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
+                (payload["ts"], _md5_hex(payload.get("summary") or "")))
+    existing = cur.fetchone()
+    return {
+        "episode_inserted": False,
+        "topics_written": 0,
+        "episode_id": int(existing[0]) if existing else None,
+        "source_key": source["source_key"],
+        "dedup": dedup or {"action": "none"},
+        "forgotten_source": True,
+    }
+
+
 def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
 
@@ -772,6 +793,10 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     episode_id: int | None = None
     with connect() as conn:
         with conn.cursor() as cur:
+            from khipu.tombstones import hub_source_forgotten
+
+            if hub_source_forgotten(cur, payload, source):
+                return _forgotten_result(cur, payload, source)
             _inherit_project(cur, payload)
             if payload.get("project"):
                 from khipu.identity import _resolve_project_alias
@@ -893,6 +918,8 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             origin = _stamp_origin(cur)
             upserted: dict[str, Any] = {}
             inserted = _upsert_episode(cur, payload, source=source, out=upserted, origin=origin)
+            if upserted.get("forgotten_source"):
+                return _forgotten_result(cur, payload, source, dedup=dedup)
             episode_id = upserted.get("episode_id")
             if not inserted:
                 # The insert hit the legacy unique key, so the row holding that

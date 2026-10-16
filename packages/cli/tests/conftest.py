@@ -48,6 +48,7 @@ import atexit
 import os
 import shutil
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -114,8 +115,14 @@ def _isolate_tombstone_registry(tmp_path, monkeypatch):
 
     def test_registry_path():
         isolated = isolated_dir()
-        return ((isolated / "forgotten_sources.json") if isolated is not None
-                else (tmp_path / "state" / "forgotten_sources.json"))
+        if isolated is not None:
+            return isolated / "forgotten_sources.json"
+        # A test that points the data dir at another of its own folders (a
+        # second Mac's state) gets that folder's registry, as production does.
+        override = os.environ.get("KHIPU_DATA_DIR")
+        if override and Path(override).is_relative_to(tmp_path):
+            return Path(override) / "forgotten_sources.json"
+        return tmp_path / "state" / "forgotten_sources.json"
 
     monkeypatch.setattr(tombstones, "registry_path", test_registry_path)
 

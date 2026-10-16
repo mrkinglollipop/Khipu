@@ -289,7 +289,10 @@ class UpsertEpisodeIdentityColumnsTest(unittest.TestCase):
             "parent_session_id": "claude_code:parent",
             "transcript_range": "0:1234",
         }
-        inserted = mirror._upsert_episode(cur, payload)
+        # A bare Mock answers no schema probe; the gate is covered in
+        # test_forget_write_gate.py.
+        with mock.patch("khipu.tombstones.hub_source_forgotten", return_value=False):
+            inserted = mirror._upsert_episode(cur, payload)
         self.assertTrue(inserted)
         sql, params = cur.execute.call_args.args
         self.assertIn("harness", sql)
@@ -309,7 +312,8 @@ class UpsertEpisodeIdentityColumnsTest(unittest.TestCase):
         cur = mock.Mock()
         cur.rowcount = 1
         payload = {"ts": "2026-09-03T00:00:00Z", "session_id": "legacy", "summary": "x"}
-        self.assertTrue(mirror._upsert_episode(cur, payload))
+        with mock.patch("khipu.tombstones.hub_source_forgotten", return_value=False):
+            self.assertTrue(mirror._upsert_episode(cur, payload))
         sql, params = cur.execute.call_args.args
         # harness/repo_root/project/parent_session_id/transcript_range -> None
         self.assertEqual(params[-6:-1], (None, None, None, None, None))
@@ -522,7 +526,7 @@ class UpsertEpisodeSchemaGateTest(unittest.TestCase):
             self.statements.append(s)
             self.params.append(params)
             if "information_schema.columns" in s:
-                self._result = [(c,) for c in self.columns]
+                self._result = [(c,) for c in self.columns] if params == ("episodes",) else []
             else:
                 self._result = []
 

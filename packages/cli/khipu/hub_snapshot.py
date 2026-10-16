@@ -1709,9 +1709,22 @@ def refresh() -> dict[str, Any]:
                                 (hub_dumped_at,))
             _apply_pending_erasures(con, dest)
             _dump_cursors(con, refreshed_at)
-            con.commit()
-            con.close()
-            os.replace(tmp_path, dest)
+            from khipu.tombstones import RegistryError, write_gate
+
+            try:
+                # Held from the scrub through the replace: a forget publishes
+                # under this lock before it erases the replica, so the dump
+                # cannot land a source forgotten after the scrub read the
+                # registry.
+                with write_gate() as gate:
+                    counts["forgotten_scrubbed"] = _scrub_forgotten(con, gate)
+                    con.commit()
+                    con.close()
+                    os.replace(tmp_path, dest)
+            except RegistryError as exc:
+                con.close()
+                tmp_path.unlink(missing_ok=True)
+                return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
             _clear_purged_topics(dest, dumped_after=dump_started)
             size_bytes = dest.stat().st_size
             new_meta: dict[str, Any] = {"schema_version": SNAPSHOT_SCHEMA_VERSION, "refreshed_at": refreshed_at, "size_bytes": size_bytes, "counts": counts}
@@ -1835,6 +1848,64 @@ def _tombstone_payload_for_episode(episode_row: Mapping[str, Any]) -> dict[str, 
             continue
         payload[field] = value.isoformat() if hasattr(value, "isoformat") else value
     return payload
+
+
+def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
+    """Delete every live replica episode whose source the gate refuses, with
+    its vectors, decisions and deliverables. The hub can hold a copy of a
+    forgotten source under another id (written before the forget, or by a
+    Mac that never saw it), and a dump must not carry it into this replica.
+    Rows already marked forgotten keep their tombstone. ``RegistryError``
+    propagates. Caller commits."""
+    cols = _snapshot_table_columns(con, "episodes")
+    if "id" not in cols or gate.empty:
+        return 0
+    live = " WHERE deleted_at IS NULL" if "deleted_at" in cols else ""
+    cursor = con.execute(f"SELECT * FROM episodes{live}")
+    names = [d[0] for d in cursor.description]
+    refused = []
+    for values in cursor.fetchall():
+        row = dict(zip(names, values, strict=True))
+        if not gate.allows_stored(_tombstone_payload_for_episode(row)):
+            refused.append(row["id"])
+    has_decisions = "episode_id" in _snapshot_table_columns(con, "decisions")
+    has_deliverables = "episode_id" in _snapshot_table_columns(con, "deliverables")
+    for eid in refused:
+        con.execute("DELETE FROM episodes WHERE id = ?", (eid,))
+        con.execute("DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?", (str(eid),))
+        if has_decisions:
+            con.execute("DELETE FROM decisions WHERE episode_id = ?", (eid,))
+        if has_deliverables:
+            con.execute("DELETE FROM deliverables WHERE episode_id = ?", (eid,))
+    return len(refused)
+
+
+def scrub_forgotten_snapshot() -> dict[str, Any]:
+    """Scrub the existing replica of forgotten sources (after a backup import
+    brought in an older one). Same lock order as ``upsert_episode``: the
+    registry first, then the refresh lock without waiting."""
+    from khipu.tombstones import RegistryError, write_gate
+
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": True, "scrubbed": 0, "snapshot": False}
+    try:
+        with write_gate() as gate:
+            lock = _acquire_refresh_lock()
+            if lock is None:
+                return {"ok": False, "error": "hub snapshot refresh in progress"}
+            try:
+                con = sqlite3.connect(str(path))
+                try:
+                    scrubbed = _scrub_forgotten(con, gate)
+                    con.commit()
+                finally:
+                    con.close()
+            finally:
+                _release_refresh_lock(lock)
+    except RegistryError as exc:
+        return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
+    return {"ok": True, "scrubbed": scrubbed, "snapshot": True}
 
 
 def upsert_episode(

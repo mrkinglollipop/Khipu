@@ -358,7 +358,8 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
     redacted copy written to the row, never the unredacted input.
 
     ``out``, when given, receives ``episode_id`` for a new row, so a caller
-    never re-selects the row it just wrote by the mutable summary.
+    never re-selects the row it just wrote by the mutable summary, and
+    ``forgotten_source`` when the gate refused a forgotten source.
     ``origin`` is the server-stamped owner (0029); the caller has already
     checked the column exists. A payload's own ``origin`` never reaches the
     column, and is dropped from the stored raw too. So is its own
@@ -431,6 +432,14 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
         cols.append("origin")
         vals.append("%s")
         params.append(origin)
+    from khipu.tombstones import hub_source_forgotten
+
+    # The one hub insert every writer reaches (write_pg, the mirror, the tail
+    # sync, the reconcile): a forgotten source never gets a new live row.
+    if hub_source_forgotten(cur, payload, source):
+        if out is not None:
+            out["forgotten_source"] = True
+        return False
     cur.execute(
         f"""
         INSERT INTO episodes
@@ -482,7 +491,10 @@ def mirror_episode(payload: dict[str, Any]) -> bool:
             # unknown origin stays NULL rather than be claimed.
             from khipu.capture import _stamp_origin
 
-            _upsert_episode(cur, payload, origin=_stamp_origin(cur))
+            upserted: dict[str, Any] = {}
+            _upsert_episode(cur, payload, out=upserted, origin=_stamp_origin(cur))
+            if upserted.get("forgotten_source"):
+                return True
             cur.execute("SAVEPOINT mirror_capture_graph")
             try:
                 persist_capture_graph(cur, payload)

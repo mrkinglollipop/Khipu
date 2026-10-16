@@ -114,7 +114,9 @@ class RedactionPrivacyTest(unittest.TestCase):
             def execute(self, _sql, params): self.params = params
 
         cur = RecordingCursor()
-        with mock.patch("khipu.db.has_columns", return_value=False):
+        # A pre-0030 hub: the gate's hub-table probe finds no forgotten_sources.
+        with mock.patch("khipu.db.has_columns", return_value=False), \
+                mock.patch("khipu.db.has_table", return_value=False):
             mirror._upsert_episode(cur, payload)
         sql_blob = json.dumps(cur.params, default=str)
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz0123456789", sql_blob)

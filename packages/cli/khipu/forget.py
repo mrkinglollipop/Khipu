@@ -104,7 +104,10 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     md5) identity the legacy file uses, or ``{"ok": False}`` when unknown.
     With ``memory_root`` the legacy lines themselves are hashed too, so a line
     another episode holds only by payload hash is recognised as shared."""
-    cur.execute("SELECT ts, summary, session_id FROM episodes WHERE id = %s", (episode_id,))
+    # The row lock first: a merge takes the same lock, so none can commit
+    # into this episode between the reads below and the tombstone.
+    cur.execute("SELECT ts, summary, session_id FROM episodes WHERE id = %s FOR UPDATE",
+                (episode_id,))
     row = cur.fetchone()
     if row is None:
         return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
@@ -113,70 +116,37 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
         "summary_md5": hashlib.md5((summary or "").encode("utf-8")).hexdigest(),
     }
-    # Every legacy line this episode may have left behind, in order: its live
-    # identity, then each source row's, then the pre-0027 raw original. None is
-    # erased until the one ownership check below has cleared it.
-    candidates = [live]
-    has_merged_sources = False
-    source_rows: list[dict[str, Any]] | None = None
-    unidentified_sources = 0
-    from khipu.capture_identity import sources_for_episode, sources_ready
-
-    raw = None
-    try:
-        cur.execute("SELECT raw FROM episodes WHERE id = %s", (episode_id,))
-        raw_row = cur.fetchone()
-        raw = raw_row[0] if isinstance(raw_row, tuple) and len(raw_row) == 1 else None
-    except Exception:  # noqa: BLE001 — old schema/driver must still forget the hub row
-        raw = None
-    sources = sources_ready(cur)
-    if sources:
-        # Every source row, origin and merged, keeps the (ts, summary_md5) it
-        # was first written under, so each legacy line this episode ever had
-        # is named exactly, whatever edits and merges did to the live summary
-        # since (RSN-6). The live identity above stays first.
-        source_rows = sources_for_episode(cur, episode_id)
-        # Recording a source row fails open, so the rows can be a subset of
-        # the sources raw names. Each missing one is rebuilt from raw, or
-        # counted as unidentified when raw no longer carries its payload.
-        recovered, missing = _sources_missing_from_rows(raw, source_rows)
-        source_rows = [*source_rows, *recovered]
-        unidentified_sources += missing
-        has_merged_sources = any(src["role"] == "merged" for src in source_rows)
-        unidentified_sources += sum(1 for src in source_rows
-                                   if src["ts"] is None or src["summary_md5"] is None)
-        for src in source_rows:
-            ident = {"ts": src["ts"], "summary_md5": src["summary_md5"]}
-            if (isinstance(ident["ts"], str) and ident["summary_md5"]
-                    and not any(_same_identity(ident, known) for known in candidates)):
-                candidates.append(ident)
-    # Pre-0027 hub (or a 0027 hub where raw named nothing to recover): an
-    # edited summary can still have an original legacy identity in raw. For merged episodes, raw describes a retained source,
-    # not an identity that forget can safely erase without a capture-identity
-    # contract.
-    if isinstance(raw, dict) and not source_rows:
-        has_merged_sources = bool(raw.get("merged_from"))
-        original = _raw_identity(raw)
-        if (not has_merged_sources and original is not None
-                and not any(_same_identity(original, known) for known in candidates)):
-            candidates.append(original)
     # Publish before _candidate_hashes reads any local legacy line. This is the
     # one privacy linearization point shared by every local writer; raw keeps
-    # pre-0027 episodes covered when no source rows exist yet.
-    receipts = raw.get("merged_from") if isinstance(raw, dict) else None
-    tombstone_payloads = ([raw] if isinstance(raw, dict) else []) + [
-        receipt["payload"] for receipt in (receipts if isinstance(receipts, list) else [])
-        if isinstance(receipt, dict) and isinstance(receipt.get("payload"), dict)
-    ] if isinstance(raw, dict) else []
+    # pre-0027 episodes covered when no source rows exist yet. Each publish is
+    # followed by a re-read: a source that reached this episode without the
+    # row lock (a fail-open source row, an older writer) is fenced before the
+    # forget can report itself complete.
+    from khipu.tombstones import RegistryError, publish_forget
+
+    read = _read_forget_sources(cur, episode_id, live)
     registry_error: str | None = None
     try:
-        from khipu.tombstones import RegistryError, publish_forget
-
-        publish_forget(source_rows, tombstone_payloads, candidates)
+        for _round in range(_PUBLISH_ROUNDS):
+            publish_forget(read["source_rows"], read["tombstone_payloads"], read["candidates"])
+            again = _read_forget_sources(cur, episode_id, live)
+            grown = bool(_read_identities(again) - _read_identities(read))
+            read = again
+            if not grown:
+                break
+        else:
+            registry_error = ("the episode's sources kept changing while it was being "
+                              "forgotten; run the forget again")
     except RegistryError as exc:
         # Keep the hub tombstone/cascade semantics intact, but absolutely do
         # not touch a local store when the writer fence could not be published.
         registry_error = str(exc)
+    raw = read["raw"]
+    sources = read["sources"]
+    source_rows = read["source_rows"]
+    candidates = read["candidates"]
+    has_merged_sources = read["has_merged_sources"]
+    unidentified_sources = read["unidentified_sources"]
     # A legacy line another episode also holds is evidence of that episode.
     # Erasing it would lose that episode's line, so it stays and the forget
     # reports itself incomplete. The live identity gets no exemption: an edit
@@ -190,6 +160,12 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     shared = [i in held or bool(h & owned) for i, h in zip(candidates, hashes)]
     shared_identities = [i for i, s in zip(candidates, shared) if s]
     legacy_identities = [i for i, s in zip(candidates, shared) if not s]
+    from khipu.tombstones import publish_hub_forget
+
+    # Same transaction as the tombstone: a writer on any Mac, or on code that
+    # predates the local registry, is refused by the 0030 triggers.
+    publish_hub_forget(cur, episode_id, [*(source_rows or []),
+                                         *_payload_identities(read["tombstone_payloads"])])
     cur.execute(
         "UPDATE episodes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL",
         (episode_id,),
@@ -256,6 +232,102 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         "shared_identities": shared_identities,
         "registry_error": registry_error,
     }
+
+
+_PUBLISH_ROUNDS = 3
+
+
+def _payload_identities(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Source identities of raw and its receipts, for a hub whose source rows
+    are incomplete. A payload that cannot be keyed is already covered by the
+    local publish refusing it."""
+    from khipu.capture_identity import source_identity
+
+    out = []
+    for payload in payloads:
+        try:
+            out.append(source_identity(payload))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _read_forget_sources(cur, episode_id: int, live: dict[str, Any]) -> dict[str, Any]:
+    """raw, the source rows, every legacy identity candidate and the payloads
+    to tombstone, as the hub holds them now."""
+    # Every legacy line this episode may have left behind, in order: its live
+    # identity, then each source row's, then the pre-0027 raw original. None is
+    # erased until the one ownership check in forget_episode has cleared it.
+    candidates = [live]
+    has_merged_sources = False
+    source_rows: list[dict[str, Any]] | None = None
+    unidentified_sources = 0
+    from khipu.capture_identity import sources_for_episode, sources_ready
+
+    raw = None
+    try:
+        cur.execute("SELECT raw FROM episodes WHERE id = %s", (episode_id,))
+        raw_row = cur.fetchone()
+        raw = raw_row[0] if isinstance(raw_row, tuple) and len(raw_row) == 1 else None
+    except Exception:  # noqa: BLE001 — old schema/driver must still forget the hub row
+        raw = None
+    sources = sources_ready(cur)
+    if sources:
+        # Every source row, origin and merged, keeps the (ts, summary_md5) it
+        # was first written under, so each legacy line this episode ever had
+        # is named exactly, whatever edits and merges did to the live summary
+        # since (RSN-6). The live identity above stays first.
+        source_rows = sources_for_episode(cur, episode_id)
+        # Recording a source row fails open, so the rows can be a subset of
+        # the sources raw names. Each missing one is rebuilt from raw, or
+        # counted as unidentified when raw no longer carries its payload.
+        recovered, missing = _sources_missing_from_rows(raw, source_rows)
+        source_rows = [*source_rows, *recovered]
+        unidentified_sources += missing
+        has_merged_sources = any(src["role"] == "merged" for src in source_rows)
+        unidentified_sources += sum(1 for src in source_rows
+                                   if src["ts"] is None or src["summary_md5"] is None)
+        for src in source_rows:
+            ident = {"ts": src["ts"], "summary_md5": src["summary_md5"]}
+            if (isinstance(ident["ts"], str) and ident["summary_md5"]
+                    and not any(_same_identity(ident, known) for known in candidates)):
+                candidates.append(ident)
+    # Pre-0027 hub (or a 0027 hub where raw named nothing to recover): an
+    # edited summary can still have an original legacy identity in raw. For merged episodes, raw describes a retained source,
+    # not an identity that forget can safely erase without a capture-identity
+    # contract.
+    if isinstance(raw, dict) and not source_rows:
+        has_merged_sources = bool(raw.get("merged_from"))
+        original = _raw_identity(raw)
+        if (not has_merged_sources and original is not None
+                and not any(_same_identity(original, known) for known in candidates)):
+            candidates.append(original)
+    receipts = raw.get("merged_from") if isinstance(raw, dict) else None
+    tombstone_payloads = ([raw] if isinstance(raw, dict) else []) + [
+        receipt["payload"] for receipt in (receipts if isinstance(receipts, list) else [])
+        if isinstance(receipt, dict) and isinstance(receipt.get("payload"), dict)
+    ] if isinstance(raw, dict) else []
+    return {"raw": raw, "sources": sources, "source_rows": source_rows,
+            "candidates": candidates, "has_merged_sources": has_merged_sources,
+            "unidentified_sources": unidentified_sources,
+            "tombstone_payloads": tombstone_payloads,
+            "receipt_ids": [r.get("source_id") for r in (receipts if isinstance(receipts, list) else [])
+                            if isinstance(r, dict) and isinstance(r.get("source_id"), str)]}
+
+
+def _read_identities(read: dict[str, Any]) -> set[str]:
+    """Every source key, payload hash and receipt one read names."""
+    from khipu.capture_identity import payload_sha256
+
+    found = {str(row[k]) for row in read["source_rows"] or []
+             for k in ("source_key", "payload_sha256") if row.get(k)}
+    found.update(read["receipt_ids"])
+    for payload in read["tombstone_payloads"]:
+        try:
+            found.add(payload_sha256(payload))
+        except Exception:  # noqa: BLE001 - publish_forget refuses an unhashable payload
+            found.add(repr(sorted(map(str, payload))))
+    return found
 
 
 def _raw_identity(payload: dict[str, Any]) -> dict[str, Any] | None:
