@@ -673,9 +673,8 @@ def offsite_health(
         "dest_remote": dest,
         "latest": {
             "status": ev.get("status"),
-            "created_at": ev["created_at"].isoformat()
-            if ev.get("created_at")
-            else None,
+            # _public_history already turned the time into ISO text.
+            "created_at": ev.get("created_at"),
             "age_seconds": age,
         },
         "max_age_days": OFFSITE_MAX_AGE_DAYS,
