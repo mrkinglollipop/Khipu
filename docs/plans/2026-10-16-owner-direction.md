@@ -137,9 +137,9 @@ The last row matters most. A dispatched job's first prompt is written by an orch
 
 - **Apply at once**, through the same function the app calls. No pending state.
 - **Owner-actions log**: `<data dir>/owner-actions.jsonl`, one line per action: `at`, `action`, `target`, `before` and `after` (enough to undo), `auth` (`app`, `terminal`, `direction`), and for direction the `words`, `harness`, `session`, `turn`, the binding strength (token or session only). Routing changes are also lines in the routing record, as now, stamped `auth: direction`.
-- **The app**: a "Done by your direction" list (Settings, Owner actions) with the words, which conversation, when, and one-tap **Undo** per line. Undo applies the inverse from `before`. An undo is itself logged.
+- **The app**: an "Every owner action" list (Settings, Owner actions) with how each change was made (by direction, with the words and which conversation; in the app; on a terminal), when, and one-tap **Undo** per line. Undo applies the inverse from `before`. An undo is itself logged. A banner names the first bad entry when the log's hash chain is broken (2.8).
 - **Undo by chat**: "undo that" or "put Codex back" is an owner direction like any other (the inverse action with its own words check).
-- **The next routing block** names it: "Paused Codex by your direction in a Claude Code conversation, 14:02Z (undo in Settings)". `author_words` (`routing.py:1100`) keeps the push free of the session id and project, as now.
+- **The next routing block** names every owner change once, however it was made: "Paused Codex by your direction in a Claude Code conversation, 14:02Z (undo in Settings)", "Set the note in the app, ...", "Paused Codex on a terminal, ...". `author_words` (`routing.py:1100`) keeps the push free of the session id and project, as now.
 - **Pending requests (rows 17 to 20)** stay for conversations that cannot pass the check (Grok Bot, a session with no hook). A direction can confirm one ("yes, keep that rule").
 
 ### 2.6 Failure modes

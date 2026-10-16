@@ -1,7 +1,9 @@
 /* Settings -> Owner actions (docs/plans/2026-10-16-owner-direction.md, 2.5
-   and section 4). "Done by your direction" lists what conversations did on
-   the owner's typed words, newest first, with one Undo per line that can be
-   undone; below it, the switches and fields of the check itself.
+   2.8 and section 4). "Every owner action" lists every owner change, however
+   it was made (by direction in a conversation, in the app, on a terminal),
+   newest first, with one Undo per line that can be undone, and a banner when
+   the log's hash chain is broken; below it, the switches and fields of the
+   check itself.
 
    The app is the owner, so every change here applies at once: each write is
    one fixed-argv Tauri command that runs `khipu owner-direction ... --from-app`,
@@ -224,7 +226,40 @@ function canUndo(a: OwnerAction): boolean {
   return !a.no_undo && (a.state === "applied" || a.state === "scheduled" || a.state == null);
 }
 
-type ActionsShape = { ok?: boolean; actions: OwnerAction[] };
+/** The log's hash chain (`owner-direction actions --json`, `chain`). */
+export type ChainState = {
+  ok: boolean;
+  lines: number;
+  first_bad: { line: number; id?: string | null; kind?: string | null; why: string } | null;
+  note?: string;
+};
+
+type ActionsShape = { ok?: boolean; actions: OwnerAction[]; chain?: ChainState };
+
+/** How the change was authorised, in words. */
+function sourceWords(a: OwnerAction): string {
+  switch (a.auth) {
+    case "direction":
+      return `You said this in ${conversationWords(a)}${a.binding === "session" ? "; checked by conversation only" : ""}.`;
+    case "app":
+      return "Done in the Khipu app.";
+    case "terminal":
+      return "Done on a terminal, with a typed yes.";
+    default:
+      return "How this was authorised is not recorded.";
+  }
+}
+
+/** The broken chain's banner text: which entry, and what that means. */
+export function chainWords(chain: ChainState | undefined): string | null {
+  const bad = chain && !chain.ok ? chain.first_bad : null;
+  if (!bad) return null;
+  const which = `line ${bad.line}${bad.id ? ` (${bad.id})` : ""}`;
+  return (
+    `The owner-actions log was changed outside Khipu at ${which}: ${bad.why}. ` +
+    "That entry and the ones after it may not be what Khipu wrote, so check them before you rely on them."
+  );
+}
 
 export function OwnerActions({ active }: { active: boolean }) {
   const show = useCliState<OwnerDirectionShow>("khipu_owner_direction_show", active);
@@ -247,7 +282,8 @@ export function OwnerActions({ active }: { active: boolean }) {
   }
 
   const conf = show.data?.settings;
-  const rows = (log.data?.actions ?? []).filter((a) => a.auth === "direction");
+  const rows = log.data?.actions ?? [];
+  const broken = chainWords(log.data?.chain);
   const seen = Object.entries(show.data?.turns ?? {}).flatMap(([h, row]) =>
     Object.keys(row.entrypoints ?? {}).map((e) => `${h}:${e}`),
   );
@@ -289,8 +325,8 @@ export function OwnerActions({ active }: { active: boolean }) {
   return (
     <>
       <p className="set-help set-intro">
-        A conversation can make an owner's change when you asked for it in your own typed words. Each one is listed
-        here, and you can undo it.
+        A conversation can make an owner's change when you asked for it in your own typed words. Every owner change,
+        made that way, in the app or on a terminal, is listed here, and you can undo it.
       </p>
       {show.error && !show.data ? (
         <p className="set-error" role="alert">
@@ -299,18 +335,23 @@ export function OwnerActions({ active }: { active: boolean }) {
       ) : null}
 
       <div className="section-card">
-        <div className="section-head">Done by your direction</div>
+        <div className="section-head">Every owner action</div>
         <div className="section-body">
+          {broken ? (
+            <p className="set-error" role="alert">
+              {broken}
+            </p>
+          ) : null}
           {log.error && !log.data ? (
             <p className="set-error" role="alert">
               Could not read the list: {log.error}
             </p>
           ) : null}
           {log.data && !rows.length ? (
-            <p className="set-help">Nothing yet. A change a conversation makes on your words shows here.</p>
+            <p className="set-help">Nothing yet. Each owner change shows here once it is made.</p>
           ) : null}
           {rows.length ? (
-            <div className="rows" role="list" aria-label="Done by your direction, newest first">
+            <div className="rows" role="list" aria-label="Every owner action, newest first">
               {rows.map((a) => {
                 const id = `undo:${a.id}`;
                 const what = actionWords(a);
@@ -323,10 +364,7 @@ export function OwnerActions({ active }: { active: boolean }) {
                         {stateTag(a)}
                       </span>
                       {a.words ? <blockquote className="route-quote">“{a.words}”</blockquote> : null}
-                      <span className="route-src">
-                        You said this in {conversationWords(a)}
-                        {a.binding === "session" ? "; checked by conversation only" : ""}.
-                      </span>
+                      <span className="route-src">{sourceWords(a)}</span>
                       {a.no_undo ? <span className="route-src">{a.no_undo}</span> : null}
                     </span>
                     <span className="route-acts">

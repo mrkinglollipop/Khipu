@@ -2472,9 +2472,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         if touched:
             causes[touched] = {"at": info["at"], "seq": info["seq"], "written_by": info["written_by"],
                                "via": info["via"], "type": kind, "state": event.get("state")}
-            if event.get("auth") == "direction":
+            if event.get("auth") in _OWNER_AUTHS:
                 # Named in the next push in fixed words (``direction_line``).
-                causes[touched].update(auth="direction", harness=event.get("harness"))
+                causes[touched].update(auth=event["auth"], harness=event.get("harness"))
         if kind in ("pause", "lift", "clear") and info["account"]:
             owner[{"pause": "pauses", "lift": "lifts", "clear": "clears"}[kind]][info["account"]] = info
         elif kind == "dismiss" and info["target"]:
@@ -3474,7 +3474,7 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
                   "items": [_change_item(k, body, prev_effective, causes, since_at)
                             for k in changed]}
         directions = [direction_line(k, causes[k], body, prev_effective, now) for k in changed
-                      if (causes.get(k) or {}).get("auth") == "direction"
+                      if (causes.get(k) or {}).get("auth") in _OWNER_AUTHS
                       and (since_at is None or (_parse(causes[k].get("at")) or since_at) >= since_at)]
         if directions:
             change["directions"] = directions
@@ -4923,14 +4923,18 @@ _DIRECTION_VERBS = {"pause": "Paused {a}", "lift": "Lifted the pause on {a}", "c
                     "rule_dismiss": "Dismissed standing rule {n}", "priority_set": "Set the priority",
                     "priority_confirm": "Confirmed the priority", "priority_undo": "Undid the priority change",
                     "priority_clear": "Cleared the priority", "priority_drop": "Cleared the priority"}
+# How an owner change was authorised (``_owner_via``): every one is named in
+# the next push, so a change made any way shows up with its Undo.
+_OWNER_AUTHS = ("direction", "app", "terminal")
 _ACCOUNT_NOTE_VERBS = {"tracked": "Started tracking {a}", "renamed": "Renamed {a}", "untracked": "Stopped tracking {a}"}
 
 
 def direction_line(entity: str, cause: dict, body: dict, prev_effective: dict | None, now: datetime) -> str:
-    """The push's line for an owner change made by direction (owner
-    direction scope 2.5): what was done, the harness's words and the time,
-    in fixed words. Never the session, the project or the owner's quoted
-    words: a push reaches every conversation (``author_words``)."""
+    """The push's line for an owner change (owner direction scope 2.5 and
+    2.8): what was done, how (by direction in a harness's conversation, in
+    the app, on a terminal) and the time, in fixed words. Never the session,
+    the project or the owner's quoted words: a push reaches every
+    conversation (``author_words``)."""
     kind, _, ident = entity.partition(":")
     label = ""
     if kind == "account":
@@ -4939,10 +4943,16 @@ def direction_line(entity: str, cause: dict, body: dict, prev_effective: dict | 
     verbs = _ACCOUNT_NOTE_VERBS if cause.get("type") == "account_note" else _DIRECTION_VERBS
     key = cause.get("state") if cause.get("type") == "account_note" else cause.get("type")
     what = verbs.get(key, "Changed the routing record").format(a=label, n=ident)
-    who = author_words({"kind": "conversation", "harness": cause.get("harness") or UNKNOWN_HARNESS})
+    if cause.get("auth") == "app":
+        how = "in the app"
+    elif cause.get("auth") == "terminal":
+        how = "on a terminal"
+    else:
+        how = "by your direction in " + author_words({"kind": "conversation",
+                                                       "harness": cause.get("harness") or UNKNOWN_HARNESS})
     at = _parse(cause.get("at"))
     when = f", {_clock(at, now)}" if at else ""
-    return f"{what} by your direction in {who}{when} (undo in Settings)."
+    return f"{what} {how}{when} (undo in Settings)."
 
 
 def summary(view: dict | None = None, *, now: datetime | None = None, brief: bool = False) -> dict:
@@ -6164,8 +6174,8 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
             head.append((line, "Standing rule " + rule_pointer(pending[entity]), THEIRS) if entity in pending
                         else (line, None, OWNERS))
     head += _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)
-    # What the owner did by direction since, each named once and first among
-    # the budgeted lines: Khipu's fixed words (``direction_line``).
+    # What the owner did since (by direction, in the app, on a terminal),
+    # each named once and first among the budgeted lines: Khipu's fixed words (``direction_line``).
     others = [_clip(line, width) for line in changed.get("directions") or []]
     others += [_clip(line, width) for group, _, line in ranked if group != 0]
 

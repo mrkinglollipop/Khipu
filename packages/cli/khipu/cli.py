@@ -884,6 +884,14 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         owner_direction_block = _owner_turns.doctor_block()
     except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
         owner_direction_block = {"ok": False, "warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # The owner-actions log's hash chain (2.8): red, naming the first bad
+    # line, when a line was written or changed outside Khipu; never gates `ok`.
+    try:
+        from khipu import owner_direction as _owner_direction
+
+        owner_actions_log_block = _owner_direction.doctor_block()
+    except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
+        owner_actions_log_block = {"ok": False, "warnings": [], "error": f"{type(e).__name__}: {e}"}
     # The ledger (Work view phase 1): counts per project, removed rows waiting
     # to purge, purged markers, offline copy. Only the outbox gates (above).
     try:
@@ -942,6 +950,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "plan_usage": plan_usage_block,
         "routing": routing_block,
         "owner_direction": owner_direction_block,
+        "owner_actions_log": owner_actions_log_block,
         "ledger": ledger_block,
         "schema_migrations": schema,
         "work": work_block,
@@ -949,6 +958,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
                      + list(owner_direction_block.get("warnings") or [])
+                     + list(owner_actions_log_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
                      + list(schema.get("warnings") or [])),
         "not_configured": not_configured,

@@ -590,7 +590,7 @@ def test_the_next_routing_block_names_a_direction_once_in_fixed_words(world, khi
     assert OWNER not in push["text"] and token not in push["text"] and "tonight" not in push["text"]
     seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
     assert routing.prompt_push(seen, budget=5.0)["kind"] == "none"
-    # Its undo by direction is named the same way; the app's own change is not.
+    # Its undo by direction is named the same way, and so is the app's own change.
     line = _log()[-1]
     undo = world.say("undo that pause on Codex")
     rc, _ = world.run(["owner-direction", "undo", line["id"]], "undo that pause on Codex", undo)
@@ -603,6 +603,21 @@ def test_the_next_routing_block_names_a_direction_once_in_fixed_words(world, khi
     assert rc == 0
     push = routing.prompt_push(seen, budget=5.0)
     assert push["kind"] == "changes" and "by your direction" not in push["text"]
+    assert push["text"].count("Set the note in the app") == 1 and "(undo in Settings)" in push["text"]
+    seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
+    assert routing.prompt_push(seen, budget=5.0)["kind"] == "none"
+
+
+def test_the_next_routing_block_names_a_terminal_change_once(world, khipu_app, monkeypatch):
+    marker = _marker()
+    khipu_app.as_shell()
+    monkeypatch.setattr(routing, "typed_yes", lambda prompt: True)
+    rc, _ = world.run(["route", "pause", "Codex"])
+    assert rc == 0
+    push = routing.prompt_push(marker, budget=5.0)
+    assert push["text"].count("Paused Codex on a terminal") == 1 and "(undo in Settings)" in push["text"]
+    seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
+    assert routing.prompt_push(seen, budget=5.0)["kind"] == "none"
 
 
 def test_a_rule_by_direction_is_named_in_the_block(world):
@@ -637,3 +652,15 @@ def test_the_apps_owner_direction_argv_apply_at_once_and_only_from_the_app(world
     first = _log()[0]
     rc, out = world.run(["owner-direction", "undo", "--from-app", "--", first["id"]])
     assert rc == 0 and out["undid"] == first["id"] and owner_turns.settings()["latest_window_h"] == 6
+
+
+def test_the_apps_own_change_is_in_the_log_and_can_be_undone_there(world, khipu_app):
+    khipu_app.as_app()
+    rc, _ = world.run(["route", "note", "set", "builds go to Codex", "--from-app"])
+    assert rc == 0 and routing.read_view()["note"]
+    (line,) = [x for x in _log() if x.get("kind") == "action"]
+    assert (line["action"], line["auth"]) == ("route.note.set", "app")
+    rc, out = world.run(["owner-direction", "undo", "--from-app", "--", line["id"]])
+    assert rc == 0, out
+    assert not routing.read_view()["note"]
+    assert owner_direction.verify_log()["ok"] is True

@@ -23,6 +23,7 @@ is scheduled a day out, and Undo cancels it until then.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import os
 import re
@@ -576,13 +577,153 @@ def _write_private(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+# The log is hash-chained (scope 2.8): each line carries ``prev``, the hash
+# of the line before it, and ``hash``, over its own canonical form. The words
+# are in that form only as ``words_sha``, so forgetting an episode can scrub a
+# line's words (``"words": null, "scrubbed": true``) without breaking the
+# chain. Lines from before the chain (no hash on any of them) may lead the
+# log; the first chained line's ``prev`` is then ``LEGACY`` plus the digest
+# of those lines, so changing them breaks the chain too.
+_UNHASHED = ("hash", "words", "scrubbed")
+LEGACY = "legacy:"
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _line_hash(line: dict) -> str:
+    body = {k: v for k, v in line.items() if k not in _UNHASHED}
+    return _sha(json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str))
+
+
+def _legacy_prev(lines: list[str]) -> str:
+    return LEGACY + _sha("".join(text + "\n" for text in lines))
+
+
+def _prev_of(raw: str) -> str:
+    lines = raw.splitlines()
+    last = next((text for text in reversed(lines) if text.strip()), None)
+    if last is None:
+        return ""
+    try:
+        row = json.loads(last)
+    except ValueError:
+        row = None
+    if isinstance(row, dict) and isinstance(row.get("hash"), str):
+        return row["hash"]
+    return _legacy_prev(lines)
+
+
 def _append(line: dict) -> dict:
+    """Append one line to the chain, under a lock so two writers never
+    chain to the same line, and on disk before it returns."""
+    import fcntl
+
     path = log_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(line, ensure_ascii=False, default=str) + "\n")
+    lock_fd = os.open(path.with_name(f".{path.name}.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raw = ""
+        line = json.loads(json.dumps(line, ensure_ascii=False, default=str))
+        for key in ("prev", "hash", "scrubbed"):
+            line.pop(key, None)
+        if isinstance(line.get("words"), str):
+            line["words_sha"] = _sha(line["words"])
+        else:
+            line.pop("words_sha", None)
+        line["prev"] = _prev_of(raw)
+        line["hash"] = _line_hash(line)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(("\n" if raw and not raw.endswith("\n") else "") + json.dumps(line, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    finally:
+        os.close(lock_fd)
     return line
+
+
+def verify_log() -> dict:
+    """Whether the log's hash chain holds: ``first_bad`` names the first line
+    that has no hash or a wrong one, does not follow the line before it, or
+    whose words do not match their hash (line numbers count from 1)."""
+    try:
+        raw = log_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raw = ""
+    except OSError as err:
+        return {"ok": False, "lines": 0, "first_bad": {"line": 0, "id": None, "kind": None,
+                                                        "why": f"the log can't be read ({err.strerror})"}}
+    texts = raw.splitlines()
+    rows: list = []
+    for text in texts:
+        try:
+            rows.append(json.loads(text) if text.strip() else None)
+        except ValueError:
+            rows.append(ValueError)
+    count = sum(1 for r in rows if r is not None)
+    first = next((i for i, r in enumerate(rows) if isinstance(r, dict) and "hash" in r), None)
+    if first is None and all(r is None or isinstance(r, dict) for r in rows):
+        out = {"ok": True, "lines": count, "first_bad": None}
+        if count:
+            out["note"] = "Every line was written before the log was chained."
+        return out
+
+    def bad(i: int, why: str) -> dict:
+        row = rows[i] if isinstance(rows[i], dict) else {}
+        return {"ok": False, "lines": count, "first_bad": {"line": i + 1, "id": row.get("id"),
+                                                           "kind": row.get("kind"), "why": why}}
+
+    start = first if first is not None else len(rows)
+    for i in range(start):
+        if rows[i] is ValueError:
+            return bad(i, "it is not a readable line")
+    if first is None:
+        return {"ok": True, "lines": count, "first_bad": None}
+    prev = _legacy_prev(texts[:first]) if first else ""
+    for i in range(first, len(rows)):
+        row = rows[i]
+        if row is None:
+            continue
+        if not isinstance(row, dict):
+            return bad(i, "it is not a readable line")
+        if not isinstance(row.get("hash"), str):
+            return bad(i, "it has no hash, so Khipu did not write it")
+        if row.get("prev") != prev:
+            if first and i == first and str(row.get("prev") or "").startswith(LEGACY):
+                return bad(i, "a line written before the log was chained was changed")
+            return bad(i, "it does not follow the line before it: a line is missing or was changed")
+        if _line_hash(row) != row["hash"]:
+            return bad(i, "it was changed after Khipu wrote it")
+        words = row.get("words")
+        if words is not None and (not isinstance(words, str) or row.get("words_sha") != _sha(words)):
+            return bad(i, "its words do not match their hash")
+        prev = row["hash"]
+    out = {"ok": True, "lines": count, "first_bad": None}
+    if first:
+        out["note"] = f"The first {first} lines were written before the log was chained."
+    return out
+
+
+def doctor_block() -> dict:
+    """Doctor's "owner actions log" row: red when the hash chain is broken,
+    naming the first bad line."""
+    chain = verify_log()
+    bad = chain.get("first_bad")
+    if bad:
+        what = f"line {bad['line']}" + (f" ({bad['id']})" if bad.get("id") else "")
+        summary = (f"The owner-actions log was changed outside Khipu at {what}: {bad['why']}. "
+                   "Check that entry in Owner actions.")
+        return {"ok": False, "chain": chain, "warnings": [summary], "summary": summary}
+    summary = f"Owner-actions log: {chain['lines']} lines, chain intact."
+    if chain.get("note"):
+        summary += " " + chain["note"]
+    return {"ok": True, "chain": chain, "warnings": [], "summary": summary}
 
 
 def read_log() -> list[dict]:
@@ -1289,9 +1430,12 @@ def run_cli(args) -> int:
         run_due()
         rows = [dict(x, state=line_state(x["id"])) for x in read_log() if x.get("kind") == "action"]
         rows.reverse()
+        chain = verify_log()
         if getattr(args, "json", False):
-            _print({"ok": True, "actions": rows})
+            _print({"ok": True, "actions": rows, "chain": chain})
         else:
+            if chain["first_bad"]:
+                print(doctor_block()["summary"])
             for x in rows:
                 print(f"{x['id']}  {x['at']}  {x['action']} {x['target']}  ({x.get('auth')}, {x['state']})"
                       + (f"  \"{x['words']}\"" if x.get("words") else ""))

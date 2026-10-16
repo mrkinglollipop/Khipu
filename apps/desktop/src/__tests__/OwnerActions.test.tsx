@@ -4,14 +4,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { OwnerActions } from "../OwnerActions";
-import type { OwnerAction, OwnerDirectionSettings } from "../OwnerActions";
+import type { ChainState, OwnerAction, OwnerDirectionSettings } from "../OwnerActions";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
 }));
 
-type Backend = { settings: OwnerDirectionSettings; actions: OwnerAction[]; refuse?: string };
+type Backend = { settings: OwnerDirectionSettings; actions: OwnerAction[]; refuse?: string; chain?: ChainState };
 let backend: Backend;
 const calls: Array<[string, Record<string, unknown> | undefined]> = [];
 
@@ -40,6 +40,7 @@ function fresh(): Backend {
         words: "pause Codex until tonight", harness: "claude_code", binding: "token", state: "applied",
       },
       { id: "z9", at: "2026-10-16T13:00:00Z", action: "route.note.set", target: "note", auth: "app", state: "applied" },
+      { id: "t7", at: "2026-10-16T12:00:00Z", action: "route.lift", target: "grok|", auth: "terminal", state: "applied" },
     ],
   };
 }
@@ -57,7 +58,11 @@ beforeEach(() => {
           turns: { claude_code: { turns: 4, eligible: 3, entrypoints: { cli: 3, "sdk-cli": 1 } } },
         });
       case "khipu_owner_direction_actions":
-        return JSON.stringify({ ok: true, actions: backend.actions });
+        return JSON.stringify({
+          ok: true,
+          actions: backend.actions,
+          chain: backend.chain ?? { ok: true, lines: backend.actions.length, first_bad: null },
+        });
       case "khipu_owner_direction_undo": {
         if (backend.refuse) return JSON.stringify({ ok: false, error: backend.refuse });
         const row = backend.actions.find((a) => a.id === args?.id)!;
@@ -86,14 +91,14 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 async function list() {
-  return screen.findByRole("list", { name: "Done by your direction, newest first" });
+  return screen.findByRole("list", { name: "Every owner action, newest first" });
 }
 
 describe("Owner actions", () => {
-  it("lists only what was done by direction, newest first, with the words, the conversation and the state", async () => {
+  it("lists every owner action, newest first, with the words, the conversation and the state", async () => {
     render(<OwnerActions active />);
     const items = within(await list()).getAllByRole("listitem");
-    expect(items).toHaveLength(3);
+    expect(items).toHaveLength(5);
     expect(items[0].textContent).toContain("Removed T-12 from the ledger for good");
     expect(items[0].textContent).toContain("Purge scheduled for");
     expect(items[0].textContent).toContain("You said this in an Aegis conversation; checked by conversation only.");
@@ -114,6 +119,38 @@ describe("Owner actions", () => {
     await waitFor(() => expect(within(items[2]).getByText("Undone")).toBeTruthy());
     expect(calls).toContainEqual(["khipu_owner_direction_undo", { id: "a1" }]);
     expect(within(items[2]).queryByRole("button")).toBeNull();
+  });
+
+  it("shows the app's and a terminal's changes with how they were made, each with Undo", async () => {
+    render(<OwnerActions active />);
+    const items = within(await list()).getAllByRole("listitem");
+    expect(items[3].textContent).toContain("Set the note");
+    expect(items[3].textContent).toContain("Done in the Khipu app.");
+    expect(items[4].textContent).toContain("Lifted the pause on Grok");
+    expect(items[4].textContent).toContain("Done on a terminal, with a typed yes.");
+    fireEvent.click(within(items[4]).getByRole("button", { name: "Undo: Lifted the pause on Grok" }));
+    await waitFor(() => expect(within(items[4]).getByText("Undone")).toBeTruthy());
+    expect(calls).toContainEqual(["khipu_owner_direction_undo", { id: "t7" }]);
+    expect(within(items[3]).getByRole("button", { name: "Undo: Set the note" })).toBeTruthy();
+  });
+
+  it("no banner while the log's chain holds", async () => {
+    render(<OwnerActions active />);
+    await list();
+    expect(screen.queryByText(/changed outside Khipu/)).toBeNull();
+  });
+
+  it("a broken chain shows a banner naming the first bad entry", async () => {
+    backend.chain = {
+      ok: false,
+      lines: 5,
+      first_bad: { line: 2, id: "c3", kind: "action", why: "it was changed after Khipu wrote it" },
+    };
+    render(<OwnerActions active />);
+    await list();
+    const alert = await screen.findByText(/changed outside Khipu/);
+    expect(alert.getAttribute("role")).toBe("alert");
+    expect(alert.textContent).toContain("at line 2 (c3): it was changed after Khipu wrote it.");
   });
 
   it("a scheduled purge's button cancels it", async () => {
