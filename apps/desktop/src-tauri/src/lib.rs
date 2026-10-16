@@ -568,6 +568,19 @@ const BUDGET_LIFT_SYNTH_TODAY_ARGV: &[&str] = &["budget", "lift", "synth", "--to
 /// every account now. Fixed argv: the webview cannot reach `--max-age`.
 const USAGE_STATUS_ARGV: &[&str] = &["usage", "--json"];
 const USAGE_REFRESH_ARGV: &[&str] = &["usage", "--fresh", "--json"];
+/// Settings clarity phase 9 (9C): the login folders Khipu could track, as
+/// `khipu usage --discover --json` reports them (paths included: the app's,
+/// never an agent's). `--now` is Look for accounts now, which ignores the
+/// once-a-day wait. Fixed argv either way.
+const ACCOUNTS_DISCOVER_ARGV: &[&str] = &["usage", "--discover", "--json"];
+const ACCOUNTS_DISCOVER_NOW_ARGV: &[&str] = &["usage", "--discover", "--now", "--json"];
+/// Forget which logins conversations used: clears the recorded login folder
+/// from every saved conversation's state.
+const ACCOUNTS_FORGET_LOGIN_PATHS_ARGV: &[&str] = &["usage", "--forget-login-paths"];
+/// `config --set KEY PATH` / `config --unset=KEY` for where Khipu finds each
+/// CLI and its Node (`khipu.config.CLI_SETTINGS`, decision 10).
+const CLI_PATH_KEYS: &[&str] = &["cli_path.claude", "cli_path.codex", "cli_path.grok", "cli_path.muse"];
+const NODE_FOLDER_KEY: &str = "node_folder";
 /// Home -> Routing, the health report's Routing row and the routing
 /// attention items (docs/plans/2026-10-14-routing-truth.md, phase 4): the
 /// routing record as `khipu route --json` prints it. Read only and fixed
@@ -1064,6 +1077,7 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
         }
         GRAPH_BACKUP_REMOTE_KEY => Ok(set(GRAPH_BACKUP_REMOTE_KEY, checked_backup_remote(value)?)),
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
+        k if cli_setting_key(k) => Ok(set(k, checked_cli_setting_path(k, value)?)),
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
         _ => Err(format!("not a settable key: {key:?}")),
     }
@@ -1090,6 +1104,7 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
         && key != COSINE_FLOOR_KEY
         && key != USAGE_ACCOUNTS_KEY
         && key != GRAPH_BACKUP_REMOTE_KEY
+        && !cli_setting_key(key)
         && !routing_key(key)
         && !by_profile
     {
@@ -1215,6 +1230,104 @@ async fn khipu_usage_status() -> Result<String, String> {
 #[tauri::command]
 async fn khipu_usage_refresh() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(USAGE_REFRESH_ARGV)).await
+}
+
+// --- Settings clarity phase 9 (9C): finding and adding accounts. Reads for
+// the app only (they carry login-folder paths); each is a fixed argv built
+// here, every value joined to its flag with `=` so it can never read as a
+// flag of its own. The app's account writes are 9B's `khipu_accounts_*`.
+
+fn cli_setting_key(key: &str) -> bool {
+    CLI_PATH_KEYS.contains(&key) || key == NODE_FOLDER_KEY
+}
+
+/// A CLI or Node folder the owner picked: a full path (or `~/...`), one line,
+/// never a flag. The CLI checks again that it is an executable file (a CLI)
+/// or a folder holding an executable `node`.
+fn checked_cli_setting_path(key: &str, raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if !(v.starts_with('/') || v.starts_with("~/")) {
+        return Err(format!("{key} must be a full path starting with / or ~/"));
+    }
+    if has_control(v) || v.chars().count() > 4096 {
+        return Err(format!("{key} must be one line of plain text"));
+    }
+    Ok(v.to_string())
+}
+
+/// A login folder for Check or one read: `~/...` or a full path, one line.
+/// A relative folder, a flag-shaped value or a control character is refused
+/// before anything runs.
+fn checked_login_folder(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if v.starts_with('-') {
+        return Err("a login folder must not start with '-'".to_string());
+    }
+    if !(v.starts_with("~/") || v.starts_with('/')) {
+        return Err("a login folder starts with ~/ or is a full path starting with /".to_string());
+    }
+    if has_control(v) || v.chars().count() > 1024 {
+        return Err("a login folder must be one line of plain text".to_string());
+    }
+    Ok(v.to_string())
+}
+
+fn checked_usage_harness(raw: &str) -> Result<String, String> {
+    let h = raw.trim().to_lowercase();
+    if USAGE_HARNESSES.contains(&h.as_str()) {
+        Ok(h)
+    } else {
+        Err("harness must be claude, codex, grok or muse".to_string())
+    }
+}
+
+fn accounts_discover_argv(now: bool) -> Vec<String> {
+    fixed_argv(if now { ACCOUNTS_DISCOVER_NOW_ARGV } else { ACCOUNTS_DISCOVER_ARGV })
+}
+
+/// The owner's Check on one found folder (decision 20: the CLI may write
+/// into it when asked, so it runs only when the owner presses Check).
+fn accounts_check_argv(folder: &str) -> Result<Vec<String>, String> {
+    Ok(vec![
+        "usage".to_string(),
+        "--discover".to_string(),
+        format!("--check={}", checked_login_folder(folder)?),
+        "--json".to_string(),
+    ])
+}
+
+/// One read of an account that is not saved (the dialog's step 3). No folder
+/// is the CLI's default login; Muse takes none.
+fn accounts_try_argv(harness: &str, folder: Option<&str>) -> Result<Vec<String>, String> {
+    let h = checked_usage_harness(harness)?;
+    let mut argv = vec!["usage".to_string(), "--try".to_string(), format!("--harness={h}")];
+    if let Some(f) = folder.map(str::trim).filter(|f| !f.is_empty()) {
+        if h == "muse" {
+            return Err("Muse has one sign-in, so it takes no login folder".to_string());
+        }
+        argv.push(format!("--folder={}", checked_login_folder(f)?));
+    }
+    Ok(argv)
+}
+
+#[tauri::command]
+async fn khipu_accounts_discover(now: Option<bool>) -> Result<String, String> {
+    run_khipu_cli_async(accounts_discover_argv(now.unwrap_or(false))).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_check(folder: String) -> Result<String, String> {
+    run_khipu_cli_async(accounts_check_argv(&folder)?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_try(harness: String, folder: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(accounts_try_argv(&harness, folder.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_forget_login_paths() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(ACCOUNTS_FORGET_LOGIN_PATHS_ARGV)).await
 }
 
 #[tauri::command]
@@ -4020,6 +4133,10 @@ pub fn run() {
             khipu_budget_lift_synth_today,
             khipu_usage_status,
             khipu_usage_refresh,
+            khipu_accounts_discover,
+            khipu_accounts_check,
+            khipu_accounts_try,
+            khipu_accounts_forget_login_paths,
             khipu_route_view,
             khipu_route_pause,
             khipu_route_lift,
@@ -6165,6 +6282,131 @@ esac
         assert!(new_folder_argv("codex", "x", SIGN_IN_NEW_OFFERED).is_err());
         assert!(new_folder_argv("codex", "x", ALL).is_ok());
         assert!(new_folder_argv("muse", "x", &["muse"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod accounts_command_tests {
+    use super::*;
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn discover_and_forget_are_fixed_argv() {
+        assert_eq!(accounts_discover_argv(false), v(&["usage", "--discover", "--json"]));
+        assert_eq!(accounts_discover_argv(true), v(&["usage", "--discover", "--now", "--json"]));
+        assert_eq!(fixed_argv(ACCOUNTS_FORGET_LOGIN_PATHS_ARGV), v(&["usage", "--forget-login-paths"]));
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"usage"));
+    }
+
+    #[test]
+    fn check_joins_the_folder_to_its_flag() {
+        assert_eq!(
+            accounts_check_argv("~/.codex-work").unwrap(),
+            v(&["usage", "--discover", "--check=~/.codex-work", "--json"])
+        );
+        assert_eq!(
+            accounts_check_argv("  /Volumes/Shared/.claude-team  ").unwrap(),
+            v(&["usage", "--discover", "--check=/Volumes/Shared/.claude-team", "--json"])
+        );
+    }
+
+    #[test]
+    fn check_refuses_flags_control_characters_and_relative_folders() {
+        for bad in ["", "-x", "--now", "--check=/x", ".codex-work", "codex-work", "~.codex-work", "~",
+            "~/.codex\n--now", "/tmp/a\rb", "/tmp/\u{7f}x"] {
+            assert!(accounts_check_argv(bad).is_err(), "accepted {bad:?}");
+        }
+        assert!(accounts_check_argv(&format!("/{}", "a".repeat(1100))).is_err());
+    }
+
+    #[test]
+    fn try_builds_exact_argv_per_harness() {
+        assert_eq!(accounts_try_argv("claude", None).unwrap(), v(&["usage", "--try", "--harness=claude"]));
+        assert_eq!(accounts_try_argv("Codex", Some("")).unwrap(), v(&["usage", "--try", "--harness=codex"]));
+        assert_eq!(
+            accounts_try_argv("claude", Some("~/.claude-client")).unwrap(),
+            v(&["usage", "--try", "--harness=claude", "--folder=~/.claude-client"])
+        );
+        assert_eq!(
+            accounts_try_argv("grok", Some("/home/someone/.grok-second")).unwrap(),
+            v(&["usage", "--try", "--harness=grok", "--folder=/home/someone/.grok-second"])
+        );
+        assert_eq!(accounts_try_argv("muse", None).unwrap(), v(&["usage", "--try", "--harness=muse"]));
+    }
+
+    #[test]
+    fn try_refuses_unknown_harnesses_muse_folders_and_bad_folders() {
+        for bad in ["", "cursor", "--harness", "clau\nde", "claude --now", "-claude"] {
+            assert!(accounts_try_argv(bad, None).is_err(), "accepted harness {bad:?}");
+        }
+        assert!(accounts_try_argv("muse", Some("~/.muse")).is_err());
+        for bad in ["-x", "--folder=/x", "relative/folder", "~/.claude\n--now", ".claude-x"] {
+            assert!(accounts_try_argv("claude", Some(bad)).is_err(), "accepted folder {bad:?}");
+        }
+    }
+
+    #[test]
+    fn cli_settings_save_and_clear_through_config() {
+        for key in ["cli_path.claude", "cli_path.codex", "cli_path.grok", "cli_path.muse"] {
+            assert_eq!(
+                config_set_argv(key, "/opt/tools/bin/cli").unwrap(),
+                v(&["config", "--set", key, "/opt/tools/bin/cli"])
+            );
+            assert_eq!(config_unset_argv(key).unwrap(), v(&["config", &format!("--unset={key}")]));
+        }
+        assert_eq!(
+            config_set_argv("node_folder", "~/.nvm/versions/node/v20.11.0/bin").unwrap(),
+            v(&["config", "--set", "node_folder", "~/.nvm/versions/node/v20.11.0/bin"])
+        );
+        assert_eq!(config_unset_argv("node_folder").unwrap(), v(&["config", "--unset=node_folder"]));
+    }
+
+    #[test]
+    fn cli_settings_refuse_relative_flag_shaped_and_multi_line_paths() {
+        for key in ["cli_path.codex", "node_folder"] {
+            for bad in ["", "codex", "bin/codex", "-x", "--set", "/opt/a\n--unset=x", "/opt/\tx"] {
+                assert!(config_set_argv(key, bad).is_err(), "{key} accepted {bad:?}");
+            }
+        }
+        for unknown in ["cli_path.cursor", "cli_path.", "cli_path", "node", "node_folders"] {
+            assert!(config_set_argv(unknown, "/opt/x").is_err(), "accepted key {unknown:?}");
+            assert!(config_unset_argv(unknown).is_err(), "unset accepted key {unknown:?}");
+        }
+    }
+
+    #[test]
+    fn cli_setting_keys_match_the_python_settings() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/khipu/config.py");
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let line = src.split("CLI_SETTINGS = (").nth(1).unwrap().split(')').next().unwrap();
+        for k in CLI_PATH_KEYS.iter().chain(std::iter::once(&NODE_FOLDER_KEY)) {
+            assert!(line.contains(&format!("\"{k}\"")), "{k} missing from CLI_SETTINGS");
+        }
+    }
+
+    /// Sign in now on an untracked folder (Section "Adding an account by
+    /// hand"): the app saves the account first, then calls the unchanged
+    /// `khipu_account_sign_in`. Before the save the folder is not in the list
+    /// and no sign-in argv can be built; after it, the exact argv is.
+    #[test]
+    fn sign_in_now_needs_the_save_first() {
+        let before = serde_json::json!({"usage_accounts": {"accounts": [
+            {"label": "Claude", "harness": "claude"}
+        ], "user_home": "/home/owner"}});
+        assert!(sign_in_argv(&before, "claude", Some("~/.claude-old")).is_err());
+        let after = serde_json::json!({"usage_accounts": {"accounts": [
+            {"label": "Claude", "harness": "claude"},
+            {"label": "Claude old", "harness": "claude", "home": "~/.claude-old"}
+        ], "user_home": "/home/owner"}});
+        assert_eq!(
+            sign_in_argv(&after, "claude", Some("~/.claude-old")).unwrap(),
+            v(&["usage", "--sign-in", "--account=Claude old", "--account-key=claude|~/.claude-old"])
+        );
+        // A refused save leaves the list as it was: still no sign-in.
+        assert!(sign_in_argv(&before, "claude", Some("/home/owner/.claude-old")).is_err());
     }
 }
 

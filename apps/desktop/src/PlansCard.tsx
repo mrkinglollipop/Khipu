@@ -717,10 +717,13 @@ function PlanRow({ row, now, pause, onSignedIn }: {
 
 /** Home → Plans: one row per account, the tightest window of each. `routing`
  *  is the routing record when it was read, for the pauses. */
-export function PlansCard({ state, routing, onOpenAccounts }: {
+export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false, onAddAccount }: {
   state: PlanUsageState;
   routing?: RouteView | null;
   onOpenAccounts?: () => void;
+  /** The owner stopped tracking every account ("Read no accounts", phase 9). */
+  noneTracked?: boolean;
+  onAddAccount?: () => void;
 }) {
   const { data, error, errorAt, loading, refreshing, refresh, reread } = state;
   const accounts = data?.accounts ?? [];
@@ -740,7 +743,17 @@ export function PlansCard({ state, routing, onOpenAccounts }: {
         ) : null}
         <RefreshButton busy={refreshing || loading} label="Refresh" onClick={() => void refresh()} />
       </div>
-      {data == null ? (
+      {noneTracked ? (
+        <div className="empty">
+          <b>No accounts tracked</b>
+          <span>You stopped tracking every account on this Mac. Add one to see how much of its plan is left.</span>
+          {onAddAccount ? (
+            <button type="button" className="sm plans-empty-btn" onClick={onAddAccount}>
+              Add an account…
+            </button>
+          ) : null}
+        </div>
+      ) : data == null ? (
         error ? (
           <EmptyState title="Could not read plan usage" hint={error} />
         ) : (
@@ -858,6 +871,10 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
           <Tag tone="ok" dot>
             {triedAge ? `Live: read ${triedAge}` : "Live"}
           </Tag>
+        ) : row.source === "rollout" && windows.length && !fail?.includes("last turn") ? (
+          // Codex's session-file fallback, kept for tracked accounts only (decision
+          // 21); a failure line that already says "last turn" says it once.
+          <span>{figuresAge ? `From its last conversation, ${figuresAge}` : "From its last conversation"}</span>
         ) : row.observed_at && windows.length && !fail?.includes("last turn") ? (
           <span>{figuresAge ? `As of its last turn, ${figuresAge}` : "As of its last turn"}</span>
         ) : windows.length ? (
@@ -1119,6 +1136,7 @@ const ACCOUNT_REFUSAL: Record<string, (c: RefusalCtx) => string> = {
   name_is_cli: () => "That name is the name of a CLI. Type a different Name.",
   name_is_id: () => "That name is the id of another account. Type a different Name.",
   version_moved: () => "The account list changed while you were working. Khipu read it again; check it and try once more.",
+  version_needed: () => "The account list changed while you were working. Khipu read it again; check it and try once more.",
   last_account: () => "This is the last account Khipu reads. Confirm to stop reading accounts altogether.",
   name_needed: () => "Give this account a name.",
   folder_not_found: () => "Khipu cannot find that login folder. Check the folder and try again.",
@@ -1144,7 +1162,8 @@ export function accountsRefusal(
 ): FormProblem {
   console.error("khipu config --set usage_accounts refused:", res.error);
   const r = res.refusal ?? {};
-  const code = typeof r.code === "string" ? r.code : "";
+  // The app's own command refuses a missing version with no code.
+  const code = typeof r.code === "string" ? r.code : res.error.includes("needs the version it read") ? "version_needed" : "";
   const index = typeof r.index === "number" ? r.index : null;
   const otherIndex = typeof r.other === "number" ? r.other : null;
   const field = typeof r.field === "string" ? r.field : null;
@@ -1192,7 +1211,15 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
     setClash(null);
     const list = next == null ? [] : storable(next, status);
     // The version of the list this editor loaded, not one fetched now.
-    const expect = status?.version ?? null;
+    const expect = status?.version?.trim() ? status.version : null;
+    if (!expect) {
+      // Never saved without the version it read: read the list, then try again.
+      await cfg.reload();
+      setSaving(false);
+      setErr(ACCOUNT_REFUSAL.version_needed({ entry: null, other: null, field: null, added: false }));
+      setClash(null);
+      return false;
+    }
     const res = list.length
       ? await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list), expect })
       : await callCli("khipu_config_unset", { key: "usage_accounts", expect });

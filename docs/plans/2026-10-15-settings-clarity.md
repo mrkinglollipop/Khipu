@@ -37,6 +37,7 @@ a card on Home that stays until he closes it, each item with a Show me button.
 | 9 | Finding and adding accounts in the app (addendum, see "Phase 9" at the end) | M–L | approved by Matt 2026-10-15 |
 | 9A | Discovery engine and CLI (`packages/cli`) | M | built and reviewed, in review (branch feat/accounts-9a) |
 | 9B | Tracking and managing accounts (`packages/cli`, routing, Rust) | M | built and reviewed, in review (branch feat/accounts-9b) |
+| 9C | App surfaces for finding and adding accounts (`apps/desktop`) | M | built, in review (branch feat/accounts-9c) |
 
 One PR per phase. Phase 1 goes first because it fixes things that are wrong today. Phases 2 to 6 can go in any
 order after 3, except that 4 and 5 need 3. Phases 7 and 8 go last, because they introduce what the earlier
@@ -581,6 +582,18 @@ Matt, 2026-10-15, after the 9A guardrail run (Rules for phase 9 and Guardrails):
     <folder>`), which ignores the daily wait. A not-checked folder is never offered on Home, is not counted in
     the 12-folder cap, and is never tracked automatically.
 
+Matt, 2026-10-16, answering the two questions left open (9 and 10 below) with the recommendations. They are
+numbered 21 and 22 because decision 20 above was already taken:
+
+21. **Codex's session-file fallback stays for tracked accounts only.** When Codex's live plan read fails for an
+    account Khipu tracks, Khipu still shows the last `rate_limits` from the tail of its five newest session files
+    (`usage.codex_rollout`); discovery and `--try` never use it (`rollout=False`). Settings says so next to
+    Codex's figures: "From its last conversation" on the account's read line.
+22. **A CLI whose install is broken is the one boundary.** Khipu sets a CLI's path and its Node folder in the
+    app, but it never repairs, reinstalls or runs an installer for another maker's program: it says what is
+    wrong and links the maker's verified install page (Claude Code and Codex today; Grok Build and Muse get no
+    link until one is verified).
+
 Review history: a twelve-stage review (`dd33e77`) and an independent Codex review of it (11 findings, all
 confirmed against the code on 2026-10-15) are folded into the text below.
 
@@ -623,7 +636,7 @@ No Grok or Muse docs beyond `--help` were checked. A device-code sign-in prints 
   (its job), and Codex's plan read falls back to the last `rate_limits` in its newest session files
   (`usage.py:691`, `codex_rollout`, which scans `<CODEX_HOME>/sessions` and reads the tail of up to five
   files). That fallback is switched off for discovery and `--try` (fix now, 9A); whether tracked accounts keep
-  it is open question 9.
+  decision 21 keeps it for tracked accounts only.
   Khipu's own capture folder (`~/.grok/khipu` by default, `session_capture.khipu_home`) is Khipu's data, not the
   Grok login's: discovery reads its session state files (source 2) and nothing else under `~/.grok` (tested
   with the default capture home, 9A).
@@ -1091,7 +1104,7 @@ today, not only in this plan, and go first, in their own PR, independent of disc
 2. Codex's plan read falls back to reading session files inside the login folder (`usage.py:691`,
    `codex_rollout`). Add a `rollout=False` switch to `probe_codex` that discovery and `--try` will use, test
    that with it off a failed live read returns its failure code and opens nothing under the folder, and test the
-   failure branch with it on. Tracked accounts keep the fallback until Matt answers open question 9.
+   failure branch with it on. Tracked accounts keep the fallback (decision 21).
 
 **9A, discovery engine and CLI (packages/cli; one session).** Read this section, `usage.py`, `claude_homes.py`,
 `t3.py`, `session_capture.py` and `synth_cli.py` first. Build: the login path recorded per session; sources 1 to
@@ -1171,16 +1184,8 @@ promotion gate, screenshots per state at 1280 and 960, the snapshots identical b
 evidence kept private and only the sanitized record published, the publication check green. Stop and report
 on any difference.
 
-### Open questions for Matt
+### Questions answered by Matt
 
-Questions 1 to 8 were answered on 2026-10-15 and are decisions 12 to 19. Two stay open:
-
-9. **Codex's session-file fallback for tracked accounts.** When Codex's live plan read fails, Khipu reads the
-   last `rate_limits` from the tail of its five newest session files, inside the login folder. Those are the
-   same transcripts Khipu's capture already reads, and only the figures are kept. Recommended: keep it for
-   tracked accounts (removing it loses figures when Codex's live read fails, against "no loss of
-   functionality"), never for discovery or `--try`, and say so in Settings next to Codex's figures ("from its
-   last conversation").
-10. **A CLI whose install is broken.** Khipu can set a CLI's path and its Node folder in the app, but it can't
-    repair or reinstall another maker's program. Recommended: accept that as the one boundary; Khipu says what
-    is wrong and links the maker's verified install page, and never runs an installer for you.
+Questions 1 to 8 were answered on 2026-10-15 and are decisions 12 to 19. Questions 9 (Codex's session-file
+fallback for tracked accounts) and 10 (a CLI whose install is broken) were answered on 2026-10-16 and are
+decisions 21 and 22. None is left open.
