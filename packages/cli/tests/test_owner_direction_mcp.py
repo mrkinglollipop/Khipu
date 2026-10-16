@@ -101,7 +101,7 @@ def _log() -> list[dict]:
 def test_a_pause_passes_from_each_harness(world, harness, entry):
     token = world.say("pause Codex until tonight please", session="s-1", harness=harness, entry=entry)
     world.server("s-1", harness)
-    is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until tonight", token)
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token)
     assert not is_error and out["ok"] is True, out
     assert _state("Codex") == "paused"
     (line,) = _log()
@@ -113,7 +113,7 @@ def test_a_pause_passes_from_each_harness(world, harness, entry):
 def test_no_session_in_the_servers_environment_is_refused(world):
     token = world.say("pause Codex until tonight please", session="s-1")
     world.server(None)
-    is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until tonight", token)
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token)
     assert is_error and out["ok"] is False and out["code"] == "no_recorded_turn"
     assert _state("Codex") != "paused"
 
@@ -130,7 +130,7 @@ def test_a_forged_session_id_is_refused(world):
     token = world.say("pause Codex until tonight please", session="s-a")
     world.say("hello there my friend", session="s-b")
     world.server("s-b")
-    is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until tonight", token)
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token)
     assert is_error and out["code"] == "no_recorded_turn"
     assert _state("Codex") != "paused"
 
@@ -139,7 +139,8 @@ def test_the_session_is_never_taken_from_the_arguments(world):
     token = world.say("pause Codex until tonight please", session="s-a")
     world.server("s-b")
     for key in ("session", "session_id"):
-        is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until tonight", token, **{key: "s-a"})
+        is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token,
+                             **{key: "s-a"})
         assert is_error and _state("Codex") != "paused"
 
 
@@ -193,7 +194,7 @@ def test_the_gateway_does_not_list_or_run_it(world):
         listed = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         names = {t["name"] for t in listed["result"]["tools"]}
         assert "khipu_owner_act" not in names and "khipu_route" in names
-        is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until tonight", token)
+        is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token)
     assert is_error and _state("Codex") != "paused"
     local = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert "khipu_owner_act" in {t["name"] for t in local["result"]["tools"]}
@@ -214,7 +215,7 @@ def test_a_job_with_its_parent_link_and_the_parents_token_passes(world):
     token = world.say("pause Codex until tonight please", session="s-parent")
     _dispatch(world, "s-parent")
     world.server("s-job")
-    is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until tonight", token,
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token,
                          owner_session="s-parent")
     assert not is_error and out["ok"] is True, out
     assert _state("Codex") == "paused"
@@ -226,7 +227,7 @@ def test_a_job_acting_on_its_own_brief_is_refused(world):
     world.say("pause Codex until tonight please", session="s-parent")
     _dispatch(world, "s-parent")
     world.server("s-job")
-    is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until tonight")
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight")
     assert is_error and out["code"] == "no_recorded_turn"
     assert _state("Codex") != "paused"
 
@@ -235,7 +236,7 @@ def test_a_job_naming_a_parent_that_never_typed_the_words_is_refused(world):
     token = world.say("build the docs page for routing", session="s-parent")
     _dispatch(world, "s-parent")
     world.server("s-job")
-    is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until tonight", token,
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token,
                          owner_session="s-parent")
     assert is_error and out["code"] == "not_the_owners_words"
     assert _state("Codex") != "paused"
@@ -246,7 +247,7 @@ def test_a_job_naming_a_session_it_was_not_started_from_is_refused(world):
     token = world.say("pause Codex until tonight please", session="s-other")
     _dispatch(world, "s-parent")
     world.server("s-job")
-    is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until tonight", token,
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token,
                          owner_session="s-other")
     assert is_error and out["code"] == "no_recorded_turn" and "not started from" in out["error"]
     assert _state("Codex") != "paused"
@@ -256,7 +257,7 @@ def test_a_session_with_no_brief_cannot_name_another(world):
     token = world.say("pause Codex until tonight please", session="s-parent")
     world.say("just a normal turn here", session="s-other")
     world.server("s-other")
-    is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until tonight", token,
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token,
                          owner_session="s-parent")
     assert is_error and out["code"] == "no_recorded_turn"
     assert _state("Codex") != "paused"
@@ -266,7 +267,8 @@ def test_a_claude_code_parent_still_needs_its_token(world):
     world.say("pause Codex until tonight please", session="s-parent")
     _dispatch(world, "s-parent")
     world.server("s-job")
-    is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until tonight", owner_session="s-parent")
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight",
+                         owner_session="s-parent")
     assert is_error and out["code"] == "no_recorded_turn"
     assert _state("Codex") != "paused"
 
@@ -277,8 +279,8 @@ def test_the_cli_takes_owner_session_too(world, capsys):
     token = world.say("pause Codex until tonight please", session="s-parent")
     _dispatch(world, "s-parent")
     world.server("s-job")
-    rc = cli.main(["route", "pause", "Codex", "--owner-words", "pause Codex until tonight", "--owner-turn", token,
-                   "--owner-session", "s-parent"])
+    rc = cli.main(["route", "pause", "Codex", "--until", "6h", "--owner-words", "pause Codex until tonight",
+                   "--owner-turn", token, "--owner-session", "s-parent"])
     assert rc == 0, capsys.readouterr().out
     assert _state("Codex") == "paused"
     assert _log()[0]["via_session"] == "s-job"

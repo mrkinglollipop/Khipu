@@ -114,6 +114,15 @@ TABLE = [
     ("pause Codex for now please", "route.pause", "codex|", {"timed": True, "until": "2h"}, TIME),
     ("pause Codex for now please", "route.pause", "codex|", {"timed": True}, PASS),
     ("pause Grok for 2 hours and lift Codex", "route.lift", "codex|", {}, PASS),
+    # a time Khipu can't resolve still needs an end, and any end is taken
+    ("pause Codex until tonight", "route.pause", "codex|", {"timed": True}, TIME),
+    ("pause Codex until tonight", "route.pause", "codex|", {"timed": True, "until": "6h"}, PASS),
+    ("pause Codex until five", "route.pause", "codex|", {"timed": True}, TIME),
+    ("pause Codex until five", "route.pause", "codex|", {"timed": True, "until": "3h"}, PASS),
+    ("pause Codex for a bit", "route.pause", "codex|", {"timed": True}, TIME),
+    ("pause Codex for a bit", "route.pause", "codex|", {"timed": True, "until": "1h"}, PASS),
+    ("pause Codex for now", "route.pause", "codex|", {"timed": True}, PASS),
+    ("pause Codex for good", "route.pause", "codex|", {"timed": True}, PASS),
 ]
 
 

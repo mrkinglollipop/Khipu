@@ -450,7 +450,7 @@ def test_words_the_owner_never_typed_and_a_piped_yes_are_still_refused(world, mo
 
 def test_a_pause_by_direction_is_stamped_logged_and_undone(world):
     token = world.say("pause Codex until tonight")
-    rc, out = world.run(["route", "pause", "Codex"], "pause Codex until tonight", token)
+    rc, out = world.run(["route", "pause", "Codex", "--until", "6h"], "pause Codex until tonight", token)
     assert rc == 0 and _state("codex|") == "paused"
     events, _bad = routing.read_events()
     assert events[-1]["via"] == "direction" and events[-1]["auth"] == "direction"
@@ -579,7 +579,7 @@ def _marker() -> dict:
 def test_the_next_routing_block_names_a_direction_once_in_fixed_words(world, khipu_app):
     marker = _marker()
     token = world.say("pause Codex until tonight please")
-    rc, _ = world.run(["route", "pause", "Codex"], "pause Codex until tonight", token)
+    rc, _ = world.run(["route", "pause", "Codex", "--until", "6h"], "pause Codex until tonight", token)
     assert rc == 0
     events, _bad = routing.read_events()
     at = routing._clock(routing._parse(events[-1]["written_at"]), routing._now())

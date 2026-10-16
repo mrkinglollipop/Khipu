@@ -548,12 +548,20 @@ _UNTIL = re.compile(r"(?<!\w)(?:until|till|til|'til)\s+"
                     r"(?:(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<half>am|pm|a\.m\.|p\.m\.)"
                     r"|(?P<h24>\d{1,2}):(?P<m24>\d{2})|(?P<named>noon|midday|midnight)|(?P<vague>tomorrow))(?!\w)")
 TIME_SLACK_S = 300
+# Times Khipu can't resolve still name an end: the command must then carry
+# one. "For now" and "for good" name none.
+_VAGUE = re.compile(r"(?<!\w)(?:(?:until|till|til|'til|through)\s+\S+"
+                    r"|for (?!now(?!\w)|good(?!\w))(?:a bit|a while|a little|the day|the night|the weekend|the week"
+                    r"|the afternoon|the evening|the morning|today|tonight|(?:\d+(?:\.\d+)?|"
+                    + "|".join(re.escape(k) for k in sorted(_COUNT, key=len, reverse=True) if k not in ("a", "an"))
+                    + r"|a few|a couple of|a couple|an?)\s+\S+)"
+                    r"|tonight|tomorrow|this (?:morning|afternoon|evening)|later today|today)(?!\w)")
 
 
 def word_time(text: str, now: float) -> tuple[str | None, float | None]:
     """The time the words name, as (the words, the epoch time it resolves
     to, or None when Khipu can't resolve it); (None, None) when they name
-    none. "For now" and "until I say" name no time."""
+    none. "For now" and "for good" name no time."""
     m = _FOR.search(text)
     if m:
         if m.group("half"):
@@ -564,7 +572,8 @@ def word_time(text: str, now: float) -> tuple[str | None, float | None]:
         return m.group(0), now + n * _UNIT_S[m.group("unit")]
     m = _UNTIL.search(text)
     if not m:
-        return None, None
+        vague = _VAGUE.search(text)
+        return (vague.group(0), None) if vague else (None, None)
     if m.group("vague"):
         return m.group(0), None
     if m.group("named"):
