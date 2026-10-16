@@ -256,14 +256,16 @@ def _transact(data: dict, before: dict, lines: list[dict]) -> dict:
     ops = _cache_ops(lines)
     _txn.open = True
     try:
+        data[config.ACCOUNT_CHANGE_OPEN] = txn
         try:
             config.save_config(data)
         except OSError:
+            data.pop(config.ACCOUNT_CHANGE_OPEN, None)
             _abort(txn)
             raise AccountsError(f"{failed}: Khipu can't write its config file", "write_failed") from None
         try:
             _apply_cache(ops)
-            return routing.account_txn_end(txn, "done")
+            out = routing.account_txn_end(txn, "done")
         except (OSError, routing.RouteError):
             changed = dict(data)
             data.clear()
@@ -280,6 +282,12 @@ def _transact(data: dict, before: dict, lines: list[dict]) -> dict:
                 _apply_cache(ops, reverse=True)
             _abort(txn)
             raise AccountsError(failed, "record_failed") from None
+        data.pop(config.ACCOUNT_CHANGE_OPEN, None)
+        try:
+            config.save_config(data)
+        except OSError:
+            data[config.ACCOUNT_CHANGE_OPEN] = txn  # done: the next read clears it
+        return out
     finally:
         _txn.open = False
 
@@ -300,20 +308,20 @@ def recover() -> None:
     if getattr(_txn, "open", False):
         return
     try:
-        if not routing.events_file().exists() or not routing.account_txns_open():
+        marked = bool(config.read_config_unsettled().get(config.ACCOUNT_CHANGE_OPEN))
+        if not marked and (not routing.events_file().exists() or not routing.account_txns_open()):
             return
         with routing._lock():
             unfinished = routing.account_txns_open()
-            if not unfinished:
-                return
             with config.mutate_config() as data:
                 version = config.accounts_version(data)
-            for begin, lines in unfinished:
-                if version == begin.get("list_after"):
-                    _apply_cache(_cache_ops(lines))
-                    routing.account_txn_end(begin["id"], "done")
-                else:
-                    routing.account_txn_end(begin["id"], "abort")
+                for begin, lines in unfinished:
+                    if version == begin.get("list_after"):
+                        _apply_cache(_cache_ops(lines))
+                        routing.account_txn_end(begin["id"], "done")
+                    else:
+                        routing.account_txn_end(begin["id"], "abort")
+                data.pop(config.ACCOUNT_CHANGE_OPEN, None)
     except (OSError, routing.RouteError):
         # Left for the next read; the record keeps the change out meanwhile.
         return

@@ -1151,7 +1151,8 @@ def test_a_change_cut_off_after_its_config_write_is_finished_on_the_next_read(ma
     with monkeypatch.context() as m, pytest.raises(KeyboardInterrupt):
         m.setattr(routing, "account_txn_end", stopped)
         accounts.move(old, "~/.claude-office", expect=_version())
-    assert _stored()[0]["home"] == "~/.claude-office" and len(routing.account_txns_open()) == 1
+    stored = config.read_config_unsettled()["usage_accounts"]  # as the file holds it, before a reader settles it
+    assert stored[0]["home"] == "~/.claude-office" and len(routing.account_txns_open()) == 1
     view = routing.read_view()
     assert not routing.account_txns_open()
     assert _entry(view, old) is None and _entry(view, new)["state"] == "limited"
@@ -1233,3 +1234,127 @@ def test_stop_takes_the_account_out_of_a_waiting_priority_request_and_what_it_re
     assert [e["account"] for e in held["replaced"]["entries"]] == ["codex|"]
     routing.undo_priority(via="app", expect=held["version"])
     assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == ["codex|"]
+
+
+# ---- review round 6 ----------------------------------------------------------------------
+
+
+def _cut_off_after_the_config_write(mac, monkeypatch) -> tuple[str, str]:
+    """A move whose process ends after its config write, before its cache
+    change and done line. (old key, new key)."""
+    old = _limited_client(mac)
+
+    def power_loss(ops, **kwargs):
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as m, pytest.raises(KeyboardInterrupt):
+        m.setattr(accounts, "_apply_cache", power_loss)
+        accounts.move(old, "~/.claude-office", expect=_version())
+    assert config.read_config_unsettled().get(config.ACCOUNT_CHANGE_OPEN)
+    return old, _key("~/.claude-office")
+
+
+@pytest.mark.parametrize("reader", [
+    config.load_config, usage.configured_accounts, usage.accounts_status, usage.reads_none, accounts.status,
+    routing.read_view, routing.accounts, lambda: usage.report(),
+], ids=["load_config", "configured_accounts", "accounts_status", "reads_none", "accounts_status_cli",
+        "read_view", "routing_accounts", "usage_report"])
+def test_every_reader_sees_a_cut_off_account_change_finished(mac, monkeypatch, reader):
+    old, new = _cut_off_after_the_config_write(mac, monkeypatch)
+    reader()
+    assert not routing.account_txns_open()
+    assert not config.read_config_unsettled().get(config.ACCOUNT_CHANGE_OPEN)
+    assert new in usage._load_cache() and old not in usage._load_cache()
+    assert _stored()[0]["home"] == "~/.claude-office"
+
+
+def test_a_settings_save_finishes_a_cut_off_account_change_first(mac, monkeypatch):
+    old, new = _cut_off_after_the_config_write(mac, monkeypatch)
+    with config.mutate_config() as data:
+        data["capture_mode"] = "hook"
+    assert not routing.account_txns_open() and new in usage._load_cache()
+    assert config.ACCOUNT_CHANGE_OPEN not in config.read_config_unsettled()
+
+
+def test_a_finished_change_leaves_no_open_mark(mac):
+    old = _limited_client(mac)
+    accounts.move(old, "~/.claude-office", expect=_version())
+    assert config.ACCOUNT_CHANGE_OPEN not in config.read_config_unsettled()
+
+
+def test_a_read_in_flight_cannot_bring_back_the_last_stopped_account(mac, monkeypatch):
+    _set(usage_accounts=[{"harness": "claude", "label": "Claude"}])
+
+    def finish_after_stop(reading, *, timeout):
+        accounts.stop("claude|", expect=_version(), confirm_last=True)
+        mac["clock"].now = T0 + timedelta(seconds=1)
+        until = routing._iso(T0 + timedelta(hours=2))
+        return [dict(usage._blank_row(a), ok=True, windows=[{"name": "weekly", "used_pct": 100, "resets_at": until}],
+                     probed_at=usage._iso((T0 + timedelta(seconds=1)).timestamp())) for a in reading]
+
+    monkeypatch.setattr(usage, "probe_all", finish_after_stop)
+    usage.report(fresh=True)
+    assert usage.configured_accounts() == []
+    assert "claude|" not in usage._load_cache()
+    assert _entry(routing.read_view(), "claude|") is None
+
+
+def test_read_no_accounts_reads_no_cache_row():
+    from khipu import routing_sources
+
+    assert routing_sources.configured_keys({"usage_accounts_none": True}) == set()
+    assert routing_sources.configured_keys({}) == {f"{h}|" for h in usage.HARNESSES}
+
+
+def test_a_missing_default_folder_is_never_probed(mac, monkeypatch):
+    called = []
+    monkeypatch.setattr(usage, "probe_grok", lambda *a, **k: called.append(True) or {"ok": False, "error": usage.E_SIGNIN})
+    row = usage.probe_account({"harness": "grok", "label": "Grok", "home": None})
+    assert row["error"] == usage.E_NO_FOLDER and not called
+
+
+def _rustc() -> tuple[str, dict] | None:
+    """rustc and an environment it runs in under the tests' temp HOME (the
+    rustup proxy finds its toolchains from the real home)."""
+    import os
+    import pwd
+    import shutil
+    from pathlib import Path
+
+    real = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    found = shutil.which("rustc") or next((str(p) for p in [real / ".cargo" / "bin" / "rustc"] if p.exists()), None)
+    if not found:
+        return None
+    env = dict(os.environ, RUSTUP_HOME=os.environ.get("RUSTUP_HOME") or str(real / ".rustup"),
+               CARGO_HOME=os.environ.get("CARGO_HOME") or str(real / ".cargo"))
+    return found, env
+
+
+def test_the_app_accepts_every_version_the_python_code_makes(mac, tmp_path):
+    """The cross-boundary check: the desktop app's own ``checked_expect``,
+    compiled from lib.rs, fed versions the real Python code made."""
+    import subprocess
+    from pathlib import Path
+
+    rustc = _rustc()
+    if rustc is None:
+        pytest.skip("no rustc on this machine")
+    source = (Path(__file__).resolve().parents[3] / "apps/desktop/src-tauri/src/lib.rs").read_text()
+    start = source.index("fn checked_expect(")
+    probe = tmp_path / "expect_probe.rs"
+    probe.write_text(source[start:source.index("\n}\n", start) + 3]
+                     + "\nfn main() { for v in std::env::args().skip(1) { if checked_expect(&v) != Ok(v.as_str()) "
+                       "{ eprintln!(\"rejected {v}\"); std::process::exit(1); } } }\n")
+    binary = tmp_path / "expect_probe"
+    built = subprocess.run([rustc[0], str(probe), "-o", str(binary)], capture_output=True, text=True, timeout=120,
+                           env=rustc[1])
+    assert built.returncode == 0, built.stderr
+    made = [_version(), routing.priority_version()]
+    _set(usage_accounts=[{"harness": "claude", "label": "Claude"}, {"harness": "codex", "label": "Codex"}])
+    made += [_version(), routing.priority_version()]
+    routing.set_priority([{"account": "codex|"}], via="app", expect=routing.priority_version())
+    made += [routing.priority_version(), routing.read_view()["priority"]["version"]]
+    made += [routing._priority_mark({"id": "hand written-id/1"}), routing._priority_mark({"_seq": 7})]
+    assert all(config.is_version(v) for v in made), made
+    ran = subprocess.run([str(binary), *made], capture_output=True, text=True, timeout=10)
+    assert ran.returncode == 0, (ran.stderr, made)

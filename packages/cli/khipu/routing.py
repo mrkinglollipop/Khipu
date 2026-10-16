@@ -2277,7 +2277,10 @@ def _lane_mapped(runner, lane, lane_map: dict) -> bool:
 
 
 def _priority_mark(event: dict) -> str:
-    return "p" + str(event.get("id") or event.get("_seq"))
+    from khipu.config import version_part
+
+    # A version (``config.is_version``) whatever id a hand-written line carries.
+    return "p" + version_part(str(event.get("id") or event.get("_seq")))
 
 
 def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,

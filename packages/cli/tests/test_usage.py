@@ -88,6 +88,12 @@ def fake(tmp_path, monkeypatch):
 
     monkeypatch.setattr(usage, "_command", lambda harness: scripts.get(harness))
     monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    # Empty default login folders: a home-less account whose folder is
+    # missing is never probed (it reads login_folder_missing).
+    home = tmp_path / "home"
+    for name in (".claude", ".codex", ".grok"):
+        (home / name).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
     return configure
 
 
@@ -1074,7 +1080,7 @@ _REFUSALS = [
     ('[{"label": "A", "harness": "claude", "home": "/x"}, {"label": "B", "harness": "claude", "home": "/x/"}]',
      "reads the same login", "login_taken", 1, "home", 0),
     (json.dumps([*_TWO, {"label": "Work", "harness": "codex", "home": "~/.codex-work"},
-                 {"label": "Work again", "harness": "codex", "home": str(Path.home() / ".codex-work")}]),
+                 {"label": "Work again", "harness": "codex", "home": "{HOME}/.codex-work"}]),
      "reads the same login", "login_taken", 3, "home", 2),
     (json.dumps([*_TWO, {"harness": "claude", "label": "x" * 65}]), "longer than 64", "too_long", 2, "label", None),
     (json.dumps([{"harness": "claude", "home": "/" + "x" * 1024}]), "longer than 1024", "too_long", 0, "home", None),
@@ -1089,7 +1095,8 @@ def test_usage_accounts_refuses_what_cannot_be_probed(fake, capsys, khipu_app, v
                                                       other):
     from khipu import config
 
-    rc, out = _config_cli(["--set", "usage_accounts", value], capsys)
+    # {HOME} is the test's own home (``fake`` sets it), not the one at import.
+    rc, out = _config_cli(["--set", "usage_accounts", value.replace("{HOME}", str(Path.home()))], capsys)
     assert rc == 2 and out["ok"] is False and needle in out["error"]
     # A fixed code with the entry and field at fault, so the app can say it in
     # its own words and point at the field instead of showing this text.

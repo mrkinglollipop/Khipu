@@ -41,8 +41,16 @@ def config_file() -> Path:
     return data_dir() / CONFIG_NAME
 
 
-@secret_result("config")
-def load_config() -> dict:
+# An account change (``accounts._transact``) writes this key in the same
+# write as the account list it makes, and clears it once the routing record
+# says the change is done. Every read of the config (``load_config``,
+# ``mutate_config``) that finds it finishes or rolls back that change first
+# (``accounts.recover``), so no reader sees a list the record and the usage
+# cache do not yet agree with.
+ACCOUNT_CHANGE_OPEN = "account_change_open"
+
+
+def _read_config() -> dict:
     path = config_file()
     if not path.is_file():
         return {}
@@ -51,6 +59,38 @@ def load_config() -> dict:
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _settle_account_change(data: dict) -> bool:
+    """Settle an unfinished account change ``data`` names; True when one was
+    settled (read the document again). Skipped while this thread holds the
+    config lock (the routing lock is taken first, never after it) or is
+    settling one already."""
+    if not data.get(ACCOUNT_CHANGE_OPEN) or getattr(_held, "depth", 0) or getattr(_held, "settling", False):
+        return False
+    from khipu import accounts
+
+    _held.settling = True
+    try:
+        accounts.recover()
+    finally:
+        _held.settling = False
+    return True
+
+
+@secret_result("config")
+def load_config() -> dict:
+    data = _read_config()
+    if _settle_account_change(data):
+        data = _read_config()
+    return data
+
+
+def read_config_unsettled() -> dict:
+    """The document as stored, an unfinished account change and all: for a
+    reader that holds a lock an account change takes after the routing lock
+    (the usage cache's), which must not wait on that lock here."""
+    return _read_config()
 
 
 @secret_result("config")
@@ -96,6 +136,8 @@ def mutate_config():
     document as stored now; the block changes it in place and it is written
     when the block ends without an error (only if it changed). A nested
     block in the same thread shares the outer one's document."""
+    if not getattr(_held, "depth", 0):
+        _settle_account_change(_read_config())
     with config_write_lock():
         if getattr(_held, "data", None) is not None:
             yield _held.data
@@ -503,6 +545,30 @@ def config_write_lock():
         with contextlib.suppress(OSError):
             fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+# The one format of a version a write hands back (``--expect``), defined
+# here and nowhere else in the package: ASCII letters and digits in parts
+# joined by single dots, at most ``VERSION_MAX`` characters. The account
+# list's is "a" and 16 hex digits; the priority's is "p" and its event's
+# mark, then "." and the account list's version when there is one
+# (``p12.a4def5fc278cfc609``). The desktop app checks the same format
+# (``checked_expect`` in apps/desktop/src-tauri/src/lib.rs), and
+# tests/test_accounts.py runs that Rust check on versions this code makes.
+VERSION_MAX = 64
+_VERSION_PART = re.compile(r"[A-Za-z0-9]+")
+
+
+def is_version(text: str) -> bool:
+    return 0 < len(text) <= VERSION_MAX and all(_VERSION_PART.fullmatch(p) for p in text.split("."))
+
+
+def version_part(raw: str) -> str:
+    """``raw`` as one part of a version: as it is when it is letters and
+    digits, else a short digest of it (an id appended by hand)."""
+    if _VERSION_PART.fullmatch(raw) and len(raw) <= 24:
+        return raw
+    return "h" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def accounts_version(data: dict | None = None) -> str:

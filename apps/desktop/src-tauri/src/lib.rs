@@ -1492,9 +1492,14 @@ fn route_priority_argv_expect(
 
 /// The version of the account list or the priority as the app read it: one
 /// short token, so it can never read as a flag or carry a second argument.
+/// The format is defined once, in packages/cli/khipu/config.py (`is_version`):
+/// ASCII letters and digits in parts joined by single dots, at most 64
+/// characters (`p12.a4def5fc278cfc609`). A pytest runs this function on
+/// versions the Python code makes, so the two can never disagree.
 fn checked_expect(raw: &str) -> Result<&str, String> {
     let v = raw.trim();
-    if !v.is_empty() && v.len() <= 40 && v.chars().all(|c| c.is_ascii_alphanumeric()) {
+    let parts_ok = v.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric()));
+    if !v.is_empty() && v.len() <= 64 && parts_ok {
         Ok(v)
     } else {
         Err("that is not a version Khipu knows; read the accounts again".to_string())
@@ -4418,7 +4423,7 @@ mod settings_command_tests {
             config_unset_argv_expect("usage_accounts", Some("v3a")).unwrap(),
             v(&["config", "--from-app", "--expect=v3a", "--unset=usage_accounts"])
         );
-        for bad in ["", "--x", "a b", "a=b", "v\n1", &"a".repeat(41)] {
+        for bad in ["", "--x", "a b", "a=b", "v\n1", &"a".repeat(65)] {
             assert!(config_set_argv_expect("usage_accounts", "[]", Some(bad)).is_err(), "{bad:?}");
             assert!(config_unset_argv_expect("usage_accounts", Some(bad)).is_err(), "{bad:?}");
         }
@@ -5143,9 +5148,20 @@ mod priority_and_sign_in_tests {
         assert_eq!(argv, v(&["route", "priority", "--from-app", "--expect=p9f", "--", "clear"]));
         let set = route_priority_argv_expect("set", &[entry("Codex", None, None)], None, Some("p0")).unwrap();
         assert_eq!(set[set.len() - 3], "--expect=p0");
-        for bad in ["", "--x", "p 1", "p=1", "p\n1", "p|1"] {
+        for bad in ["", "--x", "p 1", "p=1", "p\n1", "p|1", ".p1", "p1.", "p1..a2", "p-1"] {
             assert!(route_priority_argv_expect("clear", &[], None, Some(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn versions_in_the_python_format_are_accepted() {
+        // The format packages/cli/khipu/config.py defines (`is_version`); a
+        // pytest also feeds this check versions the Python code makes.
+        let longest = format!("p{}.a{}", "1".repeat(24), "f".repeat(16));
+        for good in ["p0", "a4def5fc278cfc609", "p0.a4def5fc278cfc609", "pe1a2b3c4.a4def5fc278cfc609", longest.as_str()] {
+            assert_eq!(checked_expect(good), Ok(good), "{good:?}");
+        }
+        assert!(checked_expect(&"a".repeat(65)).is_err());
     }
 
     #[test]

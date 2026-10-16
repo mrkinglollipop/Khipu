@@ -872,14 +872,15 @@ def runner_evidence(status: dict, cache: dict) -> list[dict]:
 
 def configured_keys(config: dict) -> set[str]:
     """The usage cache keys of the configured accounts: each valid
-    ``usage_accounts`` entry, or with none set every harness's default
-    login (what ``usage.configured_accounts`` reads, without its PATH
-    lookup, so every caller gets the same set)."""
+    ``usage_accounts`` entry, with none set every harness's default
+    login, or nothing after the owner chose "Read no accounts" (what
+    ``usage.configured_accounts`` reads, without its PATH lookup, so every
+    caller gets the same set)."""
     from khipu import usage
 
     raw = config.get("usage_accounts")
     if not isinstance(raw, list) or not raw:
-        return {f"{harness}|" for harness in usage.HARNESSES}
+        return set() if usage.reads_none(config) else {f"{harness}|" for harness in usage.HARNESSES}
     out = set()
     for entry in raw:
         account = usage._account_from_entry(entry)

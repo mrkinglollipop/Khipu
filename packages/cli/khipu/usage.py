@@ -1160,10 +1160,11 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
         if account.get("invalid"):
             data = {"ok": False, "error": E_INVALID,
                     "note": f"This account entry is not valid: {account['invalid']}"}
-        elif home and harness in _HOME_VARS and not _login_folder_there(home):
+        elif harness in _HOME_VARS and not _login_folder_there(home or str(default_login(harness))):
             # Checked on the folder itself (nothing inside it is read): a CLI
             # pointed at a missing folder answers "not signed in", which a
-            # sign-in can't fix when the folder moved or was removed.
+            # sign-in can't fix when the folder moved or was removed. A
+            # home-less account reads its CLI's default folder.
             data = {"ok": False, "error": E_NO_FOLDER, "note": NO_FOLDER_NOTE}
         elif harness == "claude":
             data = probe_claude(home, timeout=timeout)
@@ -1318,11 +1319,19 @@ def _store(accounts: list[dict], rows: list[dict]) -> list[dict]:
             with contextlib.suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_EX)
         cache = _load_cache()
+        from khipu.config import read_config_unsettled
+        from khipu.routing_sources import configured_keys
+
+        # The list as it is now, not as it was when the read began: a read
+        # still running when its account was stopped or moved writes no row
+        # under a key the list no longer holds. Read unsettled: an account
+        # change takes this cache's lock after the routing lock.
+        current = configured_keys(read_config_unsettled())
         merged = []
         for account, row in zip(accounts, rows):
             key = _key(account)
             out = _merge(cache.get(key), row)
-            if not account.get("invalid"):
+            if not account.get("invalid") and key in current:
                 cache[key] = {k: v for k, v in out.items() if k not in ("cached", "stale", "refreshing")}
             merged.append(out)
         _save_cache(cache)
