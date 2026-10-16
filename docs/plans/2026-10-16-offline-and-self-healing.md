@@ -113,10 +113,10 @@ Each slice: read the named code first, keep the hermetic pytest oracle green (fr
 
 Slices 1 and 4 together fix the incident's visible symptoms; slice 2 removes the root cause. Order: 1, 2, 4, 3, 5, 6, 7.
 
-## Questions for Matt
+## Decisions (Matt, 2026-10-16)
 
-1. Is it right that prompt-time recall should answer from a replica that is hours behind (marked stale) rather than give no prior work at all? This doc assumes yes, because no answer is worse than an old one, and nothing is dropped.
-2. How fresh should the replica be kept when the hub is reachable: within 15 minutes (the existing throttle) or something else? More often means more hub reads, not more model cost.
-3. Do you want an owner override for the promotion gate in the app, or should the gate only ever wait and retry by itself?
-4. Owner writes made offline (closing an owed item, superseding a decision): queue them and replay later, or refuse them with a plain message until the hub is back?
-5. How long a window should doctor's rate checks judge (this doc proposes the last hour, changeable in Settings)?
+1. Prompt-time recall answers from the replica even when it is hours behind, marked stale with its age, rather than give no prior work.
+2. Keep the replica within 15 minutes of the hub when the hub is reachable (the existing throttle), changeable in Settings.
+3. The promotion gate waits and retries by itself after an outage, and Settings also has an owner override for a red check the owner knows is harmless.
+4. Owner writes made offline (closing an owed item, superseding a decision) are queued on the Mac, shown as waiting to sync, and replayed when the hub is back, the same way captures already work.
+5. Doctor's rate checks judge the last hour, changeable in Settings.
