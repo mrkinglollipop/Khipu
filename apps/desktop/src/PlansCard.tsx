@@ -529,7 +529,7 @@ function figuresAt(row: UsageAccount): string | null {
   return row.observed_at || row.last_good_at || row.probed_at || null;
 }
 
-function RefreshButton({ busy, label, onClick }: { busy: boolean; label: string; onClick: () => void }) {
+export function RefreshButton({ busy, label, onClick }: { busy: boolean; label: string; onClick: () => void }) {
   return (
     <button type="button" className="sm" disabled={busy} aria-busy={busy || undefined} onClick={onClick}>
       {busy ? (
@@ -544,7 +544,7 @@ function RefreshButton({ busy, label, onClick }: { busy: boolean; label: string;
 
 const NO_ACCOUNTS_TITLE = "No accounts to read yet";
 const NO_ACCOUNTS_HINT =
-  "List your accounts in Settings → Capture & models and Khipu shows how much of each plan is left. It can read Claude Code, Codex, Grok Build and Muse.";
+  "List your accounts in Settings → Accounts and routing and Khipu shows how much of each plan is left. It can read Claude Code, Codex, Grok Build and Muse.";
 const NO_ACCOUNTS_HINT_HERE =
   "List your accounts below and Khipu shows how much of each plan is left. It can read Claude Code, Codex, Grok Build and Muse.";
 export const MUSE_NO_TURN = "No figures yet. Muse reports its plan after its first turn.";
@@ -723,7 +723,7 @@ export function PlansCard({ state, routing, onOpenAccounts }: {
           <span>{NO_ACCOUNTS_HINT}</span>
           {onOpenAccounts ? (
             <button type="button" className="sm plans-empty-btn" onClick={onOpenAccounts}
-              aria-label="Which accounts Khipu reads: opens Settings, Capture & models">
+              aria-label="Which accounts Khipu reads: opens Settings, Accounts and routing">
               Which accounts Khipu reads
             </button>
           ) : null}
@@ -768,7 +768,7 @@ function failureLine(row: UsageAccount, status: PlanStatus, now: Date): string |
 /** One account in Settings: a bordered block under its name, holding every
  *  line about it (the pause first, each window, the one failure line with
  *  sign-in, when it was read, and Details), so no line floats loose. */
-function PlanBlock({ row, now, pause, onSignedIn }: {
+export function PlanBlock({ row, now, pause, onSignedIn }: {
   row: UsageAccount; now: Date; pause?: string; onSignedIn?: () => Promise<unknown> | void;
 }) {
   const [open, setOpen] = useState(false);
@@ -860,9 +860,10 @@ function PlanBlock({ row, now, pause, onSignedIn }: {
   );
 }
 
-/** Settings → Capture & models → Plans: one block per account, Check all
- *  now, and which accounts are read (`usage_accounts`). Shares Home's reads
- *  (`state`). Phase 3 moves it into Settings → Accounts and routing. */
+/** Plans as one card: one block per account, Check all now, and which
+ *  accounts are read (`usage_accounts`). Shares Home's reads (`state`).
+ *  Settings → Accounts and routing now shows each block inside its account
+ *  (settings clarity phase 3); this card stays for its unit tests. */
 export function PlansSettingsCard({ state, active, routing }: {
   state: PlanUsageState;
   active: boolean;

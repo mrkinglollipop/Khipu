@@ -30,7 +30,27 @@ function row(extra: Partial<UsageAccount>): UsageAccount {
 type Answer = string | object | ((args: Record<string, unknown> | undefined) => unknown);
 let answers: Record<string, Answer>;
 
+// Settings clarity phase 3 folds Settings -> Accounts and routing into
+// groups; these tests read every group and account line open.
+const ALL_OPEN = [
+  "accounts", "priority", "rules", "holds", "telling", "resets", "runners", "table", "changes", "sub:hears", "sub:sizes",
+  ...["claude|", SECOND, "codex|", "grok|"].map((k) => `account:${k}`),
+];
+
+// jsdom here has no usable localStorage; an in-memory one stands in.
+function memoryStorage() {
+  const m = new Map<string, string>();
+  return {
+    getItem: (k: string) => m.get(k) ?? null,
+    setItem: (k: string, v: string) => void m.set(k, String(v)),
+    removeItem: (k: string) => void m.delete(k),
+    clear: () => m.clear(),
+  };
+}
+
 beforeEach(() => {
+  vi.stubGlobal("localStorage", memoryStorage());
+  localStorage.setItem("khipu.routing.open", JSON.stringify(ALL_OPEN));
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(NOW);
   answers = {};
@@ -43,6 +63,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   vi.useRealTimers();
   invokeMock.mockReset();
 });

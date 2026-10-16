@@ -341,7 +341,7 @@ function itemRow(change: RouteChange, item: RouteChangeItem, i: number, now: Dat
       aside: "(not matched to an account)",
     };
   }
-  if (item.entity === "table") return { ...base, subject: "Routing table", text: "NOW block changed" };
+  if (item.entity === "table") return { ...base, subject: "Routing table", text: "Current-state section changed" };
   return { ...base, subject: capitalise(kind), text: "changed" };
 }
 
@@ -358,7 +358,7 @@ function legacyRow(change: RouteChange, entity: string, i: number, view: RouteVi
   if (entity === "note") return { ...base, subject: "Your note" };
   if (kind === "hold") return { ...base, subject: "A hold" };
   if (kind === "runner") return { ...base, subject: `${ident} job runner` };
-  if (entity === "table") return { ...base, subject: "Routing table", text: "NOW block changed" };
+  if (entity === "table") return { ...base, subject: "Routing table", text: "Current-state section changed" };
   return { ...base, subject: capitalise(kind) };
 }
 
@@ -418,7 +418,7 @@ export function tableErrorWords(error: string): string {
     missing: "no file at that path",
     "a folder, not a file": "that is a folder, not a file",
     "not a regular file": "that is not a plain file",
-    "no NOW block": "it has no NOW block",
+    "no NOW block": "it has no current-state section",
     "not allowed to read it": "Khipu isn't allowed to read it",
   };
   return words[error] ?? "it can't be read";

@@ -27,6 +27,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 // Wed 2026-10-14, 11:40 AM in New York (the mock's time).
 const MORNING = new Date("2026-10-14T15:40:00Z");
+const KEYS = ["claude|", "claude|/logins/claude-second", "codex|", "grok|", "muse|"];
 
 function acct(label: string, harness: string, extra: Partial<RouteAccount>): RouteAccount {
   return {
@@ -153,7 +154,27 @@ function config(extra: Record<string, unknown> = {}) {
 type Answer = string | Record<string, unknown> | ((args: Record<string, unknown> | undefined) => unknown);
 let answers: Record<string, Answer>;
 
+// Settings clarity phase 3 folds the page into groups; these tests read
+// every group open, every account line open and Telling's inner folds open.
+const ALL_OPEN = [
+  "accounts", "priority", "rules", "holds", "telling", "resets", "runners", "table", "changes", "sub:hears", "sub:sizes",
+  ...KEYS.map((k) => `account:${k}`),
+];
+
+// jsdom here has no usable localStorage; an in-memory one stands in.
+function memoryStorage() {
+  const m = new Map<string, string>();
+  return {
+    getItem: (k: string) => m.get(k) ?? null,
+    setItem: (k: string, v: string) => void m.set(k, String(v)),
+    removeItem: (k: string) => void m.delete(k),
+    clear: () => m.clear(),
+  };
+}
+
 beforeEach(() => {
+  vi.stubGlobal("localStorage", memoryStorage());
+  localStorage.setItem("khipu.routing.open", JSON.stringify(ALL_OPEN));
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(MORNING);
   answers = {
@@ -170,6 +191,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   vi.useRealTimers();
   invokeMock.mockReset();
 });
@@ -976,7 +998,8 @@ describe("Settings -> Routing: checking for resets", () => {
     expect(row("Accounts", "Claude main")).toHaveTextContent("Khipu checks again at 2:02 PM.");
     fireEvent.click(within(row("Accounts", "Claude main")).getByRole("button", { name: "Check now" }));
     await waitFor(() => expect(calls("khipu_route_check")).toEqual([{ account: "claude|" }]));
-    expect(await screen.findByRole("status")).toHaveTextContent("not checked: the Mac was busy");
+    // The page has its own status line ("Reading what needs you…" without a plan read): look in the row.
+    expect(await within(row("Accounts", "Claude main")).findByRole("status")).toHaveTextContent("not checked: the Mac was busy");
   });
 
   it("words the busy-Mac row and offers no wait, no attempts and no retries (fix round 1, F7)", async () => {
@@ -1056,7 +1079,7 @@ describe("Settings -> Routing: job runner folders, lanes, the table and changes"
 
   it("matches an unmatched lane to an account", async () => {
     await page();
-    const list = await screen.findByRole("list", { name: "Project B" });
+    const list = await screen.findByRole("list", { name: "Project B lanes" });
     const lane = within(list).getAllByRole("listitem").find((r) => r.textContent?.startsWith("opus-batch"))!;
     expect(lane).toHaveTextContent("Not matched");
     fireEvent.change(within(lane).getByLabelText("Account for opus-batch"), { target: { value: "Claude main" } });
@@ -1071,7 +1094,7 @@ describe("Settings -> Routing: job runner folders, lanes, the table and changes"
   it("shows the routing table file read only, and recent changes by day", async () => {
     await page();
     expect(await screen.findByText("/notes/routing/ROUTING-NOW.md")).toBeInTheDocument();
-    expect(screen.getByText("NOW block changed 9:20 AM")).toBeInTheDocument();
+    expect(screen.getByText("Current-state section changed 9:20 AM")).toBeInTheDocument();
     const today = screen.getByRole("list", { name: "Today" });
     expect(within(today).getAllByRole("listitem")[0]).toHaveTextContent("Standing rule 6 removed");
     expect(screen.getByRole("list", { name: "Yesterday" })).toHaveTextContent("Grok Build paused by you");
@@ -1317,7 +1340,7 @@ describe("Settings -> Routing: the routing table file in plain words", () => {
   it.each([
     ["missing", "Can't read it: no file at that path"],
     ["a folder, not a file", "Can't read it: that is a folder, not a file"],
-    ["no NOW block", "Can't read it: it has no NOW block"],
+    ["no NOW block", "Can't read it: it has no current-state section"],
   ])("says why the file can't be read: %s (S2)", async (error, words) => {
     answers.khipu_route_view = () => {
       const v = view();
@@ -1366,12 +1389,12 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
   it("keeps both lane changes made before the first one's re-read (finding 1)", async () => {
     const cli = heldConfig();
     await page();
-    const b = await screen.findByRole("list", { name: "Project B" });
+    const b = await screen.findByRole("list", { name: "Project B lanes" });
     const opus = within(b).getAllByRole("listitem").find((r) => r.textContent?.startsWith("opus-batch"))!;
     fireEvent.change(within(opus).getByLabelText("Account for opus-batch"), { target: { value: "Claude main" } });
     fireEvent.click(within(opus).getByRole("button", { name: "Save" }));
     fireEvent.click(screen.getByRole("button", { name: "Change the account for Project A's codex lane" }));
-    const a = screen.getByRole("list", { name: "Project A" });
+    const a = screen.getByRole("list", { name: "Project A lanes" });
     const codex = within(a).getAllByRole("listitem").find((r) => r.textContent?.startsWith("codex"))!;
     fireEvent.change(within(codex).getByLabelText("Account for codex"), { target: { value: "Claude second" } });
     fireEvent.click(within(codex).getByRole("button", { name: "Save" }));
