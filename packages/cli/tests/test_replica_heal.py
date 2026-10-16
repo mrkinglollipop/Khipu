@@ -168,3 +168,63 @@ def test_cli_check_interval_rerenders_the_job(hub, capsys, monkeypatch):
     assert calls == [1] and out["job"] == {"ok": True, "skipped": "x"}
     assert main(["config", "--set", "replica_check_every", "30"]) == 2
     assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def _pulls(monkeypatch, result):
+    calls = []
+    monkeypatch.setattr(hub_snapshot, "pull_changes", lambda: calls.append(1) or dict(result))
+    return calls
+
+
+def test_an_update_is_a_pull_and_no_dump_when_it_succeeds(hub, monkeypatch):
+    calls = _pulls(monkeypatch, {"ok": True, "episodes": 3})
+    out = replica_heal._sync()
+    assert out == {"ok": True, "episodes": 3} and calls == [1] and hub.dumps == 0
+
+
+def test_a_pull_that_needs_a_dump_falls_back_to_one(hub, monkeypatch):
+    _pulls(monkeypatch, {"ok": False, "needs_dump": True, "error": "more than 2000 changes since the last update"})
+    out = replica_heal._sync()
+    assert hub.dumps == 1 and out["ok"] is True
+    assert out["fallback_from_pull"] == "more than 2000 changes since the last update"
+
+
+def test_a_pull_error_while_the_hub_answers_falls_back_to_a_dump(hub, monkeypatch):
+    _pulls(monkeypatch, {"ok": False, "error": "OperationalError: relation missing", "hub_unreachable": False})
+    out = replica_heal._sync()
+    assert hub.dumps == 1 and out["fallback_from_pull"] == "OperationalError: relation missing"
+
+
+def test_a_hub_lost_during_the_pull_is_waited_out_not_failed(hub, monkeypatch):
+    hub.up = True
+    hub.age(3600)
+    _pulls(monkeypatch, {"ok": False, "error": "ConnectionTimeout: x", "hub_unreachable": True})
+    out = replica_heal.run()
+    assert out["ok"] is True and (out["action"], out["reason"]) == ("waiting", "hub_unreachable")
+    state = replica_heal.read_state()
+    assert state["hub_unreachable_since"] and "last_failed_at" not in state
+    assert hub.dumps == 0
+
+
+def test_an_unreachable_hub_or_a_dump_in_progress_is_returned_as_it_is(hub, monkeypatch):
+    for result in ({"ok": False, "error": "ConnectionTimeout: x", "hub_unreachable": True},
+                   {"ok": False, "error": "hub snapshot refresh in progress"}):
+        _pulls(monkeypatch, result)
+        assert replica_heal._sync() == result
+    assert hub.dumps == 0
+
+
+def test_a_measurement_older_than_the_last_pull_no_longer_describes_the_copy(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
+    refreshed = "2026-10-16T06:00:00+00:00"
+    health = {"exists": True, "age_seconds": 60, "refreshed_at": refreshed}
+    monkeypatch.setattr(hub_snapshot, "snapshot_health", lambda: dict(health))
+    checked = datetime.now(timezone.utc) - timedelta(minutes=5)
+    hub_snapshot.freshness_path().write_text(json.dumps({
+        "refreshed_at": refreshed, "checked_at": checked.isoformat(), "state": "behind",
+        "lag_seconds": hub_snapshot.SNAPSHOT_LAG_BEHIND_S + 600}), encoding="utf-8")
+    fresh, why = hub_snapshot.snapshot_is_fresh()
+    assert fresh is False and why["distrusted_by"] == "measurement"
+    hub_snapshot._write_meta({"last_pull_at": (checked + timedelta(minutes=1)).isoformat()})
+    fresh, why = hub_snapshot.snapshot_is_fresh()
+    assert fresh is True and "distrusted_by" not in why

@@ -10,6 +10,11 @@ work, and does it only when the hub answers:
 - the hub answers again after a run found it unreachable: an update at once;
 - the last update is ``replica_refresh_after`` old or more: an update.
 
+An update is an incremental pull (``hub_snapshot.pull_changes``: what other
+machines and the gateway wrote, missed patches, re-built vectors, decisions);
+a full dump is its fallback, when the pull has too much to catch up or fails
+while the hub answers.
+
 Otherwise it does nothing and opens no connection. It never runs from a hook,
 a status read or a tab click. Every dump goes through ``hub_snapshot.refresh``
 and its lock, so this job, the nightly and ``khipu snapshot refresh`` never
@@ -248,7 +253,19 @@ def _full_dump() -> dict[str, Any]:
 
 
 def _sync() -> dict[str, Any]:
-    return _full_dump()
+    from khipu import hub_snapshot
+
+    try:
+        pulled = hub_snapshot.pull_changes()
+    except Exception as exc:  # noqa: BLE001 - a pull that cannot run is a dump's job
+        pulled = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    if pulled.get("ok"):
+        return pulled
+    # Waiting out a dump in progress or an unreachable hub is the caller's job;
+    # anything else means the pull cannot bring the copy level.
+    if pulled.get("hub_unreachable") or "in progress" in str(pulled.get("error") or ""):
+        return pulled
+    return {**_full_dump(), "fallback_from_pull": pulled.get("error")}
 
 
 def run() -> dict[str, Any]:
@@ -285,6 +302,12 @@ def run() -> dict[str, Any]:
     elif "in progress" in str(result.get("error") or ""):
         out["action"] = "skipped"
         out["reason"] = "refresh_in_progress"
+    elif result.get("hub_unreachable"):
+        # Lost between the probe and the pull: waited out like a failed probe.
+        state["hub_unreachable_since"] = now.isoformat()
+        state["last_error"] = result.get("error")
+        out["action"] = "waiting"
+        out["reason"] = "hub_unreachable"
     else:
         state["last_failed_at"] = _now().isoformat()
         state["last_error"] = result.get("error")

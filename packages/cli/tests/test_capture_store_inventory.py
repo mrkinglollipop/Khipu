@@ -104,7 +104,8 @@ NOT_CAPTURE = {
                      "integrations._probe_aegis_refusal", "integrations._probe_extract",
                      "integrations._probe_hook", "integrations._probe_native_extract"), _TOOLS),
     **dict.fromkeys(("hub_snapshot._mark_purged_topic", "hub_snapshot._queue_erasure",
-                     "hub_snapshot._write_last_known", "hub_snapshot._write_meta"), _REPLICA_META),
+                     "hub_snapshot._write_last_known", "hub_snapshot._write_meta",
+                     "hub_snapshot._queue_missed_patch"), _REPLICA_META),
     **dict.fromkeys(("tombstones._atomic_write", "tombstones._locked_registry",
                      "tombstones.publish_identities"), _REGISTRY),
 }
