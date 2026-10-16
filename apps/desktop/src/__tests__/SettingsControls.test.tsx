@@ -6,6 +6,7 @@ import {
   CaptureTuningCard,
   GatewayTokenCard,
   GatewayUrlCard,
+  GraphBackupRemoteCard,
   JobsCard,
   PathOverridesCard,
 } from "../SettingsControls";
@@ -88,7 +89,7 @@ afterEach(() => {
 describe("CaptureTuningCard", () => {
   it("changes capture mode through khipu_config_set with the fixed key", async () => {
     render(<CaptureTuningCard active />);
-    const select = (await screen.findByLabelText("Where a capture is written")) as HTMLSelectElement;
+    const select = (await screen.findByLabelText("Where captures are written")) as HTMLSelectElement;
     await waitFor(() => expect(select).not.toBeDisabled());
     fireEvent.change(select, { target: { value: "hub" } });
     await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "capture_mode", value: "hub" }]));
@@ -96,7 +97,7 @@ describe("CaptureTuningCard", () => {
 
   it("locks a threshold the environment decides and names the variable", async () => {
     render(<CaptureTuningCard active />);
-    const close = (await screen.findByLabelText("Close an open commitment at")) as HTMLInputElement;
+    const close = (await screen.findByLabelText("Close a commitment when a later capture matches it at")) as HTMLInputElement;
     await waitFor(() => expect(close.value).toBe("0.9"));
     expect(close).toBeDisabled();
     expect(screen.getAllByText("Locked").length).toBeGreaterThan(0);
@@ -106,8 +107,12 @@ describe("CaptureTuningCard", () => {
   it("describes the independent matching rules beside both thresholds", async () => {
     render(<CaptureTuningCard active />);
     await screen.findByLabelText("Merge near-duplicate captures at");
-    expect(screen.getByText(/meaning-based threshold.*independent word matching rule/i)).toBeInTheDocument();
-    expect(screen.getByText(/meaning-based closure threshold.*separate word and completion rule/i)).toBeInTheDocument();
+    expect(
+      screen.getByText("From 0 to 1; higher merges only closer matches. A word matching rule can also merge close captures. Default 0.92."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("From 0 to 1. A word and completion rule can also close a commitment. Default 0.85."),
+    ).toBeInTheDocument();
   });
 
   it("keeps both newest threshold values when reversed reloads finish", async () => {
@@ -130,7 +135,7 @@ describe("CaptureTuningCard", () => {
 
     render(<CaptureTuningCard active />);
     const dedup = (await screen.findByLabelText("Merge near-duplicate captures at")) as HTMLInputElement;
-    const close = screen.getByLabelText("Close an open commitment at") as HTMLInputElement;
+    const close = screen.getByLabelText("Close a commitment when a later capture matches it at") as HTMLInputElement;
     await waitFor(() => expect(close.value).toBe("0.85"));
 
     fireEvent.change(dedup, { target: { value: "0.8" } });
@@ -161,6 +166,65 @@ describe("CaptureTuningCard", () => {
     expect(close.value).toBe("0.7");
   });
 
+  it("is two cards: when a conversation is saved, and commitments", async () => {
+    const { container } = render(<CaptureTuningCard active turns={5} minutes={20} />);
+    await screen.findByLabelText("Your names");
+    const heads = Array.from(container.querySelectorAll(".section-head")).map((h) => h.textContent);
+    expect(heads).toEqual(["When Khipu saves a conversation", "Commitments"]);
+    expect(
+      screen.getByText(
+        "After 5 turns or 20 minutes, before a conversation is compacted, and when it ends. The same on every harness.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Keys, tokens and passwords are masked before anything is summarised or stored.")).toBeInTheDocument();
+    const [first, second] = Array.from(container.querySelectorAll(".section-card"));
+    expect(first.querySelector("select")).not.toBeNull();
+    expect(first.textContent).toContain("Merge near-duplicate captures at");
+    expect(second.textContent).toContain("A commitment is something a conversation said is still owed");
+    expect(second.textContent).toContain("Your names");
+    expect(second.textContent).toContain("Close a commitment when a later capture matches it at");
+    expect(second.textContent).toContain("Default: none.");
+  });
+
+  it("reads the settings once for both cards", async () => {
+    render(<CaptureTuningCard active />);
+    await screen.findByLabelText("Your names");
+    expect(calls.filter(([c]) => c === "khipu_config_show")).toHaveLength(1);
+  });
+
+  it("shows Reading… instead of a false mode until the settings are read", async () => {
+    let release: (raw: string) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd !== "khipu_config_show") throw new Error(`unexpected command ${cmd}`);
+      return new Promise<string>((resolve) => (release = resolve));
+    });
+    render(<CaptureTuningCard active />);
+    const select = screen.getByLabelText("Where captures are written") as HTMLSelectElement;
+    expect(select.selectedOptions[0].textContent).toBe("Reading…");
+    expect(select).toBeDisabled();
+    expect(screen.queryByText("Files and Khipu")).toBeNull();
+    await act(async () => release(JSON.stringify(config)));
+    await waitFor(() => expect(select.selectedOptions[0].textContent).toBe("Files and Khipu"));
+  });
+
+  it("says when the settings cannot be read", async () => {
+    invokeMock.mockImplementation(async () => {
+      throw new Error("config unreadable");
+    });
+    render(<CaptureTuningCard active />);
+    expect(await screen.findByText(/Could not read the settings: .*config unreadable/)).toBeInTheDocument();
+    expect(screen.queryByText("Files and Khipu")).toBeNull();
+  });
+
+  it("names the variable that locks where captures are written", async () => {
+    config = { ...config, capture_mode: "hub", capture_mode_source: "env" };
+    render(<CaptureTuningCard active />);
+    const select = (await screen.findByLabelText("Where captures are written")) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe("hub"));
+    expect(select).toBeDisabled();
+    expect(screen.getByText("KHIPU_CAPTURE_MODE")).toBeInTheDocument();
+  });
+
   it("saves the dedup threshold and your names, and shows the CLI's refusal", async () => {
     render(<CaptureTuningCard active />);
     const dedup = (await screen.findByLabelText("Merge near-duplicate captures at")) as HTMLInputElement;
@@ -175,6 +239,24 @@ describe("CaptureTuningCard", () => {
     fireEvent.submit(names.closest("form")!);
     expect(await screen.findByText("user_aliases is not writable")).toBeInTheDocument();
     expect(calls).toContainEqual(["khipu_config_set", { key: "user_aliases", value: "matt, matthew" }]);
+  });
+
+  it("saves the commitment closing threshold as commitment_close_similarity", async () => {
+    config = {
+      ...config,
+      float_settings: {
+        dedup_similarity: { value: 0.92, source: "default", default: 0.92 },
+        commitment_close_similarity: { value: 0.85, source: "default", default: 0.85 },
+      },
+    };
+    render(<CaptureTuningCard active />);
+    const close = (await screen.findByLabelText("Close a commitment when a later capture matches it at")) as HTMLInputElement;
+    await waitFor(() => expect(close.value).toBe("0.85"));
+    fireEvent.change(close, { target: { value: "0.8" } });
+    fireEvent.submit(close.closest("form")!);
+    await waitFor(() =>
+      expect(calls).toContainEqual(["khipu_config_set", { key: "commitment_close_similarity", value: "0.8" }]),
+    );
   });
 });
 
@@ -285,5 +367,49 @@ describe("GatewayTokenCard", () => {
     fireEvent.submit(field.closest("form")!);
     expect(await screen.findByRole("alert")).toHaveTextContent("token is empty");
     expect(field.value).toBe("abc");
+  });
+});
+
+describe("GraphBackupRemoteCard", () => {
+  const def = "r2:khipu-backups/khipu-graph";
+
+  it("shows the default and where it came from, and saves a valid destination", async () => {
+    config.graph_backup_remote = { value: def, source: "default", default: def };
+    render(<GraphBackupRemoteCard active />);
+    const field = (await screen.findByLabelText("Off-site copy goes to")) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe(def));
+    expect(screen.getByText("Comes from the default.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Use the default" })).not.toBeInTheDocument();
+    fireEvent.change(field, { target: { value: " r2:my-bucket/graph " } });
+    fireEvent.submit(field.closest("form")!);
+    await waitFor(() =>
+      expect(calls).toContainEqual(["khipu_config_set", { key: "graph_backup_remote", value: "r2:my-bucket/graph" }]),
+    );
+  });
+
+  it("refuses a value without a remote name before calling the CLI", async () => {
+    config.graph_backup_remote = { value: def, source: "default", default: def };
+    render(<GraphBackupRemoteCard active />);
+    const field = (await screen.findByLabelText("Off-site copy goes to")) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe(def));
+    fireEvent.change(field, { target: { value: "just-a-bucket" } });
+    fireEvent.submit(field.closest("form")!);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/rclone remote and folder/);
+    expect(calls.some(([cmd]) => cmd === "khipu_config_set")).toBe(false);
+  });
+
+  it("offers the default again for a saved value and locks an environment one", async () => {
+    config.graph_backup_remote = { value: "r2:mine/g", source: "config", default: def };
+    render(<GraphBackupRemoteCard active />);
+    expect(await screen.findByText("Comes from this Mac's settings.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Use the default" }));
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "graph_backup_remote" }]));
+    cleanup();
+    config.graph_backup_remote = { value: "r2:env/g", source: "env", default: def };
+    render(<GraphBackupRemoteCard active />);
+    const field = (await screen.findByLabelText("Off-site copy goes to")) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe("r2:env/g"));
+    expect(field).toBeDisabled();
+    expect(screen.getByText("Comes from the environment variable KHIPU_GRAPH_BACKUP_REMOTE.")).toBeInTheDocument();
   });
 });

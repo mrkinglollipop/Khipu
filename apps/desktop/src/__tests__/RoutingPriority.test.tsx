@@ -5,7 +5,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { AccountReach, PlansSettingsCard, liveWords, signInOffer, signInOutcome } from "../PlansCard";
+import { PlansSettingsCard, SignInControl, liveWords, signInOffer, signInOutcome } from "../PlansCard";
 import type { PlanUsageState, UsageAccount } from "../PlansCard";
 import { RoutingCard } from "../RoutingCard";
 import { RoutingSettings } from "../RoutingSettings";
@@ -30,7 +30,27 @@ function row(extra: Partial<UsageAccount>): UsageAccount {
 type Answer = string | object | ((args: Record<string, unknown> | undefined) => unknown);
 let answers: Record<string, Answer>;
 
+// Settings clarity phase 3 folds Settings -> Accounts and routing into
+// groups; these tests read every group and account line open.
+const ALL_OPEN = [
+  "accounts", "priority", "rules", "holds", "telling", "resets", "runners", "table", "changes", "sub:hears", "sub:sizes",
+  ...["claude|", SECOND, "codex|", "grok|"].map((k) => `account:${k}`),
+];
+
+// jsdom here has no usable localStorage; an in-memory one stands in.
+function memoryStorage() {
+  const m = new Map<string, string>();
+  return {
+    getItem: (k: string) => m.get(k) ?? null,
+    setItem: (k: string, v: string) => void m.set(k, String(v)),
+    removeItem: (k: string) => void m.delete(k),
+    clear: () => m.clear(),
+  };
+}
+
 beforeEach(() => {
+  vi.stubGlobal("localStorage", memoryStorage());
+  localStorage.setItem("khipu.routing.open", JSON.stringify(ALL_OPEN));
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(NOW);
   answers = {};
@@ -43,6 +63,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   vi.useRealTimers();
   invokeMock.mockReset();
 });
@@ -68,27 +89,33 @@ describe("each account says whether Khipu can read it", () => {
 
   it("offers Sign in again for Claude and Codex, and says where to sign in for Grok and Muse", () => {
     expect(signInOffer(row({}))).toBeNull();
+    expect(signInOffer(row({ ok: false, error: "no_plan_figures", home: "~/.claude-second" }))).toBeNull();
+    expect(liveWords(row({ ok: false, error: "no_plan_figures" })).text).toBe(
+      "Can't be read just now (didn't send its plan figures)");
     expect(signInOffer(row({ ok: false, error: "not_signed_in" }))).toBe("button");
     expect(signInOffer(row({ ok: false, error: "no_plan_limits", home: "~/.claude-second" }))).toBe("button");
     expect(signInOffer(row({ harness: "codex", ok: false, error: "not_signed_in" }))).toBe("button");
     expect(signInOffer(row({ ok: false, error: "not_installed" }))).toBeNull();
     expect(signInOffer(row({ harness: "grok", ok: false, error: "not_signed_in" }))).toBe("elsewhere");
-    render(<AccountReach row={row({ harness: "grok", account: "Grok", ok: false, error: "not_signed_in" })} />);
+    // Settings clarity phase 2: only a sign-in problem offers a sign-in.
+    for (const error of ["timeout", "cli_error", "bad_reply", "no_answer", "pending", "invalid_account"]) {
+      expect(signInOffer(row({ harness: "grok", ok: false, error }))).toBeNull();
+    }
+    render(<SignInControl row={row({ harness: "grok", account: "Grok", ok: false, error: "not_signed_in" })} />);
     expect(screen.getByText("Sign in from Grok Build")).toBeTruthy();
     expect(screen.queryByRole("button")).toBeNull();
     cleanup();
-    render(<AccountReach row={row({ harness: "muse", account: "Muse", ok: false, error: "no_plan_limits" })} />);
+    render(<SignInControl row={row({ harness: "muse", account: "Muse", ok: false, error: "no_plan_limits" })} />);
     expect(screen.getByText("Sign in from Muse")).toBeTruthy();
     cleanup();
-    render(<AccountReach row={row({})} />);
-    expect(screen.getByText("Live: read 2 min ago")).toBeTruthy();
-    expect(screen.queryByRole("button")).toBeNull();
+    const { container } = render(<SignInControl row={row({})} />);
+    expect(container.textContent).toBe("");
   });
 
   it("sends only the account's CLI and login folder, then reads again and shows the new state", async () => {
     const second = row({ account: "Claude second", home: "~/.claude-second", ok: false, error: "no_plan_limits" });
     const state: PlanUsageState = {
-      data: { accounts: [row({ ok: false, error: "not_signed_in" }), second] }, error: null, loading: false,
+      data: { accounts: [row({ ok: false, error: "not_signed_in" }), second] }, error: null, errorAt: null, loading: false,
       refreshing: false, load: vi.fn(), refresh: vi.fn(), reread: vi.fn(async () => undefined),
     };
     answers.khipu_config_show = { usage_accounts: { value: null, source: "default", accounts: [] } };

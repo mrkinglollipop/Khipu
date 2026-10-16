@@ -21,6 +21,7 @@ import pytest
 
 from khipu import mcp_server as ms
 from khipu import routing
+from khipu import usage as usage_mod
 from khipu.mcp_server import handle_message
 
 T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
@@ -770,7 +771,9 @@ def test_a_clipped_report_never_keeps_part_of_a_login_folder(home):
     stored = _events()
     for event in stored:
         assert tmp not in json.dumps(event), event
-    assert stored[0]["evidence"].startswith("saw it in .claude-third")
+    # A login folder stands as its account's id, never its folder name (slice 9A).
+    third = routing.account_id(usage_mod._key({"harness": "claude", "home": where}))
+    assert stored[0]["evidence"].startswith(f"saw it in {third}")
     for text in _strings(_route()):
         assert tmp not in text and "a-long-folder-name" not in text, text
 
@@ -846,9 +849,11 @@ def test_no_character_a_conversation_writes_can_close_the_quote_or_speak_for_the
 
 
 def test_the_owners_words_are_whole_and_the_same_in_khipu_route_and_the_light_status(home):
-    # R3-3: one policy in both answers. The owner's note, rules and hold words
-    # are shown word for word, a login folder in them included; everything
-    # else is cut of paths in both.
+    # R3-3: one policy in both answers. The owner's note and rules are shown
+    # word for word, a login folder in them included; everything else is cut
+    # of paths in both. Slice 9A narrowed the exception to the note and the
+    # standing rules (agent_view): a hold, the owner's too, names a login
+    # folder by its account's id (its line is clipped, so it can't be kept whole).
     private = _private_accounts(home)
     where = str(private / ".claude-third")
     note = f"Claude third ({where}) is kept for reviews."
@@ -861,13 +866,15 @@ def test_the_owners_words_are_whole_and_the_same_in_khipu_route_and_the_light_st
     view = _route()
     assert view["note"]["text"] == note
     assert [r["text"] for r in view["rules"]] == [rule]
-    assert view["holds"][0]["text"] == held and f"\u201c{held}\u201d" in view["holds"][0]["line"]
+    third = routing.account_id(usage_mod._key({"harness": "claude", "home": where}))
+    assert view["holds"][0]["text"] == f"keep {third} free"
+    assert f"\u201ckeep {third} free\u201d" in view["holds"][0]["line"]
     light = routing.light_status()["text"]
     assert ms._routing_light()["text"] == light
     for words in (note, rule):
         assert words in light, (words, light)
-    # The hold's line may be clipped to the push's line length, never rewritten.
-    assert f"keep {where[:30]}" in light, light
+    # The push clips the hold's line first, so a cut path is said as "a folder".
+    assert f"keep {third}" in light or "keep a folder" in light, light
     # Outside the owner's words, no path in either answer.
     for text in [light.replace(note, "").replace(rule, "").replace(held, "")] + [
             t for t in _strings(view) if note not in t and rule not in t and held not in t]:
@@ -934,7 +941,7 @@ def test_no_mcp_answer_holds_a_configured_path_or_an_account_key(home):
     assert "claude|" + where in keys
     forbidden = [where, "/logins/claude-second", str(runner), str(table), *keys]
     note = f"Claude third ({where}) is kept for reviews."
-    owner_hold = ".claude-third"  # the owner's words, a piece of a login folder
+    owner_hold = ".claude-third"  # the owner's hold, a piece of a login folder: scrubbed since slice 9A
     assert owner_hold in where
     answers: list = []
 
@@ -963,7 +970,7 @@ def test_no_mcp_answer_holds_a_configured_path_or_an_account_key(home):
     with mock.patch.object(routing, "read_view", side_effect=RuntimeError(f"broke reading {where} {table}")):
         answers.append(_call("khipu_route", {})[1])
         answers.append(_call("khipu_route_report", {"action": "end_hold", "hold_id": "h-x"})[1])
-    owner_words = [note, owner_hold]
+    owner_words = [note]
     for answer in answers:
         for text in _strings(answer):
             for needle in forbidden:
@@ -972,8 +979,8 @@ def test_no_mcp_answer_holds_a_configured_path_or_an_account_key(home):
     view = _route()
     assert view["note"]["text"] == note and note in routing.light_status()["text"]
     held = next(h for h in view["holds"] if h["owner"])
-    assert held["text"] == owner_hold and f"“{owner_hold}”" in held["line"]
     third = next(a for a in view["accounts"] if a["label"] == "Claude third")
+    assert held["text"] == third["id"] and f"“{third['id']}”" in held["line"]
     assert held["scope"] == {"kind": "account", "account": third["id"]}
 
 

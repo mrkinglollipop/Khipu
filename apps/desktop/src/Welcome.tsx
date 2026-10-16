@@ -11,6 +11,7 @@ import { buildAttention, type Attention } from "./doctorAttention";
 import { LABEL as HARNESS_LABEL } from "./IntegrationsPanel";
 import type { RecallProbeStatus } from "./IntegrationsPanel";
 import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
+import { SetupAccountsStep } from "./SetupAccounts";
 import { SynthAccess, defaultSynthModel, synthModelError } from "./SynthProvider";
 
 /** `docs/plans/2026-09-05-setup-that-cannot-strand-you.md` stage ids.
@@ -43,7 +44,7 @@ export function welcomeCompleted(): boolean {
 
 export const SUPPORT_EMAIL = "support@kinglollipop.com";
 
-type StepId = "welcome" | "database" | "model" | "graph" | "agents" | "finish";
+export type StepId = "welcome" | "database" | "model" | "graph" | "agents" | "accounts" | "finish";
 type DbMode = "join" | "local" | "remote";
 
 const STEPS: { id: StepId; label: string }[] = [
@@ -52,8 +53,15 @@ const STEPS: { id: StepId; label: string }[] = [
   { id: "model", label: "Model" },
   { id: "graph", label: "Graph" },
   { id: "agents", label: "Agents" },
+  { id: "accounts", label: "Accounts" },
   { id: "finish", label: "Finish" },
 ];
+
+/** A step id from outside (a What's new button) may name a step this build
+ * does not have yet; fall back to the first step. */
+function stepOrWelcome(id: string | undefined): StepId {
+  return STEPS.find((s) => s.id === id)?.id ?? "welcome";
+}
 
 function joinFailMessage(
   out: Record<string, unknown> | null,
@@ -176,19 +184,19 @@ export function Welcome({
   /** Jump to this step instead of the usual "welcome" start — Settings ›
    *  Database's "Connect to a server you run or another Mac…" reopens this
    *  flow at the Database step rather than restarting from step 1. */
-  initialStep?: StepId;
+  initialStep?: string;
   /** Bumped by the caller on every click so revisiting the same
    *  `initialStep` (the user backed out and clicked the Settings link again)
    *  still jumps — `initialStep` alone would not change value the second
    *  time, so nothing would tell this component to re-read it. */
   initialStepKey?: number;
 }) {
-  const [step, setStep] = useState<StepId>(initialStep ?? "welcome");
+  const [step, setStep] = useState<StepId>(stepOrWelcome(initialStep));
   const idx = STEPS.findIndex((s) => s.id === step);
   const go = (n: number) => setStep(STEPS[Math.max(0, Math.min(STEPS.length - 1, idx + n))].id);
 
   useEffect(() => {
-    if (initialStepKey) setStep(initialStep ?? "welcome");
+    if (initialStepKey) setStep(stepOrWelcome(initialStep));
     // Only the bump should retrigger this — `initialStep` alone can repeat
     // ("database" twice in a row) without a fresh navigation to react to.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -997,18 +1005,19 @@ export function Welcome({
             Khipu gives your coding agents a memory that outlives the session.
             Each agent records what happened, the database keeps it as searchable
             text and a map of what connects to what, and the next session reads it
-            back — from any of your Macs.
+            back, from any of your Macs.
           </p>
           <p className="muted">
-            Setup is six steps. Each one checks itself, so you can close this and
+            Setup is seven steps. Each one checks itself, so you can close this and
             come back; nothing here has to be finished in one go.
           </p>
           <ul className="welcome-list">
-            <li><strong>Database</strong> — join a Khipu you already have, set one up on this Mac, or connect to one you run.</li>
-            <li><strong>Model</strong> — cloud Gemini, a local model, or skip for now (recording waits, nothing is lost).</li>
-            <li><strong>Graph</strong> — installs the graph builder next to the app.</li>
-            <li><strong>Agents</strong> — one click per harness to wire in recording.</li>
-            <li><strong>Finish</strong> — a health check, and where to get help.</li>
+            <li><strong>Database</strong>: join a Khipu you already have, set one up on this Mac, or connect to one you run.</li>
+            <li><strong>Model</strong>: cloud Gemini, a local model, or skip for now (recording waits, nothing is lost).</li>
+            <li><strong>Graph</strong>: installs the graph builder next to the app.</li>
+            <li><strong>Agents</strong>: one click per harness to wire in recording.</li>
+            <li className="new-line"><strong>Accounts</strong>: see how much of each plan is left and tell your agents which accounts have room. Optional.</li>
+            <li><strong>Finish</strong>: a health check, and where to get help.</li>
           </ul>
         </>
       ) : null}
@@ -1067,7 +1076,7 @@ export function Welcome({
               <ol className="welcome-list muted">
                 <li>
                   Click <strong>Import join kit file…</strong> and pick that file.
-                  A passphrase is optional — only if you typed one when saving.
+                  Type the passphrase set when the kit was saved first.
                 </li>
                 <li>
                   Nearby PIN is optional (same Wi‑Fi). File import is enough to continue.
@@ -1084,7 +1093,7 @@ export function Welcome({
                 </button>
               </div>
               <p className="muted" style={{ marginTop: "0.75rem" }}>
-                Optional passphrase (only if you set one when saving the file):
+                Join kit passphrase (leave blank only for a kit saved unencrypted):
               </p>
               <div className="toolbar" style={{ width: "100%" }}>
                 <input
@@ -1094,8 +1103,8 @@ export function Welcome({
                   spellCheck={false}
                   value={joinPassphrase}
                   onChange={(e) => setJoinPassphrase(e.target.value)}
-                  placeholder="Leave blank unless the file is locked"
-                  aria-label="Optional join passphrase"
+                  placeholder="Passphrase from the working Mac"
+                  aria-label="Join kit passphrase"
                 />
               </div>
               <p className="muted" style={{ marginTop: "0.75rem" }}>
@@ -1729,6 +1738,9 @@ export function Welcome({
         </>
       ) : null}
 
+      {step === "accounts" ? (
+        <SetupAccountsStep active={step === "accounts"} onBack={() => go(-1)} onNext={() => go(1)} />
+      ) : (
       <div className="toolbar welcome-nav">
         <button type="button" onClick={() => go(-1)} disabled={idx === 0}>
           <ChevronLeft size={14} aria-hidden /> Back
@@ -1773,6 +1785,7 @@ export function Welcome({
           </button>
         )}
       </div>
+      )}
     </div>
   );
 }

@@ -648,46 +648,76 @@ def _clean(text, limit: int) -> str:
     return _clip(words, limit)
 
 
-def _configured_paths() -> list[str]:
+def _configured_path_names() -> dict[str, str | tuple[str, str]]:
     """Every folder and file path Khipu is configured with (login folders,
     job runner folders, the routing table, the rules seed), each as written,
-    expanded and resolved, longest first."""
+    expanded and resolved, with what stands for it in a conversation's
+    words: a login folder as (harness, home), for its account's id as
+    khipu_route gives it (worked out only when used: the id's salt is made
+    on first use), any other path as "a folder"."""
     from khipu.config import load_config
 
     config: dict = {}
     with contextlib.suppress(Exception):
         config = load_config()
-    paths: set[str] = set()
+    paths: dict[str, str | tuple[str, str]] = {}
+    logins: list[tuple[str, str]] = []
+    items = config.get("usage_accounts")
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("home"), str):
+            logins.append((str(item.get("harness") or "").strip().lower(), item["home"]))
+    with contextlib.suppress(Exception):
+        logins += [(a["harness"], str(a["home"])) for a in accounts() if a.get("home")]
+    for harness, home in logins:
+        paths.setdefault(home, (harness, home.strip()))
     for name in ("routing_table", "routing_rules_seed"):
         if isinstance(config.get(name), str):
-            paths.add(config[name])
-    for name, field in (("routing_sources", "path"), ("usage_accounts", "home")):
-        items = config.get(name)
-        for item in items if isinstance(items, list) else []:
-            if isinstance(item, dict) and isinstance(item.get(field), str):
-                paths.add(item[field])
-    with contextlib.suppress(Exception):
-        paths |= {str(a["home"]) for a in accounts() if a.get("home")}
-    variants: set[str] = set()
-    for path in paths:
+            paths.setdefault(config[name], "a folder")
+    items = config.get("routing_sources")
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("path"), str):
+            paths.setdefault(item["path"], "a folder")
+    variants: dict[str, str | tuple[str, str]] = {}
+    for path, name in paths.items():
         path = path.strip()
         if len(path) < 2:
             continue
-        variants.add(path.rstrip("/") or path)
+        variants.setdefault(path.rstrip("/") or path, name)
         with contextlib.suppress(Exception):
-            variants.add(os.path.expanduser(path).rstrip("/"))
-            variants.add(os.path.realpath(os.path.expanduser(path)).rstrip("/"))
-    return sorted((v for v in variants if v and v != "/"), key=len, reverse=True)
+            variants.setdefault(os.path.expanduser(path).rstrip("/"), name)
+            variants.setdefault(os.path.realpath(os.path.expanduser(path)).rstrip("/"), name)
+    return {v: n for v, n in variants.items() if v and v != "/"}
+
+
+def _configured_paths() -> list[str]:
+    """Every configured path (``_configured_path_names``), longest first."""
+    return sorted(_configured_path_names(), key=len, reverse=True)
 
 
 def _cut_paths(words: str) -> str:
-    """``words`` with each configured path cut to its last name: done once,
-    to a conversation's words before they are stored, so the record never
-    holds one of the owner's paths in a conversation's words."""
-    for path in _configured_paths():
+    """``words`` with each configured path replaced: a login folder by its
+    account's id, any other path by "a folder". Done once, to a
+    conversation's words before they are stored, so the record never holds
+    one of the owner's paths, or a login folder's name, in them."""
+    from khipu import usage
+
+    names = _configured_path_names()
+    for path in sorted(names, key=len, reverse=True):
         if path in words:
-            words = words.replace(path, Path(path).name or "a folder")
+            name = names[path]
+            if isinstance(name, tuple):
+                name = account_id(usage._key({"harness": name[0], "home": name[1]}))
+            words = words.replace(path, name)
     return words
+
+
+def _for_agents(value, view: dict | None = None):
+    """``value`` as an agent may read it (``agent_view.scrub``): the owner's
+    note and standing rules in ``view`` pass as he wrote them."""
+    from khipu import agent_view
+
+    keys = [a.get("key") for a in (view or {}).get("accounts") or [] if isinstance(a, dict)] if view else None
+    return agent_view.scrub(value, keep=agent_view.keep_owner_words(view), extra_keys=keys)
 
 
 def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime:
@@ -3033,6 +3063,12 @@ def _save_view(view: dict) -> None:
 def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
     if not view or view.get("fingerprint") != fingerprint or "priority_version" not in view:
         return False
+    # A whole-log read of a runner's events still under way goes on at the
+    # next read, one bounded chunk at a time, though no file changed.
+    runners = ((view.get("source_cache") or {}).get("runners") or {}).values()
+    if any(isinstance((r.get("events") or {}).get("scan"), dict) and not r["events"]["scan"].get("done")
+           and not r["events"]["scan"].get("unfinished") for r in runners if isinstance(r, dict)):
+        return False
     folded = _parse(view.get("folded_at"))
     if folded is not None and (folded - now).total_seconds() > CLOCK_TOLERANCE:
         return False  # folded at a time further ahead of this clock than it trusts: fold again at now
@@ -4592,7 +4628,9 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         lines += [item[1] for item in kept]
         if dropped:
             lines.append(f"{dropped} more lines: run `khipu route`")
-    return {"text": "\n".join(lines), "dropped": dropped, "rules_note_chars": rules_note_chars,
+    # Read by conversations (the pushes, khipu_status) and printed by
+    # `khipu route --summary`: scrubbed, the owner's words kept whole.
+    return {"text": _for_agents("\n".join(lines), view), "dropped": dropped, "rules_note_chars": rules_note_chars,
             "version": view["version"], "epoch": view.get("epoch")}
 
 
@@ -4872,6 +4910,15 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     # (phase 4): each watched rule's check, as doctor carries it, and the
     # two times the app words its warnings by.
     out["rule_checks"] = routing_sources.rule_checks(view.get("source_cache") or {}, view.get("rules") or [])
+    # Settings -> Accounts and routing (clarity phase 5): what each checked
+    # rule's last check found and when it ran, so a rule row says "nothing
+    # wrong found" only after a check that ran. Every registered runner is a
+    # source, a runner Khipu never read included.
+    registered = [r.get("name") for r in (view.get("sources") or {}).get("runners") or [] if isinstance(r, dict)]
+    out["rule_results"] = routing_sources.rule_results(view.get("source_cache") or {}, view.get("rules") or [],
+                                                       out["rule_checks"], now=now,
+                                                       stale_after=cfg["routing_stale_after"] or 0,
+                                                       runners=registered)
     out["warn_after"] = {"disagreement": cfg["routing_disagreement_warn_after"],
                          "not_refreshed": cfg["routing_not_refreshed_after"]}
     # How long a limit reported without a time lasts (the card says so).
@@ -5148,9 +5195,9 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
             mine = {f"account:{key}"} | {f"hold:{i}" for i in _holds_on(key, view)}
             pairs = [(e, line) for e, line in pairs
                      if e in mine or e.startswith("rule:") or e in ("note", "priority")]
-        return {"since": out["since"], "epoch": out["epoch"], "version": out["version"],
-                "complete": out["complete"], "entities": [_public_entity(e) for e, _line in pairs],
-                "lines": [line for _e, line in pairs], "about": ABOUT}
+        return _for_agents({"since": out["since"], "epoch": out["epoch"], "version": out["version"],
+                            "complete": out["complete"], "entities": [_public_entity(e) for e, _line in pairs],
+                            "lines": [line for _e, line in pairs], "about": ABOUT}, view)
     out = {k: view[k] for k in _VIEW_FIELDS if k in view}
     out["generated_at"] = _iso(now)
     out["seed"] = _pick(view.get("seed"), ("at", "count"))
@@ -5168,7 +5215,7 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
         out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
                                if r.get("silent") or r.get("unreadable")]
     out["about"] = ABOUT
-    return out
+    return _for_agents(out, view)
 
 
 # What a conversation may write through MCP, and what it may not. The owner's
@@ -5216,7 +5263,7 @@ def conversation_write(args: dict, *, author: dict, now: datetime | None = None,
         if written.get("account"):
             out["account"] = account_id(written["account"])
             out["label"] = _label_of(written["account"], accounts())
-        return out
+        return _for_agents(out)
 
 
 def _conversation_write(args: dict, *, author: dict, now: datetime | None = None) -> dict:
@@ -5289,7 +5336,7 @@ def conversation_priority(entries, *, until=None, owner_request: str, author: di
         out = {k: written[k] for k in _WRITE_FIELDS if k in written}
         out["priority"] = held
         out["about"] = ABOUT
-        return out
+        return _for_agents(out, view)
 
 
 def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_BUDGET,
@@ -5408,7 +5455,9 @@ def prompt_imports() -> None:
     it before its budget starts, so the budget times the read and not a cold
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
-    from khipu import config, features, paths, redact, routing_sources, session_capture, usage  # noqa: F401
+    from khipu import (  # noqa: F401
+        agent_view, claude_homes, config, discover, features, paths, redact, routing_sources, session_capture,
+        usage)
 
 
 def prompt_budget() -> float:
@@ -5724,12 +5773,13 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
                 # under the same budget as any change push.
                 nothing = {"entities": [], "lines": [], "since": seen}
                 text, _count = changes_text(nothing, view, now, cfg, stale=stale)
-                return dict(base, kind="changes", text=text, count=0, unrefreshed=view.get("checked_at"))
+                return dict(base, kind="changes", text=_for_agents(text, view), count=0,
+                            unrefreshed=view.get("checked_at"))
             return dict(base, kind="none", text=None, count=0)
         changed = since(seen, view, now=now, epoch=marker.get("epoch"))
         if changed["complete"]:
             text, count = changes_text(changed, view, now, cfg, stale=stale)
-            return dict(base, kind="changes", text=text, count=count,
+            return dict(base, kind="changes", text=_for_agents(text, view), count=count,
                         unrefreshed=view.get("checked_at") if stale else None)
         why = "the changes are no longer kept"
     out = summary(view, now=now)

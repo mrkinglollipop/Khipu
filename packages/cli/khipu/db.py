@@ -8,6 +8,8 @@ from pathlib import Path
 import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
+from khipu.output_guard import secret_result
+
 DEFAULT_DSN_FILE = Path.home() / ".config" / "khipu" / "dsn"
 LEGACY_DSN_FILE = Path.home() / ".config" / "alzy" / "dsn"
 CONNECT_TIMEOUT_SECONDS = 5
@@ -29,6 +31,7 @@ _MIGRATION_DONE = False
 _MIGRATION_LOCK = threading.Lock()
 
 
+@secret_result("database_url")
 def resolve_dsn() -> str:
     """Order: KHIPU_/ALZY_ DATABASE_URL → Keychain → data_dir/dsn."""
     global _MIGRATION_DONE

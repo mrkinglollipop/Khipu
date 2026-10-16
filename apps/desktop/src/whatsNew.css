@@ -1,0 +1,78 @@
+/* What's new (settings clarity phase 8): the dialog, the Home card and the
+ * Settings -> Updates history. Rules follow whats-new.html in the mocks. */
+.post-update-dialog.wn-dialog { max-width: min(520px, calc(100vw - 32px)); }
+.wn-sub { margin: 2px 0 0; font-size: var(--t-sm); }
+.wn-list,
+.wn-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+.wn-item,
+.wn-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--border);
+}
+.wn-item:last-child,
+.wn-row:last-child { border-bottom: 0; }
+.wn-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  line-height: 1.4;
+}
+.wn-text b { color: var(--text); font-size: var(--t-md); }
+.wn-item button,
+.wn-row button { flex: none; white-space: nowrap; }
+.wn-more { margin: 0; }
+.wn-row { font-size: var(--t-sm); }
+.wn-t { flex: 1; min-width: 0; }
+.wn-t b { color: var(--text); }
+
+.wn-ver { margin: var(--s3) 0 var(--s1); font-size: var(--t-md); font-weight: 650; color: var(--text); }
+.wn-ver:first-child { margin-top: 0; }
+.wn-history .disclose { margin-top: var(--s3); }
+
+/* The Home card */
+.wn-card .card-head { display: flex; align-items: center; }
+.wn-card-h { margin: 0; font: inherit; font-weight: 650; color: var(--text); letter-spacing: inherit; text-transform: inherit; }
+.wn-card .wn-rows { border: 0; border-radius: 0; }
+.wn-card .wn-row { padding: var(--s2) var(--s4); }
+.wn-card-foot { font-size: var(--t-sm); }
+
+/* Fold button, scoped to the history (App.css has no button fold yet). */
+.wn-history .fold.disclose { border-top: 1px solid var(--border); padding-top: var(--s1); }
+.wn-history button.fold-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  width: 100%;
+  height: auto;
+  min-height: 32px;
+  margin: 0;
+  padding: var(--s2) 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  font: inherit;
+  font-size: var(--t-sm);
+  color: var(--muted);
+  text-align: left;
+  cursor: pointer;
+  transition: none;
+}
+.wn-history button.fold-btn:hover { border: 0; background: transparent; color: var(--text-2); }
+.wn-history button.fold-btn:focus-visible { outline: none; box-shadow: inset 0 0 0 3px var(--ring); border-radius: var(--r-sm); }
+.wn-history button.fold-btn[aria-expanded="true"] > .disclosure-chevron { transform: rotate(90deg); }
+.wn-history .fold-body[hidden] { display: none; }
+.wn-history .fold-btn .tag { margin-left: var(--s2); }

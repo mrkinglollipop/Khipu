@@ -1,4 +1,8 @@
-/* Settings -> Routing (docs/plans/2026-10-14-routing-truth.md, phase 4,
+/* Settings -> Accounts and routing. Since settings clarity phase 3
+   (docs/plans/2026-10-15-settings-clarity.md) the page is nine groups that
+   fold, with Needs you on top; the closed lines and problems come from
+   routingOverview.ts. Before that: Settings -> Routing
+   (docs/plans/2026-10-14-routing-truth.md, phase 4,
    second half; mock docs/mockups/2026-10-14-routing/settings-routing.html).
    Every option phases 1a to 3c built, each usable here and each limit
    raisable or removable on the spot: the accounts (Mark paused until, Lift,
@@ -15,12 +19,16 @@
 
 import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent, ReactNode, RefObject } from "react";
-import { Loader2 } from "lucide-react";
+import { ChevronRight, Loader2 } from "lucide-react";
 import { EmptyState, Tag } from "./ui";
 import { callCli, useCliState } from "./settingsCli";
 import type { FeaturesShape } from "./settingsCli";
-import type { UsageReport } from "./PlansCard";
+import { PlanBlock, RefreshButton, UsageAccountsField, planPauses } from "./PlansCard";
+import type { PlanUsageState, UsageAccount } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
+import { GROUPS, accountTags, accountWeek, routingOverview } from "./routingOverview";
+import type { GroupKey, GroupTag, OverviewSettings, Problem } from "./routingOverview";
+import "./routingOverview.css";
 import {
   accountSource,
   accountState,
@@ -30,7 +38,9 @@ import {
   modelDisagreementWords,
   paceWords,
   pastWords,
+  ROUTE_READ_FAILED,
   priorityPendingWords,
+  ruleResultLines,
   saidWhen,
   useRouting,
   whenLocal,
@@ -46,6 +56,7 @@ import type {
   RouteRule,
   RouteRunner,
   RouteView,
+  RuleResult,
 } from "./routing";
 import {
   agoSpan,
@@ -475,23 +486,27 @@ function DisagreePanel({ a, w, now, back }: { a: RouteAccount; w: Writer; now: D
   );
 }
 
+/** What an account line shows when it opens: who said so, the next check,
+ *  the pace sentence, its buttons, its forms and its disagreement panel,
+ *  then (`children`) its Plans block. Its name and state are on the line. */
 function AccountRow({
   a,
   w,
   now,
   reportDefault,
   fact,
+  children,
 }: {
   a: RouteAccount;
   w: Writer;
   now: Date;
   reportDefault?: number;
   fact?: PlanFact;
+  children?: ReactNode;
 }) {
   const [pausing, setPausing] = useState(false);
   const pauseBtn = useRef<HTMLButtonElement>(null);
   const formId = `pause-${useId().replace(/:/g, "")}`;
-  const st = accountState(a, now);
   const src = accountSource(a, now, null, reportDefault);
   const close = () => {
     setPausing(false);
@@ -501,23 +516,13 @@ function AccountRow({
   const liftId = `lift:${a.key}`;
   const clearId = `clear:${a.key}`;
   return (
-    <div className="row-item route-acct" role="listitem">
-      <span className="route-name">{a.label}</span>
+    <div className="acct-body">
       <span className="route-what">
-        <span className="route-state">
-          <span className={st.tone ? `hdot ${st.tone}` : "hdot"} aria-hidden />
-          <span>{st.text}</span>
-          {a.disagreement ? (
-            <Tag tone="warn" dot>
-              Sources disagree
-            </Tag>
-          ) : null}
-        </span>
         {src ? <span className="route-src">{src}</span> : null}
         {a.next_check ? <span className="route-src">Khipu checks again at {whenLocal(a.next_check, now)}.</span> : null}
         {fact && a.configured !== false ? <span className="route-src">{paceWords(fact, now)}</span> : null}
       </span>
-      <span className="route-acts">
+      <span className="route-acts toolbar">
         {a.checkable !== false && a.configured !== false && ["limited", "probably_open", "unknown"].includes(a.state) ? (
           <>
             <button type="button" className="sm" disabled={w.anyBusy}
@@ -573,6 +578,7 @@ function AccountRow({
           <WriteError w={w} id={clearId} />
         </div>
       ) : null}
+      {children}
     </div>
   );
 }
@@ -581,9 +587,7 @@ function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteVie
   const enabled = cfg?.routing?.routing_reset_check?.value === true;
   const next = (data?.accounts ?? []).filter((a) => a.next_check).map((a) => `${a.label}: ${whenLocal(a.next_check!, new Date())}`);
   return (
-    <div className="section-card">
-      <div className="section-head">Checking for resets</div>
-      <div className="section-body">
+    <div className="section-body">
         <SwitchRow id="route-reset-check" label="Check an account at its reset time"
           what="Khipu reads only an account's usage. It never sends a model turn."
           tag={<Tag>{enabled ? "On" : "Off"}</Tag>} checked={enabled} disabled={!cfg || w.anyBusy}
@@ -598,7 +602,6 @@ function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteVie
         </div>
         <p className="set-help">{next.length ? `Khipu checks again at ${next.join("; ")}.` : "No reset checks are scheduled."}</p>
         <p className="set-help">{(data?.accounts ?? []).filter((a) => a.reset_check?.reason).map((a) => `${a.label}: ${a.reset_check?.reason}`).join("; ") || "No account has a reset-check reason."}</p>
-      </div>
     </div>
   );
 }
@@ -796,15 +799,15 @@ function PrioritySection({
   const paceOn = cfg?.routing?.routing_pace_order?.value !== false;
   const ids = entries.map((e) => `priority:move:${e.account}`).concat(entries.map((e) => `priority:remove:${e.account}`));
   return (
-    <div className="route-priority-set" role="group" aria-label="Your priority">
-      <h3 className="sub-title">Priority</h3>
+    <div className="section-body route-priority-set" role="group" aria-label="Your priority">
       <p className="set-help">
         Your order of accounts, each with your words for its role and an end if you want one. Conversations hear it
         first, before the account lines, word for word. Khipu keeps your order as you set it and never picks or reorders
         for you; if the first account is limited, paused or down, conversations hear that beside it.
       </p>
       {p?.pending ? (
-        <div className="route-disagree" role="group" aria-label="A conversation set your priority">
+        <div className="route-disagree" role="group" aria-label="A conversation set your priority"
+          data-route-item="priority:pending" tabIndex={-1}>
           <span>
             <b>{priorityPendingWords(p)}</b>
           </span>
@@ -939,51 +942,169 @@ function PrioritySection({
   );
 }
 
-function AccountsSection({
+/** Which groups, account lines and inner folds are open, by key. */
+type Folds = { isOpen: (key: string) => boolean; toggle: (key: string) => void };
+
+/** One account as a line that folds: name, state in words with its dot, the
+ *  week and pace, and its problem tags; open, what today's row showed and its
+ *  Plans block. */
+function AccountLine({
+  a,
   data,
-  plans,
-  cfg,
+  plan,
+  pause,
+  onSignedIn,
+  tags,
+  folds,
   w,
   now,
-  reread,
 }: {
+  a: RouteAccount;
   data: RouteView;
-  plans?: UsageReport | null;
-  cfg: RouteConfig | null;
+  plan?: UsageAccount;
+  pause?: string;
+  onSignedIn?: () => Promise<unknown> | void;
+  tags: GroupTag[];
+  folds: Folds;
   w: Writer;
   now: Date;
-  reread: () => Promise<unknown>;
 }) {
-  const accounts = inPlansOrder(data.accounts ?? [], plans);
+  const key = `account:${a.key}`;
+  const open = folds.isOpen(key);
+  const bodyId = `route-acct-${useId().replace(/:/g, "")}`;
+  const st = accountState(a, now);
+  const fact = data.plan_facts?.[a.key];
+  const { week, pace } = a.configured !== false ? accountWeek(fact, now) : { week: null, pace: null };
   return (
-    <div className="section-card">
-      <div className="section-head">Accounts</div>
-      <div className="section-body">
-        <PrioritySection data={data} cfg={cfg} w={w} now={now} reread={reread} />
-        <p className="set-help">
-          The same accounts as Plans, from the list in Settings → Capture &amp; models. Reports come from four
-          places: each account's plan check, your job runners, conversations, and you. Your routing table is not one
-          of them.
-        </p>
-        {accounts.length ? (
-          <div className="rows" role="list" aria-label="Accounts">
-            {accounts.map((a) => (
-              <AccountRow key={a.key} a={a} w={w} now={now} reportDefault={data.report_default_limit}
-                fact={data.plan_facts?.[a.key]} />
+    <div role="listitem">
+      <div className="fold route-aline" data-open={open}>
+        <button type="button" className="fold-btn" aria-expanded={open} aria-controls={bodyId} data-route-item={key}
+          onClick={() => folds.toggle(key)}>
+          <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
+          <span className="an">{a.label}</span>
+          <span className="as">
+            <span className={st.tone ? `hdot ${st.tone}` : "hdot"} aria-hidden />
+            <span>{st.text}</span>
+          </span>
+          <span className="ap">
+            {week ? <span className="ap-week">{week}</span> : null}
+            {pace ? <span className="ap-pace">{pace}</span> : null}
+          </span>
+          <span className="at">
+            {tags.map((t) => (
+              <Tag key={t.text} tone={t.tone} dot>
+                {t.text}
+              </Tag>
             ))}
-          </div>
-        ) : (
-          <EmptyState
-            title="No accounts to show"
-            hint="Add an account under Plans in Settings → Capture & models, and it shows here."
-          />
-        )}
-        <p className="set-help">
-          Mark paused tells conversations you want an account left alone; Lift ends it. Clear ends a limit or a
-          "down" report at once, and Khipu treats the account as open until something newer reports on it; if Claude
-          or a job runner reports the limit again, it comes back.
-        </p>
+          </span>
+        </button>
+        <div className="fold-body" id={bodyId} role="region" aria-label={a.label} hidden={!open}>
+          <AccountRow a={a} w={w} now={now} reportDefault={data.report_default_limit} fact={fact}>
+            {plan ? <PlanBlock row={plan} now={now} pause={pause} onSignedIn={onSignedIn} /> : null}
+          </AccountRow>
+        </div>
       </div>
+    </div>
+  );
+}
+
+function AccountsSection({
+  data,
+  plansState,
+  problems,
+  folds,
+  active,
+  w,
+  now,
+}: {
+  data: RouteView;
+  plansState?: PlanUsageState | null;
+  problems: Problem[];
+  folds: Folds;
+  active: boolean;
+  w: Writer;
+  now: Date;
+}) {
+  const plans = plansState?.data ?? null;
+  const accounts = inPlansOrder(data.accounts ?? [], plans);
+  const rows = plans?.accounts ?? [];
+  const pauses = planPauses(data, now);
+  const routed = (row: UsageAccount) => row.key != null && accounts.some((a) => a.key === row.key);
+  const loose = rows.filter((row) => !routed(row));
+  const [changing, setChanging] = useState(false);
+  const fieldId = `route-accounts-read-${useId().replace(/:/g, "")}`;
+  // Whose plans Khipu reads: the plan read's names, else the record's.
+  const names = (plans ? rows.map((r) => r.account || r.harness || "an account") : accounts.map((a) => a.label)).join(", ");
+  return (
+    <div className="section-body">
+      {accounts.length ? (
+        <div className="route-alist" role="list" aria-label="Accounts">
+          {accounts.map((a) => (
+            <AccountLine key={a.key} a={a} data={data} plan={rows.find((r) => r.key != null && r.key === a.key)}
+              pause={pauses.get(a.key)} onSignedIn={plansState?.reread} tags={accountTags(problems, a.key)}
+              folds={folds} w={w} now={now} />
+          ))}
+        </div>
+      ) : (
+        <EmptyState
+          title="No accounts to show"
+          hint="Add an account under Which accounts Khipu reads, at the end of this group, and it shows here."
+        />
+      )}
+      {loose.length ? (
+        <div className="plan-blocks">
+          {loose.map((row, i) => (
+            <div key={`${row.harness}|${row.home ?? ""}|${i}`} data-route-item={`plan:${row.key ?? (row.account || row.harness || "An account")}`}
+              tabIndex={-1}>
+              <PlanBlock row={row} now={now} pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={plansState?.reread} />
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {plansState ? (
+        <>
+          {plansState.error ? (
+            <p className="set-error" role="alert">
+              {plansState.error}
+            </p>
+          ) : null}
+          {plansState.loading && plansState.data == null ? (
+            <p className="set-help" role="status">
+              Reading plan usage…
+            </p>
+          ) : null}
+          <div className="toolbar">
+            <RefreshButton busy={plansState.refreshing || plansState.loading} label="Check all now"
+              onClick={() => void plansState.refresh()} />
+            <span className="muted">Asks every CLI again now; takes up to about seven seconds. No model call is made.</span>
+          </div>
+        </>
+      ) : null}
+      <p className="set-help">
+        The same accounts as Plans, from the list at the end of this group. Reports come from four places: each
+        account's plan check, your job runners, conversations, and you. Your routing table is not one of them.
+      </p>
+      <p className="set-help">
+        Mark paused tells conversations you want an account left alone; Lift ends it. Clear ends a limit or a
+        "down" report at once, and Khipu treats the account as open until something newer reports on it; if Claude
+        or a job runner reports the limit again, it comes back.
+      </p>
+      <div className="acct-foot">
+        <span>
+          Which accounts Khipu reads:{" "}
+          {plans ? names || "none" : names || (plansState?.error ? "Khipu couldn't read the list" : "Reading…")}
+        </span>
+        <span className="spacer" />
+        <button type="button" className="sm" aria-label="Change which accounts Khipu reads" aria-expanded={changing}
+          aria-controls={changing ? fieldId : undefined} onClick={() => setChanging((v) => !v)}>
+          Change…
+        </button>
+      </div>
+      {changing ? (
+        <div id={fieldId}>
+          <UsageAccountsField active={active} onChanged={plansState?.reread} />
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1017,12 +1138,11 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
   }
   const written = note?.at ? `written ${whenLocal(note.at, now) || "today"}` : null;
   return (
-    <div className="section-card">
-      <div className="section-head">
-        Your note to every conversation<span className="spacer" />
-        {written ? <span className="meta">{written}</span> : null}
-      </div>
-      <div className="section-body">
+    <div className="section-body">
+        <h2 className="sub-title">
+          Your note to every conversation
+          {written ? <span className="meta">{` · ${written}`}</span> : null}
+        </h2>
         {note ? (
           <blockquote className="route-quote">“{note.text}”</blockquote>
         ) : (
@@ -1100,7 +1220,6 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
           never turns it into a choice of account. Earlier notes stay in Recent changes. Khipu sets no limit on its
           length; the app hands over up to {WORDS_MOST_KB} KB of text in one change.
         </p>
-      </div>
     </div>
   );
 }
@@ -1119,6 +1238,7 @@ function ruleRemoveButton(n: number): HTMLElement | null {
 function RuleRow({
   r,
   watched,
+  result,
   ask,
   setAsk,
   w,
@@ -1128,6 +1248,7 @@ function RuleRow({
 }: {
   r: RouteRule;
   watched: boolean;
+  result: RuleResult | undefined;
   ask: RuleAsk;
   setAsk: (a: RuleAsk) => void;
   w: Writer;
@@ -1157,8 +1278,10 @@ function RuleRow({
     }
   };
   const origin = ruleOrigin(r.source, r.date, now);
+  const checks = ruleResultLines(watched, result, now.getTime());
   return (
-    <li className="row-item route-rule">
+    <li className={`row-item route-rule${watched && result?.result === "broken" ? " broken" : ""}`}
+      data-route-item={`rule:${r.n}`} tabIndex={-1}>
       <span className="route-rule-n" aria-hidden>
         {r.n}.
       </span>
@@ -1169,7 +1292,6 @@ function RuleRow({
           {pending ? <Tag tone="warn">{r.pending_kind === "changed" ? "Changed, reconfirm" : "Added, confirm"}</Tag> : null}
           {!pending && toConfirm ? <Tag tone="warn">Seeded, confirm</Tag> : null}
           {r.seeded && r.confirmed ? <Tag tone="ok">Confirmed</Tag> : null}
-          <Tag>{watched ? "Watched" : "Not watched by Khipu"}</Tag>
           {pending ? (
             <span className="set-help">
               {`${r.pending_kind === "changed" ? "Changed" : "Added"} by ${r.pending_by ?? "a conversation"} at the owner's request; the owner has not confirmed it yet.`}
@@ -1177,6 +1299,9 @@ function RuleRow({
             </span>
           ) : null}
         </span>
+        {checks.map((c) => (
+          <span key={c.text} className={`rule-result${c.tone ? ` ${c.tone}` : ""}`}>{c.text}</span>
+        ))}
       </span>
       <span className="route-acts">
         {toConfirm ? (
@@ -1307,8 +1432,26 @@ function RuleRow({
   );
 }
 
+type RuleFilter = "all" | "confirm" | "checked" | "broken";
+
+const RULE_FILTERS: { key: RuleFilter; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "confirm", label: "To confirm" },
+  { key: "checked", label: "Checked by Khipu" },
+  { key: "broken", label: "May be broken" },
+];
+
+const rulesWord = (n: number) => `${n} rule${n === 1 ? "" : "s"}`;
+
 function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }) {
   const rules = data.rules ?? [];
+  const results = data.rule_results ?? [];
+  // Which rules Khipu checks: those with a result (the same matrix the lines
+  // come from); an older Khipu without results names them in watched_rules.
+  const watchedRules = data.rule_results ? results.map((x) => x.rule) : (data.watched_rules ?? []);
+  const resultOf = (n: number) => results.find((x) => x.rule === n);
+  const [filter, setFilter] = useState<RuleFilter>("all");
+  const filterLabel = useId();
   const [ask, setAsk] = useState<RuleAsk>(null);
   const [removed, setRemoved] = useState<RouteRule | null>(null);
   const [draft, setDraft] = useState("");
@@ -1316,6 +1459,15 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
   const fieldId = useId();
   const addBtn = useRef<HTMLButtonElement>(null);
   const toConfirm = rules.filter((r) => r.pending || (r.seeded && !r.confirmed)).length;
+  const inFilter: Record<RuleFilter, (r: RouteRule) => boolean> = {
+    all: () => true,
+    confirm: (r) => !!r.pending || (!!r.seeded && !r.confirmed),
+    checked: (r) => watchedRules.includes(r.n),
+    broken: (r) => watchedRules.includes(r.n) && resultOf(r.n)?.result === "broken",
+  };
+  const counts = Object.fromEntries(RULE_FILTERS.map((f) => [f.key, rules.filter(inFilter[f.key]).length])) as Record<RuleFilter, number>;
+  const shown = rules.filter(inFilter[filter]);
+  const checkable = rules.filter((r) => watchedRules.includes(r.n)).length;
   async function add(e: FormEvent) {
     e.preventDefault();
     if (!draft.trim()) {
@@ -1334,29 +1486,63 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
   }
   const restoreId = removed ? `rule-restore:${removed.n}` : "";
   return (
-    <div className="section-card">
-      <div className="section-head">
-        Standing rules<span className="spacer" />
-        <Tag>
-          {`${rules.length} rule${rules.length === 1 ? "" : "s"}`}
-          {toConfirm ? ` · ${toConfirm} to confirm` : ""}
-        </Tag>
-      </div>
-      <div className="section-body">
+    <div className="section-body">
+        <h2 className="sub-title">
+          Standing rules{" "}
+          <Tag>
+            {`${rules.length} rule${rules.length === 1 ? "" : "s"}`}
+            {toConfirm ? ` · ${toConfirm} to confirm` : ""}
+          </Tag>
+        </h2>
         <p className="set-help">
-          Every conversation sees these first, in full, before anything else. They are never shortened or cut, and
-          Khipu sets no limit on their length (the app hands over up to {WORDS_MOST_KB} KB of text at once). Rules
-          marked Seeded were copied from your routing table and your instructions. A conversation can add or change a
-          rule at your request; those rows show what changed and stay pending until you confirm or undo them.
+          {"Every conversation sees these rules first, in full. "}
+          {checkable
+            ? `Khipu can check ${checkable} of them by reading your job runners' settings; if one looks broken you get a warning.`
+            : "Khipu can check rules about -fast models, the paid xAI API and Grok work by reading your job runners' settings; none of these is one."}
+          {" Khipu never stops any work."}
+        </p>
+        <p className="set-help">
+          Rules marked Seeded were copied from your routing table and your instructions; confirm each one, or edit or
+          remove it. A conversation can add or change a rule at your request; those rows show what changed and stay
+          pending until you confirm or undo them. Rules are never shortened or cut, and Khipu sets no limit on their
+          length (the app hands over up to {WORDS_MOST_KB} KB of text at once).
         </p>
         {rules.length ? (
+          <div className="route-filter">
+            <span className="lbl" id={filterLabel}>
+              Show rules
+            </span>
+            <div className="chips" role="group" aria-labelledby={filterLabel}>
+              {RULE_FILTERS.map((f) => (
+                <button
+                  key={f.key}
+                  type="button"
+                  className={`chip${filter === f.key ? " on" : ""}`}
+                  aria-pressed={filter === f.key}
+                  aria-label={`${f.label}, ${rulesWord(counts[f.key])}`}
+                  onClick={() => setFilter(f.key)}
+                >
+                  {f.label} <span className="n" aria-hidden>{counts[f.key]}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {shown.length ? (
           <ol className="rows route-rule-list" role="list" aria-label="Standing rules">
-            {rules.map((r) => (
-              <RuleRow key={r.n} r={r} watched={(data.watched_rules ?? []).includes(r.n)} ask={ask} setAsk={setAsk} w={w} now={now} onRemoved={setRemoved} back={() => addBtn.current} />
+            {shown.map((r) => (
+              <RuleRow key={r.n} r={r} watched={watchedRules.includes(r.n)} result={resultOf(r.n)} ask={ask} setAsk={setAsk} w={w} now={now} onRemoved={setRemoved} back={() => addBtn.current} />
             ))}
           </ol>
+        ) : rules.length ? (
+          <p className="set-help">
+            {`No rules here. `}
+            <button type="button" className="sm link" onClick={() => setFilter("all")}>
+              Show all {rulesWord(rules.length)}
+            </button>
+          </p>
         ) : (
-          <p className="set-help">No standing rules yet.</p>
+          <p className="set-help">No standing rules yet. Add one below.</p>
         )}
         {removed && !rules.some((r) => r.n === removed.n) ? (
           <div className="route-undo" role="status">
@@ -1413,11 +1599,9 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
           <WriteError w={w} id="rule-add" />
         </form>
         <p className="set-help">
-          Khipu doesn't enforce rules. A rule marked Watched has a check: when it looks broken you get a warning on
-          Home and in the health report, and nothing is stopped. A rule marked Not watched by Khipu has no check Khipu
-          can run.
+          Khipu doesn't enforce rules. A rule Checked by Khipu that looks broken shows a warning here, on Home and in
+          the health report; nothing is stopped.
         </p>
-      </div>
     </div>
   );
 }
@@ -1656,16 +1840,14 @@ function HoldsSection({
     if (ok) setText("");
   }
   return (
-    <div className="section-card">
-      <div className="section-head">Holds</div>
-      <div className="section-body">
+    <div className="section-body">
         <p className="set-help">Short notes about one account, this Mac or all work. Every hold from a conversation ends on its own.</p>
         {holds.length ? (
           <div className="rows" role="list" aria-label="Holds">
             {holds.map((h, i) => {
               const id = `hold-end:${h.id}`;
               return (
-                <div key={h.id} className="row-item route-acct" role="listitem">
+                <div key={h.id} className="row-item route-acct" role="listitem" data-route-item={`hold:${h.id}`} tabIndex={-1}>
                   <span className="route-name">{capitalise(h.scope_label)}</span>
                   <span className="route-what">
                     <span className="route-state">{holdWords(h)}</span>
@@ -1822,7 +2004,6 @@ function HoldsSection({
             reread={reread}
           />
         </div>
-      </div>
     </div>
   );
 }
@@ -2046,6 +2227,101 @@ function DispatchScriptsRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Wr
   );
 }
 
+/** Telling's sizes and times, each a row with Change…. */
+const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }[] = [
+  {
+    name: "Longest summary at the start of a conversation",
+    help: "Your rules and your note are never cut; this limits what follows them.",
+    fields: [{ key: "routing_summary_chars", label: "Longest summary", unit: "chars", options: [1000, 1500, 3000, 6000, 0], zero: "No limit" }],
+  },
+  {
+    name: "Longest update before a prompt",
+    help: "Rules and your note are never cut.",
+    fields: [{ key: "routing_prompt_chars", label: "Longest update", unit: "chars", options: [200, 400, 800, 1600, 0], zero: "No limit" }],
+  },
+  {
+    name: "Longest line",
+    help: "Each line about an account, a hold or a lane. Rules and your note are never cut.",
+    fields: [{ key: "routing_line_chars", label: "Longest line", unit: "chars", options: [100, 200, 400, 800, 0], zero: "No limit" }],
+  },
+  {
+    name: "Time allowed before a prompt",
+    help: "If reading takes longer, the update waits for the next prompt; memory search is not slowed. Never more than one second.",
+    fields: [{ key: "routing_prompt_budget_ms", label: "Time allowed", unit: "ms", options: [25, 50, 100, 200, 500, 1000] }],
+  },
+  {
+    name: "Warn when reading before a prompt is too slow on more than",
+    help: "Of prompts in the last 7 days; the warning shows in the health report.",
+    fields: [{ key: "routing_slow_read_pct", label: "Warn above", unit: "pct", options: [0.5, 1, 2, 5, 10, 0], zero: "Never" }],
+  },
+  {
+    name: "Time allowed at the start of a conversation",
+    help: "How long Khipu works on the summary when a conversation starts, so its memory still arrives on time. Never more than 8 seconds.",
+    fields: [{ key: "routing_start_budget_ms", label: "Time allowed at the start", unit: "ms", options: [250, 500, 1000, 2000, 4000, 8000] }],
+  },
+  {
+    name: "Send everything again when a conversation is this far behind",
+    help: "Also when it comes back after being idle.",
+    fields: [
+      { key: "routing_resend_after_versions", label: "Changes", unit: "changes", options: [10, 20, 50, 100, 0], zero: "Never by count" },
+      { key: "routing_resend_after", label: "Or time", unit: "time", options: [H, 3 * H, 6 * H, 12 * H, 24 * H, 0], zero: "Never by time" },
+    ],
+    join: " or ",
+  },
+  {
+    name: "Treat a report as out of date after",
+    help: "An account with only out-of-date reports shows as Unknown, never as open.",
+    fields: [{ key: "routing_stale_after", label: "Out of date after", unit: "time", options: [H, 6 * H, 12 * H, 24 * H, 48 * H, 0], zero: "Never" }],
+  },
+  {
+    name: "How long a limit reported without a time lasts",
+    help: "When a conversation reports a limit but not when it ends. A newer report replaces it sooner.",
+    fields: [{ key: "routing_report_default_limit", label: "Lasts", unit: "time", options: [10 * M, 30 * M, H, 2 * H, 5 * H, 24 * H] }],
+  },
+  {
+    name: "Warn when two reports disagree for",
+    help: "The warning shows on Home and in the health report.",
+    fields: [{ key: "routing_disagreement_warn_after", label: "Warn after", unit: "time", options: [10 * M, 30 * M, H, 2 * H, 0], zero: "Never" }],
+  },
+  {
+    name: "Say the record is not refreshed after",
+    help: "Conversations are told when Khipu itself has stopped updating.",
+    fields: [{ key: "routing_not_refreshed_after", label: "Not refreshed after", unit: "time", options: [2 * M, 5 * M, 10 * M, 30 * M, 0], zero: "Never" }],
+  },
+];
+
+/** "11 settings, 2 changed from the default", from the values Khipu read. */
+function sizesLine(cfg: RouteConfig | null, cfgError?: string | null): string {
+  if (!cfg) return cfgError ? "Couldn't read its settings" : "Reading…";
+  const changed = SIZES.filter((r) =>
+    r.fields.some((f) => {
+      const v = settingNumber(cfg, f.key);
+      const d = settingDefault(cfg, f.key);
+      return v != null && d != null && v !== d;
+    }),
+  ).length;
+  const n = SIZES.length;
+  return `${n} ${n === 1 ? "setting" : "settings"}, ${changed ? `${changed} changed from the default` : "none changed from the default"}`;
+}
+
+/** A fold inside a group: closed by default, its closed line beside its name. */
+function SubFold({ k, name, line, folds, children }: { k: string; name: string; line: string; folds: Folds; children: ReactNode }) {
+  const open = folds.isOpen(k);
+  const bodyId = `route-sub-${useId().replace(/:/g, "")}`;
+  return (
+    <div className="fold disclose route-sub-fold" data-open={open}>
+      <button type="button" className="disclosure fold-btn" aria-expanded={open} aria-controls={bodyId} onClick={() => folds.toggle(k)}>
+        <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
+        <span>{name}</span>
+        <span className="sline">{line}</span>
+      </button>
+      <div className="fold-body" id={bodyId} role="region" aria-label={name} hidden={!open}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 function TellingSection({
   data,
   cfg,
@@ -2055,6 +2331,7 @@ function TellingSection({
   w,
   reread,
   rereadFeatures,
+  folds,
 }: {
   data: RouteView | null;
   cfg: RouteConfig | null;
@@ -2064,6 +2341,7 @@ function TellingSection({
   w: Writer;
   reread: () => Promise<unknown>;
   rereadFeatures: () => Promise<unknown>;
+  folds: Folds;
 }) {
   const master = features?.features?.routing_push;
   // The switch's state could not be read (the read failed, or it has no
@@ -2083,8 +2361,7 @@ function TellingSection({
   const old = data?.old_switches ?? {};
   const oldSet = [old.env ? "env" : null, old.file ? "file" : null].filter(Boolean);
   return (
-    <div className="section-card">
-      <div className="section-head">Telling conversations</div>
+    <div className="section-body">
       <p className="opt-group-note">
         A running conversation hears a change as soon as its app allows. Any conversation can also ask Khipu.
         Switching these off stops only the telling.
@@ -2155,118 +2432,26 @@ function TellingSection({
           error={<WriteError w={w} id="push-delegation" />}
         />
       </div>
-      <div className="section-body">
-        <div className="rows">
-          <DispatchScriptsRow cfg={cfg} w={w} reread={reread} />
-        </div>
+      <div className="rows">
+        <DispatchScriptsRow cfg={cfg} w={w} reread={reread} />
       </div>
-      <div className="section-body">
-        <h3 className="sub-title" id="route-hear-h">
-          What each kind of conversation hears
-        </h3>
-        <div className="rows" role="list" aria-labelledby="route-hear-h">
-          {HEARS.map(([name, words]) => (
-            <div key={name} className="row-item route-hear" role="listitem">
-              <span className="route-name">{name}</span>
-              <span className="set-help">{words}</span>
-            </div>
-          ))}
-        </div>
-        <h3 className="sub-title">Sizes and times</h3>
-        <div className="rows">
-          <LimitRow
-            name="Longest summary at the start of a conversation"
-            help="Your rules and your note are never cut; this limits what follows them."
-            fields={[{ key: "routing_summary_chars", label: "Longest summary", unit: "chars", options: [1000, 1500, 3000, 6000, 0], zero: "No limit" }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Longest update before a prompt"
-            help="Rules and your note are never cut."
-            fields={[{ key: "routing_prompt_chars", label: "Longest update", unit: "chars", options: [200, 400, 800, 1600, 0], zero: "No limit" }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Longest line"
-            help="Each line about an account, a hold or a lane. Rules and your note are never cut."
-            fields={[{ key: "routing_line_chars", label: "Longest line", unit: "chars", options: [100, 200, 400, 800, 0], zero: "No limit" }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Time allowed before a prompt"
-            help="If reading takes longer, the update waits for the next prompt; memory search is not slowed. Never more than one second."
-            fields={[{ key: "routing_prompt_budget_ms", label: "Time allowed", unit: "ms", options: [25, 50, 100, 200, 500, 1000] }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Warn when reading before a prompt is too slow on more than"
-            help="Of prompts in the last 7 days; the warning shows in the health report."
-            fields={[{ key: "routing_slow_read_pct", label: "Warn above", unit: "pct", options: [0.5, 1, 2, 5, 10, 0], zero: "Never" }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Time allowed at the start of a conversation"
-            help="How long Khipu works on the summary when a conversation starts, so its memory still arrives on time. Never more than 8 seconds."
-            fields={[{ key: "routing_start_budget_ms", label: "Time allowed at the start", unit: "ms", options: [250, 500, 1000, 2000, 4000, 8000] }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Send everything again when a conversation is this far behind"
-            help="Also when it comes back after being idle."
-            fields={[
-              { key: "routing_resend_after_versions", label: "Changes", unit: "changes", options: [10, 20, 50, 100, 0], zero: "Never by count" },
-              { key: "routing_resend_after", label: "Or time", unit: "time", options: [H, 3 * H, 6 * H, 12 * H, 24 * H, 0], zero: "Never by time" },
-            ]}
-            join=" or "
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Treat a report as out of date after"
-            help="An account with only out-of-date reports shows as Unknown, never as open."
-            fields={[{ key: "routing_stale_after", label: "Out of date after", unit: "time", options: [H, 6 * H, 12 * H, 24 * H, 48 * H, 0], zero: "Never" }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="How long a limit reported without a time lasts"
-            help="When a conversation reports a limit but not when it ends. A newer report replaces it sooner."
-            fields={[{ key: "routing_report_default_limit", label: "Lasts", unit: "time", options: [10 * M, 30 * M, H, 2 * H, 5 * H, 24 * H] }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Warn when two reports disagree for"
-            help="The warning shows on Home and in the health report."
-            fields={[{ key: "routing_disagreement_warn_after", label: "Warn after", unit: "time", options: [10 * M, 30 * M, H, 2 * H, 0], zero: "Never" }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Say the record is not refreshed after"
-            help="Conversations are told when Khipu itself has stopped updating."
-            fields={[{ key: "routing_not_refreshed_after", label: "Not refreshed after", unit: "time", options: [2 * M, 5 * M, 10 * M, 30 * M, 0], zero: "Never" }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-        </div>
+        <SubFold k="sub:hears" name="What each kind of conversation hears" line={`${HEARS.length} kinds`} folds={folds}>
+          <div className="rows" role="list" aria-label="What each kind of conversation hears">
+            {HEARS.map(([name, words]) => (
+              <div key={name} className="row-item route-hear" role="listitem">
+                <span className="route-name">{name}</span>
+                <span className="set-help">{words}</span>
+              </div>
+            ))}
+          </div>
+        </SubFold>
+        <SubFold k="sub:sizes" name="Sizes and times" line={sizesLine(cfg, cfgError)} folds={folds}>
+          <div className="rows">
+            {SIZES.map((r) => (
+              <LimitRow key={r.name} name={r.name} help={r.help} fields={r.fields} join={r.join} cfg={cfg} w={w} reread={reread} />
+            ))}
+          </div>
+        </SubFold>
         {oldSet.length ? (
           <p className="set-help" role="status">
             <b>Your old "routing off" switch is set, so nothing is told.</b>{" "}
@@ -2292,7 +2477,6 @@ function TellingSection({
             conversations started from that shell are told nothing. Setting either one turns the telling off.
           </p>
         )}
-      </div>
     </div>
   );
 }
@@ -2438,52 +2622,25 @@ function FoldersSection({
       closeAdd();
     }
   }
+  const laneRaw = cfg?.routing?.routing_lane_map?.value;
+  const map: LaneMap = laneRaw && typeof laneRaw === "object" && !Array.isArray(laneRaw) ? (laneRaw as LaneMap) : {};
+  const accounts = data?.accounts ?? [];
+  const lanesOf = (name: string) =>
+    [...new Set([...(runners.find((x) => x.name === name)?.lanes ?? []), ...Object.keys(map[name] ?? {})])].sort();
+  // Lanes of a runner the folders don't name still show, after the folders.
+  const others = [...new Set([...runners.map((r) => r.name), ...refused, ...Object.keys(map)])].filter(
+    (name) => !entries.some((e) => e.name === name),
+  );
+  const unmatchedLimits = data?.unmatched ?? [];
+  const lanesList = (name: string, lanes: string[]) => (
+    <div className="lane-sub" role="list" aria-label={`${name} lanes`}>
+      {lanes.map((lane) => (
+        <LaneRow key={lane} runner={name} lane={lane} target={map[name]?.[lane]} accounts={accounts} w={w} reread={reread} />
+      ))}
+    </div>
+  );
   return (
-    <div className="section-card">
-      <div className="section-head">
-        Job runner folders<span className="spacer" />
-        <button
-          ref={addBtn}
-          type="button"
-          className="sm"
-          aria-expanded={adding}
-          disabled={!cfg}
-          onClick={() => setAdding((v) => !v)}
-        >
-          Add a folder…
-        </button>
-      </div>
-      <div className="section-body">
-        {adding ? (
-          <form className="route-pause route-folder-form" aria-label="Add a job runner folder" onSubmit={add} onKeyDown={escapeCloses(closeAdd)}>
-            <div className="toolbar">
-              <label htmlFor={`${base}-name`}>Name</label>
-              <input id={`${base}-name`} value={name} autoFocus autoComplete="off" placeholder="Project A…" onChange={(e) => setName(e.target.value)} />
-            </div>
-            <div className="toolbar">
-              <label htmlFor={`${base}-path`}>Folder</label>
-              <input
-                id={`${base}-path`}
-                className="mono"
-                value={path}
-                autoComplete="off"
-                spellCheck={false}
-                placeholder="/path/to/the/runner's state folder…"
-                onChange={(e) => setPath(e.target.value)}
-              />
-            </div>
-            <WriteError w={w} id="folder-add" />
-            <div className="toolbar">
-              <button type="submit" className="primary sm" disabled={w.isBusy("folder-add")}>
-                <Busy on={w.isBusy("folder-add")} />
-                Add folder
-              </button>
-              <button type="button" className="sm link" onClick={closeAdd}>
-                Cancel
-              </button>
-            </div>
-          </form>
-        ) : null}
+    <div className="section-body">
         {entries.length ? (
           <div className="rows" role="list" aria-label="Job runner folders">
             {entries.map((entry) => {
@@ -2493,7 +2650,8 @@ function FoldersSection({
                 : runnerState(r, now);
               const id = `folder-remove:${entry.name}`;
               return (
-                <div key={entry.name} className="row-item route-acct" role="listitem">
+                <div key={entry.name} className="row-item route-acct" role="listitem" data-route-item={`runner:${entry.name}`}
+                  tabIndex={-1}>
                   <span className="route-name">{entry.name}</span>
                   <span className="route-what">
                     <span className="route-state">
@@ -2545,6 +2703,7 @@ function FoldersSection({
                       </div>
                     </ConfirmGroup>
                   ) : null}
+                  {recordRead === "ready" && lanesOf(entry.name).length ? lanesList(entry.name, lanesOf(entry.name)) : null}
                 </div>
               );
             })}
@@ -2554,6 +2713,86 @@ function FoldersSection({
         ) : (
           <p className="set-help">No job runner folders yet. Add one to let Khipu read a runner's limits and heartbeat.</p>
         )}
+        {recordRead !== "ready" ? (
+          // Before the lane map is read every lane would look unmatched.
+          <RecordReadLine read={recordRead} what="job runner lanes" />
+        ) : others.length ? (
+          others.map((name) => {
+            const lanes = lanesOf(name);
+            const r = runners.find((x) => x.name === name);
+            const isRefused = refused.includes(name);
+            // A runner Khipu reports on that isn't in your folders list: its
+            // state still shows, so a problem with it has a place here.
+            const st = isRefused ? { text: "Refused: it is inside a private folder", tone: "err" as const } : r ? runnerState(r, now) : null;
+            return (
+              <div key={name} className="rows">
+                <h2 className="rows-head route-day">{name}</h2>
+                {st ? (
+                  <div className="row-item route-acct" data-route-item={`runner:${name}`} tabIndex={-1}>
+                    <span className="route-name">{name}</span>
+                    <span className="route-what">
+                      <span className="route-state">
+                        <span className={st.tone ? `hdot ${st.tone}` : "hdot"} aria-hidden />
+                        {st.text}
+                      </span>
+                      <span className="route-src">
+                        Not in your job runner folders{r?.path ? ` · ${r.path}` : ""}
+                      </span>
+                    </span>
+                  </div>
+                ) : null}
+                {lanes.length ? (
+                  lanesList(name, lanes)
+                ) : (
+                  <p className="set-help route-lanes-none">Khipu hasn't read any lanes from this runner's settings yet.</p>
+                )}
+              </div>
+            );
+          })
+        ) : !entries.length ? (
+          <p className="set-help">Lanes show here once a job runner folder is added and read.</p>
+        ) : null}
+        {unmatchedLimits.length ? (
+          <p className="set-help" role="status">
+            {unmatchedLimits.length === 1 ? "A limit came" : `${unmatchedLimits.length} limits came`} from a lane that
+            isn't matched to an account. Match it above and the limit counts for that account.
+          </p>
+        ) : null}
+        <div className="toolbar">
+          <button ref={addBtn} type="button" className="sm" aria-expanded={adding} disabled={!cfg} onClick={() => setAdding((v) => !v)}>
+            Add a folder…
+          </button>
+        </div>
+        {adding ? (
+          <form className="route-pause route-folder-form" aria-label="Add a job runner folder" onSubmit={add} onKeyDown={escapeCloses(closeAdd)}>
+            <div className="toolbar">
+              <label htmlFor={`${base}-name`}>Name</label>
+              <input id={`${base}-name`} value={name} autoFocus autoComplete="off" placeholder="Project A…" onChange={(e) => setName(e.target.value)} />
+            </div>
+            <div className="toolbar">
+              <label htmlFor={`${base}-path`}>Folder</label>
+              <input
+                id={`${base}-path`}
+                className="mono"
+                value={path}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="/path/to/the/runner's state folder…"
+                onChange={(e) => setPath(e.target.value)}
+              />
+            </div>
+            <WriteError w={w} id="folder-add" />
+            <div className="toolbar">
+              <button type="submit" className="primary sm" disabled={w.isBusy("folder-add")}>
+                <Busy on={w.isBusy("folder-add")} />
+                Add folder
+              </button>
+              <button type="button" className="sm link" onClick={closeAdd}>
+                Cancel
+              </button>
+            </div>
+          </form>
+        ) : null}
         <div className="rows">
           <LimitRow
             name="Say a job runner stopped reporting after"
@@ -2601,7 +2840,10 @@ function FoldersSection({
           its limits, its job starts, its heartbeat and the few lane settings it needs to watch your rules. Every line
           it keeps is checked for secrets first. A folder inside API Keys, My Portfolio or any sign-in file is refused.
         </p>
-      </div>
+        <p className="set-help">
+          A limit on one lane closes every lane on the same account. A lane that isn't matched is never guessed;
+          conversations are told a limit came from an unmatched lane.
+        </p>
     </div>
   );
 }
@@ -2657,7 +2899,7 @@ function LaneRow({
     if (ok && choice) setOpen(false);
   }
   return (
-    <div className="row-item route-lane" role="listitem">
+    <div className="row-item route-lane" role="listitem" data-route-item={`lane:${runner}/${lane}`} tabIndex={-1}>
       <span className="mono">{lane}</span>
       <span aria-hidden>→</span>
       {open ? (
@@ -2721,80 +2963,6 @@ function LaneRow({
   );
 }
 
-function LanesSection({
-  data,
-  cfg,
-  recordRead = "ready",
-  w,
-  reread,
-}: {
-  data: RouteView | null;
-  cfg: RouteConfig | null;
-  recordRead?: RecordRead;
-  w: Writer;
-  reread: () => Promise<unknown>;
-}) {
-  const raw = cfg?.routing?.routing_lane_map?.value;
-  const map: LaneMap = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as LaneMap) : {};
-  const runners = data?.sources?.runners ?? [];
-  const accounts = data?.accounts ?? [];
-  const names = [...new Set([...runners.map((r) => r.name), ...Object.keys(map)])];
-  const unmatchedLimits = data?.unmatched ?? [];
-  return (
-    <div className="section-card">
-      <div className="section-head">Which account each job lane uses</div>
-      <div className="section-body">
-        {recordRead !== "ready" ? (
-          // Before the lane map is read every lane would look unmatched.
-          <RecordReadLine read={recordRead} what="job runner lanes" />
-        ) : names.length ? (
-          names.map((name) => {
-            const r = runners.find((x) => x.name === name);
-            const lanes = [...new Set([...(r?.lanes ?? []), ...Object.keys(map[name] ?? {})])].sort();
-            const headId = `lanes-${name.replace(/[^A-Za-z0-9_-]/g, "_")}`;
-            return (
-              <div key={name} className="rows">
-                <h3 className="rows-head route-day" id={headId}>
-                  {name}
-                </h3>
-                {lanes.length ? (
-                  <div role="list" aria-labelledby={headId}>
-                    {lanes.map((lane) => (
-                      <LaneRow
-                        key={lane}
-                        runner={name}
-                        lane={lane}
-                        target={map[name]?.[lane]}
-                        accounts={accounts}
-                        w={w}
-                        reread={reread}
-                      />
-                    ))}
-                  </div>
-                ) : (
-                  <p className="set-help route-lanes-none">Khipu hasn't read any lanes from this runner's settings yet.</p>
-                )}
-              </div>
-            );
-          })
-        ) : (
-          <p className="set-help">Lanes show here once a job runner folder is added and read.</p>
-        )}
-        {unmatchedLimits.length ? (
-          <p className="set-help" role="status">
-            {unmatchedLimits.length === 1 ? "A limit came" : `${unmatchedLimits.length} limits came`} from a lane that
-            isn't matched to an account. Match it above and the limit counts for that account.
-          </p>
-        ) : null}
-        <p className="set-help">
-          A limit on one lane closes every lane on the same account. A lane that isn't matched is never guessed;
-          conversations are told a limit came from an unmatched lane.
-        </p>
-      </div>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // The routing table file and recent changes
 // ---------------------------------------------------------------------------
@@ -2822,7 +2990,7 @@ function TableSection({
   const id = "table-file";
   let val = "Not read yet";
   if (table?.error) val = `Can't read it: ${tableErrorWords(table.error)}`;
-  else if (table?.changed_at) val = `NOW block changed ${whenLocal(table.changed_at, now)}`;
+  else if (table?.changed_at) val = `Current-state section changed ${whenLocal(table.changed_at, now)}`;
   else if (table) val = "Read; no change seen yet";
   const close = () => {
     setOpen(false);
@@ -2846,16 +3014,14 @@ function TableSection({
     if (await w.run(id, "khipu_config_unset", { key: "routing_table" }, reread)) close();
   }
   return (
-    <div className="section-card">
-      <div className="section-head">Routing table file</div>
-      <div className="section-body">
+    <div className="section-body">
         <div className="rows">
           <div className="row-item route-limit">
             <span className="route-limit-text">
               <span className="route-limit-name mono">{path ?? "No file set"}</span>
               <span className="set-help">
-                Read only. Khipu notes when its NOW block changes; it never takes an account's state from it, and never
-                writes to it.
+                An old file you kept by hand before Khipu had its own record. Khipu reads it but never writes to it and
+                never takes an account's state from it; it only notes when the file's current-state section changes.
               </span>
             </span>
             <span className="route-val">{path ? val : ""}</span>
@@ -2922,7 +3088,6 @@ function TableSection({
             ) : null}
           </div>
         </div>
-      </div>
     </div>
   );
 }
@@ -2931,17 +3096,15 @@ function ChangesSection({ data, w, now }: { data: RouteView; w: Writer; now: Dat
   const days = changeDays(data, now);
   const active = new Set((data.rules ?? []).map((r) => r.n));
   return (
-    <div className="section-card">
-      <div className="section-head">Recent changes</div>
       <div className="section-body route-days">
         {days.length ? (
           days.map((day) => {
             const headId = `route-day-${day.key}`;
             return (
               <div key={day.key} className="rows">
-                <h3 className="rows-head route-day" id={headId}>
+                <h2 className="rows-head route-day" id={headId}>
                   {day.label}
-                </h3>
+                </h2>
                 <div role="list" aria-labelledby={headId}>
                   {day.rows.map((row) => {
                     const id = row.restore != null ? `rule-restore:${row.restore}` : "";
@@ -2985,7 +3148,6 @@ function ChangesSection({ data, w, now }: { data: RouteView; w: Writer; now: Dat
           <p className="set-help">No changes yet.</p>
         )}
       </div>
-    </div>
   );
 }
 
@@ -2993,7 +3155,113 @@ function ChangesSection({ data, w, now }: { data: RouteView; w: Writer; now: Dat
 // The page
 // ---------------------------------------------------------------------------
 
-export function RoutingSettings({ active, plans }: { active: boolean; plans?: UsageReport | null }) {
+const FOLDS_KEY = "khipu.routing.open";
+const READING_NEEDS = "Reading what needs you…";
+
+/** Which folds are open, as this Mac remembers them; null when nothing is
+ *  remembered or storage can't be read (the page then opens Accounts only). */
+function readFolds(): string[] | null {
+  try {
+    const raw = window.localStorage.getItem(FOLDS_KEY);
+    if (raw == null) return null;
+    const v: unknown = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeFolds(keys: string[]): void {
+  try {
+    window.localStorage.setItem(FOLDS_KEY, JSON.stringify(keys));
+  } catch {
+    // Not remembered on this Mac this time; the page works the same.
+  }
+}
+
+function useFolds() {
+  const [open, setOpen] = useState<string[]>(() => readFolds() ?? ["accounts"]);
+  const change = (edit: (prev: string[]) => string[]) =>
+    setOpen((prev) => {
+      const next = edit(prev);
+      writeFolds(next);
+      return next;
+    });
+  const groups = GROUPS.map((g) => g.key as string);
+  return {
+    isOpen: (key: string) => open.includes(key),
+    toggle: (key: string) => change((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key])),
+    openKeys: (keys: string[]) => change((prev) => [...prev, ...keys.filter((k) => !prev.includes(k))]),
+    setGroups: (on: boolean) =>
+      change((prev) => (on ? [...prev, ...groups.filter((k) => !prev.includes(k))] : prev.filter((k) => !groups.includes(k)))),
+  };
+}
+
+/** One group: a fold button with its name, closed line and problem tags, and
+ *  its body, kept mounted while closed so a half-filled form keeps its words. */
+function Group({
+  k,
+  name,
+  line,
+  tags,
+  folds,
+  children,
+}: {
+  k: GroupKey;
+  name: string;
+  line: string;
+  tags: GroupTag[];
+  folds: Folds;
+  children: ReactNode;
+}) {
+  const open = folds.isOpen(k);
+  const bodyId = `route-group-${k}`;
+  return (
+    <div className="fold disclose route-group" data-open={open}>
+      <button type="button" className="disclosure fold-btn" aria-expanded={open} aria-controls={bodyId} data-settings-group={k}
+        onClick={() => folds.toggle(k)}>
+        <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
+        <span className="gname">{name}</span>
+        <span className="gline">{line === "Reading…" ? <span className="reading">Reading…</span> : line}</span>
+        <span className="gtags">
+          {tags.map((t) => (
+            <Tag key={t.text} tone={t.tone} dot>
+              {t.text}
+            </Tag>
+          ))}
+        </span>
+      </button>
+      <div className="fold-body" id={bodyId} role="region" aria-label={name} hidden={!open}>
+        <div className="disclose-body">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/** The routing record's read failure as one sentence's cause. */
+function recordCause(error: string): string {
+  if (error === ROUTE_READ_FAILED) return "Khipu's routing command failed";
+  const t = error.trim().replace(/\.$/, "");
+  return t.charAt(0).toLowerCase() + t.slice(1);
+}
+
+function selectorValue(v: string): string {
+  return v.replace(/["\\]/g, "\\$&");
+}
+
+/** Settings → Accounts and routing (settings clarity phase 3): the intro,
+ *  Needs you, and nine groups that fold, each saying on its closed line what
+ *  it holds and every problem inside it. `plansState` is the plan read Home
+ *  shares; `onSetUpAccounts` opens setup at its accounts step. */
+export function RoutingSettings({
+  active,
+  plansState,
+  onSetUpAccounts,
+}: {
+  active: boolean;
+  plansState?: PlanUsageState | null;
+  onSetUpAccounts?: () => void;
+}) {
   const route = useRouting(active);
   const config = useCliState<RouteConfig>("khipu_config_show", active);
   const features = useCliState<FeaturesShape>("khipu_features_show", active);
@@ -3003,47 +3271,85 @@ export function RoutingSettings({ active, plans }: { active: boolean; plans?: Us
     await route.load(true);
   };
   const w = useWriter(rereadRoute);
+  const folds = useFolds();
+  const [focusItem, setFocusItem] = useState<{ item: string | null; group: GroupKey } | null>(null);
+  const [retrying, setRetrying] = useState(false);
   const now = new Date();
   const data = route.data;
   // Folders and lanes come from both the routing record and the settings;
   // until both are read they say so, never "none yet".
   const recordRead: RecordRead =
     data && config.data ? "ready" : (!data && route.error) || (!config.data && config.error) ? "failed" : "reading";
-  return (
-    <div className="route-settings">
-      <p className="set-help set-intro">
-        Khipu tells every conversation which accounts can take work, what you have paused and what your rules are. It
-        never sends, stops or reorders work; your agents decide.
-      </p>
-      {route.error ? (
-        <p className="set-error" role="alert">
-          {route.error}
-        </p>
-      ) : null}
-      {data && data.record === false ? (
-        <div className="section-card">
-          <div className="section-head">No routing record on this Mac</div>
-          <div className="section-body">
-            <p className="set-help">
-              Khipu starts one when a plan check, a job runner folder or a conversation reports on an account, or when
-              you add a rule, a note or a hold here. Until then no account is shown as open.
-            </p>
-          </div>
-        </div>
-      ) : null}
-      {data ? (
-        <>
-          <AccountsSection data={data} plans={plans} cfg={config.data} w={w} now={now} reread={rereadConfig} />
-          <NoteSection data={data} w={w} now={now} />
-          <RulesSection data={data} w={w} now={now} />
-          <HoldsSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
-          <ResetChecksSection data={data} cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} />
-        </>
-      ) : !route.error ? (
-        <p className="set-help" role="status">
-          Reading the routing record…
-        </p>
-      ) : null}
+  const push = features.data?.features?.routing_push ?? null;
+  const settings: OverviewSettings = {
+    routing: config.data?.routing ?? null,
+    routingError: config.data ? null : config.error,
+    push,
+    pushError: features.error ?? (features.data && !push ? "Khipu's features list has no routing switch" : null),
+  };
+  const recordError = data ? null : route.error;
+  const overview = routingOverview(data, recordError, plansState?.data, plansState?.error, settings, now);
+  const needs = overview.problems.filter((p) => p.needs);
+  // "Nothing here needs you" only once every read the problems come from is
+  // in: the record, the settings (lanes, folders) and plan usage (plans,
+  // sign-ins). A read still under way says so; a failed one says which
+  // checks didn't run. Problems already found still list.
+  const recordFailed = !data && !!route.error;
+  const settingsFailed = !config.data && !!config.error;
+  const plansFailed = !!plansState && plansState.data == null && !!plansState.error;
+  const stillReading =
+    (!data && !route.error) || (!config.data && !config.error) || !plansState || (plansState.data == null && !plansState.error);
+  const notRun = [settingsFailed ? "its settings" : null, plansFailed ? "plan usage" : null].filter((x): x is string => !!x);
+  const needsNote = recordFailed
+    ? null
+    : stillReading
+      ? READING_NEEDS
+      : notRun.length
+        ? `Khipu couldn't read ${notRun.join(" or ")}, so some checks didn't run.`
+        : needs.length
+          ? null
+          : "Nothing here needs you.";
+
+  useEffect(() => {
+    if (!focusItem) return;
+    setFocusItem(null);
+    const el =
+      (focusItem.item ? document.querySelector<HTMLElement>(`[data-route-item="${selectorValue(focusItem.item)}"]`) : null) ??
+      document.querySelector<HTMLElement>(`[data-settings-group="${focusItem.group}"]`);
+    el?.scrollIntoView?.({ block: "center" });
+    el?.focus();
+  }, [focusItem]);
+
+  const show = (p: Problem) => {
+    folds.openKeys([p.group, ...(p.item?.startsWith("account:") ? [p.item] : [])]);
+    setFocusItem({ item: p.item ?? null, group: p.group });
+  };
+
+  const unread = route.error ? (
+    <p className="set-error">Khipu couldn't read the routing record, so this stays blank until the read works.</p>
+  ) : (
+    <p className="set-help" role="status">
+      Reading the routing record…
+    </p>
+  );
+
+  const body: Record<GroupKey, ReactNode> = {
+    accounts: data ? (
+      <AccountsSection data={data} plansState={plansState} problems={overview.problems} folds={folds} active={active} w={w} now={now} />
+    ) : (
+      unread
+    ),
+    priority: data ? <PrioritySection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} /> : unread,
+    rules: data ? (
+      <>
+        <NoteSection data={data} w={w} now={now} />
+        <RulesSection data={data} w={w} now={now} />
+      </>
+    ) : (
+      unread
+    ),
+    holds: data ? <HoldsSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} /> : unread,
+    telling: (
       <TellingSection
         data={data}
         cfg={config.data}
@@ -3053,11 +3359,102 @@ export function RoutingSettings({ active, plans }: { active: boolean; plans?: Us
         w={w}
         reread={rereadConfig}
         rereadFeatures={features.reload}
+        folds={folds}
       />
-      <FoldersSection data={data} cfg={config.data} recordRead={recordRead} w={w} now={now} reread={rereadConfig} />
-      <LanesSection data={data} cfg={config.data} recordRead={recordRead} w={w} reread={rereadConfig} />
-      <TableSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
-      {data ? <ChangesSection data={data} w={w} now={now} /> : null}
+    ),
+    resets: <ResetChecksSection data={data} cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} />,
+    runners: <FoldersSection data={data} cfg={config.data} recordRead={recordRead} w={w} now={now} reread={rereadConfig} />,
+    table: <TableSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />,
+    changes: data ? <ChangesSection data={data} w={w} now={now} /> : unread,
+  };
+
+  return (
+    <div className="route-settings">
+      <div className="route-top">
+        <p className="set-help set-intro">
+          Khipu tells your conversations which accounts have room, what you paused and what your rules are. Your agents
+          decide where work goes.
+        </p>
+        <div className="grp-btns">
+          <button type="button" className="sm" onClick={() => folds.setGroups(true)}>
+            Open all groups
+          </button>
+          <button type="button" className="sm" onClick={() => folds.setGroups(false)}>
+            Close all groups
+          </button>
+        </div>
+      </div>
+      {route.error ? (
+        <div className="set-error err-inline" role="alert">
+          <span>
+            {data
+              ? `Couldn't read the routing record just now: ${recordCause(route.error)}. What shows below is from the last read.`
+              : `Couldn't read the routing record: ${recordCause(route.error)}. Nothing below is a guess; it stays blank until the read works.`}
+          </span>
+          <button
+            type="button"
+            className="sm"
+            disabled={retrying}
+            aria-busy={retrying || undefined}
+            onClick={async () => {
+              setRetrying(true);
+              try {
+                await route.load(true);
+              } finally {
+                setRetrying(false);
+              }
+            }}
+          >
+            <Busy on={retrying} />
+            Try again
+          </button>
+        </div>
+      ) : null}
+      {data && data.record === false ? (
+        <div className="callout route-none" role="region" aria-label="No routing record on this Mac">
+          <div className="txt">
+            <b>No routing record on this Mac</b>
+            <span>
+              Khipu starts one when a plan check, a job runner folder or a conversation reports on an account, or when
+              you add a rule, a note or a hold here. Until then no account is shown as open.
+            </span>
+            {onSetUpAccounts ? (
+              <div className="toolbar">
+                <button type="button" className="primary sm" onClick={onSetUpAccounts}>
+                  Set up accounts
+                </button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      {needs.length ? (
+        <div className="callout warn needs" role="region" aria-label="Needs you">
+          <div className="txt">
+            <b>Needs you</b>
+            <ul>
+              {needs.map((p) => (
+                <li key={p.key}>
+                  <span>{p.needs}</span>
+                  <button type="button" className="sm" aria-label={`Show ${p.show ?? "it"}`} onClick={() => show(p)}>
+                    Show
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      ) : null}
+      {needsNote ? (
+        <p className="needs-none" role={needsNote === READING_NEEDS ? "status" : undefined}>
+          {needsNote}
+        </p>
+      ) : null}
+      {GROUPS.map((g) => (
+        <Group key={g.key} k={g.key} name={g.name} line={overview.lines[g.key]} tags={overview.tags[g.key]} folds={folds}>
+          {body[g.key]}
+        </Group>
+      ))}
       {config.error && !config.data ? (
         <p className="set-error" role="alert">
           Could not read the settings: {config.error}

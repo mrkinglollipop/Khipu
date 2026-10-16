@@ -51,7 +51,10 @@ load() {
   q -d postgres -Atqc "CREATE DATABASE $DB"
   local skipped=0 f out n
   for f in "$ROOT"/ops/migrations/*.sql; do
-    out=$(q -d "$DB" -v ON_ERROR_STOP=0 -q -f "$f" 2>&1 || true)
+    # 0029 takes this machine's origin from khipu.local_origin, which `khipu
+    # migrate` sets; a scratch database gets a fixed stand-in.
+    out=$(PGOPTIONS="-c khipu.local_origin=local:000000000000" \
+      q -d "$DB" -v ON_ERROR_STOP=0 -q -f "$f" 2>&1 || true)
     n=$(printf '%s\n' "$out" | grep -c "ERROR" || true)
     skipped=$((skipped + n))
   done

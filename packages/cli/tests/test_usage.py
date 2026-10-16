@@ -120,12 +120,31 @@ def test_claude_adapter_sets_the_configured_home(fake, tmp_path):
     assert _child(out)["env_values"]["CLAUDE_CONFIG_DIR"] == str(tmp_path / "second")
 
 
-def test_claude_login_without_rate_limits_is_a_coded_failure_with_a_fixed_note(fake):
+def test_claude_plan_with_limits_but_no_figures_this_time_is_not_a_sign_in_failure(fake):
+    # Signed in, rate_limits_available true, rate_limits null: Claude Code
+    # skipped the figures on this read; signing in again would not help.
     fake("claude", "claude-null.jsonl")
     row = usage.probe_account({"label": "Claude", "harness": "claude", "home": None})
     assert row["ok"] is False
-    assert row["error"] == "no_plan_limits"
-    assert "/login" in row["note"]
+    assert row["error"] == usage.E_NO_FIGURES == "no_plan_figures"
+    assert "/login" not in row["note"] and "sign in" not in row["note"].lower()
+
+
+def _claude_usage_frames(**body) -> list[dict]:
+    return [{"type": "control_response", "response": {"subtype": "success", "request_id": "usage",
+                                                       "response": {"subscription_type": "max", **body}}}]
+
+
+@pytest.mark.parametrize("body, code", [
+    ({"rate_limits_available": True, "rate_limits": None}, "no_plan_figures"),
+    ({"rate_limits_available": False, "rate_limits": None}, "no_plan_limits"),
+    ({"rate_limits": None}, "no_plan_limits"),
+    ({"rate_limits_available": "true", "rate_limits": None}, "no_plan_limits"),
+])
+def test_parse_claude_tells_missing_figures_from_a_login_without_limits(body, code):
+    with pytest.raises(usage.ProbeError) as caught:
+        usage.parse_claude(_claude_usage_frames(**body))
+    assert caught.value.code == code
 
 
 def test_codex_adapter_reads_the_recorded_reply(fake):
@@ -313,6 +332,18 @@ def test_cache_max_age_and_fresh(fake, monkeypatch):
     assert saved["rows"]["claude|"]["windows"][0]["used_pct"] == 3
 
 
+def test_every_report_row_carries_the_routing_records_key(fake, monkeypatch):
+    """Settings clarity review P2: the app pairs a plan row with its routing
+    account by this key, never by a label another login may reuse."""
+    monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [_row(ok=False, error="timeout")
+                                                                          for _ in accounts])
+    accounts = [{"label": "Claude", "harness": "codex", "home": None},
+                {"label": "Claude", "harness": "claude", "home": "/tmp"}]
+    rows = usage.report(accounts=accounts, fresh=True)["accounts"]
+    assert [r["key"] for r in rows] == [usage.account_key(a) for a in accounts]
+    assert rows[0]["key"] == "codex|" and rows[0]["account"] == "Claude"
+
+
 def test_failed_probe_keeps_the_last_figures_marked_stale(fake, monkeypatch):
     usage._save_cache({"claude|": _cached(_ago(10))})
     monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [_row(ok=False, error="timeout")])
@@ -393,9 +424,10 @@ def test_summary_and_table():
 
 
 def test_mcp_tool_returns_report_and_declines_on_the_gateway(fake, monkeypatch):
-    monkeypatch.setattr(usage, "report", lambda **kw: {"accounts": [], "summary_text": [], "kw": kw})
+    calls = []
+    monkeypatch.setattr(usage, "report", lambda **kw: calls.append(kw) or {"accounts": [], "summary_text": []})
     out = mcp_server.TOOL_FUNCS["khipu_usage"]({"fresh": True, "max_age": 30})
-    assert out["kw"] == {"fresh": True, "max_age": 30.0, "background": True}
+    assert calls == [{"fresh": True, "max_age": 30.0, "background": True}] and out["accounts"] == []
     monkeypatch.setenv(mcp_server.GATEWAY_ACTIVE_ENV, "1")
     out = mcp_server.TOOL_FUNCS["khipu_usage"]({})
     assert out["available"] is False
@@ -1146,6 +1178,26 @@ def test_no_note_khipu_writes_carries_a_code():
         "again")
     assert usage._note("no_plan_limits", "claude", "~/.claude-t3-second") == (
         "This sign-in reports no plan limits. Open Claude Code with this login folder and sign in again (/login)")
+    assert usage._note("no_plan_figures", "claude", "~/.claude-second") == (
+        "Claude Code did not send its plan figures just now; Khipu keeps the last ones and asks again")
+
+
+def test_every_code_a_probe_can_return_has_a_plain_note():
+    """Settings clarity, phase 2: the app shows the row's note as the cause, so
+    a code with no note would leave it inventing words. The sign-in command's
+    own codes never reach a plan row."""
+    sign_in = {usage.E_NOT_CONFIGURED, usage.E_AMBIGUOUS, usage.E_NO_SIGN_IN, usage.E_SIGN_IN_TIMEOUT}
+    codes = [value for name, value in vars(usage).items()
+             if name.startswith("E_") and isinstance(value, str) and value not in sign_in]
+    assert len(codes) >= 11
+    for code in [*codes, "exit_1", "exit_127", "signal_9"]:
+        for harness in usage.HARNESSES:
+            assert usage._note(code, harness), (code, harness)
+    assert usage._note("timeout", "grok") == "Grok Build didn't answer in time"
+    assert usage._note("no_answer", "grok") == "Grok Build didn't answer"
+    assert usage._note("exit_3", "grok") == "Grok Build didn't answer"
+    assert usage._note("cli_error", "codex") == "Codex reported an error when asked"
+    assert usage._note("bad_reply", "claude") == "Claude Code answered in a way Khipu can't read"
 
 
 def test_a_failed_probe_row_carries_the_plain_note_for_its_account(fake):
@@ -1164,6 +1216,16 @@ def test_a_failed_probe_shows_its_own_note_on_the_kept_figures(fake, monkeypatch
     assert row["note"] == usage._note("no_plan_limits", "claude") and "/login" in row["note"]
     saved = json.loads(usage.cache_file().read_text())["rows"]["claude|"]
     assert saved["note"] == usage._note("no_plan_limits", "claude")
+
+
+def test_missing_plan_figures_keep_the_last_figures_with_their_age(fake, monkeypatch):
+    usage._save_cache({"claude|": _cached(_ago(60 * 3), note=None)})
+    failed = dict(_row(ok=False, error="no_plan_figures"), note=usage._note("no_plan_figures", "claude"))
+    monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [failed])
+    row = usage.report(accounts=[{"label": "Claude", "harness": "claude", "home": None}], fresh=True)["accounts"][0]
+    assert row["ok"] is False and row["error"] == "no_plan_figures"
+    assert row["windows"][0]["used_pct"] == 55 and row["last_good_at"]
+    assert row["note"] == usage._note("no_plan_figures", "claude")
 
 
 def test_a_fallback_note_does_not_outlive_its_good_read(fake, monkeypatch):

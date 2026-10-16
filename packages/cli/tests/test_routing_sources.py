@@ -563,6 +563,358 @@ def test_route_json_carries_what_the_app_card_needs(home, capsys):
     assert not {"fingerprint", "digest", "source_cache"} & set(out)
 
 
+def _results(out: dict) -> dict[int, dict]:
+    return {r["rule"]: r for r in out["rule_results"]}
+
+
+def test_a_rule_says_nothing_wrong_found_only_after_a_check_that_ran(home, capsys):
+    """Settings clarity phase 5: each checked rule's result and the time its
+    check ran; "ok" needs a lane the check could judge."""
+    for text in ("Grok never builds or fixes privacy or safety code.",
+                 "Every Grok result that is acted on gets a re-check from a different model family.",
+                 "Never a -fast tier.", "Never the paid xAI API.", "Be kind to the Mac."):
+        routing.add_rule(text, via="app")
+    # No job runner folder added: every checked rule says it can't check yet.
+    assert routing.run_cli(_args(json=True)) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert {n: r["result"] for n, r in _results(out).items()} == {1: "no_runner", 2: "no_runner", 3: "no_runner",
+                                                                    4: "no_runner"}
+    assert all(r["at"] is None for r in out["rule_results"])
+    _register(home)
+    assert routing.run_cli(_args(json=True)) == 0
+    out = json.loads(capsys.readouterr().out)
+    results = _results(out)
+    assert 5 not in results  # a rule with no check has no result
+    assert [results[n]["result"] for n in (1, 2, 3, 4)] == ["ok", "ok", "ok", "cannot_check"]
+    assert results[1]["at"] == routing._iso(T0) and results[3]["at"] == routing._iso(T0)
+    assert results[3]["lanes"] > 0 and results[3]["unchecked"] > 0  # the grok lane's model is in its script
+    assert results[4]["at"] is None and "paid xAI API can't be checked" in results[4]["why"]
+
+
+def test_a_broken_check_is_the_rules_result_and_a_lane_less_rule_says_so(home, capsys):
+    _register(home, lanes_a={"codex": "Codex"})
+    routing.add_rule("Never a -fast tier.", via="app")
+    routing.add_rule("Never the paid xAI API.", via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"] = {"codex": dict(config["lanes"]["codex"], model="gpt-6.1-sol-fast")}
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    assert routing.run_cli(_args(json=True)) == 0
+    out = json.loads(capsys.readouterr().out)
+    results = _results(out)
+    assert results[1]["result"] == "broken" and results[1]["at"] is None
+    assert results[1]["text"] == ("A standing rule may be broken: project A's settings name a model ending in "
+                                  "-fast for its codex lane.")
+    assert results[2]["result"] == "no_lane"  # no Grok lane: nothing for the xAI check to read
+
+
+def test_a_failed_runner_read_is_never_dated_by_a_fresh_one(home, capsys):
+    """Codex review P2: A's settings fail and a day passes while B still reads
+    well; A's kept lanes must not count as checked, and B's fresh time must
+    not date the rule as "just now"."""
+    _register(home, b=True)
+    routing.add_rule("Never a -fast tier.", via="app")
+    assert routing.run_cli(_args(json=True)) == 0
+    assert _results(json.loads(capsys.readouterr().out))[1]["result"] == "ok"
+    (home["a"] / "config.json").write_text("{not json")
+    home["clock"].advance(hours=24)
+    assert routing.run_cli(_args(json=True)) == 0
+    result = _results(json.loads(capsys.readouterr().out))[1]
+    assert result["result"] == "failed" and result["at"] is None
+    (check,) = result["checks"]
+    cells = {c["runner"]: c for c in check["cells"]}
+    assert cells["project A"]["outcome"] == "failed"
+    settings = cells["project A"]["reads"]["settings"]
+    assert settings["failed"] is True and settings["good_at"] == routing._iso(T0)
+    assert cells["project B"]["outcome"] == "ok" and cells["project B"]["reads"]["settings"]["failed"] is False
+    assert cells["project B"]["reads"]["settings"]["good_at"] == routing._iso(T0 + timedelta(hours=24))
+
+
+def test_a_source_read_too_long_ago_is_stale_and_coverage_takes_the_oldest_time():
+    rules = [{"n": 1, "text": "Never a -fast tier."}]
+    lanes = {"codex": {"kind": "codex", "model": "x", "confirm_lane": None, "fast": False, "model_in_launch": True,
+                       "script": None}}
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+
+    def runner(at: datetime) -> dict:
+        return {"config": {"data": {"lanes": lanes}, "good_at": routing._iso(at), "since": None}}
+
+    fresh = {"runners": {"A": runner(now - timedelta(hours=2)), "B": runner(now - timedelta(minutes=1))}}
+    (ok,) = routing_sources.rule_results(fresh, rules, now=now, stale_after=12 * 3600)
+    assert ok["result"] == "ok" and ok["at"] == routing._iso(now - timedelta(hours=2))  # the oldest, not the newest
+    old = {"runners": {"A": runner(now - timedelta(hours=13)), "B": runner(now - timedelta(minutes=1))}}
+    (stale,) = routing_sources.rule_results(old, rules, now=now, stale_after=12 * 3600)
+    assert stale["result"] == "stale" and stale["at"] is None
+    assert [c["runner"] for c in stale["checks"][0]["cells"] if c["outcome"] == "stale"] == ["A"]
+
+
+def test_a_rule_with_several_checks_passes_only_when_every_check_passed(home, capsys):
+    """Codex review P2: the privacy check passes while the paid xAI check
+    can't see the launch environment; the rule is not a pass, and both
+    outcomes are kept."""
+    _register(home)
+    routing.add_rule("Grok never uses the paid xAI API for privacy work.", via="app")
+    assert routing.run_cli(_args(json=True)) == 0
+    result = _results(json.loads(capsys.readouterr().out))[1]
+    assert result["result"] == "cannot_check" and result["at"] is None
+    assert {c["check"]: c["result"] for c in result["checks"]} == {"paid_xai": "cannot_check",
+                                                                  "grok_private": "ok"}
+
+
+def test_a_runner_whose_settings_were_never_read_is_not_a_pass(home):
+    rules = [{"n": 1, "text": "Never a -fast tier."}]
+    cache = {"runners": {"project A": {"config": {"data": None, "good_at": None}}}}
+    (result,) = routing_sources.rule_results(cache, rules)
+    assert (result["rule"], result["result"], result["at"]) == (1, "not_read", None)
+    (check,) = result["checks"]
+    assert (check["check"], check["result"]) == ("fast_tier", "not_read")
+    assert [(c["runner"], c["outcome"], c["reads"]["settings"]["read"]) for c in check["cells"]] == [
+        ("project A", "not_read", False)]
+    # A registered runner the cache never held is a source too.
+    (result,) = routing_sources.rule_results({"runners": {}}, rules, runners=["project B"])
+    assert result["result"] == "not_read" and result["checks"][0]["cells"][0]["runner"] == "project B"
+
+
+def _cell(result: dict, check: str, runner: str) -> dict:
+    found = next(c for c in result["checks"] if c["check"] == check)
+    return next(c for c in found["cells"] if c["runner"] == runner)
+
+
+def test_a_runner_never_read_is_a_source_of_the_check_and_never_a_pass(home, capsys):
+    """Codex review round 2 (A): B's settings are malformed before Khipu ever
+    read them; B is still a source of the check, so the rule is not a pass."""
+    _register(home, b=True)
+    (home["b"] / "config.json").write_text("{not json")
+    routing.add_rule("Never a -fast tier.", via="app")
+    assert routing.run_cli(_args(json=True)) == 0
+    result = _results(json.loads(capsys.readouterr().out))[1]
+    assert result["result"] != "ok" and result["at"] is None
+    cell = _cell(result, "fast_tier", "project B")
+    assert cell["outcome"] in ("not_read", "failed")
+    assert cell["reads"]["settings"]["read"] is False
+    assert _cell(result, "fast_tier", "project A")["outcome"] == "ok"
+
+
+def test_the_privacy_check_needs_fresh_settings_as_well_as_events(home, capsys):
+    """Codex review round 2 (B): the privacy check reads its lanes from the
+    settings, so failed settings stop it even while the events still read."""
+    _register(home)
+    routing.add_rule("Grok never builds or fixes privacy or safety code.", via="app")
+    assert routing.run_cli(_args(json=True)) == 0
+    assert _results(json.loads(capsys.readouterr().out))[1]["result"] == "ok"
+    (home["a"] / "config.json").write_text("{not json")
+    home["clock"].advance(hours=24)
+    _append(home["a"], "2026-10-15T14:59:00Z pipe-7 HOLD unrelated")
+    assert routing.run_cli(_args(json=True)) == 0
+    result = _results(json.loads(capsys.readouterr().out))[1]
+    assert result["result"] != "ok" and result["at"] is None
+    cell = _cell(result, "grok_private", "project A")
+    settings = cell["reads"]["settings"]
+    assert settings["failed"] is True and settings["good_at"] == routing._iso(T0)
+    assert cell["reads"]["events"]["failed"] is False
+    assert cell["outcome"] == "failed"
+
+
+def test_a_broken_check_never_marks_another_check_of_the_same_rule(home, capsys):
+    """Codex review round 2 (C): broken findings match the check and runner,
+    never the rule number."""
+    _register(home)
+    routing.add_rule("Never a -fast tier or the paid xAI API.", via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"]["codex"]["model"] = "gpt-6.1-sol-fast"
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    assert routing.run_cli(_args(json=True)) == 0
+    result = _results(json.loads(capsys.readouterr().out))[1]
+    checks = {c["check"]: c for c in result["checks"]}
+    assert result["result"] == "broken"
+    assert checks["fast_tier"]["result"] == "broken"
+    assert checks["fast_tier"]["text"] == ("A standing rule may be broken: project A's settings name a model "
+                                           "ending in -fast for its codex lane.")
+    assert checks["paid_xai"]["result"] == "cannot_check" and checks["paid_xai"]["text"] is None
+    assert "paid xAI API can't be checked" in checks["paid_xai"]["why"]
+
+
+def _lane(model: str, extra: list[str] | None = None) -> dict:
+    return {"kind": "codex", "model": model, "launch": ["bash", "/runner/launch-codex.sh", model, *(extra or [])]}
+
+
+def _fast_result(home, capsys, lanes: dict) -> dict:
+    _register(home, lanes_a={name: "Codex" for name in lanes})
+    routing.add_rule("Never a -fast tier.", via="app")
+    config = json.loads((home["a"] / "config.json").read_text())
+    config["lanes"] = lanes
+    (home["a"] / "config.json").write_text(json.dumps(config))
+    assert routing.run_cli(_args(json=True)) == 0
+    return _results(json.loads(capsys.readouterr().out))[1]
+
+
+def test_a_fast_lane_after_the_64th_is_still_checked(home, capsys):
+    """Codex review round 3: 64 passing lanes then a -fast one read as a pass."""
+    lanes = {f"lane{i:02d}": _lane("gpt-6.1-sol") for i in range(64)}
+    lanes["lane64"] = _lane("gpt-6.1-sol-fast")
+    assert _fast_result(home, capsys, lanes)["result"] == "broken"
+
+
+def test_a_fast_launch_argument_past_the_64th_is_still_checked(home, capsys):
+    lanes = {"codex": _lane("gpt-6.1-sol", [f"--flag{i}" for i in range(70)] + ["sol-fast"])}
+    assert _fast_result(home, capsys, lanes)["result"] == "broken"
+
+
+def test_lanes_a_cap_leaves_out_mean_not_fully_checked(home, capsys, monkeypatch):
+    monkeypatch.setattr(routing_sources, "LANES_MAX", 2)
+    result = _fast_result(home, capsys, {f"lane{i}": _lane("gpt-6.1-sol") for i in range(3)})
+    assert result["result"] == "incomplete" and result["at"] is None
+    (cell,) = result["checks"][0]["cells"]
+    assert cell["outcome"] == "incomplete" and cell["skipped"] == {"lanes": 1}
+
+
+def test_lanes_whose_names_collide_are_counted_as_left_out():
+    parsed = routing_sources._parse_config(json.dumps({"lanes": {
+        "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaa": _lane("a"), "sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbbbbbbbb": _lane("b"),
+        "ok": _lane("c")}}).encode())
+    assert len(parsed["lanes"]) == 2 and parsed["skipped"] == {"lanes": 1}
+    # A kind Khipu withholds can't be told apart from a Grok lane's.
+    kinds = routing_sources._parse_config(json.dumps({"lanes": {"x": dict(_lane("a"), kind="sk-ant-api03-cccccccccccccccccccccccccc")}}).encode())
+    assert kinds["skipped"] == {"kinds": 1}
+
+
+PRIVATE_GROK = ("2026-10-14T11:00:00Z pipe-9 ADDED branch=project-a/secret stage=built check_lane=grokcheck "
+                "fix_lanes=grok max_checks=3 privacy")
+
+
+def _filler(n: int) -> str:
+    return "".join(f"2026-10-14T11:{(i // 60) % 60:02d}:{i % 60:02d}Z pipe-{1000 + i} ADDED branch=project-a/x{i} "
+                   f"stage=built check_lane=codex fix_lanes=second max_checks=3\n" for i in range(n))
+
+
+def _privacy(home, capsys) -> dict:
+    """One refresh of the app's view, a minute later each time; the privacy
+    rule's result."""
+    home["clock"].advance(minutes=1)
+    assert routing.run_cli(_args(json=True)) == 0
+    return _results(json.loads(capsys.readouterr().out))[1]
+
+
+def _privacy_rule(home) -> None:
+    _register(home)
+    routing.add_rule("Grok never builds or fixes privacy or safety code.", via="app")
+
+
+def test_a_log_larger_than_the_old_window_is_covered_from_its_first_line(home, capsys):
+    """The privacy check reads the whole events log once, then only what is
+    new: a private Grok line before the last 512 KB is still found."""
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    log.write_text(PRIVATE_GROK + "\n" + _filler(6000))
+    assert log.stat().st_size > routing_sources.TAIL_BYTES
+    result = _privacy(home, capsys)
+    assert result["result"] == "broken" and "pipe-9" in result["text"]
+    log.write_text(_filler(6000))  # same file rewritten in place, clean
+    assert _privacy(home, capsys)["result"] == "ok"
+
+
+def test_a_rotated_log_is_read_again_from_its_start(home, capsys):
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    log.write_text(_filler(50))
+    assert _privacy(home, capsys)["result"] == "ok"
+    log.rename(home["a"] / "events.log.1")
+    log.write_text(PRIVATE_GROK + "\n")  # a new, smaller file
+    result = _privacy(home, capsys)
+    assert result["result"] == "broken" and result["checks"][0]["cells"][0]["scan"]["reset"] == "rotated"
+
+
+def test_a_truncated_log_is_read_again_and_forgets_what_it_held(home, capsys):
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    log.write_text(PRIVATE_GROK + "\n" + _filler(50))
+    assert _privacy(home, capsys)["result"] == "broken"
+    with open(log, "w", encoding="utf-8") as fh:  # truncated in place, then grown past the old offset
+        fh.write(_filler(200))
+    result = _privacy(home, capsys)
+    assert result["result"] == "ok" and result["checks"][0]["cells"][0]["scan"]["reset"] == "rewritten"
+    with open(log, "w", encoding="utf-8") as fh:  # truncated to less than was read
+        fh.write(_filler(3))
+    assert _privacy(home, capsys)["checks"][0]["cells"][0]["scan"]["reset"] == "truncated"
+
+
+def _touch(path: Path, seconds: int) -> None:
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + seconds * 10 ** 9))
+
+
+def test_a_rewrite_that_keeps_the_start_and_the_length_is_scanned_again(home, capsys):
+    """Codex round 4: same inode, same length, first 4 KB kept, private Grok
+    work written after it; a new mtime means a full rescan."""
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    clean = _filler(200)
+    log.write_text(clean)
+    assert _privacy(home, capsys)["result"] == "ok"
+    lines = clean.splitlines(keepends=True)
+    victim = next(i for i, line in enumerate(lines) if sum(map(len, lines[:i])) > 4096)
+    room = len(lines[victim]) + len(lines[victim + 1])  # two lines' room: the private line is longer than one
+    lines[victim:victim + 2] = [PRIVATE_GROK.ljust(room - 1) + "\n"]
+    with open(log, "r+", encoding="utf-8") as fh:
+        fh.write("".join(lines))
+    assert log.stat().st_size == len(clean)
+    _touch(log, 5)
+    result = _privacy(home, capsys)
+    assert result["result"] == "broken" and result["checks"][0]["cells"][0]["scan"]["reset"] == "rewritten"
+
+
+def test_a_change_just_before_the_offset_then_an_append_is_scanned_again(home, capsys):
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    clean = _filler(200)
+    log.write_text(clean)
+    assert _privacy(home, capsys)["result"] == "ok"
+    lines = clean.splitlines(keepends=True)
+    lines[-3:-1] = [PRIVATE_GROK.ljust(len(lines[-3]) + len(lines[-2]) - 1) + "\n"]
+    log.write_text("".join(lines) + _filler(1))
+    result = _privacy(home, capsys)
+    assert result["result"] == "broken" and result["checks"][0]["cells"][0]["scan"]["reset"] == "rewritten"
+
+
+def test_a_final_line_without_its_newline_is_never_a_clean_scan(home, capsys):
+    """Codex round 4: the unfinished last line is not read; the check says
+    checking, and after ten minutes unchanged, not fully checked."""
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    log.write_text(_filler(3) + PRIVATE_GROK)  # no newline at the end
+    first = _privacy(home, capsys)
+    assert first["result"] == "checking"
+    home["clock"].advance(minutes=11)
+    late = _privacy(home, capsys)
+    cell = late["checks"][0]["cells"][0]
+    assert late["result"] == "incomplete" and cell["skipped"] == {"unfinished_line": 1}
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write("\n")
+    assert _privacy(home, capsys)["result"] == "broken"
+
+
+def test_a_corrupt_cursor_means_one_full_scan():
+    for cursor in (None, "junk", {"ino": "x", "offset": -5}, {"dev": 1, "ino": 2, "offset": 10 ** 12}):
+        assert routing_sources._valid_cursor(cursor, os.stat(__file__)) is False
+
+
+def test_a_long_scan_says_checking_until_it_has_read_the_whole_log(home, capsys, monkeypatch):
+    monkeypatch.setattr(routing_sources, "SCAN_CHUNK", 64 * 1024)
+    _privacy_rule(home)
+    log = home["a"] / "events.log"
+    log.write_text(_filler(3000) + PRIVATE_GROK + "\n")
+    first = _privacy(home, capsys)
+    cell = first["checks"][0]["cells"][0]
+    assert first["result"] == "checking" and 0 < cell["scan"]["read"] < cell["scan"]["size"]
+    for _ in range(20):
+        result = _privacy(home, capsys)
+        if result["result"] != "checking":
+            break
+    assert result["result"] == "broken"
+    _append(home["a"], "2026-10-14T15:00:00Z pipe-77 ADDED branch=project-a/y stage=built check_lane=codex "
+                       "fix_lanes=second max_checks=3")
+    assert _privacy(home, capsys)["result"] == "broken"  # what it found stays found; only new bytes are read
+
+
 def test_a_launch_while_paused_is_named(home):
     _register(home)
     routing.pause("Claude", via="app")

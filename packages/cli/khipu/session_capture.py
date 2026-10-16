@@ -1109,8 +1109,9 @@ def iter_states():
 def _clear_at(dfd: int, name: str, *, older_than: float | None) -> str:
     """Drop the login folder from one state file under the hook's own lock
     for it, keeping everything else, its mode and its mtime. Returns
-    ``cleared``, ``busy`` (the lock is held) or ``unchanged`` (no field, too
-    recent, corrupt, gone or not a regular file: never rewritten)."""
+    ``cleared``, ``busy`` (the lock is held), ``failed`` (the rewrite could
+    not be written) or ``unchanged`` (no field, too recent, corrupt, gone or
+    not a regular file: never rewritten)."""
     lock = name[: -len(".json")] + ".lock"
     with _lock_at(dfd, lock) as acquired:
         if not acquired:
@@ -1134,10 +1135,13 @@ def _clear_at(dfd: int, name: str, *, older_than: float | None) -> str:
             info = os.stat(name, dir_fd=dfd, follow_symlinks=False)
             if not stat.S_ISREG(info.st_mode):
                 return "unchanged"
+        except OSError:
+            return "unchanged"
+        try:
             _write_at(dfd, name, json.dumps(st), mode=stat.S_IMODE(info.st_mode),
                       times_ns=(info.st_atime_ns, info.st_mtime_ns))
         except OSError:
-            return "unchanged"
+            return "failed"
         return "cleared"
 
 
@@ -1180,9 +1184,10 @@ def _apply_pending(dfd: int) -> int:
     for name in pending:
         result = _clear_at(dfd, name, older_than=None)
         cleared += result == "cleared"
-        if result == "busy":
+        if result in ("busy", "failed"):
             busy.append(name)
-    _save_pending_at(dfd, busy)
+    with contextlib.suppress(OSError):
+        _save_pending_at(dfd, busy)
     return cleared
 
 
@@ -1217,21 +1222,34 @@ def forget_login_homes(*, now: float | None = None) -> dict:
     stamp the time, so discovery also stops deriving a folder for any session
     seen at or before it. A session whose hook holds its lock is recorded as
     pending and cleared by the next sweep (the hook runs one after releasing
-    its lock); ``pending`` says how many are left."""
+    its lock); ``pending`` says how many are left. ``failed`` counts files
+    that could not be rewritten (and the stamp, if it could not be written),
+    and ``unreachable`` says the state folder could not be opened at all:
+    either means the paths may still be on disk."""
     now = time.time() if now is None else now
     with _state_dir_fd(create=True) as dfd:
         if dfd is None:
-            return {"cleared": 0, "pending": 0}
-        with contextlib.suppress(OSError):
+            return {"cleared": 0, "pending": 0, "failed": 0, "unreachable": True}
+        failed = 0
+        try:
             _write_at(dfd, LOGIN_FORGOTTEN_STAMP, repr(float(now)))
-        cleared, busy = 0, []
+        except OSError:
+            failed += 1
+        cleared, busy, retry = 0, [], []
         for name in _state_names(dfd):
             result = _clear_at(dfd, name, older_than=None)
             cleared += result == "cleared"
             if result == "busy":
                 busy.append(name)
-        _save_pending_at(dfd, busy)
-        return {"cleared": cleared, "pending": len(busy)}
+            elif result == "failed":
+                retry.append(name)
+        failed += len(retry)
+        try:
+            # A file that failed is retried by the next sweep, like a busy one.
+            _save_pending_at(dfd, busy + retry)
+        except OSError:
+            failed += 1
+        return {"cleared": cleared, "pending": len(busy), "failed": failed, "unreachable": False}
 
 
 def login_homes_forgotten_at() -> float | None:
@@ -2180,7 +2198,10 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 # with no turn in it (2026-08-24 false red).
                 st.update(seen_end=new_off, seen_ts=time.time(), transcript_path=str(path),
                           host_pids=ancestor_pids())
-                recorded = login_home(harness)
+                # Retention, Forget and discovery never follow a capture home
+                # that is a symlink, so a path recorded through one could
+                # never be cleared: record none there.
+                recorded = None if os.path.islink(khipu_home()) else login_home(harness)
                 if recorded:
                     st[LOGIN_HOME_FIELD] = recorded
                 if session_cwd(env):
