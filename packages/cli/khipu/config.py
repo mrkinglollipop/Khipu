@@ -525,50 +525,6 @@ def check_accounts_version(data: dict, expect: "str | None") -> None:
                             "version_moved")
 
 
-def set_usage_accounts(raw: "str | list | None", *, expect: "str | None" = None,
-                       request: "dict | None" = None, via: "str | None" = None) -> Path:
-    """Store ``usage_accounts``, the accounts ``khipu usage`` reads (JSON text
-    or a list of ``{label, harness, home?}``, checked by
-    ``khipu.usage.parse_usage_accounts`` against the list stored now, so an
-    untouched entry is never dropped). None or an empty list removes the
-    key: every installed CLI with its default login. ``expect`` is the
-    version the writer read (``accounts_version``); a write is refused when
-    the stored one moved. ``request`` marks the write as a conversation's at
-    the owner's request (kept, with the list it replaced, until the owner
-    confirms or undoes it); an owner's write ends any such request, and
-    with ``via`` (how the owner made it) the routing record notes each login
-    it starts tracking, so later reports by that login's key are the new
-    account's and not those of an account moved away from the folder."""
-    from khipu import accounts, routing
-    from khipu.usage import AccountsError, parse_usage_accounts
-
-    # The routing lock first, in the account writers' order.
-    with routing._lock(), mutate_config() as data:
-        check_accounts_version(data, expect)
-        if request is not None and isinstance(data.get("usage_accounts_request"), dict):
-            raise AccountsError("a conversation's change to the account list is still waiting for the owner; "
-                                "he confirms or undoes it in Settings first", "request_waiting")
-        previous = data.get("usage_accounts") if isinstance(data.get("usage_accounts"), list) else None
-        entries = [] if raw is None else parse_usage_accounts(raw, previous=previous)
-        # Lanes name accounts by key before any label in the list changes.
-        accounts.convert_lanes(data, accounts.known_of(accounts.current_list(data)[1]))
-        if request is not None:
-            data["usage_accounts_request"] = dict(request, prior=previous, prior_none=data.get("usage_accounts_none"))
-        else:
-            data.pop("usage_accounts_request", None)
-        before = {a["key"] for a in accounts.known_of(accounts.current_list(data)[1])}
-        if entries:
-            data["usage_accounts"] = entries
-        else:
-            data.pop("usage_accounts", None)
-        data.pop("usage_accounts_none", None)
-        added = [a["key"] for a in accounts.known_of(accounts.current_list(data)[1]) if a["key"] not in before]
-        save_config(data)
-        if request is None and via is not None and added:
-            accounts._notes([{"type": "account_note", "account": k, "state": "tracked"} for k in added], via)
-        return config_file()
-
-
 AUTO_TRACK_KEY = "usage_auto_track"
 
 

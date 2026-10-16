@@ -1738,9 +1738,16 @@ def _owner_move(event: dict) -> tuple[str, str] | None:
     return old, new
 
 
-def _owner_tracked(event: dict) -> str | None:
+def _list_change(event: dict) -> bool:
+    """Whether an ``account_note`` records a change to the account list: the
+    owner's, or a conversation's made at his request (``owner_request``),
+    which changes the list at once (decision 15)."""
     by = event.get("written_by") or OWNER
-    if event.get("type") == "account_note" and event.get("state") == "tracked" and by.get("kind") == "owner":
+    return by.get("kind") == "owner" or (by.get("kind") == "conversation" and bool(event.get("owner_request")))
+
+
+def _owner_tracked(event: dict) -> str | None:
+    if event.get("type") == "account_note" and event.get("state") == "tracked" and _list_change(event):
         return event.get("account") or None
     return None
 
@@ -2473,9 +2480,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 priority_version = _priority_mark(event)
             priority = None
         elif kind == "account_note" and info["account"] and event.get("state") in ACCOUNT_NOTE_STATES \
-                and info["written_by"].get("kind") == "owner":
-            notes[info["account"]] = {"state": event["state"], "text": event.get("text"), "at": info["at"],
-                                      "seq": info["seq"]}
+                and _list_change(event):
+            if info["written_by"].get("kind") == "owner":
+                notes[info["account"]] = {"state": event["state"], "text": event.get("text"), "at": info["at"],
+                                          "seq": info["seq"]}
             # Lanes whose label two accounts carried until this change: what
             # they reported before it stays unmatched, never the one left.
             for pair in event.get("lanes_cut") if isinstance(event.get("lanes_cut"), list) else ():
@@ -3876,6 +3884,24 @@ def owner_writes(events: list[dict], via: str) -> dict:
     return out
 
 
+def request_writes(events: list[dict], author: dict, owner_request: str) -> dict:
+    """A conversation's lines about the account list it changed at the
+    owner's request, in one append: written by it, with his request's words,
+    so the fold reads the change (a key tracked again ends its forwarding;
+    a label left to one account keeps what its lanes said before unmatched)
+    and never shows them as the owner's."""
+    if not events:
+        return {"ok": True, "ids": [], "version": None}
+    words = _clean(owner_request, 0)
+    lines = [dict(e, written_by=dict(author), owner_request=words, via="cli", id=e.get("id") or _new_id("c"))
+             for e in events]
+    written, view = _write_many(lines)
+    out = {"ok": True, "ids": [w["id"] for w in written], "version": view.get("version")}
+    if view.get("saved") is False:
+        out["saved"] = False
+    return out
+
+
 def pause(account: str, *, until: str | None = None, via: str, now: datetime | None = None) -> dict:
     now = now or _now()
     key = resolve_account(account)
@@ -4132,6 +4158,12 @@ def priority_version(now: datetime | None = None) -> str:
     return read_view(now).get("priority_version") or "p0"
 
 
+def _needs_version(expect) -> None:
+    if not str(expect or "").strip():
+        raise PriorityVersionNeeded("say which version of the priority this change was made on (--expect); "
+                                    "read it again first")
+
+
 def _check_priority(expect, now: datetime | None) -> None:
     """Refuse when ``expect`` is given and the priority moved; the caller
     holds the routing lock until its write is down."""
@@ -4142,7 +4174,8 @@ def _check_priority(expect, now: datetime | None) -> None:
 def set_priority(entries, *, until=None, via: str, now: datetime | None = None, expect=None) -> dict:
     """The owner's priority, as given: confirmed, and in place of any
     request still waiting for him. ``expect`` is the priority's version as
-    read (``priority_version``): refused once it moved."""
+    read (``priority_version``), required: refused once it moved."""
+    _needs_version(expect)
     now = now or _now()
     rows = _priority_entries(entries, now=now, conversation=False)
     with _lock():
@@ -4155,8 +4188,16 @@ def request_priority(entries, *, until=None, owner_request: str | None = None, a
                      via: str = "mcp", now: datetime | None = None, expect=None) -> dict:
     """A priority a conversation sets at the owner's request: live at once,
     marked with that conversation and unconfirmed, with the priority it
-    replaced kept for Undo. A request waiting from another conversation is
-    the owner's to answer first, as with a standing rule."""
+    replaced kept for Undo. ``expect`` is the priority's version as read,
+    required, so of two requests made on one read only the first lands. A
+    request waiting from another conversation is the owner's to answer
+    first, as with a standing rule."""
+    _needs_version(expect)
+    return _request_priority(entries, until=until, owner_request=owner_request, author=author, via=via, now=now,
+                             expect=expect)
+
+
+def _request_priority(entries, *, until, owner_request, author, via: str, now: datetime | None, expect) -> dict:
     now = now or _now()
     request_words = _one_line(owner_request)
     if not request_words:
@@ -4203,6 +4244,7 @@ def undo_priority(*, via: str, now: datetime | None = None, expect=None) -> dict
 
 
 def clear_priority(*, via: str, now: datetime | None = None, expect=None) -> dict:
+    _needs_version(expect)
     with _lock():
         _check_priority(expect, now)
         _held_priority(now)
@@ -5529,7 +5571,11 @@ def conversation_priority(entries, *, until=None, owner_request: str, author: di
     if by.get("harness") in (None, "", SHELL):
         by["harness"] = UNKNOWN_HARNESS
     with _for_a_conversation(), lock_budget(lock_wait):
-        written = request_priority(entries, until=until, owner_request=owner_request, author=by, via="mcp", now=now)
+        # khipu_route_priority carries no version: under the routing lock it
+        # can replace only the owner's priority or this conversation's own
+        # request, never another conversation's waiting one.
+        written = _request_priority(entries, until=until, owner_request=owner_request, author=by, via="mcp", now=now,
+                                    expect=None)
         view = read_view(now)
         held = _public_priority(view, now or _now(), plan_facts(view, now or _now()))
         out = {k: written[k] for k in _WRITE_FIELDS if k in written}
@@ -6354,9 +6400,8 @@ def _priority_cli(args, now: datetime) -> int:
         return 2
     now = _now()
     expect = getattr(args, "expect", None)
-    if action in ("set", "clear") and not (expect or "").strip():
-        raise PriorityVersionNeeded("say which version of the priority this change was made on (--expect); "
-                                    "read it again first")
+    if action in ("set", "clear"):
+        _needs_version(expect)
     if action == "set":
         out = set_priority(_priority_entries_arg(args), until=args.until, via=via, now=now, expect=expect)
     elif action == "confirm":

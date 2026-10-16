@@ -175,26 +175,204 @@ def _lanes_on(lane_map: dict, key: str, known: list[dict]) -> list[tuple[str, st
             for lane, target in lanes.items() if routing._lane_target(target, known) == key]
 
 
-def _store(data: dict, entries: list) -> None:
-    """The list into ``data`` as the owner's write: "Read no accounts" and a
-    conversation's waiting request end with it."""
+def _store(data: dict, entries: list, *, none: bool = False, request: dict | None = None) -> None:
+    """The list into ``data``, the one place it is written (``_commit``
+    calls it): "Read no accounts" only with ``none``; a conversation's
+    request kept as ``request`` (with what it replaced), else ended."""
     if entries:
         data["usage_accounts"] = entries
     else:
         data.pop("usage_accounts", None)
-    data.pop("usage_accounts_none", None)
-    data.pop("usage_accounts_request", None)
+    if none:
+        data["usage_accounts_none"] = True
+    else:
+        data.pop("usage_accounts_none", None)
+    if request is not None:
+        data["usage_accounts_request"] = request
+    else:
+        data.pop("usage_accounts_request", None)
+
+
+VERSION_NEEDED = ("say which version of the account list this change was made on (--expect); "
+                  "read the list again first")
 
 
 @contextlib.contextmanager
-def _locked(expect):
+def _locked(expect, *, required: bool = True):
     """The config document under the write lock, version checked; the
-    caller saves it. The routing lock is held around it (taken first), so
-    the list's change and the record's lines about it fold as one version:
-    no fold in between shows the account half changed."""
+    caller saves it. ``expect`` (the version the caller read) is required
+    unless ``required`` is off. The routing lock is held around it (taken
+    first), so the list's change and the record's lines about it fold as
+    one version: no fold in between shows the account half changed."""
+    if required and not str(expect or "").strip():
+        raise AccountsError(VERSION_NEEDED, "version_needed")
     with routing._lock(), config.mutate_config() as data:
         config.check_accounts_version(data, expect)
         yield data
+
+
+def _installed_defaults() -> list[dict]:
+    """The list an unset ``usage_accounts`` reads: each installed CLI's
+    default login, home-less."""
+    return [{"label": usage.LABELS[h], "harness": h} for h in usage.HARNESSES if usage._command(h)]
+
+
+def _plan(before: list[dict], after: list[dict], *, moves: bool) -> list[tuple]:
+    """The operations that turn one list into another (each as ``known_of``
+    gives it), by key: a key in both under another name is renamed; with
+    ``moves``, a key gone and a new one of the same CLI under the same name
+    is that account's login folder moved; every other key gone is stopped
+    and every other new one tracked. A change of order alone is a reorder,
+    which needs no line in the record."""
+    old = {a["key"]: a for a in before}
+    new = {a["key"]: a for a in after}
+    gone = [k for k in old if k not in new]
+    came = [k for k in new if k not in old]
+    ops: list[tuple] = []
+    if moves:
+        for key in list(gone):
+            twin = next((n for n in came if new[n]["harness"] == old[key]["harness"]
+                         and new[n]["label"] == old[key]["label"]), None)
+            if twin is not None:
+                ops.append(("move", key, twin))
+                gone.remove(key)
+                came.remove(twin)
+    ops += [("rename", k) for k in old if k in new and old[k]["label"] != new[k]["label"]]
+    ops += [("stop", k) for k in gone]
+    ops += [("track", k) for k in came]
+    return ops
+
+
+def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: dict | None = None,
+            none: bool = False, view: dict | None = None, keep_priority: bool = False, keep_pause: bool = False,
+            keep_lanes: bool = False, end_holds=()) -> dict:
+    """The one write of the account list, under ``_locked``: ``base`` (the
+    list as it stood) becomes ``parsed`` (checked by
+    ``usage.parse_usage_accounts``) through the operations ``_plan`` finds,
+    each with its effects and its lines in the routing record, all saved
+    in one config write and one append to the record.
+
+    The owner's: lanes move to keys first (``convert_lanes``), so a rename
+    breaks none; a move carries its lanes and its usage cache row, and its
+    ``account_move`` forwards the old key's records; a stop takes its lanes
+    (unless ``keep_lanes``), its priority entry, its pause and the holds in
+    ``end_holds``, and its cache row; each rename and stop carries the lanes
+    whose label it left to one account (``lanes_cut``); a track's note ends
+    any forwarding of its key. A conversation's at the owner's ``request``:
+    the same list change and notes, written by the conversation and kept
+    for the owner to confirm or undo; no move (moving a login folder is the
+    owner's), and the owner's own settings (lanes, priority, pause, holds,
+    Not offered again) stay as they are."""
+    owner = request is None
+    after_list = parsed if parsed or none else _installed_defaults()
+    known, after = known_of(base), known_of(after_list)
+    ops = _plan(known, after, moves=owner)
+    old = {a["key"]: a for a in known}
+    new = {a["key"]: a for a in after}
+    moves = [(op[1], op[2]) for op in ops if op[0] == "move"]
+    renames = [op[1] for op in ops if op[0] == "rename"]
+    stops = [op[1] for op in ops if op[0] == "stop"]
+    tracks = [op[1] for op in ops if op[0] == "track"]
+    repairs = convert_lanes(data, known)
+    stop_lanes = {k: _lanes_on(data.get("routing_lane_map") or {}, k, known) for k in stops}
+    moved_lanes = []
+    if owner:
+        for was, now in moves:
+            for runner, lane in _lanes_on(data.get("routing_lane_map") or {}, was, known):
+                data["routing_lane_map"][runner][lane] = now
+                moved_lanes.append((runner, lane))
+        if not keep_lanes and any(stop_lanes.values()):
+            lane_map = {r: dict(v) for r, v in data["routing_lane_map"].items()}
+            for runner, lane in (pair for k in stops for pair in stop_lanes[k]):
+                lane_map[runner].pop(lane, None)
+                if not lane_map[runner]:
+                    lane_map.pop(runner)
+            data["routing_lane_map"] = lane_map
+    events: list[dict] = [{"type": "account_move", "account": was, "target": now} for was, now in moves]
+    notes = [{"type": "account_note", "account": k, "state": "renamed", "text": old[k]["label"]} for k in renames]
+    done: dict = {"priority": None, "pause": None}
+    if stops and owner:
+        view = routing.read_view() if view is None else view
+        stop_events, done = _stop_events(view, stops, keep_priority=keep_priority, keep_pause=keep_pause,
+                                         end_holds=list(end_holds))
+        events += stop_events
+    notes += [{"type": "account_note", "account": k, "state": "untracked", "text": old[k]["label"]} for k in stops]
+    if notes and _cuts(repairs):
+        # What a lane said while two accounts carried its label stays
+        # unmatched once this change leaves the label to one.
+        notes[0] = dict(notes[0], **_cuts(repairs))
+    events += notes + [{"type": "account_note", "account": k, "state": "tracked"} for k in tracks]
+    held = None
+    if not owner:
+        held = dict(request, prior=stored, prior_none=data.get("usage_accounts_none"))
+    _store(data, parsed, none=none, request=held)
+    config.save_config(data)
+    version = config.accounts_version(data)
+    if owner:
+        for was, now in moves:
+            _move_row(was, now)
+        for key in stops:
+            _drop_row(key)
+        record = _notes(events, via)
+    else:
+        record = _request_notes(events, request)
+    return {"version": version, "repairs": repairs, "record": record, "done": done, "stop_lanes": stop_lanes,
+            "moved_lanes": moved_lanes, "owner": owner, "tracked": [new[k] for k in tracks],
+            "stopped": [old[k] for k in stops]}
+
+
+def _request_notes(events: list[dict], request: dict) -> dict:
+    by = request.get("by") if isinstance(request.get("by"), dict) else routing.conversation_author()
+    try:
+        return routing.request_writes(events, by, str(request.get("request") or ""))
+    except routing.RouteError as err:
+        return {"ok": False, "error": str(err)}
+
+
+def _settle(res: dict) -> None:
+    """After an owner's write, outside its locks: a login tracked leaves Not
+    offered again; one stopped is not offered again."""
+    if not res["owner"]:
+        return
+    for account in res["tracked"]:
+        _set_declined(account["harness"], _account_path(account), None)
+    for account in res["stopped"]:
+        _set_declined(account["harness"], _account_path(account), STOPPED_WHY)
+
+
+def _home_less(entries: list, stored) -> list:
+    """Each new or changed entry that names its CLI's default login folder
+    (by real folder: a full path, a symlink) stored home-less, as
+    ``canonical_home`` stores it, so its key stays ``harness|``."""
+    kept = [e for e in stored or [] if isinstance(e, dict)]
+    out = []
+    for entry in entries:
+        if entry.get("home") and not any(usage._same_entry(entry, k) for k in kept) \
+                and usage.login_identity(usage._account_from_entry(entry)) \
+                == usage.login_identity({"harness": entry["harness"]}):
+            entry = {k: v for k, v in entry.items() if k != "home"}
+        out.append(entry)
+    return out
+
+
+def save_list(raw, *, expect, via: str = "app", request: dict | None = None) -> dict:
+    """A save of the whole list (``khipu config --set/--unset
+    usage_accounts``: the app, a typed yes, or a conversation at the owner's
+    ``request``), turned into the operations it implies and committed as
+    they are (``_commit``). None or an empty list goes back to every
+    installed CLI's default login."""
+    with _locked(expect) as data:
+        if request is not None and isinstance(data.get("usage_accounts_request"), dict):
+            raise AccountsError("a conversation's change to the account list is still waiting for the owner; "
+                                "he confirms or undoes it in Settings first", "request_waiting")
+        stored, base = current_list(data)
+        parsed = [] if raw is None else _home_less(usage.parse_usage_accounts(raw, previous=stored), stored)
+        res = _commit(data, stored, base, parsed, via=via, request=request)
+    _settle(res)
+    out = {"ok": True, "version": res["version"], "lane_repairs": res["repairs"]}
+    if not res["record"].get("ok"):
+        out["record_error"] = res["record"].get("error")
+    return out
 
 
 def _notes(events: list[dict], via: str) -> dict:
@@ -407,7 +585,6 @@ def track(entries, *, expect=None, shown_defaults=None, read: bool = True, via: 
             raise AccountsError("a conversation's change to the account list is still waiting for the owner",
                                 "request_waiting")
         stored, base = current_list(data, shown_defaults)
-        known = known_of(base)
         taken = {usage._account_from_entry(e)["label"].casefold() for e in base if isinstance(e, dict)}
         new: list[dict] = []
         for i, (harness, raw_home, label) in enumerate(wanted):
@@ -430,20 +607,16 @@ def track(entries, *, expect=None, shown_defaults=None, read: bool = True, via: 
                 entry["home"] = home
             new.append(entry)
         parsed = usage.parse_usage_accounts([*base, *new], previous=stored)
-        repairs = convert_lanes(data, known)
-        _store(data, parsed)
-        config.save_config(data)
-        version = config.accounts_version(data)
         added = [usage._account_from_entry(e) for e in parsed[len(base):]]
         keys = [usage._key(a) for a in added]
-        record = _notes([{"type": "account_note", "account": k, "state": "tracked"} for k in keys], via)
-    for account in added:
-        _set_declined(account["harness"], _account_path(account), None)
+        res = _commit(data, stored, base, parsed, via=via)
+    _settle(res)
     rows = usage.report(fresh=True, accounts=added)["accounts"] if read else []
-    out = {"ok": True, "version": version, "accounts": [{"key": k, "label": a["label"]} for k, a in zip(keys, added)],
-           "rows": rows, "lane_repairs": repairs}
-    if not record.get("ok"):
-        out["record_error"] = record.get("error")
+    out = {"ok": True, "version": res["version"],
+           "accounts": [{"key": k, "label": a["label"]} for k, a in zip(keys, added)],
+           "rows": rows, "lane_repairs": res["repairs"]}
+    if not res["record"].get("ok"):
+        out["record_error"] = res["record"].get("error")
     return out
 
 
@@ -457,22 +630,16 @@ def rename(key, name, *, expect=None, via: str = "app") -> dict:
     with _locked(expect) as data:
         stored, base = current_list(data)
         i = _find(base, key)
-        known = known_of(base)
         old = usage._account_from_entry(base[i])["label"]
         changed = list(base)
         changed[i] = dict(base[i], label=name)
         parsed = usage.parse_usage_accounts(changed, previous=stored)
-        repairs = convert_lanes(data, known)
-        _store(data, parsed)
-        config.save_config(data)
-        version = config.accounts_version(data)
+        res = _commit(data, stored, base, parsed, via=via)
         lanes = len(_lanes_on(data.get("routing_lane_map") or {}, key, known_of(parsed)))
-        record = _notes([dict({"type": "account_note", "account": key, "state": "renamed", "text": old},
-                              **_cuts(repairs))], via)
-    out = {"ok": True, "version": version, "key": key, "label": name, "was": old, "mentions": _mentions(old),
-           "lanes": lanes, "lane_repairs": repairs}
-    if not record.get("ok"):
-        out["record_error"] = record.get("error")
+    out = {"ok": True, "version": res["version"], "key": key, "label": name, "was": old, "mentions": _mentions(old),
+           "lanes": lanes, "lane_repairs": res["repairs"]}
+    if not res["record"].get("ok"):
+        out["record_error"] = res["record"].get("error")
     return out
 
 
@@ -484,16 +651,17 @@ def _cuts(repairs: list[dict]) -> dict:
     return {"lanes_cut": pairs} if pairs else {}
 
 
-def _stop_events(view: dict, key: str, label: str, *, keep_priority: bool, keep_pause: bool,
-                 end_holds: list[str], cuts: dict | None = None) -> tuple[list[dict], dict]:
-    """The routing record's lines for a Stop tracking, from the view read
-    before it: the priority without it (or cleared), its pause lifted, the
-    holds the owner ticked ended, and the note."""
+def _stop_events(view: dict, keys: list[str], *, keep_priority: bool, keep_pause: bool,
+                 end_holds: list[str]) -> tuple[list[dict], dict]:
+    """The routing record's lines for a Stop tracking of ``keys``, from the
+    view read before it: the priority without them (or cleared), their
+    pauses lifted and the holds the owner ticked ended. Their notes are
+    the caller's."""
     done: dict = {"priority": None, "pause": None}
     events: list[dict] = []
     held = view.get("priority")
-    if held and any(e["account"] == key for e in held["entries"]):
-        rest = [e for e in held["entries"] if e["account"] != key]
+    if held and any(e["account"] in keys for e in held["entries"]):
+        rest = [e for e in held["entries"] if e["account"] not in keys]
         if keep_priority:
             done["priority"] = "kept"
         elif held.get("pending"):
@@ -505,15 +673,15 @@ def _stop_events(view: dict, key: str, label: str, *, keep_priority: bool, keep_
                                         "until": e.get("until")} for e in rest]}
                           if rest else {"type": "priority_clear"})
             done["priority"] = "removed"
-    entry = next((a for a in view["accounts"] if a["key"] == key), None)
-    if entry is not None and entry["state"] == routing.PAUSED:
-        if keep_pause:
-            done["pause"] = "kept"
-        else:
-            events.append({"type": "lift", "account": key})
-            done["pause"] = "ended"
+    for key in keys:
+        entry = next((a for a in view["accounts"] if a["key"] == key), None)
+        if entry is not None and entry["state"] == routing.PAUSED:
+            if keep_pause:
+                done["pause"] = "kept"
+            else:
+                events.append({"type": "lift", "account": key})
+                done["pause"] = "ended"
     events += [{"type": "hold_end", "target": hold} for hold in end_holds]
-    events.append(dict({"type": "account_note", "account": key, "state": "untracked", "text": label}, **(cuts or {})))
     return events, done
 
 
@@ -544,36 +712,19 @@ def stop(key, *, expect=None, keep_priority: bool = False, keep_pause: bool = Fa
         if not rest and not confirm_last:
             raise AccountsError("this is the last account Khipu tracks on this Mac; stopping it leaves none read",
                                 "last_account")
-        known = known_of(base)
-        repairs = convert_lanes(data, known)
-        lanes = _lanes_on(data.get("routing_lane_map") or {}, key, known)
-        if lanes and not keep_lanes:
-            lane_map = {r: dict(v) for r, v in data["routing_lane_map"].items()}
-            for runner, lane in lanes:
-                lane_map[runner].pop(lane, None)
-                if not lane_map[runner]:
-                    lane_map.pop(runner)
-            data["routing_lane_map"] = lane_map
-        if rest:
-            _store(data, usage.parse_usage_accounts(rest, previous=stored))
-        else:
-            _store(data, [])
-            data["usage_accounts_none"] = True
-        events, done = _stop_events(view, key, account["label"], keep_priority=keep_priority,
-                                    keep_pause=keep_pause, end_holds=end_holds, cuts=_cuts(repairs))
-        config.save_config(data)
-        version = config.accounts_version(data)
-        _drop_row(key)
-        record = _notes(events, via)
-    _set_declined(account["harness"], _account_path(account), STOPPED_WHY)
-    shown = [{"runner": r, "lane": lane} for r, lane in lanes]
-    out = {"ok": True, "version": version, "key": key, "label": account["label"], "none": not rest,
+        parsed = usage.parse_usage_accounts(rest, previous=stored) if rest else []
+        res = _commit(data, stored, base, parsed, via=via, none=not rest, view=view, keep_priority=keep_priority,
+                      keep_pause=keep_pause, keep_lanes=keep_lanes, end_holds=end_holds)
+    _settle(res)
+    done = res["done"]
+    shown = [{"runner": r, "lane": lane} for r, lane in res["stop_lanes"].get(key, [])]
+    out = {"ok": True, "version": res["version"], "key": key, "label": account["label"], "none": not rest,
            "priority": done["priority"], "pause": done["pause"],
            "lanes_removed": [] if keep_lanes else shown, "lanes_kept": shown if keep_lanes else [],
            "holds_ended": end_holds, "holds_kept": [h for h in holds_on if h not in end_holds],
-           "mentions": _mentions(account["label"], view), "declined": True, "lane_repairs": repairs}
-    if not record.get("ok"):
-        out["record_error"] = record.get("error")
+           "mentions": _mentions(account["label"], view), "declined": True, "lane_repairs": res["repairs"]}
+    if not res["record"].get("ok"):
+        out["record_error"] = res["record"].get("error")
     return out
 
 
@@ -593,7 +744,6 @@ def move(key, folder, *, expect=None, via: str = "app") -> dict:
     with _locked(expect) as data:
         stored, base = current_list(data)
         i = _find(base, key)
-        known = known_of(base)
         label = usage._account_from_entry(base[i])["label"]
         entry = {k: v for k, v in base[i].items() if k != "home"}
         if home:
@@ -604,19 +754,11 @@ def move(key, folder, *, expect=None, via: str = "app") -> dict:
         changed = list(base)
         changed[i] = entry
         parsed = usage.parse_usage_accounts(changed, previous=stored)
-        repairs = convert_lanes(data, known)
-        moved = _lanes_on(data.get("routing_lane_map") or {}, key, known)
-        for runner, lane in moved:
-            data["routing_lane_map"][runner][lane] = new_key
-        _store(data, parsed)
-        config.save_config(data)
-        version = config.accounts_version(data)
-        _move_row(key, new_key)
-        record = _notes([{"type": "account_move", "account": key, "target": new_key}], via)
-    out = {"ok": True, "version": version, "key": new_key, "was": key, "label": label, "lanes": len(moved),
-           "lane_repairs": repairs}
-    if not record.get("ok"):
-        out["record_error"] = record.get("error")
+        res = _commit(data, stored, base, parsed, via=via)
+    out = {"ok": True, "version": res["version"], "key": new_key, "was": key, "label": label,
+           "lanes": len(res["moved_lanes"]), "lane_repairs": res["repairs"]}
+    if not res["record"].get("ok"):
+        out["record_error"] = res["record"].get("error")
     return out
 
 
@@ -643,29 +785,29 @@ def auto_track(found: dict) -> list[dict]:
             continue
         entry = {"harness": cand["cli"], "home": None if cand.get("default") else cand.get("path"), "label": None}
         try:
-            done = track([entry], via="auto")
+            done = track([entry], expect=config.accounts_version(), via="auto")
         except (AccountsError, routing.RouteError, config.InvalidConfigDocument):
             continue
         out += [dict(a, via="auto") for a in done["accounts"]]
     return out
 
 
-def answer_request(action: str) -> dict:
+def answer_request(action: str, *, via: str = "app") -> dict:
     """The owner's answer to a conversation's change to the list (decision
     15): confirm keeps it; undo puts back the list it replaced."""
-    with config.mutate_config() as data:
+    with _locked(None, required=False) as data:
         request = data.get("usage_accounts_request")
         if not isinstance(request, dict):
             raise AccountsError("no conversation's change to the account list is waiting", "no_request")
+        stored, base = current_list(data)
         if action == "undo":
             prior = request.get("prior")
-            _store(data, prior if isinstance(prior, list) else [])
-            if request.get("prior_none") is True:
-                data["usage_accounts_none"] = True
-        data.pop("usage_accounts_request", None)
-        config.save_config(data)
-        version = config.accounts_version(data)
-    return {"ok": True, "version": version, "action": action}
+            res = _commit(data, stored, base, prior if isinstance(prior, list) else [], via=via,
+                          none=request.get("prior_none") is True)
+        else:
+            res = _commit(data, stored, base, list(stored or []), via=via)
+    _settle(res)
+    return {"ok": True, "version": res["version"], "action": action}
 
 
 def status() -> dict:
@@ -721,7 +863,7 @@ def run_cli(args) -> int:
         elif cmd == "auto-track":
             out = set_auto_track(args.state == "on")
         elif cmd == "request":
-            out = answer_request(args.action)
+            out = answer_request(args.action, via=via)
         else:
             raise AccountsError(f"unknown accounts command {cmd!r}", "bad_command")
         _print(out)

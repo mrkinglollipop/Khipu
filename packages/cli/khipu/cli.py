@@ -3035,37 +3035,34 @@ def cmd_config(args: argparse.Namespace) -> int:
         # `--set usage_accounts '[{"label": "Claude second", "harness":
         # "claude", "home": "~/.claude-second"}]'`; `--unset` (or `[]`) goes
         # back to every installed CLI with its default login.
-        from khipu import routing, usage
-        from khipu.config import set_usage_accounts
+        from khipu import accounts, routing, usage
+        from khipu.config import config_file
 
         # Decision 15: the owner's (the app, or a typed yes on a terminal),
         # or a conversation's at his request, marked until he answers it.
         request = via = None
-        if getattr(args, "at_owner_request", None) is not None:
-            words = routing._one_line(args.at_owner_request)
-            if not words:
-                print(json.dumps({"ok": False, "error": "describe the owner's request in one line",
-                                  "code": "request_needs_words"}))
-                return 2
-            request = {"request": words, "by": routing.conversation_author(), "at": routing._iso(routing._now())}
-        else:
-            auth = routing._OWNER_AUTH.set(None)
-            try:
-                via = routing._owner_via(args)
-            finally:
-                routing._OWNER_AUTH.reset(auth)
-            if via is None:
-                print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
-                return 2
-        expect = (getattr(args, "expect", None) or "").strip()
+        # The owner's check stays set through the save, so the record's
+        # lines about it say how it was authorised.
+        auth = routing._OWNER_AUTH.set(None)
         try:
-            if not expect:
-                # A save carries the version it read (``khipu accounts`` or
-                # ``config.accounts_version``), so a stale one never lands.
-                raise usage.AccountsError("say which version of the account list this change was made on "
-                                          "(--expect); read the list again first", "version_needed")
-            path = set_usage_accounts(args.set[1] if args.set else None, expect=expect, request=request,
-                                      via=None if request is not None else via)
+            if getattr(args, "at_owner_request", None) is not None:
+                words = routing._one_line(args.at_owner_request)
+                if not words:
+                    print(json.dumps({"ok": False, "error": "describe the owner's request in one line",
+                                      "code": "request_needs_words"}))
+                    return 2
+                request = {"request": words, "by": routing.conversation_author(),
+                           "at": routing._iso(routing._now())}
+            else:
+                via = routing._owner_via(args)
+                if via is None:
+                    print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
+                    return 2
+            # One write path for the list: the save becomes the account
+            # operations it implies (track, rename, stop, move), each with
+            # its lines in the routing record, on the version it read.
+            saved = accounts.save_list(args.set[1] if args.set else None, expect=getattr(args, "expect", None),
+                                       via=via or "cli", request=request)
         except usage.AccountsError as err:
             # A fixed code, the entry and the field at fault: the app says it
             # in its own words and never shows the text.
@@ -3074,7 +3071,12 @@ def cmd_config(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
-        print(json.dumps({"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(path)}))
+        finally:
+            routing._OWNER_AUTH.reset(auth)
+        out = {"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(config_file())}
+        if saved.get("record_error"):
+            out["record_error"] = saved["record_error"]
+        print(json.dumps(out))
         return 0
     from khipu.config import CLI_SETTINGS
 

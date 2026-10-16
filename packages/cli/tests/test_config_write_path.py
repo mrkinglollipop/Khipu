@@ -27,6 +27,9 @@ PRIVATE_READS = {("join.py", "_load_config_for_mutation"):
                  "refuses a corrupt document before an import changes anything; writes go through mutate_config"}
 # Writers that may call save_config: inside these blocks the document is the held one.
 HOLDERS = {"mutate_config", "_locked"}
+# Functions that save the document their caller holds: (module, name); every
+# call of one must itself be inside a HOLDERS block.
+HELD_SAVERS = {("accounts.py", "_commit")}
 WRITES = {"write_text", "write_bytes", "replace", "rename", "unlink", "write_private_file", "_restore_file",
           "open", "dump"}
 # Modules writing a config.json that is not this install's: module -> why.
@@ -69,15 +72,27 @@ def test_every_save_is_inside_the_one_write_path():
         for node in ast.walk(tree):
             if not (isinstance(node, ast.Call) and _name(node.func) == "save_config"):
                 continue
-            up, held = parents.get(node), False
-            while up is not None and not held:
-                if isinstance(up, ast.With):
-                    held = any(isinstance(item.context_expr, ast.Call) and _name(item.context_expr.func) in HOLDERS
-                               for item in up.items)
-                up = parents.get(up)
-            if not held:
+            if not _held(node, parents, path.name):
                 found.append(f"{path.relative_to(PACKAGE)}:{node.lineno}")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and (path.name, _name(node.func)) in HELD_SAVERS \
+                    and not _held(node, parents, None):
+                found.append(f"{path.relative_to(PACKAGE)}:{node.lineno} {_name(node.func)}")
     assert not found, "save_config outside a mutate_config block: " + ", ".join(found)
+
+
+def _held(node, parents, module) -> bool:
+    """Whether ``node`` sits in a HOLDERS block, or (``module`` given) in a
+    HELD_SAVERS function of that module."""
+    up = parents.get(node)
+    while up is not None:
+        if isinstance(up, ast.With) and any(isinstance(item.context_expr, ast.Call)
+                                            and _name(item.context_expr.func) in HOLDERS for item in up.items):
+            return True
+        if module and isinstance(up, ast.FunctionDef) and (module, up.name) in HELD_SAVERS:
+            return True
+        up = parents.get(up)
+    return False
 
 
 def test_no_module_writes_the_config_file_itself():
@@ -169,3 +184,46 @@ def test_concurrent_writers_of_different_settings_keep_every_change(data_dir):
     for t in threads:
         t.join(5)
     assert config.load_config() == {f"k{i}": i for i in range(8)}
+
+
+def _account_list_writes(tree) -> list:
+    """Each place a module changes ``usage_accounts`` itself: a subscript
+    store or delete, or a ``pop``/``setdefault``/``update`` naming it."""
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.Delete)):
+            targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+            for t in targets:
+                if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) \
+                        and t.slice.value == "usage_accounts":
+                    out.append(node)
+        elif isinstance(node, ast.Call) and _name(node.func) in ("pop", "setdefault", "update") and any(
+                isinstance(a, ast.Constant) and a.value == "usage_accounts" for a in node.args):
+            out.append(node)
+    return out
+
+
+def test_the_account_list_has_one_writer():
+    # The account list changes only through accounts.py's operations: one
+    # store (``_store``), called only by ``_commit``, which every operation
+    # and every generic save of the list goes through with its events.
+    found = []
+    for path in sorted(PACKAGE.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = _parents(tree)
+        for node in _account_list_writes(tree):
+            up = parents.get(node)
+            while up is not None and not isinstance(up, ast.FunctionDef):
+                up = parents.get(up)
+            where = f"{path.relative_to(PACKAGE)}:{node.lineno}"
+            if path.name != "accounts.py" or up is None or up.name != "_store":
+                found.append(where)
+        if path.name == "accounts.py":
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and _name(node.func) == "_store":
+                    up = parents.get(node)
+                    while up is not None and not isinstance(up, ast.FunctionDef):
+                        up = parents.get(up)
+                    if up is None or up.name != "_commit":
+                        found.append(f"accounts.py:{node.lineno} _store")
+    assert not found, "usage_accounts written outside accounts._commit: " + ", ".join(found)
