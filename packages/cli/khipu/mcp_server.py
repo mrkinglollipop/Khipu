@@ -47,6 +47,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -1872,6 +1873,43 @@ _LEDGER_TEXT = ("project", "id", "title", "kind", "parent", "state", "evidence",
                 "children", "op_id")
 
 
+_LEDGER_FREE_TEXT = ("title", "evidence", "note")
+# A path at a word's start ("/x", "~/x", a backslash path, a drive letter)
+# or a word holding two or more folder separators.
+_LEDGER_PATH = re.compile(r"^(?:~[/\\]|/(?=[\w.~-])|\\|[A-Za-z]:[/\\])|[^/\\]+[/\\][^/\\]*[/\\]")
+
+
+def _ledger_args(args: dict) -> dict:
+    """The one check every text field of ``khipu_ledger`` passes before
+    anything is written or queued (rule 4: titles and short plain words,
+    never code, file contents, logs or private paths). Text only; nothing
+    key-shaped; one line with no control characters and no code fence; and in
+    the free-text fields each path-shaped word cut to its last name (a link
+    is not a path). Returns the fields as they will be saved."""
+    from khipu import ledger
+
+    for key in _LEDGER_TEXT:
+        if args.get(key) is not None and not isinstance(args[key], str):
+            raise ValueError(f"{key} must be text")
+    ledger.refuse_secrets([args.get(k) for k in _LEDGER_TEXT])
+    out = dict(args)
+    for key in _LEDGER_TEXT:
+        value = args.get(key)
+        if value is None:
+            continue
+        if "```" in value or any(ord(c) < 32 or 0x7F <= ord(c) <= 0x9F or c in "\u2028\u2029" for c in value):
+            raise ledger.LedgerError(f"{key} must be one line of plain words about the work: no code, file "
+                                     "contents, command output or logs. Nothing was saved", "not_one_line")
+        if key in _LEDGER_FREE_TEXT:
+            words = []
+            for word in value.split(" "):
+                if not word.startswith("https://") and _LEDGER_PATH.search(word):
+                    word = re.split(r"[/\\]+", word.rstrip("/\\"))[-1] or word
+                words.append(word)
+            out[key] = " ".join(words)
+    return out
+
+
 def _tool_ledger(args: dict) -> dict:
     """``khipu ledger`` as a tool: the same verbs and fields, JSON back. A
     refusal is a tool error carrying the error and its reason word. Restore,
@@ -1879,9 +1917,6 @@ def _tool_ledger(args: dict) -> dict:
     verb = args.get("verb")
     if verb not in _LEDGER_VERBS:
         raise ValueError(f"verb must be one of: {', '.join(_LEDGER_VERBS)}")
-    for key in _LEDGER_TEXT:
-        if args.get(key) is not None and not isinstance(args[key], str):
-            raise ValueError(f"{key} must be text")
     stale = args.get("stale_hours")
     if stale is not None and (isinstance(stale, bool) or not isinstance(stale, (int, float))):
         raise ValueError("stale_hours must be a number")
@@ -1891,7 +1926,7 @@ def _tool_ledger(args: dict) -> dict:
     from khipu import ledger
 
     try:
-        ledger.refuse_secrets([args.get(k) for k in _LEDGER_TEXT])
+        args = _ledger_args(args)
         project = ledger._project_for(argparse.Namespace(project=args.get("project") or None))
         row_id = args.get("id") or ""
         if verb in ("add", "set", "remove"):

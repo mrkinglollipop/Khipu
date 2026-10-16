@@ -341,3 +341,206 @@ def test_the_status_line_counts_rows_loose_ends_and_needs(hub):
     assert ledger.status_line() == {"available": True, "rows": 4, "loose_ends": 2, "needs_owner": 1, "outbox": 0}
     assert ledger.status_line(hub=False) == {"available": False, "rows": None, "loose_ends": None,
                                              "needs_owner": None, "outbox": 0}
+
+
+# ---- (k) review regressions: the import's model -----------------------------------------
+
+
+def _threaded_set(dsn, row_id: str, state: str):
+    """A set from another writer on its own connection (another Mac, say),
+    started on a thread; returns the thread."""
+    import threading
+
+    from khipu import ledger
+
+    def go():
+        with _real_connect(dsn) as conn:
+            ledger.apply_op(conn, ledger.new_op("set", P, row_id, fields={"state": state}, source="cli"))
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    return t
+
+
+def test_catching_up_never_overwrites_a_writer_that_lands_during_it(hub, tmp_path, monkeypatch):
+    import time
+
+    from khipu import ledger_import
+
+    doc = {"rows": {"a": _row("a")}}
+    path = _write(tmp_path, doc)
+    assert _import(path)[0] == 0
+    doc["rows"]["a"].update(state="BUILT-UNMERGED", updated="2026-10-02T00:00:00Z")
+    _write(tmp_path, doc)
+    seen: dict = {}
+    real = ledger_import._save_vocab
+
+    def other_writer_arrives(*args, **kw):
+        seen["thread"] = _threaded_set(hub, "a", "IN FLIGHT")
+        time.sleep(0.5)
+        seen["blocked"] = seen["thread"].is_alive()
+        return real(*args, **kw)
+
+    monkeypatch.setattr(ledger_import, "_save_vocab", other_writer_arrives)
+    rc, report = _import(path, "--catch-up")
+    seen["thread"].join(10)
+    assert rc == 0 and report["result"] == "caught up", report
+    # The other writer waited for the catch-up, then landed after it: its value stands.
+    assert seen["blocked"], "the other writer was not held off while the catch-up ran"
+    assert _sql(hub, "SELECT state FROM ledger_rows WHERE row_id = 'a'") == [("IN FLIGHT",)]
+
+
+def test_an_extra_row_written_during_an_import_rolls_it_back(hub, tmp_path, monkeypatch):
+    from khipu import ledger_import
+
+    real = ledger_import._insert_rows
+
+    def and_one_more(cur, project, ids, rows, now):
+        real(cur, project, ids, rows, now)
+        real(cur, project, ["zz-extra"], {"zz-extra": _row("zz-extra")}, now)
+
+    monkeypatch.setattr(ledger_import, "_insert_rows", and_one_more)
+    rc, report = _import(_write(tmp_path, {"rows": {"a": _row("a")}}))
+    assert rc == 1 and report["result"] == "rolled back", report
+    assert _sql(hub, "SELECT count(*) FROM ledger_rows")[0][0] == 0
+
+
+def test_a_duplicated_history_entry_in_a_catch_up_rolls_it_back(hub, tmp_path, monkeypatch):
+    from khipu import ledger_import
+
+    doc = {"rows": {"a": _row("a")}}
+    path = _write(tmp_path, doc)
+    assert _import(path)[0] == 0
+    before = _counts(hub)
+    doc["rows"]["a"]["history"].append({"at": "2026-10-02T00:00:00Z", "event": "Looked at it"})
+    _write(tmp_path, doc)
+    real = ledger_import._insert_history
+
+    def twice(cur, project, entries):
+        real(cur, project, entries)
+        real(cur, project, [e for e in entries if e[2] is None])
+
+    monkeypatch.setattr(ledger_import, "_insert_history", twice)
+    rc, report = _import(path, "--catch-up")
+    assert rc == 1 and report["result"] == "rolled back", report
+    assert _counts(hub)[:2] == before[:2]
+
+
+def test_a_history_only_change_in_both_places_is_listed(hub, tmp_path):
+    doc = {"rows": {"a": _row("a")}}
+    path = _write(tmp_path, doc)
+    assert _import(path)[0] == 0
+    ok("set", "a", "--note", "Local note")
+    doc["rows"]["a"]["history"].append({"at": "2026-10-02T00:00:00Z", "event": "Old tracker note"})
+    _write(tmp_path, doc)
+    rc, report = _import(path, "--catch-up")
+    assert rc == 0 and report["plan"]["both"] == ["a"], report
+    assert "Changed in both places" in report["words"]
+
+
+def test_secret_shaped_keys_are_masked_on_import_and_export(hub, tmp_path):
+    row = _row("a")
+    row["extra"] = {KEY: "synthetic"}
+    doc = {"rows": {"a": row}, KEY: 1}
+    rc, report = _import(_write(tmp_path, doc))
+    assert rc == 0 and report["result"] == "done", report
+    assert report["masked"] and KEY not in json.dumps(report)
+    assert KEY not in json.dumps(_export())
+
+
+@pytest.mark.parametrize("how", ["row", "history"])
+def test_duplicate_json_members_are_refused(how, tmp_path):
+    from khipu import ledger, ledger_import
+
+    a, b = _row("a"), _row("a")
+    b["title"] = "Second row"
+    if how == "row":
+        text = '{"rows": {"a": ' + json.dumps(a) + ', "a": ' + json.dumps(b) + "}}"
+    else:
+        text = json.dumps({"rows": {"a": _row("a", history=[])}}).replace(
+            '"history": []', '"history": [{"ts": "2026-10-01T00:00:00Z", "note": "first", "note": "last"}]')
+    path = tmp_path / "tracker.json"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ledger.LedgerError, match="more than once"):
+        ledger_import.read_tracker(path)
+
+
+# ---- (l) review regressions: reading the file safely ----------------------------------------
+
+
+def test_a_link_swapped_in_after_the_checks_is_never_followed(tmp_path, monkeypatch):
+    import os
+
+    from khipu import ledger, ledger_import
+
+    chosen = _write(tmp_path, {"rows": {"a": _row("a")}}, "chosen.json")
+    other = _write(tmp_path, {"rows": {"b": _row("b")}}, "other.json")
+    real_open = os.open
+
+    def swap(name, flags, *a, **k):
+        if Path(os.fspath(name)).name == "chosen.json":
+            chosen.unlink()
+            chosen.symlink_to(other)
+        return real_open(name, flags, *a, **k)
+
+    monkeypatch.setattr(os, "open", swap)
+    try:
+        got = ledger_import.read_tracker(chosen)
+    except ledger.LedgerError as exc:
+        assert exc.reason == "refused"
+        return
+    assert set(got["rows"]) == {"a"}, f"read another file: {list(got['rows'])}"
+
+
+@pytest.mark.parametrize("how", ["symlink", "hardlink"])
+def test_a_linked_tracker_file_is_refused(how, tmp_path):
+    import os
+
+    from khipu import ledger, ledger_import
+
+    target = _write(tmp_path, {"rows": {"a": _row("a")}}, "real.json")
+    link = tmp_path / "chosen.json"
+    link.symlink_to(target) if how == "symlink" else os.link(target, link)
+    with pytest.raises(ledger.LedgerError) as caught:
+        ledger_import.read_tracker(link)
+    assert caught.value.reason == "refused"
+
+
+def test_a_configured_login_folder_is_refused(tmp_path, monkeypatch):
+    from khipu import config, ledger, ledger_import
+
+    login = tmp_path / "login-home"
+    login.mkdir()
+    path = _write(login, {"rows": {"a": _row("a")}})
+    monkeypatch.setattr(config, "load_config",
+                        lambda *a, **k: {"usage_accounts": [{"harness": "codex", "home": str(login)}]})
+    with pytest.raises(ledger.LedgerError) as caught:
+        ledger_import.read_tracker(path)
+    assert caught.value.reason == "refused" and "private" in str(caught.value)
+
+
+# ---- (m) review regressions: khipu_ledger keeps to titles (rule 4) ----------------------------
+
+
+@pytest.mark.parametrize("field", ["title", "evidence", "note", "owner"])
+def test_khipu_ledger_refuses_multiline_code(field, hub):
+    from khipu import ledger
+
+    text = 'def customer_export():\n    return open("records.csv").read()'
+    args = {"verb": "add", "project": P, "id": "a", "title": "Work title", "kind": "slice", field: text}
+    err, got = _tool(args)
+    assert err and got["reason"] == "not_one_line", got
+    assert ledger.queued_ops() == [] and _sql(hub, "SELECT count(*) FROM ledger_rows")[0][0] == 0
+
+
+def test_khipu_ledger_cuts_full_paths_to_their_last_name(hub):
+    err, got = _tool({"verb": "add", "project": P, "id": "a", "kind": "slice",
+                      "title": "Check /private/customer/records.csv today",
+                      "evidence": "see ~/work/notes/plan.md and C:\\data\\x.txt, https://example.com/a/b/c",
+                      "note": "moved from /srv/app/build"})
+    assert not err, got
+    err, got = _tool({"verb": "get", "project": P, "id": "a"})
+    row = got["row"]
+    assert row["title"] == "Check records.csv today"
+    assert row["evidence"] == "see plan.md and x.txt, https://example.com/a/b/c"
+    assert row["history"][0]["note"] == "moved from build"

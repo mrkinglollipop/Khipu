@@ -2,17 +2,20 @@
 in the tracker's shape (Work view phase 2; docs/plans/2026-10-15-work-view.md,
 "Importing an existing tracker").
 
-A tracker file is one JSON object, ``{"rows": {id: row}}``. It is read
-read-only through the routing reader (``routing_sources.read_only``: no write
-handle, no lock, a private folder refused before anything is opened), with no
-size limit: the no-loss rule wins. Khipu never writes, moves or deletes it.
+A tracker file is one JSON object, ``{"rows": {id: row}}``. It is opened once,
+read-only, with no link followed on the way (``_open_tracker``); a private or
+login folder is refused before anything is opened, and a name repeated in one
+JSON object is refused rather than one copy dropped. No size limit: the
+no-loss rule wins. Khipu never writes, moves or deletes it.
 
-An import writes every row and every history entry in one transaction, keeping
-each entry exactly as found (``ledger_history.raw``), then checks itself: the
-counts of rows, history entries, rows per state, per kind and with a parent,
-and a round trip through ``export_rows`` compared field by field with the
-file. Anything that differs rolls the whole import back. The only allowed
-difference is a string Khipu's secret redaction masked, which the report names.
+An import is one transaction holding the project's ledger lock
+(``ledger.lock_project``) from its first read to its commit, so no other
+writer lands in between. It writes every row and every history entry, keeping
+each entry exactly as found (``ledger_history.raw``), then checks the whole
+project against the file: the rows and entries it wrote are exactly the
+file's, both ways, and every other row reads as it did. Anything that differs
+rolls the whole import back. The only allowed difference is a string Khipu's
+secret redaction masked (a value or a key), which the report names.
 
 What a tracker row holds that the ledger's columns cannot (a missing field, a
 value that is not text, a time written another way, a key the ledger has no
@@ -21,9 +24,11 @@ row back as it was.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import stat
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -52,8 +57,8 @@ _DROPPED_WORDS = frozenset({"dropped", "cancelled", "canceled", "abandoned", "wo
 
 
 def _mask(value: Any, where: str, masked: list[str]) -> Any:
-    """``value`` with every key-shaped string masked; ``masked`` gets the
-    place of each one. Keys of objects are structure and kept as they are."""
+    """``value`` with every key-shaped string masked, the keys of objects
+    included; ``masked`` gets the place of each one."""
     from khipu.redact import redact_secrets
 
     if isinstance(value, str):
@@ -62,7 +67,13 @@ def _mask(value: Any, where: str, masked: list[str]) -> Any:
             masked.append(where)
         return out
     if isinstance(value, dict):
-        return {k: _mask(v, f"{where}.{k}", masked) for k, v in value.items()}
+        out_d: dict[str, Any] = {}
+        for k, v in value.items():
+            name, hits = redact_secrets(k, force=True)
+            if hits:
+                masked.append(f"{where}.{name}")
+            out_d[name] = _mask(v, f"{where}.{name}", masked)
+        return out_d
     if isinstance(value, list):
         return [_mask(v, f"{where}[{i}]", masked) for i, v in enumerate(value)]
     return value
@@ -73,24 +84,134 @@ def _listed(ids: list[str]) -> str:
     return shown + (f" and {len(ids) - _SHOWN} more" if len(ids) > _SHOWN else "")
 
 
+class _Refused(Exception):
+    """A private or login folder, or a link on the way to the file."""
+
+
+def _login_folder(path: str) -> bool:
+    """Whether ``path`` is in a login folder Khipu knows (configured,
+    discovered, in the routing record or a harness default), decided from
+    names and links alone: nothing inside one is listed or opened."""
+    from khipu import agent_view
+
+    home = agent_view._home_dir()
+    target = agent_view._fold(path.rstrip("/"))
+    for harness, raw in agent_view._homes(None, agent_view._saved_view()):
+        if raw is None:
+            folder = agent_view._DEFAULT_FOLDERS.get(harness)
+            if not folder or not home:
+                continue
+            raw = os.path.join(home, folder)
+        for form in agent_view._forms(raw, home):
+            form = agent_view._fold(form.rstrip("/"))
+            if not form.startswith("~") and (target == form or target.startswith(form + "/")):
+                return True
+    return False
+
+
+def _private_place(path: str) -> bool:
+    from khipu import routing_sources
+
+    try:
+        return routing_sources.private_path(path) or _login_folder(path) \
+            or _login_folder(os.path.realpath(path))
+    except Exception:  # noqa: BLE001  (unsure is private)
+        return True
+
+
+def _open_tracker(path: Path) -> int:
+    """A read-only descriptor for the tracker at ``path``. Its folder is
+    resolved and checked, then reached one folder at a time from ``/`` with
+    ``O_NOFOLLOW``, and the file opened by name from that folder's
+    descriptor with ``O_NOFOLLOW``: a link anywhere on the way, put there
+    before or after the checks, is refused, never followed. The opened file
+    must be a regular file with one name (a hard link could be another name
+    for a private file)."""
+    if _private_place(str(path)):
+        raise _Refused
+    folder = os.path.realpath(path.parent)
+    if _private_place(os.path.join(folder, path.name)):
+        raise _Refused
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    fd = os.open("/", os.O_RDONLY | directory)
+    try:
+        try:
+            for part in Path(folder).parts[1:]:
+                step = os.open(part, os.O_RDONLY | directory | nofollow, dir_fd=fd)
+                os.close(fd)
+                fd = step
+            got = os.open(path.name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | nofollow, dir_fd=fd)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise _Refused from None
+            raise
+    finally:
+        os.close(fd)
+    try:
+        st = os.fstat(got)
+        if stat.S_ISDIR(st.st_mode):
+            raise IsADirectoryError("a folder, not a file")
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        if st.st_nlink > 1:
+            raise _Refused
+    except BaseException:
+        os.close(got)
+        raise
+    return got
+
+
+def _read_all(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while chunk := os.read(fd, 1 << 20):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+class _Repeated(ValueError):
+    def __init__(self, key: str):
+        super().__init__(key)
+        self.key = key
+
+
+def _no_repeats(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """A JSON object, refused when a name appears in it twice: the parser
+    would otherwise keep only the last, losing the first without a word."""
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise _Repeated(key)
+        out[key] = value
+    return out
+
+
 def read_tracker(path: str | os.PathLike) -> dict[str, Any]:
     """The tracker file at ``path``: its name (never its folder), digest, rows
     with key-shaped strings masked, and what was masked. Refuses a file it
-    cannot take whole, naming why; nothing is skipped silently."""
+    cannot take whole, naming why; nothing is skipped silently. No size
+    limit: the no-loss rule wins."""
     from khipu.redact import redact_secrets
-    from khipu.routing_sources import _short_error, read_only
+    from khipu.routing_sources import _short_error
 
     p = Path(os.path.abspath(Path(path).expanduser()))
     try:
-        data, _mtime = read_only(p, tail=0)  # tail 0: the whole file, no size limit
-    except PermissionError as exc:
-        if "private" in str(exc):
-            raise LedgerError("Not read: the file is inside a private folder.", "refused") from None
-        raise LedgerError(f"Couldn't read the tracker file: {_short_error(exc)}", "unreadable") from None
+        fd = _open_tracker(p)
+        try:
+            data = _read_all(fd)
+        finally:
+            os.close(fd)
+    except _Refused:
+        raise LedgerError("Not read: the file is inside a private folder or a login folder, or is reached through a link.",
+                          "refused") from None
     except OSError as exc:
         raise LedgerError(f"Couldn't read the tracker file: {_short_error(exc)}", "unreadable") from None
     try:
-        doc = json.loads(data.decode("utf-8"))
+        doc = json.loads(data.decode("utf-8"), object_pairs_hook=_no_repeats)
+    except _Repeated as exc:
+        name = exc.key if not redact_secrets(exc.key, force=True)[1] else "a key-shaped name"
+        raise LedgerError(f"Nothing was imported: the name {name[:80]!r} appears more than once in one object of "
+                          "the file, so one of them would be lost.", "repeated") from None
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise LedgerError("Couldn't read the tracker file: not readable JSON", "unreadable") from None
     if not isinstance(doc, dict) or not isinstance(doc.get("rows"), dict):
@@ -121,8 +242,9 @@ def read_tracker(path: str | os.PathLike) -> dict[str, Any]:
     if problems:
         raise LedgerError("Nothing was imported; these rows can't be taken as they are: " + "; ".join(problems[:_SHOWN])
                           + (f"; and {len(problems) - _SHOWN} more" if len(problems) > _SHOWN else ""), "bad_rows")
+    other = sorted(k for k in doc if k != "rows")
     return {"name": p.name, "digest": hashlib.sha256(data).hexdigest(), "rows": rows, "masked": masked,
-            "other_keys": sorted(k for k in doc if k != "rows")}
+            "other_keys": [redact_secrets(k, force=True)[0] for k in other]}
 
 
 # ---- counting ----------------------------------------------------------------------
@@ -408,10 +530,53 @@ def _compare(expected: dict[str, dict], got: dict[str, dict]) -> list[str]:
     return out
 
 
-def _verify(cur, project: str, expected: dict[str, dict], counts: dict[str, Any]) -> dict[str, Any]:
-    got = export_rows(cur, project, ids=list(expected), raw_only=True)
-    ledger_counts = tracker_counts(got)
+def _snapshot(cur, project: str) -> dict[str, Any]:
+    """The whole project as it stands in this transaction: every row id
+    (removed rows included), each live row in the tracker's shape with the
+    entries that came from an old file, and how many of Khipu's own entries
+    each row holds."""
+    cur.execute("SELECT row_id FROM ledger_rows WHERE project = %s", (project,))
+    ids = {r[0] for r in cur.fetchall()}
+    rows = export_rows(cur, project, raw_only=True)
+    cur.execute("SELECT row_id, count(*) FROM ledger_history WHERE project = %s AND raw IS NULL GROUP BY row_id",
+                (project,))
+    return {"ids": ids, "rows": rows, "own": dict(cur.fetchall())}
+
+
+def _history_counter(row: dict[str, Any] | None) -> Counter:
+    return Counter(_entry_key(e) for e in (row or {}).get("history") or [])
+
+
+def _fields(row: dict[str, Any] | None) -> dict[str, Any]:
+    return {k: v for k, v in (row or {}).items() if k != "history"}
+
+
+def _unchanged(before: dict[str, Any], after: dict[str, Any], ids) -> list[str]:
+    """Rows the import had no business changing that read differently now."""
+    out = []
+    for row_id in sorted(ids):
+        if before["rows"].get(row_id) != after["rows"].get(row_id) \
+                or before["own"].get(row_id, 0) != after["own"].get(row_id, 0):
+            out.append(f"{row_id}: changed, though the import does not touch it")
+    return out
+
+
+def _verify(cur, project: str, expected: dict[str, dict], counts: dict[str, Any],
+            before: dict[str, Any]) -> dict[str, Any]:
+    """The whole project against the file, inside the import's transaction:
+    the rows that were not here before are exactly the file's rows, each
+    reading back field by field with its history in order, plus one
+    "Imported from" line each; the rows that were here before read as they
+    did."""
+    after = _snapshot(cur, project)
+    scope = after["ids"] - before["ids"]
+    got = {i: r for i, r in after["rows"].items() if i in scope}
     differs = _compare(expected, got)
+    differs += [f"{i}: in the ledger but not in the file" for i in sorted(scope - set(expected))]
+    differs += [f"{i}.history: {after['own'].get(i, 0)} import line(s), not 1" for i in sorted(scope & set(expected))
+                if after["own"].get(i, 0) != 1]
+    differs += _unchanged(before, after, before["ids"])
+    ledger_counts = tracker_counts(got)
     mismatched = [k for k in ("rows", "history", "by_state", "by_kind", "with_parent") if counts[k] != ledger_counts[k]]
     return {"ok": not differs and not mismatched, "counts_in_ledger": ledger_counts, "counts_differ": mismatched,
             "fields_differ": differs[:_SHOWN], "fields_differ_count": len(differs)}
@@ -477,25 +642,47 @@ def run_import(path: str | os.PathLike, project: str, *, dry_run: bool = False, 
 
 def _import_locked(conn, project: str, src: dict[str, Any], report: dict[str, Any], *, dry_run: bool,
                    catch_up: bool) -> dict[str, Any]:
+    """One transaction holding the project's ledger lock from the first read
+    to the commit: what is here, the plan, the writes and the check all see
+    the same ledger, and no other writer lands in between."""
+    try:
+        with conn.cursor() as cur:
+            ledger.lock_project(cur, project)
+            out = _import_in(cur, project, src, report, dry_run=dry_run, catch_up=catch_up)
+        if out.pop("commit", False):
+            conn.commit()
+        else:
+            conn.rollback()
+        return out
+    except _Mismatch as exc:
+        conn.rollback()
+        _record_rollback(conn, project, src, report)
+        return {**report, "ok": False, "result": "rolled back", "reason": "mismatch",
+                "words": exc.words + _differences(report["check"])}
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _import_in(cur, project: str, src: dict[str, Any], report: dict[str, Any], *, dry_run: bool,
+               catch_up: bool) -> dict[str, Any]:
     rows, ids = src["rows"], list(src["rows"])
-    with conn.cursor() as cur:
-        cur.execute("SELECT digest, result FROM ledger_imports WHERE project = %s AND result IN ('done', 'caught up') "
-                    "ORDER BY id DESC", (project,))
-        landed = cur.fetchall()
-        here, purged = _existing(cur, project, ids)
-        existing = ledger._vocab(cur, project)
-    conn.rollback()
+    cur.execute("SELECT digest, result FROM ledger_imports WHERE project = %s AND result IN ('done', 'caught up') "
+                "ORDER BY id DESC", (project,))
+    landed = cur.fetchall()
+    here, purged = _existing(cur, project, ids)
+    existing = ledger._vocab(cur, project)
     if src["digest"] in {d for d, _r in landed}:
         return {**report, "result": "nothing new", "words": "Nothing new: every row and history entry is already here."}
     if catch_up and not landed:
         return {**report, "ok": False, "result": "refused", "reason": "no_import",
                 "words": f"Nothing was imported into {project} yet, so there is nothing to catch up."}
     if catch_up:
-        return _catch_up(conn, project, src, report, here, purged, existing, dry_run=dry_run)
+        return _catch_up(cur, project, src, report, here, purged, existing, dry_run=dry_run)
     # A file imported before and brought again: with nothing new it is the
     # no-op a re-import must be; anything new waits for --catch-up.
     if landed and here:
-        plan = _catch_up(conn, project, src, dict(report), here, purged, existing, dry_run=True)
+        plan = _catch_up(cur, project, src, dict(report), here, purged, existing, dry_run=True)
         if plan["result"] == "nothing new":
             return plan
         taken = sorted(here)
@@ -519,42 +706,35 @@ def _import_locked(conn, project: str, src: dict[str, Any], report: dict[str, An
     if dry_run:
         return {**report, "result": "dry run", "hub_checked": True,
                 "words": f"Ready to import {counts_words(report['counts_in_file'])}. Nothing was written."}
-    now = ledger._now()
-    try:
-        with conn.cursor() as cur:
-            _save_vocab(cur, project, vocab, added, not existing["state"])
-            _insert_rows(cur, project, order, rows, now)
-            cur.execute("INSERT INTO ledger_imports (project, file_name, digest, result) VALUES (%s, %s, %s, "
-                        "'in progress') RETURNING id", (project, src["name"], src["digest"]))
-            import_id = cur.fetchone()[0]
-            event = f"Imported from {src['name']} on {ledger._date_words(now)}"
-            _insert_history(cur, project, [(i, _note_entry(event, now), f"{MARKER_OP}{import_id}") for i in order])
-            check = _verify(cur, project, rows, report["counts_in_file"])
-            report["check"] = check
-            if not check["ok"]:
-                raise _Mismatch()
-            from psycopg.types.json import Jsonb
+    from psycopg.types.json import Jsonb
 
-            cur.execute("UPDATE ledger_imports SET counts = %s, result = 'done' WHERE id = %s",
-                        (Jsonb({**report, "result": "done"}), import_id))
-            ledger._mark_lag(project, order)
-        conn.commit()
-    except _Mismatch:
-        conn.rollback()
-        _record_rollback(conn, project, src, report)
-        return {**report, "ok": False, "result": "rolled back", "reason": "mismatch",
-                "words": "Nothing was imported: the check after writing found differences, so it was undone. "
-                         + _differences(report["check"])}
-    except BaseException:
-        conn.rollback()
-        raise
-    return {**report, "result": "done", "import_id": import_id, "affected": order,
+    now = ledger._now()
+    before = _snapshot(cur, project)
+    _save_vocab(cur, project, vocab, added, not existing["state"])
+    _insert_rows(cur, project, order, rows, now)
+    cur.execute("INSERT INTO ledger_imports (project, file_name, digest, result) VALUES (%s, %s, %s, "
+                "'in progress') RETURNING id", (project, src["name"], src["digest"]))
+    import_id = cur.fetchone()[0]
+    event = f"Imported from {src['name']} on {ledger._date_words(now)}"
+    _insert_history(cur, project, [(i, _note_entry(event, now), f"{MARKER_OP}{import_id}") for i in order])
+    check = _verify(cur, project, rows, report["counts_in_file"], before)
+    report["check"] = check
+    if not check["ok"]:
+        raise _Mismatch("Nothing was imported: the check after writing found differences, so it was undone. ")
+    cur.execute("UPDATE ledger_imports SET counts = %s, result = 'done' WHERE id = %s",
+                (Jsonb({**report, "result": "done"}), import_id))
+    ledger._mark_lag(project, order)
+    return {**report, "result": "done", "import_id": import_id, "affected": order, "commit": True,
             "words": f"Imported {counts_words(report['counts_in_file'])}; every count matches and the round trip "
                      "gives the file back" + (" except the masked fields listed." if src["masked"] else ".")}
 
 
 class _Mismatch(Exception):
     """The check after writing found a difference; the import is undone."""
+
+    def __init__(self, words: str):
+        super().__init__(words)
+        self.words = words
 
 
 def _record_rollback(conn, project: str, src: dict[str, Any], report: dict[str, Any]) -> None:
@@ -585,13 +765,14 @@ def counts_words(counts: dict[str, Any]) -> str:
 _FIELD_COLS = ("title", "kind", "parent", "state", "evidence", "owner")
 
 
-def _catch_up(conn, project: str, src: dict[str, Any], report: dict[str, Any], here: dict[str, Any],
+def _catch_up(cur, project: str, src: dict[str, Any], report: dict[str, Any], here: dict[str, Any],
               purged: dict[str, Any], existing: dict[str, list], *, dry_run: bool) -> dict[str, Any]:
     """Bring in what the old file gained since the last import: new rows,
     history entries the ledger does not hold (matched exactly), and new field
-    values. A row changed in the ledger too keeps the ledger's values, gets the
-    file's entries as history, and is listed as changed in both places for
-    the owner to settle; Khipu never picks a winner."""
+    values. A row changed in the ledger too since Khipu last brought it in
+    keeps the ledger's values, gets the file's entries as history, and is
+    listed as changed in both places for the owner to settle; Khipu never
+    picks a winner. Runs inside the import's locked transaction."""
     from psycopg.types.json import Jsonb
 
     rows = src["rows"]
@@ -602,18 +783,20 @@ def _catch_up(conn, project: str, src: dict[str, Any], report: dict[str, Any], h
     now = ledger._now()
     plan: dict[str, Any] = {"new_rows": new_ids, "new_entries": 0, "updated": [], "both": [],
                             "skipped_removed": removed, "skipped_purged": gone}
-    with conn.cursor() as cur:
-        current = export_rows(cur, project, ids=live, raw_only=True)
-        cur.execute("SELECT DISTINCT row_id FROM ledger_history WHERE project = %s AND row_id = ANY(%s) "
-                    "AND source <> 'import'", (project, live))
-        touched = {r[0] for r in cur.fetchall()}
-        cur.execute("SELECT row_id, refs->'imported'->>'file' FROM ledger_rows WHERE project = %s "
-                    "AND row_id = ANY(%s)", (project, live))
-        seen_as = dict(cur.fetchall())
-    conn.rollback()
+    before = _snapshot(cur, project)
+    current = before["rows"]
+    # Changed here since Khipu last brought the row in from a file.
+    cur.execute("SELECT DISTINCT h.row_id FROM ledger_history h WHERE h.project = %s AND h.row_id = ANY(%s) "
+                "AND h.source <> 'import' AND h.id > coalesce((SELECT max(i.id) FROM ledger_history i "
+                "WHERE i.project = h.project AND i.row_id = h.row_id AND i.source = 'import'), 0)", (project, live))
+    touched = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT row_id, refs->'imported'->>'file' FROM ledger_rows WHERE project = %s "
+                "AND row_id = ANY(%s)", (project, live))
+    seen_as = dict(cur.fetchall())
     adds: dict[str, list] = {}
+    history_only: list[str] = []
     for row_id in live:
-        have = Counter(_entry_key(e) for e in current[row_id].get("history") or [])
+        have = _history_counter(current.get(row_id))
         fresh = []
         for entry in rows[row_id].get("history") or []:
             k = _entry_key(entry)
@@ -626,13 +809,16 @@ def _catch_up(conn, project: str, src: dict[str, Any], report: dict[str, Any], h
             plan["new_entries"] += len(fresh)
         # The file changed this row when it no longer reads as it did at the
         # last import (or, with no record of that, as the ledger has it).
-        theirs = {k: v for k, v in rows[row_id].items() if k != "history"}
+        theirs = _fields(rows[row_id])
         if seen_as.get(row_id):
             changed = _row_digest(rows[row_id]) != seen_as[row_id]
         else:
-            changed = {k: v for k, v in current[row_id].items() if k != "history"} != theirs
+            changed = _fields(current.get(row_id)) != theirs
         if changed:
             (plan["both"] if row_id in touched else plan["updated"]).append(row_id)
+        elif fresh and row_id in touched:
+            plan["both"].append(row_id)
+            history_only.append(row_id)
     plan["new_entries"] += sum(len(rows[i].get("history") or []) for i in new_ids)
     report["plan"] = plan
     if not (new_ids or plan["new_entries"] or plan["updated"] or plan["both"]):
@@ -643,46 +829,37 @@ def _catch_up(conn, project: str, src: dict[str, Any], report: dict[str, Any], h
     if dry_run:
         return {**report, "result": "dry run", "hub_checked": True, "words": _plan_words(plan) + " Nothing was written."}
     affected = new_ids + list(adds) + [i for i in plan["updated"] + plan["both"] if i not in adds]
-    try:
-        with conn.cursor() as cur:
-            _save_vocab(cur, project, vocab, added, False)
-            if new_ids:
-                _insert_rows(cur, project, _board_order({i: rows[i] for i in new_ids}, vocab), rows, now)
-            for row_id, entries in adds.items():
-                fallback = ledger._parse_time(rows[row_id].get("updated")) or now
-                _insert_history(cur, project, [(row_id, _entry_columns(e, fallback), None) for e in entries])
-            cur.execute("INSERT INTO ledger_imports (project, file_name, digest, result) VALUES (%s, %s, %s, "
-                        "'in progress') RETURNING id", (project, src["name"], src["digest"]))
-            import_id = cur.fetchone()[0]
-            for row_id in plan["updated"]:
-                _bring_fields(cur, project, row_id, rows[row_id], now, f"{CATCH_UP_OP}{import_id}", src["name"])
-            for row_id in plan["both"]:
-                state = rows[row_id].get("state")
-                event = (f"Changed in both places: the old tracker says {_word_of(state)}; this ledger was not "
-                         "changed. Settle it in the app.")
-                _insert_history(cur, project, [(row_id, _note_entry(event, now), f"{BOTH_OP}{import_id}")])
-                # Seen now: the same change is not raised again by the next catch-up.
-                cur.execute("UPDATE ledger_rows SET refs = jsonb_set(refs, '{imported,file}', %s, true) "
-                            "WHERE project = %s AND row_id = %s AND refs ? 'imported'",
-                            (Jsonb(_row_digest(rows[row_id])), project, row_id))
-            check = _verify_catch_up(cur, project, rows, live + new_ids, plan)
-            report["check"] = check
-            if not check["ok"]:
-                raise _Mismatch()
-            cur.execute("UPDATE ledger_imports SET counts = %s, result = 'caught up' WHERE id = %s",
-                        (Jsonb({**report, "result": "caught up"}), import_id))
-            ledger._mark_lag(project, affected)
-        conn.commit()
-    except _Mismatch:
-        conn.rollback()
-        _record_rollback(conn, project, src, report)
-        return {**report, "ok": False, "result": "rolled back", "reason": "mismatch",
-                "words": "Nothing was brought in: the check after writing found differences, so it was undone. "
-                         + _differences(report["check"])}
-    except BaseException:
-        conn.rollback()
-        raise
-    return {**report, "result": "caught up", "import_id": import_id, "affected": affected,
+    _save_vocab(cur, project, vocab, added, False)
+    if new_ids:
+        _insert_rows(cur, project, _board_order({i: rows[i] for i in new_ids}, vocab), rows, now)
+    for row_id, entries in adds.items():
+        fallback = ledger._parse_time(rows[row_id].get("updated")) or now
+        _insert_history(cur, project, [(row_id, _entry_columns(e, fallback), None) for e in entries])
+    cur.execute("INSERT INTO ledger_imports (project, file_name, digest, result) VALUES (%s, %s, %s, "
+                "'in progress') RETURNING id", (project, src["name"], src["digest"]))
+    import_id = cur.fetchone()[0]
+    for row_id in plan["updated"]:
+        _bring_fields(cur, project, row_id, rows[row_id], now, f"{CATCH_UP_OP}{import_id}", src["name"])
+    for row_id in plan["both"]:
+        if row_id in history_only:
+            event = ("Changed in both places: the old tracker has new history for this row, brought in above; "
+                     "this ledger's values were kept. Settle it in the app.")
+        else:
+            event = (f"Changed in both places: the old tracker says {_word_of(rows[row_id].get('state'))}; this "
+                     "ledger was not changed. Settle it in the app.")
+        _insert_history(cur, project, [(row_id, _note_entry(event, now), f"{BOTH_OP}{import_id}")])
+        # Seen now: the same change is not raised again by the next catch-up.
+        cur.execute("UPDATE ledger_rows SET refs = jsonb_set(refs, '{imported,file}', %s, true) "
+                    "WHERE project = %s AND row_id = %s AND refs ? 'imported'",
+                    (Jsonb(_row_digest(rows[row_id])), project, row_id))
+    check = _verify_catch_up(cur, project, rows, plan, adds, before)
+    report["check"] = check
+    if not check["ok"]:
+        raise _Mismatch("Nothing was brought in: the check after writing found differences, so it was undone. ")
+    cur.execute("UPDATE ledger_imports SET counts = %s, result = 'caught up' WHERE id = %s",
+                (Jsonb({**report, "result": "caught up"}), import_id))
+    ledger._mark_lag(project, affected)
+    return {**report, "result": "caught up", "import_id": import_id, "affected": affected, "commit": True,
             "words": _plan_words(plan).replace("Would bring in", "Brought in", 1)}
 
 
@@ -710,21 +887,38 @@ def _bring_fields(cur, project: str, row_id: str, row: dict[str, Any], now: date
     _insert_history(cur, project, [(row_id, entry, op_id)])
 
 
-def _verify_catch_up(cur, project: str, rows: dict[str, dict], ids: list[str], plan: dict[str, Any]) -> dict:
-    """Every entry of the file is in the ledger now, and every row brought in
-    or updated reads back as the file has it."""
-    got = export_rows(cur, project, ids=ids, raw_only=True)
-    missing = []
-    for row_id in ids:
-        have = Counter(_entry_key(e) for e in (got.get(row_id) or {}).get("history") or [])
-        for entry in rows[row_id].get("history") or []:
-            k = _entry_key(entry)
-            if have[k]:
-                have[k] -= 1
-            else:
-                missing.append(f"{row_id}.history")
-                break
-    differs = _compare({i: rows[i] for i in plan["new_rows"] + plan["updated"]}, got) + missing
+def _verify_catch_up(cur, project: str, rows: dict[str, dict], plan: dict[str, Any], adds: dict[str, list],
+                     before: dict[str, Any]) -> dict:
+    """The whole project against what the catch-up meant to do, inside its
+    transaction: the rows now are the rows before plus the new ones; a new
+    row reads back as the file has it; each row's entries from old files are
+    exactly the ones it had plus the ones brought in (as a multiset, both
+    ways); an updated row reads as the file has it and holds one more entry
+    of Khipu's, a row changed in both places keeps its values and holds one
+    more; every other row reads as it did."""
+    after = _snapshot(cur, project)
+    new = set(plan["new_rows"])
+    differs: list[str] = []
+    if after["ids"] != before["ids"] | new:
+        extra = sorted(after["ids"] - before["ids"] - new)
+        lost = sorted((before["ids"] | new) - after["ids"])
+        differs += [f"{i}: in the ledger but not brought in" for i in extra]
+        differs += [f"{i}: missing from the ledger" for i in lost]
+    differs += _compare({i: rows[i] for i in plan["new_rows"]}, {i: after["rows"].get(i) for i in new
+                                                                 if i in after["rows"]})
+    differs += [f"{i}.history: {after['own'].get(i, 0)} entries of Khipu's, not 0" for i in sorted(new)
+                if after["own"].get(i, 0)]
+    for row_id in sorted(set(before["rows"]) - new):
+        was, now_row = before["rows"][row_id], after["rows"].get(row_id)
+        want = _history_counter(was) + Counter(_entry_key(e) for e in adds.get(row_id, []))
+        if _history_counter(now_row) != want:
+            differs.append(f"{row_id}.history")
+        expect_fields = _fields(rows[row_id]) if row_id in plan["updated"] else _fields(was)
+        if _fields(now_row) != expect_fields:
+            differs.append(f"{row_id}: fields")
+        own = before["own"].get(row_id, 0) + (row_id in plan["updated"]) + (row_id in plan["both"])
+        if after["own"].get(row_id, 0) != own:
+            differs.append(f"{row_id}.history: {after['own'].get(row_id, 0)} entries of Khipu's, not {own}")
     return {"ok": not differs, "fields_differ": differs[:_SHOWN], "fields_differ_count": len(differs),
             "counts_differ": []}
 

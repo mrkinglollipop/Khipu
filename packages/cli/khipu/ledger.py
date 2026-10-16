@@ -466,6 +466,14 @@ def _row_dict(values: tuple) -> dict[str, Any]:
     return dict(zip(_ROW_COLS, values, strict=True))
 
 
+def lock_project(cur, project: str) -> None:
+    """Hold the project's ledger lock until this transaction ends. Every
+    ledger writer takes it first (each write, a purge, an import), so an
+    import reads, writes and verifies with no other writer in between, on
+    this Mac or any other."""
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext('khipu-ledger'), hashtext(%s))", (project,))
+
+
 def _lock_row(cur, project: str, row_id: str) -> dict[str, Any] | None:
     cur.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s AND row_id = %s FOR UPDATE",
                 (project, row_id))
@@ -732,6 +740,7 @@ def apply_op(conn, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
                 # before the offline copy heard of it: a retry repairs that.
                 _replica_sync(conn, op["project"], result.get("affected") or [])
                 return {**result, "retried": True}
+            lock_project(cur, op["project"])
             cur.execute("SAVEPOINT ledger_op")
             verb = _VERBS[op["verb"]]
             try:
@@ -764,6 +773,7 @@ def purge(conn, project: str, row_id: str) -> dict[str, Any]:
     refuse_secrets(project, row_id)
     try:
         with conn.cursor() as cur:
+            lock_project(cur, project)
             if not _purge_row(cur, project, row_id):
                 marker = _marker(cur, project, row_id)
                 if marker:
@@ -795,6 +805,7 @@ def purge_due(conn, *, now: datetime | None = None) -> dict[str, Any]:
     for project, row_id in due:
         try:
             with conn.cursor() as cur:
+                lock_project(cur, project)
                 purged += int(_purge_row(cur, project, row_id))
             conn.commit()
         except BaseException:
