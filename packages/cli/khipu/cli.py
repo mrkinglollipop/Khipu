@@ -875,6 +875,15 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         routing_block = _routing.doctor_block()
     except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
         routing_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # Owner direction (docs/plans/2026-10-16-owner-direction.md, 2.6): turns
+    # the prompt hook recorded in the last day per harness. Red when the check
+    # is on and a harness with the hook installed recorded none; never gates `ok`.
+    try:
+        from khipu import owner_turns as _owner_turns
+
+        owner_direction_block = _owner_turns.doctor_block()
+    except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
+        owner_direction_block = {"ok": False, "warnings": [], "error": f"{type(e).__name__}: {e}"}
     # The ledger (Work view phase 1): counts per project, removed rows waiting
     # to purge, purged markers, offline copy. Only the outbox gates (above).
     try:
@@ -932,12 +941,14 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "decision_links": decision_links_block,
         "plan_usage": plan_usage_block,
         "routing": routing_block,
+        "owner_direction": owner_direction_block,
         "ledger": ledger_block,
         "schema_migrations": schema,
         "work": work_block,
         "promotion": _promotion_block(),
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
+                     + list(owner_direction_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
                      + list(schema.get("warnings") or [])),
         "not_configured": not_configured,

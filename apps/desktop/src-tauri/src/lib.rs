@@ -6004,7 +6004,7 @@ mod audit_1010_regression_tests {
     #[test]
     fn bundle_stages_both_recall_launchers() {
         let script = include_str!("../../scripts/bundle_cli.sh");
-        for name in ["khipu-prompt-recall", "khipu-recall-client.py"] { assert!(script.contains(name), "{name}"); }
+        for name in ["khipu-prompt-recall", "khipu-recall-client.py", "khipu-owner-turn.py"] { assert!(script.contains(name), "{name}"); }
     }
 
     #[test]

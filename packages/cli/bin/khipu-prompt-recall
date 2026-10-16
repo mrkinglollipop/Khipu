@@ -5,10 +5,11 @@
 # {} when nothing qualifies. Never fails a turn: any error -> {}.
 # Aegis's runner env means Aegis is calling, and Aegis gets no per-prompt
 # push by ANY route: its UserPromptSubmit is an Observe gate that discards
-# stdout, same as its SessionStart (see khipu/recall_rule.py). Refuse on
-# GROK runner vars AND on the pack's KHIPU_HARNESS=aegis mark, same guard as
-# khipu-recall-hook.
-if [ -n "${GROK_HOOK_NAME:-}${GROK_HOOK_EVENT:-}" ] || [ "${KHIPU_HARNESS:-}" = "aegis" ]; then
+# stdout, same as its SessionStart (see khipu/recall_rule.py). A compat import
+# (GROK runner vars without the pack's KHIPU_HARNESS=aegis mark) runs nothing
+# at all, same guard as khipu-recall-hook. The pack's own entry only records
+# the owner's turn (below) and then prints {}.
+if [ -n "${GROK_HOOK_NAME:-}${GROK_HOOK_EVENT:-}" ] && [ "${KHIPU_HARNESS:-}" != "aegis" ]; then
   cat >/dev/null 2>&1
   echo '{}'
   exit 0
@@ -37,8 +38,23 @@ SHAPE=claude
 for a in "$@"; do
   case "$a" in --cursor) SHAPE=cursor ;; esac
 done
-# stdin can be read once, and both paths below need the payload.
+# stdin can be read once, and every path below needs the payload.
 PAYLOAD=$(cat)
+# Owner direction: record the turn first, on every path (khipu.owner_turns).
+# The recorder is stdlib-only, prints the turn token or nothing, and never
+# fails; only a token it printed reaches the answer, never one inherited.
+unset KHIPU_OWNER_TURN
+if [ -f "$SELF_DIR/khipu-owner-turn.py" ]; then
+  TURN=$(printf '%s' "$PAYLOAD" | "$PY" -S -E -B "$SELF_DIR/khipu-owner-turn.py" 2>/dev/null)
+  case "$TURN" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+      [ "$SHAPE" = "claude" ] && KHIPU_OWNER_TURN="$TURN" && export KHIPU_OWNER_TURN ;;
+  esac
+fi
+if [ "${KHIPU_HARNESS:-}" = "aegis" ]; then
+  echo '{}'
+  exit 0
+fi
 # The warm recall service (khipu recall serve) answers in a few milliseconds; the
 # client is stdlib-only. Exit 3 selects cold fallback; after a connected
 # failure it also supplies the remaining absolute deadline. Exit 4 means

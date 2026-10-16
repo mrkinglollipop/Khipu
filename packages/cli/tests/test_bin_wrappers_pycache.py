@@ -28,6 +28,9 @@ DONTWRITE_WRAPPERS = ("khipu-aegis-capture",)
 # them under `python3 -S -E -B`): nothing of theirs is ever compiled to a .pyc,
 # so there is no bytecode cache to redirect.
 STDLIB_ONLY_SCRIPTS = ("khipu-recall-client.py",)
+# Python scripts the launcher runs with ``-B``: they import a few stdlib-only
+# khipu modules, and ``-B`` keeps those from ever being written as bytecode.
+NO_BYTECODE_SCRIPTS = {"khipu-owner-turn.py": "khipu-prompt-recall"}
 
 
 @pytest.mark.parametrize("name", PYCACHE_WRAPPERS)
@@ -58,11 +61,17 @@ def test_stdlib_only_script_imports_no_khipu(name):
     assert "import khipu" not in text and "from khipu" not in text, name
 
 
+@pytest.mark.parametrize("name,launcher", sorted(NO_BYTECODE_SCRIPTS.items()))
+def test_no_bytecode_script_is_run_with_dash_b(name, launcher):
+    text = (BIN_DIR / launcher).read_text(encoding="utf-8")
+    assert f'-S -E -B "$SELF_DIR/{name}"' in text, name
+
+
 def test_every_wrapper_covered():
     """Guards against a new bin/khipu-* launcher shipping without either
     mechanism — extend PYCACHE_WRAPPERS or DONTWRITE_WRAPPERS above."""
     all_wrappers = {p.name for p in BIN_DIR.iterdir() if p.is_file()}
-    known = set(PYCACHE_WRAPPERS) | set(DONTWRITE_WRAPPERS) | set(STDLIB_ONLY_SCRIPTS)
+    known = set(PYCACHE_WRAPPERS) | set(DONTWRITE_WRAPPERS) | set(STDLIB_ONLY_SCRIPTS) | set(NO_BYTECODE_SCRIPTS)
     unaccounted = all_wrappers - known
     # No allowlist. khipu-capture-hook was the last entry and had no reference
     # anywhere in the repo (audit 2026-09-04) — it was deleted rather than

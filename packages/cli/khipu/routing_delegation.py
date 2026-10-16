@@ -499,7 +499,132 @@ def hook_main(raw: str, environ=None) -> tuple[dict, dict | None, str | None]:
         return ({} if _helper(payload) else subagent_start(payload)), None, None
     if event and event != "PreToolUse":
         return {}, None, None
-    return pre_tool_use(payload, environ)
+    out = pre_tool_use(payload, environ)
+    # After the push, so noting the brief never spends the push's time budget.
+    note_brief(payload, env)
+    return out
+
+
+# The field a delegation tool's brief arrives in: Claude Code's Agent (and
+# Task) ``prompt``, Codex's spawn_agent ``message``. T3's delegate_task has no
+# fixture yet, so every text value in its input long enough to be a brief is
+# noted: a field under any name still marks the job's first turn.
+_BRIEF_FIELDS = {"Agent": ("prompt",), "Task": ("prompt",), "spawn_agent": ("message",)}
+
+
+def _texts(value: Any, depth: int = 0) -> list[str]:
+    if isinstance(value, str):
+        return [value] if len(value.split()) >= 4 else []
+    if depth >= 3:
+        return []
+    items = value.values() if isinstance(value, dict) else value if isinstance(value, list) else ()
+    return [t for v in items for t in _texts(v, depth + 1)]
+# What a dispatch command's options look like, to find its prompt word. An
+# option not listed here (or one that takes several words) means the prompt
+# cannot be told apart safely, and the brief is not noted.
+_CLAUDE_FLAGS = frozenset({"-p", "--print", "--verbose", "--dangerously-skip-permissions", "-c", "--continue",
+                           "--include-partial-messages", "--strict-mcp-config", "--no-session-persistence"})
+_CLAUDE_VALUED = frozenset({"--model", "--output-format", "--input-format", "--append-system-prompt",
+                            "--system-prompt", "--permission-mode", "--max-turns", "--fallback-model",
+                            "--session-id", "--settings", "--setting-sources", "--permission-prompt-tool",
+                            "--effort", "--agent", "--json-schema", "--max-budget-usd"})
+_CODEX_FLAGS = frozenset({"--json", "--skip-git-repo-check", "--full-auto", "--oss", "--ephemeral",
+                          "--dangerously-bypass-approvals-and-sandbox", "--experimental-json"})
+_CODEX_VALUED = frozenset({"-m", "--model", "-c", "--config", "-C", "--cd", "-s", "--sandbox", "-p", "--profile",
+                           "-o", "--output-last-message", "--color", "--output-schema", "--local-provider"})
+
+
+def _prompt_word(args: list[str], flags: frozenset[str], valued: frozenset[str]) -> str | None:
+    """The one prompt word of a dispatch command's arguments, or None."""
+    i = 0
+    while i < len(args):
+        word = args[i]
+        if word in flags:
+            i += 1
+        elif word in valued:
+            i += 2
+        elif word.startswith("--") and word.split("=", 1)[0] in valued and "=" in word:
+            i += 1
+        elif word.startswith("-"):
+            return None
+        else:
+            # A word the shell would still expand is not the text the job got.
+            return None if ("$(" in word or "`" in word) else word
+    return None
+
+
+def shell_briefs(command: Any, deadline: float | None = None) -> list[str] | None:
+    """The prompts of the ``claude -p`` and ``codex exec`` commands a shell
+    command starts, or None when one of them cannot be read safely (stdin,
+    an option this does not know, a command substitution)."""
+    deadline = time.monotonic() + _SCAN_BUDGET_S if deadline is None else deadline
+    try:
+        if isinstance(command, list):
+            argvs = [_bounded_argv(command, deadline) or []]
+        elif isinstance(command, str):
+            argvs = _segments(command, deadline)
+        else:
+            return None
+        out = []
+        for argv in argvs:
+            argv = _strip_prefix(argv, deadline)
+            if not argv:
+                continue
+            base, args = os.path.basename(argv[0]), argv[1:]
+            if base == "claude" and _prints(args):
+                word = _prompt_word(args, _CLAUDE_FLAGS, _CLAUDE_VALUED)
+            elif base == "codex" and "exec" in args:
+                word = _prompt_word(args[args.index("exec") + 1:], _CODEX_FLAGS, _CODEX_VALUED)
+                if word in ("resume", "review", "-"):
+                    word = None
+            else:
+                continue
+            if word is None:
+                return None
+            out.append(word)
+        return out
+    except _OutOfTime:
+        return None
+
+
+def briefs_of(payload: dict) -> list[str]:
+    """The briefs a delegation call hands on, where they can be read."""
+    name = _tool_name(payload)
+    tool_input = payload.get("tool_input") or payload.get("toolInput")
+    if name is None or not isinstance(tool_input, dict):
+        return []
+    if name == "delegate_task" or name.endswith("__delegate_task"):
+        return _texts(tool_input)
+    if name in _BRIEF_FIELDS:
+        for field in _BRIEF_FIELDS[name]:
+            if isinstance(tool_input.get(field), str):
+                return [tool_input[field]]
+        return []
+    if name in SHELL_TOOLS:
+        command = tool_input.get(SHELL_TOOLS[name])
+        if not _mentions(command, ("claude", "codex"), time.monotonic() + _SCAN_BUDGET_S):
+            return []
+        return shell_briefs(command) or []
+    return []
+
+
+def note_brief(payload: dict, env) -> None:
+    """Owner direction: note each brief this call hands on, so the job's
+    first turn (the brief) is never taken for the owner's (``owner_turns``).
+    Runs whatever the routing push's switches say. Never raises."""
+    try:
+        if not might_delegate(payload):
+            return
+        from khipu import owner_turns
+
+        if not owner_turns.settings()["enabled"]:
+            return
+        parent = str(payload.get("session_id") or payload.get("sessionId") or "")
+        harness = owner_turns.harness_of(env, payload)
+        for brief in briefs_of(payload):
+            owner_turns.note_brief(brief, parent=parent, harness=harness)
+    except Exception:  # noqa: BLE001 - noting a brief never fails the call
+        pass
 
 
 def main() -> None:
