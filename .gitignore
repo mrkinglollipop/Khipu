@@ -15,3 +15,6 @@ apps/desktop/src-tauri/target/
 
 # Marketing production and media are maintained outside the public product repo.
 /docs/sizzle-reel/
+
+# Shared Rust build output for worktrees
+/.cargo-target/
