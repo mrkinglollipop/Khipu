@@ -253,13 +253,28 @@ def _trips_redaction(text: str) -> bool:
     return routing_sources._redacted(text, len(text) + 1) != text
 
 
+PATH_WORDS = "(a path)"
+
+
+def _path_token(token: str) -> bool:
+    """Whether one space-free word is path-shaped once the quotes and
+    punctuation around it are set aside."""
+    return bool(_PATH_SHAPE.search(token.lstrip(_WRAP_OPEN).rstrip(_WRAP_CLOSE)))
+
+
+def _has_path(text: str) -> bool:
+    return any(_path_token(t) for t in _LINK.sub(" ", text).split())
+
+
 def _cut_paths(text: str) -> str:
-    """Each token holding a slash or a backslash cut to its last name."""
+    """Each path-shaped word replaced with PATH_WORDS (its quotes and
+    punctuation kept); links and every other word are left as they are."""
     out = []
     for token in text.split(" "):
-        if "/" in token or "\\" in token:
-            tail = re.split(r"[/\\]+", token.rstrip("/\\"))[-1]
-            token = tail or token.strip("/\\")
+        if not _LINK.search(token) and _path_token(token):
+            core = token.lstrip(_WRAP_OPEN).rstrip(_WRAP_CLOSE)
+            start = token.index(core)
+            token = token[:start] + PATH_WORDS + token[start + len(core):]
         out.append(token)
     return " ".join(out)
 
@@ -282,12 +297,17 @@ def clean_text(value: Any, cap: int) -> str | None:
     return text
 
 
-# A routing account key ("harness|login folder"); a path at a word's start
-# ("/x", "~/x", a backslash path, a drive letter); or a word holding any folder
-# separator, so a relative "folder/file" too. A link's own path is not a local
-# path: links are cut out first.
+# A routing account key ("harness|login folder"). A word is path-shaped when it
+# starts with ~, ./, ../, / or \ (or a separator follows punctuation inside it,
+# as in "dir=/x"), is a drive path, holds two or more separators, or holds one
+# and ends in a file extension. So "a/b/c" and "source/private.txt" are paths;
+# "CI/CD", "and/or" and "3/4" are not. A link's own path is not a local path:
+# links are cut out first.
 _ACCOUNT_KEY = re.compile(r"(?i)(?<![\w-])(?:claude|codex|grok|muse)\|")
-_PATH_SHAPE = re.compile(r"(?:^|[^\w.-])(?:~[/\\]|/(?=[\w.~-])|\\)|\b[A-Za-z]:[/\\]|[^\s/\\]+[/\\]")
+_PATH_SHAPE = re.compile(r"^~(?:[/\\]|[A-Za-z_]|$)|^\.{1,2}[/\\]|^[/\\](?=[\w.~-])|[^\w.-][/\\]"
+                         r"|[A-Za-z]:[/\\]|[/\\].*[/\\]|[/\\][^/\\]*\.[A-Za-z0-9]+$")
+_WRAP_OPEN = "\"'`([{<"
+_WRAP_CLOSE = "\"'`)]}>,;:!?."
 _LINK = re.compile(r"https://\S+")
 
 
@@ -296,7 +316,7 @@ def _private_text(text: str, table: Any = None) -> bool:
     holds an account key or is path-shaped, or (given agent_view's table)
     names a login folder, the home folder or a user name."""
     one = " ".join(text.split())
-    if _trips_redaction(one) or _ACCOUNT_KEY.search(text) or _PATH_SHAPE.search(_LINK.sub(" ", text)):
+    if _trips_redaction(one) or _ACCOUNT_KEY.search(text) or _has_path(text):
         return True
     if table is not None:
         from khipu import agent_view
