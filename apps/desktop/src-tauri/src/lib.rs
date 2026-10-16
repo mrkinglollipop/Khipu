@@ -784,6 +784,10 @@ fn checked_usage_accounts_kept(raw: &str, stored: &[Value]) -> Result<String, St
                 out.push(kept.clone());
                 continue;
             }
+        } else if stored.contains(entry) {
+            // Not an object (a hand-edited null, say), stored exactly so: kept.
+            out.push(entry.clone());
+            continue;
         }
         let obj = entry
             .as_object()
@@ -5194,6 +5198,17 @@ mod priority_and_sign_in_tests {
         let changed = r#"[{"harness": "legacy-cli", "label": "Renamed"}]"#;
         assert!(checked_usage_accounts_kept(changed, &stored).is_err());
         assert!(checked_usage_accounts(r#"[{"harness": "legacy-cli", "label": "Legacy"}]"#).is_err());
+    }
+
+    #[test]
+    fn an_untouched_entry_that_is_not_an_object_goes_through_as_stored() {
+        let stored: Vec<Value> = serde_json::from_str(r#"[{"harness": "codex", "label": "Codex"}, null, 7]"#).unwrap();
+        let sent = r#"[{"harness": "codex", "label": "Codex"}, null, 7, {"harness": "claude", "label": "Work"}]"#;
+        let out: Value = serde_json::from_str(&checked_usage_accounts_kept(sent, &stored).unwrap()).unwrap();
+        assert_eq!(out[1], Value::Null);
+        assert_eq!(out[2], serde_json::json!(7));
+        // One not stored is still refused.
+        assert!(checked_usage_accounts_kept(r#"[null, "x"]"#, &stored).is_err());
     }
 
     fn acct(harness: &str, home: Option<&str>, label: Option<&str>) -> AccountEntry {

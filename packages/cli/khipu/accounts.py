@@ -361,7 +361,7 @@ def _plan(before: list[dict], after: list[dict], *, moves: bool) -> list[tuple]:
 
 def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: dict | None = None,
             none: bool = False, view: dict | None = None, keep_priority: bool = False, keep_pause: bool = False,
-            keep_lanes: bool = False, end_holds=()) -> dict:
+            keep_lanes: bool = False, end_holds=(), confirmed: list | None = None) -> dict:
     """The one write of the account list, under ``_locked``: ``base`` (the
     list as it stood) becomes ``parsed`` (checked by
     ``usage.parse_usage_accounts``) through the operations ``_plan`` finds,
@@ -379,12 +379,16 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
     the same list change and notes, written by the conversation and kept
     for the owner to confirm or undo; no move (moving a login folder is the
     owner's), and the owner's own settings (lanes, priority, pause, holds,
-    Not offered again) stay as they are."""
+    Not offered again) stay as they are.
+
+    The owner's confirm of that request passes ``confirmed``, the list as it
+    stood before it: each account the request took off then gets the owner's
+    Stop tracking, as above; its other notes are the request's own."""
     owner = request is None
     before = copy.deepcopy(data)
     after_list = parsed if parsed or none else _installed_defaults()
-    known, after = known_of(base), known_of(after_list)
-    ops = _plan(known, after, moves=owner)
+    known, after = known_of(base if confirmed is None else confirmed), known_of(after_list)
+    ops = _plan(known, after, moves=owner and confirmed is None)
     old = {a["key"]: a for a in known}
     new = {a["key"]: a for a in after}
     moves = [(op[1], op[2]) for op in ops if op[0] == "move"]
@@ -399,6 +403,13 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
             for runner, lane in _lanes_on(data.get("routing_lane_map") or {}, was, known):
                 data["routing_lane_map"][runner][lane] = now
                 moved_lanes.append((runner, lane))
+            # A conversation's lane map still waiting for the owner keeps the
+            # map it replaced for his Undo: its lanes follow the move too, so
+            # Undo never hands them to whoever tracks the old folder next.
+            waiting = routing._setting_requests(data).get("routing_lane_map") or {}
+            if isinstance(waiting.get("prior"), dict):
+                for runner, lane in _lanes_on(waiting["prior"], was, known):
+                    waiting["prior"][runner][lane] = now
         if not keep_lanes and any(stop_lanes.values()):
             lane_map = {r: dict(v) for r, v in data["routing_lane_map"].items()}
             for runner, lane in (pair for k in stops for pair in stop_lanes[k]):
@@ -407,7 +418,8 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
                     lane_map.pop(runner)
             data["routing_lane_map"] = lane_map
     events: list[dict] = [{"type": "account_move", "account": was, "target": now} for was, now in moves]
-    notes = [{"type": "account_note", "account": k, "state": "renamed", "text": old[k]["label"]} for k in renames]
+    notes = [{"type": "account_note", "account": k, "state": "renamed", "text": old[k]["label"]}
+             for k in renames if confirmed is None]
     done: dict = {"priority": None, "pause": None}
     if stops and owner:
         view = routing.read_view() if view is None else view
@@ -419,7 +431,8 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
         # What a lane said while two accounts carried its label stays
         # unmatched once this change leaves the label to one.
         notes[0] = dict(notes[0], **_cuts(repairs))
-    events += notes + [{"type": "account_note", "account": k, "state": "tracked"} for k in tracks]
+    events += notes + [{"type": "account_note", "account": k, "state": "tracked"} for k in tracks
+                       if confirmed is None]
     held = None
     if not owner:
         held = dict(request, prior=stored, prior_none=data.get("usage_accounts_none"))
@@ -937,7 +950,11 @@ def answer_request(action: str, *, expect=None, via: str = "app") -> dict:
             res = _commit(data, stored, base, prior if isinstance(prior, list) else [], via=via,
                           none=request.get("prior_none") is True)
         else:
-            res = _commit(data, stored, base, list(stored or []), via=via)
+            prior = request.get("prior")
+            if not (isinstance(prior, list) and prior):
+                prior = [] if request.get("prior_none") is True else _installed_defaults()
+            res = _commit(data, stored, base, list(stored or []), via=via, none=usage.reads_none(data),
+                          confirmed=prior)
     _settle(res)
     return {"ok": True, "version": res["version"], "action": action}
 

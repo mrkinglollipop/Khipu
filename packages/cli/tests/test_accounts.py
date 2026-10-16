@@ -1358,3 +1358,44 @@ def test_the_app_accepts_every_version_the_python_code_makes(mac, tmp_path):
     assert all(config.is_version(v) for v in made), made
     ran = subprocess.run([str(binary), *made], capture_output=True, text=True, timeout=10)
     assert ran.returncode == 0, (ran.stderr, made)
+
+
+# ---- review round 7 ----------------------------------------------------------------------
+
+
+def test_confirming_a_requested_removal_runs_the_owners_stop(mac):
+    _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
+    routing.pause("claude|", via="app")
+    routing.set_priority([{"account": "claude|"}, {"account": "codex|"}], via="app",
+                         expect=routing.priority_version())
+    routing.set_setting("routing_lane_map", {"jobs": {"r": "claude|"}})
+    accounts.save_list([{"harness": "codex", "label": "Second"}], expect=_version(),
+                       request={"by": ME, "request": "remove First"})
+    accounts.answer_request("confirm", expect=_version())
+    view = routing.read_view()
+    assert [e["account"] for e in view["priority"]["entries"]] == ["codex|"]
+    assert config.load_config()["routing_lane_map"] == {}
+    assert [(a["key"], a["state"]) for a in view["accounts"]] == [("codex|", "unknown")]
+
+
+def test_an_untouched_entry_that_is_not_an_object_survives_track(mac):
+    _set(usage_accounts=[{"harness": "claude", "label": "First"}, None])
+    (mac["home"] / ".claude-work").mkdir()
+    accounts.track([{"harness": "claude", "label": "Work", "home": "~/.claude-work"}], expect=_version(),
+                   read=False)
+    assert _stored()[1] is None
+
+
+def test_undo_of_a_lane_request_follows_a_later_move(mac):
+    _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
+    (mac["home"] / ".claude-moved").mkdir()
+    old, new = "claude|", _key("~/.claude-moved")
+    routing.set_setting("routing_lane_map", {"jobs": {"r": old}})
+    routing.set_setting("routing_lane_map", {"jobs": {"r": "codex|"}}, request={"by": ME, "request": "try Second"})
+    accounts.move(old, "~/.claude-moved", expect=_version())
+    routing.answer_setting_request("routing_lane_map", "undo")
+    assert config.load_config()["routing_lane_map"] == {"jobs": {"r": new}}
+    accounts.track([{"harness": "claude", "label": "New tenant"}], expect=_version(), read=False)
+    routing.report(state="limited", runner="jobs", lane="r", until="2h", author=ME)
+    states = {a["key"]: a["state"] for a in routing.read_view()["accounts"]}
+    assert states[new] == "limited" and states[old] != "limited", states

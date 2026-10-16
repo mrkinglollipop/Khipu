@@ -30,6 +30,7 @@ absent, never zero.
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import heapq
 import json
@@ -1011,7 +1012,7 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
         raise AccountsError('usage_accounts must be a list of {"label", "harness", "home"} entries', "bad_list")
     if len(raw) > ACCOUNTS_MAX:
         raise AccountsError(f"usage_accounts holds at most {ACCOUNTS_MAX} entries, got {len(raw)}", "too_many")
-    kept = [e for e in (previous or []) if isinstance(e, dict)]
+    kept = list(previous or [])
     # Ids all start "acct-" (``routing.account_id``): only a name that does
     # needs them worked out (which makes this install's id secret).
     ids = _account_ids(raw) if any(isinstance(e, dict)
@@ -1024,10 +1025,12 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
     checked: list[tuple[dict, bool]] = []
     for i, entry in enumerate(raw):
         where = f"usage_accounts entry {i + 1}"
-        if any(_same_entry(entry, old) for old in kept):
-            # Stored as it is: kept whatever per-entry rule it breaks today.
+        if any(_same_entry(entry, old) or (not isinstance(entry, dict) and type(entry) is type(old)
+                                           and entry == old) for old in kept):
+            # Stored as it is (an object, or any other JSON value): kept
+            # whatever per-entry rule it breaks today.
             checked.append((_account_from_entry(entry), True))
-            out.append(dict(entry))
+            out.append(copy.deepcopy(entry))
             continue
         if not isinstance(entry, dict):
             raise AccountsError(f"{where} is not an object", "bad_entry", index=i)
