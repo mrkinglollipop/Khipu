@@ -544,7 +544,7 @@ def installed_corpus(tmp_dir: Path, **build_kwargs: Any):
     profile_dim = build_kwargs.get("profile_dim", PROFILE_DIM)
     handle = build_corpus(tmp_dir, **build_kwargs)
 
-    def _fake_query_embed(prompt: str, profile: str) -> list[float]:  # noqa: ARG001
+    def _fake_query_embed(prompt: str, profile: str, deadline: float | None = None) -> list[float]:  # noqa: ARG001
         return pseudo_embed(prompt, dim=profile_dim)
 
     with mock.patch.object(hs, "snapshot_path", return_value=handle.snapshot_path), \

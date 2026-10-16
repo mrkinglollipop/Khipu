@@ -504,7 +504,8 @@ def test_replay_refuses_an_empty_answer_where_live_had_one(home, monkeypatch):
     assert not out["ok"] and "empty answer where live had 1 hit" in out["detail"]
 
 
-def _cosine_only_hook(runs: list, cand_late: list[bool], live_late: tuple[bool, ...] = (False,)):
+def _cosine_only_hook(runs: list, cand_late: list[bool], live_late: tuple[bool, ...] = (False,),
+                      note: str = "embedding late"):
     """A fake hook for a query whose words match nothing: its hits come from
     the cosine leg alone, so a run whose embedding was late answers nothing
     (``legs=['lexical'] degraded=embedding late``). The candidate's runs with
@@ -519,7 +520,7 @@ def _cosine_only_hook(runs: list, cand_late: list[bool], live_late: tuple[bool, 
         nth = sum(1 for r in runs if r == (who, "off")) - 1
         plan = cand_late if who == "cand" else live_late
         late = (not on) and nth < len(plan) and plan[nth]
-        hits, legs, degraded = ([], ["lexical"], "embedding late") if late else (
+        hits, legs, degraded = ([], ["lexical"], note) if late else (
             ["episode:3"], ["lexical", "cosine"], None)
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         line = (f"{stamp} [khipu-prompt-recall] session=s1 reason=ok ms=300.0 hits={hits} legs={legs} "
@@ -553,6 +554,23 @@ def test_replay_notes_an_empty_answer_whose_legs_differ_from_live_twice(home, mo
     assert out["ok"], out
     assert "empty where live had 1 hit(s) not counted" in out["detail"]
     assert "degraded=embedding late" in out["detail"]
+
+
+def test_replay_refuses_an_embedding_that_failed_on_every_prompt_while_live_s_ran(home, monkeypatch):
+    # A failed embedding on one cold run is the provider; on every replayed
+    # prompt while live's ran, it is the candidate's code.
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _cosine_only_hook([], cand_late=[True] * 4, note="embedding error"))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert "the candidate's embedding failed on all 1 prompt(s) while live's ran" in out["detail"]
+
+
+def test_replay_passes_an_embedding_that_failed_once_then_ran(home, monkeypatch):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _cosine_only_hook([], cand_late=[True], note="embedding error"))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"], out
 
 
 def test_replay_still_refuses_an_empty_answer_when_the_replay_ran_live_s_legs(home, monkeypatch):

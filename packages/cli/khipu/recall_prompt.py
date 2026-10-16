@@ -1852,6 +1852,12 @@ def _relevance_gate(rows: list[dict[str, Any]], tokens: list[str]) -> list[dict[
 # file-based since this lane must not need Postgres at all.
 QUERY_EMBED_CACHE_MAX = 500
 QUERY_EMBED_LOCAL_TIMEOUT_S = 0.7
+# A provider error that may pass (429, a 5xx, a dropped connection) is tried
+# once more only while at least this much of the lane's deadline is left: the
+# measured cold query embed is 0.3-0.6 s, and the cosine scan still needs its
+# share after it.
+QUERY_EMBED_RETRY_MIN_S = 0.3
+_TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
 
 # Phase 0 session C (finding B10): the single JSON file this cache used to be
 # was parsed in full on EVERY prompt (measured 46ms at 8.5MB) and rewritten
@@ -1958,14 +1964,33 @@ def _query_embed_cache_put(key: str, vec: list[float]) -> None:
         pass
 
 
-def _cached_query_embed(prompt: str, profile: str) -> list[float]:
+def _transient_embed_error(exc: BaseException) -> bool:
+    """Whether a query-embed failure may pass on a second try: a 429 or 5xx,
+    or a network error, found anywhere in the exception's cause chain (the
+    embed client wraps both in RuntimeError). A refused key, a bad request or
+    a spent budget is not."""
+    import urllib.error
+
+    seen = exc
+    while seen is not None:
+        if isinstance(seen, urllib.error.HTTPError):
+            return seen.code in _TRANSIENT_HTTP
+        if isinstance(seen, OSError):  # URLError, connection resets, socket timeouts
+            return True
+        seen = seen.__cause__
+    return False
+
+
+def _cached_query_embed(prompt: str, profile: str, deadline: float | None = None) -> list[float]:
     """The query vector for ``prompt`` under ``profile`` — cached locally by
     sha256(profile + normalized prompt); a cache miss costs one embed API
     call on its OWN short budget (QUERY_EMBED_LOCAL_TIMEOUT_S), separate
     from the per-prompt hook's overall 1.2s wall clock, so a slow/failed
     embed call gives up on the COSINE leg specifically rather than eating
     the whole budget and returning nothing when the lexical leg alone would
-    have had something.
+    have had something. A transient provider error is tried once more when
+    ``deadline`` leaves at least QUERY_EMBED_RETRY_MIN_S, on a timeout that
+    ends by the deadline.
     """
     from khipu.embed import embed_one, prefix_query, uses_task_prefixes
     from khipu.redact import redact_secrets
@@ -1976,10 +2001,19 @@ def _cached_query_embed(prompt: str, profile: str) -> list[float]:
     if hit:
         return hit
     api_q = prefix_query(prompt) if uses_task_prefixes(profile) else prompt
-    vec = embed_one(
-        api_q, profile=profile, retries=0, timeout=QUERY_EMBED_LOCAL_TIMEOUT_S, delay=0,
-        input_type="query",
-    )
+    timeout = QUERY_EMBED_LOCAL_TIMEOUT_S
+    for attempt in (1, 2):
+        try:
+            vec = embed_one(
+                api_q, profile=profile, retries=0, timeout=timeout, delay=0, input_type="query",
+            )
+            break
+        except Exception as exc:
+            left = None if deadline is None else deadline - time.monotonic()
+            if attempt == 2 or left is None or left < QUERY_EMBED_RETRY_MIN_S or not _transient_embed_error(exc):
+                raise
+            _log(f"query embed retried once: {type(exc).__name__}")
+            timeout = min(QUERY_EMBED_LOCAL_TIMEOUT_S, left)
     _query_embed_cache_put(key, vec)
     return vec
 
@@ -2076,7 +2110,7 @@ def _snapshot_search_hits(
 
     def _cosine_worker() -> None:
         try:
-            vec = _cached_query_embed(prompt, profile)
+            vec = _cached_query_embed(prompt, profile, deadline)
             cosine_box["rows"] = hub_snapshot.cosine_candidates_snapshot(
                 vec, profile, limit=_SEARCH_LIMIT, deadline=deadline
             )
@@ -2087,6 +2121,11 @@ def _snapshot_search_hits(
     if profile:
         t_cos = threading.Thread(target=_cosine_worker, daemon=True)
         t_cos.start()
+        # The vector matrix loads while the embedding request is in flight. A
+        # one-shot hook has no cached matrix, and loading it (about 0.25 s for
+        # 25,000 rows) only after the embedding returned (0.3-0.6 s) ran the
+        # scan past the deadline on about a third of cold prompts (2026-10-16).
+        threading.Thread(target=hub_snapshot.warm_matrix, args=(profile,), daemon=True).start()
 
     # Keyword leg runs on the calling thread while the embedding request (if
     # any) is in flight on its own daemon thread above.
@@ -2123,8 +2162,9 @@ def _snapshot_search_hits(
             legs.append("cosine")
             cosine_rows = cosine_box["rows"]
         elif "error" in cosine_box:
-            degraded = "embedding error"
             exc = cosine_box["error"]
+            # The scan's own deadline is lateness, not a failed embedding.
+            degraded = "embedding late" if isinstance(exc, TimeoutError) else "embedding error"
             _log(f"snapshot cosine leg skipped: {type(exc).__name__}: {exc}")
         else:
             degraded = "embedding late"

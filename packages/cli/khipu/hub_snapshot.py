@@ -5282,6 +5282,17 @@ def _matrix_rows(
         _MATRIX_LOCK.release()
 
 
+def warm_matrix(profile: str, kind: str | None = None) -> None:
+    """Load the replica's vectors for ``profile`` into the generation cache,
+    so a scan that starts later finds them there (or waits on this load under
+    the lock instead of starting its own). Never raises: the scan reports any
+    failure itself."""
+    try:
+        _matrix_rows(snapshot_path(), profile, kind)
+    except Exception as exc:  # noqa: BLE001 — a warm-up only
+        _log(f"replica matrix warm-up skipped: {type(exc).__name__}")
+
+
 def cosine_candidates_snapshot(
     vec: Sequence[float], profile: str, *, limit: int, kind: str | None = None,
     deadline: float | None = None,
