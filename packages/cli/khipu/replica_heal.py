@@ -36,6 +36,8 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "replica_refresh_after": ("duration", 15 * 60,
                               "Bring this Mac's copy up to date when its last update is this old (0: at every check)"),
     "replica_check_every": ("duration", 5 * 60, "How often the background job checks this Mac's copy"),
+    "hub_down_memo_for": ("duration", 60,
+                          "After a failed connection to the database, skip new attempts for this long (0: never skip)"),
 }
 CHECK_EVERY_MIN_S = 60
 STATE_NAME = "replica-heal.json"
@@ -135,6 +137,23 @@ def ensure_wake_file() -> Path:
     if not path.exists():
         path.write_text("", encoding="utf-8")
     return path
+
+
+def wake() -> None:
+    """Ask the job for a check now (the plist watches the wake file). Silent
+    when the file cannot be touched; skipped in an isolated run."""
+    from khipu.paths import isolated_dir
+
+    if isolated_dir() is not None:
+        return
+    try:
+        path = wake_path()
+        try:
+            os.utime(path)
+        except FileNotFoundError:
+            ensure_wake_file()
+    except OSError:
+        pass
 
 
 def read_state() -> dict[str, Any]:

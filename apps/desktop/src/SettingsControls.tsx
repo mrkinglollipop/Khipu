@@ -570,6 +570,20 @@ export function ReplicaCopyCard({ active }: { active: boolean }) {
             />
           );
         })}
+        <SettingField
+          label="Skip the database after a failed connection for (seconds)"
+          help="After a connection to the database fails, recall and search use this Mac's copy without trying again for this long. 0 always tries. Default 60."
+          narrow
+          inputMode="decimal"
+          value={cfg.data?.replica?.hub_down_memo_for ? String(cfg.data.replica.hub_down_memo_for.value) : ""}
+          canReset={cfg.data?.replica?.hub_down_memo_for?.source === "file"}
+          onReset={() => unsetConfig("hub_down_memo_for", cfg.reload)}
+          onSave={async (v) =>
+            /^\d{1,7}$/.test(v.trim())
+              ? writeConfig("hub_down_memo_for", String(Number(v.trim())), cfg.reload)
+              : "Enter a whole number of seconds, 0 or more."
+          }
+        />
       </div>
     </div>
   );

@@ -618,10 +618,11 @@ fn checked_backup_remote(value: &str) -> Result<String, String> {
     }
 }
 /// Settings -> Data, "This Mac's copy": how old the copy may get before the
-/// background job updates it, and how often the job looks. Lengths of time in
+/// background job updates it, how often the job looks, and how long a failed
+/// database connection is remembered. Lengths of time in
 /// whole seconds (the page shows minutes); `config --set KEY N` or
 /// `config --unset=KEY` (the default again).
-const REPLICA_DURATION_KEYS: &[&str] = &["replica_refresh_after", "replica_check_every"];
+const REPLICA_DURATION_KEYS: &[&str] = &["replica_refresh_after", "replica_check_every", "hub_down_memo_for"];
 
 /// A whole number of seconds: digits only, at most ten years, and the check
 /// interval at least a minute (the CLI's own floor).
@@ -4835,6 +4836,12 @@ mod settings_command_tests {
         assert_eq!(config_set_argv("replica_refresh_after", " 0 ").unwrap(), v(&["config", "--set", "replica_refresh_after", "0"]));
         assert_eq!(config_set_argv("replica_check_every", "60").unwrap(), v(&["config", "--set", "replica_check_every", "60"]));
         assert_eq!(config_unset_argv("replica_check_every").unwrap(), v(&["config", "--unset=replica_check_every"]));
+        assert_eq!(config_set_argv("hub_down_memo_for", "90").unwrap(), v(&["config", "--set", "hub_down_memo_for", "90"]));
+        assert_eq!(config_set_argv("hub_down_memo_for", "0").unwrap(), v(&["config", "--set", "hub_down_memo_for", "0"]));
+        assert_eq!(config_unset_argv("hub_down_memo_for").unwrap(), v(&["config", "--unset=hub_down_memo_for"]));
+        for bad in ["-1", "1.5", "abc", ""] {
+            assert!(config_set_argv("hub_down_memo_for", bad).is_err(), "{bad}");
+        }
         for bad in ["-1", "abc", "1e3", ""] {
             assert!(config_set_argv("replica_refresh_after", bad).is_err(), "{bad}");
         }

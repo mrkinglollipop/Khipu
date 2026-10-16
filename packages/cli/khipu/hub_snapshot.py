@@ -312,10 +312,19 @@ def try_hub_connect(
 
     from khipu.db import conninfo_with_local_root_cert, resolve_dsn
 
-    return psycopg.connect(
-        conninfo_with_local_root_cert(resolve_dsn()),
-        connect_timeout=connect_timeout,
-    )
+    from khipu import hub_reach
+
+    try:
+        conn = psycopg.connect(
+            conninfo_with_local_root_cert(resolve_dsn()),
+            connect_timeout=connect_timeout,
+        )
+    except Exception as exc:
+        if hub_connection_failed(exc):
+            hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
+        raise
+    hub_reach.note_reachable()
+    return conn
 
 
 def open_snapshot() -> sqlite3.Connection:
