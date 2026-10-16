@@ -31,9 +31,11 @@ import {
   jobFor,
   jobTone,
   meaningOf,
+  NO_PROJECT,
   plural,
   runTone,
   runWords,
+  shortProject,
   sourceLine,
   stateWords,
   timeOnly,
@@ -78,18 +80,20 @@ function boardName(board: WorkBoard): string {
   return board.name ?? board.project ?? WITHHELD.name;
 }
 
-function projectName(view: WorkViewDoc, project: string | null): string {
-  if (!project) return "Khipu";
+function projectName(view: WorkViewDoc, project: string): string {
   const board = view.projects.find((p) => p.project === project);
   if (board) return boardName(board);
-  return project.split("/").pop() || project;
+  return shortProject(project);
 }
 
-/** A waiting item's project words. A ledger row always has a project, so
- *  one without was withheld; any other item without one is Khipu's own. */
-function waitProject(view: WorkViewDoc, item: WaitItem): string {
-  if (item.source === "ledger" && !item.project) return WITHHELD.name;
-  return projectName(view, item.project);
+/** A waiting item's project words, by Owed's rule (`shortProject`). A ledger
+ *  row always has a project, so one without was withheld, as is any item the
+ *  view marks masked; only a routing item is Khipu's own, and a commitment
+ *  with no project says so. */
+export function waitProject(view: WorkViewDoc, item: WaitItem): string {
+  if (item.project) return projectName(view, item.project);
+  if (item.source === "ledger" || item.masked) return WITHHELD.name;
+  return item.source === "routing" ? "Khipu" : NO_PROJECT;
 }
 
 function DragHeader({ title, lede, children }: { title: string; lede: string; children?: ReactNode }) {

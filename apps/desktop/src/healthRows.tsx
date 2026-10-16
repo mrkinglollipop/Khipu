@@ -51,6 +51,7 @@ export type HealthRow = {
 // falls through to `humanize()` below and sorts after these by status group.
 const LABELS: Record<string, string> = {
   hub_ok: "Database reachable",
+  disk_space_ok: "Enough free disk space",
   hub_snapshot_ok: "Offline copy of memory",
   dsn_file_ok: "Connection stored on this Mac",
   drift_ok: "Memory index matches the database",
@@ -232,6 +233,12 @@ function detailFor(key: string, parsed: Record<string, unknown>): string | undef
   if (key === "hub_snapshot_ok") return hubSnapshotDetail(parsed.hub_snapshot as HubSnapshotBlock | undefined);
   if (key === "synth_provider_ok") return synthProviderDetail(parsed.synth_provider as DoctorSynthProvider | undefined);
   if (key === "synth_budget_ok") return synthBudgetDetail(parsed.synth_budget as SynthBudget | undefined);
+  // A warning keeps the flag true, so the row stays green and says why; red
+  // takes its sentence from the attention item instead.
+  if (key === "disk_space_ok") {
+    const ds = parsed.disk_space as { level?: string; message?: string } | undefined;
+    return ds?.level === "amber" && ds.message ? ds.message : undefined;
+  }
   return undefined;
 }
 

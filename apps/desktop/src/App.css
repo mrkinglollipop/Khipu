@@ -2142,6 +2142,18 @@ button.row.on {
   overflow: hidden;
   overflow-wrap: anywhere;
 }
+/* "seen 3 days ago" sits under the text it dates. As its own cell it took the
+   text's width at full size and pushed Done and Snooze to a third line when
+   narrow. */
+.owed-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.owed-seen {
+  font-size: var(--t-xs);
+}
 
 /* Under ~1040px the six fixed columns leave the text under 150px, so the row
    stacks: text on its own line, the columns beneath it. */
@@ -2153,12 +2165,9 @@ button.row.on {
     flex-wrap: wrap;
     row-gap: var(--s1);
   }
-  .owed-text {
+  .owed-main {
     order: -1;
     flex: 1 1 100%;
-  }
-  .owed-seen {
-    order: 1;
   }
   .card .owed-row .acts-cell {
     order: 2;
@@ -3106,6 +3115,12 @@ input.switch:disabled {
   row-gap: var(--s1);
   align-items: center;
 }
+/* Check now and "Khipu checks again" belong to the state and its source: left
+   to auto-placement they fell into the next line's name column, under the
+   account's name. */
+.card .row.route-row > .route-acts { grid-column: 2 / -1; justify-content: flex-start; }
+.card .row.route-row > .route-src + .route-src { grid-column: 3 / -1; }
+.card .row.route-row > .route-src:empty { display: none; }
 .route-state { display: inline-flex; align-items: baseline; gap: var(--s2); font-size: var(--t-md); color: var(--text); }
 .route-state .hdot { flex: none; transform: translateY(-1px); }
 .route-src { font-size: var(--t-xs); color: var(--muted); text-align: right; min-width: 0; }
@@ -3174,13 +3189,16 @@ input.switch:disabled {
    either into a column a word wide. */
 @media (max-width: 1040px) {
   .card .row.route-row { grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr); }
-  .route-row .route-src { grid-column: 2 / -1; text-align: left; }
+  .route-row .route-src,
+  .card .row.route-row > .route-src + .route-src { grid-column: 2 / -1; text-align: left; }
   .route-hold { grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr); }
   .route-hold .route-src { grid-column: 2 / -1; text-align: left; }
 }
 @media (max-width: 760px) {
   .card .row.route-row { grid-template-columns: minmax(6rem, 1fr) auto; }
-  .route-src { grid-column: 1 / -1; text-align: left; }
+  .route-src,
+  .card .row.route-row > .route-src + .route-src,
+  .card .row.route-row > .route-acts { grid-column: 1 / -1; text-align: left; }
   .route-note { grid-column: 1 / -1; flex-wrap: wrap; }
   .route-hold { grid-template-columns: 1fr; }
   /* Undo the 1040px placement: on one column a second-column end made an

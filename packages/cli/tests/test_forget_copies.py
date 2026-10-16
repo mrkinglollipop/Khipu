@@ -16,6 +16,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import timedelta
@@ -265,6 +266,20 @@ class ForgetCopiesTest(unittest.TestCase):
         self.assertEqual(self.located(out, temp), {"place": "replica temp", "path": str(temp),
                                                    "state": "copy remains"})
         self.assertTrue(temp.is_file(), "a replica temp is reported, never edited")
+
+    def test_a_leftover_replica_temp_holding_the_row_is_removed(self):
+        temp = self.replica_temp(".hub_snapshot.k2x9ab.sqlite", rows=[(1, self.a["summary"])])
+        journal = Path(str(temp) + "-journal")
+        journal.write_bytes(b"pages")
+        old = time.time() - hs.STALE_TEMP_AGE_S - 60
+        for path in (temp, journal):
+            os.utime(path, (old, old))
+        out = run_forget(self.world, 1, self.root)
+        self.assertTrue(out["complete"], out.get("partial_errors"))
+        self.assertEqual(self.located(out, temp), {"place": "replica temp", "path": str(temp),
+                                                   "state": "removed"})
+        self.assertFalse(temp.exists())
+        self.assertFalse(journal.exists())
 
     def test_a_torn_replica_temp_keeps_the_forget_partial(self):
         temp = self.replica_temp(".hub_snapshot.k2x9ab.sqlite", raw=b"torn replica page " * 300)

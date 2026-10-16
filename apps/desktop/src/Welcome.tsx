@@ -906,7 +906,7 @@ export function Welcome({
 
   const runFinishFix = useCallback(
     async (item: Attention) => {
-      if (!item.fix || item.fix.kind === "revisions") return;
+      if (!item.fix || item.fix.kind === "revisions" || item.fix.kind === "storage-report") return;
       setFixBusy(item.key);
       try {
         if (item.fix.kind === "reinstall-hook" && item.harness) {
@@ -1699,7 +1699,7 @@ export function Welcome({
                   tone={item.tone}
                   title={item.title}
                   action={
-                    item.fix && item.fix.kind !== "revisions" ? (
+                    item.fix && item.fix.kind !== "revisions" && item.fix.kind !== "storage-report" ? (
                       <button
                         type="button"
                         disabled={fixBusy != null}

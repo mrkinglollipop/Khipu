@@ -267,7 +267,9 @@ def _full_dump() -> dict[str, Any]:
     try:
         out = refresh()
     except Exception as exc:  # noqa: BLE001 - reported in the run's result
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+        from khipu.storage import describe_os_error
+
+        return {"ok": False, "error": describe_os_error(exc)[:300]}
     return {k: v for k, v in out.items() if k != "path"}
 
 

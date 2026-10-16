@@ -3789,7 +3789,9 @@ def _io_phrase(exc: OSError, verb: str) -> str:
         return f"not allowed to {verb} it"
     if exc.errno == errno.EROFS:
         return "read-only disk"
-    if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+    from khipu.storage import disk_full
+
+    if disk_full(exc):
         return "the disk is full"
     if isinstance(exc, FileNotFoundError):
         return "a folder is missing"

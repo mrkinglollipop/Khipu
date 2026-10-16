@@ -110,7 +110,7 @@ def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str
 
 def enqueue(payload: dict[str, Any], *, reason: str = "") -> Path:
     """Durably queue a capture; acknowledge an existing file only for equal
-    content and equal origin."""
+    content and equal origin. A full disk is raised in plain words."""
     stamp = _queued_origin()
     # Only the envelope says who owns a queued capture; the caller's own claim
     # is dropped here as write_pg drops it.
@@ -143,7 +143,16 @@ def enqueue(payload: dict[str, Any], *, reason: str = "") -> Path:
                 # Keep legacy names for uncontested jobs; conflicting evidence gets
                 # a stable full-content hash rather than replacing either source.
                 dst = collision
-            _atomic_write(dst, job)
+            try:
+                _atomic_write(dst, job)
+            except OSError as exc:
+                from khipu.storage import describe_os_error, disk_full
+
+                if disk_full(exc):
+                    # Said plainly: the callers log it as the reason it was not queued.
+                    raise OSError(exc.errno, f"the capture could not be queued: "
+                                             f"{describe_os_error(exc)}") from exc
+                raise
     _log(f"queued {dst.name} ({reason or 'pg write failed'})")
     return dst
 

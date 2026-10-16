@@ -465,6 +465,17 @@ def waiting(rows, items, routing=ROUTING):
 NEEDS = row("n-1", "Approve the signing certificate renewal", kind="needs-owner", state="NEEDS OWNER", ago=86400)
 
 
+def test_a_withheld_project_is_marked_so_it_is_never_read_as_none(env):
+    # The scan withholds a project it can't keep (here a path); the item
+    # still had one, so the app must not name it Khipu's own or "no project".
+    got = {w["id"]: w for w in waiting([], [commitment("c1", project="/srv/work/aegis"),
+                                            commitment("c2", text="Pick the colour", project=None),
+                                            commitment("c3", text="Name the release", project="acme/atlas")])}
+    assert got["c1"]["project"] is None and got["c1"].get("masked") is True
+    assert got["c2"]["project"] is None and "masked" not in got["c2"]
+    assert got["c3"]["project"] == "acme/atlas" and "masked" not in got["c3"]
+
+
 def test_a_linked_pair_shows_once(env):
     linked = row("n-1", "Something else entirely", kind="needs-owner", state="NEEDS OWNER",
                  refs={"commitment": "c1"})
