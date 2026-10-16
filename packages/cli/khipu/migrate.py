@@ -19,6 +19,7 @@ is fine for one operator and useless for anyone else setting Khipu up.
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 
 _VERSION_RE = re.compile(r"^(\d{4}_[a-z0-9_]+)\.sql$")
@@ -28,6 +29,9 @@ _VERSION_RE = re.compile(r"^(\d{4}_[a-z0-9_]+)\.sql$")
 LOCAL_ORIGIN_SETTING = "khipu.local_origin"
 # The value that applies such a migration without claiming any existing row.
 LOCAL_ORIGIN_NONE = "none"
+# A step that hits its own lock_timeout (0030) is retried this many times.
+LOCK_RETRIES = 3
+LOCK_RETRY_DELAY_S = 2.0
 _STEP_MARKER = "-- khipu:step"
 _STEP_ANYWHERE_RE = re.compile(r"-- khipu:step\b")
 
@@ -252,21 +256,32 @@ def _run_migrations(conn, *, dry_run: bool, directory: Path | None,
         # psycopg's connection is a transaction already; commit after each so
         # a later failure cannot roll back an earlier, successful one.
         for i, part in enumerate(parts):
-            with conn.cursor() as cur:
-                if value is not None:
-                    # Transaction-local, so every step sets it again.
-                    cur.execute("SELECT set_config(%s, %s, true)",
-                                (LOCAL_ORIGIN_SETTING, value))
-                cur.execute(part)
-                if i == len(parts) - 1:
-                    # Belt and braces: the file records itself, but if a
-                    # migration forgets to, the runner would re-apply it forever.
-                    cur.execute(
-                        "INSERT INTO schema_migrations (version, note) VALUES (%s, %s) "
-                        "ON CONFLICT (version) DO NOTHING",
-                        (version, f"applied by khipu migrate from {path.name}"),
-                    )
-            conn.commit()
+            for attempt in range(LOCK_RETRIES + 1):
+                try:
+                    with conn.cursor() as cur:
+                        if value is not None:
+                            # Transaction-local, so every step sets it again.
+                            cur.execute("SELECT set_config(%s, %s, true)",
+                                        (LOCAL_ORIGIN_SETTING, value))
+                        cur.execute(part)
+                        if i == len(parts) - 1:
+                            # Belt and braces: the file records itself, but if a
+                            # migration forgets to, the runner would re-apply it forever.
+                            cur.execute(
+                                "INSERT INTO schema_migrations (version, note) VALUES (%s, %s) "
+                                "ON CONFLICT (version) DO NOTHING",
+                                (version, f"applied by khipu migrate from {path.name}"),
+                            )
+                    conn.commit()
+                    break
+                except Exception as exc:
+                    # A step that sets lock_timeout gives up rather than queue
+                    # every capture behind a long transaction; it is retried
+                    # whole, a bounded number of times, then the error stands.
+                    if type(exc).__name__ != "LockNotAvailable" or attempt == LOCK_RETRIES:
+                        raise
+                    conn.rollback()
+                    time.sleep(LOCK_RETRY_DELAY_S * (attempt + 1))
         result["ran"].append(version)
     result["pending"] = []
     return result

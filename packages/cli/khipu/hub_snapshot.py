@@ -1908,6 +1908,50 @@ def scrub_forgotten_snapshot() -> dict[str, Any]:
     return {"ok": True, "scrubbed": scrubbed, "snapshot": True}
 
 
+def staging_path() -> Path:
+    """A fresh temporary file beside the replica, named the way a refresh
+    names its dump, so forget's crash-left temp check sees it too."""
+    from khipu.paths import ensure_data_dir
+
+    ensure_data_dir()
+    dest = snapshot_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".hub_snapshot.", suffix=".sqlite", dir=dest.parent)
+    os.close(fd)
+    return Path(name)
+
+
+def publish_imported_snapshot(staged: Path) -> dict[str, Any]:
+    """Scrub a replica copy a backup import staged, then atomically make it
+    the replica. Readers never see the copy before its scrub: it is not the
+    replica until ``os.replace``. Same lock order as a refresh: the registry,
+    then the refresh lock without waiting. When the scrub cannot run, the
+    staged copy is discarded and the current replica is left as it was."""
+    from khipu.tombstones import RegistryError, write_gate
+
+    try:
+        with write_gate() as gate:
+            lock = _acquire_refresh_lock()
+            if lock is None:
+                staged.unlink(missing_ok=True)
+                return {"ok": False, "imported": False,
+                        "error": "hub snapshot refresh in progress; the next refresh rebuilds it"}
+            try:
+                con = sqlite3.connect(str(staged))
+                try:
+                    scrubbed = _scrub_forgotten(con, gate)
+                    con.commit()
+                finally:
+                    con.close()
+                os.replace(staged, snapshot_path())
+            finally:
+                _release_refresh_lock(lock)
+    except (RegistryError, sqlite3.Error, OSError) as exc:
+        staged.unlink(missing_ok=True)
+        return {"ok": False, "imported": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, "imported": True, "scrubbed": scrubbed, "snapshot": True}
+
+
 def upsert_episode(
     episode_row: Mapping[str, Any],
     embedding_rows: Sequence[Mapping[str, Any]],

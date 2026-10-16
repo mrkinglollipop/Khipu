@@ -342,6 +342,15 @@ def _upsert_topic(
     return changed
 
 
+def _savepoint(cur, name: str) -> bool:
+    """Open a savepoint; False on a cursor without them (autocommit, fakes)."""
+    try:
+        cur.execute(f"SAVEPOINT {name}")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _upsert_episode(cur, payload: dict[str, Any], *,
                     source: dict[str, Any] | None = None,
                     out: dict[str, Any] | None = None,
@@ -432,7 +441,8 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
         cols.append("origin")
         vals.append("%s")
         params.append(origin)
-    from khipu.tombstones import hub_source_forgotten
+    from khipu.capture_identity import record_source, source_identity
+    from khipu.tombstones import announce_hub_identities, hub_source_forgotten, is_forgotten_refusal
 
     # The one hub insert every writer reaches (write_pg, the mirror, the tail
     # sync, the reconcile): a forgotten source never gets a new live row.
@@ -440,29 +450,47 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
         if out is not None:
             out["forgotten_source"] = True
         return False
-    cur.execute(
-        f"""
-        INSERT INTO episodes
-          ({', '.join(cols)})
-        VALUES
-          ({', '.join(vals)})
-        ON CONFLICT DO NOTHING
-        RETURNING id
-        """,
-        tuple(params),
-    )
-    inserted = cur.rowcount > 0
-    if inserted:
-        try:
-            row = cur.fetchone()
-            if row:
-                if out is not None:
-                    out["episode_id"] = int(row[0])
-                from khipu.capture_identity import record_source, source_identity
-
-                record_source(cur, int(row[0]), "origin", source or source_identity(safe))
-        except Exception as exc:  # noqa: BLE001 — the episode row stays; fail-open
-            _log(f"source row skipped ({type(exc).__name__}: {exc})")
+    origin_source = source or source_identity(safe)
+    # The episode row and its source row are one write: the hub refuses the
+    # episode row itself for a forgotten source (0030), and a refused source
+    # row rolls the episode row back with it, so no partial write survives.
+    savepoint = _savepoint(cur, "khipu_episode_write")
+    try:
+        announce_hub_identities(cur, payload, source, origin_source)
+        cur.execute(
+            f"""
+            INSERT INTO episodes
+              ({', '.join(cols)})
+            VALUES
+              ({', '.join(vals)})
+            ON CONFLICT DO NOTHING
+            RETURNING id
+            """,
+            tuple(params),
+        )
+        inserted = cur.rowcount > 0
+        if inserted:
+            try:
+                row = cur.fetchone()
+                if row:
+                    if out is not None:
+                        out["episode_id"] = int(row[0])
+                    record_source(cur, int(row[0]), "origin", origin_source)
+            except Exception as exc:  # noqa: BLE001 — the episode row stays; fail-open
+                if is_forgotten_refusal(exc):
+                    raise
+                _log(f"source row skipped ({type(exc).__name__}: {exc})")
+    except Exception as exc:
+        if not is_forgotten_refusal(exc):
+            raise
+        if savepoint:
+            cur.execute("ROLLBACK TO SAVEPOINT khipu_episode_write")
+        if out is not None:
+            out.pop("episode_id", None)
+            out["forgotten_source"] = True
+        return False
+    if savepoint:
+        cur.execute("RELEASE SAVEPOINT khipu_episode_write")
     return inserted
 
 
@@ -483,7 +511,10 @@ def mirror_episode(payload: dict[str, Any]) -> bool:
     summary = (payload.get("summary") or "").strip()
     if not summary:
         return False
-    with connect() as conn:
+    from khipu import memory_lock
+
+    # Shared through the commit: never interleaves with a forget on this Mac.
+    with memory_lock.shared(), connect() as conn:
         with conn.cursor() as cur:
             # A live capture by this process, so it is stamped like write_pg's.
             # The file replays below (sync_recent_episodes, reconcile) are not:
@@ -608,7 +639,10 @@ def sync_recent_episodes(memory_root: Path, *, tail_lines: int = 40) -> dict[str
     if not keys:
         return stats
     inserted_payloads: list[tuple[dict[str, Any], int | None]] = []
-    with connect() as conn:
+    from khipu import memory_lock
+
+    # Shared through the commit: never interleaves with a forget on this Mac.
+    with memory_lock.shared(), connect() as conn:
         with conn.cursor() as cur:
             missing = set(episodes_missing_in_pg(cur, keys))
             for obj, key in zip(objs, keys):
@@ -664,7 +698,10 @@ def reconcile_memory_root(memory_root: Path) -> dict[str, int]:
         "topics_unreadable": 0,
         "tombstoned": 0,
     }
-    with connect() as conn:
+    from khipu import memory_lock
+
+    # Shared through the commit: never interleaves with a forget on this Mac.
+    with memory_lock.shared(), connect() as conn:
         with conn.cursor() as cur:
             if episode_paths:
                 # Anti-join first, insert only the missing lines: a plain

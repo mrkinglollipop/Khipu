@@ -23,6 +23,27 @@
 -- writer either commits before the forget publishes (and is a separate
 -- episode the forget does not cover) or waits and then sees the identity.
 --
+-- The hub decides at the episode row. A current writer names the identities
+-- of the row it is inserting in the transaction-local setting
+-- khipu.source_identities (khipu/tombstones.py, announce_hub_identities), and
+-- the episodes insert trigger refuses the row itself when one is forgotten.
+-- It also holds each identity's advisory lock until commit, so a forget
+-- cannot land between the episode row and its source row, and no savepoint
+-- around the source row can leave a live episode behind. A writer that names
+-- nothing (older code) is still refused on the natural key.
+--
+-- Order, all in this file's one transaction: lock both tables, create the
+-- table and the triggers, then backfill. The locks come first, episodes then
+-- episode_sources, the order every writer takes them (an episode row, then
+-- its source row), so this migration and a writer cannot deadlock. SHARE ROW
+-- EXCLUSIVE blocks inserts, updates and deletes on both tables until commit,
+-- so no forget can commit between the backfill's scan and the triggers going
+-- live: the backfill sees every forget committed before this migration, and
+-- every later forget runs under the triggers. Reads are not blocked.
+-- lock_timeout makes a long transaction holding either table fail this
+-- migration after 5 s instead of queueing every capture behind it; the next
+-- khipu migrate run retries it from the start.
+--
 -- Additive only: a new table, five new functions, three new triggers and a
 -- backfill into the new table. No existing table, column, constraint or row
 -- changes. Updates the triggers do not refuse (hygiene setting project or
@@ -36,13 +57,11 @@
 -- each khipu_* function below, DROP TABLE forgotten_sources and deleting the
 -- 0030 row from schema_migrations. Reversing removes the hub-side refusal;
 -- each Mac's local registry still fences its own writers.
---
--- Locks: CREATE TRIGGER takes a SHARE ROW EXCLUSIVE lock on its table, so
--- captures wait while this runs; lock_timeout makes a long transaction
--- holding episodes fail this migration instead of queueing every writer
--- behind it. A re-run completes it.
 
 SET LOCAL lock_timeout = '5s';
+
+LOCK TABLE episodes IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE episode_sources IN SHARE ROW EXCLUSIVE MODE;
 
 CREATE TABLE IF NOT EXISTS forgotten_sources (
     identity      TEXT PRIMARY KEY,
@@ -52,19 +71,6 @@ CREATE TABLE IF NOT EXISTS forgotten_sources (
 
 COMMENT ON TABLE forgotten_sources IS
     'Source keys and payload hashes of forgotten episodes (durable forget). Never deleted by Khipu; the 0030 triggers refuse an insert or merge that names one, and un-forgetting an episode.';
-
--- Backfill: every source of an episode forgotten before this migration.
-INSERT INTO forgotten_sources (identity, episode_id)
-SELECT s.source_key, s.episode_id
-FROM episode_sources s JOIN episodes e ON e.id = s.episode_id
-WHERE e.deleted_at IS NOT NULL
-ON CONFLICT (identity) DO NOTHING;
-
-INSERT INTO forgotten_sources (identity, episode_id)
-SELECT s.payload_sha256, s.episode_id
-FROM episode_sources s JOIN episodes e ON e.id = s.episode_id
-WHERE e.deleted_at IS NOT NULL AND s.payload_sha256 IS NOT NULL
-ON CONFLICT (identity) DO NOTHING;
 
 CREATE OR REPLACE FUNCTION khipu_natural_source_key(
     harness TEXT, session_id TEXT, transcript_range TEXT, window_id TEXT, part TEXT)
@@ -104,15 +110,20 @@ BEGIN
 END
 $$;
 
+-- The natural key from the row, plus every identity the writer named.
 CREATE OR REPLACE FUNCTION khipu_episodes_forgotten_insert()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-    PERFORM khipu_refuse_forgotten(ARRAY[khipu_natural_source_key(
-        coalesce(NEW.harness, NEW.raw->>'harness'),
-        NEW.session_id,
-        coalesce(NEW.transcript_range, NEW.raw->>'transcript_range'),
-        coalesce(NEW.window_id, NEW.raw->>'window_id'),
-        NEW.raw->>'part')]);
+    PERFORM khipu_refuse_forgotten(
+        ARRAY[khipu_natural_source_key(
+            coalesce(NEW.harness, NEW.raw->>'harness'),
+            NEW.session_id,
+            coalesce(NEW.transcript_range, NEW.raw->>'transcript_range'),
+            coalesce(NEW.window_id, NEW.raw->>'window_id'),
+            NEW.raw->>'part')]
+        || coalesce(string_to_array(
+               nullif(current_setting('khipu.source_identities', true), ''), ','),
+           ARRAY[]::TEXT[]));
     RETURN NEW;
 END
 $$;
@@ -151,11 +162,6 @@ BEGIN
 END
 $$;
 
-DROP TRIGGER IF EXISTS khipu_episode_sources_forgotten ON episode_sources;
-CREATE TRIGGER khipu_episode_sources_forgotten
-    BEFORE INSERT ON episode_sources
-    FOR EACH ROW EXECUTE FUNCTION khipu_episode_sources_forgotten();
-
 DROP TRIGGER IF EXISTS khipu_episodes_forgotten_insert ON episodes;
 CREATE TRIGGER khipu_episodes_forgotten_insert
     BEFORE INSERT ON episodes
@@ -166,9 +172,64 @@ CREATE TRIGGER khipu_episodes_forgotten_update
     BEFORE UPDATE ON episodes
     FOR EACH ROW EXECUTE FUNCTION khipu_episodes_forgotten_update();
 
+DROP TRIGGER IF EXISTS khipu_episode_sources_forgotten ON episode_sources;
+CREATE TRIGGER khipu_episode_sources_forgotten
+    BEFORE INSERT ON episode_sources
+    FOR EACH ROW EXECUTE FUNCTION khipu_episode_sources_forgotten();
+
+-- Backfill, after the triggers and under the locks above: every identity of
+-- an episode forgotten before this migration. Its source rows' keys and
+-- payload hashes; its natural key from its own columns, so an episode whose
+-- source row was never recorded is still covered; and each merge receipt's
+-- payload hash and natural key, for a merge whose source row is missing.
+INSERT INTO forgotten_sources (identity, episode_id)
+SELECT s.source_key, s.episode_id
+FROM episode_sources s JOIN episodes e ON e.id = s.episode_id
+WHERE e.deleted_at IS NOT NULL
+ON CONFLICT (identity) DO NOTHING;
+
+INSERT INTO forgotten_sources (identity, episode_id)
+SELECT s.payload_sha256, s.episode_id
+FROM episode_sources s JOIN episodes e ON e.id = s.episode_id
+WHERE e.deleted_at IS NOT NULL AND s.payload_sha256 IS NOT NULL
+ON CONFLICT (identity) DO NOTHING;
+
+INSERT INTO forgotten_sources (identity, episode_id)
+SELECT k, id FROM (
+    SELECT e.id, khipu_natural_source_key(
+        coalesce(e.harness, e.raw->>'harness'),
+        e.session_id,
+        coalesce(e.transcript_range, e.raw->>'transcript_range'),
+        coalesce(e.window_id, e.raw->>'window_id'),
+        e.raw->>'part') AS k
+    FROM episodes e
+    WHERE e.deleted_at IS NOT NULL
+) natural_keys
+WHERE k IS NOT NULL
+ON CONFLICT (identity) DO NOTHING;
+
+INSERT INTO forgotten_sources (identity, episode_id)
+SELECT k, id FROM (
+    SELECT e.id, unnest(ARRAY[
+        nullif(m.entry->>'source_id', ''),
+        khipu_natural_source_key(
+            m.entry->'payload'->>'harness',
+            coalesce(m.entry->'payload'->>'session_id', m.entry->>'session_id'),
+            m.entry->'payload'->>'transcript_range',
+            m.entry->'payload'->>'window_id',
+            m.entry->'payload'->>'part')]) AS k
+    FROM episodes e
+    CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(e.raw->'merged_from') = 'array'
+             THEN e.raw->'merged_from' ELSE '[]'::jsonb END) AS m(entry)
+    WHERE e.deleted_at IS NOT NULL AND jsonb_typeof(m.entry) = 'object'
+) receipt_keys
+WHERE k IS NOT NULL
+ON CONFLICT (identity) DO NOTHING;
+
 INSERT INTO schema_migrations (version, note)
 VALUES (
     '0030_forgotten_sources',
-    'Durable forget: forgotten_sources (identity PK, episode_id, forgotten_at), backfilled from forgotten episodes'' source rows; triggers refuse inserting a forgotten source into episodes or episode_sources, merging one into an episode, and un-forgetting an episode'
+    'Durable forget: forgotten_sources (identity PK, episode_id, forgotten_at), backfilled from forgotten episodes'' source rows, natural keys and merge receipts; triggers refuse inserting a forgotten source into episodes (natural key or the writer''s named identities) or episode_sources, merging one into an episode, and un-forgetting an episode'
 )
 ON CONFLICT (version) DO NOTHING;

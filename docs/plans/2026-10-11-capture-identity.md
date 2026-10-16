@@ -257,27 +257,28 @@ refused by the hub itself.
 Pinned by `tests/test_episode_write_gate_inventory.py`: a new path fails that test until it is routed
 through the gate and added here.
 
-| Path (`packages/cli/khipu/`) | Writes | Gated by |
-| --- | --- | --- |
-| `mirror._upsert_episode` | hub episode row + origin source row | `hub_source_forgotten` before the INSERT; 0030 insert triggers |
-| `capture.write_pg` | hub (via `_upsert_episode`, `_merge_into_episode`) | `hub_source_forgotten` first thing inside the cursor |
-| `mirror.mirror_episode` | hub (via `_upsert_episode`), capture graph | the callee; a refusal skips the graph mint |
-| `mirror.sync_recent_episodes`, `mirror.reconcile_memory_root` | hub (via `_upsert_episode`) | the callee |
-| `capture._merge_into_episode` | hub merge receipt + merged source row | `hub_source_forgotten` under the target row lock; 0030 update trigger |
-| `capture_identity.record_source` / `_insert_source` | hub `episode_sources` | called only from the two gated writers above; 0030 insert trigger |
-| `capture.run_capture_v2` | legacy `episodes.jsonl` (subprocess) | `write_guard` held through the child, lock FD handed to it |
-| `outbox.enqueue`, `outbox.drain`, `outbox.retry_dead` | outbox, dead and quarantine job files | `write_guard` at each job write |
-| `session_capture.enqueue` | transcript jobs upstream of extraction | none needed: holds no episode; its results go through `write_pg` |
-| `hub_snapshot.refresh` (`_insert_episodes`) | replica, full dump | `write_gate` from `_scrub_forgotten` through `os.replace` |
-| `hub_snapshot.upsert_episode` (`_upsert_episode_unfenced`) | replica, one episode | `write_guard` held through the SQLite commit |
-| `hub_snapshot.scrub_forgotten_snapshot` | replica deletes | `write_gate` |
-| `hub_snapshot.forget_episode_in_snapshot`, `_apply_pending_erasures` | replica tombstones | erase |
-| `paths.import_local` | data folder from a backup | registry merged, never copied; jobs naming a forgotten source skipped under `write_gate`; an imported replica is scrubbed |
-| `join.import_kit` | settings and credentials | writes no episodes |
-| `ledger` import | ledger rows | writes no episodes |
-| migrations 0027, 0029, 0030 | backfills (source rows, origin, `forgotten_sources`) | 0030 backfills the forgotten identities |
-| `hygiene.apply_backfill_*`, `capture._claim_unowned_episode`, `cli._cmd_episode_edit` | project/repo_root, origin, summary on existing rows | metadata only; the edit skips forgotten rows |
-| `forget.forget_episode` | hub tombstone, `forgotten_sources` | erase |
+| Path (`packages/cli/khipu/`) | Writes | Gated by | Memory lock |
+| --- | --- | --- | --- |
+| `mirror._upsert_episode` | hub episode row + origin source row | `hub_source_forgotten` before the INSERT; 0030 insert triggers | shared (callers) |
+| `capture.write_pg` | hub (via `_upsert_episode`, `_merge_into_episode`) | `hub_source_forgotten` first thing inside the cursor | shared |
+| `mirror.mirror_episode` | hub (via `_upsert_episode`), capture graph | the callee; a refusal skips the graph mint | shared |
+| `mirror.sync_recent_episodes`, `mirror.reconcile_memory_root` | hub (via `_upsert_episode`) | the callee | shared |
+| `capture._merge_into_episode` | hub merge receipt + merged source row | `hub_source_forgotten` under the target row lock; 0030 update trigger | shared (via `write_pg`) |
+| `capture_identity.record_source` / `_insert_source` | hub `episode_sources` | called only from the two gated writers above; 0030 insert trigger | shared (callers) |
+| `capture.run_capture_v2` | legacy `episodes.jsonl` (subprocess) | `write_guard` held through the child, lock FD handed to it | shared (via `capture.capture`) |
+| `outbox.enqueue`, `outbox.drain`, `outbox.retry_dead` | outbox, dead and quarantine job files | `write_guard` at each job write | shared |
+| `session_capture.enqueue` | transcript jobs upstream of extraction | none needed: holds no episode; its results go through `write_pg` | none: runs in the Aegis sandbox, which cannot write the data folder; shares forget's claim lock |
+| `session_capture._claim`, `_release`, `_discard_claim`, `_save_claimed_job`, `_archive_empty` | claimed native job files and their checkpoints | none for the registry; `_save_claimed_job` takes `write_gate` and raises `JobForgotten` for a forgotten or removed claim; forget removes queued and claimed jobs naming its sources | shared |
+| `hub_snapshot.refresh` (`_insert_episodes`) | replica, full dump | `write_gate` from `_scrub_forgotten` through `os.replace` | shared |
+| `hub_snapshot.upsert_episode` (`_upsert_episode_unfenced`) | replica, one episode | `write_guard` held through the SQLite commit | shared |
+| `hub_snapshot.scrub_forgotten_snapshot` | replica deletes | `write_gate` | shared |
+| `hub_snapshot.forget_episode_in_snapshot`, `_apply_pending_erasures` | replica tombstones | erase | exclusive (inside a forget) |
+| `paths.import_local` | data folder from a backup | registry merged, never copied; jobs naming a forgotten source skipped under `write_gate`; the backup's replica is staged, scrubbed in the staging copy, then `os.replace`d (`hub_snapshot.publish_imported_snapshot`) | shared |
+| `join.import_kit` | settings and credentials | writes no episodes; holds the lock because it writes the data folder | shared |
+| `ledger` import | ledger rows | writes no episodes | none |
+| migrations 0027, 0029, 0030 | backfills (source rows, origin, `forgotten_sources`) | 0030 backfills the forgotten identities | none (table locks, see below) |
+| `hygiene.apply_backfill_*`, `capture._claim_unowned_episode`, `cli._cmd_episode_edit` | project/repo_root, origin, summary on existing rows | metadata only; the edit skips forgotten rows | none |
+| `forget.forget_episode` | hub tombstone, `forgotten_sources` | erase | exclusive (`forget.forget_everywhere`) |
 
 ### The four holes and the test that pins each
 
@@ -300,13 +301,101 @@ All in `tests/test_forget_write_gate.py`.
 - A duplicate copy of a source committed under another episode id before the forget began is a separate
   episode. The gate keeps it out of the replica and refuses new writes of it, but it stays live on the hub
   until it is forgotten by its own id.
-- Real PostgreSQL concurrency of the 0030 triggers is covered only by `tests/test_forgotten_sources_scratch.py`,
-  which skips without a provisioned scratch database. The SQL was exercised by hand against a throwaway
-  local PostgreSQL 16 cluster with a minimal schema (refusals, an unrelated insert, a forget holding the
-  advisory lock), not against the full migration chain.
+- Real PostgreSQL behaviour of the 0030 triggers is now covered by `tests/test_forgotten_sources_pg.py`
+  (hermetic cluster, see the next section); the first-draft scratch-database test is gone.
 - Once anything is forgotten, every full refresh checks each live replica row against the registry. Rows
   are already redacted when stored, so the scrub uses `Gate.allows_stored`, which skips re-redaction (about
   0.75 ms per large row under load, against about 16 ms with it). The cost on the live replica is
   estimated, not measured; it falls under the capture-path timing gate before merge.
 - An imported replica that cannot be scrubbed (a refresh holds its lock) is deleted; the next refresh
   rebuilds it.
+
+## Durable forget: one memory lock (2026-10-15)
+
+Why the model changed. The write gate checked a registry at each writer. Seven review rounds still each
+found a new interleaving: two forgets rewriting the same legacy log, a native job claimed across a forget,
+an episode row committed before its source row was refused, a backup replica readable before its scrub,
+a migration and a writer taking the two tables in opposite orders. Each was a different writer racing a
+different step of a forget. The fix is to stop reasoning about steps.
+
+**The lock** (`khipu/memory_lock.py`, file `.memory.lock` in the data folder, one per Mac). `forget_everywhere`
+holds it exclusive for its whole run. Every local writer holds it shared for its whole write (the table
+above), except `session_capture.enqueue`: it runs inside the Aegis sandbox, which cannot create the lock
+file, and queues a transcript, not an episode. Forget's native-job scan takes the same claim lock, so an
+enqueue lands before the scan (and is removed) or after it, where the checkpoint and the hub refuse its drain. So two forgets serialize, a writer waits for a whole forget, and a forget waits for every writer
+in flight. It is taken before every other Khipu lock (`write_gate` takes it first), it is re-entrant, a
+writer that tries to start a forget inside its own write is refused (upgrading would wait on itself), and
+a legacy child process inherits the shared descriptor through `handoff`, validated like the registry
+handoff.
+
+**The hub decides at the episode row.** A writer names the identities of the row it inserts in the
+transaction-local setting `khipu.source_identities` (`tombstones.announce_hub_identities`). The 0030
+episodes insert trigger refuses the row itself for its natural key or any named identity, and holds each
+identity's advisory lock until commit, so a forget cannot land between the episode row and its source
+row. `mirror._upsert_episode` wraps the episode INSERT and its origin source row in the savepoint
+`khipu_episode_write`; a forgotten refusal from either rolls both back and returns False with
+`out["forgotten_source"]`. `capture._merge_into_episode` does the same around its UPDATE and merged source
+row (`khipu_merge_write`). `record_source` re-raises the refusal as `ForgottenSourceRefused`. Forget now
+publishes the hub identities after the tombstone UPDATE, in the same transaction.
+
+**Backup import is staged.** `paths.import_local` stages the backup's replica, scrubs it in the staging copy
+and only then `os.replace`s it (`hub_snapshot.publish_imported_snapshot`). The replica path never holds a
+forgotten row, and a scrub that cannot run leaves the current replica as it was.
+
+**Native jobs in completion.** `forget._native_job_remainder` removes queued and claimed native jobs whose
+`session_capture.job_source_identity` matches a source row's key; an unreadable job keeps the forget
+incomplete. A drainer's later checkpoint raises `JobForgotten` instead of writing a forgotten or removed
+claim back.
+
+**Migration 0030 order.** One transaction: `LOCK episodes`, then `LOCK episode_sources` (SHARE ROW
+EXCLUSIVE, the order writers take them: episode row, then source row), then the table, functions and
+triggers, then the backfill. No forget can commit between the backfill's scan and the triggers going
+live. The backfill covers source keys and payload hashes of deleted episodes, the natural key of every
+deleted episode (so one with no source row is covered) and each merge receipt's id and natural key.
+`lock_timeout` is 5 s; `migrate._run_migrations` retries a step that raises `LockNotAvailable` up to
+`LOCK_RETRIES` (3) times.
+
+### Tests that pin each
+
+- Two forgets: `test_two_forgets_cannot_rewrite_a_completed_forgets_source`. Writers wait for a whole forget:
+  `test_every_kind_of_local_writer_waits_for_a_whole_forget` (outbox, native checkpoint, backup import, replica
+  scrub, `write_pg`, mirror). Lock rules: `test_a_forget_cannot_start_inside_a_local_write`,
+  `test_the_lock_is_reentrant_for_a_writer_and_for_a_forget`. All in `tests/test_forget_memory_lock.py`.
+- Native jobs: `test_a_claimed_native_job_cannot_outlive_a_completed_forget`,
+  `test_a_native_job_from_another_source_is_kept`, `test_an_unreadable_native_job_keeps_the_forget_open`.
+- Refused source row undoes its episode row: `test_a_refused_source_row_rolls_back_its_episode_row` (fake
+  cursor) and, against the real triggers, `test_hash_only_forget_committed_first_refuses_the_episode_row`.
+- Staged import: `test_an_imported_replica_is_never_readable_before_its_scrub`,
+  `test_an_import_whose_scrub_cannot_run_leaves_the_current_replica`.
+- Migration, on a real PostgreSQL (`tests/test_forgotten_sources_pg.py`, cluster and template database from
+  `tests/hermetic_pg.py`): `test_the_full_chain_applies_and_0030_is_safe_to_run_twice`,
+  `test_backfill_covers_historic_forgotten_episode_without_source_row`,
+  `test_backfill_covers_the_merge_receipt_of_a_forgotten_episode`,
+  `test_a_forget_committed_before_the_migration_is_backfilled`,
+  `test_no_forget_can_commit_between_the_backfill_scan_and_the_triggers`,
+  `test_migration_does_not_deadlock_normal_two_table_writer`.
+- Writers against the triggers: `test_a_normal_upsert_inserts_the_episode_and_its_origin_source_row`,
+  `test_hash_only_writer_first_holds_the_identity_until_it_commits`,
+  `test_a_merge_of_a_forgotten_source_returns_false_and_leaves_the_target`.
+- Every writer holds the lock: `test_every_local_writer_entry_point_holds_the_memory_lock`,
+  `test_every_gated_writer_is_reached_only_from_a_locked_entry_point`,
+  `test_locked_entries_exist_and_the_lock_is_taken_before_the_gate` (`tests/test_episode_write_gate_inventory.py`).
+
+On a machine with PostgreSQL older than 19 the hermetic chain drops 0001's `CREATE PROPERTY GRAPH` from
+its temporary copy of the migrations (nothing here reads the graph).
+
+### Measured cost
+
+Capture insert path (`mirror._upsert_episode`, episode row plus origin source row, one commit per insert,
+distinct natural keys), 3 rounds of 500 after a 50-insert warm-up, on 20,000 seeded episodes and source
+rows, hermetic local cluster with fsync off, `hub_source_forgotten` unpatched. Median per insert:
+**1.20 ms at 0029 (no triggers), 1.60 ms at 0030 (triggers, `khipu.source_identities`, 200 forgotten
+identities), +0.41 ms**. Fsync is off, so the commit on a real hub adds the same cost to both sides.
+
+### Remaining boundary
+
+A writer from older code on another Mac that names no identities and has no natural key (no session id or
+transcript range) is not refused at its episode row. It is still refused at its source row, under its own
+savepoint, and whether that undoes the episode row depends on that older code. The lock is per Mac: a
+forget on one Mac does not wait for a writer on another; the hub's advisory locks and triggers cover that
+case.

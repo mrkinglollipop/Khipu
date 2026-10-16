@@ -5,6 +5,13 @@ forgotten-source gate in khipu/tombstones.py. Five review rounds each found a
 writer nobody had listed, so this test lists them: a new write path fails it
 until it is routed through the gate and added to the inventory in
 docs/plans/2026-10-11-capture-identity.md ("Durable forget: the write gate").
+
+Two more rounds showed the gate alone does not order a writer against a whole
+forget, so every local writer entry point also holds the per-Mac memory lock
+(khipu/memory_lock.py, shared for a write, exclusive for a forget). LOCKED
+below lists those entry points, and the tests check each one names the lock
+(or reaches it through the gate) and that every gated writer is reached only
+from a locked one ("Durable forget: one memory lock").
 """
 from __future__ import annotations
 
@@ -64,6 +71,38 @@ ALLOWED = {
     ("outbox", "enqueue"): "gate",
     ("outbox", "retry_dead"): "gate",
 }
+
+# Every local writer entry point, by module.function, and what it must name.
+# "shared" and "exclusive" are memory_lock.shared / memory_lock.exclusive.
+# A writer may instead reach the lock through the gate (write_gate takes the
+# shared lock first) or write_guard (which does the same). Forget is the one
+# exclusive holder.
+LOCKED = {
+    "capture.capture": "shared",
+    "capture.write_pg": "shared",
+    "forget.forget_everywhere": "exclusive",
+    "hub_snapshot.publish_imported_snapshot": "shared",
+    "hub_snapshot.refresh": "shared",
+    "hub_snapshot.scrub_forgotten_snapshot": "shared",
+    "hub_snapshot.upsert_episode": "shared",
+    "join.import_kit": "shared",
+    "mirror.mirror_episode": "shared",
+    "mirror.reconcile_memory_root": "shared",
+    "mirror.sync_recent_episodes": "shared",
+    "outbox.drain": "shared",
+    "outbox.enqueue": "shared",
+    "outbox.retry_dead": "shared",
+    "paths.import_local": "shared",
+    "session_capture._archive_empty": "shared",
+    "session_capture._claim": "shared",
+    "session_capture._discard_claim": "shared",
+    "session_capture._release": "shared",
+    "session_capture._save_claimed_job": "shared",
+}
+# Exempt on purpose: session_capture.enqueue runs inside the Aegis sandbox,
+# which cannot write the data folder (no lock file), and it queues a
+# transcript, not an episode. Forget's native-job scan shares its claim lock.
+LOCK_VIA_GATE = ("write_gate", "write_guard")
 
 # Migrations that write episodes or their sources. 0030 adds only triggers
 # and its own table, and is listed so a later edit that writes rows is seen.
@@ -172,3 +211,51 @@ def test_episode_writing_migrations_are_pinned():
                           "against forgotten_sources (0030) and add them to ALLOWED_MIGRATIONS "
                           "and the inventory in docs/plans/2026-10-11-capture-identity.md")
     assert (MIGRATIONS / "0030_forgotten_sources.sql").is_file()
+
+
+def test_every_local_writer_entry_point_holds_the_memory_lock():
+    modules = _modules()
+    for qualified, mode in sorted(LOCKED.items()):
+        mod, func = qualified.rsplit(".", 1)
+        body = modules[mod].body(func)
+        if mode == "exclusive":
+            assert "memory_lock.exclusive" in body, \
+                f"{qualified} is a forget and must hold memory_lock.exclusive for its whole run"
+            continue
+        assert "memory_lock.shared" in body or any(g in body for g in LOCK_VIA_GATE), \
+            f"{qualified} is a local writer and must hold memory_lock.shared (or go through " \
+            "write_gate / write_guard, which take it); otherwise a forget can interleave with it"
+
+
+def test_every_gated_writer_is_reached_only_from_a_locked_entry_point():
+    modules = _modules()
+
+    def covered(qualified: str, seen: frozenset = frozenset()) -> bool:
+        if qualified in LOCKED:
+            return True
+        if qualified in seen:
+            return False
+        func = qualified.rsplit(".", 1)[1]
+        sites = _call_sites(modules, func)
+        return bool(sites) and all(covered(site, seen | {qualified}) for site in sites)
+
+    for (mod, func), how in sorted(ALLOWED.items()):
+        if how == "gate" or how.startswith("calls:"):
+            qualified = f"{mod}.{func}"
+            # A "calls:" entry's only write is that call, so it is also fine
+            # when the function it calls is itself locked.
+            via = how.split(":", 1)[1] if how.startswith("calls:") else None
+            assert covered(qualified) or (via and covered(via)), (
+                f"{qualified} is a gated writer that some caller reaches outside the memory "
+                "lock; add that caller to LOCKED (and make it hold memory_lock.shared) or route "
+                "it through a locked entry point")
+
+
+def test_locked_entries_exist_and_the_lock_is_taken_before_the_gate():
+    modules = _modules()
+    for qualified in LOCKED:
+        mod, func = qualified.rsplit(".", 1)
+        assert any(f.name == func for f in modules[mod].functions), f"LOCKED lists missing {qualified}"
+    gate = modules["tombstones"].body("write_gate")
+    assert gate.index("memory_lock.shared()") < gate.index("_locked_registry()"), \
+        "write_gate must take the memory lock before the registry lock"

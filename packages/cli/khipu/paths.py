@@ -244,6 +244,7 @@ def backup_local(*, dest: Path) -> dict:
 _REGISTRY_NAME = "forgotten_sources.json"
 _REGISTRY_LOCK_NAME = ".forgotten_sources.lock"
 _SNAPSHOT_NAME = "hub_snapshot.sqlite"  # khipu.hub_snapshot.SNAPSHOT_NAME
+_MEMORY_LOCK_NAME = ".memory.lock"  # khipu.memory_lock.LOCK_NAME
 
 
 def _forgotten_job(data: bytes, gate) -> bool:
@@ -263,93 +264,121 @@ def import_local(*, source: Path, merge: bool = True) -> dict:
     A completed forget must survive the restore of a backup taken before it:
     the backup's tombstone registry is merged into this one, never copied
     over it, and every queued job naming a forgotten source is left behind.
+    The backup's replica is written to a staging copy, scrubbed there, and
+    only then atomically made the replica, so no reader sees it unscrubbed.
+    The whole import holds the memory lock shared, so it never interleaves
+    with a forget.
     """
     refuse_if_isolated("an imported data folder")
-    from khipu import tombstones
+    from khipu import memory_lock
+
+    with memory_lock.shared():
+        return _import_local(source=source, merge=merge)
+
+
+def _skipped_name(parts: tuple[str, ...]) -> bool:
+    """Lock files and the replica's journal: a journal from the backup would
+    be replayed into whatever replica is current, so it is never copied."""
+    return (parts in ((_REGISTRY_NAME,), (_REGISTRY_LOCK_NAME,), (_MEMORY_LOCK_NAME,))
+            or (len(parts) == 1 and parts[0].startswith(_SNAPSHOT_NAME + "-")))
+
+
+def _import_local(*, source: Path, merge: bool) -> dict:
+    from khipu import hub_snapshot, tombstones
 
     source = source.expanduser()
     target = ensure_data_dir()
     imported = 0
     skipped_forgotten = 0
-    snapshot_imported = False
-    if source.is_dir():
-        registry = source / _REGISTRY_NAME
-        if registry.is_file():
-            tombstones.merge_registry_bytes(registry.read_bytes())
-        with tombstones.write_gate() as gate:
-            for p in source.rglob("*"):
-                if not p.is_file():
-                    continue
-                rel = p.relative_to(source)
-                if rel.parts in ((_REGISTRY_NAME,), (_REGISTRY_LOCK_NAME,)):
-                    continue
-                dst = target / rel
-                if dst.exists() and not merge:
-                    continue
-                if dst.exists() and p.samefile(dst):
-                    raise shutil.SameFileError(f"{p!s} and {dst!s} are the same file")
-                if p.suffix == ".json" and _forgotten_job(p.read_bytes(), gate):
-                    skipped_forgotten += 1
-                    continue
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                if dst.name in SENSITIVE_FILENAMES:
-                    with p.open("rb") as source_file:
-                        copy_sensitive(source_file, dst)
-                else:
-                    shutil.copy2(p, dst)
-                imported += 1
-                snapshot_imported |= rel.parts == (_SNAPSHOT_NAME,)
-    elif source.is_file() and source.suffix.lower() == ".zip":
-        with zipfile.ZipFile(source, "r") as zf:
-            infos = [info for info in zf.infolist() if not info.is_dir()]
-            for info in infos:
-                # Zip-slip guard. Compare by path components, not by string
-                # prefix: with target /a/b, "/a/bc/evil".startswith("/a/b") is
-                # True, so a sibling directory escaped the old check entirely
-                # (audit 2026-08-17).
-                dest = (target / info.filename).resolve()
-                if not dest.is_relative_to(target.resolve()):
-                    raise RuntimeError(f"refusing unsafe zip path: {info.filename}")
-            for info in infos:
-                if Path(info.filename).parts == (_REGISTRY_NAME,):
-                    tombstones.merge_registry_bytes(zf.read(info))
+    staged: Path | None = None
+
+    def stage(reader) -> None:
+        nonlocal staged
+        if staged is None:
+            staged = hub_snapshot.staging_path()
+        copy_sensitive(reader, staged)
+
+    try:
+        if source.is_dir():
+            registry = source / _REGISTRY_NAME
+            if registry.is_file():
+                tombstones.merge_registry_bytes(registry.read_bytes())
             with tombstones.write_gate() as gate:
-                for info in infos:
-                    parts = Path(info.filename).parts
-                    if parts in ((_REGISTRY_NAME,), (_REGISTRY_LOCK_NAME,)):
+                for p in source.rglob("*"):
+                    if not p.is_file():
                         continue
-                    dest = (target / info.filename).resolve()
-                    if dest.exists() and not merge:
+                    rel = p.relative_to(source)
+                    if _skipped_name(rel.parts):
                         continue
-                    if (info.filename.endswith(".json")
-                            and _forgotten_job(zf.read(info), gate)):
+                    dst = target / rel
+                    if dst.exists() and not merge:
+                        continue
+                    if dst.exists() and p.samefile(dst):
+                        raise shutil.SameFileError(f"{p!s} and {dst!s} are the same file")
+                    if p.suffix == ".json" and _forgotten_job(p.read_bytes(), gate):
                         skipped_forgotten += 1
                         continue
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(info) as source_file:
-                        if dest.name in SENSITIVE_FILENAMES:
-                            copy_sensitive(source_file, dest)
-                        else:
-                            with open(dest, "wb") as out:
-                                shutil.copyfileobj(source_file, out)
+                    if rel.parts == (_SNAPSHOT_NAME,):
+                        with p.open("rb") as source_file:
+                            stage(source_file)
+                        imported += 1
+                        continue
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if dst.name in SENSITIVE_FILENAMES:
+                        with p.open("rb") as source_file:
+                            copy_sensitive(source_file, dst)
+                    else:
+                        shutil.copy2(p, dst)
                     imported += 1
-                    snapshot_imported |= parts == (_SNAPSHOT_NAME,)
-    else:
-        raise RuntimeError("import source must be a .zip or a directory")
-    scrub = None
-    if snapshot_imported:
-        # After the gate is released: the scrub takes the registry and then
-        # the refresh lock, the order every replica writer uses.
-        from khipu.hub_snapshot import scrub_forgotten_snapshot
-
-        scrub = scrub_forgotten_snapshot()
-        if not scrub.get("ok"):
-            # The replica is a cache the next refresh rebuilds; an unscrubbed
-            # one could serve a forgotten source until then.
-            from khipu.hub_snapshot import snapshot_path
-
-            snapshot_path().unlink(missing_ok=True)
-            scrub = {**scrub, "removed": True}
+        elif source.is_file() and source.suffix.lower() == ".zip":
+            with zipfile.ZipFile(source, "r") as zf:
+                infos = [info for info in zf.infolist() if not info.is_dir()]
+                for info in infos:
+                    # Zip-slip guard. Compare by path components, not by string
+                    # prefix: with target /a/b, "/a/bc/evil".startswith("/a/b") is
+                    # True, so a sibling directory escaped the old check entirely
+                    # (audit 2026-08-17).
+                    dest = (target / info.filename).resolve()
+                    if not dest.is_relative_to(target.resolve()):
+                        raise RuntimeError(f"refusing unsafe zip path: {info.filename}")
+                for info in infos:
+                    if Path(info.filename).parts == (_REGISTRY_NAME,):
+                        tombstones.merge_registry_bytes(zf.read(info))
+                with tombstones.write_gate() as gate:
+                    for info in infos:
+                        parts = Path(info.filename).parts
+                        if _skipped_name(parts):
+                            continue
+                        dest = (target / info.filename).resolve()
+                        if dest.exists() and not merge:
+                            continue
+                        if (info.filename.endswith(".json")
+                                and _forgotten_job(zf.read(info), gate)):
+                            skipped_forgotten += 1
+                            continue
+                        if parts == (_SNAPSHOT_NAME,):
+                            with zf.open(info) as source_file:
+                                stage(source_file)
+                            imported += 1
+                            continue
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(info) as source_file:
+                            if dest.name in SENSITIVE_FILENAMES:
+                                copy_sensitive(source_file, dest)
+                            else:
+                                with open(dest, "wb") as out:
+                                    shutil.copyfileobj(source_file, out)
+                        imported += 1
+        else:
+            raise RuntimeError("import source must be a .zip or a directory")
+        scrub = None
+        if staged is not None:
+            # After the gate is released: publishing takes the registry and
+            # then the refresh lock, the order every replica writer uses.
+            scrub = hub_snapshot.publish_imported_snapshot(staged)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
     out = {
         "ok": True,
         "imported": imported,

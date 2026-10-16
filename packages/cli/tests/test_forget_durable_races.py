@@ -1,6 +1,7 @@
 """Failing-first reproductions for forget completing ahead of local writers."""
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from unittest import mock
 
@@ -14,12 +15,17 @@ from tests.test_capture_identity import _SourcesFakeCursor
 
 @pytest.mark.parametrize("mode", ["dual", "hub"])
 def test_forget_between_pg_commit_and_file_write(tmp_path, mode):
+    """A forget starting between the hub commit and the legacy file write used
+    to complete ahead of the write. The memory lock now excludes that
+    interleaving: the forget, started in another thread at the same hook point,
+    waits for the capture to finish, then removes what it wrote."""
     payload = {"ts": "2026-10-01T09:00:00Z", "summary": "R6-INFLIGHT-CAPTURE-TEXT",
                "harness": "codex", "session_id": "codex:r6", "transcript_range": "0:10"}
     cur = _SourcesFakeCursor()
     (tmp_path / "replica").mkdir()
     fo.write_lines(tmp_path, [])
     observed = {}
+    forgets = []
 
     def concurrent_forget(value, *, episode_id):
         ep = cur.episodes[episode_id]
@@ -28,8 +34,14 @@ def test_forget_between_pg_commit_and_file_write(tmp_path, mode):
                                                  raw=ep["raw"], deleted=False)},
                  "sources": [dict(s, source_key=k) for k, s in cur.sources.items()],
                  "sources_enabled": True}
-        observed["forget"] = fo.run_forget(world, episode_id, tmp_path)
-        assert observed["forget"]["complete"], observed["forget"]
+        def run():
+            observed["forget"] = fo.run_forget(world, episode_id, tmp_path)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(0.3)
+        assert thread.is_alive(), "forget ran inside a local write"
+        forgets.append(thread)
         return False
 
     child = tmp_path / "file_writer.py"
@@ -48,6 +60,11 @@ def test_forget_between_pg_commit_and_file_write(tmp_path, mode):
             mock.patch.object(cap, "_capture_v2", return_value=child), \
             mock.patch("khipu.paths.isolated_dir", return_value=None):
         assert cap.capture(dict(payload), mode=mode, result=result) == 0
+        # Joined inside the patches: the forget thread uses the same ones.
+        assert forgets and forgets[0].is_alive()
+        forgets[0].join(10)
+        assert not forgets[0].is_alive()
+    assert observed["forget"]["complete"], observed["forget"]
     assert payload["summary"] not in (tmp_path / "episodes.jsonl").read_text(), (
         "capture appended forgotten plaintext after forget returned complete=True")
 

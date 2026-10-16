@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
@@ -118,7 +119,32 @@ def test_forget_interleaves_before_outbox_enqueue_and_drain_paths(registry, tmp_
     assert not bad.exists()
 
 
+def _forget_waits_in_thread(payload: dict, root: Path) -> dict:
+    """Start a real forget in another thread at a writer's hook point. The
+    memory lock holds it off while the writer is mid-write: assert it is
+    still blocked, and return a handle to join once the writer has returned."""
+    box: dict = {}
+
+    def run():
+        box["result"] = _forget(payload, root)
+
+    box["thread"] = threading.Thread(target=run)
+    box["thread"].start()
+    box["thread"].join(0.3)
+    assert box["thread"].is_alive(), "forget ran inside a local write"
+    return box
+
+
+def _finish_forget(box: dict) -> None:
+    box["thread"].join(10)
+    assert not box["thread"].is_alive()
+    assert box["result"]["complete"], box["result"]
+
+
 def test_forget_interleaves_at_retry_and_bury_write_boundaries(registry, tmp_path, monkeypatch):
+    """The interleaving is now excluded by the memory lock: the forget starts
+    at the retry write boundary in another thread and waits for the drain,
+    then removes the buried copy. Pins that the forget waits."""
     payload = _payload()
     d = outbox.outbox_dir()
     d.mkdir(parents=True)
@@ -131,8 +157,7 @@ def test_forget_interleaves_at_retry_and_bury_write_boundaries(registry, tmp_pat
     def pause_at_retry(value):
         calls["count"] += 1
         if calls["count"] == 2:
-            result = _forget(payload, tmp_path)
-            assert result["complete"], result
+            calls["forget"] = _forget_waits_in_thread(payload, tmp_path)
         with original(value) as allowed:
             yield allowed
 
@@ -140,19 +165,36 @@ def test_forget_interleaves_at_retry_and_bury_write_boundaries(registry, tmp_pat
     with mock.patch("khipu.capture.write_pg", side_effect=RuntimeError("retry me")):
         outbox.drain()
     assert calls["count"] == 2
+    _finish_forget(calls["forget"])
     assert not job.exists()
     assert not (d / "dead" / job.name).exists()
 
 
 def test_forget_interleaves_before_retry_dead_requeue(registry, tmp_path, monkeypatch):
+    """The interleaving is now excluded by the memory lock: the forget starts
+    before the requeue's guard in another thread and waits for retry_dead to
+    return, then removes the dead job. Pins that the forget waits."""
     payload = _payload()
     dead = outbox.dead_dir()
     dead.mkdir(parents=True)
     job = dead / "late.json"
     job.write_text(json.dumps({"payload": payload, "attempts": outbox.MAX_ATTEMPTS}), encoding="utf-8")
-    _publish_at_last_check(monkeypatch, payload, tmp_path)
-    assert outbox.retry_dead()["moved"] == 0
+    original = tombstones.write_guard
+    started = {}
+
+    @contextmanager
+    def start_forget_once(value):
+        if not started:
+            started["forget"] = _forget_waits_in_thread(payload, tmp_path)
+        with original(value) as allowed:
+            yield allowed
+
+    monkeypatch.setattr(tombstones, "write_guard", start_forget_once)
+    outbox.retry_dead()
+    assert started
+    _finish_forget(started["forget"])
     assert not job.exists()
+    assert not (outbox.outbox_dir() / job.name).exists()
 
 
 def test_forget_interleaves_before_replica_write_through(registry, tmp_path, monkeypatch):

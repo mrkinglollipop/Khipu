@@ -153,8 +153,14 @@ def record_source(cur, episode_id: int, role: str, ident: dict[str, Any], *,
 
     An origin whose key another episode already holds gets the episode key,
     the same rule the 0027 backfill applies, so every episode keeps an origin
-    row. A merged source already recorded keeps its first row."""
+    row. A merged source already recorded keeps its first row.
+
+    The one failure that is not fail-open is the hub refusing a forgotten
+    source (0030): ``ForgottenSourceRefused`` reaches the caller, which must
+    roll back the episode write it made this row for."""
     import sys
+
+    from khipu.tombstones import ForgottenSourceRefused, is_forgotten_refusal
 
     from khipu.db import has_table
 
@@ -186,6 +192,8 @@ def record_source(cur, episode_id: int, role: str, ident: dict[str, Any], *,
             cur.execute("ROLLBACK TO SAVEPOINT capture_source_row")
         except Exception:  # noqa: BLE001
             pass
+        if is_forgotten_refusal(exc):
+            raise ForgottenSourceRefused(str(exc)) from exc
         print(f"[khipu-capture] source row not recorded ({type(exc).__name__}: {exc})",
               file=sys.stderr, flush=True)
         return None

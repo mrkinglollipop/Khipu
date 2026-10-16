@@ -262,7 +262,11 @@ def write_gate() -> Iterator[Gate]:
     Callers keep this open until their atomic replace or SQLite commit
     completes, exactly as ``write_guard`` requires for a single payload.
     """
-    with _locked_registry() as (_path, value, lease):
+    from khipu import memory_lock
+
+    # The memory lock first: it orders every writer against a whole forget,
+    # and it is always taken before any other Khipu lock.
+    with memory_lock.shared(), _locked_registry() as (_path, value, lease):
         token = _OWNED_WRITER_LOCK.set(lease) if not lease.borrowed else None
         try:
             yield Gate(value)
@@ -291,14 +295,18 @@ def is_forgotten(payload: dict[str, Any]) -> bool:
 
 def subprocess_lock_handoff() -> tuple[dict[str, str], tuple[int, ...]]:
     """Environment and FD inheritance for a legacy child inside write_guard."""
+    from khipu import memory_lock
+
     lease = _OWNED_WRITER_LOCK.get()
     if lease is None:
         return {}, ()
     stat = os.fstat(lease.fd)
+    memory_env, memory_fds = memory_lock.handoff()
     return ({"KHIPU_TOMBSTONE_LOCK_FD": str(lease.fd),
              "KHIPU_TOMBSTONE_LOCK_DEV": str(stat.st_dev),
              "KHIPU_TOMBSTONE_LOCK_INO": str(stat.st_ino),
-             "KHIPU_TOMBSTONE_REGISTRY": str(lease.registry.resolve())}, (lease.fd,))
+             "KHIPU_TOMBSTONE_REGISTRY": str(lease.registry.resolve()),
+             **memory_env}, (lease.fd, *memory_fds))
 
 
 def publish_payloads(payloads: list[dict[str, Any]]) -> None:
@@ -392,6 +400,40 @@ def _hub_identities(payload: dict[str, Any], source: dict[str, Any] | None) -> l
         raise RegistryError(f"tombstone identity failed: {type(exc).__name__}") from exc
     found = {ident.get("source_key"), ident.get("payload_sha256"), *keys, *hashes}
     return sorted(str(item) for item in found if item)
+
+
+_REFUSAL = "khipu: forgotten source"
+HUB_IDENTITIES_SETTING = "khipu.source_identities"
+
+
+class ForgottenSourceRefused(ForgottenSource):
+    """The hub's 0030 trigger refused a write naming a forgotten source."""
+
+
+def is_forgotten_refusal(exc: BaseException) -> bool:
+    """Whether a database error is the 0030 triggers' refusal."""
+    return isinstance(exc, ForgottenSourceRefused) or _REFUSAL in str(exc)
+
+
+def announce_hub_identities(cur, payload: dict[str, Any],
+                            *sources: dict[str, Any] | None) -> None:
+    """Name the identities of the episode row about to be inserted, for the
+    0030 insert trigger: it refuses the row itself when one is forgotten, and
+    holds each identity's advisory lock until commit, so a forget cannot land
+    between the episode row and its source row. Transaction-local; a hub
+    without ``forgotten_sources`` is not asked."""
+    from khipu.db import has_table
+
+    try:
+        if not has_table(cur, "forgotten_sources"):
+            return
+    except Exception:  # noqa: BLE001 - a probe that cannot run (no real cursor) skips the announcement
+        return
+    found = set(_hub_identities(payload, sources[0] if sources else None))
+    for source in sources:
+        found.update(str(source[k]) for k in ("source_key", "payload_sha256")
+                     if source and source.get(k))
+    cur.execute("SELECT set_config(%s, %s, true)", (HUB_IDENTITIES_SETTING, ",".join(sorted(found))))
 
 
 def hub_source_forgotten(cur, payload: dict[str, Any],

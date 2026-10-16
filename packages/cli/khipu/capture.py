@@ -460,10 +460,25 @@ def _merge_into_episode(
         sets.append("verbatim = %s::jsonb")
         params.append(json.dumps(verbatim, ensure_ascii=False))
     params.append(target_id)
-    cur.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id = %s", params)
+    from khipu.mirror import _savepoint
+    from khipu.tombstones import is_forgotten_refusal
 
-    record_source(cur, target_id, "merged", source,
-                  ts=payload.get("ts"), summary=payload.get("summary"))
+    # The receipt and the merged source row are one write: the hub refuses
+    # either for a forgotten source (0030), and the refusal undoes both, so
+    # the caller falls through to an insert the hub refuses the same way.
+    savepoint = _savepoint(cur, "khipu_merge_write")
+    try:
+        cur.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id = %s", params)
+        record_source(cur, target_id, "merged", source,
+                      ts=payload.get("ts"), summary=payload.get("summary"))
+    except Exception as exc:
+        if not is_forgotten_refusal(exc):
+            raise
+        if savepoint:
+            cur.execute("ROLLBACK TO SAVEPOINT khipu_merge_write")
+        return False
+    if savepoint:
+        cur.execute("RELEASE SAVEPOINT khipu_merge_write")
 
     # The merged capture's own open/closed loops belong to the target episode
     # — same call the insert path makes in write_pg, same SAVEPOINT fail-open.
@@ -791,7 +806,11 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     source = source_identity(payload)
     topics_written = 0
     episode_id: int | None = None
-    with connect() as conn:
+    from khipu import memory_lock
+
+    # Shared for the whole transaction, through its commit: a forget on this
+    # Mac either finished before it began or starts after it committed.
+    with memory_lock.shared(), connect() as conn:
         with conn.cursor() as cur:
             from khipu.tombstones import hub_source_forgotten
 
@@ -1120,7 +1139,22 @@ def capture(payload: dict[str, Any], *, mode: str | None = None,
             result: dict[str, Any] | None = None) -> int:
     """Route one capture by mode. ``result``, when given, receives write_pg's
     stats (``episode_id``, ``episode_inserted``, ``source_key``) on a hub
-    write, so a caller that reports the episode never looks it up again."""
+    write, so a caller that reports the episode never looks it up again.
+
+    Holds the memory lock shared for every leg (hub row, outbox, legacy file,
+    vectors), so a forget on this Mac never interleaves with one capture."""
+    from khipu import memory_lock
+
+    try:
+        with memory_lock.shared():
+            return _capture(payload, mode=mode, result=result)
+    except memory_lock.MemoryLockError as exc:
+        _log(f"memory lock unavailable; capture refused ({exc})")
+        return EX_SOFTWARE
+
+
+def _capture(payload: dict[str, Any], *, mode: str | None,
+             result: dict[str, Any] | None) -> int:
     mode = (mode or capture_mode()).lower()
     try:
         _validate_timestamp(payload)

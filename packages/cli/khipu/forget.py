@@ -162,15 +162,20 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     legacy_identities = [i for i, s in zip(candidates, shared) if not s]
     from khipu.tombstones import publish_hub_forget
 
-    # Same transaction as the tombstone: a writer on any Mac, or on code that
-    # predates the local registry, is refused by the 0030 triggers.
-    publish_hub_forget(cur, episode_id, [*(source_rows or []),
-                                         *_payload_identities(read["tombstone_payloads"])])
     cur.execute(
         "UPDATE episodes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL",
         (episode_id,),
     )
     soft_deleted = cur.rowcount > 0
+    # Same transaction as the tombstone: a writer on any Mac, or on code that
+    # predates the local registry, is refused by the 0030 triggers. After the
+    # tombstone, not before: while 0030 is being applied the UPDATE above
+    # waits on its table lock, and only once it returns is forgotten_sources
+    # visible to this transaction. Before it, the identities would be
+    # silently skipped; the migration's own backfill covers a forget that
+    # committed before it.
+    publish_hub_forget(cur, episode_id, [*(source_rows or []),
+                                         *_payload_identities(read["tombstone_payloads"])])
     cur.execute(
         "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
         (str(episode_id),),
@@ -1228,11 +1233,103 @@ def plain_summary(out: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _native_job_remainder(session_id: str | None,
+                          source_rows: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Remove native capture jobs (queued, claimed, or a crash-left checkpoint)
+    that will capture one of the episode's sources, and report every job kept.
+
+    A job is matched on the source key its capture will carry
+    (``session_capture.job_source_identity``). It holds the transcript, and a
+    claimed one may hold the extracted episode too, so a match is removed,
+    under the queue's claim lock. A drainer that still holds the claim cannot
+    write it back: its checkpoint refuses a forgotten source or a removed
+    claim, and its hub write is refused. A job that cannot be read, or, with
+    no source rows, any job from the same session, is kept and reported."""
+    from khipu import session_capture as sc
+    from khipu.capture_identity import source_key
+
+    keys = {row["source_key"] for row in source_rows or [] if row.get("source_key")}
+    remaining: list[str] = []
+    inspected: list[dict[str, str]] = []
+    removed = 0
+    try:
+        directory = sc.queue_dir()
+        with sc._claim_lock() as acquired:
+            if not acquired:
+                raise OSError("queue claim lock unavailable")
+            try:
+                names = sorted(path.name for path in directory.iterdir())
+            except FileNotFoundError:
+                names = []
+            for name in names:
+                if not (name.endswith(".json") or ".claimed." in name or name.endswith(".tmp")):
+                    continue
+                path = directory / name
+                if not _present_file(path):
+                    continue
+                state, why = "clean", None
+                try:
+                    job = json.loads(path.read_text(encoding="utf-8"))
+                    ident = sc.job_source_identity(job)
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError, UnicodeError) as exc:
+                    state = "unreadable"
+                    why = (f"native capture job {path} could not be read "
+                           f"({type(exc).__name__}), so it was kept")
+                    ident = None
+                if state == "clean" and ident is not None:
+                    if keys and source_key(ident) in keys:
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            continue
+                        except OSError as exc:
+                            state = "copy remains"
+                            why = (f"native capture job {path} could not be removed "
+                                   f"({type(exc).__name__}), so it was kept")
+                        else:
+                            state = "removed"
+                            removed += 1
+                    elif not keys and session_id and ident["session_id"] == session_id:
+                        state = "copy remains"
+                        why = (f"native capture job {path} is from the same session, but with "
+                               "no source rows it cannot be matched exactly, so it was kept")
+                loc = {"place": "native capture job", "path": str(path), "state": state}
+                if why:
+                    loc["why"] = why
+                    remaining.append(f"native jobs: {why}")
+                inspected.append(loc)
+    except Exception as exc:  # noqa: BLE001 - an unchecked queue keeps the forget open
+        why = f"native capture jobs could not be checked ({type(exc).__name__}), so the forget stays open"
+        return {"ok": False, "removed": removed, "remaining": [*remaining, f"native jobs: {why}"],
+                "inspected": [*inspected, {"place": "native capture jobs", "path": None,
+                                           "state": "not checked", "why": why}]}
+    return {"ok": not remaining, "removed": removed, "remaining": remaining,
+            "inspected": inspected}
+
+
 def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
                       gateway: bool | None = None) -> dict[str, Any]:
     """Hub + legacy file. Opens its own connection and commits. ``gateway``
     defaults to the marker the HTTPS gateway sets at startup: a gateway with
-    no memory root keeps no legacy logs, so they are not applicable there."""
+    no memory root keeps no legacy logs, so they are not applicable there.
+
+    Holds this Mac's memory lock exclusive for the whole run, from the
+    registry publish to the completion check: two forgets serialize, and no
+    local writer (each holds it shared) interleaves with one."""
+    from khipu import memory_lock
+
+    try:
+        with memory_lock.exclusive():
+            return _forget_everywhere(episode_id, memory_root=memory_root, gateway=gateway)
+    except memory_lock.MemoryLockError as exc:
+        return {"ok": False, "id": episode_id, "complete": False,
+                "error": f"forget not started: {exc}"}
+
+
+def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
+                       gateway: bool | None) -> dict[str, Any]:
     from khipu.db import connect
 
     root_resolved = True
@@ -1316,9 +1413,12 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
     out["replica_temps"] = _replica_temp_remainder(episode_id)
     if not out["replica_temps"]["ok"]:
         partial.append("replica_temp")
+    out["native_jobs"] = _native_job_remainder(out.get("session_id"), out.get("source_rows"))
+    if not out["native_jobs"]["ok"]:
+        partial.append("native_jobs")
     out["locations"] = _merge_locations(
         legacy_locs, *(item.get("inspected", []) for item in out["outboxes"]),
-        out["replica_temps"]["locations"])
+        out["replica_temps"]["locations"], out["native_jobs"]["inspected"])
     out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
                      "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
     if not out["outbox"]["ok"]:
@@ -1338,6 +1438,7 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
         "replica_temp": [loc.get("why") or f"{loc['path']}: {loc['state']}"
                          for loc in out["replica_temps"]["locations"]
                          if loc["state"] in INCOMPLETE_STATES],
+        "native_jobs": out["native_jobs"]["remaining"],
     }
     if out.get("unidentified_sources", 0) > 0:
         out["partial_errors"]["legacy_file"] = [
