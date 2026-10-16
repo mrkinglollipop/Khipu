@@ -152,6 +152,12 @@ STORES: tuple[Store, ...] = (
           "a binary copy of the commitments table, whose text a capture opened",
           "kept: closed commitments remain by design (forget's kept text)",
           _w("hygiene.backup_commitments")),
+    Store("owed tidy plan", "the file named with khipu owed tidy --plan-out; the app keeps it at "
+          "data folder state/owed-tidy/plan-<project>-<hash>.json",
+          "a clean-up plan: open commitments' text, owners and the evidence for each change",
+          "kept: commitments' text remains by design (forget's kept text); each plan is rewritten "
+          "on the next Tidy this list",
+          _w("cli.cmd_owed_tidy")),
     Store("local backup", "a backup folder or archive the owner chose",
           "a copy of the data folder", "kept: backups are kept for recovery (forget's kept text); "
           "an import restores only what a store here says it may, each file through that "

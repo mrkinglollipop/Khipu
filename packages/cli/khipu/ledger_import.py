@@ -548,11 +548,12 @@ def _existing(cur, project: str, ids: list[str]) -> tuple[dict[str, Any], dict[s
 def in_inbox(path: str | os.PathLike) -> bool:
     """Whether ``path`` is a copy in the ledger inbox (``paths.ledger_inbox``).
     A copy never changes, so catching up is not used for it."""
-    from khipu import paths
+    from khipu import paths, safe_read
 
     try:
-        return os.path.dirname(os.path.realpath(path)) == os.path.realpath(paths.ledger_inbox())
-    except OSError:
+        folder, _name = safe_read.parse(path)
+        return os.path.samefile(folder, paths.ledger_inbox())
+    except (safe_read.Refused, OSError):
         return False
 
 
