@@ -160,6 +160,19 @@ Argued, since the owner's default is nothing:
 - **Nothing an owner does stays app-only.** Restore (row 14) becomes undoable by direction. Purge (row 15) becomes a two-turn direction (2.3 step 6), still no app step.
 - **One exception, recommended: weakening this check.** The trusted-entrypoint list, the wrapper list and the "session-only binding" switch for Aegis decide what counts as his words for every other action. If a direction could widen them, one unwrapped paste could open the door for everything after it. Recommendation: by direction he can turn owner direction **off** or **tighten** it at once; widening it (adding an entrypoint, turning on session-only binding, lengthening the windows past their defaults) is done in the app. This is a recommendation, his call (question 1).
 
+### 2.8 Known boundary: the same Mac user
+
+Khipu and the agents run as one Mac user. A program running as that user can write the owner-turn files, write the owner-actions log, or run the prompt hook's shim with `exec` from a bash shell so that the shim's parent looks like a harness. File modes and process checks cannot separate two programs of the same user, so none of this can be made impossible. Matt accepted this limit on 2026-10-16: every owner action is made tamper-evident and visible instead.
+
+What is closed:
+
+- **Running the shim by hand.** Each recorded turn names the process that ran the hook (its issuer: the first process above the hook's own `sh`, `bash` or `dash` shells). An issuer that is an interactive shell (zsh, fish, tcsh, csh, ksh) or a script interpreter (Python, Perl, Ruby, osascript) is refused, so a shim run from an agent's zsh shell or from a script never carries the owner's word. Otherwise the issuer must be an ancestor of the call that acts on the turn, as the harness is above every command its conversation runs (refusal `not_from_the_hook`). A dispatched job acting on its parent's turn skips only the ancestor test.
+- **Wrappers anywhere.** A turn that holds a machine wrapper (a task notification, a message from another session, a slash command's output) anywhere, not only at the start, never counts.
+
+What remains: `exec` tricks from a bash shell, direct writes to the turn files, and log lines written through Khipu's own append code.
+
+Why that is acceptable: every owner action is a line in a hash-chained, append-only log. Each line carries the hash of the line before it and its own hash (the words enter it as their hash, so forgetting can scrub the words without breaking the chain). Any line written another way, changed later or deleted breaks the chain at a named entry: doctor turns red and names it, and the app shows a banner on Owner actions naming it. Every owner action, by direction, in the app or on a terminal, is listed on Owner actions and named in the next routing block, with Undo.
+
 ## 3. Slices
 
 Each slice is one session. The oracle for every slice is the hermetic pytest run from `packages/cli` under a temp HOME with `KHIPU_KEYCHAIN=0` (only the named known failure allowed), and `ruff check` unchanged; slices that touch the app add `npx vitest run` and `npm run build` in `apps/desktop`, and Rust changes add `cargo test --offline --lib`. Read-to-act: inspect the files named in section 1 before writing.

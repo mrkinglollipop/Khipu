@@ -57,6 +57,16 @@ def _hook(prompt: str) -> str:
                           env=env, timeout=60)
     found = re.search(r"Owner turn: ([0-9a-f]{8})", done.stdout)
     assert found, (done.stdout, done.stderr)
+    # Run from here, the hook's issuer is this test's Python, which the check
+    # refuses (a shim run by hand). Stand the harness in for it: the turn's
+    # issuer becomes the one conftest puts above this process.
+    from tests.conftest import FAKE_HOOK_ISSUER
+
+    path = owner_turns.session_file(SESSION)
+    rows = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()]
+    assert rows[-1]["turn"] == found.group(1) and "refused" in rows[-1]["issuer"], rows[-1]
+    rows[-1]["issuer"] = dict(FAKE_HOOK_ISSUER)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     return found.group(1)
 
 

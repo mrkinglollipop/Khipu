@@ -16,7 +16,9 @@ milliseconds without the rest of the package.
 Which turns count (``eligible``) is decided at check time against the
 current settings, so turning the check off or tightening it applies to turns
 already recorded. The recorder stores the facts: harness, entrypoint, and
-whether the turn was a machine message, a T3 helper or a dispatched brief.
+whether the turn was a machine message, a T3 helper or a dispatched brief,
+and which process ran the hook (``hook_issuer``), which the check needs to
+be above the call that acts on the turn.
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +54,16 @@ DEFAULTS = {
     "session_binding": True,
 }
 SESSION_ONLY_HARNESSES = ("aegis",)
+# The shells a harness runs a hook command through, and the shim itself:
+# skipped on the way up to the hook's issuer. On macOS /bin/sh runs as
+# /bin/bash (or dash), so the kernel's path never says "sh" alone.
+HOOK_SHELLS = ("sh", "bash", "dash")
+# An issuer that is one of these is an agent's own shell or a script, never
+# a harness running its prompt hook: its turn never carries the owner's
+# word. node is not here: Claude Code can run as node.
+REFUSED_ISSUERS = ("zsh", "fish", "tcsh", "csh", "ksh")
+REFUSED_ISSUER_PREFIXES = ("python", "perl", "ruby", "osascript")
+_ISSUER_MOST = 16
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]")
 
 
@@ -237,17 +250,76 @@ def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
     return True, ""
 
 
-def record(payload: dict, env: dict | None = None, now: float | None = None) -> str | None:
+def _proc_info(pid: int) -> tuple[int, str, float] | None:
+    """A process's parent, the path of the file it runs and when it started,
+    as the kernel has them; None when they can't be read. A copy of
+    ``routing._proc_info``: this module stays standard library only."""
+    if sys.platform != "darwin" or pid <= 0:
+        return None
+    try:
+        import ctypes
+        import struct
+
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+        info = ctypes.create_string_buffer(136)  # struct proc_bsdinfo
+        if lib.proc_pidinfo(pid, 3, ctypes.c_uint64(0), info, 136) != 136:  # PROC_PIDTBSDINFO
+            return None
+        path = ctypes.create_string_buffer(4096)  # PROC_PIDPATHINFO_MAXSIZE
+        if lib.proc_pidpath(pid, path, 4096) <= 0:
+            return None
+        sec, usec = struct.unpack_from("QQ", info, 120)  # pbi_start_tvsec, pbi_start_tvusec
+        return struct.unpack_from("I", info, 16)[0], os.fsdecode(path.value), sec + usec / 1e6
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _refused_issuer(name: str) -> bool:
+    low = name.lower()
+    return low in REFUSED_ISSUERS or low.startswith(REFUSED_ISSUER_PREFIXES)
+
+
+def hook_issuer() -> dict | None:
+    """The process that ran this hook: the first one above this process that
+    is not a hook shell (``HOOK_SHELLS``). ``{"pid", "start", "exe"}`` for a
+    harness; ``{"refused": exe}`` when it is an interactive shell or a script
+    interpreter (someone ran the shim by hand); None when the tree can't be
+    read. Same-user processes can't be told apart for certain (scope 2.8):
+    this closes running the shim from an agent's shell, not ``exec`` tricks."""
+    me = _proc_info(os.getpid())
+    if me is None:
+        return None
+    pid, born = me[0], me[2]
+    for _ in range(_ISSUER_MOST):
+        info = _proc_info(pid)
+        if info is None:
+            return None
+        parent, exe, started = info
+        if started > born:
+            return None  # the parent died and its number went to a newer process
+        born = started
+        name = os.path.basename(os.path.realpath(exe))
+        if name in HOOK_SHELLS:
+            pid = parent
+            continue
+        if _refused_issuer(name):
+            return {"refused": name}
+        return {"pid": pid, "start": started, "exe": name}
+    return None
+
+
+def record(payload: dict, env: dict | None = None, now: float | None = None,
+           issuer: dict | None = None) -> str | None:
     """Record one prompt-submit turn. Returns the turn token to push into the
     conversation when the turn is eligible and the harness shows hook output
-    (Claude Code, Codex), else None. Never raises."""
+    (Claude Code, Codex), else None. ``issuer`` None means this process's
+    (``hook_issuer``). Never raises."""
     try:
-        return _record(payload, os.environ if env is None else env, time.time() if now is None else now)
+        return _record(payload, os.environ if env is None else env, time.time() if now is None else now, issuer)
     except Exception:  # noqa: BLE001 - the recorder must never fail a prompt
         return None
 
 
-def _record(payload: dict, env, now: float) -> str | None:
+def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
     if not isinstance(payload, dict):
         return None
     conf = settings()
@@ -260,14 +332,16 @@ def _record(payload: dict, env, now: float) -> str | None:
     harness = harness_of(env, payload)
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
     text = clean_user_text(prompt, owner=True).strip()
-    machine = is_machine(text)
+    machine = is_machine(text, anywhere=True)
+    if issuer is None:
+        issuer = hook_issuer() or {"refused": "unknown"}
     turn = {
         "at": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "ts": now, "harness": harness, "session": session,
         "entrypoint": entrypoint_of(harness, env, payload, session), "cwd": cwd,
         "turn": secrets.token_hex(4),
         "text": "" if machine else text[:TEXT_MOST],
-        "machine": machine, "helper": t3.is_helper_session(cwd),
+        "machine": machine, "helper": t3.is_helper_session(cwd), "issuer": issuer,
     }
     brief = None if machine else brief_for(text, now)
     turn["delegated"] = brief is not None

@@ -62,6 +62,11 @@ def clean_user_text(text: str, *, owner: bool = False) -> str:
     return _CURSOR_WRAP.sub("", text)   # no strip: ACP user text arrives in chunks that must re-join exactly
 
 
-def is_machine(text: str) -> bool:
-    """True when a cleaned user turn is a message the harness wrote."""
+def is_machine(text: str, *, anywhere: bool = False) -> bool:
+    """True when a cleaned user turn is a message the harness wrote: it opens
+    with one of ``MACHINE_USER_TAGS``. ``anywhere`` (the owner-turn recorder):
+    one of them anywhere in the turn, since text inside a wrapper is never
+    the owner's and a turn that mixes the two can't say which words are."""
+    if anywhere:
+        return any(tag in text for tag in MACHINE_USER_TAGS)
     return text.lstrip().startswith(MACHINE_USER_TAGS)

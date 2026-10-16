@@ -358,6 +358,7 @@ def check(action: str, target: str, words: str, *, turn_token: str | None = None
         session, via_session = _parent_of(session, str(owner_session).strip(), now), session
     quote = str(words or "")
     turn = _the_turn(session, turn_token, quote, conf, now, short_ok=widening)  # steps 1 to 3
+    _from_the_hook(turn, ancestry=via_session is None)
     if widening:  # step 6 (decision 1): a later turn confirms it
         if _confirms_pending(action, target, value, session, turn, quote, conf, now):
             return _stamp(turn, session, quote, turn_token, confirms=True, via_session=via_session)
@@ -443,6 +444,44 @@ def _the_turn(session: str, token, quote: str, conf: dict, now: float, *, short_
         raise stale
     _verbatim(quote, {"text": ""})
     raise AssertionError("unreachable")
+
+
+_CHAIN_MOST = 16
+
+
+def _caller_chain() -> list[tuple[int, float]]:
+    """This process's ancestors, parent first, as (pid, start time). Stops
+    where a parent started after its child (its number was reused)."""
+    me = owner_turns._proc_info(os.getpid())
+    if me is None:
+        return []
+    pid, born = me[0], me[2]
+    out: list[tuple[int, float]] = []
+    for _ in range(_CHAIN_MOST):
+        info = owner_turns._proc_info(pid)
+        if info is None or info[2] > born:
+            break
+        out.append((pid, info[2]))
+        pid, born = info[0], info[2]
+        if pid <= 1:
+            break
+    return out
+
+
+def _from_the_hook(turn: dict, *, ancestry: bool = True) -> None:
+    """The turn was recorded by a hook its harness ran: its issuer is not an
+    agent's shell or a script, and (``ancestry``) is above this call, as the
+    harness is above every command its conversation runs. A dispatched job
+    acting on its parent's turn skips the ancestry test only: a job T3
+    started is not a descendant of the parent conversation's harness."""
+    issuer = turn.get("issuer")
+    refused = not isinstance(issuer, dict) or "refused" in issuer or not isinstance(issuer.get("pid"), int)
+    if not refused and ancestry:
+        refused = (issuer["pid"], issuer.get("start")) not in _caller_chain()
+    if refused:
+        raise DirectionRefused("not_from_the_hook",
+                               "That turn was not recorded by the prompt hook of the conversation making this call, "
+                               "so it can't carry the owner's word. Ask the owner to say it again here.")
 
 
 def _is_fresh(turn: dict, usable: list[dict], conf: dict, now: float) -> bool:

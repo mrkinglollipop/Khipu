@@ -83,7 +83,7 @@ if not hasattr(_t3, 'cache_thread'):
     importlib.reload(_t3)
 from khipu.lines import split_lines
 from khipu.t3 import cache_thread, is_helper_session
-from khipu.turn_text import INJECTED_CONTEXT_TAGS, MACHINE_USER_TAGS, clean_user_text  # noqa: F401
+from khipu.turn_text import INJECTED_CONTEXT_TAGS, MACHINE_USER_TAGS, clean_user_text, is_machine  # noqa: F401
 
 HARNESSES = ("claude_code", "cursor", "codex", "aegis")
 
@@ -328,7 +328,7 @@ def _machine_user_message(text: str) -> str | None:
     """What the window keeps for a machine-generated user message, or None
     when ``text`` (already cleaned) is something the person wrote."""
     head = text.lstrip()
-    if not head.startswith(MACHINE_USER_TAGS):
+    if not is_machine(head):
         return None
     m = _TAG_NAME.match(head)
     tag = m.group(1) if m else "notification"
