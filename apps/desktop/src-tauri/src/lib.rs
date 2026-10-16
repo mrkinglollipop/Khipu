@@ -745,30 +745,12 @@ fn checked_usage_accounts(raw: &str) -> Result<String, String> {
     checked_usage_accounts_kept(raw, &[])
 }
 
-/// An entry's account fields as `khipu.usage._same_entry` compares them:
-/// text trimmed, a missing or empty field left out, any other field ignored.
-fn same_entry_fields(entry: &Value) -> Option<serde_json::Map<String, Value>> {
-    let obj = entry.as_object()?;
-    let mut out = serde_json::Map::new();
-    for field in ["label", "harness", "home"] {
-        match obj.get(field) {
-            None | Some(Value::Null) => {}
-            Some(Value::String(s)) if s.is_empty() => {}
-            Some(Value::String(s)) => {
-                out.insert(field.to_string(), Value::String(s.trim().to_string()));
-            }
-            Some(other) => {
-                out.insert(field.to_string(), other.clone());
-            }
-        }
-    }
-    Some(out)
-}
-
 /// As `checked_usage_accounts`, with `stored` the list saved now: an entry
-/// the owner left as it is stored goes through exactly as stored, whatever
-/// rule it breaks today (as the CLI keeps it); only entries he added or
-/// changed are checked here.
+/// the owner left exactly as it is stored (the same JSON value, at its own
+/// place or, after a reorder, at another) goes through untouched, whatever
+/// rule it breaks today (as the CLI keeps it); each stored entry answers
+/// one sent entry at most. Only entries he added or changed are checked
+/// here.
 fn checked_usage_accounts_kept(raw: &str, stored: &[Value]) -> Result<String, String> {
     let not_a_list = || "usage_accounts must be a JSON list of accounts".to_string();
     let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|_| not_a_list())?;
@@ -776,16 +758,21 @@ fn checked_usage_accounts_kept(raw: &str, stored: &[Value]) -> Result<String, St
     if entries.len() > USAGE_ACCOUNTS_MAX {
         return Err(format!("usage_accounts holds at most {USAGE_ACCOUNTS_MAX} entries"));
     }
+    let mut used = vec![false; stored.len()];
+    for (i, entry) in entries.iter().enumerate() {
+        if stored.get(i) == Some(entry) {
+            used[i] = true;
+        }
+    }
     let mut out = Vec::with_capacity(entries.len());
     for (i, entry) in entries.iter().enumerate() {
         let n = i + 1;
-        if let Some(fields) = same_entry_fields(entry) {
-            if let Some(kept) = stored.iter().find(|s| same_entry_fields(s).as_ref() == Some(&fields)) {
-                out.push(kept.clone());
-                continue;
-            }
-        } else if stored.contains(entry) {
-            // Not an object (a hand-edited null, say), stored exactly so: kept.
+        if stored.get(i) == Some(entry) {
+            out.push(entry.clone());
+            continue;
+        }
+        if let Some(j) = (0..stored.len()).find(|&j| !used[j] && &stored[j] == entry) {
+            used[j] = true;
             out.push(entry.clone());
             continue;
         }
@@ -5187,17 +5174,40 @@ mod priority_and_sign_in_tests {
         )
         .unwrap();
         // The app sends the untouched entry back and adds one: Add is not blocked by it.
-        let sent = r#"[{"harness": "codex", "label": "Codex"}, {"harness": "legacy-cli", "label": " Legacy ", "note": 1},
+        let sent = r#"[{"harness": "codex", "label": "Codex"}, {"harness": "legacy-cli", "label": "Legacy", "note": 1},
                        {"harness": "Claude", "label": "Work", "home": "~/.claude-work"}]"#;
         let out: Value = serde_json::from_str(&checked_usage_accounts_kept(sent, &stored).unwrap()).unwrap();
         assert_eq!(out[1], stored[1]);
         assert_eq!(out[2], serde_json::json!({"harness": "claude", "label": "Work", "home": "~/.claude-work"}));
         let argv = config_set_argv_kept(USAGE_ACCOUNTS_KEY, sent, Some("a1"), &stored).unwrap();
         assert_eq!(argv[..5], v(&["config", "--from-app", "--expect=a1", "--set", USAGE_ACCOUNTS_KEY])[..]);
-        // Changed, or with nothing stored, it is checked as any new entry.
+        // Changed (even only by spaces), or with nothing stored, it is checked as any new entry.
         let changed = r#"[{"harness": "legacy-cli", "label": "Renamed"}]"#;
         assert!(checked_usage_accounts_kept(changed, &stored).is_err());
+        let spaced = r#"[{"harness": "legacy-cli", "label": " Legacy ", "note": 1}]"#;
+        assert!(checked_usage_accounts_kept(spaced, &stored).is_err());
         assert!(checked_usage_accounts(r#"[{"harness": "legacy-cli", "label": "Legacy"}]"#).is_err());
+    }
+
+    #[test]
+    fn each_untouched_entry_keeps_its_own_stored_value() {
+        // Two entries the same in their account fields but not in their
+        // others: each goes through as itself, never as the first.
+        let stored: Vec<Value> = serde_json::from_str(
+            r#"[{"harness": "legacy-cli", "label": "Legacy", "note": "first"},
+                {"harness": "legacy-cli", "label": "Legacy", "note": "second"}]"#,
+        )
+        .unwrap();
+        let sent = serde_json::to_string(&stored).unwrap();
+        let out: Value = serde_json::from_str(&checked_usage_accounts_kept(&sent, &stored).unwrap()).unwrap();
+        assert_eq!(out, Value::Array(stored.clone()));
+        // Reordered, each is still itself.
+        let reordered = serde_json::to_string(&[stored[1].clone(), stored[0].clone()]).unwrap();
+        let out: Value = serde_json::from_str(&checked_usage_accounts_kept(&reordered, &stored).unwrap()).unwrap();
+        assert_eq!(out, serde_json::json!([stored[1], stored[0]]));
+        // One stored entry answers one sent entry: a copy of it is new, and checked.
+        let twice = serde_json::to_string(&[stored[0].clone(), stored[0].clone()]).unwrap();
+        assert!(checked_usage_accounts_kept(&twice, &stored).is_err());
     }
 
     #[test]

@@ -1249,17 +1249,24 @@ def _load_cache() -> dict[str, dict]:
     return {k: v for k, v in rows.items() if isinstance(v, dict)} if isinstance(rows, dict) else {}
 
 
-def _save_cache(rows: dict[str, dict]) -> None:
+def _save_cache(rows: dict[str, dict], *, strict: bool = False) -> None:
+    """A read-only data dir costs the cache, never the answer; ``strict``
+    (an account change's own write, which rolls back on it) raises."""
     path = cache_file()
+    tmp = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, suffix=".tmp",
                                          encoding="utf-8") as fh:
-            json.dump({"version": CACHE_VERSION, "rows": rows}, fh, indent=2, sort_keys=True)
             tmp = Path(fh.name)
+            json.dump({"version": CACHE_VERSION, "rows": rows}, fh, indent=2, sort_keys=True)
         os.replace(tmp, path)
     except OSError:
-        pass  # a read-only data dir costs the cache, never the answer
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        if strict:
+            raise
 
 
 def _open_lock(name: str) -> int | None:

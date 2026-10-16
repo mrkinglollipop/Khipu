@@ -1517,3 +1517,76 @@ def test_stops_not_offered_again_is_part_of_its_transaction(mac, monkeypatch):
     accounts.recover()
     assert not routing.account_txns_open()
     assert any(e["cli"] == "claude" and e["why"] == accounts.STOPPED_WHY for e in discover.turned_down())
+
+
+# ---- review round 9 -----------------------------------------------------------------------
+
+
+def test_failed_stop_rolls_back_its_cache_row_and_not_offered_again(mac, monkeypatch):
+    _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
+    cache = {"claude|": {"harness": "claude", "account": "First", "plan": "max", "ok": True, "windows": []}}
+    usage._save_cache(cache)
+    before_declined = discover.turned_down()
+    with monkeypatch.context() as m:
+        _fail_append(m, 2)
+        with pytest.raises(usage.AccountsError) as exc:
+            accounts.stop("claude|", expect=_version())
+    assert exc.value.code == "record_failed"
+    assert any(a["harness"] == "claude" for a in config.load_config()["usage_accounts"])
+    assert usage._load_cache() == cache
+    assert discover.turned_down() == before_declined
+
+
+def test_move_fails_when_its_cache_write_fails(mac, monkeypatch):
+    import os
+
+    _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
+    (mac["home"] / ".claude-moved").mkdir()
+    old = "claude|"
+    cache = {old: {"harness": "claude", "account": "First", "plan": "max", "ok": True, "windows": []}}
+    usage._save_cache(cache)
+    version = _version()
+    replace = os.replace
+
+    def fail_only_usage_cache(src, dst, *args, **kw):
+        if str(dst) == str(usage.cache_file()):
+            raise PermissionError(13, "usage cache replacement denied")
+        return replace(src, dst, *args, **kw)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "replace", fail_only_usage_cache)
+        with pytest.raises(usage.AccountsError) as exc:
+            accounts.move(old, "~/.claude-moved", expect=version)
+    assert exc.value.code == "record_failed"
+    assert _version() == version
+    assert usage._load_cache() == cache
+    assert not routing.account_txns_open()
+
+
+def test_move_without_its_own_cache_row_drops_a_former_tenants(mac):
+    _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
+    (mac["home"] / ".claude-moved").mkdir()
+    new = usage._key({"harness": "claude", "home": "~/.claude-moved"})
+    usage._save_cache({new: {"harness": "claude", "account": "Former tenant", "plan": "pro", "ok": True,
+                             "windows": [{"name": "weekly", "used_pct": 100, "resets_at": "2027-01-01T00:00:00Z"}]}})
+    accounts.move("claude|", "~/.claude-moved", expect=_version())
+    assert new not in usage._load_cache()
+
+
+def test_last_valid_account_needs_confirmation_beside_invalid_entries(mac):
+    _set(usage_accounts=[{"harness": "claude", "label": "First"}, None])
+    with pytest.raises(usage.AccountsError) as exc:
+        accounts.stop("claude|", expect=_version())
+    assert exc.value.code == "last_account"
+
+
+def test_only_invalid_entries_left_read_a_kept_default_as_not_tracked(mac):
+    _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "old-cli", "label": "Legacy"}])
+    routing.pause("claude|", via="app")
+    routing.set_priority([{"account": "claude|"}], via="app", expect=routing.priority_version())
+    accounts.stop("claude|", expect=_version(), keep_pause=True, keep_priority=True, confirm_last=True)
+    assert not accounts.known_of(config.load_config()["usage_accounts"])
+    view = routing.read_view()
+    row = next(a for a in view["accounts"] if a["key"] == "claude|")
+    assert row["configured"] is False
+    assert view["priority"]["entries"][0]["in_settings"] is False

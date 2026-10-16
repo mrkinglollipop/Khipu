@@ -1102,6 +1102,26 @@ note; a hand-edited invalid entry survives an Add; a move carries reports and ev
 entry folds a late report under the old key into the new account; an ambiguous lane label is left for repair,
 never converted to the first match.
 
+**9B known boundaries and follow-ups.** Left out of 9B on purpose, after nine rounds of review:
+
+- A rollback puts back only what the change touched: the usage cache rows of its keys and the Not offered
+  again entries of its logins, as they stood just before. A refresh that writes one of those same rows in the
+  moment between the change and its rollback loses that write. Only cached figures are lost, and the next
+  refresh reads them again.
+- If the rollback's own write of the cache or of Not offered again fails (a full or read-only disk), the
+  config and the routing record are rolled back but those two stores keep what the change wrote. Figures are
+  read again later; a login left on Not offered again can be offered again from Settings.
+- Not offered again entries put back by a rollback go to the end of that list, not to their old place.
+- A move cut off part way is finished by `recover` on the next read, which cannot tell whether the cache
+  step already ran, so it keeps any row at the new key: one left by a former tenant of that folder, when the
+  account had no row of its own, stays until the next refresh replaces it. Telling them apart would need a
+  marker in the cache row.
+- The app keeps an untouched entry only when it sends it back exactly as stored (the same JSON value, which
+  `storable` in `PlansCard.tsx` does); one changed in any way, even by spaces, is checked as a new entry.
+- Stopping the last valid account beside invalid entries (with the owner's confirmation) keeps the invalid
+  entries stored, so the list is not "Read no accounts" but reads no account; a kept pause or priority on a
+  default login then shows as not tracked.
+
 **9C, app surfaces (apps/desktop; one session).** Read `add-account*.html` and `PlansCard.tsx` first. Build: the
 dialog (steps 1 and 3, every state but sign-in), Found rows, "Found, not checked" rows with Check and its
 help line (decision 20), Looking…, couldn't check, last run line, Home's

@@ -1678,8 +1678,10 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     from khipu import usage
 
     # "Read no accounts" (settings clarity decision 14): no default login
-    # counts as read while it holds.
-    cfg["_accounts_none"] = usage.reads_none(config)
+    # counts as read while it holds. Nor while a list is stored: only its
+    # valid entries are read, so one holding none of them reads no account.
+    listed = config.get("usage_accounts")
+    cfg["_accounts_none"] = usage.reads_none(config) or (isinstance(listed, list) and bool(listed))
     # Part of the priority's version: an account move, track or stop can
     # change what a priority entry's key refers to.
     from khipu.config import accounts_version

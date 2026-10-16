@@ -232,15 +232,12 @@ def _cache_ops(lines: list[dict], declines=None) -> list[tuple]:
                if isinstance(d, dict) and isinstance(d.get("account"), str)])
 
 
-def _apply_cache(ops: list[tuple], *, reverse: bool = False) -> None:
-    """Apply the changes (each can be applied again); ``reverse`` moves the
-    moved rows back (a dropped row is a cache entry, read again later, and
-    Not offered again only changes what Home offers)."""
-    for op in reversed(ops) if reverse else ops:
+def _apply_cache(ops: list[tuple], *, again: bool = False) -> None:
+    """Apply the changes (``again``: possibly a second time, by ``recover``);
+    a rollback puts back what ``_snapshot`` read before them (``_restore``)."""
+    for op in ops:
         if op[0] == "move":
-            _move_row(*((op[2], op[1]) if reverse else (op[1], op[2])))
-        elif reverse:
-            continue
+            _move_row(op[1], op[2], again=again)
         elif op[0] == "drop":
             _drop_row(op[1])
         else:
@@ -252,8 +249,9 @@ def _transact(data: dict, before: dict, lines: list[dict], declines: list[dict])
     """Commit one account change as a transaction, under the routing and
     config locks: its intent (its lines, and the account list's version
     before and after) goes into the routing record first; then the config
-    and the usage cache; then its ``done`` line. A step that fails rolls the
-    config and cache back and aborts it, and is raised, never returned as
+    and the usage cache; then its ``done`` line. A step that fails rolls back
+    all it touched (the config, the cache rows, Not offered again) and aborts
+    it, and is raised, never returned as
     done. A change cut off part way is finished or rolled back by
     ``recover`` before anything reads it, so the list and the record's
     history never disagree."""
@@ -273,7 +271,9 @@ def _transact(data: dict, before: dict, lines: list[dict], declines: list[dict])
             data.pop(config.ACCOUNT_CHANGE_OPEN, None)
             _abort(txn)
             raise AccountsError(f"{failed}: Khipu can't write its config file", "write_failed") from None
+        snap = None
         try:
+            snap = _snapshot(ops)
             _apply_cache(ops)
             out = routing.account_txn_end(txn, "done")
         except (OSError, routing.RouteError, AccountsError):
@@ -288,8 +288,9 @@ def _transact(data: dict, before: dict, lines: list[dict], declines: list[dict])
                 data.update(changed)
                 raise AccountsError("Khipu could not finish this change to its accounts; it finishes it the next "
                                     "time it reads them", "record_failed") from None
-            with contextlib.suppress(OSError, AccountsError):
-                _apply_cache(ops, reverse=True)
+            if snap is not None:
+                with contextlib.suppress(OSError, AccountsError):
+                    _restore(snap)
             _abort(txn)
             raise AccountsError(failed, "record_failed") from None
         data.pop(config.ACCOUNT_CHANGE_OPEN, None)
@@ -337,7 +338,7 @@ def recover() -> None:
                 version = config.accounts_version(data)
                 for begin, lines in unfinished:
                     if version == begin.get("list_after"):
-                        _apply_cache(_cache_ops(lines, begin.get("declines")))
+                        _apply_cache(_cache_ops(lines, begin.get("declines")), again=True)
                         routing.account_txn_end(begin["id"], "done")
                     else:
                         routing.account_txn_end(begin["id"], "abort")
@@ -590,6 +591,9 @@ def _mentions(label: str, view: dict | None = None) -> list[dict]:
 
 @contextlib.contextmanager
 def _cache():
+    """The usage cache rows under its write lock, saved after. Inside a
+    transaction a save is not best-effort (``usage._save_cache`` is): one
+    that fails raises ``OSError`` and the change rolls back."""
     fd = usage._open_lock(usage.WRITE_LOCK_NAME)
     try:
         if fd is not None:
@@ -597,7 +601,7 @@ def _cache():
                 fcntl.flock(fd, fcntl.LOCK_EX)
         rows = usage._load_cache()
         yield rows
-        usage._save_cache(rows)
+        usage._save_cache(rows, strict=True)
     finally:
         usage._release(fd)
 
@@ -607,11 +611,45 @@ def _drop_row(key: str) -> None:
         rows.pop(key, None)
 
 
-def _move_row(old: str, new: str) -> None:
+def _move_row(old: str, new: str, *, again: bool = False) -> None:
+    """The moved account's figures, never an earlier tenant's of the folder
+    it moved to: with none of its own, the row goes. ``again`` (``recover``
+    finishing a change that may have moved it already) keeps the row there."""
     with _cache() as rows:
         row = rows.pop(old, None)
         if row is not None:
-            rows[new] = row  # the moved account's figures, never an earlier tenant's
+            rows[new] = row
+        elif not again:
+            rows.pop(new, None)
+
+
+def _login_of(key: str) -> tuple[str, object]:
+    harness, _, home = key.partition("|")
+    return harness, _account_path({"harness": harness, "home": home or None})
+
+
+def _snapshot(ops: list[tuple]) -> tuple:
+    """What ``ops`` touch outside the config, as it stands before they run:
+    the cache rows of their keys and the Not offered again entries of their
+    logins, so a rollback puts back exactly these."""
+    keys = {k for op in ops if op[0] in ("move", "drop") for k in op[1:]}
+    rows = usage._load_cache()
+    logins = [_login_of(op[1]) for op in ops if op[0] == "decline"]
+    declined = [copy.deepcopy(i) for i in discover.turned_down() if any(_same_login(i, *lg) for lg in logins)]
+    return keys, {k: copy.deepcopy(rows[k]) for k in keys if k in rows}, logins, declined
+
+
+def _restore(snap: tuple) -> None:
+    keys, rows_before, logins, declined = snap
+    if keys:
+        with _cache() as rows:
+            for key in keys:
+                rows.pop(key, None)
+            rows.update(rows_before)
+    if logins:
+        with _declined_lock():
+            items = [i for i in discover.turned_down() if not any(_same_login(i, *lg) for lg in logins)]
+            _save_declined(items + declined)
 
 
 # ---- Not offered again ------------------------------------------------------------------
@@ -896,7 +934,8 @@ def stop(key, *, expect=None, keep_priority: bool = False, keep_pause: bool = Fa
         i = _find(base, key)
         account = usage._account_from_entry(base[i])
         rest = base[:i] + base[i + 1:]
-        if not rest and not confirm_last:
+        # Invalid entries kept beside it are read as no account.
+        if not known_of(rest) and not confirm_last:
             raise AccountsError("this is the last account Khipu tracks on this Mac; stopping it leaves none read",
                                 "last_account")
         parsed = usage.parse_usage_accounts(rest, previous=stored) if rest else []
