@@ -22,6 +22,7 @@ hub answers. It skips when a snapshot already exists and is younger than
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -384,6 +385,75 @@ def _queue_erasure(episode_id: int, path: Path | None = None) -> bool:
         return True
     except OSError:
         return False
+
+
+def _purged_topics_dir(path: Path | None = None) -> Path:
+    path = path or snapshot_path()
+    return path.parent / ".hub_snapshot.purged-topics"
+
+
+def _purged_topic_marker(path: Path, slug: str) -> Path:
+    # A slug may hold "/" or ":", so the file is named by its hash and holds it.
+    return _purged_topics_dir(path) / hashlib.sha256(slug.encode("utf-8")).hexdigest()
+
+
+def _mark_purged_topic(slug: str, path: Path | None = None) -> bool:
+    """Record a purged topic beside the replica before the replica is
+    touched, so an embedding catch-up whose replica write lands after the
+    purge can never put the topic back, even when the purge could not take
+    the lock."""
+    path = path or snapshot_path()
+    marker = _purged_topic_marker(path, slug)
+    try:
+        marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, slug.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        dfd = os.open(marker.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return True
+    except OSError:
+        return False
+
+
+def _purged_topic_slugs(path: Path | None = None) -> set[str]:
+    try:
+        markers = list(_purged_topics_dir(path).iterdir())
+    except FileNotFoundError:
+        return set()
+    out = set()
+    for marker in markers:
+        try:
+            out.add(marker.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            continue
+    return out
+
+
+def _purge_marker_time(path: Path, slug: str) -> float:
+    return _purged_topic_marker(path, slug).stat().st_mtime
+
+
+def _clear_purged_topics(path: Path | None = None, *, dumped_after: float) -> None:
+    """Drop the markers a full dump already reflects: the hub delete commits
+    before its marker is written, so a dump that began at or after a marker
+    cannot hold that topic unless it was legitimately created again."""
+    try:
+        markers = list(_purged_topics_dir(path).iterdir())
+    except FileNotFoundError:
+        return
+    for marker in markers:
+        try:
+            if marker.stat().st_mtime <= dumped_after:
+                marker.unlink()
+        except OSError:
+            continue
 
 
 def _apply_pending_erasures(con: sqlite3.Connection, path: Path) -> None:
@@ -1586,7 +1656,21 @@ def refresh() -> dict[str, Any]:
     Holds a cross-process flock for the whole dump so doctor ``maybe_refresh``
     and ``khipu snapshot refresh`` serialize. If another dump is live, returns
     ``{"ok": False, "error": ...}`` instead of dumping anyway.
+
+    The shared memory lock is held from the first hub read to publication, so
+    a forget (which holds it exclusive) never completes while a dump that read
+    the forgotten rows is still being written.
     """
+    from khipu import memory_lock
+
+    try:
+        with memory_lock.shared():
+            return _refresh_locked()
+    except memory_lock.MemoryLockError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _refresh_locked() -> dict[str, Any]:
     lock = _acquire_refresh_lock()
     if lock is None:
         return {
@@ -1599,6 +1683,8 @@ def refresh() -> dict[str, Any]:
         ensure_data_dir()
         dest = snapshot_path()
         started_at = _utcnow_iso()
+        # Markers older than this are reflected in the dump that follows.
+        dump_started = time.time()
         tmp_dir = dest.parent
         fd, tmp_name = tempfile.mkstemp(
             prefix=".hub_snapshot.", suffix=".sqlite", dir=tmp_dir
@@ -1637,9 +1723,23 @@ def refresh() -> dict[str, Any]:
                                 (hub_dumped_at,))
             _apply_pending_erasures(con, dest)
             _dump_cursors(con, refreshed_at)
-            con.commit()
-            con.close()
-            os.replace(tmp_path, dest)
+            from khipu.tombstones import RegistryError, write_gate
+
+            try:
+                # Held from the scrub through the replace: a forget publishes
+                # under this lock before it erases the replica, so the dump
+                # cannot land a source forgotten after the scrub read the
+                # registry.
+                with write_gate() as gate:
+                    counts["forgotten_scrubbed"] = _scrub_forgotten(con, gate)
+                    con.commit()
+                    con.close()
+                    os.replace(tmp_path, dest)
+            except RegistryError as exc:
+                con.close()
+                tmp_path.unlink(missing_ok=True)
+                return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
+            _clear_purged_topics(dest, dumped_after=dump_started)
             size_bytes = dest.stat().st_size
             new_meta: dict[str, Any] = {"schema_version": SNAPSHOT_SCHEMA_VERSION, "refreshed_at": refreshed_at, "size_bytes": size_bytes, "counts": counts}
             if hub_dumped_at:
@@ -1740,7 +1840,185 @@ def _write_deliverable_rows(
     )
 
 
+def _tombstone_payload_for_episode(episode_row: Mapping[str, Any]) -> dict[str, Any]:
+    """A capture-shaped identity for the local tombstone fence.
+
+    Incremental snapshot callers also pass DB presentation fields such as
+    ``id`` and aware ``ingested_at`` datetimes. Those are not capture
+    identity, and feeding them to canonical JSON would reject an otherwise
+    supported snapshot update.
+    """
+    raw = episode_row.get("raw")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    if isinstance(raw, dict):
+        return dict(raw)
+    payload: dict[str, Any] = {}
+    for field, value in episode_row.items():
+        if field in {"id", "ingested_at", "deleted_at", "raw"}:
+            continue
+        payload[field] = value.isoformat() if hasattr(value, "isoformat") else value
+    return payload
+
+
+def _tombstone_payloads_for_episode(episode_row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Every identity forget may have registered for this row: its raw (or
+    its columns when raw is gone), the natural source identity its own
+    columns hold, and those columns completed by what raw still carries.
+    An older or edit-rewritten raw can lack the source fields while the
+    columns still name the forgotten source (see ``forget._natural_identities``)."""
+    from khipu.capture_identity import SOURCE_FIELDS, has_natural_key
+
+    payloads = [_tombstone_payload_for_episode(episode_row)]
+    column = {k: (None if episode_row.get(k) is None else str(episode_row.get(k)))
+              for k in SOURCE_FIELDS}
+    if not has_natural_key(column):
+        return payloads
+    payloads.append(column)
+    raw = payloads[0]
+    merged = {k: column[k] if column[k] is not None else
+              (None if raw.get(k) is None else str(raw.get(k))) for k in SOURCE_FIELDS}
+    if merged != column:
+        payloads.append(merged)
+    return payloads
+
+
+def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
+    """Delete every live replica episode whose source the gate refuses, with
+    its vectors, decisions and deliverables. The hub can hold a copy of a
+    forgotten source under another id (written before the forget, or by a
+    Mac that never saw it), and a dump must not carry it into this replica.
+    Rows already marked forgotten keep their tombstone. A live row whose id
+    the registry records as forgotten is refused too: a backup can hold that
+    episode under an older raw that no source identity matches.
+    ``RegistryError`` propagates. Caller commits."""
+    cols = _snapshot_table_columns(con, "episodes")
+    if "id" not in cols or gate.empty:
+        return 0
+    live = " WHERE deleted_at IS NULL" if "deleted_at" in cols else ""
+    cursor = con.execute(f"SELECT * FROM episodes{live}")
+    names = [d[0] for d in cursor.description]
+    refused = []
+    forgotten_ids = gate.episode_ids
+    for values in cursor.fetchall():
+        row = dict(zip(names, values, strict=True))
+        if row["id"] in forgotten_ids or not all(
+                gate.allows_stored(p) for p in _tombstone_payloads_for_episode(row)):
+            refused.append(row["id"])
+    has_decisions = "episode_id" in _snapshot_table_columns(con, "decisions")
+    has_deliverables = "episode_id" in _snapshot_table_columns(con, "deliverables")
+    for eid in refused:
+        con.execute("DELETE FROM episodes WHERE id = ?", (eid,))
+        con.execute("DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?", (str(eid),))
+        if has_decisions:
+            con.execute("DELETE FROM decisions WHERE episode_id = ?", (eid,))
+        if has_deliverables:
+            con.execute("DELETE FROM deliverables WHERE episode_id = ?", (eid,))
+    return len(refused)
+
+
+def scrub_forgotten_snapshot() -> dict[str, Any]:
+    """Scrub the existing replica of forgotten sources (after a backup import
+    brought in an older one). Same lock order as ``upsert_episode``: the
+    registry first, then the refresh lock without waiting."""
+    from khipu.tombstones import RegistryError, write_gate
+
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": True, "scrubbed": 0, "snapshot": False}
+    try:
+        with write_gate() as gate:
+            lock = _acquire_refresh_lock()
+            if lock is None:
+                return {"ok": False, "error": "hub snapshot refresh in progress"}
+            try:
+                con = sqlite3.connect(str(path))
+                try:
+                    scrubbed = _scrub_forgotten(con, gate)
+                    con.commit()
+                finally:
+                    con.close()
+            finally:
+                _release_refresh_lock(lock)
+    except RegistryError as exc:
+        return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
+    return {"ok": True, "scrubbed": scrubbed, "snapshot": True}
+
+
+def staging_path() -> Path:
+    """A fresh temporary file beside the replica, named the way a refresh
+    names its dump, so forget's crash-left temp check sees it too."""
+    from khipu.paths import ensure_data_dir
+
+    ensure_data_dir()
+    dest = snapshot_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".hub_snapshot.", suffix=".sqlite", dir=dest.parent)
+    os.close(fd)
+    return Path(name)
+
+
+def publish_imported_snapshot(staged: Path) -> dict[str, Any]:
+    """Scrub a replica copy a backup import staged, then atomically make it
+    the replica. Readers never see the copy before its scrub: it is not the
+    replica until ``os.replace``. Same lock order as a refresh: the registry,
+    then the refresh lock without waiting. When the scrub cannot run, the
+    staged copy is discarded and the current replica is left as it was."""
+    from khipu.tombstones import RegistryError, write_gate
+
+    try:
+        with write_gate() as gate:
+            lock = _acquire_refresh_lock()
+            if lock is None:
+                staged.unlink(missing_ok=True)
+                return {"ok": False, "imported": False,
+                        "error": "hub snapshot refresh in progress; the next refresh rebuilds it"}
+            try:
+                con = sqlite3.connect(str(staged))
+                try:
+                    # Erasures this Mac queued but has not applied yet name
+                    # episode ids the backup may hold live.
+                    _apply_pending_erasures(con, snapshot_path())
+                    scrubbed = _scrub_forgotten(con, gate)
+                    con.commit()
+                finally:
+                    con.close()
+                os.replace(staged, snapshot_path())
+            finally:
+                _release_refresh_lock(lock)
+    except (RegistryError, sqlite3.Error, OSError) as exc:
+        staged.unlink(missing_ok=True)
+        return {"ok": False, "imported": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, "imported": True, "scrubbed": scrubbed, "snapshot": True}
+
+
 def upsert_episode(
+    episode_row: Mapping[str, Any],
+    embedding_rows: Sequence[Mapping[str, Any]],
+    decision_rows: Sequence[Mapping[str, Any]] = (),
+    deliverable_rows: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Write-through fenced by the durable forgotten-source registry."""
+    from khipu.tombstones import RegistryError, write_guard
+
+    payloads = _tombstone_payloads_for_episode(episode_row)
+    try:
+        # Keep this lock through the SQLite transaction below. Forget takes it
+        # before its replica erase, so a late incremental write cannot restore
+        # a source after forget returns.
+        with write_guard(*payloads) as allowed:
+            if not allowed:
+                return {"ok": False, "error": "forgotten source"}
+            return _upsert_episode_unfenced(episode_row, embedding_rows, decision_rows,
+                                            deliverable_rows)
+    except RegistryError as exc:
+        return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
+
+
+def _upsert_episode_unfenced(
     episode_row: Mapping[str, Any],
     embedding_rows: Sequence[Mapping[str, Any]],
     decision_rows: Sequence[Mapping[str, Any]] = (),
@@ -1904,7 +2182,12 @@ def upsert_embeddings(
         con = sqlite3.connect(str(path))
         try:
             topic_cols = _snapshot_table_columns(con, "topics")
+            # A catch-up that read a topic before it was purged must not put
+            # it back: its hub write may have committed before the purge.
+            purged = _purged_topic_slugs(path)
             for row in topic_rows:
+                if row["slug"] in purged:
+                    continue
                 old = con.execute("SELECT deleted_at FROM topics WHERE slug = ?", (row["slug"],)).fetchone()
                 if old and old[0] is not None:
                     continue
@@ -1921,6 +2204,8 @@ def upsert_embeddings(
                             (profile, kind, ref))
             for erow in embedding_rows:
                 if erow.get("kind") == "episode" and str(erow.get("ref")) in {str(i) for i in _pending_erasure_ids(path)}:
+                    continue
+                if erow.get("kind") == "topic" and str(erow.get("ref")) in purged:
                     continue
                 ecols = [c for c in _EMBED_COLS if c in erow]
                 evals = []
@@ -2000,6 +2285,68 @@ def forget_episode_in_snapshot(episode_id: int) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — the hub write already succeeded
         _record_write_error(("tombstones",), f"{type(exc).__name__}: {exc} (erasure queued)")
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        _release_refresh_lock(lock)
+
+
+def purge_topic_in_snapshot(slug: str) -> dict[str, Any]:
+    """Remove one purged topic from the local sqlite replica: its ``topics``
+    row (the ``topics_fts`` entry goes with it), its ``topic_revisions`` and
+    its ``memory_embeddings`` rows. ``khipu topic purge``'s replica half,
+    under the same refresh lock as ``refresh()`` and
+    ``forget_episode_in_snapshot``.
+
+    ``{"ok": True, "applicable": False}`` when this Mac has no replica (never
+    creates one). ``{"ok": False, "reason": ...}`` when the replica could not
+    be changed, so the caller never reports the topic gone from this Mac while
+    the replica still serves it. Never raises."""
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": True, "applicable": False, "reason": "this Mac has no local replica"}
+    if not _mark_purged_topic(slug, path):
+        return {"ok": False, "applicable": True,
+                "reason": "could not record the purge beside the replica"}
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "applicable": True, "reason": "a replica refresh is in progress"}
+    try:
+        # mode=rw: a replica removed since the check above is not recreated.
+        con = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=2.0)
+        try:
+            if not {"slug"} <= _snapshot_table_columns(con, "topics"):
+                return {"ok": False, "applicable": True, "reason": "the replica has no topics table"}
+            fts_tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ('topics_fts', 'topics_fts_ad')"
+            )}
+            if "topics_fts" in fts_tables and "topics_fts_ad" not in fts_tables:
+                # An external-content index keeps a deleted row's terms
+                # unless the exact indexed values are deleted from it.
+                cols = ", ".join(_TOPIC_FTS_COLS)
+                con.execute(
+                    f"INSERT INTO topics_fts(topics_fts, rowid, {cols}) "
+                    f"SELECT 'delete', rowid, {cols} FROM topics WHERE slug = ?",
+                    (slug,),
+                )
+            embeddings = 0
+            if {"kind", "ref"} <= _snapshot_table_columns(con, "memory_embeddings"):
+                embeddings = con.execute(
+                    "DELETE FROM memory_embeddings WHERE kind = 'topic' AND ref = ?", (slug,)
+                ).rowcount
+            revisions = 0
+            if "slug" in _snapshot_table_columns(con, "topic_revisions"):
+                revisions = con.execute(
+                    "DELETE FROM topic_revisions WHERE slug = ?", (slug,)
+                ).rowcount
+            topics = con.execute("DELETE FROM topics WHERE slug = ?", (slug,)).rowcount
+            con.commit()
+        finally:
+            con.close()
+        return {
+            "ok": True, "applicable": True, "topic_removed": bool(topics),
+            "revisions_removed": revisions, "embeddings_removed": embeddings,
+        }
+    except Exception as exc:  # noqa: BLE001 - reported to the caller, never raised
+        return {"ok": False, "applicable": True, "reason": f"{type(exc).__name__}: {exc}"}
     finally:
         _release_refresh_lock(lock)
 

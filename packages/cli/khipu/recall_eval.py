@@ -54,6 +54,7 @@ import json
 import math
 import random
 import time
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -73,6 +74,31 @@ def default_golden_path() -> Path:
 
     env = os.environ.get("KHIPU_RECALL_GOLDEN")
     return Path(env) if env and isolated_dir() is None else data_dir() / "recall-golden.jsonl"
+
+
+def drop_forgotten_lines(text: str, episode_ids: Iterable[int]) -> tuple[str, int]:
+    """The golden file without every line that names a forgotten episode in
+    ``expect`` or ``stale``, and how many were dropped. Such a line's query
+    usually quotes that episode's private text. Blank and ``#`` lines are
+    kept. Raises ValueError on a line that cannot be judged, so a caller
+    never keeps or restores a file it could not check."""
+    forgotten = {str(i) for i in episode_ids}
+    kept: list[str] = []
+    dropped = 0
+    for i, raw in enumerate(split_lines(text, keepends=True), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            kept.append(raw)
+            continue
+        entry = json.loads(line)
+        if not isinstance(entry, dict):
+            raise ValueError(f"line {i} is not an entry")
+        named = [*(entry.get("expect") or []), *(entry.get("stale") or [])]
+        if forgotten & {str(x) for x in named}:
+            dropped += 1
+            continue
+        kept.append(raw)
+    return "".join(kept), dropped
 
 
 def load_golden(path: Path) -> list[dict[str, Any]]:

@@ -979,10 +979,15 @@ def backfill_decisions(cur, *, apply: bool = False, limit: int | None = None) ->
     """
     if not _decisions_ready(cur):
         return {"ok": False, "error": "decisions table not migrated"}
+    from khipu.db import has_columns
+
+    # A forgotten episode's decisions were removed with it and must not be
+    # re-derived from its tombstone.
+    live = "AND deleted_at IS NULL " if has_columns(cur, "episodes", "deleted_at") else ""
     sql = (
         "SELECT id, project, session_id, decisions, ts FROM episodes "
         "WHERE decisions IS NOT NULL AND jsonb_array_length(decisions) > 0 "
-        "ORDER BY ts ASC"
+        f"{live}ORDER BY ts ASC"
     )
     if limit:
         cur.execute(sql + " LIMIT %s", (limit,))

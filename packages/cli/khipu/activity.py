@@ -17,16 +17,26 @@ def _deranked_topic_statuses() -> frozenset[str]:
     return DERANKED_STATUSES
 
 
+def _live_where(cur) -> str:
+    """``WHERE deleted_at IS NULL `` when the episodes table has the column: a
+    forgotten episode is never listed or counted for display. A pre-0010 hub
+    has no column and keeps its old behavior."""
+    from khipu.db import has_columns
+
+    return "WHERE deleted_at IS NULL " if has_columns(cur, "episodes", "deleted_at") else ""
+
+
 def _recent_rows(cur, limit: int) -> list[dict]:
-    """Recent episodes on a cursor the caller already owns, so a payload that
-    needs several queries opens one connection instead of one per query."""
+    """Recent live episodes on a cursor the caller already owns, so a payload
+    that needs several queries opens one connection instead of one per query."""
     cur.execute(
-        """
+        f"""
         SELECT id, ts, ingested_at, session_id, scope,
                summary,
                topics, decisions, preferences,
                now() - ingested_at AS mirror_age
         FROM episodes
+        {_live_where(cur)}
         ORDER BY COALESCE(ingested_at, ts) DESC
         LIMIT %s
         """,
@@ -178,8 +188,10 @@ def media_detail(asset_id: str) -> dict | None:
 def activity_payload(*, limit: int = 40) -> dict:
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM episodes")
+            cur.execute(f"SELECT COUNT(*) FROM episodes {_live_where(cur)}")
             n = int(cur.fetchone()[0])
+            # Capture liveness counts every row: forgetting the newest capture
+            # must not make the pipeline look stalled.
             cur.execute(
                 "SELECT MAX(ts), MAX(ingested_at), now() - MAX(ingested_at) FROM episodes"
             )
