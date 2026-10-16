@@ -28,7 +28,7 @@ def _env(*names: str, default: str = "") -> str:
 # was an unconditional NameError on every `khipu jobs install/refresh/
 # uninstall <name>` call with explicit names — a different function's scope
 # does not see a parser-builder's locals. Module level so both see it.
-_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain", "recall_daemon")
+_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain", "recall_daemon", "replica_refresh")
 
 
 def _memory_root_default() -> str | None:
@@ -3210,6 +3210,25 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": True, "graph_backup_remote": graph_backup_remote_status(),
                           "config_file": str(path)}))
         return 0
+    from khipu import replica_heal
+
+    if (args.set and args.set[0] in replica_heal.SETTINGS) or args.unset in replica_heal.SETTINGS:
+        # This Mac's copy (offline design A): how old before the background
+        # job updates it, and how often it looks. The check interval is baked
+        # into the job's plist, so changing it re-renders the job.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = replica_heal.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        reply = {"ok": True, key: replica_heal.settings_status()[key], "config_file": str(path)}
+        if key == "replica_check_every":
+            from khipu import launchd_gen
+
+            reply["job"] = launchd_gen.rerender_replica_job()
+        print(json.dumps(reply))
+        return 0
     from khipu import ledger as _ledger
 
     if (args.set and args.set[0] in _ledger.SETTINGS) or args.unset in _ledger.SETTINGS:
@@ -3386,6 +3405,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "cli_settings": cli_settings_status(),
         "routing": _routing.settings_status(),
         "ledger": _ledger.settings_status(),
+        "replica": replica_heal.settings_status(),
         "work": _work.settings_status(),
         "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
@@ -3798,6 +3818,14 @@ def cmd_jobs(args: argparse.Namespace) -> int:
 def cmd_snapshot(args: argparse.Namespace) -> int:
     from khipu.hub_snapshot import refresh, snapshot_freshness
 
+    if args.snapshot_cmd == "heal":
+        from khipu import jobs, replica_heal
+
+        out = replica_heal.run()
+        rc = 0 if out.get("ok") else 1
+        jobs._write_job_state("replica_refresh", rc)
+        print(json.dumps(out, indent=2))
+        return rc
     if args.snapshot_cmd == "status":
         # Local evidence only (no hub connection): the state, per-table
         # cursors and the last measurement status or doctor made.
@@ -5821,14 +5849,14 @@ def build_parser() -> argparse.ArgumentParser:
     jb_sub = jb.add_subparsers(dest="jobs_cmd", required=True)
     jb_sub.add_parser("status", help="Print khipu.jobs.job_status() as JSON")
     jbi = jb_sub.add_parser("install", help="Render + load the named jobs (default: all)")
-    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon}")
+    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon,replica_refresh}")
     jbr = jb_sub.add_parser(
         "refresh",
         help="Re-render + reload installed jobs whose plist is stale (default: all installed)",
     )
-    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon}")
+    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon,replica_refresh}")
     jbu = jb_sub.add_parser("uninstall", help="Unload + remove the named jobs (default: all)")
-    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon}")
+    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon,replica_refresh}")
     jb.set_defaults(func=cmd_jobs)
 
     pmt = sub.add_parser(
@@ -5850,6 +5878,10 @@ def build_parser() -> argparse.ArgumentParser:
     snap_sub = snap.add_subparsers(dest="snapshot_cmd", required=True)
     snap_sub.add_parser(
         "refresh", help="Dump hub tables into hub_snapshot.sqlite (hub must be up)"
+    )
+    snap_sub.add_parser(
+        "heal",
+        help="Bring this Mac's copy up to date when it needs it (what the replica_refresh job runs)",
     )
     snap_sub.add_parser("status", help="Snapshot age, size, and row counts from meta")
     snap.set_defaults(func=cmd_snapshot)

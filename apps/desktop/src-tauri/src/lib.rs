@@ -533,6 +533,7 @@ const JOB_NAMES: &[&str] = &[
     "notes_watch",
     "queue_drain",
     "recall_daemon",
+    "replica_refresh",
 ];
 
 const CAPTURE_MODES: &[&str] = &["legacy", "dual", "hub"];
@@ -615,6 +616,29 @@ fn checked_backup_remote(value: &str) -> Result<String, String> {
     } else {
         Err(format!("graph_backup_remote must look like r2:bucket/folder, got {value:?}"))
     }
+}
+/// Settings -> Data, "This Mac's copy": how old the copy may get before the
+/// background job updates it, and how often the job looks. Lengths of time in
+/// whole seconds (the page shows minutes); `config --set KEY N` or
+/// `config --unset=KEY` (the default again).
+const REPLICA_DURATION_KEYS: &[&str] = &["replica_refresh_after", "replica_check_every"];
+
+/// A whole number of seconds: digits only, at most ten years, and the check
+/// interval at least a minute (the CLI's own floor).
+fn replica_setting_value(key: &str, value: &str) -> Result<String, String> {
+    let v = value.trim();
+    let n: u64 = if !v.is_empty() && v.len() <= 12 && v.chars().all(|c| c.is_ascii_digit()) {
+        v.parse().unwrap_or(u64::MAX)
+    } else {
+        u64::MAX
+    };
+    if n > 10 * 366 * 86_400 {
+        return Err(format!("{key} must be a whole number of seconds, got {value:?}"));
+    }
+    if key == "replica_check_every" && n < 60 {
+        return Err(format!("{key} must be at least 60 seconds"));
+    }
+    Ok(n.to_string())
 }
 const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse"];
 const USAGE_ACCOUNTS_MAX: usize = 32;
@@ -1079,6 +1103,7 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
         k if cli_setting_key(k) => Ok(set(k, checked_cli_setting_path(k, value)?)),
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
+        k if REPLICA_DURATION_KEYS.contains(&k) => Ok(set(k, replica_setting_value(k, value)?)),
         _ => Err(format!("not a settable key: {key:?}")),
     }
 }
@@ -1106,6 +1131,7 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
         && key != GRAPH_BACKUP_REMOTE_KEY
         && !cli_setting_key(key)
         && !routing_key(key)
+        && !REPLICA_DURATION_KEYS.contains(&key)
         && !by_profile
     {
         return Err(format!("not a resettable key: {key:?}"));
@@ -4804,6 +4830,18 @@ mod settings_command_tests {
     }
 
     #[test]
+    fn replica_settings_are_whole_seconds() {
+        assert_eq!(config_set_argv("replica_refresh_after", "1200").unwrap(), v(&["config", "--set", "replica_refresh_after", "1200"]));
+        assert_eq!(config_set_argv("replica_refresh_after", " 0 ").unwrap(), v(&["config", "--set", "replica_refresh_after", "0"]));
+        assert_eq!(config_set_argv("replica_check_every", "60").unwrap(), v(&["config", "--set", "replica_check_every", "60"]));
+        assert_eq!(config_unset_argv("replica_check_every").unwrap(), v(&["config", "--unset=replica_check_every"]));
+        for bad in ["-1", "abc", "1e3", ""] {
+            assert!(config_set_argv("replica_refresh_after", bad).is_err(), "{bad}");
+        }
+        assert!(config_set_argv("replica_check_every", "30").is_err());
+    }
+
+    #[test]
     fn routing_settings_are_reprinted_or_refused() {
         assert_eq!(config_set_argv("routing_stale_after", "43200").unwrap(), v(&["config", "--from-app", "--set", "routing_stale_after", "43200"]));
         assert_eq!(config_set_argv("routing_summary_chars", " 0 ").unwrap(), v(&["config", "--from-app", "--set", "routing_summary_chars", "0"]));
@@ -5099,7 +5137,7 @@ mod settings_command_tests {
         for n in JOB_NAMES {
             assert!(job_argv("install", n).is_ok());
         }
-        assert_eq!(JOB_NAMES.len(), 6);
+        assert_eq!(JOB_NAMES.len(), 7);
     }
 
     #[test]

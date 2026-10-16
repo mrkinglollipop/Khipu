@@ -52,6 +52,9 @@ NOT_CAPTURE = {
     "signin._write_json": "the sign-in attempt (id, folder, pid, start times, argv) and the login folders "
                           "Khipu made; no capture text",
     "signin.start": "a temporary empty folder the login process runs in, removed when the attempt ends",
+    # The replica job (offline design A): run counters and the wake file; no capture text.
+    "replica_heal._write_state": "the replica job's counters and health: times, error words, no capture text",
+    "replica_heal.ensure_wake_file": "an empty file the replica job's plist watches",
     **dict.fromkeys(("config._write_config", "integrations._backup", "integrations._cursor_install",
                      "integrations._grok_bot_install", "integrations._write_json",
                      "integrations._write_toml", "integrations.set_gateway_token",
