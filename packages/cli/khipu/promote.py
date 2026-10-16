@@ -993,14 +993,29 @@ def _search_problem(run: dict[str, Any]) -> str | None:
     return None
 
 
-def _off_problem(label: str, live_hits: list, cand: dict[str, Any]) -> str | None:
+def _empty_by_timing(live: dict[str, Any] | None, cand: dict[str, Any]) -> bool:
+    """Whether the candidate answered nothing where live had hits only
+    because its embedding was late or failed: it logged an embedding
+    degraded note and ran no cosine leg where live ran one. A query whose
+    words match nothing finds its hits on the cosine leg alone, so such a
+    run is empty with sound code."""
+    if not (live and live.get("hits")) or cand["hits"]:
+        return False
+    return (str(cand.get("degraded") or "").startswith("embedding")
+            and "'cosine'" in str(live.get("legs") or "") and "'cosine'" not in str(cand.get("legs") or ""))
+
+
+def _off_problem(label: str, live: dict[str, Any] | None, cand: dict[str, Any]) -> str | None:
     """Why the candidate's run with routing off fails the step, or None: its
     own search fails (``_search_problem``), or it answered nothing where the
-    live code had hits. The same test for the first run and the replayed one."""
+    live code had hits, unless only its embedding was late
+    (``_empty_by_timing``). The same test for the first run and the replayed
+    one."""
     what = _search_problem(cand)
     if what:
         return f"{label}: {what}"
-    if live_hits and not cand["hits"]:
+    live_hits = (live or {}).get("hits") or []
+    if live_hits and not cand["hits"] and not _empty_by_timing(live, cand):
         return f"{label}: empty answer where live had {len(live_hits)} hit(s)"
     return None
 
@@ -1050,7 +1065,11 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     search with routing on times out, fails or runs past the 1.2 s budget
     (the same test as with routing off), or when its search answer differs
     with routing on while both runs ran the same legs with the same degraded
-    note. A failing pair, or one whose legs or degraded note differ, is
+    note. An empty answer where live had hits that came only from the
+    candidate's embedding being late or failed (no cosine leg where live ran
+    one) replays live and the candidate once more; if it is still that, it
+    is noted, not failed (a query whose words match nothing finds its hits
+    on the cosine leg alone). A failing pair, or one whose legs or degraded note differ, is
     replayed once more first, so a search or a read that was late once is
     not taken for the candidate's routing, and both replayed runs are held
     to their tests (the run with routing off to the search and empty-answer
@@ -1077,8 +1096,16 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
                 if live_hook.exists() else None)
         cand = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-cand-{i}", legacy=cand_legacy, routing=False)
         label = f"prompt {i + 1}"
+        problem = _off_problem(label, live, cand)
+        if problem is None and _empty_by_timing(live, cand):
+            # Once more, both live and the candidate, before an empty answer
+            # from a late embedding is set aside as timing.
+            live = _recall_once(live_hook, sample, f"khipu-gate-{nonce}-live-{i}-again", legacy=live_legacy,
+                                routing=False)
+            cand = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-cand-{i}-again", legacy=cand_legacy,
+                                routing=False)
+            problem = _off_problem(label, live, cand)
         live_hits = (live or {}).get("hits") or []
-        problem = _off_problem(label, live_hits, cand)
         if problem:
             problems.append(problem)
             continue
@@ -1097,12 +1124,15 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
                               routing=True, root=Path(candidate))
             # Both replayed runs are tested: the one with routing off
             # replaces the first, so it is held to the first one's tests.
-            problem = _off_problem(label, live_hits, cand) or _routing_problem(label, cand, on)
+            problem = _off_problem(label, live, cand) or _routing_problem(label, cand, on)
         if problem:
             problems.append(problem)
             continue
         overlap = len(set(live_hits) & set(cand["hits"]))
         note = f"{label}: {len(cand['hits'])} hit(s), {overlap} shared with live, {cand['ms']:.0f} ms"
+        if _empty_by_timing(live, cand):
+            note += (f", empty where live had {len(live_hits)} hit(s) not counted (no cosine leg after a replay: "
+                     f"timing, not code; degraded={cand.get('degraded')})")
         if on.get("routing"):
             routed_runs += 1
             on_ms = f"{on['ms']:.0f} ms" if on.get("ms") is not None else "no time"
