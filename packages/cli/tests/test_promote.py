@@ -504,6 +504,83 @@ def test_replay_refuses_an_empty_answer_where_live_had_one(home, monkeypatch):
     assert not out["ok"] and "empty answer where live had 1 hit" in out["detail"]
 
 
+def _cosine_only_hook(runs: list, cand_late: list[bool], live_late: tuple[bool, ...] = (False,)):
+    """A fake hook for a query whose words match nothing: its hits come from
+    the cosine leg alone, so a run whose embedding was late answers nothing
+    (``legs=['lexical'] degraded=embedding late``). The candidate's runs with
+    routing off are late as ``cand_late`` says in order (then on time), and
+    live's as ``live_late``."""
+    def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
+        if argv[1:2] == ["-c"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"push": True}) + "\n", "")
+        on = env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1"
+        who = "cand" if "/candidate/packages/" in argv[0] else "live"
+        runs.append((who, "on" if on else "off"))
+        nth = sum(1 for r in runs if r == (who, "off")) - 1
+        plan = cand_late if who == "cand" else live_late
+        late = (not on) and nth < len(plan) and plan[nth]
+        hits, legs, degraded = ([], ["lexical"], "embedding late") if late else (
+            ["episode:3"], ["lexical", "cosine"], None)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = (f"{stamp} [khipu-prompt-recall] session=s1 reason=ok ms=300.0 hits={hits} legs={legs} "
+                f"degraded={degraded}" + (" routing=full" if on else ""))
+        log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(line + "\n")
+        return subprocess.CompletedProcess(argv, 0, '{"hookSpecificOutput": {}}\n', "")
+    return fake_run
+
+
+def test_replay_passes_an_empty_answer_whose_embedding_was_late_once(home, monkeypatch):
+    # 2026-10-16: a promotion refused with "empty answer where live had 3
+    # hit(s)" for a query whose hits are cosine-only. Replayed by hand, live
+    # and the candidate alike answered nothing whenever their embedding was
+    # late; the gate failed the candidate on one late embedding.
+    candidate = _one_query(home)
+    runs: list = []
+    monkeypatch.setattr(pm, "_run", _cosine_only_hook(runs, cand_late=[True]))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"], out
+    assert "prompt 1: 1 hit(s), 1 shared with live" in out["detail"]
+    # Live and the candidate were both replayed once before the step went on.
+    assert runs[:4] == [("live", "off"), ("cand", "off"), ("live", "off"), ("cand", "off")]
+
+
+def test_replay_notes_an_empty_answer_whose_legs_differ_from_live_twice(home, monkeypatch):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _cosine_only_hook([], cand_late=[True, True, True]))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"], out
+    assert "empty where live had 1 hit(s) not counted" in out["detail"]
+    assert "degraded=embedding late" in out["detail"]
+
+
+def test_replay_still_refuses_an_empty_answer_when_the_replay_ran_live_s_legs(home, monkeypatch):
+    # Late once, then empty with the very legs live ran: that is the code.
+    candidate = _one_query(home)
+
+    def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
+        if argv[1:2] == ["-c"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        cand = "/candidate/packages/" in argv[0]
+        seen.append(cand)
+        late = cand and seen.count(True) == 1
+        hits = [] if cand else ["episode:3"]
+        legs, degraded = (["lexical"], "embedding late") if late else (["lexical", "cosine"], None)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(f"{stamp} [khipu-prompt-recall] session=s1 reason=ok ms=300.0 hits={hits} "
+                       f"legs={legs} degraded={degraded}\n")
+        return subprocess.CompletedProcess(argv, 0, '{"hookSpecificOutput": {}}\n', "")
+
+    seen: list = []
+    monkeypatch.setattr(pm, "_run", fake_run)
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"] and "prompt 1: empty answer where live had 1 hit(s)" in out["detail"]
+    assert seen == [False, True, False, True]
+
+
 def _routing_hook(runs: list, *, on_status="full", on_hits=("episode:3",), off_hits=("episode:3",),
                   first_on_hits=None, first_on_status=None, push=None, on_reason="ok", on_ms=300.0,
                   again_off=None):
