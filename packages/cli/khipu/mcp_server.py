@@ -1571,8 +1571,9 @@ def _tool_owed_update(args: dict) -> dict:
 
 def _owed_update_on_hub(args: dict) -> dict:
     """The hub half of ``_tool_owed_update``, also what a queued write
-    replays. The write's id is recorded in the same transaction; an id the
-    hub already applied applies nothing again."""
+    replays. The write's id and outcome are recorded in the same transaction
+    (``owner_writes.apply_on_hub``); an id the hub already answered applies
+    nothing again."""
     cid = _positive_id(args.get("id"), "id")
     action = (args.get("action") or "").strip().lower()
     _ensure_path()
@@ -1583,26 +1584,24 @@ def _owed_update_on_hub(args: dict) -> dict:
             **({"until": str(args.get("until") or "")} if action == "snooze" else {})}
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
         with conn.cursor() as cur:
-            if not owner_writes.record_on_hub(cur, "owed_update", args):
-                conn.rollback()
-                return {"ok": True, "already_applied": True, **echo}
-            if action == "snooze":
-                from khipu.cli import _snooze_until_sql
+            def write() -> dict:
+                if action == "snooze":
+                    from khipu.cli import _snooze_until_sql
 
-                parsed = _snooze_until_sql(str(args.get("until") or ""))
-                if parsed is None:
-                    raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
-                expr, param = parsed
-                params = ([param] if param is not None else []) + [cid]
-                cur.execute(f"UPDATE commitments SET due_after = {expr} WHERE id = %s", tuple(params))
-                ok = cur.rowcount > 0
-            else:
-                ok = commitments.set_status(cur, cid, "closed" if action == "close" else "open")
-            if not ok:
-                # Raised inside the transaction, so the id is never recorded.
-                raise ValueError(f"no such commitment: {cid}")
-        conn.commit()
-    return {"ok": True, **echo}
+                    parsed = _snooze_until_sql(str(args.get("until") or ""))
+                    if parsed is None:
+                        raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
+                    expr, param = parsed
+                    params = ([param] if param is not None else []) + [cid]
+                    cur.execute(f"UPDATE commitments SET due_after = {expr} WHERE id = %s", tuple(params))
+                    ok = cur.rowcount > 0
+                else:
+                    ok = commitments.set_status(cur, cid, "closed" if action == "close" else "open")
+                if not ok:
+                    raise ValueError(f"no such commitment: {cid}")
+                return {"ok": True, **echo}
+
+            return owner_writes.apply_on_hub(conn, cur, "owed_update", args, write, echo)
 
 
 class _ToolFailure(ValueError):
@@ -1763,61 +1762,55 @@ def _decisions_update_on_hub(args: dict) -> dict:
 
     reason = redact_secrets(str(args.get("reason") or ""))[0] or None
 
+    key = "link_id" if action in ("confirm", "reject") else "id"
+    echo = {"action": action, key: link_id if key == "link_id" else decision_id}
+
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
         with conn.cursor() as cur:
-            # Recorded first, so every branch below commits it with the write.
-            if not owner_writes.record_on_hub(cur, "decisions_update", args):
-                conn.rollback()
-                key = "link_id" if action in ("confirm", "reject") else "id"
-                return {"ok": True, "already_applied": True, "action": action,
-                        key: link_id if key == "link_id" else decision_id}
-            evidence_ready = _decisions._evidence_ready(cur)
-            degrade_note = (
-                None if evidence_ready
-                else "evidence fields were not recorded (migration 0024 not applied)"
-            )
-            if action in ("confirm", "reject"):
-                out = _decisions.resolve_link(cur, link_id, action, source="agent")
-                conn.commit()
-                return out
-            if action == "restore":
-                ok = _decisions.restore(cur, decision_id)
-                conn.commit()
-                return {"ok": ok, "id": decision_id, "action": "restore"}
-            if action == "retract":
-                ok = _decisions.retract(cur, decision_id, reason)
-                conn.commit()
-                out = {"ok": ok, "id": decision_id, "action": "retract"}
+            # A reply with ok false is a refusal: apply_on_hub undoes the
+            # write (a decision made for new_text included) and records it.
+            def write() -> dict:
+                evidence_ready = _decisions._evidence_ready(cur)
+                degrade_note = (
+                    None if evidence_ready
+                    else "evidence fields were not recorded (migration 0024 not applied)"
+                )
+                if action in ("confirm", "reject"):
+                    return _decisions.resolve_link(cur, link_id, action, source="agent")
+                if action == "restore":
+                    ok = _decisions.restore(cur, decision_id)
+                    return {"ok": ok, "id": decision_id, "action": "restore"}
+                if action == "retract":
+                    ok = _decisions.retract(cur, decision_id, reason)
+                    out = {"ok": ok, "id": decision_id, "action": "retract"}
+                    if degrade_note:
+                        out["note"] = degrade_note
+                    return out
+                # action == "supersede"
+                if new_id_arg is not None:
+                    new_id = new_id_arg
+                else:
+                    original = _decisions._fetch_decision_row(cur, decision_id)
+                    if original is None:
+                        raise ValueError(f"no such decision: {decision_id}")
+                    if original.get("superseded_by") is not None:
+                        return {"ok": False, "id": decision_id,
+                                "superseded_by": original["superseded_by"], "action": "supersede"}
+                    new_id = _decisions.create_decision(
+                        cur, project=args.get("project") or original.get("project"),
+                        text=redact_secrets(str(new_text))[0],
+                        session_id=args.get("session_id") or None,
+                        source_kind=args.get("source_kind") or "assistant",
+                    )
+                ok = _decisions.supersede(cur, decision_id, new_id, source="agent", reason=reason)
+                out = {"ok": ok, "id": decision_id, "action": "supersede"}
+                if ok or new_id_arg is not None:
+                    out["superseded_by"] = new_id
                 if degrade_note:
                     out["note"] = degrade_note
                 return out
-            # action == "supersede"
-            if new_id_arg is not None:
-                new_id = new_id_arg
-            else:
-                original = _decisions._fetch_decision_row(cur, decision_id)
-                if original is None:
-                    raise ValueError(f"no such decision: {decision_id}")
-                if original.get("superseded_by") is not None:
-                    return {"ok": False, "id": decision_id,
-                            "superseded_by": original["superseded_by"], "action": "supersede"}
-                new_id = _decisions.create_decision(
-                    cur, project=args.get("project") or original.get("project"),
-                    text=redact_secrets(str(new_text))[0],
-                    session_id=args.get("session_id") or None,
-                    source_kind=args.get("source_kind") or "assistant",
-                )
-            ok = _decisions.supersede(cur, decision_id, new_id, source="agent", reason=reason)
-            if not ok and new_id_arg is None:
-                conn.rollback()
-            else:
-                conn.commit()
-            out = {"ok": ok, "id": decision_id, "action": "supersede"}
-            if ok or new_id_arg is not None:
-                out["superseded_by"] = new_id
-            if degrade_note:
-                out["note"] = degrade_note
-            return out
+
+            return owner_writes.apply_on_hub(conn, cur, "decisions_update", args, write, echo)
 
 
 def _tool_brief(args: dict) -> dict:

@@ -16,8 +16,10 @@ from khipu import cli, db
 from khipu import hub_snapshot as hs
 from khipu import mcp_server as srv
 from khipu import offline_reads, owner_writes
+from tests.test_owner_writes_exactly_once import tx_hub  # noqa: F401
 
 DOWN = psycopg.OperationalError("connection timeout expired")
+_REAL_LANDED = owner_writes._landed
 
 
 @pytest.fixture
@@ -29,7 +31,7 @@ def home(tmp_path, monkeypatch):
     (tmp_path / "data").mkdir()
     db._TABLE_COLUMNS_CACHE.clear()
     # No hub here: its record of applied writes holds none of these ids.
-    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: False)
+    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: None)
     return tmp_path / "data"
 
 
@@ -272,7 +274,7 @@ def test_a_crash_after_the_hub_commits_never_applies_the_write_twice(home, monke
     with pytest.raises(SystemExit):
         owner_writes.drain()
     assert owner_writes.status()["pending"] == 1
-    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: True)
+    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: ("applied", None))
     out = owner_writes.drain()
     assert len(commits) == 1, f"hub applied same write {len(commits)} times"
     assert out["replayed"] == 1 and _queued(home) == []
@@ -291,7 +293,7 @@ def test_a_send_the_hub_does_not_show_is_sent_again_once(home, monkeypatch):
     monkeypatch.setattr(owner_writes, "_apply", apply)
     with pytest.raises(SystemExit):
         owner_writes.drain()
-    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: False)
+    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: None)
     assert owner_writes.drain()["replayed"] == 1
     assert commits == [1, 1] and _queued(home) == []
 
@@ -306,7 +308,7 @@ def test_a_crash_during_a_direct_write_is_checked_on_the_hub_before_any_resend(h
     assert owner_writes.status()["pending"] == 1
     sent = []
     monkeypatch.setattr(owner_writes, "_apply", lambda tool, args: sent.append(args) or {"ok": True})
-    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: True)
+    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: ("applied", None))
     assert owner_writes.drain()["replayed"] == 1 and sent == []
 
 
@@ -399,3 +401,73 @@ def test_only_the_ledger_sends_an_owner_write_to_the_hub():
                     and node.func.attr == "run" and getattr(node.func.value, "id", "") == "owner_writes":
                 callers.append(path.name)
     assert sorted(set(callers)) == ["cli.py", "mcp_server.py"]
+
+
+# Every action of every owner write tool, each made to be refused by the hub.
+_REFUSED_WRITES = {
+    "owed_update": [{"id": 1, "action": "close"}, {"id": 1, "action": "reopen"},
+                    {"id": 1, "action": "snooze", "until": "7d"}],
+    "decisions_update": [{"id": 1, "action": "supersede", "by": 2},
+                         {"id": 1, "action": "supersede", "new_text": "scratch replacement"},
+                         {"id": 1, "action": "restore"}, {"id": 1, "action": "retract"},
+                         {"link_id": 1, "action": "confirm"}, {"link_id": 1, "action": "reject"}],
+}
+
+
+def test_every_owner_writer_records_its_outcome_with_the_write():
+    """Sibling of the test above: each hub half applies through
+    owner_writes.apply_on_hub, which records the outcome (applied or refused)
+    in the write's transaction, and never commits or records on its own."""
+    import ast
+    import inspect
+    import textwrap
+
+    from khipu import mcp_server
+
+    assert set(_REFUSED_WRITES) == set(owner_writes.TOOLS)
+    for tool in owner_writes.TOOLS:
+        fn = getattr(mcp_server, f"_{tool}_on_hub")
+        calls = [n.func.attr for n in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(fn))))
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+        assert calls.count("apply_on_hub") == 1, tool
+        assert not {"commit", "rollback", "record_on_hub"} & set(calls), (tool, calls)
+
+
+@pytest.mark.parametrize("tool,args", [(t, a) for t, cases in _REFUSED_WRITES.items() for a in cases],
+                         ids=lambda v: v if isinstance(v, str) else "-".join(map(str, v.values())))
+def test_a_refused_owner_write_replays_as_refused_after_a_lost_reply(tx_hub, monkeypatch, tool, args):  # noqa: F811
+    import psycopg
+
+    from khipu import commitments, decisions
+
+    monkeypatch.setattr(owner_writes, "_landed", _REAL_LANDED)
+    tx_hub.missing = True
+    monkeypatch.setattr(commitments, "set_status", lambda cur, cid, status: False)
+    monkeypatch.setattr(decisions, "restore", lambda cur, did: False)
+    monkeypatch.setattr(decisions, "retract", lambda cur, did, reason: False)
+    monkeypatch.setattr(decisions, "supersede", lambda cur, old, new, **kw: False)
+    monkeypatch.setattr(decisions, "_fetch_decision_row", lambda cur, did: {"id": did, "superseded_by": None})
+    monkeypatch.setattr(decisions, "create_decision", lambda cur, **kw: 5)
+
+    def resolve_link(cur, link_id, action, **kw):
+        if action == "confirm":
+            raise ValueError(f"no such link: {link_id}")
+        return {"ok": False, "error": "decision_links table not migrated"}
+
+    monkeypatch.setattr(decisions, "resolve_link", resolve_link)
+    real_apply = owner_writes._apply
+
+    def lost_reply(tool, args):
+        try:
+            assert real_apply(tool, args)["ok"] is False
+        except ValueError:
+            pass
+        raise psycopg.OperationalError("server closed the connection after COMMIT")
+
+    monkeypatch.setattr(owner_writes, "_apply", lost_reply)
+    assert owner_writes.run(tool, dict(args))["waiting_to_sync"]
+    monkeypatch.setattr(owner_writes, "_apply", lambda *a: pytest.fail("a refused write was sent again"))
+    out = owner_writes.drain()
+    assert out["refused"] == 1 and out["replayed"] == 0, out
+    assert [o for o, _e in tx_hub.answered.values()] == ["refused"]
+    assert tx_hub.commitment_writes == 0

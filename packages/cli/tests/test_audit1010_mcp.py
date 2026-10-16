@@ -22,6 +22,7 @@ def _no_hub_record(monkeypatch):
     from khipu import owner_writes
 
     monkeypatch.setattr(owner_writes, "record_on_hub", lambda cur, tool, args: True)
+    monkeypatch.setattr(owner_writes, "_refuse_on_hub", lambda conn, cur, tool, args, error: conn.rollback())
 
 
 def request(name, args, ident=1):

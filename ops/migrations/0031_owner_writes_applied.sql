@@ -9,7 +9,10 @@
 -- one; a closed item may have been closed by someone else). Each write now
 -- carries a unique id; the hub inserts it here in the same transaction as the
 -- write, refusing to apply an id it already holds, and a replay asks this
--- table whether its id was applied before sending again.
+-- table whether its id was applied before sending again. A write the hub
+-- refuses (no such row, already superseded) is recorded with outcome
+-- 'refused' and its reason, in one transaction with the undone write, so a
+-- replay after a lost reply reports the refusal instead of calling it applied.
 --
 -- Additive only: one new table. No existing table, column or row changes, and
 -- creating a new table takes no lock any writer holds. lock_timeout still
@@ -24,15 +27,17 @@ SET LOCAL lock_timeout = '5s';
 CREATE TABLE IF NOT EXISTS owner_writes_applied (
     write_id    TEXT PRIMARY KEY,
     tool        TEXT NOT NULL,
+    outcome     TEXT NOT NULL DEFAULT 'applied' CHECK (outcome IN ('applied', 'refused')),
+    error       TEXT,
     applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 COMMENT ON TABLE owner_writes_applied IS
-    'Ids of owner writes (owed and decision updates) the hub applied, inserted in the same transaction as the write. A replay asks here whether its id landed; an id already here is never applied again.';
+    'Ids of owner writes (owed and decision updates) the hub answered, with the outcome (applied or refused), inserted in the same transaction as the write. A replay asks here whether its id landed and how; an id already here is never applied again.';
 
 INSERT INTO schema_migrations (version, note)
 VALUES (
     '0031_owner_writes_applied',
-    'owner_writes_applied (write_id PK, tool, applied_at): owner writes recorded in the same transaction as the write, so a replay applies each exactly once'
+    'owner_writes_applied (write_id PK, tool, outcome, error, applied_at): owner writes recorded with their outcome in the same transaction as the write, so a replay applies each exactly once'
 )
 ON CONFLICT (version) DO NOTHING;

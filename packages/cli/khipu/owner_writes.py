@@ -17,11 +17,16 @@ the id in ``owner_writes_applied`` (migration 0031) in the same transaction as
 the write (``record_on_hub``) and never applies an id it already holds. Any
 entry, whatever its state, may already be on the hub (a lost COMMIT reply
 leaves it ``waiting``; a crash leaves it ``sending`` or ``reserved``), so a
-replay first asks the hub whether its id was applied (``_landed``) and sends
+replay first asks the hub whether its id was answered (``_landed``) and sends
 it only when it was not: exactly once, read from the record, never inferred
-from the rows the write touched. A hub without the record (0031 not applied)
-keeps every entry waiting. One the hub refuses (an error, or ``ok: false``)
-moves to ``refused/`` with the reason and is reported, never counted as done.
+from the rows the write touched. The record keeps the outcome: a write the hub
+refuses (an error, or ``ok: false``) commits its id as refused, with the
+reason, in one transaction with the undone write (``apply_on_hub``), so a
+replay after a lost reply reports the refusal and never calls it applied. A
+hub without the record (0031 not applied) keeps every entry waiting. A refused
+entry moves to ``refused/`` with the reason and is reported, never counted as
+done. An entry with no id was queued by a build before ids existed; whether
+it landed cannot be known, so it is refused for the owner to check, never sent.
 Forgetting is not queued here: a forget that only looked done would be a
 privacy failure.
 """
@@ -42,6 +47,7 @@ TOOLS = ("owed_update", "decisions_update")
 # shape it would have had from the hub.
 _ECHO = ("id", "link_id", "action", "until", "by")
 _HELD = threading.local()  # the entry this thread's run() is applying
+_NO_ID = "queued by an older build; check it and redo it"
 
 
 class HubRecordMissing(RuntimeError):
@@ -59,15 +65,66 @@ def record_on_hub(cur, tool: str, args: dict[str, Any]) -> bool:
     must roll back and apply nothing."""
     import psycopg
 
-    write_id = str(args.get("write_id") or "")
-    if not write_id:
-        raise ValueError("an owner write reached the hub without its write_id")
+    write_id = _write_id(args)
     try:
         cur.execute("INSERT INTO owner_writes_applied (write_id, tool) VALUES (%s, %s) "
                     "ON CONFLICT (write_id) DO NOTHING", (write_id, tool))
     except psycopg.errors.UndefinedTable as exc:
         raise HubRecordMissing("the hub has no record of applied owner writes; run khipu migrate (0031)") from exc
     return cur.rowcount == 1
+
+
+def _write_id(args: dict[str, Any]) -> str:
+    write_id = str(args.get("write_id") or "")
+    if not write_id:
+        raise ValueError("an owner write reached the hub without its write_id")
+    return write_id
+
+
+def _refuse_on_hub(conn, cur, tool: str, args: dict[str, Any], error: str) -> None:
+    """Undo this write and commit its id with the outcome refused, in one
+    transaction."""
+    conn.rollback()
+    cur.execute("INSERT INTO owner_writes_applied (write_id, tool, outcome, error) "
+                "VALUES (%s, %s, 'refused', %s) ON CONFLICT (write_id) DO NOTHING",
+                (_write_id(args), tool, error[:300]))
+    conn.commit()
+
+
+def _outcome_on_hub(cur, args: dict[str, Any]) -> tuple[str, str | None] | None:
+    """``(outcome, error)`` the hub recorded for this write, or ``None``."""
+    cur.execute("SELECT outcome, error FROM owner_writes_applied WHERE write_id = %s",
+                (_write_id(args),))
+    row = cur.fetchone()
+    return None if row is None else (str(row[0]), row[1])
+
+
+def _refusal(out: dict[str, Any]) -> str:
+    return str(out.get("error") or "the hub refused this write: " + json.dumps(out, default=str)[:200])
+
+
+def apply_on_hub(conn, cur, tool: str, args: dict[str, Any], write, echo: dict[str, Any]) -> dict[str, Any]:
+    """Apply one owner write on the hub with its outcome recorded in the same
+    transaction. ``write()`` makes the change in ``cur`` and returns the reply;
+    a reply with ``ok: false`` or a ``ValueError`` is a refusal: the change is
+    undone and the id committed as refused. An id the hub already answered
+    applies nothing and replies with the recorded outcome."""
+    if not record_on_hub(cur, tool, args):
+        conn.rollback()
+        prior = _outcome_on_hub(cur, args)
+        if prior is not None and prior[0] == "refused":
+            return {"ok": False, "already_refused": True, "error": prior[1], **echo}
+        return {"ok": True, "already_applied": True, **echo}
+    try:
+        out = write()
+    except ValueError as exc:
+        _refuse_on_hub(conn, cur, tool, args, f"{type(exc).__name__}: {exc}")
+        raise
+    if isinstance(out, dict) and out.get("ok") is False:
+        _refuse_on_hub(conn, cur, tool, args, _refusal(out))
+    else:
+        conn.commit()
+    return out
 
 
 def queue_dir() -> Path:
@@ -111,10 +168,10 @@ def _apply(tool: str, args: dict[str, Any]) -> dict[str, Any]:
     return fn(args)
 
 
-def _landed(tool: str, args: dict[str, Any]) -> bool:
-    """Whether the hub applied this write: its id is in the hub's record.
-    Raises when the hub cannot be asked, and ``HubRecordMissing`` when it
-    keeps no record."""
+def _landed(tool: str, args: dict[str, Any]) -> tuple[str, str | None] | None:
+    """``(outcome, error)`` when the hub answered this write (its id is in
+    the hub's record), else ``None``. Raises when the hub cannot be asked, and
+    ``HubRecordMissing`` when it keeps no record."""
     import psycopg
 
     from khipu import offline
@@ -123,12 +180,10 @@ def _landed(tool: str, args: dict[str, Any]) -> bool:
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
         with conn.cursor() as cur:
             try:
-                cur.execute("SELECT 1 FROM owner_writes_applied WHERE write_id = %s",
-                            (str(args.get("write_id") or ""),))
+                return _outcome_on_hub(cur, args)
             except psycopg.errors.UndefinedTable as exc:
                 raise HubRecordMissing(
                     "the hub has no record of applied owner writes; run khipu migrate (0031)") from exc
-            return cur.fetchone() is not None
 
 
 def _write(path: Path, job: dict[str, Any]) -> None:
@@ -260,11 +315,15 @@ def _replay(path: Path) -> str | None:
         _refuse(path, {}, "ValueError: this waiting write could not be read")
         return "refused"
     if not job["args"].get("write_id"):
-        # Queued before writes carried ids: given one now, before any send.
-        job = {**job, "args": _with_id(job["args"])}
-        _write(path, job)
+        # It may have landed already, and no record can say: never sent.
+        _refuse(path, job, _NO_ID)
+        return "refused"
     try:
-        if _landed(job["tool"], job["args"]):
+        landed = _landed(job["tool"], job["args"])
+        if landed is not None:
+            if landed[0] == "refused":
+                _refuse(path, job, landed[1] or "the hub refused this write")
+                return "refused"
             _remove(path)
             return "replayed"
         _write(path, {**job, "state": "sending", "sent_at": datetime.now(timezone.utc).isoformat()})
@@ -277,8 +336,7 @@ def _replay(path: Path) -> str | None:
         _refuse(path, job, f"{type(exc).__name__}: {str(exc)[:200]}")
         return "refused"
     if isinstance(result, dict) and result.get("ok") is False:
-        _refuse(path, job, str(result.get("error") or "the hub refused this write: "
-                               + json.dumps(result, default=str)[:200]))
+        _refuse(path, job, _refusal(result))
         return "refused"
     _remove(path)
     return "replayed"
