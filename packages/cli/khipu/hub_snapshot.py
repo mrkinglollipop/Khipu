@@ -90,7 +90,9 @@ _TABLES = (
 # Version 4 adds the external-content FTS5 tables `episodes_fts`/`topics_fts`
 # (trigram) and their triggers; `search_snapshot` uses them when present and
 # falls back to LIKE on a file without them.
-SNAPSHOT_SCHEMA_VERSION = 4
+# Version 5 adds the ledger (projects, words, live rows, their history), so
+# `khipu ledger` reads while the hub is away. Removed rows are never in it.
+SNAPSHOT_SCHEMA_VERSION = 5
 
 _DELIVERABLE_COLS = (
     "id",
@@ -994,6 +996,8 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
             CREATE INDEX idx_snapshot_deliverables_project ON deliverables (project);
             """
         )
+    if version >= 5:
+        con.executescript(_LEDGER_SCHEMA_SQL)
     if version >= 4:
         try:
             con.executescript(_FTS_SCHEMA_SQL)
@@ -1001,6 +1005,258 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
             # A Python whose SQLite lacks FTS5 still writes a usable replica;
             # search_snapshot finds no FTS tables and stays on LIKE.
             _log(f"replica FTS tables not created: {exc}")
+
+
+_LEDGER_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS ledger_projects (
+    project TEXT PRIMARY KEY, name TEXT, hidden INTEGER, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS ledger_vocab (
+    project TEXT, field TEXT, word TEXT, meaning TEXT, position INTEGER,
+    PRIMARY KEY (project, field, word)
+);
+CREATE TABLE IF NOT EXISTS ledger_rows (
+    project TEXT, row_id TEXT, title TEXT, kind TEXT, parent TEXT, state TEXT, owner TEXT,
+    evidence TEXT, link TEXT, refs TEXT, seq INTEGER, created_at TEXT, updated_at TEXT,
+    version INTEGER, PRIMARY KEY (project, row_id)
+);
+CREATE TABLE IF NOT EXISTS ledger_history (
+    id INTEGER PRIMARY KEY, project TEXT, row_id TEXT, at TEXT, at_text TEXT, author TEXT,
+    shape TEXT, from_state TEXT, to_state TEXT, changes TEXT, note TEXT, event TEXT, raw TEXT,
+    source TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_snapshot_ledger_history_row ON ledger_history (project, row_id, id);
+CREATE TABLE IF NOT EXISTS ledger_gone (
+    project TEXT, row_id TEXT, version INTEGER, PRIMARY KEY (project, row_id)
+);
+"""
+# A purged id never comes back, so its marker outranks every version.
+LEDGER_PURGED_VERSION = 2**62
+_LEDGER_ROW_COLS = ("project", "row_id", "title", "kind", "parent", "state", "owner", "evidence", "link",
+                    "refs", "seq", "created_at", "updated_at", "version")
+_LEDGER_HIST_COLS = ("id", "project", "row_id", "at", "at_text", "author", "shape", "from_state", "to_state",
+                     "changes", "note", "event", "raw", "source")
+_LEDGER_JSON_COLS = frozenset({"refs", "author", "changes", "raw"})
+_LEDGER_TS_COLS = frozenset({"created_at", "updated_at", "at"})
+
+
+def _ledger_value(col: str, val: Any) -> Any:
+    if col in _LEDGER_JSON_COLS:
+        return _json_text(val)
+    if col in _LEDGER_TS_COLS:
+        return _ts_text(val)
+    return val
+
+
+def _insert_ledger(cur, con: sqlite3.Connection) -> int:
+    """The ledger's live rows (never a removed one), their history, and each
+    project's words. Empty (0, no error) on a hub without migration 0028."""
+    if "row_id" not in _pg_columns(cur, "ledger_rows"):
+        return 0
+    con.executescript(_LEDGER_SCHEMA_SQL)
+    cur.execute("SELECT project, name, hidden, created_at FROM ledger_projects")
+    for project, name, hidden, created in cur.fetchall():
+        con.execute("INSERT INTO ledger_projects VALUES (?, ?, ?, ?)", (project, name, int(bool(hidden)),
+                                                                         _ts_text(created)))
+    cur.execute("SELECT project, field, word, meaning, position FROM ledger_vocab")
+    con.executemany("INSERT INTO ledger_vocab VALUES (?, ?, ?, ?, ?)", cur.fetchall())
+    cur.execute(f"SELECT {', '.join(_LEDGER_ROW_COLS)} FROM ledger_rows WHERE removed_at IS NULL")
+    rows = cur.fetchall()
+    con.executemany(
+        f"INSERT INTO ledger_rows ({', '.join(_LEDGER_ROW_COLS)}) VALUES ({', '.join('?' * len(_LEDGER_ROW_COLS))})",
+        [[_ledger_value(c, v) for c, v in zip(_LEDGER_ROW_COLS, r, strict=True)] for r in rows],
+    )
+    sel = ", ".join(f"h.{c}" for c in _LEDGER_HIST_COLS)
+    cur.execute(f"SELECT {sel} FROM ledger_history h JOIN ledger_rows r ON r.project = h.project "
+                "AND r.row_id = h.row_id WHERE r.removed_at IS NULL ORDER BY h.id")
+    con.executemany(
+        f"INSERT INTO ledger_history ({', '.join(_LEDGER_HIST_COLS)}) "
+        f"VALUES ({', '.join('?' * len(_LEDGER_HIST_COLS))})",
+        [[_ledger_value(c, v) for c, v in zip(_LEDGER_HIST_COLS, h, strict=True)] for h in cur.fetchall()],
+    )
+    # Removed and purged ids, so a write-through that read the row before it
+    # went cannot put it back after this dump.
+    cur.execute("SELECT project, row_id, version FROM ledger_rows WHERE removed_at IS NOT NULL")
+    gone = cur.fetchall()
+    cur.execute("SELECT project, row_id FROM ledger_removed")
+    gone += [(p, r, LEDGER_PURGED_VERSION) for p, r in cur.fetchall()]
+    con.executemany("INSERT OR REPLACE INTO ledger_gone VALUES (?, ?, ?)", gone)
+    return len(rows)
+
+
+def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mapping[str, list],
+                          rows: Sequence[Mapping[str, Any]], history: Sequence[Mapping[str, Any]],
+                          row_ids: Sequence[str], gone: Mapping[str, int] | None = None) -> dict[str, Any]:
+    """Write ``row_ids`` of ``project`` through to the replica: each live one
+    in ``rows`` (with its whole ``history``), and each removed one in ``gone``
+    at the version it was removed at (``LEDGER_PURGED_VERSION`` for a purge
+    the hub recorded). Any other id is left as it is: a row missing from the
+    hub may be a write not committed yet, so absence is never a purge. A row and its
+    history are replaced whole, and only by a newer or equal revision: its
+    version, then its last history id (a late conditional write adds history
+    without a new version). A removed or purged id leaves a marker, so a writer
+    that read the hub before a newer change and lands after it changes
+    nothing. Under the refresh lock, like every incremental write here.
+    Fail-open."""
+    path = snapshot_path()
+    # Missing is judged under the lock: a first refresh still dumping has no
+    # file yet, but may have read the hub before this change.
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    if not path.is_file():
+        _release_refresh_lock(lock)
+        return {"ok": False, "error": "hub snapshot missing", "missing": True}
+    gone = dict(gone or {})
+    live = {r["row_id"]: r for r in rows}
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            con.executescript(_LEDGER_SCHEMA_SQL)
+
+            def held(row_id: str) -> tuple[int | None, int | None]:
+                got = con.execute("SELECT version FROM ledger_rows WHERE project = ? AND row_id = ?",
+                                  (project, row_id)).fetchone()
+                mark = con.execute("SELECT version FROM ledger_gone WHERE project = ? AND row_id = ?",
+                                   (project, row_id)).fetchone()
+                return (got[0] if got else None), (mark[0] if mark else None)
+
+            def held_last_entry(row_id: str) -> int:
+                got = con.execute("SELECT MAX(id) FROM ledger_history WHERE project = ? AND row_id = ?",
+                                  (project, row_id)).fetchone()
+                return int(got[0] or 0) if got else 0
+
+            last_entry: dict[str, int] = {}
+            for h in history:
+                last_entry[h.get("row_id")] = max(last_entry.get(h.get("row_id"), 0), int(h.get("id") or 0))
+
+            def drop(row_id: str) -> None:
+                con.execute("DELETE FROM ledger_rows WHERE project = ? AND row_id = ?", (project, row_id))
+                con.execute("DELETE FROM ledger_history WHERE project = ? AND row_id = ?", (project, row_id))
+
+            if proj is not None:
+                con.execute("INSERT OR REPLACE INTO ledger_projects VALUES (?, ?, ?, ?)",
+                            (project, proj[0], int(bool(proj[1])), _ts_text(proj[2])))
+            con.execute("DELETE FROM ledger_vocab WHERE project = ?", (project,))
+            con.executemany("INSERT INTO ledger_vocab VALUES (?, 'state', ?, ?, ?)",
+                            [(project, w, m, i) for i, (w, m) in enumerate(vocab.get("state") or [])])
+            con.executemany("INSERT INTO ledger_vocab VALUES (?, 'kind', ?, '', ?)",
+                            [(project, w, i) for i, w in enumerate(vocab.get("kind") or [])])
+            written, stale = [], 0
+            for row_id, row in live.items():
+                have, mark = held(row_id)
+                version = int(row.get("version") or 0)
+                if max(have or 0, mark or 0) > version or (
+                        have == version and held_last_entry(row_id) > last_entry.get(row_id, 0)):
+                    stale += 1
+                    continue
+                drop(row_id)
+                con.execute("DELETE FROM ledger_gone WHERE project = ? AND row_id = ?", (project, row_id))
+                values = {**row, "project": project}
+                con.execute(
+                    f"INSERT INTO ledger_rows ({', '.join(_LEDGER_ROW_COLS)}) "
+                    f"VALUES ({', '.join('?' * len(_LEDGER_ROW_COLS))})",
+                    [_ledger_value(c, values.get(c)) for c in _LEDGER_ROW_COLS],
+                )
+                written.append(row_id)
+            for row_id, version in gone.items():
+                have, mark = held(row_id)
+                if have is not None and have > version:
+                    stale += 1
+                    continue
+                drop(row_id)
+                con.execute("INSERT OR REPLACE INTO ledger_gone VALUES (?, ?, ?)",
+                            (project, row_id, max(version, mark or 0)))
+            for h in history:
+                if h.get("row_id") not in written:
+                    continue
+                values = {**h, "project": project}
+                con.execute(
+                    f"INSERT OR REPLACE INTO ledger_history ({', '.join(_LEDGER_HIST_COLS)}) "
+                    f"VALUES ({', '.join('?' * len(_LEDGER_HIST_COLS))})",
+                    [_ledger_value(c, values.get(c)) for c in _LEDGER_HIST_COLS],
+                )
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True, "rows": len(written), "stale": stale}
+    except Exception as exc:  # noqa: BLE001  (the hub write already landed)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        _release_refresh_lock(lock)
+
+
+def ledger_in_snapshot() -> bool:
+    try:
+        con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        return bool(_snapshot_table_columns(con, "ledger_rows"))
+    finally:
+        con.close()
+
+
+def ledger_gone_version(project: str, row_id: str) -> int | None:
+    """The replica's gone marker version for one row; None when the replica,
+    its marker table or the marker is missing. Unlike the readers above it
+    raises when the replica is there but cannot be read: a caller deciding
+    whether a row was purged must not take an unreadable copy for "no"."""
+    try:
+        os.stat(snapshot_path())
+    except FileNotFoundError:
+        return None
+    con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
+    try:
+        if con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ledger_gone'").fetchone() is None:
+            return None
+        got = con.execute("SELECT version FROM ledger_gone WHERE project = ? AND row_id = ?",
+                          (project, row_id)).fetchone()
+    finally:
+        con.close()
+    return int(got[0]) if got else None
+
+
+def ledger_read_snapshot(project: str) -> dict[str, Any] | None:
+    """``project``'s words, live rows and history from the replica, with the
+    replica's time; None when the replica or its ledger tables are missing."""
+    if not snapshot_path().is_file():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        if not _snapshot_table_columns(con, "ledger_rows"):
+            return None
+        vocab: dict[str, list] = {"state": [], "kind": []}
+        for field, word, meaning in con.execute(
+                "SELECT field, word, meaning FROM ledger_vocab WHERE project = ? ORDER BY field, position",
+                (project,)):
+            if field == "state":
+                vocab["state"].append([word, meaning])
+            else:
+                vocab["kind"].append(word)
+        cols = [c for c in _LEDGER_ROW_COLS if c != "project"]
+        rows = [dict(zip(cols, r, strict=True)) for r in con.execute(
+            f"SELECT {', '.join(cols)} FROM ledger_rows WHERE project = ? ORDER BY seq", (project,))]
+        hcols = [c for c in _LEDGER_HIST_COLS if c != "project"]
+        history = []
+        for h in con.execute(f"SELECT {', '.join(hcols)} FROM ledger_history WHERE project = ? ORDER BY id",
+                             (project,)):
+            entry = dict(zip(hcols, h, strict=True))
+            for key in _LEDGER_JSON_COLS & set(entry):
+                if isinstance(entry[key], str):
+                    entry[key] = json.loads(entry[key])
+            history.append(entry)
+        gone: dict[str, int] = {}
+        if _snapshot_table_columns(con, "ledger_gone"):
+            gone = dict(con.execute("SELECT row_id, version FROM ledger_gone WHERE project = ?", (project,)))
+    except (sqlite3.Error, ValueError):
+        return None
+    finally:
+        con.close()
+    return {"vocab": vocab, "rows": rows, "history": history, "gone": gone, "as_of": meta().get("refreshed_at")}
 
 
 _EPISODE_FTS_COLS = ("summary", "topics", "decisions", "preferences", "people")
@@ -1372,6 +1628,7 @@ def refresh() -> dict[str, Any]:
                     )
                     counts["decisions"] = _insert_decisions(cur, con)
                     counts["deliverables"] = _insert_deliverables(cur, con)
+                    counts["ledger_rows"] = _insert_ledger(cur, con)
             refreshed_at = _utcnow_iso()
             if _snapshot_table_columns(con, "snapshot_meta"):
                 con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('refreshed_at', ?)", (refreshed_at,))

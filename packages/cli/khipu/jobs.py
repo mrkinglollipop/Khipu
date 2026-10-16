@@ -329,6 +329,7 @@ def run_nightly() -> int:
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
     _record_nightly_step(steps, "commitments_hygiene", **_step_result(_hygiene_commitments()))
+    _record_nightly_step(steps, "ledger", **_step_result(_ledger_nightly()))
     _record_nightly_step(steps, "snapshot_refresh", **_step_result(_refresh_snapshot()))
     briefs_result = _briefs_build_if_on()
     if briefs_result is not None:
@@ -338,6 +339,17 @@ def run_nightly() -> int:
     if final_rc != rc:
         _write_job_state("nightly", final_rc)
     return final_rc
+
+
+def _ledger_nightly() -> dict[str, Any]:
+    """Land waiting ledger writes and purge rows removed longer ago than
+    `ledger_purge_after`; before the replica dump so it carries the result."""
+    try:
+        from khipu.ledger import nightly
+
+        return nightly()
+    except Exception as exc:  # noqa: BLE001  (a ledger miss cannot fail the night)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _refresh_snapshot() -> dict[str, Any]:

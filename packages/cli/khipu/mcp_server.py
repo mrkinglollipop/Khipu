@@ -585,11 +585,20 @@ TOOLS: list[dict] = [
             "legacy file. Use it for a capture that was wrong, a test, or "
             "something that should not have been remembered. Through the "
             "HTTPS gateway only episodes captured by a cloud harness can be "
-            "forgotten; local captures are forgotten from the Mac that owns them."
+            "forgotten; local captures are forgotten from the Mac that owns them. "
+            "A ledger id (ledger:<project>#<row id>) removes that ledger row, the "
+            "same as `khipu ledger remove`: it leaves every list at once and the "
+            "owner can restore it in the app for 30 days."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "integer", "description": "Episode id (khipu_capture returns it)"}},
+            "properties": {
+                "id": {"type": ["integer", "string"],
+                       "description": "Episode id (khipu_capture returns it), or ledger:<project>#<row id>"},
+                "note": {"type": "string", "description": "Ledger rows only: why it is removed"},
+                "children": {"type": "string", "enum": ["remove", "move-up"],
+                             "description": "Ledger rows with children only: remove them too, or move them up"},
+            },
             "required": ["id"],
         },
     },
@@ -1513,6 +1522,15 @@ def _tool_forget(args: dict) -> dict:
     """Complete forget of one episode (khipu.forget). From the gateway only a
     cloud harness's own captures may be forgotten: a local episode belongs to
     the Mac that captured it and is forgotten there."""
+    if isinstance(args.get("id"), str) and args["id"].startswith("ledger:"):
+        _ensure_path()
+        from khipu import ledger
+
+        try:
+            return ledger.remove_ref(args["id"], note=str(args.get("note") or ""),
+                                     children=args.get("children"), source="mcp")
+        except ledger.LedgerError as exc:
+            raise ValueError(str(exc)) from None
     eid = _positive_id(args.get("id"), "id")
     _ensure_path()
     from khipu.forget import LOCAL_HARNESSES, forget_everywhere

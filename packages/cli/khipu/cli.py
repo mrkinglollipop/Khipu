@@ -209,7 +209,7 @@ LOCAL_GATES = (
     "outbox_ok", "capture_liveness_ok", "git_sync_ok", "dsn_file_ok", "synth_provider_ok",
     "jobs_ok", "index_freshness_ok", "synth_budget_ok", "graph_backup_ok", "bundle_seal_ok",
     "prompt_recall_snapshot_ok", "prompt_recall_outcomes_ok", "recall_daemon_ok",
-    "nightly_steps_ok", "degraded_rate_ok", "launchers_ok",
+    "nightly_steps_ok", "degraded_rate_ok", "launchers_ok", "ledger_outbox_ok",
 )
 
 
@@ -408,8 +408,18 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         launchers = integ.launcher_health()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         launchers = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The ledger's own outbox: a queued ledger write is one the hub does not
+    # have yet. Red while it holds anything, as the capture outbox is.
+    try:
+        from khipu.ledger import outbox_status as ledger_outbox_status
+
+        ledger_outbox = ledger_outbox_status()
+    except Exception as e:  # noqa: BLE001  (a failed check must not look like a pass)
+        ledger_outbox = {"pending": -1, "error": f"{type(e).__name__}: {e}"}
+    ledger_outbox_ok = ledger_outbox.get("pending") == 0 and not ledger_outbox.get("refused")
     return {
         "outbox": outbox, "outbox_ok": outbox_ok,
+        "ledger_outbox": ledger_outbox, "ledger_outbox_ok": ledger_outbox_ok,
         "capture_liveness": liveness, "capture_liveness_ok": bool(liveness.get("ok")),
         "git_sync": git_sync, "git_sync_ok": bool(git_sync.get("ok")),
         "secrets": secrets, "dsn_file_ok": dsn_file_ok,
@@ -827,6 +837,14 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         routing_block = _routing.doctor_block()
     except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
         routing_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # The ledger (Work view phase 1): counts per project, removed rows waiting
+    # to purge, purged markers, offline copy. Only the outbox gates (above).
+    try:
+        from khipu import ledger as _ledger
+
+        ledger_block = _ledger.doctor_block()
+    except Exception as e:  # noqa: BLE001  (a failed check must not crash doctor)
+        ledger_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -836,6 +854,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "drift": drift,
         "graph_drift": graph,
         "outbox": outbox,
+        "ledger_outbox": local["ledger_outbox"],
         "capture_liveness": liveness,
         "git_sync": git_sync,
         "backup": backup,
@@ -867,8 +886,10 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "decision_links": decision_links_block,
         "plan_usage": plan_usage_block,
         "routing": routing_block,
-        # Warnings that never gate `ok` (plans nearly used up; routing).
-        "warnings": list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or []),
+        "ledger": ledger_block,
+        # Warnings that never gate `ok` (plans nearly used up; routing; ledger).
+        "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
+                     + list(ledger_block.get("warnings") or [])),
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -916,6 +937,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             # (`launchers["consistent"]`) is a warning, folded in separately
             # below, and never reaches this aggregate.
             and bool(launchers.get("ok"))
+            and local["ledger_outbox_ok"]
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
@@ -947,6 +969,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "degraded_rate_ok": bool(degraded_rate.get("ok")),
         "launchers_ok": bool(launchers.get("ok")),
         "nightly_steps_ok": local["nightly_steps_ok"],
+        "ledger_outbox_ok": local["ledger_outbox_ok"],
     }
     print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
@@ -2939,6 +2962,19 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps({"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(path)}))
         return 0
+    from khipu import ledger as _ledger
+
+    if (args.set and args.set[0] in _ledger.SETTINGS) or args.unset in _ledger.SETTINGS:
+        # Every ledger limit and time (Work view, rule 7): `--set
+        # ledger_title_chars 0` lifts it, `--unset` for the default again.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _ledger.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _ledger.settings_status()[key], "config_file": str(path)}))
+        return 0
     from khipu import routing as _routing
 
     if (args.set and args.set[0] in _routing.SETTINGS) or args.unset in _routing.SETTINGS:
@@ -3052,6 +3088,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
         "usage_accounts": usage.accounts_status(),
         "routing": _routing.settings_status(),
+        "ledger": _ledger.settings_status(),
         "config_file": str(config_file()),
         "config": load_config(),
     }
@@ -4095,8 +4132,18 @@ def cmd_components(args: argparse.Namespace) -> int:
     return 1
 
 
+class _Parser(argparse.ArgumentParser):
+    """Usage errors quote what was typed; a key-shaped value is masked first.
+    Subparsers inherit the class."""
+
+    def error(self, message: str):
+        from khipu.redact import redact_secrets
+
+        super().error(redact_secrets(message, force=True)[0])
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="khipu", description="Khipu memory hub CLI")
+    p = _Parser(prog="khipu", description="Khipu memory hub CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("status", help="PG counts + optional drift")
@@ -4442,6 +4489,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r.add_argument("--memory-root", default=_memory_root_default())
     r.set_defaults(func=cmd_regen_memory)
+
+    from khipu import ledger as _ledger
+
+    _ledger.add_parser(sub)
 
     nt = sub.add_parser("nightly", help="Run consolidate_nightly.py (memory wiki)")
     nt.set_defaults(func=cmd_nightly)

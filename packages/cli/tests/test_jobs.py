@@ -74,12 +74,13 @@ class JobsRunTest(unittest.TestCase):
                     mock.patch.object(jobs, "_prune_query_cache"), \
                     mock.patch.object(jobs, "_mark_stale_commitments"), \
                     mock.patch.object(jobs, "_hygiene_commitments"), \
+                    mock.patch.object(jobs, "_ledger_nightly"), \
                     mock.patch.object(jobs, "_refresh_snapshot"), \
                     mock.patch.object(jobs, "_briefs_build_if_on", return_value=None):
                 self.assertEqual(jobs.run_nightly(), expected)
             script.assert_called_once()
             self.assertFalse(record.call_args_list[0].kwargs["ok"])
-            self.assertEqual(record.call_count, 8)
+            self.assertEqual(record.call_count, 9)
 
     def test_run_nightly_writes_nightly_last_json_with_every_step(self):
         """F3/D1: nightly-last.json is the persisted evidence Phase 6 will
@@ -98,7 +99,7 @@ class JobsRunTest(unittest.TestCase):
         self.assertEqual(
             names,
             ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
-             "query_cache_prune", "commitments_mark_stale", "commitments_hygiene",
+             "query_cache_prune", "commitments_mark_stale", "commitments_hygiene", "ledger",
              "snapshot_refresh"],
         )
         for step in payload["steps"]:
