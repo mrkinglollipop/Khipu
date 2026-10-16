@@ -74,6 +74,7 @@ import {
   type NoticeTarget,
 } from "./postUpdateNotices";
 import { WhatsNewCard, WhatsNewHistory, revealSettingsGroup } from "./WhatsNew";
+import { HomeAccountCards } from "./FoundAccounts";
 import "./App.css";
 
 /** Six destinations, one per user job, plus the first-run flow and Revisions —
@@ -2384,6 +2385,10 @@ export default function App() {
   const routing = useRouting(tab === "home");
   // Plans shows a pause only from a record read without error, never a guess.
   const routingForPlans = routing.error ? null : routing.data;
+  // Phase 9: "Read no accounts" (Plans says so) and Plans' Add an account…,
+  // which opens the dialog Home's account cards hold.
+  const [noneTracked, setNoneTracked] = useState(false);
+  const [addAccountSignal, setAddAccountSignal] = useState(0);
   const routingItems = useMemo(() => routingAttention(routing.data), [routing.data]);
   const homeAttention = useMemo(
     () => [...attention, ...planItems, ...routingItems],
@@ -3578,6 +3583,22 @@ export default function App() {
                 }}
               />
             ) : null}
+            {/* Phase 9: the Found card or the automatic-tracking card, after
+             *  What's new and before the attention callouts. */}
+            <HomeAccountCards
+              active
+              addSignal={addAccountSignal}
+              onNone={setNoneTracked}
+              onChanged={() => {
+                void plans.reread();
+                void routing.load();
+              }}
+              onOpenAccounts={() => {
+                setSettingsSection("routing");
+                setTab("settings");
+                revealSettingsGroup("accounts");
+              }}
+            />
             {homeAttention.map((a) => (
               <Callout
                 key={a.key}
@@ -3664,6 +3685,8 @@ export default function App() {
             <PlansCard
               state={plans}
               routing={routingForPlans}
+              noneTracked={noneTracked}
+              onAddAccount={() => setAddAccountSignal((n) => n + 1)}
               onOpenAccounts={() => {
                 setSettingsSection("routing");
                 setTab("settings");

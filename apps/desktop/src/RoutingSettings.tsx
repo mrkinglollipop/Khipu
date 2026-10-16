@@ -29,6 +29,8 @@ import { inPlansOrder } from "./RoutingCard";
 import { GROUPS, accountTags, accountWeek, routingOverview } from "./routingOverview";
 import type { GroupKey, GroupTag, OverviewSettings, Problem } from "./routingOverview";
 import "./routingOverview.css";
+import { AccountExtras, FinderBottom, FinderTop, foundCount, useAccountsFinder } from "./FoundAccounts";
+import type { AccountsFinder, FinderConfig } from "./FoundAccounts";
 import {
   accountSource,
   accountState,
@@ -958,6 +960,7 @@ function AccountLine({
   folds,
   w,
   now,
+  finder,
 }: {
   a: RouteAccount;
   data: RouteView;
@@ -968,6 +971,7 @@ function AccountLine({
   folds: Folds;
   w: Writer;
   now: Date;
+  finder?: AccountsFinder | null;
 }) {
   const key = `account:${a.key}`;
   const open = folds.isOpen(key);
@@ -999,6 +1003,14 @@ function AccountLine({
           </span>
         </button>
         <div className="fold-body" id={bodyId} role="region" aria-label={a.label} hidden={!open}>
+          {finder && a.configured !== false ? (
+            <AccountExtras label={a.label} harness={a.harness} home={homeOfKey(a.key)} row={plan} support={finder.support} now={now}
+              onRename={() => finder.openRename({ key: a.key, label: a.label, harness: a.harness, home: homeOfKey(a.key) })}
+              onStop={() => finder.openStop({ key: a.key, label: a.label, harness: a.harness, home: homeOfKey(a.key) })}
+              onChooseFolder={(opener) =>
+                void finder.chooseFolderFor({ key: a.key, label: a.label, harness: a.harness, home: homeOfKey(a.key) }, opener)
+              } />
+          ) : null}
           <AccountRow a={a} w={w} now={now} reportDefault={data.report_default_limit} fact={fact}>
             {plan ? <PlanBlock row={plan} now={now} pause={pause} onSignedIn={onSignedIn} /> : null}
           </AccountRow>
@@ -1006,6 +1018,13 @@ function AccountLine({
       </div>
     </div>
   );
+}
+
+/** The login folder in an account key (`harness|folder`); null for a
+ *  default login. */
+function homeOfKey(key: string): string | null {
+  const i = key.indexOf("|");
+  return i >= 0 && key.slice(i + 1) ? key.slice(i + 1) : null;
 }
 
 function AccountsSection({
@@ -1016,6 +1035,7 @@ function AccountsSection({
   active,
   w,
   now,
+  finder,
 }: {
   data: RouteView;
   plansState?: PlanUsageState | null;
@@ -1024,6 +1044,7 @@ function AccountsSection({
   active: boolean;
   w: Writer;
   now: Date;
+  finder?: AccountsFinder | null;
 }) {
   const plans = plansState?.data ?? null;
   const accounts = inPlansOrder(data.accounts ?? [], plans);
@@ -1037,15 +1058,16 @@ function AccountsSection({
   const names = (plans ? rows.map((r) => r.account || r.harness || "an account") : accounts.map((a) => a.label)).join(", ");
   return (
     <div className="section-body">
+      {finder ? <FinderTop finder={finder} rows={rows} /> : null}
       {accounts.length ? (
         <div className="route-alist" role="list" aria-label="Accounts">
           {accounts.map((a) => (
             <AccountLine key={a.key} a={a} data={data} plan={rows.find((r) => r.key != null && r.key === a.key)}
               pause={pauses.get(a.key)} onSignedIn={plansState?.reread} tags={accountTags(problems, a.key)}
-              folds={folds} w={w} now={now} />
+              folds={folds} w={w} now={now} finder={finder} />
           ))}
         </div>
-      ) : (
+      ) : finder?.none ? null : (
         <EmptyState
           title="No accounts to show"
           hint="Add an account under Which accounts Khipu reads, at the end of this group, and it shows here."
@@ -1105,6 +1127,7 @@ function AccountsSection({
           <UsageAccountsField active={active} onChanged={plansState?.reread} />
         </div>
       ) : null}
+      {finder ? <FinderBottom finder={finder} /> : null}
     </div>
   );
 }
@@ -3197,6 +3220,9 @@ function useFolds() {
   };
 }
 
+/** A tag on a group's closed line: its problems, and phase 9's neutral "N found". */
+type ShownTag = { text: string; tone: GroupTag["tone"] | "accent" };
+
 /** One group: a fold button with its name, closed line and problem tags, and
  *  its body, kept mounted while closed so a half-filled form keeps its words. */
 function Group({
@@ -3210,7 +3236,7 @@ function Group({
   k: GroupKey;
   name: string;
   line: string;
-  tags: GroupTag[];
+  tags: ShownTag[];
   folds: Folds;
   children: ReactNode;
 }) {
@@ -3272,6 +3298,26 @@ export function RoutingSettings({
   };
   const w = useWriter(rereadRoute);
   const folds = useFolds();
+  const laneRaw = config.data?.routing?.routing_lane_map?.value;
+  const finder = useAccountsFinder(active, {
+    view: route.data,
+    laneMap: laneRaw && typeof laneRaw === "object" && !Array.isArray(laneRaw) ? (laneRaw as Record<string, Record<string, string>>) : null,
+    config: (config.data as FinderConfig | null) ?? null,
+    rereadConfig: config.reload,
+    onChanged: () => {
+      void plansState?.reread();
+      void route.load(true);
+    },
+    onShowAccount: (label) => {
+      const a = (route.data?.accounts ?? []).find((x) => x.label === label);
+      folds.openKeys(["accounts", ...(a ? [`account:${a.key}`] : [])]);
+      setFocusItem({ item: a ? `account:${a.key}` : null, group: "accounts" });
+    },
+    onEdit: () => {
+      folds.openKeys(["rules"]);
+      setFocusItem({ item: null, group: "rules" });
+    },
+  });
   const [focusItem, setFocusItem] = useState<{ item: string | null; group: GroupKey } | null>(null);
   const [retrying, setRetrying] = useState(false);
   const now = new Date();
@@ -3289,6 +3335,11 @@ export function RoutingSettings({
   };
   const recordError = data ? null : route.error;
   const overview = routingOverview(data, recordError, plansState?.data, plansState?.error, settings, now);
+  // Phase 9: "Looking…" while discovery runs, never "0 found"; "N found" is a
+  // neutral tag on the closed line, never a problem (rule 6 amended).
+  if (finder.disc.looking) overview.lines.accounts = "Looking…";
+  const nFound = foundCount(finder.disc.data);
+  const foundTag: ShownTag | null = nFound && !finder.disc.looking ? { text: `${nFound} found`, tone: "accent" } : null;
   const needs = overview.problems.filter((p) => p.needs);
   // "Nothing here needs you" only once every read the problems come from is
   // in: the record, the settings (lanes, folders) and plan usage (plans,
@@ -3335,7 +3386,8 @@ export function RoutingSettings({
 
   const body: Record<GroupKey, ReactNode> = {
     accounts: data ? (
-      <AccountsSection data={data} plansState={plansState} problems={overview.problems} folds={folds} active={active} w={w} now={now} />
+      <AccountsSection data={data} plansState={plansState} problems={overview.problems} folds={folds} active={active} w={w} now={now}
+        finder={finder} />
     ) : (
       unread
     ),
@@ -3451,7 +3503,8 @@ export function RoutingSettings({
         </p>
       ) : null}
       {GROUPS.map((g) => (
-        <Group key={g.key} k={g.key} name={g.name} line={overview.lines[g.key]} tags={overview.tags[g.key]} folds={folds}>
+        <Group key={g.key} k={g.key} name={g.name} line={overview.lines[g.key]}
+          tags={g.key === "accounts" && foundTag ? [foundTag, ...overview.tags[g.key]] : overview.tags[g.key]} folds={folds}>
           {body[g.key]}
         </Group>
       ))}

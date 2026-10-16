@@ -146,7 +146,7 @@ function mount() {
 }
 
 async function ready() {
-  await screen.findByText("Signed in, Max, 62% of its week left");
+  await screen.findByText("Default login: signed in, Max, 62% of its week left");
   await screen.findAllByLabelText("Read this account's plan");
 }
 
@@ -200,7 +200,7 @@ describe("Setup › Accounts step", () => {
     fake();
     mount();
     await ready();
-    expect(screen.getByText("Not signed in. Sign in from Grok Build, then Check again.")).toBeInTheDocument();
+    expect(screen.getByText("Default login: not signed in. Sign in from Grok Build, then Check again.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Check Grok Build again" })).toBeInTheDocument();
   });
 
@@ -223,7 +223,7 @@ describe("Setup › Accounts step", () => {
     mount();
     await ready();
     expect(await screen.findByText("Can't read this setting")).toBeInTheDocument();
-    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: "Tell my conversations about this" })).not.toBeInTheDocument();
   });
 
   it("with no installed accounts the No accounts found callout shows", async () => {
@@ -294,7 +294,7 @@ describe("Setup › Accounts step, review fixes", () => {
     await ready();
     fireEvent.click(screen.getByRole("button", { name: "Check Grok Build again" }));
     expect(await screen.findByText(/last check didn't work/)).toBeInTheDocument();
-    expect(screen.getByText("Signed in, Max, 62% of its week left")).toBeInTheDocument();
+    expect(screen.getByText("Default login: signed in, Max, 62% of its week left")).toBeInTheDocument();
   });
 
   it("an account left out of your own list is not called not found", async () => {
@@ -304,7 +304,7 @@ describe("Setup › Accounts step, review fixes", () => {
       rows: [report().accounts[0]],
     });
     mount();
-    await screen.findByText("Signed in, Max, 62% of its week left");
+    await screen.findByText("Default login: signed in, Max, 62% of its week left");
     await screen.findByText(/Not in your account list: Codex, Grok Build and Muse/);
     expect(screen.queryByText(/Not found on this Mac/)).not.toBeInTheDocument();
   });

@@ -28,8 +28,55 @@ import {
   windowLabel,
 } from "./PlansCard";
 import type { UsageAccount, UsageAccountEntry } from "./PlansCard";
+import { COMING, cliName, planWord, plural, reasonWords, suggestedName, useAccountsSupport, useDiscovery } from "./accountsApi";
+import type { Candidate } from "./accountsApi";
+import { AddAccountDialog } from "./AddAccountDialog";
+import { AutoTrackSwitch, addQuietLogins } from "./FoundAccounts";
+import { signInOutcome } from "./PlansCard";
 
-type AccountsStatus = { source: "file" | "default"; accounts: UsageAccountEntry[]; user_home?: string | null };
+type AccountsStatus = { source: "file" | "default" | "none"; accounts: UsageAccountEntry[]; user_home?: string | null };
+
+/** A login discovery found that Khipu doesn't track yet, as a plan row the
+ *  step can list and tick (phase 9): signed in starts ticked, the rest off. */
+type FoundRow = UsageAccount & { found: Candidate };
+
+function foundRowOf(c: Candidate): FoundRow {
+  return {
+    harness: c.cli,
+    account: suggestedName(c),
+    home: c.default || c.cli === "muse" ? null : c.path,
+    ok: c.state === "signed_in",
+    error: c.state === "not_signed_in" ? "not_signed_in" : c.state === "couldnt_check" ? (c.reason ?? "no_answer") : null,
+    plan: c.plan,
+    windows: [],
+    found: c,
+  };
+}
+
+function isFound(r: UsageAccount): r is FoundRow {
+  return (r as FoundRow).found != null;
+}
+
+/** A found login's name and line, as the setup mock words them. */
+function foundWords(c: Candidate): { name: string; line: string; tone: "ok" | "warn" | null } {
+  const where = c.cli === "muse" ? "Muse" : c.default ? "Default login" : c.path ?? "Its folder";
+  if (c.state === "signed_in") {
+    const conv = c.conversations_7d ? ` ${plural(c.conversations_7d, "conversation", "conversations")} this week ran on it.` : "";
+    return {
+      name: `${cliName(c.cli)}, ${c.default ? "default login" : "second login"}`,
+      line: `${where}: signed in${planWord(c.plan) ? `, ${planWord(c.plan)}` : ""}.${conv}`,
+      tone: "ok",
+    };
+  }
+  if (c.state === "not_signed_in") {
+    return { name: `${cliName(c.cli)}, another folder`, line: `${where}: not signed in. Leave it off, or sign in to it after setup.`, tone: null };
+  }
+  return {
+    name: `${cliName(c.cli)}, another folder`,
+    line: `${where}: couldn't check (${reasonWords(c.cli, c.reason)}). Leave it off, or check it later in Settings.`,
+    tone: "warn",
+  };
+}
 
 const CLI_TITLE: Record<string, string> = Object.fromEntries(USAGE_HARNESS_OPTIONS);
 
@@ -151,7 +198,7 @@ export function planAccountList(
   return { list, ids: new Set(list.map((e) => accountId(e.harness, e.home, uh))), changed };
 }
 
-type ListStart = { source: "file" | "default"; ids: Set<string> };
+type ListStart = { source: "file" | "default" | "none"; ids: Set<string> };
 type ListWrite = { kind: "none" } | { kind: "set"; list: StoredEntry[] } | { kind: "unset"; list: StoredEntry[] };
 
 /** What Next writes to the account list given `status`, the list saved now.
@@ -258,7 +305,21 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
   const uid = useId();
 
   const rows = usage.data?.accounts ?? null;
-  const found = useMemo(() => (rows ?? []).filter((r) => !(r.ok === false && r.error === "not_installed")), [rows]);
+  // Phase 9: what discovery found besides the accounts read now. Folders
+  // found only by name wait for Check in Settings (decision 20).
+  const disc = useDiscovery(active);
+  const { support } = useAccountsSupport(active);
+  const extra = useMemo(
+    () =>
+      (disc.data?.candidates ?? [])
+        .filter((c) => c.state === "signed_in" || c.state === "not_signed_in" || c.state === "couldnt_check")
+        .map(foundRowOf),
+    [disc.data],
+  );
+  const found = useMemo(
+    () => [...(rows ?? []).filter((r) => !(r.ok === false && r.error === "not_installed")), ...(rows ? extra : [])],
+    [rows, extra],
+  );
   // "Not found" only on evidence: a not_installed row, or, with the default
   // list (every CLI whose command is on this Mac), a CLI with no row at all.
   // A CLI left out of the owner's own list is only not listed.
@@ -269,15 +330,29 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
     .map(([, name]) => name);
   const notListed = status?.source === "file" ? absent.filter(([h]) => !notInstalled.has(h)).map(([, name]) => name) : [];
 
-  // The owner's edits, as operations on whatever is saved when Next runs.
-  const [readOps, setReadOps] = useState<Map<string, boolean>>(new Map());
+  // The owner's edits, as operations on whatever is saved when Next runs. A
+  // signed-in found login starts ticked: ticked plus Next is the owner's
+  // Track (section 1); one left unticked is neither tracked nor turned down.
+  const [ownOps, setReadOps] = useState<Map<string, boolean>>(new Map());
+  const readOps = useMemo(() => {
+    const m = new Map<string, boolean>();
+    for (const r of extra) {
+      if (r.found.state === "signed_in") m.set(accountId(r.harness, r.home, userHome), true);
+    }
+    for (const [k, v] of ownOps) m.set(k, v);
+    return m;
+  }, [extra, ownOps, userHome]);
+  const [addOpen, setAddOpen] = useState(0);
+  const [autoOn, setAutoOn] = useState<boolean | null>(null);
+  const [signing, setSigning] = useState<string | null>(null);
+  const [signSaid, setSignSaid] = useState<string | null>(null);
   const [moves, setMoves] = useState<Move[]>([]);
   const [tell, setTell] = useState<boolean | null>(null);
 
   const listedIds = status ? planAccountList(status, new Map(), found).ids : null;
   const isChecked = (r: UsageAccount) => {
     const id = accountId(r.harness, r.home, userHome);
-    return readOps.get(id) ?? (listedIds ? listedIds.has(id) : true);
+    return readOps.get(id) ?? (isFound(r) ? false : listedIds ? listedIds.has(id) : true);
   };
   // The list as first read, and whether this step turned the default list
   // into an explicit one: going back to the default is then this step's to do.
@@ -317,7 +392,26 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
   const checkAgain = () => {
     void usage.refresh();
     void cfg.read();
+    void disc.run(false);
   };
+
+  /** Sign in now on a default login that is tracked but not signed in: the
+   *  existing sign-in for an account in the list, then a fresh read. */
+  async function signInDefault(r: UsageAccount) {
+    const name = r.account || cliTitle(r.harness);
+    setSigning(name);
+    setSignSaid(null);
+    try {
+      const res = await callCli<{ ok?: boolean; error?: string; row?: UsageAccount }>("khipu_account_sign_in", {
+        harness: r.harness,
+        home: r.home ?? null,
+      });
+      setSignSaid(`${name}: ${signInOutcome(res)}`);
+      void usage.refresh();
+    } finally {
+      setSigning(null);
+    }
+  }
 
   async function next() {
     setSaving(true);
@@ -413,6 +507,18 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         setMoves([]);
         void route.read();
       }
+      if (autoOn != null && support.state === "here" && autoOn !== support.status.auto_track) {
+        const res = await callCli("khipu_accounts_auto_track", { on: autoOn });
+        if (!res.ok) {
+          console.error("khipu accounts auto-track failed:", res.error);
+          say("change Track new accounts automatically");
+          return;
+        }
+        done.push("Track new accounts automatically");
+      }
+      // A found login left unticked stays in Settings only, never on Home
+      // (decision 12).
+      addQuietLogins(extra.filter((r) => !isChecked(r)).map((r) => r.found.id));
       if (tell != null) {
         const f = await features.read();
         const sw = f.ok ? f.data.features?.routing_push : undefined;
@@ -481,16 +587,28 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
             </button>
           }
         >
-          Khipu looked for {listOf(USAGE_HARNESS_OPTIONS.map(([, n]) => n))}. Install one and choose Check again, or carry
-          on: nothing on this step is required.
+          Khipu looked for {listOf(USAGE_HARNESS_OPTIONS.map(([, n]) => n))}. Install one and choose Check again, add one kept
+          somewhere unusual, or carry on: nothing on this step is required.{" "}
+          <button type="button" className="sm" disabled={saving} onClick={() => setAddOpen((n) => n + 1)}>
+            Add another account…
+          </button>
         </Callout>
       ) : (
         <>
           <ul className="acct-list" aria-label="Accounts found on this Mac">
             {found.map((r, i) => {
               const id = accountId(r.harness, r.home, userHome);
-              const line = accountLine(r, now);
-              const name = r.account || cliTitle(r.harness);
+              const fw = isFound(r) ? foundWords(r.found) : null;
+              const read = accountLine(r, now);
+              // A default login's line names it, as the setup mock does.
+              const line = fw
+                ? { text: fw.line, tone: fw.tone }
+                : !r.home && r.harness !== "muse"
+                  ? { text: `Default login: ${read.text.charAt(0).toLowerCase()}${read.text.slice(1)}`, tone: read.tone }
+                  : read;
+              const name = fw ? fw.name : r.account || cliTitle(r.harness);
+              const signable = !fw && r.ok === false && r.error === "not_signed_in" && (r.harness === "claude" || r.harness === "codex");
+              const byCode = !fw && r.ok === false && r.error === "not_signed_in" && (r.harness === "grok" || r.harness === "muse");
               // Ids by position: two distinct accounts never share one.
               const box = `${uid}-read-${i}`;
               return (
@@ -499,13 +617,26 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
                   <div className="acct-main">
                     <strong id={`${box}-name`}>{name}</strong>
                     <span className="acct-line">{line.text}</span>
-                    {r.ok === false && r.error === "not_signed_in" ? (
+                    {!fw && r.ok === false && r.error === "not_signed_in" ? (
                       <span className="acct-act">
+                        {signable ? (
+                          <button type="button" className="sm primary" disabled={signing != null || saving} aria-busy={signing === name || undefined}
+                            aria-label={`Sign in to ${name} now`} onClick={() => void signInDefault(r)}>
+                            {signing === name ? <Loader2 size={14} className="spin" aria-hidden /> : null}
+                            Sign in now
+                          </button>
+                        ) : null}
+                        {byCode ? (
+                          <button type="button" className="sm primary" disabled aria-describedby={`${box}-code`}>
+                            Sign in with a code
+                          </button>
+                        ) : null}
                         <button type="button" className="sm" disabled={usage.refreshing || saving} aria-busy={usage.refreshing || undefined}
                           aria-label={`Check ${name} again`} onClick={checkAgain}>
                           {usage.refreshing ? <Loader2 size={14} className="spin" aria-hidden /> : null}
                           Check again
                         </button>
+                        {byCode ? <span className="aa-coming" id={`${box}-code`}>{COMING.codeSignIn}</span> : null}
                       </span>
                     ) : null}
                   </div>
@@ -534,6 +665,21 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
               );
             })}
           </ul>
+          {signSaid ? (
+            <p className="set-help" role="status">
+              {signSaid}
+            </p>
+          ) : signing ? (
+            <p className="set-help" role="status">
+              Finish signing in to {signing} in your browser; Khipu reads the account again when you're done.
+            </p>
+          ) : null}
+          <div className="toolbar">
+            <button type="button" className="sm" disabled={saving} onClick={() => setAddOpen((n) => n + 1)}>
+              Add another account…
+            </button>
+            <span className="t2">Sign in to a second Claude or Codex account, or choose a login kept somewhere else.</span>
+          </div>
           {listPlan && listWrite ? (
             <p className="set-help" role="status">
               {listWrite.kind === "unset"
@@ -640,7 +786,25 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
           </div>
         </div>
       </div>
-      <p className="set-help">Standing rules and holds can be added later in Settings → Accounts and routing.</p>
+      <AutoTrackSwitch setup support={support} value={autoOn ?? (support.state === "here" ? support.status.auto_track : false)}
+        onChange={(on) => setAutoOn(on)} />
+      <p className="set-help">
+        Signed-in logins are on by default; a login that is not signed in starts off. Standing rules and holds can be added
+        later in Settings → Accounts and routing.
+      </p>
+      {addOpen ? (
+        <AddAccountDialog key={addOpen} open onClose={() => setAddOpen(0)} discovery={disc.data} onRediscover={(n) => disc.run(n)}
+          onCheck={async (folder) => {
+            const r = await disc.check(folder);
+            return r.ok ? { ok: true, candidate: r.candidate } : { ok: false, error: r.error };
+          }}
+          tracked={status?.accounts ?? []} shownDefaults={status?.source === "default" ? status.accounts : null} support={support}
+          onSaved={() => {
+            void cfg.read();
+            void usage.refresh();
+            void disc.run(false);
+          }} />
+      ) : null}
       {err ? <p className="set-error" role="alert">{err}</p> : null}
 
       <div className="toolbar welcome-nav">

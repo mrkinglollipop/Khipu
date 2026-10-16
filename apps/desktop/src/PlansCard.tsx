@@ -685,10 +685,13 @@ function PlanRow({ row, now, pause, onSignedIn }: {
 
 /** Home → Plans: one row per account, the tightest window of each. `routing`
  *  is the routing record when it was read, for the pauses. */
-export function PlansCard({ state, routing, onOpenAccounts }: {
+export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false, onAddAccount }: {
   state: PlanUsageState;
   routing?: RouteView | null;
   onOpenAccounts?: () => void;
+  /** The owner stopped tracking every account ("Read no accounts", phase 9). */
+  noneTracked?: boolean;
+  onAddAccount?: () => void;
 }) {
   const { data, error, errorAt, loading, refreshing, refresh, reread } = state;
   const accounts = data?.accounts ?? [];
@@ -708,7 +711,17 @@ export function PlansCard({ state, routing, onOpenAccounts }: {
         ) : null}
         <RefreshButton busy={refreshing || loading} label="Refresh" onClick={() => void refresh()} />
       </div>
-      {data == null ? (
+      {noneTracked ? (
+        <div className="empty">
+          <b>No accounts tracked</b>
+          <span>You stopped tracking every account on this Mac. Add one to see how much of its plan is left.</span>
+          {onAddAccount ? (
+            <button type="button" className="sm plans-empty-btn" onClick={onAddAccount}>
+              Add an account…
+            </button>
+          ) : null}
+        </div>
+      ) : data == null ? (
         error ? (
           <EmptyState title="Could not read plan usage" hint={error} />
         ) : (

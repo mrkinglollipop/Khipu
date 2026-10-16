@@ -36,6 +36,7 @@ a card on Home that stays until he closes it, each item with a Show me button.
 | 8 | What's new after an update (dialog and Home card), and its history in Settings → Updates | S | done (merged 2026-10-15) |
 | 9 | Finding and adding accounts in the app (addendum, see "Phase 9" at the end) | M–L | approved by Matt 2026-10-15 |
 | 9A | Discovery engine and CLI (`packages/cli`) | M | built and reviewed, in review (branch feat/accounts-9a) |
+| 9C | App surfaces for finding and adding accounts (`apps/desktop`) | M | built, in review (branch feat/accounts-9c) |
 
 One PR per phase. Phase 1 goes first because it fixes things that are wrong today. Phases 2 to 6 can go in any
 order after 3, except that 4 and 5 need 3. Phases 7 and 8 go last, because they introduce what the earlier
