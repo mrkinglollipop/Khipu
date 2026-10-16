@@ -1181,6 +1181,10 @@ def sweep_login_homes(*, now: float | None = None, force: bool = False) -> int:
                         return cleared
             older = now - LOGIN_HOME_KEEP_S
             cleared += sum(_clear_at(dfd, n, older_than=older) == "cleared" for n in _state_names(dfd))
+            # The owner-turn retention, as a backstop to the replica-refresh timer.
+            from khipu import owner_turns
+
+            owner_turns.sweep(now)
             with contextlib.suppress(OSError):
                 _write_at(dfd, _LOGIN_SWEEP_STAMP, "", times_ns=(int(now * 1e9), int(now * 1e9)))
             return cleared

@@ -22,6 +22,7 @@ is scheduled a day out, and Undo cancels it until then.
 """
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import hashlib
 import json
@@ -840,6 +841,39 @@ def _save_pending(rows: list[dict]) -> None:
     _write_private(_pending_path(), json.dumps(rows, indent=2) + "\n")
 
 
+def expire_pending(now: float | None = None) -> int:
+    """Drop the widenings that waited longer than the turn retention: they
+    quote the owner's words, which are kept no longer than the turns."""
+    now = _clock() if now is None else now
+    rows = _pending()
+    kept = [p for p in rows if now - _float(p.get("ts")) < owner_turns.RETENTION_S]
+    if len(kept) != len(rows):
+        _save_pending(kept)
+    return len(rows) - len(kept)
+
+
+def forget_pending(sessions) -> int:
+    """Drop the widenings these sessions asked for (forget's owner words
+    scan). Raises OSError when the file can't be rewritten."""
+    names = set(sessions)
+    try:
+        raw = _pending_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    rows = _pending() if raw else []
+    kept = [p for p in rows if p.get("session") not in names]
+    if len(kept) != len(rows):
+        _save_pending(kept)
+    return len(rows) - len(kept)
+
+
+def _float(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _note_pending(action, target, value, session, turn, quote, now) -> None:
     rows = [p for p in _pending() if now - float(p.get("ts") or 0) < owner_turns.RETENTION_S
             and not (p.get("session") == session and p.get("action") == action and p.get("target") == target)]
@@ -933,8 +967,24 @@ def _line_hash(line: dict) -> str:
     return _sha(json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str))
 
 
+def _legacy_form(text: str) -> str:
+    """A line from before the chain as its digest sees it: words only as
+    their hash, so scrubbing them (``scrub_words``) leaves the digest as it
+    was, while any other change to the line still breaks the chain."""
+    try:
+        row = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(row, dict) or ("words" not in row and "words_sha" not in row):
+        return text
+    words = row.get("words")
+    body = {k: v for k, v in row.items() if k not in _UNHASHED}
+    body["words_sha"] = _sha(words) if isinstance(words, str) else row.get("words_sha")
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
 def _legacy_prev(lines: list[str]) -> str:
-    return LEGACY + _sha("".join(text + "\n" for text in lines))
+    return LEGACY + _sha("".join(_legacy_form(text) + "\n" for text in lines))
 
 
 def _prev_of(raw: str) -> str:
@@ -951,9 +1001,9 @@ def _prev_of(raw: str) -> str:
     return _legacy_prev(lines)
 
 
-def _append(line: dict) -> dict:
-    """Append one line to the chain, under a lock so two writers never
-    chain to the same line, and on disk before it returns."""
+@contextlib.contextmanager
+def _log_locked():
+    """The log's lock (a sidecar file): one writer at a time."""
     import fcntl
 
     path = log_path()
@@ -961,6 +1011,15 @@ def _append(line: dict) -> dict:
     lock_fd = os.open(path.with_name(f".{path.name}.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield path
+    finally:
+        os.close(lock_fd)
+
+
+def _append(line: dict) -> dict:
+    """Append one line to the chain, under a lock so two writers never
+    chain to the same line, and on disk before it returns."""
+    with _log_locked() as path:
         try:
             raw = path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -979,9 +1038,36 @@ def _append(line: dict) -> dict:
             fh.write(("\n" if raw and not raw.endswith("\n") else "") + json.dumps(line, ensure_ascii=False) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
-    finally:
-        os.close(lock_fd)
     return line
+
+
+def scrub_words(sessions) -> int:
+    """Forget's owner words scan on the log: blank the quoted words of every
+    line these sessions wrote or acted for (``"words": null, "scrubbed":
+    true``). ``words_sha`` and the hash stay, so the chain still holds and
+    the action and its Undo stay. Returns how many lines were scrubbed;
+    raises OSError when the log can't be read or rewritten."""
+    names = set(sessions)
+    with _log_locked() as path:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return 0
+        out, count = [], 0
+        for text in raw.splitlines():
+            try:
+                row = json.loads(text)
+            except ValueError:
+                row = None
+            if (isinstance(row, dict) and isinstance(row.get("words"), str)
+                    and (row.get("session") in names or row.get("via_session") in names)):
+                row["words_sha"] = row.get("words_sha") or _sha(row["words"])
+                row["words"], row["scrubbed"] = None, True
+                text, count = json.dumps(row, ensure_ascii=False), count + 1
+            out.append(text)
+        if count:
+            _write_private(path, "".join(text + "\n" for text in out))
+    return count
 
 
 def verify_log() -> dict:
@@ -1796,6 +1882,18 @@ def run_due(now: float | None = None) -> list[str]:
         except Exception:  # noqa: BLE001 - the ledger command that called this goes on
             continue
     return done
+
+
+def timer(now: float | None = None) -> dict:
+    """What the replica-refresh job runs for owner direction, every few
+    minutes: the turn retention (``owner_turns.sweep``). Local files only.
+    Never raises."""
+    out: dict[str, Any] = {}
+    try:
+        out["sweep"] = owner_turns.sweep(now)
+    except Exception as err:  # noqa: BLE001 - the job it runs in goes on
+        out["sweep"] = {"ok": False, "errors": [f"{type(err).__name__}: {err}"]}
+    return out
 
 
 # ---- undo ----------------------------------------------------------------------------------

@@ -3997,10 +3997,13 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     from khipu.hub_snapshot import refresh, snapshot_freshness
 
     if args.snapshot_cmd == "heal":
-        from khipu import jobs, replica_heal
+        from khipu import jobs, owner_direction, replica_heal
 
         out = replica_heal.run()
         rc = 0 if out.get("ok") else 1
+        # The replica-refresh job is Khipu's timer: the owner-turn retention
+        # and overdue purges ride on it. Never changes the heal's result.
+        out["owner_direction"] = owner_direction.timer()
         jobs._write_job_state("replica_refresh", rc)
         print(json.dumps(out, indent=2))
         return rc

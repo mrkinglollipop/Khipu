@@ -9,9 +9,10 @@ never passes through this hook as this session's typed turn.
 
 One file per session, ``<capture home>/owner-turns/<session>.jsonl``, mode
 0600 in a 0700 folder: never synced, captured, searched or backed up. Lines
-older than ``RETENTION_S`` go on the next write. Standard library plus
-``khipu.t3`` and ``khipu.turn_text``, so the hook's recorder starts in a few
-milliseconds without the rest of the package.
+older than ``RETENTION_S`` go on the next write or read of the file, and on
+the timer's ``sweep`` (the replica-refresh job) when neither comes. Standard
+library plus ``khipu.t3`` and ``khipu.turn_text``, so the hook's recorder
+starts in a few milliseconds without the rest of the package.
 
 Which turns count (``eligible``) is decided at check time against the
 current settings, so turning the check off or tightening it applies to turns
@@ -379,21 +380,128 @@ def _first_ts(path: Path) -> float | None:
         return None
 
 
-def _sweep(now: float) -> None:
-    """Delete session files untouched for longer than the retention."""
-    for path in folder().glob("*.jsonl"):
+def _ts(row: dict) -> float:
+    try:
+        return float(row.get("ts") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _prune(path: Path, now: float) -> int:
+    """Drop the lines of one file older than the retention, by each line's
+    own time (a file's mtime says nothing about its oldest line); delete the
+    file when none remain. Returns how many lines went."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    rows = _read_lines(path) if raw else []
+    kept = [r for r in rows if now - _ts(r) < RETENTION_S]
+    gone = len(raw.splitlines()) - len(kept)
+    if not gone:
+        return 0
+    if kept:
+        _write_private(path, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept))
+    else:
+        path.unlink(missing_ok=True)
+    return gone
+
+
+def _sweep(now: float) -> dict:
+    """Prune every turn file and briefs.jsonl line by line."""
+    out = {"ok": True, "lines": 0, "errors": []}
+    try:
+        paths = sorted(folder().glob("*.jsonl"))
+    except OSError as err:
+        return {"ok": False, "lines": 0, "errors": [f"{folder()}: {err}"]}
+    for path in paths:
         try:
-            if path.name != "briefs.jsonl" and now - path.stat().st_mtime >= RETENTION_S:
-                path.unlink()
-        except OSError:
+            out["lines"] += _prune(path, now)
+        except OSError as err:
+            out["ok"] = False
+            out["errors"].append(f"{path.name}: {err.strerror or err}")
+    return out
+
+
+def sweep(now: float | None = None) -> dict:
+    """The retention, applied on a timer (the replica-refresh job and the
+    capture hook's storage sweep), so the owner's words go a day after they
+    were typed even when no later prompt or read comes: every turn file and
+    briefs.jsonl line by line, and the widenings waiting for a yes. Local
+    files only. Never raises; ``ok`` false names what could not be pruned."""
+    now = time.time() if now is None else now
+    try:
+        out = _sweep(now)
+    except Exception as err:  # noqa: BLE001 - a timer sweep reports, never fails its job
+        out = {"ok": False, "lines": 0, "errors": [f"{type(err).__name__}: {err}"]}
+    try:
+        from khipu import owner_direction
+
+        out["pending"] = owner_direction.expire_pending(now)
+    except Exception as err:  # noqa: BLE001
+        out["ok"] = False
+        out["errors"].append(f"pending widenings: {type(err).__name__}: {err}")
+    return out
+
+
+def forget_sessions(sessions) -> dict:
+    """Forget's owner words scan on the turn files: delete every recorded
+    turn of these sessions (their files whole, and their lines in any other
+    file), any rewrite temp beside those files, and the briefs they gave or
+    were. Raises OSError when a file can't be read or changed, so the forget
+    stays open."""
+    names = {n for n in sessions if n}
+    out = {"files": 0, "lines": 0, "briefs": 0}
+    d = folder()
+    if not names or not d.exists():
+        return out
+    files = {session_file(n).name for n in names}
+    # scandir, not glob: a folder that can't be listed must raise, never
+    # look empty.
+    with os.scandir(d) as entries:
+        listed = sorted(e.name for e in entries)
+    texts: set[str] = set()
+    for name in listed:
+        path = d / name
+        if name == "briefs.jsonl" or not name.endswith(".jsonl"):
             continue
+        path.read_text(encoding="utf-8")  # unreadable raises
+        rows = _read_lines(path)
+        mine = [r for r in rows if path.name in files or r.get("session") in names]
+        if not mine:
+            continue
+        texts |= {hashlib.sha256(_norm(str(r.get("text") or "")).encode()).hexdigest() for r in mine}
+        kept = [r for r in rows if r not in mine]
+        if kept:
+            _write_private(path, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept))
+            out["lines"] += len(mine)
+        else:
+            path.unlink()
+            out["files"] += 1
+    for name in listed:
+        if name.endswith(".tmp") and any(name.startswith(f".{f}.") for f in files):
+            (d / name).unlink(missing_ok=True)
+    briefs = d / "briefs.jsonl"
+    rows = _read_lines(briefs)
+    kept = [b for b in rows if b.get("parent") not in names and b.get("sha") not in texts]
+    if len(kept) != len(rows):
+        _write_private(briefs, "".join(json.dumps(b) + "\n" for b in kept))
+        out["briefs"] = len(rows) - len(kept)
+    return out
 
 
 def turns(session: str, now: float | None = None) -> list[dict]:
     """The session's recorded turns, oldest first, within the retention."""
     now = time.time() if now is None else now
-    return [t for t in _read_lines(session_file(session))
-            if t.get("session") == session and now - float(t.get("ts") or 0) < RETENTION_S]
+    path = session_file(session)
+    rows = _read_lines(path)
+    if any(now - _ts(t) >= RETENTION_S for t in rows):
+        # Retention is a deadline on the words, not a filter on the read.
+        try:
+            _prune(path, now)
+        except OSError:
+            pass
+    return [t for t in rows if t.get("session") == session and now - _ts(t) < RETENTION_S]
 
 
 def counts(now: float | None = None) -> dict:
