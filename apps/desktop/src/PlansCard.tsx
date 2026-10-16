@@ -1093,6 +1093,7 @@ const ACCOUNT_REFUSAL: Record<string, (c: RefusalCtx) => string> = {
   name_is_cli: () => "That name is the name of a CLI. Type a different Name.",
   name_is_id: () => "That name is the id of another account. Type a different Name.",
   version_moved: () => "The account list changed while you were working. Khipu read it again; check it and try once more.",
+  version_needed: () => "The account list changed while you were working. Khipu read it again; check it and try once more.",
   last_account: () => "This is the last account Khipu reads. Confirm to stop reading accounts altogether.",
   name_needed: () => "Give this account a name.",
   folder_not_found: () => "Khipu cannot find that login folder. Check the folder and try again.",
@@ -1118,7 +1119,8 @@ export function accountsRefusal(
 ): FormProblem {
   console.error("khipu config --set usage_accounts refused:", res.error);
   const r = res.refusal ?? {};
-  const code = typeof r.code === "string" ? r.code : "";
+  // The app's own command refuses a missing version with no code.
+  const code = typeof r.code === "string" ? r.code : res.error.includes("needs the version it read") ? "version_needed" : "";
   const index = typeof r.index === "number" ? r.index : null;
   const otherIndex = typeof r.other === "number" ? r.other : null;
   const field = typeof r.field === "string" ? r.field : null;
@@ -1166,7 +1168,15 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
     setClash(null);
     const list = next == null ? [] : storable(next);
     // The version of the list this editor loaded, not one fetched now.
-    const expect = status?.version ?? null;
+    const expect = status?.version?.trim() ? status.version : null;
+    if (!expect) {
+      // Never saved without the version it read: read the list, then try again.
+      await cfg.reload();
+      setSaving(false);
+      setErr(ACCOUNT_REFUSAL.version_needed({ entry: null, other: null, field: null, added: false }));
+      setClash(null);
+      return false;
+    }
     const res = list.length
       ? await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list), expect })
       : await callCli("khipu_config_unset", { key: "usage_accounts", expect });

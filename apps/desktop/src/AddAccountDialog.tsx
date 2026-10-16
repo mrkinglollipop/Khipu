@@ -240,6 +240,7 @@ export function AddAccountDialog({
   start,
   onSaved,
   onShowAccount,
+  onReload,
   canSignInNew = false,
 }: {
   open: boolean;
@@ -257,6 +258,8 @@ export function AddAccountDialog({
   start?: AddAccountStart;
   onSaved: (label: string) => void;
   onShowAccount?: (label: string) => void;
+  /** Reads the account list again after a save refused for its version. */
+  onReload?: () => Promise<unknown>;
   /** 9D's new-folder sign-in is here. */
   canSignInNew?: boolean;
 }) {
@@ -948,7 +951,18 @@ export function AddAccountDialog({
           result
         )}
         {problem && !duplicate && problem.field !== "name" ? (
-          <p className="set-error" role="alert">{problem.message}</p>
+          <p className="set-error" role="alert">
+            {problem.message}
+            {problem.reload && onReload ? (
+              <>
+                {" "}
+                <button type="button" className="sm" disabled={saving}
+                  onClick={async () => { await onReload(); setProblem(null); }}>
+                  Reload
+                </button>
+              </>
+            ) : null}
+          </p>
         ) : null}
         {signIn?.kind === "running" ? (
           <div className="aa-wait" role="status">

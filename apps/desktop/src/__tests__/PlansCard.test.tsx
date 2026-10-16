@@ -865,7 +865,7 @@ describe("the account cap and failures that are not about an entry (fix round 4)
     expect(screen.getByLabelText("Login folder").getAttribute("aria-invalid")).toBeNull();
     // An entry marked not valid is left out of what is stored, so it does not count.
     const withInvalid = [...accounts.slice(1), { label: "Odd", harness: "gemini", home: null, invalid: "not read" }];
-    configShow = { usage_accounts: { value: withInvalid, source: "file", user_home: "/Users/me", accounts: withInvalid } };
+    configShow = { usage_accounts: { value: withInvalid, source: "file", user_home: "/Users/me", accounts: withInvalid, version: "v1" } };
     cleanup();
     render(<Settings />);
     await waitFor(() => expect(screen.getByText("Your list")).toBeTruthy());
@@ -875,6 +875,19 @@ describe("the account cap and failures that are not about an entry (fix round 4)
     fireEvent.click(screen.getByRole("button", { name: "Add" }));
     await waitFor(() => expect(configSets()).toHaveLength(1));
     expect(screen.queryByText(TOO_MANY)).toBeNull();
+  });
+
+  it("a list read with no version is never saved over: nothing is sent and it says so in plain words", async () => {
+    const accounts = [{ label: "Claude", harness: "claude", home: null }];
+    configShow = { usage_accounts: { value: accounts, source: "file", user_home: "/Users/me", accounts } };
+    render(<Settings />);
+    await waitFor(() => expect(screen.getByText("Your list")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Codex work" } });
+    fireEvent.change(screen.getByLabelText("CLI"), { target: { value: "codex" } });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.codex-work" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    expect(await screen.findByText(/The account list changed while you were working\. Khipu read it again/)).toBeTruthy();
+    expect(configSets()).toHaveLength(0);
   });
 
   it("says the cap when the app's own command refuses a list over it, with no code", () => {

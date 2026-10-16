@@ -452,6 +452,8 @@ export type SaveProblem = {
   field: "name" | "home" | null;
   /** login_taken: the name of the account that already reads this login. */
   other?: string | null;
+  /** The list moved after it was read (or no version was read): Reload. */
+  reload?: boolean;
 };
 
 export type SaveOutcome =
@@ -459,6 +461,28 @@ export type SaveOutcome =
   | { ok: false; problem: SaveProblem };
 
 const NOT_SAVED = "Khipu could not save the account. Try again in a minute.";
+
+/** A save refused because the account list moved after it was read. */
+export const LIST_MOVED =
+  "The account list was changed somewhere else after Khipu read it, so nothing was saved. Reload to see it as it is now, then try again.";
+
+/** The version of the list as this screen read it, or null when none was
+ *  read: a save never goes out without one (the CLI and the app's commands
+ *  refuse it). */
+export function readVersion(support: Support): string | null {
+  const v = support.state === "here" ? support.status.version : null;
+  return typeof v === "string" && v.trim() ? v : null;
+}
+
+/** Whether a refused save was refused for its version: the CLI's codes, or
+ *  the app's own command refusing a missing or malformed one (no code). */
+export function versionRefused(res: { ok: boolean; error?: string; refusal?: Record<string, unknown> }): boolean {
+  if (res.ok) return false;
+  const code = res.refusal?.code;
+  if (code === "version_moved" || code === "version_needed") return true;
+  const text = res.error ?? "";
+  return !res.refusal && (text.includes("needs the version it read") || text.includes("not a version Khipu knows"));
+}
 
 /** 9B's refusal codes in Khipu's own words; `entry` is the account sent. */
 export function trackRefusalWords(code: string, entry: NewAccount, other?: string | null): SaveProblem {
@@ -484,7 +508,8 @@ export function trackRefusalWords(code: string, entry: NewAccount, other?: strin
     case "no_such_folder":
       return { code, field: "home", message: "Khipu can't find that login folder." };
     case "version_moved":
-      return { code, field: null, message: "The account list changed while this was open. Close this and try again." };
+    case "version_needed":
+      return { code, field: null, message: LIST_MOVED, reload: true };
     case "owner_only":
       return { code, field: null, message: "Only you can change the account list, from the app. Nothing was saved." };
     default:
@@ -507,9 +532,11 @@ export async function saveNewAccount(
     return { ok: false, problem: { code: "not_read", field: null, message: "Khipu couldn't read the account list, so nothing was saved. Try again in a minute." } };
   }
   const st = known.status;
+  const expect = readVersion(known);
+  if (!expect) return { ok: false, problem: trackRefusalWords("version_needed", entry) };
   const args: Record<string, unknown> = {
     entries: [{ harness: entry.harness, home: entry.home, label: entry.label }],
-    expect: st.version,
+    expect,
   };
   if (st.value == null && !st.none) {
     args.shownDefaults = (shownDefaults ?? st.accounts)
@@ -520,7 +547,7 @@ export async function saveNewAccount(
   if (!res.ok) {
     console.error("khipu accounts track refused:", res.error);
     const r = res.refusal ?? {};
-    const code = typeof r.code === "string" ? r.code : "";
+    const code = versionRefused(res) ? "version_moved" : typeof r.code === "string" ? r.code : "";
     const otherIdx = typeof r.other === "number" ? r.other : null;
     const other = otherIdx != null ? (st.accounts[otherIdx]?.label ?? null) : null;
     return { ok: false, problem: trackRefusalWords(code, entry, other) };

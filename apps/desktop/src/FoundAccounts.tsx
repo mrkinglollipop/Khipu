@@ -24,6 +24,7 @@ import { Tag } from "./ui";
 import { callCli } from "./settingsCli";
 import {
   COMING,
+  LIST_MOVED,
   checkErrorWords,
   checkHelp,
   cliName,
@@ -35,13 +36,32 @@ import {
   nameProblem,
   planWord,
   plural,
+  readVersion,
   reasonWords,
   saveCliSetting,
   serviceName,
   useAccountsSupport,
   useDiscovery,
+  versionRefused,
   CLI_IDS,
 } from "./accountsApi";
+
+/** The refusal line of a save refused for its version, with Reload. */
+function MovedError({ text, stale, busy, onReload }: { text: string; stale: boolean; busy?: boolean; onReload?: () => void }) {
+  return (
+    <p className="set-error" role="alert">
+      {text}
+      {stale && onReload ? (
+        <>
+          {" "}
+          <button type="button" className="sm" disabled={busy} onClick={onReload}>
+            Reload
+          </button>
+        </>
+      ) : null}
+    </p>
+  );
+}
 import type {
   Candidate,
   CliId,
@@ -811,6 +831,7 @@ export function RenameDialog({
   onClose,
   onRenamed,
   onEdit,
+  onReload,
 }: {
   open: boolean;
   account: ManagedAccount;
@@ -820,11 +841,14 @@ export function RenameDialog({
   onClose: () => void;
   onRenamed: (r: RenameResult9B) => void;
   onEdit?: (what: Mention) => void;
+  /** Reads the account list again after a save refused for its version. */
+  onReload?: () => Promise<unknown>;
 }) {
   const id = useId().replace(/:/g, "");
   const [name, setName] = useState(account.label);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [stale, setStale] = useState(false);
   const here = support.state === "here";
   const others = taken.filter((t) => t.toLowerCase() !== account.label.toLowerCase());
   const problem = name.trim() === account.label ? null : nameProblem(name, !account.home, others);
@@ -839,15 +863,19 @@ export function RenameDialog({
   ].filter(Boolean) as string[];
   async function rename() {
     if (!here || problem || !name.trim() || name.trim() === account.label) return;
+    const expect = readVersion(support);
+    setErr(expect ? null : LIST_MOVED);
+    setStale(!expect);
+    if (!expect) return;
     setBusy(true);
-    setErr(null);
     try {
-      const res = await callCli<RenameResult9B>("khipu_accounts_rename", { account: account.key, name: name.trim(), expect: support.status.version });
+      const res = await callCli<RenameResult9B>("khipu_accounts_rename", { account: account.key, name: name.trim(), expect });
       if (!res.ok) {
         console.error("khipu accounts rename refused:", res.error);
         const code = typeof res.refusal?.code === "string" ? res.refusal.code : "";
-        setErr(code === "name_taken" ? `Another account is already named ${name.trim()}.` : code === "version_moved"
-          ? "The account list changed while this was open. Close this and try again."
+        const moved = versionRefused(res);
+        setStale(moved);
+        setErr(moved ? LIST_MOVED : code === "name_taken" ? `Another account is already named ${name.trim()}.`
           : "Khipu could not rename it. Try again in a minute.");
         return;
       }
@@ -885,7 +913,10 @@ export function RenameDialog({
           <b>Not changed:</b> scripts and agent briefs outside Khipu that use the old name.
         </li>
       </ul>
-      {err ? <p className="set-error" role="alert">{err}</p> : null}
+      {err ? (
+        <MovedError text={err} stale={stale} busy={busy}
+          onReload={onReload && (async () => { await onReload(); setErr(null); setStale(false); })} />
+      ) : null}
       <div className="aa-actions">
         <button type="button" className="aa-left" onClick={onClose}>
           Cancel
@@ -907,6 +938,7 @@ export function StopTrackingDialog({
   onClose,
   onStopped,
   onEdit,
+  onReload,
 }: {
   open: boolean;
   account: ManagedAccount;
@@ -915,6 +947,8 @@ export function StopTrackingDialog({
   onClose: () => void;
   onStopped: (r: StopResult9B) => void;
   onEdit?: (what: Mention) => void;
+  /** Reads the account list again after a save refused for its version. */
+  onReload?: () => Promise<unknown>;
 }) {
   const id = useId().replace(/:/g, "");
   const here = support.state === "here";
@@ -924,15 +958,19 @@ export function StopTrackingDialog({
   const [holds, setHolds] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
   const folder = account.harness === "muse" ? "Muse's one login" : account.home ?? `the default login ${account.harness === "claude" ? "~/.claude" : account.harness === "codex" ? "~/.codex" : "~/.grok"}`;
   async function stop() {
     if (!here) return;
+    const expect = readVersion(support);
+    setErr(expect ? null : LIST_MOVED);
+    setStale(!expect);
+    if (!expect) return;
     setBusy(true);
-    setErr(null);
     try {
       const res = await callCli<StopResult9B>("khipu_accounts_stop", {
         account: account.key,
-        expect: support.status.version,
+        expect,
         keepPriority: !prio,
         keepPause: !pause,
         keepLanes: !lanes,
@@ -941,8 +979,9 @@ export function StopTrackingDialog({
       });
       if (!res.ok) {
         console.error("khipu accounts stop refused:", res.error);
-        const code = typeof res.refusal?.code === "string" ? res.refusal.code : "";
-        setErr(code === "version_moved" ? "The account list changed while this was open. Close this and try again." : "Khipu could not stop tracking it. Try again in a minute.");
+        const moved = versionRefused(res);
+        setStale(moved);
+        setErr(moved ? LIST_MOVED : "Khipu could not stop tracking it. Try again in a minute.");
         return;
       }
       onStopped(res.data);
@@ -1039,7 +1078,10 @@ export function StopTrackingDialog({
           </>
         )}
       </ul>
-      {err ? <p className="set-error" role="alert">{err}</p> : null}
+      {err ? (
+        <MovedError text={err} stale={stale} busy={busy}
+          onReload={onReload && (async () => { await onReload(); setErr(null); setStale(false); })} />
+      ) : null}
       <div className="aa-actions">
         <button type="button" className="aa-left" onClick={onClose}>
           Cancel
@@ -1213,7 +1255,17 @@ export function useAccountsFinder(
   const [add, setAdd] = useState<{ start?: AddAccountStart; shown: UsageAccountEntry[] | null; n: number } | null>(null);
   const [rename, setRename] = useState<ManagedAccount | null>(null);
   const [stop, setStop] = useState<ManagedAccount | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessageText] = useState<string | null>(null);
+  // Set when the shown message is a save refused for its version: Reload.
+  const [stale, setStale] = useState(false);
+  const setMessage = useCallback((m: string | null) => {
+    setMessageText(m);
+    setStale(false);
+  }, []);
+  const refused = useCallback((m: string) => {
+    setMessageText(m);
+    setStale(true);
+  }, []);
   const nAdd = useRef(0);
 
   const usage = cfg?.usage_accounts ?? null;
@@ -1328,16 +1380,19 @@ export function useAccountsFinder(
   const move = useCallback(
     async (m: Moved) => {
       if (support.state !== "here" || !m.account.key || !m.candidate.path) return;
-      const res = await callCli("khipu_accounts_move", { account: m.account.key, folder: m.candidate.path, expect: support.status.version });
+      const expect = readVersion(support);
+      if (!expect) return refused(LIST_MOVED);
+      const res = await callCli("khipu_accounts_move", { account: m.account.key, folder: m.candidate.path, expect });
       if (!res.ok) {
         console.error("khipu accounts move refused:", res.error);
+        if (versionRefused(res)) return refused(LIST_MOVED);
         setMessage("Khipu couldn't move the account. Try again in a minute.");
         return;
       }
       setMessage(`${m.account.label}'s login folder is now ${m.candidate.path}.`);
       await changed();
     },
-    [support, changed],
+    [support, changed, refused, setMessage],
   );
 
   const chooseFolderFor = useCallback(
@@ -1345,15 +1400,18 @@ export function useAccountsFinder(
       if (support.state !== "here") return;
       const picked = await pickPath(opener, "folder");
       if (!picked) return;
-      const res = await callCli("khipu_accounts_move", { account: a.key, folder: picked, expect: support.status.version });
+      const expect = readVersion(support);
+      if (!expect) return refused(LIST_MOVED);
+      const res = await callCli("khipu_accounts_move", { account: a.key, folder: picked, expect });
       if (!res.ok) {
         console.error("khipu accounts move refused:", res.error);
+        if (versionRefused(res)) return refused(LIST_MOVED);
         setMessage("Khipu couldn't use that folder for it. Choose the login folder itself.");
         return;
       }
       await changed();
     },
-    [support, changed],
+    [support, changed, refused, setMessage],
   );
 
   const view = opts.view ?? null;
@@ -1376,18 +1434,18 @@ export function useAccountsFinder(
             setMessage(`Khipu now tracks ${label}.`);
             void changed();
           }}
-          onShowAccount={opts.onShowAccount} />
+          onShowAccount={opts.onShowAccount} onReload={reloadSupport} />
       ) : null}
       {rename ? (
         <RenameDialog open account={rename} refs={refs(rename)} taken={tracked.map((t) => t.label)} support={support}
-          onClose={() => setRename(null)} onEdit={opts.onEdit}
+          onClose={() => setRename(null)} onEdit={opts.onEdit} onReload={reloadSupport}
           onRenamed={(r) => {
             setMessage(`${r.was} is now called ${r.label}.`);
             void changed();
           }} />
       ) : null}
       {stop ? (
-        <StopTrackingDialog open account={stop} refs={refs(stop)} support={support} onClose={() => setStop(null)} onEdit={opts.onEdit}
+        <StopTrackingDialog open account={stop} refs={refs(stop)} support={support} onClose={() => setStop(null)} onEdit={opts.onEdit} onReload={reloadSupport}
           onStopped={(r) => {
             setMessage(r.none ? "Khipu tracks no accounts on this Mac now." : `Khipu stopped tracking ${r.label}.`);
             void changed();
@@ -1404,6 +1462,12 @@ export function useAccountsFinder(
     none,
     message,
     setMessage,
+    stale,
+    refused,
+    reload: async () => {
+      await reloadSupport();
+      setMessage(null);
+    },
     openAdd,
     openRename: setRename,
     openStop: setStop,
@@ -1440,9 +1504,13 @@ export function FinderTop({ finder, rows = [] }: { finder: AccountsFinder; rows?
         onTrack={(c) => finder.openAdd({ candidate: c })} onCheck={(c) => void finder.check(c)} onDecline={(c) => void finder.decline(c)}
         onMove={(m) => void finder.move(m)} />
       {finder.message ? (
-        <p className="set-help" role="status">
-          {finder.message}
-        </p>
+        finder.stale ? (
+          <MovedError text={finder.message} stale onReload={() => void finder.reload()} />
+        ) : (
+          <p className="set-help" role="status">
+            {finder.message}
+          </p>
+        )
       ) : null}
       {finder.none ? <NoAccountsTracked onAdd={() => finder.openAdd()} /> : null}
     </>
@@ -1525,9 +1593,12 @@ export function HomeAccountCards({
         <HomeAutoCard card={auto}
           onUndo={async () => {
             if (finder.support.state !== "here") return;
-            const res = await callCli("khipu_accounts_stop", { account: auto.key, expect: finder.support.status.version });
+            const expect = readVersion(finder.support);
+            if (!expect) return finder.refused(LIST_MOVED);
+            const res = await callCli("khipu_accounts_stop", { account: auto.key, expect });
             if (!res.ok) {
               console.error("khipu accounts stop (undo) refused:", res.error);
+              if (versionRefused(res)) return finder.refused(LIST_MOVED);
               finder.setMessage("Khipu couldn't undo it. Use Stop tracking… in Settings → Accounts and routing.");
               return;
             }
@@ -1546,9 +1617,13 @@ export function HomeAccountCards({
           }} />
       ) : null}
       {finder.message && (auto || showFound) ? (
-        <p className="set-help" role="status">
-          {finder.message}
-        </p>
+        finder.stale ? (
+          <MovedError text={finder.message} stale onReload={() => void finder.reload()} />
+        ) : (
+          <p className="set-help" role="status">
+            {finder.message}
+          </p>
+        )
       ) : null}
       {finder.dialogs}
     </>

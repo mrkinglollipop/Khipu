@@ -30,7 +30,7 @@ import {
   useAccountsFinder,
 } from "../FoundAccounts";
 import type { AccountRefs } from "../FoundAccounts";
-import { COMING, discoverAccounts, lastRunLine, normalDiscover, saveNewAccount, signInNow, useDiscovery } from "../accountsApi";
+import { COMING, LIST_MOVED, discoverAccounts, lastRunLine, normalDiscover, saveNewAccount, signInNow, useDiscovery, versionRefused } from "../accountsApi";
 import type { DiscoverResult, Support } from "../accountsApi";
 import { SetupAccountsStep } from "../SetupAccounts";
 import { POST_UPDATE_NOTICES as NOTICES } from "../postUpdateNotices";
@@ -892,14 +892,16 @@ describe("setup's Accounts step with what discovery found", () => {
   function fakeSetup(disc: DiscoverResult) {
     let accounts = [{ label: "Claude Code", harness: "claude" }];
     let source = "default";
+    let version = 1;
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       switch (cmd) {
         case "khipu_usage_status":
         case "khipu_usage_refresh":
           return JSON.stringify({ accounts: [{ harness: "claude", account: "Claude Code", home: null, ok: true, plan: "max", windows: [] }] });
         case "khipu_config_show":
-          return JSON.stringify({ usage_accounts: { source, accounts, user_home: "/home/someone" } });
+          return JSON.stringify({ usage_accounts: { source, accounts, user_home: "/home/someone", version: `a${version}` } });
         case "khipu_config_set":
+          version += 1;
           accounts = JSON.parse(String(args?.value));
           source = "file";
           return JSON.stringify({ ok: true });
@@ -941,7 +943,9 @@ describe("setup's Accounts step with what discovery found", () => {
     // The one save path: the ticked login goes to Track, never into a list
     // the app writes itself.
     expect(calls("khipu_config_set")).toHaveLength(0);
-    const sent = calls("khipu_accounts_track")[0][1] as { entries: Array<{ home?: string | null; label?: string }>; shownDefaults?: unknown };
+    const sent = calls("khipu_accounts_track")[0][1] as { entries: Array<{ home?: string | null; label?: string }>; shownDefaults?: unknown; expect?: string };
+    // The version of the list setup read, so a list changed meanwhile is never saved over.
+    expect(sent.expect).toBe("a1");
     expect(sent.entries).toEqual([{ harness: "claude", home: "~/.claude-client", label: "Claude client" }]);
     expect(sent.shownDefaults).toEqual([{ harness: "claude", home: null, label: "Claude Code" }]);
     cleanup();
@@ -1012,5 +1016,82 @@ describe("What's new", () => {
     expect(items).toHaveLength(1);
     expect(items[0].text).toBe("Khipu tells your conversations which accounts have room. It also finds your other logins and lets you add one.");
     expect(release.items.filter((i) => /logins/.test(i.title))).toHaveLength(0);
+  });
+});
+
+describe("every account save carries the version it read", () => {
+  const notSignedIn = { candidate: OLD, read: { ok: false, row: { harness: "claude", ok: false, error: "not_signed_in", windows: [] } } } as AddAccountStart;
+  const acct = { key: "claude|~/.claude-client", label: "Claude client", harness: "claude", home: "~/.claude-client" };
+  const noRefs: AccountRefs = { rules: [], note: false, holds: [], lanes: [], priority: null, pausedUntil: undefined, last: false };
+
+  it("the dialog's Save sends the version of the list it read, never one fetched at save time", async () => {
+    fakeKhipu({ status: status9B({ version: "v99" }) });
+    render(<Dialog start={notSignedIn} support={{ state: "here", status: status9B({ version: "v12" }) }} />);
+    fireEvent.click(screen.getByRole("button", { name: "Save without signing in" }));
+    await waitFor(() => expect(calls("khipu_accounts_track")).toHaveLength(1));
+    expect(calls("khipu_accounts_track")[0][1]).toMatchObject({ expect: "v12" });
+    expect(calls("khipu_accounts_status")).toHaveLength(0);
+  });
+
+  it("a list read with no version sends nothing and says so, with Reload", async () => {
+    fakeKhipu();
+    const out = await saveNewAccount({ harness: "claude", home: "~/.claude-old", label: "Claude old" },
+      { state: "here", status: status9B({ version: "" }) }, null);
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.problem.message).toBe(LIST_MOVED);
+      expect(out.problem.reload).toBe(true);
+    }
+    expect(calls("khipu_accounts_track")).toHaveLength(0);
+  });
+
+  it("version moved: the dialog says it in plain words, and Reload reads the list again", async () => {
+    fakeKhipu({ trackRefusal: { ok: false, error: "the account list changed after it was read; read it again", code: "version_moved" } });
+    const reload = vi.fn(async () => undefined);
+    render(
+      <AddAccountDialog open onClose={() => {}} discovery={discovery()} onRediscover={async () => null}
+        onCheck={async () => ({ ok: false, error: "folder_not_found" })} tracked={TRACKED} shownDefaults={TRACKED}
+        support={HERE} start={notSignedIn} onSaved={() => {}} onReload={reload} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save without signing in" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(LIST_MOVED);
+    expect(alert).not.toHaveTextContent(/read it again$/);
+    fireEvent.click(within(alert).getByRole("button", { name: "Reload" }));
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText(LIST_MOVED)).not.toBeInTheDocument());
+  });
+
+  it("version moved on Rename and Stop tracking: plain words and Reload, nothing else claimed", async () => {
+    fakeKhipu();
+    invokeMock.mockImplementation(async () =>
+      JSON.stringify({ ok: false, error: "the account list changed after it was read; read it again and redo the change", code: "version_moved" }));
+    const reload = vi.fn(async () => undefined);
+    const renamed = vi.fn();
+    render(<RenameDialog open account={acct} refs={noRefs} taken={["Claude client"]} support={HERE}
+      onClose={() => {}} onRenamed={renamed} onReload={reload} />);
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Claude work 2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(LIST_MOVED);
+    expect(calls("khipu_accounts_rename")[0][1]).toMatchObject({ expect: "v12" });
+    expect(renamed).not.toHaveBeenCalled();
+    fireEvent.click(within(alert).getByRole("button", { name: "Reload" }));
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+    cleanup();
+
+    const stopped = vi.fn();
+    render(<StopTrackingDialog open account={acct} refs={noRefs} support={HERE} onClose={() => {}} onStopped={stopped} onReload={reload} />);
+    fireEvent.click(screen.getByRole("button", { name: /Stop tracking/ }));
+    const stopAlert = await screen.findByRole("alert");
+    expect(stopAlert).toHaveTextContent(LIST_MOVED);
+    expect(within(stopAlert).getByRole("button", { name: "Reload" })).toBeInTheDocument();
+    expect(stopped).not.toHaveBeenCalled();
+  });
+
+  it("the app's own command refusing a missing version counts as moved too", () => {
+    expect(versionRefused({ ok: false, error: "the account list save needs the version it read; reload and try again" })).toBe(true);
+    expect(versionRefused({ ok: false, error: "x", refusal: { code: "version_needed" } })).toBe(true);
+    expect(versionRefused({ ok: false, error: "taken", refusal: { code: "name_taken" } })).toBe(false);
   });
 });

@@ -30,7 +30,7 @@ import {
   windowLabel,
 } from "./PlansCard";
 import type { UsageAccount, UsageAccountEntry } from "./PlansCard";
-import { COMING, cliName, planWord, plural, reasonWords, suggestedName, useAccountsSupport, useDiscovery } from "./accountsApi";
+import { COMING, cliName, planWord, plural, reasonWords, suggestedName, useAccountsSupport, useDiscovery, versionRefused } from "./accountsApi";
 import type { Candidate } from "./accountsApi";
 import { AddAccountDialog } from "./AddAccountDialog";
 import { AutoTrackSwitch, addQuietLogins } from "./FoundAccounts";
@@ -470,8 +470,8 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
       setErr(
         `${done.length ? `Khipu saved ${listOf(done)}, but` : "Khipu"} couldn't ${cant}. Try Next again, or Skip for now and change it later in Settings.`,
       );
-    const refusedAsMoved = (res: { refusal?: Record<string, unknown> }, what: string): boolean => {
-      if (res.refusal?.code !== "version_moved") return false;
+    const refusedAsMoved = (res: { ok: boolean; error?: string; refusal?: Record<string, unknown> }, what: string): boolean => {
+      if (!versionRefused(res)) return false;
       setErr(
         `${done.length ? `Khipu saved ${listOf(done)}, but ` : ""}${what} was changed somewhere else after setup read it, ` +
           "so Khipu didn't save over it. Reload to see what is saved now, then press Next again.",
@@ -502,10 +502,16 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
           return;
         }
         if (plan.kind !== "none") {
+          const expect = fresh.version?.trim() ? fresh.version : null;
+          // No version read, no save: the save would replace a list Khipu never saw.
+          if (!expect) {
+            refusedAsMoved({ ok: false, refusal: { code: "version_needed" } }, "the account list");
+            return;
+          }
           const res =
             plan.kind === "unset"
-              ? await callCli("khipu_config_unset", { key: "usage_accounts", expect: fresh.version ?? null })
-              : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(plan.list), expect: fresh.version ?? null });
+              ? await callCli("khipu_config_unset", { key: "usage_accounts", expect })
+              : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(plan.list), expect });
           if (!res.ok) {
             if (refusedAsMoved(res, "the account list")) return;
             console.error("khipu config usage_accounts failed:", res.error);
@@ -530,9 +536,13 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         }
         if (toTrack.length) {
           const st = listNow ?? fresh;
+          if (!st.version?.trim()) {
+            refusedAsMoved({ ok: false, refusal: { code: "version_needed" } }, "the account list");
+            return;
+          }
           const args: Record<string, unknown> = {
             entries: toTrack.map((r) => ({ harness: r.harness, home: r.home ?? null, label: r.account || cliTitle(r.harness) })),
-            expect: st.version ?? "",
+            expect: st.version,
           };
           if (st.source === "default") {
             args.shownDefaults = st.accounts.filter((e) => !e.invalid).map((e) => ({ harness: e.harness, home: null, label: e.label }));
@@ -569,11 +579,16 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         }
         const plan = planPriority(r.data.priority ?? null, vis, moves, uh);
         if (plan) {
+          const expect = r.data.priority?.version || r.data.priority_version || null;
+          if (!expect) {
+            refusedAsMoved({ ok: false, refusal: { code: "version_needed" } }, "your order");
+            return;
+          }
           const res = await callCli("khipu_route_priority", {
             action: "set",
             entries: plan.entries,
             until: plan.until,
-            expect: r.data.priority?.version ?? r.data.priority_version ?? null,
+            expect,
           });
           if (!res.ok) {
             if (refusedAsMoved(res, "your order")) return;
