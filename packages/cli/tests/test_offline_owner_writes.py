@@ -442,7 +442,7 @@ def test_a_refused_owner_write_replays_as_refused_after_a_lost_reply(tx_hub, mon
 
     monkeypatch.setattr(owner_writes, "_landed", _REAL_LANDED)
     tx_hub.missing = True
-    monkeypatch.setattr(commitments, "set_status", lambda cur, cid, status: False)
+    monkeypatch.setattr(commitments, "set_status", lambda cur, cid, status, **kw: False)
     monkeypatch.setattr(decisions, "restore", lambda cur, did: False)
     monkeypatch.setattr(decisions, "retract", lambda cur, did, reason: False)
     monkeypatch.setattr(decisions, "supersede", lambda cur, old, new, **kw: False)

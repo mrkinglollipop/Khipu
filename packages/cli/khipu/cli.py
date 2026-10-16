@@ -2306,8 +2306,16 @@ def cmd_owed(args: argparse.Namespace) -> int:
     if close_id or reopen_id:
         cid = int(close_id or reopen_id)
         new_status = "closed" if close_id else "open"
+        from khipu import routing
+
+        # "you, in the app" only when the app started this process, by the
+        # check ledger._check_from_app makes; any other caller is a
+        # conversation's command.
+        by = commitments.BY_APP if routing._caller()["app"] else commitments.BY_CONVERSATION
         try:
-            res = owner_writes.run("owed_update", {"id": cid, "action": "close" if close_id else "reopen"})
+            res = owner_writes.run("owed_update", {
+                "id": cid, "action": "close" if close_id else "reopen", "by": by,
+                **({"reason": args.reason} if close_id and getattr(args, "reason", None) else {})})
         except ValueError:
             print(json.dumps({"ok": False, "id": cid, "status": new_status}))
             return 1
@@ -5240,6 +5248,7 @@ def build_parser() -> argparse.ArgumentParser:
     owed.add_argument("--limit", type=int, default=50)
     owed.add_argument("--close", metavar="ID", default=None, help="Close commitment ID")
     owed.add_argument("--reopen", metavar="ID", default=None, help="Reopen commitment ID")
+    owed.add_argument("--reason", default=None, help="With --close: why it is done (kept on the item)")
     owed.add_argument(
         "--snooze", metavar="ID", default=None,
         help="Push commitment ID's due date out (needs --until)",

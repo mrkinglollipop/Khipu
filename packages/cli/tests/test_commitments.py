@@ -230,10 +230,12 @@ class _CommitmentsCursor:
                 self.rowcount = 0
             return
         if s.startswith("UPDATE commitments SET status = %s"):
-            status, cid = params
+            status, *reason, cid = params
             r = self.rows.get(cid)
             if r:
                 r["status"] = status
+                if reason:
+                    r["close_reason"] = reason[0]
                 self.rowcount = 1
             else:
                 self.rowcount = 0

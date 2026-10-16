@@ -537,10 +537,14 @@ def count_settings_status() -> dict:
 # (account limit, not logged in, transport error, a reply that is not the
 # capture JSON): `gemini` retries that window on Gemini Flash when a Gemini
 # key resolves, `none` leaves the job queued for a later retry. Unset = gemini.
+# `owed_pr_check_github`: whether the owed close rules ask GitHub, read-only
+# through `gh pr view`, whether a pull request an item names has merged
+# (docs/plans/2026-10-16-owed-and-ledger-ssot.md, decision 1). Unset = on.
 # ---------------------------------------------------------------------------
 
 CHOICE_SETTINGS: dict[str, tuple[str, ...]] = {
     "synth_fallback": ("gemini", "none"),
+    "owed_pr_check_github": ("on", "off"),
 }
 
 

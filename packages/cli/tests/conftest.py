@@ -101,6 +101,16 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     with open(_shim, "w") as _fh:
         _fh.write("#!/bin/sh\necho 'Could not find service (khipu test shim)' >&2\nexit 113\n")
     os.chmod(_shim, 0o755)
+    # The owed close rules ask GitHub through `gh pr view` (on by default).
+    # No test may reach the real GitHub: this gh fails every call, and a test
+    # that needs an answer puts its own fake gh first on PATH.
+    _gh = os.path.join(_SHIM_DIR, "gh")
+    with open(_gh, "w") as _fh:
+        _fh.write("#!/bin/sh\necho 'gh is a khipu test shim' >&2\nexit 1\n")
+    os.chmod(_gh, 0o755)
+    # Named explicitly too: gh is also looked for in the install folders,
+    # where this Mac's real one may be.
+    os.environ["KHIPU_GH_CLI"] = _gh
     os.environ["PATH"] = _SHIM_DIR + os.pathsep + os.environ.get("PATH", "")
 
 

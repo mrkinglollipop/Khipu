@@ -573,6 +573,7 @@ TOOLS: list[dict] = [
                 "id": {"type": "integer", "description": "Commitment id"},
                 "action": {"type": "string", "description": "close | reopen | snooze"},
                 "until": {"type": "string", "description": "snooze only: 2026-09-30, 7d, 2w, 1m"},
+                "reason": {"type": "string", "description": "close only: why it is done (kept on the item)"},
             },
             "required": ["id", "action"],
         },
@@ -1563,9 +1564,12 @@ def _tool_owed_update(args: dict) -> dict:
         if _snooze_until_sql(str(args.get("until") or "")) is None:
             raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
     _ensure_path()
-    from khipu import owner_writes
+    from khipu import commitments, owner_writes
 
-    return owner_writes.run("owed_update", {**args, "id": cid, "action": action},
+    # Who closed it is set here, never taken from the caller: a tool call is
+    # a conversation (the app and `khipu owed` pass their own).
+    return owner_writes.run("owed_update", {**args, "id": cid, "action": action,
+                                            "by": commitments.BY_CONVERSATION},
                             queue_ok=not _via_https_gateway())
 
 
@@ -1596,7 +1600,9 @@ def _owed_update_on_hub(args: dict) -> dict:
                     cur.execute(f"UPDATE commitments SET due_after = {expr} WHERE id = %s", tuple(params))
                     ok = cur.rowcount > 0
                 else:
-                    ok = commitments.set_status(cur, cid, "closed" if action == "close" else "open")
+                    ok = commitments.set_status(cur, cid, "closed" if action == "close" else "open",
+                                                reason=str(args.get("reason") or "") or None,
+                                                by=str(args.get("by") or "") or None)
                 if not ok:
                     raise ValueError(f"no such commitment: {cid}")
                 return {"ok": True, **echo}

@@ -84,6 +84,8 @@ _CANDIDATES = {
     # The plan usage probes (khipu.usage) look these two up the same way.
     "grok": ("~/.grok/bin/grok", "/opt/homebrew/bin/grok", "/usr/local/bin/grok", "~/.local/bin/grok"),
     "muse": ("/opt/homebrew/bin/muse", "/usr/local/bin/muse", "~/.local/bin/muse"),
+    # The owed close rules' read-only `gh pr view` (khipu.close_rules).
+    "gh": ("/opt/homebrew/bin/gh", "/usr/local/bin/gh"),
 }
 # Where a Node version manager puts a CLI installed with ``npm i -g`` (or its
 # own global add), none of them on launchd's PATH: tried last, in this order.

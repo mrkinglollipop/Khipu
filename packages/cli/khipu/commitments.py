@@ -54,6 +54,10 @@ OWNER_AGENT = "agent"
 ORCHESTRATOR = "orchestrator"
 ORIGIN_CONVERSATION = "conversation"
 ORIGIN_JOB = "job"
+# Who closed an item (closed_by, migration 0034).
+BY_RULE = "Khipu, by rule"
+BY_APP = "you, in the app"
+BY_CONVERSATION = "a conversation"
 _DONE_PREFIX_RE = re.compile(r"^\s*done\s*:\s*", re.I)
 _ISO_Z_RE = re.compile(r"Z$")
 _RELATIVE_DUE_RE = re.compile(
@@ -878,6 +882,19 @@ def _owner_columns_ready(cur) -> bool:
         return False
 
 
+def _close_columns_ready(cur) -> bool:
+    """True when migration 0034 (prs, closed_by, close_rule_key and the rule
+    notes) has been applied. Fail-closed like the others: a pre-migration hub
+    still opens, closes and lists; it only lacks the close rules."""
+    try:
+        from khipu.db import has_columns
+
+        return has_columns(cur, "commitments", "prs", "closed_by", "close_rule_key", "close_evidence",
+                           "reopened_rule_keys", "settle_suggestion", "pr_check")
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
 def _touch_seen(cur, commitment_id: int) -> None:
     """Record that a later capture restated an already-open commitment.
 
@@ -956,6 +973,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     trigger_ready = _future_trigger_ready(cur)
     trigger_text_ready = _trigger_text_ready(cur)
     owner_ready = _owner_columns_ready(cur)
+    close_ready = _close_columns_ready(cur)
     origin = capture_origin(payload)
     inserted = 0
     rejected = 0
@@ -1050,6 +1068,12 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             cols += ", origin, owner_label"
             vals += ", %s, %s"
             params = (*params, origin, owner_label)
+        if close_ready:
+            from khipu.close_rules import parse_prs
+
+            cols += ", prs"
+            vals += ", %s"
+            params = (*params, parse_prs(norm["text"]))
         returning = " RETURNING id" if owner_ready else ""
         cur.execute(
             f"""
@@ -1203,6 +1227,36 @@ def _cosine_scores(cur, text: str, commitment_ids: list[int]) -> dict[int, float
         return {}
 
 
+def completion_match(text: str, row_text: str, *, kind: str, threshold: float,
+                     cos: float | None = None) -> tuple[float, str, bool]:
+    """``(score, via, semantic)``: how ``text`` (a closed loop, a ``done:``
+    statement, or a decision) completes an item reading ``row_text``. ``via``
+    is empty when it does not reach the bar. The one test :func:`auto_close`
+    and the decision rule (``khipu.close_rules``) both use."""
+    completion = _completion_text(text)
+    tokens = set(re.findall(r"[\w./-]+", completion))
+    target = _completion_text(row_text)
+    exact = completion == target
+    if not exact and len(tokens) < 3:
+        return 0.0, "", False
+    # Ordinary completion must preserve the full lexical evidence;
+    # substring containment is reserved for an explicit done statement.
+    text_score = _match_score(text, row_text) if kind == "done" else _jaccard(completion, target)
+    covers = set(re.findall(r"[\w./-]+", target)) <= tokens
+    score = 0.0
+    via = ""
+    text_threshold = DONE_MATCH_MIN_SCORE if kind == "done" else threshold
+    if text_score >= text_threshold and (kind == "done" or covers):
+        score = text_score
+        via = "explicit done (best match)" if kind == "done" else "text"
+    # High overlap with missing words can mean a changed qualifier
+    # (staging versus production); cosine must not erase that evidence.
+    if cos is not None and cos >= threshold and cos > score \
+            and (covers or text_score < NEAR_DUP_MIN_SCORE):
+        return cos, "cosine", True
+    return score, via, False
+
+
 def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
     """Match every closed_loop / done-decision against this scope's open
     commitments (``scope``: project, else parent_session_id/session_id — fix
@@ -1239,8 +1293,6 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
         best_via = ""
         tied = False
         semantic_matches = 0
-        completion = _completion_text(text)
-        tokens = set(re.findall(r"[\w./-]+", completion))
         for row in open_rows:
             cid = row["id"]
             if cid in already_closed:
@@ -1249,27 +1301,10 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
                 if cid == reference:
                     best_id, best_score, best_via = cid, 1.0, "commitment id"
                 continue
-            target = _completion_text(row["text"])
-            exact = completion == target
-            if not exact and len(tokens) < 3:
-                continue
-            # Ordinary completion must preserve the full lexical evidence;
-            # substring containment is reserved for an explicit done statement.
-            text_score = _match_score(text, row["text"]) if kind == "done" else _jaccard(completion, target)
-            covers = set(re.findall(r"[\w./-]+", target)) <= tokens
-            cos = cosine.get(cid)
-            score = 0.0
-            via = ""
-            text_threshold = DONE_MATCH_MIN_SCORE if kind == "done" else threshold
-            if text_score >= text_threshold and (kind == "done" or covers):
-                score = text_score
-                via = "explicit done (best match)" if kind == "done" else "text"
-            # High overlap with missing words can mean a changed qualifier
-            # (staging versus production); cosine must not erase that evidence.
-            if cos is not None and cos >= threshold and cos > score \
-                    and (covers or text_score < NEAR_DUP_MIN_SCORE):
+            score, via, semantic = completion_match(text, row["text"], kind=kind, threshold=threshold,
+                                                    cos=cosine.get(cid))
+            if semantic:
                 semantic_matches += 1
-                score, via = cos, "cosine"
             if via and score > best_score:
                 best_id, best_score, best_via = cid, score, via
                 tied = False
@@ -1503,6 +1538,8 @@ def list_owed(cur, *, project: str | None = None, parent_session_id: str | None 
         select_cols.append("future_trigger")
     if _owner_columns_ready(cur):
         select_cols += ["origin", "owner_label"]
+    if _close_columns_ready(cur):
+        select_cols += ["prs", "closed_by", "close_rule_key", "settle_suggestion", "pr_check"]
     cur.execute(
         f"""
         SELECT {', '.join(select_cols)}
@@ -1533,6 +1570,13 @@ def finish_owed_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict
         row["future_trigger"] = trigger
         row["owner"], row["owner_label"] = row_owner(row, future_trigger=trigger)
         row.setdefault("origin", None)
+        # Migration 0034's fields, the same shape on a hub without them. A
+        # looser decision match is offered, never applied (design (b)).
+        for key in ("prs", "closed_by", "close_rule_key", "settle_suggestion", "pr_check"):
+            row.setdefault(key, None)
+        suggestion = row["settle_suggestion"] if isinstance(row["settle_suggestion"], dict) else None
+        row["looks_settled"] = (f"Looks settled by decision {suggestion['decision_id']}"
+                                if suggestion and suggestion.get("decision_id") else None)
         # Sort rank for the Owed surface: user-owed first (blocker → question →
         # everything else the user owes), then assistant promises with an
         # explicit future trigger, then the rest by kind. Computed here so the
@@ -1572,14 +1616,27 @@ def add_hub_ages(rows: list[dict[str, Any]], hub_now: Any) -> list[dict[str, Any
     return rows
 
 
-def set_status(cur, commitment_id: int, status: str) -> bool:
+def set_status(cur, commitment_id: int, status: str, *, reason: str | None = None,
+               by: str | None = None) -> bool:
+    """Close, reopen, stale or drop one commitment by hand. A close keeps its
+    ``reason`` (default "closed by hand") and, once migration 0034 is in,
+    ``by`` (:data:`BY_APP`, :data:`BY_CONVERSATION`). A reopen restores the
+    item and remembers the rule key that closed it, so the same rule and
+    evidence never close it again (``khipu.close_rules``)."""
     if status not in ("open", "closed", "stale", "dropped"):
         raise ValueError(f"status must be open/closed/stale/dropped, got {status!r}")
+    close_ready = _close_columns_ready(cur)
     if status == "open":
         refreshed = "last_seen_at = now()" if _seen_columns_ready(cur) else "opened_at = now()"
+        rule = ""
+        if close_ready:
+            rule = (", reopened_rule_keys = CASE WHEN close_rule_key IS NULL "
+                    "OR close_rule_key = ANY(reopened_rule_keys) THEN reopened_rule_keys "
+                    "ELSE array_append(reopened_rule_keys, close_rule_key) END, "
+                    "closed_by = NULL, close_rule_key = NULL, close_evidence = NULL")
         cur.execute(
             "UPDATE commitments SET status = 'open', closed_episode = NULL, "
-            f"closed_at = NULL, close_reason = NULL, {refreshed} WHERE id = %s "
+            f"closed_at = NULL, close_reason = NULL{rule}, {refreshed} WHERE id = %s "
             f"AND {_not_forgotten_clause(cur)} "
             "AND NOT EXISTS (SELECT 1 FROM commitments other "
             "WHERE other.id != commitments.id AND other.status = 'open' "
@@ -1589,9 +1646,16 @@ def set_status(cur, commitment_id: int, status: str) -> bool:
         )
     else:
         extra = ", closed_at = now()" if status == "closed" else ""
+        params: list[Any] = [status]
+        if status in ("closed", "dropped"):
+            extra += ", close_reason = %s"
+            params.append((reason or "").strip()[:300] or f"{status} by hand")
+            if close_ready:
+                extra += ", closed_by = %s, close_rule_key = NULL, close_evidence = NULL"
+                params.append(by)
         cur.execute(
             f"UPDATE commitments SET status = %s{extra} WHERE id = %s "
             f"AND {_not_forgotten_clause(cur)}",
-            (status, commitment_id),
+            (*params, commitment_id),
         )
     return cur.rowcount > 0
