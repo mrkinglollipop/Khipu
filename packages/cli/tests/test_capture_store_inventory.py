@@ -55,6 +55,10 @@ NOT_CAPTURE = {
     # The replica job (offline design A): run counters and the wake file; no capture text.
     "replica_heal._write_state": "the replica job's counters and health: times, error words, no capture text",
     "replica_heal.ensure_wake_file": "an empty file the replica job's plist watches",
+    "storage.sweep_if_due": "when the storage sweep last ran and what it removed: names and sizes",
+    "storage._rotate_log": "an over-size log copied to <name>.1 and emptied: the same log lines, "
+                           "never capture text",
+    "storage.trim_synth_usage": "the summariser's token counts, rewritten without old lines",
     "hub_reach.note_unreachable": "the hub-unreachable memo: two times and a short error word, no capture text",
     **dict.fromkeys(("config._write_config", "integrations._backup", "integrations._cursor_install",
                      "integrations._grok_bot_install", "integrations._write_json",

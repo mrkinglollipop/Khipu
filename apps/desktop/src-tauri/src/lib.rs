@@ -746,6 +746,48 @@ fn replica_setting_value(key: &str, value: &str) -> Result<String, String> {
     }
     Ok(n.to_string())
 }
+/// Settings -> Health checks, "Storage" (slice 8): the free-space thresholds,
+/// how long backups and usage lines are kept, and the log size cap. Each is
+/// `config --set KEY N` or `config --unset=KEY`. Tuples are (key, largest
+/// allowed value, whole numbers only); 0 is allowed everywhere.
+const STORAGE_KEYS: &[(&str, f64, bool)] = &[
+    ("disk_warn_free_gb", 1_000_000.0, false),
+    ("disk_warn_free_percent", 100.0, false),
+    ("disk_fail_free_gb", 1_000_000.0, false),
+    ("disk_fail_free_percent", 100.0, false),
+    ("commitments_backup_keep_days", 36_500.0, true),
+    ("synth_usage_keep_days", 36_500.0, true),
+    ("log_max_mb", 1_000_000.0, false),
+];
+
+fn storage_key(key: &str) -> bool {
+    STORAGE_KEYS.iter().any(|(k, _, _)| *k == key)
+}
+
+/// A plain non-negative number (digits, one optional decimal part), within the
+/// key's largest value; the day keys take whole numbers only.
+fn storage_setting_value(key: &str, raw: &str) -> Result<String, String> {
+    let (_, high, whole) = STORAGE_KEYS
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .ok_or_else(|| format!("not a storage setting: {key:?}"))?;
+    let v = raw.trim();
+    let (int, frac) = match v.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (v, None),
+    };
+    let digits = |t: &str| !t.is_empty() && t.len() <= 12 && t.bytes().all(|b| b.is_ascii_digit());
+    let shaped = digits(int) && frac.map_or(true, |f| !*whole && digits(f));
+    let n: f64 = if shaped { v.parse().unwrap_or(f64::MAX) } else { f64::MAX };
+    if n > *high {
+        return Err(if *whole {
+            format!("{key} must be a whole number from 0 to {high}, got {raw:?}")
+        } else {
+            format!("{key} must be a number from 0 to {high}, got {raw:?}")
+        });
+    }
+    Ok(v.to_string())
+}
 const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse"];
 const USAGE_ACCOUNTS_MAX: usize = 32;
 /// Settings -> Routing (routing truth phase 4): the sizes, times and switches
@@ -1267,6 +1309,7 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
         k if REPLICA_DURATION_KEYS.contains(&k) => Ok(set(k, replica_setting_value(k, value)?)),
         k if OFFLINE_DURATION_KEYS.contains(&k) => Ok(set(k, routing_setting_value(k, value)?)),
+        k if storage_key(k) => Ok(set(k, storage_setting_value(k, value)?)),
         _ => Err(format!("not a settable key: {key:?}")),
     }
 }
@@ -1298,6 +1341,7 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
         && !routing_key(key)
         && !REPLICA_DURATION_KEYS.contains(&key)
         && !OFFLINE_DURATION_KEYS.contains(&key)
+        && !storage_key(key)
         && !by_profile
     {
         return Err(format!("not a resettable key: {key:?}"));
@@ -3785,7 +3829,7 @@ fn join_receive_sync(passphrase: String, pin: String, out_path: Option<String>) 
 const ALLOWED_SUBCOMMANDS: &[&str] = &[
     "status", "doctor", "activity", "search", "graph", "revisions", "paths",
     "backup-local", "import-local", "integrations", "sources", "models",
-    "episode", "owed",
+    "episode", "owed", "storage",
 ];
 
 /// Fire-and-forget job runners — long-running consolidate/graphify passes.
@@ -4817,7 +4861,7 @@ mod run_khipu_guard_tests {
     fn every_subcommand_the_ui_calls_is_allowed() {
         for s in ["status", "doctor", "activity", "search", "graph", "revisions",
                   "paths", "backup-local", "import-local", "integrations", "sources",
-                  "models", "episode", "owed"] {
+                  "models", "episode", "owed", "storage"] {
             assert!(ALLOWED_SUBCOMMANDS.contains(&s), "UI calls `{s}` but it is not allowed");
         }
     }
@@ -4845,7 +4889,7 @@ mod run_khipu_guard_tests {
     fn the_allowlist_is_exactly_what_the_front_end_invokes() {
         // Grown by hand, so pin the size: adding an entry without a call site is
         // how the five above got in.
-        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 15);
     }
 
     #[test]
@@ -4888,7 +4932,7 @@ mod settings_command_tests {
         for s in ["features", "config", "jobs", "recall", "gateway", "embed", "budget", "usage", "route"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of the allowlist");
         }
-        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 15);
     }
 
     #[test]
@@ -5198,6 +5242,29 @@ mod settings_command_tests {
         // The other ceilings are not offered by the app.
         assert!(config_set_argv("embed_daily_calls", "10").is_err());
         assert!(config_unset_argv("synth_daily_calls").is_err());
+    }
+
+    #[test]
+    fn the_storage_settings_are_checked_and_resettable() {
+        for (key, high, whole) in STORAGE_KEYS {
+            assert_eq!(config_set_argv(key, " 0 ").unwrap(), v(&["config", "--set", key, "0"]));
+            assert_eq!(config_set_argv(key, &format!("{high}")).unwrap()[3], format!("{high}"));
+            assert!(config_set_argv(key, &format!("{}", high + 1.0)).is_err());
+            for bad in ["", "-1", "abc", "--unset", "1e3", "1.", ".5", "1 2"] {
+                assert!(config_set_argv(key, bad).is_err(), "{key} accepted {bad:?}");
+            }
+            assert_eq!(config_set_argv(key, "2.5").is_ok(), !*whole, "{key} decimal");
+            assert_eq!(config_unset_argv(key).unwrap(), v(&["config", &format!("--unset={key}")]));
+        }
+        assert_eq!(
+            config_set_argv("disk_warn_free_percent", "5.5").unwrap(),
+            v(&["config", "--set", "disk_warn_free_percent", "5.5"])
+        );
+        assert!(config_set_argv("disk_warn_free_percent", "100.5").is_err());
+        assert!(config_set_argv("synth_usage_keep_days", "1.5").is_err());
+        assert!(config_set_argv("disk_unknown", "1").is_err());
+        assert!(config_unset_argv("disk_unknown").is_err());
+        assert!(ALLOWED_SUBCOMMANDS.contains(&"storage"));
     }
 
     #[test]
@@ -5616,7 +5683,7 @@ mod embeddings_command_tests {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of ALLOWED_SUBCOMMANDS");
             assert!(!SPAWN_ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of SPAWN_ALLOWED_SUBCOMMANDS");
         }
-        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 14);
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 15);
         assert_eq!(SPAWN_ALLOWED_SUBCOMMANDS, &["nightly", "graph-build", "monthly"]);
         assert_eq!(JOB_SPAWN_VERBS, &["embed-backfill", "library-backfill"]);
     }
