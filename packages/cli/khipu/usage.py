@@ -144,6 +144,8 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return f"{name} could not be started"
     if code == E_INVALID:
         return "This account entry is not valid"
+    if code == E_NO_FOLDER:
+        return NO_FOLDER_NOTE
     if code == E_INTERNAL:
         return "Khipu could not run the check"
     return None

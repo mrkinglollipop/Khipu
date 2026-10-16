@@ -792,6 +792,8 @@ def test_casefold_and_reserved_secrets_never_reach_agents(
     config_file().write_text(json.dumps({"usage_accounts": [
         {"label": "Work", "harness": "claude", "home": login}]}))
     monkeypatch.setattr(usage, "_command", lambda h: "/tmp/fake-cli")
+    # The login folder need not exist: the fake CLI answers either way.
+    monkeypatch.setattr(usage, "_login_folder_there", lambda home: True)
     monkeypatch.setattr(usage, "_converse", lambda *a, **kw: [
         {"type": "control_response", "response": {"request_id": "init", "response":
             {"claude_code_version": payload}}},

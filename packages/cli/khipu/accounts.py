@@ -402,6 +402,11 @@ def track(entries, *, expect=None, shown_defaults=None, read: bool = True, via: 
     leaves Not offered again, the record notes it, and it is read once."""
     wanted = _track_entries(entries)
     with _locked(expect) as data:
+        if via == "auto" and isinstance(data.get("usage_accounts_request"), dict):
+            # Saving would end a conversation's change still waiting for the
+            # owner (decision 15); only the owner's own write may.
+            raise AccountsError("a conversation's change to the account list is still waiting for the owner",
+                                "request_waiting")
         stored, base = current_list(data, shown_defaults)
         known = known_of(base)
         taken = {usage._account_from_entry(e)["label"].casefold() for e in base if isinstance(e, dict)}

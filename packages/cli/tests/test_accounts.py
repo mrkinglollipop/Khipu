@@ -10,6 +10,7 @@ patched ``usage.probe_all``.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -495,3 +496,87 @@ def test_the_switch_on_tracks_only_what_home_would_offer(mac, capsys, monkeypatc
     assert [a["label"] for a in mac["read"]] == ["Claude client"]
     rc, out = _cli(["accounts", "auto-track", "--from-app", "off"], capsys)
     assert rc == 0 and accounts.status()["auto_track"] is False
+
+
+# ---- slice 9B review: confirmed findings, each a failing test first ----
+
+def test_a1_a_lane_map_save_never_overwrites_a_track_that_lands_meanwhile(mac, capsys, monkeypatch):
+    # The lane-map save reads config.json, then converts labels against the
+    # accounts known; a track started by another writer in between must wait
+    # for the save and then land, never be overwritten by it.
+    real = routing.accounts
+    result: dict = {}
+    racer: list[threading.Thread] = []
+
+    def track_now():
+        try:
+            result["track"] = accounts.track([CLIENT], read=False)
+        except Exception as err:  # noqa: BLE001 - the test reports whatever the racer hit
+            result["error"] = err
+
+    def racing(*a, **k):
+        if not racer:
+            racer.append(threading.Thread(target=track_now))
+            racer[0].start()
+            racer[0].join(0.5)
+        return real(*a, **k)
+
+    monkeypatch.setattr(routing, "accounts", racing)
+    routing.set_setting("routing_lane_map", json.dumps({"jobs": {"a": "Codex"}}))
+    assert racer
+    racer[0].join(10)
+    assert not racer[0].is_alive() and "error" not in result, result
+    stored = _stored() or []
+    assert any(isinstance(e, dict) and e.get("home") == "~/.claude-client" for e in stored), stored
+    assert config.load_config()["routing_lane_map"] == {"jobs": {"a": "codex|"}}
+
+
+def _moved(mac, capsys):
+    old, office = _key("~/.claude-client"), _key("~/.claude-office")
+    (mac["home"] / ".claude-office").mkdir()
+    _set(usage_accounts=[{"label": "Claude", "harness": "claude"},
+                         {"label": "Claude client", "harness": "claude", "home": "~/.claude-client"}])
+    old_id = routing.account_id(old)
+    rc, out = _cli(["accounts", "move", "--from-app", f"--expect={_version()}", f"--account={old}",
+                    "--folder=~/.claude-office"], capsys)
+    assert rc == 0 and out["key"] == office
+    return old, old_id, office
+
+
+def test_a2_a_late_report_by_the_old_id_lands_on_the_moved_account(mac, capsys):
+    _old, old_id, office = _moved(mac, capsys)
+    later = T0 + timedelta(hours=4)
+    routing.report(state="limited", account=old_id, author=ME, message=f"Limit reached, resets at {routing._iso(later)}")
+    assert _entry(routing.read_view(), office)["state"] == "limited"
+
+
+def test_a2_a_late_report_by_the_old_key_lands_on_the_moved_account(mac, capsys):
+    old, _old_id, office = _moved(mac, capsys)
+    later = T0 + timedelta(hours=4)
+    routing.report(state="limited", account=old, author=ME, message=f"Limit reached, resets at {routing._iso(later)}")
+    assert _entry(routing.read_view(), office)["state"] == "limited"
+
+
+def test_a2_an_unknown_folder_is_still_refused_after_a_move(mac, capsys):
+    _moved(mac, capsys)
+    try:
+        routing.report(state="limited", account=_key("~/.claude-elsewhere"), author=ME, message="Limit reached")
+    except routing.RouteError:
+        return
+    raise AssertionError("a folder never tracked or moved was accepted")
+
+
+def test_b1_automatic_tracking_leaves_a_conversations_request_waiting(mac, capsys, monkeypatch):
+    _set(usage_accounts=[{"label": "Codex", "harness": "codex"}], usage_auto_track=True)
+    mac["callers"].as_shell("/usr/local/bin/claude")
+    value = json.dumps([{"label": "Codex", "harness": "codex"}, {"label": "Claude", "harness": "claude"}])
+    rc, _out = _cli(["config", "--at-owner-request=add my Claude login", "--set", "usage_accounts", value], capsys)
+    assert rc == 0 and accounts.status()["request"] is not None
+    _found(monkeypatch)
+    rc, out = _cli(["usage", "--discover", "--json"], capsys)
+    assert rc == 0
+    assert accounts.status()["request"] is not None, "automatic tracking ended a request waiting for the owner"
+    mac["callers"].as_app()
+    rc, out = _cli(["accounts", "request", "undo", "--from-app"], capsys)
+    assert rc == 0, out
+    assert [e["harness"] for e in _stored()] == ["codex"]

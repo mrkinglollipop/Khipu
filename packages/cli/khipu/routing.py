@@ -446,25 +446,28 @@ def settings_status() -> dict[str, dict]:
 
 
 def set_setting(key: str, raw) -> Path:
-    """Store a routing setting (``None`` removes it: the default again)."""
-    from khipu.config import _load_config_for_mutation, save_config
+    """Store a routing setting (``None`` removes it: the default again).
+    Read, converted and saved under the locks the account writers take, in
+    their order (routing, then config), so neither write loses the other."""
+    from khipu.config import _load_config_for_mutation, config_write_lock, save_config
 
     if key not in SETTINGS:
         raise KeyError(f"unknown routing setting {key!r}")
     kind = SETTINGS[key][0]
-    data = _load_config_for_mutation()
-    if raw is None:
-        data.pop(key, None)
-    else:
-        try:
-            data[key] = _coerce(kind, raw, key)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{key} must be JSON: {exc.msg}") from None
-        if kind == "lane_map":
-            # Stored by account key from 9B on (settings clarity decision 7),
-            # converted against the accounts known now.
-            data[key] = convert_lane_map(data[key], accounts())[0]
-    return save_config(data)
+    with _lock(), config_write_lock():
+        data = _load_config_for_mutation()
+        if raw is None:
+            data.pop(key, None)
+        else:
+            try:
+                data[key] = _coerce(kind, raw, key)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{key} must be JSON: {exc.msg}") from None
+            if kind == "lane_map":
+                # Stored by account key from 9B on (settings clarity decision 7),
+                # converted against the accounts known now.
+                data[key] = convert_lane_map(data[key], accounts())[0]
+        return save_config(data)
 
 
 # ---- time and text -------------------------------------------------------------
@@ -921,6 +924,29 @@ def resolve_account(name: str, known: list[dict] | None = None, *, conversation:
         return f"{low}|"
     labels = ", ".join(a["label"] for a in known) or "none"
     raise RouteError(f"Khipu doesn't know the account {raw!r}; known: {labels} (or harness|login folder)")
+
+
+def _resolve_reported(name: str) -> str:
+    """The account a conversation reports on. One still running from a login
+    folder the owner moved names it by the key or id it had before the move;
+    that resolves to where it moved (``forwarding``), when that account is
+    known now. Anything else is refused as ``resolve_account`` refuses it."""
+    from khipu import usage
+
+    try:
+        return resolve_account(name, conversation=True)
+    except RouteError:
+        forward = forwarding(read_events()[0])
+        raw = (name or "").strip()
+        if "|" in raw:
+            harness, _, home = raw.partition("|")
+            old = usage._key({"harness": harness.strip().lower(), "home": home.strip() or None})
+        else:
+            old = next((k for k in forward if account_id(k) == raw), None)
+        new = _forwarded(old, forward) if old in forward else None
+        if new is None or new not in {a["key"] for a in accounts()}:
+            raise
+        return new
 
 
 def _resolve_quiet(name: str, known: list[dict]) -> str | None:
@@ -3552,7 +3578,7 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
         if not (message and message.strip()):
             raise RouteError("--seen is when the limit message was shown: give the message too (--message)")
         seen_at = parse_seen(seen, now)
-    key = resolve_account(account, conversation=True) if account else None
+    key = _resolve_reported(account) if account else None
     event: dict[str, Any] = {"type": "evidence", "source": "report", "state": state, "via": via,
                              "written_by": author or conversation_author()}
     if key:
