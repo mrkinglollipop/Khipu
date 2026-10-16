@@ -4,8 +4,9 @@ The tool runs the owner command the CLI runs, with ``--owner-words``,
 ``--owner-turn`` and ``--owner-session`` (``owner_direction.gate``), so
 there is one check, not two. The arguments become that command's argv from
 a fixed table per action: each action takes only its own keys, every value
-is typed, options are passed as ``--name=value`` and positionals after
-``--``, so no value can become a flag (``--from-app`` above all). The
+is typed, options are passed as ``--name=value`` and positionals follow the
+command words with none starting with ``-`` (no ``--``: Python 3.11's argparse
+rejects it before a ``nargs="*"`` positional), so no value can become a flag (``--from-app`` above all). The
 session is never an argument: the check reads it from this process's
 environment, which the harness set when it started the MCP server.
 
@@ -158,6 +159,20 @@ def _bare(value: str, key: str) -> str:
     return value
 
 
+def full_argv(head: list[str], positionals: list[str], owner: list[str]) -> list[str]:
+    """The whole argv: the command words, then the positionals, then every
+    option. No ``--``, and the positionals stay next to the command because
+    Python 3.11's argparse closes a ``nargs="*"`` positional at the first
+    option, leaving later ones unrecognised. A positional that starts with
+    ``-`` is refused, since nothing else keeps it from being read as a flag."""
+    for value in positionals:
+        _bare(value, "a value")
+    n = 0
+    while n < len(head) and not head[n].startswith("-"):
+        n += 1
+    return head[:n] + positionals + head[n:] + owner
+
+
 def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     """(the command and its options, its positionals) for ``action``."""
     from khipu import routing
@@ -280,7 +295,10 @@ def act(action, args, words, turn=None, owner_session=None) -> tuple[bool, dict]
         owner.append(f"--owner-turn={turn.strip()}")
     if owner_session is not None:
         owner.append(f"--owner-session={owner_session.strip()}")
-    full = head + owner + (["--", *positionals] if positionals else [])
+    try:
+        full = full_argv(head, positionals, owner)
+    except Refused as err:
+        return False, err.refusal()
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
         try:
