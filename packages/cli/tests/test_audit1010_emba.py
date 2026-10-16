@@ -769,7 +769,7 @@ class CatchupStalenessTest(unittest.TestCase):
             out = embed.topics_embed_lag_minutes(profile="prof")
         self.assertFalse(out["ok"])
         self.assertIn("slug = ANY", cur.sql)
-        self.assertEqual(cur.params, (["stale"], "prof"))
+        self.assertEqual(cur.params, ("prof", ["stale"], "prof"))
 
     def test_recent_catchup_selects_stale_topic_even_when_a_vector_exists(self) -> None:
         class Cur:
@@ -964,6 +964,7 @@ class ReplicaCatchupTest(unittest.TestCase):
                  mock.patch("khipu.db.has_columns", return_value=False), \
                  mock.patch.object(embed, "_active_profile", return_value="prof"), \
                  mock.patch.object(embed, "_existing_hashes_for_refs", side_effect=hashes), \
+                 mock.patch.object(embed, "_changed_topic_refs", return_value=["note"]), \
                  mock.patch.object(embed, "episode_text", return_value="" if empty else "A"), \
                  mock.patch.object(embed, "topic_text", return_value="" if empty else "A"), \
                  mock.patch.object(embed, "chunk_text", return_value=[] if empty else ["A"]), \

@@ -68,46 +68,412 @@ class EncryptRoundtripTest(unittest.TestCase):
             self.assertEqual(j.resolve_passphrase(None), "")
             self.assertEqual(j.resolve_passphrase("  "), "")
 
-    def test_export_kit_plaintext_when_passphrase_empty(self) -> None:
-        with (
+    def _export_patches(self):
+        return (
             mock.patch("khipu.keychain.get_dsn", return_value="postgres://u:p@hub/db"),
             mock.patch("khipu.config.capture_mode", return_value="hub"),
             mock.patch("khipu.config.gateway_url", return_value=None),
-            mock.patch("khipu.keychain.get_gemini_key", return_value=None),
+            mock.patch("khipu.keychain.get_gemini_key", return_value="gem-key"),
             mock.patch("khipu.keychain.get_openai_compat_key", return_value=None),
             mock.patch.object(j, "_models_export_blob", return_value={}),
             mock.patch.object(
                 j, "_fetch_live_counts", return_value={"episodes": 1, "topics": 1, "nodes": 1}
             ),
             mock.patch("khipu.paths.root_cert_file", return_value=Path("/no/such/root.crt")),
-        ):
-            blob = j.export_kit("")
+        )
+
+    def _export(self, passphrase: str, **kw) -> bytes:
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for p in self._export_patches():
+                stack.enter_context(p)
+            return j.export_kit(passphrase, **kw)
+
+    def test_export_kit_refuses_without_passphrase(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            self._export("")
+        self.assertIn("needs a passphrase", str(ctx.exception))
+        self.assertIn("--allow-unencrypted", str(ctx.exception))
+
+    def test_export_kit_plaintext_only_with_explicit_opt_out(self) -> None:
+        blob = self._export("", allow_unencrypted=True)
         data = json.loads(blob.decode("utf-8"))
         self.assertEqual(data["database_url"], "postgres://u:p@hub/db")
         self.assertNotIn("ciphertext_b64", data)
+        # Reading an existing unencrypted kit keeps working without a passphrase.
         self.assertEqual(j.decrypt_payload(blob, ""), data)
 
     def test_export_kit_encrypts_when_passphrase_set(self) -> None:
-        with (
-            mock.patch("khipu.keychain.get_dsn", return_value="postgres://u:p@hub/db"),
-            mock.patch("khipu.config.capture_mode", return_value="hub"),
-            mock.patch("khipu.config.gateway_url", return_value=None),
-            mock.patch("khipu.keychain.get_gemini_key", return_value=None),
-            mock.patch("khipu.keychain.get_openai_compat_key", return_value=None),
-            mock.patch.object(j, "_models_export_blob", return_value={}),
-            mock.patch.object(
-                j, "_fetch_live_counts", return_value={"episodes": 1, "topics": 1, "nodes": 1}
-            ),
-            mock.patch("khipu.paths.root_cert_file", return_value=Path("/no/such/root.crt")),
-        ):
-            blob = j.export_kit("secret")
+        blob = self._export("secret")
+        self.assertNotIn(b"postgres://", blob)
+        self.assertNotIn(b"gem-key", blob)
         envelope = json.loads(blob.decode("utf-8"))
         self.assertIn("ciphertext_b64", envelope)
         out = j.decrypt_payload(blob, "secret")
         self.assertEqual(out["database_url"], "postgres://u:p@hub/db")
+        self.assertEqual(out["gemini_api_key"], "gem-key")
         with self.assertRaises(ValueError) as ctx:
             j.decrypt_payload(blob, "")
         self.assertIn("passphrase-protected", str(ctx.exception))
+
+
+class JoinCliPassphraseTest(unittest.TestCase):
+    def _run(self, argv: list[str], env: dict[str, str] | None = None):
+        import contextlib
+        import io
+
+        from khipu import cli
+
+        buf = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"KHIPU_JOIN_PASSPHRASE": "", **(env or {})}),
+            mock.patch("khipu.join.export_kit", return_value=b"kit") as export,
+            mock.patch("khipu.join.write_kit_file", side_effect=lambda p, b: p) as write,
+            mock.patch("khipu.join.decrypt_payload", return_value={"expected": {}}),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = cli.main(argv)
+        return rc, buf.getvalue(), export, write
+
+    def test_export_without_passphrase_is_refused_in_plain_words(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, stdout, export, write = self._run(["join", "export", "--out", out])
+        self.assertEqual(rc, 2)
+        body = json.loads(stdout)
+        self.assertFalse(body["ok"])
+        self.assertIn("needs a passphrase", body["error"])
+        self.assertIn("database password", body["error"])
+        export.assert_not_called()
+        write.assert_not_called()
+
+    def test_advertise_without_passphrase_is_refused(self) -> None:
+        rc, stdout, export, _ = self._run(["join", "advertise"])
+        self.assertEqual(rc, 2)
+        self.assertIn("needs a passphrase", json.loads(stdout)["error"])
+        export.assert_not_called()
+
+    def test_export_opt_out_flag_makes_unencrypted_kit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, stdout, export, _ = self._run(
+                ["join", "export", "--out", out, "--allow-unencrypted"]
+            )
+        self.assertEqual(rc, 0)
+        export.assert_called_once_with("", allow_unencrypted=True)
+
+    def test_export_with_passphrase_never_prints_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, stdout, export, _ = self._run(
+                ["join", "export", "--out", out], env={"KHIPU_JOIN_PASSPHRASE": "s3cret-phrase"}
+            )
+        self.assertEqual(rc, 0)
+        export.assert_called_once_with("s3cret-phrase", allow_unencrypted=False)
+        self.assertNotIn("s3cret-phrase", stdout)
+
+
+
+class MalformedDsnTest(unittest.TestCase):
+    def test_malformed_database_url_error_never_echoes_kit_content(self) -> None:
+        kit = json.dumps({
+            "format": j.FORMAT_VERSION,
+            "database_url": "host=hub password=hunter2secret hunter2tail",
+        }).encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"KHIPU_DATA_DIR": tmp}
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                j.import_kit(kit, "")
+        msg = str(ctx.exception)
+        self.assertNotIn("hunter2", msg)
+        self.assertNotIn("host=hub", msg)
+        self.assertIn("database address", msg)
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertTrue(ctx.exception.__suppress_context__)
+
+
+class PassphraseInputTest(unittest.TestCase):
+    """A passphrase never travels as a literal argument: env, stdin, a file
+    descriptor or the terminal prompt."""
+
+    def _run(self, argv, *, stdin_text=None, tty=False, getpass_value=None):
+        import contextlib
+        import io
+
+        from khipu import cli
+
+        buf = io.StringIO()
+        stdin = io.StringIO(stdin_text or "")
+        stdin.isatty = lambda: tty  # type: ignore[method-assign]
+        with (
+            mock.patch.dict(os.environ, {"KHIPU_JOIN_PASSPHRASE": ""}),
+            mock.patch("sys.stdin", stdin),
+            mock.patch("getpass.getpass", return_value=getpass_value or "") as gp,
+            mock.patch("khipu.join.export_kit", return_value=b"kit") as export,
+            mock.patch("khipu.join.write_kit_file", side_effect=lambda p, b: p),
+            mock.patch("khipu.join.decrypt_payload", return_value={"expected": {}}),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = cli.main(argv)
+        return rc, buf.getvalue(), export, gp
+
+    def test_literal_passphrase_argument_is_refused_and_steers_to_safe_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, stdout, export, _ = self._run(["join", "export", "--out", out, "--passphrase", "s3cret"])
+        self.assertEqual(rc, 2)
+        body = json.loads(stdout)
+        self.assertIn("visible to other processes", body["error"])
+        self.assertIn("KHIPU_JOIN_PASSPHRASE", body["error"])
+        self.assertNotIn("s3cret", stdout)
+        export.assert_not_called()
+
+    def test_passphrase_stdin_reads_one_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, stdout, export, _ = self._run(
+                ["join", "export", "--out", out, "--passphrase-stdin"], stdin_text="from stdin\nextra\n"
+            )
+        self.assertEqual(rc, 0)
+        export.assert_called_once_with("from stdin", allow_unencrypted=False)
+        self.assertNotIn("from stdin", stdout)
+
+    def test_passphrase_fd_reads_from_the_descriptor(self) -> None:
+        r, w = os.pipe()
+        os.write(w, b"from fd\n")
+        os.close(w)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = str(Path(tmp) / "kit.khipujoin")
+                rc, _, export, _ = self._run(["join", "export", "--out", out, "--passphrase-fd", str(r)])
+        finally:
+            try:
+                os.close(r)
+            except OSError:
+                pass
+        self.assertEqual(rc, 0)
+        export.assert_called_once_with("from fd", allow_unencrypted=False)
+
+    def test_interactive_export_prompts_for_the_passphrase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "kit.khipujoin")
+            rc, _, export, gp = self._run(
+                ["join", "export", "--out", out], tty=True, getpass_value="typed"
+            )
+        self.assertEqual(rc, 0)
+        gp.assert_called()
+        export.assert_called_once_with("typed", allow_unencrypted=False)
+
+
+SECRET = "SYNTHETIC_DSN_PASSWORD"
+RAW = f'invalid percent-encoded token: "%{SECRET}"'
+
+
+class JoinErrorTextTest(unittest.TestCase):
+    """No join path prints an exception's raw text: Khipu's own messages go
+    through the redactor, anything else becomes a fixed message."""
+
+    def _cli(self, argv, **patches):
+        import contextlib
+        import io
+
+        from khipu import cli
+
+        buf = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {"KHIPU_JOIN_PASSPHRASE": "phrase"}))
+            for target, side_effect in patches.items():
+                stack.enter_context(mock.patch(target.replace("__", "."), side_effect=side_effect))
+            stack.enter_context(contextlib.redirect_stdout(buf))
+            rc = cli.main(argv)
+        return rc, buf.getvalue()
+
+    def test_export_never_prints_raw_exception_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out = self._cli(["join", "export", "--out", str(Path(tmp) / "k.khipujoin")],
+                                khipu__join__export_kit=Exception(RAW))
+        self.assertEqual(rc, 1)
+        self.assertNotIn(SECRET, out)
+        self.assertIn("Exception", json.loads(out)["error"])
+
+    def test_advertise_never_prints_raw_exception_text(self) -> None:
+        rc, out = self._cli(["join", "advertise"], khipu__join_pair__advertise_join_kit=Exception(RAW))
+        self.assertEqual(rc, 1)
+        self.assertNotIn(SECRET, out)
+
+    def test_import_and_receive_never_print_raw_exception_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            kit = Path(tmp) / "k.khipujoin"
+            kit.write_bytes(b"{}")
+            rc, out = self._cli(["join", "import", "--file", str(kit)],
+                                khipu__join__import_kit=Exception(RAW))
+        self.assertEqual(rc, 1)
+        self.assertNotIn(SECRET, out)
+        rc, out = self._cli(["join", "receive", "--pin", "123456"],
+                            khipu__join_pair__receive_join_kit=Exception(RAW))
+        self.assertEqual(rc, 1)
+        self.assertNotIn(SECRET, out)
+
+    def test_khipu_messages_are_kept_but_redacted(self) -> None:
+        msg = ("bad postgresql://admin:hunter2pw@hub.example/db and "
+               "host=hub password=hunter3pw and password='hunter4 pw'")
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out = self._cli(["join", "export", "--out", str(Path(tmp) / "k.khipujoin")],
+                                khipu__join__export_kit=j.JoinError(msg))
+        err = json.loads(out)["error"]
+        for leaked in ("hunter2pw", "hunter3pw", "hunter4", "admin:"):
+            self.assertNotIn(leaked, err)
+        self.assertIn("hub.example/db", err)
+
+    def test_export_kit_hub_failure_carries_no_raw_text(self) -> None:
+        for raw, expect in ((RAW, "could not be read"),
+                            (f"connection refused {SECRET}", "hub.invalid:5432 unreachable")):
+            with self.subTest(raw=raw):
+                msg = self._export_failure(raw)
+                self.assertNotIn(SECRET, msg)
+                self.assertIn(expect, msg)
+
+    def _export_failure(self, raw: str) -> str:
+        def boom():
+            raise RuntimeError(raw)
+
+        with (
+            mock.patch("khipu.keychain.get_dsn", return_value="postgresql://u:x@hub.invalid/db"),
+            mock.patch("khipu.config.capture_mode", return_value="hub"),
+            mock.patch("khipu.paths.root_cert_file", return_value=Path("/no/such/root.crt")),
+            mock.patch.object(j, "_models_export_blob", return_value={}),
+            mock.patch.object(j, "_fetch_live_counts", side_effect=boom),
+            mock.patch.object(j, "_dsn_host_port", return_value="hub.invalid:5432"),
+        ):
+            with self.assertRaises(j.JoinError) as ctx:
+                j.export_kit("phrase")
+        return str(ctx.exception)
+
+    def test_hub_connect_classifier_carries_no_raw_text(self) -> None:
+        for exc in (RuntimeError(RAW), RuntimeError(f"root certificate {RAW}")):
+            self.assertNotIn(SECRET, j.classify_hub_connect_error(exc, "hub:5432"))
+
+    def test_nearby_connect_error_carries_no_raw_text(self) -> None:
+        from khipu import join_pair
+
+        self.assertNotIn(SECRET, join_pair.friendly_connect_error(OSError(RAW), [("h", 1)]))
+
+
+KIT_SECRET = "sk-SYNTHETICKITSECRET0123456789abcdef"
+
+
+def _wrong_type_variants():
+    """(label, payload) with each kit field in turn holding the secret in a
+    value of the wrong type (and a few right-type, wrong-value cases)."""
+    base = {
+        "format": j.FORMAT_VERSION,
+        "database_url": "postgresql://u@hub.example/db",
+        "capture_mode": "dual",
+        "models": {
+            "synth": {"provider": "cloud", "endpoint": "", "model_id": "gemini-2.5-flash"},
+            "embed": {"provider": "cloud", "endpoint": "", "model_id": ""},
+            "vision": {"provider": "off", "endpoint": "", "model_id": ""},
+        },
+        "expected": {"episodes": 1, "topics": 1, "nodes": 1},
+        "created_at": "2026-10-15T00:00:00+00:00",
+        "gateway_url": "https://gateway.example",
+        "gemini_api_key": "gem",
+        "openai_compat_api_key": "oai",
+        "root_crt_pem": "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----",
+    }
+    string_fields = ("format", "database_url", "capture_mode", "created_at", "gateway_url",
+                     "gemini_api_key", "openai_compat_api_key", "root_crt_pem")
+    out = []
+    for field in string_fields:
+        for bad in ({"k": KIT_SECRET}, [KIT_SECRET], 12345):
+            out.append((f"{field}={type(bad).__name__}", {**base, field: bad}))
+    out.append(("capture_mode=value", {**base, "capture_mode": KIT_SECRET}))
+    out.append(("format=value", {**base, "format": KIT_SECRET}))
+    for field in ("models", "expected"):
+        for bad in (KIT_SECRET, [KIT_SECRET], 7):
+            out.append((f"{field}={type(bad).__name__}", {**base, field: bad}))
+    for count in ("episodes", "topics", "nodes"):
+        for bad in (KIT_SECRET, {"k": KIT_SECRET}, [KIT_SECRET], True, -1):
+            out.append((f"expected.{count}={bad!r}"[:40],
+                        {**base, "expected": {**base["expected"], count: bad}}))
+    for role in ("synth", "embed", "vision"):
+        out.append((f"models.{role}=str", {**base, "models": {**base["models"], role: KIT_SECRET}}))
+        out.append((f"models.{role}.provider", {**base, "models": {
+            **base["models"], role: {**base["models"][role], "provider": KIT_SECRET}}}))
+        out.append((f"models.{role}.model_id", {**base, "models": {
+            **base["models"], role: {**base["models"][role], "model_id": [KIT_SECRET]}}}))
+    return out
+
+
+class KitFieldLeakTest(unittest.TestCase):
+    """Every field of a decrypted kit is checked with fixed text naming the
+    field, never its value, on both import and receive."""
+
+    def _capture(self, fn):
+        import contextlib
+        import io
+        import traceback
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = fn()
+            except BaseException:  # noqa: BLE001 — an escaped traceback is output too
+                err.write(traceback.format_exc())
+                rc = None
+        return rc, out.getvalue() + err.getvalue()
+
+    def _env(self, tmp):
+        return mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": tmp, "KHIPU_JOIN_PASSPHRASE": "phrase"})
+
+    def _guards(self):
+        import contextlib
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(j, "_fetch_live_counts", side_effect=RuntimeError("no hub in tests")))
+        stack.enter_context(mock.patch("khipu.migrate.run", return_value={"ok": True}))
+        return stack
+
+    def test_import_never_shows_a_wrong_typed_field_value(self) -> None:
+        from khipu import cli
+
+        for label, payload in _wrong_type_variants():
+            with self.subTest(field=label), tempfile.TemporaryDirectory() as tmp, self._env(tmp), self._guards():
+                kit = Path(tmp) / "k.khipujoin"
+                kit.write_bytes(j.encrypt_payload(payload, "phrase"))
+                rc, text = self._capture(lambda: cli.main(["join", "import", "--file", str(kit)]))
+                self.assertNotIn(KIT_SECRET, text)
+                self.assertNotIn("SYNTHETICKITSECRET", text)
+                self.assertEqual(rc, 1, text)
+                self.assertIn("join kit", json.loads(text)["error"])
+
+    def test_receive_never_shows_a_wrong_typed_field_value(self) -> None:
+        from khipu import cli, join_pair
+
+        for label, payload in _wrong_type_variants():
+            blob = j.encrypt_payload(payload, "phrase")
+            tls = mock.Mock()
+            tls.recv.side_effect = [blob, b""]
+            ctx = mock.Mock()
+            ctx.wrap_socket.return_value = tls
+            header = (json.dumps({"ok": True, "bytes": len(blob)}) + "\n").encode("utf-8")
+            with (
+                self.subTest(field=label),
+                tempfile.TemporaryDirectory() as tmp,
+                self._env(tmp),
+                self._guards(),
+                mock.patch.object(join_pair, "_browse_service", return_value=[{"name": "mac"}]),
+                mock.patch.object(join_pair, "_resolve_service", return_value=("h", 1, None)),
+                mock.patch.object(join_pair, "_tcp_connect", return_value=(mock.Mock(), "h", 1)),
+                mock.patch.object(join_pair, "_readline", return_value=header),
+                mock.patch("khipu.join_pair.ssl.SSLContext", return_value=ctx),
+            ):
+                rc, text = self._capture(lambda: cli.main(["join", "receive", "--pin", "123456"]))
+                self.assertNotIn(KIT_SECRET, text)
+                self.assertNotIn("SYNTHETICKITSECRET", text)
+                self.assertEqual(rc, 1, text)
 
 
 class LocalhostRefuseTest(unittest.TestCase):

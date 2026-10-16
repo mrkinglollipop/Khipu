@@ -62,6 +62,7 @@ import {
   GatewayUrlCard,
   JobsCard,
   PathOverridesCard,
+  GraphBackupRemoteCard,
 } from "./SettingsControls";
 import {
   launchWhatsNew,
@@ -2353,6 +2354,7 @@ export default function App() {
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [setupJoinPassphrase, setSetupJoinPassphrase] = useState("");
+  const [setupJoinAllowUnencrypted, setSetupJoinAllowUnencrypted] = useState(false);
   const [setupJoinMsg, setSetupJoinMsg] = useState<string | null>(null);
   const [setupJoinExpected, setSetupJoinExpected] = useState<Counts | null>(null);
   const [advertiseBusy, setAdvertiseBusy] = useState(false);
@@ -2890,8 +2892,13 @@ export default function App() {
     }
   }, [backupOut]);
 
+  // A database only this Mac can reach cannot be joined; otherwise a kit is
+  // made only with a passphrase or the owner's explicit unencrypted opt-out.
+  const joinKitBlocked = dbHostKind === "this-mac" || dbHostKind === "local-docker";
+  const joinKitReady = setupJoinPassphrase.trim() !== "" || setupJoinAllowUnencrypted;
+
   const exportJoinKit = useCallback(async () => {
-    const passphrase = setupJoinPassphrase.trim();
+    const passphrase = setupJoinAllowUnencrypted ? "" : setupJoinPassphrase.trim();
     setSetupJoinMsg(null);
     try {
       const dest = await saveFileDialog({
@@ -2902,6 +2909,7 @@ export default function App() {
       const raw = await invoke<string>("join_export", {
         passphrase,
         outPath: dest.trim(),
+        allowUnencrypted: setupJoinAllowUnencrypted,
       });
       const parsed = parseJson(raw) as {
         ok?: boolean;
@@ -2914,19 +2922,26 @@ export default function App() {
         return;
       }
       setSetupJoinExpected(parsed.expected ?? null);
-      setSetupJoinMsg(`Saved join kit to ${parsed.out ?? dest}`);
+      setSetupJoinPassphrase("");
+      setSetupJoinMsg(
+        `Saved ${passphrase ? "an encrypted" : "an unencrypted"} join kit to ${parsed.out ?? dest}`,
+      );
     } catch (e) {
       setSetupJoinMsg(String(e));
     }
-  }, [setupJoinPassphrase]);
+  }, [setupJoinPassphrase, setupJoinAllowUnencrypted]);
 
   const startJoinAdvertise = useCallback(async () => {
-    const passphrase = setupJoinPassphrase.trim();
+    const passphrase = setupJoinAllowUnencrypted ? "" : setupJoinPassphrase.trim();
     setAdvertiseBusy(true);
     setSetupJoinMsg(null);
     setAdvertiseInfo(null);
     try {
-      const raw = await invoke<string>("join_advertise", { passphrase, timeout: 600 });
+      const raw = await invoke<string>("join_advertise", {
+        passphrase,
+        timeout: 600,
+        allowUnencrypted: setupJoinAllowUnencrypted,
+      });
       const parsed = parseJson(raw) as {
         ok?: boolean;
         error?: string;
@@ -2939,6 +2954,7 @@ export default function App() {
         setSetupJoinMsg(String(parsed?.error ?? "Advertise failed."));
         return;
       }
+      setSetupJoinPassphrase("");
       setAdvertiseInfo({
         pin: parsed.pin,
         timeout_sec: parsed.timeout_sec,
@@ -2953,7 +2969,7 @@ export default function App() {
     } finally {
       setAdvertiseBusy(false);
     }
-  }, [setupJoinPassphrase]);
+  }, [setupJoinPassphrase, setupJoinAllowUnencrypted]);
 
   const runScheduledJob = useCallback(async (subcommand: string) => {
     setJobSpawnMsg(null);
@@ -5469,6 +5485,8 @@ export default function App() {
 
                     <PathOverridesCard active={tab === "settings" && settingsSection === "data"} />
 
+                    <GraphBackupRemoteCard active={tab === "settings" && settingsSection === "data"} />
+
                     <div className="section-card">
                       <div className="section-head">Backup</div>
                       <div className="section-body">
@@ -5548,9 +5566,10 @@ export default function App() {
                       ) : null}
                       <p className="muted">
                         Do this on the Mac that <strong>already works</strong>. Save
-                        a join kit and AirDrop it to the new Mac — that file is
-                        enough. The passphrase is optional (only if you want the
-                        file locked).
+                        a join kit and AirDrop it to the new Mac; that file is
+                        enough. The kit holds the database password and any API
+                        keys, so it is locked with a passphrase you type on the new
+                        Mac.
                       </p>
                       <ol className="welcome-list muted">
                         <li>
@@ -5573,24 +5592,44 @@ export default function App() {
                           duplicate entries in the graph.
                         </li>
                       </ul>
+                      <label className="muted" htmlFor="join-kit-passphrase">
+                        Join kit passphrase
+                      </label>
                       <div className="toolbar" style={{ width: "100%" }}>
                         <input
+                          id="join-kit-passphrase"
                           className="mono"
                           type="password"
                           autoComplete="off"
                           spellCheck={false}
                           value={setupJoinPassphrase}
                           onChange={(e) => setSetupJoinPassphrase(e.target.value)}
-                          placeholder="Optional passphrase (leave blank for an unlocked file)"
-                          aria-label="Optional join export passphrase"
-                          disabled={dbHostKind === "this-mac" || dbHostKind === "local-docker"}
+                          placeholder="Type a passphrase for the new Mac"
+                          disabled={joinKitBlocked || setupJoinAllowUnencrypted}
                         />
                       </div>
+                      <label className="row-meta">
+                        <input
+                          type="checkbox"
+                          checked={setupJoinAllowUnencrypted}
+                          disabled={joinKitBlocked}
+                          onChange={(e) => setSetupJoinAllowUnencrypted(e.target.checked)}
+                        />{" "}
+                        I understand: make it unencrypted
+                      </label>
+                      {setupJoinAllowUnencrypted ? (
+                        <Callout
+                          tone="warn"
+                          title="Anyone who gets this file can read the database password and API keys."
+                        />
+                      ) : !joinKitReady && !joinKitBlocked ? (
+                        <p className="muted">Type a passphrase to save or advertise a join kit.</p>
+                      ) : null}
                       <div className="toolbar">
                         <button
                           type="button"
                           className="primary"
-                          disabled={dbHostKind === "this-mac" || dbHostKind === "local-docker"}
+                          disabled={joinKitBlocked || !joinKitReady}
                           onClick={() => void exportJoinKit()}
                         >
                           Save join kit…
@@ -5603,9 +5642,7 @@ export default function App() {
                       <div className="toolbar">
                         <button
                           type="button"
-                          disabled={
-                            advertiseBusy || dbHostKind === "this-mac" || dbHostKind === "local-docker"
-                          }
+                          disabled={advertiseBusy || joinKitBlocked || !joinKitReady}
                           onClick={() => void startJoinAdvertise()}
                         >
                           {advertiseBusy ? "Advertising…" : "Advertise nearby (PIN)"}

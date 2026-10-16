@@ -163,7 +163,7 @@ class MemoryPlannedOnceTest(unittest.TestCase):
             out = embed.topics_embed_lag_minutes(gaps=kept)
         self.assertTrue(out["ok"])
         sql, params = cur.execute.call_args[0]
-        self.assertEqual(params, (["t1"], "p@1"))
+        self.assertEqual(params, ("p@1", ["t1"], "p@1"))
 
     def test_gaps_for_another_profile_are_not_reused(self):
         cur = mock.MagicMock()

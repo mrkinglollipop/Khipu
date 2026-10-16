@@ -1348,6 +1348,7 @@ _LOCAL_FAILURES = {
     "nightly_steps_ok": ("khipu.jobs.nightly_step_health", {"notes_reconcile_ok": {"ok": False}}),
     "degraded_rate_ok": ("khipu.query_log.degraded_rate", {"ok": False}),
     "launchers_ok": ("khipu.integrations.launcher_health", {"ok": False}),
+    "ledger_outbox_ok": ("khipu.ledger.outbox_status", {"pending": 1, "refused": 0}),
 }
 
 
