@@ -729,6 +729,26 @@ fn parse_daily_calls(key: &str, raw: &str) -> Result<String, String> {
     Ok(v.to_string())
 }
 
+/// `config --set KEY N` / `config --unset=KEY` for a length of time in whole
+/// minutes (`khipu.config.MINUTE_SETTINGS`), with each key's allowed range.
+const MINUTE_KEYS: &[(&str, u64, u64)] = &[("doctor_rate_window_minutes", 5, 7 * 24 * 60)];
+
+fn minute_key(key: &str) -> Option<(u64, u64)> {
+    MINUTE_KEYS.iter().find(|(k, _, _)| *k == key).map(|(_, low, high)| (*low, *high))
+}
+
+fn parse_minutes(key: &str, raw: &str) -> Result<String, String> {
+    let (low, high) = minute_key(key).ok_or_else(|| format!("not a minutes setting: {key:?}"))?;
+    let v: u64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{key} must be a whole number of minutes, got {raw:?}"))?;
+    if !(low..=high).contains(&v) {
+        return Err(format!("{key} must be between {low} and {high} minutes, got {raw:?}"));
+    }
+    Ok(v.to_string())
+}
+
 fn checked_operand(key: &str, raw: &str, allow_empty: bool) -> Result<String, String> {
     let v = raw.trim();
     if v.is_empty() {
@@ -1068,6 +1088,7 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
         }
         "user_aliases" => Ok(set("user_aliases", checked_operand(key, value, true)?)),
         k if DAILY_CALL_KEYS.contains(&k) => Ok(set(k, parse_daily_calls(k, value)?)),
+        k if minute_key(k).is_some() => Ok(set(k, parse_minutes(k, value)?)),
         "synth_fallback" => {
             let v = value.trim();
             if !SYNTH_FALLBACKS.contains(&v) {
@@ -1104,6 +1125,7 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
         && key != COSINE_FLOOR_KEY
         && key != USAGE_ACCOUNTS_KEY
         && key != GRAPH_BACKUP_REMOTE_KEY
+        && minute_key(key).is_none()
         && !cli_setting_key(key)
         && !routing_key(key)
         && !by_profile
@@ -3070,6 +3092,16 @@ fn run_khipu_cli_with_stdin(args: &[String], stdin_text: &str) -> Result<String,
     Ok(stdout)
 }
 
+/// Rebuild this Mac's offline copy of memory now (the fix doctor names for
+/// prompt-time recall). `snapshot` stays out of `ALLOWED_SUBCOMMANDS`; this
+/// command fixes the argv to exactly `snapshot refresh`.
+const SNAPSHOT_REFRESH_ARGV: &[&str] = &["snapshot", "refresh"];
+
+#[tauri::command]
+async fn khipu_snapshot_refresh() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(SNAPSHOT_REFRESH_ARGV)).await
+}
+
 /// Apply (or plan) the schema. `migrate` is a state-changing subcommand and is
 /// deliberately NOT in `ALLOWED_SUBCOMMANDS`; this command fixes the argv to
 /// exactly `migrate` / `migrate --dry-run` so the UI can offer setup without
@@ -4128,6 +4160,7 @@ pub fn run() {
             khipu_feature_set,
             khipu_config_show,
             khipu_config_set,
+            khipu_snapshot_refresh,
             khipu_config_request,
             khipu_config_unset,
             khipu_budget_status,
@@ -4977,6 +5010,19 @@ mod settings_command_tests {
         // The other ceilings are not offered by the app.
         assert!(config_set_argv("embed_daily_calls", "10").is_err());
         assert!(config_unset_argv("synth_daily_calls").is_err());
+    }
+
+    #[test]
+    fn the_doctor_rate_window_is_whole_minutes_in_range() {
+        let key = "doctor_rate_window_minutes";
+        assert_eq!(config_set_argv(key, " 90 ").unwrap(), v(&["config", "--set", key, "90"]));
+        assert_eq!(config_set_argv(key, "5").unwrap(), v(&["config", "--set", key, "5"]));
+        for bad in ["", "0", "4", "-5", "1.5", "abc", "--unset", "10081"] {
+            assert!(config_set_argv(key, bad).is_err(), "accepted {bad:?}");
+        }
+        assert_eq!(config_unset_argv(key).unwrap(), v(&["config", "--unset=doctor_rate_window_minutes"]));
+        assert_eq!(SNAPSHOT_REFRESH_ARGV, &["snapshot", "refresh"]);
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"snapshot"));
     }
 
     #[test]

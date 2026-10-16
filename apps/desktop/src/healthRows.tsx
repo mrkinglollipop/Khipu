@@ -77,6 +77,8 @@ const LABELS: Record<string, string> = {
   // D6/F2/F4: topic-embedding lag and the search-degrade rate.
   topics_embed_lag_ok: "Search index catching up on time",
   degraded_rate_ok: "Search rarely falls back to keyword-only",
+  prompt_recall_outcomes_ok: "Recall answers before each prompt in time",
+  prompt_recall_snapshot_ok: "Recall before each prompt reads this Mac's copy",
   // Not a doctor field: read from `khipu usage --json` (plansHealthRow).
   plans: "Plans",
   // Not a doctor field: read from `khipu route --json` (routingHealthRow).

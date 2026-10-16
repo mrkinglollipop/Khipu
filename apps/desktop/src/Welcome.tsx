@@ -915,6 +915,8 @@ export function Welcome({
           await runKhipu(["doctor", "--probe"]);
         } else if (item.fix.kind === "apply-migrations") {
           await invoke<string>("khipu_migrate", { dryRun: false });
+        } else if (item.fix.kind === "refresh-snapshot") {
+          await invoke<string>("khipu_snapshot_refresh");
         }
       } catch {
         // reloadDoctor below reports whatever state actually resulted.

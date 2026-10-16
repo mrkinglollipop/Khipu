@@ -29,7 +29,10 @@ export type Attention = {
   tone: "err" | "warn";
   title: string;
   cause: string;
-  fix?: { label: string; kind: "reinstall-hook" | "recall-probe" | "revisions" | "open-harnesses" | "apply-migrations" };
+  fix?: {
+    label: string;
+    kind: "reinstall-hook" | "recall-probe" | "revisions" | "open-harnesses" | "apply-migrations" | "refresh-snapshot";
+  };
   harness?: string;
 };
 
@@ -40,6 +43,13 @@ export const HARNESS_LABEL: Record<string, string> = {
   codex: "Codex",
   grok_bot: "Grok Bot",
 };
+
+/** " in the last 60 minutes" for a rate check's window, or "" when unknown. */
+function windowWords(minutes: number | undefined): string {
+  if (typeof minutes !== "number" || minutes <= 0) return "";
+  if (minutes % 60 === 0 && minutes >= 120) return ` in the last ${minutes / 60} hours`;
+  return ` in the last ${minutes} minutes`;
+}
 
 export function harnessLabel(id: string): string {
   return HARNESS_LABEL[id] ?? id;
@@ -288,14 +298,65 @@ export function buildAttention(parsed: Record<string, unknown>): {
   }
 
   if ((parsed as { degraded_rate_ok?: boolean }).degraded_rate_ok === false) {
-    const dr = (parsed as { degraded_rate?: { rate?: number; degraded?: number; sampled?: number } }).degraded_rate;
+    const dr = (parsed as {
+      degraded_rate?: { rate?: number; degraded?: number; sampled?: number; window_minutes?: number };
+    }).degraded_rate;
     const pct = dr?.rate != null ? Math.round(dr.rate * 100) : 0;
     issues.push(`Search degraded ${pct}% of recent queries`);
     items.push({
       key: "degraded_rate",
       tone: "warn",
       title: "Search has been falling back to keyword-only often",
-      cause: `${pct}% of the last ${dr?.sampled ?? 0} searches (${dr?.degraded ?? 0}) could not use meaning-based search — usually a missing or exhausted embedding budget.`,
+      cause: `${pct}% of the last ${dr?.sampled ?? 0} searches${windowWords(dr?.window_minutes)} (${dr?.degraded ?? 0}) could not use meaning-based search, usually a missing or exhausted embedding budget. Searches made while the database was out of reach are not counted, and this clears by itself once recent searches are healthy.`,
+    });
+  }
+
+  // Prompt-time recall's real outcomes over the rate window (doctor's
+  // `prompt_recall_outcomes`). Calls made while the database was out of
+  // reach are counted apart and never turn this red.
+  if ((parsed as { prompt_recall_outcomes_ok?: boolean }).prompt_recall_outcomes_ok === false) {
+    const po = (parsed as {
+      prompt_recall_outcomes?: {
+        available?: boolean;
+        insufficient?: boolean;
+        count?: number;
+        failure_rate?: number;
+        window_minutes?: number;
+      };
+    }).prompt_recall_outcomes;
+    if (po?.insufficient) {
+      issues.push("Prompt-time recall has not answered enough prompts to judge");
+      items.push({
+        key: "prompt_recall_outcomes",
+        tone: "warn",
+        title: "Recall before each prompt has too little record to judge",
+        cause:
+          po.available === false
+            ? "Its log could not be read on this Mac, so whether recall answers before your prompts is unknown."
+            : `It answered ${po.count ?? 0} prompts in the last seven days; 20 are needed before Khipu judges it.`,
+      });
+    } else {
+      const pct = po?.failure_rate != null ? Math.round(po.failure_rate * 100) : 0;
+      issues.push(`Prompt-time recall missed ${pct}% of recent prompts`);
+      items.push({
+        key: "prompt_recall_outcomes",
+        tone: "err",
+        title: "Recall before each prompt is missing its deadline",
+        cause: `${pct}% of the last ${po?.count ?? 0} prompts${windowWords(po?.window_minutes)} got no prior work in time. Refreshing the offline copy lets recall answer from this Mac. This clears by itself once recent prompts answer in time.`,
+        fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
+      });
+    }
+  }
+
+  const prs = (parsed as { prompt_recall_snapshot?: { fresh?: boolean } }).prompt_recall_snapshot;
+  if (prs && prs.fresh === false) {
+    issues.push("Prompt-time recall is using the database, not the offline copy");
+    items.push({
+      key: "prompt_recall_snapshot",
+      tone: "warn",
+      title: "Recall before each prompt is reading the slower database",
+      cause: "This Mac's offline copy is not trusted right now, so each prompt waits on the database and may time out. Refreshing the offline copy brings recall back to this Mac.",
+      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
     });
   }
 
@@ -378,6 +439,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: "warn",
       title: "The offline copy of your memory is out of date",
       cause: `${why} Recall reads it first, and turns to the slower database once a full rebuild is more than a day old.`,
+      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
     });
   }
 

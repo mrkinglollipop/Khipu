@@ -2840,6 +2840,9 @@ def prior_work_for_prompt(
     degraded_legs: list[str] = []
     interpretation: dict[str, Any] | None = None
     stage: str | None = None
+    # The hub could not be reached during this call: doctor counts it as an
+    # offline call, not as a failure of the lane.
+    offline = False
     progress: dict[str, Any] = {}
     search_deadline = t0 + (max(0.05, budget_ms / 1000.0) + _BUDGET_SAFETY_SLACK_S
                             if budget_ms is not None else TIMEOUT_S)
@@ -2868,6 +2871,7 @@ def prior_work_for_prompt(
             legs = result.get("legs") or []
             degraded = result.get("degraded")
             reason = result.get("reason") or reason
+            offline = bool(result.get("offline"))
         else:
             result = _run_with_timeout(
                 _search_hits, max(0, deadline - time.monotonic()), prompt, cwd=cwd, limit=limit, tz=tz,
@@ -2878,6 +2882,7 @@ def prior_work_for_prompt(
             degraded = result.get("degraded")
             degraded_legs = result.get("degraded_legs") or []
             interpretation = result.get("time_interpretation")
+            offline = bool(result.get("offline"))
     except _TimedOut:
         # Read once: the search thread may still publish after this point.
         provisional = progress.get("provisional")
@@ -2897,6 +2902,7 @@ def prior_work_for_prompt(
     except Exception as exc:  # noqa: BLE001 — fail open on any search failure
         reason = f"error: {type(exc).__name__}: {exc}"
         hits = []
+        offline = _hub_unreachable_error(exc)
     if thread_worker is not None:
         thread_worker.join(max(0, deadline - time.monotonic()))
         priority = thread_box.get("hits") or []
@@ -2926,6 +2932,8 @@ def prior_work_for_prompt(
             dedup_out = {"context": "", "hits": [], "reason": "dedup", "ms": ms}
             dedup_out["legs"] = legs
             dedup_out["degraded"] = degraded
+            if offline:
+                dedup_out["offline"] = True
             dedup_meta = _meta(legs=legs, degraded=degraded, reason="dedup", ms=ms, hits=hits)
             if dedup_meta is not None:
                 dedup_out["prior_work_meta"] = dedup_meta
@@ -2941,6 +2949,8 @@ def prior_work_for_prompt(
     out["degraded"] = degraded
     if stage:
         out["stage"] = stage
+    if offline:
+        out["offline"] = True
     if degraded_legs:
         out["degraded_legs"] = degraded_legs
     if interpretation:
@@ -3014,6 +3024,17 @@ def _stdin_payload(raw: str) -> dict[str, Any]:
         return {}
 
 
+def _hub_unreachable_error(exc: BaseException) -> bool:
+    """Whether a failed search failed because the hub could not be reached.
+    Never raises."""
+    try:
+        from khipu.hub_snapshot import hub_connection_failed
+
+        return hub_connection_failed(exc)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def log_terminal_outcome(raw: str, reason: str, *, ms: float = 0.0) -> None:
     payload = _stdin_payload(raw)
     session = payload.get("session_id") or payload.get("sessionId") or "?"
@@ -3034,8 +3055,9 @@ def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | 
         session = payload.get("session_id") or payload.get("sessionId") or "?"
         hit_ids = [f"{h.get('kind')}:{h.get('id')}" for h in result["hits"]]
         stage = f" stage={result['stage']}" if result.get("stage") else ""
+        stage += " offline=1" if result.get("offline") else ""
         ms = round((time.monotonic() - delivery["started"]) * 1000, 1) if "started" in delivery else result["ms"]
-        # routing= goes last, after degraded= and stage=, so every reader of
+        # routing= goes last, after degraded=, stage= and offline=, so every reader of
         # this line (doctor's outcome rate, the promotion gate) still parses it.
         _log(f"session={session} reason={result['reason']} ms={ms} hits={hit_ids} "
              f"legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}{routed}")
@@ -3079,6 +3101,7 @@ def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
         ctx, routed = result["context"], {"status": "skipped:error"}
     hit_ids = [f"{h.get('kind')}:{h.get('id')}" for h in result["hits"]]
     stage = f" stage={result['stage']}" if result.get("stage") else ""
+    stage += " offline=1" if result.get("offline") else ""
     if delivery is not None:
         delivery.update(result=result, raw=raw, started=started)
         if routed:
@@ -3165,6 +3188,15 @@ _LOG_LINE_RE = re.compile(
     r"^(?P<stamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) \[khipu-prompt-recall\] "
     r"session=.*? reason=(?P<reason>.*?) ms=(?P<ms>[0-9.]+) hits="
 )
+# A call made while the hub could not be reached: reported apart, never as a
+# failure of the lane (the lane did its job if it answered from the replica).
+_OFFLINE_FIELD_RE = re.compile(r" offline=1(?= |$)")
+
+# The button the app shows beside this check (Home and the health report).
+OUTCOMES_FIX = (
+    "press Refresh offline copy on this check in the app; if it stays red, "
+    "this Mac cannot answer inside the deadline and per-prompt recall is effectively off"
+)
 
 
 def _classify_call_reason(reason: str) -> str | None:
@@ -3195,18 +3227,40 @@ def _tail_text(path: Path, *, max_bytes: int) -> str:
         return f.read().decode("utf-8", errors="replace")
 
 
-def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
+def _rate_window_s() -> int:
+    """Doctor's rate window (``doctor_rate_window_minutes``, set in the app's
+    Settings), in seconds. Never raises."""
+    try:
+        from khipu.config import minute_setting
+
+        return minute_setting("doctor_rate_window_minutes") * 60
+    except Exception:  # noqa: BLE001 — a broken config must not break doctor
+        return 60 * 60
+
+
+def prompt_recall_outcomes(*, now: datetime | None = None,
+                           window_s: int | None = None) -> dict[str, Any]:
     """Doctor's real evidence for the per-prompt lane (finding B10): count,
     timeout rate and median latency of actually-searched calls (reason ok,
     dedup, timeout or error — a gated call never reached a search leg and
-    does not count) over the last 7 days, read from the hook's own log.
+    does not count), read from the hook's own log.
 
-    Not ok when at least half of 20 or more attempts failed or timed out.
-    Fewer observations report insufficient evidence, rather than measured
-    health. Missing or unreadable telemetry reports available=False.
+    Only calls inside the rate window (``doctor_rate_window_minutes``,
+    default an hour) are judged, so a past outage ages out by itself on an
+    idle Mac. Calls tagged ``offline=1`` (the hub could not be reached) are
+    counted apart as ``offline`` and never as failures.
+
+    Not ok when at least half of 20 or more judged calls failed or timed
+    out. Fewer judged calls in the window is not a verdict: green with
+    ``quiet`` when the lane answered at least 20 calls in the last 7 days
+    (it runs, it has just been quiet), otherwise insufficient evidence.
+    Missing or unreadable telemetry reports available=False.
     """
     now = now or datetime.now(timezone.utc)
-    cutoff = now.timestamp() - _OUTCOMES_WINDOW_S
+    window_s = _rate_window_s() if window_s is None else int(window_s)
+    lookback_cutoff = now.timestamp() - _OUTCOMES_WINDOW_S
+    window_cutoff = now.timestamp() - window_s
+    window_minutes = round(window_s / 60)
     path = _log_path()
     try:
         if not path.is_file():
@@ -3216,6 +3270,8 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
         return {"ok": False, "available": False, "insufficient": True, "count": 0}
 
     calls: list[tuple[str, float]] = []
+    offline = 0
+    lookback = 0
     for line in split_lines(raw):
         m = _LOG_LINE_RE.match(line)
         if not m:
@@ -3226,18 +3282,27 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
             )
         except ValueError:
             continue
-        if stamp.timestamp() < cutoff:
+        if stamp.timestamp() < lookback_cutoff:
             continue
         category = _classify_call_reason(m.group("reason"))
         if category is None:
+            continue
+        lookback += 1
+        if stamp.timestamp() < window_cutoff:
+            continue
+        if _OFFLINE_FIELD_RE.search(line):
+            offline += 1
             continue
         calls.append((category, float(m.group("ms"))))
 
     # The log is append-only, so the end of the list is the most recent calls.
     calls = calls[-_OUTCOMES_MAX_CALLS:]
     total = len(calls)
+    base = {"available": True, "count": total, "offline": offline, "window_minutes": window_minutes}
     if total < _OUTCOMES_MIN_CALLS:
-        return {"ok": False, "available": True, "insufficient": True, "count": total}
+        if lookback >= _OUTCOMES_MIN_CALLS:
+            return {**base, "ok": True, "insufficient": True, "quiet": True}
+        return {**base, "ok": False, "insufficient": True}
 
     timeouts = sum(1 for category, _ms in calls if category == "timeout")
     errors = sum(1 for category, _ms in calls if category == "error")
@@ -3251,10 +3316,9 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
         else (ms_values[mid - 1] + ms_values[mid]) / 2
     )
     out: dict[str, Any] = {
+        **base,
         "ok": failure_rate < _OUTCOMES_TIMEOUT_RATE_RED,
-        "available": True,
         "insufficient": False,
-        "count": total,
         "timeout_rate": round(timeout_rate, 4),
         "error_rate": round(errors / total, 4),
         "failure_rate": round(failure_rate, 4),
@@ -3262,13 +3326,10 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
     }
     if not out["ok"]:
         out["reason"] = (
-            f"{timeouts + errors} of the last {total} recall attempts failed: "
-            f"{errors} errors and {timeouts} missed the deadline"
+            f"{timeouts + errors} of the last {total} recall attempts in the last "
+            f"{window_minutes} minutes failed: {errors} errors and {timeouts} missed the deadline"
         )
-        out["fix"] = (
-            "run `khipu snapshot refresh`; if this stays red the machine cannot "
-            "answer inside the deadline and per-prompt recall is effectively off"
-        )
+        out["fix"] = OUTCOMES_FIX
     return out
 
 

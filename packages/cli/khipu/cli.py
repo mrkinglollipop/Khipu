@@ -3065,6 +3065,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         FLOAT_SETTINGS,
         INT_SETTINGS,
         LIST_SETTINGS,
+        MINUTE_SETTINGS,
         capture_mode,
         config_file,
         gateway_url,
@@ -3291,6 +3292,17 @@ def cmd_config(args: argparse.Namespace) -> int:
         value, source = choice_setting(key)
         print(json.dumps({"ok": True, key: value, "source": source, "config_file": str(path)}))
         return 0
+    if (args.set and args.set[0] in MINUTE_SETTINGS) or args.unset in MINUTE_SETTINGS:
+        from khipu.config import minute_settings_status, set_minute_setting
+
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = set_minute_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: minute_settings_status()[key], "config_file": str(path)}))
+        return 0
     if (args.set and args.set[0] in INT_SETTINGS) or args.unset in INT_SETTINGS:
         # Daily call ceilings (synth_daily_calls, embed_daily_calls,
         # library_embed_daily_calls): whole numbers >= 0, 0 = unlimited.
@@ -3364,6 +3376,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         float_settings_status,
         graph_backup_remote_status,
         list_setting,
+        minute_settings_status,
         path_settings_status,
     )
 
@@ -3380,6 +3393,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "paths": path_settings_status(),
         "user_aliases": list(list_setting("user_aliases")),
         "float_settings": float_settings_status(),
+        "minute_settings": minute_settings_status(),
         "relevance_cosine_floor": relevance.cosine_floor_status(),
         "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
         "usage_accounts": usage.accounts_status(),
@@ -5620,12 +5634,13 @@ def build_parser() -> argparse.ArgumentParser:
         "window does on a provider other than Gemini), the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew") '
         "the graph backup destination (graph_backup_remote, an rclone "
-        "remote:path, default r2:khipu-backups/khipu-graph) "
+        "remote:path, default r2:khipu-backups/khipu-graph), how far back "
+        "doctor's rate checks look (doctor_rate_window_minutes, default 60) "
         "or the plan usage accounts as JSON (usage_accounts "
         '\'[{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}]\')',
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting, a daily call ceiling, synth_fallback, graph_backup_remote or usage_accounts, or "
+                     help="Remove a path setting, a daily call ceiling, a minutes setting, synth_fallback, graph_backup_remote or usage_accounts, or "
                      "relevance.cosine_floor / "
                      "relevance.cosine_floor_by_profile.<profile> to restore its default")
     cfg.add_argument(

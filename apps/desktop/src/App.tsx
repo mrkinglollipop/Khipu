@@ -66,6 +66,7 @@ import {
   PathOverridesCard,
   GraphBackupRemoteCard,
 } from "./SettingsControls";
+import { HealthChecksCard } from "./HealthChecksCard";
 import {
   launchWhatsNew,
   recordVersionOnSetupFinish,
@@ -1602,6 +1603,21 @@ export default function App() {
     setError(null);
     try {
       await invoke<string>("khipu_migrate", { dryRun: false });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setProbeBusy(false);
+      await loadDoctor(true);
+    }
+  }, [loadDoctor]);
+
+  /** `khipu snapshot refresh` through its fixed-argv command: rebuilds this
+   *  Mac's offline copy, the fix doctor names for prompt-time recall. */
+  const refreshSnapshot = useCallback(async () => {
+    setProbeBusy(true);
+    setError(null);
+    try {
+      await invoke<string>("khipu_snapshot_refresh");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -3656,6 +3672,8 @@ export default function App() {
                             setTab("harnesses");
                           } else if (a.fix?.kind === "apply-migrations") {
                             void applyMigrations();
+                          } else if (a.fix?.kind === "refresh-snapshot") {
+                            void refreshSnapshot();
                           }
                         }}
                       >
@@ -3982,6 +4000,8 @@ export default function App() {
                     setTab("revisions");
                   } else if (fix.kind === "apply-migrations") {
                     void applyMigrations();
+                  } else if (fix.kind === "refresh-snapshot") {
+                    void refreshSnapshot();
                   }
                 }}
               />
@@ -5928,6 +5948,8 @@ export default function App() {
                     </div>
 
                     <JobsCard active={tab === "settings" && settingsSection === "advanced"} />
+
+                    <HealthChecksCard active={tab === "settings" && settingsSection === "advanced"} />
 
                     <RawJson
                       text={settingsRawText}

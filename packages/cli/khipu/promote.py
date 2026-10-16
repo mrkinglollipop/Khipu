@@ -64,7 +64,7 @@ _SUMMARY_RE = re.compile(
 # The summary line's last field when the routing push is on (phase 3b), and
 # the search's degraded note before it.
 _ROUTING_FIELD_RE = re.compile(r" routing=(?P<status>\S+)\s*$")
-_DEGRADED_RE = re.compile(r" degraded=(?P<degraded>.*?)(?= stage=| routing=|\s*$)")
+_DEGRADED_RE = re.compile(r" degraded=(?P<degraded>.*?)(?= stage=| offline=| routing=|\s*$)")
 _LEGS_RE = re.compile(r" legs=(?P<legs>\[.*?\]) degraded=")
 # Routing statuses a candidate's replay with the push on may log and still
 # pass: it waited for another fold past its budget (``fold-busy``: on a live

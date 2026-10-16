@@ -302,7 +302,7 @@ class DoctorOutcomesTest(unittest.TestCase):
         now = datetime(2026, 9, 28, tzinfo=timezone.utc)
         lines = []
         for i in range(25):
-            ts = (now - timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ts = (now - timedelta(minutes=2 * i)).strftime("%Y-%m-%dT%H:%M:%SZ")
             reason = "timeout>1.2s" if i % 10 == 0 else "ok"  # ~12% timeouts
             lines.append(_log_line(ts, reason, 800.0 + i))
         self._write(lines)
@@ -317,7 +317,7 @@ class DoctorOutcomesTest(unittest.TestCase):
         now = datetime(2026, 9, 28, tzinfo=timezone.utc)
         lines = []
         for i in range(25):
-            ts = (now - timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ts = (now - timedelta(minutes=2 * i)).strftime("%Y-%m-%dT%H:%M:%SZ")
             reason = "ok" if i % 10 == 0 else "timeout>1.2s"  # ~88% timeouts
             lines.append(_log_line(ts, reason, 1200.0))
         self._write(lines)
@@ -403,7 +403,7 @@ class DoctorOutcomesTest(unittest.TestCase):
             ts = (now - timedelta(minutes=200 - i)).strftime("%Y-%m-%dT%H:%M:%SZ")
             lines.append(_log_line(ts, "ok", 500.0))
         self._write(lines)
-        out = rp.prompt_recall_outcomes(now=now)
+        out = rp.prompt_recall_outcomes(now=now, window_s=rp._OUTCOMES_WINDOW_S)
         self.assertTrue(out["ok"])
         self.assertEqual(out["count"], rp._OUTCOMES_MAX_CALLS)
         self.assertEqual(out["timeout_rate"], 0.0)
@@ -418,11 +418,65 @@ class DoctorOutcomesTest(unittest.TestCase):
             ts = (now - timedelta(minutes=200 - i)).strftime("%Y-%m-%dT%H:%M:%SZ")
             lines.append(_log_line(ts, "timeout>1.2s", 1200.0))
         self._write(lines)
-        out = rp.prompt_recall_outcomes(now=now)
+        out = rp.prompt_recall_outcomes(now=now, window_s=rp._OUTCOMES_WINDOW_S)
         self.assertFalse(out["ok"])
         self.assertEqual(out["timeout_rate"], 1.0)
         self.assertIn("deadline", out["reason"])
-        self.assertIn("khipu snapshot refresh", out["fix"])
+        self.assertIn("Refresh offline copy", out["fix"])
+        self.assertNotIn("khipu ", out["fix"])
+
+    # Offline and self-healing, slice 1: the check judges a time window.
+
+    def _timeouts(self, now: datetime, minutes_ago: int, n: int = 100, *, offline: bool = False) -> list[str]:
+        out = []
+        for i in range(n):
+            ts = (now - timedelta(minutes=minutes_ago, seconds=n - i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            out.append(_log_line(ts, "timeout>1.2s", 1200.0) + (" offline=1" if offline else ""))
+        return out
+
+    def test_an_old_outage_ages_out_on_an_idle_mac(self) -> None:
+        now = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc)
+        self._write(self._timeouts(now, minutes_ago=120))
+        out = rp.prompt_recall_outcomes(now=now, window_s=3600)
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["quiet"])
+        self.assertEqual(out["count"], 0)
+        self.assertEqual(out["window_minutes"], 60)
+
+    def test_recent_timeouts_stay_red(self) -> None:
+        now = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc)
+        self._write(self._timeouts(now, minutes_ago=5))
+        out = rp.prompt_recall_outcomes(now=now, window_s=3600)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["count"], 100)
+        self.assertEqual(out["timeout_rate"], 1.0)
+
+    def test_offline_calls_are_not_failures(self) -> None:
+        now = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc)
+        ok_ts = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lines = self._timeouts(now, minutes_ago=10, offline=True) + [_log_line(ok_ts, "ok", 300.0)] * 25
+        self._write(lines)
+        out = rp.prompt_recall_outcomes(now=now, window_s=3600)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["offline"], 100)
+        self.assertEqual(out["count"], 25)
+        self.assertEqual(out["timeout_rate"], 0.0)
+
+    def test_only_offline_calls_in_the_window_is_not_red(self) -> None:
+        now = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc)
+        self._write(self._timeouts(now, minutes_ago=5, offline=True))
+        out = rp.prompt_recall_outcomes(now=now, window_s=3600)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["offline"], 100)
+
+    def test_the_window_is_the_owner_setting(self) -> None:
+        now = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc)
+        self._write(self._timeouts(now, minutes_ago=120))
+        with mock.patch("khipu.config.minute_setting", return_value=180) as setting:
+            out = rp.prompt_recall_outcomes(now=now)
+        setting.assert_called_with("doctor_rate_window_minutes")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["window_minutes"], 180)
 
     def test_doctor_never_raises_on_an_unreadable_directory(self) -> None:
         # _log_path pointed at a path whose parent does not exist at all —

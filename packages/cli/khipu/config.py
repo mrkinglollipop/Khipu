@@ -411,6 +411,66 @@ def set_int_setting(key: str, value: "int | None") -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Lengths of time in whole minutes, each with its default and its allowed
+# range. `doctor_rate_window_minutes` is how far back doctor's rate checks
+# (prompt-time recall outcomes, search fallbacks) look, so a past outage ages
+# out on its own (docs/plans/2026-10-16-offline-and-self-healing.md, D).
+# ---------------------------------------------------------------------------
+
+MINUTE_SETTINGS: dict[str, tuple[int, int, int]] = {
+    "doctor_rate_window_minutes": (60, 5, 7 * 24 * 60),
+}
+
+
+def parse_minute_setting(key: str, raw: "str | int") -> int:
+    """``raw`` as whole minutes inside the key's range; ValueError names the
+    key and the range otherwise."""
+    _default, low, high = MINUTE_SETTINGS[key]
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a whole number of minutes, got {raw!r}") from None
+    if not low <= value <= high:
+        raise ValueError(f"{key} must be between {low} and {high} minutes, got {value}")
+    return value
+
+
+def minute_setting(key: str) -> int:
+    """The stored minutes for ``key``, or its default when unset or invalid."""
+    default, _low, _high = MINUTE_SETTINGS[key]
+    stored = load_config().get(key)
+    if isinstance(stored, bool) or not isinstance(stored, int):
+        return default
+    try:
+        return parse_minute_setting(key, stored)
+    except ValueError:
+        return default
+
+
+def set_minute_setting(key: str, value: "str | int | None") -> Path:
+    if key not in MINUTE_SETTINGS:
+        raise KeyError(f"unknown minutes setting {key!r}; known: {sorted(MINUTE_SETTINGS)}")
+    with mutate_config() as data:
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = parse_minute_setting(key, value)
+        return config_file()
+
+
+def minute_settings_status() -> dict:
+    """Every minutes setting with its value, source and range, for
+    ``khipu config``."""
+    out = {}
+    stored = load_config()
+    for key, (default, low, high) in MINUTE_SETTINGS.items():
+        value = minute_setting(key)
+        source = "file" if key in stored and stored.get(key) == value else "default"
+        out[key] = {"value": value, "source": source, "default": default, "min": low, "max": high}
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Choice settings: one of a fixed set of words. `synth_fallback` says what
 # happens when a summariser provider other than Gemini fails a window
 # (account limit, not logged in, transport error, a reply that is not the
