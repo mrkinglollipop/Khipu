@@ -128,8 +128,8 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     registry_error: str | None = None
     try:
         for _round in range(_PUBLISH_ROUNDS):
-            publish_forget([*(read["source_rows"] or []), *read["column_sources"]],
-                           read["tombstone_payloads"], read["candidates"])
+            publish_forget(_registered_sources(read), read["tombstone_payloads"],
+                           read["candidates"])
             again = _read_forget_sources(cur, episode_id, live)
             grown = bool(_read_identities(again) - _read_identities(read))
             read = again
@@ -237,6 +237,10 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         "legacy_identities": legacy_identities,
         "has_merged_sources": has_merged_sources,
         "source_rows": source_rows,
+        # The queued-job scans match on what the registry fences, natural
+        # identities from the episode's columns included. A pre-0027 hub has
+        # no source rows, and its scans keep any same-session job instead.
+        "scan_sources": None if source_rows is None else _registered_sources(read),
         "unidentified_sources": unidentified_sources,
         "shared_identities": shared_identities,
         "registry_error": registry_error,
@@ -244,6 +248,13 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
 
 
 _PUBLISH_ROUNDS = 3
+
+
+def _registered_sources(read: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every source identity one read names: the source rows and the natural
+    identities the episode's columns hold. The registry fences exactly these,
+    and every queued-job scan matches against the same list."""
+    return [*(read["source_rows"] or []), *read["column_sources"]]
 
 
 def _payload_identities(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1176,17 +1187,67 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
             "inspected": inspected}
 
 
+GOLDEN_TEMP_PREFIX = ".recall-golden."
+
+
 def _scrub_recall_golden(episode_id: int) -> dict[str, Any]:
     """Drop every recall test line that names this episode: its query
     usually quotes the episode's text. A file that cannot be read, judged or
-    rewritten keeps the forget open."""
+    rewritten keeps the forget open. Rewrite temps a crash left beside it are
+    removed first."""
+    from khipu.recall_eval import default_golden_path
+
+    try:
+        path = default_golden_path()
+    except OSError as exc:
+        return {"ok": False, "removed": 0, "locations": [{
+            "place": "recall golden set", "path": None, "state": "unreadable",
+            "why": f"the recall test file could not be found ({type(exc).__name__}), so it may "
+                   "still quote this episode"}]}
+    temps = _remove_golden_temps(path.parent)
+    out = _scrub_golden_file(path, episode_id)
+    out["locations"] = [*temps, *out["locations"]]
+    out["ok"] = out["ok"] and not any(loc["state"] in INCOMPLETE_STATES for loc in temps)
+    return out
+
+
+def _remove_golden_temps(directory: Path) -> list[dict[str, str]]:
+    """Remove every ``.recall-golden.*.tmp`` in the golden file's folder. Only
+    this scrub writes them, under the memory lock forget holds exclusive, so
+    any one seen here was left by a crash mid-rewrite. It may hold the whole
+    file, quotes of this episode included, and is never restored from a backup
+    (a hidden name no store claims)."""
+    place = "recall golden temp"
+    try:
+        names = [n for n in _listing(directory)
+                 if n.startswith(GOLDEN_TEMP_PREFIX) and n.endswith(".tmp")]
+    except OSError as exc:
+        return [{"place": place, "path": str(directory), "state": "unreadable",
+                 "why": f"the recall test folder could not be listed ({type(exc).__name__}), so a "
+                        "crash-left rewrite may still quote this episode"}]
+    locations: list[dict[str, str]] = []
+    for name in names:
+        temp = directory / name
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            locations.append({"place": place, "path": str(temp), "state": "copy remains",
+                              "why": f"a crash-left recall test rewrite {temp} could not be removed "
+                                     f"({type(exc).__name__}), so it may still quote this episode"})
+        else:
+            locations.append({"place": place, "path": str(temp), "state": "removed"})
+    return locations
+
+
+def _scrub_golden_file(path: Path, episode_id: int) -> dict[str, Any]:
     import tempfile
 
-    from khipu.recall_eval import default_golden_path, drop_forgotten_lines
+    from khipu.recall_eval import drop_forgotten_lines
 
     place = "recall golden set"
     try:
-        path = default_golden_path()
         fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return {"ok": True, "removed": 0, "locations": []}
@@ -1201,7 +1262,7 @@ def _scrub_recall_golden(episode_id: int) -> dict[str, Any]:
                 raise OSError("not a regular file")
             text, removed = drop_forgotten_lines(handle.read().decode("utf-8"), [episode_id])
         if removed:
-            tmp_fd, tmp = tempfile.mkstemp(prefix=".recall-golden.", suffix=".tmp", dir=path.parent)
+            tmp_fd, tmp = tempfile.mkstemp(prefix=GOLDEN_TEMP_PREFIX, suffix=".tmp", dir=path.parent)
             try:
                 with os.fdopen(tmp_fd, "wb") as out:
                     out.write(text.encode("utf-8"))
@@ -1572,12 +1633,12 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         partial.append("legacy_file")
     out["outboxes"] = [_outbox_remainder(out.get("session_id"),
                                        has_merged_sources=out.get("has_merged_sources", False),
-                                       source_rows=out.get("source_rows"),
+                                       source_rows=out.get("scan_sources"),
                                        episode_id=episode_id)]
     out["replica_temps"] = _replica_temp_remainder(episode_id)
     if not out["replica_temps"]["ok"]:
         partial.append("replica_temp")
-    out["native_jobs"] = _native_job_remainder(out.get("session_id"), out.get("source_rows"),
+    out["native_jobs"] = _native_job_remainder(out.get("session_id"), out.get("scan_sources"),
                                                out.get("has_merged_sources", False))
     if not out["native_jobs"]["ok"]:
         partial.append("native_jobs")

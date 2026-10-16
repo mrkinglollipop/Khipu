@@ -505,11 +505,15 @@ Limits accepted for this merge, each a follow-up rather than a blocker:
 - **The recall eval record is kept.** `khipu recall eval --record` writes the golden queries, quoted text
   included, to a file the owner names outside the data folder; forget cannot find it. Follow-up: write
   records into the data folder so the recall golden scan can cover them.
-- **Open from the final review (round 15), fixed next on their own branch.** (1) The native-queue and
-  outbox scans get only source rows, not the natural identities recovered from episode columns, so a job
-  keyed by a historical fallback identity can stay while forget reports complete. (2) A temporary
-  `.recall-golden.*.tmp` left by a crash mid-rewrite is not scanned, so forget can report complete while it
-  still quotes the episode. Both have failing probes and are fixed on fix/forget-followups.
+- **Fixed from the final review (round 15).** (1) The native-queue and outbox scans got only source rows,
+  not the natural identities recovered from episode columns, so a job keyed by a historical fallback
+  identity could stay while forget reported complete. Now `forget._registered_sources` is the one list the
+  registry fences and both scans match against (`scan_sources` in the forget result). A pre-0027 hub has
+  no source rows and keeps its same-session fallback. (2) A `.recall-golden.*.tmp` left by a crash
+  mid-rewrite was never scanned. The recall golden store now owns that temp pattern: forget removes every
+  one beside the golden file (only the scrub writes them, under the memory lock forget holds), a temp it
+  cannot remove keeps the forget open, and backup import never restores one (a hidden name no store
+  claims). Tests: `tests/test_forget_round15.py`.
 - **A recall golden line is matched by episode id only.** A line whose query quotes a forgotten episode
   but whose `expect` names only a topic or another episode is kept, since the registry holds identities and
   ids, never the forgotten text.

@@ -111,10 +111,11 @@ STORES: tuple[Store, ...] = (
     Store("legacy writer", "data folder .legacy_writers/<pgid>.json",
           "the process group of a legacy writer that may still append", "legacy writers",
           _w("writer_groups.record")),
-    Store("recall golden set", "data folder recall-golden.jsonl, or the file KHIPU_RECALL_GOLDEN names",
+    Store("recall golden set", "data folder recall-golden.jsonl, or the file KHIPU_RECALL_GOLDEN names, "
+          "and .recall-golden.*.tmp rewrites beside it",
           "recall test queries, which usually quote a captured episode's private text, each "
           "with the episode ids it expects", "recall golden",
-          _w("forget._scrub_recall_golden"),
+          _w("forget._scrub_golden_file"),
           Restore(("recall-golden.jsonl",), "recall golden")),
     Store("recall eval record", "a file the owner names with khipu recall eval --record",
           "the golden queries, quoted text included, and the ids each one returned",
