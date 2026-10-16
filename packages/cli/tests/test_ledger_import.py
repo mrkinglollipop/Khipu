@@ -544,3 +544,76 @@ def test_khipu_ledger_cuts_full_paths_to_their_last_name(hub):
     assert row["title"] == "Check records.csv today"
     assert row["evidence"] == "see plan.md and x.txt, https://example.com/a/b/c"
     assert row["history"][0]["note"] == "moved from build"
+
+
+# ---- (n) review round 2b regressions -------------------------------------------------------
+
+
+def test_an_unresolved_conflict_blocks_updates_on_the_next_catch_up(hub, tmp_path):
+    doc = {"rows": {"a": _row("a")}}
+    path = _write(tmp_path, doc)
+    assert _import(path)[0] == 0
+    ok("set", "a", "--state", "IN FLIGHT")
+    doc["rows"]["a"].update(state="BUILT-UNMERGED", updated="2026-10-02T00:00:00Z")
+    doc["rows"]["a"]["history"].append({"at": "2026-10-02T00:00:00Z", "event": "Built"})
+    _write(tmp_path, doc)
+    rc, first = _import(path, "--catch-up")
+    assert rc == 0 and first["plan"]["both"] == ["a"], first
+    # Neither the conflict note nor the file's entries brought in with it settle the row.
+    doc["rows"]["a"].update(state="DONE", updated="2026-10-03T00:00:00Z")
+    _write(tmp_path, doc)
+    rc, second = _import(path, "--catch-up")
+    state = _sql(hub, "SELECT state FROM ledger_rows WHERE row_id = 'a'")[0][0]
+    assert rc == 0 and second["plan"]["both"] == ["a"] and not second["plan"]["updated"], second
+    assert state == "IN FLIGHT"
+
+
+def test_two_secret_shaped_keys_in_one_object_are_both_kept(hub, tmp_path):
+    row = _row("a")
+    row["extra"] = {KEY: "first value", KEY[:-1] + "Z": "second value"}
+    rc, report = _import(_write(tmp_path, {"rows": {"a": row}}))
+    assert rc == 0 and report["result"] == "done", report
+    assert len(report["masked"]) == 2 and len(set(report["masked"])) == 2, report["masked"]
+    back = _export()["a"]["extra"]
+    assert sorted(back.values()) == ["first value", "second value"], back
+    assert KEY not in json.dumps(back) and KEY not in json.dumps(report)
+
+
+def test_a_changed_native_history_entry_rolls_the_import_back(hub, tmp_path, monkeypatch):
+    from khipu import ledger_import
+
+    ok("add", "local", "--title", "Local row", "--kind", "slice", "--note", "Original note")
+    real = ledger_import._insert_rows
+
+    def corrupt(cur, project, ids, rows, now):
+        real(cur, project, ids, rows, now)
+        cur.execute("UPDATE ledger_history SET note = 'CORRUPTED' WHERE project = %s AND row_id = 'local'", (P,))
+
+    monkeypatch.setattr(ledger_import, "_insert_rows", corrupt)
+    rc, report = _import(_write(tmp_path, {"rows": {"a": _row("a")}}))
+    notes = _sql(hub, "SELECT note FROM ledger_history WHERE row_id = 'local'")
+    assert rc == 1 and report["result"] == "rolled back", report
+    assert notes == [("Original note",)]
+
+
+def test_a_link_in_a_parent_folder_is_refused(tmp_path):
+    from khipu import ledger, ledger_import
+
+    real = tmp_path / "real"
+    real.mkdir()
+    _write(real, {"rows": {"a": _row("a")}})
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ledger.LedgerError) as caught:
+        ledger_import.read_tracker(alias / "tracker.json")
+    assert caught.value.reason == "refused" and "link" in str(caught.value)
+
+
+def test_khipu_ledger_cuts_a_path_in_the_owner_and_refuses_one_as_a_project(hub):
+    err, got = _tool({"verb": "add", "project": P, "id": "a", "title": "Work", "kind": "slice",
+                      "owner": "/private/customer/alice"})
+    assert not err, got
+    assert _sql(hub, "SELECT owner FROM ledger_rows WHERE row_id = 'a'") == [("alice",)]
+    err, got = _tool({"verb": "add", "project": "/private/customer/acme", "id": "b", "title": "Work",
+                      "kind": "slice"})
+    assert err and got["reason"] == "path", got

@@ -1873,19 +1873,23 @@ _LEDGER_TEXT = ("project", "id", "title", "kind", "parent", "state", "evidence",
                 "children", "op_id")
 
 
-_LEDGER_FREE_TEXT = ("title", "evidence", "note")
+# Fields that name a row or a project: cutting a path in one would point at
+# another, so a path there is refused instead. A link is not a path.
+_LEDGER_NAMES = ("project", "id", "parent", "children", "if_state", "op_id", "link")
 # A path at a word's start ("/x", "~/x", a backslash path, a drive letter)
 # or a word holding two or more folder separators.
-_LEDGER_PATH = re.compile(r"^(?:~[/\\]|/(?=[\w.~-])|\\|[A-Za-z]:[/\\])|[^/\\]+[/\\][^/\\]*[/\\]")
+_LEDGER_PATH_START = r"^(?:~[/\\]|/(?=[\w.~-])|\\|[A-Za-z]:[/\\])"
+_LEDGER_PATH = re.compile(_LEDGER_PATH_START + r"|[^/\\]+[/\\][^/\\]*[/\\]")
 
 
 def _ledger_args(args: dict) -> dict:
     """The one check every text field of ``khipu_ledger`` passes before
     anything is written or queued (rule 4: titles and short plain words,
     never code, file contents, logs or private paths). Text only; nothing
-    key-shaped; one line with no control characters and no code fence; and in
-    the free-text fields each path-shaped word cut to its last name (a link
-    is not a path). Returns the fields as they will be saved."""
+    key-shaped; one line with no control characters and no code fence; in a
+    field naming a row or project no word starting as a path; and in every
+    other field each path-shaped word cut to its last name. Returns the
+    fields as they will be saved."""
     from khipu import ledger
 
     for key in _LEDGER_TEXT:
@@ -1900,7 +1904,10 @@ def _ledger_args(args: dict) -> dict:
         if "```" in value or any(ord(c) < 32 or 0x7F <= ord(c) <= 0x9F or c in "\u2028\u2029" for c in value):
             raise ledger.LedgerError(f"{key} must be one line of plain words about the work: no code, file "
                                      "contents, command output or logs. Nothing was saved", "not_one_line")
-        if key in _LEDGER_FREE_TEXT:
+        if key in _LEDGER_NAMES:
+            if key != "link" and any(re.match(_LEDGER_PATH_START, w) for w in value.split()):
+                raise ledger.LedgerError(f"{key} must not be a file path. Nothing was saved", "path")
+        else:
             words = []
             for word in value.split(" "):
                 if not word.startswith("https://") and _LEDGER_PATH.search(word):
