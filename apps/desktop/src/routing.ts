@@ -206,6 +206,8 @@ export type RoutePriority = {
   pending_by?: string | null;
   owner_request?: string | null;
   replaced?: { entries: RoutePriorityEntry[]; until?: string | null } | null;
+  /** The priority as read; a write that carries it is refused once it moved. */
+  version?: string | null;
 };
 
 /** What Khipu read of an account's plan (`routing.plan_fact`): its longest
@@ -226,6 +228,8 @@ export type PlanFact = {
 export type RouteView = {
   record?: boolean;
   version?: number;
+  /** The priority's version, also when none is set (`version_moved` guard). */
+  priority_version?: string | null;
   checked_at?: string;
   accounts?: RouteAccount[];
   holds?: RouteHold[];

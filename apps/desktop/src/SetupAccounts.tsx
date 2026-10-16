@@ -10,7 +10,9 @@
    nothing, and a change made elsewhere while setup is open (an account
    renamed, removed or added) is kept. Skip for now writes nothing. The
    writes are the ones Settings makes: `config --set usage_accounts`,
-   `route priority set` and the `routing_push` feature switch. */
+   `route priority set` and the `routing_push` feature switch. The first two
+   carry the version they read, so a change saved elsewhere between that read
+   and the write is refused, never overwritten. */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
@@ -29,7 +31,14 @@ import {
 } from "./PlansCard";
 import type { UsageAccount, UsageAccountEntry } from "./PlansCard";
 
-type AccountsStatus = { source: "file" | "default"; accounts: UsageAccountEntry[]; user_home?: string | null };
+/** `version` names the list as read: a save carries it (`expect`) and is
+ *  refused (`version_moved`) when the list changed after it was read. */
+type AccountsStatus = {
+  source: "file" | "default";
+  accounts: UsageAccountEntry[];
+  user_home?: string | null;
+  version?: string | null;
+};
 
 const CLI_TITLE: Record<string, string> = Object.fromEntries(USAGE_HARNESS_OPTIONS);
 
@@ -303,9 +312,29 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
 
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Set when a save was refused because what it read changed meanwhile: the
+  // error then offers Reload, which reads both again.
+  const [moved, setMoved] = useState(false);
+  const [reloading, setReloading] = useState(false);
   useEffect(() => {
-    if (!active) setErr(null);
+    if (!active) {
+      setErr(null);
+      setMoved(false);
+    }
   }, [active]);
+
+  async function reload() {
+    setReloading(true);
+    try {
+      const [c, r] = await Promise.all([cfg.read(), route.read()]);
+      if (c.ok && r.ok) {
+        setErr(null);
+        setMoved(false);
+      }
+    } finally {
+      setReloading(false);
+    }
+  }
 
   const move = (i: number, by: -1 | 1) => {
     const key = order[i];
@@ -322,6 +351,7 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
   async function next() {
     setSaving(true);
     setErr(null);
+    setMoved(false);
     // What the screen promised when Next was pressed: the help line's list
     // and the order shown. A fresh read that gives a different plan writes
     // nothing; the screen then shows the new plan and Next is pressed again.
@@ -333,6 +363,15 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
       setErr(
         `${done.length ? `Khipu saved ${listOf(done)}, but` : "Khipu"} couldn't ${cant}. Try Next again, or Skip for now and change it later in Settings.`,
       );
+    const refusedAsMoved = (res: { refusal?: Record<string, unknown> }, what: string): boolean => {
+      if (res.refusal?.code !== "version_moved") return false;
+      setErr(
+        `${done.length ? `Khipu saved ${listOf(done)}, but ` : ""}${what} was changed somewhere else after setup read it, ` +
+          "so Khipu didn't save over it. Reload to see what is saved now, then press Next again.",
+      );
+      setMoved(true);
+      return true;
+    };
     const changedElsewhere = (what: string) =>
       setErr(
         `${done.length ? `Khipu saved ${listOf(done)}. ` : ""}${what} changed while setup was open, so Khipu saved nothing more. ` +
@@ -357,9 +396,10 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         if (plan.kind !== "none") {
           const res =
             plan.kind === "unset"
-              ? await callCli("khipu_config_unset", { key: "usage_accounts" })
-              : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(plan.list) });
+              ? await callCli("khipu_config_unset", { key: "usage_accounts", expect: fresh.version ?? null })
+              : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(plan.list), expect: fresh.version ?? null });
           if (!res.ok) {
+            if (refusedAsMoved(res, "the account list")) return;
             console.error("khipu config usage_accounts failed:", res.error);
             say("save which accounts to read");
             return;
@@ -401,8 +441,14 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         }
         const plan = planPriority(r.data.priority ?? null, vis, moves, uh);
         if (plan) {
-          const res = await callCli("khipu_route_priority", { action: "set", entries: plan.entries, until: plan.until });
+          const res = await callCli("khipu_route_priority", {
+            action: "set",
+            entries: plan.entries,
+            until: plan.until,
+            expect: r.data.priority?.version ?? r.data.priority_version ?? null,
+          });
           if (!res.ok) {
+            if (refusedAsMoved(res, "your order")) return;
             console.error("khipu route priority failed:", res.error);
             say("save the order");
             return;
@@ -641,7 +687,17 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         </div>
       </div>
       <p className="set-help">Standing rules and holds can be added later in Settings → Accounts and routing.</p>
-      {err ? <p className="set-error" role="alert">{err}</p> : null}
+      {err ? (
+        <div className="set-error" role="alert">
+          <p>{err}</p>
+          {moved ? (
+            <button type="button" className="sm" onClick={() => void reload()} disabled={reloading || saving} aria-busy={reloading || undefined}>
+              {reloading ? <Loader2 size={14} className="spin" aria-hidden /> : null}
+              Reload
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="toolbar welcome-nav">
         <button type="button" onClick={onBack} disabled={saving}>

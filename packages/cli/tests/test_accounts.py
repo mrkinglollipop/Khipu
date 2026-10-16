@@ -402,6 +402,20 @@ def test_the_priority_takes_its_version(mac, capsys):
     assert rc == 0 and routing.read_view()["priority"] is None
 
 
+def test_the_route_view_names_the_priority_version_with_no_priority_set(mac, capsys):
+    # Setup's first order is saved with the version read even when no priority
+    # is set, and after a clear the version is no longer p0.
+    rc, out = _cli(["route", "--json"], capsys)
+    assert rc == 0 and out["priority"] is None and out["priority_version"] == "p0"
+    assert _cli(["route", "priority", "set", "Codex", "--from-app", "--expect=p0"], capsys)[0] == 0
+    version = _cli(["route", "--json"], capsys)[1]["priority_version"]
+    assert _cli(["route", "priority", "clear", "--from-app", f"--expect={version}"], capsys)[0] == 0
+    rc, out = _cli(["route", "--json"], capsys)
+    assert out["priority"] is None and out["priority_version"] not in ("p0", version)
+    assert _cli(["route", "priority", "set", "Codex", "--from-app", f"--expect={out['priority_version']}"],
+                capsys)[0] == 0
+
+
 def test_owner_writes_need_the_app_or_a_typed_yes(mac, capsys):
     entries = f"--entries={json.dumps([CLIENT])}"
     rc, out = _cli(["accounts", "track", entries], capsys)
