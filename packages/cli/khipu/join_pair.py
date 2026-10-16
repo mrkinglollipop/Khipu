@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from khipu.output_guard import guard_output
+from khipu.output_guard import emit_pairing_banner, guard_output
 from khipu.join_errors import JoinError
 
 SERVICE_TYPE = "_khipu-join._tcp"
@@ -638,7 +638,7 @@ def advertise_join_kit(
         passphrase,
         timeout_s=timeout,
         pin=pin,
-        on_ready=lambda: print(json.dumps(banner), flush=True),
+        on_ready=lambda: emit_pairing_banner(json.dumps(banner) + "\n"),
         allow_unencrypted=allow_unencrypted,
     )
     out["phase"] = "finished"
