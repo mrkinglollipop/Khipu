@@ -2,7 +2,7 @@
 // nothing is written until Next, and only what the owner changed.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { SetupAccountsStep } from "../SetupAccounts";
+import { accountId, planAccountList, SetupAccountsStep } from "../SetupAccounts";
 import { Welcome } from "../Welcome";
 
 const invokeMock = vi.fn();
@@ -53,6 +53,8 @@ type Opts = {
   source?: "file" | "default";
   configFailAfterFirst?: boolean;
   failOnce?: string[];
+  /** Writes whose next call finds the thing changed elsewhere first. */
+  raceOnce?: string[];
 };
 
 /** What the fake Khipu holds now: writes change it, and a test can change
@@ -63,6 +65,9 @@ type World = {
   priority: { entries: Array<{ account: string; label: string; role?: string | null; until?: string | null }>; until?: string | null } | null;
   push: boolean;
   rows: unknown[];
+  /** Bumped on every write, as the CLI's versions move. */
+  listVersion: number;
+  priorityVersion: number;
 };
 let world: World;
 /** Commands whose next answer is captured when asked and held until released. */
@@ -78,6 +83,15 @@ function fake(o: Opts = {}): World {
     priority: (o.priority as World["priority"]) ?? null,
     push: true,
     rows: (o.rows ?? report().accounts) as unknown[],
+    listVersion: 1,
+    priorityVersion: 0,
+  };
+  const racing = new Set(o.raceOnce ?? []);
+  const moved = { ok: false, error: "the account list changed after it was read; read it again", code: "version_moved" };
+  // The CLI's compare-and-swap: a write that names a version is refused once it moved.
+  const listMoved = (cmd: string, args: Record<string, unknown> | undefined) => {
+    if (racing.delete(cmd)) world.listVersion += 1;
+    return args?.expect != null && args.expect !== `a${world.listVersion}`;
   };
   holding = new Set();
   held = [];
@@ -90,14 +104,20 @@ function fake(o: Opts = {}): World {
         return JSON.stringify(report(world.rows));
       case "khipu_config_show":
         if (o.configFailAfterFirst && calls("khipu_config_show").length > 1) throw new Error("config failed");
-        return JSON.stringify({ usage_accounts: { source: world.source, accounts: world.accounts, user_home: "/Users/test" } });
+        return JSON.stringify({
+          usage_accounts: { source: world.source, accounts: world.accounts, user_home: "/Users/test", version: `a${world.listVersion}` },
+        });
       case "khipu_config_set":
+        if (listMoved(cmd, args)) return JSON.stringify(moved);
         world.accounts = JSON.parse(String(args?.value));
         world.source = "file";
+        world.listVersion += 1;
         return JSON.stringify({ ok: true });
       case "khipu_config_unset":
+        if (listMoved(cmd, args)) return JSON.stringify(moved);
         world.accounts = [...defaults];
         world.source = "default";
+        world.listVersion += 1;
         return JSON.stringify({ ok: true });
       case "khipu_features_show":
         if (o.featuresFail) throw new Error("no");
@@ -107,8 +127,17 @@ function fake(o: Opts = {}): World {
         return JSON.stringify({ ok: true });
       case "khipu_route_view":
         if (o.routeFail) throw new Error("route failed");
-        return JSON.stringify({ accounts: [], priority: world.priority });
+        return JSON.stringify({
+          accounts: [],
+          priority: world.priority ? { ...world.priority, version: `p${world.priorityVersion}` } : null,
+          priority_version: `p${world.priorityVersion}`,
+        });
       case "khipu_route_priority": {
+        if (racing.delete(cmd)) world.priorityVersion += 1;
+        if (args?.expect != null && args.expect !== `p${world.priorityVersion}`) {
+          return JSON.stringify({ ...moved, error: "the priority changed after it was read; read it again" });
+        }
+        world.priorityVersion += 1;
         const entries = (args?.entries ?? []) as Array<{ account: string; role?: string | null; until?: string | null }>;
         world.priority = { entries: entries.map((e) => ({ ...e, label: e.account })), until: (args?.until as string | null) ?? null };
         return JSON.stringify({ ok: true });
@@ -632,6 +661,110 @@ describe("Setup › Accounts step, review round 5", () => {
   });
 });
 
+describe("Setup › Accounts step, saves carry the version they read", () => {
+  it("the account list is saved with the version Next read", async () => {
+    fake();
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(screen.getAllByLabelText("Read this account's plan")[1]);
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    const set = calls("khipu_config_set");
+    expect(set).toHaveLength(1);
+    expect(set[0][1].expect).toBe("a1");
+  });
+
+  it("going back to the default list is saved with the version read", async () => {
+    fake({ failOnce: ["khipu_route_priority"] });
+    const { onNext } = mount();
+    await ready();
+    const box = () => screen.getAllByLabelText("Read this account's plan")[1];
+    fireEvent.click(box());
+    fireEvent.click(screen.getByRole("button", { name: "Move Grok Build up" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await screen.findByText(/couldn't save the order/);
+    fireEvent.click(box());
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    const unset = calls("khipu_config_unset");
+    expect(unset).toHaveLength(1);
+    expect(unset[0][1].expect).toBe("a2");
+  });
+
+  it("the order is saved with the priority version read, also when no priority is set", async () => {
+    fake();
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(screen.getByRole("button", { name: "Move Codex up" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(calls("khipu_route_priority")[0][1].expect).toBe("p0");
+  });
+
+  it("the order is saved with the version of the priority already set", async () => {
+    const w = fake({ priority: { entries: [{ account: "grok|", label: "Grok Build" }], until: null } });
+    w.priorityVersion = 7;
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(screen.getByRole("button", { name: "Move Codex up" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(calls("khipu_route_priority")[0][1].expect).toBe("p7");
+  });
+
+  it("a list changed elsewhere after Next read it is refused in plain words, and Reload then Next saves it", async () => {
+    const w = fake({ raceOnce: ["khipu_config_set"] });
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(screen.getAllByLabelText("Read this account's plan")[1]);
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    const alert = await screen.findByText(/the account list was changed somewhere else after setup read it/);
+    expect(alert.textContent).toContain("Reload to see what is saved now, then press Next again.");
+    expect(alert.textContent).not.toContain("read it again;");
+    expect(onNext).not.toHaveBeenCalled();
+    expect(w.accounts.map((e) => e.harness)).toEqual(["claude", "codex", "grok", "muse"]);
+    const shows = calls("khipu_config_show").length;
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Reload" })).toBeNull());
+    expect(calls("khipu_config_show").length).toBeGreaterThan(shows);
+    expect(screen.queryByText(/changed somewhere else/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(w.accounts.map((e) => e.harness)).toEqual(["claude", "grok", "muse"]);
+  });
+
+  it("an order changed elsewhere after Next read it is refused, says what was saved, and Reload clears it", async () => {
+    const w = fake({ raceOnce: ["khipu_route_priority"] });
+    const { onNext } = mount();
+    await ready();
+    fireEvent.click(screen.getAllByLabelText("Read this account's plan")[3]);
+    fireEvent.click(screen.getByRole("button", { name: "Move Codex up" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    const alert = await screen.findByText(/your order was changed somewhere else after setup read it/);
+    expect(alert.textContent).toMatch(/^Khipu saved which accounts to read, but /);
+    expect(w.priority).toBeNull();
+    expect(onNext).not.toHaveBeenCalled();
+    const routes = calls("khipu_route_view").length;
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+    await waitFor(() => expect(screen.queryByRole("alert", { name: /changed somewhere else/ })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Reload" })).toBeNull());
+    expect(calls("khipu_route_view").length).toBeGreaterThan(routes);
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await waitFor(() => expect(onNext).toHaveBeenCalled());
+    expect(w.priority?.entries.map((e) => e.account)).toEqual(["codex|", "claude|", "grok|"]);
+  });
+
+  it("any other refusal offers no Reload", async () => {
+    fake({ failOnce: ["khipu_config_set"] });
+    mount();
+    await ready();
+    fireEvent.click(screen.getAllByLabelText("Read this account's plan")[1]);
+    fireEvent.click(screen.getByRole("button", { name: /^Next/ }));
+    await screen.findByText(/couldn't save which accounts to read/);
+    expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
+  });
+});
+
 describe("Setup › the rail", () => {
   it("the rail shows seven steps with Accounts sixth, and Welcome lists the Accounts line", async () => {
     invokeMock.mockImplementation(async () => "{}");
@@ -650,5 +783,46 @@ describe("Setup › the rail", () => {
     expect(items[5]).toHaveTextContent("Accounts");
     expect(screen.getByText(/Setup is seven steps/)).toBeInTheDocument();
     expect(screen.getByText(/see how much of each plan is left/)).toBeInTheDocument();
+  });
+});
+
+describe("Setup › Accounts step, entries it did not change go back as stored (review round 4)", () => {
+  const untouched = { harness: "claude", label: "Untouched", home: ".claude-legacy" };
+  const status = {
+    source: "file" as const,
+    version: "av1",
+    user_home: "/Users/me",
+    value: [{ label: " Codex ", harness: "codex" }, untouched, 7],
+    accounts: [
+      { label: "Codex", harness: "codex", home: null },
+      { label: "Untouched", harness: "claude", home: ".claude-legacy", invalid: "relative folder" },
+      { label: "?", harness: "?", home: null, invalid: "this entry is not an account" },
+    ],
+  };
+
+  it("adds an account without dropping an invalid one or rewriting a valid one", () => {
+    const rows = [{ harness: "claude", home: "~/.claude-client", account: "Client" }] as never[];
+    const plan = planAccountList(status, new Map([[accountId("claude", "~/.claude-client", "/Users/me"), true]]), rows);
+    expect(plan.changed).toBe(true);
+    expect(plan.list).toEqual([
+      { label: " Codex ", harness: "codex" },
+      untouched,
+      7,
+      { label: "Client", harness: "claude", home: "~/.claude-client" },
+    ]);
+    expect(plan.labels).toEqual(["Codex", "Untouched", "?", "Client"]);
+  });
+
+  it("removes only the account unchecked, never matching an invalid entry", () => {
+    const plan = planAccountList(
+      status,
+      new Map([
+        [accountId("codex", null, "/Users/me"), false],
+        [accountId("claude", ".claude-legacy", "/Users/me"), false],
+      ]),
+      [],
+    );
+    expect(plan.list).toEqual([untouched, 7]);
+    expect([...plan.ids]).toEqual([]);
   });
 });

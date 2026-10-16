@@ -69,6 +69,11 @@ def home(tmp_path, monkeypatch):
                                                    "routing_reset_check": False}))
     capture = Path(tempfile.mkdtemp(prefix="krd-", dir="/tmp"))  # AF_UNIX paths are short
     monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
+    # Empty default login folders, so a home-less account is probed (a
+    # missing one reads login_folder_missing without a probe).
+    for name in (".claude", ".codex", ".grok"):
+        (tmp_path / "home" / name).mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(capture))
     monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
     monkeypatch.delenv("ROUTING_NOW_OFF", raising=False)

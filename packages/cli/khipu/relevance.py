@@ -90,22 +90,22 @@ def set_cosine_floor(value: "float | None"):
     """Write ``relevance.cosine_floor`` to config.json where ``cosine_floor()``
     reads it; ``None`` removes it (and an emptied ``relevance`` object) so the
     default applies. Raises ``ValueError`` outside (0, 1]."""
-    from khipu.config import load_config, save_config
+    from khipu.config import config_file, mutate_config
 
-    data = load_config()
-    section = data.get("relevance")
-    section = dict(section) if isinstance(section, dict) else {}
-    if value is None:
-        section.pop("cosine_floor", None)
-    else:
-        if isinstance(value, bool) or not (0.0 < float(value) <= 1.0):
-            raise ValueError(f"relevance.cosine_floor must be a number above 0 and at most 1, got {value!r}")
-        section["cosine_floor"] = float(value)
-    if section:
-        data["relevance"] = section
-    else:
-        data.pop("relevance", None)
-    return save_config(data)
+    if value is not None and (isinstance(value, bool) or not (0.0 < float(value) <= 1.0)):
+        raise ValueError(f"relevance.cosine_floor must be a number above 0 and at most 1, got {value!r}")
+    with mutate_config() as data:
+        section = data.get("relevance")
+        section = dict(section) if isinstance(section, dict) else {}
+        if value is None:
+            section.pop("cosine_floor", None)
+        else:
+            section["cosine_floor"] = float(value)
+        if section:
+            data["relevance"] = section
+        else:
+            data.pop("relevance", None)
+    return config_file()
 
 
 # A profile id as it appears in config.json keys: model@dim, so it may carry
@@ -151,7 +151,7 @@ def set_cosine_floor_for_profile(profile: str, value: "float | None"):
     """Write (or, with ``None``, remove) one profile's floor under
     ``relevance.cosine_floor_by_profile`` in config.json. ``ValueError`` for
     an id that is not a plausible profile id or a value outside (0, 1]."""
-    from khipu.config import load_config, save_config
+    from khipu.config import config_file, mutate_config
 
     profile = (profile or "").strip()
     if not PROFILE_KEY_RE.match(profile):
@@ -159,24 +159,24 @@ def set_cosine_floor_for_profile(profile: str, value: "float | None"):
     if value is not None and not _valid_floor(value):
         raise ValueError(
             f"{BY_PROFILE_KEY}{profile} must be a number above 0 and at most 1, got {value!r}")
-    data = load_config()
-    section = data.get("relevance")
-    section = dict(section) if isinstance(section, dict) else {}
-    table = section.get("cosine_floor_by_profile")
-    table = dict(table) if isinstance(table, dict) else {}
-    if value is None:
-        table.pop(profile, None)
-    else:
-        table[profile] = float(value)
-    if table:
-        section["cosine_floor_by_profile"] = table
-    else:
-        section.pop("cosine_floor_by_profile", None)
-    if section:
-        data["relevance"] = section
-    else:
-        data.pop("relevance", None)
-    return save_config(data)
+    with mutate_config() as data:
+        section = data.get("relevance")
+        section = dict(section) if isinstance(section, dict) else {}
+        table = section.get("cosine_floor_by_profile")
+        table = dict(table) if isinstance(table, dict) else {}
+        if value is None:
+            table.pop(profile, None)
+        else:
+            table[profile] = float(value)
+        if table:
+            section["cosine_floor_by_profile"] = table
+        else:
+            section.pop("cosine_floor_by_profile", None)
+        if section:
+            data["relevance"] = section
+        else:
+            data.pop("relevance", None)
+    return config_file()
 
 
 def need(token_count: int) -> int:

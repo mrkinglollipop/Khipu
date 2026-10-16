@@ -25,7 +25,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from khipu import capture_stores, db, forget, hub_snapshot, outbox, paths, recall_eval, tombstones
+from khipu import capture_stores, db, forget, hub_snapshot, outbox, paths, recall_eval, tombstones, work
 from khipu import session_capture as sc
 from khipu import writer_groups as wg
 from tests import test_forget_ownership as fo
@@ -314,12 +314,28 @@ INJECT = {
     "legacy writers": lambda mp, tmp: _deny_listing(mp, wg.records_dir),
     # A folder where the recall test file should be cannot be read as one.
     "recall golden": lambda mp, tmp: recall_eval.default_golden_path().mkdir(parents=True),
+    "work view": lambda mp, tmp: _deny_listing(mp, lambda: work.view_file().parent),
 }
 
 
 def test_every_forget_scan_has_a_failure_injection():
     assert set(INJECT) == set(capture_stores.FORGET_SCANS)
     assert {s.forget for s in capture_stores.STORES if s.scanned} <= set(INJECT)
+
+
+def test_forget_removes_the_saved_work_view_and_its_temps(tmp_path, monkeypatch):
+    (tmp_path / "memory").mkdir()
+    view = work.view_file()
+    view.parent.mkdir(parents=True)
+    view.write_text(json.dumps({"waiting": [{"source": "commitment", "text": "quoted words"}]}))
+    temp = view.with_name(f".{view.name}.123.tmp")
+    temp.write_text("{}")
+    other = view.with_name("links.json")
+    other.write_text("{}")
+    result = _forget(tmp_path, monkeypatch)
+    assert not view.exists() and not temp.exists() and other.exists()
+    assert {loc["path"] for loc in result["locations"]
+            if loc["place"] == "work view" and loc["state"] == "removed"} == {str(view), str(temp)}
 
 
 @pytest.mark.parametrize("store", [s for s in capture_stores.STORES if s.scanned],

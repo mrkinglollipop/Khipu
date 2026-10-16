@@ -52,7 +52,7 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(config.capture_mode(), "hub")
 
     def test_an_unknown_stored_value_falls_back_to_the_default(self):
-        config.save_config({"capture_mode": "banana"})
+        config._write_config({"capture_mode": "banana"})
         self.assertEqual(config.capture_mode(), "dual")
 
     def test_setting_an_invalid_mode_raises_and_writes_nothing(self):

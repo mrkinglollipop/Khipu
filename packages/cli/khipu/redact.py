@@ -37,6 +37,7 @@ _PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     # little so a key pasted with a trailing character cut off still matches.
     ("anthropic", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}"), MASK),
     ("openai", re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}"), MASK),
+    ("xai", re.compile(r"\bxai-[A-Za-z0-9_-]{20,}"), MASK),
     ("stripe", re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}"), MASK),
     ("aws-access", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), MASK),
     ("github", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})"), MASK),

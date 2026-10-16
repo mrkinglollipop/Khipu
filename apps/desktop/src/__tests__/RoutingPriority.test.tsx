@@ -151,7 +151,7 @@ const PRIORITY: RoutePriority = {
     { account: "codex|", label: "Codex", role: "cross-family reviews", until: null, in_settings: true },
     { account: "claude|", label: "Claude", role: "orchestration only", until: null, in_settings: true },
   ],
-  until: null, at: "2026-10-15T13:00:00Z", via: "app", pending: false, confirmed: true,
+  until: null, at: "2026-10-15T13:00:00Z", via: "app", pending: false, confirmed: true, version: "p7",
 };
 
 function view(priority: RoutePriority | null = PRIORITY): RouteView {
@@ -197,10 +197,10 @@ describe("the priority on Home", () => {
     expect(screen.getByText("Not confirmed")).toBeTruthy();
     expect(screen.getByText("Set by a Claude Code conversation at your request; you haven't confirmed it yet.")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
-    await waitFor(() => expect(calls("khipu_route_priority")).toEqual([{ action: "confirm" }]));
+    await waitFor(() => expect(calls("khipu_route_priority")).toEqual([{ action: "confirm", expect: "p7" }]));
     await waitFor(() => expect(load).toHaveBeenCalledWith(true));
     fireEvent.click(screen.getByRole("button", { name: "Undo" }));
-    await waitFor(() => expect(calls("khipu_route_priority")[1]).toEqual({ action: "undo" }));
+    await waitFor(() => expect(calls("khipu_route_priority")[1]).toEqual({ action: "undo", expect: "p7" }));
   });
 });
 
@@ -226,7 +226,7 @@ describe("the priority and the pace in Settings -> Routing", () => {
     expect(within(list).getAllByRole("listitem").map((li) => li.textContent?.split(".")[1]?.trim().split(/all|cross|orch/)[0]))
       .toEqual(["Claude second", "Codex", "Claude"]);
     fireEvent.click(screen.getByRole("button", { name: "Move Codex up" }));
-    await waitFor(() => expect(sent()[0]).toEqual({ action: "set", until: null, entries: [
+    await waitFor(() => expect(sent()[0]).toEqual({ action: "set", until: null, expect: "p7", entries: [
       { account: "codex|", role: "cross-family reviews", until: null },
       { account: SECOND, role: "all Claude work first", until: "2026-10-17T19:00:00Z" },
       { account: "claude|", role: "orchestration only", until: null },
@@ -254,6 +254,15 @@ describe("the priority and the pace in Settings -> Routing", () => {
     expect(last.account).toBe("claude|");
     expect(last.role).toBe("--from-app -- clear");
     expect(last.until).toMatch(/^2026-10-16T09:00:00/);
+    expect((sent()[0] as { expect: string }).expect).toBe("p7");
+  });
+
+  it("shows a plain sentence, not the CLI's text, when the priority moved since it was read", async () => {
+    await page();
+    answers.khipu_route_priority = () => ({ ok: false, code: "version_moved", error: "priority version moved" });
+    fireEvent.click(screen.getByRole("button", { name: "Move Codex up" }));
+    expect(await screen.findByText(/changed somewhere else after this page read it/)).toBeTruthy();
+    expect(screen.queryByText(/priority version moved/)).toBeNull();
   });
 
   it("clears the whole priority after asking, and confirms or undoes one a conversation set", async () => {
@@ -263,12 +272,12 @@ describe("the priority and the pace in Settings -> Routing", () => {
     expect(screen.getByText(/It replaced: 1\. Claude: orchestration only/)).toBeTruthy();
     const group = screen.getByRole("group", { name: "A conversation set your priority" });
     fireEvent.click(within(group).getByRole("button", { name: "Confirm" }));
-    await waitFor(() => expect(sent()).toEqual([{ action: "confirm" }]));
+    await waitFor(() => expect(sent()).toEqual([{ action: "confirm", expect: "p7" }]));
     fireEvent.click(within(group).getByRole("button", { name: "Undo" }));
-    await waitFor(() => expect(sent()[1]).toEqual({ action: "undo" }));
+    await waitFor(() => expect(sent()[1]).toEqual({ action: "undo", expect: "p7" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear the priority" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear it" }));
-    await waitFor(() => expect(sent()[2]).toEqual({ action: "clear" }));
+    await waitFor(() => expect(sent()[2]).toEqual({ action: "clear", expect: "p7" }));
   });
 
   it("shows each account's pace beside it, and the ordering switch and its warning setting", async () => {

@@ -12,7 +12,7 @@ import os
 from typing import Any
 from urllib.parse import urlparse
 
-from khipu.config import load_config, save_config
+from khipu.config import load_config, mutate_config
 
 ROLES = ("synth", "embed", "vision")
 CLI_PROVIDERS = frozenset({"claude-cli", "codex-cli"})
@@ -175,16 +175,15 @@ def show_models() -> dict[str, Any]:
 
 
 def _store_roles(roles: dict[str, dict[str, str]]) -> dict[str, Any]:
-    data = load_config()
-    data["models"] = {
-        role: {
-            "provider": roles[role]["provider"],
-            "endpoint": roles[role]["endpoint"],
-            "model_id": roles[role]["model_id"],
+    with mutate_config() as data:
+        data["models"] = {
+            role: {
+                "provider": roles[role]["provider"],
+                "endpoint": roles[role]["endpoint"],
+                "model_id": roles[role]["model_id"],
+            }
+            for role in ROLES
         }
-        for role in ROLES
-    }
-    save_config(data)
     return show_models()
 
 
@@ -217,9 +216,10 @@ def set_models_replace(payload: dict[str, Any]) -> dict[str, Any]:
     Refuse without writing when the on-disk ``models`` key is present and
     fails validation (same gate as merge). Missing key is first-time OK.
     """
-    _require_stored_models_writable()
-    roles = validate_models_object(payload, for_set=True)
-    return _store_roles(roles)
+    with mutate_config():
+        _require_stored_models_writable()
+        roles = validate_models_object(payload, for_set=True)
+        return _store_roles(roles)
 
 
 def set_models_merge_role(
@@ -242,22 +242,24 @@ def set_models_merge_role(
     if (role == "synth" and provider.strip().lower() in {"openai", "openrouter", "codex-cli"}
             and not (model_id or "").strip()):
         raise ValueError(f"synth: {provider.strip().lower()} provider requires --model (model_id)")
-    _require_stored_models_writable()
-    current = show_models()
-    base = {r: dict(current[r]) for r in ROLES}
-    patch: dict[str, Any] = {"provider": provider}
-    if endpoint is not None:
-        patch["endpoint"] = endpoint
-    else:
-        patch["endpoint"] = base[role].get("endpoint", "")
-    if model_id is not None:
-        patch["model_id"] = model_id
-    else:
-        canonical = "gemini" if provider.strip().lower() == "cloud" else provider.strip().lower()
-        patch["model_id"] = ("" if role == "synth" and canonical != base[role]["provider"]
-                             else base[role].get("model_id", ""))
-    base[role] = _normalize_role(role, patch, for_set=True)
-    return _store_roles(base)
+    # Read and write under one lock: the other roles are the ones stored now.
+    with mutate_config():
+        _require_stored_models_writable()
+        current = show_models()
+        base = {r: dict(current[r]) for r in ROLES}
+        patch: dict[str, Any] = {"provider": provider}
+        if endpoint is not None:
+            patch["endpoint"] = endpoint
+        else:
+            patch["endpoint"] = base[role].get("endpoint", "")
+        if model_id is not None:
+            patch["model_id"] = model_id
+        else:
+            canonical = "gemini" if provider.strip().lower() == "cloud" else provider.strip().lower()
+            patch["model_id"] = ("" if role == "synth" and canonical != base[role]["provider"]
+                                 else base[role].get("model_id", ""))
+        base[role] = _normalize_role(role, patch, for_set=True)
+        return _store_roles(base)
 
 
 def synth_settings() -> dict[str, str]:

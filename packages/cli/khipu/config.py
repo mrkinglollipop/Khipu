@@ -16,9 +16,12 @@ Modes:
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import os
 import re
+import threading
 from pathlib import Path
 
 from khipu.output_guard import secret_result
@@ -38,8 +41,16 @@ def config_file() -> Path:
     return data_dir() / CONFIG_NAME
 
 
-@secret_result("config")
-def load_config() -> dict:
+# An account change (``accounts._transact``) writes this key in the same
+# write as the account list it makes, and clears it once the routing record
+# says the change is done. Every read of the config (``load_config``,
+# ``mutate_config``) that finds it finishes or rolls back that change first
+# (``accounts.recover``), so no reader sees a list the record and the usage
+# cache do not yet agree with.
+ACCOUNT_CHANGE_OPEN = "account_change_open"
+
+
+def _read_config() -> dict:
     path = config_file()
     if not path.is_file():
         return {}
@@ -48,6 +59,42 @@ def load_config() -> dict:
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _settle_account_change(data: dict) -> bool:
+    """Settle an unfinished account change ``data`` names; True when one was
+    settled (read the document again). Skipped while this thread holds the
+    config lock (the routing lock is taken first, never after it) or is
+    settling one already."""
+    if not data.get(ACCOUNT_CHANGE_OPEN) or getattr(_held, "depth", 0) or getattr(_held, "settling", False):
+        return False
+    from khipu import accounts
+
+    _held.settling = True
+    try:
+        accounts.recover()
+    except accounts.AccountsError:
+        # Not settled yet: the document as stored. Every account write is
+        # refused until it is (``accounts._locked``).
+        return False
+    finally:
+        _held.settling = False
+    return True
+
+
+@secret_result("config")
+def load_config() -> dict:
+    data = _read_config()
+    if _settle_account_change(data):
+        data = _read_config()
+    return data
+
+
+def read_config_unsettled() -> dict:
+    """The document as stored, an unfinished account change and all: for a
+    reader that holds a lock an account change takes after the routing lock
+    (the usage cache's), which must not wait on that lock here."""
+    return _read_config()
 
 
 @secret_result("config")
@@ -65,12 +112,68 @@ def _load_config_for_mutation() -> dict:
     return data
 
 
-def save_config(data: dict) -> Path:
+def check_config_readable() -> None:
+    """Raise ``InvalidConfigDocument`` when config.json is there but can't be
+    read or parsed (or isn't an object): for a reader that must not lean on
+    the empty document ``load_config`` returns then. Writes nothing."""
+    _load_config_for_mutation()
+
+
+# The one write path for config.json. Every writer in the package changes the
+# document inside ``mutate_config()``: it takes ``config_write_lock``, reads the
+# file as it is now, hands the writer that copy and writes it back when the
+# block ends. No module writes a whole-file copy it read earlier, so a save of
+# one setting can never undo another writer's save that landed in between
+# (``tests/test_config_write_path.py`` keeps every other module off the file).
+_held = threading.local()
+
+
+def _write_config(data: dict) -> Path:
     path = config_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+    return path
+
+
+def _body(data: dict) -> str:
+    return json.dumps(data, sort_keys=True, default=str)
+
+
+@contextlib.contextmanager
+def mutate_config():
+    """Read, change and write config.json under the one lock. Yields the
+    document as stored now; the block changes it in place and it is written
+    when the block ends without an error (only if it changed). A nested
+    block in the same thread shares the outer one's document."""
+    if not getattr(_held, "depth", 0):
+        _settle_account_change(_read_config())
+    with config_write_lock():
+        if getattr(_held, "data", None) is not None:
+            yield _held.data
+            if _body(_held.data) != _held.written:
+                _write_config(_held.data)
+                _held.written = _body(_held.data)
+            return
+        data = _load_config_for_mutation()
+        _held.data, _held.written = data, _body(data)
+        try:
+            yield data
+            if _body(data) != _held.written:
+                _write_config(data)
+        finally:
+            _held.data = _held.written = None
+
+
+def save_config(data: dict) -> Path:
+    """Write the document ``mutate_config`` handed this thread now, before
+    its block ends (a writer that must land before it does something else).
+    Any other dict is refused: it would be a stale whole-file copy."""
+    if data is not getattr(_held, "data", None):
+        raise RuntimeError("config.json is written only inside config.mutate_config()")
+    path = _write_config(data)
+    _held.written = _body(data)
     return path
 
 
@@ -86,9 +189,9 @@ def set_capture_mode(mode: str) -> Path:
     mode = (mode or "").strip().lower()
     if mode not in CAPTURE_MODES:
         raise ValueError(f"capture_mode must be one of {CAPTURE_MODES}, got {mode!r}")
-    data = _load_config_for_mutation()
-    data["capture_mode"] = mode
-    return save_config(data)
+    with mutate_config() as data:
+        data["capture_mode"] = mode
+        return config_file()
 
 
 def gateway_url() -> str:
@@ -104,12 +207,12 @@ def set_gateway_url(url: str) -> Path:
     url = (url or "").strip().rstrip("/")
     if url and not url.startswith("https://"):
         raise ValueError("gateway_url must be an https:// URL (it carries a bearer token)")
-    data = _load_config_for_mutation()
-    if url:
-        data["gateway_url"] = url
-    else:
-        data.pop("gateway_url", None)
-    return save_config(data)
+    with mutate_config() as data:
+        if url:
+            data["gateway_url"] = url
+        else:
+            data.pop("gateway_url", None)
+        return config_file()
 
 
 # ---------------------------------------------------------------------------
@@ -163,12 +266,12 @@ def path_setting(key: str) -> Path | None:
 def set_path_setting(key: str, value: str | None) -> Path:
     if key not in PATH_SETTINGS:
         raise KeyError(f"unknown path setting {key!r}; known: {sorted(PATH_SETTINGS)}")
-    data = _load_config_for_mutation()
-    if value is None or not str(value).strip():
-        data.pop(key, None)
-    else:
-        data[key] = str(Path(str(value)).expanduser())
-    return save_config(data)
+    with mutate_config() as data:
+        if value is None or not str(value).strip():
+            data.pop(key, None)
+        else:
+            data[key] = str(Path(str(value)).expanduser())
+        return config_file()
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +311,9 @@ def float_setting(key: str) -> float:
 def set_float_setting(key: str, value: float) -> Path:
     if key not in FLOAT_SETTINGS:
         raise KeyError(f"unknown float setting {key!r}; known: {sorted(FLOAT_SETTINGS)}")
-    data = _load_config_for_mutation()
-    data[key] = float(value)
-    return save_config(data)
+    with mutate_config() as data:
+        data[key] = float(value)
+        return config_file()
 
 
 # ---------------------------------------------------------------------------
@@ -252,12 +355,12 @@ def set_list_setting(key: str, values: "str | list[str] | tuple[str, ...]") -> P
     if isinstance(values, str):
         values = _split_csv(values)
     cleaned = [str(v).strip() for v in values if str(v).strip()]
-    data = _load_config_for_mutation()
-    if cleaned:
-        data[key] = cleaned
-    else:
-        data.pop(key, None)
-    return save_config(data)
+    with mutate_config() as data:
+        if cleaned:
+            data[key] = cleaned
+        else:
+            data.pop(key, None)
+        return config_file()
 
 
 # ---------------------------------------------------------------------------
@@ -299,12 +402,12 @@ def parse_int_setting(key: str, raw: "str | int") -> int:
 def set_int_setting(key: str, value: "int | None") -> Path:
     if key not in INT_SETTINGS:
         raise KeyError(f"unknown integer setting {key!r}; known: {sorted(INT_SETTINGS)}")
-    data = _load_config_for_mutation()
-    if value is None:
-        data.pop(key, None)
-    else:
-        data[key] = parse_int_setting(key, value)
-    return save_config(data)
+    with mutate_config() as data:
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = parse_int_setting(key, value)
+        return config_file()
 
 
 # ---------------------------------------------------------------------------
@@ -332,15 +435,15 @@ def choice_setting(key: str) -> tuple[str, str]:
 
 def set_choice_setting(key: str, value: "str | None") -> Path:
     choices = CHOICE_SETTINGS[key]
-    data = _load_config_for_mutation()
-    if value is None:
-        data.pop(key, None)
-    else:
-        word = str(value).strip().lower()
-        if word not in choices:
-            raise ValueError(f"{key} must be one of {', '.join(choices)}, got {value!r}")
-        data[key] = word
-    return save_config(data)
+    with mutate_config() as data:
+        if value is None:
+            data.pop(key, None)
+        else:
+            word = str(value).strip().lower()
+            if word not in choices:
+                raise ValueError(f"{key} must be one of {', '.join(choices)}, got {value!r}")
+            data[key] = word
+        return config_file()
 
 
 # ---------------------------------------------------------------------------
@@ -411,28 +514,101 @@ def graph_backup_remote_status() -> dict:
 
 
 def set_graph_backup_remote(value: "str | None") -> Path:
-    data = _load_config_for_mutation()
-    if not (value or "").strip():
-        data.pop("graph_backup_remote", None)
-    else:
-        data["graph_backup_remote"] = check_graph_backup_remote(str(value))
-    return save_config(data)
+    with mutate_config() as data:
+        if not (value or "").strip():
+            data.pop("graph_backup_remote", None)
+        else:
+            data["graph_backup_remote"] = check_graph_backup_remote(str(value))
+        return config_file()
 
 
-def set_usage_accounts(raw: "str | list | None") -> Path:
-    """Store ``usage_accounts``, the accounts ``khipu usage`` reads (JSON text
-    or a list of ``{label, harness, home?}``, checked by
-    ``khipu.usage.parse_usage_accounts``). None or an empty list removes the
-    key: every installed CLI with its default login."""
-    from khipu.usage import parse_usage_accounts
+CONFIG_LOCK_NAME = ".config.lock"
+# What a version of the account list is made of: the list, "Read no
+# accounts", and a conversation's request still waiting for the owner.
+_ACCOUNT_STATE_KEYS = ("usage_accounts", "usage_accounts_none", "usage_accounts_request")
 
-    entries = [] if raw is None else parse_usage_accounts(raw)
-    data = _load_config_for_mutation()
-    if entries:
-        data["usage_accounts"] = entries
-    else:
-        data.pop("usage_accounts", None)
-    return save_config(data)
+
+@contextlib.contextmanager
+def config_write_lock():
+    """One read-compare-write of config.json at a time across processes
+    (flock; released if the holder dies). ``mutate_config`` holds it from
+    its read to its save; it may be taken again by the thread holding it."""
+    import fcntl  # here, not at the top: config is imported where fcntl isn't (the Windows lock backend)
+
+    if getattr(_held, "depth", 0):
+        # Already held by this thread (flock is per open file, so taking it
+        # again here would wait on itself).
+        _held.depth += 1
+        try:
+            yield
+        finally:
+            _held.depth -= 1
+        return
+    path = config_file().with_name(CONFIG_LOCK_NAME)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _held.depth = 1
+        yield
+    finally:
+        _held.depth = 0
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+# The one format of a version a write hands back (``--expect``), defined
+# here and nowhere else in the package: ASCII letters and digits in parts
+# joined by single dots, at most ``VERSION_MAX`` characters. The account
+# list's is "a" and 16 hex digits; the priority's is "p" and its event's
+# mark, then "." and the account list's version when there is one
+# (``p12.a4def5fc278cfc609``). The desktop app checks the same format
+# (``checked_expect`` in apps/desktop/src-tauri/src/lib.rs), and
+# tests/test_accounts.py runs that Rust check on versions this code makes.
+VERSION_MAX = 64
+_VERSION_PART = re.compile(r"[A-Za-z0-9]+")
+
+
+def is_version(text: str) -> bool:
+    return 0 < len(text) <= VERSION_MAX and all(_VERSION_PART.fullmatch(p) for p in text.split("."))
+
+
+def version_part(raw: str) -> str:
+    """``raw`` as one part of a version: as it is when it is letters and
+    digits, else a short digest of it (an id appended by hand)."""
+    if _VERSION_PART.fullmatch(raw) and len(raw) <= 24:
+        return raw
+    return "h" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def accounts_version(data: dict | None = None) -> str:
+    """The version of the stored account list: a short digest of what
+    ``_ACCOUNT_STATE_KEYS`` hold. A write that carries the version it read
+    (``expect``) is refused once it moved."""
+    data = load_config() if data is None else data
+    body = {k: data.get(k) for k in _ACCOUNT_STATE_KEYS}
+    text = json.dumps(body, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return "a" + hashlib.sha256(text.encode("ascii")).hexdigest()[:16]
+
+
+def check_accounts_version(data: dict, expect: "str | None") -> None:
+    """Refuse (``AccountsError`` ``version_moved``) when ``expect`` is given
+    and the stored list is no longer the one it names."""
+    from khipu.usage import AccountsError
+
+    if expect is not None and str(expect).strip() != accounts_version(data):
+        raise AccountsError("the account list changed after it was read; read it again and redo the change",
+                            "version_moved")
+
+
+AUTO_TRACK_KEY = "usage_auto_track"
+
+
+def auto_track() -> bool:
+    """Whether found accounts a conversation used are tracked without asking
+    (settings clarity phase 9; per Mac, off by default)."""
+    return load_config().get(AUTO_TRACK_KEY) is True
 
 
 # ---------------------------------------------------------------------------
@@ -478,20 +654,20 @@ def cli_setting(key: str) -> str | None:
 def set_cli_setting(key: str, value: "str | None") -> Path:
     if key not in CLI_SETTINGS:
         raise KeyError(f"unknown CLI setting {key!r}; known: {list(CLI_SETTINGS)}")
-    data = _load_config_for_mutation()
-    if value is None or not str(value).strip():
-        data.pop(key, None)
-        return save_config(data)
-    path = Path(str(value).strip()).expanduser()
-    if not path.is_absolute():
-        raise ValueError(f"{key} must be a full path")
-    if key == "node_folder":
-        if not _executable_file(path / "node"):
-            raise ValueError("node_folder must be a folder holding an executable node")
-    elif not _executable_file(path):
-        raise ValueError(f"{key} must be an executable file")
-    data[key] = str(path)
-    return save_config(data)
+    with mutate_config() as data:
+        if value is None or not str(value).strip():
+            data.pop(key, None)
+            return config_file()
+        path = Path(str(value).strip()).expanduser()
+        if not path.is_absolute():
+            raise ValueError(f"{key} must be a full path")
+        if key == "node_folder":
+            if not _executable_file(path / "node"):
+                raise ValueError("node_folder must be a folder holding an executable node")
+        elif not _executable_file(path):
+            raise ValueError(f"{key} must be an executable file")
+        data[key] = str(path)
+        return config_file()
 
 
 def cli_settings_status() -> dict:

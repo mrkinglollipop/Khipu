@@ -477,8 +477,17 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
         "dsn_present": bool(local["secrets"].get("dsn")) and not local["secrets"].get("error"),
         "skipped": "hub, network and probe checks (run plain `khipu doctor` for those)",
     }
+    # The one hub read --quick makes: the code this gate is about to promote
+    # may ship a migration the hub has not had. An unreachable hub is not
+    # gated here (--quick skips reachability); a pending migration is.
+    from khipu.migrate import doctor_check as _schema_check
+
+    schema = _schema_check()
+    out["schema_migrations"] = schema
+    out["schema_migrations_ok"] = not schema.get("pending")
+    out["warnings"] = list(schema.get("warnings") or [])
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
-                 and all(bool(local[k]) for k in LOCAL_GATES))
+                 and all(bool(local[k]) for k in LOCAL_GATES) and out["schema_migrations_ok"])
     print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
 
@@ -497,7 +506,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # 2026-10-15, most of it waiting on the network).
     from concurrent.futures import ThreadPoolExecutor
 
-    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="khipu-doctor")
+    pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="khipu-doctor")
     try:
         workers = _doctor_start_workers(pool, args, mem, sample_drift)
         return _cmd_doctor_body(args, workers, mem, status_payload, backup_health)
@@ -581,6 +590,9 @@ def _doctor_start_workers(pool, args, mem, sample_drift) -> dict:
     # Every check that reads only this Mac; `doctor --quick` gates on the same
     # set (khipu.promote's first gate step).
     workers["local"] = pool.submit(_doctor_local_checks, mem)
+    from khipu.migrate import doctor_check as _schema_check
+
+    workers["schema"] = pool.submit(_schema_check)
     return workers
 
 
@@ -816,6 +828,12 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     else:
         graph = graph_error
     embed_coverage, embed_coverage_ok, topics_lag = embed_future.result()
+    # Pending migrations: red. With the hub down the read fails too; hub_ok
+    # is already red for that, so the schema row says why it was not checked.
+    schema = workers["schema"].result()
+    if not hub_ok and schema.get("error"):
+        schema = {**schema, "ok": True, "skipped": "the database did not answer"}
+    schema_ok = bool(schema.get("ok"))
     liveness.setdefault("harnesses", {})["gateway"] = gw_liveness
     if not gw_liveness.get("ok", True):
         liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
@@ -854,6 +872,13 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         ledger_block = _ledger.doctor_block()
     except Exception as e:  # noqa: BLE001  (a failed check must not crash doctor)
         ledger_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # The live view's summary files (Work view phase 3): warns, never gates `ok`.
+    try:
+        from khipu import work as _work
+
+        work_block = _work.doctor_block()
+    except Exception as e:  # noqa: BLE001  (a failed check must not crash doctor)
+        work_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -897,9 +922,12 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "plan_usage": plan_usage_block,
         "routing": routing_block,
         "ledger": ledger_block,
-        # Warnings that never gate `ok` (plans nearly used up; routing; ledger).
+        "schema_migrations": schema,
+        "work": work_block,
+        # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
-                     + list(ledger_block.get("warnings") or [])),
+                     + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
+                     + list(schema.get("warnings") or [])),
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -948,6 +976,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             # below, and never reaches this aggregate.
             and bool(launchers.get("ok"))
             and local["ledger_outbox_ok"]
+            and schema_ok
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
@@ -980,6 +1009,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "launchers_ok": bool(launchers.get("ok")),
         "nightly_steps_ok": local["nightly_steps_ok"],
         "ledger_outbox_ok": local["ledger_outbox_ok"],
+        "schema_migrations_ok": schema_ok,
     }
     print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
@@ -2097,6 +2127,11 @@ def cmd_usage(args: argparse.Namespace) -> int:
         out = discover.discover(now=bool(getattr(args, "now", False)), check=getattr(args, "check", None))
         if getattr(args, "check", None) is None:
             out["clis"] = discover.cli_states()
+        # The owner's automatic-tracking switch (off by default): what Home
+        # would offer is tracked through the one save path.
+        from khipu import accounts
+
+        out["auto_tracked"] = accounts.auto_track(out)
         if args.json:
             print(json.dumps(out, indent=2))
         else:
@@ -2144,6 +2179,14 @@ def cmd_usage(args: argparse.Namespace) -> int:
     else:
         print(usage.table(rep))
     return 0
+
+
+def cmd_accounts(args: argparse.Namespace) -> int:
+    """`khipu accounts`: track, rename, stop tracking, move and decline the
+    accounts plan usage reads (settings clarity phase 9, 9B). Owner only."""
+    from khipu import accounts
+
+    return accounts.run_cli(args)
 
 
 def cmd_route(args: argparse.Namespace) -> int:
@@ -2956,6 +2999,30 @@ def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
         offset = nxt
 
 
+def _owner_or_request(args: argparse.Namespace) -> "dict | int":
+    """{} for the owner's write (the app, or a typed yes on a terminal), a
+    conversation's request with ``--at-owner-request``, or the exit code
+    after a refusal was printed."""
+    from khipu import routing
+
+    if getattr(args, "at_owner_request", None) is not None:
+        words = routing._one_line(args.at_owner_request)
+        if not words:
+            print(json.dumps({"ok": False, "error": "describe the owner's request in one line",
+                              "code": "request_needs_words"}))
+            return 2
+        return {"request": words, "by": routing.conversation_author(), "at": routing._iso(routing._now())}
+    auth = routing._OWNER_AUTH.set(None)
+    try:
+        via = routing._owner_via(args)
+    finally:
+        routing._OWNER_AUTH.reset(auth)
+    if via is None:
+        print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
+        return 2
+    return {}
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     from khipu.config import (
         CHOICE_SETTINGS,
@@ -3037,11 +3104,34 @@ def cmd_config(args: argparse.Namespace) -> int:
         # `--set usage_accounts '[{"label": "Claude second", "harness":
         # "claude", "home": "~/.claude-second"}]'`; `--unset` (or `[]`) goes
         # back to every installed CLI with its default login.
-        from khipu import usage
-        from khipu.config import set_usage_accounts
+        from khipu import accounts, routing, usage
+        from khipu.config import config_file
 
+        # Decision 15: the owner's (the app, or a typed yes on a terminal),
+        # or a conversation's at his request, marked until he answers it.
+        request = via = None
+        # The owner's check stays set through the save, so the record's
+        # lines about it say how it was authorised.
+        auth = routing._OWNER_AUTH.set(None)
         try:
-            path = set_usage_accounts(args.set[1] if args.set else None)
+            if getattr(args, "at_owner_request", None) is not None:
+                words = routing._one_line(args.at_owner_request)
+                if not words:
+                    print(json.dumps({"ok": False, "error": "describe the owner's request in one line",
+                                      "code": "request_needs_words"}))
+                    return 2
+                request = {"request": words, "by": routing.conversation_author(),
+                           "at": routing._iso(routing._now())}
+            else:
+                via = routing._owner_via(args)
+                if via is None:
+                    print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
+                    return 2
+            # One write path for the list: the save becomes the account
+            # operations it implies (track, rename, stop, move), each with
+            # its lines in the routing record, on the version it read.
+            saved = accounts.save_list(args.set[1] if args.set else None, expect=getattr(args, "expect", None),
+                                       via=via or "cli", request=request)
         except usage.AccountsError as err:
             # A fixed code, the entry and the field at fault: the app says it
             # in its own words and never shows the text.
@@ -3050,7 +3140,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
-        print(json.dumps({"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(path)}))
+        finally:
+            routing._OWNER_AUTH.reset(auth)
+        print(json.dumps({"ok": True, "version": saved["version"], "usage_accounts": usage.accounts_status(),
+                          "config_file": str(config_file())}))
         return 0
     from khipu.config import CLI_SETTINGS
 
@@ -3094,17 +3187,59 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps({"ok": True, key: _ledger.settings_status()[key], "config_file": str(path)}))
         return 0
+    from khipu import work as _work
+
+    if (args.set and args.set[0] in _work.SETTINGS) or args.unset in _work.SETTINGS:
+        # Every work-view limit and time (rule 7): `--set work_max_jobs 0`
+        # lifts it, `--unset` for the default again.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _work.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _work.settings_status()[key], "config_file": str(path)}))
+        return 0
     from khipu import routing as _routing
 
+    if isinstance(getattr(args, "answer_request", None), (list, tuple)):
+        # The owner's answer to a conversation's change to a routing setting.
+        key, action = args.answer_request
+        auth = _routing._OWNER_AUTH.set(None)
+        try:
+            via = _routing._owner_via(args)
+        finally:
+            _routing._OWNER_AUTH.reset(auth)
+        if via is None:
+            print(json.dumps({"ok": False, "error": _routing._REFUSED, "code": "owner_only"}))
+            return 2
+        try:
+            path = _routing.answer_setting_request(key, action)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err), "code": getattr(err, "code", None)}))
+            return 2
+        print(json.dumps({"ok": True, "action": action, key: _routing.settings_status().get(key),
+                          "config_file": str(path)}))
+        return 0
     if (args.set and args.set[0] in _routing.SETTINGS) or args.unset in _routing.SETTINGS:
         # Every size, time and switch of the routing record (routing truth
         # scope, decision 13): `--set routing_stale_after 12h`, `--unset` for
         # the default again.
         key = args.set[0] if args.set else args.unset
+        # Decision 15, as for the account list: the owner's (the app, or a
+        # typed yes on a terminal), or a conversation's at his request,
+        # marked until he answers it. A lane map or a job runner folder
+        # decides whose limits a report counts against.
+        request = _owner_or_request(args)
+        if isinstance(request, int):
+            return request
         try:
-            path = _routing.set_setting(key, args.set[1] if args.set else None)
+            path = _routing.set_setting(key, args.set[1] if args.set else None, request=request or None)
         except ValueError as err:
-            print(json.dumps({"ok": False, "error": str(err)}))
+            out = {"ok": False, "error": str(err)}
+            if getattr(err, "code", None):
+                out["code"] = err.code
+            print(json.dumps(out))
             return 2
         print(json.dumps({"ok": True, key: _routing.settings_status()[key], "config_file": str(path)}))
         return 0
@@ -3215,6 +3350,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "cli_settings": cli_settings_status(),
         "routing": _routing.settings_status(),
         "ledger": _ledger.settings_status(),
+        "work": _work.settings_status(),
         "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
         "config": load_config(),
@@ -4675,6 +4811,9 @@ def build_parser() -> argparse.ArgumentParser:
     from khipu import ledger as _ledger
 
     _ledger.add_parser(sub)
+    from khipu import work as _work
+
+    _work.add_parser(sub)
 
     nt = sub.add_parser("nightly", help="Run consolidate_nightly.py (memory wiki)")
     nt.set_defaults(func=cmd_nightly)
@@ -4986,6 +5125,8 @@ def build_parser() -> argparse.ArgumentParser:
     rprio.add_argument("--at-owner-request", default=None, metavar="REQUEST",
                        help="A conversation: the owner's request, in one line (set only; stays unconfirmed)")
     rprio.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    rprio.add_argument("--expect", default=None, metavar="V",
+                       help="The priority's version as read; refused if it changed since")
     rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire, restore or confirm a standing rule", parents=[rt_json])
     rrule.add_argument("action", choices=("add", "edit", "retire", "restore", "confirm", "undo", "dismiss"))
     rrule.add_argument("params", nargs="*")
@@ -5443,7 +5584,58 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("legacy", "dual", "hub"),
         help="Persist capture_mode to the Hub config file",
     )
+    cfg.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    cfg.add_argument("--expect", default=None, metavar="V",
+                     help="With usage_accounts: the list's version as read; refused if it changed since")
+    cfg.add_argument("--at-owner-request", default=None, metavar="REQUEST",
+                     help="With usage_accounts or a routing setting, a conversation: the owner's request, in one "
+                          "line (the change stays unconfirmed until he answers it)")
+    cfg.add_argument("--answer-request", nargs=2, default=None, metavar=("KEY", "ANSWER"),
+                     help="The owner's answer (confirm or undo) to a conversation's change to a routing setting")
     cfg.set_defaults(func=cmd_config)
+
+    acc = sub.add_parser("accounts", help="The accounts plan usage reads: track, rename, stop tracking, move "
+                                          "(owner only; for the app)")
+    acc.set_defaults(func=cmd_accounts, accounts_cmd=None)
+    acc_owner = argparse.ArgumentParser(add_help=False)
+    acc_owner.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    acc_cas = argparse.ArgumentParser(add_help=False)
+    acc_cas.add_argument("--expect", default=None, metavar="V",
+                         help="The list's version as read (accounts status); refused if it changed since")
+    acc_sub = acc.add_subparsers(dest="accounts_cmd")
+    acc_sub.add_parser("status", help="The tracked accounts, the list's version and what is not offered again")
+    atrack = acc_sub.add_parser("track", parents=[acc_owner, acc_cas], help="Track one or more logins")
+    atrack.add_argument("--entries", required=True, metavar="JSON",
+                        help='[{"harness": "claude", "home": "~/.claude-work" or null, "label": "..." or null}]')
+    atrack.add_argument("--shown-defaults", default=None, metavar="JSON",
+                        help="The default accounts as the app showed them (written out when no list is saved)")
+    atrack.add_argument("--no-read", action="store_true", help="Do not read the new accounts once")
+    aren = acc_sub.add_parser("rename", parents=[acc_owner, acc_cas], help="Rename an account (its key stays)")
+    aren.add_argument("--account", required=True, metavar="KEY")
+    aren.add_argument("--name", required=True)
+    astop = acc_sub.add_parser("stop", parents=[acc_owner, acc_cas], help="Stop tracking an account")
+    astop.add_argument("--account", required=True, metavar="KEY")
+    astop.add_argument("--keep-priority", action="store_true", help="Leave it in your priority")
+    astop.add_argument("--keep-pause", action="store_true", help="Leave its pause until its end")
+    astop.add_argument("--keep-lanes", action="store_true", help="Leave the lanes that point at it")
+    astop.add_argument("--end-hold", action="append", default=None, metavar="ID", help="End this hold on it too")
+    astop.add_argument("--confirm-last", action="store_true",
+                       help="It is the last account: track none (Read no accounts)")
+    amove = acc_sub.add_parser("move", parents=[acc_owner, acc_cas],
+                               help="The account's login folder moved: carry everything to the new folder")
+    amove.add_argument("--account", required=True, metavar="KEY")
+    amove.add_argument("--folder", required=True, metavar="F")
+    for name, words in (("decline", "Not this one: do not offer this login again"),
+                        ("offer-again", "Offer a login turned down again")):
+        adec = acc_sub.add_parser(name, parents=[acc_owner], help=words)
+        adec.add_argument("--harness", required=True, choices=("claude", "codex", "grok", "muse"))
+        adec.add_argument("--folder", default=None, metavar="F", help="The login folder; none = the default login")
+    aauto = acc_sub.add_parser("auto-track", parents=[acc_owner],
+                               help="Track found logins a conversation used without asking (on this Mac)")
+    aauto.add_argument("state", choices=("on", "off"))
+    areq = acc_sub.add_parser("request", parents=[acc_owner, acc_cas],
+                              help="Answer a conversation's change to the account list")
+    areq.add_argument("action", choices=("confirm", "undo"))
 
     bud = sub.add_parser("budget", help="Daily call ceilings: status, and lifting one")
     bud_sub = bud.add_subparsers(dest="budget_cmd", required=True)

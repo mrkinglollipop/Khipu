@@ -228,6 +228,18 @@ Record an owner-requested standing rule, or a change to rule number `rule`. Para
 
 Record the owner's account order. Parameters: `entries` (the accounts in the owner's order, with his words for each role) and `owner_request` (both required), `until` (optional). It is live at once and marked unconfirmed until the owner confirms or undoes it in Settings, Routing. This tool cannot confirm, undo or clear a priority.
 
+## Work
+
+### khipu_ledger
+
+The project's ledger of what work is done and what is not, with the old tracker script's verbs. Parameters: `verb` (required: `add`, `set`, `get`, `list`, `loose-ends`, `needs-owner`, `needs-matt`, `render`, `check`, `remove` or `removed`), plus the same fields as `khipu ledger` as JSON: `project` (default: the folder's project), `id`, `title`, `kind`, `parent`, `state`, `evidence`, `owner`, `note`, `link`, `if_state`, `children`, `op_id`, `stale_hours` and `summary`.
+
+A write returns its result and its `op_id`; pass the same `op_id` to retry it safely, and `if_state` to write only if the row is still in that state. `get`, `list`, `loose-ends` and `needs-owner` return rows; `render` returns the markdown board and `check` the check's result. A refusal is a tool error carrying `error` and `reason`. When the database is away a write waits on this Mac and reaches the ledger when it answers. Restoring a removed row, removing it for good and importing an old tracker are the owner's, in the app.
+
+Rows carry titles and short plain-words lines about the work, never code, diffs, file contents, command output, logs, prompts, briefs, customer or financial details.
+
+`khipu_status` (the full call) carries a `ledger` line: live rows, loose ends, rows waiting on the owner and writes waiting in the outbox, across every project.
+
 ## Related
 
 - [CLI reference](cli.md): the same operations from a terminal (`khipu search`, `khipu owed`, `khipu decisions`, `khipu route`, `khipu usage`).

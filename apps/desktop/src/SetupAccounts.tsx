@@ -10,7 +10,9 @@
    nothing, and a change made elsewhere while setup is open (an account
    renamed, removed or added) is kept. Skip for now writes nothing. The
    writes are the ones Settings makes: `config --set usage_accounts`,
-   `route priority set` and the `routing_push` feature switch. */
+   `route priority set` and the `routing_push` feature switch. The first two
+   carry the version they read, so a change saved elsewhere between that read
+   and the write is refused, never overwritten. */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
@@ -29,7 +31,16 @@ import {
 } from "./PlansCard";
 import type { UsageAccount, UsageAccountEntry } from "./PlansCard";
 
-type AccountsStatus = { source: "file" | "default"; accounts: UsageAccountEntry[]; user_home?: string | null };
+/** `version` names the list as read: a save carries it (`expect`) and is
+ *  refused (`version_moved`) when the list changed after it was read. */
+type AccountsStatus = {
+  /** The list as stored (null when unset), one entry per row of `accounts`. */
+  value?: unknown[] | null;
+  source: "file" | "default";
+  accounts: UsageAccountEntry[];
+  user_home?: string | null;
+  version?: string | null;
+};
 
 const CLI_TITLE: Record<string, string> = Object.fromEntries(USAGE_HARNESS_OPTIONS);
 
@@ -122,37 +133,51 @@ type Move = { key: string; past: string; dir: -1 | 1 };
 
 /** The account list once the read operations are applied to `status`, the
  *  list saved now: unchecking removes that account, checking adds it back
- *  (as its plan row names it) only when it is missing. `changed` is false
- *  when every operation is already satisfied. */
+ *  (as its plan row names it) only when it is missing. An entry no operation
+ *  touches goes back exactly as stored, an invalid one too: only Khipu
+ *  decides what is valid. `labels` names each entry of `list`; `changed` is
+ *  false when every operation is already satisfied. */
 export function planAccountList(
   status: AccountsStatus,
   readOps: Map<string, boolean>,
   rows: UsageAccount[],
-): { list: StoredEntry[]; ids: Set<string>; changed: boolean } {
+): { list: unknown[]; labels: string[]; ids: Set<string>; changed: boolean } {
   const uh = status.user_home ?? null;
-  const list: StoredEntry[] = status.accounts
-    .filter((e) => !e.invalid)
-    .map((e) => (e.home ? { label: e.label, harness: e.harness, home: e.home } : { label: e.label, harness: e.harness }));
+  const raw = status.source === "file" && Array.isArray(status.value) ? status.value : null;
+  type Item = { stored: unknown; label: string; id: string | null };
+  const items: Item[] = status.accounts.map((e, i) => ({
+    stored: raw && i < raw.length ? raw[i] : storedOf(e),
+    label: e.label,
+    id: e.invalid ? null : accountId(e.harness, e.home, uh),
+  }));
   let changed = false;
   for (const [id, on] of readOps) {
-    const at = list.findIndex((e) => accountId(e.harness, e.home, uh) === id);
+    const at = items.findIndex((e) => e.id === id);
     if (!on && at >= 0) {
-      list.splice(at, 1);
+      items.splice(at, 1);
       changed = true;
     } else if (on && at < 0) {
       const r = rows.find((row) => accountId(row.harness, row.home, uh) === id);
       if (r?.harness) {
         const label = r.account || cliTitle(r.harness);
-        list.push(r.home ? { label, harness: r.harness, home: r.home } : { label, harness: r.harness });
+        items.push({ stored: storedOf({ label, harness: r.harness, home: r.home }), label, id });
         changed = true;
       }
     }
   }
-  return { list, ids: new Set(list.map((e) => accountId(e.harness, e.home, uh))), changed };
+  const ids = new Set(items.flatMap((e) => (e.id == null ? [] : [e.id])));
+  return { list: items.map((e) => e.stored), labels: items.map((e) => e.label), ids, changed };
+}
+
+function storedOf(e: { label: string; harness: string; home?: string | null }): StoredEntry {
+  return e.home ? { label: e.label, harness: e.harness, home: e.home } : { label: e.label, harness: e.harness };
 }
 
 type ListStart = { source: "file" | "default"; ids: Set<string> };
-type ListWrite = { kind: "none" } | { kind: "set"; list: StoredEntry[] } | { kind: "unset"; list: StoredEntry[] };
+type ListWrite =
+  | { kind: "none" }
+  | { kind: "set"; list: unknown[]; labels: string[] }
+  | { kind: "unset"; list: unknown[]; labels: string[] };
 
 /** What Next writes to the account list given `status`, the list saved now.
  *  When this step turned the default list into an explicit one and the
@@ -168,9 +193,9 @@ export function planListWrite(
   const plan = planAccountList(status, readOps, rows);
   const sameAsStart = start != null && plan.ids.size === start.ids.size && [...plan.ids].every((id) => start.ids.has(id));
   if (convertedHere && status.source === "file" && start?.source === "default" && sameAsStart) {
-    return { kind: "unset", list: plan.list };
+    return { kind: "unset", list: plan.list, labels: plan.labels };
   }
-  if (plan.changed && plan.list.length) return { kind: "set", list: plan.list };
+  if (plan.changed && plan.list.length) return { kind: "set", list: plan.list, labels: plan.labels };
   return { kind: "none" };
 }
 
@@ -303,9 +328,29 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
 
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Set when a save was refused because what it read changed meanwhile: the
+  // error then offers Reload, which reads both again.
+  const [moved, setMoved] = useState(false);
+  const [reloading, setReloading] = useState(false);
   useEffect(() => {
-    if (!active) setErr(null);
+    if (!active) {
+      setErr(null);
+      setMoved(false);
+    }
   }, [active]);
+
+  async function reload() {
+    setReloading(true);
+    try {
+      const [c, r] = await Promise.all([cfg.read(), route.read()]);
+      if (c.ok && r.ok) {
+        setErr(null);
+        setMoved(false);
+      }
+    } finally {
+      setReloading(false);
+    }
+  }
 
   const move = (i: number, by: -1 | 1) => {
     const key = order[i];
@@ -322,6 +367,7 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
   async function next() {
     setSaving(true);
     setErr(null);
+    setMoved(false);
     // What the screen promised when Next was pressed: the help line's list
     // and the order shown. A fresh read that gives a different plan writes
     // nothing; the screen then shows the new plan and Next is pressed again.
@@ -333,6 +379,15 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
       setErr(
         `${done.length ? `Khipu saved ${listOf(done)}, but` : "Khipu"} couldn't ${cant}. Try Next again, or Skip for now and change it later in Settings.`,
       );
+    const refusedAsMoved = (res: { refusal?: Record<string, unknown> }, what: string): boolean => {
+      if (res.refusal?.code !== "version_moved") return false;
+      setErr(
+        `${done.length ? `Khipu saved ${listOf(done)}, but ` : ""}${what} was changed somewhere else after setup read it, ` +
+          "so Khipu didn't save over it. Reload to see what is saved now, then press Next again.",
+      );
+      setMoved(true);
+      return true;
+    };
     const changedElsewhere = (what: string) =>
       setErr(
         `${done.length ? `Khipu saved ${listOf(done)}. ` : ""}${what} changed while setup was open, so Khipu saved nothing more. ` +
@@ -357,9 +412,10 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         if (plan.kind !== "none") {
           const res =
             plan.kind === "unset"
-              ? await callCli("khipu_config_unset", { key: "usage_accounts" })
-              : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(plan.list) });
+              ? await callCli("khipu_config_unset", { key: "usage_accounts", expect: fresh.version ?? null })
+              : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(plan.list), expect: fresh.version ?? null });
           if (!res.ok) {
+            if (refusedAsMoved(res, "the account list")) return;
             console.error("khipu config usage_accounts failed:", res.error);
             say("save which accounts to read");
             return;
@@ -401,8 +457,14 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         }
         const plan = planPriority(r.data.priority ?? null, vis, moves, uh);
         if (plan) {
-          const res = await callCli("khipu_route_priority", { action: "set", entries: plan.entries, until: plan.until });
+          const res = await callCli("khipu_route_priority", {
+            action: "set",
+            entries: plan.entries,
+            until: plan.until,
+            expect: r.data.priority?.version ?? r.data.priority_version ?? null,
+          });
           if (!res.ok) {
+            if (refusedAsMoved(res, "your order")) return;
             console.error("khipu route priority failed:", res.error);
             say("save the order");
             return;
@@ -539,7 +601,7 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
               {listWrite.kind === "unset"
                 ? "Next goes back to reading every account Khipu finds on this Mac."
                 : listWrite.kind === "set"
-                  ? `Next saves the account list as: ${listOf(listWrite.list.map((e) => e.label))}.`
+                  ? `Next saves the account list as: ${listOf(listWrite.labels)}.`
                   : listPlan.list.length === 0
                     ? "With none chosen, Next leaves the account list as it is saved."
                     : "The account list is already saved this way."}
@@ -641,7 +703,17 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         </div>
       </div>
       <p className="set-help">Standing rules and holds can be added later in Settings → Accounts and routing.</p>
-      {err ? <p className="set-error" role="alert">{err}</p> : null}
+      {err ? (
+        <div className="set-error" role="alert">
+          <p>{err}</p>
+          {moved ? (
+            <button type="button" className="sm" onClick={() => void reload()} disabled={reloading || saving} aria-busy={reloading || undefined}>
+              {reloading ? <Loader2 size={14} className="spin" aria-hidden /> : null}
+              Reload
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="toolbar welcome-nav">
         <button type="button" onClick={onBack} disabled={saving}>

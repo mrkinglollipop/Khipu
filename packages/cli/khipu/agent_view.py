@@ -10,7 +10,9 @@ expanded, resolved, in its ~/ form and by its folder name), replaced by the
 account's id as khipu_route gives it; the other configured folders and files;
 this Mac's home folder; the user names those paths carry; and anything else
 shaped like a private path. The app and the owner's own `khipu usage --json`
-never pass through here and keep their paths. Memory content (khipu_search,
+never pass through here and keep their paths. The ledger's and the Work
+view's agent-facing and JSON outputs leave through ``project``: this scrub,
+account keys first, and a stricter final scan. Memory content (khipu_search,
 khipu_get, khipu_status's prior work) never passes through here either: a
 scrub would alter what was remembered.
 
@@ -30,6 +32,7 @@ import hashlib
 import html
 import os
 import re
+import stat
 import threading
 import time
 import unicodedata
@@ -125,8 +128,17 @@ def _saved_view() -> dict:
 def _homes(extra_keys: Iterable[str] | None, view: dict) -> list[tuple[str, str | None]]:
     """Every (harness, login folder) Khipu knows: configured (invalid entries
     included), discovered Claude homes, the routing record's accounts, the
-    caller's ``extra_keys`` ("harness|home") and each default login."""
+    caller's ``extra_keys`` ("harness|home"), each default login and each
+    one set for this process through a harness's own variable
+    (``CODEX_HOME``, ``GROK_HOME``, ``CLAUDE_CONFIG_DIR``)."""
     out: list[tuple[str, str | None]] = [(h, None) for h in _DEFAULT_FOLDERS]
+    with contextlib.suppress(Exception):
+        from khipu.usage import _HOME_VARS
+
+        for harness, var in _HOME_VARS.items():
+            value = (os.environ.get(var) or "").strip()
+            if value:
+                out.append((harness, value))
     with contextlib.suppress(Exception):
         from khipu.config import load_config
 
@@ -159,6 +171,60 @@ def _homes(extra_keys: Iterable[str] | None, view: dict) -> list[tuple[str, str 
             harness, _, home = key.partition("|")
             out.append((harness, home or None))
     return out
+
+
+def _config_whole() -> None:
+    """Raise when the config file is there but can't be read or parsed (or
+    isn't an object): the login folders it names are then unknown, so the
+    table ``_homes`` builds is incomplete and nothing may lean on it."""
+    from khipu.config import check_config_readable
+
+    check_config_readable()
+
+
+def strict_table():
+    """``_table(None)``, raising instead when ``_config_whole`` does."""
+    _config_whole()
+    return _table(None)
+
+
+def _login_forms():
+    """Each spelling (``_forms``, without a trailing slash or ``~``) of each
+    login folder ``_homes`` knows. Raises while the config is unreadable."""
+    _config_whole()
+    home = _home_dir()
+    for harness, raw in _homes(None, _saved_view()):
+        if raw is None:
+            folder = _DEFAULT_FOLDERS.get(harness)
+            if not folder or not home:
+                continue
+            raw = os.path.join(home, folder)
+        for form in _forms(raw, home):
+            form = form.rstrip("/")
+            if not form.startswith("~"):
+                yield form
+
+
+def in_login_folder(path: str) -> bool:
+    """Whether ``path`` is in one of the login folders ``_homes`` knows (in
+    any of its spellings), decided from names and links alone: nothing
+    inside one is listed or opened."""
+    target = _fold(path.rstrip("/"))
+    return any(target == form or target.startswith(form + "/") for form in map(_fold, _login_forms()))
+
+
+def login_folder_ids() -> frozenset[tuple[int, int]]:
+    """The (device, inode) of each login folder ``_homes`` knows that is
+    there, so a folder is known as one whatever name reached it (macOS's
+    ``/System/Volumes/Data/...`` is the same folder as its plain path). Only
+    each folder itself is looked at, never anything inside it."""
+    ids = set()
+    for form in set(_login_forms()):
+        with contextlib.suppress(OSError, ValueError):
+            st = os.stat(form)
+            if stat.S_ISDIR(st.st_mode):
+                ids.add((st.st_dev, st.st_ino))
+    return frozenset(ids)
 
 
 class _Id:
@@ -469,6 +535,177 @@ def scrub(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] | None =
     table = _table(extra_keys)
     words = sorted({w for w in [*keep, *table.owner] if isinstance(w, str) and w}, key=len, reverse=True)
     return _walk(value, table, words)
+
+
+# A routing account key, "harness|login folder" (the folder may be empty).
+_ACCOUNT_KEY = re.compile(r"(?i)(?<![\w-])(claude|codex|grok|muse)\|")
+# The final scan's: a harness name with anything before or after it ahead
+# of the bar ("x_codex|", "codex2|") is still a key.
+_ANY_ACCOUNT_KEY = re.compile(r"(?i)(?:claude|codex|grok|muse)[^\s|]*\|")
+_KEY_HOME = re.compile(r"[^\s\"'`,;)\]}]*")
+
+
+def _account_keys(text: str, table: _Table) -> str:
+    """Each account key in ``text`` replaced by the account's id. A folder
+    Khipu knows is taken whole, spaces included; any other runs to the
+    first space."""
+    out, last = [], 0
+    for m in _ACCOUNT_KEY.finditer(text):
+        if m.start() < last:
+            continue
+        found = table.roots.match(text, m.end()) if table.roots is not None else None
+        end = found.end() if found else _KEY_HOME.match(text, m.end()).end()
+        out += [text[last:m.start()], str(_Id(m.group(1).lower(), text[m.end():end] or None))]
+        last = end
+    return "".join(out) + text[last:]
+
+
+def _project_text(text: str, table: _Table) -> str:
+    from khipu.redact import redact_secrets
+
+    from khipu import work
+
+    # work.py's rule: each path-shaped word that is left becomes "(a path)",
+    # decoded before it is checked, a link's path and query included.
+    text = work._cut_paths(_scrub_text(_account_keys(text, table), table, []))
+    # Fail closed: an account key, a key-shaped secret or a path still in
+    # the finished value, in any decoding of it, withholds the whole value.
+    for variant in _decoded_variants(text):
+        if _ANY_ACCOUNT_KEY.search(variant) or redact_secrets(variant, force=True)[1] \
+                or (variant != text and work._has_path(variant)):
+            return WITHHELD
+    return text
+
+
+def _project_walk(value, table):
+    if isinstance(value, str):
+        return _project_text(value, table)
+    if isinstance(value, dict):
+        return {(_project_text(k, table) if isinstance(k, str) else k): _project_walk(v, table)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_project_walk(v, table) for v in value)
+    return value
+
+
+# Text that can't carry a name: numbers and times.
+_NAMELESS = re.compile(r"[0-9TZ:.+\- ]*")
+# The ledger's and the Work view's own field names: the only object keys
+# kept when the privacy table can't be built. A key merely shaped like a
+# field name (a tracker id, a login folder's name) is withheld with its value.
+VIEW_FIELDS = frozenset({
+    "absent", "account_ref", "accounts", "actions", "add", "affected", "all", "also_owed", "as_of", "at",
+    "at_text", "author", "available", "away", "blocked", "blocking", "board", "both", "built", "busy",
+    "by", "by_kind", "by_state", "capped", "catch_up", "changed", "changed_today", "changes", "check",
+    "checking", "children", "clamped", "cleared", "closed", "commit", "contents", "copied", "count",
+    "counts", "counts_differ", "counts_in_file", "counts_in_ledger", "created_at", "days_left", "default",
+    "digest", "disagrees", "done", "dropped", "ended_at", "entered", "error", "event", "evidence",
+    "existing_ids", "extra", "failed", "failures", "fields", "fields_differ", "fields_differ_count",
+    "file", "first_line", "fixing", "flagged", "for", "format", "from", "from_state", "generated_at",
+    "goals", "gone", "hidden", "hist", "history", "holds", "hub", "hub_checked", "id", "ids", "if_state",
+    "import_id", "imported", "imports", "in_dump", "in_offline_copy", "incomplete", "interval_s", "items",
+    "jobs", "key", "kind", "label", "labels", "landed", "lanes", "last", "last_good", "late", "ledger",
+    "ledger_as_of", "ledger_evidence_chars", "ledger_id_chars", "ledger_offline", "ledger_outbox",
+    "ledger_owner_word", "ledger_purge_after", "ledger_stale_after", "ledger_title_chars", "left", "line",
+    "link", "live", "looks_like", "loose_end_count", "loose_ends", "masked", "matched", "meaning",
+    "merged", "merged_at", "missing", "missing_parent", "name", "needs_owner", "new", "new_entries",
+    "new_rows", "new_words", "none", "note", "now", "of", "off", "offline", "offline_as_of",
+    "offline_copy_error", "offline_copy_waiting", "ok", "old", "older", "oldest_age_s", "on", "op",
+    "op_id", "open", "opened_at", "orig", "other_keys", "other_project", "out", "outbox", "outcome",
+    "owner", "parent", "parent_missing", "pending", "plan", "privacy", "problem", "problems", "project",
+    "project_key", "projects", "prs", "pruned", "purged", "purged_ids", "purged_markers", "queue_added",
+    "queue_removed", "queue_restored", "queued", "queued_at", "quiet", "raw", "reason", "reason_word",
+    "refresh_s", "refs", "refused", "remove", "removed", "removed_at", "removed_by", "removed_note",
+    "removed_waiting_to_purge", "requested", "restore", "result", "retried", "rewritten", "row", "row_id",
+    "rows", "rules", "runner", "running", "runs", "seq", "set", "shape", "shipped", "show_now", "shown",
+    "since", "skipped", "skipped_purged", "skipped_removed", "source", "sources", "stage", "stage_at",
+    "stage_known", "stage_words", "stale", "stale_sources", "stamp", "started_at", "state", "state_known",
+    "state_words", "status", "stopped", "stopped_early", "stored", "summary", "task", "testing", "text",
+    "title", "to", "to_state", "trains", "ts", "unreadable", "updated", "updated_at", "valid_until",
+    "value", "verb", "verdict", "verified", "version", "vocab", "waiting", "waiting_list_ignored",
+    "warnings", "with_parent", "words", "work_clock_slack", "work_file_max_bytes", "work_finished_for",
+    "work_gone_after", "work_job_quiet_after", "work_line_chars", "work_max_jobs", "work_max_prs",
+    "work_max_runs", "work_max_trains", "work_merged_for", "work_projects", "work_refresh",
+    "work_stale_after", "written_at"
+})
+INCOMPLETE = "Khipu withheld this answer: it could not load its list of private names and folders."
+
+
+def _withhold_names(value, fixed=None, names=None):
+    """``value`` with every string that could carry a name withheld, for
+    when the replacement table can't be built: a login folder's name can
+    then not be told from any other word. Kept: numbers, times, work.py's
+    own words and object keys from ``VIEW_FIELDS`` or those words (never this Mac's
+    user name). Every other key is withheld, and its value with it."""
+    if fixed is None:
+        from khipu import work
+
+        fixed = work._fixed_words()
+        home = _home_dir()
+        names = {n.casefold() for n in (os.path.basename(home or ""), os.environ.get("USER", "")) if n}
+    if isinstance(value, str):
+        return value if value in fixed or _NAMELESS.fullmatch(value) else WITHHELD
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if not isinstance(k, str) or ((k in VIEW_FIELDS or k in fixed) and k.casefold() not in names):
+                out[k] = _withhold_names(v, fixed, names)
+            else:
+                out[WITHHELD] = WITHHELD
+        return out
+    if isinstance(value, (list, tuple)):
+        return type(value)(_withhold_names(v, fixed, names) for v in value)
+    return value
+
+
+def _projected(value):
+    """(``value`` projected, whether it is complete)."""
+    try:
+        table = strict_table()
+    except Exception:  # noqa: BLE001
+        return _withhold_names(value), False
+    return _project_walk(value, table), True
+
+
+def project(value):
+    """``value`` as the ledger and the Work view hand it to an agent or a
+    JSON reader (khipu_ledger, ``khipu ledger ... --json``, ``khipu work
+    --json``, ``khipu work check --json``, view.json): account keys become
+    account ids, then ``scrub``'s replacements, then a final scan that
+    withholds any string still holding an account key, a secret or a
+    private path. No owner's words are kept whole here.
+
+    When the replacement table can't be built, or the config naming login
+    folders can't be read, it fails closed: every string
+    that could carry a name is withheld, and a dict says so with
+    ``"incomplete": true``."""
+    out, complete = _projected(value)
+    if not complete and isinstance(out, dict):
+        out["incomplete"] = True
+    return out
+
+
+def emit(payload=None, text: str | None = None, *, as_json: bool = False, stream=None, to_file=None,
+         indent: int | None = 2, sort_keys: bool = False) -> None:
+    """The one way a ``khipu ledger`` or ``khipu work`` answer leaves Khipu,
+    on stdout, stderr or a file the caller named: ``payload`` as JSON when
+    ``as_json``, else ``text``; either way through ``project`` first. Text is
+    projected line by line, so one withheld line never blanks the rest."""
+    import json
+    import sys
+
+    if as_json:
+        out = json.dumps(project(payload), indent=indent, sort_keys=sort_keys, default=str, ensure_ascii=False)
+    elif text is not None:
+        lines, complete = _projected(str(text).split("\n"))
+        out = "\n".join(lines + ([] if complete else [INCOMPLETE]))
+    else:
+        return
+    if to_file is not None:
+        with open(to_file, "w", encoding="utf-8") as fh:
+            fh.write(out + "\n")
+        return
+    print(out, file=stream or sys.stdout)
 
 
 def error_text(exc: BaseException) -> str:

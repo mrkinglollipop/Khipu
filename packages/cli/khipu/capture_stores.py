@@ -33,7 +33,7 @@ from pathlib import Path
 
 # The scans forget runs, by the name a store gives.
 FORGET_SCANS = ("native jobs", "outbox", "legacy logs", "replica", "replica temps",
-                "legacy writers", "recall golden")
+                "legacy writers", "recall golden", "work view")
 
 
 # The scrubs a restored file may go through, by the name an entry gives.
@@ -111,11 +111,17 @@ STORES: tuple[Store, ...] = (
     Store("legacy writer", "data folder .legacy_writers/<pgid>.json",
           "the process group of a legacy writer that may still append", "legacy writers",
           _w("writer_groups.record")),
-    Store("recall golden set", "data folder recall-golden.jsonl, or the file KHIPU_RECALL_GOLDEN names",
+    Store("recall golden set", "data folder recall-golden.jsonl, or the file KHIPU_RECALL_GOLDEN names, "
+          "and .recall-golden.*.tmp rewrites beside it",
           "recall test queries, which usually quote a captured episode's private text, each "
           "with the episode ids it expects", "recall golden",
-          _w("forget._scrub_recall_golden"),
+          _w("forget._scrub_golden_file"),
           Restore(("recall-golden.jsonl",), "recall golden")),
+    Store("work view", "data folder state/work/view.json and .view.json.*.tmp rewrites beside it; "
+          "the same writer saves state/work/last/*.json, links.json and hidden.json there, which "
+          "hold job summaries, ids and hashes only",
+          "the Work view's read model, which lists open commitments' text", "work view",
+          _w("work._write_json")),
     Store("recall eval record", "a file the owner names with khipu recall eval --record",
           "the golden queries, quoted text included, and the ids each one returned",
           "kept: an owner-chosen file outside the data folder that forget cannot find; a known "
