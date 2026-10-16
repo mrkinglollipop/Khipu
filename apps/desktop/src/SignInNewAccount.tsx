@@ -19,13 +19,24 @@ type Call = <T = Record<string, unknown>>(command: string, args?: Record<string,
 type Attempt = { id: string; folder: string; started: number; deadline: number };
 type StartAnswer = { attempt: Attempt; state?: string; link?: string; code?: string };
 type StatusAnswer = { attempt?: Attempt; state: string; error?: string };
+type CancelAnswer = { state?: string; stopped?: unknown; left?: number[]; error?: string };
 type FolderAnswer = { folder: string };
 
-type Phase = "intro" | "starting" | "waiting" | "nocode" | "failed";
+// "stopping": the owner's Stop and cancel is in flight; "stuck": the CLI
+// could not stop it (or not fully), so the dialog stays open with Stop again.
+type Phase = "intro" | "starting" | "waiting" | "stopping" | "stuck" | "nocode" | "failed";
 
 const POLL_MS = 2000;
 
 const CLI_TITLE: Record<SignInCli, string> = { claude: "Claude", codex: "Codex", grok: "Grok Build", muse: "Muse" };
+
+const NOT_FULLY_STOPPED =
+  "Khipu could not fully stop the sign-in: part of it is still running. Nothing was saved. Choose Stop again.";
+
+/** The CLI's answer says part of the login's process group still runs. */
+function stillRunning(answer: { stopped?: unknown; left?: unknown; error?: unknown } | undefined): boolean {
+  return answer?.stopped === "left" || (Array.isArray(answer?.left) && answer.left.length > 0) || answer?.error === "not_stopped";
+}
 
 function minutesSince(startedSec: number, nowMs: number): number {
   return Math.max(0, Math.floor((nowMs - startedSec * 1000) / 60000));
@@ -107,11 +118,14 @@ export function SignInNewAccount({
   // Whether Khipu made (or reused) the login folder for this dialog; Try
   // again after a folder refusal makes it first.
   const folderMadeRef = useRef(false);
+  // The attempt this dialog is on now, by id; a status reply asked for any
+  // other attempt (one from before Start again) is ignored.
+  const currentRef = useRef<string | null>(null);
   const [stopProblem, setStopProblem] = useState<string | null>(null);
   const signedInRef = useRef(onSignedIn);
   signedInRef.current = onSignedIn;
 
-  const active = phase === "starting" || phase === "waiting";
+  const active = phase === "starting" || phase === "waiting" || phase === "stuck";
 
   const fail = useCallback((text: string, why: string | null) => {
     setProblem(text);
@@ -121,9 +135,28 @@ export function SignInNewAccount({
     setPhase("failed");
   }, []);
 
+  // Stop the current attempt; the dialog closes only once the CLI says its
+  // login is fully stopped (or that no attempt is left to stop).
+  const finishStop = useCallback(async () => {
+    doneRef.current = true;
+    setStopProblem(null);
+    setPhase("stopping");
+    const res = await call<CancelAnswer>("khipu_account_sign_in_cancel", { remove_folder: false });
+    const answer = res.ok ? res.data : (res.refusal as CancelAnswer | undefined);
+    const left = stillRunning(answer);
+    if ((res.ok && !left) || (!res.ok && answer?.error === "no_attempt")) {
+      currentRef.current = null;
+      onCancel();
+      return;
+    }
+    setStopProblem(left ? NOT_FULLY_STOPPED : "Khipu couldn't stop the sign-in just now. Choose Stop again.");
+    setPhase("stuck");
+  }, [call, onCancel]);
+
   const begin = useCallback(
     async (again: boolean) => {
       setPhase("starting");
+      currentRef.current = null;
       cancelAskedRef.current = false;
       setProblem(null);
       setDetail(null);
@@ -132,7 +165,10 @@ export function SignInNewAccount({
       setLink(null);
       if (!again || !folderMadeRef.current) {
         const made = await call<FolderAnswer>("khipu_account_new_folder", { harness: cli, name: accountName });
-        if (cancelAskedRef.current) return;
+        if (cancelAskedRef.current) {
+          onCancel(); // nothing has started yet
+          return;
+        }
         if (!made.ok) {
           const err = (made.refusal?.error as string | undefined) ?? undefined;
           fail(startProblem(err, cliName), err ? `Code: ${err}` : made.error);
@@ -142,12 +178,32 @@ export function SignInNewAccount({
       }
       const res = await call<StartAnswer>("khipu_account_sign_in_new", { harness: cli, again });
       if (cancelAskedRef.current) {
-        // The dialog already closed: stop the login start just began.
-        if (res.ok) await call("khipu_account_sign_in_cancel", { remove_folder: false });
+        // Stop was asked while start ran: stop the login it began, and close
+        // only once that stop succeeds.
+        if (!res.ok) {
+          onCancel();
+          return;
+        }
+        setAttempt(res.data.attempt);
+        currentRef.current = res.data.attempt.id;
+        await finishStop();
         return;
       }
       if (!res.ok) {
         const err = res.refusal?.error as string | undefined;
+        if (stillRunning(res.refusal)) {
+          // The earlier login could not be fully stopped: it is still this
+          // dialog's to stop.
+          const prior = res.refusal?.attempt as Attempt | undefined;
+          if (prior) {
+            setAttempt(prior);
+            currentRef.current = prior.id;
+          }
+          doneRef.current = true;
+          setStopProblem(NOT_FULLY_STOPPED);
+          setPhase("stuck");
+          return;
+        }
         if (err === "no_code") {
           setPhase("nocode");
           return;
@@ -156,11 +212,12 @@ export function SignInNewAccount({
         return;
       }
       setAttempt(res.data.attempt);
+      currentRef.current = res.data.attempt.id;
       setLink(safeLink(res.data.link));
       setCode(res.data.code ?? null);
       setPhase("waiting");
     },
-    [call, cli, cliName, accountName, fail],
+    [call, cli, cliName, accountName, fail, finishStop, onCancel],
   );
 
   // Poll while waiting.
@@ -169,8 +226,10 @@ export function SignInNewAccount({
     doneRef.current = false;
     const timer = setInterval(async () => {
       setTick((n) => n + 1);
+      const asked = currentRef.current;
+      if (!asked) return;
       const res = await call<StatusAnswer>("khipu_account_sign_in_status");
-      if (doneRef.current) return;
+      if (doneRef.current || currentRef.current !== asked) return;
       // A finished attempt is an answer; an older CLI sent its end states as
       // ok: false, so a refusal that names one is read the same way.
       const answer = res.ok ? res.data : (res.refusal as StatusAnswer | undefined);
@@ -181,6 +240,14 @@ export function SignInNewAccount({
       }
       if (!answer || typeof answer.state !== "string") return; // keep waiting; the next poll tries again
       const { state, attempt: seen, error } = answer;
+      if (seen && seen.id !== asked) return;
+      if (state === "not_stopped") {
+        // Khipu timed it out but could not fully stop it.
+        doneRef.current = true;
+        setStopProblem(NOT_FULLY_STOPPED);
+        setPhase("stuck");
+        return;
+      }
       if (state === "signed_in") {
         doneRef.current = true;
         signedInRef.current((seen ?? attempt)?.folder ?? "");
@@ -201,18 +268,19 @@ export function SignInNewAccount({
     return () => clearInterval(timer);
   }, [phase, call, attempt, cliName, fail, now]);
 
-  // Escape while signing in asks first, the same as Stop and cancel.
+  // Escape while signing in asks first, the same as Stop and cancel; while a
+  // stop is in flight it does nothing, so the dialog never closes before it.
   useEffect(() => {
-    if (!active || confirming) return;
+    if ((!active && phase !== "stopping") || confirming) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       e.preventDefault();
       e.stopPropagation();
-      setConfirming(true);
+      if (phase !== "stopping") setConfirming(true);
     };
     document.addEventListener("keydown", onKey, true);
     return () => document.removeEventListener("keydown", onKey, true);
-  }, [active, confirming]);
+  }, [active, confirming, phase]);
 
   if (!offered) return null;
 
@@ -222,21 +290,18 @@ export function SignInNewAccount({
       // Start hasn't answered: nothing to stop yet. begin() stops the
       // attempt start returns, and never moves on to waiting.
       cancelAskedRef.current = true;
-      onCancel();
+      setPhase("stopping");
       return;
     }
-    doneRef.current = true;
-    const res = await call("khipu_account_sign_in_cancel", { remove_folder: false });
-    if (!res.ok && attempt) {
-      // The login may still be running: keep the dialog so the owner can try again.
-      doneRef.current = false;
-      setStopProblem("Khipu couldn't stop the sign-in just now. Choose Stop and cancel again.");
-      return;
-    }
-    onCancel();
+    await finishStop();
   };
   const cancelFailed = async () => {
-    await call("khipu_account_sign_in_cancel", { remove_folder: true });
+    const res = await call<CancelAnswer>("khipu_account_sign_in_cancel", { remove_folder: true });
+    if (stillRunning(res.ok ? res.data : (res.refusal as CancelAnswer | undefined))) {
+      setStopProblem(NOT_FULLY_STOPPED);
+      setPhase("stuck");
+      return;
+    }
     onCancel();
   };
   const copyCode = async () => {
@@ -320,10 +385,36 @@ export function SignInNewAccount({
               </p>
             </>
           )}
-          {stopProblem ? <p role="alert">{stopProblem}</p> : null}
           <div className="kit-dialog-actions">
             <button type="button" onClick={() => setConfirming(true)}>Stop and cancel</button>
             <button type="button" onClick={() => void begin(true)}>Start again</button>
+          </div>
+        </>
+      ) : null}
+
+      {phase === "stopping" ? (
+        <>
+          {head(`${cliName}: stopping the sign-in…`)}
+          <p role="status">
+            <Loader2 size={14} className="spin" aria-hidden /> Stopping the sign-in.
+          </p>
+        </>
+      ) : null}
+
+      {phase === "stuck" ? (
+        <>
+          {head(`${cliName}: sign-in not stopped`)}
+          <div role="alert">
+            <p><strong>The sign-in is still running</strong></p>
+            {stopProblem ? <p>{stopProblem}</p> : null}
+          </div>
+          {folder ? (
+            <p className="meta">
+              It was signing in to <code>{folder}</code>.
+            </p>
+          ) : null}
+          <div className="kit-dialog-actions">
+            <button type="button" className="primary" onClick={() => void finishStop()}>Stop again</button>
           </div>
         </>
       ) : null}

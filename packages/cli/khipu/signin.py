@@ -112,6 +112,7 @@ E_NO_CODE = "no_code"
 E_SLUG = "bad_name"
 E_TAKEN = "folder_taken"
 E_NO_ATTEMPT = "no_attempt"
+E_NOT_STOPPED = "not_stopped"
 
 WAITING = "waiting"
 STARTING = "starting"
@@ -120,6 +121,9 @@ NOT_SIGNED_IN = "not_signed_in"
 COULDNT_CHECK = "couldnt_check"
 TIMED_OUT = "timeout"
 CANCELLED = "cancelled"
+# The login's group could not be fully stopped: its record stays, so the
+# attempt stays owned and Stop again can reach it.
+NOT_STOPPED = "not_stopped"
 
 
 def wait_s() -> float:
@@ -281,6 +285,33 @@ def _still_held(path: Path, dir_fd: int) -> bool:
     except OSError:
         return False
     return info is not None and (info.st_dev, info.st_ino) == (held.st_dev, held.st_ino)
+
+
+def _components(path: Path) -> tuple | None:
+    """Each component of ``path`` as its own entry (``lstat``, never
+    followed): identity and file type, from the folder up to the root."""
+    out = []
+    for part in (path, *path.parents):
+        try:
+            info = os.lstat(part)
+        except OSError:
+            return None
+        out.append((str(part), info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)))
+    return tuple(out)
+
+
+def _pinned(path: Path, dir_fd: int, parts: tuple | None) -> bool:
+    """The path a login is given still resolves to the folder held open:
+    the folder is that same real folder, no component of the path changed
+    (none became a symlink or another entry) since ``parts`` was taken, and
+    the path followed the way the child follows it lands on that folder."""
+    if parts is None or not _still_held(path, dir_fd) or _components(path) != parts:
+        return False
+    try:
+        held, seen = os.fstat(dir_fd), os.stat(path)
+    except OSError:
+        return False
+    return (seen.st_dev, seen.st_ino) == (held.st_dev, held.st_ino)
 
 
 def make_folder(cli: str, name: str) -> dict:
@@ -516,6 +547,16 @@ def kill_if_ours(rec: dict, *, ps=None, killpg=None, getpgid=None, members=None)
     return stop_group(rec, ps=ps, killpg=killpg, getpgid=getpgid, members=members)[0]
 
 
+def _stop_and_end(rec: dict, *, ps=None, killpg=None) -> tuple[str, list[int]]:
+    """``stop_group``, then end the attempt only once nothing of its group
+    is left. While a member lives the record stays: the attempt stays owned
+    (a new start is busy) and Stop again can still reach it."""
+    result, left = stop_group(rec, ps=ps, killpg=killpg)
+    if not left:
+        _end_attempt(rec)
+    return result, left
+
+
 def _owner(ps) -> dict | None:
     """The app that runs this call (its parent process), as ``ps`` reports it."""
     pid = os.getppid()
@@ -630,8 +671,7 @@ def reap(*, ps=None, killpg=None) -> dict:
         rec = _attempt()
         if rec is None:
             return {"ok": True, "reaped": None}
-        result, left = stop_group(rec, ps=ps, killpg=killpg)
-        _end_attempt(rec)
+        result, left = _stop_and_end(rec, ps=ps, killpg=killpg)
         return {"ok": True, "reaped": result, **({"left": left} if left else {})}
     finally:
         usage._release(fd)
@@ -651,9 +691,11 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
     sign-in at a time: a second start gets ``busy`` unless ``again`` (Start
     again), which ends the running one first. A leftover attempt (its
     process ended, is no longer ours, outlived its wait, or the app that
-    started it is gone, as after a crash) is reaped first. The folder is held
-    open from its check to the launch, and the launch is refused if its name
-    no longer names that same folder."""
+    started it is gone, as after a crash) is reaped first; while any member of
+    its group still runs it stays owned and start is ``busy``. The folder is
+    held open from its check to the launch and checked again once the login
+    runs; if its path no longer leads to that same folder, the login is
+    stopped and the start refused."""
     if cli not in CLIS:
         return {"ok": False, "error": E_REFUSED}
     if not PROVEN.get(cli):
@@ -672,6 +714,7 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
         return {"ok": False, "error": E_BUSY}
     dir_fd = None
     try:
+        parts = None
         if path is not None:
             dir_fd = _open_dir(path)
             try:
@@ -679,6 +722,9 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
             except OSError:
                 held = None
             if held is None or _made_item(cli, path.name, held) is None:
+                return {"ok": False, "error": E_REFUSED}
+            parts = _components(path)
+            if not _pinned(path, dir_fd, parts):
                 return {"ok": False, "error": E_REFUSED}
         # Checked under the lock: a folder that has signed in is an account
         # now, re-signed only through Sign in again.
@@ -690,16 +736,17 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
             current = now_ts < _deadline(old)
             if current and not again and _alive(old, ps) and not _owner_gone(old, ps):
                 return {"ok": False, "error": E_BUSY, "attempt": _public(old)}
-            kill_if_ours(old, ps=ps, killpg=killpg)
-            _end_attempt(old)
+            _, left = _stop_and_end(old, ps=ps, killpg=killpg)
+            if left:
+                return {"ok": False, "error": E_BUSY, "attempt": _public(old), "left": left}
         binary = usage._command(cli)
         if not binary:
             return {"ok": False, "error": E_NOT_INSTALLED}
         argv = [binary, *ARGV[cli]]
         env = usage.probe_environment(cli, str(path) if path else None, binary)
-        # The last check before the spawn: a swap after this point is not
-        # this call's to see, one before it is refused.
-        if path is not None and not _still_held(path, dir_fd):
+        # The last check before the spawn; the same check runs again once the
+        # login runs (below), because the child re-resolves the folder path.
+        if path is not None and not _pinned(path, dir_fd, parts):
             return {"ok": False, "error": E_REFUSED}
         cwd = tempfile.mkdtemp(prefix="khipu-sign-in-")
         code_kind = cli in CODE
@@ -732,6 +779,15 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
             _stop_own(proc, killpg)
             _end_attempt(rec)
             return {"ok": False, "error": E_START}
+        # A path in a variable cannot be pinned to the folder held open: the
+        # child resolves it again. A swap during the spawn is caught here and
+        # the verified group stopped; a swap and swap back between the two
+        # checks is the boundary the plan's 9D section names.
+        if path is not None and not _pinned(path, dir_fd, parts):
+            _, left = _stop_and_end(rec, ps=ps, killpg=killpg)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=KILL_GRACE_S)
+            return {"ok": False, "error": E_REFUSED, **({"left": left} if left else {})}
         out = {"ok": True, "attempt": _public(rec), "state": WAITING}
         if code_kind:
             try:
@@ -739,13 +795,13 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
             except (OSError, ValueError):
                 found = None
             if found is None:
-                kill_if_ours(rec, ps=ps, killpg=killpg)
-                _end_attempt(rec)
+                _, left = _stop_and_end(rec, ps=ps, killpg=killpg)
                 with contextlib.suppress(Exception):
                     proc.stdout.close()
                 with contextlib.suppress(Exception):
                     proc.wait(timeout=KILL_GRACE_S)
-                return {"ok": False, "error": E_NO_CODE, "cli_name": usage.CLI_NAMES[cli]}
+                return {"ok": False, "error": E_NO_CODE, "cli_name": usage.CLI_NAMES[cli],
+                        **({"left": left} if left else {})}
             (drain or _drain)(proc.stdout)
             out["link"], out["code"] = found
             del found
@@ -793,8 +849,10 @@ def status(attempt_id: str, *, ps=None, killpg=None, check=None, now=None) -> di
         if _alive(rec, ps):
             if now_ts < _deadline(rec):
                 return {"ok": True, "attempt": _public(rec), "state": WAITING}
-            kill_if_ours(rec, ps=ps, killpg=killpg)
-            _end_attempt(rec)
+            result, left = _stop_and_end(rec, ps=ps, killpg=killpg)
+            if left:
+                return {"ok": True, "attempt": _public(rec), "state": NOT_STOPPED, "stopped": result,
+                        "left": left}
             # A finished attempt is an answer, not a refusal: ``ok: false`` is
             # kept for real refusals (``no_attempt``), which the app ignores.
             return {"ok": True, "attempt": _public(rec), "state": TIMED_OUT, "error": usage.E_SIGN_IN_TIMEOUT}
@@ -812,8 +870,9 @@ def status(attempt_id: str, *, ps=None, killpg=None, check=None, now=None) -> di
                 state = COULDNT_CHECK
         if state == SIGNED_IN and path is not None:
             _mark_signed_in(rec["cli"], path)
-        _end_attempt(rec)
-        return {"ok": True, "attempt": _public(rec), "state": state}
+        # The login ended; anything still in its group keeps the record.
+        result, left = _stop_and_end(rec, ps=ps, killpg=killpg)
+        return {"ok": True, "attempt": _public(rec), "state": state, **({"left": left} if left else {})}
     finally:
         usage._release(fd)
 
@@ -840,10 +899,13 @@ def cancel(attempt_id: str | None, *, remove_folder: bool = False, cli: str | No
             in_use = rec is not None and rec.get("cli") == cli and rec.get("folder") == folder
             return {"ok": True, "state": CANCELLED, "stopped": None,
                     "folder_removed": False if in_use else remove_unused_folder(cli, folder)}
-        result, left = stop_group(rec, ps=ps, killpg=killpg)
-        _end_attempt(rec)
-        out = {"ok": True, "attempt": _public(rec), "state": CANCELLED, "stopped": result,
-               **({"left": left} if left else {})}
+        result, left = _stop_and_end(rec, ps=ps, killpg=killpg)
+        if left:
+            # Not stopped: the record and the folder stay, and the app keeps
+            # the dialog open with Stop again.
+            return {"ok": False, "error": E_NOT_STOPPED, "attempt": _public(rec), "state": NOT_STOPPED,
+                    "stopped": result, "left": left}
+        out = {"ok": True, "attempt": _public(rec), "state": CANCELLED, "stopped": result}
         if remove_folder and rec.get("folder"):
             out["folder_removed"] = remove_unused_folder(rec["cli"], rec["folder"])
         return out

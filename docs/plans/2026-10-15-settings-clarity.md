@@ -859,6 +859,22 @@ start and on quit; until then the login may still finish and write into the fold
 sees. "Open the sign-in page again" is replaced by **Start again** (kill, then start), since
 nothing reads a Claude or Codex login's output.
 
+**A group that will not stop.** While any member of the login's process group is still alive after a stop
+(cancel, Start again, the timeout, the reaper, a refused start), its record stays: the attempt stays owned, a
+new start answers `busy` with what is left, cancel answers `not_stopped` with the pids left, and the dialog
+stays open saying the sign-in could not be fully stopped, with Stop again. It closes only once a cancel
+succeeds.
+
+**Known boundary: the folder path.** The login gets its folder as a path in a variable
+(`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), which the child resolves again itself; a path cannot be pinned to the
+folder descriptor Khipu holds. So Khipu checks, before the spawn and again once the login runs, that the folder
+is the same real folder it made, that no component of its path changed (none became a symlink or another
+entry), and that the path followed lands on the held folder; if the second check fails, it stops the verified
+group and refuses the start. What remains is a swap and swap back between those two checks, while the child
+resolves the path. That needs a process running as the same user in the home folder, which can already write
+to any login folder directly, so the check closes the window as far as the OS allows and no further design is
+added for it.
+
 **Claude and Codex:** the browser opens; the dialog waits up to 15 minutes ("Waiting for you to finish signing in
 in your browser"), with Stop and cancel and Start again.
 

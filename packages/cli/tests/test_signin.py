@@ -407,12 +407,12 @@ def test_the_total_cap_stops_reading(box, monkeypatch):
     os.close(w)
 
 
-def test_no_code_in_time_stops_the_login_through_kill_if_ours(box, monkeypatch):
+def test_no_code_in_time_stops_the_login_through_the_verified_stop(box, monkeypatch):
     monkeypatch.setattr(signin, "PROVEN", ALL_PROVEN)
     monkeypatch.setattr(signin, "CODE_WAIT_S", 0.3)
     seen = []
-    real = signin.kill_if_ours
-    monkeypatch.setattr(signin, "kill_if_ours", lambda rec, **kw: seen.append(rec["pid"]) or real(rec, **kw))
+    real = signin.stop_group
+    monkeypatch.setattr(signin, "stop_group", lambda rec, **kw: seen.append(rec["pid"]) or real(rec, **kw))
     box.stdout, w = _code_pipe([b"Starting...\n"], close=False)
     out = signin.start("grok", _folder("lab", "grok"), **box.kw())
     os.close(w)
@@ -602,7 +602,7 @@ def test_a_leftover_group_whose_leader_already_ended_is_reported_and_not_signall
     box.table[1_000_050] = {"stat": "S", "lstart": LSTART, "command": "/fake/bin/node helper", "pgid": 1_000_001}
     box.end(1_000_001)
     assert signin.reap(ps=box.ps, killpg=box.killpg) == {"ok": True, "reaped": "left", "left": [1_000_050]}
-    assert box.killed == []
+    assert box.killed == [] and _attempt_file().exists()
 
 
 @pytest.mark.parametrize("matching", [True, False])
@@ -873,3 +873,113 @@ def test_cancel_with_no_attempt_removes_only_an_empty_folder_khipu_made(box):
     res = signin.cancel(None, remove_folder=True, cli="claude", folder=folder)
     assert res == {"ok": True, "state": signin.CANCELLED, "stopped": None, "folder_removed": True}
     assert not (box.home / ".claude-client").exists()
+
+
+# ---- a group that outlives its stop (second review of 419e9c6) -------------------------------
+
+
+def test_a_new_start_never_forgets_a_surviving_old_group(box):
+    folder = _folder()
+    signin.start("claude", folder, **box.kw())
+    box.table[1_000_050] = {"stat": "S", "lstart": LSTART, "command": "/fake/bin/helper", "pgid": 1_000_001}
+    box.end(1_000_001)
+    second = signin.start("claude", folder, **box.kw())
+    assert not second["ok"] and second["error"] == signin.E_BUSY, (second, box.members(1_000_001))
+    assert second["left"] == [1_000_050] and _attempt_file().exists()
+    box.end(1_000_050)
+    assert signin.start("claude", folder, **box.kw())["ok"]
+
+
+def test_cancel_keeps_the_record_and_reports_failure_while_the_group_survives(box):
+    out = signin.start("claude", _folder(), **box.kw())
+    box.table[1_000_001]["ignore"] = {signal.SIGTERM, signal.SIGKILL}
+    box.table[1_000_050] = {"stat": "S", "lstart": LSTART, "command": "/fake/bin/helper", "pgid": 1_000_001,
+                            "ignore": {signal.SIGTERM, signal.SIGKILL}}
+    res = signin.cancel(out["attempt"]["id"], remove_folder=True, ps=box.ps, killpg=box.killpg)
+    assert res["stopped"] == "left"
+    assert res["ok"] is False and res["error"] == signin.E_NOT_STOPPED and res["left"] == [1_000_001, 1_000_050]
+    assert _attempt_file().exists(), (res, box.members(1_000_001))
+    assert "folder_removed" not in res and (box.home / ".claude-client").is_dir()
+    assert signin.start("claude", out["attempt"]["folder"], **box.kw())["error"] == signin.E_BUSY
+    # Stop again, once the group can end, ends it and the record with it.
+    for pid in (1_000_001, 1_000_050):
+        box.table[pid]["ignore"] = set()
+    again = signin.cancel(out["attempt"]["id"], ps=box.ps, killpg=box.killpg)
+    assert again["ok"] and again["stopped"] == "killed" and not _attempt_file().exists()
+
+
+def test_the_reaper_keeps_the_record_while_the_group_survives(box):
+    signin.start("claude", _folder(), **box.kw())
+    box.table[1_000_050] = {"stat": "S", "lstart": LSTART, "command": "/fake/bin/helper", "pgid": 1_000_001}
+    box.end(1_000_001)
+    assert signin.reap(ps=box.ps, killpg=box.killpg) == {"ok": True, "reaped": "left", "left": [1_000_050]}
+    assert _attempt_file().exists()
+
+
+def test_a_finished_login_whose_helper_survives_keeps_its_record(box):
+    folder = _folder()
+    out = signin.start("claude", folder, **box.kw())
+    box.table[1_000_050] = {"stat": "S", "lstart": LSTART, "command": "/fake/bin/helper", "pgid": 1_000_001}
+    box.end(1_000_001)
+    res = signin.status(out["attempt"]["id"], ps=box.ps, check=lambda cli, path: signin.NOT_SIGNED_IN)
+    assert res["state"] == signin.NOT_SIGNED_IN and res["left"] == [1_000_050]
+    assert _attempt_file().exists() and box.killed == []
+    assert signin.start("claude", folder, **box.kw())["error"] == signin.E_BUSY
+
+
+def test_a_folder_swapped_after_the_last_check_fails_the_start(box, tmp_path):
+    folder = _folder()
+    path = box.home / ".claude-client"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    seen = {}
+
+    def swapping_popen(argv, **kw):
+        # Right at the spawn, after start's last check before it: the child
+        # re-resolves CLAUDE_CONFIG_DIR and would land outside Khipu's folder.
+        path.rename(box.home / ".claude-client-moved")
+        path.symlink_to(outside, target_is_directory=True)
+        seen["target"] = Path(kw["env"]["CLAUDE_CONFIG_DIR"]).resolve()
+        return box.popen(argv, **kw)
+
+    res = signin.start("claude", folder, popen=swapping_popen, ps=box.ps, killpg=box.killpg)
+    assert res == {"ok": False, "error": signin.E_REFUSED}, (res, seen)
+    assert box.killed and box.killed[0][0] == 1_000_001 and box.members(1_000_001) == []
+    assert not _attempt_file().exists()
+
+
+def test_a_parent_folder_swapped_for_a_symlink_after_the_spawn_fails_the_start(box, monkeypatch, tmp_path):
+    # The home folder itself is one component of the path the child resolves.
+    real_home = box.home
+    monkeypatch.setenv("HOME", str(tmp_path / "via" / "home"))
+    (tmp_path / "via").mkdir()
+    os.rename(real_home, tmp_path / "via" / "home")
+    folder = _folder()
+    decoy = tmp_path / "decoy"
+    (decoy / ".claude-client").mkdir(parents=True)
+
+    def swapping_popen(argv, **kw):
+        os.rename(tmp_path / "via", tmp_path / "via-moved")
+        os.mkdir(tmp_path / "via")
+        os.symlink(decoy, tmp_path / "via" / "home")
+        return box.popen(argv, **kw)
+
+    res = signin.start("claude", folder, popen=swapping_popen, ps=box.ps, killpg=box.killpg)
+    assert res == {"ok": False, "error": signin.E_REFUSED}
+    assert box.members(1_000_001) == [] and not _attempt_file().exists()
+
+
+def test_a_refused_start_whose_group_survives_keeps_the_record(box, tmp_path):
+    folder = _folder()
+    path = box.home / ".claude-client"
+
+    def swapping_popen(argv, **kw):
+        proc = box.popen(argv, **kw)
+        box.table[proc.pid]["ignore"] = {signal.SIGTERM, signal.SIGKILL}
+        path.rename(box.home / ".claude-client-moved")
+        path.mkdir()
+        return proc
+
+    res = signin.start("claude", folder, popen=swapping_popen, ps=box.ps, killpg=box.killpg)
+    assert res["ok"] is False and res["error"] == signin.E_REFUSED and res["left"] == [1_000_001]
+    assert _attempt_file().exists()
