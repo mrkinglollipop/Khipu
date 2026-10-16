@@ -262,37 +262,60 @@ PATH_WORDS = "(a path)"
 
 def _path_token(token: str) -> bool:
     """Whether one space-free word is path-shaped once the quotes and
-    punctuation around it are set aside."""
-    return bool(_PATH_SHAPE.search(token.lstrip(_WRAP_OPEN).rstrip(_WRAP_CLOSE)))
+    punctuation around it are set aside, as written or in any decoding of it
+    (percent, ``\\u`` and ``&#`` escapes): "%2Fopt%2Fx.txt" is a path."""
+    from khipu import agent_view
+
+    return any(_PATH_SHAPE.search(v.lstrip(_WRAP_OPEN).rstrip(_WRAP_CLOSE))
+               for v in agent_view._decoded_variants(token))
+
+
+def _link_rest_private(rest: str) -> bool:
+    """Whether a link's path, query or fragment holds a path: each path
+    segment and each query or fragment name and value is checked like any
+    other word. Only a link's scheme and host are never checked."""
+    path, _, after = rest.partition("?") if "?" in rest else rest.partition("#")
+    words = path.split("/") + re.split(r"[&=#]", after)
+    return any(_path_token(w) for w in words if w)
 
 
 def _pieces(token: str) -> list[tuple[str, bool]]:
     """``token`` split into (piece, is_link): each link by its exact span,
     and the words around it split again at "=", "," and ";" (kept as their
-    own pieces), so a path joined to a link or a value is still seen."""
+    own pieces), so a path joined to a link or a value is still seen. A
+    link whose path, query or fragment holds a path keeps only its scheme
+    and host as a link; the rest is a path piece of its own."""
     out: list[tuple[str, bool]] = []
     last = 0
     for m in _LINK.finditer(token):
         out += [(p, False) for p in _JOINS.split(token[last:m.start()]) if p]
-        out.append((m.group(), True))
+        head = _LINK_HEAD.match(m.group()).group()
+        rest = m.group()[len(head):]
+        if rest and _link_rest_private(rest):
+            out += [(head, True), (rest, None)]
+        else:
+            out.append((m.group(), True))
         last = m.end()
     out += [(p, False) for p in _JOINS.split(token[last:]) if p]
     return out
 
 
 def _has_path(text: str) -> bool:
-    return any(not link and _path_token(p) for t in text.split() for p, link in _pieces(t))
+    return any(link is None or (not link and _path_token(p)) for t in text.split() for p, link in _pieces(t))
 
 
 def _cut_paths(text: str) -> str:
     """Each path-shaped piece of a word replaced with PATH_WORDS (its quotes
-    and punctuation kept); links, cut out by their exact span, and every
-    other piece are left as they are."""
+    and punctuation kept); a link's path, query and fragment when they hold
+    a path; links, cut out by their exact span, and every other piece are
+    left as they are."""
     out = []
     for token in text.split(" "):
         parts = []
         for piece, link in _pieces(token):
-            if not link and _path_token(piece):
+            if link is None:
+                piece = " " + PATH_WORDS
+            elif not link and _path_token(piece):
                 core = piece.lstrip(_WRAP_OPEN).rstrip(_WRAP_CLOSE)
                 start = piece.index(core)
                 piece = piece[:start] + PATH_WORDS + piece[start + len(core):]
@@ -333,6 +356,7 @@ _WRAP_CLOSE = "\"'`)]}>,;:!?."
 # A link's exact span: it ends at a space, a quote or a bracket, so text
 # joined to its end is checked on its own.
 _LINK = re.compile(r"https://[^\s\"'`<>()\[\]{}]+")
+_LINK_HEAD = re.compile(r"https://[^/?#]*")
 _JOINS = re.compile(r"([=,;])")
 
 
@@ -1144,11 +1168,13 @@ def _account_ref(job: dict, runner: str | None, routing_info: dict) -> dict:
     return {"label": label, "matched": False}
 
 
-def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime) -> list[dict]:
+def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime,
+             times: list[datetime] | None = None) -> list[dict]:
     """Waiting on you: ledger needs-you rows, commitments that need the user,
     and routing items. A linked or exactly matching row and commitment show
     once (the row, with ``also_owed``); a near match is only suggested.
-    Blocking first, then oldest first."""
+    Blocking first, then oldest first. The next time an item's words change
+    (a hold's age in days) is added to ``times``."""
     from khipu import ledger
     from khipu.commitments import content_hash
 
@@ -1219,6 +1245,8 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime) -
         if h.get("owner") and h.get("remind"):
             at = _parse_time(h.get("at"))
             days = int((now - at).total_seconds() // 86400) if at else 0
+            if at and times is not None:
+                times.append(at + timedelta(days=days + 1))
             items.append({"source": "routing", "key": f"routing:hold:{h.get('id')}", "project": None,
                           "id": f"hold:{h.get('id')}",
                           "title": f"Your hold on {clean_text(h.get('scope_label'), 60) or 'an account'} "
@@ -1324,7 +1352,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                                if p["stage"] == "flagged" or (p.get("verdict") or {}).get("outcome") == "flagged")
         projects.append(board)
 
-    waiting = _waiting(ledger_data, owed, routing_info, now)
+    waiting = _waiting(ledger_data, owed, routing_info, now, times)
     try:
         outbox = int(ledger.outbox_status().get("pending") or 0)
     except Exception:  # noqa: BLE001
@@ -1482,6 +1510,17 @@ def _emit(payload: Any = None, text: str | None = None, *, as_json: bool = True,
 
 
 def cmd(args: argparse.Namespace) -> int:
+    """``khipu work``: every answer, an unexpected error's too, through ``_emit``."""
+    from khipu import agent_view
+
+    try:
+        return _cmd(args)
+    except Exception as exc:  # noqa: BLE001  (answered like a refusal)
+        _emit({"ok": False, "error": agent_view.error_text(exc), "reason": "failed"}, indent=None)
+        return 1
+
+
+def _cmd(args: argparse.Namespace) -> int:
     from khipu import ledger
 
     sub = getattr(args, "work_cmd", None)

@@ -303,7 +303,13 @@ def test_every_verb_is_classified():
         ledger.require("ledger something-new")
 
 
-class _Guarded(Exception):
+# BaseException, so the commands' catch-all for unexpected errors can't
+# answer for them: each must reach the test.
+class _Guarded(BaseException):
+    pass
+
+
+class _Touched(BaseException):
     pass
 
 
@@ -315,7 +321,7 @@ def test_every_changing_verb_calls_the_guard_before_anything_else(monkeypatch, t
         raise _Guarded(command)
 
     def touched(*a, **k):
-        raise AssertionError("reached a backend before the owner check")
+        raise _Touched("reached a backend before the owner check")
 
     monkeypatch.setattr(ledger, "require", guard)
     for name in ("load", "get", "write", "purge", "_connect", "removed_rows"):

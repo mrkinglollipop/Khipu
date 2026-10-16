@@ -2214,6 +2214,9 @@ def _dispatch_message(msg: dict) -> dict | None:
             _drop_modules_if_code_changed()
         from khipu import agent_view
 
+        # Every error leaves through the tool's own pass: a projected tool's
+        # through agent_view.project, whatever raised it.
+        scrub = agent_view.project if name in _AGENT_PROJECTED else agent_view.scrub
         try:
             payload = func(params.get("arguments") or {})
             if name in _AGENT_SCRUBBED:
@@ -2221,10 +2224,9 @@ def _dispatch_message(msg: dict) -> dict | None:
             elif name in _AGENT_PROJECTED:
                 payload = agent_view.project(payload)
         except _ToolFailure as exc:
-            scrub = agent_view.project if name in _AGENT_PROJECTED else agent_view.scrub
             return _result(req_id, _tool_text(scrub(exc.payload), is_error=True))
         except ValueError as exc:  # argument/mode rejections → tool error, not crash
-            return _result(req_id, _tool_text({"error": agent_view.scrub(str(exc))}, is_error=True))
+            return _result(req_id, _tool_text(scrub({"error": str(exc)}), is_error=True))
         except KeyboardInterrupt:
             raise
         except BaseException as exc:  # noqa: BLE001 — DB down, or SystemExit from
@@ -2234,7 +2236,8 @@ def _dispatch_message(msg: dict) -> dict | None:
             # A tool failing is a tool error; only the transport may end us.
             # Its own text may name a file: fixed words for a filesystem
             # error, anything else scrubbed (agent_view.error_text).
-            return _result(req_id, _tool_text({"error": agent_view.error_text(exc)}, is_error=True))
+            error = {"error": agent_view.error_text(exc)}
+            return _result(req_id, _tool_text(scrub(error) if name in _AGENT_PROJECTED else error, is_error=True))
         finally:
             if _RELOAD_ON_CHANGE:
                 _note_loaded_modules()

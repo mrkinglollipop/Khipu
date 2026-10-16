@@ -466,24 +466,28 @@ function WaitingCard({
                               ? `Looks like “${item.looks_like.title}” in the ledger`
                               : "Looks like a ledger row whose title is withheld"}
                           </span>
-                          <button type="button" className="sm link" disabled={busy !== null}
-                            onClick={() => void write(item.key, () => callCli("khipu_work_same", {
-                              project: item.project,
-                              row: item.looks_like!.id,
-                              commitment: item.id,
-                              same: true,
-                            }))}>
-                            These are the same
-                          </button>
-                          <button type="button" className="sm link" disabled={busy !== null}
-                            onClick={() => void write(item.key, () => callCli("khipu_work_same", {
-                              project: item.project,
-                              row: item.looks_like!.id,
-                              commitment: item.id,
-                              same: false,
-                            }))}>
-                            Not the same
-                          </button>
+                          {canAct(item, "same") ? (
+                            <>
+                              <button type="button" className="sm link" disabled={busy !== null}
+                                onClick={() => void write(item.key, () => callCli("khipu_work_same", {
+                                  project: item.project,
+                                  row: item.looks_like!.id,
+                                  commitment: item.id,
+                                  same: true,
+                                }))}>
+                                These are the same
+                              </button>
+                              <button type="button" className="sm link" disabled={busy !== null}
+                                onClick={() => void write(item.key, () => callCli("khipu_work_same", {
+                                  project: item.project,
+                                  row: item.looks_like!.id,
+                                  commitment: item.id,
+                                  same: false,
+                                }))}>
+                                Not the same
+                              </button>
+                            </>
+                          ) : null}
                         </>
                       ) : null}
                     </span>
@@ -492,12 +496,16 @@ function WaitingCard({
                   <span className="wk-acts">
                     {item.source === "ledger" && canWrite ? (
                       <>
-                        <button type="button" className="sm primary" disabled={busy !== null} onClick={() => done(item)}>
-                          {isBusy ? "Saving…" : "Done"}
-                        </button>
-                        <button type="button" className="sm" disabled={busy !== null} onClick={() => drop(item)}>
-                          Drop
-                        </button>
+                        {canAct(item, "done", vocabOf(view, item.project)) ? (
+                          <button type="button" className="sm primary" disabled={busy !== null} onClick={() => done(item)}>
+                            {isBusy ? "Saving…" : "Done"}
+                          </button>
+                        ) : null}
+                        {canAct(item, "drop", vocabOf(view, item.project)) ? (
+                          <button type="button" className="sm" disabled={busy !== null} onClick={() => drop(item)}>
+                            Drop
+                          </button>
+                        ) : null}
                         <button type="button" className="sm" disabled={busy !== null} onClick={() => setAnswering(item)}>
                           Answered…
                         </button>

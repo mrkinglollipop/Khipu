@@ -21,6 +21,7 @@ import {
   stateTone,
   stateWords,
   updatedWords,
+  usableRowId,
   wordFor,
 } from "./work";
 import type { HistoryEntry, LedgerList, LedgerRow, RemovedRow, Vocab, WorkView } from "./work";
@@ -166,7 +167,7 @@ export function LedgerPage({
   const [staleOnly, setStaleOnly] = useState(false);
   const [hideFinished, setHideFinished] = useState(true);
   const [limit, setLimit] = useState(PAGE);
-  const [selected, setSelected] = useState<string | null>(initialRow ?? null);
+  const [selected, setSelected] = useState<string | null>(usableRowId(initialRow) ? initialRow : null);
   const [detail, setDetail] = useState<LedgerRow | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   // The row open now: a detail answer for any other row arrived late and is
@@ -220,7 +221,7 @@ export function LedgerPage({
 
   useEffect(() => {
     setRefusal(null);
-    if (!selected) {
+    if (!usableRowId(selected)) {
       setDetail(null);
       setForm(null);
       return;
@@ -358,13 +359,17 @@ export function LedgerPage({
     const old = m === "open" && days != null && days >= STALE_DAYS;
     const when = old ? plural(days ?? 0, "day") : m === "needs" ? ageWords(r.updated, now) : changedWords(r.updated, now);
     const sel = r.id === selected;
+    // A withheld id can't be looked up: its row shows, with no action.
+    const usable = usableRowId(r.id);
     listItems.push(
       <div key={r.id} role="listitem">
         <button
           type="button"
           className={["row", "lg-row", r.parent ? "child" : null, sel ? "sel" : null].filter(Boolean).join(" ")}
           aria-current={sel ? "true" : undefined}
-          onClick={() => setSelected(r.id)}
+          disabled={!usable}
+          title={usable ? undefined : "This row's id is withheld, so it can't be opened here"}
+          onClick={usable ? () => setSelected(r.id) : undefined}
         >
           <span className="lg-id">{r.id}</span>
           <span className="lg-title">{r.title}</span>

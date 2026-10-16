@@ -2394,6 +2394,14 @@ def cmd(args: argparse.Namespace) -> int:
         else:
             _say(f"error: {exc}")
         return 1
+    except Exception as exc:  # noqa: BLE001  (an unexpected error answers through the same emit)
+        from khipu import agent_view
+
+        if getattr(args, "json", False):
+            _emit(args, {"ok": False, "error": agent_view.error_text(exc), "reason": "failed"})
+        else:
+            _say(f"error: {agent_view.error_text(exc)}")
+        return 1
 
 
 # Who may run each verb of ``khipu ledger`` and ``khipu work`` that changes

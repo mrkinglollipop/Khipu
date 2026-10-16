@@ -150,9 +150,28 @@ const NEEDS: Record<WaitItem["source"], Array<"key" | "project" | "id">> = {
   routing: ["key"],
 };
 
-export function canAct(item: WaitItem): boolean {
+const has = (v: string | null | undefined) => v != null && v !== "";
+
+/** Whether the app may offer ``action`` on ``item`` (no action: any at all).
+ *  Beyond the item's own keys, "These are the same" and "Not the same" name
+ *  the project's ledger row, so they need the project and that row's id;
+ *  Done and Drop on a ledger row need ``vocab`` to define that state. */
+export function canAct(item: WaitItem, action?: WaitAction, vocab?: Vocab | null): boolean {
   const needs = NEEDS[item.source];
-  return needs !== undefined && needs.every((k) => item[k] != null && item[k] !== "");
+  if (needs === undefined || !needs.every((k) => has(item[k]))) return false;
+  if (action === "same" || action === "not_same") return has(item.project) && usableRowId(item.looks_like?.id);
+  if (item.source === "ledger" && (action === "done" || action === "drop")) {
+    return wordFor(vocab, action === "done" ? "done" : "dropped") != null;
+  }
+  return true;
+}
+
+// A row id as the ledger accepts one (ledger.py's _ID_RE). An id the
+// projection changed ("(a path)", "[redacted]") is not one, and the app
+// never looks it up or acts on it.
+const ROW_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
+export function usableRowId(id: string | null | undefined): id is string {
+  return id != null && ROW_ID.test(id);
 }
 
 export type WorkCounts = {

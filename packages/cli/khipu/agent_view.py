@@ -535,12 +535,14 @@ def _project_text(text: str, table: _Table) -> str:
 
     from khipu import work
 
-    # work.py's rule: each path-shaped word that is left becomes "(a path)".
+    # work.py's rule: each path-shaped word that is left becomes "(a path)",
+    # decoded before it is checked, a link's path and query included.
     text = work._cut_paths(_scrub_text(_account_keys(text, table), table, []))
-    # Fail closed: an account key or a key-shaped secret still in the
-    # finished value, in any decoding of it, withholds the whole value.
+    # Fail closed: an account key, a key-shaped secret or a path still in
+    # the finished value, in any decoding of it, withholds the whole value.
     for variant in _decoded_variants(text):
-        if _ANY_ACCOUNT_KEY.search(variant) or redact_secrets(variant, force=True)[1]:
+        if _ANY_ACCOUNT_KEY.search(variant) or redact_secrets(variant, force=True)[1] \
+                or (variant != text and work._has_path(variant)):
             return WITHHELD
     return text
 
@@ -556,6 +558,47 @@ def _project_walk(value, table):
     return value
 
 
+# Text that can't carry a name: numbers and times. Field names (lowercase
+# words joined by "_") are Khipu's own, as are work.py's fixed words.
+_NAMELESS = re.compile(r"[0-9TZ:.+\- ]*")
+_FIELD = re.compile(r"[a-z][a-z0-9_]{0,39}")
+INCOMPLETE = "Khipu withheld this answer: it could not load its list of private names and folders."
+
+
+def _withhold_names(value, fixed=None, names=None):
+    """``value`` with every string that could carry a name withheld, for
+    when the replacement table can't be built: a login folder's name can
+    then not be told from any other word. Kept: numbers, times, work.py's
+    own words and object keys shaped like field names (never this Mac's
+    user name)."""
+    if fixed is None:
+        from khipu import work
+
+        fixed = work._fixed_words()
+        home = _home_dir()
+        names = {n.casefold() for n in (os.path.basename(home or ""), os.environ.get("USER", "")) if n}
+    if isinstance(value, str):
+        return value if value in fixed or _NAMELESS.fullmatch(value) else WITHHELD
+    if isinstance(value, dict):
+        def key(k):
+            if not isinstance(k, str) or ((_FIELD.fullmatch(k) or k in fixed) and k.casefold() not in names):
+                return k
+            return WITHHELD
+        return {key(k): _withhold_names(v, fixed, names) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_withhold_names(v, fixed, names) for v in value)
+    return value
+
+
+def _projected(value):
+    """(``value`` projected, whether it is complete)."""
+    try:
+        table = _table(None)
+    except Exception:  # noqa: BLE001
+        return _withhold_names(value), False
+    return _project_walk(value, table), True
+
+
 def project(value):
     """``value`` as the ledger and the Work view hand it to an agent or a
     JSON reader (khipu_ledger, ``khipu ledger ... --json``, ``khipu work
@@ -564,15 +607,13 @@ def project(value):
     withholds any string still holding an account key, a secret or a
     private path. No owner's words are kept whole here.
 
-    When the replacement table can't be built, the final scan still runs
-    over an empty one (paths, account keys and secrets are still withheld);
-    the Work view's own last pass has already withheld every name it could
-    not tell from a login folder's."""
-    try:
-        table = _table(None)
-    except Exception:  # noqa: BLE001
-        table = _Table(None, [], None, {}, [], set())
-    return _project_walk(value, table)
+    When the replacement table can't be built, it fails closed: every string
+    that could carry a name is withheld, and a dict says so with
+    ``"incomplete": true``."""
+    out, complete = _projected(value)
+    if not complete and isinstance(out, dict):
+        out["incomplete"] = True
+    return out
 
 
 def emit(payload=None, text: str | None = None, *, as_json: bool = False, stream=None, to_file=None,
@@ -587,7 +628,8 @@ def emit(payload=None, text: str | None = None, *, as_json: bool = False, stream
     if as_json:
         out = json.dumps(project(payload), indent=indent, sort_keys=sort_keys, default=str, ensure_ascii=False)
     elif text is not None:
-        out = "\n".join(project(str(text).split("\n")))
+        lines, complete = _projected(str(text).split("\n"))
+        out = "\n".join(lines + ([] if complete else [INCOMPLETE]))
     else:
         return
     if to_file is not None:
