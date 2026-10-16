@@ -101,7 +101,18 @@ export type ConfigShape = {
   replica?: Record<string, { value: number; default: number; source: string }>;
   graph_backup_remote?: { value: string; source: "env" | "config" | "default"; default: string; error?: string };
   minute_settings?: Record<string, { value: number; source: "file" | "default"; default: number; min: number; max: number }>;
-  promote_gate_ignore?: { value: string[]; choices: string[]; error?: string };
+  /** The owner's one-time "Update anyway": `value` is the checks the next
+   *  update skips once (empty when none is set); `blocked_by` is the red
+   *  checks that held the last update back, when that alone did. */
+  promote_gate_ignore?: {
+    value: string[];
+    choices: string[];
+    blocked_by?: string[];
+    set_at?: string | null;
+    expires_at?: string | null;
+    by?: string | null;
+    error?: string;
+  };
   config?: Record<string, unknown>;
   /** `offline.settings_status()`: each duration with the CLI's own words. */
   offline?: Record<string, { value: number; default: number; kind: string; source: string; words: string }>;

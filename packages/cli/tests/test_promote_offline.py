@@ -1,7 +1,8 @@
 """Offline and self-healing, slice 7 (docs/plans/2026-10-16-offline-and-self-healing.md, E):
 the promotion gate after an outage. Reds whose evidence is all from a time the
 hub was out of reach do not refuse; the hub steps wait for the hub; a refusal
-that is only the hub is queued and retried; the owner can pass over a check."""
+that is only the hub is queued and retried; the owner can have the next update
+skip a red check once ("Update anyway")."""
 from __future__ import annotations
 
 import io
@@ -72,43 +73,162 @@ def test_a_failed_import_is_never_excused(home, monkeypatch):
     assert not pm.gate_doctor(_checkout(home / "c"))["ok"]
 
 
-def test_the_owner_override_passes_over_a_check_and_the_record_names_it(home, monkeypatch, tmp_path):
-    pm.set_gate_ignore("degraded_rate")
-    assert pm.gate_ignore() == ["degraded_rate"]
+def test_a_statement_timeout_from_the_hub_is_not_offline_evidence(home, monkeypatch, tmp_path):
+    # A SQL statement timeout is not proof the hub cannot be reached.
+    from datetime import datetime, timezone
+
+    from khipu import outbox
+
+    job = {"queued_at": datetime.now(timezone.utc).isoformat(), "payload": {}, "attempts": 0,
+           "last_error": "QueryCanceled: canceling statement due to statement timeout"}
+    path = tmp_path / "capture.json"
+    path.write_text(json.dumps(job))
+    monkeypatch.setattr(outbox, "jobs", lambda: [path])
+    monkeypatch.setattr(outbox, "dead_jobs", lambda: [])
+    monkeypatch.setattr(outbox, "quarantine_dir", lambda: tmp_path / "absent")
+    result = outbox.status()
+    _doctor_says(monkeypatch, {**_BASE, "outbox_ok": False, "outbox": result})
+    gate = pm.gate_doctor(_checkout(home / "c"))
+    assert not gate["ok"], gate
+
+
+# ---- the owner's one-time override ("Update anyway") -------------------------
+
+
+def _owner(monkeypatch, via: str | None = "app") -> None:
+    from khipu import routing
+
+    monkeypatch.setattr(routing, "_owner_via", lambda args: via)
+
+
+def test_the_owner_override_skips_a_check_once_and_the_record_names_it(home, monkeypatch, tmp_path):
+    _promotable(home, monkeypatch, tmp_path)
+    monkeypatch.setattr(pm, "hub_reachable", lambda **kw: True)
     _doctor_says(monkeypatch, {**_BASE, "degraded_rate_ok": False, "degraded_rate": {"ok": False}})
-    monkeypatch.setattr(pm, "_repo", lambda: _checkout(tmp_path / "repo"))
-    out = pm.gate_only("doctor")
+    for name in ("recall", "capture", "version"):
+        monkeypatch.setitem(pm.GATE_STEPS, name, lambda c: {"ok": True, "ms": 1, "detail": "ok"})
+    refused = pm.promote("origin/main")
+    assert not refused["ok"] and refused["gate"][0]["red_checks"] == ["degraded_rate"]
+    assert pm.gate_ignore_status()["blocked_by"] == ["degraded_rate"]
+
+    pm.set_gate_ignore("degraded_rate", by="app")
+    assert pm.gate_ignore() == ["degraded_rate"]
+    out = pm.promote("origin/main")
     assert out["ok"], out
     assert out["gate"][0]["ignored_reds"] == ["degraded_rate"]
     logged = pm.records()[-1]
     assert logged["gate"][0]["ignored_reds"] == ["degraded_rate"]
-    assert "owner" in logged["gate"][0]["detail"]
-    pm.set_gate_ignore(None)
+    assert "skipped once" in logged["gate"][0]["detail"] and "owner" in logged["gate"][0]["detail"]
+    assert logged["override"]["checks"] == ["degraded_rate"] and logged["override"]["by"] == "app"
+    assert logged["override"]["cleared"] is True
+    # Used once, then cleared: the next attempt refuses on the same red.
+    assert pm.gate_ignore() == []
+    assert not pm.promote("origin/main")["ok"]
+
+
+def test_an_unused_override_lapses_after_a_day(home, monkeypatch):
+    pm.set_gate_ignore("outbox", by="app")
+    assert pm.gate_ignore() == ["outbox"]
+    later = pm.OVERRIDE_TTL_S + 60
+    monkeypatch.setattr(pm, "_override_age_s", lambda stored: later)
+    assert pm.gate_ignore() == [] and pm.gate_override() is None
+    _doctor_says(monkeypatch, {**_BASE, "outbox_ok": False, "outbox": {"offline_only": False}})
     assert not pm.gate_doctor(_checkout(home / "c"))["ok"]
+
+
+def test_an_override_kept_while_its_promotion_waits_for_the_hub(home, monkeypatch, tmp_path):
+    _promotable(home, monkeypatch, tmp_path)
+    monkeypatch.setattr(pm, "hub_reachable", lambda **kw: False)
+    _doctor_says(monkeypatch, {**_BASE, "outbox_ok": False, "outbox": {"offline_only": False}})
+    monkeypatch.setitem(pm.GATE_STEPS, "recall", lambda c: {"ok": False, "ms": 1, "detail": "connection refused"})
+    pm.set_gate_ignore("outbox", by="terminal")
+    out = pm.promote("origin/main")
+    assert out["queued"] and out["override"]["cleared"] is False
+    assert pm.gate_ignore() == ["outbox"]
+
+
+def test_a_standing_list_left_from_before_is_never_read(home):
+    from khipu.config import mutate_config
+
+    with mutate_config() as data:
+        data[pm.GATE_IGNORE_KEY] = ["outbox", "degraded_rate"]
+    assert pm.gate_ignore() == [] and pm.gate_override() is None
 
 
 def test_the_override_takes_only_checks_the_gate_runs(home):
     with pytest.raises(ValueError, match="not a check the gate runs: imports"):
-        pm.set_gate_ignore("outbox,imports")
+        pm.set_gate_ignore("outbox,imports", by="app")
     assert pm.gate_ignore() == []
     assert "outbox" in pm.gate_ignorable() and "jobs" not in pm.gate_ignorable()
 
 
-def test_the_override_is_a_setting_the_cli_writes_and_shows(home):
+def test_the_override_is_a_setting_the_cli_writes_and_shows(home, monkeypatch):
     from khipu import cli
 
+    _owner(monkeypatch, "app")
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = cli.main(["config", "--set", "promote_gate_ignore", "outbox, degraded_rate"])
+        rc = cli.main(["config", "--from-app", "--set", "promote_gate_ignore", "outbox, degraded_rate"])
     assert rc == 0
-    assert json.loads(buf.getvalue())["promote_gate_ignore"]["value"] == ["outbox", "degraded_rate"]
+    shown = json.loads(buf.getvalue())["promote_gate_ignore"]
+    assert shown["value"] == ["outbox", "degraded_rate"] and shown["by"] == "app" and shown["expires_at"]
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = cli.main(["config", "--set", "promote_gate_ignore", "nope"])
+        rc = cli.main(["config", "--from-app", "--set", "promote_gate_ignore", "nope"])
     assert rc == 2 and "nope" in json.loads(buf.getvalue())["error"]
     with redirect_stdout(io.StringIO()):
-        assert cli.main(["config", "--unset", "promote_gate_ignore"]) == 0
+        assert cli.main(["config", "--from-app", "--unset", "promote_gate_ignore"]) == 0
     assert pm.gate_ignore() == []
+
+
+def test_override_refuses_non_owner(home, monkeypatch):
+    from khipu import cli
+
+    _owner(monkeypatch, None)
+    with redirect_stdout(io.StringIO()):
+        rc = cli.main(["config", "--set", "promote_gate_ignore", "outbox"])
+    assert rc == 2 and pm.gate_ignore() == [], f"rc={rc}, ignore={pm.gate_ignore()}"
+    pm.set_gate_ignore("outbox", by="app")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.main(["config", "--unset", "promote_gate_ignore"])
+    assert rc == 2 and json.loads(buf.getvalue())["code"] == "owner_only"
+    assert pm.gate_ignore() == ["outbox"]
+
+
+def test_every_writer_of_the_override_goes_through_the_owner_gate():
+    """The override's key is written by promote.py alone (set, and the clear
+    after a use), and set_gate_ignore has one caller outside it: the config
+    command's override branch, which asks the owner first."""
+    import ast
+
+    package = Path(pm.__file__).resolve().parent
+    writers, callers = [], []
+    for path in sorted(package.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        if "promote_gate_ignore" in source and path.name != "promote.py":
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and node.value == "promote_gate_ignore":
+                    writers.append(path.name)
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Call) and isinstance(node.func, (ast.Attribute, ast.Name))
+                        and getattr(node.func, "attr", getattr(node.func, "id", None))
+                        in ("set_gate_ignore", "clear_gate_override")):
+                    callers.append((path.name, fn.name))
+    # cli.py names the key only to route `config --set/--unset` to its branch.
+    assert set(writers) <= {"cli.py"}, writers
+    outside = {c for c in callers if c[0] != "promote.py"}
+    assert outside == {("cli.py", "_config_gate_override")}, outside
+    import inspect
+
+    from khipu import cli
+
+    body = inspect.getsource(cli._config_gate_override)
+    assert body.index("_owner_only(") < body.index("set_gate_ignore(")
 
 
 # ---- the hub steps and the queue ---------------------------------------------
@@ -220,6 +340,31 @@ def test_a_retry_refused_for_another_reason_leaves_nothing_queued(home, monkeypa
     out = pm.retry_queued()
     assert not out["ok"] and "queued" not in out
     assert pm.queued() is None
+
+
+def test_queued_promotion_survives_retry_crash(home, monkeypatch):
+    entry = pm._queue("original-ref", "fake-commit", "hub unreachable", None)
+    monkeypatch.setattr(pm, "hub_reachable", lambda **kw: True)
+
+    def crash(*a):
+        raise SystemExit("simulated death during candidate preparation")
+
+    monkeypatch.setattr(pm, "_promote_locked", crash)
+    with pytest.raises(SystemExit):
+        pm.retry_queued()
+    assert pm.queued() == entry, pm.queued()
+
+
+def test_the_queue_is_removed_at_one_point_after_the_run():
+    """``_clear_queue`` has one caller, in ``promote``, after
+    ``_promote_locked`` returned."""
+    import inspect
+    import re
+
+    src = inspect.getsource(pm)
+    assert len(re.findall(r"(?<!def )\b_clear_queue\(", src)) == 1
+    body = inspect.getsource(pm.promote)
+    assert body.index("_promote_locked(") < body.index("_clear_queue()")
 
 
 def test_nothing_queued_is_a_quiet_no_op(home):

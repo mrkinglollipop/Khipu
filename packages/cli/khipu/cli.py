@@ -3075,6 +3075,17 @@ def _owner_or_request(args: argparse.Namespace) -> "dict | int":
                               "code": "request_needs_words"}))
             return 2
         return {"request": words, "by": routing.conversation_author(), "at": routing._iso(routing._now())}
+    via = _owner_only(args)
+    return via if isinstance(via, int) else {}
+
+
+def _owner_only(args: argparse.Namespace) -> "str | int":
+    """The owner check for a config change only the owner makes (the app,
+    or a typed yes on a terminal; ``routing._owner_via``): how it was
+    authorised ("app" or "cli"), or the exit code after a refusal was
+    printed."""
+    from khipu import routing
+
     auth = routing._OWNER_AUTH.set(None)
     try:
         via = routing._owner_via(args)
@@ -3083,7 +3094,7 @@ def _owner_or_request(args: argparse.Namespace) -> "dict | int":
     if via is None:
         print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
         return 2
-    return {}
+    return via
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -3301,13 +3312,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     if isinstance(getattr(args, "answer_request", None), (list, tuple)):
         # The owner's answer to a conversation's change to a routing setting.
         key, action = args.answer_request
-        auth = _routing._OWNER_AUTH.set(None)
-        try:
-            via = _routing._owner_via(args)
-        finally:
-            _routing._OWNER_AUTH.reset(auth)
-        if via is None:
-            print(json.dumps({"ok": False, "error": _routing._REFUSED, "code": "owner_only"}))
+        if isinstance(_owner_only(args), int):
             return 2
         try:
             path = _routing.answer_setting_request(key, action)
@@ -3352,18 +3357,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": True, key: value, "source": source, "config_file": str(path)}))
         return 0
     if (args.set and args.set[0] == "promote_gate_ignore") or args.unset == "promote_gate_ignore":
-        # The checks the owner knows are harmless: the promotion gate's
-        # doctor step passes over them and names them in its record.
-        from khipu import promote as _promote
-
-        try:
-            path = _promote.set_gate_ignore(args.set[1] if args.set else None)
-        except ValueError as err:
-            print(json.dumps({"ok": False, "error": str(err)}))
-            return 2
-        print(json.dumps({"ok": True, "promote_gate_ignore": _promote.gate_ignore_status(),
-                          "config_file": str(path)}))
-        return 0
+        return _config_gate_override(args)
     if (args.set and args.set[0] in MINUTE_SETTINGS) or args.unset in MINUTE_SETTINGS:
         from khipu.config import minute_settings_status, set_minute_setting
 
@@ -3481,6 +3475,27 @@ def cmd_config(args: argparse.Namespace) -> int:
         "config": load_config(),
     }
     print(json.dumps(out, indent=2))
+    return 0
+
+
+def _config_gate_override(args: argparse.Namespace) -> int:
+    """`config --set promote_gate_ignore CHECKS` / `--unset`: the owner's
+    one-time "Update anyway". The next promotion skips these red checks
+    once, names them in its record, then clears it; unused, it lapses after
+    a day. Only the owner sets or cancels it (the app, or a typed yes)."""
+    from khipu import promote as _promote
+
+    via = _owner_only(args)
+    if isinstance(via, int):
+        return via
+    try:
+        path = _promote.set_gate_ignore(args.set[1] if args.set else None,
+                                        by="app" if via == "app" else "terminal")
+    except ValueError as err:
+        print(json.dumps({"ok": False, "error": str(err)}))
+        return 2
+    print(json.dumps({"ok": True, "promote_gate_ignore": _promote.gate_ignore_status(),
+                      "config_file": str(path)}))
     return 0
 
 
@@ -5743,8 +5758,9 @@ def build_parser() -> argparse.ArgumentParser:
         "remote:path, default r2:khipu-backups/khipu-graph), how far back "
         "doctor's rate checks look (doctor_rate_window_minutes, default 60), "
         "how long the promotion gate waits for an unreachable hub "
-        "(promote_hub_wait_minutes, default 10), the doctor checks the gate "
-        "passes over (promote_gate_ignore, comma-separated check names) "
+        "(promote_hub_wait_minutes, default 10), the red doctor checks the "
+        "next promotion skips once (promote_gate_ignore, comma-separated "
+        "check names; the owner's only, it clears after one use or a day) "
         "or the plan usage accounts as JSON (usage_accounts "
         '\'[{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}]\')',
     )

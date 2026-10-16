@@ -97,7 +97,7 @@ One idea: **the replica is the read path, and the replica heals itself.** The hu
 
 - The gate separates "this candidate is broken" from "this Mac was offline": a red check whose evidence is all from an offline period does not refuse a candidate. The recall and capture steps that need the hub wait for reachability (bounded, reported) rather than refusing.
 - When the gate refuses only because the hub is unreachable, the promotion is queued and retried by itself when the hub answers, and the app shows that it is waiting.
-- An owner override for the gate in the app, logged in `promotions.jsonl`. This is Matt's call (question 3).
+- A one-time owner override for the gate in the app ("Update anyway"), logged in `promotions.jsonl` and cleared after one use (decision 3).
 
 ## Slices (one session each)
 
@@ -117,6 +117,6 @@ Slices 1 and 4 together fix the incident's visible symptoms; slice 2 removes the
 
 1. Prompt-time recall answers from the replica even when it is hours behind, marked stale with its age, rather than give no prior work.
 2. Keep the replica within 15 minutes of the hub when the hub is reachable (the existing throttle), changeable in Settings.
-3. The promotion gate waits and retries by itself after an outage, and Settings also has an owner override for a red check the owner knows is harmless.
+3. The promotion gate waits and retries by itself after an outage, and Settings also has an owner override for red checks the owner knows are harmless. The override is one-time (owner's reviewer, approved by Matt): the owner chooses "Update anyway" for the red checks that held the last update back; the next promotion skips them once, records that in `promotions.jsonl`, and the override then clears itself (it lapses after 24 hours if no promotion runs; a promotion queued for the hub keeps it for its retry). Only the owner sets or cancels it: the app, or a typed yes on a terminal. There is no standing list.
 4. Owner writes made offline (closing an owed item, superseding a decision) are queued on the Mac, shown as waiting to sync, and replayed when the hub is back, the same way captures already work.
 5. Doctor's rate checks judge the last hour, changeable in Settings.

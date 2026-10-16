@@ -2,9 +2,11 @@
    slice 1): how far back doctor's rate checks look. A past outage ages out of
    the window by itself, so a red light from an hour the network was down
    clears without anyone doing anything. Read from `khipu config`, written
-   through `khipu_config_set` / `khipu_config_unset`, then re-read. */
+   through `khipu_config_set` / `khipu_config_unset`, then re-read.
+   "Update anyway" is one-time (slice 7, decision 3): the next update skips the
+   red checks that held the last one back, once, then it clears itself. */
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { healthCheckLabel } from "./healthRows";
 import { SettingField } from "./SettingsControls";
 import { callCli, useCliState } from "./settingsCli";
@@ -24,6 +26,13 @@ export function windowMinutesError(raw: string, min: number, max: number): strin
   return null;
 }
 
+/** The time a one-time override lapses, in this Mac's clock. */
+export function lapseTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
+}
+
 export function HealthChecksCard({ active }: { active: boolean }) {
   const cfg = useCliState<ConfigShape>("khipu_config_show", active);
   const row = cfg.data?.minute_settings?.[WINDOW_KEY];
@@ -31,10 +40,9 @@ export function HealthChecksCard({ active }: { active: boolean }) {
   const max = row?.max ?? 10080;
   const wait = cfg.data?.minute_settings?.[WAIT_KEY];
   const ignore = cfg.data?.promote_gate_ignore;
-  const ignoreValue = (ignore?.value ?? []).join(",");
-  const [picked, setPicked] = useState<string[]>([]);
+  const pending = ignore?.value ?? [];
+  const blocked = ignore?.blocked_by ?? [];
   const [ignoreError, setIgnoreError] = useState<string | null>(null);
-  useEffect(() => setPicked(ignore?.value ?? []), [ignoreValue]); // eslint-disable-line react-hooks/exhaustive-deps
   const readFailed = cfg.error != null && !cfg.data;
 
   return (
@@ -107,43 +115,54 @@ export function HealthChecksCard({ active }: { active: boolean }) {
           }}
         />
         {ignore ? (
-          <fieldset className="set-field">
-            <legend className="set-label">Checks you know are harmless</legend>
-            <p className="set-help">
-              The update check passes over the checks you tick here, and names each one in its record.
-            </p>
-            {ignore.choices.map((name) => (
-              <label key={name} style={{ display: "block" }}>
-                <input
-                  type="checkbox"
-                  checked={picked.includes(name)}
-                  onChange={(e) =>
-                    setPicked((cur) => (e.target.checked ? [...cur, name] : cur.filter((n) => n !== name)))
-                  }
-                />{" "}
-                {healthCheckLabel(name)}
-              </label>
-            ))}
-            <button
-              type="button"
-              className="btn"
-              onClick={async () => {
-                const res =
-                  picked.length > 0
-                    ? await callCli("khipu_config_set", { key: IGNORE_KEY, value: picked.join(",") })
-                    : await callCli("khipu_config_unset", { key: IGNORE_KEY });
-                await cfg.reload();
-                setIgnoreError(res.ok ? null : res.error);
-              }}
-            >
-              Save
-            </button>
+          <div className="set-field">
+            <div className="set-label">Update anyway</div>
+            {pending.length > 0 ? (
+              <>
+                <p className="set-help">
+                  The next update skips these checks once: {pending.map(healthCheckLabel).join(", ")}. It is named in
+                  that update's record, then cleared.
+                  {ignore.expires_at ? ` If no update runs, it lapses at ${lapseTime(ignore.expires_at)}.` : ""}
+                </p>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={async () => {
+                    const res = await callCli("khipu_config_unset", { key: IGNORE_KEY });
+                    await cfg.reload();
+                    setIgnoreError(res.ok ? null : res.error);
+                  }}
+                >
+                  Cancel
+                </button>
+              </>
+            ) : blocked.length > 0 ? (
+              <>
+                <p className="set-help">
+                  The last update was held back by: {blocked.map(healthCheckLabel).join(", ")}. If you know these are
+                  harmless, the next update can skip them once. Later updates check them again.
+                </p>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={async () => {
+                    const res = await callCli("khipu_config_set", { key: IGNORE_KEY, value: blocked.join(",") });
+                    await cfg.reload();
+                    setIgnoreError(res.ok ? null : res.error);
+                  }}
+                >
+                  Update anyway
+                </button>
+              </>
+            ) : (
+              <p className="set-help">No health check is holding an update back.</p>
+            )}
             {ignoreError ? (
               <p className="set-error" role="alert">
                 {ignoreError}
               </p>
             ) : null}
-          </fieldset>
+          </div>
         ) : null}
       </div>
     </div>

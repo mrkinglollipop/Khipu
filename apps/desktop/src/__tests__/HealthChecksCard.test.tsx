@@ -13,11 +13,13 @@ vi.mock("@tauri-apps/api/core", () => ({
 const calls: Array<[string, Record<string, unknown> | undefined]> = [];
 let stored: number | null;
 let ignored: string[];
+let blocked: string[];
 
 beforeEach(() => {
   calls.length = 0;
   stored = null;
-  ignored = ["degraded_rate"];
+  ignored = [];
+  blocked = ["degraded_rate", "outbox"];
   invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
     calls.push([cmd, args]);
     switch (cmd) {
@@ -33,7 +35,12 @@ beforeEach(() => {
             },
             promote_hub_wait_minutes: { value: 10, source: "default", default: 10, min: 0, max: 240 },
           },
-          promote_gate_ignore: { value: ignored, choices: ["outbox", "degraded_rate"] },
+          promote_gate_ignore: {
+            value: ignored,
+            choices: ["outbox", "degraded_rate"],
+            blocked_by: blocked,
+            expires_at: ignored.length ? "2026-10-17T12:00:00Z" : null,
+          },
         });
       case "khipu_config_set":
         if (args?.key === "promote_gate_ignore") {
@@ -126,28 +133,32 @@ describe("buildAttention: rate checks", () => {
 });
 
 describe("HealthChecksCard: before a new version goes live", () => {
-  it("saves the ticked checks as one comma-joined value", async () => {
+  it("offers Update anyway for the checks that held the last update back, once", async () => {
     render(<HealthChecksCard active />);
-    const outbox = await screen.findByLabelText(/Queued captures delivered/);
-    const rate = screen.getByLabelText(/Search rarely falls back/);
-    await waitFor(() => expect(rate).toBeChecked());
-    fireEvent.click(outbox);
-    const saves = screen.getAllByRole("button", { name: "Save" });
-    fireEvent.click(saves[saves.length - 1]);
+    expect(await screen.findByText(/The last update was held back by/)).toHaveTextContent(
+      /Search rarely falls back.*Queued captures delivered/,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Update anyway" }));
     await waitFor(() =>
       expect(calls).toContainEqual(["khipu_config_set", { key: "promote_gate_ignore", value: "degraded_rate,outbox" }]),
     );
+    expect(await screen.findByText(/The next update skips these checks once/)).toHaveTextContent(/lapses at/);
+    expect(screen.queryByRole("button", { name: "Update anyway" })).toBeNull();
   });
 
-  it("clears the list when nothing is ticked", async () => {
+  it("cancels a waiting Update anyway", async () => {
+    ignored = ["outbox"];
     render(<HealthChecksCard active />);
-    const rate = await screen.findByLabelText(/Search rarely falls back/);
-    await waitFor(() => expect(rate).toBeChecked());
-    fireEvent.click(rate);
-    const saves = screen.getAllByRole("button", { name: "Save" });
-    fireEvent.click(saves[saves.length - 1]);
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "promote_gate_ignore" }]));
-    expect(calls.some(([c, a]) => c === "khipu_config_set" && a?.key === "promote_gate_ignore")).toBe(false);
+  });
+
+  it("offers nothing when no check is holding an update back", async () => {
+    blocked = [];
+    render(<HealthChecksCard active />);
+    expect(await screen.findByText("No health check is holding an update back.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update anyway" })).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
   });
 
   it("shows the wait setting", async () => {

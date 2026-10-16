@@ -45,9 +45,11 @@ HUB_STEPS = ("recall", "capture")
 HUB_WAIT_KEY = "promote_hub_wait_minutes"
 HUB_POLL_S = 10.0
 HUB_PROBE_TIMEOUT_S = 3
-# The owner's override: doctor checks they know are harmless, which the
-# doctor step does not refuse on. Each use is named in the gate's record.
+# The owner's one-time override ("Update anyway"): red doctor checks the next
+# promotion skips once. It is named in that run's record, then clears itself,
+# and lapses unused after OVERRIDE_TTL_S.
 GATE_IGNORE_KEY = "promote_gate_ignore"
+OVERRIDE_TTL_S = 24 * 60 * 60
 # Never part of the doctor step's red list (gate_doctor skips them).
 _DOCTOR_NOT_GATED = ("jobs_ok", "synth_provider_ok")
 # launchd starts a job with this PATH and nothing else (no plist sets one).
@@ -568,28 +570,55 @@ def _launchd_env(ctx: dict[str, str]) -> dict[str, str]:
 
 
 def gate_ignorable() -> tuple[str, ...]:
-    """The doctor checks the owner may tell the gate to pass over: every
+    """The doctor checks the owner may have the next update skip once: every
     local check doctor --quick gates on, plus pending database updates."""
     from khipu.cli import LOCAL_GATES
 
     return (*(k[:-3] for k in LOCAL_GATES if k not in _DOCTOR_NOT_GATED), "schema_migrations")
 
 
-def gate_ignore() -> list[str]:
-    """The checks the owner said are harmless (``promote_gate_ignore``),
-    keeping only names the gate knows."""
+def _override_age_s(stored: dict[str, Any]) -> float | None:
+    try:
+        at = datetime.fromisoformat(str(stored.get("set_at")).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if at.tzinfo is None:
+        return None
+    return (datetime.now(timezone.utc) - at).total_seconds()
+
+
+def gate_override() -> dict[str, Any] | None:
+    """The owner's one-time "Update anyway" (``promote_gate_ignore``):
+    ``{"checks", "set_at", "by"}``, or None when there is none, it is older
+    than ``OVERRIDE_TTL_S``, or the stored value is not one (a standing list
+    from before is never read). Only the gate's doctor step reads it."""
     from khipu.config import load_config
 
     stored = load_config().get(GATE_IGNORE_KEY)
-    if not isinstance(stored, list):
-        return []
+    if not isinstance(stored, dict) or not isinstance(stored.get("checks"), list):
+        return None
+    age = _override_age_s(stored)
+    if age is None or age < -60 or age > OVERRIDE_TTL_S:
+        return None
     known = gate_ignorable()
-    return [name for name in stored if isinstance(name, str) and name in known]
+    checks = [name for name in stored["checks"] if isinstance(name, str) and name in known]
+    if not checks:
+        return None
+    return {"checks": checks, "set_at": stored.get("set_at"), "by": stored.get("by")}
 
 
-def set_gate_ignore(value: "str | list[str] | None") -> Path:
-    """Store the owner's list (comma-separated text or a list); empty or
-    None removes it. ValueError names an unknown check."""
+def gate_ignore() -> list[str]:
+    """The checks the next promotion skips once (empty when none)."""
+    found = gate_override()
+    return list(found["checks"]) if found else []
+
+
+def set_gate_ignore(value: "str | list[str] | None", *, by: str | None = None) -> Path:
+    """Store the owner's one-time override for these checks (comma-separated
+    text or a list), stamped now; empty or None removes it. ``by`` is how
+    the owner said so ("app" or "terminal"); the only caller outside this
+    module is the config command, after its owner check. ValueError names
+    an unknown check."""
     from khipu.config import config_file, mutate_config
 
     if isinstance(value, str):
@@ -602,14 +631,50 @@ def set_gate_ignore(value: "str | list[str] | None") -> Path:
                          f"one of {', '.join(known)}")
     with mutate_config() as data:
         if names:
-            data[GATE_IGNORE_KEY] = names
+            data[GATE_IGNORE_KEY] = {"checks": names, "set_at": _now(), "by": by or "?"}
         else:
             data.pop(GATE_IGNORE_KEY, None)
         return config_file()
 
 
+def clear_gate_override(set_at: Any) -> bool:
+    """Remove the override a promotion just used, only if it is still the
+    one stamped ``set_at`` (a newer choice made meanwhile stays)."""
+    from khipu.config import mutate_config
+
+    with mutate_config() as data:
+        stored = data.get(GATE_IGNORE_KEY)
+        if isinstance(stored, dict) and stored.get("set_at") == set_at:
+            data.pop(GATE_IGNORE_KEY, None)
+            return True
+    return False
+
+
+def _blocked_by() -> list[str]:
+    """The red checks that held the latest gated run back at the doctor
+    step, when an override could let it through (nothing else was wrong)."""
+    for row in reversed(records()):
+        step = next((s for s in row.get("gate") or [] if isinstance(s, dict) and s.get("step") == "doctor"), None)
+        if step is None:
+            continue
+        if step.get("ok") or step.get("other_problems") or not step.get("red_checks"):
+            return []
+        known = gate_ignorable()
+        reds = [str(n) for n in step["red_checks"]]
+        return reds if all(n in known for n in reds) else []
+    return []
+
+
 def gate_ignore_status() -> dict[str, Any]:
-    return {"value": gate_ignore(), "choices": list(gate_ignorable())}
+    found = gate_override()
+    expires = None
+    if found:
+        at = datetime.fromisoformat(str(found["set_at"]).replace("Z", "+00:00"))
+        expires = (at.timestamp() + OVERRIDE_TTL_S)
+        expires = datetime.fromtimestamp(expires, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return {"value": list(found["checks"]) if found else [], "set_at": found["set_at"] if found else None,
+            "by": found["by"] if found else None, "expires_at": expires,
+            "blocked_by": _blocked_by(), "choices": list(gate_ignorable())}
 
 
 def hub_reachable(*, timeout: int = HUB_PROBE_TIMEOUT_S) -> bool | None:
@@ -669,10 +734,13 @@ def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str
 
     A red check whose block says ``offline_only`` (its evidence is all from
     a time the hub could not be reached) does not refuse a candidate, and
-    nor does a check the owner listed in ``promote_gate_ignore``; both are
-    named in the step's record."""
+    nor does a check the owner's one-time override names (``gate_override``);
+    both are named in the step's record, with the override itself, so the
+    promotion can clear it after this one use."""
     from khipu import launchd_gen
 
+    override = gate_override()
+    used = {"override": override} if override else {}
     ctx = launchd_gen.render_context(root=Path(candidate))
     r = _run([ctx["KHIPU_PYTHON"], "-m", "khipu", "doctor", "--quick"], env=_launchd_env(ctx),
              cwd=ctx["WORKING_DIRECTORY"], timeout=90)
@@ -681,7 +749,7 @@ def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str
     except ValueError:
         out = {}
     if r.returncode == 0 and out.get("ok") is True:
-        return True, f"doctor --quick ok ({ctx['KHIPU_PYTHON']}, PATH={LAUNCHD_PATH})"
+        return True, f"doctor --quick ok ({ctx['KHIPU_PYTHON']}, PATH={LAUNCHD_PATH})", used
     hard = r.returncode not in (0, 2) or not out
     problems = []
     failed_imports = (out.get("imports") or {}).get("failed") or {}
@@ -698,9 +766,10 @@ def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str
     reds = [key for key, value in out.items()
             if key.endswith("_ok") and value is False and key not in _DOCTOR_NOT_GATED]
     offline = [k[:-3] for k in reds if _offline_only(out, k)]
-    ignore = set(gate_ignore())
+    ignore = set(override["checks"]) if override else set()
     ignored = [k[:-3] for k in reds if k[:-3] in ignore and k[:-3] not in offline]
     red = [k[:-3] for k in reds if k[:-3] not in offline and k[:-3] not in ignored]
+    other = bool(problems) or hard
     if red:
         problems.append("red: " + ", ".join(red))
     if not out:
@@ -710,10 +779,11 @@ def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str
         if offline:
             notes.append("red only from a time the hub was out of reach: " + ", ".join(offline))
         if ignored:
-            notes.append("passed over as the owner set in Settings: " + ", ".join(ignored))
+            notes.append("skipped once, as the owner chose Update anyway: " + ", ".join(ignored))
         extra = {k: v for k, v in (("offline_reds", offline), ("ignored_reds", ignored)) if v}
-        return True, "doctor --quick ok; " + "; ".join(notes), extra
-    return False, "; ".join(problems) or f"exit {r.returncode}"
+        return True, "doctor --quick ok; " + "; ".join(notes), {**extra, **used}
+    return False, "; ".join(problems) or f"exit {r.returncode}", {
+        **({"red_checks": red} if red else {}), **({"other_problems": True} if other else {}), **used}
 
 
 def _parse_summary(line: str) -> dict[str, Any] | None:
@@ -1391,18 +1461,28 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
 
     Every run replaces a queued promotion; a run the gate refused only
     because the hub was out of reach is queued again (``queue_file``) for
-    ``retry_queued``. ``retry_of`` is the queued entry a retry runs for."""
+    ``retry_queued``. ``retry_of`` is the queued entry a retry runs for.
+
+    The queued entry is removed in one place, after the run returned: a run
+    that dies part way leaves it queued for the next retry. The owner's
+    one-time override the doctor step read is cleared at the same point,
+    unless the run is queued again (the retry is the same attempt)."""
     t0 = time.monotonic()
     with _lock() as held:
         if not held:
             return {"ok": False, "action": "promote", "error": "another promotion is running"}
         previous = queued()
-        _clear_queue()
         out = _promote_locked(ref, t0)
+        _clear_queue()
         failed = next((step for step in out.get("gate") or [] if not step["ok"]), None)
         if not out.get("ok") and failed is not None and failed.get("hub_unreachable"):
             out["queued"] = _queue((retry_of or {}).get("ref") or ref, out.get("commit"), out.get("error") or "",
                                    retry_of or previous)
+        doctor = next((step for step in out.get("gate") or [] if step.get("step") == "doctor"), None)
+        override = (doctor or {}).get("override")
+        if override:
+            cleared = False if out.get("queued") else clear_gate_override(override.get("set_at"))
+            out["override"] = {**override, "skipped": doctor.get("ignored_reds") or [], "cleared": cleared}
         if retry_of is not None:
             out["retry_of"] = retry_of.get("queued_at")
         return record(out)
@@ -1627,6 +1707,11 @@ def format_result(out: dict[str, Any]) -> str:
     lines.append(head)
     for step in out.get("gate") or []:
         lines.append(f"  {step['step']:<8} {'ok  ' if step['ok'] else 'FAIL'} {step['ms']:>6} ms  {step['detail']}")
+    override = out.get("override")
+    if override:
+        lines.append(f"Update anyway ({', '.join(override.get('checks') or [])}): "
+                     + ("used, and now cleared" if override.get("cleared")
+                        else "kept for the retry" if out.get("queued") else "not cleared"))
     if out.get("ok"):
         if action in ("promote", "rollback"):
             lines.append(f"live is now {Path(out['slot']).name}. {MCP_NOTE}")

@@ -41,6 +41,8 @@ from typing import Any
 
 import fcntl
 
+from khipu.hub_errors import unreachable_error, unreachable_text
+
 
 def _log(msg: str) -> None:
     print(f"[khipu-outbox] {msg}", file=sys.stderr, flush=True)
@@ -336,7 +338,7 @@ def status() -> dict[str, Any]:
             unreadable += 1
         if age is not None and (oldest_age is None or age > oldest_age):
             oldest_age, oldest_job = age, jp.name
-        if _hub_unreachable_text(str(job.get("last_error") or job.get("reason") or "")):
+        if unreachable_text(str(job.get("last_error") or job.get("reason") or "")):
             offline += 1
     quarantined = len(list(quarantine_dir().glob("*.json"))) if quarantine_dir().is_dir() else 0
     # Existing doctor callers use ``dead`` to detect work that cannot replay.
@@ -348,19 +350,6 @@ def status() -> dict[str, Any]:
             "oldest_job": oldest_job, "unreadable": unreadable,
             "dead": dead, "quarantined": quarantined,
             "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only}
-
-
-def _hub_unreachable_text(text: str) -> bool:
-    """Whether a queued job's recorded error (``last_error``, else the
-    ``reason`` it was queued with: an exception's class name and message)
-    says the hub could not be reached. Matches the shapes
-    ``hub_snapshot.hub_connection_failed`` treats as connection failures."""
-    if not text:
-        return False
-    name = text.split(":", 1)[0]
-    lowered = text.lower()
-    return ("Operational" in name or "Connection" in name or "Timeout" in name
-            or any(word in lowered for word in ("connect", "timeout", "timed out", "refused")))
 
 
 def _retry_order(jp: Path) -> tuple[bool, str, str]:
@@ -484,7 +473,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                     job["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
                     job["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
                     name = type(e).__name__
-                    unreachable = "Operational" in name or "Connection" in name or "connect" in str(e).lower()
+                    unreachable = unreachable_error(e)
                     # A deferred origin claim is transient and its job holds the
                     # only record of the owner: retried, never buried.
                     deferred = isinstance(e, ClaimDeferred)

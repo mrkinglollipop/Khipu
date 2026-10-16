@@ -869,14 +869,21 @@ fn parse_daily_calls(key: &str, raw: &str) -> Result<String, String> {
 const MINUTE_KEYS: &[(&str, u64, u64)] =
     &[("doctor_rate_window_minutes", 5, 7 * 24 * 60), ("promote_hub_wait_minutes", 0, 240)];
 
-/// The promotion gate's list of checks the owner has passed over
-/// (`khipu.config` key `promote_gate_ignore`): comma-separated check names.
+/// The owner's one-time "Update anyway" (`khipu.config` key
+/// `promote_gate_ignore`): the red checks, comma-separated, that the next
+/// promotion skips once. It clears itself after that run, or after a day.
+/// The owner's only, so the app's save carries `--from-app`.
 const GATE_IGNORE_KEY: &str = "promote_gate_ignore";
+
+/// A setting only the owner changes: the app's save says `--from-app`.
+fn owner_key(key: &str) -> bool {
+    routing_key(key) || key == GATE_IGNORE_KEY
+}
 
 fn parse_gate_ignore(raw: &str) -> Result<String, String> {
     let names: Vec<&str> = raw.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
     if names.is_empty() {
-        return Err(format!("{GATE_IGNORE_KEY} must name at least one check; reset it to clear the list"));
+        return Err(format!("{GATE_IGNORE_KEY} must name at least one check; cancel it to clear it"));
     }
     if names.len() > 32 {
         return Err(format!("{GATE_IGNORE_KEY} names too many checks"));
@@ -1206,11 +1213,12 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
     if expect.is_some() {
         return Err(format!("{key} takes no version to check"));
     }
-    // A routing setting is the owner's (decision 15): the app's own save
-    // says so, or the CLI refuses it as a conversation's.
+    // A routing setting and the one-time "Update anyway" are the owner's
+    // (decision 15): the app's own save says so, or the CLI refuses it as a
+    // conversation's.
     let set = |k: &str, v: String| {
         let mut argv = vec!["config".to_string()];
-        if routing_key(k) {
+        if owner_key(k) {
             argv.push("--from-app".to_string());
         }
         argv.extend(["--set".to_string(), k.to_string(), v]);
@@ -1294,7 +1302,7 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
     {
         return Err(format!("not a resettable key: {key:?}"));
     }
-    if routing_key(key) {
+    if owner_key(key) {
         return Ok(vec!["config".to_string(), "--from-app".to_string(), format!("--unset={key}")]);
     }
     Ok(vec!["config".to_string(), format!("--unset={key}")])
@@ -5214,14 +5222,14 @@ mod settings_command_tests {
         let key = "promote_gate_ignore";
         assert_eq!(
             config_set_argv(key, " outbox , degraded_rate ").unwrap(),
-            v(&["config", "--set", key, "outbox,degraded_rate"])
+            v(&["config", "--from-app", "--set", key, "outbox,degraded_rate"])
         );
         for bad in ["", " , ", "Outbox", "out box", "--unset", "a-b", &"x".repeat(41)] {
             assert!(config_set_argv(key, bad).is_err(), "accepted {bad:?}");
         }
         let many = (0..33).map(|_| "a").collect::<Vec<_>>().join(",");
         assert!(config_set_argv(key, &many).is_err());
-        assert_eq!(config_unset_argv(key).unwrap(), v(&["config", "--unset=promote_gate_ignore"]));
+        assert_eq!(config_unset_argv(key).unwrap(), v(&["config", "--from-app", "--unset=promote_gate_ignore"]));
     }
 
     #[test]

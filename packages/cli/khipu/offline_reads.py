@@ -3,8 +3,10 @@
 
 Each returns ``None`` when there is nothing to read (no replica, or one made
 before the table existed): the caller then reports the hub's own error. Rows
-of a forgotten episode are left out, the same as on the hub. The payload
-carries the stale marker MCP search uses (``hub_snapshot.stale_fields``).
+of a forgotten episode, or one whose erasure is still queued, are left out
+through the one replica forget fence (``hub_snapshot.forget_fence_sql``).
+The payload carries the stale marker MCP search uses
+(``hub_snapshot.stale_fields``).
 """
 from __future__ import annotations
 
@@ -26,15 +28,6 @@ def _open() -> sqlite3.Connection | None:
     return con
 
 
-def _forgotten_clause(con: sqlite3.Connection, table: str, episode_col: str) -> str:
-    if "deleted_at" not in hub_snapshot._snapshot_table_columns(con, "episodes"):
-        return ""
-    return (
-        f" AND NOT EXISTS (SELECT 1 FROM episodes e WHERE e.id = {table}.{episode_col} "
-        "AND e.deleted_at IS NOT NULL)"
-    )
-
-
 def owed(project: str | None, status: str, limit: int) -> dict[str, Any] | None:
     from khipu import commitments
 
@@ -49,7 +42,7 @@ def owed(project: str | None, status: str, limit: int) -> dict[str, Any] | None:
         if project:
             sql += " AND project = ?"
             params.append(project)
-        sql += _forgotten_clause(con, "commitments", "opened_episode")
+        sql += hub_snapshot.forget_fence_sql(con, "commitments", "opened_episode")
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
     except sqlite3.Error:
         return None
@@ -83,7 +76,7 @@ def decisions(project: str | None, since: Any, status: str, limit: int) -> dict[
         if project:
             sql += " AND project = ?"
             params.append(project)
-        sql += _forgotten_clause(con, "decisions", "episode_id")
+        sql += hub_snapshot.forget_fence_sql(con, "decisions", "episode_id")
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
     except sqlite3.Error:
         return None

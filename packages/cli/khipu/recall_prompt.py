@@ -1992,10 +1992,15 @@ class _SnapshotUnusable(Exception):
     hub. Carries the reason so it can be logged (never silently)."""
 
 
-def _stale_marker(health: dict[str, Any]) -> dict[str, Any]:
+def _stale_marker(health: dict[str, Any], *, why: str | None = None) -> dict[str, Any]:
+    """The one stale marker for an answer from this Mac's copy that is not
+    trusted, or that stands in for the hub (Matt, 2026-10-16, decision 1:
+    every stale answer carries its age). ``render_block`` turns it into the
+    one line ``_stale_line`` words; every such answer path builds it here
+    (tests/test_replica_pull_integrity.py enumerates them)."""
     return {
         "age_seconds": health.get("age_seconds"), "refreshed_at": health.get("refreshed_at"),
-        "why": health.get("distrusted_by") or "overdue",
+        "why": why or health.get("distrusted_by") or "overdue",
     }
 
 
@@ -2700,7 +2705,7 @@ def render_block(hits: list[dict[str, Any]], *, produced: str = "", stale: dict[
     out = [_HEADING]
     if len(f"{_HEADING}\n{_FOOTER}") > BLOCK_CHAR_BUDGET:
         return ""
-    if stale and hits:
+    if stale:
         line = _stale_line(stale)
         if len("\n".join([*out, line, _FOOTER])) <= BLOCK_CHAR_BUDGET:
             out.append(line)
@@ -2780,19 +2785,23 @@ def _thread_memory_hits(thread: str, *, progress: dict | None = None) -> list[di
             con.execute("PRAGMA busy_timeout = 2")
             cols = hub_snapshot._snapshot_table_columns(con, "decisions")
             retracted = "AND d.retracted_at IS NULL" if "retracted_at" in cols else ""
+            fence = hub_snapshot.forget_fence_sql(con, "d", "episode_id")
             rows = con.execute(
                 "SELECT 'decision', d.id, d.text, d.episode_id, d.decided_at "
                 "FROM decisions d JOIN episodes e ON e.id = d.episode_id "
                 "WHERE CASE WHEN json_valid(e.raw) THEN "
                 "json_extract(e.raw, '$.t3_thread_id') END = ? "
                 "AND e.deleted_at IS NULL AND d.superseded_by IS NULL "
-                f"{retracted} ORDER BY d.decided_at DESC, d.id DESC LIMIT 3", (thread,),
+                f"{retracted}{fence} ORDER BY d.decided_at DESC, d.id DESC LIMIT 3", (thread,),
             ).fetchall()
             local_hits = rows_to_hits(rows)
             for hit in local_hits:
                 hit["status"] = "standing (replica)"
-            if progress is not None:
-                progress["hits"] = local_hits
+            if progress is not None and local_hits:
+                # Published before the hub leg, as one value: a caller whose
+                # deadline passes first answers from these, and an answer
+                # from this Mac's copy in place of the hub carries its age.
+                progress["local"] = (local_hits, _stale_marker(hub_snapshot.snapshot_health(), why="hub not reached"))
         finally:
             con.close()
     except Exception:  # noqa: BLE001 — old/missing replicas cannot block the hub leg
@@ -2988,7 +2997,15 @@ def prior_work_for_prompt(
         offline = _hub_unreachable_error(exc)
     if thread_worker is not None:
         thread_worker.join(max(0, deadline - time.monotonic()))
-        priority = thread_box.get("hits") or []
+        # The final answer first, then the replica's: the replica's is
+        # published before the hub leg runs, so it is never missed here.
+        priority = thread_box.get("hits")
+        local = thread_box.get("local")
+        if priority is None and local:
+            priority = local[0]
+        if local and priority is local[0]:
+            replica_stale = replica_stale or local[1]
+        priority = priority or []
         if priority:
             hits = priority + (hits or [])
             legs = ["t3_thread", *legs]
@@ -2996,12 +3013,16 @@ def prior_work_for_prompt(
         if thread_worker.is_alive():
             degraded_legs.append("t3_thread")
     produced = ""
+    produced_box: dict[str, Any] = {}
     remaining = min(DELIVERABLE_LINE_TIMEOUT_S, max(0, deadline - time.monotonic()))
     if remaining > 0:
         try:
-            produced = _run_with_timeout(_deliverable_context_line, remaining, tokens, cwd=cwd)
+            produced = _run_with_timeout(_deliverable_context_line, remaining, tokens, cwd=cwd,
+                                         stale_box=produced_box)
         except Exception:  # noqa: BLE001 — optional evidence cannot discard completed search
             pass
+    if produced:
+        replica_stale = replica_stale or produced_box.get("replica_stale")
     context = render_block(hits or [], produced=produced, stale=replica_stale)
 
     if hits and session_id and not thread and context:
@@ -3046,11 +3067,13 @@ def prior_work_for_prompt(
     return out
 
 
-def _replica_deliverable_line(project: str, tokens: list[str]) -> str | None:
+def _replica_deliverable_line(project: str, tokens: list[str], *,
+                              stale_box: dict[str, Any] | None = None) -> str | None:
     """The line from the local replica ("" when nothing matches), or None
     when the replica cannot answer (missing, no dump time on record, an older
     dump with no ``deliverables`` table, unreadable). Imports neither the Postgres driver
-    nor ``khipu.db``."""
+    nor ``khipu.db``. A line from a copy that is not trusted puts its stale
+    marker in ``stale_box["replica_stale"]``."""
     from khipu import deliverables as _deliverables
     from khipu import hub_snapshot
 
@@ -3067,10 +3090,14 @@ def _replica_deliverable_line(project: str, tokens: list[str]) -> str | None:
         con.close()
     if rows is None:
         return None
-    return _deliverables.line_from_rows(rows, tokens) or ""
+    line = _deliverables.line_from_rows(rows, tokens) or ""
+    if line and not fresh and stale_box is not None:
+        stale_box["replica_stale"] = _stale_marker(health)
+    return line
 
 
-def _deliverable_context_line(tokens: list[str], *, cwd: str | None) -> str:
+def _deliverable_context_line(tokens: list[str], *, cwd: str | None,
+                              stale_box: dict[str, Any] | None = None) -> str:
     """The O4 "You produced …" line for this prompt's tokens, or "". Never
     raises: a resolve/DB failure here degrades to no line, same fail-open
     posture as every other step in this module. The local replica answers
@@ -3082,7 +3109,7 @@ def _deliverable_context_line(tokens: list[str], *, cwd: str | None) -> str:
         if not project:
             return ""
         try:
-            local = _replica_deliverable_line(project, tokens)
+            local = _replica_deliverable_line(project, tokens, stale_box=stale_box)
         except Exception as exc:  # noqa: BLE001 — an unusable replica falls back to the hub
             _log(f"deliverable replica unusable ({type(exc).__name__}: {exc})")
             local = None

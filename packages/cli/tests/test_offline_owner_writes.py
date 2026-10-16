@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -249,3 +250,150 @@ def test_the_app_wait_setting_defaults_to_sixty_and_round_trips(home, capsys):
     args = parser.parse_args(["config", "--unset", "app_cli_timeout"])
     assert args.func(args) == 0
     assert offline.setting("app_cli_timeout") == 60
+
+
+# ---------------------------------------------------------------------------
+# one replay ledger: order, exactly once, refusals kept
+# ---------------------------------------------------------------------------
+
+def test_a_crash_after_the_hub_commits_never_applies_the_write_twice(home, monkeypatch):
+    owner_writes._enqueue("owed_update", {"id": 1, "action": "snooze", "until": "7d"}, "connection refused")
+    commits = []
+
+    def apply(tool, args):
+        commits.append(dict(args))  # the hub's commit lands, then this process dies
+        if len(commits) == 1:
+            raise SystemExit("simulated process death after hub commit")
+        return {"ok": True}
+
+    monkeypatch.setattr(owner_writes, "_apply", apply)
+    with pytest.raises(SystemExit):
+        owner_writes.drain()
+    assert owner_writes.status()["pending"] == 1
+    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: True)
+    out = owner_writes.drain()
+    assert len(commits) == 1, f"hub applied same write {len(commits)} times"
+    assert out["replayed"] == 1 and _queued(home) == []
+
+
+def test_a_send_the_hub_does_not_show_is_sent_again_once(home, monkeypatch):
+    owner_writes._enqueue("owed_update", {"id": 1, "action": "close"}, "connection refused")
+    commits = []
+
+    def apply(tool, args):
+        commits.append(args["id"])
+        if len(commits) == 1:
+            raise SystemExit("simulated process death before the hub answered")
+        return {"ok": True}
+
+    monkeypatch.setattr(owner_writes, "_apply", apply)
+    with pytest.raises(SystemExit):
+        owner_writes.drain()
+    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: False)
+    assert owner_writes.drain()["replayed"] == 1
+    assert commits == [1, 1] and _queued(home) == []
+
+
+def test_a_crash_during_a_direct_write_is_checked_on_the_hub_before_any_resend(home, monkeypatch):
+    def die(tool, args):
+        raise SystemExit("simulated process death during a direct write")
+
+    monkeypatch.setattr(owner_writes, "_apply", die)
+    with pytest.raises(SystemExit):
+        owner_writes.run("owed_update", {"id": 4, "action": "close"})
+    assert owner_writes.status()["pending"] == 1
+    sent = []
+    monkeypatch.setattr(owner_writes, "_apply", lambda tool, args: sent.append(args) or {"ok": True})
+    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: True)
+    assert owner_writes.drain()["replayed"] == 1 and sent == []
+
+
+def test_a_landed_check_that_cannot_reach_the_hub_keeps_the_write_waiting(home, monkeypatch):
+    owner_writes._enqueue("owed_update", {"id": 1, "action": "close"}, "connection refused")
+    path = _queued(home)[0]
+    path.write_text(json.dumps({**json.loads(path.read_text()), "state": "sending"}))
+    sent = []
+    monkeypatch.setattr(owner_writes, "_apply", lambda tool, args: sent.append(args) or {"ok": True})
+
+    def away(tool, args):
+        raise DOWN
+
+    monkeypatch.setattr(owner_writes, "_landed", away)
+    out = owner_writes.drain()
+    assert out["stopped_early"] and out["waiting"] == 1 and sent == []
+
+
+def test_a_result_the_hub_refused_is_kept_as_refused_not_counted_as_done(home, monkeypatch):
+    owner_writes._enqueue("decisions_update", {"id": 9, "action": "restore"}, "connection refused")
+    monkeypatch.setattr(owner_writes, "_apply", lambda *_: {"ok": False, "id": 9, "action": "restore"})
+    result = owner_writes.drain()
+    assert result["refused"] == 1, result
+    assert result["replayed"] == 0 and _queued(home) == []
+    kept = json.loads(next((home / "owner-writes" / "refused").glob("*.json")).read_text())
+    assert kept["args"]["id"] == 9 and "refused" in kept["error"]
+    assert owner_writes.status()["refused"] == 1
+
+
+def test_a_write_made_during_a_replay_cannot_be_overtaken_by_a_later_one(home, monkeypatch):
+    owner_writes._enqueue("owed_update", {"id": 1, "action": "close"}, "connection refused")
+    applying, finish = threading.Event(), threading.Event()
+    enqueue_entered, release_enqueue = threading.Event(), threading.Event()
+    calls = []
+
+    def apply(tool, args):
+        if args["id"] == 1:
+            applying.set()
+            assert finish.wait(5)
+        calls.append(args["id"])
+        return {"ok": True}
+
+    monkeypatch.setattr(owner_writes, "_apply", apply)
+    real_enqueue = owner_writes._enqueue
+
+    def delayed_enqueue(tool, args, reason):
+        if args["id"] == 2:
+            enqueue_entered.set()
+            assert release_enqueue.wait(5)
+        return real_enqueue(tool, args, reason)
+
+    monkeypatch.setattr(owner_writes, "_enqueue", delayed_enqueue)
+    drain = threading.Thread(target=owner_writes.drain)
+    newer = threading.Thread(target=lambda: owner_writes.run("owed_update", {"id": 2, "action": "reopen"}))
+    drain.start()
+    assert applying.wait(5)
+    newer.start()
+    assert enqueue_entered.wait(5)
+    finish.set()
+    drain.join(5)
+    owner_writes.run("owed_update", {"id": 3, "action": "close"})
+    release_enqueue.set()
+    newer.join(5)
+    owner_writes.drain()
+    assert calls == [1, 2, 3], calls
+
+
+def test_only_the_ledger_sends_an_owner_write_to_the_hub():
+    """Every queued-or-direct owner write goes through owner_writes.run, so
+    the order and exactly-once rules above hold for all of them."""
+    import ast
+    from pathlib import Path
+
+    package = Path(owner_writes.__file__).resolve().parent
+    hub_halves = {"_owed_update_on_hub", "_decisions_update_on_hub"}
+    found = []
+    for path in sorted(package.rglob("*.py")):
+        if path.name == "owner_writes.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            word = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
+            if word in hub_halves:
+                found.append(f"{path.name}:{node.lineno} {word}")
+    assert not found, "send owner writes through owner_writes.run: " + ", ".join(found)
+    callers = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr == "run" and getattr(node.func.value, "id", "") == "owner_writes":
+                callers.append(path.name)
+    assert sorted(set(callers)) == ["cli.py", "mcp_server.py"]
