@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { RoutingSettings } from "../RoutingSettings";
 import { revealSettingsGroup } from "../WhatsNew";
-import { GROUPS, routingProblems } from "../routingOverview";
+import { GROUPS, accountWeek, routingProblems } from "../routingOverview";
 import type { PlanUsageState, UsageAccount } from "../PlansCard";
 import type { RouteAccount, RouteView } from "../routing";
 // The stylesheets as written, for the headless Chrome layout check (vitest
@@ -601,6 +601,60 @@ function heightInChrome(html: string): number {
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe("Accounts and routing: a passing gap keeps its figures, as on Home", () => {
+  const SECOND = "claude|/logins/claude-second";
+  /** Claude second open, its plan read just now without figures. */
+  function gapView(): RouteView {
+    const v = calm();
+    v.plan_facts = { [SECOND]: { readable: false, why: "plan figures can't be read just now" } };
+    return v;
+  }
+  const gapRow = (extra: Partial<UsageAccount> = {}) =>
+    planRow({ key: SECOND, account: "Claude second", home: "/logins/claude-second", ok: false, error: "no_plan_figures",
+      windows: [{ name: "weekly", used_pct: 40, resets_at: "2026-10-17T19:00:00Z" }],
+      stale: true, last_good_at: "2026-10-14T08:40:00Z", last_attempt_at: "2026-10-14T15:38:00Z", probed_at: "2026-10-14T15:38:00Z",
+      note: "Claude Code did not send its plan figures just now; Khipu keeps the last ones and asks again", ...extra });
+  const settingsOf = (stale: number) => ({ routing: config({ routing_stale_after: setting(stale, 43200) }).routing, push: { enabled: true } });
+
+  it("keeps the last figures with Home's words in the account row, and nothing needs you", async () => {
+    answers.khipu_route_view = gapView();
+    render(<RoutingSettings active plansState={plansOf([planRow({ key: "claude|" }), gapRow()])} />);
+    expect(await screen.findByText("Nothing here needs you.")).toBeInTheDocument();
+    const line = within(screen.getByRole("list", { name: "Accounts" })).getAllByRole("listitem")
+      .find((li) => li.textContent?.startsWith("Claude second"))!;
+    expect(line.querySelector(".ap-week")).toHaveTextContent(/^60% of its week left, resets /);
+    expect(line.querySelector(".ap-pace")).toHaveTextContent("Can't read it now; figures from 7 h ago");
+    expect(line.querySelector(".at")?.textContent).toBe("");
+    expect(groupButton("Accounts").querySelectorAll(".tag")).toHaveLength(0);
+  });
+
+  it("makes it a problem once the kept figures are older than the stale setting, or there are none", () => {
+    const v = gapView();
+    const plan = (row: UsageAccount) => routingProblems(v, { accounts: [row] }, null, settingsOf(43200), MORNING)
+      .filter((p) => p.key === `plan:${SECOND}`);
+    expect(plan(gapRow())).toEqual([]);
+    expect(routingProblems(v, { accounts: [gapRow()] }, null, settingsOf(6 * 3600), MORNING).map((p) => p.needs))
+      .toContain("Claude second: Khipu can't read its plan");
+    // 0 is "Never": kept figures never go out of date.
+    expect(routingProblems(v, { accounts: [gapRow({ last_good_at: "2026-10-01T00:00:00Z" })] }, null, settingsOf(0), MORNING)
+      .filter((p) => p.key === `plan:${SECOND}`)).toEqual([]);
+    expect(plan(gapRow({ windows: [] }))).toHaveLength(1);
+    expect(plan(gapRow({ error: "timeout" }))).toEqual([]);
+    // Stale kept figures leave the row's figures to the routing record.
+    expect(accountWeek(v.plan_facts![SECOND], MORNING, gapRow(), 6 * 3600).week).toBeNull();
+  });
+
+  it("keeps codes that need the owner in Needs you even with figures kept", async () => {
+    answers.khipu_route_view = gapView();
+    render(<RoutingSettings active plansState={plansOf([gapRow({ error: "not_signed_in" })])} />);
+    const needs = await screen.findByRole("region", { name: "Needs you" });
+    await waitFor(() => expect(needs).toHaveTextContent("Claude second: not signed in"));
+    const v = gapView();
+    expect(routingProblems(v, { accounts: [gapRow({ error: "no_plan_limits" })] }, null, settingsOf(43200), MORNING).map((p) => p.needs))
+      .toContain("Claude second: its sign-in reports no plan limits");
+  });
+});
 
 describe.skipIf(!CHROME)("Accounts and routing laid out at 1280 wide", () => {
   /** Five accounts, five problems: a disagreement, a plan that can't be read,

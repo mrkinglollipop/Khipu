@@ -26,7 +26,7 @@ import type { FeaturesShape } from "./settingsCli";
 import { PlanBlock, RefreshButton, UsageAccountsField, planPauses } from "./PlansCard";
 import type { PlanUsageState, UsageAccount } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
-import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, routingOverview } from "./routingOverview";
+import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, routingOverview, staleAfterSeconds } from "./routingOverview";
 import type { GroupKey, GroupTag, OverviewSettings, Problem } from "./routingOverview";
 import {
   ACCOUNT_FILTERS,
@@ -976,6 +976,7 @@ function AccountLine({
   onSignedIn,
   tags,
   folds,
+  staleAfterS,
   w,
   now,
 }: {
@@ -986,6 +987,7 @@ function AccountLine({
   onSignedIn?: () => Promise<unknown> | void;
   tags: GroupTag[];
   folds: Folds;
+  staleAfterS: number;
   w: Writer;
   now: Date;
 }) {
@@ -994,7 +996,7 @@ function AccountLine({
   const bodyId = `route-acct-${useId().replace(/:/g, "")}`;
   const st = accountState(a, now);
   const fact = data.plan_facts?.[a.key];
-  const { week, pace } = a.configured !== false ? accountWeek(fact, now) : { week: null, pace: null };
+  const { week, pace } = a.configured !== false ? accountWeek(fact, now, plan, staleAfterS) : { week: null, pace: null };
   return (
     <div role="listitem">
       <div className="fold route-aline" data-open={open}>
@@ -1035,6 +1037,7 @@ function AccountsSection({
   folds,
   lists,
   active,
+  staleAfterS,
   w,
   now,
 }: {
@@ -1043,6 +1046,7 @@ function AccountsSection({
   problems: Problem[];
   folds: Folds;
   lists: ListControls;
+  staleAfterS: number;
   active: boolean;
   w: Writer;
   now: Date;
@@ -1112,7 +1116,7 @@ function AccountsSection({
               {shownAccounts.map((a) => (
                 <AccountLine key={a.key} a={a} data={data} plan={rows.find((r) => r.key != null && r.key === a.key)}
                   pause={pauses.get(a.key)} onSignedIn={plansState?.reread} tags={accountTags(problems, a.key)}
-                  folds={folds} w={w} now={now} />
+                  folds={folds} staleAfterS={staleAfterS} w={w} now={now} />
               ))}
             </div>
           ) : (
@@ -3574,7 +3578,8 @@ export function RoutingSettings({
 
   const body: Record<GroupKey, ReactNode> = {
     accounts: data ? (
-      <AccountsSection data={data} plansState={plansState} problems={overview.problems} folds={folds} lists={lists} active={active} w={w} now={now} />
+      <AccountsSection data={data} plansState={plansState} problems={overview.problems} folds={folds} lists={lists} active={active}
+        staleAfterS={staleAfterSeconds(settings)} w={w} now={now} />
     ) : (
       unread
     ),
