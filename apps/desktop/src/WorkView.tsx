@@ -361,6 +361,15 @@ function WaitingCard({
     return out;
   };
 
+  const drop = (item: WaitItem) => {
+    const word = wordFor(vocabOf(view, item.project), "dropped");
+    if (!word) {
+      setRefusal("Khipu didn't find this project's word for dropped.");
+      return;
+    }
+    void write(item.key, () => setLedgerState(item, word));
+  };
+
   const done = (item: WaitItem) => {
     if (item.source === "ledger") {
       const word = wordFor(vocabOf(view, item.project), "done");
@@ -484,6 +493,9 @@ function WaitingCard({
                       <>
                         <button type="button" className="sm primary" disabled={busy !== null} onClick={() => done(item)}>
                           {isBusy ? "Saving…" : "Done"}
+                        </button>
+                        <button type="button" className="sm" disabled={busy !== null} onClick={() => drop(item)}>
+                          Drop
                         </button>
                         <button type="button" className="sm" disabled={busy !== null} onClick={() => setAnswering(item)}>
                           Answered…

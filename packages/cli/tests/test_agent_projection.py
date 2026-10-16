@@ -137,3 +137,19 @@ def test_the_projection_fails_closed_on_what_its_replacements_miss(private):
     # Ordinary words, links and ids pass as they are.
     plain = {"id": "row-1", "title": "Fix the CI/CD step", "link": "https://example.com/pr/1", "rows": 3}
     assert agent_view.project(plain) == plain
+
+
+def test_projection_withholds_every_file_location_and_any_prefixed_account_key():
+    from khipu import agent_view
+
+    payload = {
+        "absolute": "read /etc/passwd",
+        "relative": "read src/private.py",
+        "windows": r"read C:\Users\somebody\secret.txt",
+        "account": "prefix_codex|opaque-login-folder",
+        "suffixed": "codex2|opaque-login-folder",
+    }
+    rendered = repr(agent_view.project(payload))
+    for forbidden in ("/etc/passwd", "src/private.py", r"C:\Users", "codex|", "codex2|"):
+        assert forbidden not in rendered
+    assert agent_view.project("read /etc/passwd") == "read (a path)"

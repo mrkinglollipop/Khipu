@@ -871,6 +871,11 @@ def _verify_catch_up(cur, project: str, rows: dict[str, dict], plan: dict[str, A
         ops = [CATCH_UP_OP] * (row_id in plan["updated"]) + [BOTH_OP] * (row_id in plan["both"])
         if has[:len(had)] != had:
             differs.append(f"{row_id}.history: the entries it had changed")
+        elif added and [_entry_key(h["raw"]) for h in has if h["has_raw"]] \
+                != [_entry_key(e) for e in rows[row_id].get("history") or []]:
+            # Compared in order: the file's entries must read back as the
+            # file lists them, not merely all be there.
+            differs.append(f"{row_id}.history: not the file's entries in the file's order")
         elif [_entry_key(h["raw"]) for h in tail[:len(added)] if h["has_raw"]] != added \
                 or len(tail) != len(added) + len(ops) \
                 or any(h["has_raw"] or not (h["op_id"] or "").startswith(op) for h, op in zip(tail[len(added):], ops)):

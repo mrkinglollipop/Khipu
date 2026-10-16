@@ -1109,3 +1109,62 @@ def test_a_login_folder_reached_through_another_name_for_the_disk_is_refused(tmp
     with pytest.raises(safe_read.Refused):
         safe_read.read_file(alias)
     assert read(Path(alias))["state"] == "refused"
+
+
+def test_safe_read_refuses_a_named_path_whose_dotdot_crosses_a_link(tmp_path):
+    # Collapsing "link/.." lexically would open tmp_path/summary.json, a
+    # different file from the one named (outside/summary.json).
+    outside = tmp_path / "outside"
+    (outside / "nested").mkdir(parents=True)
+    (outside / "summary.json").write_bytes(b"named")
+    (tmp_path / "summary.json").write_bytes(b"other")
+    (tmp_path / "link").symlink_to(outside / "nested", target_is_directory=True)
+    for named in (tmp_path / "link" / ".." / "summary.json", f"{tmp_path}/./summary.json"):
+        with pytest.raises(safe_read.Refused):
+            safe_read.read_file(named)
+
+
+def test_a_source_set_to_another_file_never_shows_the_previous_files_jobs(tmp_path):
+    first = put(tmp_path, summary(), "first.json")
+    assert work.read_source(entry(first), cfg(), NOW)["contents"]["jobs"]
+    replacement = put(tmp_path, "{", "replacement.json")
+    got = work.read_source(entry(replacement), cfg(), NOW)
+    assert got["state"] == "unreadable"
+    assert not got["contents"]
+
+
+def test_a_snooze_ending_is_a_deadline_of_the_view(monkeypatch):
+    from khipu import commitments, hub_snapshot
+
+    deadline = NOW + timedelta(seconds=60)
+    clock = [NOW]
+    parked = {"id": 42, "text": "Approve the release", "project": "atlas", "owner": "user",
+              "kind": "blocker", "opened_at": NOW - timedelta(days=2), "due_after": deadline}
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    class Conn:
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hub_snapshot, "try_hub_connect", lambda **kw: Conn())
+    monkeypatch.setattr(commitments, "list_owed",
+                        lambda cur, **kw: [] if kw.get("hide_snoozed") and clock[0] < deadline else [parked])
+
+    def view():
+        return work.build_view(clock[0], cfg=cfg(), ledger_data=NO_LEDGER, owed=work.read_owed(),
+                               routing_info=ROUTING)
+
+    before = view()
+    clock[0] = deadline
+    after = view()
+    assert before["counts"]["waiting"] == 0 and after["counts"]["waiting"] == 1
+    assert before["valid_until"] == work._z(deadline)

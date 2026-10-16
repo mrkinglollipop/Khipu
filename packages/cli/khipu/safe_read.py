@@ -165,7 +165,13 @@ def open_file(path: str | os.PathLike, limit: int = 0) -> Opened:
     """Open ``path`` read-only as the module text says. Raises ``Refused``,
     ``FileNotFoundError``, ``IsADirectoryError``, ``TooBig`` (over ``limit``
     bytes; 0 is no limit) or ``OSError``."""
-    p = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+    raw = os.path.expanduser(os.fspath(path))
+    # Normalising "." or ".." away would open a different file than the one
+    # named when a link sits before it ("link/.." is the link's parent, not
+    # this folder), so a path holding either is refused, never collapsed.
+    if any(part in (".", "..") for part in raw.split(os.sep)):
+        raise Refused
+    p = Path(os.path.abspath(raw))
     if private_place(str(p)):
         raise Refused
     folder = system_links_resolved(str(p.parent))

@@ -746,8 +746,12 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
     project, path = entry["project"], Path(entry["file"])
     if _private_place(str(path)):
         return {"state": "refused", "problem": SOURCE_PROBLEMS["refused"], "contents": None}
+    # The last good read stands in only for the same file (its name as set,
+    # kept as a hash): a source set to another file never shows this one's.
+    name = hashlib.sha256(os.fsencode(str(path))).hexdigest()[:16]
     last = _read_json(_last_file(project))
-    last = last if isinstance(last, dict) and last.get("project_key") == project else None
+    last = last if isinstance(last, dict) and last.get("project_key") == project \
+        and isinstance(last.get("stamp"), list) and last["stamp"][:1] == [name] else None
     limit = cfg["work_file_max_bytes"]
     try:
         opened = _open_checked(path, limit)
@@ -764,7 +768,7 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
         # Which file was read (its name as set, device and inode) as well as
         # its times and size: another file with the same time and size is
         # read afresh. The name is kept only as a hash.
-        stamp = [hashlib.sha256(os.fsencode(str(path))).hexdigest()[:16], st.st_dev, st.st_ino,
+        stamp = [name, st.st_dev, st.st_ino,
                  st.st_mtime_ns, st.st_ctime_ns, st.st_size, _cfg_digest(cfg)]
         if last is not None and last.get("stamp") == stamp:
             parsed = last["contents"]
@@ -915,7 +919,14 @@ def read_owed() -> dict[str, Any]:
         with conn.cursor() as cur:
             # No limit: the list is every open commitment, the user's picked after.
             rows = list_owed(cur, status="open", limit=None, hide_snoozed=True)
-        return {"items": [r for r in rows if r.get("owner") == "user"], "error": None}
+            # A snoozed one enters Waiting when its snooze ends: that end is
+            # a deadline of the view (valid_until).
+            shown = {r.get("id") for r in rows}
+            ends = [_parse_time(r.get("due_after")) for r in list_owed(cur, status="open", limit=None)
+                    if r.get("owner") == "user" and r.get("id") not in shown]
+            ends = [t for t in ends if t is not None]
+        return {"items": [r for r in rows if r.get("owner") == "user"], "error": None,
+                "valid_until": min(ends) if ends else None}
     except Exception as exc:  # noqa: BLE001
         return {"items": [], "error": type(exc).__name__}
     finally:

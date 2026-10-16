@@ -17,6 +17,13 @@ from tests.test_ledger import KEY, P, _real_connect, _sql, ok, run
 # The scratch PostgreSQL and a clean ledger in it, as test_ledger has them.
 pg_dsn, hub = _tl.pg_dsn, _tl.hub
 
+
+@pytest.fixture(autouse=True)
+def _started_by_the_app(khipu_app):
+    """An import is the owner's change: here the app itself started it,
+    unless a test says otherwise."""
+    return khipu_app
+
 STATES = ["VERIFIED", "MERGED-UNVERIFIED", "BUILT-UNMERGED", "IN FLIGHT", "QUEUED", "NOT STARTED", "NEEDS MATT",
           "DROPPED", "DONE", "ON HOLD"]  # the last is not a standard word
 KINDS = ["goal", "slice", "review", "loose-end", "needs-matt", "audit-item", "drive", "wave", "train",
@@ -834,3 +841,96 @@ def test_a_ledger_row_changed_in_both_places_is_noted_once_per_change_in_the_fil
     assert rc == 0 and third["plan"]["both"] == ["b-1"] and notes() == n1 + 1, third
     b1 = _export()["b-1"]
     assert "refs" not in b1 and b1["title"] == "The ledger's own", b1
+
+
+# ---- owner-only import and in-order catch-up (cross-family review) ----------------
+
+def test_import_is_refused_when_the_app_did_not_start_it_even_without_from_app(monkeypatch, tmp_path, capsys):
+    from khipu import cli, ledger_import, routing
+
+    tracker = tmp_path / "tracker.json"
+    tracker.write_text(json.dumps({"rows": {}}), encoding="utf-8")
+    monkeypatch.setattr(routing, "_caller", lambda: {"app": False, "chain": ["pytest"]})
+    called = []
+    monkeypatch.setattr(
+        ledger_import,
+        "run_import",
+        lambda *a, **k: called.append((a, k)) or {
+            "ok": True,
+            "result": "done",
+            "file": "tracker.json",
+            "project": P,
+            "words": "imported",
+            "counts_in_file": {
+                "rows": 0,
+                "history": 0,
+                "with_parent": 0,
+                "by_state": {},
+                "by_kind": {},
+                "missing_parent": [],
+            },
+            "masked": [],
+            "other_keys": [],
+        },
+    )
+    args = cli.build_parser().parse_args(
+        ["ledger", "import", str(tracker), "--project", P, "--json"]
+    )
+    rc = args.func(args)
+    output = capsys.readouterr()
+    assert rc == 1 and "only the Khipu app" in (output.out + output.err)
+    assert called == []
+
+
+def test_catch_up_rejects_history_inserted_before_an_existing_entry(hub, tmp_path):
+    first = {"at": "2026-10-01T00:00:00Z", "event": "first"}
+    second = {"at": "2026-10-02T00:00:00Z", "event": "second"}
+    third = {"at": "2026-10-03T00:00:00Z", "event": "third"}
+    doc = {"rows": {"a": _row("a", history=[first, third])}}
+    path = _write(tmp_path, doc)
+    assert _import(path)[0] == 0
+
+    doc["rows"]["a"]["history"] = [first, second, third]
+    _write(tmp_path, doc)
+    rc, report = _import(path, "--catch-up")
+
+    assert rc == 1 and report["result"] == "rolled back", report
+    raw = [h for h in _export()["a"]["history"] if "by" not in h]
+    assert raw == [first, third]
+
+
+def test_catch_up_verifier_rejects_a_middle_entry_appended_out_of_order(monkeypatch):
+    from khipu import ledger_import
+
+    first = {"at": "2026-10-01T00:00:00Z", "event": "first"}
+    second = {"at": "2026-10-02T00:00:00Z", "event": "second"}
+    third = {"at": "2026-10-03T00:00:00Z", "event": "third"}
+    source = {"a": _row("a", history=[first, second, third])}
+    row = {"row_id": "a", "refs": {"imported": {"file": "digest"}}, "state": "QUEUED"}
+    before_hist = [
+        {"has_raw": True, "raw": first},
+        {"has_raw": True, "raw": third},
+    ]
+    before = {
+        "ids": {"a"},
+        "all": {"a": row},
+        "hist": {"a": before_hist},
+        "rows": {"a": _row("a", history=[first, third])},
+    }
+    after = {
+        "ids": {"a"},
+        "all": {"a": row},
+        "hist": {"a": before_hist + [{"has_raw": True, "raw": second}]},
+        "rows": {"a": _row("a", history=[first, third, second])},
+    }
+    monkeypatch.setattr(ledger_import, "_snapshot", lambda *a: after)
+
+    check = ledger_import._verify_catch_up(
+        None,
+        P,
+        source,
+        {"new_rows": [], "updated": [], "both": []},
+        {"a": [second]},
+        before,
+    )
+    assert not check["ok"], check

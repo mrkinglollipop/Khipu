@@ -2329,6 +2329,8 @@ def cmd(args: argparse.Namespace) -> int:
         refuse_secrets([v for k, v in vars(args).items() if k != "func"])
         if getattr(args, "from_app", False):
             _check_from_app()
+        if verb == "import" and not args.dry_run:
+            _check_owner()
         project = _project_for(args)
         if verb in ("add", "set", "remove", "restore"):
             return _cmd_write(args, verb, project)
@@ -2406,6 +2408,24 @@ def _check_from_app() -> None:
     if not routing._caller()["app"]:
         raise LedgerError("only the Khipu app can make this change as you; it was not the app that asked, "
                           "so nothing was changed", "not_app")
+
+
+def _check_owner() -> None:
+    """An import (or a catch-up) is the owner's change, with or without
+    ``--from-app``: it runs when the app itself started this process
+    (``routing._caller``), or after a typed yes on a terminal."""
+    from khipu import routing
+
+    if routing._caller()["app"]:
+        return
+    try:
+        answer = input("Importing a tracker is the owner's change. Type yes to confirm: ") \
+            if sys.stdin.isatty() else ""
+    except (EOFError, OSError):
+        answer = ""
+    if answer.strip().lower() != "yes":
+        raise LedgerError("only the Khipu app, or a typed yes on a terminal, can import a tracker; "
+                          "nothing was changed", "not_app")
 
 
 def _cmd_write(args: argparse.Namespace, verb: str, project: str) -> int:
@@ -2587,6 +2607,7 @@ def add_parser(sub) -> None:
     im.add_argument("file")
     im.add_argument("--dry-run", action="store_true", help="Report what would be imported; write nothing")
     im.add_argument("--catch-up", action="store_true", help="Bring in only what changed since the last import")
+    im.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     common(im)
 
     ex = verbs.add_parser("export", help="The project in the old tracker file's shape")

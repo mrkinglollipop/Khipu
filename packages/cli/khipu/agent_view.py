@@ -509,6 +509,9 @@ def scrub(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] | None =
 
 # A routing account key, "harness|login folder" (the folder may be empty).
 _ACCOUNT_KEY = re.compile(r"(?i)(?<![\w-])(claude|codex|grok|muse)\|")
+# The final scan's: a harness name with anything before or after it ahead
+# of the bar ("x_codex|", "codex2|") is still a key.
+_ANY_ACCOUNT_KEY = re.compile(r"(?i)(?:claude|codex|grok|muse)[^\s|]*\|")
 _KEY_HOME = re.compile(r"[^\s\"'`,;)\]}]*")
 
 
@@ -530,11 +533,14 @@ def _account_keys(text: str, table: _Table) -> str:
 def _project_text(text: str, table: _Table) -> str:
     from khipu.redact import redact_secrets
 
-    text = _scrub_text(_account_keys(text, table), table, [])
+    from khipu import work
+
+    # work.py's rule: each path-shaped word that is left becomes "(a path)".
+    text = work._cut_paths(_scrub_text(_account_keys(text, table), table, []))
     # Fail closed: an account key or a key-shaped secret still in the
     # finished value, in any decoding of it, withholds the whole value.
     for variant in _decoded_variants(text):
-        if _ACCOUNT_KEY.search(variant) or redact_secrets(variant, force=True)[1]:
+        if _ANY_ACCOUNT_KEY.search(variant) or redact_secrets(variant, force=True)[1]:
             return WITHHELD
     return text
 

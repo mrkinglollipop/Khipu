@@ -93,3 +93,29 @@ it("opening the ledger and reading its rows never changes one", async () => {
   await screen.findByText("Row a");
   expect(changes()).toEqual([]);
 });
+
+it("a ledger need offers Drop beside Done, and Drop sets the project's word for dropped", async () => {
+  const doc: Doc = {
+    format: "khipu-work-view", version: 1, generated_at: "2026-10-16T12:00:00Z",
+    projects: [{
+      project: "atlas", name: "Atlas", source: { state: "none" }, jobs: [], prs: [], trains: [], merged: [], flagged: 0,
+      ledger: { rows: 1, by_state: { "NEEDS OWNER": 1 }, goals: [], loose_ends: [], loose_end_count: 0,
+        changed_today: [], vocab },
+    }],
+    live: [],
+    waiting: [{ source: "ledger", key: "ledger:atlas#decision-7", project: "atlas", id: "decision-7",
+      title: "Owner decision", kind: "needs-owner", blocking: false,
+      actions: ["done", "drop", "answered", "open_ledger"] }],
+    counts: { waiting: 1, blocking: 0, running: 0, flagged: 0, stale_sources: 0, ledger_outbox: 0 },
+  } as unknown as Doc;
+  invokeMock.mockResolvedValue(JSON.stringify({ ok: true }));
+  render(<WorkView work={{ data: doc, error: null, loading: false, readAt: null, load: async () => {} }}
+    routing={{ data: null, error: null, loading: false, lastOkAt: null, firstRead: false, load: async () => {} }}
+    owedSection={null} owedFocusKey={0} onOwedClose={async () => {}} onSnooze={() => {}} onOpenRouting={() => {}} />);
+  expect(screen.getByRole("button", { name: "Done" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Answered…" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Open in ledger" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Drop" }));
+  await waitFor(() => expect(changes().length).toBe(1));
+  expect(changes()[0][1]).toMatchObject({ project: "atlas", id: "decision-7", change: { state: "DROPPED" } });
+});
