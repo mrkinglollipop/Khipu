@@ -41,7 +41,7 @@ import type { ClaudeHomesReport } from "./railHealth";
 import { RightNowCard } from "./RightNow";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
-import { buildAttention, harnessLabel, routingAttention, type Attention } from "./doctorAttention";
+import { buildAttention, harnessLabel, promotionAttention, routingAttention, type Attention } from "./doctorAttention";
 import { HealthReportRows } from "./healthRows";
 import { SummariserCalls, SynthFallbackField, SynthProviderChoices, synthModelError } from "./SynthProvider";
 import { KeysCard } from "./KeysCard";
@@ -2439,9 +2439,10 @@ export default function App() {
   const [noneTracked, setNoneTracked] = useState(false);
   const [addAccountSignal, setAddAccountSignal] = useState(0);
   const routingItems = useMemo(() => routingAttention(routing.data), [routing.data]);
+  const promotionItems = useMemo(() => promotionAttention(doctorParsed), [doctorParsed]);
   const homeAttention = useMemo(
-    () => [...attention, ...planItems, ...routingItems],
-    [attention, planItems, routingItems],
+    () => [...attention, ...planItems, ...routingItems, ...promotionItems],
+    [attention, planItems, routingItems, promotionItems],
   );
   // "Connect to a server you run or another Mac…" reopens the first-run flow
   // at the Database step rather than restarting it — `welcomeInitialStepKey`

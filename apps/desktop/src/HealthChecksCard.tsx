@@ -4,11 +4,15 @@
    clears without anyone doing anything. Read from `khipu config`, written
    through `khipu_config_set` / `khipu_config_unset`, then re-read. */
 
+import { useEffect, useState } from "react";
+import { healthCheckLabel } from "./healthRows";
 import { SettingField } from "./SettingsControls";
 import { callCli, useCliState } from "./settingsCli";
 import type { ConfigShape } from "./settingsCli";
 
 const WINDOW_KEY = "doctor_rate_window_minutes";
+const WAIT_KEY = "promote_hub_wait_minutes";
+const IGNORE_KEY = "promote_gate_ignore";
 
 /** Client-side check for immediate feedback; the Tauri command and the CLI
  *  check the same range again. */
@@ -25,6 +29,12 @@ export function HealthChecksCard({ active }: { active: boolean }) {
   const row = cfg.data?.minute_settings?.[WINDOW_KEY];
   const min = row?.min ?? 5;
   const max = row?.max ?? 10080;
+  const wait = cfg.data?.minute_settings?.[WAIT_KEY];
+  const ignore = cfg.data?.promote_gate_ignore;
+  const ignoreValue = (ignore?.value ?? []).join(",");
+  const [picked, setPicked] = useState<string[]>([]);
+  const [ignoreError, setIgnoreError] = useState<string | null>(null);
+  useEffect(() => setPicked(ignore?.value ?? []), [ignoreValue]); // eslint-disable-line react-hooks/exhaustive-deps
   const readFailed = cfg.error != null && !cfg.data;
 
   return (
@@ -65,6 +75,76 @@ export function HealthChecksCard({ active }: { active: boolean }) {
             return res.ok ? null : res.error;
           }}
         />
+      </div>
+      <div className="section-head">Before a new version of Khipu goes live</div>
+      <div className="section-body">
+        <SettingField
+          label="How long to wait for the database"
+          mono
+          narrow
+          inputMode="decimal"
+          value={wait ? String(wait.value) : ""}
+          help={
+            <>
+              In minutes. If the database is out of reach while a new version is checked, Khipu waits this long, then
+              checks again by itself once the database answers.
+              {wait ? ` Default ${wait.default}.` : ""}
+            </>
+          }
+          onSave={async (v) => {
+            const bad = windowMinutesError(v, wait?.min ?? 0, wait?.max ?? 240);
+            if (bad) return bad;
+            const res = await callCli("khipu_config_set", { key: WAIT_KEY, value: v.trim() });
+            await cfg.reload();
+            return res.ok ? null : res.error;
+          }}
+          canReset={wait?.source === "file"}
+          resetLabel="Use default"
+          onReset={async () => {
+            const res = await callCli("khipu_config_unset", { key: WAIT_KEY });
+            await cfg.reload();
+            return res.ok ? null : res.error;
+          }}
+        />
+        {ignore ? (
+          <fieldset className="set-field">
+            <legend className="set-label">Checks you know are harmless</legend>
+            <p className="set-help">
+              The update check passes over the checks you tick here, and names each one in its record.
+            </p>
+            {ignore.choices.map((name) => (
+              <label key={name} style={{ display: "block" }}>
+                <input
+                  type="checkbox"
+                  checked={picked.includes(name)}
+                  onChange={(e) =>
+                    setPicked((cur) => (e.target.checked ? [...cur, name] : cur.filter((n) => n !== name)))
+                  }
+                />{" "}
+                {healthCheckLabel(name)}
+              </label>
+            ))}
+            <button
+              type="button"
+              className="btn"
+              onClick={async () => {
+                const res =
+                  picked.length > 0
+                    ? await callCli("khipu_config_set", { key: IGNORE_KEY, value: picked.join(",") })
+                    : await callCli("khipu_config_unset", { key: IGNORE_KEY });
+                await cfg.reload();
+                setIgnoreError(res.ok ? null : res.error);
+              }}
+            >
+              Save
+            </button>
+            {ignoreError ? (
+              <p className="set-error" role="alert">
+                {ignoreError}
+              </p>
+            ) : null}
+          </fieldset>
+        ) : null}
       </div>
     </div>
   );

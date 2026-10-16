@@ -107,6 +107,11 @@ function humanize(key: string): string {
     .join(" ");
 }
 
+/** A check's plain-words name from its bare name ("outbox"), as the rows show it. */
+export function healthCheckLabel(name: string): string {
+  return LABELS[`${name}_ok`] ?? humanize(`${name}_ok`);
+}
+
 function isNotConfigured(key: string, notConfigured: string[]): boolean {
   if (notConfigured.length === 0) return false;
   const candidates = [

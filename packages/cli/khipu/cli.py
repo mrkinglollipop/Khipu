@@ -443,6 +443,17 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     }
 
 
+def _promotion_block() -> dict:
+    """A promotion waiting for the hub (khipu.promote.queued), for the app.
+    Never gates ``ok``."""
+    try:
+        from khipu.promote import queued
+
+        return {"queued": queued()}
+    except Exception as e:  # noqa: BLE001
+        return {"queued": None, "error": f"{type(e).__name__}: {e}"}
+
+
 def _cmd_doctor_quick(args: argparse.Namespace) -> int:
     """`khipu doctor --quick`: imports, config, DSN presence and every local
     check plain doctor gates on (``LOCAL_GATES``: outbox, capture liveness,
@@ -924,6 +935,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "ledger": ledger_block,
         "schema_migrations": schema,
         "work": work_block,
+        "promotion": _promotion_block(),
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
@@ -3292,6 +3304,19 @@ def cmd_config(args: argparse.Namespace) -> int:
         value, source = choice_setting(key)
         print(json.dumps({"ok": True, key: value, "source": source, "config_file": str(path)}))
         return 0
+    if (args.set and args.set[0] == "promote_gate_ignore") or args.unset == "promote_gate_ignore":
+        # The checks the owner knows are harmless: the promotion gate's
+        # doctor step passes over them and names them in its record.
+        from khipu import promote as _promote
+
+        try:
+            path = _promote.set_gate_ignore(args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, "promote_gate_ignore": _promote.gate_ignore_status(),
+                          "config_file": str(path)}))
+        return 0
     if (args.set and args.set[0] in MINUTE_SETTINGS) or args.unset in MINUTE_SETTINGS:
         from khipu.config import minute_settings_status, set_minute_setting
 
@@ -3394,6 +3419,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "user_aliases": list(list_setting("user_aliases")),
         "float_settings": float_settings_status(),
         "minute_settings": minute_settings_status(),
+        "promote_gate_ignore": _promote_gate_ignore_status(),
         "relevance_cosine_floor": relevance.cosine_floor_status(),
         "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
         "usage_accounts": usage.accounts_status(),
@@ -3407,6 +3433,15 @@ def cmd_config(args: argparse.Namespace) -> int:
     }
     print(json.dumps(out, indent=2))
     return 0
+
+
+def _promote_gate_ignore_status() -> dict:
+    try:
+        from khipu.promote import gate_ignore_status
+
+        return gate_ignore_status()
+    except Exception as e:  # noqa: BLE001 — showing config must not fail on this
+        return {"value": [], "choices": [], "error": f"{type(e).__name__}: {e}"}
 
 
 BUDGET_LIFT_SCOPES = ("synth", "memory", "library")
@@ -3760,14 +3795,16 @@ def cmd_promote(args: argparse.Namespace) -> int:
     khipu.promote and docs/plans/2026-10-14-promotion-gate.md)."""
     from khipu import promote as pm
 
-    chosen = [flag for flag in ("rollback", "status", "gate_only") if getattr(args, flag, None)]
+    chosen = [flag for flag in ("rollback", "status", "gate_only", "retry_queued") if getattr(args, flag, None)]
     if len(chosen) > 1:
-        print(json.dumps({"ok": False, "error": "choose one of --rollback, --status, --gate-only"}))
+        print(json.dumps({"ok": False, "error": "choose one of --rollback, --status, --gate-only, --retry-queued"}))
         return 2
-    if (args.rollback or args.status) and args.ref:
+    if (args.rollback or args.status or args.retry_queued) and args.ref:
         print(json.dumps({"ok": False, "error": "a ref applies to a promotion or --gate-only only"}))
         return 2
-    if args.status:
+    if args.retry_queued:
+        out = pm.retry_queued()
+    elif args.status:
         out = pm.status()
     elif args.rollback:
         out = pm.rollback()
@@ -4032,6 +4069,14 @@ def cmd_sessions(args: argparse.Namespace) -> int:
         print(json.dumps(sc.sweep_idle(limit=args.limit, dry_run=args.dry_run), indent=2))
         return 0
     out = sc.drain(limit=args.limit, dry_run=args.dry_run, sweep=True)
+    if not args.dry_run:
+        # A promotion queued while the hub was out of reach is retried from
+        # here, in its own process (khipu.promote.kick_queued_retry).
+        from khipu.promote import kick_queued_retry
+
+        kicked = kick_queued_retry()
+        if kicked is not None:
+            out["promotion_retry"] = kicked
     print(json.dumps(out, indent=2))
     return 0 if out["failed"] == 0 else 2
 
@@ -5635,7 +5680,10 @@ def build_parser() -> argparse.ArgumentParser:
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew") '
         "the graph backup destination (graph_backup_remote, an rclone "
         "remote:path, default r2:khipu-backups/khipu-graph), how far back "
-        "doctor's rate checks look (doctor_rate_window_minutes, default 60) "
+        "doctor's rate checks look (doctor_rate_window_minutes, default 60), "
+        "how long the promotion gate waits for an unreachable hub "
+        "(promote_hub_wait_minutes, default 10), the doctor checks the gate "
+        "passes over (promote_gate_ignore, comma-separated check names) "
         "or the plan usage accounts as JSON (usage_accounts "
         '\'[{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}]\')',
     )
@@ -5855,6 +5903,8 @@ def build_parser() -> argparse.ArgumentParser:
     pmt.add_argument("--status", action="store_true", help="Live commit, main commit, drift, last gate result")
     pmt.add_argument("--gate-only", choices=("doctor", "recall", "capture", "version"), default=None,
                      metavar="STEP", help="Run one gate step (doctor, recall, capture, version); never flips")
+    pmt.add_argument("--retry-queued", action="store_true",
+                     help="Run the promotion queued while the hub was out of reach, if the hub answers now")
     pmt.add_argument("--json", action="store_true", help="Print the full result as JSON")
     pmt.set_defaults(func=cmd_promote)
 

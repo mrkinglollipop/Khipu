@@ -419,6 +419,9 @@ def set_int_setting(key: str, value: "int | None") -> Path:
 
 MINUTE_SETTINGS: dict[str, tuple[int, int, int]] = {
     "doctor_rate_window_minutes": (60, 5, 7 * 24 * 60),
+    # How long the promotion gate waits for an unreachable hub before it
+    # queues the promotion to run again once the hub answers (E). 0: no wait.
+    "promote_hub_wait_minutes": (10, 0, 4 * 60),
 }
 
 

@@ -731,7 +731,28 @@ fn parse_daily_calls(key: &str, raw: &str) -> Result<String, String> {
 
 /// `config --set KEY N` / `config --unset=KEY` for a length of time in whole
 /// minutes (`khipu.config.MINUTE_SETTINGS`), with each key's allowed range.
-const MINUTE_KEYS: &[(&str, u64, u64)] = &[("doctor_rate_window_minutes", 5, 7 * 24 * 60)];
+const MINUTE_KEYS: &[(&str, u64, u64)] =
+    &[("doctor_rate_window_minutes", 5, 7 * 24 * 60), ("promote_hub_wait_minutes", 0, 240)];
+
+/// The promotion gate's list of checks the owner has passed over
+/// (`khipu.config` key `promote_gate_ignore`): comma-separated check names.
+const GATE_IGNORE_KEY: &str = "promote_gate_ignore";
+
+fn parse_gate_ignore(raw: &str) -> Result<String, String> {
+    let names: Vec<&str> = raw.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+    if names.is_empty() {
+        return Err(format!("{GATE_IGNORE_KEY} must name at least one check; reset it to clear the list"));
+    }
+    if names.len() > 32 {
+        return Err(format!("{GATE_IGNORE_KEY} names too many checks"));
+    }
+    for n in &names {
+        if n.is_empty() || n.len() > 40 || !n.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+            return Err(format!("not a check name: {n:?}"));
+        }
+    }
+    Ok(names.join(","))
+}
 
 fn minute_key(key: &str) -> Option<(u64, u64)> {
     MINUTE_KEYS.iter().find(|(k, _, _)| *k == key).map(|(_, low, high)| (*low, *high))
@@ -1089,6 +1110,7 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
         "user_aliases" => Ok(set("user_aliases", checked_operand(key, value, true)?)),
         k if DAILY_CALL_KEYS.contains(&k) => Ok(set(k, parse_daily_calls(k, value)?)),
         k if minute_key(k).is_some() => Ok(set(k, parse_minutes(k, value)?)),
+        GATE_IGNORE_KEY => Ok(set(GATE_IGNORE_KEY, parse_gate_ignore(value)?)),
         "synth_fallback" => {
             let v = value.trim();
             if !SYNTH_FALLBACKS.contains(&v) {
@@ -1126,6 +1148,7 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
         && key != USAGE_ACCOUNTS_KEY
         && key != GRAPH_BACKUP_REMOTE_KEY
         && minute_key(key).is_none()
+        && key != GATE_IGNORE_KEY
         && !cli_setting_key(key)
         && !routing_key(key)
         && !by_profile
@@ -5023,6 +5046,25 @@ mod settings_command_tests {
         assert_eq!(config_unset_argv(key).unwrap(), v(&["config", "--unset=doctor_rate_window_minutes"]));
         assert_eq!(SNAPSHOT_REFRESH_ARGV, &["snapshot", "refresh"]);
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"snapshot"));
+    }
+
+    #[test]
+    fn the_promotion_gate_settings_are_checked() {
+        let wait = "promote_hub_wait_minutes";
+        assert_eq!(config_set_argv(wait, "0").unwrap(), v(&["config", "--set", wait, "0"]));
+        assert_eq!(config_set_argv(wait, "240").unwrap(), v(&["config", "--set", wait, "240"]));
+        assert!(config_set_argv(wait, "241").is_err());
+        let key = "promote_gate_ignore";
+        assert_eq!(
+            config_set_argv(key, " outbox , degraded_rate ").unwrap(),
+            v(&["config", "--set", key, "outbox,degraded_rate"])
+        );
+        for bad in ["", " , ", "Outbox", "out box", "--unset", "a-b", &"x".repeat(41)] {
+            assert!(config_set_argv(key, bad).is_err(), "accepted {bad:?}");
+        }
+        let many = (0..33).map(|_| "a").collect::<Vec<_>>().join(",");
+        assert!(config_set_argv(key, &many).is_err());
+        assert_eq!(config_unset_argv(key).unwrap(), v(&["config", "--unset=promote_gate_ignore"]));
     }
 
     #[test]

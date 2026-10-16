@@ -19,7 +19,7 @@ import {
   spanWords,
 } from "./routing";
 import type { RouteView } from "./routing";
-import { fmtAgo } from "./time";
+import { fmtAgo, fmtAgoSince } from "./time";
 
 /** A named red check, in plain words, with at most one fix. Callers render
  *  one callout per entry; `fix` is omitted where the app has no honest fix to
@@ -522,4 +522,22 @@ export function routingAttention(view: RouteView | null | undefined, now: Date =
     });
   }
   return items;
+}
+
+/** A new version of Khipu that was refused only because the database was out
+ *  of reach, and is waiting to be checked again by itself. */
+export function promotionAttention(parsed: Record<string, unknown> | null | undefined): Attention[] {
+  const q = (parsed as { promotion?: { queued?: { queued_at?: string } | null } } | null | undefined)?.promotion?.queued;
+  if (!q) return [];
+  const when = fmtAgoSince(q.queued_at) ?? "";
+  return [
+    {
+      key: "promotion",
+      tone: "warn",
+      title: "A new version of Khipu is waiting for the database",
+      cause:
+        `It was queued${when ? ` ${when}` : ""} because the database could not be reached while it was checked. ` +
+        "It goes live by itself once the database answers and its checks pass.",
+    },
+  ];
 }

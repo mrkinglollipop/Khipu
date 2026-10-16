@@ -100,6 +100,7 @@ export type ConfigShape = {
   relevance_cosine_floor?: { value: number; source: string; default: number };
   graph_backup_remote?: { value: string; source: "env" | "config" | "default"; default: string; error?: string };
   minute_settings?: Record<string, { value: number; source: "file" | "default"; default: number; min: number; max: number }>;
+  promote_gate_ignore?: { value: string[]; choices: string[]; error?: string };
   config?: Record<string, unknown>;
 };
 
