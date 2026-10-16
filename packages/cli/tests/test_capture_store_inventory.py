@@ -59,7 +59,7 @@ NOT_CAPTURE = {
                      "jobs._nightly_log", "jobs._offsite_if_due", "jobs._record_nightly_step",
                      "jobs._run_script", "jobs._write_job_state", "migrate._save_lock_notes",
                      "probe._persist_result", "probe._write_state", "promote._recall_once",
-                     "promote._run", "recall_eval.write_record",
+                     "promote._run",
                      "recall_prompt._dedup_transaction", "recall_prompt._detach_child",
                      "recall_prompt._log", "recall_prompt._prompt_routing_child",
                      "recall_prompt._query_embed_cache_connect",

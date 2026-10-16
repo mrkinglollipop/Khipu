@@ -287,16 +287,17 @@ def write_gate() -> Iterator[Gate]:
 
 
 @contextmanager
-def write_guard(payload: dict[str, Any]) -> Iterator[bool]:
+def write_guard(payload: dict[str, Any], *also: dict[str, Any]) -> Iterator[bool]:
     """Serialize the last source check and the caller's local write.
 
     Callers must keep this context open until their atomic replace/SQLite
-    commit completes.  ``False`` means the payload is a forgotten source.
+    commit completes.  ``False`` means the payload, or any of ``also`` (other
+    identities of the same row), is a forgotten source.
     ``RegistryError`` means no safe decision could be made and must abort the
     write rather than treating an unreadable registry as empty.
     """
     with write_gate() as gate:
-        yield gate.allows(payload)
+        yield all(gate.allows(p) for p in (payload, *also))
 
 
 def is_forgotten(payload: dict[str, Any]) -> bool:

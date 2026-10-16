@@ -37,12 +37,12 @@ def _publish_at_last_check(monkeypatch, payload: dict, root: Path):
     fired = {"value": False}
 
     @contextmanager
-    def scheduled(value):
+    def scheduled(value, *also):
         if not fired["value"]:
             fired["value"] = True
             result = _forget(payload, root)
             assert result["complete"], result
-        with original(value) as allowed:
+        with original(value, *also) as allowed:
             yield allowed
 
     monkeypatch.setattr(tombstones, "write_guard", scheduled)

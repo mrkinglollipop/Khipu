@@ -433,3 +433,19 @@ def test_interrupted_atomic_publication_retains_prior_fence(monkeypatch, stage):
         tombstones.publish_payloads([b])
     assert tombstones.is_forgotten(a)
     assert tombstones.is_forgotten(b) == (stage == "after_replace")
+
+
+def test_memory_lock_refuses_a_data_folder_that_is_not_a_directory(tmp_path, monkeypatch):
+    from unittest import mock
+
+    from khipu import memory_lock
+
+    not_a_folder = tmp_path / "data"
+    not_a_folder.write_text("")
+    monkeypatch.chdir(tmp_path)
+    for folder in (not_a_folder, mock.MagicMock()):
+        with mock.patch("khipu.paths.ensure_data_dir", return_value=folder):
+            with pytest.raises(memory_lock.MemoryLockError):
+                with memory_lock.shared():
+                    pass
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["data"]

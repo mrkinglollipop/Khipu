@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import stat
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -72,8 +73,12 @@ def _inherited() -> int | None:
 def _take(mode: str) -> Iterator[None]:
     try:
         path = lock_path()
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError as exc:
+        # A data folder that is not a real directory is refused rather than
+        # turned into a file name in the working directory.
+        if not stat.S_ISDIR(os.stat(path.parent).st_mode):
+            raise NotADirectoryError(str(path.parent))
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except (OSError, TypeError) as exc:
         raise MemoryLockError(f"memory lock unavailable: {type(exc).__name__}") from exc
     try:
         try:

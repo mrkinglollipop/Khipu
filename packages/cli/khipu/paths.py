@@ -382,7 +382,8 @@ def _not_restored_why(parts: tuple[str, ...]) -> str:
 
 # How each restore scrub treats a file a store claims (khipu/capture_stores.py,
 # RESTORE_SCRUBS): "copy" restores it as it is, "job" leaves it out when it is
-# a queued job for a forgotten source, "stage" scrubs the replica in a staging
+# a queued job for a forgotten source, "golden" drops each recall test line
+# that names a forgotten episode, "stage" scrubs the replica in a staging
 # copy before it becomes the replica, "merged" means the file was merged
 # before the copy loop and is not copied.
 RESTORE_SCRUBS = {
@@ -390,6 +391,7 @@ RESTORE_SCRUBS = {
     "replica staging": "stage",
     "content addressed": "copy",  # images shared by hash: a known boundary of forget
     "registry merge": "merged",
+    "recall golden": "golden",
     "no capture text": "copy",
 }
 
@@ -719,6 +721,20 @@ def _import_local(*, source: Path, merge: bool) -> dict:
                                 "forget registry, so it may hold a forgotten source and was not "
                                 "restored")})
                             continue
+                    if scrub == "golden":
+                        from khipu.recall_eval import drop_forgotten_lines
+
+                        try:
+                            text, dropped = drop_forgotten_lines(
+                                staged.read_bytes().decode("utf-8"), gate.episode_ids)
+                        except ValueError:
+                            not_restored.append({"path": rel, "why": (
+                                "a recall test file with a line that could not be read or checked "
+                                "against the forget registry, so it may quote a forgotten episode "
+                                "and was not restored")})
+                            continue
+                        skipped_forgotten += dropped
+                        staged.write_bytes(text.encode("utf-8"))
                     if scrub != "stage":
                         with open(staged, "rb") as staged_file:
                             _restore_file(root_fd, tuple(rel.split("/")), staged_file)

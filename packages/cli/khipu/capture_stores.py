@@ -33,12 +33,12 @@ from pathlib import Path
 
 # The scans forget runs, by the name a store gives.
 FORGET_SCANS = ("native jobs", "outbox", "legacy logs", "replica", "replica temps",
-                "legacy writers")
+                "legacy writers", "recall golden")
 
 
 # The scrubs a restored file may go through, by the name an entry gives.
 RESTORE_SCRUBS = ("queued job", "replica staging", "content addressed", "registry merge",
-                  "no capture text")
+                  "recall golden", "no capture text")
 
 
 @dataclass(frozen=True)
@@ -98,7 +98,7 @@ STORES: tuple[Store, ...] = (
           _w("forget._rewrite_log", "forget._scrub_copy")),
     Store("replica", "data folder hub_snapshot.sqlite",
           "episode rows, vectors, decisions and deliverables", "replica",
-          _w("hub_snapshot.refresh", "hub_snapshot._upsert_episode_unfenced",
+          _w("hub_snapshot._refresh_locked", "hub_snapshot._upsert_episode_unfenced",
              "hub_snapshot.upsert_embeddings", "hub_snapshot.apply_decision_changes",
              "hub_snapshot.sync_decision_changes", "hub_snapshot.ledger_write_snapshot",
              "hub_snapshot.forget_episode_in_snapshot", "hub_snapshot.scrub_forgotten_snapshot",
@@ -111,6 +111,16 @@ STORES: tuple[Store, ...] = (
     Store("legacy writer", "data folder .legacy_writers/<pgid>.json",
           "the process group of a legacy writer that may still append", "legacy writers",
           _w("writer_groups.record")),
+    Store("recall golden set", "data folder recall-golden.jsonl, or the file KHIPU_RECALL_GOLDEN names",
+          "recall test queries, which usually quote a captured episode's private text, each "
+          "with the episode ids it expects", "recall golden",
+          _w("forget._scrub_recall_golden"),
+          Restore(("recall-golden.jsonl",), "recall golden")),
+    Store("recall eval record", "a file the owner names with khipu recall eval --record",
+          "the golden queries, quoted text included, and the ids each one returned",
+          "kept: an owner-chosen file outside the data folder that forget cannot find; a known "
+          "boundary in the scope doc",
+          _w("recall_eval.write_record")),
     Store("session state", "capture home state/<harness>--<session>.json and .capture-now.json",
           "offsets and hashes; carried text and a capture note that no queued job holds yet",
           "none: carried text and a note belong to the next window, which is not a source until "
@@ -157,8 +167,8 @@ class DataFiles:
 OTHER_DATA: tuple[DataFiles, ...] = (
     DataFiles("settings", "settings, credentials and source lists",
               Restore(("config.json", "dsn", "root.crt", "gateway-token", "graph_sources.json",
-                       "graph_sources.resolved.json", "migrate_lock_notes.json",
-                       "recall-golden.jsonl"), "no capture text")),
+                       "graph_sources.resolved.json", "migrate_lock_notes.json"),
+                      "no capture text")),
     DataFiles("forget registry", "identities and ids of forgotten sources, never their text",
               Restore(("forgotten_sources.json",), "registry merge")),
     DataFiles("ledger outbox", "ledger writes waiting for the hub, the owner's work rows",

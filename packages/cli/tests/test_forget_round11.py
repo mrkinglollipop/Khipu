@@ -115,7 +115,7 @@ def test_every_restorable_store_has_a_scrub():
 
 def test_every_capture_store_says_whether_a_backup_restores_it():
     restored = {s.name for s in capture_stores.STORES if s.restore is not None}
-    assert restored == {"outbox job", "replica", "conversation media"}
+    assert restored == {"outbox job", "replica", "conversation media", "recall golden set"}
     claimed = [e.name for e in capture_stores.restorable()]
     assert len(claimed) == len(set(claimed))
 

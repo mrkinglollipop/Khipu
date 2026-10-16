@@ -1656,7 +1656,21 @@ def refresh() -> dict[str, Any]:
     Holds a cross-process flock for the whole dump so doctor ``maybe_refresh``
     and ``khipu snapshot refresh`` serialize. If another dump is live, returns
     ``{"ok": False, "error": ...}`` instead of dumping anyway.
+
+    The shared memory lock is held from the first hub read to publication, so
+    a forget (which holds it exclusive) never completes while a dump that read
+    the forgotten rows is still being written.
     """
+    from khipu import memory_lock
+
+    try:
+        with memory_lock.shared():
+            return _refresh_locked()
+    except memory_lock.MemoryLockError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _refresh_locked() -> dict[str, Any]:
     lock = _acquire_refresh_lock()
     if lock is None:
         return {
@@ -1850,6 +1864,28 @@ def _tombstone_payload_for_episode(episode_row: Mapping[str, Any]) -> dict[str, 
     return payload
 
 
+def _tombstone_payloads_for_episode(episode_row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Every identity forget may have registered for this row: its raw (or
+    its columns when raw is gone), the natural source identity its own
+    columns hold, and those columns completed by what raw still carries.
+    An older or edit-rewritten raw can lack the source fields while the
+    columns still name the forgotten source (see ``forget._natural_identities``)."""
+    from khipu.capture_identity import SOURCE_FIELDS, has_natural_key
+
+    payloads = [_tombstone_payload_for_episode(episode_row)]
+    column = {k: (None if episode_row.get(k) is None else str(episode_row.get(k)))
+              for k in SOURCE_FIELDS}
+    if not has_natural_key(column):
+        return payloads
+    payloads.append(column)
+    raw = payloads[0]
+    merged = {k: column[k] if column[k] is not None else
+              (None if raw.get(k) is None else str(raw.get(k))) for k in SOURCE_FIELDS}
+    if merged != column:
+        payloads.append(merged)
+    return payloads
+
+
 def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
     """Delete every live replica episode whose source the gate refuses, with
     its vectors, decisions and deliverables. The hub can hold a copy of a
@@ -1869,7 +1905,8 @@ def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
     forgotten_ids = gate.episode_ids
     for values in cursor.fetchall():
         row = dict(zip(names, values, strict=True))
-        if row["id"] in forgotten_ids or not gate.allows_stored(_tombstone_payload_for_episode(row)):
+        if row["id"] in forgotten_ids or not all(
+                gate.allows_stored(p) for p in _tombstone_payloads_for_episode(row)):
             refused.append(row["id"])
     has_decisions = "episode_id" in _snapshot_table_columns(con, "decisions")
     has_deliverables = "episode_id" in _snapshot_table_columns(con, "deliverables")
@@ -1967,12 +2004,12 @@ def upsert_episode(
     """Write-through fenced by the durable forgotten-source registry."""
     from khipu.tombstones import RegistryError, write_guard
 
-    payload = _tombstone_payload_for_episode(episode_row)
+    payloads = _tombstone_payloads_for_episode(episode_row)
     try:
         # Keep this lock through the SQLite transaction below. Forget takes it
         # before its replica erase, so a late incremental write cannot restore
         # a source after forget returns.
-        with write_guard(payload) as allowed:
+        with write_guard(*payloads) as allowed:
             if not allowed:
                 return {"ok": False, "error": "forgotten source"}
             return _upsert_episode_unfenced(episode_row, embedding_rows, decision_rows,

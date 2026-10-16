@@ -1176,6 +1176,48 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
             "inspected": inspected}
 
 
+def _scrub_recall_golden(episode_id: int) -> dict[str, Any]:
+    """Drop every recall test line that names this episode: its query
+    usually quotes the episode's text. A file that cannot be read, judged or
+    rewritten keeps the forget open."""
+    import tempfile
+
+    from khipu.recall_eval import default_golden_path, drop_forgotten_lines
+
+    place = "recall golden set"
+    try:
+        path = default_golden_path()
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return {"ok": True, "removed": 0, "locations": []}
+    except OSError as exc:
+        return {"ok": False, "removed": 0, "locations": [{
+            "place": place, "path": None, "state": "unreadable",
+            "why": f"the recall test file could not be read ({type(exc).__name__}), so it may "
+                   "still quote this episode"}]}
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise OSError("not a regular file")
+            text, removed = drop_forgotten_lines(handle.read().decode("utf-8"), [episode_id])
+        if removed:
+            tmp_fd, tmp = tempfile.mkstemp(prefix=".recall-golden.", suffix=".tmp", dir=path.parent)
+            try:
+                with os.fdopen(tmp_fd, "wb") as out:
+                    out.write(text.encode("utf-8"))
+                os.replace(tmp, path)
+            except BaseException:
+                Path(tmp).unlink(missing_ok=True)
+                raise
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "removed": 0, "locations": [{
+            "place": place, "path": str(path), "state": "unreadable",
+            "why": f"the recall test file could not be checked or rewritten "
+                   f"({type(exc).__name__}), so it may still quote this episode"}]}
+    return {"ok": True, "removed": removed, "locations": [{
+        "place": place, "path": str(path), "state": "removed" if removed else "clean"}]}
+
+
 def _replica_temp_remainder(episode_id: int) -> dict[str, Any]:
     """Report, never edit, temporary replica files a crashed refresh left
     beside the replica (``.hub_snapshot.<random>.sqlite`` and its journal
@@ -1542,11 +1584,15 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
     out["legacy_writers"] = writers
     if not writers["ok"]:
         partial.append("legacy_writer")
+    out["recall_golden"] = _scrub_recall_golden(episode_id)
+    if not out["recall_golden"]["ok"]:
+        partial.append("recall_golden")
     # Every store the inventory says forget scans must be one of the scans
     # above; a store added without its scan keeps the forget open.
     from khipu.capture_stores import STORES
 
-    ran = {"native jobs", "outbox", "legacy logs", "replica", "replica temps", "legacy writers"}
+    ran = {"native jobs", "outbox", "legacy logs", "replica", "replica temps", "legacy writers",
+           "recall golden"}
     unscanned = [{"place": st.name, "path": None, "state": "not checked",
                   "why": (f"{st.name} ({st.where}) is in the store inventory but forget has no "
                           "scan for it, so the forget stays open")}
@@ -1557,7 +1603,7 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
     out["locations"] = _merge_locations(
         legacy_locs, *(item.get("inspected", []) for item in out["outboxes"]),
         out["replica_temps"]["locations"], out["native_jobs"]["inspected"],
-        writers["locations"], unscanned)
+        writers["locations"], out["recall_golden"]["locations"], unscanned)
     out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
                      "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
     if not out["outbox"]["ok"]:
@@ -1581,6 +1627,8 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         "legacy_writer": [loc.get("why") for loc in writers["locations"]
                           if loc["state"] in INCOMPLETE_STATES],
         "store_inventory": [loc["why"] for loc in unscanned],
+        "recall_golden": [loc.get("why") for loc in out["recall_golden"]["locations"]
+                          if loc["state"] in INCOMPLETE_STATES],
     }
     if out.get("unidentified_sources", 0) > 0:
         out["partial_errors"]["legacy_file"] = [

@@ -269,7 +269,7 @@ through the gate and added here.
 | `outbox.enqueue`, `outbox.drain`, `outbox.retry_dead` | outbox, dead and quarantine job files | `write_guard` at each job write | shared |
 | `session_capture.enqueue` | transcript jobs upstream of extraction | none needed: holds no episode; its results go through `write_pg` | none: runs in the Aegis sandbox, which cannot write the data folder; shares forget's claim lock |
 | `session_capture._claim`, `_release`, `_discard_claim`, `_save_claimed_job`, `_archive_empty` | claimed native job files and their checkpoints | none for the registry; `_save_claimed_job` takes `write_gate` and raises `JobForgotten` for a forgotten or removed claim; forget removes queued and claimed jobs naming its sources | shared |
-| `hub_snapshot.refresh` (`_insert_episodes`) | replica, full dump | `write_gate` from `_scrub_forgotten` through `os.replace` | shared |
+| `hub_snapshot.refresh` (`_refresh_locked`, `_insert_episodes`) | replica, full dump | `write_gate` from `_scrub_forgotten` through `os.replace` | shared, from the first hub read through publication |
 | `hub_snapshot.upsert_episode` (`_upsert_episode_unfenced`) | replica, one episode | `write_guard` held through the SQLite commit | shared |
 | `hub_snapshot.scrub_forgotten_snapshot` | replica deletes | `write_gate` | shared |
 | `hub_snapshot.forget_episode_in_snapshot`, `_apply_pending_erasures` | replica tombstones | erase | exclusive (inside a forget) |
@@ -437,6 +437,8 @@ entry with the reason it holds no capture data. A new writer therefore cannot sh
 | replica | data folder `hub_snapshot.sqlite` | episode rows, vectors, decisions and deliverables | scan "replica" |
 | replica temp | data folder `.hub_snapshot.<random>.sqlite` and its journal and WAL | a refresh dump or a staged backup replica | scan "replica temps" |
 | legacy writer | data folder `.legacy_writers/<pgid>.json` | the process group of a legacy writer that may still append | scan "legacy writers" |
+| recall golden set | data folder `recall-golden.jsonl`, or the file `KHIPU_RECALL_GOLDEN` names | recall test queries, which usually quote a captured episode's private text, with the episode ids each expects | scan "recall golden": every line naming the episode in `expect` or `stale` is dropped; a file that cannot be read or judged keeps the forget open |
+| recall eval record | a file the owner names with `khipu recall eval --record` | the golden queries, quoted text included, and the ids each returned | kept: an owner-chosen file outside the data folder that forget cannot find |
 | session state | capture home `state/<harness>--<session>.json` and `.capture-now.json` | offsets and hashes; carried text and a capture note not yet queued | none: the carried text belongs to the next window, which is refused when queued if its source is forgotten |
 | capture log | capture home `logs/session-capture.log` | drain and hook events: file names, counts and lengths | none: it never holds summary or transcript text |
 | conversation media | data folder `media/conversation_memory/<sha256>.<ext>` | images found in transcripts, shared by content hash | kept: content-addressed, can belong to several episodes |
@@ -447,7 +449,9 @@ entry with the reason it holds no capture data. A new writer therefore cannot sh
 **Import is an allow-list.** `capture_stores` says which stores a backup may restore and the exact file
 patterns each owns (`Store.restore`, plus `OTHER_DATA` for settings, the forget registry and waiting
 ledger writes). Each restored file goes through its entry's scrub (`paths.RESTORE_SCRUBS`): a queued job
-for a forgotten source is left out, the replica is staged and scrubbed, the registry is merged. Every
+for a forgotten source is left out, the replica is staged and scrubbed, the registry is merged, and the
+recall golden set loses every line that names a forgotten episode id (a file with a line that cannot be
+judged is not restored). Every
 other file in a backup (temps such as a crash-left `.job.json.<random>.tmp`, sidecars, locks, writer
 records, unknown names) is left out and listed in the report's `not_restored`.
 
@@ -478,3 +482,23 @@ state carry and capture notes are not sources until a window is queued.
 `test_every_store_is_scanned_by_forget_or_says_why_not`,
 `test_forget_reads_its_folders_from_the_inventory`,
 `test_a_store_without_a_forget_scan_keeps_the_forget_open`.
+
+## Known boundaries and follow-ups (2026-10-16)
+
+Limits accepted for this merge, each a follow-up rather than a blocker:
+
+- **A process that calls `setsid` itself.** Forget stops each recorded legacy writer's process group
+  before it reads the logs. A child that starts its own session leaves that group, so the stop does not
+  reach it and it could still append after the forget checked the logs. Follow-up: track writers by
+  something a child cannot leave (a held descriptor or a process tree walk), not only the group id.
+- **Migration 0030 holds both tables while its backfill runs.** Both table locks are held for the whole
+  one-transaction migration, so every capture on every Mac waits while it applies: measured at 14 ms
+  typical (200 forgotten episodes) and 0.41 s worst case (all 20,000 forgotten), inside the 5 s
+  `lock_timeout` (see "Measured cost" above). Follow-up: a batched backfill outside the table locks if a
+  hub ever grows far past the measured size.
+- **The recall eval record is kept.** `khipu recall eval --record` writes the golden queries, quoted text
+  included, to a file the owner names outside the data folder; forget cannot find it. Follow-up: write
+  records into the data folder so the recall golden scan can cover them.
+- **A recall golden line is matched by episode id only.** A line whose query quotes a forgotten episode
+  but whose `expect` names only a topic or another episode is kept, since the registry holds identities and
+  ids, never the forgotten text.

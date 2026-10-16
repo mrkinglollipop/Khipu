@@ -25,7 +25,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from khipu import capture_stores, db, forget, hub_snapshot, outbox, paths, tombstones
+from khipu import capture_stores, db, forget, hub_snapshot, outbox, paths, recall_eval, tombstones
 from khipu import session_capture as sc
 from khipu import writer_groups as wg
 from tests import test_forget_ownership as fo
@@ -312,6 +312,8 @@ INJECT = {
     "replica": lambda mp, tmp: _fail_replica(mp),
     "replica temps": lambda mp, tmp: _deny_listing(mp, lambda: hub_snapshot.snapshot_path().parent),
     "legacy writers": lambda mp, tmp: _deny_listing(mp, wg.records_dir),
+    # A folder where the recall test file should be cannot be read as one.
+    "recall golden": lambda mp, tmp: recall_eval.default_golden_path().mkdir(parents=True),
 }
 
 
