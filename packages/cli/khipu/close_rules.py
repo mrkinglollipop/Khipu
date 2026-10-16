@@ -311,7 +311,13 @@ def _pr_reason(found: dict[int, tuple[str, str]]) -> str:
     return "; ".join(parts)
 
 
-def _close(cur, cid: int, *, reason: str, key: str, evidence: dict, episode: int | None) -> bool:
+def _close(cur, cid: int, *, reason: str, key: str, evidence: dict, episode: int | None,
+           sink: dict | None = None) -> bool:
+    """Close one item by rule, or, with ``sink`` (the clean-up planner), only
+    record what would close it and write nothing."""
+    if sink is not None:
+        sink[cid] = {"reason": reason[:300], "key": key, "evidence": evidence, "episode": episode}
+        return True
     cur.execute(
         "UPDATE commitments SET status = 'closed', closed_at = now(), closed_episode = %s, "
         "close_reason = %s, closed_by = %s, close_rule_key = %s, close_evidence = %s::jsonb "
@@ -339,7 +345,7 @@ def _open_items(cur, project: str | None) -> list[dict[str, Any]]:
 
 
 def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, episode_id: int | None,
-             github: GitHub) -> None:
+             github: GitHub, sink: dict | None = None) -> None:
     by_project: dict[str, list[dict]] = {}
     for item in items:
         if item["prs"]:
@@ -397,13 +403,13 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
                 evidence = {"rule": "pr", "prs": {str(n): {"state": s, "source": src}
                                                   for n, (s, src) in found.items()}}
                 if _close(cur, item["id"], reason=_pr_reason(found), key=key, evidence=evidence,
-                          episode=max(capture_episodes) if capture_episodes else None):
+                          episode=max(capture_episodes) if capture_episodes else None, sink=sink):
                     report["closed_pr"] += 1
                     item["closed"] = True
                 continue
             check = {"states": {str(n): f"{s} ({SOURCE_WORDS[src]})" for n, (s, src) in found.items()},
                      "waiting": waiting}
-            if check != item["pr_check"]:
+            if sink is None and check != item["pr_check"]:
                 cur.execute("UPDATE commitments SET pr_check = %s::jsonb WHERE id = %s",
                             (json.dumps(check), item["id"]))
 
@@ -445,7 +451,8 @@ def _settles(item: dict, decisions: list[tuple], threshold: float):
     return strict or loose
 
 
-def _decision_rule(cur, items: list[dict], report: dict, *, episode_id: int | None) -> None:
+def _decision_rule(cur, items: list[dict], report: dict, *, episode_id: int | None,
+                   sink: dict | None = None) -> None:
     from khipu.config import float_setting
     from khipu.db import has_columns
 
@@ -484,10 +491,12 @@ def _decision_rule(cur, items: list[dict], report: dict, *, episode_id: int | No
                     continue
                 if _close(cur, item["id"], reason=f"settled by decision {did}: {text[:150]!r}", key=key,
                           evidence={"rule": "decision", "decision_id": did, "match": how,
-                                    "score": round(score, 3)}, episode=dep):
+                                    "score": round(score, 3)}, episode=dep, sink=sink):
                     report["closed_decision"] += 1
                 continue
             _, did, text, near = hit
+            if sink is not None:
+                continue
             old = item["suggestion"] if isinstance(item["suggestion"], dict) else {}
             if old.get("decision_id") == did or float(old.get("score") or 0) > near:
                 continue
@@ -520,3 +529,19 @@ def run(cur, *, payload: dict[str, Any] | None = None, episode_id: int | None = 
     if report["closed_pr"] or report["closed_decision"]:
         _log(f"closed {report['closed_pr']} by pull request, {report['closed_decision']} by decision")
     return report
+
+
+def plan_closes(cur, items: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """What the PR and decision rules would close among ``items`` (rows as
+    ``_open_items`` gives them), as ``{id: {reason, key, evidence, episode}}``,
+    writing nothing: the clean-up planner's read-only view of the nightly run
+    (``khipu.owed_tidy``). Items whose ``prs`` is not parsed yet are parsed
+    here, in memory."""
+    for item in items:
+        if item.get("prs") is None:
+            item["prs"] = parse_prs(item.get("text") or "")
+    report: dict[str, Any] = {"closed_pr": 0, "closed_decision": 0, "suggested": 0, "kept_open_reopened": 0}
+    sink: dict[int, dict[str, Any]] = {}
+    _pr_rule(cur, items, report, payload=None, episode_id=None, github=GitHub(), sink=sink)
+    _decision_rule(cur, items, report, episode_id=None, sink=sink)
+    return sink

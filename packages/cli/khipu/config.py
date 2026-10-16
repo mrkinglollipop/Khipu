@@ -481,13 +481,16 @@ def minute_settings_status() -> dict:
 # (docs/plans/2026-10-16-owed-and-ledger-ssot.md, decision 2).
 # `owed_page_max` is the most items one `khipu_owed` page returns, and
 # `owed_bulk_max` the most ids one `khipu_owed_update` call changes (the same
-# scope, design (c)).
+# scope, design (c)). `owed_tidy_calls` is the most model calls one `khipu
+# owed tidy` plan makes for the items its rules cannot sort (design (d),
+# decision 4); past it those items are kept as they are and counted.
 # ---------------------------------------------------------------------------
 
 COUNT_SETTINGS: dict[str, int] = {
     "owed_orchestrator_slice_max": 3,
     "owed_page_max": 200,
     "owed_bulk_max": 500,
+    "owed_tidy_calls": 25,
 }
 
 

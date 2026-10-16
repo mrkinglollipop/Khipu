@@ -2361,6 +2361,49 @@ def cmd_owed(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_owed_tidy(args: argparse.Namespace) -> int:
+    """`khipu owed tidy --project P`: plan the clean-up (writes nothing),
+    `--apply PLAN` apply a plan in one batch, `--undo BATCH` undo one. Plain
+    JSON out, like the other owed commands (khipu.owed_tidy)."""
+    from khipu import offline, owed_tidy
+    from khipu.db import connect
+
+    project = args.project
+    if args.apply and args.undo:
+        print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
+        return 2
+    if args.apply:
+        try:
+            doc = json.loads(Path(args.apply).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(json.dumps({"ok": False, "error": f"could not read the plan: {type(exc).__name__}"}))
+            return 2
+        if isinstance(doc, dict) and doc.get("project") != project:
+            print(json.dumps({"ok": False, "error": f"this plan is for project {doc.get('project')!r}, "
+                                                    f"not {project!r}; nothing was changed"}))
+            return 2
+        res = owed_tidy.apply(doc)
+        print(json.dumps(res, indent=2, default=str))
+        return 0 if res.get("ok") else 1
+    if args.undo:
+        res = owed_tidy.undo(args.undo)
+        if res.get("ok") and res.get("project") != project:
+            res = dict(res, note=f"the batch was for project {res.get('project')!r}")
+        print(json.dumps(res, indent=2, default=str))
+        return 0 if res.get("ok") else 1
+    with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+        with conn.cursor() as cur:
+            doc = owed_tidy.plan(cur, project, use_model=not args.no_model)
+    if args.plan_out:
+        Path(args.plan_out).write_text(json.dumps(doc, indent=2, default=str) + "\n", encoding="utf-8")
+        print(json.dumps({"ok": True, "plan_out": args.plan_out, "project": project,
+                          "totals": doc["totals"], "model": doc["model"], "notes": doc["notes"]},
+                         indent=2, default=str))
+    else:
+        print(json.dumps(doc, indent=2, default=str))
+    return 0
+
+
 def _owed_ids_arg(raw: str) -> list[int]:
     ids: list[int] = []
     for part in str(raw).split(","):
@@ -5343,6 +5386,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--envelope", action="store_true",
         help="Print {results, stale, snapshot_refreshed_at, waiting_to_sync} instead of the bare list",
     )
+    owed_sub = owed.add_subparsers(dest="owed_cmd")
+    tidy = owed_sub.add_parser(
+        "tidy", help="Plan the one-time clean-up of a project's Owed list; apply or undo a plan")
+    tidy.add_argument("--project", required=True)
+    tidy.add_argument("--plan-out", metavar="FILE", default=None,
+                      help="Write the plan to FILE and print only its totals")
+    tidy.add_argument("--apply", metavar="PLAN", default=None, help="Apply the plan in the file PLAN")
+    tidy.add_argument("--undo", metavar="BATCH", default=None, help="Undo the applied batch BATCH")
+    tidy.add_argument("--no-model", action="store_true",
+                      help="Rules only: no model pass for the items the rules cannot sort")
+    tidy.set_defaults(func=cmd_owed_tidy)
     owed.set_defaults(func=cmd_owed)
 
     us = sub.add_parser(
