@@ -1275,7 +1275,8 @@ def _append_locked(*events: dict) -> None:
 _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", "basis", "source", "window",
                 "evidence", "until", "written_at", "via", "text", "file", "date", "sha256", "clock_at",
                 "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
-                "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after")
+                "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
+                "harness")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries")
 _WHOLE_MOST = 2 ** 53
@@ -2470,7 +2471,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         touched = _touched(kind, event, info)
         if touched:
             causes[touched] = {"at": info["at"], "seq": info["seq"], "written_by": info["written_by"],
-                               "via": info["via"]}
+                               "via": info["via"], "type": kind, "state": event.get("state")}
+            if event.get("auth") == "direction":
+                # Named in the next push in fixed words (``direction_line``).
+                causes[touched].update(auth="direction", harness=event.get("harness"))
         if kind in ("pause", "lift", "clear") and info["account"]:
             owner[{"pause": "pauses", "lift": "lifts", "clear": "clears"}[kind]][info["account"]] = info
         elif kind == "dismiss" and info["target"]:
@@ -3465,10 +3469,16 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
                              k.partition(":")[0], 5), k))
         changed = [k for k in changed if body["effective"].get(k) != prev_effective.get(k)]
         view_for_lines = dict(body, version=version)
-        changes.append({"version": version, "at": _iso(now), "entities": changed,
-                        "lines": [change_line(k, view_for_lines, now, prev_effective) for k in changed],
-                        "items": [_change_item(k, body, prev_effective, causes, since_at)
-                                  for k in changed]})
+        change = {"version": version, "at": _iso(now), "entities": changed,
+                  "lines": [change_line(k, view_for_lines, now, prev_effective) for k in changed],
+                  "items": [_change_item(k, body, prev_effective, causes, since_at)
+                            for k in changed]}
+        directions = [direction_line(k, causes[k], body, prev_effective, now) for k in changed
+                      if (causes.get(k) or {}).get("auth") == "direction"
+                      and (since_at is None or (_parse(causes[k].get("at")) or since_at) >= since_at)]
+        if directions:
+            change["directions"] = directions
+        changes.append(change)
         changes = changes[-CHANGES_KEPT:]
     out = dict(body, schema=SCHEMA, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
                record=record, bad_lines=bad, fingerprint=fingerprint, changes=changes)
@@ -4903,6 +4913,38 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
     return entity
 
 
+_DIRECTION_VERBS = {"pause": "Paused {a}", "lift": "Lifted the pause on {a}", "clear": "Cleared the report on {a}",
+                    "dismiss": "Dismissed a report on {a}", "account_move": "Moved {a} to another login folder",
+                    "hold": "Added a hold", "hold_end": "Ended a hold", "note_set": "Set the note",
+                    "note_end": "Ended the note", "rule_add": "Added standing rule {n}",
+                    "rule_edit": "Changed standing rule {n}", "rule_retire": "Retired standing rule {n}",
+                    "rule_restore": "Restored standing rule {n}", "rule_confirm": "Confirmed standing rule {n}",
+                    "rule_undo": "Undid the change to standing rule {n}",
+                    "rule_dismiss": "Dismissed standing rule {n}", "priority_set": "Set the priority",
+                    "priority_confirm": "Confirmed the priority", "priority_undo": "Undid the priority change",
+                    "priority_clear": "Cleared the priority", "priority_drop": "Cleared the priority"}
+_ACCOUNT_NOTE_VERBS = {"tracked": "Started tracking {a}", "renamed": "Renamed {a}", "untracked": "Stopped tracking {a}"}
+
+
+def direction_line(entity: str, cause: dict, body: dict, prev_effective: dict | None, now: datetime) -> str:
+    """The push's line for an owner change made by direction (owner
+    direction scope 2.5): what was done, the harness's words and the time,
+    in fixed words. Never the session, the project or the owner's quoted
+    words: a push reaches every conversation (``author_words``)."""
+    kind, _, ident = entity.partition(":")
+    label = ""
+    if kind == "account":
+        entry = next((a for a in body.get("accounts") or [] if a["key"] == ident), None) or {}
+        label = entry.get("label") or ((prev_effective or {}).get(entity) or {}).get("label") or _label_for_key(ident)
+    verbs = _ACCOUNT_NOTE_VERBS if cause.get("type") == "account_note" else _DIRECTION_VERBS
+    key = cause.get("state") if cause.get("type") == "account_note" else cause.get("type")
+    what = verbs.get(key, "Changed the routing record").format(a=label, n=ident)
+    who = author_words({"kind": "conversation", "harness": cause.get("harness") or UNKNOWN_HARNESS})
+    at = _parse(cause.get("at"))
+    when = f", {_clock(at, now)}" if at else ""
+    return f"{what} by your direction in {who}{when} (undo in Settings)."
+
+
 def summary(view: dict | None = None, *, now: datetime | None = None, brief: bool = False) -> dict:
     """The full summary (``khipu route --summary``, the session-start text):
     a heading with the time and version, the standing rules whole, the note
@@ -5021,16 +5063,18 @@ def since(version: int, view: dict | None = None, *, now: datetime | None = None
     oldest = changes[0]["version"] if changes else view["version"] + 1
     complete = (oldest - 1 <= version <= view["version"] and view.get("saved", True) is not False
                 and (epoch is None or epoch == view.get("epoch")))
+    directions: list[str] = []
     if complete:
         entities: list[str] = []
         for change in changes:
             if change["version"] > version:
                 entities += [e for e in change["entities"] if e not in entities]
+                directions += [d for d in change.get("directions") or [] if isinstance(d, str)]
     else:
         entities = list(view.get("effective") or {})
     lines = [_current_line(e, view, now) for e in entities]
     return {"since": version, "epoch": view.get("epoch"), "version": view["version"], "complete": complete,
-            "entities": entities, "lines": lines}
+            "entities": entities, "lines": lines, "directions": directions}
 
 
 def _current_line(entity: str, view: dict, now: datetime) -> str:
@@ -6120,7 +6164,10 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
             head.append((line, "Standing rule " + rule_pointer(pending[entity]), THEIRS) if entity in pending
                         else (line, None, OWNERS))
     head += _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)
-    others = [_clip(line, width) for group, _, line in ranked if group != 0]
+    # What the owner did by direction since, each named once and first among
+    # the budgeted lines: Khipu's fixed words (``direction_line``).
+    others = [_clip(line, width) for line in changed.get("directions") or []]
+    others += [_clip(line, width) for group, _, line in ranked if group != 0]
 
     def overflow(n: int) -> str:
         return f"{n} more change{'s' if n != 1 else ''}: `khipu_route` since {changed['since']}"

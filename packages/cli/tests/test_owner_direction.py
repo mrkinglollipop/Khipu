@@ -563,3 +563,77 @@ def test_the_actions_list_is_newest_first(world):
         world.run(["route", "pause", name], text, token)
     rc, out = world.run(["owner-direction", "actions", "--json"])
     assert rc == 0 and [a["target"] for a in out["actions"]] == ["grok|", "codex|"]
+
+
+# ---- the next routing block names it (slice 4) ------------------------------------------------
+
+
+def _marker() -> dict:
+    """A conversation that has just had the full summary of a record."""
+    routing.report(account="Claude", state="open",
+                   author={"kind": "conversation", "harness": "codex", "project": "p", "session": "s-other"})
+    first = routing.prompt_push(None, budget=5.0)
+    return {"version": first["version"], "epoch": first["epoch"], "full_at": routing._iso(routing._now())}
+
+
+def test_the_next_routing_block_names_a_direction_once_in_fixed_words(world, khipu_app):
+    marker = _marker()
+    token = world.say("pause Codex until tonight please")
+    rc, _ = world.run(["route", "pause", "Codex"], "pause Codex until tonight", token)
+    assert rc == 0
+    events, _bad = routing.read_events()
+    at = routing._clock(routing._parse(events[-1]["written_at"]), routing._now())
+    push = routing.prompt_push(marker, budget=5.0)
+    assert push["kind"] == "changes"
+    assert f"Paused Codex by your direction in a Claude Code conversation, {at} (undo in Settings)." in push["text"]
+    # Fixed words only: never the session, the turn or the owner's words.
+    assert OWNER not in push["text"] and token not in push["text"] and "tonight" not in push["text"]
+    seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
+    assert routing.prompt_push(seen, budget=5.0)["kind"] == "none"
+    # Its undo by direction is named the same way; the app's own change is not.
+    line = _log()[-1]
+    undo = world.say("undo that pause on Codex")
+    rc, _ = world.run(["owner-direction", "undo", line["id"]], "undo that pause on Codex", undo)
+    assert rc == 0
+    push = routing.prompt_push(seen, budget=5.0)
+    assert "Lifted the pause on Codex by your direction in a Claude Code conversation" in push["text"]
+    seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
+    khipu_app.as_app()
+    rc, _ = world.run(["route", "note", "set", "builds go to Codex", "--from-app"])
+    assert rc == 0
+    push = routing.prompt_push(seen, budget=5.0)
+    assert push["kind"] == "changes" and "by your direction" not in push["text"]
+
+
+def test_a_rule_by_direction_is_named_in_the_block(world):
+    marker = _marker()
+    token = world.say("add a rule: never run the fast tier")
+    rc, _ = world.run(["route", "rule", "add", "never run the fast tier"], "add a rule: never run the fast tier",
+                      token)
+    assert rc == 0
+    push = routing.prompt_push(marker, budget=5.0)
+    assert "Added standing rule 1 by your direction in a Claude Code conversation" in push["text"]
+
+
+def test_the_apps_owner_direction_argv_apply_at_once_and_only_from_the_app(world, khipu_app):
+    """Settings, Owner actions: the argv the app's Rust commands build
+    (``owner_direction_*_argv`` in lib.rs). The app is the owner, so a
+    widening needs no second turn; the same argv from a shell is refused."""
+    rc, out = world.run(["owner-direction", "set", "--from-app", "--", "latest_window_h", "12"])
+    assert rc == 2 and out["code"] == "owner_only"
+    khipu_app.as_app()
+    for argv in (["set", "--from-app", "--", "latest_window_h", "12"],
+                 ["set", "--from-app", "--", "earlier_window_min", "45"],
+                 ["set", "--from-app", "--", "trust", "claude_code:sdk-cli"],
+                 ["set", "--from-app", "--", "session_binding", "off"],
+                 ["off", "--from-app"], ["on", "--from-app"]):
+        rc, out = world.run(["owner-direction", *argv])
+        assert rc == 0 and out["ok"] is True, argv
+    conf = owner_turns.settings()
+    assert (conf["latest_window_h"], conf["earlier_window_min"], conf["session_binding"], conf["enabled"]) == \
+        (12, 45, False, True)
+    assert "claude_code:sdk-cli" in conf["trusted"]
+    assert {line["auth"] for line in _log()} == {"app"}
+    first = _log()[0]
+    rc, out = world.run(["owner-direction", "undo", "--from-app", "--", first["id"]])
+    assert rc == 0 and out["undid"] == first["id"] and owner_turns.settings()["latest_window_h"] == 6
