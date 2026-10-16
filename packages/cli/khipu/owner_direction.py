@@ -1886,13 +1886,19 @@ def run_due(now: float | None = None) -> list[str]:
 
 def timer(now: float | None = None) -> dict:
     """What the replica-refresh job runs for owner direction, every few
-    minutes: the turn retention (``owner_turns.sweep``). Local files only.
-    Never raises."""
+    minutes: the turn retention (``owner_turns.sweep``) and the purges whose
+    day has passed (``run_due``). Local files and the ledger only. Never
+    raises."""
     out: dict[str, Any] = {}
     try:
         out["sweep"] = owner_turns.sweep(now)
     except Exception as err:  # noqa: BLE001 - the job it runs in goes on
         out["sweep"] = {"ok": False, "errors": [f"{type(err).__name__}: {err}"]}
+    try:
+        out["purged"] = run_due(now)
+    except Exception as err:  # noqa: BLE001
+        out["purged"] = []
+        out["error"] = f"{type(err).__name__}: {err}"
     return out
 
 
@@ -1927,6 +1933,11 @@ def _undo_refusal(line: dict | None, line_id: str) -> str | None:
     if line["action"] == "ledger.purge":
         if state != "scheduled":
             return f"the purge {line_id} already ran; a row removed for good can't come back"
+        # Due is due whether or not the timer has run it yet: Undo can't
+        # race the purge, and what the owner sees can't depend on which won.
+        if _float(line.get("runs_at_ts")) <= _clock():
+            return (f"the purge {line_id} passed its deadline ({line.get('runs_at') or 'its scheduled time'}), "
+                    "so it can no longer be cancelled; it runs on the next timer if it has not run already")
         return None
     if _UNDO.get(line["action"]) is None or "no_undo" in line:
         return line.get("no_undo") or f"owner action {line_id} ({line['action']}) can't be undone"

@@ -60,6 +60,22 @@ def test_owner_turn_plaintext_is_not_left_past_retention_without_another_prompt(
     assert not path.exists(), "expired owner words remain plaintext until a future prompt is recorded"
 
 
+def test_undo_refuses_a_scheduled_purge_once_its_deadline_has_passed(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    original_clock = owner_direction._clock
+    try:
+        owner_direction._clock = lambda: 1_700_000_000.0
+        owner_direction._append({
+            "kind": "action", "id": "purge-1", "at": "2023-11-14T00:00:00Z",
+            "action": "ledger.purge", "target": "atlas#T-12", "state": "scheduled",
+            "runs_at_ts": 1_700_000_000.0 - 1,
+        })
+        with pytest.raises(ValueError, match="already ran|deadline"):
+            owner_direction.undo("purge-1", "direction")
+    finally:
+        owner_direction._clock = original_clock
+
+
 def test_completed_local_forget_does_not_leave_raw_owner_turn_words(tmp_path, monkeypatch):
     """A fake local forget may complete only if its matching owner words are gone too."""
     from tests import test_forget_ownership as fo
@@ -129,16 +145,20 @@ def test_the_sweep_prunes_every_file_line_by_line_and_expires_waiting_widenings(
     assert [p["words"] for p in owner_direction._pending()] == ["new"]
 
 
-def test_the_replica_refresh_job_runs_the_sweep(folders, monkeypatch):
+def test_the_replica_refresh_job_runs_the_sweep_and_due_purges(folders, monkeypatch):
     from khipu import cli, replica_heal
 
     long_ago = time.time() - owner_turns.RETENTION_S - 60
     _say("s-timer", "words nobody followed up", long_ago, folders)
+    ran: list = []
     monkeypatch.setattr(replica_heal, "run", lambda: {"ok": True, "action": "none"})
+    real_run_due = owner_direction.run_due
+    monkeypatch.setattr(owner_direction, "run_due", lambda now=None: ran.append(now) or real_run_due(now))
     with mock.patch("sys.stdout"):
         rc = cli.main(["snapshot", "heal"])
     assert rc == 0
     assert not owner_turns.session_file("s-timer").exists()
+    assert ran, "the replica-refresh job did not run the due purges"
 
 
 def test_the_replica_refresh_job_still_heals_when_the_sweep_fails(folders, monkeypatch):
@@ -243,3 +263,55 @@ def test_both_owner_stores_name_the_owner_words_scan():
     assert stores["owner turns"].forget == "owner words"
     assert stores["owner actions"].forget == "owner words"
     assert "owner words" in capture_stores.FORGET_SCANS
+
+
+# ---- the purge timer --------------------------------------------------------------------------
+
+
+def _scheduled_purge(world, monkeypatch, row: str = "T-12") -> tuple[dict, list]:
+    from khipu import ledger
+
+    purged: list = []
+    monkeypatch.setattr(ledger, "_connect", lambda: type("C", (), {"close": lambda self: None})())
+    monkeypatch.setattr(ledger, "purge", lambda conn, project, r: purged.append((project, r)) or {"ok": True})
+    words = f"purge {row} from the ledger"
+    rc, out = world.run(["ledger", "purge", row, "--project", "atlas", "--json"], words, world.say(words))
+    assert rc == 0 and out["state"] == "scheduled", out
+    return owner_direction.actions()[-1], purged
+
+
+def test_a_due_purge_can_not_be_cancelled_even_before_it_ran(world, monkeypatch):
+    line, purged = _scheduled_purge(world, monkeypatch)
+    monkeypatch.setattr(owner_direction, "_clock", lambda: time.time() + owner_direction.PURGE_DELAY_S + 60)
+    with pytest.raises(ValueError, match="deadline"):
+        owner_direction.undo(line["id"], "direction")
+    assert owner_direction.line_state(line["id"]) == "scheduled" and purged == []
+
+
+def test_undo_says_a_purge_already_ran_once_it_ran(world, monkeypatch):
+    line, purged = _scheduled_purge(world, monkeypatch)
+    owner_direction.run_due(now=time.time() + owner_direction.PURGE_DELAY_S + 60)
+    assert purged == [("atlas", "T-12")]
+    with pytest.raises(ValueError, match="already ran"):
+        owner_direction.undo(line["id"], "direction")
+
+
+def test_an_undo_command_for_a_due_purge_is_refused_with_the_deadline(world, monkeypatch):
+    line, _purged = _scheduled_purge(world, monkeypatch)
+    monkeypatch.setattr(owner_direction, "_clock", lambda: time.time() + owner_direction.PURGE_DELAY_S + 60)
+    words = f"undo the purge {line['id']}"
+    rc, out = world.run(["owner-direction", "undo", line["id"]], words, world.say(words))
+    assert rc == 2 and out["code"] == "refused" and "deadline" in out["error"], out
+
+
+def test_an_overdue_purge_runs_from_the_replica_refresh_timer(world, monkeypatch):
+    from khipu import cli, replica_heal
+
+    line, purged = _scheduled_purge(world, monkeypatch)
+    monkeypatch.setattr(owner_direction, "_clock", lambda: time.time() + owner_direction.PURGE_DELAY_S + 60)
+    monkeypatch.setattr(replica_heal, "run", lambda: {"ok": True, "action": "none"})
+    with mock.patch("sys.stdout"):
+        assert cli.main(["snapshot", "heal"]) == 0
+    assert purged == [("atlas", "T-12")]
+    assert owner_direction.line_state(line["id"]) == "done"
+    assert json.loads(json.dumps(owner_direction.verify_log()))["ok"] is True
