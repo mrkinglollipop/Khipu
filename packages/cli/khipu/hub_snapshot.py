@@ -2402,8 +2402,10 @@ def _refresh_locked() -> dict[str, Any]:
             if not isinstance(exc, Exception):
                 raise
             try:
+                from khipu.storage import describe_os_error
+
                 side = _read_sidecar()
-                side["refresh_error"] = {"at": _utcnow_iso(), "error": f"{type(exc).__name__}: {exc}"[:300]}
+                side["refresh_error"] = {"at": _utcnow_iso(), "error": describe_os_error(exc)[:300]}
                 _write_meta(side)
             except Exception:  # noqa: BLE001 — the dump's own error is what the caller sees
                 pass

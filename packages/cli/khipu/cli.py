@@ -210,7 +210,7 @@ LOCAL_GATES = (
     "outbox_ok", "capture_liveness_ok", "git_sync_ok", "dsn_file_ok", "synth_provider_ok",
     "jobs_ok", "index_freshness_ok", "synth_budget_ok", "graph_backup_ok", "bundle_seal_ok",
     "prompt_recall_snapshot_ok", "prompt_recall_outcomes_ok", "recall_daemon_ok",
-    "nightly_steps_ok", "degraded_rate_ok", "launchers_ok", "ledger_outbox_ok",
+    "nightly_steps_ok", "degraded_rate_ok", "launchers_ok", "ledger_outbox_ok", "disk_space_ok",
 )
 
 
@@ -418,6 +418,14 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     except Exception as e:  # noqa: BLE001  (a failed check must not look like a pass)
         ledger_outbox = {"pending": -1, "error": f"{type(e).__name__}: {e}"}
     ledger_outbox_ok = ledger_outbox.get("pending") == 0 and not ledger_outbox.get("refused")
+    # Free space where Khipu writes (slice 8): red holds back an update, which
+    # writes a whole slot copy; amber is a warning and never gates.
+    try:
+        from khipu import storage
+
+        disk_space = storage.disk_space()
+    except Exception as e:  # noqa: BLE001  (a failed check must not look like a pass)
+        disk_space = {"ok": False, "level": "red", "volumes": [], "error": f"{type(e).__name__}: {e}"}
     return {
         "outbox": outbox, "outbox_ok": outbox_ok,
         "ledger_outbox": ledger_outbox, "ledger_outbox_ok": ledger_outbox_ok,
@@ -439,8 +447,15 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         "nightly_steps_ok": all(bool(v.get("ok")) for v in nightly_steps.values()),
         "degraded_rate": degraded_rate, "degraded_rate_ok": bool(degraded_rate.get("ok")),
         "launchers": launchers, "launchers_ok": bool(launchers.get("ok")),
+        "disk_space": disk_space, "disk_space_ok": bool(disk_space.get("ok")),
         "not_configured": not_configured,
     }
+
+
+def _disk_space_warnings(local: dict) -> list[str]:
+    """An amber disk is a warning; red is already its own failed check."""
+    block = local.get("disk_space") or {}
+    return [block["message"]] if block.get("level") == "amber" and block.get("message") else []
 
 
 def _promotion_block() -> dict:
@@ -496,7 +511,7 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
     schema = _schema_check()
     out["schema_migrations"] = schema
     out["schema_migrations_ok"] = not schema.get("pending")
-    out["warnings"] = list(schema.get("warnings") or [])
+    out["warnings"] = list(schema.get("warnings") or []) + _disk_space_warnings(local)
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
                  and all(bool(local[k]) for k in LOCAL_GATES) and out["schema_migrations_ok"])
     print(_strict_json(out, indent=2, default=str))
@@ -900,6 +915,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "graph_drift": graph,
         "outbox": outbox,
         "ledger_outbox": local["ledger_outbox"],
+        "disk_space": local["disk_space"],
         "capture_liveness": liveness,
         "git_sync": git_sync,
         "backup": backup,
@@ -939,7 +955,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
-                     + list(schema.get("warnings") or [])),
+                     + list(schema.get("warnings") or []) + _disk_space_warnings(local)),
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -988,6 +1004,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             # below, and never reaches this aggregate.
             and bool(launchers.get("ok"))
             and local["ledger_outbox_ok"]
+            and local["disk_space_ok"]
             and schema_ok
         ),
         "graph_backup": _graph_backup,
@@ -1021,6 +1038,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "launchers_ok": bool(launchers.get("ok")),
         "nightly_steps_ok": local["nightly_steps_ok"],
         "ledger_outbox_ok": local["ledger_outbox_ok"],
+        "disk_space_ok": local["disk_space_ok"],
         "schema_migrations_ok": schema_ok,
     }
     print(_strict_json(out, indent=2, default=str))
@@ -3951,7 +3969,9 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     try:
         out = refresh()
     except Exception as exc:
-        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+        from khipu.storage import describe_os_error
+
+        print(json.dumps({"ok": False, "error": describe_os_error(exc)}))
         return 1
     print(json.dumps(out, indent=2))
     return 0 if out.get("ok") else 2
@@ -4322,7 +4342,7 @@ def cmd_backup_local(args: argparse.Namespace) -> int:
 
     out = backup_local(dest=Path(args.out))
     print(json.dumps(out, indent=2))
-    return 0
+    return 0 if out.get("ok") else 1
 
 
 def cmd_nightly(_args: argparse.Namespace) -> int:

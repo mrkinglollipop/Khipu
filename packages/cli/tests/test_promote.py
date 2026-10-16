@@ -1383,6 +1383,7 @@ _LOCAL_FAILURES = {
     "degraded_rate_ok": ("khipu.query_log.degraded_rate", {"ok": False}),
     "launchers_ok": ("khipu.integrations.launcher_health", {"ok": False}),
     "ledger_outbox_ok": ("khipu.ledger.outbox_status", {"pending": 1, "refused": 0}),
+    "disk_space_ok": ("khipu.storage.disk_space", {"ok": False, "level": "red", "volumes": []}),
 }
 
 
@@ -1415,6 +1416,24 @@ def test_quick_doctor_gates_on_every_local_check_full_doctor_gates_on(home):
         assert quick[gate] is False and full[gate] is False, gate
         assert quick["ok"] is False and full["ok"] is False, gate
 
+
+@pytest.mark.parametrize("free_gb, ok", [(2, False), (8, True)])
+def test_a_red_disk_fails_both_doctors_and_amber_is_only_a_warning(home, monkeypatch, free_gb, ok):
+    import shutil as _sh
+    from unittest import mock
+
+    from khipu import storage
+
+    assert "disk_space" in pm.gate_ignorable()
+    monkeypatch.setattr(storage.shutil, "disk_usage",
+                        lambda _p: _sh._ntuple_diskusage(100 * 10**9, (100 - free_gb) * 10**9, free_gb * 10**9))
+    real = [mock.patch("khipu.storage.disk_space", storage.disk_space)]
+    quick, full = _doctor(True, real), _doctor(False, real)
+    assert quick["disk_space_ok"] is ok and full["disk_space_ok"] is ok
+    assert quick["ok"] is ok and full["ok"] is ok, (quick, full)
+    assert full["disk_space"]["level"] == ("amber" if ok else "red")
+    warned = [w for w in full["warnings"] + quick["warnings"] if "is free on the disk" in w]
+    assert len(warned) == (2 if ok else 0)
 
 def test_an_isolated_run_keeps_state_inside_and_reads_credentials_from_the_caller(home, monkeypatch, tmp_path):
     from khipu import config, paths, session_capture

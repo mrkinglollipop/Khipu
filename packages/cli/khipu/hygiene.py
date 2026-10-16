@@ -666,13 +666,24 @@ def backup_commitments(conn, *, dest_root: Path | None = None) -> Path:
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dest = (dest_root or commitments_backup_dir()) / f"commitments-{ts}"
-    dest.mkdir(parents=True, exist_ok=True)
-    data = dest / "commitments.bin"
-    with conn.cursor() as cur, open(data, "wb") as fh:
-        with cur.copy("COPY commitments TO STDOUT (FORMAT BINARY)") as copy:
-            for block in copy:
-                fh.write(bytes(block))
-    (dest / "RESTORE.md").write_text(_RESTORE_MD.format(ts=ts), encoding="utf-8")
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        data = dest / "commitments.bin"
+        with conn.cursor() as cur, open(data, "wb") as fh:
+            with cur.copy("COPY commitments TO STDOUT (FORMAT BINARY)") as copy:
+                for block in copy:
+                    fh.write(bytes(block))
+        (dest / "RESTORE.md").write_text(_RESTORE_MD.format(ts=ts), encoding="utf-8")
+    except OSError as exc:
+        from khipu.storage import describe_os_error, disk_full
+
+        if not disk_full(exc):
+            raise
+        # A half-written backup restores nothing and only holds space.
+        import shutil
+
+        shutil.rmtree(dest, ignore_errors=True)
+        raise OSError(exc.errno, f"the commitments backup could not be written: {describe_os_error(exc)}") from exc
     try:
         from khipu import storage
 

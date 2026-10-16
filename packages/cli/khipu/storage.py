@@ -126,11 +126,16 @@ def _remove(path: Path, out: dict[str, Any], what: str) -> None:
     out["freed_bytes"] += size
 
 
-def describe_os_error(exc: BaseException) -> str:
-    """An OS error in plain words; a full disk is named as one."""
+def disk_full(exc: BaseException) -> bool:
+    """True for the errors a full disk (or a used-up quota) raises."""
     import errno
 
-    if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+    return isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT)
+
+
+def describe_os_error(exc: BaseException) -> str:
+    """An OS error in plain words; a full disk is named as one."""
+    if disk_full(exc):
         where = f" ({exc.filename})" if getattr(exc, "filename", None) else ""
         return f"the disk is full: no space left to write{where}"
     return f"{type(exc).__name__}: {exc}"
@@ -308,6 +313,74 @@ def sweep() -> dict[str, Any]:
         out["errors"].append(f"replica temps: {describe_os_error(exc)}")
     out["ok"] = not out["errors"]
     return out
+
+
+# ---- disk space --------------------------------------------------------------
+
+GB = 1000 ** 3
+_WORSE = {"ok": 0, "amber": 1, "red": 2}
+
+
+def _existing(path: Path) -> Path:
+    """``path``, or its nearest folder that exists (a fresh install has no
+    data folder yet; the disk it will be on is what matters)."""
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path
+
+
+def _gb(n: int) -> str:
+    return f"{n / GB:.1f} GB"
+
+
+def disk_space(limits: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Free space on the disk that holds Khipu's data and on the one that
+    holds temporary files (one row when they are the same disk). Red below
+    the fail thresholds, which holds back an update; amber below the warning
+    ones, which never does."""
+    import tempfile
+
+    from khipu.paths import data_dir
+
+    limits = limits or settings()
+    volumes: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen: set[int] = set()
+    for label, path in (("Khipu's data", data_dir()), ("temporary files", Path(tempfile.gettempdir()))):
+        try:
+            probe = _existing(path)
+            device = probe.stat().st_dev
+            if device in seen:
+                continue
+            seen.add(device)
+            usage = shutil.disk_usage(probe)
+        except OSError as exc:
+            errors.append(f"{label}: {describe_os_error(exc)}")
+            continue
+        percent = round(usage.free * 100 / usage.total, 1) if usage.total else 0.0
+        free_gb = usage.free / GB
+        if free_gb < limits["disk_fail_free_gb"] or percent < limits["disk_fail_free_percent"]:
+            level = "red"
+        elif free_gb < limits["disk_warn_free_gb"] or percent < limits["disk_warn_free_percent"]:
+            level = "amber"
+        else:
+            level = "ok"
+        volumes.append({"label": label, "path": str(path), "free_bytes": usage.free,
+                        "total_bytes": usage.total, "free_percent": percent, "level": level})
+    worst = max(volumes, key=lambda v: (_WORSE[v["level"]], -v["free_bytes"]), default=None)
+    level = "red" if errors else (worst["level"] if worst else "red")
+    if errors:
+        message = "Khipu could not check the free space on its disks: " + "; ".join(errors)
+    elif worst is None:
+        message = "Khipu could not check the free space on its disks."
+    elif level == "ok":
+        message = f"{_gb(worst['free_bytes'])} is free on the disk that holds {worst['label']}."
+    else:
+        message = (f"Only {_gb(worst['free_bytes'])} is free on the disk that holds {worst['label']}. "
+                   "Khipu cannot save new memory when the disk is full. "
+                   "Open the storage report to see what is using space.")
+    return {"ok": level != "red", "level": level, "volumes": volumes, "message": message,
+            "fix": {"label": "Open storage report", "kind": "storage-report"}}
 
 
 def _sweep_state_path() -> Path:

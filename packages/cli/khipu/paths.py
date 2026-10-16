@@ -231,15 +231,25 @@ def backup_local(*, dest: Path) -> dict:
         dest = dest / f"khipu-local-{stamp}.zip"
     dest.parent.mkdir(parents=True, exist_ok=True)
     count = 0
-    with sensitive_writer(dest) as archive_file:
-        with zipfile.ZipFile(archive_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for p in src.rglob("*"):
-                if not p.is_file():
-                    continue
-                if p.name == POINTER_NAME and src == DEFAULT_DIR:
-                    continue
-                zf.write(p, arcname=str(p.relative_to(src)))
-                count += 1
+    try:
+        with sensitive_writer(dest) as archive_file:
+            with zipfile.ZipFile(archive_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for p in src.rglob("*"):
+                    if not p.is_file():
+                        continue
+                    if p.name == POINTER_NAME and src == DEFAULT_DIR:
+                        continue
+                    zf.write(p, arcname=str(p.relative_to(src)))
+                    count += 1
+    except OSError as exc:
+        from khipu.storage import describe_os_error, disk_full
+
+        if not disk_full(exc):
+            raise
+        # A half-written archive is no backup and only holds space.
+        dest.unlink(missing_ok=True)
+        return {"ok": False, "error": f"the backup could not be written: {describe_os_error(exc)}",
+                "archive": str(dest), "source": str(src)}
     return {"ok": True, "archive": str(dest), "files": count, "source": str(src)}
 
 

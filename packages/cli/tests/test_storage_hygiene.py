@@ -288,3 +288,108 @@ def test_the_suite_keeps_its_temporary_folders_under_one_root_removed_at_exit():
     child_root = done.stdout.strip().splitlines()[-1]
     assert Path(child_root).name.startswith("kt-")
     assert not Path(child_root).exists()
+
+
+# ---- disk space ----------------------------------------------------------------
+
+
+def _usage(free_gb, total_gb=400):
+    import shutil as _sh
+
+    return lambda _p: _sh._ntuple_diskusage(int(total_gb * 1e9), int((total_gb - free_gb) * 1e9),
+                                            int(free_gb * 1e9))
+
+
+@pytest.mark.parametrize("free_gb, level", [(200, "ok"), (8, "amber"), (2.1, "red")])
+def test_disk_space_judges_free_space_by_the_settings(data_dir, monkeypatch, free_gb, level):
+    from khipu import storage
+
+    monkeypatch.setattr(storage.shutil, "disk_usage", _usage(free_gb))
+
+    out = storage.disk_space()
+
+    assert out["level"] == level and out["ok"] is (level != "red")
+    assert out["volumes"] and out["volumes"][0]["label"] == "Khipu's data"
+    assert out["fix"] == {"label": "Open storage report", "kind": "storage-report"}
+    if level == "red":
+        assert out["message"].startswith("Only 2.1 GB is free on the disk that holds Khipu's data.")
+        assert "Khipu cannot save new memory when the disk is full" in out["message"]
+    storage.set_setting("disk_fail_free_gb", 0)
+    storage.set_setting("disk_fail_free_percent", 0)
+    assert storage.disk_space()["ok"] is True
+
+
+def test_a_percent_threshold_counts_on_a_small_disk(data_dir, monkeypatch):
+    from khipu import storage
+
+    monkeypatch.setattr(storage.shutil, "disk_usage", _usage(15, total_gb=1000))
+
+    assert storage.disk_space()["level"] == "red"
+
+
+
+# ---- a full disk said plainly ------------------------------------------------
+
+
+def _full(*_a, **_k):
+    import errno
+
+    raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def test_a_refresh_on_a_full_disk_says_so(data_dir, monkeypatch):
+    from khipu import replica_heal
+
+    monkeypatch.setattr(hs, "try_hub_connect", _full)
+
+    out = replica_heal._full_dump()
+
+    assert out["ok"] is False and out["error"].startswith("the disk is full")
+    assert hs._read_sidecar()["refresh_error"]["error"].startswith("the disk is full")
+    assert _temps(data_dir) == []
+
+
+def test_the_outbox_on_a_full_disk_says_so(data_dir, tmp_path, monkeypatch):
+    from khipu import outbox
+
+    monkeypatch.setenv("KHIPU_OUTBOX", str(tmp_path / "outbox"))
+    monkeypatch.setattr(outbox, "_queued_origin", lambda: {"origin": None})
+    monkeypatch.setattr(outbox, "_atomic_write", _full)
+
+    with pytest.raises(OSError, match="the capture could not be queued: the disk is full"):
+        outbox.enqueue({"summary": "a note", "project": "p", "session_id": "claude:1", "harness": "claude"})
+
+
+def test_a_local_backup_on_a_full_disk_says_so_and_leaves_no_half_archive(data_dir, tmp_path, monkeypatch):
+    import zipfile
+
+    from khipu import paths
+
+    (data_dir / "config.json").write_text("{}")
+    monkeypatch.setattr(zipfile.ZipFile, "write", _full)
+    dest = tmp_path / "out" / "b.zip"
+
+    out = paths.backup_local(dest=dest)
+
+    assert out["ok"] is False and "the disk is full" in out["error"] and not dest.exists()
+
+
+def test_a_commitments_backup_on_a_full_disk_says_so(data_dir, tmp_path, monkeypatch):
+    from khipu import hygiene
+
+    class _FullCopy(_Copy):
+        def __iter__(self):
+            _full()
+            yield b""
+
+    class _FullCur(_Cur):
+        def copy(self, _sql):
+            return _FullCopy()
+
+    class _FullConn:
+        def cursor(self):
+            return _FullCur()
+
+    with pytest.raises(OSError, match="commitments backup could not be written: the disk is full"):
+        hygiene.backup_commitments(_FullConn(), dest_root=tmp_path / "backups")
+    assert list((tmp_path / "backups").iterdir()) == []
