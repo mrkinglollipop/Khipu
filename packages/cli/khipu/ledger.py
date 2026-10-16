@@ -2312,6 +2312,10 @@ def cmd(args: argparse.Namespace) -> int:
             return _cmd_write(args, verb, project)
         if verb == "purge":
             return _cmd_purge(args, project)
+        if verb == "import":
+            return _cmd_import(args, project)
+        if verb == "export":
+            return _cmd_export(args, project)
         if verb == "removed":
             rows = removed_rows(None if args.all_projects else project)
             _emit(args, {"ok": True, "removed": rows},
@@ -2405,6 +2409,69 @@ def _cmd_purge(args: argparse.Namespace, project: str) -> int:
     return 0
 
 
+def _cmd_import(args: argparse.Namespace, project: str) -> int:
+    from khipu import ledger_import
+
+    report = ledger_import.run_import(args.file, project, dry_run=args.dry_run, catch_up=args.catch_up)
+    _emit(args, report, ledger_import.report_text(report))
+    return 0 if report["result"] in ("done", "caught up", "nothing new", "dry run") else 1
+
+
+def _cmd_export(args: argparse.Namespace, project: str) -> int:
+    """The project in the tracker file's shape, every row and its history."""
+    from khipu import ledger_import
+
+    try:
+        conn = _connect()
+    except HubAway as exc:
+        raise LedgerError("the database is away; export needs it", "away") from exc
+    try:
+        with conn.cursor() as cur:
+            rows = ledger_import.export_rows(cur, project)
+        conn.rollback()
+    finally:
+        conn.close()
+    text = json.dumps({"rows": rows}, indent=2, ensure_ascii=False, default=str)
+    if args.out:
+        Path(args.out).write_text(text + "\n", encoding="utf-8")
+        print(f"exported {len(rows)} rows -> {args.out}")
+    else:
+        print(text)
+    return 0
+
+
+def status_line(*, hub: bool = True) -> dict[str, Any]:
+    """khipu_status's ``ledger`` line across every project: live rows, loose
+    ends (open, or a state the project does not know, as ``is_loose``), rows
+    waiting on the owner, and writes waiting in the outbox. Fail-open: an
+    error costs only this line. ``hub=False`` (the caller already found the
+    hub away) reports the outbox alone without trying the hub again."""
+    out: dict[str, Any] = {"available": False, "rows": None, "loose_ends": None, "needs_owner": None,
+                           "outbox": None}
+    try:
+        out["outbox"] = outbox_status()["pending"]
+    except Exception:  # noqa: BLE001
+        pass
+    if not hub:
+        return out
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*), count(*) FILTER (WHERE v.meaning IS NULL OR v.meaning = 'open'), "
+                            "count(*) FILTER (WHERE v.meaning = 'needs') FROM ledger_rows r LEFT JOIN ledger_vocab v "
+                            "ON v.project = r.project AND v.field = 'state' AND v.word = r.state "
+                            "WHERE r.removed_at IS NULL")
+                rows, loose, needs = cur.fetchone()
+            conn.rollback()
+        finally:
+            conn.close()
+        out.update(available=True, rows=rows, loose_ends=loose, needs_owner=needs)
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = type(exc).__name__
+    return out
+
+
 def add_parser(sub) -> None:
     """``khipu ledger <verb>``: the tracker's verbs and flags, plus remove."""
     p = sub.add_parser("ledger", help="The ledger of what work is done and not done (tracker verbs)")
@@ -2481,5 +2548,16 @@ def add_parser(sub) -> None:
     pg = verbs.add_parser("purge", help="Remove a removed row for good (the app's Remove for good)")
     pg.add_argument("id")
     common(pg, write=True)
+
+    im = verbs.add_parser("import", help="Import an old tracker file (the app's Import a tracker)")
+    im.add_argument("file")
+    im.add_argument("--dry-run", action="store_true", help="Report what would be imported; write nothing")
+    im.add_argument("--catch-up", action="store_true", help="Bring in only what changed since the last import")
+    common(im)
+
+    ex = verbs.add_parser("export", help="The project in the old tracker file's shape")
+    ex.add_argument("--tracker-json", action="store_true", required=True)
+    ex.add_argument("--out", default=None)
+    common(ex)
 
     p.set_defaults(func=cmd)

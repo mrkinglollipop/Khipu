@@ -872,6 +872,47 @@ TOOLS: list[dict] = [
             "required": ["entries", "owner_request"],
         },
     },
+    {
+        "name": "khipu_ledger",
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "description": (
+            "The project's ledger of what work is done and what is not, with "
+            "the old tracker script's verbs: add, set, get, list, loose-ends, "
+            "needs-owner (needs-matt is the same), render (the markdown board), "
+            "check, remove and removed. Writes keep the old and new value of "
+            "every field in the row's history; pass if_state to write only if "
+            "the row is still in that state, and op_id to retry a write safely. "
+            "Rows carry titles and short plain-words lines about the work, "
+            "never code, diffs, file contents, command output, logs, prompts, "
+            "briefs, customer or financial details. Restoring a removed row, "
+            "removing it for good and importing an old tracker are the "
+            "owner's, in the app."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "verb": {"type": "string", "enum": ["add", "set", "get", "list", "loose-ends", "needs-owner",
+                                                    "needs-matt", "render", "check", "remove", "removed"]},
+                "project": {"type": "string", "description": "Project key (default: this folder's project)"},
+                "id": {"type": "string", "description": "add, set, get, remove: the row id"},
+                "title": {"type": "string"},
+                "kind": {"type": "string", "description": "add: one of the project's kinds"},
+                "parent": {"type": "string", "description": "add: the parent row's id"},
+                "state": {"type": "string", "description": "add, set: one of the project's states; list: filter"},
+                "evidence": {"type": "string", "description": "A short plain-words line, such as a PR number"},
+                "owner": {"type": "string"},
+                "note": {"type": "string", "description": "A short plain-words line for the row's history"},
+                "link": {"type": "string", "description": "An https link"},
+                "if_state": {"type": "string", "description": "set: write only if the row is still in this state"},
+                "children": {"type": "string", "enum": ["remove", "move-up"],
+                             "description": "remove: what happens to the row's children"},
+                "op_id": {"type": "string", "description": "Pass the same id to retry a write safely"},
+                "stale_hours": {"type": "number", "description": "list: only rows unchanged for this long"},
+                "summary": {"type": "boolean", "description": "loose-ends: counts per state only"},
+            },
+            "required": ["verb"],
+        },
+    },
 ]
 
 
@@ -1230,10 +1271,22 @@ def _tool_status(args: dict) -> dict:
         from khipu import agent_view
 
         payload["hub_error"] = agent_view.error_text(exc)
+    _attach_ledger(payload)
     _attach_prior_work(payload, args)
     _attach_contract(payload)
     _attach_plan_warnings(payload)
     return payload
+
+
+def _attach_ledger(payload: dict) -> None:
+    """The ledger line: rows, loose ends, rows waiting on the owner and
+    waiting writes, across every project. When the hub already failed above
+    it reports the outbox alone, without trying the hub again. Optional: a
+    failure costs only this field."""
+    with contextlib.suppress(Exception):
+        from khipu import ledger
+
+        payload["ledger"] = ledger.status_line(hub="hub_error" not in payload)
 
 
 def _attach_plan_warnings(payload: dict) -> None:
@@ -1813,6 +1866,78 @@ def _tool_route_priority(args: dict) -> dict:
                                          author=routing.conversation_author())
 
 
+_LEDGER_VERBS = ("add", "set", "get", "list", "loose-ends", "needs-owner", "needs-matt", "render", "check",
+                 "remove", "removed")
+_LEDGER_TEXT = ("project", "id", "title", "kind", "parent", "state", "evidence", "owner", "note", "link", "if_state",
+                "children", "op_id")
+
+
+def _tool_ledger(args: dict) -> dict:
+    """``khipu ledger`` as a tool: the same verbs and fields, JSON back. A
+    refusal is a tool error carrying the error and its reason word. Restore,
+    purge and import are the owner's, in the app, so they are not verbs here."""
+    verb = args.get("verb")
+    if verb not in _LEDGER_VERBS:
+        raise ValueError(f"verb must be one of: {', '.join(_LEDGER_VERBS)}")
+    for key in _LEDGER_TEXT:
+        if args.get(key) is not None and not isinstance(args[key], str):
+            raise ValueError(f"{key} must be text")
+    stale = args.get("stale_hours")
+    if stale is not None and (isinstance(stale, bool) or not isinstance(stale, (int, float))):
+        raise ValueError("stale_hours must be a number")
+    _ensure_path()
+    import argparse
+
+    from khipu import ledger
+
+    try:
+        ledger.refuse_secrets([args.get(k) for k in _LEDGER_TEXT])
+        project = ledger._project_for(argparse.Namespace(project=args.get("project") or None))
+        row_id = args.get("id") or ""
+        if verb in ("add", "set", "remove"):
+            if verb == "add" and not (args.get("title") and args.get("kind")):
+                raise ledger.LedgerError("add needs a title and a kind", "missing")
+            if verb == "add":
+                fields = {k: args.get(k) or "" for k in ("title", "kind", "parent", "evidence", "link")}
+                fields.update(state=args.get("state"), owner=args.get("owner") or "none")
+            elif verb == "set":
+                fields = {k: args.get(k) for k in ("state", "evidence", "owner", "title", "link")}
+            else:
+                fields = {}
+            op = ledger.new_op(verb, project, row_id, fields=fields, note=args.get("note") or "",
+                               if_state=args.get("if_state") if verb == "set" else None,
+                               children=args.get("children") if verb == "remove" else None,
+                               op_id=args.get("op_id"), source="mcp")
+            result = ledger.write(op)
+            return {**result, "op_id": op["op_id"], "project": project}
+        if verb == "get":
+            got = ledger.get(project, row_id)
+            out = {"ok": True, "row": ledger.row_json(got["row"], got["history"], project)}
+            if got.get("offline"):
+                out["offline_as_of"] = got.get("as_of")
+            return out
+        if verb == "removed":
+            return {"ok": True, "project": project, "removed": ledger.removed_rows(project)}
+        view = ledger.load(project)
+        head = {"ok": True, "project": project, "offline": view["offline"], "as_of": view.get("as_of")}
+        if verb == "render":
+            return {**head, "board": ledger.render_board(view)}
+        if verb == "check":
+            return {**head, **ledger.check(view)}
+        if verb == "list":
+            rows, _text = ledger.render_list(view, state=args.get("state"), kind=args.get("kind"),
+                                             owner=args.get("owner"), stale_hours=stale)
+        elif verb == "loose-ends":
+            rows, text = ledger.render_loose_ends(view, summary=bool(args.get("summary")))
+            if args.get("summary"):
+                return {**head, "summary": text}
+        else:
+            rows, _text = ledger.render_needs(view)
+        return {**head, "rows": [ledger.row_json(r, [], project) for r in rows]}
+    except ledger.LedgerError as exc:
+        raise _ToolFailure({"ok": False, "error": str(exc), "reason": exc.reason}) from None
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
@@ -1831,6 +1956,7 @@ TOOL_FUNCS = {
     "khipu_route_report": _tool_route_report,
     "khipu_route_rule": _tool_route_rule,
     "khipu_route_priority": _tool_route_priority,
+    "khipu_ledger": _tool_ledger,
 }
 
 
