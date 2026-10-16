@@ -159,9 +159,25 @@ def _homes(extra_keys: Iterable[str] | None, view: dict) -> list[tuple[str, str 
     return out
 
 
+def _config_whole() -> None:
+    """Raise when the config file is there but can't be read or parsed (or
+    isn't an object): the login folders it names are then unknown, so the
+    table ``_homes`` builds is incomplete and nothing may lean on it."""
+    from khipu.config import _load_config_for_mutation
+
+    _load_config_for_mutation()
+
+
+def strict_table():
+    """``_table(None)``, raising instead when ``_config_whole`` does."""
+    _config_whole()
+    return _table(None)
+
+
 def _login_forms():
     """Each spelling (``_forms``, without a trailing slash or ``~``) of each
-    login folder ``_homes`` knows."""
+    login folder ``_homes`` knows. Raises while the config is unreadable."""
+    _config_whole()
     home = _home_dir()
     for harness, raw in _homes(None, _saved_view()):
         if raw is None:
@@ -631,7 +647,7 @@ def _withhold_names(value, fixed=None, names=None):
 def _projected(value):
     """(``value`` projected, whether it is complete)."""
     try:
-        table = _table(None)
+        table = strict_table()
     except Exception:  # noqa: BLE001
         return _withhold_names(value), False
     return _project_walk(value, table), True
@@ -645,7 +661,8 @@ def project(value):
     withholds any string still holding an account key, a secret or a
     private path. No owner's words are kept whole here.
 
-    When the replacement table can't be built, it fails closed: every string
+    When the replacement table can't be built, or the config naming login
+    folders can't be read, it fails closed: every string
     that could carry a name is withheld, and a dict says so with
     ``"incomplete": true``."""
     out, complete = _projected(value)

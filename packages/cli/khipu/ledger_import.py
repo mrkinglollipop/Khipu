@@ -723,7 +723,11 @@ def _catch_up(cur, project: str, src: dict[str, Any], report: dict[str, Any], he
     rows = src["rows"]
     removed = sorted(i for i, at in here.items() if at is not None)
     gone = sorted(i for i in purged if i not in here)
-    live = [i for i in rows if i in here and here[i] is None]
+    if gone:
+        return {**report, "ok": False, "result": "refused", "reason": "purged", "purged_ids": gone,
+                "words": "Nothing was caught up: " + "; ".join(
+                    f"row {i} was removed for good on {ledger._date_words(purged[i])}" for i in gone[:_SHOWN])}
+    live =[i for i in rows if i in here and here[i] is None]
     new_ids = [i for i in rows if i not in here and i not in purged]
     now = ledger._now()
     plan: dict[str, Any] = {"new_rows": new_ids, "new_entries": 0, "updated": [], "both": [],

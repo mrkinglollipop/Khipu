@@ -416,7 +416,7 @@ class _Scan:
         try:
             from khipu import agent_view
 
-            self.table = agent_view._table(None)
+            self.table = agent_view.strict_table()
         except Exception:  # noqa: BLE001  (fail closed: see __call__)
             self.table = None
         self.degraded = self.table is None
