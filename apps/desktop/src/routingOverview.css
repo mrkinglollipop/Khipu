@@ -1,0 +1,118 @@
+/* Settings -> Accounts and routing: an overview that folds (settings clarity
+   phase 3; mocks docs/mockups/2026-10-15-settings-clarity/routing*.html,
+   routing.css "Routing overview that folds" and "Review fix", folds.css).
+   Every fold is a button with aria-expanded that controls the region under it. */
+
+.route-settings { gap: var(--s3); }
+
+/* The fold button, from folds.css. */
+.route-settings .fold.disclose { border-top: 1px solid var(--border); padding-top: var(--s1); }
+.route-settings button.fold-btn {
+  display: flex; align-items: center; justify-content: flex-start; gap: var(--s2); width: 100%; height: auto; min-height: 32px; margin: 0;
+  padding: var(--s2) 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; font: inherit;
+  font-size: var(--t-sm); font-weight: inherit; color: var(--muted); text-align: left; cursor: pointer; transition: none;
+}
+.route-settings button.fold-btn:hover { border: 0; background: transparent; color: var(--text-2); }
+.route-settings button.fold-btn:focus-visible { outline: none; box-shadow: inset 0 0 0 3px var(--ring); border-radius: var(--r-sm); }
+.route-settings button.fold-btn[aria-expanded="true"] > .disclosure-chevron { transform: rotate(90deg); }
+.route-settings .fold-body[hidden] { display: none; }
+
+/* The intro, with Open all groups and Close all groups at its top right. */
+.route-top { display: flex; align-items: flex-start; gap: var(--s2) var(--s4); flex-wrap: wrap; }
+.route-top .set-intro { flex: 1 1 22rem; min-width: 0; }
+.route-top .grp-btns { flex: none; display: inline-flex; gap: var(--s2); margin-left: auto; }
+
+/* A group: a card whose head is its fold button. */
+/* The card's edge is drawn as a shadow, so a closed group is its 44 px button
+   and no taller (nine closed groups fit one screen). */
+.route-settings .fold.disclose.route-group {
+  border: 0; border-radius: var(--r-md); background: var(--surface);
+  box-shadow: 0 0 0 1px var(--border), var(--shadow-sm); padding: 0; overflow: hidden;
+}
+.route-settings .fold.disclose.route-group > .fold-btn {
+  flex-wrap: wrap; gap: var(--s1) var(--s3); padding: 11px 16px; min-height: 44px; font-size: var(--t-md); color: var(--text);
+}
+.route-settings .fold.disclose.route-group > .fold-btn:hover { background: var(--surface-2); color: var(--text); }
+.route-settings .fold.disclose.route-group[data-open="true"] > .fold-btn { border-bottom: 1px solid var(--border); }
+.route-group .gname { font-size: 14px; font-weight: 600; flex: 0 0 15rem; display: inline-flex; align-items: center; gap: var(--s2); }
+.route-group .gline { font-size: var(--t-sm); color: var(--text-2); font-weight: 400; flex: 1 1 8rem; min-width: 0; }
+.route-group .gtags { display: inline-flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+.route-group > .fold-body > .disclose-body { padding: 12px 16px 16px; gap: var(--s2); }
+/* The sections inside a group were cards of their own: no second padding. */
+.route-group .disclose-body > .section-body { padding: 0; }
+.route-group .disclose-body > .section-body + .section-body { border-top: 1px solid var(--border); padding-top: var(--s3); }
+.route-settings .reading { color: var(--muted); font-size: var(--t-sm); font-style: normal; }
+
+/* A fold inside a group (Telling's two). */
+.route-settings .fold.disclose.route-sub-fold { margin-top: var(--s2); }
+.route-settings .fold.disclose.route-sub-fold > .fold-btn {
+  font-size: var(--t-sm); color: var(--text); font-weight: 600; flex-wrap: wrap; gap: var(--s1) var(--s2);
+}
+.route-sub-fold > .fold-btn .sline { font-weight: 400; color: var(--text-2); }
+.route-sub-fold > .fold-body { padding-bottom: var(--s2); }
+
+/* Needs you, or the grey line that nothing does. */
+.route-settings .needs { padding: 6px var(--s4); border-radius: var(--r-md); }
+.needs .txt { gap: 2px; }
+.route-settings .needs b { font-size: var(--t-sm); line-height: 1.4; }
+.needs ul { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px var(--s5); }
+.needs li { display: flex; align-items: center; gap: var(--s3); min-height: 26px; font-size: var(--t-sm); line-height: 1.3; color: var(--text); }
+.needs li > span { flex: 1; min-width: 0; color: var(--text); }
+.needs li button { flex: none; }
+.needs-none { margin: 0; font-size: var(--t-sm); color: var(--muted); }
+.route-settings .err-inline { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+.route-none .toolbar { margin-top: var(--s2); }
+
+/* Accounts: one line per account, a grid so a long state wraps in its own
+   column; below 600 px of list width the week and pace drop under it. */
+.route-alist { display: flex; flex-direction: column; container-type: inline-size; }
+.route-alist > [role="listitem"] { border-bottom: 1px solid var(--border); }
+.route-alist > [role="listitem"]:last-child { border-bottom: 0; }
+.route-settings .fold.route-aline { padding: 0; }
+.route-settings .fold.route-aline > button.fold-btn {
+  display: grid; grid-template-columns: 14px 8rem minmax(0, 1fr) minmax(0, 1.15fr) 9.5rem;
+  column-gap: var(--s3); row-gap: 2px; align-items: start; padding: 10px 4px; min-height: 44px;
+  font-size: var(--t-md); color: var(--text);
+}
+.route-settings .fold.route-aline > button.fold-btn:hover { background: var(--surface-2); color: var(--text); }
+.route-aline > button.fold-btn > .disclosure-chevron { margin-top: 3px; color: var(--muted); }
+.route-aline .an { font-weight: 600; min-width: 0; }
+.route-aline .as { display: flex; align-items: baseline; gap: var(--s2); line-height: 1.4; min-width: 0; }
+.route-aline .as .hdot { transform: translateY(-1px); }
+.route-aline .ap { display: flex; flex-direction: column; gap: 1px; line-height: 1.4; min-width: 0; font-size: var(--t-sm); }
+.route-aline .ap-week { color: var(--text-2); }
+.route-aline .ap-pace { color: var(--muted); font-size: var(--t-xs); }
+.route-aline .at { display: inline-flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; }
+@container (max-width: 600px) {
+  .route-settings .fold.route-aline > button.fold-btn { grid-template-columns: 14px 7.5rem minmax(0, 1fr); }
+  .route-aline .ap,
+  .route-aline .at { grid-column: 3 / -1; justify-content: flex-start; }
+}
+.acct-body { padding: 2px 2px var(--s3) calc(14px + var(--s3)); display: flex; flex-direction: column; gap: var(--s2); }
+.acct-body .route-what { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.acct-body .route-src { text-align: left; }
+.acct-body .route-acts { justify-content: flex-start; }
+.acct-body .route-disagree,
+.acct-body .route-pause { grid-column: auto; margin-top: 0; }
+.acct-foot { border-top: 1px solid var(--border); padding-top: var(--s2); display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; font-size: var(--t-sm); color: var(--text-2); }
+.acct-foot .spacer { flex: 1; }
+
+/* Job runners and lanes: each folder's lanes under it. */
+.row-item.route-acct > .lane-sub { grid-column: 1 / -1; }
+.lane-sub { display: flex; flex-direction: column; margin-top: var(--s2); border-top: 1px solid var(--border); }
+.lane-sub .route-lane { padding-left: 0; }
+.lane-sub .route-src { text-align: left; }
+
+/* Headings moved up a level so none is skipped; the look stays the same. */
+.route-settings h2.sub-title { margin: var(--s3) 0 var(--s1); font-size: var(--t-sm); font-weight: 600; color: var(--text-2); letter-spacing: 0; text-transform: none; line-height: 1.4; }
+.route-settings .section-body > h2.sub-title:first-child { margin-top: 0; }
+.route-settings h2.sub-title .meta { font-weight: 400; }
+.route-settings h2.sub-title .tag { margin-left: var(--s1); }
+.route-settings h2.rows-head.route-day { margin: 0; }
+
+[data-route-item][tabindex="-1"]:focus:not(:focus-visible) { outline: none; }
+
+@media (max-width: 1100px) {
+  .needs ul { grid-template-columns: 1fr; }
+  .needs li { flex-wrap: wrap; }
+}

@@ -53,11 +53,11 @@ export const ALL_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>([
   "rule-results",
   "capture-models-cards",
   "setup-accounts-step",
-  "rule-results",
 ]);
 
 /** What this build has. */
 export const BUILD_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>([
+  "routing-overview",
   "plans-per-account",
   "capture-models-cards",
   "setup-accounts-step",
