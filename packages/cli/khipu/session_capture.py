@@ -2525,6 +2525,14 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         except Exception as exc:  # noqa: BLE001 — session jobs must still get a turn
             out["outbox"] = {"error": f"{type(exc).__name__}: {exc}"}
             out["failed"] += 1
+        try:
+            # Owner writes made while the hub was away (closing an owed item).
+            from khipu import owner_writes
+
+            if owner_writes.waiting():
+                out["owner_writes"] = owner_writes.drain()
+        except Exception as exc:  # noqa: BLE001 — never holds up the session jobs
+            out["owner_writes"] = {"error": f"{type(exc).__name__}: {exc}"}
     if not jobs:
         return out
     from khipu.capture import capture

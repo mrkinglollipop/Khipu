@@ -93,7 +93,29 @@ _TABLES = (
 # falls back to LIKE on a file without them.
 # Version 5 adds the ledger (projects, words, live rows, their history), so
 # `khipu ledger` reads while the hub is away. Removed rows are never in it.
-SNAPSHOT_SCHEMA_VERSION = 5
+# Version 6 adds `commitments`, so `khipu_owed` answers while the hub is away
+# (offline and self-healing scope, slice 5). Rows of a forgotten episode are
+# never in it.
+SNAPSHOT_SCHEMA_VERSION = 6
+
+_COMMITMENT_COLS = (
+    "id",
+    "text",
+    "project",
+    "owner",
+    "kind",
+    "opened_episode",
+    "opened_at",
+    "due_after",
+    "status",
+    "closed_episode",
+    "closed_at",
+    "close_reason",
+    # 0012 / 0013 columns; a hub that is behind dumps without them.
+    "last_seen_at",
+    "seen_count",
+    "future_trigger",
+)
 
 _DELIVERABLE_COLS = (
     "id",
@@ -1068,6 +1090,29 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
         )
     if version >= 5:
         con.executescript(_LEDGER_SCHEMA_SQL)
+    if version >= 6:
+        con.executescript(
+            """
+            CREATE TABLE commitments (
+                id INTEGER PRIMARY KEY,
+                text TEXT,
+                project TEXT,
+                owner TEXT,
+                kind TEXT,
+                opened_episode INTEGER,
+                opened_at TEXT,
+                due_after TEXT,
+                status TEXT,
+                closed_episode INTEGER,
+                closed_at TEXT,
+                close_reason TEXT,
+                last_seen_at TEXT,
+                seen_count INTEGER,
+                future_trigger INTEGER
+            );
+            CREATE INDEX idx_snapshot_commitments_project_status ON commitments (project, status);
+            """
+        )
     if version >= 4:
         try:
             con.executescript(_FTS_SCHEMA_SQL)
@@ -1650,6 +1695,36 @@ def _insert_deliverables(cur, con: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def _insert_commitments(cur, con: sqlite3.Connection) -> int:
+    """Empty (returns 0, no error) on a hub with no ``commitments`` table.
+    Rows opened by a forgotten episode are never exported, the same
+    exclusion ``commitments.list_owed`` applies at read time."""
+    hub_cols = _pg_columns(cur, "commitments")
+    if not {"id", "text", "status"} <= hub_cols:
+        return 0
+    cols = [c for c in _COMMITMENT_COLS if c in hub_cols]
+    sel = ", ".join(cols)
+    where = ""
+    if "opened_episode" in cols and "deleted_at" in _pg_columns(cur, "episodes"):
+        where = (
+            " WHERE NOT EXISTS (SELECT 1 FROM episodes e WHERE e.id = commitments.opened_episode "
+            "AND e.deleted_at IS NOT NULL)"
+        )
+    cur.execute(f"SELECT {sel} FROM commitments{where} ORDER BY id")
+    rows = cur.fetchall()
+    ts_cols = {"opened_at", "due_after", "closed_at", "last_seen_at"}
+    for row in rows:
+        vals = [
+            _ts_text(val) if col in ts_cols else (int(bool(val)) if col == "future_trigger" else val)
+            for col, val in zip(cols, row, strict=True)
+        ]
+        con.execute(
+            f"INSERT INTO commitments ({sel}) VALUES ({', '.join('?' * len(cols))})",
+            vals,
+        )
+    return len(rows)
+
+
 def refresh() -> dict[str, Any]:
     """Dump hub tables into a fresh sqlite file and atomically replace the snapshot.
 
@@ -1714,6 +1789,7 @@ def _refresh_locked() -> dict[str, Any]:
                     )
                     counts["decisions"] = _insert_decisions(cur, con)
                     counts["deliverables"] = _insert_deliverables(cur, con)
+                    counts["commitments"] = _insert_commitments(cur, con)
                     counts["ledger_rows"] = _insert_ledger(cur, con)
             refreshed_at = _utcnow_iso()
             if _snapshot_table_columns(con, "snapshot_meta"):

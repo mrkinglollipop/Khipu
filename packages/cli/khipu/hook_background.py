@@ -135,6 +135,14 @@ def run(mem_root: str, harness: str, sid: str) -> None:
     except Exception as e:  # noqa: BLE001
         _say(sid, harness, f"outbox drain skipped: {type(e).__name__}: {e}")
     try:
+        # Owner writes made while the hub was away. One listdir when empty.
+        from khipu import owner_writes
+
+        if owner_writes.waiting():
+            _say(sid, harness, f"owner writes drain {owner_writes.drain()}")
+    except Exception as e:  # noqa: BLE001
+        _say(sid, harness, f"owner writes drain skipped: {type(e).__name__}: {e}")
+    try:
         # Ledger writes made while the hub was away. One listdir when empty.
         from khipu.ledger import _outbox_jobs as ledger_jobs
         from khipu.ledger import drain as ledger_drain

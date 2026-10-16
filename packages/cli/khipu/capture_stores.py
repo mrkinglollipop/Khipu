@@ -179,6 +179,8 @@ OTHER_DATA: tuple[DataFiles, ...] = (
               Restore(("forgotten_sources.json",), "registry merge")),
     DataFiles("ledger outbox", "ledger writes waiting for the hub, the owner's work rows",
               Restore(("ledger-outbox/*.json",), "no capture text")),
+    DataFiles("owner writes", "owner writes waiting for the hub: closing an owed item, superseding a decision",
+              Restore(("owner-writes/*.json",), "no capture text")),
 )
 
 

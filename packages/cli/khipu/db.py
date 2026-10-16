@@ -97,13 +97,42 @@ def conninfo_with_local_root_cert(dsn: str) -> str:
     return make_conninfo(**params)
 
 
-def connect(*, autocommit: bool = False):
-    """Bound connection setup; SQL timeouts belong to the operation's caller."""
+def _keepalive_kwargs() -> dict:
+    """TCP keepalives so a connection a network change silenced is given up
+    after ``hub_dead_connection_after`` seconds, not the system's hours."""
+    from khipu import offline
+
+    after = int(offline.setting("hub_dead_connection_after") or 0)
+    if after <= 0:
+        return {}
+    return {
+        "keepalives": 1,
+        "keepalives_idle": max(1, after // 2),
+        "keepalives_interval": max(1, after // 6),
+        "keepalives_count": 3,
+    }
+
+
+def _with_statement_timeout(conninfo: str, seconds: float) -> str:
+    """``conninfo`` with ``-c statement_timeout`` added to its options."""
+    params = {key: val for key, val in conninfo_to_dict(conninfo).items() if val is not None}
+    flag = f"-c statement_timeout={int(seconds * 1000)}"
+    existing = (params.get("options") or "").strip()
+    params["options"] = f"{existing} {flag}" if existing else flag
+    return make_conninfo(**params)
+
+
+def connect(*, autocommit: bool = False, statement_timeout_s: float | None = None):
+    """Bound connection setup; SQL timeouts belong to the operation's caller
+    (``statement_timeout_s`` is how a caller asks for one)."""
     conninfo = conninfo_with_local_root_cert(resolve_dsn())
+    if statement_timeout_s is not None and statement_timeout_s > 0:
+        conninfo = _with_statement_timeout(conninfo, statement_timeout_s)
     return psycopg.connect(
         conninfo,
         autocommit=autocommit,
         connect_timeout=CONNECT_TIMEOUT_SECONDS,
+        **_keepalive_kwargs(),
     )
 
 

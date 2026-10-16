@@ -85,6 +85,11 @@ NOT_CAPTURE = {
     **dict.fromkeys(("ledger._migrate_outcomes", "ledger._prune_outcomes", "ledger._record_outcome",
                      "ledger._record_rejected", "ledger._refuse_job", "ledger._replica_pending",
                      "ledger._set_aside", "ledger.enqueue"), _LEDGER),
+    # Owner writes queued while the hub is away: the tool name and its arguments (ids, an action,
+    # a decision's text the owner typed), a lock file, and the refused copies.
+    **dict.fromkeys(("owner_writes._enqueue", "owner_writes._refuse"),
+                    "owner writes waiting for the hub: ids, actions, a decision's text; not captures"),
+    "owner_writes.drain": _LOCKS,
     # The one way a ledger or work answer leaves Khipu; only ``khipu ledger ... --out``
     # names a file, and it gets the ledger board or ledger rows.
     "agent_view.emit": "a ledger board or ledger rows, to a file the owner names with --out; not captures",
