@@ -88,6 +88,12 @@ def fake(tmp_path, monkeypatch):
 
     monkeypatch.setattr(usage, "_command", lambda harness: scripts.get(harness))
     monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    # Empty default login folders: a home-less account whose folder is
+    # missing is never probed (it reads login_folder_missing).
+    home = tmp_path / "home"
+    for name in (".claude", ".codex", ".grok"):
+        (home / name).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
     return configure
 
 
@@ -968,9 +974,15 @@ NO_USER_HOME = "~khipu-no-such-user-7f3a/.claude"
 
 
 def _config_cli(argv, capsys):
+    """``khipu config`` as the app runs it: a write to usage_accounts is the
+    owner's (decision 15), so it carries ``--from-app`` and each test that
+    makes one takes the ``khipu_app`` fixture (the app as its caller)."""
+    from khipu import config
     from khipu.cli import main
 
-    rc = main(["config", *argv])
+    # It also carries the version of the list it read (required).
+    owner = ["--from-app", f"--expect={config.accounts_version()}"] if "usage_accounts" in argv else []
+    rc = main(["config", *owner, *argv])
     return rc, json.loads(capsys.readouterr().out)
 
 
@@ -1012,7 +1024,7 @@ def test_a_relative_login_folder_is_an_invalid_entry_never_probed(fake, tmp_path
     assert not out.exists(), "an invalid entry is never probed"
 
 
-def test_usage_accounts_are_set_shown_and_unset_through_config(fake, capsys):
+def test_usage_accounts_are_set_shown_and_unset_through_config(fake, capsys, khipu_app):
     from khipu import config
 
     fake("claude", "claude.jsonl")
@@ -1034,7 +1046,7 @@ def test_usage_accounts_are_set_shown_and_unset_through_config(fake, capsys):
         "value": None, "source": "default",
         "accounts": [{"label": "Claude", "harness": "claude", "home": None},
                      {"label": "Grok", "harness": "grok", "home": None}],
-        "user_home": str(Path.home())}
+        "user_home": str(Path.home()), "version": config.accounts_version(), "none": False, "request": None}
     assert "usage_accounts" not in json.loads(config.config_file().read_text())
     # An empty list is the default too.
     assert _config_cli(["--set", "usage_accounts", json.dumps([{"harness": "codex"}])], capsys)[0] == 0
@@ -1068,7 +1080,7 @@ _REFUSALS = [
     ('[{"label": "A", "harness": "claude", "home": "/x"}, {"label": "B", "harness": "claude", "home": "/x/"}]',
      "reads the same login", "login_taken", 1, "home", 0),
     (json.dumps([*_TWO, {"label": "Work", "harness": "codex", "home": "~/.codex-work"},
-                 {"label": "Work again", "harness": "codex", "home": str(Path.home() / ".codex-work")}]),
+                 {"label": "Work again", "harness": "codex", "home": "{HOME}/.codex-work"}]),
      "reads the same login", "login_taken", 3, "home", 2),
     (json.dumps([*_TWO, {"harness": "claude", "label": "x" * 65}]), "longer than 64", "too_long", 2, "label", None),
     (json.dumps([{"harness": "claude", "home": "/" + "x" * 1024}]), "longer than 1024", "too_long", 0, "home", None),
@@ -1079,10 +1091,12 @@ _REFUSALS = [
 
 @pytest.mark.parametrize("value, needle, code, index, field, other", _REFUSALS,
                          ids=[f"{row[2]}-{n}" for n, row in enumerate(_REFUSALS)])
-def test_usage_accounts_refuses_what_cannot_be_probed(fake, capsys, value, needle, code, index, field, other):
+def test_usage_accounts_refuses_what_cannot_be_probed(fake, capsys, khipu_app, value, needle, code, index, field,
+                                                      other):
     from khipu import config
 
-    rc, out = _config_cli(["--set", "usage_accounts", value], capsys)
+    # {HOME} is the test's own home (``fake`` sets it), not the one at import.
+    rc, out = _config_cli(["--set", "usage_accounts", value.replace("{HOME}", str(Path.home()))], capsys)
     assert rc == 2 and out["ok"] is False and needle in out["error"]
     # A fixed code with the entry and field at fault, so the app can say it in
     # its own words and point at the field instead of showing this text.
@@ -1116,6 +1130,25 @@ def test_every_error_code_has_a_plain_phrase_in_the_app():
     assert not missing, f"no plain phrase in PlansCard.tsx for {missing}"
     # exit_<n> / signal_<n> are matched by pattern there.
     assert "(exit|signal)_" in app.read_text(encoding="utf-8")
+
+
+def test_usage_accounts_without_the_owner_is_refused_and_stores_nothing(fake, capsys, khipu_app):
+    """Decision 15: no conversation sets the account list by passing a flag;
+    without --from-app from the app itself, or a typed yes, nothing is
+    written."""
+    from khipu import config
+    from khipu.cli import main
+
+    value = json.dumps([{"label": "Claude", "harness": "claude"}])
+    assert main(["config", "--set", "usage_accounts", value]) == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False and out["code"] == "owner_only"
+    khipu_app.as_shell("/usr/local/bin/claude")
+    assert main(["config", "--from-app", "--set", "usage_accounts", value]) == 2
+    assert json.loads(capsys.readouterr().out)["code"] == "owner_only"
+    assert main(["config", "--from-app", "--unset", "usage_accounts"]) == 2
+    capsys.readouterr()
+    assert not config.config_file().exists()
 
 
 # ---- notes on kept figures, plain words only ---------------------------------------
@@ -1177,6 +1210,7 @@ def test_every_code_a_probe_can_return_has_a_plain_note():
 
 
 def test_a_failed_probe_row_carries_the_plain_note_for_its_account(fake):
+    (Path.home() / ".grok-work").mkdir(exist_ok=True)  # a missing folder is its own note (9B)
     row = usage.probe_account({"label": "Grok work", "harness": "grok", "home": "~/.grok-work"})
     assert row["ok"] is False and row["error"] == "not_installed"
     assert row["note"] == "Grok Build is not installed on this Mac"

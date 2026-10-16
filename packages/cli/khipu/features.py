@@ -135,14 +135,14 @@ def set_enabled(name: str, value: bool):
     """Persist ``name`` to config.json's ``features`` object. Raises
     ``KeyError`` for a name outside ``FEATURES``."""
     _check_known(name)
-    from khipu.config import load_config, save_config
+    from khipu.config import config_file, mutate_config
 
-    data = load_config()
-    feats = data.get("features")
-    feats = dict(feats) if isinstance(feats, dict) else {}
-    feats[name] = bool(value)
-    data["features"] = feats
-    return save_config(data)
+    with mutate_config() as data:
+        feats = data.get("features")
+        feats = dict(feats) if isinstance(feats, dict) else {}
+        feats[name] = bool(value)
+        data["features"] = feats
+    return config_file()
 
 
 def _unknown_names() -> list[str]:

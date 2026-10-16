@@ -308,6 +308,9 @@ def _write_dsn_file(dsn: str) -> None:
     write_private_file(path, (dsn.strip() + "\n").encode("utf-8"))
 
 
+_UNSET = object()
+
+
 def _file_snapshot(path: Path) -> bytes | None:
     try:
         return path.read_bytes()
@@ -467,7 +470,6 @@ def _import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
     ensure_data_dir()
     cert_path = root_cert_file()
     dsn_path = dsn_file()
-    config_path = config_mod.config_file()
     root_pem = payload.get("root_crt_pem")
     if root_pem is not None and not isinstance(root_pem, str):
         raise JoinError("root_crt_pem must be a string")
@@ -484,8 +486,11 @@ def _import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
     snapshots = {
         dsn_path: _file_snapshot(dsn_path),
         cert_path: _file_snapshot(cert_path),
-        config_path: _file_snapshot(config_path),
     }
+    # Settings the import may change, put back one by one on failure: the
+    # config file is shared with every other writer, so it is never restored
+    # as a whole-file copy.
+    config_keys = {k: existing_config.get(k, _UNSET) for k in ("capture_mode", "models", "gateway_url")}
     credential_updates = [(keychain.DSN_ACCOUNT, set_dsn, None)]
     for field, account, setter in (
         ("gemini_api_key", keychain.GEMINI_ACCOUNT, set_gemini_key),
@@ -542,6 +547,15 @@ def _import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
                 _restore_file(path, snapshot)
             except OSError:
                 rollback_errors.append(f"file {path.name}")
+        try:
+            with config_mod.mutate_config() as data:
+                for key, value in config_keys.items():
+                    if value is _UNSET:
+                        data.pop(key, None)
+                    else:
+                        data[key] = value
+        except (OSError, config_mod.InvalidConfigDocument):
+            rollback_errors.append(f"file {config_mod.CONFIG_NAME}")
         if rollback_errors:
             raise JoinError("join import failed; rollback failed for " + ", ".join(rollback_errors)) from exc
         raise

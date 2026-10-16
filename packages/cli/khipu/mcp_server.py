@@ -1806,8 +1806,11 @@ def _tool_route_priority(args: dict) -> dict:
     until = args.get("until")
     if until is not None and not isinstance(until, str):
         raise ValueError("until must be text")
+    # The version as of building this request, read inside the call's lock
+    # budget: one that moves before the write lands refuses it, and the
+    # request still waits for the owner.
     return routing.conversation_priority(entries, until=until, owner_request=owner_request,
-                                         author=routing.conversation_author())
+                                         author=routing.conversation_author(), expect_current=True)
 
 
 TOOL_FUNCS = {

@@ -135,16 +135,16 @@ def settings_status() -> dict[str, dict]:
 
 def set_setting(key: str, raw: Any) -> Path:
     """Store a ledger setting (``None`` removes it: the default again)."""
-    from khipu.config import _load_config_for_mutation, save_config
+    from khipu.config import config_file, mutate_config
 
     if key not in SETTINGS:
         raise KeyError(f"unknown ledger setting {key!r}")
-    data = _load_config_for_mutation()
-    if raw is None:
-        data.pop(key, None)
-    else:
-        data[key] = _coerce(SETTINGS[key][0], raw, key)
-    return save_config(data)
+    with mutate_config() as data:
+        if raw is None:
+            data.pop(key, None)
+        else:
+            data[key] = _coerce(SETTINGS[key][0], raw, key)
+    return config_file()
 
 
 def default_vocab(owner_word: str | None = None) -> dict[str, list]:
