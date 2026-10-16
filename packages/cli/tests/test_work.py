@@ -403,6 +403,7 @@ def test_ledger_part_of_a_board_without_a_runner():
     assert b["source"]["state"] == "none" and b["ledger"]["rows"] == 3
     goal = b["ledger"]["goals"][0]
     assert goal["id"] == "g-1" and goal["children"] == 2 and goal["verified"] == 1
+    assert ["DONE", "done"] in b["ledger"]["vocab"]["state"] and "goal" in b["ledger"]["vocab"]["kind"]
 
 
 def test_the_view_holds_no_path_login_folder_or_account_key(tmp_path):
@@ -597,3 +598,18 @@ def test_hide_and_same_commands(env, monkeypatch):
     links = work.read_links()
     assert links["same"] == [["atlas", "n-1", "c5"]] and links["not_same"] == []
     assert run("same", "nohash", "c5")[0] == 1
+
+
+def test_the_apps_same_and_unhide_argv_parse():
+    """The desktop's fixed argv (src-tauri lib.rs, work_command_tests)."""
+    from khipu import cli
+
+    for argv in (["work", "same", "--", "owner/atlas#n-7", "42"], ["work", "unhide", "--", "42"]):
+        args = cli.build_parser().parse_args(argv)
+        with redirect_stdout(io.StringIO()) as out:
+            assert args.func(args) == 0, out.getvalue()
+    assert work.read_links()["same"] == [["owner/atlas", "n-7", "42"]]
+    args = cli.build_parser().parse_args(["work", "not-same", "--", "owner/atlas#n-7", "42"])
+    with redirect_stdout(io.StringIO()):
+        assert args.func(args) == 0
+    assert work.read_links() == {"same": [], "not_same": [["owner/atlas", "n-7", "42"]]}

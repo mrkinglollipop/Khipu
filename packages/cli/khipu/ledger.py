@@ -2332,7 +2332,7 @@ def cmd(args: argparse.Namespace) -> int:
             rows, text = render_list(view, state=args.state, kind=args.kind, owner=args.owner,
                                      stale_hours=args.stale_hours)
             _emit(args, {"ok": True, "project": project, "offline": view["offline"], "as_of": view.get("as_of"),
-                         "rows": [row_json(r, [], project) for r in rows]}, text)
+                         "vocab": view["vocab"], "rows": [row_json(r, [], project) for r in rows]}, text)
         elif verb == "loose-ends":
             rows, text = render_loose_ends(view, summary=args.summary)
             _emit(args, {"ok": True, "project": project, "rows": [row_json(r, [], project) for r in rows]}, text)
