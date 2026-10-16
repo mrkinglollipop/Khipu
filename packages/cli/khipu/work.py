@@ -23,6 +23,7 @@ every string that is not a time or work.py's own words, saying so).
 from __future__ import annotations
 
 import argparse
+import copy
 import difflib
 import errno
 import hashlib
@@ -553,6 +554,45 @@ _READERS = {"jobs": (_job, "updated_at", "work_max_jobs"), "prs": (_pr, "stage_a
             "trains": (_train, "updated_at", "work_max_trains")}
 
 
+def _cap_runs(trains: list[dict], cfg: dict, r: _Reading) -> None:
+    # work_max_runs counts every run of the trains shown, not each train's.
+    runs = [run for t in trains for run in t["runs"]]
+    kept = {id(run) for run in _newest(runs, "at", cfg["work_max_runs"], r, "runs")}
+    for t in trains:
+        t["runs"] = [run for run in t["runs"] if id(run) in kept]
+
+
+def _within_caps(contents: dict | None, cfg: dict) -> dict | None:
+    """A last good read held to the caps and line limit set now: it was
+    cleaned under the settings of its day, which may since be lower."""
+    if not contents:
+        return contents
+    out = copy.deepcopy(contents)
+    line = cfg["work_line_chars"]
+    r = _Reading(out.get("project") or "", cfg, _now())
+    jobs = []
+    for item in out.get("jobs") or []:
+        item["summary"] = clean_text(item.get("summary"), line)
+        if item["summary"] is None:  # a job's summary is required
+            r.dropped += 1
+            continue
+        jobs.append(item)
+    out["jobs"] = jobs
+    for item in [*(out.get("prs") or []), *(out.get("trains") or []),
+                 *(run for t in out.get("trains") or [] for run in t.get("runs") or [])]:
+        item["summary"] = clean_text(item.get("summary"), line)
+    for key, (_reader, newest, cap_key) in _READERS.items():
+        out[key] = _newest(out.get(key) or [], newest, cfg[cap_key], r, key)
+    _cap_runs(out["trains"], cfg, r)
+    capped = dict(out.get("capped") or {})
+    for what, now_capped in r.capped.items():
+        before = capped.get(what) if isinstance(capped.get(what), dict) else {}
+        capped[what] = {"shown": now_capped["shown"], "of": max(now_capped["of"], before.get("of") or 0)}
+    out["capped"] = capped
+    out["dropped"] = (out.get("dropped") or 0) + r.dropped
+    return out
+
+
 class Unreadable(Exception):
     """The file as a whole can't be read; ``state`` says which way."""
 
@@ -611,11 +651,7 @@ def parse_summary(data: bytes, project: str | None, cfg: dict, now: datetime) ->
             except (_Drop, TypeError, ValueError, OverflowError):
                 r.dropped += 1
         out[key] = _newest(items, newest, cfg[cap_key], r, key)
-    # work_max_runs counts every run of the trains shown, not each train's.
-    runs = [run for t in out["trains"] for run in t["runs"]]
-    kept = {id(run) for run in _newest(runs, "at", cfg["work_max_runs"], r, "runs")}
-    for t in out["trains"]:
-        t["runs"] = [run for run in t["runs"] if id(run) in kept]
+    _cap_runs(out["trains"], cfg, r)
     waiting = doc.get("waiting_on_owner")
     out["waiting_list_ignored"] = 0 if waiting is None else (len(waiting) if isinstance(waiting, list) else 1)
     out.update(dropped=r.dropped, other_project=r.other_project, clamped=r.clamped, capped=r.capped)
@@ -650,42 +686,24 @@ def _kb(size: int) -> str:
     return f"{size / (1024 * 1024):.1f} MB" if size >= 1024 * 1024 else f"{max(1, round(size / 1024))} KB"
 
 
-def _failed(state: str, problem: str, last: dict | None, **detail: Any) -> dict:
+def _failed(state: str, problem: str, last: dict | None, cfg: dict, **detail: Any) -> dict:
     """A read that failed: its state, and the last good read to show."""
-    return {"state": state, "problem": problem, "contents": (last or {}).get("contents"), **detail}
+    return {"state": state, "problem": problem, "contents": _within_caps((last or {}).get("contents"), cfg),
+            **detail}
 
 
 class _Refused(Exception):
     """A private or login folder, or a link on the way to the file."""
 
 
-def _login_folder(path: str) -> bool:
-    """Whether ``path`` is in a login folder Khipu knows (configured,
-    discovered, in the routing record or a harness default), decided from
-    names and links alone: nothing inside one is listed or opened."""
-    from khipu import agent_view
-
-    home = agent_view._home_dir()
-    target = agent_view._fold(path.rstrip("/"))
-    for harness, raw in agent_view._homes(None, agent_view._saved_view()):
-        if raw is None:
-            folder = agent_view._DEFAULT_FOLDERS.get(harness)
-            if not folder or not home:
-                continue
-            raw = os.path.join(home, folder)
-        for form in agent_view._forms(raw, home):
-            form = agent_view._fold(form.rstrip("/"))
-            if not form.startswith("~") and (target == form or target.startswith(form + "/")):
-                return True
-    return False
-
-
 def _private_place(path: str) -> bool:
-    from khipu import routing_sources
+    """A private place or a login folder: the same list of login folders
+    the final scan scrubs (agent_view's)."""
+    from khipu import agent_view, routing_sources
 
     try:
-        return routing_sources.private_path(path) or _login_folder(path) \
-            or _login_folder(os.path.realpath(path))
+        return routing_sources.private_path(path) or agent_view.in_login_folder(path) \
+            or agent_view.in_login_folder(os.path.realpath(path))
     except Exception:  # noqa: BLE001  (unsure is private)
         return True
 
@@ -792,9 +810,9 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
     except FileNotFoundError:
         return {"state": "missing", "problem": SOURCE_PROBLEMS["missing"], "contents": None}
     except Unreadable as exc:
-        return _failed(exc.state, exc.problem, last, **exc.detail)
+        return _failed(exc.state, exc.problem, last, cfg, **exc.detail)
     except OSError:
-        return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last)
+        return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last, cfg)
     try:
         # Which file was read (its name as set, device and inode) as well as
         # its times and size: another file with the same time and size is
@@ -807,16 +825,16 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
             try:
                 data = _read_fd(fd, limit or st.st_size or 1)
             except OSError:
-                return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last)
+                return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last, cfg)
             try:
                 parsed = parse_summary(data, project, cfg, now)
             except Unreadable as exc:
                 if exc.state in ("wrong_project", "newer_format"):
                     return {"state": exc.state, "problem": exc.problem, "contents": None, **exc.detail}
-                return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last)
+                return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last, cfg)
             before = _parse_time(((last or {}).get("contents") or {}).get("written_at"))
             if before is not None and _parse_time(parsed["written_at"]) < before:
-                return _failed("unreadable", SOURCE_PROBLEMS["older"], last)
+                return _failed("unreadable", SOURCE_PROBLEMS["older"], last, cfg)
             try:
                 _write_json(_last_file(project), {"project_key": project, "stamp": stamp, "contents": parsed})
             except OSError:
@@ -825,9 +843,11 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
         os.close(fd)
     age = (now - _parse_time(parsed["written_at"])).total_seconds()
     stale = _stale_after(cfg, parsed)
-    if cfg["work_gone_after"] and age > cfg["work_gone_after"]:
+    # Each limit is reached at its instant (>=), the instant build_view
+    # hands on as valid_until: a refresh at that instant sees the change.
+    if cfg["work_gone_after"] and age >= cfg["work_gone_after"]:
         state = "gone"
-    elif stale and age > stale:
+    elif stale and age >= stale:
         state = "stale"
     else:
         state = "ok"
@@ -975,7 +995,7 @@ def read_routing(now: datetime) -> dict[str, Any]:
                                                           "label": routing._label_of(key, known)}
         labels = {a["label"].casefold(): {"id": a["id"], "label": a["label"]} for a in accounts}
         return {"accounts": accounts, "rules": view.get("rules") or [], "holds": view.get("holds") or [],
-                "lanes": lanes, "labels": labels, "error": None}
+                "lanes": lanes, "labels": labels, "valid_until": view.get("valid_until"), "error": None}
     except Exception as exc:  # noqa: BLE001
         return {"accounts": [], "rules": [], "holds": [], "lanes": {}, "labels": {}, "error": type(exc).__name__}
 
@@ -1108,13 +1128,13 @@ def _ledger_part(rows: list[dict], vocab: dict, now: datetime, times: list[datet
     loose_out = []
     for r in loose[:10]:
         item = _row_out(r, vocab)
-        item["stale"] = bool(stale_after and (now - _when(r)).total_seconds() > stale_after)
+        item["stale"] = bool(stale_after and (now - _when(r)).total_seconds() >= stale_after)
         if stale_after and not item["stale"]:
             times.append(_when(r) + timedelta(seconds=stale_after))
         item["parent_missing"] = bool(r["parent"]) and r["parent"] not in ids
         loose_out.append(item)
-    recent = [_row_out(r, vocab) for r in ordered if (now - _when(r)).total_seconds() <= 86400]
-    times.extend(_when(r) + timedelta(seconds=86400) for r in ordered if (now - _when(r)).total_seconds() <= 86400)
+    recent = [_row_out(r, vocab) for r in ordered if (now - _when(r)).total_seconds() < 86400]
+    times.extend(_when(r) + timedelta(seconds=86400) for r in ordered if (now - _when(r)).total_seconds() < 86400)
     return {"rows": len(rows), "by_state": counts, "goals": goals, "loose_ends": loose_out,
             "loose_end_count": len(loose), "changed_today": recent}
 
@@ -1257,7 +1277,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                 times.append(written + timedelta(seconds=_stale_after(cfg, contents)))
             # A failed read shows the last good one: its jobs stop showing
             # live once that read is older than work_gone_after.
-            gone = bool(cfg["work_gone_after"]) and (now - written).total_seconds() > cfg["work_gone_after"]
+            gone = bool(cfg["work_gone_after"]) and (now - written).total_seconds() >= cfg["work_gone_after"]
             if cfg["work_gone_after"] and not gone:
                 times.append(written + timedelta(seconds=cfg["work_gone_after"]))
             runner = (contents.get("runner") or {}).get("name")
@@ -1268,11 +1288,11 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                 updated = _parse_time(job["updated_at"])
                 if job["state"] in JOB_ENDED and cfg["work_finished_for"]:
                     ended = _parse_time(job.get("ended_at")) or updated
-                    if (now - ended).total_seconds() > cfg["work_finished_for"]:
+                    if (now - ended).total_seconds() >= cfg["work_finished_for"]:
                         continue
                     times.append(ended + timedelta(seconds=cfg["work_finished_for"]))
                 quiet = cfg["work_job_quiet_after"]
-                job["quiet"] = bool(job["state"] == "running" and quiet and (now - updated).total_seconds() > quiet)
+                job["quiet"] = bool(job["state"] == "running" and quiet and (now - updated).total_seconds() >= quiet)
                 if job["state"] == "running" and quiet and not job["quiet"]:
                     times.append(updated + timedelta(seconds=quiet))
                 job["account_ref"] = _account_ref(job, runner, routing_info)
@@ -1288,7 +1308,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                 pr = dict(raw_pr)
                 if pr["stage"] in ("merged", "closed") and cfg["work_merged_for"]:
                     done_at = _parse_time(pr.get("merged_at") or pr["stage_at"])
-                    if (now - done_at).total_seconds() > cfg["work_merged_for"]:
+                    if (now - done_at).total_seconds() >= cfg["work_merged_for"]:
                         continue
                     times.append(done_at + timedelta(seconds=cfg["work_merged_for"]))
                 pr["ledger"] = [{"id": r["row_id"], "state": r["state"], "state_words": state_words(r["state"]),
@@ -1302,7 +1322,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
             for train in contents.get("trains") or []:
                 if train["state"] in ("shipped", "dropped") and cfg["work_merged_for"]:
                     at = _parse_time(train["updated_at"])
-                    if (now - at).total_seconds() > cfg["work_merged_for"]:
+                    if (now - at).total_seconds() >= cfg["work_merged_for"]:
                         continue
                     times.append(at + timedelta(seconds=cfg["work_merged_for"]))
                 board["trains"].append(train)
@@ -1315,6 +1335,9 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
         outbox = int(ledger.outbox_status().get("pending") or 0)
     except Exception:  # noqa: BLE001
         outbox = 0
+    # The earliest deadline of every input: the routing record's (a hold
+    # reminder entering Waiting on you) and any the ledger or commitments give.
+    times.extend(_parse_time(part.get("valid_until")) for part in (ledger_data, owed, routing_info))
     future = [t for t in times if t is not None and t > now]
     scan = _Scan()
     view = scan({

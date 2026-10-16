@@ -125,8 +125,17 @@ def _saved_view() -> dict:
 def _homes(extra_keys: Iterable[str] | None, view: dict) -> list[tuple[str, str | None]]:
     """Every (harness, login folder) Khipu knows: configured (invalid entries
     included), discovered Claude homes, the routing record's accounts, the
-    caller's ``extra_keys`` ("harness|home") and each default login."""
+    caller's ``extra_keys`` ("harness|home"), each default login and each
+    one set for this process through a harness's own variable
+    (``CODEX_HOME``, ``GROK_HOME``, ``CLAUDE_CONFIG_DIR``)."""
     out: list[tuple[str, str | None]] = [(h, None) for h in _DEFAULT_FOLDERS]
+    with contextlib.suppress(Exception):
+        from khipu.usage import _HOME_VARS
+
+        for harness, var in _HOME_VARS.items():
+            value = (os.environ.get(var) or "").strip()
+            if value:
+                out.append((harness, value))
     with contextlib.suppress(Exception):
         from khipu.config import load_config
 
@@ -145,6 +154,25 @@ def _homes(extra_keys: Iterable[str] | None, view: dict) -> list[tuple[str, str 
             harness, _, home = key.partition("|")
             out.append((harness, home or None))
     return out
+
+
+def in_login_folder(path: str) -> bool:
+    """Whether ``path`` is in one of the login folders ``_homes`` knows (in
+    any of its spellings), decided from names and links alone: nothing
+    inside one is listed or opened."""
+    home = _home_dir()
+    target = _fold(path.rstrip("/"))
+    for harness, raw in _homes(None, _saved_view()):
+        if raw is None:
+            folder = _DEFAULT_FOLDERS.get(harness)
+            if not folder or not home:
+                continue
+            raw = os.path.join(home, folder)
+        for form in _forms(raw, home):
+            form = _fold(form.rstrip("/"))
+            if not form.startswith("~") and (target == form or target.startswith(form + "/")):
+                return True
+    return False
 
 
 class _Id:

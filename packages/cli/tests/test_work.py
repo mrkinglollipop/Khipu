@@ -866,3 +866,90 @@ def test_a_link_in_a_parent_folder_is_refused(tmp_path):
     alias.symlink_to(target.parent, target_is_directory=True)
     got = read(alias / target.name)
     assert got["state"] == "refused" and got["contents"] is None
+
+
+# ---- review regressions, round 3 (cross-family review of 2a69343) ----------------------------
+
+
+@pytest.mark.parametrize("variable", ["CODEX_HOME", "GROK_HOME"])
+def test_a_login_folder_set_through_the_environment_is_refused_and_scrubbed(tmp_path, monkeypatch, variable):
+    from khipu import agent_view
+
+    login = tmp_path / "fictional-login-739"
+    login.mkdir()
+    inside = login / "work-summary.json"
+    inside.write_text(json.dumps(summary()))
+    monkeypatch.setenv(variable, str(login))
+    agent_view._TABLE.update(sig=None, at=0.0, table=None)
+    opened = []
+    real = work._open_summary
+    monkeypatch.setattr(work, "_open_summary", lambda p: (opened.append(p), real(p))[1])
+    assert read(inside)["state"] == "refused" and opened == []
+    # A summary elsewhere that names the folder: the name never leaves.
+    path = put(tmp_path, summary(jobs=[job(summary="Checking fictional-login-739")]))
+    monkeypatch.setattr(work, "_open_summary", real)
+    for result in cli_and_saved(monkeypatch, cfg(work_projects=[entry(path)])):
+        assert "fictional-login-739" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("broken", ["unreadable", "too_big"])
+@pytest.mark.parametrize("cap", ["count", "text"])
+def test_a_last_good_read_obeys_caps_lowered_since(tmp_path, monkeypatch, broken, cap):
+    path = put(tmp_path, summary(jobs=[job(f"job-{i}") for i in range(3)]))
+    assert read(path, work_max_jobs=0, work_line_chars=0)["state"] == "ok"
+    config = cfg(work_projects=[entry(path)])
+    config["work_max_jobs" if cap == "count" else "work_line_chars"] = 1 if cap == "count" else 8
+    if broken == "unreadable":
+        path.write_text("{")
+    else:
+        config["work_file_max_bytes"] = 1
+    for result in cli_and_saved(monkeypatch, config):
+        board_ = result["projects"][0]
+        assert board_["source"]["state"] == broken
+        if cap == "count":
+            assert len(board_["jobs"]) == 1 and board_["source"]["capped"]["jobs"] == {"shown": 1, "of": 3}
+        else:
+            assert max(len(j["summary"]) for j in board_["jobs"]) <= 8
+
+
+def test_the_routing_record_deadline_is_in_valid_until(monkeypatch):
+    import contextlib
+
+    from khipu import routing
+
+    route_cfg = routing.settings({"routing_owner_hold_reminder": 3600})
+    deadline = NOW + timedelta(seconds=60)
+    hold = {"type": "hold", "id": "hold-1", "_seq": 1, "scope": {"kind": "all"}, "reason": "keep",
+            "text": "Synthetic hold", "until": None, "owner": True, "written_by": routing.OWNER, "via": "app",
+            "written_at": _t(3540)}
+    monkeypatch.setattr(routing, "read_view", lambda now: routing.fold([hold], now=now, cfg=route_cfg, known=[]))
+    monkeypatch.setattr(routing, "settings", lambda: route_cfg)
+    monkeypatch.setattr(routing, "plan_facts", lambda view, now: {})
+    monkeypatch.setattr(routing, "lock_budget", lambda *a: contextlib.nullcontext())
+
+    def at(now):
+        return work.build_view(now, cfg=cfg(), ledger_data=NO_LEDGER, owed=NO_OWED,
+                               routing_info=work.read_routing(now))
+
+    before = at(NOW)
+    assert before["counts"]["waiting"] == 0 and at(deadline)["counts"]["waiting"] == 1
+    assert before["valid_until"] == work._z(deadline)
+
+
+def test_a_refresh_at_the_exact_deadline_sees_the_change(tmp_path):
+    path = put(tmp_path, summary())
+
+    def at(now):
+        return work.build_view(now, cfg=cfg(work_projects=[entry(path)]), ledger_data=NO_LEDGER,
+                               owed=NO_OWED, routing_info=ROUTING)
+
+    first = at(NOW)
+    deadline = work._parse_time(first["valid_until"])
+    assert first["projects"][0]["source"]["state"] == "ok"
+    exact = at(deadline)
+    # The state at the deadline is the new one, or the next deadline is
+    # no later than the first instant the new state shows.
+    if exact["projects"][0]["source"]["state"] == "ok":
+        following = work._parse_time(exact["valid_until"])
+        assert following is not None and following <= deadline + timedelta(seconds=1)
+    assert at(deadline + timedelta(seconds=1))["projects"][0]["source"]["state"] == "stale"
