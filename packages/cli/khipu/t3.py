@@ -300,14 +300,24 @@ def strip_handoff(text: str, *, prefer_last: bool = False) -> str:
     return "" if norm.endswith(HANDOFF_USER_MARKER.rstrip("\n")) else text
 
 
-def claude_instances(settings_file: Path) -> list[dict[str, Any]]:
-    """Every Claude instance in T3's ``settings.json`` (``providerInstances``
-    entries whose ``driver`` is ``claudeAgent``), as ``{id, name, home_path,
-    enabled}``. ``home_path`` is ``""`` when T3 runs it from the default
-    ``~/.claude``. Nothing else in that file is read into the result: it can
-    hold tokens."""
+CODEX_DRIVER = "codex"
+# The name an instance gets when T3 gives none and its id is the driver's own.
+_DRIVER_NAMES = {CLAUDE_DRIVER: "Claude", CODEX_DRIVER: "Codex"}
+
+
+def provider_instances(settings_file: Path | None, drivers, *, text: str | None = None) -> list[dict[str, Any]]:
+    """Every instance in T3's ``settings.json`` (``providerInstances``)
+    whose ``driver`` is one of ``drivers``, as ``{id, driver, name,
+    home_path, enabled}``. Only ``driver``, ``displayName``,
+    ``config.homePath`` and ``enabled`` are read into the result: the file
+    can hold tokens. ``home_path`` is ``""`` when T3 runs the instance from
+    its CLI's default login folder. ``text``: the file's contents, already
+    read by a caller that opens it its own way (discovery, no symlinks)."""
+    wanted = set(drivers)
     try:
-        data = json.loads(settings_file.read_text(encoding="utf-8"))
+        if settings_file is not None:
+            text = settings_file.read_text(encoding="utf-8")
+        data = json.loads(text) if text is not None else None
     except (OSError, ValueError):
         return []
     instances = data.get("providerInstances") if isinstance(data, dict) else None
@@ -315,19 +325,31 @@ def claude_instances(settings_file: Path) -> list[dict[str, Any]]:
         return []
     out: list[dict[str, Any]] = []
     for instance_id, inst in instances.items():
-        if not isinstance(inst, dict) or inst.get("driver") != CLAUDE_DRIVER:
+        if not isinstance(inst, dict) or inst.get("driver") not in wanted:
             continue
+        driver = inst["driver"]
         config = inst.get("config") if isinstance(inst.get("config"), dict) else {}
         home_path = config.get("homePath")
         display = inst.get("displayName")
         if isinstance(display, str) and display.strip():
             name = display.strip()
         else:
-            name = "Claude" if instance_id == CLAUDE_DRIVER else str(instance_id)
+            name = _DRIVER_NAMES.get(driver, str(instance_id)) if instance_id == driver else str(instance_id)
         out.append({
             "id": str(instance_id),
+            "driver": driver,
             "name": name,
             "home_path": home_path.strip() if isinstance(home_path, str) else "",
             "enabled": inst.get("enabled") is not False,
         })
     return out
+
+
+def claude_instances(settings_file: Path) -> list[dict[str, Any]]:
+    """Every Claude instance in T3's ``settings.json`` (``providerInstances``
+    entries whose ``driver`` is ``claudeAgent``), as ``{id, name, home_path,
+    enabled}``. ``home_path`` is ``""`` when T3 runs it from the default
+    ``~/.claude``. Nothing else in that file is read into the result: it can
+    hold tokens."""
+    return [{k: inst[k] for k in ("id", "name", "home_path", "enabled")}
+            for inst in provider_instances(settings_file, (CLAUDE_DRIVER,))]

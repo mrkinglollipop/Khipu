@@ -5188,7 +5188,8 @@ def prompt_imports() -> None:
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
     from khipu import (  # noqa: F401
-        agent_view, claude_homes, config, features, paths, redact, routing_sources, session_capture, usage)
+        agent_view, claude_homes, config, discover, features, paths, redact, routing_sources, session_capture,
+        usage)
 
 
 def prompt_budget() -> float:

@@ -45,7 +45,7 @@ import { buildAttention, harnessLabel, routingAttention, type Attention } from "
 import { HealthReportRows } from "./healthRows";
 import { SummariserCalls, SynthFallbackField, SynthProviderChoices, synthModelError } from "./SynthProvider";
 import { KeysCard } from "./KeysCard";
-import { PlansCard, PlansSettingsCard, usePlanAttention, usePlanUsage } from "./PlansCard";
+import { PlansCard, usePlanAttention, usePlanUsage } from "./PlansCard";
 import { RoutingCard } from "./RoutingCard";
 import { RoutingSettings } from "./RoutingSettings";
 import { useRouting } from "./routing";
@@ -490,7 +490,7 @@ type SettingsSection =
 const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["database", "Database"],
   ["capture", "Capture & models"],
-  ["routing", "Routing"],
+  ["routing", "Accounts and routing"],
   ["features", "Optional features"],
   ["index", "Embeddings"],
   ["data", "Data & backups"],
@@ -2369,19 +2369,19 @@ export default function App() {
   // only the cached figures; the app reads `khipu usage --json` itself (it can
   // probe on demand) and adds one attention item when any window still in
   // force is at or above 90%. One reader shared by Home and Settings ->
-  // Capture & models, so the two never start the subscription CLIs twice; it
+  // Accounts and routing, so the two never start the subscription CLIs twice; it
   // re-reads on entering either view. The item is re-judged every minute
   // while it shows and at its earliest reset, so it never outlives a reset
   // or freezes its countdown while Home stays open.
   const plans = usePlanUsage(
-    tab === "home" ? "home" : tab === "settings" && settingsSection === "capture" ? "settings" : null,
+    tab === "home" ? "home" : tab === "settings" && settingsSection === "routing" ? "settings" : null,
   );
   const planItems = usePlanAttention(plans.data);
   // Routing truth phase 4: the routing record (`khipu route --json`), read on
   // Home and every minute while Home stays open. Its attention items warn and
   // block nothing (the record is guidance, not a gate).
-  // Also read on Settings -> Capture & models, where Plans shows the pauses.
-  const routing = useRouting(tab === "home" || (tab === "settings" && settingsSection === "capture"));
+  // Settings -> Accounts and routing reads its own.
+  const routing = useRouting(tab === "home");
   // Plans shows a pause only from a record read without error, never a guess.
   const routingForPlans = routing.error ? null : routing.data;
   const routingItems = useMemo(() => routingAttention(routing.data), [routing.data]);
@@ -3665,8 +3665,9 @@ export default function App() {
               state={plans}
               routing={routingForPlans}
               onOpenAccounts={() => {
-                setSettingsSection("capture");
+                setSettingsSection("routing");
                 setTab("settings");
+                revealSettingsGroup("accounts");
               }}
             />
 
@@ -5391,12 +5392,6 @@ export default function App() {
                       onKeySaved={onKeySaved}
                     />
 
-                    <PlansSettingsCard
-                      state={plans}
-                      active={tab === "settings" && settingsSection === "capture"}
-                      routing={routingForPlans}
-                    />
-
                     <p className="cm-pointer">
                       The model for search by meaning has its own section,{" "}
                       <button type="button" className="link sm" onClick={() => setSettingsSection("index")}>
@@ -5410,7 +5405,8 @@ export default function App() {
                 {settingsSection === "routing" ? (
                   <RoutingSettings
                     active={tab === "settings" && settingsSection === "routing"}
-                    plans={plans.data}
+                    plansState={plans}
+                    onSetUpAccounts={openAccountsStepInFirstRun}
                   />
                 ) : null}
 

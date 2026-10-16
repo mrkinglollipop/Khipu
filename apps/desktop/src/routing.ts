@@ -808,7 +808,7 @@ function entityWords(entity: string, view: RouteView): string {
     const [runner, lane] = ident.split("/");
     return `${runner}'s ${lane} lane changed`;
   }
-  if (entity === "table") return "the routing table's NOW block changed";
+  if (entity === "table") return "the routing table's current-state section changed";
   return entity;
 }
 
@@ -932,7 +932,8 @@ export function priorityPendingWords(p: RoutePriority): string {
   return `Set by ${p.pending_by || "a conversation"} at your request; you haven't confirmed it yet.`;
 }
 
-function rateWords(pace: number): string {
+/** A pace in words: "1.7", "12" or "less than 0.01". */
+export function rateWords(pace: number): string {
   if (pace >= 10) return pace.toFixed(0);
   if (pace >= 0.1) return String(Math.round(pace * 10) / 10);
   return pace >= 0.01 ? String(Math.round(pace * 100) / 100) : "less than 0.01";
