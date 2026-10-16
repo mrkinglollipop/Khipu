@@ -225,6 +225,19 @@ class DestRemoteSafetyTest(unittest.TestCase):
                 self.assertFalse(health["ok"])
                 self.assertIn("named rclone remote", health["reason"])
 
+    def test_a_recent_offsite_copy_reads_as_fresh(self):
+        from datetime import datetime, timezone
+
+        event = {"status": "ok", "created_at": datetime.now(timezone.utc), "age_seconds": 3600}
+        with (
+            mock.patch.dict(os.environ, {"KHIPU_GRAPH_BACKUP_REMOTE": "r2:my-bucket/graph"}),
+            mock.patch("khipu.graph_backup.has_r2_remote", return_value=True),
+            mock.patch("khipu.graph_backup._latest_ops_event", return_value=event),
+        ):
+            health = graph_backup.offsite_health(producer=True)
+        self.assertTrue(health["ok"])
+        self.assertEqual(health["latest"]["created_at"], event["created_at"].isoformat())
+
     def test_hand_edited_config_value_is_validated(self):
         import json as _json
 
