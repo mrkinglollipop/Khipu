@@ -499,6 +499,11 @@ Limits accepted for this merge, each a follow-up rather than a blocker:
 - **The recall eval record is kept.** `khipu recall eval --record` writes the golden queries, quoted text
   included, to a file the owner names outside the data folder; forget cannot find it. Follow-up: write
   records into the data folder so the recall golden scan can cover them.
+- **Open from the final review (round 15), fixed next on their own branch.** (1) The native-queue and
+  outbox scans get only source rows, not the natural identities recovered from episode columns, so a job
+  keyed by a historical fallback identity can stay while forget reports complete. (2) A temporary
+  `.recall-golden.*.tmp` left by a crash mid-rewrite is not scanned, so forget can report complete while it
+  still quotes the episode. Both have failing probes and are fixed on fix/forget-followups.
 - **A recall golden line is matched by episode id only.** A line whose query quotes a forgotten episode
   but whose `expect` names only a topic or another episode is kept, since the registry holds identities and
   ids, never the forgotten text.
