@@ -116,3 +116,12 @@
   .needs ul { grid-template-columns: 1fr; }
   .needs li { flex-wrap: wrap; }
 }
+
+/* Sorting, filtering and searching the lists (settings clarity phase 4). */
+.route-filter select.sort { height: 32px; min-width: 13rem; }
+.search-row { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+.search-row .filter-input { min-width: 12rem; }
+.who-kind { display: flex; flex-direction: column; gap: var(--s2); }
+button.chip[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent); color: var(--accent-text); background: var(--accent-soft);
+}
