@@ -859,6 +859,22 @@ start and on quit; until then the login may still finish and write into the fold
 sees. "Open the sign-in page again" is replaced by **Start again** (kill, then start), since
 nothing reads a Claude or Codex login's output.
 
+**A group that will not stop.** While any member of the login's process group is still alive after a stop
+(cancel, Start again, the timeout, the reaper, a refused start), its record stays: the attempt stays owned, a
+new start answers `busy` with what is left, cancel answers `not_stopped` with the pids left, and the dialog
+stays open saying the sign-in could not be fully stopped, with Stop again. It closes only once a cancel
+succeeds.
+
+**Known boundary: the folder path.** The login gets its folder as a path in a variable
+(`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), which the child resolves again itself; a path cannot be pinned to the
+folder descriptor Khipu holds. So Khipu checks, before the spawn and again once the login runs, that the folder
+is the same real folder it made, that no component of its path changed (none became a symlink or another
+entry), and that the path followed lands on the held folder; if the second check fails, it stops the verified
+group and refuses the start. What remains is a swap and swap back between those two checks, while the child
+resolves the path. That needs a process running as the same user in the home folder, which can already write
+to any login folder directly, so the check closes the window as far as the OS allows and no further design is
+added for it.
+
 **Claude and Codex:** the browser opens; the dialog waits up to 15 minutes ("Waiting for you to finish signing in
 in your browser"), with Stop and cancel and Start again.
 
@@ -1050,6 +1066,25 @@ footer says "on this Mac".
   CLIs (below).
 - **Order:** 9C and 9E start only after phases 3, 7 and 8 are merged and promoted; otherwise stop and ask.
 - If anything in routing is found keyed by label alone besides the lane map, stop and ask.
+
+#### Owner proofs still to run (9D)
+
+Until each proof below passes, its entry in `signin.PROVEN` stays False and the app does not offer Sign in to
+another account for that CLI (it offers only Use a login I already have). Claude Code is the only CLI turned on.
+
+- [ ] **Codex Keychain, with two scratch folders.** Make two empty scratch folders. Run `CODEX_HOME=<scratch A>
+  codex login` and sign in to account A, then `CODEX_HOME=<scratch B> codex login` and sign in to account B.
+  Then run `codex login status` under each scratch folder and under the default login. Pass: each scratch
+  folder reports its own account and the default login is unchanged. Record the Codex version. On a pass, set
+  `signin.PROVEN["codex"]` to True and add codex to the Rust `SIGN_IN_NEW_OFFERED` list. On a fail, Codex keeps
+  only Use a login I already have.
+- [ ] **Grok Build device code** (after the Grok pause lifts). With a scratch `GROK_HOME`, run `grok login
+  --device-auth` and stop at the code line (no real sign-in). Confirm `~/.grok` and `~/.grok/leader.sock` are
+  unchanged, using a stat of those two entries only. Record the real link host and the shape of the code, so
+  `signin.CODE_HOSTS` and the code shape can be confirmed before `signin.PROVEN["grok"]` turns on.
+- [ ] **Muse code sign-in.** The same shape: run its login, stop at the code line, confirm the link host and the
+  shape of the code, and confirm it asks nothing on the terminal (Khipu starts it with no terminal and no
+  input). Only then does `signin.PROVEN["muse"]` turn on.
 
 ### Proof on this Mac
 

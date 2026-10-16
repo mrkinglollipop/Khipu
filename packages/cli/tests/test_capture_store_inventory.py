@@ -41,12 +41,17 @@ NOT_CAPTURE = {
                      "recall_prompt._session_lock", "routing._lock", "session_capture._beat_lock",
                      "session_capture._capture_now_lock", "session_capture._claim_lock",
                      "usage._open_lock", "discover._try_lock", "config.config_write_lock",
-                     "accounts._declined_lock"), _LOCKS),
+                     "accounts._declined_lock", "signin._lock"), _LOCKS),
     # Account discovery (9A): which login folders exist and when they were checked,
     # and a throwaway folder a status check runs in. Folder names and counts only.
     "discover._save_store": "account discovery results: folder names, CLI kinds and check times",
     "discover.run_once": "a temporary empty folder a CLI status check runs in, removed after",
     "accounts._save_declined": "the logins the owner chose not to be offered again: folder names and CLI kinds",
+    # Signing in a new account (9D): the running attempt and the folders Khipu made.
+    # A sign-in code and link are held in memory only, never written.
+    "signin._write_json": "the sign-in attempt (id, folder, pid, start times, argv) and the login folders "
+                          "Khipu made; no capture text",
+    "signin.start": "a temporary empty folder the login process runs in, removed when the attempt ends",
     **dict.fromkeys(("config._write_config", "integrations._backup", "integrations._cursor_install",
                      "integrations._grok_bot_install", "integrations._write_json",
                      "integrations._write_toml", "integrations.set_gateway_token",

@@ -869,13 +869,17 @@ def discover(*, now: bool = False, check: str | None = None, at: float | None = 
     """One discovery run: gather the candidates, check what is due (or, with
     ``check``, only that one folder, ignoring the wait), keep the result and
     return it. A run while another holds the lock checks nothing and returns
-    the last stored result with ``looking: true``."""
-    fd = _try_lock()
+    the last stored result with ``looking: true``, as does a run while a
+    sign-in Khipu started is still running (its folder is being written)."""
+    from khipu import signin  # lazy: signin imports this module
+
+    signing_in = signin.running()
+    fd = None if signing_in else _try_lock()
     if fd is None:
         out = _view(_load_store())
         out["looking"] = True
         if check is not None:
-            out["check"] = {"ok": False, "error": "looking"}
+            out["check"] = {"ok": False, "error": "sign_in_running" if signing_in else "looking"}
         return out
     try:
         now_ts = time.time() if at is None else at

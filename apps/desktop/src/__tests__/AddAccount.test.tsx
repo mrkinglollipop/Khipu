@@ -228,10 +228,57 @@ describe("Add an account: step 2, which login", () => {
     expect(screen.getByRole("button", { name: "Next" })).toBeEnabled();
   });
 
-  it("Sign in to another account shows disabled with words until 9D is here", () => {
+  it("Sign in to another account shows disabled with words where it is not offered", () => {
     render(<Dialog start={{ cli: "claude", step: 2 }} />);
     expect(screen.getByRole("radio", { name: /Sign in to another account/ })).toBeDisabled();
     expect(screen.getByText(COMING.signInNew)).toBeInTheDocument();
+  });
+
+  it("Sign in to another account is offered where the CLI says so", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "khipu_account_sign_in_offers"
+        ? JSON.stringify({ claude: { offered: true }, codex: { offered: false } })
+        : JSON.stringify({ ok: true }),
+    );
+    render(<Dialog start={{ cli: "claude", step: 2 }} canSignInNew={undefined} />);
+    await waitFor(() => expect(screen.getByRole("radio", { name: /Sign in to another account/ })).toBeEnabled());
+    expect(screen.queryByText(COMING.signInNew)).not.toBeInTheDocument();
+    cleanup();
+    render(<Dialog start={{ cli: "codex", step: 2 }} canSignInNew={undefined} />);
+    await waitFor(() => expect(calls("khipu_account_sign_in_offers").length).toBeGreaterThan(1));
+    expect(screen.getByRole("radio", { name: /Sign in to another account/ })).toBeDisabled();
+  });
+
+  it("a new sign-in that finishes goes on to step 3 with its folder and name, saving nothing", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "khipu_account_new_folder":
+          return JSON.stringify({ ok: true, folder: "~/.claude-lab", reused: false });
+        case "khipu_account_sign_in_new":
+          return JSON.stringify({ ok: true, state: "waiting",
+            attempt: { id: "0123456789abcdef", folder: "~/.claude-lab", started: 1_800_000_000, deadline: 1_800_000_900 } });
+        case "khipu_account_sign_in_status":
+          return JSON.stringify({ ok: true, state: "signed_in", attempt: { id: "0123456789abcdef", folder: "~/.claude-lab" } });
+        case "khipu_accounts_try":
+          return JSON.stringify({ ok: true, default: false, row: liveRow({ account: "Claude lab" }) });
+        default:
+          return JSON.stringify({ ok: true });
+      }
+    });
+    render(<Dialog start={{ cli: "claude", step: 2 }} canSignInNew />);
+    fireEvent.click(screen.getByRole("radio", { name: /Sign in to another account/ }));
+    const open = screen.getByRole("button", { name: "Open the sign-in page" });
+    expect(open).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Name for this account"), { target: { value: "Claude lab" } });
+    expect(open).toBeEnabled();
+    fireEvent.click(open);
+    await waitFor(() => expect(screen.getByRole("heading", { name: /Check and save/ })).toBeInTheDocument(), { timeout: 5000 });
+    expect(calls("khipu_account_new_folder")[0][1]).toEqual({ harness: "claude", name: "Claude lab" });
+    expect(screen.getByLabelText("Name")).toHaveValue("Claude lab");
+    await waitFor(() => expect(calls("khipu_accounts_try").length).toBe(1));
+    expect(calls("khipu_accounts_try")[0][1]).toMatchObject({ harness: "claude", folder: "~/.claude-lab" });
+    expect(names()).not.toContain("khipu_accounts_track");
+    expect(names()).not.toContain("khipu_config_set");
   });
 
   it("nothing found besides what is tracked", () => {
