@@ -101,6 +101,9 @@ class ForgottenEpisodeStaysForgottenInTheReplicaTest(unittest.TestCase):
         a vector for it is the worst case the readers must survive."""
 
         class Pg:
+            def __init__(self):
+                self._result = []
+
             def __enter__(self):
                 return self
 
@@ -110,12 +113,21 @@ class ForgottenEpisodeStaysForgottenInTheReplicaTest(unittest.TestCase):
             def cursor(self):
                 return self
 
-            def execute(self, *_args, **_kwargs):
-                pass
+            def execute(self, sql, params=None):
+                if sql == "SELECT now()":
+                    self._result = [(datetime(2026, 10, 3, tzinfo=timezone.utc),)]
+                elif "FROM information_schema.columns" in sql and params == ("ledger_rows",):
+                    # This fixture has no optional ledger schema.
+                    self._result = []
+                else:
+                    raise AssertionError(f"unexpected query: {sql}")
 
             def fetchone(self):
-                # The dump reads the hub's own clock before any table.
-                return (datetime(2026, 10, 3, tzinfo=timezone.utc),)
+                return self._result.pop(0) if self._result else None
+
+            def fetchall(self):
+                rows, self._result = self._result, []
+                return rows
 
         def episodes(_cur, con):
             _fill(con, gone_deleted_at="2026-10-02T00:00:00+00:00")

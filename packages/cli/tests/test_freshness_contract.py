@@ -198,6 +198,8 @@ class TopicsCatchupContractTest(unittest.TestCase):
                     want = set(params[0])
                     self._result = [(slug, t["title"], t["body"], {"slug": slug})
                                     for slug, t in sorted(self.topics.items()) if slug in want]
+                elif s.startswith("SELECT 1 FROM topics") and "FOR SHARE" in s:
+                    self._result = [(1,)] if params[0] in self.topics else []
                 elif s.startswith("SELECT kind, ref, chunk_idx, content_hash FROM memory_embeddings"):
                     refs = set(params[2]) if len(params) > 2 else None
                     self._result = [(k, r, i, h) for (k, r, i), h in self.hashes.items()
