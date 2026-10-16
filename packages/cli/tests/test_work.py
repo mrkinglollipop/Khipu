@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from khipu import work
+from khipu import safe_read, work
 
 NOW = datetime(2026, 10, 15, 20, 0, 0, tzinfo=timezone.utc)
 KEY = "sk-ant-" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4"
@@ -882,12 +882,12 @@ def test_a_login_folder_set_through_the_environment_is_refused_and_scrubbed(tmp_
     monkeypatch.setenv(variable, str(login))
     agent_view._TABLE.update(sig=None, at=0.0, table=None)
     opened = []
-    real = work._open_summary
-    monkeypatch.setattr(work, "_open_summary", lambda p: (opened.append(p), real(p))[1])
+    real = safe_read.open_file
+    monkeypatch.setattr(safe_read, "open_file", lambda p, *a: (opened.append(p), real(p, *a))[1])
     assert read(inside)["state"] == "refused" and opened == []
     # A summary elsewhere that names the folder: the name never leaves.
     path = put(tmp_path, summary(jobs=[job(summary="Checking fictional-login-739")]))
-    monkeypatch.setattr(work, "_open_summary", real)
+    monkeypatch.setattr(safe_read, "open_file", real)
     for result in cli_and_saved(monkeypatch, cfg(work_projects=[entry(path)])):
         assert "fictional-login-739" not in json.dumps(result)
 

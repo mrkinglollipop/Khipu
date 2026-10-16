@@ -617,3 +617,165 @@ def test_khipu_ledger_cuts_a_path_in_the_owner_and_refuses_one_as_a_project(hub)
     err, got = _tool({"verb": "add", "project": "/private/customer/acme", "id": "b", "title": "Work",
                       "kind": "slice"})
     assert err and got["reason"] == "path", got
+
+
+# ---- review regressions, round 3: one safe read, the whole project verified ---------------
+
+
+@pytest.mark.parametrize("variable", ["CODEX_HOME", "GROK_HOME"])
+def test_a_login_folder_set_through_a_harness_variable_is_refused(variable, tmp_path, monkeypatch):
+    from khipu import agent_view, ledger, ledger_import
+
+    login = tmp_path / "alternate-login"
+    login.mkdir()
+    path = _write(login, {"rows": {"a": _row("a")}})
+    monkeypatch.setenv(variable, str(login))
+    monkeypatch.setattr(agent_view, "_saved_view", lambda: {})
+    with pytest.raises(ledger.LedgerError) as caught:
+        ledger_import.read_tracker(path)
+    assert caught.value.reason == "refused"
+
+
+def _unlink_after_open(monkeypatch, chosen: Path):
+    import os
+
+    real_open = os.open
+
+    def race(name, flags, *a, **k):
+        fd = real_open(name, flags, *a, **k)
+        if str(name) == chosen.name:
+            chosen.unlink()
+        return fd
+
+    monkeypatch.setattr(os, "open", race)
+
+
+def test_a_hard_link_whose_outside_name_goes_after_the_open_is_refused(tmp_path, monkeypatch):
+    import os
+
+    from khipu import config, ledger, ledger_import
+
+    login = tmp_path / "configured-login"
+    login.mkdir()
+    private = _write(login, {"rows": {"private": _row("private")}})
+    chosen = tmp_path / "chosen.json"
+    os.link(private, chosen)
+    monkeypatch.setattr(config, "load_config",
+                        lambda *a, **k: {"usage_accounts": [{"harness": "codex", "home": str(login)}]})
+    _unlink_after_open(monkeypatch, chosen)
+    with pytest.raises(ledger.LedgerError) as caught:
+        ledger_import.read_tracker(chosen)
+    assert caught.value.reason == "refused"
+
+
+def test_the_summary_reader_refuses_the_same_hard_link_race(tmp_path, monkeypatch):
+    import os
+
+    from khipu import config, work
+
+    login = tmp_path / "configured-login"
+    login.mkdir()
+    private = login / "work-summary.json"
+    private.write_text("{}", encoding="utf-8")
+    chosen = tmp_path / "work-summary.json"
+    os.link(private, chosen)
+    monkeypatch.setattr(config, "load_config",
+                        lambda *a, **k: {"usage_accounts": [{"harness": "codex", "home": str(login)}]})
+    _unlink_after_open(monkeypatch, chosen)
+    ok_, problems, _parsed = work.check_file(str(chosen))
+    assert not ok_ and problems == [work.SOURCE_PROBLEMS["refused"]]
+
+
+def test_both_readers_open_through_the_one_safe_read(tmp_path, monkeypatch):
+    from khipu import ledger_import, safe_read, work
+
+    for name in ("_open_tracker", "_read_all", "_login_folder", "_system_links_resolved", "_Refused"):
+        assert not hasattr(ledger_import, name), name
+    for name in ("_open_summary", "_read_fd", "_system_links_resolved", "_Refused"):
+        assert not hasattr(work, name), name
+    seen = []
+    real = safe_read.open_file
+    monkeypatch.setattr(safe_read, "open_file", lambda p, *a: (seen.append(Path(p).name), real(p, *a))[1])
+    ledger_import.read_tracker(_write(tmp_path, {"rows": {"a": _row("a")}}))
+    work.check_file(str(_write(tmp_path, {}, "work-summary.json")))
+    assert seen == ["tracker.json", "work-summary.json"]
+
+
+def test_a_key_shaped_file_name_never_reaches_the_import_record(hub, tmp_path):
+    from khipu import ledger_import
+
+    # The CLI refuses a key-shaped argument before this; the app calls run_import directly.
+    report = ledger_import.run_import(_write(tmp_path, {"rows": {"a": _row("a")}}, KEY + ".json"), P)
+    assert report["result"] == "done", report
+    stored = _sql(hub, "SELECT file_name, counts::text FROM ledger_imports")
+    events = _sql(hub, "SELECT event FROM ledger_history WHERE event IS NOT NULL")
+    assert KEY not in json.dumps([stored, events, report], default=str)
+
+
+@pytest.mark.parametrize("damage", ["title", "imported history", "removed for good"])
+def test_damage_to_a_removed_row_rolls_the_import_back(damage, hub, tmp_path, monkeypatch):
+    from khipu import ledger_import
+
+    assert _import(_write(tmp_path, {"rows": {"old": _row("old")}}, "first.json"))[0] == 0
+    ok("remove", "old")
+    before = _sql(hub, "SELECT row_id, title, removed_at FROM ledger_rows ORDER BY row_id")
+    real = ledger_import._insert_rows
+    query = {"title": "UPDATE ledger_rows SET title = 'CORRUPTED' WHERE project = %s AND row_id = 'old'",
+             "imported history": "UPDATE ledger_history SET raw = '{\"event\": \"CORRUPTED\"}'::jsonb "
+                                 "WHERE project = %s AND row_id = 'old' AND raw IS NOT NULL",
+             "removed for good": "DELETE FROM ledger_rows WHERE project = %s AND row_id = 'old'"}[damage]
+
+    def corrupt(cur, project, ids, rows, now):
+        real(cur, project, ids, rows, now)
+        cur.execute(query, (P,))
+
+    monkeypatch.setattr(ledger_import, "_insert_rows", corrupt)
+    rc, report = _import(_write(tmp_path, {"rows": {"new": _row("new")}}, "second.json"))
+    assert rc == 1 and report["result"] == "rolled back", report
+    assert _sql(hub, "SELECT row_id, title, removed_at FROM ledger_rows ORDER BY row_id") == before
+
+
+def test_a_catch_up_that_deletes_a_removed_row_rolls_back(hub, tmp_path, monkeypatch):
+    from khipu import ledger_import
+
+    doc = {"rows": {"a": _row("a"), "old": _row("old")}}
+    path = _write(tmp_path, doc)
+    assert _import(path)[0] == 0
+    ok("remove", "old")
+    doc["rows"]["b"] = _row("b")
+    _write(tmp_path, doc)
+    real = ledger_import._insert_rows
+
+    def and_delete(cur, project, ids, rows, now):
+        real(cur, project, ids, rows, now)
+        cur.execute("DELETE FROM ledger_history WHERE project = %s AND row_id = 'old'", (P,))
+        cur.execute("DELETE FROM ledger_rows WHERE project = %s AND row_id = 'old'", (P,))
+
+    monkeypatch.setattr(ledger_import, "_insert_rows", and_delete)
+    rc, report = _import(path, "--catch-up")
+    assert rc == 1 and report["result"] == "rolled back", report
+    assert _sql(hub, "SELECT row_id FROM ledger_rows ORDER BY row_id") == [("a",), ("old",)]
+
+
+def test_a_catch_up_that_reorders_imported_history_rolls_back(hub, tmp_path, monkeypatch):
+    from khipu import ledger_import
+
+    doc = {"rows": {"a": _row("a", history=[{"at": "2026-10-01T00:00:00Z", "event": "first"},
+                                             {"at": "2026-10-02T00:00:00Z", "event": "second"}])}}
+    path = _write(tmp_path, doc)
+    assert _import(path)[0] == 0
+    doc["rows"]["a"]["history"].append({"at": "2026-10-03T00:00:00Z", "event": "third"})
+    _write(tmp_path, doc)
+    real = ledger_import._insert_history
+
+    def swap(cur, project, entries):
+        real(cur, project, entries)
+        cur.execute("UPDATE ledger_history SET raw = CASE raw->>'event' "
+                    "WHEN 'first' THEN '{\"at\": \"2026-10-02T00:00:00Z\", \"event\": \"second\"}'::jsonb "
+                    "WHEN 'second' THEN '{\"at\": \"2026-10-01T00:00:00Z\", \"event\": \"first\"}'::jsonb "
+                    "ELSE raw END WHERE project = %s AND row_id = 'a' AND raw IS NOT NULL", (P,))
+
+    monkeypatch.setattr(ledger_import, "_insert_history", swap)
+    rc, report = _import(path, "--catch-up")
+    assert rc == 1 and report["result"] == "rolled back", report
+    assert [e.get("event") for e in _export()["a"]["history"]] == ["first", "second"]

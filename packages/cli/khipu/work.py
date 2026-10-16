@@ -3,12 +3,10 @@ docs/plans/2026-10-15-work-view.md, Part B).
 
 Each project's job runner writes a summary file (``work-summary.json``,
 format 1, schema in ``docs/formats/work-summary-1.schema.json``). Khipu only
-reads it: the private-folder and login-folder checks before anything is
-opened, then one open (``O_RDONLY | O_NONBLOCK | O_NOFOLLOW``) by name from a
-descriptor of its folder, reached one folder at a time without following a
-link, and ``fstat`` on what was opened (a regular file with one name, size
-checked; no lock, no temp file). A summary file reached through a link is
-refused. Nothing here writes a project's files or sends anything to a runner.
+reads it, through ``khipu.safe_read`` (the private-folder and login-folder
+checks, an open that follows no link, a regular file with one name, size
+checked, and the name checked again after the read; no lock, no temp file).
+Nothing here writes a project's files or sends anything to a runner.
 
 ``build_view`` folds the summaries, the ledger, Khipu's open commitments that
 need the user and the routing record into one document, ``khipu-work-view``
@@ -25,17 +23,17 @@ from __future__ import annotations
 import argparse
 import copy
 import difflib
-import errno
 import hashlib
 import json
 import os
 import re
-import stat
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
+
+from khipu import safe_read
 
 FORMAT = "khipu-work-summary"
 FORMAT_VERSION = 1
@@ -692,100 +690,19 @@ def _failed(state: str, problem: str, last: dict | None, cfg: dict, **detail: An
             **detail}
 
 
-class _Refused(Exception):
-    """A private or login folder, or a link on the way to the file."""
-
-
 def _private_place(path: str) -> bool:
-    """A private place or a login folder: the same list of login folders
-    the final scan scrubs (agent_view's)."""
-    from khipu import agent_view, routing_sources
+    return safe_read.private_place(path)
 
+
+def _open_checked(path: Path, limit: int) -> safe_read.Opened:
+    """``safe_read.open_file``, with a file over ``limit`` as ``Unreadable``
+    (``too_big``). Raises ``safe_read.Refused``, ``FileNotFoundError`` or
+    ``OSError`` otherwise."""
     try:
-        return routing_sources.private_path(path) or agent_view.in_login_folder(path) \
-            or agent_view.in_login_folder(os.path.realpath(path))
-    except Exception:  # noqa: BLE001  (unsure is private)
-        return True
-
-
-def _system_links_resolved(folder: str) -> str:
-    """``folder`` with only its first name resolved, and only when that is a
-    link the system owns at the top of the disk (``/tmp``, ``/var`` and
-    ``/etc`` on macOS). Every other link stays, so the walk refuses it."""
-    parts = Path(folder).parts
-    if len(parts) < 2:
-        return folder
-    top = os.path.join("/", parts[1])
-    try:
-        st = os.lstat(top)
-    except OSError:
-        return folder
-    if not stat.S_ISLNK(st.st_mode) or st.st_uid != 0:
-        return folder
-    real = os.path.realpath(top)
-    return os.path.join(real, *parts[2:]) if real != top else folder
-
-
-def _open_summary(path: Path) -> int:
-    """A read-only descriptor for the summary file at ``path``. Its folder is
-    checked (only a system link at the top resolved), then reached one folder at a time from ``/`` with
-    ``O_NOFOLLOW``, and the file opened by name from that folder's
-    descriptor with ``O_NOFOLLOW``: a link anywhere on the way, put there
-    before or after the checks, is refused, never followed."""
-    path = Path(os.path.abspath(os.fspath(path.expanduser())))
-    if _private_place(str(path)):
-        raise _Refused
-    folder = _system_links_resolved(str(path.parent))
-    if _private_place(os.path.join(folder, path.name)):
-        raise _Refused
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        try:
-            for part in Path(folder).parts[1:]:
-                step = os.open(part, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow, dir_fd=fd)
-                os.close(fd)
-                fd = step
-            return os.open(path.name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | nofollow, dir_fd=fd)
-        except OSError as exc:
-            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                raise _Refused from None
-            raise
-    finally:
-        os.close(fd)
-
-
-def _read_fd(fd: int, most: int) -> bytes:
-    chunks: list[bytes] = []
-    got = 0
-    while got < most:
-        chunk = os.read(fd, min(65536, most - got))
-        if not chunk:
-            break
-        chunks.append(chunk)
-        got += len(chunk)
-    return b"".join(chunks)
-
-
-def _open_checked(path: Path, limit: int) -> tuple[int, os.stat_result]:
-    """``_open_summary`` and ``fstat`` on what it opened: a regular file
-    with one name (a hard link could be another name for a private file),
-    no larger than ``limit`` (0: no limit). Raises ``_Refused``,
-    ``FileNotFoundError``, ``Unreadable`` (``too_big``) or ``OSError``."""
-    fd = _open_summary(path)
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError("not a regular file")
-        if st.st_nlink > 1:
-            raise _Refused
-        if limit and st.st_size > limit:
-            raise Unreadable("too_big", f"The summary file is {_kb(st.st_size)}, over the {_kb(limit)} limit.",
-                             size=st.st_size, limit=limit)
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd, st
+        return safe_read.open_file(path, limit)
+    except safe_read.TooBig as exc:
+        raise Unreadable("too_big", f"The summary file is {_kb(exc.size)}, over the {_kb(limit)} limit.",
+                         size=exc.size, limit=limit) from None
 
 
 def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
@@ -804,8 +721,8 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
     last = last if isinstance(last, dict) and last.get("project_key") == project else None
     limit = cfg["work_file_max_bytes"]
     try:
-        fd, st = _open_checked(path, limit)
-    except _Refused:
+        opened = _open_checked(path, limit)
+    except safe_read.Refused:
         return {"state": "refused", "problem": SOURCE_PROBLEMS["refused"], "contents": None}
     except FileNotFoundError:
         return {"state": "missing", "problem": SOURCE_PROBLEMS["missing"], "contents": None}
@@ -813,6 +730,7 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
         return _failed(exc.state, exc.problem, last, cfg, **exc.detail)
     except OSError:
         return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last, cfg)
+    st = opened.st
     try:
         # Which file was read (its name as set, device and inode) as well as
         # its times and size: another file with the same time and size is
@@ -823,7 +741,10 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
             parsed = last["contents"]
         else:
             try:
-                data = _read_fd(fd, limit or st.st_size or 1)
+                data = opened.read(limit or st.st_size or 1)
+                opened.recheck()
+            except safe_read.Refused:
+                return {"state": "refused", "problem": SOURCE_PROBLEMS["refused"], "contents": None}
             except OSError:
                 return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last, cfg)
             try:
@@ -840,7 +761,7 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
             except OSError:
                 pass  # the last good read is a convenience; this read still shows
     finally:
-        os.close(fd)
+        opened.close()
     age = (now - _parse_time(parsed["written_at"])).total_seconds()
     stale = _stale_after(cfg, parsed)
     # Each limit is reached at its instant (>=), the instant build_view
@@ -1413,8 +1334,8 @@ def check_file(path: str) -> tuple[bool, list[str], dict | None]:
     cfg = settings()
     limit = cfg["work_file_max_bytes"]
     try:
-        fd, st = _open_checked(Path(path), limit)
-    except _Refused:
+        opened = _open_checked(Path(path), limit)
+    except safe_read.Refused:
         return False, [SOURCE_PROBLEMS["refused"]], None
     except FileNotFoundError:
         return False, ["No file at that path."], None
@@ -1423,11 +1344,14 @@ def check_file(path: str) -> tuple[bool, list[str], dict | None]:
     except OSError as exc:
         return False, [f"The file can't be read ({routing_sources._short_error(exc)})."], None
     try:
-        data = _read_fd(fd, limit or st.st_size or 1)
+        data = opened.read(limit or opened.st.st_size or 1)
+        opened.recheck()
+    except safe_read.Refused:
+        return False, [SOURCE_PROBLEMS["refused"]], None
     except OSError as exc:
         return False, [f"The file can't be read ({routing_sources._short_error(exc)})."], None
     finally:
-        os.close(fd)
+        opened.close()
     try:
         parsed = parse_summary(data, None, cfg, _now())
     except Unreadable as exc:

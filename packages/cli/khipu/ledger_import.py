@@ -3,8 +3,8 @@ in the tracker's shape (Work view phase 2; docs/plans/2026-10-15-work-view.md,
 "Importing an existing tracker").
 
 A tracker file is one JSON object, ``{"rows": {id: row}}``. It is opened once,
-read-only, with no link followed on the way (``_open_tracker``); a private or
-login folder is refused before anything is opened, and a name repeated in one
+read-only, through ``khipu.safe_read`` (no link followed, one name, a private or
+login folder refused before anything is opened), and a name repeated in one
 JSON object is refused rather than one copy dropped. No size limit: the
 no-loss rule wins. Khipu never writes, moves or deletes it.
 
@@ -24,17 +24,15 @@ row back as it was.
 """
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import os
-import stat
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from khipu import ledger
+from khipu import ledger, safe_read
 from khipu.ledger import LedgerError
 
 TRACKER_KEYS = ("id", "title", "kind", "parent", "state", "evidence", "owner", "updated", "history")
@@ -91,110 +89,6 @@ def _listed(ids: list[str]) -> str:
     return shown + (f" and {len(ids) - _SHOWN} more" if len(ids) > _SHOWN else "")
 
 
-class _Refused(Exception):
-    """A private or login folder, or a link on the way to the file."""
-
-
-def _login_folder(path: str) -> bool:
-    """Whether ``path`` is in a login folder Khipu knows (configured,
-    discovered, in the routing record or a harness default), decided from
-    names and links alone: nothing inside one is listed or opened."""
-    from khipu import agent_view
-
-    home = agent_view._home_dir()
-    target = agent_view._fold(path.rstrip("/"))
-    for harness, raw in agent_view._homes(None, agent_view._saved_view()):
-        if raw is None:
-            folder = agent_view._DEFAULT_FOLDERS.get(harness)
-            if not folder or not home:
-                continue
-            raw = os.path.join(home, folder)
-        for form in agent_view._forms(raw, home):
-            form = agent_view._fold(form.rstrip("/"))
-            if not form.startswith("~") and (target == form or target.startswith(form + "/")):
-                return True
-    return False
-
-
-def _private_place(path: str) -> bool:
-    from khipu import routing_sources
-
-    try:
-        return routing_sources.private_path(path) or _login_folder(path) \
-            or _login_folder(os.path.realpath(path))
-    except Exception:  # noqa: BLE001  (unsure is private)
-        return True
-
-
-def _system_links_resolved(folder: str) -> str:
-    """``folder`` with only its first name resolved, and only when that is a
-    link the system owns at the top of the disk (``/tmp``, ``/var`` and
-    ``/etc`` on macOS). Every other link stays, so the walk refuses it.
-    (A copy of work.py's, kept here so the two readers stay independent.)"""
-    parts = Path(folder).parts
-    if len(parts) < 2:
-        return folder
-    top = os.path.join("/", parts[1])
-    try:
-        st = os.lstat(top)
-    except OSError:
-        return folder
-    if not stat.S_ISLNK(st.st_mode) or st.st_uid != 0:
-        return folder
-    real = os.path.realpath(top)
-    return os.path.join(real, *parts[2:]) if real != top else folder
-
-
-def _open_tracker(path: Path) -> int:
-    """A read-only descriptor for the tracker at ``path``. Its folder is
-    checked (only a system link at the top resolved), then reached one folder at a time from ``/`` with
-    ``O_NOFOLLOW``, and the file opened by name from that folder's
-    descriptor with ``O_NOFOLLOW``: a link anywhere on the way, put there
-    before or after the checks, is refused, never followed. The opened file
-    must be a regular file with one name (a hard link could be another name
-    for a private file)."""
-    if _private_place(str(path)):
-        raise _Refused
-    folder = _system_links_resolved(str(path.parent))
-    if _private_place(os.path.join(folder, path.name)):
-        raise _Refused
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    directory = getattr(os, "O_DIRECTORY", 0)
-    fd = os.open("/", os.O_RDONLY | directory)
-    try:
-        try:
-            for part in Path(folder).parts[1:]:
-                step = os.open(part, os.O_RDONLY | directory | nofollow, dir_fd=fd)
-                os.close(fd)
-                fd = step
-            got = os.open(path.name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | nofollow, dir_fd=fd)
-        except OSError as exc:
-            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                raise _Refused from None
-            raise
-    finally:
-        os.close(fd)
-    try:
-        st = os.fstat(got)
-        if stat.S_ISDIR(st.st_mode):
-            raise IsADirectoryError("a folder, not a file")
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError("not a regular file")
-        if st.st_nlink > 1:
-            raise _Refused
-    except BaseException:
-        os.close(got)
-        raise
-    return got
-
-
-def _read_all(fd: int) -> bytes:
-    chunks: list[bytes] = []
-    while chunk := os.read(fd, 1 << 20):
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
 class _Repeated(ValueError):
     def __init__(self, key: str):
         super().__init__(key)
@@ -222,12 +116,8 @@ def read_tracker(path: str | os.PathLike) -> dict[str, Any]:
 
     p = Path(os.path.abspath(Path(path).expanduser()))
     try:
-        fd = _open_tracker(p)
-        try:
-            data = _read_all(fd)
-        finally:
-            os.close(fd)
-    except _Refused:
+        data, _st = safe_read.read_file(p)
+    except safe_read.Refused:
         raise LedgerError("Not read: the file is inside a private folder or a login folder, or is reached through a link.",
                           "refused") from None
     except OSError as exc:
@@ -269,7 +159,9 @@ def read_tracker(path: str | os.PathLike) -> dict[str, Any]:
         raise LedgerError("Nothing was imported; these rows can't be taken as they are: " + "; ".join(problems[:_SHOWN])
                           + (f"; and {len(problems) - _SHOWN} more" if len(problems) > _SHOWN else ""), "bad_rows")
     other = sorted(k for k in doc if k != "rows")
-    return {"name": p.name, "digest": hashlib.sha256(data).hexdigest(), "rows": rows, "masked": masked,
+    # The name goes into reports and ledger_imports.file_name: a key-shaped
+    # name is masked like any other string from the file.
+    return {"name": redact_secrets(p.name, force=True)[0], "digest": hashlib.sha256(data).hexdigest(), "rows": rows, "masked": masked,
             "other_keys": [redact_secrets(k, force=True)[0] for k in other]}
 
 
@@ -557,23 +449,26 @@ def _compare(expected: dict[str, dict], got: dict[str, dict]) -> list[str]:
 
 
 def _snapshot(cur, project: str) -> dict[str, Any]:
-    """The whole project as it stands in this transaction: every row id
-    (removed rows included), each live row in the tracker's shape with the
-    entries that came from an old file, and each row's own entries (every
-    one not from an old file, in order, by content)."""
-    cur.execute("SELECT row_id FROM ledger_rows WHERE project = %s", (project,))
-    ids = {r[0] for r in cur.fetchall()}
-    rows = export_rows(cur, project, raw_only=True)
-    cur.execute(f"SELECT row_id, {', '.join(_OWN_COLS)} FROM ledger_history WHERE project = %s AND raw IS NULL "
-                "ORDER BY id", (project,))
-    own: dict[str, list[str]] = {}
+    """The whole project as it stands in this transaction: every row, live
+    and removed, with all its columns (``all``); every row's whole history in
+    order with all its columns, entries from an old file included (``hist``);
+    and each live row in the tracker's shape with the entries that came from
+    an old file (``rows``)."""
+    cur.execute(f"SELECT {', '.join(ledger._ROW_COLS)} FROM ledger_rows WHERE project = %s", (project,))
+    every = {}
+    for values in cur.fetchall():
+        row = dict(zip(ledger._ROW_COLS, values, strict=True))
+        every[row["row_id"]] = row
+    cols = ", ".join(c if c != "has_raw" else "raw IS NOT NULL" for c in _ALL_HIST)
+    cur.execute(f"SELECT row_id, {cols} FROM ledger_history WHERE project = %s ORDER BY id", (project,))
+    hist: dict[str, list[dict]] = {}
     for row_id, *values in cur.fetchall():
-        own.setdefault(row_id, []).append(_entry_key(values))
-    return {"ids": ids, "rows": rows, "own": own}
+        hist.setdefault(row_id, []).append(dict(zip(_ALL_HIST, values, strict=True)))
+    return {"ids": set(every), "all": every, "hist": hist, "rows": export_rows(cur, project, raw_only=True)}
 
 
-_OWN_COLS = ("id", "at", "at_text", "author", "shape", "from_state", "to_state", "changes", "note", "event", "op_id",
-             "source")
+_ALL_HIST = ("id", "at", "at_text", "author", "shape", "from_state", "to_state", "changes", "note", "event", "raw",
+             "has_raw", "op_id", "source")
 
 
 def _history_counter(row: dict[str, Any] | None) -> Counter:
@@ -584,12 +479,20 @@ def _fields(row: dict[str, Any] | None) -> dict[str, Any]:
     return {k: v for k, v in (row or {}).items() if k != "history"}
 
 
-def _unchanged(before: dict[str, Any], after: dict[str, Any], ids) -> list[str]:
-    """Rows the import had no business changing that read differently now."""
+def _ids_differ(before: dict[str, Any], after: dict[str, Any], new: set[str], what: str) -> list[str]:
+    want = before["ids"] | new
+    return ([f"{i}: in the ledger but not {what}" for i in sorted(after["ids"] - want)]
+            + [f"{i}: missing from the ledger" for i in sorted(want - after["ids"])])
+
+
+def _unchanged(before: dict[str, Any], after: dict[str, Any], skip: set[str]) -> list[str]:
+    """Every row, live or removed, and every row's history, that the import
+    had no business changing, compared column by column and entry by entry
+    in order, both ways."""
     out = []
-    for row_id in sorted(ids):
-        if before["rows"].get(row_id) != after["rows"].get(row_id) \
-                or before["own"].get(row_id, []) != after["own"].get(row_id, []):
+    for row_id in sorted((set(before["all"]) | set(before["hist"]) | set(after["hist"])) - skip):
+        if before["all"].get(row_id) != after["all"].get(row_id) \
+                or before["hist"].get(row_id, []) != after["hist"].get(row_id, []):
             out.append(f"{row_id}: changed, though the import does not touch it")
     return out
 
@@ -598,17 +501,20 @@ def _verify(cur, project: str, expected: dict[str, dict], counts: dict[str, Any]
             before: dict[str, Any]) -> dict[str, Any]:
     """The whole project against the file, inside the import's transaction:
     the rows that were not here before are exactly the file's rows, each
-    reading back field by field with its history in order, plus one
-    "Imported from" line each; the rows that were here before read as they
-    did."""
+    reading back field by field with its history in order, then one
+    "Imported from" line; every row that was here before, live or removed,
+    reads as it did, history and all."""
     after = _snapshot(cur, project)
-    scope = after["ids"] - before["ids"]
-    got = {i: r for i, r in after["rows"].items() if i in scope}
-    differs = _compare(expected, got)
-    differs += [f"{i}: in the ledger but not in the file" for i in sorted(scope - set(expected))]
-    differs += [f"{i}.history: {len(after['own'].get(i, []))} import line(s), not 1"
-                for i in sorted(scope & set(expected)) if len(after["own"].get(i, [])) != 1]
-    differs += _unchanged(before, after, before["ids"])
+    new = set(expected) - before["ids"]
+    got = {i: r for i, r in after["rows"].items() if i in new}
+    differs = _ids_differ(before, after, new, "in the file")
+    differs += _compare(expected, got)
+    for row_id in sorted(new):
+        hist = after["hist"].get(row_id, [])
+        own = [h for h in hist if not h["has_raw"]]
+        if len(own) != 1 or hist[-1] is not own[0] or not (own[0]["op_id"] or "").startswith(MARKER_OP):
+            differs.append(f"{row_id}.history: {len(own)} entries of Khipu's, not one import line at the end")
+    differs += _unchanged(before, after, new)
     ledger_counts = tracker_counts(got)
     mismatched = [k for k in ("rows", "history", "by_state", "by_kind", "with_parent") if counts[k] != ledger_counts[k]]
     return {"ok": not differs and not mismatched, "counts_in_ledger": ledger_counts, "counts_differ": mismatched,
@@ -928,39 +834,50 @@ def _bring_fields(cur, project: str, row_id: str, row: dict[str, Any], now: date
 def _verify_catch_up(cur, project: str, rows: dict[str, dict], plan: dict[str, Any], adds: dict[str, list],
                      before: dict[str, Any]) -> dict:
     """The whole project against what the catch-up meant to do, inside its
-    transaction: the rows now are the rows before plus the new ones; a new
-    row reads back as the file has it; each row's entries from old files are
-    exactly the ones it had plus the ones brought in (as a multiset, both
-    ways); an updated row reads as the file has it and holds one more entry
-    of Khipu's, a row changed in both places keeps its values and holds one
-    more; every other row reads as it did."""
+    transaction, every row live or removed: the rows now are the rows before
+    plus the new ones; a new row reads back as the file has it, with no entry
+    of Khipu's; a row the catch-up touched keeps its whole history as it was,
+    in order, followed by exactly the file's new entries in the file's order
+    and then one entry of Khipu's if it was updated and one if it changed in
+    both places; an updated row reads as the file has it, any other keeps
+    its values (a row changed in both places notes the file's version in
+    ``refs``); every other row and its history read as they did."""
     after = _snapshot(cur, project)
     new = set(plan["new_rows"])
-    differs: list[str] = []
-    if after["ids"] != before["ids"] | new:
-        extra = sorted(after["ids"] - before["ids"] - new)
-        lost = sorted((before["ids"] | new) - after["ids"])
-        differs += [f"{i}: in the ledger but not brought in" for i in extra]
-        differs += [f"{i}: missing from the ledger" for i in lost]
-    differs += _compare({i: rows[i] for i in plan["new_rows"]}, {i: after["rows"].get(i) for i in new
+    touched = set(adds) | set(plan["updated"]) | set(plan["both"])
+    differs = _ids_differ(before, after, new, "brought in")
+    differs += _compare({i: rows[i] for i in plan["new_rows"]}, {i: after["rows"][i] for i in new
                                                                  if i in after["rows"]})
-    differs += [f"{i}.history: {len(after['own'].get(i, []))} entries of Khipu's, not 0" for i in sorted(new)
-                if after["own"].get(i)]
-    for row_id in sorted(set(before["rows"]) - new):
-        was, now_row = before["rows"][row_id], after["rows"].get(row_id)
-        want = _history_counter(was) + Counter(_entry_key(e) for e in adds.get(row_id, []))
-        if _history_counter(now_row) != want:
-            differs.append(f"{row_id}.history")
-        expect_fields = _fields(rows[row_id]) if row_id in plan["updated"] else _fields(was)
-        if _fields(now_row) != expect_fields:
+    differs += [f"{i}.history: entries of Khipu's, not 0" for i in sorted(new)
+                if any(not h["has_raw"] for h in after["hist"].get(i, []))]
+    for row_id in sorted(touched):
+        had, has = before["hist"].get(row_id, []), after["hist"].get(row_id, [])
+        tail = has[len(had):]
+        added = [_entry_key(e) for e in adds.get(row_id, [])]
+        ops = [CATCH_UP_OP] * (row_id in plan["updated"]) + [BOTH_OP] * (row_id in plan["both"])
+        if has[:len(had)] != had:
+            differs.append(f"{row_id}.history: the entries it had changed")
+        elif [_entry_key(h["raw"]) for h in tail[:len(added)] if h["has_raw"]] != added \
+                or len(tail) != len(added) + len(ops) \
+                or any(h["has_raw"] or not (h["op_id"] or "").startswith(op) for h, op in zip(tail[len(added):], ops)):
+            differs.append(f"{row_id}.history: not the file's {len(added)} new entries in order and {len(ops)} of "
+                           "Khipu's")
+        was, now_row = before["all"][row_id], after["all"].get(row_id)
+        if now_row is None:
+            continue
+        if row_id in plan["updated"]:
+            fixed = ("seq", "created_at", "link", "removed_at", "removed_by", "removed_note")
+            if any(was[k] != now_row[k] for k in fixed) or _fields(after["rows"].get(row_id)) != _fields(rows[row_id]):
+                differs.append(f"{row_id}: fields")
+            continue
+        def plain(row: dict[str, Any]) -> dict[str, Any]:
+            refs = dict(row["refs"] or {})
+            if row_id in plan["both"] and isinstance(refs.get("imported"), dict):
+                refs["imported"] = {k: v for k, v in refs["imported"].items() if k != "file"}
+            return {**row, "refs": refs}
+        if plain(was) != plain(now_row):
             differs.append(f"{row_id}: fields")
-        # Khipu's own entries are the ones it had, unchanged and in order,
-        # plus one for an updated row and one for a row changed in both places.
-        had, has = before["own"].get(row_id, []), after["own"].get(row_id, [])
-        own = len(had) + (row_id in plan["updated"]) + (row_id in plan["both"])
-        if len(has) != own or has[:len(had)] != had:
-            differs.append(f"{row_id}.history: {len(has)} entries of Khipu's, not the {len(had)} it had plus "
-                           f"{own - len(had)}")
+    differs += _unchanged(before, after, new | touched)
     return {"ok": not differs, "fields_differ": differs[:_SHOWN], "fields_differ_count": len(differs),
             "counts_differ": []}
 

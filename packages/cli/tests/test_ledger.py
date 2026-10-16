@@ -24,7 +24,27 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 MIGRATIONS = REPO / "ops" / "migrations"
-INITDB, PG_CTL = shutil.which("initdb"), shutil.which("pg_ctl")
+
+
+def _pg_tool(name: str) -> str | None:
+    """``name`` on PATH, else from a usual PostgreSQL install, so the rollback
+    and concurrency tests run on a scratch database rather than skip when a
+    shell's PATH leaves the install out."""
+    import glob
+
+    found = shutil.which(name)
+    if found:
+        return found
+    for pattern in ("/opt/homebrew/opt/postgresql@*/bin", "/usr/local/opt/postgresql@*/bin",
+                    "/opt/homebrew/bin", "/usr/local/bin", "/Applications/Postgres.app/Contents/Versions/*/bin",
+                    "/usr/lib/postgresql/*/bin"):
+        for folder in sorted(glob.glob(pattern), reverse=True):
+            if os.access(os.path.join(folder, name), os.X_OK):
+                return os.path.join(folder, name)
+    return None
+
+
+INITDB, PG_CTL = _pg_tool("initdb"), _pg_tool("pg_ctl")
 P = "acme/widget"
 KEY = "sk-ant-" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4"
 
