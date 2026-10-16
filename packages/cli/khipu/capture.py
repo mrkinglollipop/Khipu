@@ -1045,21 +1045,42 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
     env = dict(os.environ)
     if suppress_mirror:
         env["KHIPU_MIRROR"] = "0"
+    # The registry flock is the file writer's write lock: hold it through the
+    # child process so a forget cannot complete after this final check and
+    # before the legacy writer appends its line.
     try:
-        proc = run_text(
-            [sys.executable, str(capture_v2)],
-            input=wire.dumps(payload),
-            env=env,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        # The PG row is already durable when we get here in dual/hub, and the
-        # PG-failure path has already queued to the outbox — so a hung file leg
-        # is a bad exit code, never an uncaught traceback out of the hook.
-        _log(f"capture_v2 timed out after 300s ({capture_v2})")
-        return EX_SOFTWARE
-    except OSError as exc:
-        _log(f"capture_v2 could not run: {type(exc).__name__}: {exc}")
+        from khipu.tombstones import RegistryError, subprocess_lock_handoff, write_guard
+
+        with write_guard(payload) as allowed:
+            if not allowed:
+                _log("forgotten source → file wiki leg skipped")
+                return 0
+            handoff_env, pass_fds = subprocess_lock_handoff()
+            # Do not propagate a caller's stale/fabricated lock marker. Only
+            # the owned guard above can export a descriptor to this child.
+            for name in ("KHIPU_TOMBSTONE_LOCK_FD", "KHIPU_TOMBSTONE_LOCK_DEV",
+                         "KHIPU_TOMBSTONE_LOCK_INO", "KHIPU_TOMBSTONE_REGISTRY"):
+                env.pop(name, None)
+            env.update(handoff_env)
+            try:
+                proc = run_text(
+                    [sys.executable, str(capture_v2)],
+                    input=wire.dumps(payload),
+                    env=env,
+                    timeout=300,
+                    pass_fds=pass_fds,
+                )
+            except subprocess.TimeoutExpired:
+                # The PG row is already durable when we get here in dual/hub, and the
+                # PG-failure path has already queued to the outbox — so a hung file leg
+                # is a bad exit code, never an uncaught traceback out of the hook.
+                _log(f"capture_v2 timed out after 300s ({capture_v2})")
+                return EX_SOFTWARE
+            except OSError as exc:
+                _log(f"capture_v2 could not run: {type(exc).__name__}: {exc}")
+                return EX_SOFTWARE
+    except RegistryError as exc:
+        _log(f"tombstone registry unavailable; file wiki leg refused ({exc})")
         return EX_SOFTWARE
     if proc.stdout.strip():
         print(proc.stdout.rstrip())

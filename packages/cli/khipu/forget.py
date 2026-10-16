@@ -160,6 +160,23 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         if (not has_merged_sources and original is not None
                 and not any(_same_identity(original, known) for known in candidates)):
             candidates.append(original)
+    # Publish before _candidate_hashes reads any local legacy line. This is the
+    # one privacy linearization point shared by every local writer; raw keeps
+    # pre-0027 episodes covered when no source rows exist yet.
+    receipts = raw.get("merged_from") if isinstance(raw, dict) else None
+    tombstone_payloads = ([raw] if isinstance(raw, dict) else []) + [
+        receipt["payload"] for receipt in (receipts if isinstance(receipts, list) else [])
+        if isinstance(receipt, dict) and isinstance(receipt.get("payload"), dict)
+    ] if isinstance(raw, dict) else []
+    registry_error: str | None = None
+    try:
+        from khipu.tombstones import RegistryError, publish_forget
+
+        publish_forget(source_rows, tombstone_payloads, candidates)
+    except RegistryError as exc:
+        # Keep the hub tombstone/cascade semantics intact, but absolutely do
+        # not touch a local store when the writer fence could not be published.
+        registry_error = str(exc)
     # A legacy line another episode also holds is evidence of that episode.
     # Erasing it would lose that episode's line, so it stays and the forget
     # reports itself incomplete. The live identity gets no exemption: an edit
@@ -167,7 +184,8 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     held = _held_elsewhere(cur, episode_id, candidates, sources=sources)
     # Another episode can hold a line by payload hash alone: a source row whose
     # legacy identity was never recorded, or a merge receipt without its payload.
-    hashes = _candidate_hashes(candidates, source_rows or [], raw, memory_root)
+    hashes = _candidate_hashes(candidates, source_rows or [], raw,
+                              None if registry_error else memory_root)
     owned = _owned_elsewhere(cur, episode_id, set().union(*hashes), sources=sources)
     shared = [i in held or bool(h & owned) for i, h in zip(candidates, hashes)]
     shared_identities = [i for i, s in zip(candidates, shared) if s]
@@ -236,6 +254,7 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         "source_rows": source_rows,
         "unidentified_sources": unidentified_sources,
         "shared_identities": shared_identities,
+        "registry_error": registry_error,
     }
 
 
@@ -381,7 +400,8 @@ def _candidate_hashes(candidates: list[dict[str, Any]], source_rows: list[dict[s
                       raw: Any, memory_root: Path | None) -> list[set[str]]:
     """For each candidate identity, every payload hash a copy of its line is
     known by: this episode's source rows and raw payloads, and each legacy
-    line carrying the identity, as written and as redacted."""
+    line carrying the identity, as written and as redacted. Its caller
+    publishes the tombstone registry before this local scan."""
     import copy
 
     from khipu.capture import _redact_capture_values
@@ -1157,6 +1177,21 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
             out = forget_episode(cur, episode_id, memory_root=memory_root)
         conn.commit()
     if not out.get("ok"):
+        return out
+    if out.get("registry_error"):
+        error = str(out["registry_error"])
+        out.update({
+            "complete": False,
+            "partial": ["tombstone_registry"],
+            "remaining": ["local tombstone registry was not published"],
+            "partial_errors": {"tombstone_registry": [error]},
+            "locations": [{"place": "tombstone registry", "path": None,
+                           "state": "not checked", "why": error}],
+            "ok": False,
+            "error": "forget incomplete; remaining stores: tombstone_registry",
+            "kept": KEPT,
+        })
+        out["message"] = plain_summary(out)
         return out
     partial: list[str] = []
     try:

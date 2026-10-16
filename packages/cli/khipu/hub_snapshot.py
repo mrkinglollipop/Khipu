@@ -1556,7 +1556,54 @@ def _write_deliverable_rows(
     )
 
 
+def _tombstone_payload_for_episode(episode_row: Mapping[str, Any]) -> dict[str, Any]:
+    """A capture-shaped identity for the local tombstone fence.
+
+    Incremental snapshot callers also pass DB presentation fields such as
+    ``id`` and aware ``ingested_at`` datetimes. Those are not capture
+    identity, and feeding them to canonical JSON would reject an otherwise
+    supported snapshot update.
+    """
+    raw = episode_row.get("raw")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    if isinstance(raw, dict):
+        return dict(raw)
+    payload: dict[str, Any] = {}
+    for field, value in episode_row.items():
+        if field in {"id", "ingested_at", "deleted_at", "raw"}:
+            continue
+        payload[field] = value.isoformat() if hasattr(value, "isoformat") else value
+    return payload
+
+
 def upsert_episode(
+    episode_row: Mapping[str, Any],
+    embedding_rows: Sequence[Mapping[str, Any]],
+    decision_rows: Sequence[Mapping[str, Any]] = (),
+    deliverable_rows: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Write-through fenced by the durable forgotten-source registry."""
+    from khipu.tombstones import RegistryError, write_guard
+
+    payload = _tombstone_payload_for_episode(episode_row)
+    try:
+        # Keep this lock through the SQLite transaction below. Forget takes it
+        # before its replica erase, so a late incremental write cannot restore
+        # a source after forget returns.
+        with write_guard(payload) as allowed:
+            if not allowed:
+                return {"ok": False, "error": "forgotten source"}
+            return _upsert_episode_unfenced(episode_row, embedding_rows, decision_rows,
+                                            deliverable_rows)
+    except RegistryError as exc:
+        return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
+
+
+def _upsert_episode_unfenced(
     episode_row: Mapping[str, Any],
     embedding_rows: Sequence[Mapping[str, Any]],
     decision_rows: Sequence[Mapping[str, Any]] = (),

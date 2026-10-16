@@ -211,3 +211,28 @@ Replica alias lookup.
 - Whether any historical row lacks both a `session_id` and a stored payload; phase 1's fallback covers it.
 - The audit's claim that an unconfigured `run_capture_v2` returns 70 on the hub-only path was read from the
   code, not reproduced live.
+
+## P2 durable-forget race checkpoint (2026-10-15)
+
+- **Status:** implemented; targeted gates pass; whole suite remains red
+- **Output:** `/tmp/khipu-forget-structural-p2/`; final root evidence in
+  `/tmp/khipu-forget-root-evidence/verification.md`
+- **Scope:** publish a durable local forgotten-source registry before local erase scans; make local capture,
+  outbox, and replica writers reject its source/payload identities under their write locks.
+- **Oracle attempts:** worker ran one collection-only failure and one behavioral failing-first selector.
+  Root ran the focused glob three times (final: 336 passed, 18 skipped, 22 subtests passed), the subprocess
+  selector twice (red, then 4 passed), and the whole suite three times. No further suite run was made.
+- **Evidence:** `failing-first.log` records the discarded collection-only failure; `behavioral-red.log` records
+  the three real pre-fix races (two file writers and a late outbox enqueue). Static syntax compilation passed;
+  no worker green pytest was run.
+- **Follow-up evidence:** root's source review exposed legacy-child lock inheritance (`subprocess-red.log`: one
+  real deadlock failure, one refusal pass). The writer now hands its owned lock FD to the child and validates
+  device/inode/path before treating it as borrowed; `subprocess-green.log` records all four checks passing.
+- **Final whole suite:** 4,844 passed, 50 failed, 46 errors, 129 skipped, 3 deselected, 2 xpassed,
+  3,888 subtests passed. Of the 96 failure/error results, 89 are socket PermissionErrors (listed separately
+  in `socket-permission-errors.txt`). The seven other failures are five CLI argument cases reproduced
+  against HEAD CLI source, one temporal `KeyError: 'time_interpretation'`, and one temporary-directory
+  cleanup `OSError: [Errno 66] Directory not empty`. The last two remain unresolved; their causes are
+  unverified. No capture/forget/outbox race or subprocess-registry test failed in this final run.
+- **Boundary:** synthetic interleavings and local subprocesses only; real PostgreSQL concurrency remains
+  unverified. No live hub, commit, or push.

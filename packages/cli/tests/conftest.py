@@ -102,6 +102,25 @@ def _reset_table_columns_cache():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_tombstone_registry(tmp_path, monkeypatch):
+    """A forgotten source is intentionally process-durable in production.
+
+    Tests reuse fixture source identities, so each test receives its own
+    state-root registry instead of allowing one test's completed forget to
+    change a later test's setup.
+    """
+    from khipu import tombstones
+    from khipu.paths import isolated_dir
+
+    def test_registry_path():
+        isolated = isolated_dir()
+        return ((isolated / "forgotten_sources.json") if isolated is not None
+                else (tmp_path / "state" / "forgotten_sources.json"))
+
+    monkeypatch.setattr(tombstones, "registry_path", test_registry_path)
+
+
+@pytest.fixture(autouse=True)
 def _reset_project_for_cwd_cache():
     # Same reason as above: a per-process cache that is right in a one-shot
     # hook and wrong between tests that fake different projects for one path.
