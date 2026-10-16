@@ -424,6 +424,81 @@ class JobsMetadataTest(unittest.TestCase):
                 chosen = jobs.nightly_log_path()
             self.assertEqual(chosen.name, "khipu-nightly.out.log")
 
+    def _entry_with(self, *, log_age_s: float | None, receipt_ts: str | None):
+        """Build the nightly entry with a stale launchd stdout log (the app's
+        CLI has no KHIPU_LEGACY_LOG_DIR, so it reads this one) and an optional
+        run receipt from ``_run_script``."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            log_dir = td_path / "logs"
+            log_dir.mkdir()
+            data_dir = td_path / "data"
+            if log_age_s is not None:
+                out = log_dir / "khipu-nightly.out.log"
+                out.write_text("old\n")
+                t = __import__("time").time() - log_age_s
+                os.utime(out, (t, t))
+            with mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(data_dir)}), \
+                 mock.patch.object(jobs, "LOG_DIR", log_dir), \
+                 mock.patch.object(jobs, "LOG_DIR_LEGACY", None), \
+                 mock.patch.object(jobs, "_plist_loaded", return_value=True):
+                if receipt_ts is not None:
+                    state = data_dir / "state"
+                    state.mkdir(parents=True)
+                    (state / "job-nightly.json").write_text(
+                        json.dumps({"exit": 0, "ts": receipt_ts}) + "\n"
+                    )
+                return jobs._job_entry("nightly")
+
+    def test_last_run_prefers_a_newer_run_receipt_over_a_stale_log(self):
+        # Live 2026-10-15: the nightly ran at 06:09Z (receipt, exit 0) but its
+        # output went to the legacy log dir, so the app read a 6-day-old log.
+        from datetime import datetime, timedelta, timezone
+
+        recent = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        entry = self._entry_with(log_age_s=6 * 86400, receipt_ts=recent)
+        self.assertEqual(entry["last_run_iso"], recent)
+        self.assertEqual(entry["last_run_source"], "receipt")
+
+    def test_last_run_falls_back_to_the_log_without_a_receipt(self):
+        entry = self._entry_with(log_age_s=3600, receipt_ts=None)
+        self.assertIsNotNone(entry["last_run_iso"])
+        self.assertEqual(entry["last_run_source"], "log")
+
+    def test_last_run_is_unknown_without_any_evidence(self):
+        entry = self._entry_with(log_age_s=None, receipt_ts=None)
+        self.assertIsNone(entry["last_run_iso"])
+        self.assertIsNone(entry["last_run_source"])
+
+    def test_log_paths_come_from_the_installed_plist(self):
+        # Codex 2026-10-15: notes_watch writes no receipt, and its plist sent
+        # output to a legacy dir the desktop CLI's environment never names.
+        import plistlib
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            agents = td_path / "LaunchAgents"
+            agents.mkdir()
+            legacy = td_path / "legacy"
+            legacy.mkdir()
+            out = legacy / "khipu-notes-watch.out.log"
+            err = legacy / "khipu-notes-watch.err.log"
+            out.write_text("ran\n")
+            with open(agents / f"{jobs.PLIST_NOTES_WATCH}.plist", "wb") as f:
+                plistlib.dump({"Label": jobs.PLIST_NOTES_WATCH,
+                               "StandardOutPath": str(out),
+                               "StandardErrorPath": str(err)}, f)
+            with mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(td_path / "data")}), \
+                 mock.patch.object(jobs, "_launchagents_dir", return_value=agents), \
+                 mock.patch.object(jobs, "LOG_DIR", td_path / "logs"), \
+                 mock.patch.object(jobs, "LOG_DIR_LEGACY", None), \
+                 mock.patch.object(jobs, "_plist_loaded", return_value=True):
+                entry = jobs._job_entry("notes_watch")
+        self.assertEqual(entry["log_path"], str(out))
+        self.assertEqual(entry["err_log_path"], str(err))
+        self.assertEqual(entry["last_run_source"], "log")
+        self.assertIsNotNone(entry["last_run_iso"])
+
     def test_job_status_shape(self):
         with mock.patch.object(jobs, "_job_entry", side_effect=lambda name: {"name": name}):
             out = jobs.job_status()

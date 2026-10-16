@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -694,7 +695,7 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
 NIGHTLY_STEP_STALE_HOURS = 36
 
 
-def _hours_since(ts: Any) -> float | None:
+def _parse_ts(ts: Any) -> datetime | None:
     if not ts:
         return None
     try:
@@ -703,6 +704,13 @@ def _hours_since(ts: Any) -> float | None:
         return None
     if t.tzinfo is None:
         t = t.replace(tzinfo=timezone.utc)
+    return t
+
+
+def _hours_since(ts: Any) -> float | None:
+    t = _parse_ts(ts)
+    if t is None:
+        return None
     return (datetime.now(timezone.utc) - t).total_seconds() / 3600
 
 
@@ -978,10 +986,32 @@ def graph_plist_path() -> Path:
     return legacy
 
 
+def _installed_log_paths(plist: Path, stem: str) -> tuple[Path, Path]:
+    """Where launchd actually sends this job's output: the installed plist's
+    StandardOutPath/StandardErrorPath. The caller's environment is not the
+    job's (the desktop CLI has no KHIPU_LEGACY_LOG_DIR), so it only decides
+    when no plist is installed or it names no path."""
+    out_log, err_log = None, None
+    try:
+        with open(plist, "rb") as f:
+            data = plistlib.load(f)
+        if isinstance(data, dict):
+            if isinstance(data.get("StandardOutPath"), str):
+                out_log = Path(data["StandardOutPath"])
+            if isinstance(data.get("StandardErrorPath"), str):
+                err_log = Path(data["StandardErrorPath"])
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        pass
+    if out_log is None or err_log is None:
+        env_out, env_err = _log_paths(stem)
+        out_log, err_log = out_log or env_out, err_log or env_err
+    return out_log, err_log
+
+
 def _job_entry(name: str) -> dict[str, Any]:
     spec = _JOB_SPECS[name]
     plist = _plist_path(spec["plist"])
-    out_log, err_log = _log_paths(spec["log_stem"])
+    out_log, err_log = _installed_log_paths(plist, spec["log_stem"])
     last_run_mtime: float | None = None
     try:
         if out_log.is_file():
@@ -996,6 +1026,23 @@ def _job_entry(name: str) -> dict[str, Any]:
         pass
     state = _read_job_state(name)
     last_exit = state.get("exit") if state else None
+    # The run receipt is the evidence a scheduled job finished; the out log
+    # alone is not. On a Mac with KHIPU_LEGACY_LOG_DIR in its plists the job
+    # writes its output there, while the app's CLI (no such env) reads the
+    # launchd stdout file, which only moves when something prints to stdout.
+    # Take the newer of the two; None means there is no evidence either way.
+    log_ts = (
+        datetime.fromtimestamp(last_run_mtime, tz=timezone.utc)
+        if last_run_mtime is not None
+        else None
+    )
+    receipt_ts = _parse_ts(state.get("ts")) if state else None
+    if receipt_ts is not None and (log_ts is None or receipt_ts >= log_ts):
+        last_run_iso, last_run_source = state.get("ts"), "receipt"
+    elif log_ts is not None:
+        last_run_iso, last_run_source = log_ts.isoformat(), "log"
+    else:
+        last_run_iso, last_run_source = None, None
     # Lazy import: launchd_gen imports from this module (_JOB_SPECS,
     # _plist_path, etc.), so importing it at module scope here would be a
     # circular import. Deferring it into the function body breaks the cycle
@@ -1021,11 +1068,8 @@ def _job_entry(name: str) -> dict[str, Any]:
         "log_path": str(out_log),
         "err_log_path": str(err_log),
         "last_run_mtime": last_run_mtime,
-        "last_run_iso": (
-            datetime.fromtimestamp(last_run_mtime, tz=timezone.utc).isoformat()
-            if last_run_mtime is not None
-            else None
-        ),
+        "last_run_iso": last_run_iso,
+        "last_run_source": last_run_source,
         "plist_loaded": _plist_loaded(spec["plist"]),
         "plist_current": current,
         "expected": expected,
