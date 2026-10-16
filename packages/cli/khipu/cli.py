@@ -477,8 +477,17 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
         "dsn_present": bool(local["secrets"].get("dsn")) and not local["secrets"].get("error"),
         "skipped": "hub, network and probe checks (run plain `khipu doctor` for those)",
     }
+    # The one hub read --quick makes: the code this gate is about to promote
+    # may ship a migration the hub has not had. An unreachable hub is not
+    # gated here (--quick skips reachability); a pending migration is.
+    from khipu.migrate import doctor_check as _schema_check
+
+    schema = _schema_check()
+    out["schema_migrations"] = schema
+    out["schema_migrations_ok"] = not schema.get("pending")
+    out["warnings"] = list(schema.get("warnings") or [])
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
-                 and all(bool(local[k]) for k in LOCAL_GATES))
+                 and all(bool(local[k]) for k in LOCAL_GATES) and out["schema_migrations_ok"])
     print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
 
@@ -497,7 +506,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # 2026-10-15, most of it waiting on the network).
     from concurrent.futures import ThreadPoolExecutor
 
-    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="khipu-doctor")
+    pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="khipu-doctor")
     try:
         workers = _doctor_start_workers(pool, args, mem, sample_drift)
         return _cmd_doctor_body(args, workers, mem, status_payload, backup_health)
@@ -581,6 +590,9 @@ def _doctor_start_workers(pool, args, mem, sample_drift) -> dict:
     # Every check that reads only this Mac; `doctor --quick` gates on the same
     # set (khipu.promote's first gate step).
     workers["local"] = pool.submit(_doctor_local_checks, mem)
+    from khipu.migrate import doctor_check as _schema_check
+
+    workers["schema"] = pool.submit(_schema_check)
     return workers
 
 
@@ -700,6 +712,14 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         notes_organise = organise.last_run()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         notes_organise = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The last migration run's table lock hold times: info only, never gates
+    # `ok`. None when no migration that locks tables has run on this Mac.
+    try:
+        from khipu import migrate as _migrate
+
+        notes_migrate = _migrate.last_lock_notes()
+    except Exception as e:  # noqa: BLE001
+        notes_migrate = {"error": f"{type(e).__name__}: {e}"}
     # K9: gateway per-token liveness, read over the network from the
     # deployed gateway's own /healthz (never deployed by doctor itself).
     # Applicable only when a gateway_url is configured.
@@ -808,6 +828,12 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     else:
         graph = graph_error
     embed_coverage, embed_coverage_ok, topics_lag = embed_future.result()
+    # Pending migrations: red. With the hub down the read fails too; hub_ok
+    # is already red for that, so the schema row says why it was not checked.
+    schema = workers["schema"].result()
+    if not hub_ok and schema.get("error"):
+        schema = {**schema, "ok": True, "skipped": "the database did not answer"}
+    schema_ok = bool(schema.get("ok"))
     liveness.setdefault("harnesses", {})["gateway"] = gw_liveness
     if not gw_liveness.get("ok", True):
         liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
@@ -846,6 +872,13 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         ledger_block = _ledger.doctor_block()
     except Exception as e:  # noqa: BLE001  (a failed check must not crash doctor)
         ledger_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # The live view's summary files (Work view phase 3): warns, never gates `ok`.
+    try:
+        from khipu import work as _work
+
+        work_block = _work.doctor_block()
+    except Exception as e:  # noqa: BLE001  (a failed check must not crash doctor)
+        work_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -875,6 +908,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
         "notes_organise": notes_organise,
+        "notes_migrate": notes_migrate,
         "nightly_steps": nightly_steps,
         "topics_embed_lag": topics_lag,
         "topics_embed_lag_minutes": topics_lag.get("lag_minutes"),
@@ -888,9 +922,12 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "plan_usage": plan_usage_block,
         "routing": routing_block,
         "ledger": ledger_block,
-        # Warnings that never gate `ok` (plans nearly used up; routing; ledger).
+        "schema_migrations": schema,
+        "work": work_block,
+        # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
-                     + list(ledger_block.get("warnings") or [])),
+                     + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
+                     + list(schema.get("warnings") or [])),
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -939,6 +976,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             # below, and never reaches this aggregate.
             and bool(launchers.get("ok"))
             and local["ledger_outbox_ok"]
+            and schema_ok
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
@@ -971,6 +1009,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "launchers_ok": bool(launchers.get("ok")),
         "nightly_steps_ok": local["nightly_steps_ok"],
         "ledger_outbox_ok": local["ledger_outbox_ok"],
+        "schema_migrations_ok": schema_ok,
     }
     print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
@@ -2349,8 +2388,11 @@ def _reembed_episode(cur, episode_id: int) -> bool:
 
     cols = ("summary", "decisions", "preferences", "topics", "people")
     verbatim_col = _episode_verbatim_select(cur)
+    # A forgotten episode's vectors were removed on purpose; an edit of its
+    # tombstone must not put them back.
     cur.execute(
-        f"SELECT {', '.join(cols)}, {verbatim_col} AS verbatim FROM episodes WHERE id = %s",
+        f"SELECT {', '.join(cols)}, {verbatim_col} AS verbatim FROM episodes "
+        f"WHERE {_episode_live_clause(cur)}id = %s",
         (episode_id,),
     )
     row = cur.fetchone()
@@ -2389,7 +2431,10 @@ def _cmd_episode_edit(args: argparse.Namespace) -> int:
     reembedded = False
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE episodes SET summary = %s WHERE id = %s", (summary, eid))
+            # A forgotten episode is not edited: its re-embed would bring a
+            # vector back for a row every reader skips.
+            cur.execute("UPDATE episodes SET summary = %s WHERE id = %s AND deleted_at IS NULL",
+                        (summary, eid))
             updated = cur.rowcount > 0
             if updated:
                 try:
@@ -2416,10 +2461,12 @@ def cmd_episode(args: argparse.Namespace) -> int:
             "error": "usage: khipu episode forget ID | khipu episode edit ID --summary TEXT",
         }))
         return 2
-    from khipu.forget import forget_everywhere
+    from khipu.forget import forget_everywhere, plain_summary
 
     out = forget_everywhere(int(args.id))
     print(json.dumps(out, default=str))
+    # The JSON is for scripts; the same result in plain words goes to stderr.
+    print(out.get("message") or plain_summary(out), file=sys.stderr)
     snapshot_ok = (out.get("snapshot") or {}).get("ok", True)
     legacy_reason = str((out.get("legacy_file") or {}).get("reason") or "")
     legacy_ok = not legacy_reason.startswith("unreadable:")
@@ -2441,7 +2488,9 @@ def cmd_topic(args: argparse.Namespace) -> int:
     slug = args.slug
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT deleted_at FROM topics WHERE slug = %s", (slug,))
+            # Locked first: an embedding catch-up holds this row shared while it
+            # writes vectors, so neither can leave vectors for a purged topic.
+            cur.execute("SELECT deleted_at FROM topics WHERE slug = %s FOR UPDATE", (slug,))
             row = cur.fetchone()
             if row is None:
                 print(json.dumps({"ok": False, "error": f"no such topic: {slug}"}))
@@ -2460,11 +2509,31 @@ def cmd_topic(args: argparse.Namespace) -> int:
             revisions_removed = cur.rowcount
             cur.execute("DELETE FROM topics WHERE slug = %s", (slug,))
         conn.commit()
+    # The hub delete is durable from here; this Mac's replica would keep
+    # serving the topic until the next full refresh unless it is purged too.
+    from khipu.hub_snapshot import purge_topic_in_snapshot
+
+    replica = purge_topic_in_snapshot(slug)
+    replica_ok = bool(replica.get("ok"))
     print(json.dumps({
-        "ok": True, "slug": slug, "revisions_removed": revisions_removed,
+        "ok": replica_ok, "slug": slug, "revisions_removed": revisions_removed,
         "embeddings_removed": embeddings_removed,
+        "hub": {"ok": True, "revisions_removed": revisions_removed,
+                "embeddings_removed": embeddings_removed},
+        "replica": replica,
     }))
-    return 0
+    if not replica_ok:
+        message = (
+            f"Purged topic {slug} from the hub, but this Mac's local replica still "
+            f"has it ({replica.get('reason')}) and can still return it. The "
+            "replica drops it at its next full refresh, which copies the hub."
+        )
+    elif not replica.get("applicable", True):
+        message = f"Purged topic {slug} from the hub. This Mac has no local replica."
+    else:
+        message = f"Purged topic {slug} from the hub and from this Mac's local replica."
+    print(message, file=sys.stderr)
+    return 0 if replica_ok else 1
 
 
 def cmd_backfill(args: argparse.Namespace) -> int:
@@ -3035,37 +3104,34 @@ def cmd_config(args: argparse.Namespace) -> int:
         # `--set usage_accounts '[{"label": "Claude second", "harness":
         # "claude", "home": "~/.claude-second"}]'`; `--unset` (or `[]`) goes
         # back to every installed CLI with its default login.
-        from khipu import routing, usage
-        from khipu.config import set_usage_accounts
+        from khipu import accounts, routing, usage
+        from khipu.config import config_file
 
         # Decision 15: the owner's (the app, or a typed yes on a terminal),
         # or a conversation's at his request, marked until he answers it.
         request = via = None
-        if getattr(args, "at_owner_request", None) is not None:
-            words = routing._one_line(args.at_owner_request)
-            if not words:
-                print(json.dumps({"ok": False, "error": "describe the owner's request in one line",
-                                  "code": "request_needs_words"}))
-                return 2
-            request = {"request": words, "by": routing.conversation_author(), "at": routing._iso(routing._now())}
-        else:
-            auth = routing._OWNER_AUTH.set(None)
-            try:
-                via = routing._owner_via(args)
-            finally:
-                routing._OWNER_AUTH.reset(auth)
-            if via is None:
-                print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
-                return 2
-        expect = (getattr(args, "expect", None) or "").strip()
+        # The owner's check stays set through the save, so the record's
+        # lines about it say how it was authorised.
+        auth = routing._OWNER_AUTH.set(None)
         try:
-            if not expect:
-                # A save carries the version it read (``khipu accounts`` or
-                # ``config.accounts_version``), so a stale one never lands.
-                raise usage.AccountsError("say which version of the account list this change was made on "
-                                          "(--expect); read the list again first", "version_needed")
-            path = set_usage_accounts(args.set[1] if args.set else None, expect=expect, request=request,
-                                      via=None if request is not None else via)
+            if getattr(args, "at_owner_request", None) is not None:
+                words = routing._one_line(args.at_owner_request)
+                if not words:
+                    print(json.dumps({"ok": False, "error": "describe the owner's request in one line",
+                                      "code": "request_needs_words"}))
+                    return 2
+                request = {"request": words, "by": routing.conversation_author(),
+                           "at": routing._iso(routing._now())}
+            else:
+                via = routing._owner_via(args)
+                if via is None:
+                    print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
+                    return 2
+            # One write path for the list: the save becomes the account
+            # operations it implies (track, rename, stop, move), each with
+            # its lines in the routing record, on the version it read.
+            saved = accounts.save_list(args.set[1] if args.set else None, expect=getattr(args, "expect", None),
+                                       via=via or "cli", request=request)
         except usage.AccountsError as err:
             # A fixed code, the entry and the field at fault: the app says it
             # in its own words and never shows the text.
@@ -3074,7 +3140,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
-        print(json.dumps({"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(path)}))
+        finally:
+            routing._OWNER_AUTH.reset(auth)
+        print(json.dumps({"ok": True, "version": saved["version"], "usage_accounts": usage.accounts_status(),
+                          "config_file": str(config_file())}))
         return 0
     from khipu.config import CLI_SETTINGS
 
@@ -3117,6 +3186,19 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
         print(json.dumps({"ok": True, key: _ledger.settings_status()[key], "config_file": str(path)}))
+        return 0
+    from khipu import work as _work
+
+    if (args.set and args.set[0] in _work.SETTINGS) or args.unset in _work.SETTINGS:
+        # Every work-view limit and time (rule 7): `--set work_max_jobs 0`
+        # lifts it, `--unset` for the default again.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _work.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _work.settings_status()[key], "config_file": str(path)}))
         return 0
     from khipu import routing as _routing
 
@@ -3268,6 +3350,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "cli_settings": cli_settings_status(),
         "routing": _routing.settings_status(),
         "ledger": _ledger.settings_status(),
+        "work": _work.settings_status(),
         "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
         "config": load_config(),
@@ -4728,6 +4811,9 @@ def build_parser() -> argparse.ArgumentParser:
     from khipu import ledger as _ledger
 
     _ledger.add_parser(sub)
+    from khipu import work as _work
+
+    _work.add_parser(sub)
 
     nt = sub.add_parser("nightly", help="Run consolidate_nightly.py (memory wiki)")
     nt.set_defaults(func=cmd_nightly)
@@ -5547,7 +5633,7 @@ def build_parser() -> argparse.ArgumentParser:
     aauto = acc_sub.add_parser("auto-track", parents=[acc_owner],
                                help="Track found logins a conversation used without asking (on this Mac)")
     aauto.add_argument("state", choices=("on", "off"))
-    areq = acc_sub.add_parser("request", parents=[acc_owner],
+    areq = acc_sub.add_parser("request", parents=[acc_owner, acc_cas],
                               help="Answer a conversation's change to the account list")
     areq.add_argument("action", choices=("confirm", "undo"))
 

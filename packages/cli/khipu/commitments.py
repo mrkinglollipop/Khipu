@@ -1247,7 +1247,7 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
 
 def list_owed(cur, *, project: str | None = None, parent_session_id: str | None = None,
               session_id: str | None = None, status: str = "open",
-              limit: int = 50, hide_snoozed: bool = False) -> list[dict[str, Any]]:
+              limit: int | None = 50, hide_snoozed: bool = False) -> list[dict[str, Any]]:
     """``project`` if given, else ``parent_session_id``/``session_id`` (fix
     3) — the same coalesced key ``open_from_episode``/``auto_close`` store
     commitments under, so a caller with only session context (no resolved

@@ -138,7 +138,13 @@ def _by_path(out: dict) -> dict[str, dict]:
 
 
 def _accounts(*entries) -> None:
-    config.set_usage_accounts(json.dumps(list(entries)))
+    # The list as a hand-edited config holds it: a save through the app
+    # would stop (and turn down) the default logins it leaves out.
+    path = config.config_file()
+    data = json.loads(path.read_text()) if path.is_file() else {}
+    data["usage_accounts"] = list(entries)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
 
 
 # ---- source 1: names in the home folder ------------------------------------------------

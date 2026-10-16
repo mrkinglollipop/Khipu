@@ -113,28 +113,35 @@ def enqueue(payload: dict[str, Any], *, reason: str = "") -> Path:
     # Only the envelope says who owns a queued capture; the caller's own claim
     # is dropped here as write_pg drops it.
     payload = {k: v for k, v in payload.items() if k != "origin"}
-    with _locked_outbox() as d:
-        evidence = {"payload": payload, **stamp} if stamp else payload
-        digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False,
-                                          separators=(",", ":")).encode("utf-8")).hexdigest()
-        collision = d / f"{digest}.json"
-        if collision.exists():
-            if not _same_evidence(_read_job(collision), payload, stamp):
-                raise ValueError("outbox identity conflicts with existing evidence")
-            return collision
-        dst = d / f"{_identity(payload)}.json"
-        job = {"payload": payload, **stamp, "reason": reason,
-               "queued_at": datetime.now(timezone.utc).isoformat(), "attempts": 0}
-        if dst.exists():
-            try:
-                if _same_evidence(_read_job(dst), payload, stamp):
-                    return dst
-            except (OSError, ValueError, TypeError):
-                pass
-            # Keep legacy names for uncontested jobs; conflicting evidence gets
-            # a stable full-content hash rather than replacing either source.
-            dst = collision
-        _atomic_write(dst, job)
+    from khipu.tombstones import ForgottenSource, write_guard
+
+    # Registry first, then the outbox lock: forget takes the same order while
+    # it publishes and scans, so this check and atomic replace are one fence.
+    with write_guard(payload) as allowed:
+        if not allowed:
+            raise ForgottenSource("queued payload belongs to a forgotten source")
+        with _locked_outbox() as d:
+            evidence = {"payload": payload, **stamp} if stamp else payload
+            digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False,
+                                              separators=(",", ":")).encode("utf-8")).hexdigest()
+            collision = d / f"{digest}.json"
+            if collision.exists():
+                if not _same_evidence(_read_job(collision), payload, stamp):
+                    raise ValueError("outbox identity conflicts with existing evidence")
+                return collision
+            dst = d / f"{_identity(payload)}.json"
+            job = {"payload": payload, **stamp, "reason": reason,
+                   "queued_at": datetime.now(timezone.utc).isoformat(), "attempts": 0}
+            if dst.exists():
+                try:
+                    if _same_evidence(_read_job(dst), payload, stamp):
+                        return dst
+                except (OSError, ValueError, TypeError):
+                    pass
+                # Keep legacy names for uncontested jobs; conflicting evidence gets
+                # a stable full-content hash rather than replacing either source.
+                dst = collision
+            _atomic_write(dst, job)
     _log(f"queued {dst.name} ({reason or 'pg write failed'})")
     return dst
 
@@ -234,19 +241,62 @@ def retry_dead() -> dict[str, Any]:
     """Move every dead job back to the queue with attempts reset."""
     moved = 0
     quarantined = 0
-    with _locked_outbox() as d:
-        for jp in dead_jobs():
+    from khipu import memory_lock
+    from khipu.tombstones import RegistryError, write_guard
+
+    # Do not hold the outbox lock while taking the registry lock: forget takes
+    # the memory lock, the registry, then the outbox. A job is re-read under
+    # all of them before moving.
+    for jp in dead_jobs():
+        # One memory-lock hold per job, from its read to its move, taken
+        # before the outbox lock like every writer's.
+        with memory_lock.shared():
             try:
-                job = _read_job(jp)
+                with _locked_outbox():
+                    snapshot = jp.read_bytes()
+                    job = _read_job(jp)
             except (OSError, ValueError, TypeError) as exc:
-                _quarantine(jp, exc)
-                quarantined += 1
+                identifiable = None
+                try:
+                    envelope = json.loads(snapshot)
+                    if isinstance(envelope, dict) and isinstance(envelope.get("payload"), dict):
+                        identifiable = envelope["payload"]
+                except (UnboundLocalError, ValueError, TypeError):
+                    pass
+                if identifiable is None:
+                    with _locked_outbox():
+                        if jp.exists():
+                            _quarantine(jp, exc)
+                            quarantined += 1
+                    continue
+                try:
+                    with write_guard(identifiable) as allowed:
+                        with _locked_outbox():
+                            if jp.exists() and jp.read_bytes() == snapshot:
+                                if allowed:
+                                    _quarantine(jp, exc)
+                                    quarantined += 1
+                                else:
+                                    jp.unlink()
+                except RegistryError as registry_error:
+                    _log(f"retry-dead quarantine refused for {jp.name}: {registry_error}")
                 continue
-            job["attempts"] = 0
-            job.pop("buried_at", None)
-            _atomic_write(d / jp.name, job)
-            jp.unlink(missing_ok=True)
-            moved += 1
+            try:
+                with write_guard(job["payload"]) as allowed:
+                    with _locked_outbox() as d:
+                        if not jp.exists() or jp.read_bytes() != snapshot:
+                            continue
+                        if not allowed:
+                            jp.unlink(missing_ok=True)
+                            continue
+                        job["attempts"] = 0
+                        job.pop("buried_at", None)
+                        _atomic_write(d / jp.name, job)
+                        jp.unlink(missing_ok=True)
+                        moved += 1
+            except RegistryError as exc:
+                _log(f"retry-dead refused for {jp.name}: {exc}")
+                continue
     return {"moved": moved, "quarantined": quarantined, "pending": len(jobs())}
 
 
@@ -325,76 +375,143 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
         if limit is not None:
             js = js[:limit]
         out["jobs"] = len(js)
+        from khipu import memory_lock
         from khipu.capture import ClaimDeferred, write_pg
         from khipu.embed import embed_on_capture
         from khipu.request_context import replaying
+        from khipu.tombstones import RegistryError, write_guard
 
         for jp in js:
-            if deadline is not None and time.monotonic() >= deadline:
-                out["time_budget_exhausted"] = True
-                break
-            with _locked_outbox():
-                if not jp.exists():
+            # One memory-lock hold per job, from its read through the hub write,
+            # its vectors and the file's removal; a forget waits for at most one job.
+            with memory_lock.shared():
+                if deadline is not None and time.monotonic() >= deadline:
+                    out["time_budget_exhausted"] = True
+                    break
+                payload: dict[str, Any] | None = None
+                identifiable: dict[str, Any] | None = None
+                read_error: Exception | None = None
+                with _locked_outbox():
+                    if not jp.exists():
+                        continue
+                    try:
+                        snapshot = jp.read_bytes()
+                        job = _read_job(jp)
+                        payload = json.loads(json.dumps(job["payload"]))
+                    except (OSError, ValueError, TypeError) as e:
+                        read_error = e
+                        # A malformed envelope can still expose an identifiable
+                        # payload (for example a bad attempts field). Do not move
+                        # such a forgotten source into quarantine after forget's
+                        # scan: registry then outbox is the universal ordering.
+                        try:
+                            envelope = json.loads(snapshot)
+                            if isinstance(envelope, dict) and isinstance(envelope.get("payload"), dict):
+                                identifiable = envelope["payload"]
+                        except (UnboundLocalError, ValueError, TypeError):
+                            pass
+                        if identifiable is None:
+                            _quarantine(jp, read_error or ValueError("unreadable job"))
+                            out["quarantined"] = out.get("quarantined", 0) + 1
+                            continue
+                if identifiable is not None:
+                    try:
+                        with write_guard(identifiable) as allowed:
+                            with _locked_outbox():
+                                if jp.exists() and jp.read_bytes() == snapshot:
+                                    if not allowed:
+                                        jp.unlink()
+                                        out["forgotten"] = out.get("forgotten", 0) + 1
+                                    else:
+                                        _quarantine(jp, read_error or ValueError("unreadable job"))
+                                        out["quarantined"] = out.get("quarantined", 0) + 1
+                    except RegistryError as registry_error:
+                        out["registry_blocked"] = out.get("registry_blocked", 0) + 1
+                        _log(f"quarantine refused for {jp.name}: {registry_error}")
                     continue
+                if payload is None:
+                    continue
+                # The queued origin, not this drainer's context, owns the row. A job
+                # queued before origins were recorded is stamped as before.
+                owner = replaying(job["origin"]) if "origin" in job else nullcontext()
                 try:
-                    snapshot = jp.read_bytes()
-                    job = _read_job(jp)
-                    payload = json.loads(json.dumps(job["payload"]))
-                except (OSError, ValueError, TypeError) as e:
-                    _quarantine(jp, e)
-                    out["quarantined"] = out.get("quarantined", 0) + 1
+                    # The registry only fences local writes. Hub ``write_pg`` has
+                    # its own tombstoned-source protection and may do slow I/O;
+                    # holding the local flock here would make enqueue wait for a
+                    # replay. The final retry/bury write below is fenced again.
+                    with write_guard(payload) as allowed:
+                        if not allowed:
+                            with _locked_outbox():
+                                try:
+                                    if jp.read_bytes() == snapshot:
+                                        jp.unlink()
+                                except FileNotFoundError:
+                                    pass
+                            out["forgotten"] = out.get("forgotten", 0) + 1
+                            continue
+                    with owner:
+                        stats = write_pg(payload)
+                except RegistryError as e:
+                    # A corrupt or unavailable registry is a privacy failure, not
+                    # a retryable reason to overwrite a queued job.
+                    out["failed"] += 1
+                    out["registry_blocked"] = out.get("registry_blocked", 0) + 1
+                    _log(f"replay refused for {jp.name}: {e}")
                     continue
-            # The queued origin, not this drainer's context, owns the row. A job
-            # queued before origins were recorded is stamped as before.
-            owner = replaying(job["origin"]) if "origin" in job else nullcontext()
-            try:
-                with owner:
-                    stats = write_pg(payload)
-            except Exception as e:  # noqa: BLE001 — keep the job; note the attempt
-                out["failed"] += 1
-                job["attempts"] += 1
-                job["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
-                job["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
-                name = type(e).__name__
-                unreachable = "Operational" in name or "Connection" in name or "connect" in str(e).lower()
-                # A deferred origin claim is transient and its job holds the
-                # only record of the owner: retried, never buried.
-                deferred = isinstance(e, ClaimDeferred)
-                job["claim_deferred"] = deferred
-                if deferred:
-                    unreachable = False
-                    out["deferred"] = out.get("deferred", 0) + 1
+                except Exception as e:  # noqa: BLE001 — keep the job; note the attempt
+                    out["failed"] += 1
+                    job["attempts"] += 1
+                    job["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+                    job["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+                    name = type(e).__name__
+                    unreachable = "Operational" in name or "Connection" in name or "connect" in str(e).lower()
+                    # A deferred origin claim is transient and its job holds the
+                    # only record of the owner: retried, never buried.
+                    deferred = isinstance(e, ClaimDeferred)
+                    job["claim_deferred"] = deferred
+                    if deferred:
+                        unreachable = False
+                        out["deferred"] = out.get("deferred", 0) + 1
+                    try:
+                        # Recheck under the same registry lock at the actual
+                        # retry/bury write boundary; otherwise a forget between a
+                        # failed replay and this atomic replace could resurrect it.
+                        with write_guard(payload) as allowed:
+                            with _locked_outbox():
+                                try:
+                                    if jp.read_bytes() == snapshot:
+                                        if not allowed:
+                                            jp.unlink()
+                                            out["forgotten"] = out.get("forgotten", 0) + 1
+                                        elif not (unreachable or deferred) and job["attempts"] >= MAX_ATTEMPTS:
+                                            _bury(jp, job)
+                                            out["buried"] = out.get("buried", 0) + 1
+                                        else:
+                                            _atomic_write(jp, job)
+                                except OSError:
+                                    pass
+                    except RegistryError as registry_error:
+                        out["registry_blocked"] = out.get("registry_blocked", 0) + 1
+                        _log(f"retry state refused for {jp.name}: {registry_error}")
+                    if unreachable:
+                        out["stopped_early"] = True
+                        _log(f"PG unreachable ({name}); leaving remaining jobs queued")
+                        break
+                    _log(f"replay failed for {jp.name}: {name}: {e}")
+                    continue
+                if stats.get("episode_inserted"):
+                    try:
+                        embed_on_capture(payload, episode_id=stats.get("episode_id"))
+                    except Exception as e:  # noqa: BLE001 — row is durable; backfill heals vectors
+                        _log(f"embed skipped for {jp.name}: {e}")
                 with _locked_outbox():
                     try:
-                        # A concurrent forget/retry owns its change. Never
-                        # resurrect a removed job or overwrite a replacement.
                         if jp.read_bytes() == snapshot:
-                            if not (unreachable or deferred) and job["attempts"] >= MAX_ATTEMPTS:
-                                _bury(jp, job)
-                                out["buried"] = out.get("buried", 0) + 1
-                            else:
-                                _atomic_write(jp, job)
-                    except OSError:
+                            jp.unlink()
+                    except FileNotFoundError:
                         pass
-                if unreachable:
-                    out["stopped_early"] = True
-                    _log(f"PG unreachable ({name}); leaving remaining jobs queued")
-                    break
-                _log(f"replay failed for {jp.name}: {name}: {e}")
-                continue
-            if stats.get("episode_inserted"):
-                try:
-                    embed_on_capture(payload)
-                except Exception as e:  # noqa: BLE001 — row is durable; backfill heals vectors
-                    _log(f"embed skipped for {jp.name}: {e}")
-            with _locked_outbox():
-                try:
-                    if jp.read_bytes() == snapshot:
-                        jp.unlink()
-                except FileNotFoundError:
-                    pass
-            out["replayed"] += 1
-            _log(f"replayed {jp.name} (inserted={stats.get('episode_inserted')})")
+                out["replayed"] += 1
+                _log(f"replayed {jp.name} (inserted={stats.get('episode_inserted')})")
         return out
     finally:
         os.close(fd)

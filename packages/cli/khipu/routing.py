@@ -1275,7 +1275,7 @@ def _append_locked(*events: dict) -> None:
 _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", "basis", "source", "window",
                 "evidence", "until", "written_at", "via", "text", "file", "date", "sha256", "clock_at",
                 "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
-                "owner_request", "prior_text", "auth", "auth_chain")
+                "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries")
 _WHOLE_MOST = 2 ** 53
@@ -1441,6 +1441,16 @@ def _checked(data: dict) -> dict | None:
                 isinstance(p, list) and len(p) == 2 and all(isinstance(x, str) for x in p) for p in cuts):
             return None
         out["lanes_cut"] = [[_no_surrogates(x) for x in p] for p in cuts]
+    declines = data.get("declines")
+    if declines is not None:
+        # An account change's Not offered again changes: each an account
+        # key, and the reason or None (taken off).
+        if out["type"] != ACCOUNT_TXN or not isinstance(declines, list) or not all(
+                isinstance(d, dict) and isinstance(d.get("account"), str)
+                and (d.get("why") is None or isinstance(d["why"], str)) for d in declines):
+            return None
+        out["declines"] = [{"account": _no_surrogates(d["account"]),
+                            "why": None if d.get("why") is None else _no_surrogates(d["why"])} for d in declines]
     if "entries" in data:
         entries = _checked_entries(out["type"], data["entries"])
         if entries is None:
@@ -1485,9 +1495,62 @@ def _line_event(raw: bytes) -> dict | None:
     return _checked(data)
 
 
+ACCOUNT_TXN = "account_txn"
+
+
+def _split_txns(events: list[dict], held: str | None = None) -> tuple[list[dict], list[tuple[dict, list[dict]]]]:
+    """(the events that count, the account transactions left unfinished as
+    (begin line, its lines)). An account change is one transaction
+    (``accounts._commit``): its ``account_txn`` begin line and its own lines
+    (each with ``txn``) go down before the config is written, and count only
+    once its ``done`` line follows and no ``abort`` does. Transaction lines
+    themselves never reach the fold.
+
+    ``held``, the account list's version in the config now: an unfinished
+    change whose list the config already holds counts too, so a change
+    ``accounts.recover`` cannot yet finish is read as the config has it."""
+    begun = {e["id"]: e for e in events if e.get("type") == ACCOUNT_TXN and e.get("state") == "begin" and e.get("id")}
+    ends: dict[str, set[str]] = {}
+    for e in events:
+        if e.get("type") == ACCOUNT_TXN and e.get("state") in ("done", "abort") and e.get("target"):
+            ends.setdefault(e["target"], set()).add(e["state"])
+    done = {t for t, states in ends.items() if states == {"done"}}
+    if held is not None:
+        done |= {t for t, b in begun.items() if t not in ends and b.get("list_after") == held}
+    kept = [e for e in events if e.get("type") != ACCOUNT_TXN and (e.get("txn") is None or e["txn"] in done)]
+    open_ = [(b, [e for e in events if e.get("txn") == t and e.get("type") != ACCOUNT_TXN])
+             for t, b in begun.items() if t not in ends]
+    for i, event in enumerate(kept):
+        event["_seq"] = i
+    return kept, open_
+
+
 def read_events() -> tuple[list[dict], int]:
-    """Every event in write order with its place in that order (``_seq``),
-    and how many lines could not be read (kept in the file, left out of the
+    """Every event that counts (``_split_txns``) in write order with its
+    place in that order (``_seq``), and how many lines could not be read."""
+    events, bad = _read_all_events()
+    return _split_txns(events, _held_list())[0], bad
+
+
+def _held_list() -> str | None:
+    """The account list's version as the config stores it now, unsettled."""
+    from khipu import config
+
+    try:
+        return config.accounts_version(config.read_config_unsettled())
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def account_txns_open() -> list[tuple[dict, list[dict]]]:
+    """The account transactions begun and neither done nor aborted."""
+    return _split_txns(_read_all_events()[0])[1]
+
+
+def _read_all_events() -> tuple[list[dict], int]:
+    """Every line Khipu could have written, transaction lines included, in
+    write order with its place in that order (``_seq``), and how many lines
+    could not be read (kept in the file, left out of the
     fold). The file is read as bytes and each line decoded on its own, so one
     line that is not UTF-8, not JSON or not of a shape Khipu writes
     (``_line_event``) costs that line alone, never the read.
@@ -1528,7 +1591,7 @@ _AUTH_OF_VIA = {"app": "app", "cli": "terminal"}
 # Lines only the owner writes; the fold counts one with no author as his.
 _OWNER_ONLY = frozenset({"pause", "lift", "clear", "dismiss", "note_set", "note_end", "rule_confirm", "rule_retire",
                          "rule_restore", "rule_undo", "rule_dismiss", "priority_confirm", "priority_undo",
-                         "priority_clear", "account_move", "account_note"})
+                         "priority_clear", "priority_drop", "account_move", "account_note"})
 
 
 def _mark_unchecked(events: list[dict]) -> None:
@@ -1567,7 +1630,7 @@ def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
     line from the line written before it. A clock behind only some of the record (a
     line written ahead, then a right clock) keeps its own time, and the fold
     orders the lines as in phase 1a."""
-    events, _bad = read_events()
+    events, _bad = _read_all_events()
     seqs = [e["seq"] for e in events if isinstance(e.get("seq"), int)]
     first = _next_after(seqs, count, len(events))
     times = [t for t in (_parse(e.get("written_at")) for e in events) if t is not None]
@@ -1615,8 +1678,15 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     from khipu import usage
 
     # "Read no accounts" (settings clarity decision 14): no default login
-    # counts as read while it holds.
-    cfg["_accounts_none"] = usage.reads_none(config)
+    # counts as read while it holds. Nor while a list is stored: only its
+    # valid entries are read, so one holding none of them reads no account.
+    listed = config.get("usage_accounts")
+    cfg["_accounts_none"] = usage.reads_none(config) or (isinstance(listed, list) and bool(listed))
+    # Part of the priority's version: an account move, track or stop can
+    # change what a priority entry's key refers to.
+    from khipu.config import accounts_version
+
+    cfg["_accounts_version"] = accounts_version(config)
     seed = cfg.get("routing_rules_seed")
     fingerprint = {"events": events_stat, "config": config_stat, "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
@@ -1738,9 +1808,16 @@ def _owner_move(event: dict) -> tuple[str, str] | None:
     return old, new
 
 
-def _owner_tracked(event: dict) -> str | None:
+def _list_change(event: dict) -> bool:
+    """Whether an ``account_note`` records a change to the account list: the
+    owner's, or a conversation's made at his request (``owner_request``),
+    which changes the list at once (decision 15)."""
     by = event.get("written_by") or OWNER
-    if event.get("type") == "account_note" and event.get("state") == "tracked" and by.get("kind") == "owner":
+    return by.get("kind") == "owner" or (by.get("kind") == "conversation" and bool(event.get("owner_request")))
+
+
+def _owner_tracked(event: dict) -> str | None:
+    if event.get("type") == "account_note" and event.get("state") == "tracked" and _list_change(event):
         return event.get("account") or None
     return None
 
@@ -2228,7 +2305,10 @@ def _lane_mapped(runner, lane, lane_map: dict) -> bool:
 
 
 def _priority_mark(event: dict) -> str:
-    return "p" + str(event.get("id") or event.get("_seq"))
+    from khipu.config import version_part
+
+    # A version (``config.is_version``) whatever id a hand-written line carries.
+    return "p" + version_part(str(event.get("id") or event.get("_seq")))
 
 
 def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,
@@ -2472,10 +2552,27 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             if priority is not None:
                 priority_version = _priority_mark(event)
             priority = None
+        elif kind == "priority_drop" and priority is not None and info["account"]:
+            # An account the owner stopped tracking leaves the priority, a
+            # conversation's request waiting for him and the one it replaced
+            # alike; a request left with no account gives way to that one.
+            def without(held):
+                if held is None:
+                    return None
+                rest = [e for e in held["entries"] if e.get("account") != info["account"]]
+                return dict(held, entries=rest) if rest else None
+            prior = without(priority.get("prior"))
+            rest = without(priority)
+            if rest is None:
+                priority = prior if priority["pending"] else None
+            else:
+                priority = dict(rest, prior=prior) if priority["pending"] else rest
+            priority_version = _priority_mark(event)
         elif kind == "account_note" and info["account"] and event.get("state") in ACCOUNT_NOTE_STATES \
-                and info["written_by"].get("kind") == "owner":
-            notes[info["account"]] = {"state": event["state"], "text": event.get("text"), "at": info["at"],
-                                      "seq": info["seq"]}
+                and _list_change(event):
+            if info["written_by"].get("kind") == "owner":
+                notes[info["account"]] = {"state": event["state"], "text": event.get("text"), "at": info["at"],
+                                          "seq": info["seq"]}
             # Lanes whose label two accounts carried until this change: what
             # they reported before it stays unmatched, never the one left.
             for pair in event.get("lanes_cut") if isinstance(event.get("lanes_cut"), list) else ():
@@ -2595,6 +2692,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                           "written_by": note["written_by"], "via": note["via"]}
     labels = {e["key"]: e["label"] for e in entries}
     in_settings = {e["key"]: e["configured"] for e in entries}
+    if cfg.get("_accounts_version"):
+        priority_version = f"{priority_version}.{cfg['_accounts_version']}"
     priority_out, priority_ended = _fold_priority(priority, now, labels, in_settings, known_keys, none=none)
     if priority_out is not None:
         priority_out["version"] = priority_version
@@ -3195,7 +3294,7 @@ def _touched(kind: str | None, event: dict, info: dict) -> str | None:
         return f"rule:{event['n']}"
     if kind in ("note_set", "note_end"):
         return "note"
-    if kind in ("priority_set", "priority_confirm", "priority_undo", "priority_clear"):
+    if kind in ("priority_set", "priority_confirm", "priority_undo", "priority_clear", "priority_drop"):
         return "priority"
     return None
 
@@ -3543,8 +3642,11 @@ def _start_fold(now: datetime, *, save: bool) -> dict:
     prev = _load_view()
     if _fresh(prev, fingerprint, now):
         return dict(prev, checked_at=_iso(now))  # the fold it waited for saved it
-    events, bad = read_events()
-    if cfg.get("routing_rules_seed") and not any(e.get("type") == "seed_import" for e in events):
+    every, bad = _read_all_events()
+    events, unfinished = _split_txns(every, _held_list())
+    if unfinished or (cfg.get("routing_rules_seed") and not any(e.get("type") == "seed_import" for e in events)):
+        # An account change left unfinished is finished or rolled back
+        # first, under the locks, by ``read_view``.
         return read_view(now)
     with _finishing():
         fold_now, body, status = _fold_body(now, cfg, known, events, prev)
@@ -3578,6 +3680,17 @@ def _unsaved_view(now: datetime) -> dict:
     return _assemble(prev, body, now, bad, fingerprint, record=bool(events) or status is not None, saved=False)
 
 
+def _recover_accounts() -> None:
+    """Finish or roll back an account change left unfinished
+    (``accounts.recover``) before the record is folded. One that cannot be
+    settled yet is folded as the config holds it (``_split_txns``); every
+    account write is refused until it is."""
+    from khipu import accounts
+
+    with contextlib.suppress(accounts.AccountsError):
+        accounts.recover()
+
+
 def read_view(now: datetime | None = None) -> dict:
     """The current view. Refolds when an input file changed or
     ``valid_until`` has passed; otherwise answers from view.json. Either way
@@ -3604,6 +3717,7 @@ def read_view(now: datetime | None = None) -> dict:
         with _fold_turn(), _lock():
             if not explicit:
                 now = _now()  # the clock once the lock is ours, not before waiting for it
+            _recover_accounts()
             inputs = _inputs()
             prev = _load_view()
             if _fresh(prev, inputs[0], now):
@@ -3863,14 +3977,51 @@ def _owner_write(event: dict, via: str) -> dict:
     return _done(written, view)
 
 
-def owner_writes(events: list[dict], via: str) -> dict:
-    """Several of the owner's lines in one append and one refold (an
-    account's Stop tracking: its priority, its pause, its holds, its note)."""
-    if not events:
-        return {"ok": True, "ids": [], "version": None}
-    lines = [_owner_stamp(dict(e, written_by=OWNER, via=via, id=e.get("id") or _new_id("o"))) for e in events]
-    written, view = _write_many(lines)
-    out = {"ok": True, "ids": [w["id"] for w in written], "version": view.get("version")}
+def owner_lines(events: list[dict], via: str) -> list[dict]:
+    """The owner's lines about an account change (an account's Stop
+    tracking: its priority, its pause, its holds, its note)."""
+    return [_owner_stamp(dict(e, written_by=OWNER, via=via, id=e.get("id") or _new_id("o"))) for e in events]
+
+
+def request_lines(events: list[dict], author: dict, owner_request: str) -> list[dict]:
+    """A conversation's lines about the account list it changed at the
+    owner's request: written by it, with his request's words, so the fold
+    reads the change (a key tracked again ends its forwarding; a label left
+    to one account keeps what its lanes said before unmatched) and never
+    shows them as the owner's."""
+    words = _clean(owner_request, 0)
+    return [dict(e, written_by=dict(author), owner_request=words, via="cli", id=e.get("id") or _new_id("c"))
+            for e in events]
+
+
+def account_txn_begin(lines: list[dict], *, before: str, after: str, declines: list[dict] | None = None) -> str:
+    """Write an account change's intent (``accounts._commit``): its begin
+    line, naming the account list's version before and after and the logins
+    it adds to or takes off Not offered again (``declines``), and its own
+    lines, in one append. None of them counts until ``account_txn_end``
+    writes ``done``. The caller holds the routing lock; nothing is written
+    when this fails (a RouteError)."""
+    txn = _new_id("t")
+    begin = {"type": ACCOUNT_TXN, "state": "begin", "id": txn, "list_before": before, "list_after": after}
+    if declines:
+        begin["declines"] = [dict(d) for d in declines]
+    lines = [begin, *(dict(line, txn=txn) for line in lines)]
+    try:
+        with _lock():
+            for line, stamp in zip(lines, _stamp_locked(_now(), len(lines))):
+                line.update(stamp)
+            _append_locked(*lines)
+    except OSError as exc:
+        raise RouteError(f"Khipu can't write its routing record ({_io_phrase(exc, 'write')})") from None
+    return txn
+
+
+def account_txn_end(txn: str, state: str) -> dict:
+    """End an account transaction: ``done`` makes its lines count, ``abort``
+    leaves them out for good. Refolded once the line is down; a RouteError
+    when it is not."""
+    written, view = _write_many([{"type": ACCOUNT_TXN, "state": state, "target": txn}])
+    out = {"ok": True, "id": written[0]["id"], "version": view.get("version")}
     if view.get("saved") is False:
         out["saved"] = False
     return out
@@ -4132,6 +4283,12 @@ def priority_version(now: datetime | None = None) -> str:
     return read_view(now).get("priority_version") or "p0"
 
 
+def _needs_version(expect) -> None:
+    if not str(expect or "").strip():
+        raise PriorityVersionNeeded("say which version of the priority this change was made on (--expect); "
+                                    "read it again first")
+
+
 def _check_priority(expect, now: datetime | None) -> None:
     """Refuse when ``expect`` is given and the priority moved; the caller
     holds the routing lock until its write is down."""
@@ -4142,7 +4299,8 @@ def _check_priority(expect, now: datetime | None) -> None:
 def set_priority(entries, *, until=None, via: str, now: datetime | None = None, expect=None) -> dict:
     """The owner's priority, as given: confirmed, and in place of any
     request still waiting for him. ``expect`` is the priority's version as
-    read (``priority_version``): refused once it moved."""
+    read (``priority_version``), required: refused once it moved."""
+    _needs_version(expect)
     now = now or _now()
     rows = _priority_entries(entries, now=now, conversation=False)
     with _lock():
@@ -4155,8 +4313,16 @@ def request_priority(entries, *, until=None, owner_request: str | None = None, a
                      via: str = "mcp", now: datetime | None = None, expect=None) -> dict:
     """A priority a conversation sets at the owner's request: live at once,
     marked with that conversation and unconfirmed, with the priority it
-    replaced kept for Undo. A request waiting from another conversation is
-    the owner's to answer first, as with a standing rule."""
+    replaced kept for Undo. ``expect`` is the priority's version as read,
+    required, so of two requests made on one read only the first lands. A
+    request waiting from another conversation is the owner's to answer
+    first, as with a standing rule."""
+    _needs_version(expect)
+    return _request_priority(entries, until=until, owner_request=owner_request, author=author, via=via, now=now,
+                             expect=expect)
+
+
+def _request_priority(entries, *, until, owner_request, author, via: str, now: datetime | None, expect) -> dict:
     now = now or _now()
     request_words = _one_line(owner_request)
     if not request_words:
@@ -4187,6 +4353,9 @@ def _held_priority(now: datetime | None, *, pending: bool | None = None) -> dict
 
 
 def confirm_priority(*, via: str, now: datetime | None = None, expect=None) -> dict:
+    """Confirm the request the owner saw: ``expect``, the priority's version
+    as read, is required, so a newer request is never confirmed unseen."""
+    _needs_version(expect)
     with _lock():
         _check_priority(expect, now)
         _held_priority(now, pending=True)
@@ -4195,7 +4364,8 @@ def confirm_priority(*, via: str, now: datetime | None = None, expect=None) -> d
 
 def undo_priority(*, via: str, now: datetime | None = None, expect=None) -> dict:
     """Put back the priority a conversation's request replaced (none, when
-    there was none)."""
+    there was none). ``expect`` is required, as for Confirm."""
+    _needs_version(expect)
     with _lock():
         _check_priority(expect, now)
         _held_priority(now, pending=True)
@@ -4203,6 +4373,7 @@ def undo_priority(*, via: str, now: datetime | None = None, expect=None) -> dict
 
 
 def clear_priority(*, via: str, now: datetime | None = None, expect=None) -> dict:
+    _needs_version(expect)
     with _lock():
         _check_priority(expect, now)
         _held_priority(now)
@@ -5520,16 +5691,31 @@ def _conversation_write(args: dict, *, author: dict, now: datetime | None = None
     return end_hold(hold_id, owner=False, author=by, via="mcp", now=now)
 
 
-def conversation_priority(entries, *, until=None, owner_request: str, author: dict,
-                          now: datetime | None = None, lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+def conversation_priority(entries, *, until=None, owner_request: str, author: dict, expect=None,
+                          expect_current: bool = False, now: datetime | None = None,
+                          lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
     """What MCP ``khipu_route_priority`` writes (``request_priority``), with
     a conversation's fixed messages and lock budget, answered field by field:
-    each account by its label and its id, never its key."""
+    each account by its label and its id, never its key. ``expect``, the
+    priority's version as read when the request was built, is required: a
+    request never lands on a newer priority it was not built on. With
+    ``expect_current`` that version is read here, inside the same lock
+    budget, so a held lock answers busy in time."""
     by = dict(author or {})
     if by.get("harness") in (None, "", SHELL):
         by["harness"] = UNKNOWN_HARNESS
     with _for_a_conversation(), lock_budget(lock_wait):
-        written = request_priority(entries, until=until, owner_request=owner_request, author=by, via="mcp", now=now)
+        try:
+            if expect_current:
+                expect = priority_version(now)
+            # Under the routing lock it can replace only the owner's priority, as
+            # of ``expect``, or this conversation's own request, never another
+            # conversation's waiting one.
+            _needs_version(expect)
+            written = _request_priority(entries, until=until, owner_request=owner_request, author=by, via="mcp",
+                                        now=now, expect=expect)
+        except LockBusy:
+            raise RouteError("Khipu's routing record is busy; try again in a moment") from None
         view = read_view(now)
         held = _public_priority(view, now or _now(), plan_facts(view, now or _now()))
         out = {k: written[k] for k in _WRITE_FIELDS if k in written}
@@ -6192,16 +6378,24 @@ def _owner_via(args) -> str | None:
             return None
         _OWNER_AUTH.set({"auth": "app", "auth_chain": " < ".join(caller["chain"] + [caller["where"]])})
         return "app"
-    try:
-        if not sys.stdin.isatty():
-            return None
-        answer = input("This is an owner's change to the routing record. Type yes to confirm: ")
-    except (EOFError, OSError):
-        return None
-    if answer.strip().lower() != "yes":
+    if not typed_yes("This is an owner's change to the routing record. Type yes to confirm: "):
         return None
     _OWNER_AUTH.set({"auth": "terminal", "auth_chain": " < ".join(_caller()["chain"])})
     return "cli"
+
+
+def typed_yes(prompt: str) -> bool:
+    """The owner's typed confirmation: a yes typed on an interactive
+    terminal. A piped or redirected answer (stdin not a terminal) is never
+    asked for and never counts. Routing's and the ledger's owner commands
+    both use this one rule."""
+    try:
+        if not sys.stdin.isatty():
+            return False
+        answer = input(prompt)
+    except (EOFError, OSError):
+        return False
+    return answer.strip().lower() == "yes"
 
 
 def _owner_stamp(event: dict) -> dict:
@@ -6354,9 +6548,7 @@ def _priority_cli(args, now: datetime) -> int:
         return 2
     now = _now()
     expect = getattr(args, "expect", None)
-    if action in ("set", "clear") and not (expect or "").strip():
-        raise PriorityVersionNeeded("say which version of the priority this change was made on (--expect); "
-                                    "read it again first")
+    _needs_version(expect)
     if action == "set":
         out = set_priority(_priority_entries_arg(args), until=args.until, via=via, now=now, expect=expect)
     elif action == "confirm":

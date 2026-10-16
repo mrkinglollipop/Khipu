@@ -1097,6 +1097,9 @@ describe("Settings -> Routing: job runner folders, lanes, the table and changes"
     expect(screen.getByText("Current-state section changed 9:20 AM")).toBeInTheDocument();
     const today = screen.getByRole("list", { name: "Today" });
     expect(within(today).getAllByRole("listitem")[0]).toHaveTextContent("Standing rule 6 removed");
+    // Earlier days are loaded on request.
+    expect(screen.queryByRole("list", { name: "Yesterday" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show earlier days" }));
     expect(screen.getByRole("list", { name: "Yesterday" })).toHaveTextContent("Grok Build paused by you");
   });
 });

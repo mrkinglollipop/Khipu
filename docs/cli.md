@@ -160,7 +160,7 @@ Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `-
 - `hold WORDS`: hold work (`hold end ID` ends one). `--reason machine-busy|disk-low|keep|outage|other`, `--until`, one of `--account`, `--machine`, `--all`, and `--owner`.
 - `wait ACCOUNT`: waits for the account to open. Exits 0 when open, 1 on timeout. It launches nothing. `--timeout`, `--confirmed`.
 - `sources`: lists each runner folder with its last good read.
-- Owner commands, which need a typed confirmation on a terminal (or the app's Settings, Routing) and refuse without one: `pause`, `lift`, `clear`, `note {set,end}`, `priority {set,confirm,undo,clear}`, `rule {add,edit,retire,restore,confirm,undo,dismiss}`, and `hold --owner`. `priority show` needs none. With `--at-owner-request`, a conversation can record a `priority set` or a `rule add` or `rule edit` that stays unconfirmed until the owner confirms it.
+- Owner commands, which need a typed confirmation on a terminal (or the app's Settings, Routing) and refuse without one: `pause`, `lift`, `clear`, `note {set,end}`, `priority {set,confirm,undo,clear}`, `rule {add,edit,retire,restore,confirm,undo,dismiss}`, and `hold --owner`. `priority show` needs none. With `--at-owner-request`, a conversation can record a `priority set` or a `rule add` or `rule edit` that stays unconfirmed until the owner confirms it. Every `priority set` and `priority clear`, the owner's or a conversation's, carries `--expect` (the priority's version as read) and is refused without it or once the priority moved.
 
 ## Database, backups and other Macs
 

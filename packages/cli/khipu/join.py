@@ -398,6 +398,16 @@ def _check_payload_fields(payload: dict[str, Any]) -> None:
 
 
 def import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
+    """Apply a join kit. Holds the memory lock shared for the whole import,
+    like every other write to this Mac's data folder, so it never interleaves
+    with a forget."""
+    from khipu import memory_lock
+
+    with memory_lock.shared():
+        return _import_kit(blob, passphrase)
+
+
+def _import_kit(blob: bytes, passphrase: str) -> dict[str, Any]:
     from khipu import config as config_mod
     from khipu import keychain
     from khipu.config import CAPTURE_MODES, set_capture_mode, set_gateway_url

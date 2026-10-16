@@ -2,7 +2,7 @@
 // nothing is written until Next, and only what the owner changed.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { SetupAccountsStep } from "../SetupAccounts";
+import { accountId, planAccountList, SetupAccountsStep } from "../SetupAccounts";
 import { Welcome } from "../Welcome";
 
 const invokeMock = vi.fn();
@@ -783,5 +783,46 @@ describe("Setup › the rail", () => {
     expect(items[5]).toHaveTextContent("Accounts");
     expect(screen.getByText(/Setup is seven steps/)).toBeInTheDocument();
     expect(screen.getByText(/see how much of each plan is left/)).toBeInTheDocument();
+  });
+});
+
+describe("Setup › Accounts step, entries it did not change go back as stored (review round 4)", () => {
+  const untouched = { harness: "claude", label: "Untouched", home: ".claude-legacy" };
+  const status = {
+    source: "file" as const,
+    version: "av1",
+    user_home: "/Users/me",
+    value: [{ label: " Codex ", harness: "codex" }, untouched, 7],
+    accounts: [
+      { label: "Codex", harness: "codex", home: null },
+      { label: "Untouched", harness: "claude", home: ".claude-legacy", invalid: "relative folder" },
+      { label: "?", harness: "?", home: null, invalid: "this entry is not an account" },
+    ],
+  };
+
+  it("adds an account without dropping an invalid one or rewriting a valid one", () => {
+    const rows = [{ harness: "claude", home: "~/.claude-client", account: "Client" }] as never[];
+    const plan = planAccountList(status, new Map([[accountId("claude", "~/.claude-client", "/Users/me"), true]]), rows);
+    expect(plan.changed).toBe(true);
+    expect(plan.list).toEqual([
+      { label: " Codex ", harness: "codex" },
+      untouched,
+      7,
+      { label: "Client", harness: "claude", home: "~/.claude-client" },
+    ]);
+    expect(plan.labels).toEqual(["Codex", "Untouched", "?", "Client"]);
+  });
+
+  it("removes only the account unchecked, never matching an invalid entry", () => {
+    const plan = planAccountList(
+      status,
+      new Map([
+        [accountId("codex", null, "/Users/me"), false],
+        [accountId("claude", ".claude-legacy", "/Users/me"), false],
+      ]),
+      [],
+    );
+    expect(plan.list).toEqual([untouched, 7]);
+    expect([...plan.ids]).toEqual([]);
   });
 });

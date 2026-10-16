@@ -30,6 +30,7 @@ absent, never zero.
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import heapq
 import json
@@ -1011,7 +1012,7 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
         raise AccountsError('usage_accounts must be a list of {"label", "harness", "home"} entries', "bad_list")
     if len(raw) > ACCOUNTS_MAX:
         raise AccountsError(f"usage_accounts holds at most {ACCOUNTS_MAX} entries, got {len(raw)}", "too_many")
-    kept = [e for e in (previous or []) if isinstance(e, dict)]
+    kept = list(previous or [])
     # Ids all start "acct-" (``routing.account_id``): only a name that does
     # needs them worked out (which makes this install's id secret).
     ids = _account_ids(raw) if any(isinstance(e, dict)
@@ -1024,10 +1025,12 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
     checked: list[tuple[dict, bool]] = []
     for i, entry in enumerate(raw):
         where = f"usage_accounts entry {i + 1}"
-        if any(_same_entry(entry, old) for old in kept):
-            # Stored as it is: kept whatever per-entry rule it breaks today.
+        if any(_same_entry(entry, old) or (not isinstance(entry, dict) and type(entry) is type(old)
+                                           and entry == old) for old in kept):
+            # Stored as it is (an object, or any other JSON value): kept
+            # whatever per-entry rule it breaks today.
             checked.append((_account_from_entry(entry), True))
-            out.append(dict(entry))
+            out.append(copy.deepcopy(entry))
             continue
         if not isinstance(entry, dict):
             raise AccountsError(f"{where} is not an object", "bad_entry", index=i)
@@ -1160,10 +1163,11 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
         if account.get("invalid"):
             data = {"ok": False, "error": E_INVALID,
                     "note": f"This account entry is not valid: {account['invalid']}"}
-        elif home and harness in _HOME_VARS and not _login_folder_there(home):
+        elif harness in _HOME_VARS and not _login_folder_there(home or str(default_login(harness))):
             # Checked on the folder itself (nothing inside it is read): a CLI
             # pointed at a missing folder answers "not signed in", which a
-            # sign-in can't fix when the folder moved or was removed.
+            # sign-in can't fix when the folder moved or was removed. A
+            # home-less account reads its CLI's default folder.
             data = {"ok": False, "error": E_NO_FOLDER, "note": NO_FOLDER_NOTE}
         elif harness == "claude":
             data = probe_claude(home, timeout=timeout)
@@ -1245,17 +1249,24 @@ def _load_cache() -> dict[str, dict]:
     return {k: v for k, v in rows.items() if isinstance(v, dict)} if isinstance(rows, dict) else {}
 
 
-def _save_cache(rows: dict[str, dict]) -> None:
+def _save_cache(rows: dict[str, dict], *, strict: bool = False) -> None:
+    """A read-only data dir costs the cache, never the answer; ``strict``
+    (an account change's own write, which rolls back on it) raises."""
     path = cache_file()
+    tmp = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, suffix=".tmp",
                                          encoding="utf-8") as fh:
-            json.dump({"version": CACHE_VERSION, "rows": rows}, fh, indent=2, sort_keys=True)
             tmp = Path(fh.name)
+            json.dump({"version": CACHE_VERSION, "rows": rows}, fh, indent=2, sort_keys=True)
         os.replace(tmp, path)
     except OSError:
-        pass  # a read-only data dir costs the cache, never the answer
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        if strict:
+            raise
 
 
 def _open_lock(name: str) -> int | None:
@@ -1318,11 +1329,19 @@ def _store(accounts: list[dict], rows: list[dict]) -> list[dict]:
             with contextlib.suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_EX)
         cache = _load_cache()
+        from khipu.config import read_config_unsettled
+        from khipu.routing_sources import configured_keys
+
+        # The list as it is now, not as it was when the read began: a read
+        # still running when its account was stopped or moved writes no row
+        # under a key the list no longer holds. Read unsettled: an account
+        # change takes this cache's lock after the routing lock.
+        current = configured_keys(read_config_unsettled())
         merged = []
         for account, row in zip(accounts, rows):
             key = _key(account)
             out = _merge(cache.get(key), row)
-            if not account.get("invalid"):
+            if not account.get("invalid") and key in current:
                 cache[key] = {k: v for k, v in out.items() if k not in ("cached", "stale", "refreshing")}
             merged.append(out)
         _save_cache(cache)

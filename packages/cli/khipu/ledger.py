@@ -466,6 +466,14 @@ def _row_dict(values: tuple) -> dict[str, Any]:
     return dict(zip(_ROW_COLS, values, strict=True))
 
 
+def lock_project(cur, project: str) -> None:
+    """Hold the project's ledger lock until this transaction ends. Every
+    ledger writer takes it first (each write, a purge, an import), so an
+    import reads, writes and verifies with no other writer in between, on
+    this Mac or any other."""
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext('khipu-ledger'), hashtext(%s))", (project,))
+
+
 def _lock_row(cur, project: str, row_id: str) -> dict[str, Any] | None:
     cur.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s AND row_id = %s FOR UPDATE",
                 (project, row_id))
@@ -662,14 +670,16 @@ def _restore(cur, op: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "verb": "restore", "id": row_id, "line": f"restored {row_id}", "affected": [row_id]}
 
 
-def _purge_row(cur, project: str, row_id: str) -> bool:
+def _purge_row(cur, project: str, row_id: str, *, removed_before: datetime | None = None) -> bool:
     """Remove a removed row for good: its row, history and ops go, and the bare
     marker (project, id, who removed it, when) stays. The only DELETEs in this
-    module are here."""
+    module are here. With ``removed_before`` (the nightly), only a row still
+    removed before then, as read under the lock: one restored and removed
+    again since the nightly looked is a fresh removal and stays."""
     cur.execute("SELECT removed_by, removed_at FROM ledger_rows WHERE project = %s AND row_id = %s "
                 "AND removed_at IS NOT NULL FOR UPDATE", (project, row_id))
     got = cur.fetchone()
-    if got is None:
+    if got is None or (removed_before is not None and not got[1] < removed_before):
         return False
     from psycopg.types.json import Jsonb
 
@@ -732,6 +742,7 @@ def apply_op(conn, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
                 # before the offline copy heard of it: a retry repairs that.
                 _replica_sync(conn, op["project"], result.get("affected") or [])
                 return {**result, "retried": True}
+            lock_project(cur, op["project"])
             cur.execute("SAVEPOINT ledger_op")
             verb = _VERBS[op["verb"]]
             try:
@@ -764,6 +775,7 @@ def purge(conn, project: str, row_id: str) -> dict[str, Any]:
     refuse_secrets(project, row_id)
     try:
         with conn.cursor() as cur:
+            lock_project(cur, project)
             if not _purge_row(cur, project, row_id):
                 marker = _marker(cur, project, row_id)
                 if marker:
@@ -795,7 +807,8 @@ def purge_due(conn, *, now: datetime | None = None) -> dict[str, Any]:
     for project, row_id in due:
         try:
             with conn.cursor() as cur:
-                purged += int(_purge_row(cur, project, row_id))
+                lock_project(cur, project)
+                purged += int(_purge_row(cur, project, row_id, removed_before=cutoff))
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -865,7 +878,7 @@ def _replica_sync(conn, project: str, row_ids: list[str]) -> None:
     except Exception as exc:  # noqa: BLE001  (the hub write already landed)
         # The row's own marker was written before the commit (the drain), so
         # the offline check still leaves it to the hub.
-        print(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}", file=sys.stderr)
+        _say(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}")
         return
     replica_catch_up(conn)
 
@@ -937,8 +950,8 @@ def _replica_catch_up_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
             if got.get("ok") or got.get("missing"):
                 done += [f"{project}#{i}" for i in ids]
             else:
-                print(f"[khipu-ledger] offline copy not updated yet ({got.get('error')}); "
-                      "the next ledger call retries it", file=sys.stderr)
+                _say(f"[khipu-ledger] offline copy not updated yet ({got.get('error')}); "
+                     "the next ledger call retries it")
         with _replica_pending() as pending:
             for key in done:
                 if pending.get(key) == seen[key]:
@@ -946,7 +959,7 @@ def _replica_catch_up_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
             out["left"] = len(pending)
         out["copied"] = len(done)
     except Exception as exc:  # noqa: BLE001  (the hub write already landed)
-        print(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}", file=sys.stderr)
+        _say(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}")
         out["error"] = f"{type(exc).__name__}: {exc}"[:200]
     return out
 
@@ -1569,7 +1582,7 @@ def _tidy(step, *args: Any, **kw: Any) -> None:
     try:
         step(*args, **kw)
     except OSError as exc:
-        print(f"[khipu-ledger] left for the next drain: {type(exc).__name__}", file=sys.stderr)
+        _say(f"[khipu-ledger] left for the next drain: {type(exc).__name__}")
 
 
 def _set_aside(path: Path) -> None:
@@ -2183,6 +2196,7 @@ def remove_ref(ref: str, *, note: str = "", children: str | None = None, source:
     if parsed is None:
         raise LedgerError("a ledger id looks like ledger:<project>#<row id>", "bad_ref")
     project, row_id = parsed
+    require("ledger remove")
     return write(new_op("remove", project, row_id, note=note, children=children, source=source))
 
 
@@ -2289,11 +2303,17 @@ def _project_for(args: argparse.Namespace) -> str:
     return _check_project(resolve_repo_root(cwd).get("project"))
 
 
-def _emit(args: argparse.Namespace, payload: dict[str, Any], text: str | None) -> None:
-    if getattr(args, "json", False):
-        print(json.dumps(payload, indent=2, default=str))
-    elif text is not None:
-        print(text)
+def _emit(args: argparse.Namespace | None, payload: Any = None, text: str | None = None, **kw: Any) -> None:
+    """Every answer this module gives (``agent_view.emit``: projected first)."""
+    from khipu import agent_view
+
+    kw.setdefault("as_json", bool(getattr(args, "json", False)))
+    agent_view.emit(payload, text, **kw)
+
+
+def _say(text: str) -> None:
+    """A note on stderr, projected like every other answer."""
+    _emit(None, text=text, stream=sys.stderr)
 
 
 def _offline_note(view: dict[str, Any]) -> str | None:
@@ -2307,11 +2327,17 @@ def cmd(args: argparse.Namespace) -> int:
     verb = args.ledger_cmd
     try:
         refuse_secrets([v for k, v in vars(args).items() if k != "func"])
+        require(f"ledger {verb}", from_app=getattr(args, "from_app", False),
+                dry_run=getattr(args, "dry_run", False))
         project = _project_for(args)
         if verb in ("add", "set", "remove", "restore"):
             return _cmd_write(args, verb, project)
         if verb == "purge":
             return _cmd_purge(args, project)
+        if verb == "import":
+            return _cmd_import(args, project)
+        if verb == "export":
+            return _cmd_export(args, project)
         if verb == "removed":
             rows = removed_rows(None if args.all_projects else project)
             _emit(args, {"ok": True, "removed": rows},
@@ -2323,7 +2349,7 @@ def cmd(args: argparse.Namespace) -> int:
             payload = row_json(got["row"], got["history"], project)
             if got.get("offline"):
                 payload["offline_as_of"] = got.get("as_of")
-            print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+            _emit(None, payload, as_json=True, sort_keys=True)
             return 0
         view = load(project)
         note = _offline_note(view)
@@ -2332,7 +2358,7 @@ def cmd(args: argparse.Namespace) -> int:
             rows, text = render_list(view, state=args.state, kind=args.kind, owner=args.owner,
                                      stale_hours=args.stale_hours)
             _emit(args, {"ok": True, "project": project, "offline": view["offline"], "as_of": view.get("as_of"),
-                         "rows": [row_json(r, [], project) for r in rows]}, text)
+                         "vocab": view["vocab"], "rows": [row_json(r, [], project) for r in rows]}, text)
         elif verb == "loose-ends":
             rows, text = render_loose_ends(view, summary=args.summary)
             _emit(args, {"ok": True, "project": project, "rows": [row_json(r, [], project) for r in rows]}, text)
@@ -2342,7 +2368,7 @@ def cmd(args: argparse.Namespace) -> int:
         elif verb == "render":
             board = render_board(view)
             if args.out:
-                Path(args.out).write_text(board, encoding="utf-8")
+                _emit(None, text=board, to_file=args.out)
                 _emit(args, {"ok": True, "rows": len(view["rows"]), "out": args.out},
                       f"rendered {len(view['rows'])} rows -> {args.out}")
             else:
@@ -2360,19 +2386,88 @@ def cmd(args: argparse.Namespace) -> int:
             _emit(args, {**result, "project": project, "vocab": view["vocab"]}, text)
             rc = 0 if result["ok"] else 1
         if note and not args.json:
-            print(note)
+            _emit(args, text=note)
         return rc
     except LedgerError as exc:
         if getattr(args, "json", False):
-            print(json.dumps({"ok": False, "error": str(exc), "reason": exc.reason}))
+            _emit(args, {"ok": False, "error": str(exc), "reason": exc.reason})
         else:
-            print(f"error: {exc}", file=sys.stderr)
+            _say(f"error: {exc}")
+        return 1
+    except Exception as exc:  # noqa: BLE001  (an unexpected error answers through the same emit)
+        from khipu import agent_view
+
+        if getattr(args, "json", False):
+            _emit(args, {"ok": False, "error": agent_view.error_text(exc), "reason": "failed"})
+        else:
+            _say(f"error: {agent_view.error_text(exc)}")
         return 1
 
 
+# Who may run each verb of ``khipu ledger`` and ``khipu work`` that changes
+# anything (and ``khipu_ledger``'s, which are a subset). "writer": any writer
+# (a conversation, a runner, the app), and a --from-app claim must come from
+# the app itself. "app": the app only. "owner": the app, or the owner's yes
+# typed on an interactive terminal (routing.typed_yes, routing's own rule).
+# Every verb not listed only reads; tests check that every verb of both
+# parsers is either here or in READ_VERBS, and that each one here calls
+# ``require`` before it does anything.
+WRITE_POLICY: dict[str, str] = {
+    "ledger add": "writer", "ledger set": "writer", "ledger remove": "writer",
+    "ledger restore": "app", "ledger purge": "app", "ledger import": "owner",
+    "work hide": "owner", "work unhide": "owner", "work same": "owner", "work not-same": "owner",
+}
+READ_VERBS = frozenset({"ledger get", "ledger list", "ledger loose-ends", "ledger needs-owner", "ledger needs-matt",
+                        "ledger render", "ledger check", "ledger removed", "ledger export", "work", "work check"})
+_APP_ONLY = {
+    "ledger restore": "a removed row is restored in the Khipu app (Settings, Work, Removed rows)",
+    "ledger purge": "removing a row for good is done in the Khipu app (Settings, Work, Removed rows)",
+}
+
+
+def require(command: str, *, from_app: bool = False, dry_run: bool = False) -> None:
+    """The one owner check for every verb that changes anything (see
+    ``WRITE_POLICY``); raises ``LedgerError`` when this caller may not run
+    ``command``. ``dry_run`` (an import that writes nothing) only reads. A
+    verb in neither table is refused: a new verb must be classified."""
+    policy = WRITE_POLICY.get(command)
+    if policy is None and command not in READ_VERBS:
+        raise LedgerError(f"{command} is not a known verb; nothing was changed", "unknown_verb")
+    if policy is None or dry_run or policy == "writer":
+        if from_app:
+            _check_from_app()
+        return
+    if policy == "app":
+        if not from_app:
+            raise LedgerError(_APP_ONLY[command], "app_only")
+        _check_from_app()
+        return
+    from khipu import routing
+
+    if from_app:
+        _check_from_app()
+        return
+    if routing._caller()["app"]:
+        return
+    if routing.typed_yes(f"This is the owner's change ({command}). Type yes to confirm: "):
+        return
+    raise LedgerError("only the Khipu app, or the owner's yes typed on a terminal, can make this change; "
+                      "nothing was changed", "not_app")
+
+
+def _check_from_app() -> None:
+    """``--from-app`` is the owner's own word (a write recorded as "you, in
+    the app", a restore, a removal for good), so it counts only when the app
+    itself started this process, by the same check routing's owner commands
+    make (``routing._caller``)."""
+    from khipu import routing
+
+    if not routing._caller()["app"]:
+        raise LedgerError("only the Khipu app can make this change as you; it was not the app that asked, "
+                          "so nothing was changed", "not_app")
+
+
 def _cmd_write(args: argparse.Namespace, verb: str, project: str) -> int:
-    if verb == "restore" and not args.from_app:
-        raise LedgerError("a removed row is restored in the Khipu app (Settings, Work, Removed rows)", "app_only")
     fields: dict[str, Any] = {}
     if verb == "add":
         fields = {"title": args.title, "kind": args.kind, "parent": args.parent or "", "state": args.state,
@@ -2390,9 +2485,6 @@ def _cmd_write(args: argparse.Namespace, verb: str, project: str) -> int:
 
 
 def _cmd_purge(args: argparse.Namespace, project: str) -> int:
-    if not args.from_app:
-        raise LedgerError("removing a row for good is done in the Khipu app (Settings, Work, Removed rows)",
-                          "app_only")
     try:
         conn = _connect()
     except HubAway as exc:
@@ -2403,6 +2495,70 @@ def _cmd_purge(args: argparse.Namespace, project: str) -> int:
         conn.close()
     _emit(args, result, result["line"])
     return 0
+
+
+def _cmd_import(args: argparse.Namespace, project: str) -> int:
+    from khipu import ledger_import
+
+    report = ledger_import.run_import(args.file, project, dry_run=args.dry_run, catch_up=args.catch_up)
+    _emit(args, report, ledger_import.report_text(report))
+    return 0 if report["result"] in ("done", "caught up", "nothing new", "dry run") else 1
+
+
+def _cmd_export(args: argparse.Namespace, project: str) -> int:
+    """The project in the tracker file's shape, every row and its history."""
+    from khipu import ledger_import
+
+    try:
+        conn = _connect()
+    except HubAway as exc:
+        raise LedgerError("the database is away; export needs it", "away") from exc
+    try:
+        with conn.cursor() as cur:
+            rows = ledger_import.export_rows(cur, project)
+        conn.rollback()
+    finally:
+        conn.close()
+    # The export is an answer like any other: projected, in the file or on
+    # stdout, with --json or without.
+    if args.out:
+        _emit(None, {"rows": rows}, as_json=True, to_file=args.out)
+        _emit(args, {"ok": True, "rows": len(rows), "out": args.out}, f"exported {len(rows)} rows -> {args.out}")
+    else:
+        _emit(None, {"rows": rows}, as_json=True)
+    return 0
+
+
+def status_line(*, hub: bool = True) -> dict[str, Any]:
+    """khipu_status's ``ledger`` line across every project: live rows, loose
+    ends (open, or a state the project does not know, as ``is_loose``), rows
+    waiting on the owner, and writes waiting in the outbox. Fail-open: an
+    error costs only this line. ``hub=False`` (the caller already found the
+    hub away) reports the outbox alone without trying the hub again."""
+    out: dict[str, Any] = {"available": False, "rows": None, "loose_ends": None, "needs_owner": None,
+                           "outbox": None}
+    try:
+        out["outbox"] = outbox_status()["pending"]
+    except Exception:  # noqa: BLE001
+        pass
+    if not hub:
+        return out
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*), count(*) FILTER (WHERE v.meaning IS NULL OR v.meaning = 'open'), "
+                            "count(*) FILTER (WHERE v.meaning = 'needs') FROM ledger_rows r LEFT JOIN ledger_vocab v "
+                            "ON v.project = r.project AND v.field = 'state' AND v.word = r.state "
+                            "WHERE r.removed_at IS NULL")
+                rows, loose, needs = cur.fetchone()
+            conn.rollback()
+        finally:
+            conn.close()
+        out.update(available=True, rows=rows, loose_ends=loose, needs_owner=needs)
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = type(exc).__name__
+    return out
 
 
 def add_parser(sub) -> None:
@@ -2481,5 +2637,17 @@ def add_parser(sub) -> None:
     pg = verbs.add_parser("purge", help="Remove a removed row for good (the app's Remove for good)")
     pg.add_argument("id")
     common(pg, write=True)
+
+    im = verbs.add_parser("import", help="Import an old tracker file (the app's Import a tracker)")
+    im.add_argument("file")
+    im.add_argument("--dry-run", action="store_true", help="Report what would be imported; write nothing")
+    im.add_argument("--catch-up", action="store_true", help="Bring in only what changed since the last import")
+    im.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    common(im)
+
+    ex = verbs.add_parser("export", help="The project in the old tracker file's shape")
+    ex.add_argument("--tracker-json", action="store_true", required=True)
+    ex.add_argument("--out", default=None)
+    common(ex)
 
     p.set_defaults(func=cmd)

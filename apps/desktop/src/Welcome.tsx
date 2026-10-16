@@ -913,6 +913,8 @@ export function Welcome({
           await runKhipu(["integrations", "install", item.harness]);
         } else if (item.fix.kind === "recall-probe") {
           await runKhipu(["doctor", "--probe"]);
+        } else if (item.fix.kind === "apply-migrations") {
+          await invoke<string>("khipu_migrate", { dryRun: false });
         }
       } catch {
         // reloadDoctor below reports whatever state actually resulted.

@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/khipu/work-summary-1.schema.json",
+  "title": "Khipu work summary, format 1",
+  "description": "Written by a project's job runner (atomically: a temp file in the same folder, then rename), read by Khipu read-only. Unknown keys are allowed and ignored. A waiting_on_owner list is no longer read; add each need as a ledger row. Khipu applies further limits when it reads (its own caps and windows); the lengths here are what a runner should write.",
+  "type": "object",
+  "required": ["format", "version", "written_at", "project"],
+  "additionalProperties": true,
+  "properties": {
+    "format": { "const": "khipu-work-summary" },
+    "version": { "type": "integer", "minimum": 1, "description": "Khipu reads 1." },
+    "written_at": { "$ref": "#/$defs/time" },
+    "project": {
+      "type": "object",
+      "required": ["id", "name"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 }
+      }
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "name": { "$ref": "#/$defs/label" },
+        "interval_s": { "type": "number", "exclusiveMinimum": 0, "maximum": 86400 }
+      }
+    },
+    "jobs": { "type": "array", "items": { "$ref": "#/$defs/job" } },
+    "prs": { "type": "array", "items": { "$ref": "#/$defs/pr" } },
+    "trains": { "type": "array", "items": { "$ref": "#/$defs/train" } }
+  },
+  "$defs": {
+    "time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 with Z or an offset."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
+    },
+    "label": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "description": "A short name; Khipu shows anything else as withheld."
+    },
+    "line": {
+      "type": "string",
+      "description": "A single line: no control characters, no paths, no secrets."
+    },
+    "job": {
+      "type": "object",
+      "required": ["id", "project", "state", "started_at", "updated_at", "summary"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "project": { "$ref": "#/$defs/id", "description": "Must equal project.id; an item for another project is left out." },
+        "state": {
+          "type": "string",
+          "description": "Known: queued, running, waiting, done, failed, stopped. Another word keeps the item and shows as not known.",
+          "examples": ["queued", "running", "waiting", "done", "failed", "stopped"]
+        },
+        "kind": { "type": "string", "examples": ["build", "check", "fix", "review", "test", "release", "other"] },
+        "for": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "pr": { "$ref": "#/$defs/id" },
+            "train": { "$ref": "#/$defs/id" },
+            "ledger": { "type": "string", "maxLength": 80, "description": "A ledger row id." },
+            "task": { "type": "string", "maxLength": 80 }
+          }
+        },
+        "account": { "$ref": "#/$defs/label" },
+        "model": { "$ref": "#/$defs/label" },
+        "lane": { "$ref": "#/$defs/label" },
+        "started_at": { "$ref": "#/$defs/time" },
+        "updated_at": { "$ref": "#/$defs/time" },
+        "ended_at": { "$ref": "#/$defs/time" },
+        "summary": { "$ref": "#/$defs/line", "maxLength": 200 },
+        "now": {
+          "type": "array",
+          "maxItems": 3,
+          "description": "The runner's own plain status lines, oldest first. Never session narration, tool output, file contents or commands.",
+          "items": {
+            "type": "object",
+            "required": ["at", "text"],
+            "additionalProperties": true,
+            "properties": {
+              "at": { "$ref": "#/$defs/time" },
+              "text": { "$ref": "#/$defs/line", "maxLength": 90 }
+            }
+          }
+        }
+      }
+    },
+    "pr": {
+      "type": "object",
+      "required": ["id", "project", "title", "stage", "stage_at"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "project": { "$ref": "#/$defs/id" },
+        "title": { "$ref": "#/$defs/line", "minLength": 1, "maxLength": 120 },
+        "stage": {
+          "type": "string",
+          "description": "Known: built, checking, fixing, cleared, flagged, merged, closed.",
+          "examples": ["built", "checking", "fixing", "cleared", "flagged", "merged", "closed"]
+        },
+        "stage_at": { "$ref": "#/$defs/time" },
+        "opened_at": { "$ref": "#/$defs/time" },
+        "merged_at": { "$ref": "#/$defs/time", "description": "Required when stage is merged." },
+        "verdict": {
+          "type": "object",
+          "required": ["outcome"],
+          "additionalProperties": true,
+          "properties": {
+            "outcome": { "enum": ["cleared", "flagged", "unclear"] },
+            "first_line": { "$ref": "#/$defs/line", "maxLength": 200 },
+            "by": { "$ref": "#/$defs/label" },
+            "at": { "$ref": "#/$defs/time" }
+          }
+        },
+        "link": { "type": "string", "pattern": "^https://", "description": "Kept only as https, host and path." },
+        "summary": { "$ref": "#/$defs/line", "maxLength": 200 }
+      },
+      "if": { "properties": { "stage": { "const": "merged" } }, "required": ["stage"] },
+      "then": { "required": ["merged_at"] }
+    },
+    "train": {
+      "type": "object",
+      "required": ["id", "project", "name", "state", "updated_at"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "project": { "$ref": "#/$defs/id" },
+        "name": { "$ref": "#/$defs/line", "minLength": 1, "maxLength": 40 },
+        "state": {
+          "type": "string",
+          "description": "Known: open, testing, blocked, shipped, dropped.",
+          "examples": ["open", "testing", "blocked", "shipped", "dropped"]
+        },
+        "updated_at": { "$ref": "#/$defs/time" },
+        "prs": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+        "runs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "state", "at"],
+            "additionalProperties": true,
+            "properties": {
+              "name": { "$ref": "#/$defs/line", "minLength": 1, "maxLength": 60 },
+              "state": {
+                "type": "string",
+                "examples": ["queued", "running", "passed", "failed", "skipped"]
+              },
+              "at": { "$ref": "#/$defs/time" },
+              "summary": { "$ref": "#/$defs/line", "maxLength": 200 }
+            }
+          }
+        },
+        "summary": { "$ref": "#/$defs/line", "maxLength": 200 }
+      }
+    }
+  },
+  "examples": [
+    {
+      "format": "khipu-work-summary",
+      "version": 1,
+      "written_at": "2026-10-15T19:40:12Z",
+      "project": { "id": "atlas", "name": "Atlas" },
+      "runner": { "name": "lanes", "interval_s": 20 },
+      "jobs": [
+        {
+          "id": "job-1042", "project": "atlas", "state": "running", "kind": "fix",
+          "for": { "pr": "41", "ledger": "s-3.2" },
+          "account": "acct-one", "model": "opus", "lane": "secondary",
+          "started_at": "2026-10-15T19:12:40Z", "updated_at": "2026-10-15T19:40:05Z",
+          "summary": "Fixing the two review findings on the sign-in screen",
+          "now": [{ "at": "2026-10-15T19:40:05Z", "text": "Running the full test suite before pushing" }]
+        }
+      ],
+      "prs": [
+        {
+          "id": "41", "project": "atlas", "title": "Sign-in screen remembers the last account",
+          "stage": "fixing", "stage_at": "2026-10-15T19:12:40Z",
+          "link": "https://github.com/example/atlas/pull/41"
+        }
+      ],
+      "trains": []
+    }
+  ]
+}

@@ -110,6 +110,8 @@ class TopicsCatchupContractTest(unittest.TestCase):
                 elif "FROM topics t WHERE t.deleted_at IS NULL" in s:
                     self._result = [("note:fresh", "Fresh", "body text",
                                      {"slug": "note:fresh", "title": "Fresh", "body": "body text"})]
+                elif s.startswith("SELECT 1 FROM topics") and "FOR SHARE" in s:
+                    self._result = [(1,)]  # the topic is still live
                 elif s.startswith("INSERT INTO memory_embeddings"):
                     self.inserts.append(params)
                     self._result = [(datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc),)]  # RETURNING built_at
@@ -196,6 +198,8 @@ class TopicsCatchupContractTest(unittest.TestCase):
                     want = set(params[0])
                     self._result = [(slug, t["title"], t["body"], {"slug": slug})
                                     for slug, t in sorted(self.topics.items()) if slug in want]
+                elif s.startswith("SELECT 1 FROM topics") and "FOR SHARE" in s:
+                    self._result = [(1,)] if params[0] in self.topics else []
                 elif s.startswith("SELECT kind, ref, chunk_idx, content_hash FROM memory_embeddings"):
                     refs = set(params[2]) if len(params) > 2 else None
                     self._result = [(k, r, i, h) for (k, r, i), h in self.hashes.items()
@@ -322,6 +326,8 @@ class PerChunkIsolationContractTest(unittest.TestCase):
                     self._result = []
                 elif s.startswith("SELECT slug, title, body FROM topics"):
                     self._result = self.rows
+                elif s.startswith("SELECT slug FROM topics") and "FOR SHARE" in s:
+                    self._result = [(slug,) for slug, _title, _body in self.rows if slug in params[0]]
                 elif s.startswith("INSERT INTO memory_embeddings"):
                     self.inserts.append(params)
                 else:

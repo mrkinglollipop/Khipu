@@ -197,10 +197,10 @@ describe("the priority on Home", () => {
     expect(screen.getByText("Not confirmed")).toBeTruthy();
     expect(screen.getByText("Set by a Claude Code conversation at your request; you haven't confirmed it yet.")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
-    await waitFor(() => expect(calls("khipu_route_priority")).toEqual([{ action: "confirm" }]));
+    await waitFor(() => expect(calls("khipu_route_priority")).toEqual([{ action: "confirm", expect: "p7" }]));
     await waitFor(() => expect(load).toHaveBeenCalledWith(true));
     fireEvent.click(screen.getByRole("button", { name: "Undo" }));
-    await waitFor(() => expect(calls("khipu_route_priority")[1]).toEqual({ action: "undo" }));
+    await waitFor(() => expect(calls("khipu_route_priority")[1]).toEqual({ action: "undo", expect: "p7" }));
   });
 });
 
@@ -272,9 +272,9 @@ describe("the priority and the pace in Settings -> Routing", () => {
     expect(screen.getByText(/It replaced: 1\. Claude: orchestration only/)).toBeTruthy();
     const group = screen.getByRole("group", { name: "A conversation set your priority" });
     fireEvent.click(within(group).getByRole("button", { name: "Confirm" }));
-    await waitFor(() => expect(sent()).toEqual([{ action: "confirm" }]));
+    await waitFor(() => expect(sent()).toEqual([{ action: "confirm", expect: "p7" }]));
     fireEvent.click(within(group).getByRole("button", { name: "Undo" }));
-    await waitFor(() => expect(sent()[1]).toEqual({ action: "undo" }));
+    await waitFor(() => expect(sent()[1]).toEqual({ action: "undo", expect: "p7" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear the priority" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear it" }));
     await waitFor(() => expect(sent()[2]).toEqual({ action: "clear", expect: "p7" }));

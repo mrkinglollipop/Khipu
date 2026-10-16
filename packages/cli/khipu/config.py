@@ -41,8 +41,16 @@ def config_file() -> Path:
     return data_dir() / CONFIG_NAME
 
 
-@secret_result("config")
-def load_config() -> dict:
+# An account change (``accounts._transact``) writes this key in the same
+# write as the account list it makes, and clears it once the routing record
+# says the change is done. Every read of the config (``load_config``,
+# ``mutate_config``) that finds it finishes or rolls back that change first
+# (``accounts.recover``), so no reader sees a list the record and the usage
+# cache do not yet agree with.
+ACCOUNT_CHANGE_OPEN = "account_change_open"
+
+
+def _read_config() -> dict:
     path = config_file()
     if not path.is_file():
         return {}
@@ -51,6 +59,42 @@ def load_config() -> dict:
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _settle_account_change(data: dict) -> bool:
+    """Settle an unfinished account change ``data`` names; True when one was
+    settled (read the document again). Skipped while this thread holds the
+    config lock (the routing lock is taken first, never after it) or is
+    settling one already."""
+    if not data.get(ACCOUNT_CHANGE_OPEN) or getattr(_held, "depth", 0) or getattr(_held, "settling", False):
+        return False
+    from khipu import accounts
+
+    _held.settling = True
+    try:
+        accounts.recover()
+    except accounts.AccountsError:
+        # Not settled yet: the document as stored. Every account write is
+        # refused until it is (``accounts._locked``).
+        return False
+    finally:
+        _held.settling = False
+    return True
+
+
+@secret_result("config")
+def load_config() -> dict:
+    data = _read_config()
+    if _settle_account_change(data):
+        data = _read_config()
+    return data
+
+
+def read_config_unsettled() -> dict:
+    """The document as stored, an unfinished account change and all: for a
+    reader that holds a lock an account change takes after the routing lock
+    (the usage cache's), which must not wait on that lock here."""
+    return _read_config()
 
 
 @secret_result("config")
@@ -66,6 +110,13 @@ def _load_config_for_mutation() -> dict:
     if not isinstance(data, dict):
         raise InvalidConfigDocument(f"cannot modify malformed config: {path}")
     return data
+
+
+def check_config_readable() -> None:
+    """Raise ``InvalidConfigDocument`` when config.json is there but can't be
+    read or parsed (or isn't an object): for a reader that must not lean on
+    the empty document ``load_config`` returns then. Writes nothing."""
+    _load_config_for_mutation()
 
 
 # The one write path for config.json. Every writer in the package changes the
@@ -96,6 +147,8 @@ def mutate_config():
     document as stored now; the block changes it in place and it is written
     when the block ends without an error (only if it changed). A nested
     block in the same thread shares the outer one's document."""
+    if not getattr(_held, "depth", 0):
+        _settle_account_change(_read_config())
     with config_write_lock():
         if getattr(_held, "data", None) is not None:
             yield _held.data
@@ -505,6 +558,30 @@ def config_write_lock():
         os.close(fd)
 
 
+# The one format of a version a write hands back (``--expect``), defined
+# here and nowhere else in the package: ASCII letters and digits in parts
+# joined by single dots, at most ``VERSION_MAX`` characters. The account
+# list's is "a" and 16 hex digits; the priority's is "p" and its event's
+# mark, then "." and the account list's version when there is one
+# (``p12.a4def5fc278cfc609``). The desktop app checks the same format
+# (``checked_expect`` in apps/desktop/src-tauri/src/lib.rs), and
+# tests/test_accounts.py runs that Rust check on versions this code makes.
+VERSION_MAX = 64
+_VERSION_PART = re.compile(r"[A-Za-z0-9]+")
+
+
+def is_version(text: str) -> bool:
+    return 0 < len(text) <= VERSION_MAX and all(_VERSION_PART.fullmatch(p) for p in text.split("."))
+
+
+def version_part(raw: str) -> str:
+    """``raw`` as one part of a version: as it is when it is letters and
+    digits, else a short digest of it (an id appended by hand)."""
+    if _VERSION_PART.fullmatch(raw) and len(raw) <= 24:
+        return raw
+    return "h" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def accounts_version(data: dict | None = None) -> str:
     """The version of the stored account list: a short digest of what
     ``_ACCOUNT_STATE_KEYS`` hold. A write that carries the version it read
@@ -523,50 +600,6 @@ def check_accounts_version(data: dict, expect: "str | None") -> None:
     if expect is not None and str(expect).strip() != accounts_version(data):
         raise AccountsError("the account list changed after it was read; read it again and redo the change",
                             "version_moved")
-
-
-def set_usage_accounts(raw: "str | list | None", *, expect: "str | None" = None,
-                       request: "dict | None" = None, via: "str | None" = None) -> Path:
-    """Store ``usage_accounts``, the accounts ``khipu usage`` reads (JSON text
-    or a list of ``{label, harness, home?}``, checked by
-    ``khipu.usage.parse_usage_accounts`` against the list stored now, so an
-    untouched entry is never dropped). None or an empty list removes the
-    key: every installed CLI with its default login. ``expect`` is the
-    version the writer read (``accounts_version``); a write is refused when
-    the stored one moved. ``request`` marks the write as a conversation's at
-    the owner's request (kept, with the list it replaced, until the owner
-    confirms or undoes it); an owner's write ends any such request, and
-    with ``via`` (how the owner made it) the routing record notes each login
-    it starts tracking, so later reports by that login's key are the new
-    account's and not those of an account moved away from the folder."""
-    from khipu import accounts, routing
-    from khipu.usage import AccountsError, parse_usage_accounts
-
-    # The routing lock first, in the account writers' order.
-    with routing._lock(), mutate_config() as data:
-        check_accounts_version(data, expect)
-        if request is not None and isinstance(data.get("usage_accounts_request"), dict):
-            raise AccountsError("a conversation's change to the account list is still waiting for the owner; "
-                                "he confirms or undoes it in Settings first", "request_waiting")
-        previous = data.get("usage_accounts") if isinstance(data.get("usage_accounts"), list) else None
-        entries = [] if raw is None else parse_usage_accounts(raw, previous=previous)
-        # Lanes name accounts by key before any label in the list changes.
-        accounts.convert_lanes(data, accounts.known_of(accounts.current_list(data)[1]))
-        if request is not None:
-            data["usage_accounts_request"] = dict(request, prior=previous, prior_none=data.get("usage_accounts_none"))
-        else:
-            data.pop("usage_accounts_request", None)
-        before = {a["key"] for a in accounts.known_of(accounts.current_list(data)[1])}
-        if entries:
-            data["usage_accounts"] = entries
-        else:
-            data.pop("usage_accounts", None)
-        data.pop("usage_accounts_none", None)
-        added = [a["key"] for a in accounts.known_of(accounts.current_list(data)[1]) if a["key"] not in before]
-        save_config(data)
-        if request is None and via is not None and added:
-            accounts._notes([{"type": "account_note", "account": k, "state": "tracked"} for k in added], via)
-        return config_file()
 
 
 AUTO_TRACK_KEY = "usage_auto_track"

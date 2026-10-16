@@ -49,6 +49,8 @@ import { PlansCard, usePlanAttention, usePlanUsage } from "./PlansCard";
 import { RoutingCard } from "./RoutingCard";
 import { RoutingSettings } from "./RoutingSettings";
 import { useRouting } from "./routing";
+import { WorkView } from "./WorkView";
+import { WORK_LEDE, badgeLabel, useWork } from "./work";
 import type { DoctorSynthProvider } from "./SynthProvider";
 import { useModelVerify } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
@@ -84,8 +86,8 @@ import "./App.css";
 type Tab =
   | "first-run"
   | "home"
+  | "work"
   | "recall"
-  | "owed"
   | "activity"
   | "harnesses"
   | "settings"
@@ -341,12 +343,12 @@ const NAV_ICONS: Record<Exclude<Tab, "first-run" | "revisions">, ReactNode> = {
       }
     />
   ),
-  owed: (
+  work: (
     <RailIcon
       d={
         <>
-          <path d="M3 4h10M3 8h7M3 12h5" />
-          <path d="m11 11 1.5 1.5L15 10" />
+          <rect x="2.5" y="3" width="11" height="10" rx="1.5" />
+          <path d="M6 3v10M10 3v10" />
         </>
       }
     />
@@ -1593,6 +1595,21 @@ export default function App() {
     }
   }, [loadDoctor]);
 
+  /** `khipu migrate` through the same fixed-argv command Welcome's
+   *  Database step uses: applies the updates doctor named as pending. */
+  const applyMigrations = useCallback(async () => {
+    setProbeBusy(true);
+    setError(null);
+    try {
+      await invoke<string>("khipu_migrate", { dryRun: false });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setProbeBusy(false);
+      await loadDoctor(true);
+    }
+  }, [loadDoctor]);
+
   /** `khipu owed` — the commitments a session left behind, cached per status
    *  so the rail badge, Home's preview and this screen's table are one fetch
    *  rather than three racing over one array. */
@@ -2255,7 +2272,7 @@ export default function App() {
     if (tab === "harnesses") void loadDoctor(false);
     if (tab === "revisions") void loadRevisions(false);
     if (tab === "activity") void loadActivity(false);
-    if (tab === "owed") {
+    if (tab === "work") {
       // All three, because the segmented control shows all three counts.
       void loadOwed(owedStatus, false);
       void loadOwed("open", false);
@@ -2290,7 +2307,7 @@ export default function App() {
   useEffect(() => {
     if (!dsnOk) return;
     const refresh = () => {
-      if (tab === "owed") {
+      if (tab === "work") {
         void loadOwed(owedStatus, false);
         void loadOwed("open", false);
         void loadOwed("closed", false);
@@ -2315,8 +2332,8 @@ export default function App() {
     () =>
       [
         ["home", "Home", "Is memory working right now?"],
+        ["work", "Work", WORK_LEDE],
         ["recall", "Recall", "What does the agent remember about this?"],
-        ["owed", "Owed", "What you still owe on each project"],
         ["activity", "Activity", "Every session Khipu recorded"],
         ["harnesses", "Harnesses", "Claude Code · Cursor · Aegis · Codex"],
         ["settings", "Settings", "Capture, models, data and this Mac"],
@@ -2375,14 +2392,30 @@ export default function App() {
   // while it shows and at its earliest reset, so it never outlives a reset
   // or freezes its countdown while Home stays open.
   const plans = usePlanUsage(
-    tab === "home" ? "home" : tab === "settings" && settingsSection === "routing" ? "settings" : null,
+    tab === "home"
+      ? "home"
+      : tab === "work"
+        ? "work"
+        : tab === "settings" && settingsSection === "routing"
+          ? "settings"
+          : null,
   );
   const planItems = usePlanAttention(plans.data);
   // Routing truth phase 4: the routing record (`khipu route --json`), read on
   // Home and every minute while Home stays open. Its attention items warn and
   // block nothing (the record is guidance, not a gate).
-  // Settings -> Accounts and routing reads its own.
-  const routing = useRouting(tab === "home");
+  // Settings -> Accounts and routing reads its own; Work shows the accounts too.
+  const routing = useRouting(tab === "home" || tab === "work");
+  // Work (docs/plans/2026-10-15-work-view.md, phase 4): the live view, read
+  // every few seconds while Work is open and once a minute for the rail
+  // badge otherwise. The Owed tab folded into Work as its own section
+  // (Decision 14); `owedFocusKey` opens Work there.
+  const work = useWork(tab === "work", dsnOk === true);
+  const [owedFocusKey, setOwedFocusKey] = useState(0);
+  const openOwedInWork = useCallback(() => {
+    setTab("work");
+    setOwedFocusKey((k) => k + 1);
+  }, []);
   // Plans shows a pause only from a record read without error, never a guess.
   const routingForPlans = routing.error ? null : routing.data;
   // Phase 9: "Read no accounts" (Plans says so) and Plans' Add an account…,
@@ -3105,7 +3138,6 @@ export default function App() {
       return Boolean(loading.status) || Boolean(loading.doctor);
     }
     if (id === "activity") return Boolean(loading.activity);
-    if (id === "owed") return owedLoading;
     if (id === "revisions") return Boolean(loading.revisions);
     if (id === "settings") return hubSnapBusy;
     return false;
@@ -3198,8 +3230,6 @@ export default function App() {
   const jobsSummary = doctorJobs
     ? `Scheduled jobs (${jobsOk} ok${nextJob ? `, next ${nextJob}` : ""}) · Full health report`
     : "Full health report";
-
-  const openOwed = owedOpenCount ?? 0;
 
   // Owed: the project and kind filters offer only values the loaded rows
   // actually carry, so a chip can never select an empty list.
@@ -3469,12 +3499,10 @@ export default function App() {
         <div className="rail-nav" data-tauri-drag-region>
           <div className="nav-group" data-tauri-drag-region>
             {navItems.map(([id, label, hint]) => {
+              const waitingN = work.data?.counts.waiting ?? 0;
+              const blockingN = work.data?.counts.blocking ?? 0;
               const badge =
-                id === "owed"
-                  ? openOwed > 0
-                    ? { n: openOwed, quiet: true }
-                    : null
-                  : id === "harnesses"
+                id === "harnesses"
                     ? harnessesBadge(liveness, claudeHomes, t3Gap)
                     : null;
               return (
@@ -3488,12 +3516,17 @@ export default function App() {
                 >
                   {NAV_ICONS[id]}
                   <span className="nav-label">{label}</span>
+                  {id === "work" && waitingN > 0 ? (
+                    <span className="nav-badge" aria-label={badgeLabel(waitingN, blockingN)}>
+                      {blockingN > 0 ? <span className="bdot" aria-hidden /> : null}
+                      {waitingN.toLocaleString()}
+                    </span>
+                  ) : null}
                   {badge ? (
                     <span
                       className={badge.quiet ? "nav-count quiet" : "nav-count"}
                     >
                       {badge.n}
-                      {id === "owed" && badge.n >= OWED_LIMIT ? "+" : ""}
                     </span>
                   ) : null}
                   {tabBusy(id) ? (
@@ -3621,6 +3654,8 @@ export default function App() {
                             setTab("revisions");
                           } else if (a.fix?.kind === "open-harnesses") {
                             setTab("harnesses");
+                          } else if (a.fix?.kind === "apply-migrations") {
+                            void applyMigrations();
                           }
                         }}
                       >
@@ -3804,7 +3839,7 @@ export default function App() {
                   <button
                     type="button"
                     className="link sm"
-                    onClick={() => setTab("owed")}
+                    onClick={openOwedInWork}
                   >
                     Open Owed
                   </button>
@@ -3945,6 +3980,8 @@ export default function App() {
                     void runRecallProbe();
                   } else if (fix.kind === "revisions") {
                     setTab("revisions");
+                  } else if (fix.kind === "apply-migrations") {
+                    void applyMigrations();
                   }
                 }}
               />
@@ -5076,161 +5113,175 @@ export default function App() {
           </div>
         </section>
 
-        <section className={panelClass("owed")}>
-          <PanelHeader
-            title="Owed"
-            lede="What you still owe on each project, kept from your own sessions."
-          >
-            {owedLoading ? <Spinner /> : null}
-            <button type="button" onClick={() => void loadOwed(owedStatus, true)}>
-              <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
-              Refresh
-            </button>
-          </PanelHeader>
-          <div className="panel-body wide">
-            <div className="inline">
-              <Segmented
-                ariaLabel="Commitment status"
-                value={owedStatus}
-                onChange={(next) => {
-                  setOwedStatus(next);
-                  void loadOwed(next, false);
-                }}
-                options={[
-                  { value: "open", label: `Open${owedCount("open")}` },
-                  { value: "closed", label: `Closed${owedCount("closed")}` },
-                  { value: "stale", label: `Stale${owedCount("stale")}` },
-                ]}
-              />
-              <div className="chips">
-                {owedProjects.map((proj) => (
-                  <Chip
-                    key={proj}
-                    title={proj}
-                    on={owedProject === proj}
-                    onClick={() =>
-                      setOwedProject(owedProject === proj ? null : proj)
-                    }
-                    onRemove={
-                      owedProject === proj ? () => setOwedProject(null) : undefined
-                    }
-                  >
-                    Project · {shortProject(proj)}
-                  </Chip>
-                ))}
-                {owedKinds.map((k) => (
-                  <Chip
-                    key={`ok-${k}`}
-                    on={owedKind === k}
-                    onClick={() => setOwedKind(owedKind === k ? null : k)}
-                    onRemove={owedKind === k ? () => setOwedKind(null) : undefined}
-                  >
-                    Kind · {OWED_KIND_LABEL[k] ?? k}
-                  </Chip>
-                ))}
-              </div>
-              <span className="meta push">
-                Closed automatically when a later capture says it was done
-              </span>
-            </div>
-
-            {loadState[`owed:${owedStatus}`] !== "ok" ? (
-              loadState[`owed:${owedStatus}`] === "failed" && owedInFlight[owedStatus] === 0 ? (
-                <ReadFailed
-                  what="commitments"
-                  onRetry={() => void loadOwed(owedStatus, true)}
-                />
-              ) : (
-                <div className="card">
-                  <ReadingLine what="commitments" />
+        <section className={panelClass("work")}>
+          <WorkView
+            work={work}
+            routing={routing}
+            plans={plans.data}
+            owedFocusKey={owedFocusKey}
+            onOwedClose={(id) => owedWrite(id, [`--close=${id}`])}
+            onSnooze={(id, title) =>
+              setSnoozeTarget(owedOpenRows.find((c) => String(c.id) === id) ?? { id: Number(id), text: title })
+            }
+            onOpenRouting={() => {
+              setSettingsSection("routing");
+              setTab("settings");
+            }}
+            owedSection={
+              <>
+                <div className="inline wk-owed-lede">
+                  <span className="meta">What you still owe on each project, kept from your own sessions.</span>
+                  {owedLoading ? <Spinner /> : null}
+                  <button type="button" className="sm" onClick={() => void loadOwed(owedStatus, true)}>
+                    <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
+                    Refresh
+                  </button>
                 </div>
-              )
-            ) : visibleOwed.length === 0 ? (
-              <div className="card">
-                <EmptyState
-                  title={
-                    owedProject
-                      ? `Nothing owed on ${shortProject(owedProject)}`
-                      : owedStatus === "open"
-                        ? "Nothing owed yet"
-                        : `Nothing ${owedStatus} here`
-                  }
-                  hint="Questions, blockers, follow-ups and promises your sessions leave open appear here."
-                />
-              </div>
-            ) : owedStatus === "open" ? (
-              // Open items are grouped by who owes them: "Needs you" first and
-              // never buried under the agent's own plan steps, which is what
-              // made a 300-row list unusable (phase 4 addendum).
-              OWED_GROUPS.map(([id, title, hint]) => {
-                const rows = visibleOwed.filter((c) => owedGroupOf(c) === id);
-                if (rows.length === 0) return null;
-                return (
-                  <Disclosure
-                    key={id}
-                    className="group"
-                    defaultOpen={id === "needs-you"}
-                    label={
-                      <>
-                        <strong>{title}</strong>
-                        <span className="nav-count quiet">{rows.length}</span>
-                        <span className="meta wrap">{hint}</span>
-                      </>
+                <div className="inline">
+                  <Segmented
+                    ariaLabel="Commitment status"
+                    value={owedStatus}
+                    onChange={(next) => {
+                      setOwedStatus(next);
+                      void loadOwed(next, false);
+                    }}
+                    options={[
+                      { value: "open", label: `Open${owedCount("open")}` },
+                      { value: "closed", label: `Closed${owedCount("closed")}` },
+                      { value: "stale", label: `Stale${owedCount("stale")}` },
+                    ]}
+                  />
+                  <div className="chips">
+                    {owedProjects.map((proj) => (
+                      <Chip
+                        key={proj}
+                        title={proj}
+                        on={owedProject === proj}
+                        onClick={() =>
+                          setOwedProject(owedProject === proj ? null : proj)
+                        }
+                        onRemove={
+                          owedProject === proj ? () => setOwedProject(null) : undefined
+                        }
+                      >
+                        Project · {shortProject(proj)}
+                      </Chip>
+                    ))}
+                    {owedKinds.map((k) => (
+                      <Chip
+                        key={`ok-${k}`}
+                        on={owedKind === k}
+                        onClick={() => setOwedKind(owedKind === k ? null : k)}
+                        onRemove={owedKind === k ? () => setOwedKind(null) : undefined}
+                      >
+                        Kind · {OWED_KIND_LABEL[k] ?? k}
+                      </Chip>
+                    ))}
+                  </div>
+                  <span className="meta push">
+                    Closed automatically when a later capture says it was done
+                  </span>
+                </div>
+
+                {loadState[`owed:${owedStatus}`] !== "ok" ? (
+                  loadState[`owed:${owedStatus}`] === "failed" && owedInFlight[owedStatus] === 0 ? (
+                    <ReadFailed
+                      what="commitments"
+                      onRetry={() => void loadOwed(owedStatus, true)}
+                    />
+                  ) : (
+                    <div className="card">
+                      <ReadingLine what="commitments" />
+                    </div>
+                  )
+                ) : visibleOwed.length === 0 ? (
+                  <div className="card">
+                    <EmptyState
+                      title={
+                        owedProject
+                          ? `Nothing owed on ${shortProject(owedProject)}`
+                          : owedStatus === "open"
+                            ? "Nothing owed yet"
+                            : `Nothing ${owedStatus} here`
+                      }
+                      hint="Questions, blockers, follow-ups and promises your sessions leave open appear here."
+                    />
+                  </div>
+                ) : owedStatus === "open" ? (
+                  // Open items are grouped by who owes them: "Needs you" first and
+                  // never buried under the agent's own plan steps, which is what
+                  // made a 300-row list unusable (phase 4 addendum).
+                  OWED_GROUPS.map(([id, title, hint]) => {
+                    const rows = visibleOwed.filter((c) => owedGroupOf(c) === id);
+                    if (rows.length === 0) return null;
+                    return (
+                      <Disclosure
+                        key={id}
+                        className="group"
+                        defaultOpen={id === "needs-you"}
+                        label={
+                          <>
+                            <strong>{title}</strong>
+                            <span className="nav-count quiet">{rows.length}</span>
+                            <span className="meta wrap">{hint}</span>
+                          </>
+                        }
+                      >
+                        {renderOwedTable(rows)}
+                      </Disclosure>
+                    );
+                  })
+                ) : (
+                  renderOwedTable(visibleOwed)
+                )}
+
+                {closedToday.length > 0 ? (
+                  <Callout
+                    tone="ok"
+                    title={`Closed today · ${closedToday.length}`}
+                    action={
+                      owedStatus === "closed" ? undefined : (
+                        <button
+                          type="button"
+                          className="sm"
+                          onClick={() => {
+                            setOwedStatus("closed");
+                            void loadOwed("closed", false);
+                          }}
+                        >
+                          Show them
+                        </button>
+                      )
                     }
                   >
-                    {renderOwedTable(rows)}
-                  </Disclosure>
-                );
-              })
-            ) : (
-              renderOwedTable(visibleOwed)
-            )}
-
-            {closedToday.length > 0 ? (
-              <Callout
-                tone="ok"
-                title={`Closed today · ${closedToday.length}`}
-                action={
-                  owedStatus === "closed" ? undefined : (
-                    <button
-                      type="button"
-                      className="sm"
-                      onClick={() => {
-                        setOwedStatus("closed");
-                        void loadOwed("closed", false);
-                      }}
-                    >
-                      Show them
-                    </button>
-                  )
-                }
-              >
-                A later capture said these were done, so they were closed.
-                Reopen one if that was wrong.
-              </Callout>
-            ) : null}
-            {owedStatus === "closed" && closedToday.length > 0 ? (
-              <div className="card">
-                <div className="card-head">Closed today</div>
-                {closedToday.map((c) => (
-                  <ListRow key={`ct-${c.id}`}>
-                    <span className="grow ellip" title={c.text}>
-                      {c.text}
-                    </span>
-                    <span className="meta">{timeLabel(c.closed_at)}</span>
-                    <button
-                      type="button"
-                      className="sm"
-                      disabled={owedBusyId === c.id}
-                      onClick={() => void owedWrite(c.id, [`--reopen=${c.id}`])}
-                    >
-                      Reopen
-                    </button>
-                  </ListRow>
-                ))}
-              </div>
-            ) : null}
-          </div>
+                    A later capture said these were done, so they were closed.
+                    Reopen one if that was wrong.
+                  </Callout>
+                ) : null}
+                {owedStatus === "closed" && closedToday.length > 0 ? (
+                  <div className="card">
+                    <div className="card-head">Closed today</div>
+                    {closedToday.map((c) => (
+                      <ListRow key={`ct-${c.id}`}>
+                        <span className="grow ellip" title={c.text}>
+                          {c.text}
+                        </span>
+                        <span className="meta">{timeLabel(c.closed_at)}</span>
+                        <button
+                          type="button"
+                          className="sm"
+                          disabled={owedBusyId === c.id}
+                          onClick={() => void owedWrite(c.id, [`--reopen=${c.id}`])}
+                        >
+                          Reopen
+                        </button>
+                      </ListRow>
+                    ))}
+                  </div>
+                ) : null}
+              </>
+            }
+          />
         </section>
 
         <section className={panelClass("harnesses")}>
@@ -6011,6 +6062,7 @@ export default function App() {
             </button>
             {(
               [
+                ["1d", "A day"],
                 ["7d", "A week"],
                 ["2w", "Two weeks"],
                 ["1m", "A month"],
@@ -6027,7 +6079,7 @@ export default function App() {
                     void owedWrite(target.id, [
                       `--snooze=${target.id}`,
                       `--until=${value}`,
-                    ]);
+                    ]).then(() => work.load(true));
                   }
                 }}
               >

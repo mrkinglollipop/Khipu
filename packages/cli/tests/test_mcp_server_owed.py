@@ -83,7 +83,7 @@ class CaptureProjectFieldTest(unittest.TestCase):
     def test_project_rides_through_to_the_payload(self):
         seen = {}
 
-        def fake_capture(payload, mode=None):
+        def fake_capture(payload, mode=None, result=None):
             seen.update(payload)
             return 0
 

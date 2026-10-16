@@ -26,8 +26,22 @@ import type { FeaturesShape } from "./settingsCli";
 import { PlanBlock, RefreshButton, UsageAccountsField, planPauses } from "./PlansCard";
 import type { PlanUsageState, UsageAccount } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
-import { GROUPS, accountTags, accountWeek, routingOverview } from "./routingOverview";
+import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, routingOverview, staleAfterSeconds } from "./routingOverview";
 import type { GroupKey, GroupTag, OverviewSettings, Problem } from "./routingOverview";
+import {
+  ACCOUNT_FILTERS,
+  ACCOUNT_SORTS,
+  CHANGE_ABOUT,
+  CHANGE_BY,
+  SEARCH_OVER,
+  accountHasProblem,
+  accountInFilter,
+  matchesQuery,
+  plural,
+  sortAccounts,
+  useListControls,
+} from "./routingLists";
+import type { AccountFilter, AccountSort, ChangeAboutFilter, ChangeByFilter, ListControls, RuleFilter } from "./routingLists";
 import "./routingOverview.css";
 import { AccountExtras, FinderBottom, FinderTop, foundCount, useAccountsFinder } from "./FoundAccounts";
 import type { AccountsFinder, FinderConfig } from "./FoundAccounts";
@@ -72,7 +86,7 @@ import {
   stateSaid,
   tableErrorWords,
 } from "./routingWords";
-import type { LimitUnit } from "./routingWords";
+import type { ChangeRow, LimitUnit } from "./routingWords";
 
 /** A conversation's change to a routing setting at your request, made and
  *  marked until you confirm it or undo it (the CLI's ``request``). */
@@ -222,6 +236,12 @@ function WriteError({ w, id, say }: { w: Writer; id: string; say?: (msg: string)
   );
 }
 
+
+/** Gives focus to `el()` once the click that removed the focused button has
+ *  rendered, so keyboard focus never drops to the page. */
+function focusAfter(el: () => HTMLElement | null | undefined): void {
+  requestAnimationFrame(() => el()?.focus());
+}
 
 function Busy({ on }: { on: boolean }) {
   return on ? <Loader2 size={14} className="spin" aria-hidden /> : null;
@@ -879,12 +899,12 @@ function PrioritySection({
           </span>
           <div className="toolbar">
             <button type="button" className="sm primary" disabled={w.isBusy("priority:confirm")}
-              onClick={() => void w.run("priority:confirm", "khipu_route_priority", { action: "confirm" })}>
+              onClick={() => void w.run("priority:confirm", "khipu_route_priority", { action: "confirm", expect })}>
               <Busy on={w.isBusy("priority:confirm")} />
               Confirm
             </button>
             <button type="button" className="sm" disabled={w.isBusy("priority:undo")}
-              onClick={() => void w.run("priority:undo", "khipu_route_priority", { action: "undo" }, null, () => addSelect.current)}>
+              onClick={() => void w.run("priority:undo", "khipu_route_priority", { action: "undo", expect }, null, () => addSelect.current)}>
               <Busy on={w.isBusy("priority:undo")} />
               Undo
             </button>
@@ -1014,6 +1034,7 @@ function AccountLine({
   onSignedIn,
   tags,
   folds,
+  staleAfterS,
   w,
   now,
   finder,
@@ -1025,6 +1046,7 @@ function AccountLine({
   onSignedIn?: () => Promise<unknown> | void;
   tags: GroupTag[];
   folds: Folds;
+  staleAfterS: number;
   w: Writer;
   now: Date;
   finder?: AccountsFinder | null;
@@ -1034,7 +1056,7 @@ function AccountLine({
   const bodyId = `route-acct-${useId().replace(/:/g, "")}`;
   const st = accountState(a, now);
   const fact = data.plan_facts?.[a.key];
-  const { week, pace } = a.configured !== false ? accountWeek(fact, now) : { week: null, pace: null };
+  const { week, pace } = a.configured !== false ? accountWeek(fact, now, plan, staleAfterS) : { week: null, pace: null };
   return (
     <div role="listitem">
       <div className="fold route-aline" data-open={open}>
@@ -1088,7 +1110,9 @@ function AccountsSection({
   plansState,
   problems,
   folds,
+  lists,
   active,
+  staleAfterS,
   w,
   now,
   finder,
@@ -1097,6 +1121,8 @@ function AccountsSection({
   plansState?: PlanUsageState | null;
   problems: Problem[];
   folds: Folds;
+  lists: ListControls;
+  staleAfterS: number;
   active: boolean;
   w: Writer;
   now: Date;
@@ -1104,25 +1130,91 @@ function AccountsSection({
 }) {
   const plans = plansState?.data ?? null;
   const accounts = inPlansOrder(data.accounts ?? [], plans);
+  const { accountSort, accountFilter } = lists.prefs;
+  // Sorting and filtering only change what shows; nothing is written.
+  const sorted = sortAccounts(accounts, accountSort, data, now);
+  const shownAccounts = sorted.filter((a) => accountInFilter(a, accountFilter, problems));
+  const filterCounts = Object.fromEntries(
+    ACCOUNT_FILTERS.map((f) => [f.key, accounts.filter((a) => accountInFilter(a, f.key, problems)).length]),
+  ) as Record<AccountFilter, number>;
+  const hiddenProblems = sorted.filter((a) => !accountInFilter(a, accountFilter, problems) && accountHasProblem(problems, a.key)).length;
+  const sortId = `route-sort-${useId().replace(/:/g, "")}`;
+  const filterLabel = useId();
   const rows = plans?.accounts ?? [];
   const pauses = planPauses(data, now);
   const routed = (row: UsageAccount) => row.key != null && accounts.some((a) => a.key === row.key);
   const loose = rows.filter((row) => !routed(row));
   const [changing, setChanging] = useState(false);
   const fieldId = `route-accounts-read-${useId().replace(/:/g, "")}`;
+  const acctChips = useRef<HTMLDivElement>(null);
+  const showAll = () => {
+    lists.set("accountFilter", "all");
+    focusAfter(() => acctChips.current?.querySelector("button"));
+  };
   // Whose plans Khipu reads: the plan read's names, else the record's.
   const names = (plans ? rows.map((r) => r.account || r.harness || "an account") : accounts.map((a) => a.label)).join(", ");
   return (
     <div className="section-body">
       {finder ? <FinderTop finder={finder} rows={rows} /> : null}
       {accounts.length ? (
-        <div className="route-alist" role="list" aria-label="Accounts">
-          {accounts.map((a) => (
-            <AccountLine key={a.key} a={a} data={data} plan={rows.find((r) => r.key != null && r.key === a.key)}
-              pause={pauses.get(a.key)} onSignedIn={plansState?.reread} tags={accountTags(problems, a.key)}
-              folds={folds} w={w} now={now} finder={finder} />
-          ))}
-        </div>
+        <>
+          <div className="route-filter">
+            <label className="lbl" htmlFor={sortId}>
+              Sort by
+            </label>
+            <select id={sortId} className="sort" value={accountSort} onChange={(e) => lists.set("accountSort", e.target.value as AccountSort)}>
+              {ACCOUNT_SORTS.map((o) => (
+                <option key={o.key} value={o.key}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="route-filter">
+            <span className="lbl" id={filterLabel}>
+              Show accounts
+            </span>
+            <div className="chips" role="group" aria-labelledby={filterLabel} ref={acctChips}>
+              {ACCOUNT_FILTERS.map((f) => (
+                <button
+                  key={f.key}
+                  type="button"
+                  className={`chip${accountFilter === f.key ? " on" : ""}`}
+                  aria-pressed={accountFilter === f.key}
+                  aria-label={`${f.label}, ${plural(filterCounts[f.key], "account", "accounts")}`}
+                  onClick={() => lists.set("accountFilter", f.key)}
+                >
+                  {f.label} <span className="n" aria-hidden>{filterCounts[f.key]}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          {shownAccounts.length ? (
+            <div className="route-alist" role="list" aria-label="Accounts">
+              {shownAccounts.map((a) => (
+                <AccountLine key={a.key} a={a} data={data} plan={rows.find((r) => r.key != null && r.key === a.key)}
+                  pause={pauses.get(a.key)} onSignedIn={plansState?.reread} tags={accountTags(problems, a.key)}
+                  folds={folds} staleAfterS={staleAfterS} w={w} now={now} finder={finder} />
+              ))}
+            </div>
+          ) : (
+            <p className="set-help" role="status">
+              No accounts here.{" "}
+              <button type="button" className="sm link" onClick={showAll}>
+                Show all {accounts.length} accounts
+              </button>
+            </p>
+          )}
+          {hiddenProblems ? (
+            <p className="set-help" role="status">
+              {hiddenProblems === 1 ? "1 account that needs a look is" : `${hiddenProblems} accounts that need a look are`} hidden by
+              this filter.{" "}
+              <button type="button" className="sm link" onClick={showAll}>
+                Show all accounts
+              </button>
+            </p>
+          ) : null}
+        </>
       ) : finder?.none ? null : (
         <EmptyState
           title="No accounts to show"
@@ -1511,8 +1603,6 @@ function RuleRow({
   );
 }
 
-type RuleFilter = "all" | "confirm" | "checked" | "broken";
-
 const RULE_FILTERS: { key: RuleFilter; label: string }[] = [
   { key: "all", label: "All" },
   { key: "confirm", label: "To confirm" },
@@ -1522,15 +1612,19 @@ const RULE_FILTERS: { key: RuleFilter; label: string }[] = [
 
 const rulesWord = (n: number) => `${n} rule${n === 1 ? "" : "s"}`;
 
-function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }) {
+function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListControls; w: Writer; now: Date }) {
   const rules = data.rules ?? [];
   const results = data.rule_results ?? [];
   // Which rules Khipu checks: those with a result (the same matrix the lines
   // come from); an older Khipu without results names them in watched_rules.
   const watchedRules = data.rule_results ? results.map((x) => x.rule) : (data.watched_rules ?? []);
   const resultOf = (n: number) => results.find((x) => x.rule === n);
-  const [filter, setFilter] = useState<RuleFilter>("all");
+  const filter = lists.prefs.ruleFilter;
+  const setFilter = (f: RuleFilter) => lists.set("ruleFilter", f);
+  const query = lists.ruleQuery;
   const filterLabel = useId();
+  const searchId = `rule-search-${useId().replace(/:/g, "")}`;
+  const ruleSearch = useRef<HTMLInputElement>(null);
   const [ask, setAsk] = useState<RuleAsk>(null);
   const [removed, setRemoved] = useState<RouteRule | null>(null);
   const [draft, setDraft] = useState("");
@@ -1545,7 +1639,9 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
     broken: (r) => watchedRules.includes(r.n) && resultOf(r.n)?.result === "broken",
   };
   const counts = Object.fromEntries(RULE_FILTERS.map((f) => [f.key, rules.filter(inFilter[f.key]).length])) as Record<RuleFilter, number>;
-  const shown = rules.filter(inFilter[filter]);
+  const inFilterRules = rules.filter(inFilter[filter]);
+  const searching = rules.length > SEARCH_OVER;
+  const shown = searching && query.trim() ? inFilterRules.filter((r) => matchesQuery(query, r.text)) : inFilterRules;
   const checkable = rules.filter((r) => watchedRules.includes(r.n)).length;
   async function add(e: FormEvent) {
     e.preventDefault();
@@ -1607,12 +1703,31 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
             </div>
           </div>
         ) : null}
+        {searching ? (
+          <div className="search-row">
+            <label className="sr-only" htmlFor={searchId}>
+              Search standing rules
+            </label>
+            <input id={searchId} ref={ruleSearch} className="filter-input" type="search" placeholder={`Search the ${rules.length} rules`}
+              autoComplete="off" value={query} onChange={(e) => lists.setRuleQuery(e.target.value)} />
+          </div>
+        ) : null}
         {shown.length ? (
           <ol className="rows route-rule-list" role="list" aria-label="Standing rules">
             {shown.map((r) => (
               <RuleRow key={r.n} r={r} watched={watchedRules.includes(r.n)} result={resultOf(r.n)} ask={ask} setAsk={setAsk} w={w} now={now} onRemoved={setRemoved} back={() => addBtn.current} />
             ))}
           </ol>
+        ) : searching && query.trim() && inFilterRules.length ? (
+          <p className="set-help" role="status">
+            {`No rules match “${query.trim()}”. `}
+            <button type="button" className="sm link" onClick={() => {
+              lists.setRuleQuery("");
+              focusAfter(() => ruleSearch.current);
+            }}>
+              Clear search
+            </button>
+          </p>
         ) : rules.length ? (
           <p className="set-help">
             {`No rules here. `}
@@ -2632,6 +2747,7 @@ function RecordReadLine({ read, what }: { read: Exclude<RecordRead, "ready">; wh
 function FoldersSection({
   data,
   cfg,
+  lists,
   recordRead = "ready",
   w,
   now,
@@ -2639,6 +2755,7 @@ function FoldersSection({
 }: {
   data: RouteView | null;
   cfg: RouteConfig | null;
+  lists: ListControls;
   recordRead?: RecordRead;
   w: Writer;
   now: Date;
@@ -2711,15 +2828,60 @@ function FoldersSection({
     (name) => !entries.some((e) => e.name === name),
   );
   const unmatchedLimits = data?.unmatched ?? [];
-  const lanesList = (name: string, lanes: string[]) => (
-    <div className="lane-sub" role="list" aria-label={`${name} lanes`}>
-      {lanes.map((lane) => (
-        <LaneRow key={lane} runner={name} lane={lane} target={map[name]?.[lane]} accounts={accounts} w={w} reread={reread} />
-      ))}
-    </div>
-  );
+  // Searching lanes: by lane, runner and mapped account; folders always stay.
+  const laneGroups = [...entries.map((e) => e.name), ...others].map((name) => ({ name, lanes: lanesOf(name) }));
+  const totalLanes = laneGroups.reduce((n, g) => n + g.lanes.length, 0);
+  const searchLanes = recordRead === "ready" && totalLanes > SEARCH_OVER;
+  const query = searchLanes ? lists.laneQuery.trim() : "";
+  const laneSearchId = `lane-search-${base}`;
+  const laneSearch = useRef<HTMLInputElement>(null);
+  const laneMatches = (name: string, lane: string) => !query || matchesQuery(query, lane, name, map[name]?.[lane]);
+  const matchingLanes = laneGroups.reduce((n, g) => n + g.lanes.filter((l) => laneMatches(g.name, l)).length, 0);
+  const hiddenNoAccount = data
+    ? lanesWithoutAccount(data, { routing: cfg?.routing ?? null, push: null }).filter(
+        (x) => lanesOf(x.runner).includes(x.lane) && !laneMatches(x.runner, x.lane),
+      ).length
+    : 0;
+  const lanesList = (name: string, lanes: string[]) => {
+    const shownLanes = lanes.filter((lane) => laneMatches(name, lane));
+    if (!shownLanes.length) return null;
+    return (
+      <div className="lane-sub" role="list" aria-label={`${name} lanes`}>
+        {shownLanes.map((lane) => (
+          <LaneRow key={lane} runner={name} lane={lane} target={map[name]?.[lane]} accounts={accounts} w={w} reread={reread} />
+        ))}
+      </div>
+    );
+  };
   return (
     <div className="section-body">
+        {searchLanes ? (
+          <>
+            <div className="search-row">
+              <label className="sr-only" htmlFor={laneSearchId}>
+                Search job runner lanes
+              </label>
+              <input id={laneSearchId} ref={laneSearch} className="filter-input" type="search" placeholder={`Search the ${totalLanes} lanes`}
+                autoComplete="off" value={lists.laneQuery} onChange={(e) => lists.setLaneQuery(e.target.value)} />
+            </div>
+            {query ? (
+              <p className="set-help" role="status">
+                {matchingLanes
+                  ? `${matchingLanes} of ${totalLanes} lanes match.`
+                  : `No lanes match “${query}”.`}
+                {hiddenNoAccount
+                  ? ` ${plural(hiddenNoAccount, "lane without an account is", "lanes without an account are")} hidden by this search.`
+                  : ""}{" "}
+                <button type="button" className="sm link" onClick={() => {
+                  lists.setLaneQuery("");
+                  focusAfter(() => laneSearch.current);
+                }}>
+                  Clear search
+                </button>
+              </p>
+            ) : null}
+          </>
+        ) : null}
         {entries.length ? (
           <div className="rows" role="list" aria-label="Job runner folders">
             {entries.map((entry) => {
@@ -3171,62 +3333,140 @@ function TableSection({
   );
 }
 
-function ChangesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }) {
+function ChangesSection({ data, lists, w, now }: { data: RouteView; lists: ListControls; w: Writer; now: Date }) {
   const days = changeDays(data, now);
   const active = new Set((data.rules ?? []).map((r) => r.n));
-  return (
-      <div className="section-body route-days">
-        {days.length ? (
-          days.map((day) => {
-            const headId = `route-day-${day.key}`;
+  const { changeBy, changeAbout } = lists.prefs;
+  // Earlier days are loaded on request: how many have been asked for.
+  const [more, setMore] = useState(0);
+  const chipsRef = useRef<HTMLDivElement>(null);
+  const byId = useId().replace(/:/g, "");
+  const filtered = days
+    .map((d) => ({ ...d, rows: d.rows.filter((r) => (changeBy === "all" || r.by === changeBy) && (changeAbout === "all" || r.about === changeAbout)) }))
+    .filter((d) => d.rows.length);
+  const today = filtered.find((d) => d.label === "Today");
+  const earlier = filtered.filter((d) => d.label !== "Today");
+  const shownEarlier = earlier.slice(0, more);
+  const next = earlier[more];
+  const filtering = changeBy !== "all" || changeAbout !== "all";
+  const setBy = (v: ChangeByFilter) => {
+    setMore(0);
+    lists.set("changeBy", v);
+  };
+  const setAbout = (v: ChangeAboutFilter) => {
+    setMore(0);
+    lists.set("changeAbout", v);
+  };
+  const chipGroup = <K extends string>(id: string, label: string, options: { key: K; label: string }[], value: K, pick: (k: K) => void) => (
+    <div className="route-filter">
+      <span className="lbl" id={id}>
+        {label}
+      </span>
+      <div className="chips" role="group" aria-labelledby={id}>
+        {options.map((o) => (
+          <button key={o.key} type="button" className={`chip${value === o.key ? " on" : ""}`} aria-pressed={value === o.key}
+            onClick={() => pick(o.key)}>
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+  const dayBlock = (day: { key: string; label: string; rows: ChangeRow[] }) => {
+    const headId = `route-day-${day.key}`;
+    return (
+      <div key={day.key} className="rows">
+        <h2 className="rows-head route-day" id={headId} tabIndex={-1}>
+          {day.label}
+        </h2>
+        <div role="list" aria-labelledby={headId}>
+          {day.rows.map((row) => {
+            const id = row.restore != null ? `rule-restore:${row.restore}` : "";
             return (
-              <div key={day.key} className="rows">
-                <h2 className="rows-head route-day" id={headId}>
-                  {day.label}
-                </h2>
-                <div role="list" aria-labelledby={headId}>
-                  {day.rows.map((row) => {
-                    const id = row.restore != null ? `rule-restore:${row.restore}` : "";
-                    return (
-                      <div key={row.key} className="row-item route-event" role="listitem">
-                        <span className="row-meta">
-                          {new Date(row.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
-                        </span>
-                        <span className="row-main">
-                          <b>{row.subject}</b> {row.text}
-                          {row.aside ? <span className="t2"> {row.aside}</span> : null}
-                          {row.restore != null && !active.has(row.restore) ? (
-                            <>
-                              {" "}
-                              <button
-                                type="button"
-                                className="sm"
-                                disabled={w.isBusy(id)}
-                                aria-label={`Bring back standing rule ${row.restore}`}
-                                onClick={() => {
-                                  const n = row.restore!;
-                                  void w.run(id, "khipu_route_rule", { action: "restore", n }, null, () => ruleRemoveButton(n));
-                                }}
-                              >
-                                <Busy on={w.isBusy(id)} />
-                                Bring it back
-                              </button>
-                              <WriteError w={w} id={id} />
-                            </>
-                          ) : null}
-                        </span>
-                        <span className="route-who">{row.who}</span>
-                      </div>
-                    );
-                  })}
-                </div>
+              <div key={row.key} className="row-item route-event" role="listitem">
+                <span className="row-meta">
+                  {new Date(row.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+                </span>
+                <span className="row-main">
+                  <b>{row.subject}</b> {row.text}
+                  {row.aside ? <span className="t2"> {row.aside}</span> : null}
+                  {row.restore != null && !active.has(row.restore) ? (
+                    <>
+                      {" "}
+                      <button
+                        type="button"
+                        className="sm"
+                        disabled={w.isBusy(id)}
+                        aria-label={`Bring back standing rule ${row.restore}`}
+                        onClick={() => {
+                          const n = row.restore!;
+                          void w.run(id, "khipu_route_rule", { action: "restore", n }, null, () => ruleRemoveButton(n));
+                        }}
+                      >
+                        <Busy on={w.isBusy(id)} />
+                        Bring it back
+                      </button>
+                      <WriteError w={w} id={id} />
+                    </>
+                  ) : null}
+                </span>
+                <span className="route-who">{row.who}</span>
               </div>
             );
-          })
-        ) : (
-          <p className="set-help">No changes yet.</p>
-        )}
+          })}
+        </div>
       </div>
+    );
+  };
+  return (
+    <div className="section-body route-days">
+      {days.length ? (
+        <>
+          <div className="who-kind" ref={chipsRef}>
+            {chipGroup(`${byId}-by`, "Changes by", CHANGE_BY, changeBy, setBy)}
+            {chipGroup(`${byId}-about`, "Changes to", CHANGE_ABOUT, changeAbout, setAbout)}
+          </div>
+          {filtered.length ? (
+            <>
+              {today ? (
+                dayBlock(today)
+              ) : (
+                <div className="rows">
+                  <h2 className="rows-head route-day">Today</h2>
+                  <p className="set-help">{filtering ? "No changes today match these filters." : "No changes today."}</p>
+                </div>
+              )}
+              {shownEarlier.map(dayBlock)}
+              {next ? (
+                <div className="toolbar">
+                  <button type="button" className="sm" onClick={() => {
+                    setMore(more + 1);
+                    focusAfter(() => document.getElementById(`route-day-${next.key}`));
+                  }}>
+                    Show earlier days
+                  </button>
+                  <span className="route-src">{`${next.label} has ${plural(next.rows.length, "more change", "more changes")}`}</span>
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <p className="set-help" role="status">
+              No changes match these filters.{" "}
+              <button type="button" className="sm link" onClick={() => {
+                setMore(0);
+                lists.set("changeBy", "all");
+                lists.set("changeAbout", "all");
+                focusAfter(() => chipsRef.current?.querySelector("button"));
+              }}>
+                Show every change
+              </button>
+            </p>
+          )}
+        </>
+      ) : (
+        <p className="set-help">No changes yet.</p>
+      )}
+    </div>
   );
 }
 
@@ -3374,6 +3614,7 @@ export function RoutingSettings({
       setFocusItem({ item: null, group: "rules" });
     },
   });
+  const lists = useListControls();
   const [focusItem, setFocusItem] = useState<{ item: string | null; group: GroupKey } | null>(null);
   const [retrying, setRetrying] = useState(false);
   const now = new Date();
@@ -3428,6 +3669,8 @@ export function RoutingSettings({
   }, [focusItem]);
 
   const show = (p: Problem) => {
+    // Clear whatever filter or search could hide the item Show points at.
+    lists.reveal(p.group);
     folds.openKeys([p.group, ...(p.item?.startsWith("account:") ? [p.item] : [])]);
     setFocusItem({ item: p.item ?? null, group: p.group });
   };
@@ -3442,7 +3685,8 @@ export function RoutingSettings({
 
   const body: Record<GroupKey, ReactNode> = {
     accounts: data ? (
-      <AccountsSection data={data} plansState={plansState} problems={overview.problems} folds={folds} active={active} w={w} now={now}
+      <AccountsSection data={data} plansState={plansState} problems={overview.problems} folds={folds} lists={lists} active={active}
+        staleAfterS={staleAfterSeconds(settings)} w={w} now={now}
         finder={finder} />
     ) : (
       unread
@@ -3451,7 +3695,7 @@ export function RoutingSettings({
     rules: data ? (
       <>
         <NoteSection data={data} w={w} now={now} />
-        <RulesSection data={data} w={w} now={now} />
+        <RulesSection data={data} lists={lists} w={w} now={now} />
       </>
     ) : (
       unread
@@ -3471,9 +3715,9 @@ export function RoutingSettings({
       />
     ),
     resets: <ResetChecksSection data={data} cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} />,
-    runners: <FoldersSection data={data} cfg={config.data} recordRead={recordRead} w={w} now={now} reread={rereadConfig} />,
+    runners: <FoldersSection data={data} cfg={config.data} lists={lists} recordRead={recordRead} w={w} now={now} reread={rereadConfig} />,
     table: <TableSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />,
-    changes: data ? <ChangesSection data={data} w={w} now={now} /> : unread,
+    changes: data ? <ChangesSection data={data} lists={lists} w={w} now={now} /> : unread,
   };
 
   return (

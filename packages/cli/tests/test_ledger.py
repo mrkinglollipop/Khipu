@@ -24,7 +24,27 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 MIGRATIONS = REPO / "ops" / "migrations"
-INITDB, PG_CTL = shutil.which("initdb"), shutil.which("pg_ctl")
+
+
+def _pg_tool(name: str) -> str | None:
+    """``name`` on PATH, else from a usual PostgreSQL install, so the rollback
+    and concurrency tests run on a scratch database rather than skip when a
+    shell's PATH leaves the install out."""
+    import glob
+
+    found = shutil.which(name)
+    if found:
+        return found
+    for pattern in ("/opt/homebrew/opt/postgresql@*/bin", "/usr/local/opt/postgresql@*/bin",
+                    "/opt/homebrew/bin", "/usr/local/bin", "/Applications/Postgres.app/Contents/Versions/*/bin",
+                    "/usr/lib/postgresql/*/bin"):
+        for folder in sorted(glob.glob(pattern), reverse=True):
+            if os.access(os.path.join(folder, name), os.X_OK):
+                return os.path.join(folder, name)
+    return None
+
+
+INITDB, PG_CTL = _pg_tool("initdb"), _pg_tool("pg_ctl")
 P = "acme/widget"
 KEY = "sk-ant-" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4"
 
@@ -71,7 +91,9 @@ def pg_dsn():
 
 
 @pytest.fixture
-def hub(pg_dsn, monkeypatch, tmp_path):
+def hub(pg_dsn, monkeypatch, tmp_path, khipu_app):
+    """The scratch cluster, empty; a ``--from-app`` write is started by the
+    app (``khipu_app``), as the desktop's own argv is."""
     import psycopg
 
     monkeypatch.setattr(psycopg, "connect", psycopg.Connection.connect)
@@ -161,6 +183,8 @@ def test_the_printed_lines_match_the_trackers_for_the_same_input(hub, monkeypatc
     assert ok("set", "s-1", "--note", "still going").strip() == "set s-1: note appended"
     lines = ok("list").splitlines()
     assert lines[0].startswith("g-1 · NOT STARTED · Ship the thing · owner=none · updated=20")
+    listed = json.loads(ok("list", "--json"))
+    assert ["NEEDS MATT", "needs"] in listed["vocab"]["state"] and [r["id"] for r in listed["rows"]][0] == "g-1"
     assert lines[-2:] == ["", "3 row(s)"]
     loose = ok("loose-ends").splitlines()
     assert loose[0] == "== IN FLIGHT (1)"
@@ -180,7 +204,8 @@ def test_the_printed_lines_match_the_trackers_for_the_same_input(hub, monkeypatc
     assert "- NEEDS MATT: 1" in board and "- needs-matt: 1" in board
     assert "**parent: g-1: Ship the thing**" in board
     out = Path(os.environ["KHIPU_DATA_DIR"]) / "board.md"
-    assert ok("render", "--out", str(out)).strip() == f"rendered 3 rows -> {out}"
+    # the printed line leaves through the projection, which names a path only as "a folder"
+    assert ok("render", "--out", str(out)).strip() == "rendered 3 rows -> a folder"
     assert out.read_text(encoding="utf-8").startswith("# Orchestrator Tracker")
     got = json.loads(ok("get", "s-1"))
     assert {"id", "title", "kind", "parent", "state", "evidence", "owner", "updated", "history"} <= set(got)
@@ -2161,3 +2186,73 @@ def test_a_queue_listing_that_fails_reports_unreadable_never_empty(monkeypatch, 
     assert ledger.nightly()["ok"] is False
     monkeypatch.setattr(os, "listdir", real_listdir)
     assert [q["op_id"] for q in ledger.queued_ops()] == ["waiting"]
+
+
+def test_the_apps_argv_shapes_parse_and_are_recorded_as_the_app(hub):
+    """The desktop's fixed argv (src-tauri lib.rs, work_command_tests): the
+    project joined to its flag, the row id after ``--``, ``--from-app``."""
+    from khipu import cli
+
+    def app(*argv):
+        args = cli.build_parser().parse_args(["ledger", *argv])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            assert args.func(args) == 0, out.getvalue()
+        return json.loads(out.getvalue())
+
+    ok("add", "n-1", "--title", "Pick a name", "--kind", "needs-owner", "--state", "NEEDS OWNER")
+    got = app("set", "--json", "--from-app", f"--project={P}", "--state=DONE", "--note=Picked.\nSecond line",
+              "--if-state=NEEDS OWNER", "--evidence=--state=DROPPED", "--", "n-1")
+    assert got["ok"] and got["state"] == "DONE"
+    row = app("get", "--json", f"--project={P}", "--", "n-1")
+    assert row["state"] == "DONE" and row["evidence"] == "--state=DROPPED"
+    assert row["history"][-1]["by"] == "you, in the app" and row["history"][-1]["note"] == "Picked.\nSecond line"
+    assert app("list", "--json", f"--project={P}")["rows"][0]["id"] == "n-1"
+    assert app("remove", "--json", "--from-app", f"--project={P}", "--note=duplicate", "--", "n-1")["ok"]
+    assert [r["id"] for r in app("removed", "--json", f"--project={P}")["removed"]] == ["n-1"]
+    assert app("restore", "--json", "--from-app", f"--project={P}", "--", "n-1")["ok"]
+
+
+@pytest.mark.parametrize("argv", [["purge", "s-1"], ["restore", "s-1"], ["set", "s-1", "--state", "DONE"],
+                                  ["remove", "s-1"]])
+def test_from_app_is_refused_when_the_app_did_not_start_the_call(hub, khipu_app, argv):
+    """A conversation passing ``--from-app`` itself can neither remove a row
+    for good, restore one, nor be recorded as "you, in the app"."""
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    if argv[0] in ("purge", "restore"):
+        ok("remove", "s-1")
+    before = _sql(hub, "SELECT count(*) FROM ledger_history")[0][0]
+    khipu_app.as_shell("/usr/local/bin/claude")
+    rc, out, err = run(*argv, "--from-app", "--project", P)
+    assert rc == 1 and "only the Khipu app" in err, (out, err)
+    assert _sql(hub, "SELECT count(*) FROM ledger_rows WHERE row_id = 's-1'")[0][0] == 1
+    assert _sql(hub, "SELECT count(*) FROM ledger_history")[0][0] == before
+    assert _sql(hub, "SELECT count(*) FROM ledger_history WHERE author->>'kind' = 'owner'")[0][0] == 0
+    khipu_app.as_app()
+    assert run(*argv, "--from-app", "--project", P)[0] == 0
+
+
+def test_the_nightly_never_purges_a_row_removed_again_after_it_looked(hub, monkeypatch):
+    """The nightly finds the rows removed long enough ago, then purges each
+    under the project lock. A row restored and removed again in between is a
+    fresh removal, owed its days of restore, and stays."""
+    from khipu import ledger
+
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    ok("remove", "s-1")
+    _sql(hub, "UPDATE ledger_rows SET removed_at = now() - interval '31 days' WHERE row_id = 's-1'")
+    real_lock = ledger.lock_project
+    raced = []
+
+    def racing_lock(cur, project):
+        if not raced:
+            raced.append(True)
+            ok("restore", "s-1", "--from-app")
+            ok("remove", "s-1")
+        return real_lock(cur, project)
+
+    monkeypatch.setattr(ledger, "lock_project", racing_lock)
+    with _real_connect(hub) as conn:
+        got = ledger.purge_due(conn)
+    assert raced and got["purged"] == 0, got
+    assert _sql(hub, "SELECT row_id, removed_at > now() - interval '1 day' FROM ledger_rows") == [("s-1", True)]

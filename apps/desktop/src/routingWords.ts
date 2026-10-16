@@ -185,9 +185,35 @@ export type ChangeRow = {
   /** Smaller words after the text, such as what it was before. */
   aside?: string;
   who: string;
+  /** Who made it, for the "Changes by" filter. */
+  by: ChangeBy;
+  /** What it changed, for the "Changes to" filter. */
+  about: ChangeAbout;
   /** A removed rule the page can bring back. */
   restore?: number;
 };
+
+export type ChangeBy = "you" | "conversations" | "runners" | "khipu";
+export type ChangeAbout = "accounts" | "rules" | "holds" | "settings";
+
+function changeBy(item: RouteChangeItem): ChangeBy {
+  if (item.by === "you") return "you";
+  if (item.source === "probe" || item.source === "check" || item.source === "table") return "khipu";
+  if (item.source === "runner" || / lanes \(read by Khipu\)$/.test(item.by ?? "")) return "runners";
+  // Khipu's own seed, an unknown writer and a report with no author are Khipu's.
+  if (!item.by || item.by === "Khipu rules seed" || item.by === "an unknown writer") return "khipu";
+  return "conversations";
+}
+
+/** Your priority is your order of accounts; folders, lanes and the old
+ *  table file are settings. */
+function changeAbout(entity: string): ChangeAbout {
+  const kind = entity.split(":")[0];
+  if (kind === "account" || kind === "priority") return "accounts";
+  if (kind === "rule" || kind === "note") return "rules";
+  if (kind === "hold") return "holds";
+  return "settings";
+}
 
 function whoWords(item: RouteChangeItem): string {
   if (item.by === "you") {
@@ -229,7 +255,7 @@ function sideSaid(raw: unknown): { who: string; state: string } | null {
 }
 
 function itemRow(change: RouteChange, item: RouteChangeItem, i: number, now: Date): ChangeRow {
-  const base = { key: `${change.version}-${i}`, at: change.at, who: whoWords(item) };
+  const base = { key: `${change.version}-${i}`, at: change.at, who: whoWords(item), by: changeBy(item), about: changeAbout(item.entity) };
   const [kind, ...rest] = item.entity.split(":");
   const ident = rest.join(":");
   const cur = item.now ?? null;
@@ -349,7 +375,7 @@ function itemRow(change: RouteChange, item: RouteChangeItem, i: number, now: Dat
 function legacyRow(change: RouteChange, entity: string, i: number, view: RouteView): ChangeRow {
   const [kind, ...rest] = entity.split(":");
   const ident = rest.join(":");
-  const base = { key: `${change.version}-${i}`, at: change.at, who: "Khipu", text: "changed" };
+  const base = { key: `${change.version}-${i}`, at: change.at, who: "Khipu", by: "khipu" as const, about: changeAbout(entity), text: "changed" };
   if (kind === "account") {
     const label = (view.accounts ?? []).find((a) => a.key === ident)?.label ?? "An account";
     return { ...base, subject: label };

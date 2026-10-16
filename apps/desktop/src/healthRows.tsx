@@ -65,6 +65,7 @@ const LABELS: Record<string, string> = {
   embed_coverage_ok: "Search index complete",
   recall_probe_ok: "Memory round trip works",
   bundle_seal_ok: "App bundle intact",
+  schema_migrations_ok: "Database has every update this version expects",
   // Phase 6 (honesty): per-nightly-step evidence (D1), instead of trusting
   // only the legacy driver's exit code.
   notes_reconcile_ok: "Notes reconciled by the nightly",

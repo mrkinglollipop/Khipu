@@ -112,7 +112,7 @@ function PriorityRow({ p, now, reload }: { p: RoutePriority; now: Date; reload: 
     setBusy(action);
     setError(null);
     try {
-      const out = await callCli("khipu_route_priority", { action });
+      const out = await callCli("khipu_route_priority", { action, expect: p.version ?? null });
       if (!out.ok) setError(out.error);
       await reload();
     } finally {
@@ -153,12 +153,12 @@ function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
-export function RoutingCard({ state, plans }: { state: RoutingState; plans?: UsageReport | null }) {
-  const { data, error, loading } = state;
-  const holdsId = useId();
-  const now = new Date();
+/** The account rows with their Check now, as the Home Routing card shows
+ *  them. The Work tab's Accounts card reuses this list, never a copy. */
+export function AccountRows({ state, plans, now }: { state: RoutingState; plans?: UsageReport | null; now: Date }) {
   const [checking, setChecking] = useState<string | null>(null);
   const [checkResult, setCheckResult] = useState<{ account: string; text: string; error: boolean } | null>(null);
+  const data = state.data;
   const check = async (account: string) => {
     if (checking !== null) return;
     setChecking(account); setCheckResult(null);
@@ -168,6 +168,29 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
       await state.load(true);
     } finally { setChecking((active) => active === account ? null : active); }
   };
+  const accounts = inPlansOrder(data?.accounts ?? [], plans);
+  if (accounts.length === 0) {
+    return (
+      <EmptyState
+        title="No accounts to show"
+        hint="The accounts listed under Plans show here once one is set up on this Mac."
+      />
+    );
+  }
+  return (
+    <div role="list" aria-label="Accounts">
+      {accounts.map((a) => (
+        <AccountRow key={a.key} a={a} now={now} plans={plans} reportDefault={data?.report_default_limit}
+          onCheck={check} checking={checking} checkResult={checkResult} />
+      ))}
+    </div>
+  );
+}
+
+export function RoutingCard({ state, plans }: { state: RoutingState; plans?: UsageReport | null }) {
+  const { data, error, loading } = state;
+  const holdsId = useId();
+  const now = new Date();
   const head = <div className="card-head">Routing</div>;
   if (data == null) {
     return (
@@ -192,7 +215,6 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
       </div>
     );
   }
-  const accounts = inPlansOrder(data.accounts ?? [], plans);
   const holds = data.holds ?? [];
   const rules = data.rules ?? [];
   const toConfirm = rules.filter((r) => r.pending || (r.seeded && !r.confirmed)).length;
@@ -220,19 +242,7 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
         </ListRow>
       ) : null}
       {data.priority ? <PriorityRow p={data.priority} now={now} reload={() => state.load(true)} /> : null}
-      {accounts.length === 0 ? (
-        <EmptyState
-          title="No accounts to show"
-          hint="The accounts listed under Plans show here once one is set up on this Mac."
-        />
-      ) : (
-        <div role="list" aria-label="Accounts">
-          {accounts.map((a) => (
-            <AccountRow key={a.key} a={a} now={now} plans={plans} reportDefault={data.report_default_limit}
-              onCheck={check} checking={checking} checkResult={checkResult} />
-          ))}
-        </div>
-      )}
+      <AccountRows state={state} plans={plans} now={now} />
       {holds.length ? (
         <div className="route-sub">
           <h2 className="route-sub-head" id={holdsId}>
