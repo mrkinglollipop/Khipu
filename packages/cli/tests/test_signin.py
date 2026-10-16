@@ -11,6 +11,7 @@ from __future__ import annotations
 import builtins
 import json
 import os
+import signal
 import stat
 import subprocess
 import threading
@@ -23,6 +24,7 @@ import pytest
 from khipu import discover, signin, usage
 
 NOW = 1_800_000_000.0
+REAL_GETPGID, REAL_MEMBERS = signin.__dict__.get("_getpgid"), signin.__dict__.get("group_members")
 LSTART = "Thu Oct 15 00:00:00 2026"
 LOGIN_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME")
 ALL_PROVEN = MappingProxyType({cli: True for cli in signin.CLIS})
@@ -61,7 +63,18 @@ class Procs:
 
     def killpg(self, pgid, sig):
         self.killed.append((pgid, sig))
-        self.table.pop(pgid, None)
+        for pid, info in list(self.table.items()):
+            if info.get("pgid", pid) == pgid and sig not in info.get("ignore", ()):
+                self.table.pop(pid)
+
+    def getpgid(self, pid):
+        if pid not in self.table:
+            raise ProcessLookupError(pid)
+        return self.table[pid].get("pgid", pid)
+
+    def members(self, pgid):
+        return [pid for pid, info in self.table.items()
+                if info.get("pgid", pid) == pgid and not info["stat"].startswith("Z")]
 
     def popen(self, argv, **kw):
         self.calls.append((list(argv), kw))
@@ -94,6 +107,10 @@ def box(tmp_path, monkeypatch):
     monkeypatch.setattr(usage, "_command", lambda harness: f"/fake/bin/{harness}")
     monkeypatch.setattr(signin, "KILL_GRACE_S", 0.2)
     procs = Procs()
+    monkeypatch.setattr(signin, "_getpgid", procs.getpgid, raising=False)
+    monkeypatch.setattr(signin, "group_members", procs.members, raising=False)
+    # The app that ran ``start``: the parent of the process running it.
+    procs.table[os.getppid()] = {"stat": "S", "lstart": LSTART, "command": "/fake/Khipu.app/Contents/MacOS/khipu"}
     procs.home, procs.tmp = home, tmp_path
     return procs
 
@@ -180,6 +197,28 @@ def test_anything_at_the_path_is_taken_then_two_then_three(box, kind):
     (box.home / ".codex-other").write_text("x")
     (box.home / ".codex-other-2").mkdir()
     assert signin.make_folder("codex", "other")["folder"] == "~/.codex-other-3"
+
+
+def test_a_taken_long_slug_keeps_its_suffix_within_32_characters(box):
+    long = "x" * 32
+    (box.home / f".claude-{long}").mkdir()
+    for n in range(2, 12):
+        out = signin.make_folder("claude", long)
+        assert out["ok"], out
+        folder = out["folder"]
+        slug_part = folder[len("~/.claude-"):]
+        assert len(slug_part) <= signin.SLUG_MAX and slug_part.endswith(f"-{n}"), folder
+        assert signin.khipu_made("claude", folder)[0] is not None
+        signin._mark_signed_in("claude", box.home / folder[2:])  # so the next call makes a new one
+
+
+def test_khipu_made_refuses_a_slug_over_32_characters(box, monkeypatch):
+    name = ".claude-" + "y" * 33
+    (box.home / name).mkdir()
+    info = os.lstat(box.home / name)
+    signin._save_folders([{"cli": "claude", "slug": "y" * 33, "name": name,
+                           "identity": signin._ident(info), "signed_in": False}])
+    assert signin.khipu_made("claude", "~/" + name) == (None, signin.E_REFUSED)
 
 
 def test_a_folder_khipu_made_that_never_signed_in_is_reused(box):
@@ -477,6 +516,116 @@ def test_start_never_keeps_a_login_it_cannot_prove_is_its_own(box):
     assert box.killed and box.killed[0][0] == 1_000_001 and not _attempt_file().exists()
 
 
+def test_a_folder_swapped_for_a_symlink_before_the_launch_is_refused(box, monkeypatch, tmp_path):
+    folder = _folder()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_env = usage.probe_environment
+
+    def swap(*a, **k):
+        # Between the check and the spawn: the folder moves away and a link
+        # to somewhere outside Khipu's folder takes its name.
+        os.rename(box.home / ".claude-client", box.home / ".claude-moved")
+        os.symlink(outside, box.home / ".claude-client")
+        return real_env(*a, **k)
+
+    monkeypatch.setattr(usage, "probe_environment", swap)
+    out = signin.start("claude", folder, **box.kw())
+    assert out == {"ok": False, "error": signin.E_REFUSED}
+    assert box.calls == [] and not _attempt_file().exists() and list(outside.iterdir()) == []
+
+
+def test_a_folder_swapped_for_another_real_folder_before_the_launch_is_refused(box, monkeypatch):
+    folder = _folder()
+    real_env = usage.probe_environment
+
+    def swap(*a, **k):
+        os.rename(box.home / ".claude-client", box.home / ".claude-moved")
+        os.mkdir(box.home / ".claude-client", 0o700)
+        return real_env(*a, **k)
+
+    monkeypatch.setattr(usage, "probe_environment", swap)
+    assert signin.start("claude", folder, **box.kw()) == {"ok": False, "error": signin.E_REFUSED}
+    assert box.calls == []
+
+
+def test_no_signal_once_the_number_stops_being_the_login(box):
+    signin.start("claude", _folder(), **box.kw())
+    rec = json.loads(_attempt_file().read_text())
+    leader = box.table[1_000_001]
+    leader["ignore"] = {signal.SIGTERM}
+    real_killpg = box.killpg
+
+    def killpg(pgid, sig):
+        real_killpg(pgid, sig)
+        # During the grace wait the number comes to name another process.
+        leader.update({"lstart": "Sat Oct 17 01:02:03 2026", "command": "/usr/bin/other"})
+
+    assert signin.kill_if_ours(rec, ps=box.ps, killpg=killpg) == "unverified"
+    assert box.killed == [(1_000_001, signal.SIGTERM)]
+
+
+def test_a_failed_group_check_sends_nothing_and_says_so(box, monkeypatch):
+    signin.start("claude", _folder(), **box.kw())
+    rec = json.loads(_attempt_file().read_text())
+
+    def denied(pid):
+        raise PermissionError(pid)
+
+    monkeypatch.setattr(signin, "_getpgid", denied)
+    assert signin.kill_if_ours(rec, ps=box.ps, killpg=box.killpg) == "unverified"
+    assert box.killed == []
+    res = signin.reap(ps=box.ps, killpg=box.killpg)
+    assert res["reaped"] == "unverified" and box.killed == []
+
+
+def test_a_child_that_ignores_sigterm_is_killed_with_the_group(box):
+    out = signin.start("claude", _folder(), **box.kw())
+    box.table[1_000_050] = {"stat": "S", "lstart": LSTART, "command": "/fake/bin/node helper",
+                            "pgid": 1_000_001, "ignore": {signal.SIGTERM}}
+    res = signin.cancel(out["attempt"]["id"], ps=box.ps, killpg=box.killpg)
+    assert res["stopped"] == "killed" and "left" not in res
+    assert box.killed == [(1_000_001, signal.SIGTERM), (1_000_001, signal.SIGKILL)]
+    assert box.members(1_000_001) == []
+
+
+def test_a_group_that_will_not_end_is_reported_not_called_killed(box):
+    out = signin.start("claude", _folder(), **box.kw())
+    box.table[1_000_050] = {"stat": "S", "lstart": LSTART, "command": "/fake/bin/node helper",
+                            "pgid": 1_000_001, "ignore": {signal.SIGTERM, signal.SIGKILL}}
+    res = signin.cancel(out["attempt"]["id"], ps=box.ps, killpg=box.killpg)
+    assert res["stopped"] == "left" and res["left"] == [1_000_050]
+
+
+def test_a_leftover_group_whose_leader_already_ended_is_reported_and_not_signalled(box):
+    signin.start("claude", _folder(), **box.kw())
+    box.table[1_000_050] = {"stat": "S", "lstart": LSTART, "command": "/fake/bin/node helper", "pgid": 1_000_001}
+    box.end(1_000_001)
+    assert signin.reap(ps=box.ps, killpg=box.killpg) == {"ok": True, "reaped": "left", "left": [1_000_050]}
+    assert box.killed == []
+
+
+@pytest.mark.parametrize("matching", [True, False])
+def test_after_an_app_crash_a_start_reaps_before_the_deadline(box, matching):
+    folder = _folder()
+    first = signin.start("claude", folder, now=NOW, **box.kw())
+    box.end(os.getppid())  # the app that owned the attempt is gone
+    if not matching:
+        box.table[1_000_001]["lstart"] = "Sat Oct 17 01:02:03 2026"
+    out = signin.start("claude", folder, now=NOW + 60, **box.kw())
+    assert out["ok"], out
+    assert out["attempt"]["id"] != first["attempt"]["id"]
+    assert [pg for pg, _ in box.killed] == ([1_000_001] if matching else [])
+    assert json.loads(_attempt_file().read_text())["pid"] == 1_000_002
+
+
+def test_a_start_while_the_owning_app_lives_is_still_busy(box):
+    folder = _folder()
+    signin.start("claude", folder, now=NOW, **box.kw())
+    assert signin.start("claude", folder, now=NOW + 60, **box.kw())["error"] == signin.E_BUSY
+    assert box.killed == []
+
+
 # ---- cancel --------------------------------------------------------------------------------------------
 
 
@@ -562,6 +711,8 @@ def _listing() -> list[str]:
 
 
 def test_a_real_fake_login_is_waited_for_and_cancel_leaves_nothing_running(box, monkeypatch):
+    monkeypatch.setattr(signin, "_getpgid", REAL_GETPGID)
+    monkeypatch.setattr(signin, "group_members", REAL_MEMBERS)
     script = box.tmp / "bin" / "claude"
     script.parent.mkdir()
     script.write_text("#!/bin/sh\nwhile :; do sleep 1; done\n")
@@ -580,6 +731,31 @@ def test_a_real_fake_login_is_waited_for_and_cancel_leaves_nothing_running(box, 
             time.sleep(0.1)
         assert not any(str(script) in line for line in _listing())
         assert not signin.running()
+    finally:
+        rec = json.loads(_attempt_file().read_text()) if _attempt_file().exists() else None
+        if rec:
+            signin.kill_if_ours(rec)
+
+
+def test_a_real_child_that_ignores_sigterm_is_gone_after_cancel(box, monkeypatch):
+    monkeypatch.setattr(signin, "_getpgid", REAL_GETPGID)
+    monkeypatch.setattr(signin, "group_members", REAL_MEMBERS)
+    script = box.tmp / "bin" / "claude"
+    script.parent.mkdir()
+    script.write_text("#!/bin/sh\n(trap '' TERM; while :; do sleep 1; done) &\nwhile :; do sleep 1; done\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(usage, "_command", lambda harness: str(script))
+    out = signin.start("claude", _folder(), ps=signin.proc_info)
+    try:
+        assert out["ok"], out
+        pgid = json.loads(_attempt_file().read_text())["pgid"]
+        end = time.monotonic() + 3
+        while time.monotonic() < end and len(signin.group_members(pgid) or []) < 2:
+            time.sleep(0.05)
+        assert len(signin.group_members(pgid)) >= 2
+        res = signin.cancel(out["attempt"]["id"])
+        assert res["stopped"] == "killed", res
+        assert signin.group_members(pgid) == []
     finally:
         rec = json.loads(_attempt_file().read_text()) if _attempt_file().exists() else None
         if rec:

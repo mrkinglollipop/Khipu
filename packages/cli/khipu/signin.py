@@ -62,7 +62,7 @@ GUARDRAIL = MappingProxyType({
 
 SLUG_MAX = 32
 _SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
-_FOLDER_RE = re.compile(r"^\.(claude|codex|grok)-([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)$")
+_FOLDER_RE = re.compile(r"^\.(claude|codex|grok)-([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?)$")
 _SKIP_SLUGS = frozenset({"default", "backup", "backups", "logs", "bak"})
 TAKEN_TRIES = 20
 
@@ -263,6 +263,26 @@ def _ident(info: os.stat_result) -> str:
     return f"inode:{info.st_dev}:{info.st_ino}"
 
 
+def _open_dir(path: Path) -> int | None:
+    """A descriptor on the folder itself; ``O_NOFOLLOW`` refuses a symlink.
+    Opening a folder reads nothing inside it."""
+    try:
+        return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+
+
+def _still_held(path: Path, dir_fd: int) -> bool:
+    """The name still names the folder held open: a real folder with the
+    same ``(st_dev, st_ino)``."""
+    info = _lstat_dir(path)
+    try:
+        held = os.fstat(dir_fd)
+    except OSError:
+        return False
+    return info is not None and (info.st_dev, info.st_ino) == (held.st_dev, held.st_ino)
+
+
 def make_folder(cli: str, name: str) -> dict:
     """Create ``~/.<cli>-<slug>`` with an exclusive ``mkdir`` (0700, never
     ``makedirs``); ``-2``, ``-3`` when anything is at that path. A folder
@@ -288,7 +308,8 @@ def make_folder(cli: str, name: str) -> dict:
             if info is not None and _ident(info) == item.get("identity"):
                 return {"ok": True, "folder": discover.display_path(home / folder), "reused": True}
         for n in range(1, TAKEN_TRIES + 1):
-            folder = f".{cli}-{base}" if n == 1 else f".{cli}-{base}-{n}"
+            # The suffix fits inside the 32 characters, as the app's check requires.
+            folder = f".{cli}-{base}" if n == 1 else f".{cli}-{base[:SLUG_MAX - len(f'-{n}')].rstrip('-')}-{n}"
             path = home / folder
             try:
                 os.mkdir(path, 0o700)
@@ -389,33 +410,130 @@ def _alive(rec: dict, ps) -> bool:
     return _matches(rec, ps(rec.get("pid")))
 
 
-def kill_if_ours(rec: dict, *, ps=None, killpg=None) -> str:
-    """Kill the attempt's process group only when its process is still the
-    one recorded: ``killed``, ``gone`` (it ended) or ``stale`` (the number
-    now belongs to something else; nothing is killed)."""
-    ps = ps or proc_info
-    killpg = killpg or os.killpg
-    pid, pgid = rec.get("pid"), rec.get("pgid")
-    if not isinstance(pid, int) or not isinstance(pgid, int) or pid <= 1 or pgid <= 1:
-        return "stale"
+def _getpgid(pid: int) -> int:
+    return os.getpgid(pid)
+
+
+def group_members(pgid: int) -> list[int] | None:
+    """The live (not zombie) processes in group ``pgid`` as ``ps`` lists
+    them, or None when ``ps`` could not run."""
+    try:
+        res = subprocess.run(["/bin/ps", "-A", "-o", "pid=,pgid=,stat="],
+                             stdin=subprocess.DEVNULL, capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    out = []
+    for line in res.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[2].startswith("Z"):
+            continue
+        with contextlib.suppress(ValueError):
+            if int(parts[1]) == pgid:
+                out.append(int(parts[0]))
+    return out
+
+
+def _leader(rec: dict, pid: int, pgid: int, ps, getpgid) -> str | None:
+    """None when ``pid`` is the recorded login and still leads group
+    ``pgid``; otherwise ``gone``, ``stale`` or ``unverified`` (the check
+    itself failed)."""
     info = ps(pid)
     if info is None or str(info.get("stat") or "").startswith("Z"):
         return "gone"
     if not _matches(rec, info):
         return "stale"
-    with contextlib.suppress(OSError):
-        if os.getpgid(pid) != pgid:
-            return "stale"
-    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-        killpg(pgid, signal.SIGTERM)
+    try:
+        group = getpgid(pid)
+    except ProcessLookupError:
+        return "gone"
+    except OSError:
+        return "unverified"
+    return None if group == pgid else "stale"
+
+
+def _until_empty(pgid: int, members) -> tuple[list[int] | None, bool]:
+    """Watch the group for ``KILL_GRACE_S``: what is left in it (``[]`` once
+    it is empty, None when ``ps`` could not say), and whether every look
+    found it holding a member."""
     end = time.monotonic() + KILL_GRACE_S
-    while time.monotonic() < end:
-        if not _alive(rec, ps):
-            return "killed"
+    left = members(pgid)
+    held = left is not None
+    while left and time.monotonic() < end:
         time.sleep(0.05)
+        left = members(pgid)
+        held = held and left is not None
+    return left, held
+
+
+def _signal(killpg, pgid: int, sig: int) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-        killpg(pgid, signal.SIGKILL)
-    return "killed"
+        killpg(pgid, sig)
+
+
+def stop_group(rec: dict, *, ps=None, killpg=None, getpgid=None, members=None) -> tuple[str, list[int]]:
+    """End the attempt's process group only while it is provably the one
+    recorded, and say what happened: ``killed`` (the group is empty),
+    ``gone`` (it had ended), ``stale`` (the number now names something else),
+    ``unverified`` (a check failed) or ``left`` (members still run; their
+    pids come with it). Nothing is sent after a failed check."""
+    ps = ps or proc_info
+    killpg = killpg or os.killpg
+    getpgid = getpgid or _getpgid
+    members = members or group_members
+    pid, pgid = rec.get("pid"), rec.get("pgid")
+    if not isinstance(pid, int) or not isinstance(pgid, int) or pid <= 1 or pid != pgid:
+        return "stale", []
+    why = _leader(rec, pid, pgid, ps, getpgid)
+    if why == "gone":
+        # The login ended before this call could prove the group its own:
+        # whatever still runs in it is reported, never signalled.
+        left = members(pgid)
+        return ("left", left) if left else ("gone", [])
+    if why is not None:
+        return why, []
+    _signal(killpg, pgid, signal.SIGTERM)
+    left, held = _until_empty(pgid, members)
+    if left == []:
+        return "killed", []
+    # Checked again right before SIGKILL: the login itself, or, once it has
+    # ended, a group seen holding a member at every look since the checked
+    # SIGTERM (a group's number is never given to a new process while any
+    # member of it lives).
+    why = _leader(rec, pid, pgid, ps, getpgid)
+    if why is not None and not (why == "gone" and held):
+        return "unverified", left or []
+    _signal(killpg, pgid, signal.SIGKILL)
+    left, _ = _until_empty(pgid, members)
+    if left == []:
+        return "killed", []
+    return ("left", left) if left else ("unverified", [])
+
+
+def kill_if_ours(rec: dict, *, ps=None, killpg=None, getpgid=None, members=None) -> str:
+    """``stop_group`` without the list of what is left."""
+    return stop_group(rec, ps=ps, killpg=killpg, getpgid=getpgid, members=members)[0]
+
+
+def _owner(ps) -> dict | None:
+    """The app that runs this call (its parent process), as ``ps`` reports it."""
+    pid = os.getppid()
+    info = ps(pid) if pid > 1 else None
+    if not info or not info.get("lstart") or not info.get("command"):
+        return None
+    return {"pid": pid, "lstart": info["lstart"], "command": info["command"]}
+
+
+def _owner_gone(rec: dict, ps) -> bool:
+    """True when the record names the app that started it and that app is no
+    longer running (it crashed or quit without reaping)."""
+    owner = rec.get("owner")
+    if not isinstance(owner, dict) or not isinstance(owner.get("pid"), int) or owner["pid"] <= 1:
+        return False  # an owner never recorded: the deadline alone decides
+    info = ps(owner["pid"])
+    return not (info and not str(info.get("stat") or "").startswith("Z")
+                and info.get("lstart") == owner.get("lstart") and info.get("command") == owner.get("command"))
 
 
 def _read_code(stream, cli: str, deadline: float) -> tuple[str, str] | None:
@@ -512,9 +630,9 @@ def reap(*, ps=None, killpg=None) -> dict:
         rec = _attempt()
         if rec is None:
             return {"ok": True, "reaped": None}
-        result = kill_if_ours(rec, ps=ps, killpg=killpg)
+        result, left = stop_group(rec, ps=ps, killpg=killpg)
         _end_attempt(rec)
-        return {"ok": True, "reaped": result}
+        return {"ok": True, "reaped": result, **({"left": left} if left else {})}
     finally:
         usage._release(fd)
 
@@ -532,8 +650,10 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
     Grok Build and Muse, once the code line arrives (``CODE_WAIT_S``). One
     sign-in at a time: a second start gets ``busy`` unless ``again`` (Start
     again), which ends the running one first. A leftover attempt (its
-    process ended, is no longer ours, or outlived its wait, as after a crash)
-    is reaped first."""
+    process ended, is no longer ours, outlived its wait, or the app that
+    started it is gone, as after a crash) is reaped first. The folder is held
+    open from its check to the launch, and the launch is refused if its name
+    no longer names that same folder."""
     if cli not in CLIS:
         return {"ok": False, "error": E_REFUSED}
     if not PROVEN.get(cli):
@@ -550,7 +670,16 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
     fd = _lock()
     if fd is None:
         return {"ok": False, "error": E_BUSY}
+    dir_fd = None
     try:
+        if path is not None:
+            dir_fd = _open_dir(path)
+            try:
+                held = os.fstat(dir_fd) if dir_fd is not None else None
+            except OSError:
+                held = None
+            if held is None or _made_item(cli, path.name, held) is None:
+                return {"ok": False, "error": E_REFUSED}
         # Checked under the lock: a folder that has signed in is an account
         # now, re-signed only through Sign in again.
         if path is not None and _ever_signed_in(cli, path):
@@ -559,7 +688,7 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
         if old is not None:
             now_ts = time.time() if now is None else now
             current = now_ts < _deadline(old)
-            if current and not again and _alive(old, ps):
+            if current and not again and _alive(old, ps) and not _owner_gone(old, ps):
                 return {"ok": False, "error": E_BUSY, "attempt": _public(old)}
             kill_if_ours(old, ps=ps, killpg=killpg)
             _end_attempt(old)
@@ -568,6 +697,10 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
             return {"ok": False, "error": E_NOT_INSTALLED}
         argv = [binary, *ARGV[cli]]
         env = usage.probe_environment(cli, str(path) if path else None, binary)
+        # The last check before the spawn: a swap after this point is not
+        # this call's to see, one before it is refused.
+        if path is not None and not _still_held(path, dir_fd):
+            return {"ok": False, "error": E_REFUSED}
         cwd = tempfile.mkdtemp(prefix="khipu-sign-in-")
         code_kind = cli in CODE
         try:
@@ -591,7 +724,7 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
                "folder": discover.display_path(path) if path else None,
                "pid": proc.pid, "pgid": proc.pid, "lstart": (info or {}).get("lstart"),
                "command": (info or {}).get("command"), "tail": list(ARGV[cli]),
-               "started": started, "deadline": started + wait_s(), "cwd": cwd}
+               "started": started, "deadline": started + wait_s(), "cwd": cwd, "owner": _owner(ps)}
         # Without the process's own start time and command line no later call
         # could prove the group is ours, so it is ended now through the handle
         # that started it (the only time Khipu signals without that proof).
@@ -618,6 +751,8 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
             del found
         return out
     finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
         usage._release(fd)
 
 
@@ -705,9 +840,10 @@ def cancel(attempt_id: str | None, *, remove_folder: bool = False, cli: str | No
             in_use = rec is not None and rec.get("cli") == cli and rec.get("folder") == folder
             return {"ok": True, "state": CANCELLED, "stopped": None,
                     "folder_removed": False if in_use else remove_unused_folder(cli, folder)}
-        result = kill_if_ours(rec, ps=ps, killpg=killpg)
+        result, left = stop_group(rec, ps=ps, killpg=killpg)
         _end_attempt(rec)
-        out = {"ok": True, "attempt": _public(rec), "state": CANCELLED, "stopped": result}
+        out = {"ok": True, "attempt": _public(rec), "state": CANCELLED, "stopped": result,
+               **({"left": left} if left else {})}
         if remove_folder and rec.get("folder"):
             out["folder_removed"] = remove_unused_folder(rec["cli"], rec["folder"])
         return out

@@ -2240,7 +2240,8 @@ async fn khipu_account_sign_in(harness: String, home: Option<String>) -> Result<
 /// then the builders below refuse them whatever the webview sends.
 const SIGN_IN_NEW_OFFERED: &[&str] = &["claude"];
 const SIGN_IN_NEW_NAME_MAX: usize = 64;
-const SIGN_IN_NEW_SLUG_MAX: usize = 40;
+/// The CLI's `signin.SLUG_MAX`: a collision suffix (`-2`) counts inside it.
+const SIGN_IN_NEW_SLUG_MAX: usize = 32;
 /// How long quitting waits for the reaper before leaving it behind.
 const SIGN_IN_REAP_WAIT: Duration = Duration::from_secs(4);
 
@@ -2285,7 +2286,7 @@ fn new_folder_argv(harness: &str, name: &str, offered: &[&str]) -> Result<Vec<St
 }
 
 /// True for `~/.<cli>-<slug>`: slug starts and ends with a letter or digit,
-/// holds only `[a-z0-9-]`, and is 1 to 40 characters (a `-2` suffix included).
+/// holds only `[a-z0-9-]`, and is 1 to 32 characters (a `-2` suffix included).
 fn sign_in_folder_shape(cli: &str, folder: &str) -> Option<String> {
     let name = folder.strip_prefix("~/")?;
     if name.contains('/') || name.contains("..") || has_control(name) {
@@ -6114,11 +6115,26 @@ mod sign_in_new_tests {
     }
 
     #[test]
-    fn longest_slug_is_forty_characters() {
+    fn longest_slug_is_thirty_two_characters_suffix_included() {
         let h = Home::new("len");
-        let slug = "a".repeat(40);
-        h.mkdir(&format!(".claude-{slug}"));
-        assert!(built(&h, "claude", &format!("~/.claude-{slug}"), SIGN_IN_NEW_OFFERED).is_ok());
+        for (slug, ok) in [
+            ("a".repeat(32), true),
+            (format!("{}-2", "a".repeat(30)), true),
+            ("a".repeat(33), false),
+            (format!("{}-2", "a".repeat(31)), false),
+            (format!("{}-20", "a".repeat(30)), false),
+            ("a".repeat(40), false),
+        ] {
+            h.mkdir(&format!(".claude-{slug}"));
+            assert_eq!(built(&h, "claude", &format!("~/.claude-{slug}"), SIGN_IN_NEW_OFFERED).is_ok(), ok, "{slug}");
+        }
+    }
+
+    #[test]
+    fn slug_limit_matches_the_cli() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/khipu/signin.py");
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert!(src.contains(&format!("\nSLUG_MAX = {SIGN_IN_NEW_SLUG_MAX}\n")), "SLUG_MAX differs from the CLI");
     }
 
     #[test]
