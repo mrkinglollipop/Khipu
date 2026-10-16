@@ -19,6 +19,7 @@ is fine for one operator and useless for anyone else setting Khipu up.
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 
 _VERSION_RE = re.compile(r"^(\d{4}_[a-z0-9_]+)\.sql$")
@@ -28,6 +29,15 @@ _VERSION_RE = re.compile(r"^(\d{4}_[a-z0-9_]+)\.sql$")
 LOCAL_ORIGIN_SETTING = "khipu.local_origin"
 # The value that applies such a migration without claiming any existing row.
 LOCAL_ORIGIN_NONE = "none"
+# A step that hits its own lock_timeout (0030) is retried this many times.
+LOCK_RETRIES = 3
+LOCK_RETRY_DELAY_S = 2.0
+# A step that takes a table lock and holds it longer than this gets a note
+# in the runner's output and in doctor (0030 holds both write-blocking locks
+# for its whole backfill: captures wait that long).
+LOCK_NOTE_THRESHOLD_S = 1.0
+_LOCK_TABLE_RE = re.compile(r"\bLOCK\s+TABLE\b", re.IGNORECASE)
+LOCK_NOTES_NAME = "migrate_lock_notes.json"
 _STEP_MARKER = "-- khipu:step"
 _STEP_ANYWHERE_RE = re.compile(r"-- khipu:step\b")
 
@@ -234,8 +244,10 @@ def _run_migrations(conn, *, dry_run: bool, directory: Path | None,
     result = {k: v for k, v in p.items()}
     result["dry_run"] = dry_run
     result["ran"] = []
+    result["notes"] = []
     if dry_run:
         return result
+    held: list[dict] = []
     # Every file is split before any runs, so a refused file never leaves
     # the database partly migrated.
     split = [(version, path, path.read_text(encoding="utf-8")) for version, path in pending]
@@ -252,21 +264,80 @@ def _run_migrations(conn, *, dry_run: bool, directory: Path | None,
         # psycopg's connection is a transaction already; commit after each so
         # a later failure cannot roll back an earlier, successful one.
         for i, part in enumerate(parts):
-            with conn.cursor() as cur:
-                if value is not None:
-                    # Transaction-local, so every step sets it again.
-                    cur.execute("SELECT set_config(%s, %s, true)",
-                                (LOCAL_ORIGIN_SETTING, value))
-                cur.execute(part)
-                if i == len(parts) - 1:
-                    # Belt and braces: the file records itself, but if a
-                    # migration forgets to, the runner would re-apply it forever.
-                    cur.execute(
-                        "INSERT INTO schema_migrations (version, note) VALUES (%s, %s) "
-                        "ON CONFLICT (version) DO NOTHING",
-                        (version, f"applied by khipu migrate from {path.name}"),
-                    )
-            conn.commit()
+            for attempt in range(LOCK_RETRIES + 1):
+                started = time.monotonic()
+                try:
+                    with conn.cursor() as cur:
+                        if value is not None:
+                            # Transaction-local, so every step sets it again.
+                            cur.execute("SELECT set_config(%s, %s, true)",
+                                        (LOCAL_ORIGIN_SETTING, value))
+                        cur.execute(part)
+                        if i == len(parts) - 1:
+                            # Belt and braces: the file records itself, but if a
+                            # migration forgets to, the runner would re-apply it forever.
+                            cur.execute(
+                                "INSERT INTO schema_migrations (version, note) VALUES (%s, %s) "
+                                "ON CONFLICT (version) DO NOTHING",
+                                (version, f"applied by khipu migrate from {path.name}"),
+                            )
+                    conn.commit()
+                    if _LOCK_TABLE_RE.search(part):
+                        held.append({"version": version, "step": i + 1,
+                                     "held_s": round(time.monotonic() - started, 3)})
+                    break
+                except Exception as exc:
+                    # A step that sets lock_timeout gives up rather than queue
+                    # every capture behind a long transaction; it is retried
+                    # whole, a bounded number of times, then the error stands.
+                    if type(exc).__name__ != "LockNotAvailable" or attempt == LOCK_RETRIES:
+                        raise
+                    conn.rollback()
+                    time.sleep(LOCK_RETRY_DELAY_S * (attempt + 1))
         result["ran"].append(version)
     result["pending"] = []
+    result["notes"] = lock_notes(held)
+    if held:
+        _save_lock_notes(held, result["notes"])
     return result
+
+
+def lock_notes(held: list[dict]) -> list[str]:
+    return [f"migration {h['version']} held write-blocking table locks for "
+            f"{h['held_s']:.2f} s; captures on every Mac waited up to that long"
+            for h in held if h["held_s"] > LOCK_NOTE_THRESHOLD_S]
+
+
+def _save_lock_notes(held: list[dict], notes: list[str]) -> None:
+    """Keep the last run's lock hold times for doctor. Best effort: the
+    migration itself has already committed."""
+    import json
+    import os
+    from datetime import datetime, timezone
+
+    from khipu.paths import ensure_data_dir
+
+    try:
+        dest = ensure_data_dir() / LOCK_NOTES_NAME
+        tmp = dest.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "steps": held, "notes": notes}, indent=2), encoding="utf-8")
+        os.replace(tmp, dest)
+    except Exception:  # noqa: BLE001 - doctor's note never fails a migration
+        pass
+
+
+def last_lock_notes() -> dict | None:
+    """Doctor row: the last migration run that took table locks, with a note
+    for each step that held them longer than LOCK_NOTE_THRESHOLD_S. None when
+    no such run happened on this Mac. Info only."""
+    import json
+
+    from khipu.paths import data_dir
+
+    try:
+        data = json.loads((data_dir() / LOCK_NOTES_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None

@@ -234,12 +234,14 @@ class JoinImportPrevalidationRegressionTest(unittest.TestCase):
         payload = {"format": join.FORMAT_VERSION, "database_url": "host=remote.example dbname=khipu", "capture_mode": "bogus"}
         blob = json.dumps(payload).encode("utf-8")
         with (
-            mock.patch("khipu.paths.ensure_data_dir"),
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("khipu.paths.ensure_data_dir", return_value=Path(tmp)),
             mock.patch("khipu.paths.root_cert_file", return_value=Path("/no/such/cert")),
             mock.patch("khipu.keychain.set_dsn") as set_dsn,
         ):
             with self.assertRaises(ValueError):
                 join.import_kit(blob, "")
+            self.assertEqual(os.listdir(tmp), [".memory.lock"])
         set_dsn.assert_not_called()
 
 

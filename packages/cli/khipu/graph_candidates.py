@@ -225,7 +225,12 @@ def _hub_topic_recent_episodes(cur, slug: str, *, seed_rank: int, seed_key: str)
 def _hub_episode_topics(cur, episode_id: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
     from khipu import topic_graph
 
-    cur.execute("SELECT topics FROM episodes WHERE id::text = %s", (episode_id,))
+    from khipu.db import has_columns
+
+    # A forgotten seed episode links nothing, the same as the replica leg's
+    # live view.
+    live = " AND deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
+    cur.execute(f"SELECT topics FROM episodes WHERE id::text = %s{live}", (episode_id,))
     row = cur.fetchone()
     if row is None or not row[0]:
         return []
@@ -490,9 +495,19 @@ def _replica_topic_recent_episodes(con, slug: str, *, seed_rank: int, seed_key: 
 
     by_slug = _episode_slug_map()
     if by_slug is not None:
+        cached = by_slug.get(slug, [])
+        # The map can be a generation behind the replica, built before an
+        # episode was forgotten: keep only ids the replica's live view still
+        # holds, or the forgotten episode's summary comes back as a candidate.
+        live: set[str] = set()
+        if cached:
+            ids = [str(eid) for _ts, eid, _summary in cached]
+            live = {str(row[0]) for row in con.execute(
+                f"SELECT CAST(id AS TEXT) FROM episodes WHERE CAST(id AS TEXT) IN "
+                f"({', '.join('?' * len(ids))})", ids).fetchall()}
         return [
             _recent_episode_row(eid, ts, summary, seed_rank=seed_rank, seed_key=seed_key)
-            for ts, eid, summary in by_slug.get(slug, [])
+            for ts, eid, summary in cached if str(eid) in live
         ]
     # A single source of truth for the slug form (unlike the hub leg, which
     # cannot call into Python mid-query): registers the SAME function

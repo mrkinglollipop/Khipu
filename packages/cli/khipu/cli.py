@@ -700,6 +700,14 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         notes_organise = organise.last_run()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         notes_organise = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The last migration run's table lock hold times: info only, never gates
+    # `ok`. None when no migration that locks tables has run on this Mac.
+    try:
+        from khipu import migrate as _migrate
+
+        notes_migrate = _migrate.last_lock_notes()
+    except Exception as e:  # noqa: BLE001
+        notes_migrate = {"error": f"{type(e).__name__}: {e}"}
     # K9: gateway per-token liveness, read over the network from the
     # deployed gateway's own /healthz (never deployed by doctor itself).
     # Applicable only when a gateway_url is configured.
@@ -875,6 +883,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
         "notes_organise": notes_organise,
+        "notes_migrate": notes_migrate,
         "nightly_steps": nightly_steps,
         "topics_embed_lag": topics_lag,
         "topics_embed_lag_minutes": topics_lag.get("lag_minutes"),
@@ -2336,8 +2345,11 @@ def _reembed_episode(cur, episode_id: int) -> bool:
 
     cols = ("summary", "decisions", "preferences", "topics", "people")
     verbatim_col = _episode_verbatim_select(cur)
+    # A forgotten episode's vectors were removed on purpose; an edit of its
+    # tombstone must not put them back.
     cur.execute(
-        f"SELECT {', '.join(cols)}, {verbatim_col} AS verbatim FROM episodes WHERE id = %s",
+        f"SELECT {', '.join(cols)}, {verbatim_col} AS verbatim FROM episodes "
+        f"WHERE {_episode_live_clause(cur)}id = %s",
         (episode_id,),
     )
     row = cur.fetchone()
@@ -2376,7 +2388,10 @@ def _cmd_episode_edit(args: argparse.Namespace) -> int:
     reembedded = False
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE episodes SET summary = %s WHERE id = %s", (summary, eid))
+            # A forgotten episode is not edited: its re-embed would bring a
+            # vector back for a row every reader skips.
+            cur.execute("UPDATE episodes SET summary = %s WHERE id = %s AND deleted_at IS NULL",
+                        (summary, eid))
             updated = cur.rowcount > 0
             if updated:
                 try:
@@ -2403,10 +2418,12 @@ def cmd_episode(args: argparse.Namespace) -> int:
             "error": "usage: khipu episode forget ID | khipu episode edit ID --summary TEXT",
         }))
         return 2
-    from khipu.forget import forget_everywhere
+    from khipu.forget import forget_everywhere, plain_summary
 
     out = forget_everywhere(int(args.id))
     print(json.dumps(out, default=str))
+    # The JSON is for scripts; the same result in plain words goes to stderr.
+    print(out.get("message") or plain_summary(out), file=sys.stderr)
     snapshot_ok = (out.get("snapshot") or {}).get("ok", True)
     legacy_reason = str((out.get("legacy_file") or {}).get("reason") or "")
     legacy_ok = not legacy_reason.startswith("unreadable:")
@@ -2428,7 +2445,9 @@ def cmd_topic(args: argparse.Namespace) -> int:
     slug = args.slug
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT deleted_at FROM topics WHERE slug = %s", (slug,))
+            # Locked first: an embedding catch-up holds this row shared while it
+            # writes vectors, so neither can leave vectors for a purged topic.
+            cur.execute("SELECT deleted_at FROM topics WHERE slug = %s FOR UPDATE", (slug,))
             row = cur.fetchone()
             if row is None:
                 print(json.dumps({"ok": False, "error": f"no such topic: {slug}"}))
@@ -2447,11 +2466,31 @@ def cmd_topic(args: argparse.Namespace) -> int:
             revisions_removed = cur.rowcount
             cur.execute("DELETE FROM topics WHERE slug = %s", (slug,))
         conn.commit()
+    # The hub delete is durable from here; this Mac's replica would keep
+    # serving the topic until the next full refresh unless it is purged too.
+    from khipu.hub_snapshot import purge_topic_in_snapshot
+
+    replica = purge_topic_in_snapshot(slug)
+    replica_ok = bool(replica.get("ok"))
     print(json.dumps({
-        "ok": True, "slug": slug, "revisions_removed": revisions_removed,
+        "ok": replica_ok, "slug": slug, "revisions_removed": revisions_removed,
         "embeddings_removed": embeddings_removed,
+        "hub": {"ok": True, "revisions_removed": revisions_removed,
+                "embeddings_removed": embeddings_removed},
+        "replica": replica,
     }))
-    return 0
+    if not replica_ok:
+        message = (
+            f"Purged topic {slug} from the hub, but this Mac's local replica still "
+            f"has it ({replica.get('reason')}) and can still return it. The "
+            "replica drops it at its next full refresh, which copies the hub."
+        )
+    elif not replica.get("applicable", True):
+        message = f"Purged topic {slug} from the hub. This Mac has no local replica."
+    else:
+        message = f"Purged topic {slug} from the hub and from this Mac's local replica."
+    print(message, file=sys.stderr)
+    return 0 if replica_ok else 1
 
 
 def cmd_backfill(args: argparse.Namespace) -> int:

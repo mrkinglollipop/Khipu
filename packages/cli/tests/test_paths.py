@@ -101,7 +101,9 @@ class ImportLocalTest(unittest.TestCase):
         (src / "dsn").write_text("postgres://x")
         (src / "sub" / "a.txt").write_text("a")
         out = paths.import_local(source=src)
-        self.assertEqual(out["imported"], 2)
+        # sub/a.txt is claimed by no store, so it is left out (round 11).
+        self.assertEqual(out["imported"], 1)
+        self.assertEqual([r["path"] for r in out["not_restored"]], ["sub/a.txt"])
         self.assertTrue((self.target / "dsn").is_file())
         self.assertEqual(oct((self.target / "dsn").stat().st_mode)[-3:], "600")
 

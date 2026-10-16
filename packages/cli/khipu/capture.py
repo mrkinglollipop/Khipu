@@ -25,14 +25,15 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from khipu import wire
-from khipu.lines import run_text
 from khipu.config import capture_mode
 
 # ---- W1.4 ingest dedup ------------------------------------------------------
@@ -85,6 +86,21 @@ def _receipts(payload: dict[str, Any], source: dict[str, Any] | None) -> list[st
     return out + [legacy] if legacy not in out else out
 
 
+def _source_key_is_safe(payload: dict[str, Any]) -> bool:
+    """The source key may answer only when it is no broader than the column
+    match that follows it. Without a natural key it is the payload hash (an
+    exact replay). With one, it needs a harness, and a window_id needs its part:
+    the 0027 backfill found historical episodes with a window_id but no part
+    that share one key, where the column match still inserts each of them."""
+    from khipu.capture_identity import has_natural_key
+
+    if not has_natural_key(payload):
+        return True
+    if not payload.get("harness"):
+        return False
+    return not payload.get("window_id") or bool(payload.get("part"))
+
+
 # How a merge matched its target, recorded on its receipt. Only an identity
 # match may later transfer ownership; a receipt without the field was written
 # before receipts recorded it and counts as similarity.
@@ -124,7 +140,17 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
     duplicate. window_id (+ part, carried in raw) makes each sibling its own
     identity. Pre-migration hub (no window_id column): falls back to the
     pre-K3 match, same as a payload with no window_id. Merge receipts are
-    matched first, by ``dedup_before_insert``."""
+    matched first, by ``dedup_before_insert``.
+
+    A hub with episode_sources (0027) answers by the capture's source key
+    first; the column match below stays as the pre-0027 path and for sources
+    recorded before the key existed."""
+    from khipu.capture_identity import episode_for_source, source_key, sources_ready
+
+    if sources_ready(cur) and _source_key_is_safe(payload):
+        recorded = episode_for_source(cur, source["source_key"] if source else source_key(payload))
+        if recorded is not None:
+            return recorded
     harness = payload.get("harness")
     session_id = payload.get("session_id")
     tr = payload.get("transcript_range")
@@ -375,11 +401,15 @@ def _merge_into_episode(
     topics, decisions, preferences, people, raw, target_ts, target_summary = row[:7]
     tags = row[7] if has_tags else None
     from khipu.capture_identity import record_source, source_identity
+    from khipu.tombstones import hub_source_forgotten
 
     # The receipt and the merged source row both come from the snapshot
     # write_pg took before enrichment, so they depend on the incoming capture
     # alone; a caller without one (tests, older paths) snapshots here.
     source = source or source_identity(payload)
+    # Checked under the target's row lock, which forget takes first.
+    if hub_source_forgotten(cur, payload, source):
+        return False
     source_id = source["payload_sha256"]
     receipts = set(_receipts(payload, source))
     for prior in (raw or {}).get("merged_from") or []:
@@ -431,10 +461,25 @@ def _merge_into_episode(
         sets.append("verbatim = %s::jsonb")
         params.append(json.dumps(verbatim, ensure_ascii=False))
     params.append(target_id)
-    cur.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id = %s", params)
+    from khipu.mirror import _savepoint
+    from khipu.tombstones import is_forgotten_refusal
 
-    record_source(cur, target_id, "merged", source,
-                  ts=payload.get("ts"), summary=payload.get("summary"))
+    # The receipt and the merged source row are one write: the hub refuses
+    # either for a forgotten source (0030), and the refusal undoes both, so
+    # the caller falls through to an insert the hub refuses the same way.
+    savepoint = _savepoint(cur, "khipu_merge_write")
+    try:
+        cur.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id = %s", params)
+        record_source(cur, target_id, "merged", source,
+                      ts=payload.get("ts"), summary=payload.get("summary"))
+    except Exception as exc:
+        if not is_forgotten_refusal(exc):
+            raise
+        if savepoint:
+            cur.execute("ROLLBACK TO SAVEPOINT khipu_merge_write")
+        return False
+    if savepoint:
+        cur.execute("RELEASE SAVEPOINT khipu_merge_write")
 
     # The merged capture's own open/closed loops belong to the target episode
     # — same call the insert path makes in write_pg, same SAVEPOINT fail-open.
@@ -509,7 +554,8 @@ def _merge_into_episode(
     return True
 
 
-def _reembed_merged_episode(ts: Any, summary: Any, merged: dict[str, Any]) -> None:
+def _reembed_merged_episode(ts: Any, summary: Any, merged: dict[str, Any], *,
+                            episode_id: int | None = None) -> None:
     """Re-embed a merged target row. Fail-open: the episode is already durable
     and `khipu embed backfill` heals any miss."""
     try:
@@ -520,7 +566,7 @@ def _reembed_merged_episode(ts: Any, summary: Any, merged: dict[str, Any]) -> No
         merged["summary"] = summary or ""
         if not merged["ts"] or not merged["summary"]:
             return
-        embed_on_capture(merged)
+        embed_on_capture(merged, episode_id=episode_id)
     except Exception as exc:  # noqa: BLE001 — vectors are additive
         _log(f"merge re-embed failed ({type(exc).__name__}: {exc})")
 
@@ -625,7 +671,8 @@ def _refresh_merged_episode(cur, episode_id: int) -> None:
                 return
             merged = dict(target.get("raw") or {})
             merged.update(target)
-            _reembed_merged_episode(target["ts"], target["summary"], merged)
+            _reembed_merged_episode(target["ts"], target["summary"], merged,
+                                    episode_id=episode_id)
     except Exception as exc:  # noqa: BLE001 — embedding is additive
         _log(f"merge refresh failed ({type(exc).__name__}: {exc})")
 
@@ -708,8 +755,31 @@ def _claim_unowned_episode(cur, episode_id: int | None, origin: str | None) -> N
                 (origin, episode_id))
 
 
+def _forgotten_result(cur, payload: dict[str, Any], source: dict[str, Any], *,
+                      dedup: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The terminal outcome for a forgotten source: nothing written. The id
+    is the tombstoned row holding its legacy identity, when there is one."""
+    cur.execute("SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
+                (payload["ts"], _md5_hex(payload.get("summary") or "")))
+    existing = cur.fetchone()
+    return {
+        "episode_inserted": False,
+        "topics_written": 0,
+        "episode_id": int(existing[0]) if existing else None,
+        "source_key": source["source_key"],
+        "dedup": dedup or {"action": "none"},
+        "forgotten_source": True,
+    }
+
+
 def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
+
+    Returns ``episode_id`` (the row this capture landed on: inserted, merged
+    into, skipped as already recorded, or already holding its legacy
+    identity), ``episode_inserted`` and ``source_key`` (the capture's key from
+    capture_identity.source_key), plus ``topics_written`` and ``dedup``.
+    Callers take the id from here; none re-selects by (ts, md5(summary)).
 
     Runs the same three steps for every writer that reaches here (the native
     extractor via session_capture.drain, the legacy capture_v2-shaped payload
@@ -737,8 +807,16 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     source = source_identity(payload)
     topics_written = 0
     episode_id: int | None = None
-    with connect() as conn:
+    from khipu import memory_lock
+
+    # Shared for the whole transaction, through its commit: a forget on this
+    # Mac either finished before it began or starts after it committed.
+    with memory_lock.shared(), connect() as conn:
         with conn.cursor() as cur:
+            from khipu.tombstones import hub_source_forgotten
+
+            if hub_source_forgotten(cur, payload, source):
+                return _forgotten_result(cur, payload, source)
             _inherit_project(cur, payload)
             if payload.get("project"):
                 from khipu.identity import _resolve_project_alias
@@ -746,6 +824,26 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 payload["project"] = _resolve_project_alias(cur, payload["project"]) or payload["project"]
             dedup = dedup_before_insert(cur, payload, source=source)
             if dedup["action"] in ("skip", "merge"):
+                # ``episode_sources`` deliberately retains the source key on
+                # a tombstoned row: a delayed outbox replay must find that
+                # tombstone instead of treating the missing live row as an
+                # invitation to insert it again. It is a terminal outcome,
+                # not an ordinary dedup skip, so callers can avoid every
+                # secondary persistence leg (legacy file, mirror, vectors).
+                cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
+                            (dedup.get("matched_episode"),))
+                matched = cur.fetchone()
+                target = matched[0] if matched else {}
+                if isinstance(target, dict) and target.get("deleted_at"):
+                    conn.commit()
+                    return {
+                        "episode_inserted": False,
+                        "topics_written": 0,
+                        "episode_id": dedup.get("matched_episode"),
+                        "source_key": source["source_key"],
+                        "dedup": dedup,
+                        "forgotten_source": True,
+                    }
                 # The job is done once this returns (the outbox deletes it),
                 # so this is the last chance to record its trusted owner. Only
                 # an identity match (an exact window, a window_id, or a receipt
@@ -773,6 +871,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     "episode_inserted": False,
                     "topics_written": 0,
                     "episode_id": dedup.get("matched_episode"),
+                    "source_key": source["source_key"],
                     "dedup": dedup,
                 }
 
@@ -837,31 +936,51 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             payload["scope"] = normalize_scope(payload.get("scope"))
 
             origin = _stamp_origin(cur)
-            inserted = _upsert_episode(cur, payload, source=source, origin=origin)
+            upserted: dict[str, Any] = {}
+            inserted = _upsert_episode(cur, payload, source=source, out=upserted, origin=origin)
+            if upserted.get("forgotten_source"):
+                return _forgotten_result(cur, payload, source, dedup=dedup)
+            episode_id = upserted.get("episode_id")
             if not inserted:
+                # The insert hit the legacy unique key, so the row holding that
+                # key is where this capture landed (the key stays unique until
+                # phase 3 moves uniqueness to the source).
                 cur.execute(
                     "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
                     (payload["ts"], _md5_hex(payload["summary"])),
                 )
                 existing = cur.fetchone()
-                try:
-                    _claim_unowned_episode(cur, existing[0] if existing else None, origin)
-                except Exception as exc:  # noqa: BLE001 - only a required claim runs SQL
-                    raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
+                episode_id = int(existing[0]) if existing else None
                 cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
-                            (existing[0] if existing else None,))
+                            (episode_id,))
                 row = cur.fetchone()
                 target = row[0] if row else {}
-                source = target.get("raw") or {}
+                # Legacy backfills can have only an episode key and no payload
+                # hash, so source dedup misses them even on an exact replay.
+                if target.get("deleted_at"):
+                    conn.commit()
+                    return {
+                        "episode_inserted": False,
+                        "topics_written": 0,
+                        "episode_id": episode_id,
+                        "source_key": source["source_key"],
+                        "dedup": dedup,
+                        "forgotten_source": True,
+                    }
+                try:
+                    _claim_unowned_episode(cur, episode_id, origin)
+                except Exception as exc:  # noqa: BLE001 - only a required claim runs SQL
+                    raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
+                stored_raw = target.get("raw") or {}
                 # The stored raw is not the payload as sent: ingestion adds
                 # tags, normalizes scope and rewrites fields on merge, so a
                 # field-by-field comparison flags ordinary replays. Until
                 # captures carry an immutable identity this is logged only;
                 # failing the job here stranded it in the queue and turned the
                 # harness red (2026-10-11).
-                if not target or any(payload.get(k) != target.get(k, source.get(k)) for k in
+                if not target or any(payload.get(k) != target.get(k, stored_raw.get(k)) for k in
                                      ("session_id", "project", "harness", "transcript_range")) \
-                        or any(payload.get(k) and payload[k] != source.get(k) for k in
+                        or any(payload.get(k) and payload[k] != stored_raw.get(k) for k in
                                ("verbatim", "decisions", "preferences", "open_loops", "closed_loops",
                                 "decision_details", "deliverables", "window_id", "part")):
                     _log("capture replay identity differs from stored source evidence; "
@@ -877,12 +996,6 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 _log(f"topic graph mint failed ({type(exc).__name__}: {exc})")
 
             if inserted:
-                cur.execute(
-                    "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
-                    (payload.get("ts"), _md5_hex(payload.get("summary") or "")),
-                )
-                row = cur.fetchone()
-                episode_id = int(row[0]) if row else None
                 if episode_id is not None:
                     cur.execute("SAVEPOINT capture_commitments")
                     try:
@@ -955,8 +1068,101 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
         "episode_inserted": inserted,
         "topics_written": topics_written,
         "episode_id": episode_id,
+        "source_key": source["source_key"],
         "dedup": dedup,
     }
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Darwin answers EPERM while the group holds only a zombie that has
+        # not been reaped yet: something is still there, so keep waiting.
+        return True
+    return True
+
+
+def _kill_group(proc: subprocess.Popen, grace: float = 30.0) -> None:
+    """SIGKILL every process in the writer's group, then wait until none is
+    left, so the caller releases its locks only after the last one is gone."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.communicate()
+    deadline = time.monotonic() + grace
+    while _group_alive(proc.pid):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"legacy writer group {proc.pid} survived SIGKILL")
+        time.sleep(0.02)
+
+
+def _run_legacy_group(argv: list[str], *, input: str, env: dict[str, str],
+                      timeout: float, pass_fds: tuple[int, ...]) -> subprocess.CompletedProcess:
+    """Run the legacy file writer in its own process group and return only
+    when no process in that group remains.
+
+    The real legacy script starts the mechanical writer without forwarding
+    the lock descriptors, so descriptor inheritance cannot cover that
+    grandchild: if the intermediary dies, the grandchild keeps writing.
+    Waiting on the whole group keeps the caller's locks held until it is
+    done. On timeout or cancel the whole group is killed and waited for.
+    A process that leaves the group on purpose (setsid) is not covered.
+    """
+    from khipu import writer_groups
+
+    deadline = time.monotonic() + timeout
+    # The group is recorded durably before the writer runs, so a forget can
+    # stop it even if this process is killed while it runs. The child waits
+    # on a gate pipe until the record exists; if this process dies first,
+    # the gate closes unopened and the child exits without running the writer.
+    gate_r, gate_w = os.pipe()
+    try:
+        proc = subprocess.Popen([sys.executable, "-c", _GATE, str(gate_r), *argv],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env,
+                                pass_fds=(*pass_fds, gate_r), start_new_session=True)
+    except BaseException:
+        os.close(gate_w)
+        raise
+    finally:
+        os.close(gate_r)
+    try:
+        try:
+            started = writer_groups.start_time(proc.pid)
+            if started is None:
+                raise OSError(f"legacy writer group {proc.pid} start time unavailable")
+            writer_groups.record(proc.pid, started)
+            os.write(gate_w, b"1")
+        finally:
+            os.close(gate_w)
+        out, err = proc.communicate(input.encode("utf-8"), timeout=timeout)
+        while _group_alive(proc.pid):
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            time.sleep(0.05)
+    except BaseException:
+        _kill_group(proc)
+        raise
+    finally:
+        writer_groups.clear(proc.pid)
+    return subprocess.CompletedProcess(argv, proc.returncode, out.decode("utf-8", "replace"),
+                                       err.decode("utf-8", "replace"))
+
+
+# Waits for the go byte on the gate descriptor, then becomes the writer.
+_GATE = (
+    "import os, sys\n"
+    "fd = int(sys.argv[1])\n"
+    "go = os.read(fd, 1)\n"
+    "os.close(fd)\n"
+    "if go != b'1':\n"
+    "    os._exit(75)\n"
+    "os.execvp(sys.argv[2], sys.argv[2:])\n"
+)
 
 
 def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
@@ -978,21 +1184,43 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
     env = dict(os.environ)
     if suppress_mirror:
         env["KHIPU_MIRROR"] = "0"
+    # The registry flock and the memory lock are the file writer's write
+    # locks: hold them until every process the legacy writer started is gone,
+    # so a forget cannot complete after this final check and before any of
+    # them appends its line.
     try:
-        proc = run_text(
-            [sys.executable, str(capture_v2)],
-            input=wire.dumps(payload),
-            env=env,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        # The PG row is already durable when we get here in dual/hub, and the
-        # PG-failure path has already queued to the outbox — so a hung file leg
-        # is a bad exit code, never an uncaught traceback out of the hook.
-        _log(f"capture_v2 timed out after 300s ({capture_v2})")
-        return EX_SOFTWARE
-    except OSError as exc:
-        _log(f"capture_v2 could not run: {type(exc).__name__}: {exc}")
+        from khipu.tombstones import RegistryError, subprocess_lock_handoff, write_guard
+
+        with write_guard(payload) as allowed:
+            if not allowed:
+                _log("forgotten source → file wiki leg skipped")
+                return 0
+            handoff_env, pass_fds = subprocess_lock_handoff()
+            # Do not propagate a caller's stale/fabricated lock marker. Only
+            # the owned guard above can export a descriptor to this child.
+            for name in ("KHIPU_TOMBSTONE_LOCK_FD", "KHIPU_TOMBSTONE_LOCK_DEV",
+                         "KHIPU_TOMBSTONE_LOCK_INO", "KHIPU_TOMBSTONE_REGISTRY"):
+                env.pop(name, None)
+            env.update(handoff_env)
+            try:
+                proc = _run_legacy_group(
+                    [sys.executable, str(capture_v2)],
+                    input=wire.dumps(payload),
+                    env=env,
+                    timeout=300,
+                    pass_fds=pass_fds,
+                )
+            except subprocess.TimeoutExpired:
+                # The PG row is already durable when we get here in dual/hub, and the
+                # PG-failure path has already queued to the outbox — so a hung file leg
+                # is a bad exit code, never an uncaught traceback out of the hook.
+                _log(f"capture_v2 timed out after 300s ({capture_v2})")
+                return EX_SOFTWARE
+            except OSError as exc:
+                _log(f"capture_v2 could not run: {type(exc).__name__}: {exc}")
+                return EX_SOFTWARE
+    except RegistryError as exc:
+        _log(f"tombstone registry unavailable; file wiki leg refused ({exc})")
         return EX_SOFTWARE
     if proc.stdout.strip():
         print(proc.stdout.rstrip())
@@ -1001,7 +1229,26 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
     return proc.returncode
 
 
-def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
+def capture(payload: dict[str, Any], *, mode: str | None = None,
+            result: dict[str, Any] | None = None) -> int:
+    """Route one capture by mode. ``result``, when given, receives write_pg's
+    stats (``episode_id``, ``episode_inserted``, ``source_key``) on a hub
+    write, so a caller that reports the episode never looks it up again.
+
+    Holds the memory lock shared for every leg (hub row, outbox, legacy file,
+    vectors), so a forget on this Mac never interleaves with one capture."""
+    from khipu import memory_lock
+
+    try:
+        with memory_lock.shared():
+            return _capture(payload, mode=mode, result=result)
+    except memory_lock.MemoryLockError as exc:
+        _log(f"memory lock unavailable; capture refused ({exc})")
+        return EX_SOFTWARE
+
+
+def _capture(payload: dict[str, Any], *, mode: str | None,
+             result: dict[str, Any] | None) -> int:
     mode = (mode or capture_mode()).lower()
     try:
         _validate_timestamp(payload)
@@ -1042,6 +1289,11 @@ def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
     # is ever double-written (the replay is the same identity upsert).
     try:
         stats = write_pg(payload)
+        if result is not None:
+            result.update(stats)
+        if stats.get("forgotten_source"):
+            _log("capture source belongs to a forgotten episode; skipping persistence legs")
+            return 0
     except CaptureIdentityConflict as exc:
         _log(str(exc))
         return EX_SOFTWARE
@@ -1073,7 +1325,7 @@ def capture(payload: dict[str, Any], *, mode: str | None = None) -> int:
     if stats["episode_inserted"]:
         from khipu.embed import embed_on_capture
 
-        embed_on_capture(payload)
+        embed_on_capture(payload, episode_id=stats.get("episode_id"))
 
     # dual: legacy file wiki is a peer; hub: PG is the record and the file is
     # its reverse mirror (plan: "Hub owns writes ... and can reverse-mirror to

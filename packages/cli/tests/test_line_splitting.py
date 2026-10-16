@@ -272,7 +272,9 @@ class ReaderTest(unittest.TestCase):
         _jsonl(mem / ".khipu-forget-backups" / "episodes.jsonl.1", rows)
         md5 = hashlib.md5(rows[0]["summary"].encode("utf-8")).hexdigest()
         out = forget.forget_in_legacy_file(mem, rows[0]["ts"], md5)
-        self.assertEqual(out["removed"], 1, out)
+        # One line from the log and one from its retained backup.
+        self.assertEqual(out["removed"], 2, out)
+        self.assertEqual(out["backups"]["removed"], 1, out)
         self.assertNotIn("reason", out)
         self.assertTrue(out["backups"]["ok"], out)
         for path in (mem / "episodes.jsonl", mem / ".khipu-forget-backups" / "episodes.jsonl.1"):

@@ -653,7 +653,7 @@ class ToolDispatchNeverKillsTheServerTest(unittest.TestCase):
     def test_capture_silences_stdout_and_reports_the_episode_id(self):
         import sys as _sys
 
-        def _noisy_capture(payload, mode=None):
+        def _noisy_capture(payload, mode=None, result=None):
             print("OK · episode appended")   # would corrupt the JSON-RPC stream
             self.assertEqual(os.environ["KHIPU_HUB_FILE_MIRROR"], "0")
             return 0

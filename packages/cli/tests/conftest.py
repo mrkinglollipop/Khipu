@@ -48,6 +48,7 @@ import atexit
 import os
 import shutil
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -99,6 +100,31 @@ def _reset_table_columns_cache():
     db._TABLE_COLUMNS_CACHE.clear()
     yield
     db._TABLE_COLUMNS_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tombstone_registry(tmp_path, monkeypatch):
+    """A forgotten source is intentionally process-durable in production.
+
+    Tests reuse fixture source identities, so each test receives its own
+    state-root registry instead of allowing one test's completed forget to
+    change a later test's setup.
+    """
+    from khipu import tombstones
+    from khipu.paths import isolated_dir
+
+    def test_registry_path():
+        isolated = isolated_dir()
+        if isolated is not None:
+            return isolated / "forgotten_sources.json"
+        # A test that points the data dir at another of its own folders (a
+        # second Mac's state) gets that folder's registry, as production does.
+        override = os.environ.get("KHIPU_DATA_DIR")
+        if override and Path(override).is_relative_to(tmp_path):
+            return Path(override) / "forgotten_sources.json"
+        return tmp_path / "state" / "forgotten_sources.json"
+
+    monkeypatch.setattr(tombstones, "registry_path", test_registry_path)
 
 
 @pytest.fixture(autouse=True)

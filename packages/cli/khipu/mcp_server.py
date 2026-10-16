@@ -580,12 +580,18 @@ TOOLS: list[dict] = [
         "name": "khipu_forget",
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
         "description": (
-            "Forget one episode completely: the row is tombstoned, its vectors "
-            "and the commitments it opened go with it, and its line leaves the "
-            "legacy file. Use it for a capture that was wrong, a test, or "
-            "something that should not have been remembered. Through the "
-            "HTTPS gateway only episodes captured by a cloud harness can be "
-            "forgotten; local captures are forgotten from the Mac that owns them. "
+            "Forget one episode: every reader stops returning it, its vectors "
+            "and the commitments it opened go with it, and its lines leave the "
+            "legacy logs. The hub and each Mac's local replica keep its row and "
+            "text, marked forgotten; no command purges it yet, and no command "
+            "restores it. A queued capture job that is an exact copy of it is "
+            "removed; a job that cannot be read, matches it only loosely, or that "
+            "another live episode also holds is kept. The result says plainly "
+            "(message, locations) whether the forget is complete, what was removed, "
+            "and what was kept or could not be checked and why. Use it for a capture that was wrong, a test, or something "
+            "that should not have been remembered. Through the HTTPS gateway only "
+            "episodes captured by a cloud harness can be forgotten; local captures "
+            "are forgotten from the Mac that owns them. "
             "A ledger id (ledger:<project>#<row id>) removes that ledger row, the "
             "same as `khipu ledger remove`: it leaves every list at once and the "
             "owner can restore it in the app for 30 days."
@@ -1425,9 +1431,10 @@ def _tool_capture(args: dict) -> dict:
     # protocol stream for the rest of the session.
     prev_mirror = os.environ.get("KHIPU_HUB_FILE_MIRROR")
     os.environ["KHIPU_HUB_FILE_MIRROR"] = "0"
+    written: dict = {}
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            rc = capture(payload, mode="hub")
+            rc = capture(payload, mode="hub", result=written)
     finally:
         if prev_mirror is None:
             os.environ.pop("KHIPU_HUB_FILE_MIRROR", None)
@@ -1436,34 +1443,20 @@ def _tool_capture(args: dict) -> dict:
     if rc != 0:
         raise ValueError(f"khipu capture exited {rc}")
     out = {"ok": True, "mode": mode, "ts": payload["ts"]}
-    episode_id = _captured_episode_id(payload)
+    episode_id = _captured_episode_id(written)
     if episode_id is not None:
         out["episode_id"] = episode_id
     return out
 
 
-def _captured_episode_id(payload: dict) -> int | None:
-    """The row this capture landed on, by the (ts, md5(summary)) identity every
-    writer shares. Fail-open — the capture already succeeded, so an id lookup
-    failure must not turn it into a tool error."""
+def _captured_episode_id(written: dict) -> int | None:
+    """The row this capture landed on, as write_pg reported it. No lookup: the
+    (ts, md5(summary)) re-select it replaced named the wrong row once a merge
+    or edit had moved the summary. None when the write did not report one."""
     try:
-        import hashlib
-
-        from khipu.db import connect
-
-        summary = (payload.get("summary") or "").strip()
-        ts = payload.get("ts")
-        if not summary or not ts:
-            return None
-        with connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
-                    (ts, hashlib.md5(summary.encode("utf-8")).hexdigest()),
-                )
-                row = cur.fetchone()
-        return int(row[0]) if row else None
-    except Exception:  # noqa: BLE001 — best-effort enrichment only
+        episode_id = written.get("episode_id")
+        return int(episode_id) if episode_id is not None else None
+    except (TypeError, ValueError):  # best-effort enrichment only
         return None
 
 
@@ -1541,7 +1534,7 @@ def _tool_forget(args: dict) -> dict:
             raise ValueError(str(exc)) from None
     eid = _positive_id(args.get("id"), "id")
     _ensure_path()
-    from khipu.forget import LOCAL_HARNESSES, forget_everywhere
+    from khipu.forget import KEPT, LOCAL_HARNESSES, forget_everywhere, plain_summary
     from khipu.db import connect
 
     if _via_https_gateway():
@@ -1559,6 +1552,10 @@ def _tool_forget(args: dict) -> dict:
             )
     out = forget_everywhere(eid)
     out.pop("identity", None)
+    # Said plainly in every result, a partial one above all: what is kept by
+    # design, and what still holds a copy or could not be checked.
+    out.setdefault("kept", KEPT)
+    out.setdefault("message", plain_summary(out))
     if not out.get("ok"):
         raise _ToolFailure(out)
     return out
