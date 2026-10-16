@@ -1593,17 +1593,37 @@ fn sign_in_status_argv(id: &str) -> Result<Vec<String>, String> {
     Ok(vec!["usage".to_string(), format!("--sign-in-status={}", sign_in_attempt_id(id)?)])
 }
 
-/// Cancel stops only the attempt this app started.
-fn sign_in_cancel_argv(id: &str, stored_id: Option<&str>, remove_folder: bool) -> Result<Vec<String>, String> {
-    let id = sign_in_attempt_id(id)?;
-    if stored_id != Some(id) {
-        return Err("That sign-in isn't the one this window started".to_string());
+/// Cancel stops only the attempt this app started (`stored_id`, from
+/// `SignInNewState`). `remove_from` is the folder Khipu made (also from that
+/// state, never from the webview) when the owner's Cancel should remove it
+/// if still empty; it is passed even with no attempt, since a sign-in that
+/// failed, timed out or showed no code has no attempt left to stop.
+fn sign_in_cancel_argv(stored_id: Option<&str>, remove_from: Option<(&str, &str)>) -> Result<Vec<String>, String> {
+    if stored_id.is_none() && remove_from.is_none() {
+        return Err("No sign-in is running".to_string());
     }
-    let mut argv = vec!["usage".to_string(), format!("--sign-in-cancel={id}")];
-    if remove_folder {
+    let mut argv = vec!["usage".to_string()];
+    match stored_id {
+        Some(id) => argv.push(format!("--sign-in-cancel={}", sign_in_attempt_id(id)?)),
+        None => argv.push("--sign-in-cancel".to_string()),
+    }
+    if let Some((cli, folder)) = remove_from {
+        if !["claude", "codex", "grok"].contains(&cli) || sign_in_folder_shape(cli, folder).is_none() {
+            return Err("That login folder isn't one Khipu made".to_string());
+        }
         argv.push("--remove-folder".to_string());
+        argv.push(format!("--harness={cli}"));
+        argv.push(format!("--folder={folder}"));
     }
     Ok(argv)
+}
+
+/// True for the status answers that end an attempt (the CLI deletes its
+/// record), so this window stops holding the attempt id.
+fn sign_in_status_is_final(answer: &Value) -> bool {
+    let state = answer.get("state").and_then(Value::as_str);
+    matches!(state, Some("signed_in" | "not_signed_in" | "couldnt_check" | "timeout"))
+        || answer.get("error").and_then(Value::as_str) == Some("no_attempt")
 }
 
 fn sign_in_user_home() -> Result<PathBuf, String> {
@@ -1645,9 +1665,9 @@ async fn khipu_account_new_folder(harness: String, name: String) -> Result<Strin
         if sign_in_folder_shape(&harness, folder).is_none() {
             return Err("Khipu made a login folder the app won't use".to_string());
         }
-        let mut state = sign_in_state();
-        state.folder = Some((harness, folder.to_string()));
-        state.attempt = None;
+        // A running attempt stays held (it is ended only by cancel, status or
+        // Start again), so this window can still stop its own login.
+        sign_in_state().folder = Some((harness, folder.to_string()));
     }
     Ok(raw)
 }
@@ -1675,23 +1695,35 @@ async fn khipu_account_sign_in_new(harness: String, again: Option<bool>) -> Resu
 #[tauri::command]
 async fn khipu_account_sign_in_status() -> Result<String, String> {
     let id = sign_in_state().attempt.clone().ok_or("No sign-in is running")?;
-    run_khipu_cli_async(sign_in_status_argv(&id)?).await
+    let raw = run_khipu_cli_async(sign_in_status_argv(&id)?).await?;
+    if sign_in_answer(&raw).map(|a| sign_in_status_is_final(&a)).unwrap_or(false) {
+        let mut state = sign_in_state();
+        if state.attempt.as_deref() == Some(id.as_str()) {
+            state.attempt = None;
+        }
+    }
+    Ok(raw)
 }
 
 /// Stop this window's sign-in; `remove_folder` also removes the empty folder
 /// Khipu made for it (the CLI refuses to remove one that has signed in).
 #[tauri::command]
 async fn khipu_account_sign_in_cancel(remove_folder: Option<bool>) -> Result<String, String> {
-    let id = sign_in_state().attempt.clone().ok_or("No sign-in is running")?;
-    let argv = sign_in_cancel_argv(&id, Some(&id), remove_folder.unwrap_or(false))?;
+    let (id, folder) = {
+        let state = sign_in_state();
+        (state.attempt.clone(), state.folder.clone())
+    };
+    let remove_from = if remove_folder.unwrap_or(false) { folder.as_ref() } else { None };
+    let argv = sign_in_cancel_argv(id.as_deref(), remove_from.map(|(c, f)| (c.as_str(), f.as_str())))?;
     let raw = run_khipu_cli_async(argv).await?;
     if let Ok(answer) = sign_in_answer(&raw) {
-        if answer.get("ok").and_then(Value::as_bool) == Some(true) {
-            let mut state = sign_in_state();
+        let ok = answer.get("ok").and_then(Value::as_bool) == Some(true);
+        let mut state = sign_in_state();
+        if (ok || answer.get("error").and_then(Value::as_str) == Some("no_attempt")) && state.attempt == id {
             state.attempt = None;
-            if answer.get("folder_removed").and_then(Value::as_bool) == Some(true) {
-                state.folder = None;
-            }
+        }
+        if ok && answer.get("folder_removed").and_then(Value::as_bool) == Some(true) && state.folder == folder {
+            state.folder = None;
         }
     }
     Ok(raw)
@@ -5055,21 +5087,111 @@ mod sign_in_new_tests {
         for bad in ["", "0123456789abcde", "0123456789abcdef0", "0123456789ABCDEF", "0123456789abcdeg",
                     "0123456789abcde;", "--remove-folder--x-"] {
             assert!(sign_in_status_argv(bad).is_err(), "{bad:?}");
-            assert!(sign_in_cancel_argv(bad, Some(bad), false).is_err(), "{bad:?}");
+            assert!(sign_in_cancel_argv(Some(bad), None).is_err(), "{bad:?}");
         }
     }
 
     #[test]
     fn cancel_stops_only_its_own_attempt() {
         let mine = "0123456789abcdef";
-        let other = "fedcba9876543210";
-        assert_eq!(sign_in_cancel_argv(mine, Some(mine), false).unwrap(), v(&["usage", "--sign-in-cancel=0123456789abcdef"]));
+        let made = Some(("claude", "~/.claude-client"));
+        assert_eq!(sign_in_cancel_argv(Some(mine), None).unwrap(), v(&["usage", "--sign-in-cancel=0123456789abcdef"]));
         assert_eq!(
-            sign_in_cancel_argv(mine, Some(mine), true).unwrap(),
-            v(&["usage", "--sign-in-cancel=0123456789abcdef", "--remove-folder"])
+            sign_in_cancel_argv(Some(mine), made).unwrap(),
+            v(&["usage", "--sign-in-cancel=0123456789abcdef", "--remove-folder", "--harness=claude",
+                "--folder=~/.claude-client"])
         );
-        assert!(sign_in_cancel_argv(other, Some(mine), false).is_err());
-        assert!(sign_in_cancel_argv(mine, None, false).is_err());
+        assert!(sign_in_cancel_argv(None, None).is_err());
+    }
+
+    #[test]
+    fn cancel_with_no_attempt_only_removes_the_folder_khipu_made() {
+        assert_eq!(
+            sign_in_cancel_argv(None, Some(("claude", "~/.claude-client"))).unwrap(),
+            v(&["usage", "--sign-in-cancel", "--remove-folder", "--harness=claude", "--folder=~/.claude-client"])
+        );
+        for (cli, folder) in [("claude", "~/.claude-a/.."), ("claude", "~/.codex-a"), ("muse", "~/.muse-a"),
+                              ("claude", "/abs/.claude-a"), ("claude", "~/.claude-a\n")] {
+            assert!(sign_in_cancel_argv(None, Some((cli, folder))).is_err(), "{folder:?}");
+        }
+    }
+
+    #[test]
+    fn final_status_answers_release_the_attempt() {
+        for state in ["signed_in", "not_signed_in", "couldnt_check", "timeout"] {
+            assert!(sign_in_status_is_final(&serde_json::json!({"ok": true, "state": state})), "{state}");
+        }
+        assert!(sign_in_status_is_final(&serde_json::json!({"ok": false, "error": "no_attempt"})));
+        assert!(!sign_in_status_is_final(&serde_json::json!({"ok": true, "state": "waiting"})));
+        assert!(!sign_in_status_is_final(&serde_json::json!({"ok": true, "state": "starting"})));
+    }
+
+    /// A fake `python` that answers the sign-in CLI calls with fixed JSON, so the
+    /// Tauri commands run end to end with no real login.
+    fn fake_cli() -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("khipu-signin-cli-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(dir.join("home/.claude-a")).unwrap();
+        std::fs::create_dir_all(dir.join("home/.claude-b")).unwrap();
+        let script = dir.join("python");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+case "$*" in
+  *--sign-in-folder*) echo '{"ok": true, "folder": "~/.claude-b", "reused": false}' ;;
+  *--sign-in-new*) echo '{"ok": true, "attempt": {"id": "0123456789abcdef"}, "state": "waiting"}' ;;
+  *--sign-in-cancel*) echo '{"ok": true, "state": "cancelled"}' ;;
+  *--sign-in-status*) echo '{"ok": true, "state": "waiting"}' ;;
+  *) echo '{}' ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn making_a_folder_does_not_forget_a_running_attempt() {
+        let dir = fake_cli();
+        let saved = (std::env::var_os("KHIPU_PYTHON"), std::env::var_os("HOME"));
+        std::env::set_var("KHIPU_PYTHON", dir.join("python"));
+        std::env::set_var("HOME", dir.join("home"));
+        {
+            let mut s = sign_in_state();
+            s.folder = Some(("claude".to_string(), "~/.claude-a".to_string()));
+            s.attempt = None;
+        }
+        let run = || {
+            // A sign-in starts and is running.
+            tauri::async_runtime::block_on(khipu_account_sign_in_new("claude".to_string(), None)).unwrap();
+            let held = sign_in_state().attempt.clone();
+            // The dialog is opened again and a new name is entered: the CLI makes
+            // a folder while the attempt still runs in the CLI's record.
+            tauri::async_runtime::block_on(khipu_account_new_folder("claude".to_string(), "b".to_string())).unwrap();
+            let kept = sign_in_state().attempt.clone();
+            // The running attempt must still be stoppable from the app.
+            let cancelled = tauri::async_runtime::block_on(khipu_account_sign_in_cancel(Some(false)));
+            (held, kept, cancelled)
+        };
+        let (held, kept, cancelled) = run();
+        for (key, value) in [("KHIPU_PYTHON", saved.0), ("HOME", saved.1)] {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        {
+            let mut s = sign_in_state();
+            s.folder = None;
+            s.attempt = None;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(held.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(kept.as_deref(), Some("0123456789abcdef"));
+        assert!(cancelled.is_ok(), "cancel after making a folder: {cancelled:?}");
     }
 
     #[test]

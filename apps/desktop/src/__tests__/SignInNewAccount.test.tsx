@@ -6,6 +6,11 @@ import { SignInNewAccount } from "../SignInNewAccount";
 import type { SignInCli } from "../SignInNewAccount";
 import type { CliResult } from "../settingsCli";
 
+// The lifecycle tests at the end run through the real callCli, with invoke
+// answering the JSON the Python CLI prints; the rest inject a fake `call`.
+const invoke = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
+
 const NOW_MS = Date.parse("2026-10-15T15:25:00Z");
 const STARTED = Math.floor(Date.parse("2026-10-15T15:22:00Z") / 1000);
 const ATTEMPT = { id: "0123456789abcdef", cli: "claude", cli_name: "Claude", folder: "~/.claude-client", kind: "browser", started: STARTED, deadline: STARTED + 900 };
@@ -211,5 +216,124 @@ describe("SignInNewAccount", () => {
     await poll();
     expect(onSignedIn).toHaveBeenCalledTimes(1);
     expect(onSignedIn).toHaveBeenCalledWith("~/.claude-client");
+  });
+});
+
+describe("SignInNewAccount lifecycle through the real callCli", () => {
+  afterEach(() => invoke.mockReset());
+
+  function mount(onCancel = vi.fn()) {
+    render(
+      <SignInNewAccount cli="claude" cliName="Claude" accountName="Claude client" offered
+        onSignedIn={vi.fn()} onBack={vi.fn()} onCancel={onCancel} now={() => STARTED * 1000 + 60_000} />,
+    );
+    return onCancel;
+  }
+
+  const answer = (cmd: string) => {
+    if (cmd === "khipu_account_new_folder") return JSON.stringify({ ok: true, folder: "~/.claude-client", reused: false });
+    if (cmd === "khipu_account_sign_in_new") return JSON.stringify({ ok: true, attempt: ATTEMPT, state: "waiting" });
+    throw new Error(`unexpected ${cmd}`);
+  };
+
+  it.each(["timeout", "not_signed_in", "couldnt_check"])("shows the failed state when status answers %s", async (state) => {
+    invoke.mockImplementation(async (cmd: string) =>
+      cmd === "khipu_account_sign_in_status" ? JSON.stringify({ ok: true, attempt: ATTEMPT, state }) : answer(cmd));
+    mount();
+    await start();
+    await poll(4000);
+    expect(screen.getByText("The sign-in didn't finish")).toBeInTheDocument();
+  });
+
+  it("shows the failed state when an older CLI sends a timeout as ok: false", async () => {
+    let polls = 0;
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd !== "khipu_account_sign_in_status") return answer(cmd);
+      polls += 1;
+      if (polls === 1) return JSON.stringify({ ok: false, attempt: ATTEMPT, state: "timeout", error: "sign_in_timeout" });
+      return JSON.stringify({ ok: false, error: "no_attempt" });
+    });
+    mount();
+    await start();
+    await poll(8000);
+    expect(screen.getByText("The sign-in didn't finish")).toBeInTheDocument();
+    expect(screen.getByText(/Code: sign_in_timeout/)).toBeInTheDocument();
+  });
+
+  it("shows the failed state when the attempt is gone", async () => {
+    invoke.mockImplementation(async (cmd: string) =>
+      cmd === "khipu_account_sign_in_status" ? JSON.stringify({ ok: false, error: "no_attempt" }) : answer(cmd));
+    mount();
+    await start();
+    await poll(4000);
+    expect(screen.getByText("The sign-in didn't finish")).toBeInTheDocument();
+  });
+
+  it("Stop and cancel while the sign-in is starting stops the login that start then returns", async () => {
+    let releaseStart: (v: string) => void = () => {};
+    let rustAttempt: string | null = null; // models SignInNewState.attempt in lib.rs
+    const cancels: string[] = [];
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_account_sign_in_new") {
+        const raw = await new Promise<string>((r) => { releaseStart = r; });
+        rustAttempt = ATTEMPT.id;
+        return raw;
+      }
+      if (cmd === "khipu_account_sign_in_cancel") {
+        if (!rustAttempt) throw "No sign-in is running"; // lib.rs khipu_account_sign_in_cancel
+        cancels.push(rustAttempt);
+        rustAttempt = null;
+        return JSON.stringify({ ok: true, state: "cancelled", stopped: "killed" });
+      }
+      if (cmd === "khipu_account_sign_in_status") return JSON.stringify({ ok: true, attempt: ATTEMPT, state: "waiting" });
+      return answer(cmd);
+    });
+    const onCancel = mount();
+    await start();
+    expect(screen.getByText(/Starting the sign-in/)).toBeInTheDocument();
+    await act(async () => { fireEvent.keyDown(document, { key: "Escape" }); });
+    await act(async () => { fireEvent.click(screen.getAllByRole("button", { name: "Stop and cancel", hidden: true }).slice(-1)[0]); });
+    expect(onCancel).toHaveBeenCalled();
+    // The CLI's start returns afterwards: the browser login is now running.
+    await act(async () => { releaseStart(JSON.stringify({ ok: true, attempt: ATTEMPT, state: "waiting" })); });
+    await poll(4000);
+    expect(cancels).toEqual([ATTEMPT.id]);
+    expect(invoke.mock.calls.map((c) => c[0])).not.toContain("khipu_account_sign_in_status");
+  });
+
+  it("keeps the dialog open with a plain error when the cancel is refused", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_account_sign_in_cancel") return JSON.stringify({ ok: false, error: "busy" });
+      if (cmd === "khipu_account_sign_in_status") return JSON.stringify({ ok: true, attempt: ATTEMPT, state: "waiting" });
+      return answer(cmd);
+    });
+    const onCancel = mount();
+    await start();
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Stop and cancel" })); });
+    await act(async () => { fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Stop and cancel" })); });
+    expect(onCancel).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Khipu couldn't stop the sign-in just now");
+  });
+});
+
+describe("SignInNewAccount Try again after a folder refusal", () => {
+  it("makes the folder again before starting", async () => {
+    let made = 0;
+    const { call } = fake({
+      khipu_account_new_folder: () =>
+        ++made === 1
+          ? { ok: false, error: "folder_taken", refusal: { ok: false, error: "folder_taken" } }
+          : { ok: true, data: { ok: true, folder: "~/.claude-client", reused: false } },
+    });
+    setup(call);
+    await start();
+    expect(screen.getByText("The sign-in didn't finish")).toBeInTheDocument();
+    expect(commands(call)).not.toContain("khipu_account_sign_in_new");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    });
+    expect(commands(call)).toEqual(["khipu_account_new_folder", "khipu_account_new_folder", "khipu_account_sign_in_new"]);
+    expect(call).toHaveBeenLastCalledWith("khipu_account_sign_in_new", expect.objectContaining({ harness: "claude" }));
+    expect(screen.getByText(/Waiting for you to finish signing in/)).toBeInTheDocument();
   });
 });

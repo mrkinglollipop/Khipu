@@ -287,7 +287,7 @@ def test_failure_saves_nothing(box):
     out = signin.start("claude", folder, **box.kw())
     box.end(1_000_001)  # the login exited without signing in
     res = signin.status(out["attempt"]["id"], ps=box.ps, check=lambda cli, path: signin.NOT_SIGNED_IN)
-    assert res["state"] == signin.NOT_SIGNED_IN and res["ok"] is False
+    assert res["state"] == signin.NOT_SIGNED_IN and res["ok"] is True
     assert _snapshot(box) == before
     assert not usage.cache_file().exists() and not _attempt_file().exists()
 
@@ -594,6 +594,13 @@ def test_the_cli_flags(box, capsys):
     assert json.loads(capsys.readouterr().out)["error"] == signin.E_GUARDRAIL
     assert main(["usage", "--sign-in-reap"]) == 0
     assert json.loads(capsys.readouterr().out) == {"ok": True, "reaped": None}
+    # Cancel with no attempt (it never started): only the empty folder's removal runs.
+    assert main(["usage", "--sign-in-cancel", "--remove-folder", "--harness=claude",
+                 "--folder=~/.claude-client"]) == 0
+    assert json.loads(capsys.readouterr().out)["folder_removed"] is True
+    assert not (box.home / ".claude-client").exists()
+    assert main(["usage", "--sign-in-cancel"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"] == signin.E_NO_ATTEMPT
 
 
 def test_wait_s_is_shortened_only_under_a_test_home(box, monkeypatch):
@@ -604,3 +611,67 @@ def test_wait_s_is_shortened_only_under_a_test_home(box, monkeypatch):
     assert signin.wait_s() == 5.0
     monkeypatch.delenv("KHIPU_DATA_DIR")
     assert signin.wait_s() == signin.WAIT_S
+
+
+def test_status_end_states_are_answers_not_refusals(box):
+    """The app turns any ``ok: false`` into a refusal and keeps waiting, so a
+    finished attempt answers ``ok: true`` with its state; ``ok: false`` is
+    only for a real refusal such as ``no_attempt``."""
+    out = signin.start("claude", _folder(), now=NOW, **box.kw())
+    res = signin.status(out["attempt"]["id"], now=NOW + signin.wait_s() + 1, ps=box.ps, killpg=box.killpg)
+    assert res["ok"] is True and res["state"] == signin.TIMED_OUT and res["error"] == usage.E_SIGN_IN_TIMEOUT
+    for state in (signin.NOT_SIGNED_IN, signin.COULDNT_CHECK):
+        out = signin.start("claude", _folder(), **box.kw())
+        box.end(box.next_pid - 1)  # the login exited
+        res = signin.status(out["attempt"]["id"], ps=box.ps, check=lambda *a, s=state: s)
+        assert res["ok"] is True and res["state"] == state, res
+    assert signin.status("0123456789abcdef") == {"ok": False, "error": signin.E_NO_ATTEMPT}
+
+
+def test_cancel_after_a_failed_sign_in_removes_the_empty_folder(box):
+    """Section 6, After it ends: the empty folder Khipu made is removed when the
+    owner chooses Cancel, though status already ended the attempt. The app
+    passes the folder Khipu returned at creation."""
+    folder = _folder()
+    out = signin.start("claude", folder, **box.kw())
+    box.end(1_000_001)
+    res = signin.status(out["attempt"]["id"], ps=box.ps, check=lambda cli, path: signin.NOT_SIGNED_IN)
+    assert res["state"] == signin.NOT_SIGNED_IN
+    res = signin.cancel(out["attempt"]["id"], remove_folder=True, cli="claude", folder=folder,
+                        ps=box.ps, killpg=box.killpg)
+    assert res["ok"] and res["folder_removed"] is True
+    assert not (box.home / ".claude-client").exists() and signin._folders() == []
+
+
+def test_cancel_after_a_timeout_removes_the_empty_folder(box):
+    folder = _folder()
+    out = signin.start("claude", folder, now=NOW, **box.kw())
+    res = signin.status(out["attempt"]["id"], now=NOW + signin.wait_s() + 1, ps=box.ps, killpg=box.killpg,
+                        check=lambda *a: signin.NOT_SIGNED_IN)
+    assert res["state"] == signin.TIMED_OUT
+    res = signin.cancel(out["attempt"]["id"], remove_folder=True, cli="claude", folder=folder,
+                        ps=box.ps, killpg=box.killpg)
+    assert res["folder_removed"] is True and not (box.home / ".claude-client").exists()
+
+
+def test_cancel_with_no_attempt_removes_only_an_empty_folder_khipu_made(box):
+    """No code (no attempt ever held): Cancel still removes the empty folder,
+    but never one that holds anything, one Khipu didn't make, or one a running
+    login is using; and without remove_folder it is still no_attempt."""
+    folder = _folder()
+    assert signin.cancel(None, cli="claude", folder=folder) == {"ok": False, "error": signin.E_NO_ATTEMPT}
+    (box.home / ".claude-other").mkdir()
+    res = signin.cancel(None, remove_folder=True, cli="claude", folder="~/.claude-other")
+    assert res["folder_removed"] is False and (box.home / ".claude-other").exists()
+    (box.home / ".claude-client" / "x").write_text("")
+    assert signin.cancel(None, remove_folder=True, cli="claude", folder=folder)["folder_removed"] is False
+    (box.home / ".claude-client" / "x").unlink()
+    out = signin.start("claude", folder, **box.kw())
+    res = signin.cancel("fedcba9876543210", remove_folder=True, cli="claude", folder=folder,
+                        ps=box.ps, killpg=box.killpg)
+    assert res["folder_removed"] is False and (box.home / ".claude-client").exists() and box.killed == []
+    assert _attempt_file().exists() and out["ok"]
+    signin.cancel(out["attempt"]["id"], ps=box.ps, killpg=box.killpg)
+    res = signin.cancel(None, remove_folder=True, cli="claude", folder=folder)
+    assert res == {"ok": True, "state": signin.CANCELLED, "stopped": None, "folder_removed": True}
+    assert not (box.home / ".claude-client").exists()

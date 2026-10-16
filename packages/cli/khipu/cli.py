@@ -2069,7 +2069,8 @@ def cmd_usage(args: argparse.Namespace) -> int:
             print(json.dumps(out, indent=2))
             return 2 if out.get("error") == signin.E_NO_ATTEMPT else 0
         if args.sign_in_cancel is not None:
-            out = signin.cancel(args.sign_in_cancel, remove_folder=bool(args.remove_folder))
+            out = signin.cancel(args.sign_in_cancel or None, remove_folder=bool(args.remove_folder),
+                                cli=getattr(args, "harness", None), folder=getattr(args, "folder", None))
             print(json.dumps(out, indent=2))
             return 0 if out.get("ok") else 1
         if not getattr(args, "harness", None):
@@ -4769,9 +4770,11 @@ def build_parser() -> argparse.ArgumentParser:
     us.add_argument("--again", action="store_true",
                     help="With --sign-in-new: end the running sign-in first (Start again)")
     us.add_argument("--sign-in-status", default=None, metavar="ID", help="The sign-in attempt's state (JSON)")
-    us.add_argument("--sign-in-cancel", default=None, metavar="ID", help="Stop and cancel that sign-in (JSON)")
+    us.add_argument("--sign-in-cancel", default=None, nargs="?", const="", metavar="ID",
+                    help="Stop and cancel that sign-in (JSON); with no ID, only --remove-folder runs")
     us.add_argument("--remove-folder", action="store_true",
-                    help="With --sign-in-cancel: also remove the folder Khipu made if it is still empty")
+                    help="With --sign-in-cancel (and --harness H --folder F once the sign-in ended): also "
+                         "remove the folder Khipu made if it is still empty")
     us.add_argument("--sign-in-reap", action="store_true",
                     help="End a leftover sign-in Khipu started (on the app's quit)")
     us.set_defaults(func=cmd_usage)

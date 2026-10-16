@@ -660,7 +660,9 @@ def status(attempt_id: str, *, ps=None, killpg=None, check=None, now=None) -> di
                 return {"ok": True, "attempt": _public(rec), "state": WAITING}
             kill_if_ours(rec, ps=ps, killpg=killpg)
             _end_attempt(rec)
-            return {"ok": False, "attempt": _public(rec), "state": TIMED_OUT, "error": usage.E_SIGN_IN_TIMEOUT}
+            # A finished attempt is an answer, not a refusal: ``ok: false`` is
+            # kept for real refusals (``no_attempt``), which the app ignores.
+            return {"ok": True, "attempt": _public(rec), "state": TIMED_OUT, "error": usage.E_SIGN_IN_TIMEOUT}
         path = None
         if rec.get("folder"):
             path, _ = khipu_made(rec.get("cli"), rec.get("folder"))
@@ -676,22 +678,33 @@ def status(attempt_id: str, *, ps=None, killpg=None, check=None, now=None) -> di
         if state == SIGNED_IN and path is not None:
             _mark_signed_in(rec["cli"], path)
         _end_attempt(rec)
-        return {"ok": state == SIGNED_IN, "attempt": _public(rec), "state": state}
+        return {"ok": True, "attempt": _public(rec), "state": state}
     finally:
         usage._release(fd)
 
 
-def cancel(attempt_id: str, *, remove_folder: bool = False, ps=None, killpg=None) -> dict:
+def cancel(attempt_id: str | None, *, remove_folder: bool = False, cli: str | None = None,
+           folder: str | None = None, ps=None, killpg=None) -> dict:
     """Stop and cancel: end the attempt's own login (only if its process is
     still the recorded one). With ``remove_folder`` (the owner's Cancel), a
-    folder Khipu made that never signed in is removed if it is still empty."""
+    folder Khipu made that never signed in is removed if it is still empty.
+
+    The owner's Cancel can come after the attempt already ended (failed,
+    timed out) or never got one (no code): then ``cli`` and ``folder`` (the
+    app passes the folder Khipu returned at creation) name the folder, and
+    only that removal runs, under the same lock and the same checks."""
     fd = _lock()
     if fd is None:
         return {"ok": False, "error": E_BUSY}
     try:
         rec = _attempt()
-        if rec is None or rec.get("id") != attempt_id:
-            return {"ok": False, "error": E_NO_ATTEMPT}
+        if rec is None or not attempt_id or rec.get("id") != attempt_id:
+            if not (remove_folder and cli and folder):
+                return {"ok": False, "error": E_NO_ATTEMPT}
+            # Never take a folder from under a login that is still running in it.
+            in_use = rec is not None and rec.get("cli") == cli and rec.get("folder") == folder
+            return {"ok": True, "state": CANCELLED, "stopped": None,
+                    "folder_removed": False if in_use else remove_unused_folder(cli, folder)}
         result = kill_if_ours(rec, ps=ps, killpg=killpg)
         _end_attempt(rec)
         out = {"ok": True, "attempt": _public(rec), "state": CANCELLED, "stopped": result}

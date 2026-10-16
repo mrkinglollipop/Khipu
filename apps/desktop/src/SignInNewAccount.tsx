@@ -90,6 +90,13 @@ export function SignInNewAccount({
   const [copied, setCopied] = useState(false);
   const titleId = useId();
   const doneRef = useRef(false);
+  // The owner's Stop and cancel while start had not answered yet: Rust has no
+  // attempt to stop then, so the attempt start returns is stopped at once.
+  const cancelAskedRef = useRef(false);
+  // Whether Khipu made (or reused) the login folder for this dialog; Try
+  // again after a folder refusal makes it first.
+  const folderMadeRef = useRef(false);
+  const [stopProblem, setStopProblem] = useState<string | null>(null);
   const signedInRef = useRef(onSignedIn);
   signedInRef.current = onSignedIn;
 
@@ -106,19 +113,28 @@ export function SignInNewAccount({
   const begin = useCallback(
     async (again: boolean) => {
       setPhase("starting");
+      cancelAskedRef.current = false;
       setProblem(null);
       setDetail(null);
+      setStopProblem(null);
       setCode(null);
       setLink(null);
-      if (!again) {
+      if (!again || !folderMadeRef.current) {
         const made = await call<FolderAnswer>("khipu_account_new_folder", { harness: cli, name: accountName });
+        if (cancelAskedRef.current) return;
         if (!made.ok) {
           const err = (made.refusal?.error as string | undefined) ?? undefined;
           fail(startProblem(err, cliName), err ? `Code: ${err}` : made.error);
           return;
         }
+        folderMadeRef.current = true;
       }
       const res = await call<StartAnswer>("khipu_account_sign_in_new", { harness: cli, again });
+      if (cancelAskedRef.current) {
+        // The dialog already closed: stop the login start just began.
+        if (res.ok) await call("khipu_account_sign_in_cancel", { remove_folder: false });
+        return;
+      }
       if (!res.ok) {
         const err = res.refusal?.error as string | undefined;
         if (err === "no_code") {
@@ -144,8 +160,16 @@ export function SignInNewAccount({
       setTick((n) => n + 1);
       const res = await call<StatusAnswer>("khipu_account_sign_in_status");
       if (doneRef.current) return;
-      if (!res.ok) return; // keep waiting; the next poll tries again
-      const { state, attempt: seen, error } = res.data;
+      // A finished attempt is an answer; an older CLI sent its end states as
+      // ok: false, so a refusal that names one is read the same way.
+      const answer = res.ok ? res.data : (res.refusal as StatusAnswer | undefined);
+      if (!res.ok && answer?.error === "no_attempt") {
+        doneRef.current = true;
+        fail(`The sign-in ended before Khipu could check it.`, "Code: no_attempt");
+        return;
+      }
+      if (!answer || typeof answer.state !== "string") return; // keep waiting; the next poll tries again
+      const { state, attempt: seen, error } = answer;
       if (state === "signed_in") {
         doneRef.current = true;
         signedInRef.current((seen ?? attempt)?.folder ?? "");
@@ -183,8 +207,21 @@ export function SignInNewAccount({
 
   const stopAndCancel = async () => {
     setConfirming(false);
+    if (phase === "starting") {
+      // Start hasn't answered: nothing to stop yet. begin() stops the
+      // attempt start returns, and never moves on to waiting.
+      cancelAskedRef.current = true;
+      onCancel();
+      return;
+    }
     doneRef.current = true;
-    await call("khipu_account_sign_in_cancel", { remove_folder: false });
+    const res = await call("khipu_account_sign_in_cancel", { remove_folder: false });
+    if (!res.ok && attempt) {
+      // The login may still be running: keep the dialog so the owner can try again.
+      doneRef.current = false;
+      setStopProblem("Khipu couldn't stop the sign-in just now. Choose Stop and cancel again.");
+      return;
+    }
     onCancel();
   };
   const cancelFailed = async () => {
@@ -271,6 +308,7 @@ export function SignInNewAccount({
               </p>
             </>
           )}
+          {stopProblem ? <p role="alert">{stopProblem}</p> : null}
           <div className="kit-dialog-actions">
             <button type="button" onClick={() => setConfirming(true)}>Stop and cancel</button>
             <button type="button" onClick={() => void begin(true)}>Start again</button>
