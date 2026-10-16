@@ -479,10 +479,15 @@ def minute_settings_status() -> dict:
 # `owed_orchestrator_slice_max` is how many items for the orchestrator (owner
 # `agent`, from its jobs) a conversation's session-start list shows
 # (docs/plans/2026-10-16-owed-and-ledger-ssot.md, decision 2).
+# `owed_page_max` is the most items one `khipu_owed` page returns, and
+# `owed_bulk_max` the most ids one `khipu_owed_update` call changes (the same
+# scope, design (c)).
 # ---------------------------------------------------------------------------
 
 COUNT_SETTINGS: dict[str, int] = {
     "owed_orchestrator_slice_max": 3,
+    "owed_page_max": 200,
+    "owed_bulk_max": 500,
 }
 
 

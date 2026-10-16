@@ -58,13 +58,13 @@ class ToolOwedTest(unittest.TestCase):
     def test_project_filter_is_forwarded(self):
         called = {}
 
-        def fake_list_owed(cur, *, project=None, status="open", limit=50):
+        def fake_fetch(cur, *, project=None, status="open"):
             called["project"] = project
             called["status"] = status
             return []
 
         with mock.patch("khipu.db.connect", return_value=_FakeConn(_FakeCur([]))), \
-                mock.patch("khipu.commitments.list_owed", fake_list_owed):
+                mock.patch("khipu.commitments.fetch_owed_rows", fake_fetch):
             srv._tool_owed({"project": "acme/widget", "status": "stale"})
         self.assertEqual(called["project"], "acme/widget")
         self.assertEqual(called["status"], "stale")

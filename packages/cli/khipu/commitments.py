@@ -14,6 +14,7 @@ never take down an episode insert that already succeeded.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -605,6 +606,9 @@ def row_owner(row: dict[str, Any], *, future_trigger: bool | None = None) -> tup
     if str(row.get("owner") or "").strip().lower() == OWNER_AGENT:
         return OWNER_AGENT, (clean_owner_label(row.get("owner_label"))
                              or agent_actor(row.get("text") or "") or ORCHESTRATOR)
+    # A reassigned owner (migration 0035) is kept as written.
+    if row.get("owner_reassigned_at") and row.get("owner") in (OWNER_USER, OWNER_ASSISTANT):
+        return str(row["owner"]), None
     return resolve_owner_and_label(
         row.get("text") or "", kind=row.get("kind"), declared=row.get("owner"),
         future_trigger=future_trigger, origin=row.get("origin"),
@@ -878,6 +882,17 @@ def _owner_columns_ready(cur) -> bool:
         from khipu.db import has_columns
 
         return has_columns(cur, "commitments", "origin", "owner_label")
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
+def _reassigned_column_ready(cur) -> bool:
+    """True when migration 0035 (``owner_reassigned_at``) has been applied.
+    Without it a reassign stores the owner and a read resolves it as before."""
+    try:
+        from khipu.db import has_columns
+
+        return has_columns(cur, "commitments", "owner_reassigned_at")
     except Exception:  # noqa: BLE001 — introspection is best-effort
         return False
 
@@ -1500,7 +1515,18 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
 def list_owed(cur, *, project: str | None = None, parent_session_id: str | None = None,
               session_id: str | None = None, status: str = "open",
               limit: int | None = 50, hide_snoozed: bool = False) -> list[dict[str, Any]]:
-    """``project`` if given, else ``parent_session_id``/``session_id`` (fix
+    """The owed rows of one scope in priority order, at most ``limit``; see
+    :func:`fetch_owed_rows` for the scope."""
+    rows = fetch_owed_rows(cur, project=project, parent_session_id=parent_session_id,
+                           session_id=session_id, status=status, hide_snoozed=hide_snoozed)
+    return finish_owed_rows(rows, limit)
+
+
+def fetch_owed_rows(cur, *, project: str | None = None, parent_session_id: str | None = None,
+                    session_id: str | None = None, status: str = "open",
+                    hide_snoozed: bool = False) -> list[dict[str, Any]]:
+    """Every raw row of one scope, newest first, owners not yet resolved.
+    ``project`` if given, else ``parent_session_id``/``session_id`` (fix
     3) — the same coalesced key ``open_from_episode``/``auto_close`` store
     commitments under, so a caller with only session context (no resolved
     project) can still find its own scope's commitments.
@@ -1540,23 +1566,38 @@ def list_owed(cur, *, project: str | None = None, parent_session_id: str | None 
         select_cols += ["origin", "owner_label"]
     if _close_columns_ready(cur):
         select_cols += ["prs", "closed_by", "close_rule_key", "settle_suggestion", "pr_check"]
+    if _reassigned_column_ready(cur):
+        select_cols.append("owner_reassigned_at")
     cur.execute(
         f"""
         SELECT {', '.join(select_cols)}
         FROM commitments
         WHERE {' AND '.join(clauses)}
-        ORDER BY opened_at DESC
+        ORDER BY opened_at DESC, id DESC
         LIMIT %s
         """,
         params,
     )
-    rows = [dict(zip(select_cols, row)) for row in cur.fetchall()]
-    return finish_owed_rows(rows, limit)
+    return [dict(zip(select_cols, row)) for row in cur.fetchall()]
 
 
 def finish_owed_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
     """Owner, trigger, priority and order for raw commitment rows, the same
     for a hub read and an offline read of the replica (``offline_reads``)."""
+    resolve_owed_rows(rows)
+    # O3: age x kind — within a priority tier (kind), the LONGEST-outstanding
+    # item leads (opened_at ascending), not the newest one the SQL fetched
+    # first. A row with no opened_at (should not happen; NOT NULL) sorts
+    # last within its tier rather than raising.
+    from datetime import datetime, timezone
+
+    _max_dt = datetime.max.replace(tzinfo=timezone.utc)
+    rows.sort(key=lambda r: (r["priority"], r.get("opened_at") or _max_dt))
+    return rows[:limit]
+
+
+def resolve_owed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Owner, trigger and priority for raw commitment rows, in place."""
     for row in rows:
         row.setdefault("last_seen_at", None)
         row["seen_count"] = int(row.get("seen_count") or 1)
@@ -1590,15 +1631,7 @@ def finish_owed_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict
         clause = trigger_clause(row.get("text") or "") if trigger else None
         row["trigger_text"] = clause
         row["until"] = until_line(clause)
-    # O3: age x kind — within a priority tier (kind), the LONGEST-outstanding
-    # item leads (opened_at ascending), not the newest one the SQL fetched
-    # first. A row with no opened_at (should not happen; NOT NULL) sorts
-    # last within its tier rather than raising.
-    from datetime import datetime, timezone
-
-    _max_dt = datetime.max.replace(tzinfo=timezone.utc)
-    rows.sort(key=lambda r: (r["priority"], r.get("opened_at") or _max_dt))
-    return rows[:limit]
+    return rows
 
 
 def add_hub_ages(rows: list[dict[str, Any]], hub_now: Any) -> list[dict[str, Any]]:
@@ -1659,3 +1692,157 @@ def set_status(cur, commitment_id: int, status: str, *, reason: str | None = Non
             (*params, commitment_id),
         )
     return cur.rowcount > 0
+
+
+# ---- paging, filters and bulk changes (design (c), slice 3) -----------------
+
+OWNERS = (OWNER_USER, OWNER_ASSISTANT, OWNER_AGENT)
+ORIGINS = (ORIGIN_CONVERSATION, ORIGIN_JOB)
+# What ``bulk_owner_gate`` returns when it passes; the hub accepts a bulk
+# change to the owner's items only with one of these on the write.
+OWNER_GATE_PASSES = ("app", "terminal")
+BULK_OWNER_REFUSAL = ("Changing more than one of the owner's own items at once needs the owner: "
+                      "do it in the Khipu app, or type yes on a terminal. Nothing was changed.")
+
+
+def _opened_key(row: dict[str, Any]) -> tuple[Any, int]:
+    from datetime import datetime, timezone
+
+    at = row.get("opened_at")
+    if isinstance(at, str):
+        try:
+            at = datetime.fromisoformat(_ISO_Z_RE.sub("+00:00", at))
+        except ValueError:
+            at = None
+    if not isinstance(at, datetime):
+        at = datetime.min.replace(tzinfo=timezone.utc)
+    elif at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return at, int(row.get("id") or 0)
+
+
+def encode_cursor(row: dict[str, Any]) -> str:
+    import base64
+
+    at, cid = _opened_key(row)
+    return base64.urlsafe_b64encode(json.dumps([at.isoformat(), cid]).encode()).decode().rstrip("=")
+
+
+def decode_cursor(raw: str) -> tuple[Any, int]:
+    """``(opened_at, id)`` of the last row a page gave; ValueError otherwise."""
+    import base64
+    from datetime import datetime
+
+    try:
+        text = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
+        at, cid = json.loads(text)
+        return _opened_key({"opened_at": datetime.fromisoformat(at), "id": int(cid)})
+    except (ValueError, TypeError, UnicodeDecodeError):
+        raise ValueError("cursor is not one khipu_owed gave; start again without it") from None
+
+
+def _row_prs(row: dict[str, Any]) -> list[int]:
+    if isinstance(row.get("prs"), list):
+        return [int(n) for n in row["prs"]]
+    from khipu.close_rules import parse_prs
+
+    return parse_prs(row.get("text") or "")
+
+
+def page_owed(rows: list[dict[str, Any]], *, owner: str | None = None, kind: str | None = None,
+              origin: str | None = None, query: str | None = None, pr: int | None = None,
+              cursor: str | None = None, limit: int | None = 50) -> dict[str, Any]:
+    """One page of raw owed rows (``fetch_owed_rows`` or the replica's), newest
+    first on the keyset (``opened_at``, ``id``), so a page never skips or
+    repeats a row while new ones arrive (they sort ahead of every cursor).
+    Owners are resolved first, so the owner filter sees what the app shows.
+    ``total`` counts every row that matches; ``counts`` holds how many each
+    owner and kind has among the rows the other filters match (the owner
+    counts ignore the owner filter, the kind counts the kind filter), so a
+    caller sees what the other headings hold. ``limit`` None or 0: no limit."""
+    resolve_owed_rows(rows)
+    words = [w for w in (query or "").lower().split() if w]
+
+    def keep(row: dict[str, Any], *, skip: str = "") -> bool:
+        if skip != "owner" and owner and owner != "all" and row["owner"] != owner:
+            return False
+        if skip != "kind" and kind and row.get("kind") != kind:
+            return False
+        if origin and (row.get("origin") or ORIGIN_CONVERSATION) != origin:
+            return False
+        if words and not all(w in (row.get("text") or "").lower() for w in words):
+            return False
+        return not (pr is not None and pr not in _row_prs(row))
+
+    counts: dict[str, dict[str, int]] = {"owner": {}, "kind": {}}
+    for row in rows:
+        if keep(row, skip="owner"):
+            counts["owner"][row["owner"]] = counts["owner"].get(row["owner"], 0) + 1
+        if keep(row, skip="kind"):
+            k = str(row.get("kind") or "followup")
+            counts["kind"][k] = counts["kind"].get(k, 0) + 1
+    matched = sorted((r for r in rows if keep(r)), key=_opened_key, reverse=True)
+    after = matched
+    if cursor:
+        last = decode_cursor(cursor)
+        after = [r for r in matched if _opened_key(r) < last]
+    page = after[:limit] if limit else after
+    more = len(after) > len(page)
+    return {"results": page, "total": len(matched), "counts": counts,
+            "next_cursor": encode_cursor(page[-1]) if more and page else None}
+
+
+def owners_of(cur, ids: list[int], *, lock: bool = False) -> dict[int, dict[str, Any]]:
+    """``{id: row}`` with the resolved owner for the given ids (forgotten
+    and missing ids left out); ``lock`` holds the rows for this transaction."""
+    cols = ["id", "text", "owner", "kind", "status"]
+    if _owner_columns_ready(cur):
+        cols += ["origin", "owner_label"]
+    if _future_trigger_ready(cur):
+        cols.append("future_trigger")
+    if _reassigned_column_ready(cur):
+        cols.append("owner_reassigned_at")
+    cur.execute(f"SELECT {', '.join(cols)} FROM commitments WHERE id = ANY(%s) "
+                f"AND {_not_forgotten_clause(cur)}{' FOR UPDATE' if lock else ''}", (list(ids),))
+    out = {}
+    for raw in cur.fetchall():
+        row = dict(zip(cols, raw))
+        trigger = has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
+        row["owner"], row["owner_label"] = row_owner(row, future_trigger=trigger)
+        out[int(row["id"])] = row
+    return out
+
+
+def reassign(cur, commitment_id: int, owner: str, label: str | None = None) -> bool:
+    """Set one item's owner by hand: ``agent`` keeps ``label`` (default the
+    orchestrator), the user and the assistant none. Once migration 0035 is in,
+    a read keeps the owner as written instead of resolving it from the text."""
+    if owner not in OWNERS:
+        raise ValueError(f"owner must be one of {', '.join(OWNERS)}, got {owner!r}")
+    sets, params = ["owner = %s"], [owner]
+    if _owner_columns_ready(cur):
+        sets.append("owner_label = %s")
+        params.append((clean_owner_label(label) or ORCHESTRATOR) if owner == OWNER_AGENT else None)
+    if _reassigned_column_ready(cur):
+        sets.append("owner_reassigned_at = now()")
+    cur.execute(f"UPDATE commitments SET {', '.join(sets)} WHERE id = %s AND {_not_forgotten_clause(cur)}",
+                (*params, commitment_id))
+    return cur.rowcount > 0
+
+
+def bulk_owner_gate(count: int) -> str | None:
+    """The owner gate for a change to more than one of the owner's own items
+    (decision 6): ``"app"`` when the Khipu app itself started this process,
+    ``"terminal"`` after the owner's yes typed on a terminal, else None. The
+    same two checks as the ledger's owner verbs (``ledger.require``), made
+    through routing's own functions, never reimplemented here. This is the
+    one place the owner's direction through the agent
+    (docs/plans/2026-10-16-owner-direction.md) plugs in when it lands."""
+    from khipu import routing
+
+    if routing._caller()["app"]:
+        return "app"
+    if routing.typed_yes(f"This changes {count} items at once, some of them the owner's own. "
+                         "Type yes to confirm: "):
+        return "terminal"
+    return None

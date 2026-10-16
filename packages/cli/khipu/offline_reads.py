@@ -31,6 +31,16 @@ def _open() -> sqlite3.Connection | None:
 def owed(project: str | None, status: str, limit: int) -> dict[str, Any] | None:
     from khipu import commitments
 
+    rows = owed_rows(project, status)
+    if rows is None:
+        return None
+    results = commitments.finish_owed_rows(rows, limit)
+    return {"status": status, "project": project or None, "results": results, **hub_snapshot.stale_fields()}
+
+
+def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
+    """The replica's raw commitment rows of one scope (owners not yet
+    resolved), for ``owed`` and the paged read (``commitments.page_owed``)."""
     con = _open()
     if con is None:
         return None
@@ -53,8 +63,7 @@ def owed(project: str | None, status: str, limit: int) -> dict[str, Any] | None:
             row[col] = hub_snapshot._utc(row.get(col))
         row["future_trigger"] = bool(row.get("future_trigger"))
         row["stale"] = True
-    results = commitments.finish_owed_rows(rows, limit)
-    return {"status": status, "project": project or None, "results": results, **hub_snapshot.stale_fields()}
+    return rows
 
 
 def decisions(project: str | None, since: Any, status: str, limit: int) -> dict[str, Any] | None:

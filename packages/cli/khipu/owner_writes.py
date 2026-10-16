@@ -45,7 +45,7 @@ from typing import Any
 TOOLS = ("owed_update", "decisions_update")
 # What a queued write's reply repeats of the request, so a caller sees the same
 # shape it would have had from the hub.
-_ECHO = ("id", "link_id", "action", "until", "by")
+_ECHO = ("id", "ids", "link_id", "action", "until", "by")
 _HELD = threading.local()  # the entry this thread's run() is applying
 _NO_ID = "queued by an older build; check it and redo it"
 
@@ -397,10 +397,12 @@ def pending_marks(tool: str) -> dict[int, str]:
         job = _read(path)
         if job is None or job["tool"] != tool:
             continue
-        try:
-            marks[int(job["args"].get("id"))] = str(job["args"].get("action") or "")
-        except (TypeError, ValueError):
-            continue
+        ids = job["args"].get("ids")
+        for one in (ids if isinstance(ids, list) else [job["args"].get("id")]):
+            try:
+                marks[int(one)] = str(job["args"].get("action") or "")
+            except (TypeError, ValueError):
+                continue
     return marks
 
 

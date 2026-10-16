@@ -2303,6 +2303,9 @@ def cmd_owed(args: argparse.Namespace) -> int:
 
     close_id = getattr(args, "close", None)
     reopen_id = getattr(args, "reopen", None)
+    reassign_ids = getattr(args, "reassign", None)
+    if reassign_ids or (close_id and "," in str(close_id)) or (reopen_id and "," in str(reopen_id)):
+        return _owed_change_cli(args)
     if close_id or reopen_id:
         cid = int(close_id or reopen_id)
         new_status = "closed" if close_id else "open"
@@ -2325,6 +2328,8 @@ def cmd_owed(args: argparse.Namespace) -> int:
 
     project = getattr(args, "project", None)
     status = getattr(args, "status", None) or "open"
+    if any(getattr(args, k, None) not in (None, "") for k in ("cursor", "owner", "kind", "origin", "query", "pr")):
+        return _owed_page_cli(args, project, status)
     limit = int(getattr(args, "limit", None) or 50)
     stale: dict = {}
     try:
@@ -2353,6 +2358,69 @@ def cmd_owed(args: argparse.Namespace) -> int:
                           "waiting_to_sync": owner_writes.status()}, indent=2, default=str))
     else:
         print(json.dumps(rows, indent=2, default=str))
+    return 0
+
+
+def _owed_ids_arg(raw: str) -> list[int]:
+    ids: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip().lstrip("#")
+        if not part:
+            continue
+        cid = int(part)
+        if cid <= 0:
+            raise ValueError
+        if cid not in ids:
+            ids.append(cid)
+    if not ids:
+        raise ValueError
+    return ids
+
+
+def _owed_change_cli(args: argparse.Namespace) -> int:
+    """`khipu owed --close ID,ID`, `--reopen ID,ID` or `--reassign ID[,ID] --to
+    OWNER`: one owner write through ``mcp_server.owed_change`` (one
+    transaction, one result per id). More than one of the owner's own items
+    passes the owner gate: the app, or a yes typed on this terminal."""
+    from khipu import commitments, mcp_server, routing
+
+    if getattr(args, "reassign", None):
+        action, raw = "reassign", args.reassign
+    elif getattr(args, "close", None):
+        action, raw = "close", args.close
+    else:
+        action, raw = "reopen", args.reopen
+    try:
+        ids = _owed_ids_arg(raw)
+    except ValueError:
+        print(json.dumps({"ok": False, "error": f"ids must be whole numbers separated by commas, got {raw!r}"}))
+        return 2
+    by = commitments.BY_APP if routing._caller()["app"] else commitments.BY_CONVERSATION
+    try:
+        res = mcp_server.owed_change(ids, action, by=by, reason=getattr(args, "reason", None),
+                                     owner=getattr(args, "to", None), owner_label=getattr(args, "label", None))
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "ids": ids, "error": str(exc)}))
+        return 2
+    print(json.dumps(res, default=str))
+    return 0 if res.get("ok") else 1
+
+
+def _owed_page_cli(args: argparse.Namespace, project: str | None, status: str) -> int:
+    """`khipu owed` with a filter or --cursor: one page, as khipu_owed gives it."""
+    from datetime import datetime, timezone
+
+    from khipu import commitments, mcp_server
+
+    try:
+        out = mcp_server._tool_owed({
+            "project": project, "status": status, "limit": getattr(args, "limit", None),
+            **{k: getattr(args, k, None) for k in ("cursor", "owner", "kind", "origin", "query", "pr")}})
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 2
+    commitments.add_hub_ages(out["results"], datetime.now(timezone.utc))
+    print(json.dumps(out, indent=2, default=str))
     return 0
 
 
@@ -5246,9 +5314,23 @@ def build_parser() -> argparse.ArgumentParser:
     owed.add_argument("--project", default=None)
     owed.add_argument("--status", default="open", choices=("open", "closed", "stale"))
     owed.add_argument("--limit", type=int, default=50)
-    owed.add_argument("--close", metavar="ID", default=None, help="Close commitment ID")
-    owed.add_argument("--reopen", metavar="ID", default=None, help="Reopen commitment ID")
-    owed.add_argument("--reason", default=None, help="With --close: why it is done (kept on the item)")
+    owed.add_argument("--owner", default=None, choices=("user", "assistant", "agent", "all"),
+                      help="Only items this owner owes (pages the list, like khipu_owed)")
+    owed.add_argument("--kind", default=None, choices=("followup", "blocker", "question", "promise"))
+    owed.add_argument("--origin", default=None, choices=("conversation", "job"))
+    owed.add_argument("--query", default=None, help="Only items whose text holds all these words")
+    owed.add_argument("--pr", type=int, default=None, help="Only items naming this pull request number")
+    owed.add_argument("--cursor", default=None, help="next_cursor from the previous page")
+    owed.add_argument("--close", metavar="ID[,ID...]", default=None, help="Close commitment ID, or several")
+    owed.add_argument("--reopen", metavar="ID[,ID...]", default=None, help="Reopen commitment ID, or several")
+    owed.add_argument("--reassign", metavar="ID[,ID...]", default=None,
+                      help="Give commitment ID, or several, to another owner (needs --to)")
+    owed.add_argument("--to", default=None, choices=("user", "assistant", "agent"),
+                      help="With --reassign: the new owner")
+    owed.add_argument("--label", default=None, help="With --reassign --to agent: who (orchestrator, builder, reviewer)")
+    owed.add_argument("--reason", default=None,
+                      help="Why (kept on a closed item); required with more than one id")
+    owed.add_argument("--json", action="store_true", help="Accepted and ignored: the output is always JSON")
     owed.add_argument(
         "--snooze", metavar="ID", default=None,
         help="Push commitment ID's due date out (needs --until)",

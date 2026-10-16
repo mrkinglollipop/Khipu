@@ -543,7 +543,10 @@ TOOLS: list[dict] = [
             "questions, promises captured as open_loops and not yet closed by "
             "a matching closed_loop/decision. Call this at session start for "
             "a harness with no pushed slice (Aegis), or whenever 'what do I "
-            "still owe on this project' would change the answer."
+            "still owe on this project' would change the answer. Pages "
+            "newest first: pass the reply's next_cursor as cursor for the "
+            "next page; total and counts (by owner and kind) cover every "
+            "matching item, not just this page."
         ),
         "inputSchema": {
             "type": "object",
@@ -553,7 +556,14 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "open (default) | closed | stale",
                 },
-                "limit": {"type": "integer", "description": "Default 50"},
+                "owner": {"type": "string", "description": "user | assistant | agent | all (default)"},
+                "kind": {"type": "string", "description": "followup | blocker | question | promise"},
+                "origin": {"type": "string", "description": "conversation | job"},
+                "query": {"type": "string", "description": "Words that must all be in the text"},
+                "pr": {"type": "integer", "description": "Only items naming this pull request number"},
+                "cursor": {"type": "string", "description": "next_cursor from the previous page"},
+                "limit": {"type": "integer",
+                          "description": "Default 50; at most the owed_page_max setting (200, 0 for no limit)"},
             },
         },
     },
@@ -561,21 +571,33 @@ TOOLS: list[dict] = [
         "name": "khipu_owed_update",
         "annotations": {"readOnlyHint": False, "idempotentHint": True},
         "description": (
-            "Close, reopen or snooze one commitment by id (ids come from "
-            "khipu_owed). Close it when the work is done or the question is "
-            "answered; snooze it with `until` (a date, or 7d / 2w / 1m) when it "
-            "is real but not now. Cloud agents: this is how you close what you "
+            "Close, reopen, snooze or reassign commitments by id (ids come "
+            "from khipu_owed). Close it when the work is done or the question "
+            "is answered; snooze it with `until` (a date, or 7d / 2w / 1m) when "
+            "it is real but not now; reassign it with `owner` (and "
+            "`owner_label` for an agent) when it is someone else's. `ids` "
+            "changes several in one transaction, one result per id, and needs "
+            "a `reason`. A change to more than one of the user's own items "
+            "needs the user (the Khipu app, or their yes on a terminal) and is "
+            "refused here, nothing changed; items you or your jobs own need "
+            "nothing more. Cloud agents: this is how you close what you "
             "opened through khipu_capture."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "id": {"type": "integer", "description": "Commitment id"},
-                "action": {"type": "string", "description": "close | reopen | snooze"},
+                "ids": {"type": "array", "items": {"type": "integer"},
+                        "description": "Several commitment ids (at most the owed_bulk_max setting, 500, 0 for no limit)"},
+                "action": {"type": "string", "description": "close | reopen | snooze | reassign"},
                 "until": {"type": "string", "description": "snooze only: 2026-09-30, 7d, 2w, 1m"},
-                "reason": {"type": "string", "description": "close only: why it is done (kept on the item)"},
+                "owner": {"type": "string", "description": "reassign only: user | assistant | agent"},
+                "owner_label": {"type": "string",
+                                "description": "reassign to agent only: who (orchestrator, builder, reviewer)"},
+                "reason": {"type": "string",
+                           "description": "why (kept on a closed item); required with more than one id"},
             },
-            "required": ["id", "action"],
+            "required": ["action"],
         },
     },
     {
@@ -1519,33 +1541,76 @@ def _captured_episode_id(written: dict) -> int | None:
 
 
 def _tool_owed(args: dict) -> dict:
-    """W3.4: list commitments. Read-only. When the hub is away it answers from
-    this Mac's replica, marked stale (``offline_reads``); with no replica to
-    read the hub's own error stands. Rows with a write still waiting to sync
-    say so (``pending_sync``)."""
+    """W3.4: list commitments, one keyset page at a time (``commitments.page_owed``).
+    Read-only. When the hub is away it answers from this Mac's replica, marked
+    stale (``offline_reads``); with no replica to read the hub's own error
+    stands. Rows with a write still waiting to sync say so (``pending_sync``)."""
     status = (args.get("status") or "open").strip().lower()
     if status not in ("open", "closed", "stale"):
         raise ValueError("status must be 'open', 'closed', or 'stale'")
-    limit = min(max(1, int(args.get("limit") or 50)), 200)
-    project = args.get("project") or None
     _ensure_path()
     from khipu import commitments, offline, offline_reads, owner_writes
     from khipu.db import connect
-    from khipu.hub_snapshot import hub_connection_failed
+    from khipu.hub_snapshot import hub_connection_failed, stale_fields
 
+    filters = owed_filters(args)
+    limit, note = owed_page_limit(args.get("limit"))
+    project = args.get("project") or None
     try:
         with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
             with conn.cursor() as cur:
-                rows = commitments.list_owed(cur, project=project, status=status, limit=limit)
-        out = {"status": status, "project": project, "results": rows}
+                rows = commitments.fetch_owed_rows(cur, project=project, status=status)
+        stale: dict = {}
     except Exception as exc:  # noqa: BLE001
         if not hub_connection_failed(exc):
             raise
-        out = offline_reads.owed(project, status, limit)
-        if out is None:
+        rows = offline_reads.owed_rows(project, status)
+        if rows is None:
             raise
+        stale = stale_fields()
+    page = commitments.page_owed(rows, **filters, limit=limit)
+    out = {"status": status, "project": project, **page, "limit": limit,
+           **({"limit_note": note} if note else {}), **stale}
     out.update(owner_writes.annotate(out["results"], "owed_update"))
     return out
+
+
+def owed_filters(args: dict) -> dict:
+    """The owed list's filters, checked: owner, kind, origin, query, pr, cursor."""
+    from khipu import commitments
+
+    owner = (args.get("owner") or "all").strip().lower()
+    if owner not in (*commitments.OWNERS, "all"):
+        raise ValueError("owner must be 'user', 'assistant', 'agent' or 'all'")
+    kind = (args.get("kind") or "").strip().lower() or None
+    if kind and kind not in commitments.VALID_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(commitments.VALID_KINDS)}")
+    origin = (args.get("origin") or "").strip().lower() or None
+    if origin and origin not in commitments.ORIGINS:
+        raise ValueError("origin must be 'conversation' or 'job'")
+    pr = args.get("pr")
+    if pr is not None and pr != "":
+        pr = _positive_id(str(pr).lstrip("#"), "pr")
+    else:
+        pr = None
+    cursor = str(args.get("cursor") or "").strip() or None
+    if cursor:
+        commitments.decode_cursor(cursor)
+    return {"owner": None if owner == "all" else owner, "kind": kind, "origin": origin,
+            "query": str(args.get("query") or "").strip() or None, "pr": pr, "cursor": cursor}
+
+
+def owed_page_limit(raw) -> tuple[int | None, str | None]:
+    """``(limit, note)``: the page size asked for (default 50), at most the
+    ``owed_page_max`` setting (0 for no limit); ``note`` says when it was cut."""
+    from khipu.config import count_setting
+
+    limit = max(1, int(raw or 50))
+    most = count_setting("owed_page_max")
+    if most and limit > most:
+        return most, (f"a page holds at most {most} items (setting owed_page_max, 0 for no limit); "
+                      "use next_cursor for the rest")
+    return limit, None
 
 
 def _tool_owed_update(args: dict) -> dict:
@@ -1553,24 +1618,110 @@ def _tool_owed_update(args: dict) -> dict:
     so a cloud agent can close what it opened (audit 2026-09-04: cloud
     clients could open commitments they could never close). With the hub away
     a local call queues the write (``owner_writes``) and says it is waiting to
-    sync; the gateway never queues."""
-    cid = _positive_id(args.get("id"), "id")
+    sync; the gateway never queues. ``ids``, or ``reassign``, go through
+    ``owed_change``: one transaction, one result per id."""
     action = (args.get("action") or "").strip().lower()
-    if action not in ("close", "reopen", "snooze"):
-        raise ValueError("action must be 'close', 'reopen' or 'snooze'")
+    if action not in ("close", "reopen", "snooze", "reassign"):
+        raise ValueError("action must be 'close', 'reopen', 'snooze' or 'reassign'")
+    _ensure_path()
+    from khipu import commitments, owner_writes
+
+    if args.get("ids") is not None or action == "reassign":
+        # Who closed it, and whether the owner gate passed, are set here and
+        # in owed_change, never taken from the caller.
+        return owed_change(_owed_ids(args), action, by=commitments.BY_CONVERSATION,
+                           reason=args.get("reason"), until=args.get("until"), owner=args.get("owner"),
+                           owner_label=args.get("owner_label"), queue_ok=not _via_https_gateway())
+    cid = _positive_id(args.get("id"), "id")
     if action == "snooze":
         from khipu.cli import _snooze_until_sql
 
         if _snooze_until_sql(str(args.get("until") or "")) is None:
             raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
-    _ensure_path()
-    from khipu import commitments, owner_writes
-
     # Who closed it is set here, never taken from the caller: a tool call is
     # a conversation (the app and `khipu owed` pass their own).
-    return owner_writes.run("owed_update", {**args, "id": cid, "action": action,
+    single = {k: v for k, v in args.items() if k != "owner_gate"}
+    return owner_writes.run("owed_update", {**single, "id": cid, "action": action,
                                             "by": commitments.BY_CONVERSATION},
                             queue_ok=not _via_https_gateway())
+
+
+def _owed_ids(args: dict) -> list[int]:
+    raw = args.get("ids")
+    if raw is None:
+        raw = [args.get("id")]
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("ids must be a list of commitment ids")
+    ids: list[int] = []
+    for one in ([args["id"]] if args.get("id") is not None and args.get("ids") is not None else []) + raw:
+        cid = _positive_id(one, "ids")
+        if cid not in ids:
+            ids.append(cid)
+    return ids
+
+
+def owed_change(ids: list[int], action: str, *, by: str, reason=None, until=None, owner=None,
+                owner_label=None, queue_ok: bool = True) -> dict:
+    """Close, reopen, snooze or reassign ``ids`` in one owner write (one
+    transaction on the hub, one result per id; queued and replayed whole when
+    the hub is away). The checks come first and refuse with nothing changed:
+    a reason for more than one id, at most ``owed_bulk_max`` ids, and the
+    owner gate (``commitments.bulk_owner_gate``) when more than one id
+    includes the owner's own items, or their owners cannot be read."""
+    from khipu import commitments, owner_writes
+    from khipu.config import count_setting
+
+    reason = str(reason or "").strip() or None
+    if len(ids) > 1 and not reason:
+        raise ValueError("a reason is required when changing more than one item; nothing was changed")
+    most = count_setting("owed_bulk_max")
+    if most and len(ids) > most:
+        raise ValueError(f"at most {most} items can be changed in one call (setting owed_bulk_max, "
+                         f"0 for no limit); this asked for {len(ids)}, so nothing was changed")
+    if action == "snooze":
+        from khipu.cli import _snooze_until_sql
+
+        if _snooze_until_sql(str(until or "")) is None:
+            raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
+    owner = str(owner or "").strip().lower() or None
+    if action == "reassign" and owner not in commitments.OWNERS:
+        raise ValueError("owner must be 'user', 'assistant' or 'agent' to reassign; nothing was changed")
+    gate = None
+    if len(ids) > 1:
+        mine = _owed_owners_items(ids)
+        if mine is None or mine:
+            gate = commitments.bulk_owner_gate(len(ids))
+            if gate is None:
+                why = ("" if mine else "The hub is away, so whose items these are cannot be checked. ")
+                return {"ok": False, "changed": 0, "action": action, "ids": ids,
+                        "needs_owner": mine if mine else ids, "error": why + commitments.BULK_OWNER_REFUSAL}
+    write = {"ids": ids, "action": action, "by": by,
+             **({"reason": reason} if reason else {}),
+             **({"until": str(until)} if action == "snooze" else {}),
+             **({"owner": owner, "owner_label": owner_label} if action == "reassign" else {}),
+             **({"owner_gate": gate} if gate else {})}
+    res = owner_writes.run("owed_update", write, queue_ok=queue_ok)
+    if res.get("waiting_to_sync"):
+        res["results"] = [{"id": cid, "ok": True, "waiting_to_sync": True} for cid in ids]
+    return res
+
+
+def _owed_owners_items(ids: list[int]) -> list[int] | None:
+    """The ids among ``ids`` that are the owner's own items, or None when the
+    hub is away and their owners cannot be read."""
+    from khipu import commitments, offline
+    from khipu.db import connect
+    from khipu.hub_snapshot import hub_connection_failed
+
+    try:
+        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+            with conn.cursor() as cur:
+                rows = commitments.owners_of(cur, ids)
+    except Exception as exc:  # noqa: BLE001
+        if hub_connection_failed(exc):
+            return None
+        raise
+    return [cid for cid in ids if rows.get(cid, {}).get("owner") == commitments.OWNER_USER]
 
 
 def _owed_update_on_hub(args: dict) -> dict:
@@ -1578,6 +1729,8 @@ def _owed_update_on_hub(args: dict) -> dict:
     replays. The write's id and outcome are recorded in the same transaction
     (``owner_writes.apply_on_hub``); an id the hub already answered applies
     nothing again."""
+    if args.get("ids") is not None:
+        return _owed_change_on_hub(args)
     cid = _positive_id(args.get("id"), "id")
     action = (args.get("action") or "").strip().lower()
     _ensure_path()
@@ -1606,6 +1759,61 @@ def _owed_update_on_hub(args: dict) -> dict:
                 if not ok:
                     raise ValueError(f"no such commitment: {cid}")
                 return {"ok": True, **echo}
+
+            return owner_writes.apply_on_hub(conn, cur, "owed_update", args, write, echo)
+
+
+def _owed_change_on_hub(args: dict) -> dict:
+    """The hub half of ``owed_change``: every id in one transaction, one
+    result per id, recorded through ``owner_writes.apply_on_hub``. The owners
+    are read under lock in the same transaction, and a change to more than
+    one id that includes the owner's own items is refused, nothing changed,
+    unless the gate passed where the write was made (``owner_gate``)."""
+    ids = [_positive_id(one, "ids") for one in args.get("ids") or []]
+    action = (args.get("action") or "").strip().lower()
+    _ensure_path()
+    from khipu import commitments, offline, owner_writes
+    from khipu.db import connect
+
+    echo = {"ids": ids, "action": action}
+    reason = str(args.get("reason") or "") or None
+    by = str(args.get("by") or "") or None
+    with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+        with conn.cursor() as cur:
+            def write() -> dict:
+                rows = commitments.owners_of(cur, ids, lock=True)
+                mine = [cid for cid in ids if rows.get(cid, {}).get("owner") == commitments.OWNER_USER]
+                if len(ids) > 1 and mine and args.get("owner_gate") not in commitments.OWNER_GATE_PASSES:
+                    return {"ok": False, "changed": 0, "needs_owner": mine,
+                            "error": commitments.BULK_OWNER_REFUSAL, **echo}
+                snooze = None
+                if action == "snooze":
+                    from khipu.cli import _snooze_until_sql
+
+                    snooze = _snooze_until_sql(str(args.get("until") or ""))
+                    if snooze is None:
+                        raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
+                results = []
+                for cid in ids:
+                    if cid not in rows:
+                        results.append({"id": cid, "ok": False, "error": f"no such commitment: {cid}"})
+                        continue
+                    if action == "snooze":
+                        expr, param = snooze
+                        cur.execute(f"UPDATE commitments SET due_after = {expr} WHERE id = %s",
+                                    (*([param] if param is not None else []), cid))
+                        ok = cur.rowcount > 0
+                    elif action == "reassign":
+                        ok = commitments.reassign(cur, cid, str(args.get("owner") or ""),
+                                                  str(args.get("owner_label") or "") or None)
+                    else:
+                        ok = commitments.set_status(cur, cid, "closed" if action == "close" else "open",
+                                                    reason=reason, by=by)
+                    results.append({"id": cid, "ok": True} if ok else {
+                        "id": cid, "ok": False,
+                        "error": ("an open item already says the same" if action == "reopen"
+                                  else f"no such commitment: {cid}")})
+                return {"ok": True, "changed": sum(1 for r in results if r["ok"]), "results": results, **echo}
 
             return owner_writes.apply_on_hub(conn, cur, "owed_update", args, write, echo)
 

@@ -1,0 +1,365 @@
+"""Paging, filters and bulk changes in the owed tools (scope
+docs/plans/2026-10-16-owed-and-ledger-ssot.md, design (c), slice 3, with
+Matt's decision 6).
+
+``khipu_owed`` pages on a keyset cursor (``opened_at``, ``id``) and says how
+many items match (``total``) and how many each owner and kind holds
+(``counts``). ``khipu_owed_update`` takes a list of ids: one transaction, one
+result per id, queued and replayed whole when the hub is away. A bulk change
+that touches the owner's own items passes the owner gate (the app, or the
+owner's yes typed on a terminal); items owned by the assistant or an agent
+need no gate. Both caps are settings, and 0 lifts each.
+
+Everything runs on the throwaway PostgreSQL of tests/hermetic_pg.py. The
+gate's inputs are faked (the process that started us, a terminal answer);
+no real terminal is ever asked.
+"""
+from __future__ import annotations
+
+import io
+import json
+from datetime import datetime, timedelta, timezone
+
+import psycopg
+import pytest
+
+from khipu import cli, commitments as co, config, db, owner_writes, routing
+from khipu import mcp_server as srv
+from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+
+PROJECT = "acme/widget"
+DOWN = psycopg.OperationalError("connection timeout expired")
+BASE_AT = datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _aliases(monkeypatch):
+    monkeypatch.setenv("KHIPU_USER_ALIASES", "matt")
+    co.reset_user_patterns()
+    yield
+    co.reset_user_patterns()
+
+
+@pytest.fixture
+def owed(hub, tmp_path, monkeypatch):  # noqa: F811
+    """A migrated hub every ``khipu.db.connect`` reaches, a temp data dir, and
+    a caller that is not the app and a stdin that is not a terminal."""
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    conn = hub.connect()
+    hub.migrate(conn=conn)
+    conn.commit()
+    db._TABLE_COLUMNS_CACHE.clear()
+    monkeypatch.setattr(db, "connect", lambda *a, **k: hub.connect())
+    monkeypatch.setattr(routing, "_caller", lambda: {"app": False, "chain": ["claude"]})
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    conn.autocommit = True
+    return conn
+
+
+def _seed(conn, n, *, start=0, text="follow up on item {i}", kind="followup", owner=None,
+          origin="conversation", label=None, at=None, step_s=1) -> list[int]:
+    """``n`` open items; ``opened_at`` steps every three rows, so ids break ties."""
+    at = at or BASE_AT
+    rows = [(text.format(i=i), PROJECT, owner, kind, at + timedelta(seconds=step_s * ((i - start) // 3)),
+             co.content_hash(PROJECT, text.format(i=i)), origin, label)
+            for i in range(start, start + n)]
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO commitments (text, project, owner, kind, opened_at, status, content_hash, origin, owner_label) "
+            "VALUES (%s, %s, %s, %s, %s, 'open', %s, %s, %s)", rows)
+        cur.execute("SELECT id FROM commitments WHERE content_hash = ANY(%s) ORDER BY id",
+                    ([r[5] for r in rows],))
+        return [int(r[0]) for r in cur.fetchall()]
+
+
+def _status(conn, ids) -> dict[int, str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, status FROM commitments WHERE id = ANY(%s)", (list(ids),))
+        return {int(i): s for i, s in cur.fetchall()}
+
+
+def _fake_terminal(monkeypatch, answer: str) -> list[str]:
+    """A stdin that is a terminal and answers ``answer``; returns the prompts."""
+    asked: list[str] = []
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr("sys.stdin", Tty(answer + "\n"))
+    monkeypatch.setattr("builtins.input", lambda prompt="": asked.append(prompt) or answer)
+    return asked
+
+
+# ---- paging -----------------------------------------------------------------
+
+
+def test_4000_items_page_through_with_no_skip_or_repeat_while_50_more_arrive(owed):
+    first = _seed(owed, 4000)
+    seen: list[int] = []
+    cursor = None
+    pages = 0
+    while True:
+        out = srv._tool_owed({"project": PROJECT, "limit": 200, **({"cursor": cursor} if cursor else {})})
+        if pages == 0:
+            assert out["total"] == 4000
+            # 50 more arrive while the caller is paging.
+            _seed(owed, 50, start=10_000, at=datetime.now(timezone.utc))
+        seen += [r["id"] for r in out["results"]]
+        pages += 1
+        cursor = out["next_cursor"]
+        if not cursor:
+            break
+        assert pages < 100
+    assert len(seen) == len(set(seen)), "a page repeated an item"
+    assert set(first) <= set(seen), "a page skipped an item"
+    assert pages == 20
+
+
+def test_the_page_size_is_50_by_default_capped_by_the_setting_and_0_lifts_it(owed):
+    _seed(owed, 600)
+    assert len(srv._tool_owed({"project": PROJECT})["results"]) == 50
+    capped = srv._tool_owed({"project": PROJECT, "limit": 500})
+    assert len(capped["results"]) == 200 and capped["limit"] == 200
+    assert "owed_page_max" in capped["limit_note"]
+    config.set_count_setting("owed_page_max", 0)
+    assert len(srv._tool_owed({"project": PROJECT, "limit": 500})["results"]) == 500
+    config.set_count_setting("owed_page_max", 10)
+    assert len(srv._tool_owed({"project": PROJECT, "limit": 500})["results"]) == 10
+
+
+def test_filters_and_counts(owed):
+    mine = _seed(owed, 3, text="should we ship widget {i}?", kind="question")
+    job = _seed(owed, 2, start=100, text="builder to rerun the suite {i}", owner="agent",
+                origin="job", label="builder")
+    pr = _seed(owed, 1, start=200, text="follow up once PR #412 merges {i}")
+    plain = _seed(owed, 4, start=300, text="tidy the release notes {i}")
+
+    every = srv._tool_owed({"project": PROJECT})
+    assert every["total"] == 10
+    assert every["counts"]["owner"] == {"user": 3, "assistant": 5, "agent": 2}
+    assert every["counts"]["kind"] == {"question": 3, "followup": 7}
+
+    user = srv._tool_owed({"project": PROJECT, "owner": "user"})
+    assert sorted(r["id"] for r in user["results"]) == mine and user["total"] == 3
+    # Counts by owner stay over every owner, so a caller sees what the other headings hold.
+    assert user["counts"]["owner"]["assistant"] == 5 and user["counts"]["kind"] == {"question": 3}
+    assert sorted(r["id"] for r in srv._tool_owed({"project": PROJECT, "owner": "agent"})["results"]) == job
+    assert sorted(r["id"] for r in srv._tool_owed({"project": PROJECT, "origin": "job"})["results"]) == job
+    assert sorted(r["id"] for r in srv._tool_owed({"project": PROJECT, "kind": "question"})["results"]) == mine
+    assert [r["id"] for r in srv._tool_owed({"project": PROJECT, "pr": 412})["results"]] == pr
+    assert sorted(r["id"] for r in srv._tool_owed({"project": PROJECT, "query": "Release NOTES"})["results"]) == plain
+    assert srv._tool_owed({"project": PROJECT, "owner": "all"})["total"] == 10
+    with pytest.raises(ValueError, match="owner"):
+        srv._tool_owed({"owner": "bogus"})
+    with pytest.raises(ValueError, match="cursor"):
+        srv._tool_owed({"cursor": "not a cursor"})
+
+
+# ---- bulk -------------------------------------------------------------------
+
+
+def test_bulk_close_of_500_is_one_transaction_with_one_result_per_id(owed, monkeypatch):
+    ids = _seed(owed, 500)
+    real = co.set_status
+    calls = {"n": 0}
+
+    def fails_late(cur, cid, status, **kw):
+        calls["n"] += 1
+        if calls["n"] == 300:
+            raise RuntimeError("the hub fell over mid-batch")
+        return real(cur, cid, status, **kw)
+
+    monkeypatch.setattr(co, "set_status", fails_late)
+    with pytest.raises(RuntimeError):
+        srv._tool_owed_update({"ids": ids, "action": "close", "reason": "shipped"})
+    assert set(_status(owed, ids).values()) == {"open"}, "a failed batch left part of it applied"
+
+    monkeypatch.setattr(co, "set_status", real)
+    out = srv._tool_owed_update({"ids": ids, "action": "close", "reason": "shipped"})
+    assert out["ok"] is True and out["changed"] == 500
+    assert [r["id"] for r in out["results"]] == ids and all(r["ok"] for r in out["results"])
+    assert set(_status(owed, ids).values()) == {"closed"}
+    with owed.cursor() as cur:
+        cur.execute("SELECT count(*) FROM owner_writes_applied WHERE tool = 'owed_update' AND outcome = 'applied'")
+        assert cur.fetchone()[0] == 1
+        cur.execute("SELECT DISTINCT close_reason, closed_by FROM commitments WHERE id = ANY(%s)", (ids,))
+        assert cur.fetchall() == [("shipped", co.BY_CONVERSATION)]
+    # An id that is not there gets its own result; the rest still apply.
+    out = srv._tool_owed_update({"ids": [9_999_999, ids[0]], "action": "reopen", "reason": "not yet"})
+    assert out["changed"] == 1 and out["results"][0] == {
+        "id": 9_999_999, "ok": False, "error": "no such commitment: 9999999"}
+
+
+def test_a_list_needs_a_reason(owed):
+    ids = _seed(owed, 2)
+    with pytest.raises(ValueError, match="reason"):
+        srv._tool_owed_update({"ids": ids, "action": "close"})
+    assert set(_status(owed, ids).values()) == {"open"}
+
+
+def test_the_bulk_cap_refuses_over_the_limit_and_0_lifts_it(owed):
+    ids = _seed(owed, 4)
+    config.set_count_setting("owed_bulk_max", 3)
+    with pytest.raises(ValueError) as err:
+        srv._tool_owed_update({"ids": ids, "action": "close", "reason": "done"})
+    assert "owed_bulk_max" in str(err.value) and "nothing was changed" in str(err.value).lower()
+    assert set(_status(owed, ids).values()) == {"open"}
+    config.set_count_setting("owed_bulk_max", 0)
+    assert srv._tool_owed_update({"ids": ids, "action": "close", "reason": "done"})["changed"] == 4
+
+
+def test_a_queued_bulk_write_replays_whole(owed, hub, monkeypatch):  # noqa: F811
+    ids = _seed(owed, 30)
+    reach = db.connect
+
+    def down(*a, **k):
+        raise DOWN
+
+    # The hub is away, so the owners cannot be read: the app's own call passes the gate.
+    monkeypatch.setattr(db, "connect", down)
+    monkeypatch.setattr(routing, "_caller", lambda: {"app": True, "chain": ["Khipu"], "where": "/Applications"})
+    out = srv._tool_owed_update({"ids": ids, "action": "close", "reason": "shipped"})
+    assert out["waiting_to_sync"] is True and [r["id"] for r in out["results"]] == ids
+    queued = sorted((owner_writes.queue_dir()).glob("*.json"))
+    assert len(queued) == 1
+    assert owner_writes.pending_marks("owed_update") == {i: "close" for i in ids}
+
+    monkeypatch.setattr(db, "connect", reach)
+    res = owner_writes.drain()
+    assert res["replayed"] == 1 and res["waiting"] == 0
+    assert set(_status(owed, ids).values()) == {"closed"}
+    assert owner_writes.drain()["replayed"] == 0
+
+
+def test_a_bulk_close_of_the_owners_items_is_refused_without_the_gate(owed):
+    mine = _seed(owed, 2, text="should we ship widget {i}?", kind="question")
+    theirs = _seed(owed, 2, start=50)
+    out = srv._tool_owed_update({"ids": mine + theirs, "action": "close", "reason": "tidy"})
+    assert out["ok"] is False and out["changed"] == 0
+    assert "Nothing was changed" in out["error"] and sorted(out["needs_owner"]) == mine
+    assert set(_status(owed, mine + theirs).values()) == {"open"}
+    # A caller cannot claim the gate itself.
+    out = srv._tool_owed_update({"ids": mine, "action": "close", "reason": "tidy", "owner_gate": "app"})
+    assert out["ok"] is False and set(_status(owed, mine).values()) == {"open"}
+
+
+def test_the_hub_refuses_a_bulk_change_to_the_owners_items_with_no_gate_stamp(owed):
+    mine = _seed(owed, 2, text="should we ship widget {i}?", kind="question")
+    out = srv._owed_update_on_hub({"ids": mine, "action": "close", "reason": "tidy", "write_id": "w1"})
+    assert out["ok"] is False and "Nothing was changed" in out["error"]
+    assert set(_status(owed, mine).values()) == {"open"}
+
+
+def test_a_bulk_close_of_the_owners_items_passes_with_the_app_or_a_typed_yes(owed, monkeypatch, capsys):
+    mine = _seed(owed, 4, text="should we ship widget {i}?", kind="question")
+    asked = _fake_terminal(monkeypatch, "yes")
+    args = cli.build_parser().parse_args(["owed", "--close", f"{mine[0]},{mine[1]}", "--reason", "Matt said done"])
+    assert args.func(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True and out["changed"] == 2 and len(asked) == 1
+    assert _status(owed, mine[:2]) == {mine[0]: "closed", mine[1]: "closed"}
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    monkeypatch.setattr(routing, "_caller", lambda: {"app": True, "chain": ["Khipu"], "where": "/Applications"})
+    args = cli.build_parser().parse_args(["owed", "--close", f"{mine[2]},{mine[3]}", "--reason", "done"])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["changed"] == 2
+    with owed.cursor() as cur:
+        cur.execute("SELECT closed_by FROM commitments WHERE id = %s", (mine[3],))
+        assert cur.fetchone()[0] == co.BY_APP
+
+
+def test_a_typed_no_refuses_and_changes_nothing(owed, monkeypatch, capsys):
+    mine = _seed(owed, 2, text="should we ship widget {i}?", kind="question")
+    _fake_terminal(monkeypatch, "no")
+    args = cli.build_parser().parse_args(["owed", "--close", f"{mine[0]},{mine[1]}", "--reason", "x"])
+    assert args.func(args) == 1
+    assert "Nothing was changed" in json.loads(capsys.readouterr().out)["error"]
+    assert set(_status(owed, mine).values()) == {"open"}
+
+
+def test_a_conversation_bulk_changes_assistant_and_agent_items_without_the_gate(owed, monkeypatch):
+    ids = _seed(owed, 3) + _seed(owed, 2, start=100, text="builder to rerun {i}", owner="agent",
+                                 origin="job", label="builder")
+    monkeypatch.setattr(routing, "typed_yes", lambda prompt: pytest.fail("the gate was asked"))
+    out = srv._tool_owed_update({"ids": ids, "action": "close", "reason": "kept my promises"})
+    assert out["ok"] is True and out["changed"] == 5
+
+
+def test_a_single_close_by_id_stays_as_today(owed, monkeypatch):
+    mine = _seed(owed, 1, text="should we ship widget {i}?", kind="question")
+    monkeypatch.setattr(routing, "typed_yes", lambda prompt: pytest.fail("the gate was asked"))
+    out = srv._tool_owed_update({"id": mine[0], "action": "close"})
+    assert out["ok"] is True and out["id"] == mine[0]
+    assert _status(owed, mine) == {mine[0]: "closed"}
+
+
+def test_reassign_moves_owner_and_label_and_it_sticks(owed):
+    ids = _seed(owed, 2, start=0, text="rerun the flaky suite {i}")
+    out = srv._tool_owed_update({"ids": ids, "action": "reassign", "owner": "agent",
+                                 "owner_label": "builder", "reason": "the job owns these"})
+    assert out["ok"] is True and out["changed"] == 2
+    rows = {r["id"]: r for r in srv._tool_owed({"project": PROJECT})["results"]}
+    assert {(rows[i]["owner"], rows[i]["owner_label"]) for i in ids} == {("agent", "builder")}
+    # A question moved to the assistant stays the assistant's, though its text reads as the owner's.
+    q = _seed(owed, 1, start=500, text="should we ship widget {i}?", kind="question")
+    srv._tool_owed_update({"id": q[0], "action": "reassign", "owner": "assistant"})
+    row = next(r for r in srv._tool_owed({"project": PROJECT})["results"] if r["id"] == q[0])
+    assert row["owner"] == "assistant"
+    with pytest.raises(ValueError, match="owner"):
+        srv._tool_owed_update({"id": q[0], "action": "reassign", "owner": "someone"})
+
+
+# ---- the CLI ----------------------------------------------------------------
+
+
+def test_cli_filters_cursor_and_json_is_a_no_op(owed, capsys):
+    mine = _seed(owed, 3, text="should we ship widget {i}?", kind="question")
+    _seed(owed, 3, start=50)
+
+    def run(*argv):
+        args = cli.build_parser().parse_args(["owed", *argv])
+        assert args.func(args) == 0
+        out = json.loads(capsys.readouterr().out)
+        # Ages are counted at each read; everything else must match.
+        for row in (out["results"] if isinstance(out, dict) else out):
+            row.pop("opened_age_s", None)
+            row.pop("last_seen_age_s", None)
+        return out
+
+    page = run("--project", PROJECT, "--owner", "user", "--limit", "2")
+    assert page["total"] == 3 and len(page["results"]) == 2 and page["next_cursor"]
+    assert page["counts"]["owner"]["assistant"] == 3
+    rest = run("--project", PROJECT, "--owner", "user", "--kind", "question", "--limit", "2",
+               "--cursor", page["next_cursor"])
+    assert sorted(r["id"] for r in page["results"] + rest["results"]) == mine and rest["next_cursor"] is None
+    assert run("--project", PROJECT, "--query", "widget", "--json") == run("--project", PROJECT, "--query", "widget")
+    # --json alone changes nothing either.
+    assert run("--project", PROJECT, "--json") == run("--project", PROJECT)
+
+
+def test_cli_reassign_and_reopen_take_lists(owed, capsys):
+    ids = _seed(owed, 2)
+
+    def run(*argv):
+        args = cli.build_parser().parse_args(["owed", *argv])
+        rc = args.func(args)
+        return rc, json.loads(capsys.readouterr().out)
+
+    rc, out = run("--reassign", f"{ids[0]},{ids[1]}", "--to", "agent", "--label", "reviewer", "--reason", "review")
+    assert rc == 0 and out["changed"] == 2
+    rc, out = run("--close", f"{ids[0]},{ids[1]}", "--reason", "done", "--json")
+    assert rc == 0 and out["changed"] == 2
+    rc, out = run("--reopen", f"{ids[0]},{ids[1]}", "--reason", "not done")
+    assert rc == 0 and set(_status(owed, ids).values()) == {"open"}
+    rc, out = run("--close", f"{ids[0]},{ids[1]}")
+    assert rc == 2 and "reason" in out["error"]
+
+
+def test_the_two_caps_are_count_settings():
+    assert config.COUNT_SETTINGS["owed_page_max"] == 200
+    assert config.COUNT_SETTINGS["owed_bulk_max"] == 500
