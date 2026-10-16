@@ -100,6 +100,8 @@ export type ConfigShape = {
   relevance_cosine_floor?: { value: number; source: string; default: number };
   graph_backup_remote?: { value: string; source: "env" | "config" | "default"; default: string; error?: string };
   config?: Record<string, unknown>;
+  /** `offline.settings_status()`: each duration with the CLI's own words. */
+  offline?: Record<string, { value: number; default: number; kind: string; source: string; words: string }>;
 };
 
 export type FeatureState = { enabled: boolean; source: "env" | "file" | "default" };

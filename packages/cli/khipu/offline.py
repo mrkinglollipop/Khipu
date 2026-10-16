@@ -17,6 +17,9 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "hub_dead_connection_after": (
         "duration", 60,
         "How soon a hub connection that went silent (a network change) is given up (0: wait for the system)"),
+    "app_cli_timeout": (
+        "duration", 60,
+        "Longest the app waits for one Khipu answer before it shows the hub as not reachable (0: no limit)"),
 }
 
 

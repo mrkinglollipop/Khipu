@@ -8,6 +8,7 @@ import {
   GatewayUrlCard,
   GraphBackupRemoteCard,
   JobsCard,
+  OfflineWaitsCard,
   PathOverridesCard,
 } from "../SettingsControls";
 
@@ -411,5 +412,35 @@ describe("GraphBackupRemoteCard", () => {
     await waitFor(() => expect(field.value).toBe("r2:env/g"));
     expect(field).toBeDisabled();
     expect(screen.getByText("Comes from the environment variable KHIPU_GRAPH_BACKUP_REMOTE.")).toBeInTheDocument();
+  });
+});
+
+describe("OfflineWaitsCard", () => {
+  const offline = (value: number, source = "default") => ({
+    value, default: 60, kind: "duration", source, words: "Longest the app waits for one Khipu answer",
+  });
+
+  it("saves a wait through khipu_config_set and resets through khipu_config_unset", async () => {
+    config = { ...config, offline: { app_cli_timeout: offline(45, "file") } };
+    render(<OfflineWaitsCard active />);
+    const field = (await screen.findByLabelText("Wait for an answer in this app (seconds)")) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe("45"));
+    expect(screen.getByText("Longest the app waits for one Khipu answer. Default 60.")).toBeInTheDocument();
+    fireEvent.change(field, { target: { value: "90" } });
+    fireEvent.click(field.closest("form")!.querySelector("button[type=submit]")!);
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "app_cli_timeout", value: "90" }]));
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "app_cli_timeout" }]));
+  });
+
+  it("refuses a value that is not whole seconds without calling the CLI", async () => {
+    config = { ...config, offline: { app_cli_timeout: offline(60) } };
+    render(<OfflineWaitsCard active />);
+    const field = (await screen.findByLabelText("Wait for an answer in this app (seconds)")) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe("60"));
+    fireEvent.change(field, { target: { value: "1.5" } });
+    fireEvent.click(field.closest("form")!.querySelector("button[type=submit]")!);
+    expect(await screen.findByRole("alert")).toHaveTextContent("whole number of seconds");
+    expect(calls.some(([c]) => c === "khipu_config_set")).toBe(false);
   });
 });

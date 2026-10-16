@@ -341,6 +341,57 @@ export function CaptureTuningCard({
 }
 
 // ---------------------------------------------------------------------------
+// When the hub is away: three waits, in whole seconds.
+// ---------------------------------------------------------------------------
+
+const OFFLINE_ROWS: ReadonlyArray<readonly [string, string]> = [
+  ["hub_statement_timeout", "Wait on the hub for a read or write (seconds)"],
+  ["hub_dead_connection_after", "Give up on a silent hub connection after (seconds)"],
+  ["app_cli_timeout", "Wait for an answer in this app (seconds)"],
+];
+
+export function OfflineWaitsCard({ active }: { active: boolean }) {
+  const cfg = useCliState<ConfigShape>("khipu_config_show", active);
+  const rows = cfg.data?.offline ?? {};
+  return (
+    <div className="section-card">
+      <div className="section-head">When the hub is away</div>
+      <div className="section-body">
+        <p className="set-help">
+          How long Khipu waits before it uses this Mac's copy of Owed and Decisions. 0 means no limit.
+        </p>
+        {cfg.error && !cfg.data ? (
+          <p className="set-error" role="alert">
+            Could not read the settings: {cfg.error}
+          </p>
+        ) : null}
+        {OFFLINE_ROWS.map(([key, label]) => {
+          const row = rows[key];
+          return (
+            <SettingField
+              key={key}
+              label={label}
+              mono
+              narrow
+              inputMode="decimal"
+              value={row ? String(row.value) : ""}
+              canReset={row?.source === "file"}
+              onReset={() => unsetConfig(key, cfg.reload)}
+              help={row ? `${row.words}. Default ${row.default}.` : undefined}
+              onSave={async (v) => {
+                const t = v.trim();
+                if (!/^\d+$/.test(t)) return "Enter a whole number of seconds, 0 or more.";
+                return writeConfig(key, t, cfg.reload);
+              }}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Another Mac: gateway_url.
 // ---------------------------------------------------------------------------
 

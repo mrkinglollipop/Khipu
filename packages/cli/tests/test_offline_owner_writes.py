@@ -234,3 +234,18 @@ def test_config_round_trip_for_the_statement_timeout(home, capsys):
     args = parser.parse_args(["config", "--unset", "hub_statement_timeout"])
     assert args.func(args) == 0
     assert offline.setting("hub_statement_timeout") == 30
+
+
+def test_the_app_wait_setting_defaults_to_sixty_and_round_trips(home, capsys):
+    from khipu import offline
+
+    assert offline.SETTINGS["app_cli_timeout"][:2] == ("duration", 60)
+    assert offline.setting("app_cli_timeout") == 60
+    parser = cli.build_parser()
+    args = parser.parse_args(["config", "--set", "app_cli_timeout", "0"])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["app_cli_timeout"]["value"] == 0
+    assert (home / "config.json").is_file()
+    args = parser.parse_args(["config", "--unset", "app_cli_timeout"])
+    assert args.func(args) == 0
+    assert offline.setting("app_cli_timeout") == 60

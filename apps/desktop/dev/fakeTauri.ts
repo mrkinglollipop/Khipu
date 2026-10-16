@@ -27,6 +27,11 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
         return {
           usage_accounts: { source: "default", accounts: TRACKED, user_home: "/home/someone" },
           cli_settings: { node_folder: { value: null, usable: false } },
+          offline: {
+            hub_statement_timeout: { value: 30, default: 30, kind: "duration", source: "default", words: "Longest an owed or decision read or write waits on the hub before it uses this Mac's copy (0: no limit)" },
+            hub_dead_connection_after: { value: 60, default: 60, kind: "duration", source: "default", words: "How soon a hub connection that went silent (a network change) is given up (0: wait for the system)" },
+            app_cli_timeout: { value: 45, default: 60, kind: "duration", source: "file", words: "Longest the app waits for one Khipu answer before it shows the hub as not reachable (0: no limit)" },
+          },
         };
       case "khipu_usage_status":
       case "khipu_usage_refresh":

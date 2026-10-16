@@ -28,6 +28,8 @@ import {
   useAccountsFinder,
 } from "../src/FoundAccounts";
 import type { AccountRefs } from "../src/FoundAccounts";
+import { OfflineBanner, SavedOnThisMac, WaitingToSync } from "../src/OfflineBanner";
+import { OfflineWaitsCard } from "../src/SettingsControls";
 import { SetupAccountsStep } from "../src/SetupAccounts";
 import { PlanBlock } from "../src/PlansCard";
 import type { UsageAccount } from "../src/PlansCard";
@@ -98,7 +100,39 @@ function FinderHost() {
   );
 }
 
+/** Owed with the hub away (offline slice 6): each banner as the tab shows it,
+ *  and a row with a queued change. Fictional data. */
+function OfflineOwedStates() {
+  const refreshed = new Date(2026, 9, 16, 9, 5).toISOString();
+  return (
+    <div className="route-settings">
+      <p className="meta">Answered from this Mac's copy</p>
+      <OfflineBanner state={{ kind: "stale", refreshedAt: refreshed }} />
+      <p className="meta">Answered from this Mac's copy, no time on record</p>
+      <OfflineBanner state={{ kind: "stale", refreshedAt: null }} />
+      <p className="meta">The load timed out</p>
+      <OfflineBanner state={{ kind: "unreachable" }} />
+      <p className="meta">After Done or Snooze while the hub is away</p>
+      <SavedOnThisMac show />
+      <p className="meta">A row with a queued change</p>
+      <div className="card">
+        <div className="card-head owed-head">
+          <span className="w88">Kind</span>
+          <span className="grow">What you owe</span>
+        </div>
+        <div className="owed-row" style={{ display: "flex", gap: 12, padding: "8px 12px", alignItems: "center" }}>
+          <span className="w88">Follow-up</span>
+          <span className="grow owed-text">Send the invoice to Acme</span>
+          <WaitingToSync pending={{ action: "close" }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNode }> = {
+  "offline-owed": { title: "Owed with the hub away: the banners and a waiting row", render: () => <OfflineOwedStates /> },
+  "offline-settings": { title: "Settings: When the hub is away", render: () => <div className="route-settings"><OfflineWaitsCard active /></div> },
   "dialog-step1": { title: "Dialog, step 1: choose the service", render: () => <Dlg /> },
   "dialog-step1-not-installed": { title: "Dialog, step 1: service not installed", render: () => <Dlg disc={discovery({ clis: CLIS_CODEX_NOT })} start={{ cli: "codex", step: 1 }} /> },
   "dialog-step1-nothing-installed": { title: "Dialog, step 1: nothing installed", render: () => <Dlg disc={discovery({ clis: CLIS_NONE })} tracked={[]} /> },
