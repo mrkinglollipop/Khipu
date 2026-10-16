@@ -5851,8 +5851,8 @@ export default function App() {
                         <p className="muted">
                           Stuck? Open the health report on <strong>Home</strong>, or
                           email <a href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>.
-                          Include the health report if it is red — it never
-                          contains secrets.
+                          If the health report is red, include it. Khipu leaves keys
+                          and passwords out of it, but read it before you send it.
                         </p>
                       </div>
                     </div>

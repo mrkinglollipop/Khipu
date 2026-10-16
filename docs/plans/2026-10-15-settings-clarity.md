@@ -26,7 +26,7 @@ a card on Home that stays until he closes it, each item with a Show me button.
 | Phase | What | Size | State |
 |---|---|---|---|
 | 0 | This scope and the mocks | S | approved by Matt 2026-10-15 |
-| 1 | Three fixes: no false "off" while loading, no "Live" beside "no turn yet", no negative ages | S | open |
+| 1 | Three fixes: no false "off" while loading, no "Live" beside "no turn yet", no negative ages | S | done (merged 2026-10-15, branch feat/clarity-polish) |
 | 2 | Plans: one block per account, one failure line, paused shown, on Home and in Settings | S–M | done (merged 2026-10-15) |
 | 3 | Routing overview: groups that fold, the Needs you list, Plans moves into Accounts | M | open |
 | 4 | Routing lists: sort and filter accounts, filter and search rules, filter recent changes | S–M | open |
