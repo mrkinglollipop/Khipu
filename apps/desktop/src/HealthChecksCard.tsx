@@ -26,6 +26,79 @@ export function windowMinutesError(raw: string, min: number, max: number): strin
   return null;
 }
 
+type StorageSetting = { key: string; label: string; unit: string; max: number; whole: boolean; help: string };
+
+/** The seven storage settings (slice 8), in the order the card shows them.
+ *  Limits match the Tauri command's; the CLI checks again. */
+export const STORAGE_SETTINGS: StorageSetting[] = [
+  {
+    key: "disk_warn_free_gb",
+    label: "Warn when free space falls below (GB)",
+    unit: "GB",
+    max: 1_000_000,
+    whole: false,
+    help: "Doctor shows a warning when either the data folder's disk or the temporary-files disk drops under this much, or under the percent below, whichever bites first.",
+  },
+  {
+    key: "disk_warn_free_percent",
+    label: "Warn when free space falls below (percent)",
+    unit: "percent",
+    max: 100,
+    whole: false,
+    help: "A share of the whole disk, from 0 to 100.",
+  },
+  {
+    key: "disk_fail_free_gb",
+    label: "Report an error when free space falls below (GB)",
+    unit: "GB",
+    max: 1_000_000,
+    whole: false,
+    help: "Doctor turns red under this much free space, because writes may start to fail.",
+  },
+  {
+    key: "disk_fail_free_percent",
+    label: "Report an error when free space falls below (percent)",
+    unit: "percent",
+    max: 100,
+    whole: false,
+    help: "A share of the whole disk, from 0 to 100.",
+  },
+  {
+    key: "commitments_backup_keep_days",
+    label: "Keep commitments backups for (days)",
+    unit: "days",
+    max: 36_500,
+    whole: true,
+    help: "Older backups of the owed list are deleted. 0 keeps every backup.",
+  },
+  {
+    key: "synth_usage_keep_days",
+    label: "Keep summariser usage records for (days)",
+    unit: "days",
+    max: 36_500,
+    whole: true,
+    help: "Older lines of the summariser's call log are trimmed. 0 keeps every line.",
+  },
+  {
+    key: "log_max_mb",
+    label: "Largest size of a log file (MB)",
+    unit: "MB",
+    max: 1_000_000,
+    whole: false,
+    help: "A log over this size is trimmed to its newest lines. 0 means no cap.",
+  },
+];
+
+/** Client-side check for a storage setting; the Tauri command and the CLI
+ *  check the same range again. */
+export function storageValueError(raw: string, s: Pick<StorageSetting, "max" | "whole" | "unit">): string | null {
+  const v = raw.trim();
+  const shape = s.whole ? /^\d+$/ : /^\d+(\.\d+)?$/;
+  if (!shape.test(v)) return s.whole ? `Enter a whole number of ${s.unit}.` : `Enter a number of ${s.unit}, such as 10 or 2.5.`;
+  if (Number(v) > s.max) return `Enter between 0 and ${s.max} ${s.unit}.`;
+  return null;
+}
+
 /** The time a one-time override lapses, in this Mac's clock. */
 export function lapseTime(iso: string): string {
   const d = new Date(iso);
@@ -83,6 +156,43 @@ export function HealthChecksCard({ active }: { active: boolean }) {
             return res.ok ? null : res.error;
           }}
         />
+      </div>
+      <div className="section-head">Storage</div>
+      <div className="section-body">
+        {STORAGE_SETTINGS.map((s) => {
+          const row = cfg.data?.storage?.[s.key];
+          return (
+            <SettingField
+              key={s.key}
+              label={s.label}
+              mono
+              narrow
+              inputMode="decimal"
+              value={row ? String(row.value) : ""}
+              help={
+                <>
+                  {s.help}
+                  {row ? ` Default ${row.default}.` : ""}
+                  {row?.source === "invalid" ? " The saved value is not usable, so the default applies." : ""}
+                </>
+              }
+              onSave={async (v) => {
+                const bad = storageValueError(v, s);
+                if (bad) return bad;
+                const res = await callCli("khipu_config_set", { key: s.key, value: v.trim() });
+                await cfg.reload();
+                return res.ok ? null : res.error;
+              }}
+              canReset={row?.source === "file" || row?.source === "invalid"}
+              resetLabel="Use default"
+              onReset={async () => {
+                const res = await callCli("khipu_config_unset", { key: s.key });
+                await cfg.reload();
+                return res.ok ? null : res.error;
+              }}
+            />
+          );
+        })}
       </div>
       <div className="section-head">Before a new version of Khipu goes live</div>
       <div className="section-body">

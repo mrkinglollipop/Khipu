@@ -2298,6 +2298,7 @@ def _refresh_locked() -> dict[str, Any]:
         # Markers older than this are reflected in the dump that follows.
         dump_started = time.time()
         tmp_dir = dest.parent
+        _sweep_stale_temps_locked(tmp_dir)
         fd, tmp_name = tempfile.mkstemp(
             prefix=".hub_snapshot.", suffix=".sqlite", dir=tmp_dir
         )
@@ -2354,7 +2355,7 @@ def _refresh_locked() -> dict[str, Any]:
                     os.replace(tmp_path, dest)
             except RegistryError as exc:
                 con.close()
-                tmp_path.unlink(missing_ok=True)
+                remove_replica_temp(tmp_path)
                 return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
             _clear_purged_topics(dest, dumped_after=dump_started)
             _clear_missed_patches(path=dest, written_before=dump_started)
@@ -2390,11 +2391,21 @@ def _refresh_locked() -> dict[str, Any]:
                 "counts": counts,
                 "schema_version": SNAPSHOT_SCHEMA_VERSION,
             }
-        except Exception as exc:
-            tmp_path.unlink(missing_ok=True)
+        except BaseException as exc:
+            # A signal or an interrupt too: the temp and its journal never
+            # outlive the dump that made them.
             try:
+                con.close()
+            except Exception:  # noqa: BLE001 — not opened yet, or already closed
+                pass
+            remove_replica_temp(tmp_path)
+            if not isinstance(exc, Exception):
+                raise
+            try:
+                from khipu.storage import describe_os_error
+
                 side = _read_sidecar()
-                side["refresh_error"] = {"at": _utcnow_iso(), "error": f"{type(exc).__name__}: {exc}"[:300]}
+                side["refresh_error"] = {"at": _utcnow_iso(), "error": describe_os_error(exc)[:300]}
                 _write_meta(side)
             except Exception:  # noqa: BLE001 — the dump's own error is what the caller sees
                 pass
@@ -2406,6 +2417,73 @@ def _refresh_locked() -> dict[str, Any]:
 def _ts_not_before(val: Any, ref: Any) -> bool:
     a, b = _utc(val), _utc(ref)
     return a is not None and b is not None and a >= b
+
+
+# A dump or a staged import that died (killed, crashed, power lost) leaves
+# its ``.hub_snapshot.<random>.sqlite`` and journal beside the replica, and
+# no reader ever opens them again. One idle this long is a leftover: a live
+# dump or a staged import writes its file continuously, and a staged import
+# publishes within seconds of finishing it.
+STALE_TEMP_AGE_S = 10 * 60
+_TEMP_SUFFIXES = ("", "-journal", "-wal", "-shm")
+
+
+def is_replica_temp(name: str) -> bool:
+    """A temporary replica file or one of its sidecars (journal, WAL, shared
+    memory); never the replica itself or the meta temp files."""
+    if not name.startswith(".hub_snapshot.") or name.startswith(".hub_snapshot.meta."):
+        return False
+    return any(name.endswith(".sqlite" + suffix) for suffix in _TEMP_SUFFIXES)
+
+
+def remove_replica_temp(path: Path) -> None:
+    """Remove a temporary replica file and every sidecar sqlite left with it."""
+    for suffix in _TEMP_SUFFIXES:
+        Path(str(path) + suffix).unlink(missing_ok=True)
+
+
+def stale_replica_temps(directory: Path, *, now: float | None = None) -> list[Path]:
+    """Leftover temporary replica files in ``directory``. The caller holds the
+    refresh lock, so no dump is writing one; a young file may still be a staged
+    import and is left alone."""
+    now = time.time() if now is None else now
+    out = []
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return []
+    for entry in entries:
+        if not is_replica_temp(entry.name):
+            continue
+        try:
+            if entry.is_file(follow_symlinks=False) and now - entry.stat().st_mtime >= STALE_TEMP_AGE_S:
+                out.append(Path(entry.path))
+        except OSError:
+            continue
+    return out
+
+
+def _sweep_stale_temps_locked(directory: Path) -> list[str]:
+    removed = []
+    for path in stale_replica_temps(directory):
+        try:
+            path.unlink(missing_ok=True)
+            removed.append(path.name)
+        except OSError:
+            continue
+    return removed
+
+
+def sweep_stale_temps() -> dict[str, Any]:
+    """Remove leftover temporary replica files under the refresh lock; a dump
+    in progress means nothing is checked this time."""
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": True, "removed": [], "skipped": "a replica refresh is running"}
+    try:
+        return {"ok": True, "removed": _sweep_stale_temps_locked(snapshot_path().parent)}
+    finally:
+        _release_refresh_lock(lock)
 
 
 def _acquire_refresh_lock():
@@ -2653,7 +2731,7 @@ def publish_imported_snapshot(staged: Path) -> dict[str, Any]:
             finally:
                 _release_refresh_lock(lock)
     except (RegistryError, sqlite3.Error, OSError) as exc:
-        staged.unlink(missing_ok=True)
+        remove_replica_temp(staged)
         return {"ok": False, "imported": False, "error": f"{type(exc).__name__}: {exc}"}
     return {"ok": True, "imported": True, "scrubbed": scrubbed, "snapshot": True}
 

@@ -1318,10 +1318,13 @@ def _scrub_golden_file(path: Path, episode_id: int) -> dict[str, Any]:
 
 
 def _replica_temp_remainder(episode_id: int) -> dict[str, Any]:
-    """Report, never edit, temporary replica files a crashed refresh left
-    beside the replica (``.hub_snapshot.<random>.sqlite`` and its journal
-    and WAL). Read under the refresh lock, so no live dump is mistaken for
-    a crash-left one; without the lock they are not checked."""
+    """Temporary replica files a crashed refresh or import left beside the
+    replica (``.hub_snapshot.<random>.sqlite`` and its journal and WAL).
+    Read under the refresh lock, so no live dump is mistaken for a
+    crash-left one; without the lock they are not checked. A leftover (idle
+    past ``hub_snapshot.STALE_TEMP_AGE_S``) is a copy nobody reads, so it is
+    removed with its sidecars; a younger one may be a staged import, which
+    is scrubbed when it is published, and is only reported."""
     try:
         from khipu import hub_snapshot
 
@@ -1337,6 +1340,20 @@ def _replica_temp_remainder(episode_id: int) -> dict[str, Any]:
             "why": "a replica refresh is running, so its temporary files could not be checked"}]}
     locations: list[dict[str, str]] = []
     try:
+        stale = {p.name for p in hub_snapshot.stale_replica_temps(directory)}
+        removed: set[str] = set()
+        for name in sorted(stale):
+            main = name if name.endswith(".sqlite") else name.rsplit("-", 1)[0]
+            if main in removed:
+                continue
+            try:
+                hub_snapshot.remove_replica_temp(directory / main)
+                (directory / name).unlink(missing_ok=True)
+            except OSError:
+                continue
+            removed.add(main)
+            locations.append({"place": "replica temp", "path": str(directory / main),
+                              "state": "removed"})
         names = _listing(directory)
         temps = [n for n in names if n.startswith(".hub_snapshot.")
                  and not n.startswith(".hub_snapshot.meta.")]

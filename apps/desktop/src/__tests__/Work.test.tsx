@@ -5,6 +5,8 @@
 // build_view prints them, plus the word helpers in work.ts.
 (globalThis as unknown as { process: { env: Record<string, string> } }).process.env.TZ = "America/New_York";
 
+// @ts-expect-error node:fs has no types here
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { WorkView } from "../WorkView";
@@ -14,6 +16,7 @@ import {
   boardFolds,
   goalBar,
   plural,
+  shortProject,
   sourceLine,
   useWork,
   wordFor,
@@ -373,6 +376,38 @@ describe("Waiting on you", () => {
     expect(rows.map((r) => r.querySelector(".wk-wait-text")?.textContent)).toEqual(["Harbor one", "Harbor two"]);
     fireEvent.click(screen.getByRole("button", { name: "Blocking 1" }));
     expect(within(list).getAllByRole("listitem")).toHaveLength(1);
+  });
+
+  it("names an item's project by Owed's rule, and never calls a withheld or missing one Khipu", async () => {
+    const owed = (project: string | null, id: string, extra: Partial<WaitItem> = {}) =>
+      wait(project, id, { source: "commitment", key: `commitment:${id}`, title: `Owed ${id}`, actions: ["done", "open_owed"], ...extra });
+    const items = [
+      owed("acme/aegis", "1"),
+      owed(null, "2", { masked: true }),
+      owed(null, "3"),
+      owed("claude_code:abc", "4"),
+    ];
+    serve(view({ projects: [], waiting: items }));
+    render(<Harness />);
+    const list = await screen.findByRole("list", { name: "Waiting on you" });
+    const rows = within(list).getAllByRole("listitem");
+    const words = (i: number) => rows[i].querySelector(".wk-wait-meta")?.textContent ?? rows[i].textContent ?? "";
+    expect(words(0)).toContain(shortProject("acme/aegis"));
+    expect(words(1)).toContain("Name withheld");
+    expect(words(2)).toContain("No project");
+    expect(words(3)).toContain("Session");
+    for (const i of [0, 1, 2, 3]) expect(within(rows[i]).queryByText("Khipu")).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Khipu / })).toBeNull();
+  });
+
+  it("the project filter row wraps inside the card instead of running past its edge", () => {
+    const css = readFileSync(`${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/Work.css`, "utf8");
+    const rule = css.match(/\.wk-filters \.seg \{([^}]*)\}/)?.[1] ?? "";
+    // App.css's .seg is `flex: none`: as a flex item it keeps its one-line
+    // width, so its own flex-wrap never fires. It has to shrink to the card.
+    expect(rule).toMatch(/flex:\s*1 1 auto/);
+    expect(rule).toMatch(/min-width:\s*0/);
+    expect(rule).toMatch(/flex-wrap:\s*wrap/);
   });
 
   it("Done on a ledger item sets the project's own done word, then reads the view again", async () => {
