@@ -55,11 +55,14 @@ from __future__ import annotations
 
 import glob
 import base64
+import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -944,10 +947,338 @@ def save_state(harness: str, sid: str, st: dict, *, preserve_mtime: bool = False
         os.utime(p, ns=(previous.st_atime_ns, previous.st_mtime_ns))
 
 
+# The login folder a conversation ran under (settings clarity phase 9,
+# discovery source 2): the value of its CLI's folder variable in the hook's own
+# environment, and nothing else. Grok Build is captured as ``aegis``.
+LOGIN_HOME_VARS = {"claude_code": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "aegis": "GROK_HOME"}
+LOGIN_HOME_FIELD = "login_home"
+# Cleared from a session's state this long after its ``seen_ts``; discovery
+# counts conversations over 7 days, so nothing that counts is lost.
+LOGIN_HOME_KEEP_S = 30 * 86400
+LOGIN_HOME_SWEEP_S = 86400
+_LOGIN_SWEEP_STAMP = "login-homes.swept"
+# When the owner last pressed Forget: discovery ignores every session seen at
+# or before it (its recorded folder and the one its transcript implies).
+LOGIN_FORGOTTEN_STAMP = "login-homes.forgotten"
+
+
+def login_home(harness: str) -> str | None:
+    """The hook's own login-folder variable for ``harness``, or None."""
+    name = LOGIN_HOME_VARS.get(harness)
+    value = (os.environ.get(name) or "").strip() if name else ""
+    return value[:1024] if value and value.isprintable() else None
+
+
+# Every read and write of the login-home fields goes through a descriptor for
+# the capture state folder, opened from the capture root with O_NOFOLLOW at each
+# step, and each entry is opened relative to it with O_NOFOLLOW: no symlink
+# below the root (the root's own name, ``state``, an entry) can redirect a read
+# or a write into a login folder, even one swapped in after the listing.
+_O_DIR = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+STATE_READ_MAX = 16 * 1024 * 1024
+LOGIN_PENDING = "login-homes.pending"
+
+
+@contextmanager
+def _state_dir_fd(*, create: bool = False):
+    """A descriptor for the capture state folder, or None when it is missing
+    or any step to it is a symlink. ``create`` makes a missing folder first."""
+    fd = None
+    for attempt in range(2):
+        root_fd = None
+        try:
+            root_fd = os.open(khipu_home(), _O_DIR)
+            fd = os.open("state", _O_DIR, dir_fd=root_fd)
+            break
+        except FileNotFoundError:
+            if not create or attempt:
+                break
+            try:
+                state_dir().mkdir(parents=True, exist_ok=True)
+            except OSError:
+                break
+        except OSError:
+            break
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+    try:
+        yield fd
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _state_names(dfd: int) -> list[str]:
+    try:
+        with os.scandir(dfd) as entries:
+            return sorted(e.name for e in entries
+                          if e.name.endswith(".json") and e.is_file(follow_symlinks=False))
+    except OSError:
+        return []
+
+
+def _read_state_at(dfd: int, name: str) -> str | None:
+    """One regular file in the state folder, never through a symlink."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > STATE_READ_MAX:
+            return None
+        chunks, size = [], 0
+        while size <= STATE_READ_MAX:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b"".join(chunks).decode("utf-8") if size <= STATE_READ_MAX else None
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def _write_at(dfd: int, name: str, text: str, *, mode: int = 0o600, times_ns=None) -> None:
+    """Replace ``name`` in the state folder atomically, never through a symlink."""
+    tmp = f"{name}.login.tmp"
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(tmp, dir_fd=dfd)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=dfd)
+    try:
+        os.write(fd, text.encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    if times_ns is not None:
+        os.utime(name, ns=times_ns, dir_fd=dfd, follow_symlinks=False)
+
+
+@contextmanager
+def _lock_at(dfd: int, lock: str):
+    """``_path_lock`` relative to the state folder's descriptor: the same
+    directory, so it excludes the hook's own lock for the file."""
+    acquired = None
+    try:
+        for _ in range(2):
+            try:
+                os.mkdir(lock, dir_fd=dfd)
+                acquired = os.stat(lock, dir_fd=dfd, follow_symlinks=False)
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - os.stat(lock, dir_fd=dfd, follow_symlinks=False).st_mtime <= 60:
+                        break
+                    os.rmdir(lock, dir_fd=dfd)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    break
+            except OSError:
+                break
+        yield acquired is not None
+    finally:
+        if acquired is not None:
+            with contextlib.suppress(OSError):
+                current = os.stat(lock, dir_fd=dfd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == (acquired.st_dev, acquired.st_ino):
+                    os.rmdir(lock, dir_fd=dfd)
+
+
+def iter_states():
+    """``(file name, state)`` for every readable session state file, read
+    through the state folder's descriptor (see ``_state_dir_fd``)."""
+    with _state_dir_fd() as dfd:
+        if dfd is None:
+            return
+        for name in _state_names(dfd):
+            text = _read_state_at(dfd, name)
+            if text is None:
+                continue
+            try:
+                st = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(st, dict):
+                yield name, st
+
+
+def _clear_at(dfd: int, name: str, *, older_than: float | None) -> str:
+    """Drop the login folder from one state file under the hook's own lock
+    for it, keeping everything else, its mode and its mtime. Returns
+    ``cleared``, ``busy`` (the lock is held), ``failed`` (the rewrite could
+    not be written) or ``unchanged`` (no field, too recent, corrupt, gone or
+    not a regular file: never rewritten)."""
+    lock = name[: -len(".json")] + ".lock"
+    with _lock_at(dfd, lock) as acquired:
+        if not acquired:
+            return "busy"
+        text = _read_state_at(dfd, name)
+        try:
+            st = json.loads(text) if text is not None else None
+        except ValueError:
+            st = None
+        if not isinstance(st, dict) or LOGIN_HOME_FIELD not in st:
+            return "unchanged"
+        if older_than is not None:
+            try:
+                seen = float(st.get("seen_ts") or 0)
+            except (TypeError, ValueError):
+                seen = 0.0
+            if seen >= older_than:
+                return "unchanged"
+        st.pop(LOGIN_HOME_FIELD, None)
+        try:
+            info = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode):
+                return "unchanged"
+        except OSError:
+            return "unchanged"
+        try:
+            _write_at(dfd, name, json.dumps(st), mode=stat.S_IMODE(info.st_mode),
+                      times_ns=(info.st_atime_ns, info.st_mtime_ns))
+        except OSError:
+            return "failed"
+        return "cleared"
+
+
+def _pending_at(dfd: int) -> list[str]:
+    text = _read_state_at(dfd, LOGIN_PENDING)
+    try:
+        names = json.loads(text) if text else []
+    except ValueError:
+        names = []
+    return [n for n in names if isinstance(n, str) and n.endswith(".json") and "/" not in n] \
+        if isinstance(names, list) else []
+
+
+def _save_pending_at(dfd: int, names) -> None:
+    names = sorted(set(names))
+    if names:
+        _write_at(dfd, LOGIN_PENDING, json.dumps(names))
+    else:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(LOGIN_PENDING, dir_fd=dfd)
+
+
+def _pending_erasures_clear() -> None:
+    with _state_dir_fd() as dfd:
+        if dfd is not None:
+            _save_pending_at(dfd, [])
+
+
+def login_homes_pending() -> int:
+    """How many busy sessions a Forget still has to clear."""
+    with _state_dir_fd() as dfd:
+        return len(_pending_at(dfd)) if dfd is not None else 0
+
+
+def _apply_pending(dfd: int) -> int:
+    pending = _pending_at(dfd)
+    if not pending:
+        return 0
+    cleared, busy = 0, []
+    for name in pending:
+        result = _clear_at(dfd, name, older_than=None)
+        cleared += result == "cleared"
+        if result in ("busy", "failed"):
+            busy.append(name)
+    with contextlib.suppress(OSError):
+        _save_pending_at(dfd, busy)
+    return cleared
+
+
+def sweep_login_homes(*, now: float | None = None, force: bool = False) -> int:
+    """Apply Forget's pending erasures (every call), then clear login folders
+    recorded more than ``LOGIN_HOME_KEEP_S`` ago (at most once a day; ``force``
+    ignores that). The hook calls it after releasing its own lock; never
+    raises."""
+    try:
+        now = time.time() if now is None else now
+        with _state_dir_fd() as dfd:
+            if dfd is None:
+                return 0
+            cleared = _apply_pending(dfd)
+            if not force:
+                with contextlib.suppress(OSError):
+                    if now - os.stat(_LOGIN_SWEEP_STAMP, dir_fd=dfd, follow_symlinks=False).st_mtime \
+                            < LOGIN_HOME_SWEEP_S:
+                        return cleared
+            older = now - LOGIN_HOME_KEEP_S
+            cleared += sum(_clear_at(dfd, n, older_than=older) == "cleared" for n in _state_names(dfd))
+            with contextlib.suppress(OSError):
+                _write_at(dfd, _LOGIN_SWEEP_STAMP, "", times_ns=(int(now * 1e9), int(now * 1e9)))
+            return cleared
+    except Exception:  # noqa: BLE001 — retention never fails a capture
+        return 0
+
+
+def forget_login_homes(*, now: float | None = None) -> dict:
+    """``khipu usage --forget-login-paths``: clear the recorded login folder
+    from every session state file (the rest of each state is untouched) and
+    stamp the time, so discovery also stops deriving a folder for any session
+    seen at or before it. A session whose hook holds its lock is recorded as
+    pending and cleared by the next sweep (the hook runs one after releasing
+    its lock); ``pending`` says how many are left. ``failed`` counts files
+    that could not be rewritten (and the stamp, if it could not be written),
+    and ``unreachable`` says the state folder could not be opened at all:
+    either means the paths may still be on disk."""
+    now = time.time() if now is None else now
+    with _state_dir_fd(create=True) as dfd:
+        if dfd is None:
+            return {"cleared": 0, "pending": 0, "failed": 0, "unreachable": True}
+        failed = 0
+        try:
+            _write_at(dfd, LOGIN_FORGOTTEN_STAMP, repr(float(now)))
+        except OSError:
+            failed += 1
+        cleared, busy, retry = 0, [], []
+        for name in _state_names(dfd):
+            result = _clear_at(dfd, name, older_than=None)
+            cleared += result == "cleared"
+            if result == "busy":
+                busy.append(name)
+            elif result == "failed":
+                retry.append(name)
+        failed += len(retry)
+        try:
+            # A file that failed is retried by the next sweep, like a busy one.
+            _save_pending_at(dfd, busy + retry)
+        except OSError:
+            failed += 1
+        return {"cleared": cleared, "pending": len(busy), "failed": failed, "unreachable": False}
+
+
+def login_homes_forgotten_at() -> float | None:
+    """When the owner last pressed Forget, or None."""
+    with _state_dir_fd() as dfd:
+        if dfd is None:
+            return None
+        text = _read_state_at(dfd, LOGIN_FORGOTTEN_STAMP)
+        try:
+            value = float((text or "").strip())
+        except ValueError:
+            try:
+                return os.stat(LOGIN_FORGOTTEN_STAMP, dir_fd=dfd, follow_symlinks=False).st_mtime
+            except OSError:
+                return None
+        return value if math.isfinite(value) else None
+
+
 @contextmanager
 def _state_lock(harness: str, sid: str):
     """Serialize offset writers without delaying a harness Stop."""
-    lock = _state_file(harness, sid).with_suffix(".lock")
+    with _path_lock(_state_file(harness, sid).with_suffix(".lock")) as acquired:
+        yield acquired
+
+
+@contextmanager
+def _path_lock(lock: Path):
+    """The state lock at ``lock`` (a directory made with mkdir): never
+    waits; a lock older than 60 s is stale and taken over."""
     lock.parent.mkdir(parents=True, exist_ok=True)
     acquired = None
     try:
@@ -1867,6 +2198,12 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 # with no turn in it (2026-08-24 false red).
                 st.update(seen_end=new_off, seen_ts=time.time(), transcript_path=str(path),
                           host_pids=ancestor_pids())
+                # Retention, Forget and discovery never follow a capture home
+                # that is a symlink, so a path recorded through one could
+                # never be cleared: record none there.
+                recorded = None if os.path.islink(khipu_home()) else login_home(harness)
+                if recorded:
+                    st[LOGIN_HOME_FIELD] = recorded
                 if session_cwd(env):
                     st["cwd"] = session_cwd(env)
                 st["session_id"] = track_sid if is_subagent_stop else sid
@@ -1908,6 +2245,9 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
         _log(f"{harness}:{sid or '?'}: hook error {out['error']}")
     finally:
         _heartbeat(harness, out)
+        # After the state lock is released, so a Forget left pending on this
+        # very session is applied now.
+        sweep_login_homes()
     return out
 
 

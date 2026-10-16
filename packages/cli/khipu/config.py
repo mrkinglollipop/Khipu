@@ -435,6 +435,72 @@ def set_usage_accounts(raw: "str | list | None") -> Path:
     return save_config(data)
 
 
+# ---------------------------------------------------------------------------
+# Where a subscription CLI and its Node live, per Mac (settings clarity phase
+# 9, decision 10). The app starts under launchd's bare PATH, where a CLI under
+# a Node version manager is either not found or found without its node; these
+# let the owner repair that in the app. ``synth_cli.binary`` reads
+# ``cli_path.<cli>`` after ``KHIPU_<NAME>_CLI``; ``usage._probe_path`` puts
+# ``node_folder`` on the probe PATH. Only an executable file (a CLI) or a
+# folder holding an executable ``node`` is stored.
+# ---------------------------------------------------------------------------
+
+CLI_SETTINGS = ("cli_path.claude", "cli_path.codex", "cli_path.grok", "cli_path.muse", "node_folder")
+
+
+def _executable_file(path: Path) -> bool:
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+def cli_setting(key: str) -> str | None:
+    """The stored path for ``key`` (one of ``CLI_SETTINGS``), or None when
+    unset or no longer usable (a moved CLI, a removed Node)."""
+    if key not in CLI_SETTINGS:
+        raise KeyError(f"unknown CLI setting {key!r}; known: {list(CLI_SETTINGS)}")
+    stored = load_config().get(key)
+    if not isinstance(stored, str) or not stored.strip():
+        return None
+    try:
+        path = Path(stored.strip()).expanduser()
+    except RuntimeError:
+        return None
+    if not path.is_absolute():
+        # A hand-edited relative value would resolve against whatever the
+        # caller's working folder is: the writer refuses it, so does this.
+        return None
+    usable = _executable_file(path / "node") if key == "node_folder" else _executable_file(path)
+    return str(path) if usable else None
+
+
+def set_cli_setting(key: str, value: "str | None") -> Path:
+    if key not in CLI_SETTINGS:
+        raise KeyError(f"unknown CLI setting {key!r}; known: {list(CLI_SETTINGS)}")
+    data = _load_config_for_mutation()
+    if value is None or not str(value).strip():
+        data.pop(key, None)
+        return save_config(data)
+    path = Path(str(value).strip()).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{key} must be a full path")
+    if key == "node_folder":
+        if not _executable_file(path / "node"):
+            raise ValueError("node_folder must be a folder holding an executable node")
+    elif not _executable_file(path):
+        raise ValueError(f"{key} must be an executable file")
+    data[key] = str(path)
+    return save_config(data)
+
+
+def cli_settings_status() -> dict:
+    """Each CLI setting as stored and whether it is usable now."""
+    stored = load_config()
+    return {key: {"value": stored.get(key) if isinstance(stored.get(key), str) else None,
+                  "usable": cli_setting(key) is not None} for key in CLI_SETTINGS}
+
+
 def path_settings_status() -> dict:
     """Every path setting with its resolved value and where it came from."""
     out = {}

@@ -194,6 +194,14 @@ def _probe_path(inherited: str | None, binary: str | None) -> str:
     the folder of the file it links to, the usual tool folders and the system
     ones, each once (see ``_TOOL_DIRS``)."""
     dirs = [d for d in (inherited or "").split(os.pathsep) if d]
+    # The Node folder the owner set in the app goes ahead of everything the
+    # lookup guessed (settings clarity phase 9, decision 10).
+    with contextlib.suppress(Exception):
+        from khipu.config import cli_setting
+
+        node_folder = cli_setting("node_folder")
+        if node_folder:
+            dirs.insert(0, node_folder)
     if binary:
         with contextlib.suppress(OSError, ValueError):
             dirs.append(os.path.dirname(os.path.abspath(binary)))
@@ -690,10 +698,12 @@ def codex_rollout(home: str | None = None, *, deadline: float | None = None) -> 
 
 
 @_guard
-def probe_codex(home: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
+def probe_codex(home: str | None = None, *, timeout: float = TIMEOUT_S, rollout: bool = True) -> dict:
     """Codex's ``account/rateLimits/read``; on failure, the last turn's figures
     from the rollout files (``source: "rollout"``). Both fit in ``timeout``:
-    the live call leaves a fifth of it (at most 1 s) for the fallback."""
+    the live call leaves a fifth of it (at most 1 s) for the fallback.
+    ``rollout=False`` (discovery and ``--try``) never falls back: the rollout
+    files are inside the login folder, which those reads never open."""
     deadline = time.monotonic() + timeout
     binary = _command("codex")
     try:
@@ -705,10 +715,12 @@ def probe_codex(home: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
             {"id": 2, "method": "account/rateLimits/read"},
         ]
         frames = _converse([binary, "app-server"], messages, lambda f: f.get("id") == 2,
-                           env=probe_environment("codex", home, binary), deadline=deadline - min(1.0, timeout * 0.2),
-                           close_stdin=False)
+                           env=probe_environment("codex", home, binary),
+                           deadline=deadline - (min(1.0, timeout * 0.2) if rollout else 0.0), close_stdin=False)
         return parse_codex(frames)
     except ProbeError as exc:
+        if not rollout:
+            raise
         fallback = codex_rollout(home, deadline=deadline)
         if fallback is None:
             raise
@@ -972,7 +984,7 @@ def _blank_row(account: dict) -> dict:
             "observed_at": None, "error": None, "note": None}
 
 
-def probe_account(account: dict, *, timeout: float = TIMEOUT_S) -> dict:
+def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = True) -> dict:
     # probe_all supplies one shared run for its worker threads. A standalone
     # reset check owns one too, so a helper alarm or stop can unwind this call
     # and kill every vendor process group before the child exits.
@@ -988,7 +1000,7 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S) -> dict:
         elif harness == "claude":
             data = probe_claude(home, timeout=timeout)
         elif harness == "codex":
-            data = probe_codex(home, timeout=timeout)
+            data = probe_codex(home, timeout=timeout, rollout=rollout)
         elif harness == "grok":
             data = probe_grok(home, timeout=timeout)
         elif harness == "muse":
