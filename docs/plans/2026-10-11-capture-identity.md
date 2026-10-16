@@ -271,6 +271,7 @@ through the gate and added here.
 | `session_capture._claim`, `_release`, `_discard_claim`, `_save_claimed_job`, `_archive_empty` | claimed native job files and their checkpoints | none for the registry; `_save_claimed_job` takes `write_gate` and raises `JobForgotten` for a forgotten or removed claim; forget removes queued and claimed jobs naming its sources | shared |
 | `hub_snapshot.refresh` (`_refresh_locked`, `_insert_episodes`) | replica, full dump | `write_gate` from `_scrub_forgotten` through `os.replace` | shared, from the first hub read through publication |
 | `hub_snapshot.upsert_episode` (`_upsert_episode_unfenced`) | replica, one episode | `write_guard` held through the SQLite commit | shared |
+| `hub_snapshot.pull_changes` (`_pull_apply`) | replica, episodes read from the hub since a cursor | only through `upsert_episode`, so its `write_guard` | shared |
 | `hub_snapshot.scrub_forgotten_snapshot` | replica deletes | `write_gate` | shared |
 | `hub_snapshot.forget_episode_in_snapshot`, `_apply_pending_erasures` | replica tombstones | erase | exclusive (inside a forget) |
 | `paths.import_local` | data folder from a backup | registry merged, never copied; jobs naming a forgotten source skipped under `write_gate`; the backup's replica is staged, scrubbed in the staging copy, then `os.replace`d (`hub_snapshot.publish_imported_snapshot`) | shared |

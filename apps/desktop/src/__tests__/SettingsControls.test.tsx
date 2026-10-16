@@ -9,6 +9,7 @@ import {
   GraphBackupRemoteCard,
   JobsCard,
   PathOverridesCard,
+  ReplicaCopyCard,
 } from "../SettingsControls";
 
 const invokeMock = vi.fn();
@@ -50,6 +51,7 @@ beforeEach(() => {
     graph_build: { plist_loaded: true, next_schedule: "daily 02:17" },
     notes_watch: { plist_loaded: false },
     queue_drain: { plist_loaded: false },
+    replica_refresh: { plist_loaded: false },
   };
   invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
     calls.push([cmd, args]);
@@ -411,5 +413,55 @@ describe("GraphBackupRemoteCard", () => {
     await waitFor(() => expect(field.value).toBe("r2:env/g"));
     expect(field).toBeDisabled();
     expect(screen.getByText("Comes from the environment variable KHIPU_GRAPH_BACKUP_REMOTE.")).toBeInTheDocument();
+  });
+});
+
+describe("ReplicaCopyCard", () => {
+  beforeEach(() => {
+    config.replica = {
+      replica_refresh_after: { value: 900, default: 900, source: "default" },
+      replica_check_every: { value: 300, default: 300, source: "default" },
+      hub_down_memo_for: { value: 60, default: 60, source: "default" },
+    };
+  });
+
+  it("shows the skip window in seconds, saves whole seconds (0 allowed) and resets from file", async () => {
+    (config.replica as Record<string, unknown>).hub_down_memo_for = { value: 90, default: 60, source: "file" };
+    render(<ReplicaCopyCard active />);
+    const memo = (await screen.findByLabelText(
+      "Skip the database after a failed connection for (seconds)",
+    )) as HTMLInputElement;
+    await waitFor(() => expect(memo.value).toBe("90"));
+    fireEvent.change(memo, { target: { value: "0" } });
+    fireEvent.submit(memo.closest("form")!);
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "hub_down_memo_for", value: "0" }]));
+    fireEvent.change(memo, { target: { value: "1.5" } });
+    fireEvent.submit(memo.closest("form")!);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/whole number of seconds/);
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "hub_down_memo_for" }]));
+  });
+
+  it("shows both times in minutes and saves minutes as whole seconds", async () => {
+    render(<ReplicaCopyCard active />);
+    const after = (await screen.findByLabelText("Bring the copy up to date after (minutes)")) as HTMLInputElement;
+    const every = screen.getByLabelText("Check every (minutes)") as HTMLInputElement;
+    await waitFor(() => expect(after.value).toBe("15"));
+    expect(every.value).toBe("5");
+    fireEvent.change(after, { target: { value: "20" } });
+    fireEvent.submit(after.closest("form")!);
+    await waitFor(() =>
+      expect(calls).toContainEqual(["khipu_config_set", { key: "replica_refresh_after", value: "1200" }]),
+    );
+  });
+
+  it("refuses a check interval under a minute before calling the CLI", async () => {
+    render(<ReplicaCopyCard active />);
+    const every = (await screen.findByLabelText("Check every (minutes)")) as HTMLInputElement;
+    await waitFor(() => expect(every.value).toBe("5"));
+    fireEvent.change(every, { target: { value: "0" } });
+    fireEvent.submit(every.closest("form")!);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/whole number of minutes, 1 or more/);
+    expect(calls.some(([cmd]) => cmd === "khipu_config_set")).toBe(false);
   });
 });

@@ -52,6 +52,10 @@ NOT_CAPTURE = {
     "signin._write_json": "the sign-in attempt (id, folder, pid, start times, argv) and the login folders "
                           "Khipu made; no capture text",
     "signin.start": "a temporary empty folder the login process runs in, removed when the attempt ends",
+    # The replica job (offline design A): run counters and the wake file; no capture text.
+    "replica_heal._write_state": "the replica job's counters and health: times, error words, no capture text",
+    "replica_heal.ensure_wake_file": "an empty file the replica job's plist watches",
+    "hub_reach.note_unreachable": "the hub-unreachable memo: two times and a short error word, no capture text",
     **dict.fromkeys(("config._write_config", "integrations._backup", "integrations._cursor_install",
                      "integrations._grok_bot_install", "integrations._write_json",
                      "integrations._write_toml", "integrations.set_gateway_token",
@@ -101,7 +105,8 @@ NOT_CAPTURE = {
                      "integrations._probe_aegis_refusal", "integrations._probe_extract",
                      "integrations._probe_hook", "integrations._probe_native_extract"), _TOOLS),
     **dict.fromkeys(("hub_snapshot._mark_purged_topic", "hub_snapshot._queue_erasure",
-                     "hub_snapshot._write_last_known", "hub_snapshot._write_meta"), _REPLICA_META),
+                     "hub_snapshot._write_last_known", "hub_snapshot._write_meta",
+                     "hub_snapshot._queue_missed_patch"), _REPLICA_META),
     **dict.fromkeys(("tombstones._atomic_write", "tombstones._locked_registry",
                      "tombstones.publish_identities"), _REGISTRY),
 }

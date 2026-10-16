@@ -398,13 +398,16 @@ class HookUsesTheReplicaTest(unittest.TestCase):
         hub.assert_called_once()
         self.assertEqual(out, "You produced hub.py on 2026-09-01 (episode 5)")
 
-    def test_a_stale_replica_falls_back_to_the_hub(self) -> None:
-        data = _replica_file([_row(1, "khipu/decisions.py")])
+    def test_a_stale_replica_still_answers_without_the_hub(self) -> None:
+        # Matt, 2026-10-16 (offline decision 1): an old copy answers rather
+        # than send the prompt to the hub.
+        data = _replica_file([_row(1, "khipu/decisions.py", episode=42, day=14)])
         old = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
         (data / hs.META_NAME).write_text(json.dumps({"refreshed_at": old}), encoding="utf-8")
-        out, hub = self._via_hub(data, None)
-        hub.assert_called_once()
-        self.assertEqual(out, "")
+        self.assertEqual(
+            self._line(data, ["decisions", "khipu"]),
+            "You produced khipu/decisions.py on 2026-09-14 (episode 42)",
+        )
 
     def test_an_unreadable_replica_falls_back_to_the_hub(self) -> None:
         data = _replica_file([_row(1, "khipu/decisions.py")])

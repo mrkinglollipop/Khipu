@@ -148,20 +148,24 @@ def test_a_mixed_episode_is_not_discarded_but_marked_mixed(tmp_path):
 
 # ---- 10. stale / offline replica and reconnection ---------------------------
 
-def test_a_stale_replica_is_unusable_and_a_refreshed_one_recovers(tmp_path):
+def test_a_stale_replica_answers_marked_stale_and_a_refreshed_one_recovers(tmp_path):
+    # Matt, 2026-10-16 (offline decision 1): a stale copy answers, marked with
+    # its age, instead of being unusable.
     now = datetime.now(timezone.utc)
     with corpus.installed_corpus(tmp_path, now=now) as handle:
         corpus.rewrite_meta(handle, refreshed_at=now - timedelta(hours=30))
         fresh, _health = hs.snapshot_is_fresh()
         assert fresh is False
-        with pytest.raises(rp._SnapshotUnusable):
-            rp._snapshot_search_hits("widget-batching endpoint pagination", project=None)
+        stale = rp._snapshot_search_hits("widget-batching endpoint pagination", project=None)
+        assert any(h["id"] == "1" for h in stale["hits"])
+        assert stale["replica_stale"]["age_seconds"] >= 30 * 3600
 
         corpus.rewrite_meta(handle, refreshed_at=datetime.now(timezone.utc))
         fresh_again, _health2 = hs.snapshot_is_fresh()
         assert fresh_again is True
         result = rp._snapshot_search_hits("widget-batching endpoint pagination", project=None)
         assert any(h["id"] == "1" for h in result["hits"])
+        assert "replica_stale" not in result
 
 
 # ---- 11. changed revision under an existing id ------------------------------

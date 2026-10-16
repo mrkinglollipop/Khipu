@@ -65,6 +65,7 @@ import {
   JobsCard,
   PathOverridesCard,
   GraphBackupRemoteCard,
+  ReplicaCopyCard,
 } from "./SettingsControls";
 import { HealthChecksCard } from "./HealthChecksCard";
 import {
@@ -5577,6 +5578,7 @@ export default function App() {
                     <PathOverridesCard active={tab === "settings" && settingsSection === "data"} />
 
                     <GraphBackupRemoteCard active={tab === "settings" && settingsSection === "data"} />
+                    <ReplicaCopyCard active={tab === "settings" && settingsSection === "data"} />
 
                     <div className="section-card">
                       <div className="section-head">Backup</div>

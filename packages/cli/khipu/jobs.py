@@ -115,6 +115,10 @@ PLIST_QUEUE_DRAIN = "com.khipu.queue-drain"
 # Not calendar-scheduled: KeepAlive, because it exits on purpose when the
 # package's code changes on disk and must come back on the new code.
 PLIST_RECALL_DAEMON = "com.khipu.recall-daemon"
+# Keeps this Mac's copy of the hub current between nightlies (khipu.replica_heal).
+# Checks every replica_check_every seconds, and at once when its wake file is
+# touched; it opens a connection only when the copy is due.
+PLIST_REPLICA_REFRESH = "com.khipu.replica-refresh"
 
 LEGACY_PLIST_NIGHTLY = "com.matt.conversation-memory-nightly"
 LEGACY_PLIST_GRAPH = "com.matt.graphify-nightly"
@@ -151,6 +155,11 @@ _JOB_SPECS: dict[str, dict[str, str]] = {
         "plist": PLIST_RECALL_DAEMON,
         "log_stem": "khipu-recall-daemon",
         "schedule": "always running (KeepAlive)",
+    },
+    "replica_refresh": {
+        "plist": PLIST_REPLICA_REFRESH,
+        "log_stem": "khipu-replica-refresh",
+        "schedule": "every 5 min",
     },
 }
 
@@ -1074,6 +1083,14 @@ def _job_entry(name: str) -> dict[str, Any]:
         )
     except Exception:
         expected = False
+    next_schedule = spec["schedule"]
+    if name == "replica_refresh":
+        try:
+            from khipu.replica_heal import schedule_words
+
+            next_schedule = schedule_words()
+        except Exception:  # noqa: BLE001 - fail open to the spec's words
+            pass
     return {
         "plist_label": spec["plist"],
         "plist_mtime": plist_mtime,
@@ -1085,7 +1102,7 @@ def _job_entry(name: str) -> dict[str, Any]:
         "plist_loaded": _plist_loaded(spec["plist"]),
         "plist_current": current,
         "expected": expected,
-        "next_schedule": spec["schedule"],
+        "next_schedule": next_schedule,
         "last_exit": last_exit,
         "last_exit_ts": state.get("ts") if state else None,
     }
@@ -1099,6 +1116,7 @@ def job_status() -> dict[str, Any]:
         "notes_watch": _job_entry("notes_watch"),
         "queue_drain": _job_entry("queue_drain"),
         "recall_daemon": _job_entry("recall_daemon"),
+        "replica_refresh": _job_entry("replica_refresh"),
         "embed_media_backfill": _on_demand_job_entry("embed_media_backfill"),
     }
 

@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from khipu.text_pages import (
     PAGE_BYTES_DEFAULT,
@@ -312,10 +312,19 @@ def try_hub_connect(
 
     from khipu.db import conninfo_with_local_root_cert, resolve_dsn
 
-    return psycopg.connect(
-        conninfo_with_local_root_cert(resolve_dsn()),
-        connect_timeout=connect_timeout,
-    )
+    from khipu import hub_reach
+
+    try:
+        conn = psycopg.connect(
+            conninfo_with_local_root_cert(resolve_dsn()),
+            connect_timeout=connect_timeout,
+        )
+    except Exception as exc:
+        if hub_connection_failed(exc):
+            hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
+        raise
+    hub_reach.note_reachable()
+    return conn
 
 
 def open_snapshot() -> sqlite3.Connection:
@@ -385,6 +394,52 @@ def _queue_erasure(episode_id: int, path: Path | None = None) -> bool:
         return True
     except OSError:
         return False
+
+
+def _missed_patch_dir(path: Path | None = None) -> Path:
+    path = path or snapshot_path()
+    return path.parent / ".hub_snapshot.missed-patches"
+
+
+def _missed_patch_ids(path: Path | None = None) -> set[int]:
+    try:
+        return {int(p.name) for p in _missed_patch_dir(path).iterdir() if p.name.isdigit()}
+    except FileNotFoundError:
+        return set()
+
+
+def _queue_missed_patch(episode_id: int, path: Path | None = None) -> bool:
+    """Record an episode whose replica write was dropped, so the next pull
+    reads it from the hub again. One empty file per id: writing it twice is
+    one marker, and it needs no lock a running dump could be holding."""
+    directory = _missed_patch_dir(path)
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(directory / str(int(episode_id)), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.close(fd)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _clear_missed_patches(ids: Iterable[int] | None = None, *, path: Path | None = None,
+                          written_before: float) -> None:
+    """Drop markers written at or before ``written_before`` (``ids``: only
+    those). A marker written after the caller read the hub is a newer miss
+    and stays."""
+    wanted = None if ids is None else {int(i) for i in ids}
+    try:
+        markers = list(_missed_patch_dir(path).iterdir())
+    except FileNotFoundError:
+        return
+    for marker in markers:
+        if not marker.name.isdigit() or (wanted is not None and int(marker.name) not in wanted):
+            continue
+        try:
+            if marker.stat().st_mtime <= written_before:
+                marker.unlink()
+        except OSError:
+            continue
 
 
 def _purged_topics_dir(path: Path | None = None) -> Path:
@@ -875,6 +930,268 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
             pass
     out.setdefault("decisions", len(rows))
     return out
+
+
+# Rows per kind one pull applies. Past it a full dump is the cheaper way to
+# catch up (the live hub took about 900 episodes in a day, 2026-10-15), and a
+# bounded pull is one that cannot hold the refresh lock for long.
+PULL_LIMIT = 2000
+_PULL_BATCH = 100
+
+
+def _pull_needs_dump(limit: int) -> dict[str, Any]:
+    return {"ok": False, "needs_dump": True, "error": f"more than {limit} changes since the last update"}
+
+
+def _replica_rows(table: str, key: str, keys: Sequence[Any]) -> tuple[set[Any], set[Any]]:
+    """``(live, deleted)``: which of ``keys`` the replica's ``table`` holds."""
+    if not keys:
+        return set(), set()
+    live: set[Any] = set()
+    deleted: set[Any] = set()
+    try:
+        con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return live, deleted
+    try:
+        cols = _snapshot_table_columns(con, table)
+        if key not in cols:
+            return live, deleted
+        mark = ", deleted_at IS NOT NULL" if "deleted_at" in cols else ", 0"
+        for part in _chunks(list(keys)):
+            for k, gone in con.execute(
+                    f"SELECT {key}{mark} FROM main.{table} WHERE {key} IN ({', '.join('?' * len(part))})", part):
+                (deleted if gone else live).add(k)
+    finally:
+        con.close()
+    return live, deleted
+
+
+def _cursor_after(old: tuple[datetime, int], newest: tuple[datetime, int] | None,
+                  cap: datetime) -> tuple[datetime, int]:
+    """Where a cursor moves: to the newest row read, but never past ``cap``
+    (the hub's now minus the overlap), and never back."""
+    new = (cap, 0)
+    if newest is not None and newest[0] <= cap:
+        new = newest
+    return max(old, new)
+
+
+def _pull_apply(cur, state: Mapping[str, Any], limit: int) -> dict[str, Any]:
+    """The hub half of ``pull_changes``, on its one cursor. Everything the
+    limit can refuse is read before the first write."""
+    from datetime import timedelta
+
+    cur.execute("SELECT now()")
+    hub_now = _utc(cur.fetchone()[0]) or datetime.now(timezone.utc)
+    cap = hub_now - timedelta(seconds=FRESHNESS_OVERLAP_S)
+    hub_cols = _pg_columns(cur, "episodes")
+    cols = [c for c in _EPISODE_COLS if c in hub_cols]
+    sel = ", ".join(cols)
+    cur.execute(
+        f"SELECT {sel} FROM episodes WHERE (ingested_at, id) > (%s, %s) ORDER BY ingested_at, id LIMIT %s",
+        (state["episodes_after"], state["episodes_after_id"], limit + 1))
+    fresh = [dict(zip(cols, r)) for r in cur.fetchall()]
+    gone: list[dict[str, Any]] = []
+    if "deleted_at" in hub_cols:
+        cur.execute(
+            f"SELECT {sel} FROM episodes WHERE deleted_at > %s ORDER BY deleted_at, id LIMIT %s",
+            (state["tombstones_after"], limit + 1))
+        gone = [dict(zip(cols, r)) for r in cur.fetchall()]
+    groups: list[tuple[Any, ...]] = []
+    emb_cols = _pg_columns(cur, "memory_embeddings")
+    if {"profile", "kind", "ref", "built_at"} <= emb_cols:
+        cur.execute(
+            "SELECT profile, kind, ref, max(built_at) FROM memory_embeddings WHERE built_at > %s "
+            "GROUP BY profile, kind, ref ORDER BY max(built_at), profile, kind, ref LIMIT %s",
+            (state["vectors_after"], limit + 1))
+        groups = list(cur.fetchall())
+    if max(len(fresh), len(gone), len(groups)) > limit:
+        return _pull_needs_dump(limit)
+
+    changed: dict[int, dict[str, Any]] = {int(r["id"]): r for r in [*fresh, *gone]}
+    want = set(state["missed"])
+    # A vector group is applied alone only when its episode is live in the
+    # replica; one for an episode the replica lacks goes through the whole
+    # episode, so the forgotten-source fence sees it first.
+    ep_refs = [int(g[2]) for g in groups if g[1] == "episode" and str(g[2]).isdigit()]
+    live, deleted = _replica_rows("episodes", "id", ep_refs)
+    topic_live, topic_deleted = _replica_rows("topics", "slug", [g[2] for g in groups if g[1] == "topic"])
+    apply_groups: list[tuple[Any, ...]] = []
+    for g in groups:
+        if g[1] == "episode":
+            if not str(g[2]).isdigit() or int(g[2]) in changed or int(g[2]) in deleted:
+                continue
+            if int(g[2]) not in live:
+                want.add(int(g[2]))
+                continue
+        elif g[1] == "topic" and g[2] in topic_deleted:
+            continue
+        apply_groups.append(g)
+    need = sorted(want - set(changed))
+    for part in _chunks(need):
+        cur.execute(f"SELECT {sel} FROM episodes WHERE id = ANY(%s)", (part,))
+        changed.update({int(r[cols.index("id")]): dict(zip(cols, r)) for r in cur.fetchall()})
+    absent = want - set(changed)
+
+    emb_sel = ", ".join("embedding::text AS embedding" if c == "embedding" else c
+                        for c in _EMBED_COLS if c in emb_cols)
+    emb_names = [c for c in _EMBED_COLS if c in emb_cols]
+    deliv_cols = _pg_columns(cur, "deliverables")
+    has_deliv = set(_DELIVERABLE_COLS) <= deliv_cols
+    done: set[int] = set()
+    live_count = tomb_count = forgotten = 0
+    ordered = sorted(changed)
+    for start in range(0, len(ordered), _PULL_BATCH):
+        batch = ordered[start:start + _PULL_BATCH]
+        alive = [i for i in batch if changed[i].get("deleted_at") is None]
+        vecs: dict[int, list[dict[str, Any]]] = {}
+        deliv: dict[int, list[dict[str, Any]]] = {}
+        if alive:
+            cur.execute(f"SELECT {emb_sel} FROM memory_embeddings WHERE kind = 'episode' AND ref = ANY(%s)",
+                        ([str(i) for i in alive],))
+            for r in cur.fetchall():
+                row = dict(zip(emb_names, r))
+                vecs.setdefault(int(row["ref"]), []).append(row)
+            if has_deliv:
+                cur.execute(f"SELECT {', '.join(_DELIVERABLE_COLS)} FROM deliverables WHERE episode_id = ANY(%s) "
+                            "ORDER BY id", (alive,))
+                for r in cur.fetchall():
+                    row = dict(zip(_DELIVERABLE_COLS, r))
+                    deliv.setdefault(int(row["episode_id"]), []).append(row)
+        for eid in batch:
+            row = changed[eid]
+            tomb = row.get("deleted_at") is not None
+            out = upsert_episode(row, [] if tomb else vecs.get(eid, []),
+                                 deliverable_rows=None if tomb or not has_deliv else deliv.get(eid, []))
+            error = str(out.get("error") or "")
+            if not out.get("ok") and tomb and "forgotten source" in error:
+                # The fence refuses a forgotten source's row, tombstone
+                # included; erasing it can never restore one, so it is
+                # applied the way a forget on this Mac applies it.
+                out = forget_episode_in_snapshot(eid)
+                error = str(out.get("error") or "")
+            if out.get("ok"):
+                tomb_count += tomb
+                live_count += not tomb
+            elif "forgotten source" in error:
+                forgotten += 1
+            elif "in progress" in error:
+                return {"ok": False, "error": "hub snapshot refresh in progress"}
+            else:
+                return {"ok": False, "error": error or "episode write refused"}
+            done.add(eid)
+
+    vector_count = 0
+    by_kind: dict[tuple[Any, Any], list[Any]] = {}
+    for profile, kind, ref, _built in apply_groups:
+        by_kind.setdefault((profile, kind), []).append(ref)
+    for (profile, kind), refs in by_kind.items():
+        for part in _chunks(refs):
+            cur.execute(f"SELECT {emb_sel} FROM memory_embeddings WHERE profile = %s AND kind = %s "
+                        "AND ref = ANY(%s)", (profile, kind, part))
+            rows = [dict(zip(emb_names, r)) for r in cur.fetchall()]
+            out = upsert_embeddings(rows, replace_refs=[(profile, kind, ref) for ref in part])
+            if not out.get("ok"):
+                error = str(out.get("error") or "")
+                return {"ok": False, "error": "hub snapshot refresh in progress" if "in progress" in error
+                        else error or "vector write refused"}
+            vector_count += len(rows)
+
+    def newest(rows: Sequence[Mapping[str, Any]], col: str) -> tuple[datetime, int] | None:
+        stamp = _utc(rows[-1].get(col)) if rows else None
+        return None if stamp is None else (stamp, int(rows[-1]["id"]))
+
+    last_group = _utc(groups[-1][3]) if groups else None
+    return {
+        "ok": True,
+        "episodes": live_count, "tombstones": tomb_count, "vectors": vector_count,
+        "forgotten_skipped": forgotten, "missed_retried": len(set(state["missed"]) & (done | absent)),
+        "cleared": set(state["missed"]) & (done | absent),
+        "cursors": {
+            "episodes": _cursor_after((state["episodes_after"], state["episodes_after_id"]),
+                                      newest(fresh, "ingested_at"), cap),
+            "tombstones": _cursor_after((state["tombstones_after"], 0), newest(gone, "deleted_at"), cap),
+            "vectors": _cursor_after((state["vectors_after"], 0),
+                                     None if last_group is None else (last_group, 0), cap),
+        },
+    }
+
+
+def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
+    """Bring the replica level with the hub without a full dump: episodes
+    ingested or tombstoned since this replica's cursors, the episodes whose
+    patch was missed (``_queue_missed_patch``), re-built vectors and the
+    decisions changed elsewhere. Every episode goes through ``upsert_episode``,
+    so the forgotten-source fence, queued erasures and tombstones apply as
+    for a capture.
+
+    The cursors live in the sidecar beside ``last_pull_at``; a full dump
+    replaces the sidecar and so resets them to its own hub time. Each moves to
+    the newest row read but never past the hub's now minus
+    ``FRESHNESS_OVERLAP_S``: ``ingested_at`` is the start of a transaction, so
+    a long one can commit an older stamp after a newer one was read, and the
+    overlap re-reads those minutes (the upserts are idempotent). More than
+    ``limit`` changes of a kind writes nothing and asks for a full dump.
+    Never raises."""
+    from datetime import timedelta
+
+    path = snapshot_path()
+    m = meta()
+    dumped = _utc(m.get("hub_dumped_at"))
+    has_meta = False
+    if path.is_file():
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                has_meta = bool(_snapshot_table_columns(con, "snapshot_meta"))
+            finally:
+                con.close()
+        except sqlite3.Error:
+            has_meta = False
+    if dumped is None or not has_meta:
+        return {"ok": False, "needs_dump": True, "error": "no full dump on record"}
+    side = _read_sidecar()
+    floor = dumped - timedelta(seconds=FRESHNESS_OVERLAP_S)
+    mine = side.get("pull_dump") == m.get("hub_dumped_at")
+
+    def stored(key: str) -> datetime:
+        return (_utc(side.get(key)) if mine else None) or floor
+
+    try:
+        after_id = int(side.get("pull_episodes_after_id") or 0) if mine else 0
+    except (TypeError, ValueError):
+        after_id = 0
+    state = {
+        "episodes_after": stored("pull_episodes_after"), "episodes_after_id": after_id,
+        "tombstones_after": stored("pull_tombstones_after"), "vectors_after": stored("pull_vectors_after"),
+        "missed": _missed_patch_ids(path),
+    }
+    started = time.time()
+    try:
+        with try_hub_connect(connect_timeout=HUB_CONNECT_TIMEOUT_S) as pg:
+            with pg.cursor() as cur:
+                result = _pull_apply(cur, state, limit)
+    except Exception as exc:  # noqa: BLE001 - reported to the caller, which decides what to do next
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300],
+                "hub_unreachable": hub_connection_failed(exc)}
+    if not result.get("ok"):
+        return result
+    decisions = sync_decision_changes()
+    try:
+        side = _read_sidecar() or meta()
+        for name, (at, at_id) in result["cursors"].items():
+            side[f"pull_{name}_after"] = at.isoformat()
+            if name == "episodes":
+                side["pull_episodes_after_id"] = at_id
+        side["pull_dump"] = m.get("hub_dumped_at")
+        side["last_pull_at"] = _utcnow_iso()
+        _write_meta(side)
+    except OSError as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    _clear_missed_patches(result["cleared"], path=path, written_before=started)
+    return {"ok": True, **{k: result[k] for k in ("episodes", "tombstones", "vectors", "missed_retried",
+                                                  "forgotten_skipped")}, "decisions": decisions}
 
 
 def _json_text(val: Any) -> str | None:
@@ -1740,6 +2057,7 @@ def _refresh_locked() -> dict[str, Any]:
                 tmp_path.unlink(missing_ok=True)
                 return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
             _clear_purged_topics(dest, dumped_after=dump_started)
+            _clear_missed_patches(path=dest, written_before=dump_started)
             size_bytes = dest.stat().st_size
             new_meta: dict[str, Any] = {"schema_version": SNAPSHOT_SCHEMA_VERSION, "refreshed_at": refreshed_at, "size_bytes": size_bytes, "counts": counts}
             if hub_dumped_at:
@@ -2058,6 +2376,8 @@ def _upsert_episode_unfenced(
     lock = _acquire_refresh_lock()
     if lock is None:
         _record_write_error(touched, "hub snapshot refresh in progress")
+        if episode_row.get("id") is not None:
+            _queue_missed_patch(episode_row["id"], path)
         return {"ok": False, "error": "hub snapshot refresh in progress"}
     try:
         eid = episode_row.get("id")
@@ -2148,6 +2468,8 @@ def _upsert_episode_unfenced(
         return {"ok": True, "episode_id": eid, "embeddings": len(embedding_rows)}
     except Exception as exc:
         _record_write_error(touched, f"{type(exc).__name__}: {exc}")
+        if episode_row.get("id") is not None:
+            _queue_missed_patch(episode_row["id"], path)
         raise
     finally:
         _release_refresh_lock(lock)
@@ -4320,6 +4642,11 @@ def _recent_measurement(health: Mapping[str, Any]) -> dict[str, Any] | None:
     # measured_at is the hub's and never is.
     checked = _utc(last.get("checked_at"))
     if checked is None or not 0 <= (datetime.now(timezone.utc) - checked).total_seconds() <= LAST_KNOWN_TRUST_S:
+        return None
+    # A pull changes the copy after a measurement was made of it: the figure
+    # no longer describes the copy, so it neither distrusts nor trusts it.
+    pulled = _utc(_read_sidecar().get("last_pull_at"))
+    if pulled is not None and checked < pulled:
         return None
     return last
 

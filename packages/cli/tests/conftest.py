@@ -128,6 +128,17 @@ def _isolate_tombstone_registry(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _forget_hub_unreachable_memo():
+    # A test that lets a hub connect fail writes the reachability memo into the
+    # shared test data dir; the next test's hub leg would then be skipped.
+    from khipu import hub_reach
+
+    hub_reach.memo_path().unlink(missing_ok=True)
+    yield
+    hub_reach.memo_path().unlink(missing_ok=True)
+
+
+@pytest.fixture(autouse=True)
 def _reset_project_for_cwd_cache():
     # Same reason as above: a per-process cache that is right in a one-shot
     # hook and wrong between tests that fake different projects for one path.

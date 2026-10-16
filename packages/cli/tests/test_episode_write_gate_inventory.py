@@ -57,6 +57,7 @@ ALLOWED = {
     ("forget", "forget_episode"): "erase",
     ("hub_snapshot", "_apply_pending_erasures"): "erase",
     ("hub_snapshot", "_insert_episodes"): "inside:hub_snapshot._refresh_locked",
+    ("hub_snapshot", "_pull_apply"): "calls:hub_snapshot.upsert_episode",
     ("hub_snapshot", "_upsert_episode_unfenced"): "inside:hub_snapshot.upsert_episode",
     ("hub_snapshot", "forget_episode_in_snapshot"): "erase",
     ("hygiene", "apply_backfill_identity"): "metadata",

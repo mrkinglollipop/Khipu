@@ -1992,6 +1992,22 @@ class _SnapshotUnusable(Exception):
     hub. Carries the reason so it can be logged (never silently)."""
 
 
+def _stale_marker(health: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "age_seconds": health.get("age_seconds"), "refreshed_at": health.get("refreshed_at"),
+        "why": health.get("distrusted_by") or "overdue",
+    }
+
+
+def _wake_replica_job() -> None:
+    try:
+        from khipu import replica_heal
+
+        replica_heal.wake()
+    except Exception:  # noqa: BLE001 - waking the job is a courtesy
+        pass
+
+
 def _snapshot_search_hits(
     prompt: str, *, project: str | None, tz: str | None = None,
     started: float | None = None, progress: dict[str, Any] | None = None,
@@ -2029,10 +2045,18 @@ def _snapshot_search_hits(
     from khipu.search_text import search_tokens, token_hit_count
 
     fresh, health = hub_snapshot.snapshot_is_fresh()
+    stale: dict[str, Any] | None = None
     if not fresh:
-        raise _SnapshotUnusable(
-            "missing" if not health.get("exists") else f"stale ({health.get('age_seconds')}s)"
-        )
+        # Matt, 2026-10-16: a copy with a dump time on record answers even when
+        # it is hours behind, marked stale; only a missing one gives way to the hub.
+        if not health.get("exists") or health.get("age_seconds") is None:
+            raise _SnapshotUnusable(
+                "missing" if not health.get("exists") else f"stale ({health.get('age_seconds')}s)"
+            )
+        stale = _stale_marker(health)
+        if progress is not None:
+            progress["replica_stale"] = stale
+        _wake_replica_job()
 
     tokens = search_tokens(prompt)
     # `started` is when the caller's own TIMEOUT_S clock began. Counting from
@@ -2100,13 +2124,14 @@ def _snapshot_search_hits(
         else:
             degraded = "embedding late"
         if "rows" not in cosine_box and provisional is not None:
-            return {**provisional, "degraded": degraded}
+            return {**provisional, "degraded": degraded, **({"replica_stale": stale} if stale else {})}
 
     _enter_stage(progress, "finish")
-    return _fuse_and_annotate(
+    out = _fuse_and_annotate(
         prompt, tokens=tokens, project=project, tz=tz,
         lexical_rows=lexical_rows, cosine_rows=cosine_rows, legs=legs, degraded=degraded,
     )
+    return {**out, "replica_stale": stale} if stale else out
 
 
 def _fuse_and_annotate(
@@ -2298,7 +2323,22 @@ def _trim_result(result: dict[str, Any], limit: int) -> dict[str, Any]:
         out["degraded_legs"] = result["degraded_legs"]
     if "time_interpretation" in result:
         out["time_interpretation"] = result["time_interpretation"]
+    if "replica_stale" in result:
+        out["replica_stale"] = result["replica_stale"]
     return out
+
+
+def _hub_known_down() -> dict[str, Any] | None:
+    """The reachability memo, when the hub is known to be down; the hub leg is
+    then skipped (logged once) and the call answers with nothing, tagged
+    offline so doctor's rate checks count it apart from lane failures."""
+    from khipu import hub_reach
+
+    memo = hub_reach.known_unreachable()
+    if memo is not None:
+        _log(f"hub unreachable since {memo.get('since')} — skipping the hub leg")
+        return {"hits": [], "legs": [], "degraded": "hub unreachable", "offline": True}
+    return None
 
 
 def _search_hits(
@@ -2339,6 +2379,11 @@ def _search_hits(
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls back
         _log(f"snapshot search failed ({type(exc).__name__}: {exc}) — falling back to hub")
 
+    skipped = _hub_known_down()
+    if skipped is not None:
+        return skipped
+
+    from khipu import hub_reach, hub_snapshot
     from khipu.embed import hybrid_search
     from khipu.redact import redact_secrets
 
@@ -2346,10 +2391,16 @@ def _search_hits(
     # include_libraries=False: this lane has a latency budget and must never
     # wait on a second embedding provider (library search is explicit-only).
     sanitized, _ = redact_secrets(prompt)
-    payload = hybrid_search(
-        sanitized, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project,
-        include_libraries=False,
-    )
+    try:
+        payload = hybrid_search(
+            sanitized, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project,
+            include_libraries=False,
+        )
+    except Exception as exc:
+        if hub_snapshot.hub_connection_failed(exc):
+            hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
+        raise
+    hub_reach.note_reachable()
     rows = _apply_score_floor(payload.get("results") or [])
     return {"hits": rows[:limit], "legs": ["hub"], "degraded": None}
 
@@ -2576,11 +2627,16 @@ def _search_hits_budgeted(
         result = _snapshot_search_hits(prompt, project=project, started=started,
                                        deadline=deadline, progress=progress)
         hits = _apply_score_floor(result["hits"])[:limit]
-        return {"hits": hits, "legs": result["legs"], "degraded": result["degraded"]}
+        return {"hits": hits, "legs": result["legs"], "degraded": result["degraded"],
+                **({"replica_stale": result["replica_stale"]} if "replica_stale" in result else {})}
     except _SnapshotUnusable as exc:
         _log(f"snapshot unusable ({exc}) — hub budgeted path")
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls through
         _log(f"snapshot search failed ({type(exc).__name__}: {exc}) — hub budgeted path")
+
+    skipped = _hub_known_down()
+    if skipped is not None:
+        return skipped
 
     from khipu.search_text import search_tokens
 
@@ -2617,7 +2673,20 @@ def _row_tag(row: dict[str, Any]) -> str:
     return " · ".join(bits)
 
 
-def render_block(hits: list[dict[str, Any]], *, produced: str = "") -> str:
+def _stale_line(stale: dict[str, Any]) -> str:
+    seconds = stale.get("age_seconds")
+    if not isinstance(seconds, (int, float)) or seconds < 0:
+        age = "out of date"
+    elif seconds < 3600:
+        age = f"{max(1, int(seconds // 60))} minutes old"
+    elif seconds < 2 * 86400:
+        age = f"{int(seconds // 3600)} hours old"
+    else:
+        age = f"{int(seconds // 86400)} days old"
+    return f"This Mac's copy of memory is {age}; newer work may be missing."
+
+
+def render_block(hits: list[dict[str, Any]], *, produced: str = "", stale: dict[str, Any] | None = None) -> str:
     """The untrusted-data-fenced block, hard-capped at BLOCK_CHAR_BUDGET.
 
     Drops whole trailing hit lines rather than mid-truncating one — same
@@ -2631,6 +2700,10 @@ def render_block(hits: list[dict[str, Any]], *, produced: str = "") -> str:
     out = [_HEADING]
     if len(f"{_HEADING}\n{_FOOTER}") > BLOCK_CHAR_BUDGET:
         return ""
+    if stale and hits:
+        line = _stale_line(stale)
+        if len("\n".join([*out, line, _FOOTER])) <= BLOCK_CHAR_BUDGET:
+            out.append(line)
     for h in hits:
         snippet = clip_snippet(str(h.get("snippet") or h.get("label") or ""), 90)
         line = f"- [{_row_tag(h)}] {snippet}"
@@ -2774,7 +2847,9 @@ def prior_work_for_prompt(
     ``_snapshot_search_hits``), or ``["hub"]`` on the TIMEOUT_S path's hub
     fallback. A gated or timed-out call reports ``[]``/``None`` or
     ``"timeout"`` respectively — never absent, so callers (the hook's log
-    line among them) can read them unconditionally. When TIMEOUT_S passes
+    line among them) can read them unconditionally. ``replica_stale`` (age,
+    refresh time, why) is present only when this Mac's copy answered while not
+    trusted; the context then carries a line saying so. When TIMEOUT_S passes
     after the keyword leg finished, the keyword-only rows are returned with
     reason ``ok`` and ``degraded`` ``"embedding late (limit)"``; only when
     nothing was ready is it a timeout, and that result carries ``stage``, the
@@ -2800,16 +2875,21 @@ def prior_work_for_prompt(
     thread = handoff_thread(prompt or "")
     prompt = strip_handoff(prompt or "", prefer_last=True).strip()
 
+    replica_stale: dict[str, Any] | None = None
+
     def _meta(
         *, legs: list[str] = (), degraded: str | None = None, reason: str,
         ms: float = 0.0, hits: list[Any] = (),
     ):
         if budget_ms is None:
             return None
-        return {
+        meta = {
             "legs": list(legs), "ms": ms, "degraded": degraded, "reason": reason,
             "outcome": _outcome_for(reason, list(hits)),
         }
+        if replica_stale:
+            meta["replica_stale"] = replica_stale
+        return meta
 
     def _gated(reason: str) -> dict[str, Any]:
         out = {"context": "", "hits": [], "reason": reason, "ms": 0.0}
@@ -2870,6 +2950,7 @@ def prior_work_for_prompt(
             hits = result.get("hits") or []
             legs = result.get("legs") or []
             degraded = result.get("degraded")
+            replica_stale = result.get("replica_stale")
             reason = result.get("reason") or reason
             offline = bool(result.get("offline"))
         else:
@@ -2883,9 +2964,11 @@ def prior_work_for_prompt(
             degraded_legs = result.get("degraded_legs") or []
             interpretation = result.get("time_interpretation")
             offline = bool(result.get("offline"))
+            replica_stale = result.get("replica_stale")
     except _TimedOut:
         # Read once: the search thread may still publish after this point.
         provisional = progress.get("provisional")
+        replica_stale = progress.get("replica_stale")
         if provisional is not None:
             result = _trim_result(provisional, limit)
             hits = result["hits"]
@@ -2919,7 +3002,7 @@ def prior_work_for_prompt(
             produced = _run_with_timeout(_deliverable_context_line, remaining, tokens, cwd=cwd)
         except Exception:  # noqa: BLE001 — optional evidence cannot discard completed search
             pass
-    context = render_block(hits or [], produced=produced)
+    context = render_block(hits or [], produced=produced, stale=replica_stale)
 
     if hits and session_id and not thread and context:
         try:
@@ -2955,6 +3038,8 @@ def prior_work_for_prompt(
         out["degraded_legs"] = degraded_legs
     if interpretation:
         out["time_interpretation"] = interpretation
+    if replica_stale:
+        out["replica_stale"] = replica_stale
     meta = _meta(legs=legs, degraded=degraded, reason=reason, ms=ms, hits=hits or [])
     if meta is not None:
         out["prior_work_meta"] = meta
@@ -2963,14 +3048,14 @@ def prior_work_for_prompt(
 
 def _replica_deliverable_line(project: str, tokens: list[str]) -> str | None:
     """The line from the local replica ("" when nothing matches), or None
-    when the replica cannot answer (stale, missing, an older dump with no
-    ``deliverables`` table, unreadable). Imports neither the Postgres driver
+    when the replica cannot answer (missing, no dump time on record, an older
+    dump with no ``deliverables`` table, unreadable). Imports neither the Postgres driver
     nor ``khipu.db``."""
     from khipu import deliverables as _deliverables
     from khipu import hub_snapshot
 
-    fresh, _health = hub_snapshot.snapshot_is_fresh()
-    if not fresh:
+    fresh, health = hub_snapshot.snapshot_is_fresh()
+    if not fresh and (not health.get("exists") or health.get("age_seconds") is None):
         return None
     try:
         con = hub_snapshot.open_snapshot()
@@ -3003,6 +3088,10 @@ def _deliverable_context_line(tokens: list[str], *, cwd: str | None) -> str:
             local = None
         if local is not None:
             return local
+        from khipu import hub_reach
+
+        if hub_reach.known_unreachable() is not None:
+            return ""
         from khipu.db import connect
         from khipu import deliverables as _deliverables
 

@@ -6,7 +6,7 @@ Khipu runs as `python3 -m khipu` (there is no installed `khipu` executable in th
 
 ## Background jobs
 
-Khipu runs its upkeep as macOS LaunchAgents. A fresh install (the Database step, or `khipu db connect`) schedules five of them:
+Khipu runs its upkeep as macOS LaunchAgents. A fresh install (the Database step, or `khipu db connect`) schedules six of them:
 
 | Job | When | What it does |
 |---|---|---|
@@ -15,12 +15,13 @@ Khipu runs its upkeep as macOS LaunchAgents. A fresh install (the Database step,
 | `monthly` | 1st of the month, 09:00 | Monthly organisation pass |
 | `notes_watch` | When watched note files change (30 s throttle) | Syncs edited notes |
 | `queue_drain` | Every 5 minutes | Drains the capture queue |
+| `replica_refresh` | Every 5 minutes (setting `replica_check_every`) | Looks at this Mac's copy of the database and brings it up to date when the last update is 15 minutes old (setting `replica_refresh_after`). It connects only when an update is due |
 
-A sixth job, `recall_daemon`, is opt-in: `khipu jobs install recall_daemon`. It keeps a warm recall service running so the per-prompt hook avoids a cold Python start. See [how-it-works.md](how-it-works.md).
+A seventh job, `recall_daemon`, is opt-in: `khipu jobs install recall_daemon`. It keeps a warm recall service running so the per-prompt hook avoids a cold Python start. See [how-it-works.md](how-it-works.md).
 
 ```bash
 khipu jobs status                      # what is installed and loaded
-khipu jobs install [NAME ...]          # render and load (default: the five above)
+khipu jobs install [NAME ...]          # render and load (default: the six above)
 khipu jobs refresh [NAME ...]          # re-render installed jobs whose plist is stale
 khipu jobs uninstall [NAME ...]        # default: all six, recall_daemon included
 ```
