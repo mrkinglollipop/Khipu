@@ -208,6 +208,44 @@ def plan(cur, directory: Path | None = None) -> dict:
     }
 
 
+def doctor_check(conn=None, directory: Path | None = None) -> dict:
+    """Doctor's schema check: red while the hub lacks a migration this code
+    ships (0028 sat unapplied on 2026-10-16 with every light green); a
+    migration the hub has that this code does not know is a warning only.
+    Read-only. ``conn`` is the caller's and stays open; without it the
+    resolved hub is opened and closed here. No configured database is a
+    skip, not red: doctor gates the missing connection on its own."""
+    block: dict = {"ok": True, "pending": [], "unknown_applied": [], "warnings": []}
+    try:
+        if conn is None:
+            from khipu.db import connect, dsn_configured
+
+            if not dsn_configured():
+                return {**block, "skipped": "no database configured"}
+            with connect() as owned, owned.cursor() as cur:
+                p = plan(cur, directory)
+        else:
+            with conn.cursor() as cur:
+                p = plan(cur, directory)
+    except Exception as e:  # noqa: BLE001  (a failed check must not look like a pass)
+        return {**block, "ok": False, "error": f"{type(e).__name__}: {e}"}
+    block["pending"] = p["pending"]
+    block["unknown_applied"] = p["unknown_applied"]
+    if p["pending"]:
+        block["ok"] = False
+        block["reason"] = (
+            "The memory database needs an update this version of Khipu expects: "
+            + ", ".join(p["pending"])
+        )
+        block["fix"] = "run `khipu migrate`"
+    if p["unknown_applied"]:
+        block["warnings"].append(
+            "The memory database has updates newer than this version of Khipu: "
+            + ", ".join(p["unknown_applied"])
+        )
+    return block
+
+
 def run(*, dry_run: bool = False, directory: Path | None = None, conn=None,
         claim_local_rows: bool = False) -> dict:
     """Apply pending migrations against ``conn``, or the resolved hub when

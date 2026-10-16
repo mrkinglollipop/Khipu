@@ -29,7 +29,7 @@ export type Attention = {
   tone: "err" | "warn";
   title: string;
   cause: string;
-  fix?: { label: string; kind: "reinstall-hook" | "recall-probe" | "revisions" | "open-harnesses" };
+  fix?: { label: string; kind: "reinstall-hook" | "recall-probe" | "revisions" | "open-harnesses" | "apply-migrations" };
   harness?: string;
 };
 
@@ -328,6 +328,34 @@ export function buildAttention(parsed: Record<string, unknown>): {
         ? `${sb.error}. Captures wait in the queue; nothing is lost.`
         : `${sb?.calls ?? "?"} of ${sb?.cap ?? "?"} calls used. Captures wait in the queue until UTC midnight, nothing is lost; lift it for today under Settings › Capture.`,
     });
+  }
+
+  // The hub lacks a migration this version ships (0028 sat unapplied on
+  // 2026-10-16 with every light green). Newer-than-the-code migrations are a
+  // warning in doctor's own `warnings`, not an item here.
+  if ((parsed as { schema_migrations_ok?: boolean }).schema_migrations_ok === false) {
+    const sm = (parsed as { schema_migrations?: { pending?: string[]; error?: string } }).schema_migrations;
+    const pending = sm?.pending ?? [];
+    if (pending.length) {
+      issues.push(`Database update pending: ${pending.join(", ")}`);
+      items.push({
+        key: "schema_migrations",
+        tone: "err",
+        title: "The memory database needs an update this version of Khipu expects",
+        cause: `Not yet applied: ${pending.join(", ")}. Until it is, the parts of Khipu that rely on it can fail. Applying it changes only the database's layout and keeps every memory.`,
+        fix: { label: "Apply update", kind: "apply-migrations" },
+      });
+    } else {
+      issues.push(`Database version check failed${sm?.error ? `: ${sm.error}` : ""}`);
+      items.push({
+        key: "schema_migrations",
+        tone: "err",
+        title: "Khipu could not check the memory database's version",
+        cause: sm?.error
+          ? `${sm.error}. Whether the database has every update this version expects is unknown until the check runs.`
+          : "Whether the database has every update this version expects is unknown until the check runs.",
+      });
+    }
   }
 
   const snap = (parsed as {
