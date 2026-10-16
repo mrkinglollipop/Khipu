@@ -257,3 +257,34 @@ def test_the_sweep_prunes_commitments_backups_and_zero_keeps_them(data_dir, tmp_
     out = storage.sweep()
 
     assert "commitments-20200101T000000Z" in out["removed"] and not any(root.iterdir())
+
+
+# ---- the test suite's own temporary folders ---------------------------------
+
+
+def test_the_suite_keeps_its_temporary_folders_under_one_root_removed_at_exit():
+    import subprocess
+    import sys
+    import tempfile
+
+    from tests import conftest
+
+    root = conftest.TEMP_ROOT
+    assert tempfile.gettempdir() == root == os.environ["TMPDIR"]
+    # Short enough that a socket under a test's own temp folder stays legal.
+    assert Path(root).name.startswith("kt-") and len(root) < 80
+    assert Path(tempfile.mkdtemp(prefix="khipu-x-")).parent == Path(root)
+
+    # A fresh interpreter loading the conftest: its root exists while it runs
+    # and is gone when it exits.
+    conftest_path = Path(conftest.__file__)
+    code = ("import runpy, tempfile, os; runpy.run_path(%r); "
+            "open(os.path.join(tempfile.mkdtemp(prefix='khipu-'), 'f'), 'w').close(); "
+            "print(tempfile.gettempdir())" % str(conftest_path))
+    env = {k: v for k, v in os.environ.items() if k != "TMPDIR"}
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
+                          cwd=str(conftest_path.parents[1]), timeout=120)
+    assert done.returncode == 0, done.stderr
+    child_root = done.stdout.strip().splitlines()[-1]
+    assert Path(child_root).name.startswith("kt-")
+    assert not Path(child_root).exists()
