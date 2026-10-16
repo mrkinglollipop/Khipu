@@ -561,7 +561,38 @@ function troubleCode(row: UsageAccount): string | null {
   return row.ok === false ? row.error ?? null : row.live_error ?? null;
 }
 
-const SIGN_IN_CODES = new Set(["not_signed_in", "no_plan_limits"]);
+/** The one rule, for Home and Settings alike, on which failed reads need the
+ *  owner: only they can fix a sign-in that is gone or reports no plan limits.
+ *  Every other failure but `pending` is a passing gap (`no_plan_figures`, a
+ *  timeout, a CLI that didn't answer): the last figures stay shown with their
+ *  age and Khipu asks again. */
+const SIGN_IN_CODES: ReadonlySet<string> = new Set(["not_signed_in", "no_plan_limits"]);
+
+export function needsOwner(code: string | null | undefined): boolean {
+  return !!code && SIGN_IN_CODES.has(code);
+}
+
+export function isPassingGap(code: string | null | undefined): boolean {
+  return !!code && code !== "pending" && !needsOwner(code);
+}
+
+/** True while a passing gap still has figures in force no older than
+ *  `staleAfterS` seconds (0: never out of date): the account shows them and
+ *  counts as no problem. Older kept figures, or none, make it a problem. */
+export function passingGapHeld(row: UsageAccount, staleAfterS: number, now: Date = new Date()): boolean {
+  if (!isPassingGap(troubleCode(row)) || liveWindows(row, now).length === 0) return false;
+  if (!(staleAfterS > 0)) return true;
+  const at = parseIso(figuresAt(row));
+  return at != null && now.getTime() - at.getTime() < staleAfterS * 1000;
+}
+
+/** The kept window an Accounts row shows for a passing gap: the tightest one
+ *  still in force, as left and reset. */
+export function keptWindow(row: UsageAccount, now: Date = new Date()): { left: number; label: string; resets_at?: string | null } | null {
+  const w = tightestWindow(row, now);
+  const p = w ? pctOf(w) : null;
+  return w && p != null ? { left: roundPct(Math.max(0, 100 - p)), label: windowLabel(w), resets_at: w.resets_at } : null;
+}
 
 /** The failure's cause in Khipu's own words: the row's note (`usage.py`
  *  `_note()` gives one for every code), else the code's phrase after the CLI's
@@ -588,7 +619,7 @@ export function planStatus(row: UsageAccount, now: Date = new Date()): PlanStatu
   const hasFigures = liveWindows(row, now).length > 0;
   const figures: PlanStatus["figures"] = !hasFigures ? "none" : code ? "kept" : "live";
   const age = fmtAgoSince(figuresAt(row));
-  if (code && SIGN_IN_CODES.has(code)) {
+  if (needsOwner(code)) {
     return { figures, say: code === "no_plan_limits" ? "Its sign-in reports no plan limits" : "Not signed in", tone: "warn", code };
   }
   if (code === "pending") return { figures, say: "Reading it for the first time", tone: "grey", code };
@@ -752,7 +783,7 @@ function whenAndAge(iso: string | null | undefined): string | null {
 function failureLine(row: UsageAccount, status: PlanStatus, now: Date): string | null {
   const code = status.code;
   if (!code || code === "pending") return null;
-  if (SIGN_IN_CODES.has(code)) {
+  if (needsOwner(code)) {
     const note = (row.note ?? "").trim();
     if (note) return /[.)]$/.test(note) ? note : `${note}.`;
     const cli = CLI_TITLE[row.harness ?? ""] ?? "This CLI";

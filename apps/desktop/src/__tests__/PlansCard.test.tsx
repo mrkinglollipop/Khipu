@@ -18,9 +18,12 @@ import {
   fmtPct,
   fmtResetLocal,
   formProblem,
+  isPassingGap,
   liveReadFailures,
   loginKey,
   meterTone,
+  needsOwner,
+  passingGapHeld,
   planAttention,
   planPauses,
   planStatus,
@@ -1138,5 +1141,42 @@ describe("per-account lookups use the backend's stable key, never the label (rev
   it("shows no pause for a row with no key rather than guessing by name", () => {
     expect(planPauses(record).get("Work")).toBeUndefined();
     expect(planPauses(record).get("claude|")).toMatch(/^Paused by you until /);
+  });
+});
+
+describe("one rule for passing gaps and codes that need the owner (shared with Settings)", () => {
+  const NOW = new Date("2026-10-14T15:40:00Z");
+  const kept = (extra: Partial<UsageAccount> = {}): UsageAccount => ({
+    harness: "claude", account: "Claude second", ok: false, error: "no_plan_figures", stale: true,
+    windows: [{ name: "weekly", used_pct: 40, resets_at: "2026-10-17T19:00:00Z" }],
+    last_good_at: "2026-10-14T08:40:00Z", probed_at: "2026-10-14T15:38:00Z", ...extra,
+  });
+
+  it("sorts the codes: sign-in trouble needs the owner, every other failure but pending passes", () => {
+    for (const c of ["not_signed_in", "no_plan_limits"]) {
+      expect(needsOwner(c)).toBe(true);
+      expect(isPassingGap(c)).toBe(false);
+    }
+    for (const c of ["no_plan_figures", "timeout", "no_answer", "exit_1", "cli_error", "bad_reply"]) {
+      expect(needsOwner(c)).toBe(false);
+      expect(isPassingGap(c)).toBe(true);
+    }
+    for (const c of ["pending", null, undefined, ""]) expect(isPassingGap(c)).toBe(false);
+  });
+
+  it("says Home's kept-figures words for a passing gap and holds it until the stale setting", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    try {
+      expect(planStatus(kept(), NOW)).toMatchObject({ figures: "kept", say: "Can't read it now; figures from 7 h ago", code: "no_plan_figures" });
+      expect(passingGapHeld(kept(), 12 * 3600, NOW)).toBe(true);
+      expect(passingGapHeld(kept(), 6 * 3600, NOW)).toBe(false);
+      expect(passingGapHeld(kept(), 0, NOW)).toBe(true);
+      expect(passingGapHeld(kept({ windows: [] }), 12 * 3600, NOW)).toBe(false);
+      expect(passingGapHeld(kept({ error: "not_signed_in" }), 12 * 3600, NOW)).toBe(false);
+      expect(planStatus(kept({ error: "not_signed_in" }), NOW).say).toBe("Not signed in");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -8,8 +8,8 @@
 
 import { brokenRules, quietRunners, rateWords, ruleWords, runnerWords, whenLocal } from "./routing";
 import type { PlanFact, RouteView } from "./routing";
-import { planStatus } from "./PlansCard";
-import type { UsageReport } from "./PlansCard";
+import { keptWindow, passingGapHeld, planStatus } from "./PlansCard";
+import type { UsageAccount, UsageReport } from "./PlansCard";
 
 export type GroupKey = "accounts" | "priority" | "rules" | "holds" | "telling" | "resets" | "runners" | "table" | "changes";
 
@@ -63,6 +63,13 @@ export type Overview = {
 };
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+/** The routing record's "out of date after" setting in seconds (0: never),
+ *  its default until the settings are read. */
+export function staleAfterSeconds(s: OverviewSettings): number {
+  const v = s.routing?.routing_stale_after?.value;
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 12 * 3600;
+}
 
 
 function laneMap(s: OverviewSettings): Record<string, Record<string, string>> {
@@ -121,6 +128,9 @@ export function routingProblems(
   for (const row of plans?.accounts ?? []) {
     const st = planStatus(row, now);
     if (!st.code || st.code === "pending") continue;
+    // A passing gap with recent figures kept is no problem (the shared rule
+    // Home uses); kept figures past the stale setting make it one.
+    if (passingGapHeld(row, staleAfterSeconds(s), now)) continue;
     const name = row.account || row.harness || "An account";
     const signIn = st.code === "not_signed_in";
     const routed = (view.accounts ?? []).some((a) => row.key != null && a.key === row.key);
@@ -354,7 +364,21 @@ export function routingOverview(
 /** An account line's week and pace, in two parts: "83% of its week left,
  *  resets Sat 3:00 PM" over "About 1.8% an hour to use it all (a lot left,
  *  little time)", or why there is no pace. */
-export function accountWeek(fact: PlanFact | undefined, now: Date): { week: string | null; pace: string | null } {
+export function accountWeek(
+  fact: PlanFact | undefined,
+  now: Date,
+  plan?: UsageAccount,
+  staleAfterS: number = 12 * 3600,
+): { week: string | null; pace: string | null } {
+  // A passing gap keeps the plan read's last figures, with Home's words for
+  // why they are not from this read.
+  if (!fact?.readable && plan && passingGapHeld(plan, staleAfterS, now)) {
+    const k = keptWindow(plan, now);
+    if (k) {
+      const reset = k.resets_at ? `, resets ${whenLocal(k.resets_at, now)}` : "";
+      return { week: `${k.left}% of its ${k.label} left${reset}`, pace: planStatus(plan, now).say };
+    }
+  }
   if (!fact) return { week: null, pace: null };
   if (!fact.readable) {
     const why = fact.why ?? "";
