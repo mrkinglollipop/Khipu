@@ -477,13 +477,12 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
     Only the owner's write (the app, or a typed yes) or a conversation's at
     his request (``request``: kept with the value it replaced until he
     answers it) reaches here; the owner's own write ends such a request."""
-    from khipu.config import _load_config_for_mutation, config_write_lock, save_config
+    from khipu.config import config_file, mutate_config
 
     if key not in SETTINGS:
         raise KeyError(f"unknown routing setting {key!r}")
     kind = SETTINGS[key][0]
-    with _lock(), config_write_lock():
-        data = _load_config_for_mutation()
+    with _lock(), mutate_config() as data:
         requests = _setting_requests(data)
         if request is not None and key in requests:
             raise SettingError(f"a conversation's change to {key} is still waiting for the owner; he confirms or "
@@ -508,18 +507,17 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
             data[SETTINGS_REQUEST_KEY] = requests
         else:
             data.pop(SETTINGS_REQUEST_KEY, None)
-        return save_config(data)
+        return config_file()
 
 
 def answer_setting_request(key: str, action: str) -> Path:
     """The owner's answer to a conversation's change to ``key``: confirm
     keeps it; undo puts back the value it replaced."""
-    from khipu.config import _load_config_for_mutation, config_write_lock, save_config
+    from khipu.config import config_file, mutate_config
 
     if action not in ("confirm", "undo"):
         raise SettingError("answer confirm or undo", "bad_answer")
-    with _lock(), config_write_lock():
-        data = _load_config_for_mutation()
+    with _lock(), mutate_config() as data:
         requests = _setting_requests(data)
         waiting = requests.pop(key, None)
         if waiting is None:
@@ -533,7 +531,7 @@ def answer_setting_request(key: str, action: str) -> Path:
             data[SETTINGS_REQUEST_KEY] = requests
         else:
             data.pop(SETTINGS_REQUEST_KEY, None)
-        return save_config(data)
+        return config_file()
 
 
 # ---- time and text -------------------------------------------------------------
@@ -979,8 +977,13 @@ def resolve_account(name: str, known: list[dict] | None = None, *, conversation:
             raise RouteError(f"Khipu doesn't know that login folder; a conversation can report only on the "
                              f"accounts Khipu knows: {labels}")
         return key
+    # An id first: no name can be one in other letters, but a list edited by
+    # hand may hold such a name, and the id must still reach its account.
     for account in known:
-        if account["label"].casefold() == raw.casefold() or raw == account_id(account["key"]):
+        if raw.casefold() == account_id(account["key"]):
+            return account["key"]
+    for account in known:
+        if account["label"].casefold() == raw.casefold():
             return account["key"]
     low = raw.lower()
     if low in usage.HARNESSES:
@@ -1008,7 +1011,7 @@ def _resolve_reported(name: str) -> str:
             harness, _, home = raw.partition("|")
             old = usage._key({"harness": harness.strip().lower(), "home": home.strip() or None})
         else:
-            old = next((k for k in forward if account_id(k) == raw), None)
+            old = next((k for k in forward if account_id(k) == raw.casefold()), None)
         new = _forwarded(old, forward) if old in forward else None
         if new is None or new not in {a["key"] for a in accounts()}:
             raise
@@ -1742,6 +1745,18 @@ def _owner_tracked(event: dict) -> str | None:
     return None
 
 
+def _before_cut(item: dict, cut: tuple[int, datetime]) -> bool:
+    """Whether lane evidence predates the change that cut its lane. A line of
+    the record goes by its place in it; a runner's own evidence (no place in
+    the record) by its time, and one with no time counts as before: what a
+    lane said while two accounts shared its label stays unmatched."""
+    seq = item.get("seq", -1)
+    if isinstance(seq, int) and seq >= 0:
+        return seq < cut[0]
+    at = item.get("at")
+    return not isinstance(at, datetime) or at <= cut[1]
+
+
 def _forward_walk(events: list[dict], known_keys: set[str] | None = None) -> tuple[dict[str, str], list[dict]]:
     """(``forwarding``'s map, ``events`` with each key forwarded as of when
     it was written). A key's records forward to where its login folder moved
@@ -1768,14 +1783,18 @@ def _forward_walk(events: list[dict], known_keys: set[str] | None = None) -> tup
         tagged.append((event, {k: era.get(k, 0) for k in keys}))
     ended = {(k, era.get(k, 0)) for k in (known_keys or ())}
 
-    def resolve(key: str, at: int) -> str:
+    def resolve(key: str, at: int, *, stop=frozenset()) -> str:
         seen = set()
-        while (key, at) in moves and (key, at) not in ended and (key, at) not in seen:
+        while (key, at) in moves and (key, at) not in stop and (key, at) not in seen:
             seen.add((key, at))
             key, at = moves[(key, at)]
         return key
 
-    forward = {old: resolve(old, at) for (old, at) in moves if at == era.get(old, 0) and (old, at) not in ended}
+    forward = {old: resolve(old, at, stop=ended) for (old, at) in moves
+               if at == era.get(old, 0) and (old, at) not in ended}
+    # A record written before its key was tracked again still follows the
+    # move made in its own era: it was the moved account's, never the new
+    # tenant's, however the folder came to be tracked again.
     out = []
     for event, eras in tagged:
         mapping = {k: resolve(k, at) for k, at in eras.items()}
@@ -2295,7 +2314,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # priority write hands back to be refused once it moved.
     priority_version = "p0"
     notes: dict[str, dict] = {}
-    lane_cuts: dict[tuple[str, str], int] = {}
+    lane_cuts: dict[tuple[str, str], tuple[int, datetime]] = {}
     seed: dict | None = None
     reset_checks: dict[tuple[str, str, str | None, str | None], dict] = {}
     # The newest written change to each entity (an owner's pause, lift,
@@ -2461,7 +2480,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             # they reported before it stays unmatched, never the one left.
             for pair in event.get("lanes_cut") if isinstance(event.get("lanes_cut"), list) else ():
                 if isinstance(pair, list) and len(pair) == 2 and all(isinstance(x, str) for x in pair):
-                    lane_cuts[(pair[0], pair[1])] = info["seq"]
+                    lane_cuts[(pair[0], pair[1])] = (info["seq"], info["at"])
         elif kind == "seed_import":
             seed = {"at": _iso(info["at"]), "file": event.get("file"), "count": event.get("count")}
     evidence.extend(dict(item, seq=item.get("seq", -1)) for item in extra)
@@ -2471,7 +2490,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     unmatched_raw: list[dict] = []
     for item in evidence:
         cut = lane_cuts.get((item.get("runner") or "", item.get("lane") or ""))
-        before_cut = (cut is not None and not item.get("account") and 0 <= item.get("seq", -1) < cut)
+        before_cut = cut is not None and not item.get("account") and _before_cut(item, cut)
         key = None if before_cut else _evidence_account(item, lane_map, known, forward)
         if not key:
             # A conversation's runner and lane count only as a pair the lane
@@ -4102,6 +4121,13 @@ class PriorityMoved(RouteError):
     code = "version_moved"
 
 
+class PriorityVersionNeeded(RouteError):
+    """An owner's priority set or clear from the CLI without the version it
+    read: refused, so a save made on a stale read never lands."""
+
+    code = "version_needed"
+
+
 def priority_version(now: datetime | None = None) -> str:
     return read_view(now).get("priority_version") or "p0"
 
@@ -5298,7 +5324,7 @@ def _account_for_a_conversation(name, known: list[dict]) -> str:
 
     raw = str(name or "").strip()
     for account in known:
-        if raw == account_id(account["key"]) or account["label"].casefold() == raw.casefold():
+        if raw.casefold() == account_id(account["key"]) or account["label"].casefold() == raw.casefold():
             return account["key"]
     low = raw.lower()
     if low in usage.HARNESSES:
@@ -6328,6 +6354,9 @@ def _priority_cli(args, now: datetime) -> int:
         return 2
     now = _now()
     expect = getattr(args, "expect", None)
+    if action in ("set", "clear") and not (expect or "").strip():
+        raise PriorityVersionNeeded("say which version of the priority this change was made on (--expect); "
+                                    "read it again first")
     if action == "set":
         out = set_priority(_priority_entries_arg(args), until=args.until, via=via, now=now, expect=expect)
     elif action == "confirm":

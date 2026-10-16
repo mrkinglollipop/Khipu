@@ -115,7 +115,7 @@ class ModelsTest(unittest.TestCase):
     def test_corrupt_models_key_show_defaults_with_error_set_refuses(self):
         from khipu import config
 
-        config.save_config({"models": "not-an-object"})
+        config._write_config({"models": "not-an-object"})
         doc = models.show_models()
         self.assertEqual(doc["synth"]["provider"], "gemini")
         self.assertIsNotNone(doc["models_error"])
@@ -135,7 +135,7 @@ class ModelsTest(unittest.TestCase):
     def test_corrupt_store_refuses_valid_three_role_replace(self):
         from khipu import config
 
-        config.save_config({"models": "not-an-object"})
+        config._write_config({"models": "not-an-object"})
         payload = {
             "synth": {
                 "provider": "cloud",

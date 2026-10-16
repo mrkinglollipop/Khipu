@@ -967,8 +967,8 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     Ok(n.to_string())
 }
 
-/// `expect` is the account list's version, kept for `usage_accounts` alone: a
-/// save made on a stale read is refused by the CLI (decision 15).
+/// `expect` is the account list's version, required for `usage_accounts`
+/// alone: a save made on a stale read is refused by the CLI (decision 15).
 fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
     config_set_argv_expect(key, value, None)
 }
@@ -976,9 +976,7 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
 fn config_set_argv_expect(key: &str, value: &str, expect: Option<&str>) -> Result<Vec<String>, String> {
     if key == USAGE_ACCOUNTS_KEY {
         let mut argv = vec!["config".to_string(), "--from-app".to_string()];
-        if let Some(e) = expect {
-            argv.push(format!("--expect={}", checked_expect(e)?));
-        }
+        argv.push(format!("--expect={}", required_expect(expect, "the account list save")?));
         argv.extend(["--set".to_string(), USAGE_ACCOUNTS_KEY.to_string(), checked_usage_accounts(value)?]);
         return Ok(argv);
     }
@@ -1044,9 +1042,7 @@ fn config_unset_argv(key: &str) -> Result<Vec<String>, String> {
 fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<String>, String> {
     if key == USAGE_ACCOUNTS_KEY {
         let mut argv = vec!["config".to_string(), "--from-app".to_string()];
-        if let Some(e) = expect {
-            argv.push(format!("--expect={}", checked_expect(e)?));
-        }
+        argv.push(format!("--expect={}", required_expect(expect, "the account list save")?));
         argv.push(format!("--unset={key}"));
         return Ok(argv);
     }
@@ -1390,8 +1386,10 @@ struct PriorityEntry {
 /// end) into JSON that travels joined to `--entries=`, so no value the
 /// webview sends can become a flag or an argument of its own; their order is
 /// the owner's, kept as sent.
+#[cfg(test)]
 fn route_priority_argv(action: &str, entries: &[PriorityEntry], until: Option<&str>) -> Result<Vec<String>, String> {
-    route_priority_argv_expect(action, entries, until, None)
+    // The shape tests below are about the entries, not the version.
+    route_priority_argv_expect(action, entries, until, Some("p1"))
 }
 
 /// `expect` is the priority's version as the owner read it (`--expect=V`,
@@ -1434,7 +1432,9 @@ fn route_priority_argv_expect(
             argv.push(format!("--until={}", checked_route_until(t)?));
         }
     }
-    if let Some(e) = expect {
+    if matches!(action, "set" | "clear") {
+        argv.push(format!("--expect={}", required_expect(expect, "the priority save")?));
+    } else if let Some(e) = expect {
         argv.push(format!("--expect={}", checked_expect(e)?));
     }
     argv.extend(["--".to_string(), action.to_string()]);
@@ -1449,6 +1449,15 @@ fn checked_expect(raw: &str) -> Result<&str, String> {
         Ok(v)
     } else {
         Err("that is not a version Khipu knows; read the accounts again".to_string())
+    }
+}
+
+/// A save that overwrites the account list or the priority must carry the
+/// version it read, so a stale save can never replace a newer one.
+fn required_expect<'a>(expect: Option<&'a str>, what: &str) -> Result<&'a str, String> {
+    match expect.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => checked_expect(e),
+        None => Err(format!("{what} needs the version it read; reload and try again")),
     }
 }
 
@@ -4311,10 +4320,11 @@ mod settings_command_tests {
 
     #[test]
     fn usage_accounts_are_a_json_list_reprinted() {
-        let argv = config_set_argv(
+        let argv = config_set_argv_expect(
             "usage_accounts",
             r#" [ {"label": " Claude second ", "harness": "Claude", "home": "~/.claude-second"},
                   {"harness": "grok", "home": null, "label": ""} ] "#,
+            Some("v3a"),
         )
         .unwrap();
         assert_eq!(
@@ -4322,12 +4332,13 @@ mod settings_command_tests {
             v(&[
                 "config",
                 "--from-app",
+                "--expect=v3a",
                 "--set",
                 "usage_accounts",
                 r#"[{"harness":"claude","home":"~/.claude-second","label":"Claude second"},{"harness":"grok"}]"#,
             ])
         );
-        assert_eq!(config_set_argv("usage_accounts", "[]").unwrap(), v(&["config", "--from-app", "--set", "usage_accounts", "[]"]));
+        assert_eq!(config_set_argv_expect("usage_accounts", "[]", Some("v3a")).unwrap(), v(&["config", "--from-app", "--expect=v3a", "--set", "usage_accounts", "[]"]));
         let many = format!("[{}]", vec![r#"{"harness":"claude"}"#; 33].join(","));
         let long_label = format!(r#"[{{"harness":"claude","label":"{}"}}]"#, "x".repeat(65));
         for bad in [
@@ -4345,9 +4356,8 @@ mod settings_command_tests {
             many.as_str(),
             long_label.as_str(),
         ] {
-            assert!(config_set_argv("usage_accounts", bad).is_err(), "accepted {bad:?}");
+            assert!(config_set_argv_expect("usage_accounts", bad, Some("v3a")).is_err(), "accepted {bad:?}");
         }
-        assert_eq!(config_unset_argv("usage_accounts").unwrap(), v(&["config", "--from-app", "--unset=usage_accounts"]));
         assert_eq!(
             config_set_argv_expect("usage_accounts", "[]", Some("v3a")).unwrap(),
             v(&["config", "--from-app", "--expect=v3a", "--set", "usage_accounts", "[]"])
@@ -4362,6 +4372,11 @@ mod settings_command_tests {
         }
         // Other keys take no version.
         assert!(config_set_argv_expect("capture_mode", "hub", Some("v1")).is_err());
+        for missing in [None, Some(""), Some("  ")] {
+            let set = config_set_argv_expect("usage_accounts", "[]", missing).unwrap_err();
+            assert!(set.contains("needs the version it read"), "{set}");
+            assert!(config_unset_argv_expect("usage_accounts", missing).is_err(), "{missing:?}");
+        }
         assert!(config_unset_argv_expect("memory_root", Some("v1")).is_err());
     }
 
@@ -5039,7 +5054,8 @@ mod priority_and_sign_in_tests {
         let argv = route_priority_argv("set", &entries, Some("2026-10-20T09:00:00Z")).unwrap();
         assert_eq!(argv[..3], v(&["route", "priority", "--from-app"])[..]);
         assert_eq!(argv[argv.len() - 2..], v(&["--", "set"])[..]);
-        assert_eq!(argv.len(), 7);
+        assert_eq!(argv.len(), 8);
+        assert_eq!(argv[5], "--expect=p1");
         let json = argv[3].strip_prefix("--entries=").unwrap();
         let parsed: Value = serde_json::from_str(json).unwrap();
         let order: Vec<&str> = parsed.as_array().unwrap().iter().map(|e| e["account"].as_str().unwrap()).collect();
@@ -5061,10 +5077,12 @@ mod priority_and_sign_in_tests {
         let many: Vec<PriorityEntry> = (0..65).map(|_| entry("Codex", None, None)).collect();
         assert!(route_priority_argv("set", &many, None).is_err());
         // Confirm, undo and clear carry nothing but their verb, whatever is sent.
-        for action in ["confirm", "undo", "clear"] {
-            let argv = route_priority_argv(action, &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z")).unwrap();
+        for action in ["confirm", "undo"] {
+            let argv = route_priority_argv_expect(action, &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), None).unwrap();
             assert_eq!(argv, v(&["route", "priority", "--from-app", "--", action]));
         }
+        let clear = route_priority_argv_expect("clear", &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), Some("p1")).unwrap();
+        assert_eq!(clear, v(&["route", "priority", "--from-app", "--expect=p1", "--", "clear"]));
     }
 
     #[test]
@@ -5076,6 +5094,20 @@ mod priority_and_sign_in_tests {
         for bad in ["", "--x", "p 1", "p=1", "p\n1", "p|1"] {
             assert!(route_priority_argv_expect("clear", &[], None, Some(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_priority_set_or_clear_without_its_version_is_refused() {
+        for missing in [None, Some(""), Some("  ")] {
+            let clear = route_priority_argv_expect("clear", &[], None, missing).unwrap_err();
+            assert!(clear.contains("needs the version it read"), "{clear}");
+            assert!(route_priority_argv_expect("set", &[entry("Codex", None, None)], None, missing).is_err());
+        }
+        // Confirm and undo answer a pending priority and take no version.
+        assert_eq!(
+            route_priority_argv_expect("confirm", &[], None, None).unwrap(),
+            v(&["route", "priority", "--from-app", "--", "confirm"])
+        );
     }
 
     fn acct(harness: &str, home: Option<&str>, label: Option<&str>) -> AccountEntry {

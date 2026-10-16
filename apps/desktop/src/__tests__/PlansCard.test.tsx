@@ -141,7 +141,7 @@ beforeEach(() => {
   refuse = null;
   configShow = {
     usage_accounts: {
-      value: null, source: "default",
+      value: null, source: "default", version: "av1",
       accounts: [
         { label: "Claude", harness: "claude", home: null },
         { label: "Codex", harness: "codex", home: null },
@@ -598,6 +598,7 @@ describe("PlansSettingsCard", () => {
             { label: "Codex", harness: "codex" },
             { label: "Claude second", harness: "claude", home: "~/.claude-second" },
           ]),
+          expect: "av1",
         },
       ]),
     );
@@ -607,6 +608,7 @@ describe("PlansSettingsCard", () => {
       usage_accounts: {
         value: [{ label: "Claude", harness: "claude" }, { label: "Odd", harness: "gemini" }],
         source: "file",
+        version: "av2",
         accounts: [
           { label: "Claude", harness: "claude", home: null },
           { label: "Odd", harness: "gemini", home: null, invalid: 'Khipu does not read the CLI "gemini"' },
@@ -624,7 +626,7 @@ describe("PlansSettingsCard", () => {
     calls.length = 0;
     fireEvent.click(screen.getByRole("button", { name: "Remove Claude" }));
     // Nothing valid is left, so the list goes back to the default.
-    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "usage_accounts" }]));
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "usage_accounts", expect: "av2" }]));
 
     refuse = { error: "usage_accounts holds at most 32 entries, got 33", code: "too_many", index: null, field: null };
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -671,6 +673,7 @@ describe("adding an account", () => {
             { label: "Codex", harness: "codex" },
             { label: "Codex (~/.codex-work)", harness: "codex", home: "~/.codex-work" },
           ]),
+          expect: "av1",
         },
       ]),
     );
@@ -739,7 +742,7 @@ describe("a refused account list, in plain words (fix round 3)", () => {
     spy = vi.spyOn(console, "error").mockImplementation(() => {});
     configShow = {
       usage_accounts: {
-        value: null, source: "default", user_home: "/Users/me",
+        value: null, source: "default", user_home: "/Users/me", version: "av3",
         accounts: [
           { label: "Claude", harness: "claude", home: null },
           { label: "Codex", harness: "codex", home: null },

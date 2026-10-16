@@ -8,7 +8,7 @@ and 11 (the agents' view). Every write here is the owner's: the CLI
 syncs through the hub.
 
 The account list is ``usage_accounts`` in config.json. Each write holds
-``config.config_write_lock`` from its read to its save and is refused when
+``config.mutate_config`` (the one config write path) from its read to its save and is refused when
 the version the caller read (``--expect``, ``config.accounts_version``) has
 moved. Account keys (``usage._key``: the CLI and the login folder) never
 change on rename (decision 7); a default login stays home-less (decision 6),
@@ -192,8 +192,7 @@ def _locked(expect):
     caller saves it. The routing lock is held around it (taken first), so
     the list's change and the record's lines about it fold as one version:
     no fold in between shows the account half changed."""
-    with routing._lock(), config.config_write_lock():
-        data = config._load_config_for_mutation()
+    with routing._lock(), config.mutate_config() as data:
         config.check_accounts_version(data, expect)
         yield data
 
@@ -622,8 +621,7 @@ def move(key, folder, *, expect=None, via: str = "app") -> dict:
 
 
 def set_auto_track(on: bool) -> dict:
-    with config.config_write_lock():
-        data = config._load_config_for_mutation()
+    with config.mutate_config() as data:
         if on:
             data[config.AUTO_TRACK_KEY] = True
         else:
@@ -655,8 +653,7 @@ def auto_track(found: dict) -> list[dict]:
 def answer_request(action: str) -> dict:
     """The owner's answer to a conversation's change to the list (decision
     15): confirm keeps it; undo puts back the list it replaced."""
-    with config.config_write_lock():
-        data = config._load_config_for_mutation()
+    with config.mutate_config() as data:
         request = data.get("usage_accounts_request")
         if not isinstance(request, dict):
             raise AccountsError("no conversation's change to the account list is waiting", "no_request")

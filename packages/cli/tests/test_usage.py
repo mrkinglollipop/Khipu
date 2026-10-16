@@ -971,9 +971,11 @@ def _config_cli(argv, capsys):
     """``khipu config`` as the app runs it: a write to usage_accounts is the
     owner's (decision 15), so it carries ``--from-app`` and each test that
     makes one takes the ``khipu_app`` fixture (the app as its caller)."""
+    from khipu import config
     from khipu.cli import main
 
-    owner = ["--from-app"] if "usage_accounts" in argv else []
+    # It also carries the version of the list it read (required).
+    owner = ["--from-app", f"--expect={config.accounts_version()}"] if "usage_accounts" in argv else []
     rc = main(["config", *owner, *argv])
     return rc, json.loads(capsys.readouterr().out)
 

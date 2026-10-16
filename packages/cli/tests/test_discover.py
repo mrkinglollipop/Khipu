@@ -1309,10 +1309,9 @@ def test_a_relative_cli_path_in_a_hand_edited_config_is_never_honoured(tmp_path,
         planted = work / "rel" / name
         planted.write_text("#!/bin/sh\nexit 0\n")
         planted.chmod(0o755)
-    data = config.load_config()
-    data["cli_path.codex"] = "rel/codex"
-    data["node_folder"] = "rel"
-    config.save_config(data)
+    with config.mutate_config() as data:
+        data["cli_path.codex"] = "rel/codex"
+        data["node_folder"] = "rel"
     monkeypatch.chdir(work)
     assert config.cli_setting("cli_path.codex") is None
     assert config.cli_setting("node_folder") is None

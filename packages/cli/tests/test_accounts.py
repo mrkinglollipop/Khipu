@@ -434,11 +434,11 @@ def test_a_conversation_at_the_owners_request_and_its_undo(mac, capsys):
     _set(usage_accounts=[{"label": "Codex", "harness": "codex"}])
     mac["callers"].as_shell("/usr/local/bin/claude")
     value = json.dumps([{"label": "Codex", "harness": "codex"}, {"label": "Claude", "harness": "claude"}])
-    rc, out = _cli(["config", "--at-owner-request=add my Claude login", "--set", "usage_accounts", value], capsys)
+    rc, out = _cli(["config", "--at-owner-request=add my Claude login", f"--expect={_version()}", "--set", "usage_accounts", value], capsys)
     assert rc == 0 and len(_stored()) == 2
     request = accounts.status()["request"]
     assert request["request"] == "add my Claude login" and request["by"]["kind"] == "conversation"
-    rc, out = _cli(["config", "--at-owner-request=again", "--set", "usage_accounts", "[]"], capsys)
+    rc, out = _cli(["config", "--at-owner-request=again", f"--expect={_version()}", "--set", "usage_accounts", "[]"], capsys)
     assert rc == 2 and out["code"] == "request_waiting" and len(_stored()) == 2
     rc, out = _cli(["accounts", "request", "undo", "--from-app"], capsys)
     assert rc == 2 and out["code"] == "owner_only"
@@ -570,7 +570,7 @@ def test_b1_automatic_tracking_leaves_a_conversations_request_waiting(mac, capsy
     _set(usage_accounts=[{"label": "Codex", "harness": "codex"}], usage_auto_track=True)
     mac["callers"].as_shell("/usr/local/bin/claude")
     value = json.dumps([{"label": "Codex", "harness": "codex"}, {"label": "Claude", "harness": "claude"}])
-    rc, _out = _cli(["config", "--at-owner-request=add my Claude login", "--set", "usage_accounts", value], capsys)
+    rc, _out = _cli(["config", "--at-owner-request=add my Claude login", f"--expect={_version()}", "--set", "usage_accounts", value], capsys)
     assert rc == 0 and accounts.status()["request"] is not None
     _found(monkeypatch)
     rc, out = _cli(["usage", "--discover", "--json"], capsys)
@@ -721,3 +721,178 @@ def test_the_apps_own_save_is_one_step_and_ends_a_waiting_request(mac, capsys):
     assert config.load_config()["routing_lane_map"] == {"jobs": {"r": "claude|"}}
     rc, out = _cli(["config", "--from-app", "--unset", "routing_lane_map"], capsys)
     assert rc == 0 and "routing_lane_map" not in config.load_config()
+
+
+# ---- review round 2: one config write path, required versions, ids ignore case -----------
+
+
+def test_retracking_a_moved_folder_by_config_keeps_the_moved_accounts_records(mac, capsys):
+    old, new = _key("~/.claude-client"), _key("~/.claude-office")
+    (mac["home"] / ".claude-office").mkdir()
+    _set(usage_accounts=[{"label": "Client", "harness": "claude", "home": "~/.claude-client"},
+                         {"label": "Codex", "harness": "codex"}])
+    routing.report(state="limited", account=old, until="2h", author=ME)
+    hold = routing.add_hold("For client", reason="keep", scope="account", account=old, owner=True, via="app")["id"]
+    accounts.move(old, "~/.claude-office", expect=_version())
+    assert _entry(routing.read_view(), new)["state"] == "limited"
+    rows = config.load_config()["usage_accounts"]
+    rows.append({"label": "New tenant", "harness": "claude", "home": "~/.claude-client"})
+    rc, out = _cli(["config", "--from-app", f"--expect={_version()}", "--set", "usage_accounts", json.dumps(rows)],
+                   capsys)
+    assert rc == 0, out
+    view = routing.read_view()
+    owner = next(h for h in view["holds"] if h["id"] == hold)["scope"]["account"]
+    assert (_entry(view, new)["state"], _entry(view, old)["state"], owner) == ("limited", "unknown", new)
+
+
+def test_an_account_id_in_other_letters_is_not_a_name(mac, capsys):
+    _set(usage_accounts=[{"label": "First", "harness": "claude"}, {"label": "Second", "harness": "codex"}])
+    ident = routing.account_id("codex|")
+    rc, out = _cli(["accounts", "rename", "--from-app", f"--expect={_version()}", "--account=claude|",
+                    f"--name={ident.upper()}"], capsys)
+    assert rc == 2 and out["code"] == "name_is_id", out
+    rows = [{"label": "First", "harness": "claude"}, {"label": "codex|".upper(), "harness": "codex"}]
+    rc, out = _cli(["config", "--from-app", f"--expect={_version()}", "--set", "usage_accounts", json.dumps(rows)],
+                   capsys)
+    assert rc == 2, out
+
+
+def test_names_compare_ignoring_case(mac, capsys):
+    _set(usage_accounts=[{"label": "First", "harness": "claude"}, {"label": "Second", "harness": "codex"}])
+    rc, out = _cli(["accounts", "rename", "--from-app", f"--expect={_version()}", "--account=claude|",
+                    "--name=SECOND"], capsys)
+    assert rc == 2 and out["code"] == "name_taken", out
+
+
+@pytest.mark.parametrize("argv", [["config", "--from-app", "--set", "usage_accounts", "[]"],
+                                  ["config", "--from-app", "--unset", "usage_accounts"]])
+def test_an_account_list_save_without_its_version_is_refused(mac, capsys, argv):
+    _set(usage_accounts=[{"label": "First", "harness": "claude"}, {"label": "Second", "harness": "codex"}])
+    rc, out = _cli(argv, capsys)
+    assert rc == 2 and out["code"] == "version_needed", out
+    assert len(_stored()) == 2
+
+
+def test_a_stale_account_list_save_is_refused(mac, capsys):
+    _set(usage_accounts=[{"label": "First", "harness": "claude"}, {"label": "Second", "harness": "codex"}])
+    seen, stale = _version(), config.load_config()["usage_accounts"]
+    accounts.rename("claude|", "Updated first", expect=seen)
+    stale[1]["label"] = "Updated second"
+    rc, out = _cli(["config", "--from-app", f"--expect={seen}", "--set", "usage_accounts", json.dumps(stale)], capsys)
+    assert rc == 2 and out["code"] == "version_moved", out
+    assert _stored()[0]["label"] == "Updated first"
+
+
+@pytest.mark.parametrize("tail", [["set", "First", "Second"], ["clear"]])
+def test_a_priority_save_without_its_version_is_refused(mac, capsys, tail):
+    _set(usage_accounts=[{"label": "First", "harness": "claude"}, {"label": "Second", "harness": "codex"}])
+    routing.set_priority([{"account": "codex|"}, {"account": "claude|"}], via="app",
+                         expect=routing.priority_version())
+    rc, out = _cli(["route", "priority", "--from-app", "--", *tail], capsys)
+    assert rc == 2 and out["code"] == "version_needed", out
+    assert [e["account"] for e in routing.read_view()["priority"]["entries"]][:1] == ["codex|"]
+
+
+def test_ambiguous_runner_evidence_stays_unmatched_after_a_rename(mac, monkeypatch):
+    _set(usage_accounts=[{"label": "Same", "harness": "claude"},
+                         {"label": "Same", "harness": "claude", "home": "~/.claude-client"}],
+         routing_lane_map={"jobs": {"r": "Same"}})
+    # The runner adapter's evidence shape: no sequence in the events log.
+    extra = {"id": "runner-limit", "runner": "jobs", "lane": "r", "account": None, "state": "limited",
+             "until": T0 + timedelta(hours=2), "basis": "cli", "scope": "all", "window": None, "source": "runner",
+             "written_by": {"kind": "runner"}, "at": T0 - timedelta(minutes=1), "message_time": True}
+    monkeypatch.setattr(routing, "_sources", lambda *a, **k: ([dict(extra)], {}, {}))
+    assert all(a["state"] != "limited" for a in routing.read_view()["accounts"])
+    accounts.rename("claude|", "Renamed", expect=_version())
+    assert all(a["state"] != "limited" for a in routing.read_view()["accounts"])
+
+
+def test_a_real_runners_old_ambiguous_limit_stays_unmatched_after_a_rename(mac, tmp_path):
+    runner = tmp_path / "runner"
+    (runner / "state").mkdir(parents=True)
+    (runner / "config.json").write_text(json.dumps({"lanes": {"r": {"kind": "claude", "model": "opus"}}}))
+    until = T0 + timedelta(hours=2)
+    (runner / "state/global.json").write_text(json.dumps({"limited": {"r": {"until": until.timestamp()}}}))
+    (runner / "state/heartbeat.json").write_text(json.dumps({"pid": 1, "time": T0.timestamp(), "interval": 20}))
+    (runner / "events.log").write_text(f"{routing._iso(T0 - timedelta(minutes=1))} pipe-1 LIMITED lane=r "
+                                       f"until={routing._iso(until)} job=fake (account limit reached)\n")
+    _set(usage_accounts=[{"label": "Same", "harness": "claude"},
+                         {"label": "Same", "harness": "claude", "home": "~/.claude-client"}],
+         routing_sources=[{"name": "jobs", "kind": "lanes", "path": str(runner)}],
+         routing_lane_map={"jobs": {"r": "Same"}})
+    before = routing.read_view()
+    assert before["unmatched"], before["sources"]
+    assert all(a["state"] != "limited" for a in before["accounts"])
+    accounts.rename("claude|", "Renamed", expect=_version())
+    after = routing.read_view()
+    assert all(a["state"] != "limited" for a in after["accounts"]), [(a["label"], a["state"]) for a in after["accounts"]]
+
+
+def _race(writers) -> list[str]:
+    barrier = threading.Barrier(len(writers))
+    results: list[str] = []
+
+    def run(fn):
+        barrier.wait(3)
+        try:
+            fn()
+            results.append("saved")
+        except (usage.AccountsError, routing.PriorityMoved) as err:
+            results.append(err.code)
+
+    threads = [threading.Thread(target=run, args=(fn,), daemon=True) for fn in writers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert all(not t.is_alive() for t in threads)
+    return sorted(results)
+
+
+def test_two_account_saves_on_one_version_one_wins(mac):
+    _set(usage_accounts=[{"label": "First", "harness": "claude"}, {"label": "Second", "harness": "codex"}])
+    seen = _version()
+    assert _race([lambda: accounts.rename("claude|", "One", expect=seen),
+                  lambda: accounts.rename("codex|", "Two", expect=seen)]) == ["saved", "version_moved"]
+
+
+def test_two_priority_saves_on_one_version_one_wins(mac):
+    _set(usage_accounts=[{"label": "First", "harness": "claude"}, {"label": "Second", "harness": "codex"}])
+    seen = routing.priority_version()
+    assert _race([lambda: routing.set_priority([{"account": "claude|"}], via="app", expect=seen),
+                  lambda: routing.set_priority([{"account": "codex|"}], via="app", expect=seen)]) == \
+        ["saved", "version_moved"]
+
+
+def test_another_settings_save_cannot_undo_an_account_save(mac, monkeypatch):
+    _set(usage_accounts=[{"label": "First", "harness": "claude"}, {"label": "Second", "harness": "codex"}])
+    loaded, resume, errors = threading.Event(), threading.Event(), []
+    original = config._load_config_for_mutation
+
+    def paused_load():
+        data = original()
+        if threading.current_thread().name == "capture-save":
+            loaded.set()
+            assert resume.wait(5)
+        return data
+
+    monkeypatch.setattr(config, "_load_config_for_mutation", paused_load)
+
+    def other_setting():
+        try:
+            config.set_capture_mode("hub")
+        except Exception as err:  # noqa: BLE001 - reported below
+            errors.append(str(err))
+
+    worker = threading.Thread(target=other_setting, name="capture-save", daemon=True)
+    worker.start()
+    assert loaded.wait(3)
+    renamer = threading.Thread(target=lambda: accounts.rename("claude|", "Updated", expect=_version()), daemon=True)
+    renamer.start()
+    renamer.join(1)  # done by now unless the other save's lock holds it
+    resume.set()
+    worker.join(5)
+    renamer.join(5)
+    assert not worker.is_alive() and not renamer.is_alive() and not errors, errors
+    stored = config.load_config()
+    assert stored["usage_accounts"][0]["label"] == "Updated" and stored["capture_mode"] == "hub"
