@@ -120,12 +120,31 @@ def test_claude_adapter_sets_the_configured_home(fake, tmp_path):
     assert _child(out)["env_values"]["CLAUDE_CONFIG_DIR"] == str(tmp_path / "second")
 
 
-def test_claude_login_without_rate_limits_is_a_coded_failure_with_a_fixed_note(fake):
+def test_claude_plan_with_limits_but_no_figures_this_time_is_not_a_sign_in_failure(fake):
+    # Signed in, rate_limits_available true, rate_limits null: Claude Code
+    # skipped the figures on this read; signing in again would not help.
     fake("claude", "claude-null.jsonl")
     row = usage.probe_account({"label": "Claude", "harness": "claude", "home": None})
     assert row["ok"] is False
-    assert row["error"] == "no_plan_limits"
-    assert "/login" in row["note"]
+    assert row["error"] == usage.E_NO_FIGURES == "no_plan_figures"
+    assert "/login" not in row["note"] and "sign in" not in row["note"].lower()
+
+
+def _claude_usage_frames(**body) -> list[dict]:
+    return [{"type": "control_response", "response": {"subtype": "success", "request_id": "usage",
+                                                       "response": {"subscription_type": "max", **body}}}]
+
+
+@pytest.mark.parametrize("body, code", [
+    ({"rate_limits_available": True, "rate_limits": None}, "no_plan_figures"),
+    ({"rate_limits_available": False, "rate_limits": None}, "no_plan_limits"),
+    ({"rate_limits": None}, "no_plan_limits"),
+    ({"rate_limits_available": "true", "rate_limits": None}, "no_plan_limits"),
+])
+def test_parse_claude_tells_missing_figures_from_a_login_without_limits(body, code):
+    with pytest.raises(usage.ProbeError) as caught:
+        usage.parse_claude(_claude_usage_frames(**body))
+    assert caught.value.code == code
 
 
 def test_codex_adapter_reads_the_recorded_reply(fake):
@@ -1135,6 +1154,8 @@ def test_no_note_khipu_writes_carries_a_code():
         "again")
     assert usage._note("no_plan_limits", "claude", "~/.claude-t3-second") == (
         "This sign-in reports no plan limits. Open Claude Code with this login folder and sign in again (/login)")
+    assert usage._note("no_plan_figures", "claude", "~/.claude-second") == (
+        "Claude Code did not send its plan figures just now; Khipu keeps the last ones and asks again")
 
 
 def test_every_code_a_probe_can_return_has_a_plain_note():
@@ -1170,6 +1191,16 @@ def test_a_failed_probe_shows_its_own_note_on_the_kept_figures(fake, monkeypatch
     assert row["note"] == usage._note("no_plan_limits", "claude") and "/login" in row["note"]
     saved = json.loads(usage.cache_file().read_text())["rows"]["claude|"]
     assert saved["note"] == usage._note("no_plan_limits", "claude")
+
+
+def test_missing_plan_figures_keep_the_last_figures_with_their_age(fake, monkeypatch):
+    usage._save_cache({"claude|": _cached(_ago(60 * 3), note=None)})
+    failed = dict(_row(ok=False, error="no_plan_figures"), note=usage._note("no_plan_figures", "claude"))
+    monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: [failed])
+    row = usage.report(accounts=[{"label": "Claude", "harness": "claude", "home": None}], fresh=True)["accounts"][0]
+    assert row["ok"] is False and row["error"] == "no_plan_figures"
+    assert row["windows"][0]["used_pct"] == 55 and row["last_good_at"]
+    assert row["note"] == usage._note("no_plan_figures", "claude")
 
 
 def test_a_fallback_note_does_not_outlive_its_good_read(fake, monkeypatch):

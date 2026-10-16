@@ -68,6 +68,9 @@ describe("each account says whether Khipu can read it", () => {
 
   it("offers Sign in again for Claude and Codex, and says where to sign in for Grok and Muse", () => {
     expect(signInOffer(row({}))).toBeNull();
+    expect(signInOffer(row({ ok: false, error: "no_plan_figures", home: "~/.claude-second" }))).toBeNull();
+    expect(liveWords(row({ ok: false, error: "no_plan_figures" })).text).toBe(
+      "Can't be read just now (didn't send its plan figures)");
     expect(signInOffer(row({ ok: false, error: "not_signed_in" }))).toBe("button");
     expect(signInOffer(row({ ok: false, error: "no_plan_limits", home: "~/.claude-second" }))).toBe("button");
     expect(signInOffer(row({ harness: "codex", ok: false, error: "not_signed_in" }))).toBe("button");
