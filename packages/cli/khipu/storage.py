@@ -293,6 +293,13 @@ def sweep() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         out["errors"].append(f"state/synth-usage.jsonl: {describe_os_error(exc)}")
     try:
+        from khipu import hygiene
+
+        out["removed"].extend(hygiene.prune_commitments_backups(
+            keep_days=int(limits["commitments_backup_keep_days"])))
+    except Exception as exc:  # noqa: BLE001
+        out["errors"].append(f"commitments backups: {describe_os_error(exc)}")
+    try:
         from khipu import hub_snapshot
 
         temps = hub_snapshot.sweep_stale_temps()

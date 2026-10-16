@@ -188,3 +188,72 @@ def test_old_usage_lines_are_dropped_and_recent_ones_kept(data_dir, logs):
     assert out["synth_usage_dropped"] == 3
     assert path.read_text().splitlines() == [line(10), line(0)]
     assert extract.synth_usage_today()["calls"] == 1
+
+
+# ---- commitments backups -------------------------------------------------------
+
+
+class _Copy:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def __iter__(self):
+        yield b"PGCOPY\n"
+
+
+class _Cur:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def copy(self, _sql):
+        return _Copy()
+
+
+class _Conn:
+    def cursor(self):
+        return _Cur()
+
+
+def test_a_new_commitments_backup_prunes_ones_older_than_the_setting(data_dir, tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from khipu import hygiene
+
+    root = tmp_path / "backups"
+    root.mkdir()
+    def stamp(days):
+        return "commitments-" + (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y%m%dT%H%M%SZ")
+    old, recent = root / stamp(31), root / stamp(29)
+    for folder in (old, recent):
+        folder.mkdir()
+        (folder / "commitments.bin").write_bytes(b"rows")
+    lookalike = root / (stamp(400) + "-mine")
+    lookalike.mkdir()
+    (root / stamp(400)).with_suffix(".txt").write_text("not a folder")
+
+    dest = hygiene.backup_commitments(_Conn(), dest_root=root)
+
+    assert dest.is_dir() and recent.is_dir() and lookalike.is_dir()
+    assert not old.exists()
+
+
+def test_the_sweep_prunes_commitments_backups_and_zero_keeps_them(data_dir, tmp_path, monkeypatch):
+    from khipu import hygiene, storage
+
+    root = tmp_path / "backups"
+    (root / "commitments-20200101T000000Z").mkdir(parents=True)
+    monkeypatch.setattr(hygiene, "commitments_backup_dir", lambda: root)
+    monkeypatch.setattr(storage, "log_dirs", lambda: [])
+
+    storage.set_setting("commitments_backup_keep_days", 0)
+    assert storage.sweep()["removed"] == []
+    storage.set_setting("commitments_backup_keep_days", None)
+    out = storage.sweep()
+
+    assert "commitments-20200101T000000Z" in out["removed"] and not any(root.iterdir())
