@@ -3387,18 +3387,20 @@ export default function App() {
                 {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
               </Tag>
             </span>
-            <span className="grow owed-text" title={c.text}>
-              {c.text}
+            <span className="grow owed-main">
+              <span className="owed-text" title={c.text}>
+                {c.text}
+              </span>
+              {seen ? (
+                <span
+                  className="meta owed-seen"
+                  title={`Restated by ${c.seen_count} captures`}
+                >
+                  seen {seen}
+                </span>
+              ) : null}
             </span>
             <WaitingToSync pending={c.pending_sync} />
-            {seen ? (
-              <span
-                className="meta owed-seen"
-                title={`Restated by ${c.seen_count} captures`}
-              >
-                seen {seen}
-              </span>
-            ) : null}
             <span className="w128">
               {c.project ? (
                 <Tag
