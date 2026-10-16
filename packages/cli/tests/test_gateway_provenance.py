@@ -780,9 +780,9 @@ class MigrateCallerClaimTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             kit = Path(d) / "kit.bin"
             kit.write_bytes(b"x")
-            args = argparse.Namespace(join_cmd="import", file=str(kit), passphrase="p",
+            args = argparse.Namespace(join_cmd="import", file=str(kit), passphrase=None,
                                       skip_migrate_check=False)
-            with mock.patch("khipu.join.resolve_passphrase", return_value="p"), \
+            with mock.patch("khipu.join.read_passphrase", return_value="p"), \
                  mock.patch("khipu.join.import_kit", return_value={"expected": {}}), \
                  mock.patch("khipu.join.verify_live_counts", return_value={"ok": True}), \
                  mock.patch("khipu.migrate.run", return_value=dict(self.RESULT)) as run, \

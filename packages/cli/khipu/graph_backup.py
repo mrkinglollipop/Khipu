@@ -13,7 +13,20 @@ from pathlib import Path
 
 from khipu.drift import BACKUP_MAX_AGE_HOURS
 
-DEST_REMOTE = "r2:matt-db-backups/khipu-graph"
+
+def _dest_remote_or_none() -> str | None:
+    try:
+        return resolve_dest_remote()
+    except ValueError:
+        return None
+
+
+def resolve_dest_remote() -> str:
+    """Offsite destination from config (``graph_backup_remote``)."""
+    from khipu.config import graph_backup_remote
+
+    return graph_backup_remote()
+
 
 OFFSITE_MAX_AGE_DAYS = 8
 INTEGRITY_TIMEOUT_SECONDS = 60
@@ -260,10 +273,11 @@ def _integrity_check(path: Path, *, timeout: int = INTEGRITY_TIMEOUT_SECONDS) ->
         )
     except subprocess.TimeoutExpired:
         return f"timeout after {timeout}s"
+    except OSError:
+        return "snapshot integrity check failed to start"
     if r.returncode != 0:
-        tail = (r.stderr or r.stdout or "").strip()
-        return f"error: {tail or r.returncode}"
-    return (r.stdout or "").strip() or "unknown"
+        return "snapshot integrity check failed"
+    return "ok" if (r.stdout or "").strip().lower() == "ok" else "snapshot integrity check failed"
 
 
 # PRAGMA integrity_check reads every page of the snapshot: on a 3.8 GB graph it
@@ -371,8 +385,8 @@ def _required_graph_tables(path: Path) -> str | None:
             }
         finally:
             con.close()
-    except sqlite3.Error as exc:
-        return f"schema probe failed: {exc}"
+    except sqlite3.Error:
+        return "schema probe failed"
     missing = sorted({"nodes", "edges"} - found)
     return f"missing required graph table(s): {', '.join(missing)}" if missing else None
 
@@ -419,15 +433,15 @@ def record_local(*, snapshot: Path | None = None) -> dict:
         _remember_integrity_ok(snap, _utcnow(), before)
     try:
         nbytes = snap.stat().st_size
-    except OSError as exc:
-        return {"ok": False, "reason": f"stat failed: {exc}"}
+    except OSError:
+        return {"ok": False, "reason": "snapshot stat failed"}
 
     try:
         embeddings = _count_embeddings(snap)
-    except sqlite3.Error as exc:
+    except sqlite3.Error:
         embeddings = -1
         ok = False
-        integrity = f"embeddings probe failed: {exc}"
+        integrity = "embeddings probe failed"
 
     detail = {
         "path": str(snap),
@@ -439,8 +453,8 @@ def record_local(*, snapshot: Path | None = None) -> dict:
 
     try:
         ev = ops_events.record("graph_snapshot", "ok" if ok else "fail", detail)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"ops_events insert failed: {exc}", **detail}
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "reason": "ops_events insert failed", **detail}
 
     out = {"ok": ok, "event": ev, **detail}
     if ok and _resolve_producer(None):
@@ -453,10 +467,18 @@ def record_local(*, snapshot: Path | None = None) -> dict:
 
 def run_offsite(
     *,
-    dest_remote: str = DEST_REMOTE,
+    dest_remote: str | None = None,
     keep: int = 3,
     rclone_bin: str = "rclone",
 ) -> dict:
+    from khipu.config import check_graph_backup_remote
+
+    try:
+        dest_remote = (
+            check_graph_backup_remote(dest_remote) if dest_remote else resolve_dest_remote()
+        )
+    except ValueError:
+        return {"ok": False, "reason": "offsite destination must be a named rclone remote"}
     resolved = resolve_rclone(rclone_bin)
     if resolved is None:
         return {
@@ -482,8 +504,8 @@ def run_offsite(
     try:
         if snap.stat().st_size <= 0:
             return {"ok": False, "reason": "latest snapshot is empty", "path": str(snap)}
-    except OSError as exc:
-        return {"ok": False, "reason": f"snapshot stat failed: {exc}", "path": str(snap)}
+    except OSError:
+        return {"ok": False, "reason": "snapshot stat failed", "path": str(snap)}
     integrity = _integrity_check(snap)
     if integrity.lower() != "ok":
         return {
@@ -504,62 +526,51 @@ def run_offsite(
         return {"ok": False, "reason": "refusing to upload live graph.sqlite"}
 
     dest = f"{dest_remote.rstrip('/')}/{snap.name}"
-    argv = [rclone_bin, "copyto", str(snap), dest]
+    argv = [rclone_bin, "copyto", "--", str(snap), dest]
     if str(live) in argv:
         return {"ok": False, "reason": "live graph path must not appear in rclone argv"}
 
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=3600)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        detail = {"path": str(snap), "dest": dest, "error": str(exc)}
+    except (OSError, subprocess.TimeoutExpired):
+        detail = {"path": str(snap), "dest": dest, "error": "offsite copy failed to run"}
         try:
             from khipu import ops_events
 
             ops_events.record("graph_snapshot_offsite", "fail", detail)
-        except Exception as rec_exc:  # noqa: BLE001
-            detail["ops_error"] = str(rec_exc)
-        return {"ok": False, "reason": str(exc), **detail}
+        except Exception:  # noqa: BLE001
+            detail["ops_error"] = "offsite ops_events insert failed"
+        return {"ok": False, "reason": "offsite copy failed to run", **detail}
 
     if r.returncode != 0:
         detail = {
             "path": str(snap),
             "dest": dest,
-            "stderr": (r.stderr or "")[-500:],
+            "reason": "offsite copy failed",
             "returncode": r.returncode,
         }
         try:
             from khipu import ops_events
 
             ops_events.record("graph_snapshot_offsite", "fail", detail)
-        except Exception as rec_exc:  # noqa: BLE001
-            detail["ops_error"] = str(rec_exc)
+        except Exception:  # noqa: BLE001
+            detail["ops_error"] = "offsite ops_events insert failed"
         return {"ok": False, **detail}
 
     pruned: list[str] = []
+    detail = {"path": str(snap), "dest": dest}
     try:
         pruned = _prune_remote_snapshots(dest_remote, keep=keep, rclone_bin=rclone_bin)
-    except Exception as exc:  # noqa: BLE001 — copy succeeded; prune is best-effort
-        detail = {
-            "path": str(snap),
-            "dest": dest,
-            "prune_error": str(exc),
-            "pruned": pruned,
-        }
-        from khipu import ops_events
+    except Exception:  # noqa: BLE001 — copy succeeded; prune is best-effort
+        detail["prune_error"] = "offsite prune failed"
 
-        ev = ops_events.record("graph_snapshot_offsite", "ok", detail)
-        return {
-            "ok": True,
-            "event": ev,
-            "pruned": pruned,
-            "prune_error": str(exc),
-            **detail,
-        }
-
-    detail = {"path": str(snap), "dest": dest, "pruned": pruned}
+    detail["pruned"] = pruned
     from khipu import ops_events
 
-    ev = ops_events.record("graph_snapshot_offsite", "ok", detail)
+    try:
+        ev = ops_events.record("graph_snapshot_offsite", "ok", detail)
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "ops_error": "offsite ops_events insert failed", **detail}
     return {"ok": True, "event": ev, **detail}
 
 
@@ -568,15 +579,13 @@ def _prune_remote_snapshots(
 ) -> list[str]:
     prefix = f"{dest_remote.rstrip('/')}/"
     r = subprocess.run(
-        [rclone_bin, "lsf", prefix],
+        [rclone_bin, "lsf", "--", prefix],
         capture_output=True,
         text=True,
         timeout=120,
     )
     if r.returncode != 0:
-        raise RuntimeError(
-            (r.stderr or r.stdout or "").strip() or f"lsf rc={r.returncode}"
-        )
+        raise RuntimeError("offsite snapshot listing failed")
 
     names = sorted(
         [
@@ -593,7 +602,7 @@ def _prune_remote_snapshots(
         if live is not None and str(live.resolve()) in target:
             continue
         dr = subprocess.run(
-            [rclone_bin, "deletefile", target],
+            [rclone_bin, "deletefile", "--", target],
             capture_output=True,
             text=True,
             timeout=120,
@@ -613,8 +622,12 @@ def offsite_health(
             "ok": True,
             "skipped": True,
             "reason": "not the graph producer",
-            "dest_remote": DEST_REMOTE,
+            "dest_remote": _dest_remote_or_none(),
         }
+    try:
+        dest = resolve_dest_remote()
+    except ValueError:
+        return {"ok": False, "skipped": False, "reason": "offsite destination must be a named rclone remote", "dest_remote": None}
 
     if not has_r2_remote():
         return {
@@ -622,13 +635,13 @@ def offsite_health(
             "skipped": False,
             "reason": (
                 "rclone remote r2: not configured on this Mac — "
-                f"offsite dest remains {DEST_REMOTE}; supply an r2 remote to enable copy"
+                f"offsite dest remains {dest}; supply an r2 remote to enable copy"
             ),
-            "dest_remote": DEST_REMOTE,
+            "dest_remote": dest,
         }
 
     now = now or _utcnow()
-    ev = _latest_ops_event("graph_snapshot_offsite")
+    ev = _public_history(_latest_ops_event("graph_snapshot_offsite"), "graph_snapshot_offsite")
     if not ev or ev.get("status") != "ok":
         reason = "no successful graph_snapshot_offsite event recorded yet"
         if ev and ev.get("status") != "ok":
@@ -637,7 +650,7 @@ def offsite_health(
             "ok": False,
             "skipped": False,
             "reason": reason,
-            "dest_remote": DEST_REMOTE,
+            "dest_remote": dest,
             "latest": ev,
             "max_age_days": OFFSITE_MAX_AGE_DAYS,
         }
@@ -648,7 +661,7 @@ def offsite_health(
             "ok": False,
             "skipped": False,
             "reason": "graph_snapshot_offsite event has no age",
-            "dest_remote": DEST_REMOTE,
+            "dest_remote": dest,
             "latest": ev,
             "max_age_days": OFFSITE_MAX_AGE_DAYS,
         }
@@ -657,7 +670,7 @@ def offsite_health(
     out = {
         "ok": fresh,
         "skipped": False,
-        "dest_remote": DEST_REMOTE,
+        "dest_remote": dest,
         "latest": {
             "status": ev.get("status"),
             "created_at": ev["created_at"].isoformat()
@@ -692,8 +705,8 @@ def scratch_drill(
     temp = (dest_dir or Path("/tmp")) / f"khipu-graph-drill-{ts}.sqlite"
     try:
         shutil.copy2(snap, temp)
-    except OSError as exc:
-        return {"ok": False, "reason": f"copy failed: {exc}"}
+    except OSError:
+        return {"ok": False, "reason": "restore drill copy failed"}
 
     integrity = _integrity_check(temp)
     ok = integrity.lower() == "ok"
@@ -711,9 +724,9 @@ def scratch_drill(
                 )
         finally:
             con.close()
-    except sqlite3.Error as exc:
+    except sqlite3.Error:
         ok = False
-        integrity = f"query failed: {exc}"
+        integrity = "restore drill query failed"
 
     detail = {
         "source": str(snap),
@@ -727,8 +740,8 @@ def scratch_drill(
 
     try:
         ev = ops_events.record("graph_restore_drill", "ok" if ok else "fail", detail)
-    except Exception as exc:  # noqa: BLE001
-        detail["ops_error"] = str(exc)
+    except Exception:  # noqa: BLE001
+        detail["ops_error"] = "restore drill ops_events insert failed"
         ev = None
         ok = False
 
@@ -743,6 +756,25 @@ def scratch_drill(
     return out
 
 
+def _public_history(event: dict | None, kind: str) -> dict | None:
+    """Historical detail is an untrusted log, not command output."""
+    if event is None:
+        return None
+    status = event.get("status")
+    status = status if status in ("ok", "fail", "skipped") else "unknown"
+    created = event.get("created_at")
+    age = event.get("age_seconds")
+    return {
+        "status": status,
+        "created_at": created.isoformat() if isinstance(created, datetime) else None,
+        "age_seconds": age if isinstance(age, (int, float)) else None,
+        "summary": ("Backup operation failed; full details are stored in the log."
+                    if status == "fail" else
+                    "Backup operation recorded; full details are stored in the log."),
+        "log_location": f"ops_events.detail (kind={kind}, latest event)",
+    }
+
+
 def status_payload() -> dict:
     local = local_health()
     offsite = offsite_health()
@@ -751,10 +783,10 @@ def status_payload() -> dict:
         "local": local,
         "offsite": offsite,
         "latest_snapshot": str(latest_snapshot()) if latest_snapshot() else None,
-        "dest_remote": DEST_REMOTE,
+        "dest_remote": _dest_remote_or_none(),
         "live_graph": str(live) if live is not None else None,
         "has_r2_remote": has_r2_remote(),
-        "last_graph_snapshot": _latest_ops_event("graph_snapshot"),
-        "last_graph_snapshot_offsite": _latest_ops_event("graph_snapshot_offsite"),
-        "last_graph_restore_drill": _latest_ops_event("graph_restore_drill"),
+        "last_graph_snapshot": _public_history(_latest_ops_event("graph_snapshot"), "graph_snapshot"),
+        "last_graph_snapshot_offsite": _public_history(_latest_ops_event("graph_snapshot_offsite"), "graph_snapshot_offsite"),
+        "last_graph_restore_drill": _public_history(_latest_ops_event("graph_restore_drill"), "graph_restore_drill"),
     }

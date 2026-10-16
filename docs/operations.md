@@ -161,14 +161,14 @@ For the Mac that builds the graph (the producer). Other Macs report these checks
 ```bash
 khipu graph-backup status
 khipu graph-backup record-local   # record a local snapshot
-khipu graph-backup offsite        # rclone copy of the latest snapshot to an r2: remote
+khipu graph-backup offsite        # rclone copy of the latest snapshot to graph_backup_remote
 khipu graph-backup drill          # restore into scratch; never touches the live graph
 ```
 
 - `graph_backup_ok` is red when the latest local snapshot is missing, empty or older than 36 hours.
 - `graph_offsite_ok` is red when no `r2:` rclone remote is configured, no successful offsite copy is recorded, or the last copy is more than 8 days old. The graph job runs the offsite copy when it is due (every 7 days), and recording a local snapshot on the producer starts a drill when the last good one is more than 8 days old.
 
-You need `rclone` installed and a remote named `r2` for the offsite part.
+You need `rclone` installed and a remote named `r2` for the offsite part. The copy goes to the `graph_backup_remote` setting, an rclone `remote:path` (default `r2:khipu-backups/khipu-graph`). It must name a remote: a local path or a value starting with a dash is refused wherever it is set, and the offsite check reports it. Set it in Settings, Data & backups, or with `khipu config --set graph_backup_remote r2:bucket/folder`; the environment variable `KHIPU_GRAPH_BACKUP_REMOTE` overrides both.
 
 ## Snapshots, the offline copy
 
@@ -216,19 +216,19 @@ A second Mac uses the same database. You give it a join kit.
 
 On the working Mac:
 
-- App: Settings, Another Mac, "Set up another Mac", then "Save join kit…". It is disabled if the database lives only on this Mac (this-mac or local Docker), because another Mac could not reach it.
-- CLI: `khipu join export --out FILE.khipujoin [--passphrase ...]`.
+- App: Settings, Another Mac, "Set up another Mac", type a passphrase, then "Save join kit…". Save and "Advertise nearby (PIN)" stay disabled until a passphrase is typed or "I understand: make it unencrypted" is ticked. Both are disabled if the database lives only on this Mac (this-mac or local Docker), because another Mac could not reach it.
+- CLI: `khipu join export --out FILE.khipujoin`, with the passphrase from `KHIPU_JOIN_PASSPHRASE`, `--passphrase-stdin`, `--passphrase-fd N` or the terminal prompt. A literal `--passphrase VALUE` is refused because other processes can read it. Without a passphrase it refuses unless `--allow-unencrypted` is passed.
 
 On the new Mac:
 
 - App: Welcome, Database, "Join a Khipu I already have", then "Import join kit file…". "Find nearby Mac" uses the PIN path.
-- CLI: `khipu join import --file FILE.khipujoin [--passphrase ...]`.
+- CLI: `khipu join import --file FILE.khipujoin`, with the passphrase supplied the same way when the kit is encrypted.
 
-Nearby pairing without a file: on the working Mac `khipu join advertise [--pin ...]` (Bonjour on the local network, TLS, 10 minutes by default); on the new Mac `khipu join receive --pin PIN`.
+Nearby pairing without a file: on the working Mac `khipu join advertise [--pin ...]` (same passphrase rule and input as export) (Bonjour on the local network, TLS, 10 minutes by default); on the new Mac `khipu join receive --pin PIN`.
 
 Notes:
 
-- The kit format is `khipu-join-v1`. With a passphrase it is encrypted with AES-GCM (PBKDF2 key, 390,000 iterations). Without one it is plain JSON holding the database address with its password and any configured API keys, readable by anyone who gets the file; Khipu writes it readable by your user only. Use a passphrase and treat the kit as a credential. Encrypting every kit is planned.
+- The kit format is `khipu-join-v1`. It is encrypted with AES-GCM (PBKDF2 key, 390,000 iterations) under the passphrase, which is required by default and never logged, printed or stored. The explicit opt-out (`--allow-unencrypted`, or the app's "I understand: make it unencrypted") writes plain JSON holding the database address with its password and any configured API keys, readable by anyone who gets the file; Khipu writes it readable by your user only. Kits saved unencrypted earlier still import without a passphrase. Treat any kit as a credential.
 - A kit whose database address is `localhost` is refused.
 - Import checks the live row counts. It fails hard only when the kit expects data and the live database shows none.
 - After you move the database (below), every other Mac needs a fresh kit.

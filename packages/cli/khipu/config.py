@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
+
+from khipu.output_guard import secret_result
 
 CAPTURE_MODES = ("legacy", "dual", "hub")
 DEFAULT_CAPTURE_MODE = "dual"
@@ -35,6 +38,7 @@ def config_file() -> Path:
     return data_dir() / CONFIG_NAME
 
 
+@secret_result("config")
 def load_config() -> dict:
     path = config_file()
     if not path.is_file():
@@ -46,6 +50,7 @@ def load_config() -> dict:
         return {}
 
 
+@secret_result("config")
 def _load_config_for_mutation() -> dict:
     """Load an existing document without overwriting malformed bytes."""
     path = config_file()
@@ -335,6 +340,82 @@ def set_choice_setting(key: str, value: "str | None") -> Path:
         if word not in choices:
             raise ValueError(f"{key} must be one of {', '.join(choices)}, got {value!r}")
         data[key] = word
+    return save_config(data)
+
+
+# ---------------------------------------------------------------------------
+# Graph backup destination: the rclone `remote:path` the offsite copy of the
+# graph snapshot goes to. Env KHIPU_GRAPH_BACKUP_REMOTE → config.json →
+# default. The remote must be named `r2` (graph_backup.has_r2_remote).
+# ---------------------------------------------------------------------------
+
+DEFAULT_GRAPH_BACKUP_REMOTE = "r2:khipu-backups/khipu-graph"
+GRAPH_BACKUP_REMOTE_ENV = "KHIPU_GRAPH_BACKUP_REMOTE"
+
+# Same rule as the app's Tauri validator (`checked_backup_remote`): a named
+# rclone remote, then a path. rclone reads anything with a slash before the
+# colon as a local path, and a leading dash as a flag.
+_BACKUP_REMOTE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+
+def check_graph_backup_remote(value: str) -> str:
+    """``value`` trimmed, or ValueError in plain words."""
+    text = (value or "").strip().rstrip("/")
+    remote, sep, path = text.partition(":")
+    ok = (
+        len(text) <= 512
+        and bool(sep)
+        and bool(path)
+        and _BACKUP_REMOTE_NAME.fullmatch(remote) is not None
+        and not any(c.isspace() or not c.isprintable() for c in text)
+    )
+    if not ok:
+        raise ValueError(
+            "graph_backup_remote must be a named rclone remote and folder, such as "
+            "r2:my-bucket/khipu-graph (not a local path, and not starting with a dash)"
+        )
+    return text
+
+
+def _graph_backup_remote_raw() -> tuple[str, str]:
+    env = (os.environ.get(GRAPH_BACKUP_REMOTE_ENV) or "").strip()
+    if env:
+        return env, "env"
+    stored = str(load_config().get("graph_backup_remote", "") or "").strip()
+    if stored:
+        return stored, "config"
+    return DEFAULT_GRAPH_BACKUP_REMOTE, "default"
+
+
+def graph_backup_remote() -> str:
+    """The resolved destination, checked whatever it came from."""
+    raw, source = _graph_backup_remote_raw()
+    try:
+        return check_graph_backup_remote(raw)
+    except ValueError as exc:
+        where = {"env": f"the environment variable {GRAPH_BACKUP_REMOTE_ENV}",
+                 "config": "config.json"}.get(source, "the default")
+        raise ValueError(f"{exc}; the value in {where} does not qualify") from None
+
+
+def graph_backup_remote_status() -> dict:
+    """The destination and where it came from: env, config or default.
+    An invalid value is reported as ``error``, never passed on."""
+    raw, source = _graph_backup_remote_raw()
+    out = {"value": raw, "source": source, "default": DEFAULT_GRAPH_BACKUP_REMOTE}
+    try:
+        out["value"] = graph_backup_remote()
+    except ValueError as exc:
+        out["error"] = str(exc)
+    return out
+
+
+def set_graph_backup_remote(value: "str | None") -> Path:
+    data = _load_config_for_mutation()
+    if not (value or "").strip():
+        data.pop("graph_backup_remote", None)
+    else:
+        data["graph_backup_remote"] = check_graph_backup_remote(str(value))
     return save_config(data)
 
 

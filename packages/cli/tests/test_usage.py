@@ -405,9 +405,10 @@ def test_summary_and_table():
 
 
 def test_mcp_tool_returns_report_and_declines_on_the_gateway(fake, monkeypatch):
-    monkeypatch.setattr(usage, "report", lambda **kw: {"accounts": [], "summary_text": [], "kw": kw})
+    calls = []
+    monkeypatch.setattr(usage, "report", lambda **kw: calls.append(kw) or {"accounts": [], "summary_text": []})
     out = mcp_server.TOOL_FUNCS["khipu_usage"]({"fresh": True, "max_age": 30})
-    assert out["kw"] == {"fresh": True, "max_age": 30.0, "background": True}
+    assert calls == [{"fresh": True, "max_age": 30.0, "background": True}] and out["accounts"] == []
     monkeypatch.setenv(mcp_server.GATEWAY_ACTIVE_ENV, "1")
     out = mcp_server.TOOL_FUNCS["khipu_usage"]({})
     assert out["available"] is False

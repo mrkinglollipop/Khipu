@@ -449,8 +449,10 @@ class Handler(BaseHTTPRequestHandler):
                 # the server. BaseException, not Exception: capture.load_payload
                 # raises SystemExit on a malformed payload, which used to unwind
                 # straight through the request thread (audit 2026-09-04).
-                detail = (f"SystemExit: capture rejected the payload (exit {exc.code})"
-                          if isinstance(exc, SystemExit) else f"{type(exc).__name__}: {exc}")
+                # Its own text may name a file: fixed words or scrubbed.
+                from khipu import agent_view
+
+                detail = agent_view.error_text(exc)
                 r = {"jsonrpc": "2.0", "id": m.get("id") if isinstance(m, dict) else None,
                      "error": {"code": -32603, "message": detail}}
                 if isinstance(m, dict) and "id" not in m:
