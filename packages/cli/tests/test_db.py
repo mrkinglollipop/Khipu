@@ -136,7 +136,31 @@ class ConnectTest(unittest.TestCase):
             "postgres://x",
             autocommit=True,
             connect_timeout=db.CONNECT_TIMEOUT_SECONDS,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
         )
+
+    def test_keepalives_follow_the_dead_connection_setting(self):
+        for value, expect in ((60, True), (0, False)):
+            with mock.patch.object(db, "resolve_dsn", return_value="postgres://x"), \
+                 mock.patch.object(db, "conninfo_with_local_root_cert", side_effect=lambda d: d), \
+                 mock.patch("khipu.offline.setting", return_value=value), \
+                 mock.patch("psycopg.connect") as pg:
+                db.connect()
+            self.assertEqual("keepalives" in pg.call_args.kwargs, expect)
+
+    def test_statement_timeout_merges_into_existing_options(self):
+        conninfo = db.make_conninfo(host="hub", options="-c search_path=private")
+        with mock.patch.object(db, "resolve_dsn", return_value="postgres://x"), \
+             mock.patch.object(db, "conninfo_with_local_root_cert", return_value=conninfo), \
+             mock.patch("psycopg.connect") as pg:
+            db.connect(statement_timeout_s=10)
+        self.assertNotIn("options", pg.call_args.kwargs)
+        options = db.conninfo_to_dict(pg.call_args.args[0])["options"]
+        self.assertIn("search_path=private", options)
+        self.assertIn("-c statement_timeout=10000", options)
 
 
 class ConninfoLocalRootCertTest(unittest.TestCase):

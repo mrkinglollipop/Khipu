@@ -103,6 +103,8 @@ export type ConfigShape = {
   minute_settings?: Record<string, { value: number; source: "file" | "default"; default: number; min: number; max: number }>;
   promote_gate_ignore?: { value: string[]; choices: string[]; error?: string };
   config?: Record<string, unknown>;
+  /** `offline.settings_status()`: each duration with the CLI's own words. */
+  offline?: Record<string, { value: number; default: number; kind: string; source: string; words: string }>;
 };
 
 export type FeatureState = { enabled: boolean; source: "env" | "file" | "default" };

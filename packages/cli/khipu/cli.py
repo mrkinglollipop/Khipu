@@ -2247,9 +2247,12 @@ def cmd_route(args: argparse.Namespace) -> int:
 
 
 def cmd_owed(args: argparse.Namespace) -> int:
-    """W3.4: `khipu owed` — list, close, reopen, or snooze commitments."""
+    """W3.4: `khipu owed` — list, close, reopen, or snooze commitments. With
+    the hub away a close, reopen or snooze waits on this Mac and replays when
+    it answers (`waiting_to_sync`), and the list comes from this Mac's copy."""
+    from khipu import commitments, offline, offline_reads, owner_writes
     from khipu.db import connect
-    from khipu import commitments
+    from khipu.hub_snapshot import hub_connection_failed
 
     snooze_id = getattr(args, "snooze", None)
     if snooze_id:
@@ -2260,49 +2263,61 @@ def cmd_owed(args: argparse.Namespace) -> int:
                 "error": "--until must be a date (2026-09-30) or a window (7d, 2 weeks)",
             }))
             return 2
-        expr, param = parsed
         cid = int(snooze_id)
-        params = ([param] if param is not None else []) + [cid]
-        with connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"UPDATE commitments SET due_after = {expr} WHERE id = %s",
-                    tuple(params),
-                )
-                ok = cur.rowcount > 0
-            conn.commit()
-        print(json.dumps({
-            "ok": ok, "id": cid,
-            "until": (getattr(args, "until", None) or "").strip(),
-        }))
-        return 0 if ok else 1
+        until = (getattr(args, "until", None) or "").strip()
+        try:
+            res = owner_writes.run("owed_update", {"id": cid, "action": "snooze", "until": until})
+        except ValueError:
+            print(json.dumps({"ok": False, "id": cid, "until": until}))
+            return 1
+        print(json.dumps({"ok": True, "id": cid, "until": until,
+                          **({"waiting_to_sync": True} if res.get("waiting_to_sync") else {})}))
+        return 0
 
     close_id = getattr(args, "close", None)
     reopen_id = getattr(args, "reopen", None)
     if close_id or reopen_id:
         cid = int(close_id or reopen_id)
         new_status = "closed" if close_id else "open"
-        with connect() as conn:
-            with conn.cursor() as cur:
-                ok = commitments.set_status(cur, cid, new_status)
-            conn.commit()
-        print(json.dumps({"ok": ok, "id": cid, "status": new_status}))
-        return 0 if ok else 1
+        try:
+            res = owner_writes.run("owed_update", {"id": cid, "action": "close" if close_id else "reopen"})
+        except ValueError:
+            print(json.dumps({"ok": False, "id": cid, "status": new_status}))
+            return 1
+        print(json.dumps({"ok": True, "id": cid, "status": new_status,
+                          **({"waiting_to_sync": True} if res.get("waiting_to_sync") else {})}))
+        return 0
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            rows = commitments.list_owed(
-                cur,
-                project=getattr(args, "project", None),
-                status=getattr(args, "status", None) or "open",
-                limit=int(getattr(args, "limit", None) or 50),
-            )
-            # Ages counted on the hub's own clock, so a Mac clock that runs
-            # ahead of or behind the hub can't make an age negative.
-            cur.execute("SELECT now()")
-            hub_now = (cur.fetchone() or [None])[0]
+    project = getattr(args, "project", None)
+    status = getattr(args, "status", None) or "open"
+    limit = int(getattr(args, "limit", None) or 50)
+    stale: dict = {}
+    try:
+        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+            with conn.cursor() as cur:
+                rows = commitments.list_owed(cur, project=project, status=status, limit=limit)
+                # Ages counted on the hub's own clock, so a Mac clock that runs
+                # ahead of or behind the hub can't make an age negative.
+                cur.execute("SELECT now()")
+                hub_now = (cur.fetchone() or [None])[0]
+    except Exception as exc:  # noqa: BLE001
+        if not hub_connection_failed(exc):
+            raise
+        copy = offline_reads.owed(project, status, limit)
+        if copy is None:
+            raise
+        rows = copy["results"]
+        stale = {"stale": True, "snapshot_refreshed_at": copy.get("snapshot_refreshed_at")}
+        from datetime import datetime, timezone
+
+        hub_now = datetime.now(timezone.utc)
     commitments.add_hub_ages(rows, hub_now)
-    print(json.dumps(rows, indent=2, default=str))
+    owner_writes.annotate(rows, "owed_update")
+    if getattr(args, "envelope", False):
+        print(json.dumps({"results": rows, "stale": bool(stale), "snapshot_refreshed_at": stale.get("snapshot_refreshed_at"),
+                          "waiting_to_sync": owner_writes.status()}, indent=2, default=str))
+    else:
+        print(json.dumps(rows, indent=2, default=str))
     return 0
 
 
@@ -3268,6 +3283,19 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps({"ok": True, key: _work.settings_status()[key], "config_file": str(path)}))
         return 0
+    from khipu import offline as _offline
+
+    if (args.set and args.set[0] in _offline.SETTINGS) or args.unset in _offline.SETTINGS:
+        # How long the hub is waited on before this Mac's copy is used: `--set
+        # hub_statement_timeout 0` lifts it, `--unset` for the default again.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _offline.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _offline.settings_status()[key], "config_file": str(path)}))
+        return 0
     from khipu import routing as _routing
 
     if isinstance(getattr(args, "answer_request", None), (list, tuple)):
@@ -3447,6 +3475,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "ledger": _ledger.settings_status(),
         "replica": replica_heal.settings_status(),
         "work": _work.settings_status(),
+        "offline": _offline.settings_status(),
         "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
         "config": load_config(),
@@ -5126,6 +5155,10 @@ def build_parser() -> argparse.ArgumentParser:
     owed.add_argument(
         "--until", default=None,
         help="With --snooze: a date (2026-09-30) or a window (7d, 2w, 3m, 2 weeks)",
+    )
+    owed.add_argument(
+        "--envelope", action="store_true",
+        help="Print {results, stale, snapshot_refreshed_at, waiting_to_sync} instead of the bare list",
     )
     owed.set_defaults(func=cmd_owed)
 

@@ -8,6 +8,8 @@ import {
   GatewayUrlCard,
   GraphBackupRemoteCard,
   JobsCard,
+  HubAwayCard,
+  OfflineWaitsCard,
   PathOverridesCard,
   ReplicaCopyCard,
 } from "../SettingsControls";
@@ -463,5 +465,71 @@ describe("ReplicaCopyCard", () => {
     fireEvent.submit(every.closest("form")!);
     expect(await screen.findByRole("alert")).toHaveTextContent(/whole number of minutes, 1 or more/);
     expect(calls.some(([cmd]) => cmd === "khipu_config_set")).toBe(false);
+  });
+});
+
+describe("OfflineWaitsCard", () => {
+  const offline = (value: number, source = "default") => ({
+    value, default: 60, kind: "duration", source, words: "Longest the app waits for one Khipu answer",
+  });
+
+  it("saves a wait through khipu_config_set and resets through khipu_config_unset", async () => {
+    config = { ...config, offline: { app_cli_timeout: offline(45, "file") } };
+    render(<OfflineWaitsCard active />);
+    const field = (await screen.findByLabelText("Wait for an answer in this app (seconds)")) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe("45"));
+    expect(screen.getByText("Longest the app waits for one Khipu answer. Default 60.")).toBeInTheDocument();
+    fireEvent.change(field, { target: { value: "90" } });
+    fireEvent.click(field.closest("form")!.querySelector("button[type=submit]")!);
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "app_cli_timeout", value: "90" }]));
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "app_cli_timeout" }]));
+  });
+
+  it("refuses a value that is not whole seconds without calling the CLI", async () => {
+    config = { ...config, offline: { app_cli_timeout: offline(60) } };
+    render(<OfflineWaitsCard active />);
+    const field = (await screen.findByLabelText("Wait for an answer in this app (seconds)")) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe("60"));
+    fireEvent.change(field, { target: { value: "1.5" } });
+    fireEvent.click(field.closest("form")!.querySelector("button[type=submit]")!);
+    expect(await screen.findByRole("alert")).toHaveTextContent("whole number of seconds");
+    expect(calls.some(([c]) => c === "khipu_config_set")).toBe(false);
+  });
+});
+
+describe("HubAwayCard", () => {
+  it("puts the copy, the skip window and the waits under one heading, each saved through khipu_config_set", async () => {
+    config = {
+      ...config,
+      replica: {
+        replica_refresh_after: { value: 900, default: 900, source: "default" },
+        replica_check_every: { value: 300, default: 300, source: "default" },
+        hub_down_memo_for: { value: 60, default: 60, source: "default" },
+      },
+      offline: {
+        hub_statement_timeout: { value: 30, default: 30, kind: "duration", source: "default", words: "a" },
+        hub_dead_connection_after: { value: 30, default: 30, kind: "duration", source: "default", words: "b" },
+        app_cli_timeout: { value: 60, default: 60, kind: "duration", source: "default", words: "c" },
+      },
+    };
+    render(<HubAwayCard active />);
+    const card = screen.getByRole("region", { name: "When the hub is away" });
+    expect(screen.getAllByText("When the hub is away")).toHaveLength(1);
+    const fields: Array<[string, string, string]> = [
+      ["Bring the copy up to date after (minutes)", "20", "1200"],
+      ["Skip the database after a failed connection for (seconds)", "45", "45"],
+      ["Wait on the hub for a read or write (seconds)", "10", "10"],
+      ["Wait for an answer in this app (seconds)", "90", "90"],
+    ];
+    const keys = ["replica_refresh_after", "hub_down_memo_for", "hub_statement_timeout", "app_cli_timeout"];
+    for (const [i, [label, typed, stored]] of fields.entries()) {
+      const field = (await screen.findByLabelText(label)) as HTMLInputElement;
+      expect(card.contains(field)).toBe(true);
+      await waitFor(() => expect(field.value).not.toBe(""));
+      fireEvent.change(field, { target: { value: typed } });
+      fireEvent.submit(field.closest("form")!);
+      await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: keys[i], value: stored }]));
+    }
   });
 });

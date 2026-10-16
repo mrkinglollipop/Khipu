@@ -33,6 +33,8 @@ import {
   Tag,
   Tile,
 } from "./ui";
+import { isHubUnreachable, OfflineBanner, parseOwedAnswer, SavedOnThisMac, WaitingToSync } from "./OfflineBanner";
+import type { OwedOffline } from "./OfflineBanner";
 import { ComponentsPanel } from "./ComponentsPanel";
 import { IntegrationsPanel, runInstall } from "./IntegrationsPanel";
 import type { LivenessPayload, RecallProbeStatus, T3Health } from "./IntegrationsPanel";
@@ -65,7 +67,7 @@ import {
   JobsCard,
   PathOverridesCard,
   GraphBackupRemoteCard,
-  ReplicaCopyCard,
+  HubAwayCard,
 } from "./SettingsControls";
 import { HealthChecksCard } from "./HealthChecksCard";
 import {
@@ -420,6 +422,8 @@ type Commitment = {
   opened_age_s?: number | null;
   last_seen_age_s?: number | null;
   read_at_ms?: number;
+  /** A change queued on this Mac while the hub was away (`khipu owed`). */
+  pending_sync?: unknown;
 };
 
 /** How long ago `opened_at` / `last_seen_at` was, from the hub's age at the
@@ -1273,6 +1277,9 @@ export default function App() {
   // Latest request per status: an older reply never overwrites a newer one.
   const owedSeq = useRef<Record<OwedStatus, number>>({ open: 0, closed: 0, stale: 0 });
   const [owedBusyId, setOwedBusyId] = useState<number | null>(null);
+  // The hub is away: per status, the banner to show above the list.
+  const [owedOffline, setOwedOffline] = useState<Partial<Record<OwedStatus, OwedOffline | null>>>({});
+  const [owedSaved, setOwedSaved] = useState(false);
   const [snoozeTarget, setSnoozeTarget] = useState<Commitment | null>(null);
   // Bumped by an attention item with no fix action, and by "Details": opens
   // Home's one disclosure instead of dead-ending.
@@ -1640,19 +1647,29 @@ export default function App() {
       try {
         const raw = await runKhipu([
           "owed",
+          "--envelope",
           `--status=${status}`,
           `--limit=${OWED_LIMIT}`,
         ]);
-        const parsed = parseJson(raw);
+        const answer = parseOwedAnswer(parseJson(raw));
         const readAt = Date.now();
-        const rows = Array.isArray(parsed) ? (parsed as Commitment[]).map((c) => ({ ...c, read_at_ms: readAt })) : [];
+        const rows = answer ? (answer.rows as Commitment[]).map((c) => ({ ...c, read_at_ms: readAt })) : [];
         if (!latest()) return;
+        setOwedOffline((prev) => ({
+          ...prev,
+          [status]: answer?.stale ? { kind: "stale", refreshedAt: answer.refreshedAt } : null,
+        }));
         setOwedByStatus((prev) => ({ ...prev, [status]: rows }));
         setOwedFetchedAt((prev) => ({ ...prev, [status]: Date.now() }));
         markLoaded(`owed:${status}`, true);
       } catch (e) {
         if (!latest()) return;
-        setError(String(e));
+        if (isHubUnreachable(String(e))) {
+          // The hub is away: a banner, not a toast. The next refresh tries again.
+          setOwedOffline((prev) => ({ ...prev, [status]: { kind: "unreachable" } }));
+        } else {
+          setError(String(e));
+        }
         markLoaded(`owed:${status}`, false);
       } finally {
         setOwedInFlight((prev) => ({ ...prev, [status]: Math.max(0, prev[status] - 1) }));
@@ -1667,13 +1684,17 @@ export default function App() {
   const owedWrite = useCallback(
     async (id: number, args: string[]) => {
       setOwedBusyId(id);
+      setOwedSaved(false);
       setError(null);
       try {
         const raw = await runKhipu(["owed", ...args]);
         const parsed = parseJson(raw) as
-          | { ok?: boolean; error?: string }
+          | { ok?: boolean; error?: string; waiting_to_sync?: boolean }
           | null;
-        if (parsed && parsed.ok === false) {
+        if (parsed && parsed.waiting_to_sync === true) {
+          // Queued on this Mac, not an error: it replays when the hub is back.
+          setOwedSaved(true);
+        } else if (parsed && parsed.ok === false) {
           setError(parsed.error ?? `Commitment #${id} was not updated.`);
         }
       } catch (e) {
@@ -3384,6 +3405,7 @@ export default function App() {
             <span className="grow owed-text" title={c.text}>
               {c.text}
             </span>
+            <WaitingToSync pending={c.pending_sync} />
             {seen ? (
               <span
                 className="meta owed-seen"
@@ -5205,12 +5227,17 @@ export default function App() {
                   </span>
                 </div>
 
+                <OfflineBanner state={owedOffline[owedStatus] ?? null} />
+                <SavedOnThisMac show={owedSaved} />
+
                 {loadState[`owed:${owedStatus}`] !== "ok" ? (
                   loadState[`owed:${owedStatus}`] === "failed" && owedInFlight[owedStatus] === 0 ? (
-                    <ReadFailed
-                      what="commitments"
-                      onRetry={() => void loadOwed(owedStatus, true)}
-                    />
+                    owedOffline[owedStatus]?.kind === "unreachable" ? null : (
+                      <ReadFailed
+                        what="commitments"
+                        onRetry={() => void loadOwed(owedStatus, true)}
+                      />
+                    )
                   ) : (
                     <div className="card">
                       <ReadingLine what="commitments" />
@@ -5578,7 +5605,7 @@ export default function App() {
                     <PathOverridesCard active={tab === "settings" && settingsSection === "data"} />
 
                     <GraphBackupRemoteCard active={tab === "settings" && settingsSection === "data"} />
-                    <ReplicaCopyCard active={tab === "settings" && settingsSection === "data"} />
+                    <HubAwayCard active={tab === "settings" && settingsSection === "data"} />
 
                     <div className="section-card">
                       <div className="section-head">Backup</div>
