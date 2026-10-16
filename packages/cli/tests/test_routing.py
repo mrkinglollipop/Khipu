@@ -1019,6 +1019,7 @@ def test_owner_words_never_typed_are_refused_like_a_piped_yes(home, capsys, monk
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-one")
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    owner_turns.write_settings({"enabled": False})
     for argv in (["route", "pause", "Codex"], ["route", "note", "set", "Codex first"],
                  ["route", "rule", "add", "Never a -fast tier."], ["route", "rule", "confirm", "1"]):
         rc, out = _cli(argv + ["--owner-words", "pause Codex for now"], capsys)

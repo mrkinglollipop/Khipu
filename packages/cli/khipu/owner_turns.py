@@ -44,7 +44,7 @@ TOKEN_RE = re.compile(r"[0-9a-f]{8}")
 DEFAULT_TRUSTED = ("claude_code:cli", "claude_code:t3", "codex:codex_cli_rs", "codex:codex_desktop",
                    "codex:codex_vscode", "codex:t3", "aegis:aegis")
 DEFAULTS = {
-    "enabled": False,
+    "enabled": True,
     "latest_window_h": 6.0,
     "earlier_window_min": 30.0,
     "trusted": list(DEFAULT_TRUSTED),
