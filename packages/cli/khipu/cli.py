@@ -3268,6 +3268,19 @@ def cmd_config(args: argparse.Namespace) -> int:
             reply["job"] = launchd_gen.rerender_replica_job()
         print(json.dumps(reply))
         return 0
+    from khipu import storage as _storage
+
+    if (args.set and args.set[0] in _storage.SETTINGS) or args.unset in _storage.SETTINGS:
+        # Storage hygiene (slice 8): disk space thresholds and how long logs,
+        # usage lines and commitments backups are kept; 0 keeps everything.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _storage.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _storage.settings_status()[key], "config_file": str(path)}))
+        return 0
     from khipu import ledger as _ledger
 
     if (args.set and args.set[0] in _ledger.SETTINGS) or args.unset in _ledger.SETTINGS:
@@ -3468,6 +3481,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "routing": _routing.settings_status(),
         "ledger": _ledger.settings_status(),
         "replica": replica_heal.settings_status(),
+        "storage": _storage.settings_status(),
         "work": _work.settings_status(),
         "offline": _offline.settings_status(),
         "graph_backup_remote": graph_backup_remote_status(),

@@ -111,3 +111,80 @@ def test_the_replica_job_sweeps_once_a_day(data_dir, monkeypatch, capsys):
 
     assert calls == [1]
     assert '"storage_sweep"' in capsys.readouterr().out
+
+
+# ---- settings, logs and usage lines ------------------------------------------
+
+
+@pytest.fixture
+def logs(data_dir, tmp_path, monkeypatch):
+    from khipu import storage
+
+    folder = tmp_path / "logs"
+    folder.mkdir()
+    monkeypatch.setattr(storage, "log_dirs", lambda: [folder])
+    return folder
+
+
+def test_storage_settings_are_set_checked_and_listed(data_dir, capsys):
+    import json
+
+    from khipu import cli, storage
+
+    assert storage.settings()["commitments_backup_keep_days"] == 30
+    assert cli.main(["config", "--set", "log_max_mb", "2.5"]) == 0
+    assert storage.settings()["log_max_mb"] == 2.5
+    capsys.readouterr()
+    assert cli.main(["config", "--set", "disk_warn_free_percent", "101"]) == 2
+    assert "0 to 100" in capsys.readouterr().out
+    assert cli.main(["config", "--unset=log_max_mb"]) == 0
+    capsys.readouterr()
+    assert cli.main(["config"]) == 0
+    block = json.loads(capsys.readouterr().out)["storage"]
+    assert set(block) == set(storage.SETTINGS)
+    assert block["log_max_mb"] == {"value": 5, "default": 5, "kind": "number", "source": "default",
+                                   "words": storage.SETTINGS["log_max_mb"][2]}
+
+
+def test_a_log_over_the_cap_is_rotated_and_a_small_one_is_not(logs, monkeypatch):
+    from khipu import storage
+
+    monkeypatch.setattr(storage, "settings", lambda: {**{k: v[1] for k, v in storage.SETTINGS.items()},
+                                                      "log_max_mb": 1})
+    big = logs / "khipu-nightly.out.log"
+    big.write_bytes(b"x" * (1024 * 1024 + 10))
+    _age(big, 3600)
+    when = big.stat().st_mtime
+    (logs / "khipu-nightly.out.log.1").write_bytes(b"an older copy")
+    small = logs / "stop-hook.log"
+    small.write_bytes(b"a line\n")
+
+    out = storage.sweep()
+
+    assert out["rotated"] == ["khipu-nightly.out.log"]
+    assert big.stat().st_size == 0 and abs(big.stat().st_mtime - when) < 1
+    assert (logs / "khipu-nightly.out.log.1").stat().st_size == 1024 * 1024 + 10
+    assert small.read_bytes() == b"a line\n" and not (logs / "stop-hook.log.1").exists()
+    assert sorted(os.listdir(logs)) == ["khipu-nightly.out.log", "khipu-nightly.out.log.1", "stop-hook.log"]
+
+
+def test_old_usage_lines_are_dropped_and_recent_ones_kept(data_dir, logs):
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    from khipu import extract, storage
+
+    now = datetime.now(timezone.utc)
+    def line(days):
+        at = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return json.dumps({"ts": at, "provider": "gemini", "model": "m", "prompt_tokens": 1,
+                           "output_tokens": 1, "thought_tokens": 0, "cached_tokens": 0, "caller": "t"})
+    path = extract.synth_usage_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join([line(200), line(91), "not json", line(10), line(0)]) + "\n")
+
+    out = storage.sweep()
+
+    assert out["synth_usage_dropped"] == 3
+    assert path.read_text().splitlines() == [line(10), line(0)]
+    assert extract.synth_usage_today()["calls"] == 1
