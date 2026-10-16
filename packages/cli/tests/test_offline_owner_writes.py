@@ -28,6 +28,8 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("KHIPU_TEST", "1")
     (tmp_path / "data").mkdir()
     db._TABLE_COLUMNS_CACHE.clear()
+    # No hub here: its record of applied writes holds none of these ids.
+    monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: False)
     return tmp_path / "data"
 
 

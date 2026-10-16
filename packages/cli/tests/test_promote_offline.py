@@ -431,3 +431,91 @@ def test_an_empty_outbox_is_not_offline_only(home):
     from khipu import outbox
 
     assert outbox.status()["offline_only"] is False
+
+
+# ---- crash safety and the override held by a queued promotion ----------------
+
+
+def test_promotion_retry_survives_crash_while_replacing_queue(home, monkeypatch):
+    pm._queue("original-ref", "fake-commit", "hub unreachable", None)
+    monkeypatch.setattr(pm, "hub_reachable", lambda **kw: True)
+    monkeypatch.setattr(pm, "_promote_locked", lambda *a: {"ok": False, "gate": [
+        {"step": "recall", "ok": False, "hub_unreachable": True}], "commit": "fake-commit"})
+
+    def die(*a):
+        raise SystemExit("crash before replacement queue is written")
+
+    monkeypatch.setattr(pm, "_queue", die)
+    with pytest.raises(SystemExit):
+        pm.retry_queued()
+    assert pm.queued() is not None, "queued promotion was deleted before its replacement existed"
+
+
+def _waiting_on_hub(monkeypatch, override) -> None:
+    monkeypatch.setattr(pm, "_promote_locked", lambda *a: {"ok": False, "gate": [
+        {"step": "doctor", "ok": True, "override": override, "ignored_reds": ["outbox"]},
+        {"step": "recall", "ok": False, "hub_unreachable": True}], "commit": "fake-commit"})
+
+
+def test_queued_override_survives_a_day_outage(home, monkeypatch):
+    pm.set_gate_ignore("outbox", by="app")
+    override = pm.gate_override()
+    _waiting_on_hub(monkeypatch, override)
+    out = pm.promote("original-ref")
+    assert out["queued"] and not out["override"]["cleared"]
+    monkeypatch.setattr(pm, "_override_age_s", lambda _: pm.OVERRIDE_TTL_S + 60)
+    assert pm.gate_ignore() == ["outbox"], "queued retry lost its owner approval after 24h"
+    held = pm.gate_ignore_status()
+    assert held["held_by_queue"] is True and held["expires_at"] is None
+
+
+def test_an_old_override_with_nothing_queued_still_lapses(home, monkeypatch):
+    pm.set_gate_ignore("outbox", by="app")
+    monkeypatch.setattr(pm, "_override_age_s", lambda _: pm.OVERRIDE_TTL_S + 60)
+    assert pm.queued() is None
+    assert pm.gate_ignore() == []
+    assert pm.gate_ignore_status()["held_by_queue"] is False
+
+
+def test_a_queue_holds_only_the_override_it_was_queued_with(home, monkeypatch):
+    pm.set_gate_ignore("outbox", by="app")
+    _waiting_on_hub(monkeypatch, pm.gate_override())
+    assert pm.promote("original-ref")["queued"]
+    # A newer choice made meanwhile carries a different stamp and lapses on its own clock.
+    pm.set_gate_ignore("outbox", by="terminal")
+    from khipu.config import mutate_config
+
+    with mutate_config() as data:
+        data[pm.GATE_IGNORE_KEY]["set_at"] = "2020-01-01T00:00:00Z"
+    assert pm.gate_ignore() == []
+
+
+def test_a_queued_override_is_cleared_when_the_retry_finishes(home, monkeypatch):
+    pm.set_gate_ignore("outbox", by="app")
+    override = pm.gate_override()
+    _waiting_on_hub(monkeypatch, override)
+    assert pm.promote("original-ref")["queued"]
+    monkeypatch.setattr(pm, "hub_reachable", lambda **kw: True)
+    monkeypatch.setattr(pm, "_promote_locked", lambda *a: {"ok": True, "gate": [
+        {"step": "doctor", "ok": True, "override": override, "ignored_reds": ["outbox"]}], "commit": "fake-commit"})
+    done = pm.retry_queued()
+    assert done["ok"] and done["override"]["cleared"] is True
+    assert pm.queued() is None and pm.gate_ignore() == []
+
+
+def test_a_doctor_outage_before_recall_is_queued(home, monkeypatch, tmp_path):
+    """A doctor red whose evidence is all from an outage passes the doctor
+    step, and the hub steps then wait and queue the promotion."""
+    _doctor_says(monkeypatch, {**_BASE, "outbox_ok": False, "outbox": {"pending": 5, "offline_only": True}})
+    monkeypatch.setattr(pm, "GATE_STEPS", {
+        "doctor": pm.gate_doctor,
+        "recall": lambda c: {"ok": False, "ms": 1, "detail": "connection refused"}})
+    monkeypatch.setattr(pm, "hub_reachable", lambda **_: False)
+    monkeypatch.setattr(pm, "hub_wait_s", lambda: 0)
+    monkeypatch.setattr(pm, "_promote_locked", lambda ref, t: {
+        "ok": False, "gate": pm.run_gate(_checkout(tmp_path / "c")), "commit": "fake"})
+    out = pm.promote("fake")
+    assert out.get("queued"), out
+    doctor = out["gate"][0]
+    assert doctor["step"] == "doctor" and doctor["ok"] and doctor["offline_reds"] == ["outbox"]
+    assert out["gate"][1]["hub_unreachable"] is True

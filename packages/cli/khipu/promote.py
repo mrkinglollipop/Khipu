@@ -587,6 +587,13 @@ def _override_age_s(stored: dict[str, Any]) -> float | None:
     return (datetime.now(timezone.utc) - at).total_seconds()
 
 
+def _held_by_queue(stored: dict[str, Any]) -> bool:
+    """True when a promotion waiting for the hub was queued with this very
+    override: it keeps the owner's approval for its retry past the day."""
+    entry = queued()
+    return bool(entry and stored.get("set_at") and entry.get("override_set_at") == stored.get("set_at"))
+
+
 def gate_override() -> dict[str, Any] | None:
     """The owner's one-time "Update anyway" (``promote_gate_ignore``):
     ``{"checks", "set_at", "by"}``, or None when there is none, it is older
@@ -598,7 +605,9 @@ def gate_override() -> dict[str, Any] | None:
     if not isinstance(stored, dict) or not isinstance(stored.get("checks"), list):
         return None
     age = _override_age_s(stored)
-    if age is None or age < -60 or age > OVERRIDE_TTL_S:
+    if age is None or age < -60:
+        return None
+    if age > OVERRIDE_TTL_S and not _held_by_queue(stored):
         return None
     known = gate_ignorable()
     checks = [name for name in stored["checks"] if isinstance(name, str) and name in known]
@@ -668,12 +677,16 @@ def _blocked_by() -> list[str]:
 def gate_ignore_status() -> dict[str, Any]:
     found = gate_override()
     expires = None
+    held = False
     if found:
+        held = _held_by_queue({"set_at": found["set_at"]})
+    if found and not held:
         at = datetime.fromisoformat(str(found["set_at"]).replace("Z", "+00:00"))
         expires = (at.timestamp() + OVERRIDE_TTL_S)
         expires = datetime.fromtimestamp(expires, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     return {"value": list(found["checks"]) if found else [], "set_at": found["set_at"] if found else None,
             "by": found["by"] if found else None, "expires_at": expires,
+            "held_by_queue": held,
             "blocked_by": _blocked_by(), "choices": list(gate_ignorable())}
 
 
@@ -1388,10 +1401,16 @@ def _clear_queue() -> None:
         pass
 
 
-def _queue(ref: str, commit: str | None, error: str, previous: dict[str, Any] | None) -> dict[str, Any]:
+def _queue(ref: str, commit: str | None, error: str, previous: dict[str, Any] | None,
+           override_set_at: Any = None) -> dict[str, Any]:
+    """Queue (or re-queue) a promotion. The file is replaced atomically, so a
+    crash leaves the old entry or the new one, never neither. A re-queue
+    carries the override the first run used (``override_set_at``)."""
+    held = override_set_at or (previous or {}).get("override_set_at")
     data = {"ref": ref, "commit": commit, "error": error,
             "queued_at": (previous or {}).get("queued_at") or _now(),
-            "attempts": int((previous or {}).get("attempts") or 0) + 1, "last_attempt_at": _now()}
+            "attempts": int((previous or {}).get("attempts") or 0) + 1, "last_attempt_at": _now(),
+            **({"override_set_at": held} if held else {})}
     _write_queue(data)
     return data
 
@@ -1463,8 +1482,9 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
     because the hub was out of reach is queued again (``queue_file``) for
     ``retry_queued``. ``retry_of`` is the queued entry a retry runs for.
 
-    The queued entry is removed in one place, after the run returned: a run
-    that dies part way leaves it queued for the next retry. The owner's
+    The queued entry is removed in one place, after the run returned and only
+    when the run is not queued again (a re-queue replaces it in one atomic
+    write): a run that dies part way leaves it queued for the next retry. The owner's
     one-time override the doctor step read is cleared at the same point,
     unless the run is queued again (the retry is the same attempt)."""
     t0 = time.monotonic()
@@ -1473,13 +1493,15 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
             return {"ok": False, "action": "promote", "error": "another promotion is running"}
         previous = queued()
         out = _promote_locked(ref, t0)
-        _clear_queue()
         failed = next((step for step in out.get("gate") or [] if not step["ok"]), None)
-        if not out.get("ok") and failed is not None and failed.get("hub_unreachable"):
-            out["queued"] = _queue((retry_of or {}).get("ref") or ref, out.get("commit"), out.get("error") or "",
-                                   retry_of or previous)
         doctor = next((step for step in out.get("gate") or [] if step.get("step") == "doctor"), None)
         override = (doctor or {}).get("override")
+        if not out.get("ok") and failed is not None and failed.get("hub_unreachable"):
+            # Written first (an atomic replace): a crash here keeps the old entry.
+            out["queued"] = _queue((retry_of or {}).get("ref") or ref, out.get("commit"), out.get("error") or "",
+                                   retry_of or previous, (override or {}).get("set_at"))
+        else:
+            _clear_queue()
         if override:
             cleared = False if out.get("queued") else clear_gate_override(override.get("set_at"))
             out["override"] = {**override, "skipped": doctor.get("ignored_reds") or [], "cleared": cleared}

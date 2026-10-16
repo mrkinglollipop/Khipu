@@ -12,10 +12,15 @@ outbox. An entry is in one of three states:
 - ``waiting``: the hub was away; it is replayed in order when the hub answers.
 - ``sending``: a replay sent it and has not yet seen the answer.
 
-A ``sending`` entry, or a ``reserved`` one whose caller died, may already be on
-the hub: it is checked there (``_landed``) and only sent again when the hub
-does not show it, so a crash between the hub's commit and the entry's removal
-never applies a write twice. One the hub refuses (an error, or ``ok: false``)
+Every write carries a unique id (``write_id``, in its args). The hub records
+the id in ``owner_writes_applied`` (migration 0031) in the same transaction as
+the write (``record_on_hub``) and never applies an id it already holds. Any
+entry, whatever its state, may already be on the hub (a lost COMMIT reply
+leaves it ``waiting``; a crash leaves it ``sending`` or ``reserved``), so a
+replay first asks the hub whether its id was applied (``_landed``) and sends
+it only when it was not: exactly once, read from the record, never inferred
+from the rows the write touched. A hub without the record (0031 not applied)
+keeps every entry waiting. One the hub refuses (an error, or ``ok: false``)
 moves to ``refused/`` with the reason and is reported, never counted as done.
 Forgetting is not queued here: a forget that only looked done would be a
 privacy failure.
@@ -27,6 +32,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,6 +42,32 @@ TOOLS = ("owed_update", "decisions_update")
 # shape it would have had from the hub.
 _ECHO = ("id", "link_id", "action", "until", "by")
 _HELD = threading.local()  # the entry this thread's run() is applying
+
+
+class HubRecordMissing(RuntimeError):
+    """The hub has no ``owner_writes_applied`` table (migration 0031 is not
+    applied there), so whether a write landed cannot be read."""
+
+
+def _with_id(args: dict[str, Any]) -> dict[str, Any]:
+    return args if args.get("write_id") else {**args, "write_id": uuid.uuid4().hex}
+
+
+def record_on_hub(cur, tool: str, args: dict[str, Any]) -> bool:
+    """Record this write's id on the hub in the caller's transaction, before
+    the write itself. False: the hub already applied this id, and the caller
+    must roll back and apply nothing."""
+    import psycopg
+
+    write_id = str(args.get("write_id") or "")
+    if not write_id:
+        raise ValueError("an owner write reached the hub without its write_id")
+    try:
+        cur.execute("INSERT INTO owner_writes_applied (write_id, tool) VALUES (%s, %s) "
+                    "ON CONFLICT (write_id) DO NOTHING", (write_id, tool))
+    except psycopg.errors.UndefinedTable as exc:
+        raise HubRecordMissing("the hub has no record of applied owner writes; run khipu migrate (0031)") from exc
+    return cur.rowcount == 1
 
 
 def queue_dir() -> Path:
@@ -80,39 +112,23 @@ def _apply(tool: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _landed(tool: str, args: dict[str, Any]) -> bool:
-    """Whether the hub already shows this write, for an entry whose last send
-    may have committed before this Mac saw the answer. Raises when the hub
-    cannot be asked."""
+    """Whether the hub applied this write: its id is in the hub's record.
+    Raises when the hub cannot be asked, and ``HubRecordMissing`` when it
+    keeps no record."""
+    import psycopg
+
     from khipu import offline
     from khipu.db import connect
 
-    action = str(args.get("action") or "").strip().lower()
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
         with conn.cursor() as cur:
-            if tool == "owed_update":
-                cur.execute("SELECT status, due_after > now() FROM commitments WHERE id = %s", (args.get("id"),))
-                row = cur.fetchone()
-                if row is None:
-                    return False
-                if action == "snooze":
-                    return bool(row[1])
-                return row[0] == ("closed" if action == "close" else "open")
-            if action in ("confirm", "reject"):
-                cur.execute("SELECT state FROM decision_links WHERE id = %s", (args.get("link_id"),))
-                row = cur.fetchone()
-                return row is not None and row[0] != "candidate"
-            cur.execute("SELECT superseded_by, retracted_at FROM decisions WHERE id = %s", (args.get("id"),))
-            row = cur.fetchone()
-            if row is None:
-                return False
-            superseded_by, retracted_at = row
-            if action == "supersede":
-                return superseded_by is not None and (args.get("by") is None or int(args["by"]) == superseded_by)
-            if action == "retract":
-                return retracted_at is not None
-            if action == "restore":
-                return superseded_by is None
-            return False
+            try:
+                cur.execute("SELECT 1 FROM owner_writes_applied WHERE write_id = %s",
+                            (str(args.get("write_id") or ""),))
+            except psycopg.errors.UndefinedTable as exc:
+                raise HubRecordMissing(
+                    "the hub has no record of applied owner writes; run khipu migrate (0031)") from exc
+            return cur.fetchone() is not None
 
 
 def _write(path: Path, job: dict[str, Any]) -> None:
@@ -185,6 +201,7 @@ def _enqueue(tool: str, args: dict[str, Any], reason: str) -> dict[str, Any]:
     if mine is not None and mine[1] == (tool, args):
         path = mine[0]
     else:
+        args = _with_id(args)
         path, held = _reserve(tool, args)
         _release(path, held)
     _write(path, {"tool": tool, "args": args, "state": "waiting", "queued_at": queued_at, "reason": reason})
@@ -198,6 +215,7 @@ def run(tool: str, args: dict[str, Any], *, queue_ok: bool = True) -> dict[str, 
     it is applied directly only when no older entry is still in line."""
     from khipu.hub_snapshot import hub_connection_failed
 
+    args = _with_id(args)
     if not queue_ok:
         return _apply(tool, args)
     path, held = _reserve(tool, args)
@@ -230,7 +248,8 @@ def _refuse(path: Path, job: dict[str, Any], error: str) -> None:
 
 def _replay(path: Path) -> str | None:
     """Replay one claimed entry: ``"replayed"``, ``"refused"``, ``"away"``,
-    or ``None`` when it was already gone."""
+    ``"unrecorded"`` (the hub keeps no record to ask), or ``None`` when it
+    was already gone."""
     from khipu.hub_snapshot import hub_connection_failed
 
     if not path.exists():
@@ -240,13 +259,18 @@ def _replay(path: Path) -> str | None:
     if job is None:  # never left to block the line behind it
         _refuse(path, {}, "ValueError: this waiting write could not be read")
         return "refused"
+    if not job["args"].get("write_id"):
+        # Queued before writes carried ids: given one now, before any send.
+        job = {**job, "args": _with_id(job["args"])}
+        _write(path, job)
     try:
-        # Reserved and unheld means its caller died mid-apply: as unknown as a send.
-        if job.get("state") in ("sending", "reserved") and _landed(job["tool"], job["args"]):
+        if _landed(job["tool"], job["args"]):
             _remove(path)
             return "replayed"
         _write(path, {**job, "state": "sending", "sent_at": datetime.now(timezone.utc).isoformat()})
         result = _apply(job["tool"], job["args"])
+    except HubRecordMissing:
+        return "unrecorded"
     except Exception as exc:  # noqa: BLE001
         if hub_connection_failed(exc):
             return "away"
@@ -284,8 +308,10 @@ def drain() -> dict[str, Any]:
                 step = _replay(path)
             finally:
                 os.close(claim)
-            if step == "away":
+            if step in ("away", "unrecorded"):
                 out["stopped_early"] = True
+                if step == "unrecorded":
+                    out["hub_needs_migrate"] = True
                 break
             if step:
                 out[step] += 1

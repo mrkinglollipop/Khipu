@@ -1570,15 +1570,22 @@ def _tool_owed_update(args: dict) -> dict:
 
 
 def _owed_update_on_hub(args: dict) -> dict:
-    """The hub half of ``_tool_owed_update``, also what a queued write replays."""
+    """The hub half of ``_tool_owed_update``, also what a queued write
+    replays. The write's id is recorded in the same transaction; an id the
+    hub already applied applies nothing again."""
     cid = _positive_id(args.get("id"), "id")
     action = (args.get("action") or "").strip().lower()
     _ensure_path()
-    from khipu import commitments, offline
+    from khipu import commitments, offline, owner_writes
     from khipu.db import connect
 
+    echo = {"id": cid, "action": action,
+            **({"until": str(args.get("until") or "")} if action == "snooze" else {})}
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
         with conn.cursor() as cur:
+            if not owner_writes.record_on_hub(cur, "owed_update", args):
+                conn.rollback()
+                return {"ok": True, "already_applied": True, **echo}
             if action == "snooze":
                 from khipu.cli import _snooze_until_sql
 
@@ -1591,11 +1598,11 @@ def _owed_update_on_hub(args: dict) -> dict:
                 ok = cur.rowcount > 0
             else:
                 ok = commitments.set_status(cur, cid, "closed" if action == "close" else "open")
+            if not ok:
+                # Raised inside the transaction, so the id is never recorded.
+                raise ValueError(f"no such commitment: {cid}")
         conn.commit()
-    if not ok:
-        raise ValueError(f"no such commitment: {cid}")
-    return {"ok": True, "id": cid, "action": action,
-            **({"until": str(args.get("until") or "")} if action == "snooze" else {})}
+    return {"ok": True, **echo}
 
 
 class _ToolFailure(ValueError):
@@ -1750,7 +1757,7 @@ def _decisions_update_on_hub(args: dict) -> dict:
     new_text = args.get("new_text")
     _ensure_path()
     from khipu import decisions as _decisions
-    from khipu import offline
+    from khipu import offline, owner_writes
     from khipu.db import connect
     from khipu.redact import redact_secrets
 
@@ -1758,6 +1765,12 @@ def _decisions_update_on_hub(args: dict) -> dict:
 
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
         with conn.cursor() as cur:
+            # Recorded first, so every branch below commits it with the write.
+            if not owner_writes.record_on_hub(cur, "decisions_update", args):
+                conn.rollback()
+                key = "link_id" if action in ("confirm", "reject") else "id"
+                return {"ok": True, "already_applied": True, "action": action,
+                        key: link_id if key == "link_id" else decision_id}
             evidence_ready = _decisions._evidence_ready(cur)
             degrade_note = (
                 None if evidence_ready

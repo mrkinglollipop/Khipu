@@ -34,6 +34,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
@@ -452,10 +453,13 @@ def _queue_missed_patch(episode_id: int, path: Path | None = None) -> bool:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         marker = directory / str(int(episode_id))
         fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.close(fd)
-        # A miss queued again is a newer miss: a pull that read the hub
-        # before now must not clear it.
-        os.utime(marker)
+        try:
+            # A miss queued again is a newer miss: a pull that read the hub
+            # before now must not clear it. Stamped through the open file, so
+            # a cleaner renaming the name meanwhile still sees the stamp.
+            os.utime(fd if os.utime in os.supports_fd else marker)
+        finally:
+            os.close(fd)
         return True
     except (OSError, ValueError, TypeError):
         return False
@@ -467,18 +471,65 @@ def _clear_missed_patches(ids: Iterable[int] | None = None, *, path: Path | None
     those). A marker written after the caller read the hub is a newer miss
     and stays."""
     wanted = None if ids is None else {int(i) for i in ids}
+    directory = _missed_patch_dir(path)
     try:
-        markers = list(_missed_patch_dir(path).iterdir())
+        markers = list(directory.iterdir())
     except FileNotFoundError:
         return
     for marker in markers:
+        if marker.name.startswith(_CLEARING_PREFIX):
+            _restore_stale_clearing(marker)
+            continue
         if not marker.name.isdigit() or (wanted is not None and int(marker.name) not in wanted):
             continue
+        # Take the marker out of the queue by renaming it first, then judge
+        # it: a writer that queues the id again after the rename makes a new
+        # file under the old name, which this never touches.
+        claimed = directory / f"{_CLEARING_PREFIX}{marker.name}-{os.getpid()}-{uuid.uuid4().hex}"
         try:
-            if marker.stat().st_mtime <= written_before:
-                marker.unlink()
+            os.rename(str(marker), str(claimed))
         except OSError:
             continue
+        try:
+            if claimed.stat().st_mtime > written_before:
+                # Re-queued before the rename: put it back. A newer marker
+                # already under the name is the same miss, so that is fine.
+                try:
+                    os.link(str(claimed), str(marker))
+                except FileExistsError:
+                    pass
+            claimed.unlink()
+        except OSError:
+            continue
+
+
+_CLEARING_PREFIX = ".clearing-"
+
+
+def _restore_stale_clearing(claimed: Path) -> None:
+    """A claimed marker whose cleaner died before judging it goes back in the
+    queue: an extra pull of one episode is harmless, a lost miss is not."""
+    try:
+        id_part, pid_part, _rest = claimed.name[len(_CLEARING_PREFIX):].split("-", 2)
+        pid = int(pid_part)
+        if not id_part.isdigit() or pid == os.getpid():
+            return
+        os.kill(pid, 0)
+        return
+    except ProcessLookupError:
+        pass
+    except (ValueError, OSError):
+        return
+    try:
+        os.link(str(claimed), str(claimed.parent / id_part))
+    except FileExistsError:
+        pass
+    except OSError:
+        return
+    try:
+        claimed.unlink()
+    except OSError:
+        pass
 
 
 def _purged_topics_dir(path: Path | None = None) -> Path:
@@ -1020,10 +1071,26 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int) -> dict[str, Any]:
     hub_cols = _pg_columns(cur, "episodes")
     cols = [c for c in _EPISODE_COLS if c in hub_cols]
     sel = ", ".join(cols)
-    cur.execute(
-        f"SELECT {sel} FROM episodes WHERE (ingested_at, id) > (%s, %s) ORDER BY ingested_at, id LIMIT %s",
-        (state["episodes_after"], state["episodes_after_id"], limit + 1))
-    fresh = [dict(zip(cols, r)) for r in cur.fetchall()]
+    after = (state["episodes_after"], state["episodes_after_id"])
+    # Episodes by their change stamp (migration 0032), so an episode edited in
+    # place (a capture merged into it) is read again; a row the stamp has not
+    # reached yet, or a hub without it, by its ingest time.
+    stamped = "changed_at" in hub_cols
+    if stamped:
+        cur.execute(
+            f"SELECT {sel}, changed_at FROM episodes WHERE (changed_at, id) > (%s, %s) "
+            "OR (changed_at IS NULL AND (ingested_at, id) > (%s, %s)) "
+            "ORDER BY coalesce(changed_at, ingested_at), id LIMIT %s",
+            (*after, *after, limit + 1))
+        fresh = [dict(zip([*cols, "changed_at"], r)) for r in cur.fetchall()]
+    else:
+        cur.execute(
+            f"SELECT {sel} FROM episodes WHERE (ingested_at, id) > (%s, %s) ORDER BY ingested_at, id LIMIT %s",
+            (*after, limit + 1))
+        fresh = [dict(zip(cols, r)) for r in cur.fetchall()]
+    # Where each row puts the episodes cursor; the stamp itself is hub-only
+    # and never written into the replica.
+    fresh_stamps = [(r.pop("changed_at", None) or r.get("ingested_at"), r.get("id")) for r in fresh]
     gone: list[dict[str, Any]] = []
     if "deleted_at" in hub_cols:
         cur.execute(
@@ -1140,7 +1207,7 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int) -> dict[str, Any]:
             cur.execute(f"SELECT {emb_sel} FROM memory_embeddings WHERE profile = %s AND kind = %s "
                         "AND ref = ANY(%s)", (profile, kind, part))
             rows = [dict(zip(emb_names, r)) for r in cur.fetchall()]
-            out = upsert_embeddings(rows, replace_refs=[(profile, kind, ref) for ref in part])
+            out = upsert_embeddings(rows, replace_refs=[(profile, kind, ref) for ref in part], read_at=read_at)
             if not out.get("ok"):
                 error = str(out.get("error") or "")
                 return {"ok": False, "error": "hub snapshot refresh in progress" if "in progress" in error
@@ -1151,11 +1218,13 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int) -> dict[str, Any]:
         stamp = _utc(rows[-1].get(col)) if rows else None
         return None if stamp is None else (stamp, int(rows[-1]["id"]))
 
-    parts = _write_pulled_tables(topic_rows, commitments)
+    last_fresh = _utc(fresh_stamps[-1][0]) if fresh_stamps else None
+
+    parts = _write_pulled_tables(topic_rows, commitments, read_at=read_at)
     last_group = _utc(groups[-1][3]) if groups else None
     cursors = {
-        "episodes": _cursor_after((state["episodes_after"], state["episodes_after_id"]),
-                                  newest(fresh, "ingested_at"), cap),
+        "episodes": _cursor_after(after, None if last_fresh is None else (last_fresh, int(fresh_stamps[-1][1])),
+                                  cap),
         "tombstones": _cursor_after((state["tombstones_after"], 0), newest(gone, "deleted_at"), cap),
         "vectors": _cursor_after((state["vectors_after"], 0),
                                  None if last_group is None else (last_group, 0), cap),
@@ -1176,13 +1245,15 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int) -> dict[str, Any]:
 
 
 def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
-                         commitments: tuple[list[str], list[Any]] | None) -> dict[str, dict[str, Any]]:
+                         commitments: tuple[list[str], list[Any]] | None, *,
+                         read_at: float) -> dict[str, dict[str, Any]]:
     """The pull's topic bodies and commitments, under the refresh lock, in one
     transaction. Each part's result by name; a part the hub or this replica
     has no table for is ``not_applicable``. A topic row older than the one
     held (by ``updated_at``) never replaces it, a tombstone held stays, and a
     purged topic is never written back. Commitments replace the replica's
-    whole table, as a dump would."""
+    whole table, as a dump would, unless the table held was read after
+    ``read_at`` (a dump or pull that finished meanwhile): then it stays."""
     parts: dict[str, dict[str, Any]] = {}
     path = snapshot_path()
     con = sqlite3.connect(str(path))
@@ -1232,8 +1303,13 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                 parts["topics"] = {"ok": True, "topics": written}
             if "commitments" in wanted:
                 cols, rows = commitments  # type: ignore[misc]
-                con.execute("DELETE FROM commitments")
-                parts["commitments"] = {"ok": True, "commitments": _write_commitment_rows(con, cols, rows)}
+                if _held_read_at(con, "commitments", "*") > read_at:
+                    parts["commitments"] = {"ok": True, "commitments": 0,
+                                            "skipped": "the replica holds a newer copy"}
+                else:
+                    con.execute("DELETE FROM commitments")
+                    parts["commitments"] = {"ok": True, "commitments": _write_commitment_rows(con, cols, rows)}
+                    _record_read_at(con, "commitments", "*", read_at)
             con.commit()
         finally:
             con.close()
@@ -1249,7 +1325,8 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
 
 def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
     """Bring the replica level with the hub without a full dump: episodes
-    ingested or tombstoned since this replica's cursors, the episodes whose
+    changed (by ``changed_at``, or ``ingested_at`` on a hub or row without
+    it) or tombstoned since this replica's cursors, the episodes whose
     patch was missed (``_queue_missed_patch``), re-built vectors, topic
     bodies changed since its cursor, the whole commitments table (they carry
     no change stamp) and the decisions changed elsewhere. Every episode goes
@@ -1260,8 +1337,8 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
     The cursors live in the sidecar beside ``last_pull_at``; a full dump
     replaces the sidecar and so resets them to its own hub time. Each moves to
     the newest row read but never past the hub's now minus
-    ``FRESHNESS_OVERLAP_S``: ``ingested_at`` is the start of a transaction, so
-    a long one can commit an older stamp after a newer one was read, and the
+    ``FRESHNESS_OVERLAP_S``: a stamp is taken inside a transaction, so a long
+    one can commit an older stamp after a newer one was read, and the
     overlap re-reads those minutes (the upserts are idempotent). More than
     ``limit`` changes of a kind writes nothing and asks for a full dump.
     Never raises."""
@@ -2420,6 +2497,12 @@ def _record_read_at(con: sqlite3.Connection, table: str, key: Any, read_at: floa
                 (table, str(key), float(read_at)))
 
 
+def _vector_key(profile: Any, kind: Any, ref: Any) -> str:
+    """The freshness rule's key for one ref's vectors under one profile."""
+    return f"{profile}\x1f{kind}\x1f{ref}"
+
+
+
 def _tombstone_payload_for_episode(episode_row: Mapping[str, Any]) -> dict[str, Any]:
     """A capture-shaped identity for the local tombstone fence.
 
@@ -2702,11 +2785,16 @@ def _upsert_episode_unfenced(
             if merged.get("deleted_at") is not None:
                 con.execute("DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?", (str(eid),))
             else:
-                for profile in {row["profile"] for row in embedding_rows}:
+                # A profile whose vectors were read after this row keeps them.
+                profiles = {row["profile"] for row in embedding_rows
+                            if _held_read_at(con, "vectors", _vector_key(row["profile"], "episode", eid)) <= version}
+                embedding_rows = [row for row in embedding_rows if row["profile"] in profiles]
+                for profile in profiles:
                     con.execute(
                         "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ? AND profile = ?",
                         (str(eid), profile),
                     )
+                    _record_read_at(con, "vectors", _vector_key(profile, "episode", eid), version)
             for erow in (() if merged.get("deleted_at") is not None else embedding_rows):
                 ecols = [c for c in _EMBED_COLS if c in erow]
                 evals = []
@@ -2763,9 +2851,13 @@ def upsert_embeddings(
     embedding_rows: Sequence[Mapping[str, Any]], *,
     topic_rows: Sequence[Mapping[str, Any]] = (),
     replace_refs: Sequence[tuple[str, str, str]] = (),
+    read_at: float | None = None,
 ) -> dict[str, Any]:
     """Incremental vectors with optional topic sources and complete ref replacement.
     Replacements affect only the named profiles, including an empty chunk set.
+    ``read_at``: when the caller read these vectors from the hub, for the
+    freshness rule; ``None`` is a live write, read now. A ref whose held
+    vectors (or, for an episode, its row) were read later is left alone.
     Used by ``embed.embed_recent_missing``'s
     bounded catch-up, which has no single episode row to key off like
     ``upsert_episode`` does. Same locking/fail-open contract as
@@ -2805,10 +2897,22 @@ def upsert_embeddings(
                     "ON CONFLICT(slug) DO UPDATE SET " + ", ".join(f"{c}=excluded.{c}" for c in cols if c != "slug"),
                     vals,
                 )
+            version = time.time() if read_at is None else float(read_at)
+            refs = {(str(p), str(k), str(r)) for p, k, r in replace_refs}
+            refs |= {(str(e.get("profile")), str(e.get("kind")), str(e.get("ref"))) for e in embedding_rows}
+            # An episode's vectors are also as new as the episode row written with them.
+            newer = {(p, k, r) for p, k, r in refs
+                     if max(_held_read_at(con, "vectors", _vector_key(p, k, r)),
+                            _held_read_at(con, "episodes", r) if k == "episode" else 0.0) > version}
             for profile, kind, ref in replace_refs:
+                if (str(profile), str(kind), str(ref)) in newer:
+                    continue
                 con.execute("DELETE FROM memory_embeddings WHERE profile = ? AND kind = ? AND ref = ?",
                             (profile, kind, ref))
+            written = 0
             for erow in embedding_rows:
+                if (str(erow.get("profile")), str(erow.get("kind")), str(erow.get("ref"))) in newer:
+                    continue
                 if erow.get("kind") == "episode" and str(erow.get("ref")) in {str(i) for i in _pending_erasure_ids(path)}:
                     continue
                 if erow.get("kind") == "topic" and str(erow.get("ref")) in purged:
@@ -2827,6 +2931,9 @@ def upsert_embeddings(
                     f"VALUES ({', '.join('?' * len(ecols))})",
                     evals,
                 )
+                written += 1
+            for ref in refs - newer:
+                _record_read_at(con, "vectors", _vector_key(*ref), version)
             now = _utcnow_iso()
             _advance_cursor(con, "vectors", synced_at=now,
                             newest=_newest_ts(r.get("built_at") for r in embedding_rows))
@@ -2841,7 +2948,10 @@ def upsert_embeddings(
         m = meta()
         m["last_incremental_upsert_at"] = _utcnow_iso()
         _write_meta(m)
-        return {"ok": True, "embeddings": len(embedding_rows)}
+        out: dict[str, Any] = {"ok": True, "embeddings": written}
+        if newer:
+            out["kept_newer"] = len(newer)
+        return out
     except Exception as exc:
         _record_write_error(touched, f"{type(exc).__name__}: {exc}")
         raise

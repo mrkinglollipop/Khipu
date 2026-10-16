@@ -12,6 +12,16 @@ from pathlib import Path
 from unittest import mock
 
 from khipu import gateway as gw, mcp_server as srv
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_hub_record(monkeypatch):
+    # The fake connections here model the write itself; the record of applied
+    # owner writes (migration 0031) is tested in test_owner_writes_exactly_once.
+    from khipu import owner_writes
+
+    monkeypatch.setattr(owner_writes, "record_on_hub", lambda cur, tool, args: True)
 
 
 def request(name, args, ident=1):

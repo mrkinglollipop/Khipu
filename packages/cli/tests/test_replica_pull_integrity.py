@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -44,7 +45,16 @@ class PullCursor(FakeCursor):
         cols = [c.strip().split(" AS ")[-1] for c in sql[len("SELECT "):sql.index(" FROM ")].split(",")]
         if table == "episodes":
             rows = [dict(r) for r in self.hub.episodes]
-            if "WHERE (ingested_at, id) >" in sql:
+            if "WHERE (changed_at, id) >" in sql:
+                # The change stamp, or the ingest time on a row the stamp
+                # has not reached yet, as the hub's migration 0032 reads it.
+                def after(r):
+                    if r.get("changed_at") is not None:
+                        return (r["changed_at"], r["id"]) > (params[0], params[1])
+                    return (r["ingested_at"], r["id"]) > (params[2], params[3])
+                rows = sorted([r for r in rows if after(r)],
+                              key=lambda r: (r.get("changed_at") or r["ingested_at"], r["id"]))[:params[4]]
+            elif "WHERE (ingested_at, id) >" in sql:
                 rows = sorted([r for r in rows if (r["ingested_at"], r["id"]) > (params[0], params[1])],
                               key=lambda r: (r["ingested_at"], r["id"]))[:params[2]]
             elif "WHERE deleted_at >" in sql:
@@ -122,7 +132,8 @@ def replica(tmp_path, monkeypatch):
             "memory_embeddings": {"profile", "kind", "ref", "built_at"},
             "deliverables": set(hs._DELIVERABLE_COLS),
             "commitments": set(hs._COMMITMENT_COLS), "topics": set(hs._TOPIC_COLS)}
-    monkeypatch.setattr(hs, "_pg_columns", lambda cur, table: cols.get(table, set()))
+    hub.columns = cols
+    monkeypatch.setattr(hs, "_pg_columns", lambda cur, table: hub.columns.get(table, set()))
     return hub
 
 
@@ -251,10 +262,137 @@ def test_nightly_job_and_capture_serialize_and_retry_missed_patch(replica, monke
     assert rows("SELECT COUNT(*) FROM episodes WHERE id=2") == [(1,)]
 
 
+def test_stale_pull_vector_cannot_replace_new_capture_vector(replica, monkeypatch):
+    old = dict(profile="probe-profile", kind="episode", ref="1", chunk_idx=0,
+               content_hash="old", embedding="[1,0]", built_at=datetime.now(timezone.utc))
+    newer = {**old, "content_hash": "new", "embedding": "[0,1]",
+             "built_at": old["built_at"] + timedelta(seconds=1)}
+    replica.columns["memory_embeddings"] = set(hs._EMBED_COLS)
+    real_execute = PullCursor.execute
+
+    def execute(cur, sql, params=()):
+        if "FROM memory_embeddings" not in sql:
+            return real_execute(cur, sql, params)
+        if "GROUP BY profile, kind, ref" in sql:
+            cur._rows = [(old["profile"], old["kind"], old["ref"], old["built_at"])]
+        elif "WHERE profile = %s AND kind = %s" in sql:
+            cur._rows = [tuple(old.get(c) for c in hs._EMBED_COLS)]
+        else:
+            cur._rows = []
+
+    monkeypatch.setattr(PullCursor, "execute", execute)
+    real_upsert = hs.upsert_embeddings
+
+    def interleave(rows, **kwargs):
+        # A live capture lands after the pull read its vectors, before it writes them.
+        assert hs.upsert_episode({**replica.episodes[0], "summary": "new capture"}, [newer])["ok"]
+        return real_upsert(rows, **kwargs)
+
+    monkeypatch.setattr(hs, "upsert_embeddings", interleave)
+    assert hs.pull_changes()["ok"]
+    got = rows("SELECT content_hash FROM memory_embeddings WHERE kind='episode' AND ref='1'")
+    assert got == [("new",)], f"older pull overwrote live capture vector: {got}"
+
+
+def test_pulled_commitments_cannot_overwrite_newer_dump(replica, monkeypatch):
+    real_write = hs._write_pulled_tables
+
+    def interleave(topics, commitments, **kw):
+        # A nightly dump finishes after the pull read the hub, before it writes.
+        def dump_commitments(cur, con):
+            con.execute("INSERT INTO commitments(id,text,status,opened_episode) "
+                        "VALUES (1,'updated by owner','open',1)")
+            return 1
+
+        def dump_episodes(cur, con):
+            con.execute("INSERT INTO episodes(id,summary) VALUES (1,'newer dump')")
+            return 1
+
+        monkeypatch.setattr(hs, "_insert_commitments", dump_commitments)
+        monkeypatch.setattr(hs, "_insert_episodes", dump_episodes)
+        for name in ("_insert_topics", "_insert_topic_revisions", "_insert_nodes", "_insert_edges",
+                     "_insert_profiles", "_insert_memory_embeddings", "_insert_decisions",
+                     "_insert_deliverables", "_insert_ledger"):
+            monkeypatch.setattr(hs, name, lambda *a: 0)
+        assert hs.refresh()["ok"]
+        return real_write(topics, commitments, **kw)
+
+    monkeypatch.setattr(hs, "_write_pulled_tables", interleave)
+    assert hs.pull_changes()["ok"]
+    got = rows("SELECT text,status FROM commitments WHERE id=1")
+    assert got == [("updated by owner", "open")], f"stale pull replaced newer nightly: {got}"
+
+
+def test_foreign_in_place_capture_edit_arrives_within_refresh_window(replica, monkeypatch):
+    # The hub stamps changed_at on every change (migration 0032); a foreign
+    # capture merged into an older episode keeps its ingest time.
+    replica.columns["episodes"] = set(hs._EPISODE_COLS) | {"changed_at"}
+    replica.episodes[0]["summary"] = "new memory merged from a foreign capture"
+    replica.episodes[0]["raw"]["merged_from"] = [{"source_id": "foreign-capture"}]
+    replica.episodes[0]["changed_at"] = datetime.now(timezone.utc)
+    monkeypatch.setattr(rh, "_hub_reachable", lambda: (True, None))
+    out = rh.run()
+    assert out["ok"] and out["action"] == "sync", out
+    got = rows("SELECT summary FROM episodes WHERE id=1")
+    assert got == [(replica.episodes[0]["summary"],)], f"heal reported success but omitted merged capture: {got}"
+    assert not any("changed_at" in c for (c,) in rows("SELECT name FROM pragma_table_info('episodes')"))
+
+
+def test_hub_without_change_stamp_still_pulls_by_ingest_time(replica):
+    replica.episodes.append({"id": 2, "summary": "new on an old hub", "ingested_at": datetime.now(timezone.utc),
+                             "deleted_at": None})
+    assert hs.pull_changes()["ok"]
+    assert rows("SELECT summary FROM episodes WHERE id=2") == [("new on an old hub",)]
+    assert not any("changed_at" in q for q in replica.queries)
+
+
+@pytest.mark.parametrize("when", ["before_rename", "after_rename"])
+def test_new_missed_patch_survives_clear_race(replica, monkeypatch, when):
+    hs._queue_missed_patch(1)
+    cutoff = time.time()
+    real_rename = os.rename
+    fired = []
+
+    def rename(src, dst, *a, **kw):
+        src_path = Path(src)
+        racing = src_path.name == "1" and src_path.parent == hs._missed_patch_dir() and not fired
+        if racing and when == "before_rename":
+            fired.append(True)
+            assert hs._queue_missed_patch(1)
+            os.utime(src_path, (cutoff + 1, cutoff + 1))
+        out = real_rename(src, dst, *a, **kw)
+        if racing and when == "after_rename":
+            fired.append(True)
+            assert hs._queue_missed_patch(1)
+        return out
+
+    monkeypatch.setattr(hs.os, "rename", rename)
+    hs._clear_missed_patches({1}, written_before=cutoff)
+    assert fired
+    assert hs._missed_patch_ids() == {1}
+    assert not [p for p in hs._missed_patch_dir().iterdir() if p.name.startswith(".")]
+
+
+def test_missed_patch_older_than_the_read_is_cleared(replica):
+    hs._queue_missed_patch(1)
+    hs._queue_missed_patch(2)
+    old = time.time() - 60
+    os.utime(hs._missed_patch_dir() / "1", (old, old))
+    hs._clear_missed_patches(written_before=old + 1)
+    assert hs._missed_patch_ids() == {2}
+
+
 # ---- the structural rules ---------------------------------------------------
 
 PACKAGE = Path(hs.__file__).resolve().parent
-_EPISODE_WRITE = re.compile(r"\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM)\s+(?:main\.)?episodes\b", re.I)
+
+
+def _write_pattern(table):
+    return re.compile(r"\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM)\s+(?:main\.)?" + table + r"\b",
+                      re.I)
+
+
+_EPISODE_WRITE = _write_pattern("episodes")
 _REPLICA_SIDE = ("con.execute", "open_snapshot(", "sqlite3.connect(")
 # Every function that writes replica episodes: (module, name) -> how the
 # freshness rule holds there.
@@ -264,6 +402,20 @@ EPISODE_WRITERS = {
     ("hub_snapshot.py", "_apply_pending_erasures"): "a forget, which always lands",
     ("hub_snapshot.py", "forget_episode_in_snapshot"): "a forget, which always lands",
     ("hub_snapshot.py", "_scrub_forgotten"): "a forget, which always lands",
+}
+# The same for replica vectors and replica commitments.
+VECTOR_WRITERS = {
+    ("hub_snapshot.py", "upsert_embeddings"): "the rule itself, per (profile, kind, ref): pull and catch-up land here",
+    ("hub_snapshot.py", "_upsert_episode_unfenced"): "the rule itself, per profile, with the episode row",
+    ("hub_snapshot.py", "_insert_memory_embeddings"): "the dump into a fresh file; refresh records its read floor",
+    ("hub_snapshot.py", "_apply_pending_erasures"): "a forget, which always lands",
+    ("hub_snapshot.py", "forget_episode_in_snapshot"): "a forget, which always lands",
+    ("hub_snapshot.py", "_scrub_forgotten"): "a forget, which always lands",
+    ("hub_snapshot.py", "purge_topic_in_snapshot"): "a topic purge, which always lands",
+}
+COMMITMENT_WRITERS = {
+    ("hub_snapshot.py", "_write_pulled_tables"): "the rule itself, for the whole table: the pull lands here",
+    ("hub_snapshot.py", "_write_commitment_rows"): "the row writer shared by the dump and _write_pulled_tables only",
 }
 # Functions in recall_prompt that answer from the replica: each builds the one
 # stale marker, unless it only works on rows another one already marked.
@@ -290,21 +442,37 @@ def _functions(path):
             yield fn, ast.get_source_segment(src, fn) or "", calls
 
 
-def test_every_replica_episode_writer_is_under_the_freshness_rule():
+def _replica_writers(pattern):
     found = set()
     for path in sorted(PACKAGE.rglob("*.py")):
         for fn, segment, _calls in _functions(path):
             if not any(k in segment for k in _REPLICA_SIDE):
                 continue
-            if any((t := _text(n)) and "%s" not in t and _EPISODE_WRITE.search(t) for n in ast.walk(fn)):
+            if any((t := _text(n)) and "%s" not in t and pattern.search(t) for n in ast.walk(fn)):
                 found.add((str(path.relative_to(PACKAGE)), fn.name))
-    assert found == set(EPISODE_WRITERS), "a replica episode writer is not listed with how the freshness rule holds"
-    calls = {fn.name: c for fn, _s, c in _functions(PACKAGE / "hub_snapshot.py")}
-    assert {"_held_read_at", "_record_read_at"} <= calls["_upsert_episode_unfenced"]
-    refresh_src = {fn.name: s for fn, s, _c in _functions(PACKAGE / "hub_snapshot.py")}["_refresh_locked"]
-    assert "_ROWS_READ_FLOOR_KEY" in refresh_src
-    pull_src = {fn.name: s for fn, s, _c in _functions(PACKAGE / "hub_snapshot.py")}["_pull_apply"]
-    assert "read_at=read_at" in pull_src
+    return found
+
+
+def test_every_replica_episode_writer_is_under_the_freshness_rule():
+    assert _replica_writers(_EPISODE_WRITE) == set(EPISODE_WRITERS), \
+        "a replica episode writer is not listed with how the freshness rule holds"
+    assert _replica_writers(_write_pattern("memory_embeddings")) == set(VECTOR_WRITERS), \
+        "a replica vector writer is not listed with how the freshness rule holds"
+    assert _replica_writers(_write_pattern("commitments")) == set(COMMITMENT_WRITERS), \
+        "a replica commitments writer is not listed with how the freshness rule holds"
+    fns = list(_functions(PACKAGE / "hub_snapshot.py"))
+    calls = {fn.name: c for fn, _s, c in fns}
+    for name in ("_upsert_episode_unfenced", "upsert_embeddings", "_write_pulled_tables"):
+        assert {"_held_read_at", "_record_read_at"} <= calls[name], name
+    assert {name for name, c in calls.items() if "_write_commitment_rows" in c} == \
+        {"_insert_commitments", "_write_pulled_tables"}
+    src = {fn.name: s for fn, s, _c in fns}
+    assert "_ROWS_READ_FLOOR_KEY" in src["_refresh_locked"]
+    pull = ast.parse(src["_pull_apply"].strip())
+    for callee in ("upsert_episode", "upsert_embeddings", "_write_pulled_tables"):
+        passed = [c for c in ast.walk(pull) if isinstance(c, ast.Call) and getattr(c.func, "id", None) == callee
+                  and any(k.arg == "read_at" and getattr(k.value, "id", None) == "read_at" for k in c.keywords)]
+        assert passed, f"_pull_apply does not pass read_at to {callee}"
 
 
 def test_a_read_older_than_the_dump_never_replaces_its_row_but_a_tombstone_lands(replica):
