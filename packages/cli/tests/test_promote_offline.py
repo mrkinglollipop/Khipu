@@ -219,8 +219,9 @@ def test_every_writer_of_the_override_goes_through_the_owner_gate():
                         and getattr(node.func, "attr", getattr(node.func, "id", None))
                         in ("set_gate_ignore", "clear_gate_override")):
                     callers.append((path.name, fn.name))
-    # cli.py names the key only to route `config --set/--unset` to its branch.
-    assert set(writers) <= {"cli.py"}, writers
+    # cli.py names the key only to route `config --set/--unset` to its branch;
+    # owner_act.py only to build that same command for khipu_owner_act.
+    assert set(writers) <= {"cli.py", "owner_act.py"}, writers
     outside = {c for c in callers if c[0] != "promote.py"}
     # Owner direction's Undo puts the override back as it was; it runs only
     # from ``owner-direction undo``, after the owner gate.

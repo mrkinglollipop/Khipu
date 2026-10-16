@@ -137,6 +137,18 @@ STORES: tuple[Store, ...] = (
           "drain and hook events: file names, counts and lengths",
           "none: it never holds summary or transcript text",
           _w("session_capture._log")),
+    Store("owner turns", "capture home owner-turns/: <session>.jsonl, briefs.jsonl, settings.json and "
+          "their .tmp rewrites",
+          "the typed text of each prompt and the briefs of dispatched jobs, for the owner-direction check",
+          "kept: every line is deleted 24 hours after it was written, and the files are never synced, "
+          "captured or searched",
+          _w("owner_turns._record", "owner_turns._write_private")),
+    Store("owner actions", "data folder owner-actions.jsonl, owner-direction-pending.json and their .tmp "
+          "rewrites",
+          "each owner action with the owner's quoted words, and widenings waiting for a second turn",
+          "kept: the owner's record of what was done in their name, for Undo; it quotes only the words "
+          "an action was taken on",
+          _w("owner_direction._append", "owner_direction._write_private")),
     Store("conversation media", "data folder media/conversation_memory/<sha256>.<ext>",
           "images found in transcripts, shared by content hash",
           "kept: images are content-addressed and can belong to several episodes; a known "

@@ -2336,7 +2336,7 @@ def cmd(args: argparse.Namespace) -> int:
                 intent = None
         stamp = require(command, from_app=getattr(args, "from_app", False), dry_run=getattr(args, "dry_run", False),
                         owner_words=getattr(args, "owner_words", None), owner_turn=getattr(args, "owner_turn", None),
-                        intent=intent)
+                        owner_session=getattr(args, "owner_session", None), intent=intent)
         from khipu import owner_direction
 
         owner_direction.run_due()
@@ -2454,13 +2454,14 @@ DIRECTION_ACTIONS = {
 
 
 def require(command: str, *, from_app: bool = False, dry_run: bool = False, owner_words: str | None = None,
-            owner_turn: str | None = None, intent: dict | None = None) -> dict | None:
+            owner_turn: str | None = None, intent: dict | None = None, owner_session: str | None = None) -> dict | None:
     """The one owner check for every verb that changes anything (see
     ``WRITE_POLICY``); raises ``LedgerError`` when this caller may not run
     ``command``. ``dry_run`` (an import that writes nothing) only reads. A
     verb in neither table is refused: a new verb must be classified.
 
-    ``owner_words`` (with ``owner_turn``) asks for the owner-direction check
+    ``owner_words`` (with ``owner_turn``, and ``owner_session`` for a
+    dispatched job) asks for the owner-direction check
     on ``intent`` in place of the app or a typed yes: the owner's verbs, the
     app's (restore, purge) and a write as the owner. Returns the direction's
     auth stamp then (``owner_direction.AlreadyDone`` when this turn already
@@ -2469,7 +2470,7 @@ def require(command: str, *, from_app: bool = False, dry_run: bool = False, owne
     if policy is None and command not in READ_VERBS:
         raise LedgerError(f"{command} is not a known verb; nothing was changed", "unknown_verb")
     if owner_words is not None and not from_app and not dry_run and policy is not None:
-        return _direction(command, owner_words, owner_turn, intent)
+        return _direction(command, owner_words, owner_turn, intent, owner_session)
     if policy is None or dry_run or policy == "writer":
         if from_app:
             _check_from_app()
@@ -2497,7 +2498,7 @@ def require(command: str, *, from_app: bool = False, dry_run: bool = False, owne
                       "direction can make this change; nothing was changed", "not_app")
 
 
-def _direction(command: str, words: str, turn: str | None, intent: dict | None) -> dict:
+def _direction(command: str, words: str, turn: str | None, intent: dict | None, session: str | None = None) -> dict:
     from types import SimpleNamespace
 
     from khipu import owner_direction
@@ -2505,7 +2506,7 @@ def _direction(command: str, words: str, turn: str | None, intent: dict | None) 
     if intent is not None and intent.get("action") != DIRECTION_ACTIONS.get(command):
         intent = None
     try:
-        return owner_direction.gate(SimpleNamespace(owner_words=words, owner_turn=turn), intent)
+        return owner_direction.gate(SimpleNamespace(owner_words=words, owner_turn=turn, owner_session=session), intent)
     except owner_direction.DirectionRefused as err:
         raise LedgerError(err.message, err.code) from None
 

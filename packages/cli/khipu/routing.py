@@ -6597,7 +6597,11 @@ def _priority_intent(args, action: str) -> dict | None:
     from khipu import owner_direction
 
     if action != "set":
-        return owner_direction.intent(f"route.priority.{action}", "priority")
+        # A pending priority is the only one an answer can mean, so "confirm
+        # it" names it (rows 17 to 20 of the owner-direction scope).
+        answer = action in ("confirm", "undo") and bool((read_view().get("priority") or {}).get("pending"))
+        return owner_direction.intent(f"route.priority.{action}", "priority",
+                                      names=[["priority", "order"] + (["that", "it"] if answer else [])])
     entries = _priority_entries_arg(args)
     keys, roles = [], []
     for item in entries if isinstance(entries, list) else []:
@@ -6628,7 +6632,15 @@ def _route_intent(cmd: str, args) -> dict | None:
         if args.action == "edit":
             return owner_direction.intent("route.rule.edit", params[0], stored=[" ".join(params[1:])]) \
                 if len(params) >= 2 else None
-        return owner_direction.intent(f"route.rule.{args.action}", params[0]) if len(params) == 1 else None
+        if len(params) != 1:
+            return None
+        if args.action in ("confirm", "undo", "dismiss"):
+            # "Keep that rule" names it when it is the one rule waiting.
+            n = params[0].strip()
+            waiting = [str(r["n"]) for r in read_view()["rules"] if r.get("pending")]
+            names = [f"rule {n}", f"rule number {n}", f"rule #{n}"] + (["that", "it"] if waiting == [n] else [])
+            return owner_direction.intent(f"route.rule.{args.action}", n, names=[names])
+        return owner_direction.intent(f"route.rule.{args.action}", params[0])
     return None
 
 

@@ -1,6 +1,6 @@
 # MCP tools
 
-Khipu exposes 17 tools through one MCP server (server id `khipu`). Agents call them to read memory, write to it, manage commitments and decisions, ask for synthesis, and read the routing record.
+Khipu exposes 19 tools through one MCP server (server id `khipu`). Agents call them to read memory, write to it, manage commitments and decisions, ask for synthesis, and read the routing record, and take an owner action the owner asked for.
 
 The tool list is returned verbatim by the server's `tools/list`. This page groups the tools by job. For the exact schema of any tool, ask the server.
 
@@ -11,6 +11,7 @@ The tool list is returned verbatim by the server's `tools/list`. This page group
   - The five routing tools (`khipu_usage`, `khipu_route`, `khipu_route_report`, `khipu_route_rule`, `khipu_route_priority`) and the `routing` field of `khipu_status` reply `{available: false, reason}`. They are local only.
   - `khipu_forget` refuses only episodes whose session id starts with a local harness name (`claude_code`, `cursor`, `codex` or `aegis`); any other episode, including one with no session id, can be forgotten through it, because the gateway does not check that the episode came from a cloud harness. A stricter check is planned.
   - `khipu_capture` writes immediately (see below).
+  - `khipu_owner_act` is not listed and refuses every call: owner direction needs the owner's typed turns, which only a prompt hook on the owner's Mac records.
 - **Features that are off.** `khipu_brief` and `khipu_reflect` reply `{available: false}` while their feature switches are off. Both default to off. `khipu features` shows the switches.
 
 ## Memory read
@@ -227,6 +228,14 @@ Record an owner-requested standing rule, or a change to rule number `rule`. Para
 ### khipu_route_priority
 
 Record the owner's account order. Parameters: `entries` (the accounts in the owner's order, with his words for each role) and `owner_request` (both required), `until` (optional). It is live at once and marked unconfirmed until the owner confirms or undoes it in Settings, Routing. This tool cannot confirm, undo or clear a priority.
+
+### khipu_owner_act
+
+Take an owner action because the owner asked for it in this conversation (owner direction). Parameters: `action` (one of the owner actions, such as `route.pause`, `route.rule.confirm`, `route.priority.confirm`, `config.answer_request.confirm` or `accounts.request.confirm`), `args` (that action's arguments, the same the CLI command takes, such as `{"account": "Codex"}`), `words` (the owner's words, quoted exactly, at least three words), `turn` (the token from the latest `Owner turn:` line) and, for a dispatched job only, `owner_session` (the session it was started from).
+
+Khipu runs the same command and the same check as `khipu ... --owner-words` on the CLI: the words must be in a recorded, fresh turn the owner typed in this conversation and must ask for this action on this target. The conversation is read from the MCP server's own environment, never from the arguments. A dispatched job may name its parent session only when the job's first turn is the brief that session dispatched; the words and the token are then the parent's, and the log names both sessions. A request waiting for the owner (a rule, a priority, a routing setting or an account list change) is confirmed the same way, and "that" or "it" names it when it is the only one of its kind waiting.
+
+The answer is the command's own result, or a tool error `{ok: false, code, error}`. On a refusal, tell the owner what Khipu said and ask them to say it again; never retry with different words. Every action is logged and can be undone from Settings or by the owner's words.
 
 ## Work
 

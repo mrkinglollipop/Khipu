@@ -1511,7 +1511,7 @@ def _cmd(args: argparse.Namespace) -> int:
     command = f"work {sub}" if sub else "work"
     try:
         ledger.require(command, owner_words=getattr(args, "owner_words", None),
-                       owner_turn=getattr(args, "owner_turn", None),
+                       owner_turn=getattr(args, "owner_turn", None), owner_session=getattr(args, "owner_session", None),
                        intent=ledger.direction_intent(command, args, None))
     except ledger.LedgerError as exc:
         _emit({"ok": False, "error": str(exc), "reason": exc.reason}, indent=None)

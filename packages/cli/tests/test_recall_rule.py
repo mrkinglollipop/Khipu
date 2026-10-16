@@ -26,8 +26,11 @@ class RuleTextTest(unittest.TestCase):
         # tools/list description is enough, and the rule pushed into every
         # session stays inside its size budget. khipu_ledger is the same: the
         # work ledger, not recall; its callers are told to use it when their
-        # project switches over (Work view phase 6).
-        for tool in (t["name"] for t in TOOLS if t["name"] not in ("khipu_usage", "khipu_ledger")):
+        # project switches over (Work view phase 6). khipu_owner_act too: it
+        # is used only when the owner asks for an owner action, and its own
+        # description carries the quoting rule.
+        for tool in (t["name"] for t in TOOLS
+                     if t["name"] not in ("khipu_usage", "khipu_ledger", "khipu_owner_act")):
             with self.subTest(tool=tool):
                 self.assertIn(tool, rr.RULE_MD)
 

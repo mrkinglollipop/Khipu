@@ -333,10 +333,15 @@ def _title(name: str) -> str:
 
 
 def check(action: str, target: str, words: str, *, turn_token: str | None = None, stored=None, names=None,
-          exclude=None, env=None, now: float | None = None, widening: bool = False, value=None) -> dict:
+          exclude=None, env=None, now: float | None = None, widening: bool = False, value=None,
+          owner_session: str | None = None) -> dict:
     """The owner-direction check (scope 2.3 with decision 1). The auth stamp
     for the record, or ``DirectionRefused``; ``AlreadyDone`` with the first
-    result when this turn already took this action on this target."""
+    result when this turn already took this action on this target.
+
+    ``owner_session`` (a dispatched job, scope 2.4): the session the job was
+    started from, whose turns the words must then be in. Accepted only when
+    a turn of the caller's own session is that session's recorded brief."""
     if action not in ACTIONS:
         raise DirectionRefused("not_by_direction", "That change can't be made by direction.")
     now = _clock() if now is None else now
@@ -348,11 +353,14 @@ def check(action: str, target: str, words: str, *, turn_token: str | None = None
     if not session:
         raise DirectionRefused("no_recorded_turn", "Khipu can't tell which conversation this is, so it can't find "
                                                    "the owner's words.")
+    via_session = None
+    if owner_session is not None:
+        session, via_session = _parent_of(session, str(owner_session).strip(), now), session
     quote = str(words or "")
     turn = _the_turn(session, turn_token, quote, conf, now, short_ok=widening)  # steps 1 to 3
     if widening:  # step 6 (decision 1): a later turn confirms it
         if _confirms_pending(action, target, value, session, turn, quote, conf, now):
-            return _stamp(turn, session, quote, turn_token, confirms=True)
+            return _stamp(turn, session, quote, turn_token, confirms=True, via_session=via_session)
         if len(_quote(quote).split()) < MIN_WORDS:
             _verbatim(quote, {"text": ""})
     _asks_for(action, target, quote, stored=stored, names=names, exclude=exclude)  # step 4
@@ -365,15 +373,33 @@ def check(action: str, target: str, words: str, *, turn_token: str | None = None
                                "This widens what counts as the owner's word, so it needs the owner's confirmation in a "
                                "later message of this conversation. Ask the owner to confirm (for example \"yes, do "
                                "it\"), then submit the same change again with their reply.")
-    return _stamp(turn, session, quote, turn_token)
+    return _stamp(turn, session, quote, turn_token, via_session=via_session)
 
 
-def _stamp(turn: dict, session: str, quote: str, token, *, confirms: bool = False) -> dict:
+def _stamp(turn: dict, session: str, quote: str, token, *, confirms: bool = False,
+           via_session: str | None = None) -> dict:
     stamp = {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
              "words": quote.strip(), "binding": "token" if token else "session"}
+    if via_session:
+        stamp["via_session"] = via_session
     if confirms:
         stamp["confirms"] = True
     return stamp
+
+
+def _parent_of(caller: str, named: str, now: float) -> str:
+    """The session a dispatched job names as its parent, when the job's own
+    session has a recorded turn that is that session's brief (the delegation
+    hook noted it, ``owner_turns.note_brief``). Anything else is refused: a
+    job can never point at a session it was not started from."""
+    linked = named and named != caller and any(
+        t.get("delegated") and t.get("parent") == named for t in owner_turns.turns(caller, now))
+    if not linked:
+        raise DirectionRefused("no_recorded_turn",
+                               "This conversation was not started from that one, so it can't act on the owner's "
+                               "words there. Ask the owner to say it again here, or leave it to the conversation "
+                               "they said it in.")
+    return named
 
 
 def _the_turn(session: str, token, quote: str, conf: dict, now: float, *, short_ok: bool = False) -> dict:
@@ -593,7 +619,7 @@ def gate(args, want: dict | None, *, env=None, now: float | None = None) -> dict
     stamp = check(want["action"], want["target"], getattr(args, "owner_words", None) or "",
                   turn_token=getattr(args, "owner_turn", None), stored=want.get("stored"), names=want.get("names"),
                   exclude=want.get("exclude"), env=env, now=now, widening=bool(want.get("widening")),
-                  value=want.get("value"))
+                  value=want.get("value"), owner_session=getattr(args, "owner_session", None))
     before = _before(want)
     if before is _UNREADABLE:
         raise DirectionRefused("before_unreadable",
@@ -637,7 +663,7 @@ def finish(result: dict | None, **extra) -> dict | None:
         line.update(undo=None, no_undo=why)
     if want.get("facts"):
         line["facts"] = want["facts"]
-    for key in ("words", "harness", "session", "turn", "binding", "auth_chain"):
+    for key in ("words", "harness", "session", "via_session", "turn", "binding", "auth_chain"):
         if stamp.get(key) is not None:
             line[key] = stamp[key]
     line.update(extra)
@@ -1309,11 +1335,14 @@ def run_cli(args) -> int:
 
 
 def add_owner_flags(parser) -> None:
-    """``--owner-words`` and ``--owner-turn`` on an owner command."""
+    """``--owner-words``, ``--owner-turn`` and ``--owner-session`` on an owner
+    command."""
     parser.add_argument("--owner-words", default=None, metavar="WORDS",
                         help="The owner's words, quoted exactly from their message, that ask for this change")
     parser.add_argument("--owner-turn", default=None, metavar="TOKEN",
                         help="The \"Owner turn\" token from the owner's message")
+    parser.add_argument("--owner-session", default=None, metavar="SESSION",
+                        help="A dispatched job: the session it was started from, where the owner typed the words")
 
 
 def add_parser(sub) -> None:
