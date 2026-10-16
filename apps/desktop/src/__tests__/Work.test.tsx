@@ -145,10 +145,12 @@ function Harness({
   onOwedClose = async () => {},
   onSnooze = () => {},
   routing = stubRouting(),
+  onImportTracker,
 }: {
   onOwedClose?: (id: number) => Promise<void>;
   onSnooze?: (id: string, title: string) => void;
   routing?: RoutingState;
+  onImportTracker?: () => void;
 }) {
   const work = useWork(true);
   return (
@@ -161,6 +163,7 @@ function Harness({
       onOwedClose={onOwedClose}
       onSnooze={onSnooze}
       onOpenRouting={() => {}}
+      onImportTracker={onImportTracker}
     />
   );
 }
@@ -323,11 +326,14 @@ describe("Work tab boards", () => {
     expect(within(card).getByText(/^Not reporting since .*\.$/)).toBeInTheDocument();
   });
 
-  it("shows the first-run empty state with no buttons when there are no projects", async () => {
+  it("shows the first-run empty state with Import a tracker when there are no projects", async () => {
     serve(view());
-    render(<Harness />);
+    const onImportTracker = vi.fn();
+    render(<Harness onImportTracker={onImportTracker} />);
     expect(await screen.findByText("No projects yet")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Import a tracker/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Import a tracker…" }));
+    expect(onImportTracker).toHaveBeenCalledTimes(1);
+    // Summary files come with the rest of Settings -> Work (phase 5).
     expect(screen.queryByRole("button", { name: /Add a summary file/ })).toBeNull();
     expect(screen.getByRole("heading", { name: "Owed" })).toBeInTheDocument();
   });

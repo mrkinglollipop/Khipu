@@ -545,6 +545,17 @@ def _existing(cur, project: str, ids: list[str]) -> tuple[dict[str, Any], dict[s
     return here, dict(cur.fetchall())
 
 
+def in_inbox(path: str | os.PathLike) -> bool:
+    """Whether ``path`` is a copy in the ledger inbox (``paths.ledger_inbox``).
+    A copy never changes, so catching up is not used for it."""
+    from khipu import paths
+
+    try:
+        return os.path.dirname(os.path.realpath(path)) == os.path.realpath(paths.ledger_inbox())
+    except OSError:
+        return False
+
+
 def run_import(path: str | os.PathLike, project: str, *, dry_run: bool = False, catch_up: bool = False,
                conn=None) -> dict[str, Any]:
     """Import the tracker at ``path`` into ``project``; see the module text.
@@ -557,7 +568,7 @@ def run_import(path: str | os.PathLike, project: str, *, dry_run: bool = False, 
     counts = tracker_counts(src["rows"])
     report: dict[str, Any] = {"ok": True, "project": project, "file": src["name"], "digest": src["digest"],
                               "counts_in_file": counts, "masked": src["masked"], "other_keys": src["other_keys"],
-                              "catch_up": catch_up}
+                              "catch_up": catch_up, "in_inbox": in_inbox(path)}
     owned = conn is None
     try:
         if owned:

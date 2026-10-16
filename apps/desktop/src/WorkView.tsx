@@ -70,6 +70,8 @@ export type WorkViewProps = {
   /** Opens App's Snooze dialog for one commitment. */
   onSnooze: (id: string, title: string) => void;
   onOpenRouting: () => void;
+  /** Opens Settings -> Work -> Ledger -> Import a tracker... */
+  onImportTracker?: () => void;
 };
 
 type LedgerTarget = { project: string; name: string; row?: string };
@@ -230,6 +232,13 @@ export function WorkView(props: WorkViewProps) {
               title="No projects yet"
               hint={FIRST_RUN_HINT}
             />
+            {props.onImportTracker ? (
+              <div className="toolbar wk-first-run">
+                <button type="button" className="sm" onClick={props.onImportTracker}>
+                  Import a tracker…
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : (
           <>

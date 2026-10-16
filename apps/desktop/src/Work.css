@@ -3,7 +3,8 @@
    (docs/mockups/2026-10-15-work-view/); tokens and components come from App.css. */
 
 .wk-panel .sr-only,
-.lg-page .sr-only {
+.lg-page .sr-only,
+.wk-import .sr-only {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -222,3 +223,14 @@ button.wk-job-title {
   .card .row.wk-goal { grid-template-columns: minmax(0, 1fr) auto; }
   .wk-bar { grid-column: 1 / -1; grid-row: 2; }
 }
+
+/* Settings -> Work -> Ledger -> Import a tracker... (slice 6; mock settings-work.html). */
+.wk-first-run { justify-content: center; }
+.wk-import { display: flex; flex-direction: column; gap: var(--s2); padding: var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); margin-top: var(--s2); }
+.wk-import .toolbar label { min-width: 4.5rem; font-size: var(--t-sm); }
+.wk-import .toolbar input { flex: 1; min-width: 0; }
+.wk-found { font-size: var(--t-sm); color: var(--text); background: var(--ok-soft); border-radius: var(--r-sm); padding: var(--s2) var(--s3); margin: 0; }
+.wk-count { width: 100%; border-collapse: collapse; font-size: var(--t-sm); }
+.wk-count th, .wk-count td { padding: 4px var(--s2); text-align: right; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+.wk-count th:first-child, .wk-count td:first-child { text-align: left; overflow-wrap: anywhere; }
+.wk-count th { color: var(--text-2); font-weight: 600; }

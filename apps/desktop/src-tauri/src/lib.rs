@@ -2394,6 +2394,35 @@ fn ledger_restore_argv(project: &str, id: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+/// The ledger inbox, `<data dir>/ledger-inbox/` (`paths.ledger_inbox`): where
+/// a project's orchestrator copies its old tracker, and where Choose file
+/// opens. Khipu never writes, moves or deletes the original.
+fn ledger_inbox_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("ledger-inbox")
+}
+
+/// A tracker file to import: one full path as the file dialog gives it, not
+/// trimmed, with no control character. The CLI's own reader (`safe_read`)
+/// decides the rest, the login-folder refusal included.
+fn checked_tracker_path(raw: &str) -> Result<String, String> {
+    if !raw.starts_with('/') || raw.len() > 4096 || raw.ends_with('/') || has_control(raw) {
+        return Err("choose the tracker file again; that is not a full path to one file".to_string());
+    }
+    Ok(raw.to_string())
+}
+
+/// `ledger import --json --from-app --project=P [--dry-run] -- PATH`: Check
+/// this file (a dry run, nothing written) and Import. The path travels after
+/// `--`, so it can never become a flag.
+fn ledger_import_argv(project: &str, path: &str, dry_run: bool) -> Result<Vec<String>, String> {
+    let mut argv = ledger_base("import", project, true)?;
+    if dry_run {
+        argv.push("--dry-run".to_string());
+    }
+    argv.extend(["--".to_string(), checked_tracker_path(path)?]);
+    Ok(argv)
+}
+
 /// `work hide|unhide -- ID`: Khipu's own record of a commitment hidden from
 /// Waiting on you until its words change.
 fn work_hide_argv(id: &str, hide: bool) -> Result<Vec<String>, String> {
@@ -2648,6 +2677,24 @@ async fn khipu_ledger_removed(project: String) -> Result<String, String> {
 #[tauri::command]
 async fn khipu_ledger_restore(project: String, id: String) -> Result<String, String> {
     run_khipu_cli_async(ledger_restore_argv(&project, &id)?).await
+}
+
+/// The ledger inbox's full path, made (owner only) when missing.
+#[tauri::command]
+async fn khipu_ledger_inbox() -> Result<String, String> {
+    let inbox = ledger_inbox_dir(&khipu_data_dir()?);
+    std::fs::create_dir_all(&inbox).map_err(|e| format!("Khipu couldn't make its ledger inbox: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(inbox.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn khipu_ledger_import(project: String, path: String, dry_run: bool) -> Result<String, String> {
+    run_khipu_cli_async(ledger_import_argv(&project, &path, dry_run)?).await
 }
 
 #[tauri::command]
@@ -4617,6 +4664,8 @@ pub fn run() {
             khipu_ledger_remove,
             khipu_ledger_removed,
             khipu_ledger_restore,
+            khipu_ledger_inbox,
+            khipu_ledger_import,
             khipu_work_hide,
             khipu_work_same,
             khipu_owed_change,
@@ -7124,6 +7173,37 @@ mod work_command_tests {
             ledger_restore_argv("atlas", "s-1").unwrap(),
             vec!["ledger", "restore", "--json", "--from-app", "--project=atlas", "--", "s-1"]
         );
+    }
+
+    #[test]
+    fn import_runs_the_fixed_argv_with_the_path_after_the_separator() {
+        assert_eq!(
+            ledger_import_argv("owner/atlas", "/data/ledger-inbox/tracker.json", true).unwrap(),
+            vec!["ledger", "import", "--json", "--from-app", "--project=owner/atlas", "--dry-run", "--",
+                 "/data/ledger-inbox/tracker.json"]
+        );
+        assert_eq!(
+            ledger_import_argv("atlas", "/data/ledger-inbox/tracker.json", false).unwrap(),
+            vec!["ledger", "import", "--json", "--from-app", "--project=atlas", "--", "/data/ledger-inbox/tracker.json"]
+        );
+        // A name that starts with a dash stays a path after `--`.
+        assert_eq!(ledger_import_argv("atlas", "/data/-x.json", false).unwrap().last().unwrap(), "/data/-x.json");
+    }
+
+    #[test]
+    fn import_refuses_a_path_that_is_not_one_full_path_and_a_bad_project() {
+        for bad in ["", "-x", "--dry-run", "tracker.json", "~/tracker.json", "/a\nb.json", "/a\u{0}b", " /a.json"] {
+            assert!(ledger_import_argv("atlas", bad, false).is_err(), "{bad:?}");
+        }
+        assert!(ledger_import_argv("atlas", &format!("/{}", "a".repeat(5000)), false).is_err());
+        for bad in ["", "a#b", "a\nb"] {
+            assert!(ledger_import_argv(bad, "/data/tracker.json", false).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_ledger_inbox_is_a_folder_in_the_data_folder() {
+        assert_eq!(ledger_inbox_dir(Path::new("/data")), PathBuf::from("/data/ledger-inbox"));
     }
 
     #[test]

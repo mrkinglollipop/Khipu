@@ -168,6 +168,19 @@ def ensure_data_dir() -> Path:
     return d
 
 
+LEDGER_INBOX = "ledger-inbox"
+
+
+def ledger_inbox() -> Path:
+    """The ledger inbox, ``<data dir>/ledger-inbox/``, made when missing
+    (owner only). A project's orchestrator copies its old tracker here at the
+    switch, so the app's Choose file can reach a tracker that lived in a login
+    folder; Khipu itself never writes, moves or deletes the original."""
+    inbox = ensure_data_dir() / LEDGER_INBOX
+    inbox.mkdir(mode=0o700, exist_ok=True)
+    return inbox
+
+
 def dsn_file() -> Path:
     if isolated_dir() is not None:
         return credential_dir() / "dsn"
@@ -794,5 +807,6 @@ def paths_status() -> dict:
         "default_data_dir": str(DEFAULT_DIR),
         "override_env": bool(_env_override()),
         "pointer": str(pointer_file()) if pointer_file().is_file() else None,
+        "ledger_inbox": str(ledger_inbox()),
         "files": list_local_files(),
     }

@@ -53,6 +53,7 @@ import { RoutingSettings } from "./RoutingSettings";
 import { useRouting } from "./routing";
 import { WorkView } from "./WorkView";
 import { WORK_LEDE, badgeLabel, shortProject, useWork } from "./work";
+import { LedgerImport } from "./LedgerImport";
 import type { DoctorSynthProvider } from "./SynthProvider";
 import { useModelVerify } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
@@ -525,11 +526,12 @@ const ACTIVITY_PAGE = 40;
 const SEARCH_KINDS = ["episode", "topic"] as const;
 
 /** Settings sub-navigation (overhaul phase 5, `mocks/main.settings.html`).
- *  Ten sections, one per thing a person comes here to change. */
+ *  Eleven sections, one per thing a person comes here to change. */
 type SettingsSection =
   | "database"
   | "capture"
   | "routing"
+  | "work"
   | "features"
   | "index"
   | "data"
@@ -542,6 +544,7 @@ const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["database", "Database"],
   ["capture", "Capture & models"],
   ["routing", "Accounts and routing"],
+  ["work", "Work"],
   ["features", "Optional features"],
   ["index", "Embeddings"],
   ["data", "Data & backups"],
@@ -3530,6 +3533,14 @@ export default function App() {
   const owedProjects = Array.from(
     new Set(owedRows.map((c) => c.project).filter((p): p is string => Boolean(p))),
   ).sort();
+  // Import a tracker… offers the commitments' project keys first, then the
+  // ledger's projects.
+  const importProjects = Array.from(
+    new Set([
+      ...owedProjects,
+      ...(work.data?.projects ?? []).map((b) => b.project).filter((p): p is string => Boolean(p)),
+    ]),
+  );
   // Tidy this list… offers the projects that have open items.
   const owedOpenProjects = Array.from(
     new Set(owedOpenRows.map((c) => c.project).filter((p): p is string => Boolean(p))),
@@ -5436,6 +5447,10 @@ export default function App() {
               setSettingsSection("routing");
               setTab("settings");
             }}
+            onImportTracker={() => {
+              setSettingsSection("work");
+              setTab("settings");
+            }}
             owedSection={
               <>
                 <div className="inline wk-owed-lede">
@@ -5817,6 +5832,13 @@ export default function App() {
                     active={tab === "settings" && settingsSection === "routing"}
                     plansState={plans}
                     onSetUpAccounts={openAccountsStepInFirstRun}
+                  />
+                ) : null}
+
+                {settingsSection === "work" ? (
+                  <LedgerImport
+                    active={tab === "settings" && settingsSection === "work"}
+                    projects={importProjects}
                   />
                 ) : null}
 
