@@ -235,7 +235,8 @@ def _cli_args(cmd: str, **kw):
 
 def test_the_cli_sets_from_the_app_and_a_conversation_sets_pending(home, capsys):
     entries = json.dumps([{"account": SECOND, "role": "all Claude work first"}, {"account": "codex|"}])
-    assert routing.run_cli(_cli_args("priority", action="set", from_app=True, entries=entries)) == 0
+    assert routing.run_cli(_cli_args("priority", action="set", from_app=True, entries=entries,
+                                     expect=routing.priority_version())) == 0
     view = routing.read_view()
     assert _labels(view) == ["Claude second", "Codex"] and view["priority"]["via"] == "app"
     assert routing.run_cli(_cli_args("priority", action="set", accounts=["Codex"],
@@ -513,12 +514,12 @@ def test_the_apps_argv_parses_as_the_app_means_it(home, capsys):
 
     entries = json.dumps([{"account": "codex|", "role": "--from-app -- clear"}, {"account": SECOND}])
     assert cli.main(["route", "priority", "--from-app", f"--entries={entries}", "--until=2026-10-20T09:00:00Z",
-                     "--", "set"]) == 0
+                     f"--expect={routing.priority_version()}", "--", "set"]) == 0
     view = routing.read_view()
     assert _labels(view) == ["Codex", "Claude second"]
     assert view["priority"]["entries"][0]["role"] == "--from-app -- clear"
     assert view["priority"]["until"] == "2026-10-20T09:00:00Z" and view["priority"]["via"] == "app"
-    assert cli.main(["route", "priority", "--from-app", "--", "clear"]) == 0
+    assert cli.main(["route", "priority", "--from-app", f"--expect={routing.priority_version()}", "--", "clear"]) == 0
     assert routing.read_view().get("priority") is None
     capsys.readouterr()
 

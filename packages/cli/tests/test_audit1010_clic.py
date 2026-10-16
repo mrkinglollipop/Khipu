@@ -583,7 +583,8 @@ class JoinTransactionRegressionTest(unittest.TestCase):
                     join.import_kit(self._payload(root_crt_pem="new cert"), "")
             self.assertEqual(dsn_path.read_bytes(), b"old dsn\n")
             self.assertEqual(cert_path.read_bytes(), b"old cert\n")
-            self.assertEqual(cfg_path.read_bytes(), b'{"capture_mode":"dual"}\n')
+            # Put back setting by setting, never as a whole-file copy.
+            self.assertEqual(json.loads(cfg_path.read_bytes()), {"capture_mode": "dual"})
 
     def test_existing_malformed_config_refuses_before_dsn_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

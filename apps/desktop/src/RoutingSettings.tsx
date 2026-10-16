@@ -168,7 +168,14 @@ function useWriter(reread: () => Promise<unknown>): Writer {
         } else {
           const res = await callCli(command, built);
           await (after ?? reread)();
-          fail(id, res.ok ? null : res.error);
+          fail(
+            id,
+            res.ok
+              ? null
+              : res.refusal?.code === "version_moved"
+                ? "This was changed somewhere else after this page read it. Khipu read it again; check it and try once more."
+                : res.error,
+          );
           setResults((previous) => {
             const next = { ...previous };
             if (!res.ok) delete next[id];
@@ -751,7 +758,7 @@ function PriorityEntryForm({
     }
     const next = priorityItems(p.entries);
     next[i] = { account: e.account, role: role.trim() || null, until: end.iso };
-    if (await w.run(id, "khipu_route_priority", { action: "set", entries: next, until: p.until ?? null })) onClose();
+    if (await w.run(id, "khipu_route_priority", { action: "set", entries: next, until: p.until ?? null, expect: p.version ?? null })) onClose();
   }
   return (
     <form className="route-pause" id={formId} aria-label={`Change ${e.label} in your priority`} onSubmit={submit} onKeyDown={escapeCloses(onClose)}>
@@ -790,7 +797,7 @@ function PriorityEndForm({ p, w, onClose }: { p: RoutePriority; w: Writer; onClo
       w.fail(id, end.error);
       return;
     }
-    if (await w.run(id, "khipu_route_priority", { action: "set", entries: priorityItems(p.entries), until: end.iso })) onClose();
+    if (await w.run(id, "khipu_route_priority", { action: "set", entries: priorityItems(p.entries), until: end.iso, expect: p.version ?? null })) onClose();
   }
   return (
     <form className="route-pause" aria-label="When your whole priority ends" onSubmit={submit} onKeyDown={escapeCloses(onClose)}>
@@ -835,10 +842,12 @@ function PrioritySection({
   const addSelect = useRef<HTMLSelectElement>(null);
   const candidates = (data.accounts ?? []).filter((a) => a.configured !== false && !entries.some((e) => e.account === a.key));
   const choice = candidates.some((a) => a.key === adding) ? adding : candidates[0]?.key ?? "";
+  // The version of the priority this page loaded, never one fetched at save time.
+  const expect = p?.version ?? data.priority_version ?? null;
   const send = (id: string, next: PriorityItem[], back?: Back) =>
     next.length
-      ? w.run(id, "khipu_route_priority", { action: "set", entries: next, until: p?.until ?? null }, null, back)
-      : w.run(id, "khipu_route_priority", { action: "clear" }, null, back);
+      ? w.run(id, "khipu_route_priority", { action: "set", entries: next, until: p?.until ?? null, expect }, null, back)
+      : w.run(id, "khipu_route_priority", { action: "clear", expect }, null, back);
   const move = (i: number, by: number) => {
     const next = priorityItems(entries);
     const [item] = next.splice(i, 1);
@@ -965,7 +974,7 @@ function PrioritySection({
           <div className="toolbar">
             <button type="button" className="sm danger" disabled={w.isBusy("priority:clear")}
               onClick={async () => {
-                if (await w.run("priority:clear", "khipu_route_priority", { action: "clear" }, null, () => addSelect.current)) setClearing(false);
+                if (await w.run("priority:clear", "khipu_route_priority", { action: "clear", expect }, null, () => addSelect.current)) setClearing(false);
               }}>
               <Busy on={w.isBusy("priority:clear")} />
               Clear it

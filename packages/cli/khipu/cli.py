@@ -3040,7 +3040,7 @@ def cmd_config(args: argparse.Namespace) -> int:
 
         # Decision 15: the owner's (the app, or a typed yes on a terminal),
         # or a conversation's at his request, marked until he answers it.
-        request = None
+        request = via = None
         if getattr(args, "at_owner_request", None) is not None:
             words = routing._one_line(args.at_owner_request)
             if not words:
@@ -3057,9 +3057,15 @@ def cmd_config(args: argparse.Namespace) -> int:
             if via is None:
                 print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
                 return 2
+        expect = (getattr(args, "expect", None) or "").strip()
         try:
-            path = set_usage_accounts(args.set[1] if args.set else None, expect=getattr(args, "expect", None),
-                                      request=request)
+            if not expect:
+                # A save carries the version it read (``khipu accounts`` or
+                # ``config.accounts_version``), so a stale one never lands.
+                raise usage.AccountsError("say which version of the account list this change was made on "
+                                          "(--expect); read the list again first", "version_needed")
+            path = set_usage_accounts(args.set[1] if args.set else None, expect=expect, request=request,
+                                      via=None if request is not None else via)
         except usage.AccountsError as err:
             # A fixed code, the entry and the field at fault: the app says it
             # in its own words and never shows the text.

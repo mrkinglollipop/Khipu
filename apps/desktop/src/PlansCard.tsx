@@ -932,6 +932,8 @@ type UsageAccountsStatus = {
   accounts: UsageAccountEntry[];
   /** The owner's own folder, so "~/.x" and "/Users/me/.x" compare as one login. */
   user_home?: string | null;
+  /** The list as read: a save carries it and is refused once the list moved. */
+  version?: string | null;
 };
 
 export const USAGE_HARNESS_OPTIONS: Array<[string, string]> = [
@@ -1163,9 +1165,11 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
     setErr(null);
     setClash(null);
     const list = next == null ? [] : storable(next);
+    // The version of the list this editor loaded, not one fetched now.
+    const expect = status?.version ?? null;
     const res = list.length
-      ? await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list) })
-      : await callCli("khipu_config_unset", { key: "usage_accounts" });
+      ? await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list), expect })
+      : await callCli("khipu_config_unset", { key: "usage_accounts", expect });
     if (res.ok) onSaved?.();
     await cfg.reload();
     setSaving(false);

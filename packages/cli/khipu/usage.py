@@ -959,7 +959,7 @@ def _name_problem(label: str, harness: str, home: str | None, ids: set[str]) -> 
     if word in HARNESSES and not (word == harness and not home):
         return "name_is_cli", (f"{label!r} is the name of a CLI; only that CLI's own default login is called "
                                f"{LABELS.get(word, word)}")
-    if label in ids:
+    if label.casefold() in {i.casefold() for i in ids}:
         return "name_is_id", f"{label!r} is another account's id"
     return None
 
@@ -1014,7 +1014,8 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
     kept = [e for e in (previous or []) if isinstance(e, dict)]
     # Ids all start "acct-" (``routing.account_id``): only a name that does
     # needs them worked out (which makes this install's id secret).
-    ids = _account_ids(raw) if any(isinstance(e, dict) and str(e.get("label") or "").strip().startswith("acct-")
+    ids = _account_ids(raw) if any(isinstance(e, dict)
+                                   and str(e.get("label") or "").strip().casefold().startswith("acct-")
                                    for e in raw) else set()
     out: list[dict] = []
     # (account, kept) per entry: every entry is checked against every other
