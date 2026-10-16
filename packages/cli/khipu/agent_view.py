@@ -558,10 +558,46 @@ def _project_walk(value, table):
     return value
 
 
-# Text that can't carry a name: numbers and times. Field names (lowercase
-# words joined by "_") are Khipu's own, as are work.py's fixed words.
+# Text that can't carry a name: numbers and times.
 _NAMELESS = re.compile(r"[0-9TZ:.+\- ]*")
-_FIELD = re.compile(r"[a-z][a-z0-9_]{0,39}")
+# The ledger's and the Work view's own field names: the only object keys
+# kept when the privacy table can't be built. A key merely shaped like a
+# field name (a tracker id, a login folder's name) is withheld with its value.
+VIEW_FIELDS = frozenset({
+    "absent", "account_ref", "accounts", "actions", "add", "affected", "all", "also_owed", "as_of", "at",
+    "at_text", "author", "available", "away", "blocked", "blocking", "board", "both", "built", "busy",
+    "by", "by_kind", "by_state", "capped", "catch_up", "changed", "changed_today", "changes", "check",
+    "checking", "children", "clamped", "cleared", "closed", "commit", "contents", "copied", "count",
+    "counts", "counts_differ", "counts_in_file", "counts_in_ledger", "created_at", "days_left", "default",
+    "digest", "disagrees", "done", "dropped", "ended_at", "entered", "error", "event", "evidence",
+    "existing_ids", "extra", "failed", "failures", "fields", "fields_differ", "fields_differ_count",
+    "file", "first_line", "fixing", "flagged", "for", "format", "from", "from_state", "generated_at",
+    "goals", "gone", "hidden", "hist", "history", "holds", "hub", "hub_checked", "id", "ids", "if_state",
+    "import_id", "imported", "imports", "in_dump", "in_offline_copy", "incomplete", "interval_s", "items",
+    "jobs", "key", "kind", "label", "labels", "landed", "lanes", "last", "last_good", "late", "ledger",
+    "ledger_as_of", "ledger_evidence_chars", "ledger_id_chars", "ledger_offline", "ledger_outbox",
+    "ledger_owner_word", "ledger_purge_after", "ledger_stale_after", "ledger_title_chars", "left", "line",
+    "link", "live", "looks_like", "loose_end_count", "loose_ends", "masked", "matched", "meaning",
+    "merged", "merged_at", "missing", "missing_parent", "name", "needs_owner", "new", "new_entries",
+    "new_rows", "new_words", "none", "note", "now", "of", "off", "offline", "offline_as_of",
+    "offline_copy_error", "offline_copy_waiting", "ok", "old", "older", "oldest_age_s", "on", "op",
+    "op_id", "open", "opened_at", "orig", "other_keys", "other_project", "out", "outbox", "outcome",
+    "owner", "parent", "parent_missing", "pending", "plan", "privacy", "problem", "problems", "project",
+    "project_key", "projects", "prs", "pruned", "purged", "purged_ids", "purged_markers", "queue_added",
+    "queue_removed", "queue_restored", "queued", "queued_at", "quiet", "raw", "reason", "reason_word",
+    "refresh_s", "refs", "refused", "remove", "removed", "removed_at", "removed_by", "removed_note",
+    "removed_waiting_to_purge", "requested", "restore", "result", "retried", "rewritten", "row", "row_id",
+    "rows", "rules", "runner", "running", "runs", "seq", "set", "shape", "shipped", "show_now", "shown",
+    "since", "skipped", "skipped_purged", "skipped_removed", "source", "sources", "stage", "stage_at",
+    "stage_known", "stage_words", "stale", "stale_sources", "stamp", "started_at", "state", "state_known",
+    "state_words", "status", "stopped", "stopped_early", "stored", "summary", "task", "testing", "text",
+    "title", "to", "to_state", "trains", "ts", "unreadable", "updated", "updated_at", "valid_until",
+    "value", "verb", "verdict", "verified", "version", "vocab", "waiting", "waiting_list_ignored",
+    "warnings", "with_parent", "words", "work_clock_slack", "work_file_max_bytes", "work_finished_for",
+    "work_gone_after", "work_job_quiet_after", "work_line_chars", "work_max_jobs", "work_max_prs",
+    "work_max_runs", "work_max_trains", "work_merged_for", "work_projects", "work_refresh",
+    "work_stale_after", "written_at"
+})
 INCOMPLETE = "Khipu withheld this answer: it could not load its list of private names and folders."
 
 
@@ -569,8 +605,8 @@ def _withhold_names(value, fixed=None, names=None):
     """``value`` with every string that could carry a name withheld, for
     when the replacement table can't be built: a login folder's name can
     then not be told from any other word. Kept: numbers, times, work.py's
-    own words and object keys shaped like field names (never this Mac's
-    user name)."""
+    own words and object keys from ``VIEW_FIELDS`` or those words (never this Mac's
+    user name). Every other key is withheld, and its value with it."""
     if fixed is None:
         from khipu import work
 
@@ -580,11 +616,13 @@ def _withhold_names(value, fixed=None, names=None):
     if isinstance(value, str):
         return value if value in fixed or _NAMELESS.fullmatch(value) else WITHHELD
     if isinstance(value, dict):
-        def key(k):
-            if not isinstance(k, str) or ((_FIELD.fullmatch(k) or k in fixed) and k.casefold() not in names):
-                return k
-            return WITHHELD
-        return {key(k): _withhold_names(v, fixed, names) for k, v in value.items()}
+        out = {}
+        for k, v in value.items():
+            if not isinstance(k, str) or ((k in VIEW_FIELDS or k in fixed) and k.casefold() not in names):
+                out[k] = _withhold_names(v, fixed, names)
+            else:
+                out[WITHHELD] = WITHHELD
+        return out
     if isinstance(value, (list, tuple)):
         return type(value)(_withhold_names(v, fixed, names) for v in value)
     return value

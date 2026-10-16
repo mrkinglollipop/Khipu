@@ -587,14 +587,20 @@ function AnswerDialog({
 }) {
   const id = useId();
   const words = vocab?.state.length ? vocab.state : DEFAULT_WORDS;
+  const choices = words.filter(([, m]) => m !== "needs").map(([w]) => w);
+  // The project's done word when it defines one, else its first state:
+  // never a word the project doesn't define.
   const doneWord = wordFor(vocab, "done") ?? "DONE";
-  const [state, setState] = useState(doneWord);
+  const initial = choices.includes(doneWord) ? doneWord : (choices[0] ?? "");
+  const [picked, setState] = useState(initial);
   const [note, setNote] = useState("");
   const key = item?.key ?? "";
   useEffect(() => {
-    setState(doneWord);
+    setState(initial);
     setNote("");
-  }, [key, doneWord]);
+  }, [key, initial]);
+  // Save sends exactly what the selector shows.
+  const state = choices.includes(picked) ? picked : initial;
   const meaning = meaningOf(vocab, state);
   return (
     <Dialog open={item != null} className="kit-dialog" ariaLabelledBy={`${id}-t`} onCancel={onCancel}>
@@ -602,7 +608,7 @@ function AnswerDialog({
         className="kit-dialog-body"
         onSubmit={(e) => {
           e.preventDefault();
-          onSave(state, note);
+          if (state) onSave(state, note);
         }}
       >
         <h2 id={`${id}-t`}>Answered</h2>
@@ -610,13 +616,11 @@ function AnswerDialog({
         <label className="wk-field" htmlFor={`${id}-s`}>
           New state
           <select id={`${id}-s`} value={state} onChange={(e) => setState(e.target.value)}>
-            {words
-              .filter(([, m]) => m !== "needs")
-              .map(([w]) => (
-                <option key={w} value={w}>
-                  {stateWords(w)}
-                </option>
-              ))}
+            {choices.map((w) => (
+              <option key={w} value={w}>
+                {stateWords(w)}
+              </option>
+            ))}
           </select>
         </label>
         <label className="wk-field" htmlFor={`${id}-n`}>
@@ -631,7 +635,7 @@ function AnswerDialog({
           <button type="button" onClick={onCancel}>
             Cancel
           </button>
-          <button type="submit" className="primary">
+          <button type="submit" className="primary" disabled={!state}>
             Save
           </button>
         </div>

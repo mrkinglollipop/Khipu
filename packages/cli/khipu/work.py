@@ -385,7 +385,6 @@ def _word(value: Any, shape: re.Pattern = _ID_RE) -> str | None:
 PRIVACY_INCOMPLETE = ("Khipu couldn't load its list of login folders and user names, so every name, title "
                       "and line that could hold one is left out of this view.")
 _Z_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-_SCHEMA_KEY = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
 
 def _fixed_words() -> frozenset[str]:
@@ -410,7 +409,8 @@ class _Scan:
 
     Without the login-folder table (``degraded``) a name can't be told
     from other words, so only times and work.py's own words are kept, and
-    only object keys shaped like the view's own field names."""
+    only object keys from the view's own field names
+    (``agent_view.VIEW_FIELDS``)."""
 
     def __init__(self) -> None:
         try:
@@ -426,11 +426,12 @@ class _Scan:
 
             home = agent_view._home_dir()
             self.names = {n.casefold() for n in (os.path.basename(home or ""), os.environ.get("USER", "")) if n}
+            self.view_fields = agent_view.VIEW_FIELDS
 
     def _keep(self, text: str, key: bool) -> bool:
         if self.degraded:
             if key:
-                return bool(_SCHEMA_KEY.match(text) or text in self.fixed) and text.casefold() not in self.names
+                return (text in self.view_fields or text in self.fixed) and text.casefold() not in self.names
             return text in self.fixed or bool(_Z_TIME.match(text))
         try:
             return not _private_text(text, self.table)
@@ -774,12 +775,12 @@ def _private_place(path: str) -> bool:
     return safe_read.private_place(path)
 
 
-def _open_checked(path: str, limit: int) -> safe_read.Opened:
-    """``safe_read.open_file``, with a file over ``limit`` as ``Unreadable``
-    (``too_big``). Raises ``safe_read.Refused``, ``FileNotFoundError`` or
-    ``OSError`` otherwise."""
+def _read_checked(path: str, limit: int) -> tuple[bytes, os.stat_result]:
+    """``safe_read.read_file`` (the whole file or nothing), with a file over
+    ``limit`` as ``Unreadable`` (``too_big``). Raises ``safe_read.Refused``,
+    ``FileNotFoundError`` or ``OSError`` otherwise."""
     try:
-        return safe_read.open_file(path, limit)
+        return safe_read.read_file(path, limit)
     except safe_read.TooBig as exc:
         raise Unreadable("too_big", f"The summary file is {_kb(exc.size)}, over the {_kb(limit)} limit.",
                          size=exc.size, limit=limit) from None
@@ -805,7 +806,7 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
         and isinstance(last.get("stamp"), list) and last["stamp"][:1] == [name] else None
     limit = cfg["work_file_max_bytes"]
     try:
-        opened = _open_checked(path, limit)
+        data, st = _read_checked(path, limit)
     except safe_read.Refused:
         return {"state": "refused", "problem": SOURCE_PROBLEMS["refused"], "contents": None}
     except FileNotFoundError:
@@ -814,38 +815,27 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
         return _failed(exc.state, exc.problem, last, cfg, **exc.detail)
     except OSError:
         return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last, cfg)
-    st = opened.st
-    try:
-        # Which file was read (its name as set, device and inode) as well as
-        # its times and size: another file with the same time and size is
-        # read afresh. The name is kept only as a hash.
-        stamp = [name, st.st_dev, st.st_ino,
-                 st.st_mtime_ns, st.st_ctime_ns, st.st_size, _cfg_digest(cfg)]
-        if last is not None and last.get("stamp") == stamp:
-            parsed = last["contents"]
-        else:
-            try:
-                data = opened.read(limit or st.st_size or 1)
-                opened.recheck()
-            except safe_read.Refused:
-                return {"state": "refused", "problem": SOURCE_PROBLEMS["refused"], "contents": None}
-            except OSError:
-                return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last, cfg)
-            try:
-                parsed = parse_summary(data, project, cfg, now)
-            except Unreadable as exc:
-                if exc.state in ("wrong_project", "newer_format"):
-                    return {"state": exc.state, "problem": exc.problem, "contents": None, **exc.detail}
-                return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last, cfg)
-            before = _parse_time(((last or {}).get("contents") or {}).get("written_at"))
-            if before is not None and _parse_time(parsed["written_at"]) < before:
-                return _failed("unreadable", SOURCE_PROBLEMS["older"], last, cfg)
-            try:
-                _write_json(_last_file(project), {"project_key": project, "stamp": stamp, "contents": parsed})
-            except OSError:
-                pass  # the last good read is a convenience; this read still shows
-    finally:
-        opened.close()
+    # Which file was read (its name as set, device and inode) as well as
+    # its times and size: another file with the same time and size is
+    # parsed afresh. The name is kept only as a hash.
+    stamp = [name, st.st_dev, st.st_ino,
+             st.st_mtime_ns, st.st_ctime_ns, st.st_size, _cfg_digest(cfg)]
+    if last is not None and last.get("stamp") == stamp:
+        parsed = last["contents"]
+    else:
+        try:
+            parsed = parse_summary(data, project, cfg, now)
+        except Unreadable as exc:
+            if exc.state in ("wrong_project", "newer_format"):
+                return {"state": exc.state, "problem": exc.problem, "contents": None, **exc.detail}
+            return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last, cfg)
+        before = _parse_time(((last or {}).get("contents") or {}).get("written_at"))
+        if before is not None and _parse_time(parsed["written_at"]) < before:
+            return _failed("unreadable", SOURCE_PROBLEMS["older"], last, cfg)
+        try:
+            _write_json(_last_file(project), {"project_key": project, "stamp": stamp, "contents": parsed})
+        except OSError:
+            pass  # the last good read is a convenience; this read still shows
     age = (now - _parse_time(parsed["written_at"])).total_seconds()
     stale = _stale_after(cfg, parsed)
     # Each limit is reached at its instant (>=), the instant build_view
@@ -1437,7 +1427,7 @@ def check_file(path: str) -> tuple[bool, list[str], dict | None]:
     cfg = settings()
     limit = cfg["work_file_max_bytes"]
     try:
-        opened = _open_checked(path, limit)
+        data, _st = _read_checked(path, limit)
     except safe_read.Refused:
         return False, [SOURCE_PROBLEMS["refused"]], None
     except FileNotFoundError:
@@ -1446,15 +1436,6 @@ def check_file(path: str) -> tuple[bool, list[str], dict | None]:
         return False, [exc.problem], None
     except OSError as exc:
         return False, [f"The file can't be read ({routing_sources._short_error(exc)})."], None
-    try:
-        data = opened.read(limit or opened.st.st_size or 1)
-        opened.recheck()
-    except safe_read.Refused:
-        return False, [SOURCE_PROBLEMS["refused"]], None
-    except OSError as exc:
-        return False, [f"The file can't be read ({routing_sources._short_error(exc)})."], None
-    finally:
-        opened.close()
     try:
         parsed = parse_summary(data, None, cfg, _now())
     except Unreadable as exc:

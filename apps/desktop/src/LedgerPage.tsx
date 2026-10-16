@@ -812,7 +812,7 @@ function RemovedDialog({
   const [busy, setBusy] = useState<string | null>(null);
   const [refusal, setRefusal] = useState<string | null>(null);
   const restore = async (rowId: string) => {
-    if (busy) return;
+    if (busy || !usableRowId(rowId)) return;
     setBusy(rowId);
     setRefusal(null);
     try {
@@ -834,10 +834,14 @@ function RemovedDialog({
               <span>
                 <span className="lg-id">{r.id}</span> <span className="lg-removed-title">{r.title}</span>
               </span>
-              <button type="button" className="sm" disabled={busy !== null} aria-label={`Restore ${r.id}`}
-                onClick={() => void restore(r.id)}>
-                {busy === r.id ? "Restoring…" : "Restore"}
-              </button>
+              {usableRowId(r.id) ? (
+                <button type="button" className="sm" disabled={busy !== null} aria-label={`Restore ${r.id}`}
+                  onClick={() => void restore(r.id)}>
+                  {busy === r.id ? "Restoring…" : "Restore"}
+                </button>
+              ) : (
+                <span className="meta">Its id was withheld, so it can't be restored here.</span>
+              )}
               <span className="meta">
                 Removed {changedWords(r.removed_at, now)} by {r.removed_by || "someone not recorded"}
                 {r.days_left != null ? `. Can be restored for ${plural(r.days_left, "more day")}.` : "."}

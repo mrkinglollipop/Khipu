@@ -242,12 +242,13 @@ def open_file(path: str | os.PathLike, limit: int = 0) -> Opened:
 def read_file(path: str | os.PathLike, limit: int = 0) -> tuple[bytes, os.stat_result]:
     """The whole file and its ``fstat``, re-checked after reading. A file
     that grew past ``limit`` while it was read raises ``TooBig``, and one
-    whose size changed raises ``Refused``: never a part of it."""
+    whose size changed since it was opened raises ``Refused``: never a part
+    of it, and never more than the ``fstat`` returned describes."""
     with open_file(path, limit) as opened:
         data = opened.read(limit + 1 if limit else 0)
         if limit and len(data) > limit:
             raise TooBig(len(data), limit)
         opened.recheck()
-        if os.fstat(opened.fd).st_size != len(data):
+        if os.fstat(opened.fd).st_size != len(data) or opened.st.st_size != len(data):
             raise Refused
         return data, opened.st
