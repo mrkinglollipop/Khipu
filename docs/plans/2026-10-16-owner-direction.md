@@ -170,10 +170,12 @@ Each slice is one session. The oracle for every slice is the hermetic pytest run
 4. **The app and the push.** Settings, Owner actions: the list, Undo per line, the off and tighten switches, the windows. The routing block line. Oracle: vitest and build, cargo tests, and a rendered check of the new section (a second-account job, screenshot to a file) per the UI rule.
 5. **Turn it on.** The switch defaults off until slice 4 is verified, then on. Oracle: an end-to-end test in a temp HOME: a recorded fake Claude Code turn "pause Codex until 5pm", an agent call with those words, the record paused, the log line, the routing block line, an Undo, the record lifted.
 
-## 4. Questions for Matt
+## 4. Decisions (Matt, 2026-10-16)
 
-1. **Widening the check from a chat** (2.7): may a direction only turn owner direction off or tighten it, with widening done in the app? Or should even widening work by direction?
-2. **Which phone front ends count?** Remote Control and T3 Code are planned as trusted. Any other way you send prompts from the phone that should count (or that should not)?
-3. **Purge by chat**: is a second "yes" turn acceptable for removing a ledger row for good, or would you rather purge be undoable for a day instead and need just one turn?
-4. **Windows**: act on the latest turn up to 6 hours old, or an earlier turn up to 30 minutes old. Right numbers?
-5. **Aegis and Grok Build** can only bind by session id (no token). Allow direction there with that weaker binding, or keep them to pending requests?
+Matt approved the design and answered the questions. These replace section 2.7's recommendation and step 6 of 2.3 where they differ.
+
+1. **Changing the check itself works by chat; nothing needs the app.** Turning owner direction off, or tightening it (shorter windows, removing an entrypoint, turning off session-only binding), works by direction in one message. Widening it (for example trusting a new front end as the owner, lengthening a window, turning session-only binding on) also works by direction, but needs a second turn of the same session whose words confirm it ("yes"), the same two-turn rule as step 6.
+2. **Front ends that count as the owner**: Remote Control and T3 Code, as the doc assumed, alongside an ordinary Claude Code or Codex session the owner types in. Dispatched jobs stay ineligible.
+3. **Purge is one message, undoable for 24 hours.** A purge by direction needs one turn. It does not run at once: it is scheduled to run a day later, and Undo (in the app or by chat) cancels it until then. Step 6's two-turn rule applies only to widening the check (decision 1).
+4. **Windows stand**: 6 hours for the session's latest owner turn, 30 minutes for an earlier one. Both are changeable in the app and by chat (shortening is a tightening, lengthening a widening).
+5. **Aegis and Grok Build are allowed every owner action** on the weaker session-only binding, the same as other harnesses. The owner-actions log records which binding was used (`token` or `session`).
