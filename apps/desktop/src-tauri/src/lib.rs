@@ -584,6 +584,25 @@ const SYNTH_FALLBACKS: &[&str] = &["gemini", "none"];
 /// `config --set usage_accounts JSON` / `config --unset usage_accounts`: the
 /// accounts Home -> Plans reads (Settings -> Capture & models -> Plans).
 const USAGE_ACCOUNTS_KEY: &str = "usage_accounts";
+const GRAPH_BACKUP_REMOTE_KEY: &str = "graph_backup_remote";
+
+/// An rclone `remote:path` (the CLI checks it again): one token, the remote
+/// name first, so it can never read as a flag.
+fn checked_backup_remote(value: &str) -> Result<String, String> {
+    let v = value.trim().trim_end_matches('/');
+    let (remote, path) = v.split_once(':').unwrap_or(("", ""));
+    let ok = v.len() <= 512
+        && !remote.is_empty()
+        && !path.is_empty()
+        && remote.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && remote.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        && !v.chars().any(|c| c.is_control() || c.is_whitespace());
+    if ok {
+        Ok(v.to_string())
+    } else {
+        Err(format!("graph_backup_remote must look like r2:bucket/folder, got {value:?}"))
+    }
+}
 const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse"];
 const USAGE_ACCOUNTS_MAX: usize = 32;
 /// Settings -> Routing (routing truth phase 4): the sizes, times and switches
@@ -988,6 +1007,7 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
             Ok(set("synth_fallback", v.to_string()))
         }
         USAGE_ACCOUNTS_KEY => Ok(set(USAGE_ACCOUNTS_KEY, checked_usage_accounts(value)?)),
+        GRAPH_BACKUP_REMOTE_KEY => Ok(set(GRAPH_BACKUP_REMOTE_KEY, checked_backup_remote(value)?)),
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
         _ => Err(format!("not a settable key: {key:?}")),
@@ -1001,6 +1021,7 @@ fn config_unset_argv(key: &str) -> Result<Vec<String>, String> {
     if !PATH_KEYS.contains(&key)
         && key != COSINE_FLOOR_KEY
         && key != USAGE_ACCOUNTS_KEY
+        && key != GRAPH_BACKUP_REMOTE_KEY
         && !routing_key(key)
         && !by_profile
     {
@@ -2305,15 +2326,26 @@ fn set_khipu_secret_sync(account: String, value: String) -> Result<String, Strin
     Ok(stdout)
 }
 
-/// Export a join kit to disk. Optional passphrase travels via env, never argv —
-/// same exposure model as `set_khipu_secret`'s stdin pipe. Empty passphrase
-/// writes a plaintext kit (the file is the secret).
+/// Export a join kit to disk. The passphrase travels via env, never argv —
+/// same exposure model as `set_khipu_secret`'s stdin pipe. The CLI refuses an
+/// empty passphrase unless `allow_unencrypted` (the owner's explicit opt-out).
 #[tauri::command]
-async fn join_export(passphrase: String, out_path: String) -> Result<String, String> {
-    spawn_blocking_cli(move || join_export_sync(passphrase, out_path)).await
+async fn join_export(
+    passphrase: String,
+    out_path: String,
+    allow_unencrypted: Option<bool>,
+) -> Result<String, String> {
+    spawn_blocking_cli(move || {
+        join_export_sync(passphrase, out_path, allow_unencrypted.unwrap_or(false))
+    })
+    .await
 }
 
-fn join_export_sync(passphrase: String, out_path: String) -> Result<String, String> {
+fn join_export_sync(
+    passphrase: String,
+    out_path: String,
+    allow_unencrypted: bool,
+) -> Result<String, String> {
     if out_path.trim().is_empty() {
         return Err("out_path is empty".to_string());
     }
@@ -2321,13 +2353,17 @@ fn join_export_sync(passphrase: String, out_path: String) -> Result<String, Stri
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
     let (bc_key, bc_val) = khipu_bytecode_env();
-    let output = Command::new(&py)
-        .arg("-m")
+    let mut cmd = Command::new(&py);
+    cmd.arg("-m")
         .arg("khipu")
         .arg("join")
         .arg("export")
         .arg("--out")
-        .arg(out_path.trim())
+        .arg(out_path.trim());
+    if allow_unencrypted {
+        cmd.arg("--allow-unencrypted");
+    }
+    let output = cmd
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
         .env("KHIPU_APP_VERSION", khipu_app_version())
@@ -2392,23 +2428,38 @@ fn join_import_sync(passphrase: String, file_path: String) -> Result<String, Str
 /// Advertise join kit on LAN (Bonjour + TLS). Spawns a background job and returns
 /// the first JSON line (PIN, port, timeout) while the server keeps running.
 #[tauri::command]
-async fn join_advertise(passphrase: String, timeout: u32) -> Result<String, String> {
-    spawn_blocking_cli(move || join_advertise_sync(passphrase, timeout)).await
+async fn join_advertise(
+    passphrase: String,
+    timeout: u32,
+    allow_unencrypted: Option<bool>,
+) -> Result<String, String> {
+    spawn_blocking_cli(move || {
+        join_advertise_sync(passphrase, timeout, allow_unencrypted.unwrap_or(false))
+    })
+    .await
 }
 
-fn join_advertise_sync(passphrase: String, timeout: u32) -> Result<String, String> {
+fn join_advertise_sync(
+    passphrase: String,
+    timeout: u32,
+    allow_unencrypted: bool,
+) -> Result<String, String> {
     let root = khipu_root()?;
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
     let (bc_key, bc_val) = khipu_bytecode_env();
     let tout = timeout.max(60);
-    let mut child = Command::new(&py)
-        .arg("-m")
+    let mut cmd = Command::new(&py);
+    cmd.arg("-m")
         .arg("khipu")
         .arg("join")
         .arg("advertise")
         .arg("--timeout")
-        .arg(tout.to_string())
+        .arg(tout.to_string());
+    if allow_unencrypted {
+        cmd.arg("--allow-unencrypted");
+    }
+    let mut child = cmd
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
         .env("KHIPU_APP_VERSION", khipu_app_version())
@@ -3871,6 +3922,18 @@ mod settings_command_tests {
         // The other ceilings are not offered by the app.
         assert!(config_set_argv("embed_daily_calls", "10").is_err());
         assert!(config_unset_argv("synth_daily_calls").is_err());
+    }
+
+    #[test]
+    fn the_graph_backup_remote_is_one_remote_path() {
+        assert_eq!(
+            config_set_argv("graph_backup_remote", " r2:my-bucket/graph/ ").unwrap(),
+            v(&["config", "--set", "graph_backup_remote", "r2:my-bucket/graph"])
+        );
+        for bad in ["", "bucket", "r2:", ":path", "--set:x", "r2:a b", "r2:a\n--x"] {
+            assert!(config_set_argv("graph_backup_remote", bad).is_err(), "accepted {bad:?}");
+        }
+        assert_eq!(config_unset_argv("graph_backup_remote").unwrap(), v(&["config", "--unset=graph_backup_remote"]));
     }
 
     #[test]

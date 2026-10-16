@@ -6,18 +6,26 @@
    `DEFAULT_SYNTH_MODELS`); the CLI validates again on save, so what is
    stored is always what the CLI accepted. */
 
-import { useState } from "react";
+import { useId, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Loader2 } from "lucide-react";
 import { Tag } from "./ui";
-import { callCli, useCliState } from "./settingsCli";
+import { callCli, useCliState, type ConfigShape } from "./settingsCli";
 import { SettingField } from "./SettingsControls";
+import { keyInfo, keyStatus, type KeyId } from "./KeysCard";
+import { fmtClock } from "./time";
+import type { ModelVerifyResult } from "./modelVerify";
+import "./CaptureModels.css";
 
 export type SynthRoute = "key" | "login" | "local";
 
 export type SynthProviderInfo = {
   id: string;
   label: string;
+  /** Short name, kind and one line for the provider rows in Settings. */
+  name: string;
+  kind?: string;
+  line: string;
   route: SynthRoute;
   /** Keychain account `khipu secrets --set` writes, for the key routes. */
   account?: string;
@@ -32,13 +40,13 @@ export type SynthProviderInfo = {
 };
 
 export const SYNTH_PROVIDERS: readonly SynthProviderInfo[] = [
-  { id: "gemini", label: "Gemini Flash (API key)", route: "key", account: "gemini_api_key", secretPrefix: "gemini", defaultModel: "gemini-2.5-flash" },
-  { id: "anthropic", label: "Claude Haiku (API key)", route: "key", account: "anthropic_api_key", secretPrefix: "anthropic", defaultModel: "claude-haiku-5-5" },
-  { id: "openai", label: "OpenAI (API key)", route: "key", account: "openai_api_key", secretPrefix: "openai", exampleModel: "gpt-6-luna" },
-  { id: "openrouter", label: "OpenRouter (one key, any model)", route: "key", account: "openrouter_api_key", secretPrefix: "openrouter", exampleModel: "openai/gpt-6-luna" },
-  { id: "claude-cli", label: "Claude on my own login (claude -p)", route: "login", defaultModel: "haiku", binary: "claude" },
-  { id: "codex-cli", label: "ChatGPT on my own login (codex)", route: "login", exampleModel: "gpt-6-luna", binary: "codex" },
-  { id: "local", label: "local", route: "local" },
+  { id: "gemini", label: "Gemini Flash (API key)", name: "Gemini Flash", kind: "API key", line: "Fastest, about 3 s, least accurate", route: "key", account: "gemini_api_key", secretPrefix: "gemini", defaultModel: "gemini-2.5-flash" },
+  { id: "anthropic", label: "Claude Haiku (API key)", name: "Claude Haiku", kind: "API key", line: "Best memory, about 11 s a capture", route: "key", account: "anthropic_api_key", secretPrefix: "anthropic", defaultModel: "claude-haiku-5-5" },
+  { id: "openai", label: "OpenAI (API key)", name: "OpenAI", kind: "API key", line: "Accurate, thinner on open loops, about 8 s", route: "key", account: "openai_api_key", secretPrefix: "openai", exampleModel: "gpt-6-luna" },
+  { id: "openrouter", label: "OpenRouter (one key, any model)", name: "OpenRouter", kind: "API key", line: "One key, any model", route: "key", account: "openrouter_api_key", secretPrefix: "openrouter", exampleModel: "openai/gpt-6-luna" },
+  { id: "claude-cli", label: "Claude on my own login (claude -p)", name: "Claude", kind: "your login", line: "Uses the login you already have; counts against that plan", route: "login", defaultModel: "haiku", binary: "claude" },
+  { id: "codex-cli", label: "ChatGPT on my own login (codex)", name: "ChatGPT", kind: "your login", line: "Uses the login you already have; counts against that plan", route: "login", exampleModel: "gpt-6-luna", binary: "codex" },
+  { id: "local", label: "local", name: "A local model", line: "A model on this Mac or your network", route: "local" },
 ];
 
 /** Older configs (and the CLI's alias) say `cloud` for Gemini. */
@@ -117,29 +125,6 @@ export function synthFallbackLine(sp: DoctorSynthProvider | null | undefined): s
   if (!sp?.fallback || canonicalSynthProvider(sp.provider ?? "") === "gemini") return null;
   if (synthFallbackSetting(sp) === "none") return "Fallback: off";
   return sp.fallback.gemini_key === false ? "Fallback: Gemini Flash, no key" : "Fallback: Gemini Flash (key present)";
-}
-
-export function SynthQualityNote() {
-  return (
-    <div>
-      <p className="set-help">
-        Claude Haiku 5.5: the best memory, first in 10 of 15 judged windows, 3
-        wrong or invented items, about 11 s a capture.
-      </p>
-      <p className="set-help">
-        GPT-6 Luna: accurate where it answers (2 wrong items) but thin on open
-        loops; about 8 s a capture at low effort, 50 s at high.
-      </p>
-      <p className="set-help">
-        Gemini 2.5 Flash: the fastest, about 3 s, and last on quality: no first
-        places, about 10 wrong or invented items.
-      </p>
-      <p className="set-help">
-        Measured 2026-10-13 on 15 real windows. Gemini stays the embedder for
-        search by meaning whichever summariser you pick.
-      </p>
-    </div>
-  );
 }
 
 function parseJson(raw: unknown): Record<string, unknown> | null {
@@ -276,78 +261,299 @@ export function SynthAccess({
 
 export type SynthRow = { provider: string; endpoint: string; model_id: string };
 
-/** Provider select, endpoint (local only), model id, the quality note and the
- *  key / login status. Changing the provider prefills its default model id. */
-export function SynthProviderFields({
+const PROVIDER_KEY: Record<string, KeyId> = {
+  gemini: "gemini",
+  anthropic: "anthropic",
+  openai: "openai",
+  openrouter: "openrouter",
+  local: "openai_compat",
+};
+
+/** Scroll to a key's row in Keys below and put focus on it. */
+function showKeyRow(id: KeyId) {
+  const el = document.getElementById(`key-row-${id}`);
+  if (!el) return;
+  el.scrollIntoView?.({ block: "center" });
+  el.focus();
+}
+
+type TagView = { tone: "neutral" | "ok" | "warn" | "err"; dot: boolean; text: string };
+
+/** The status words on a provider row. Key routes follow the key's status
+ *  in Keys below; login routes follow the health report; local follows the
+ *  endpoint check. */
+function providerTag(
+  info: SynthProviderInfo,
+  presence: SynthSecretsPresence | null,
+  verifyResult: ModelVerifyResult | null,
+  doctorSynth: DoctorSynthProvider | null,
+  runError?: string | null,
+): TagView {
+  const notChecked: TagView = { tone: "neutral", dot: false, text: "Not checked" };
+  if (info.route === "login") {
+    if (doctorSynth == null || canonicalSynthProvider(doctorSynth.provider ?? "") !== info.id) return notChecked;
+    return doctorSynth.binary
+      ? { tone: "ok", dot: true, text: "Found on this Mac" }
+      : { tone: "err", dot: true, text: "Not found on this Mac" };
+  }
+  if (info.route === "local") {
+    const st = keyStatus(presence, verifyResult, "openai_compat");
+    if (runError) return { tone: "err", dot: true, text: "Check could not run" };
+    if (st.check === "ok") return { tone: "ok", dot: true, text: "Works" };
+    if (st.check === "failed") return { tone: "err", dot: true, text: "Check failed" };
+    return notChecked;
+  }
+  const keyId = PROVIDER_KEY[info.id];
+  const st = keyStatus(presence, verifyResult, keyId);
+  if (st.source === "unknown") return notChecked;
+  if (st.source === "none") return { tone: "neutral", dot: false, text: "No key" };
+  if (runError) return { tone: "err", dot: true, text: "Check could not run" };
+  if (st.check === "ok") return { tone: "ok", dot: true, text: "Key works" };
+  if (st.check === "failed") return { tone: "err", dot: true, text: "Key check failed" };
+  return notChecked;
+}
+
+function KeyLine({
+  info,
+  presence,
+  verifyResult,
+  doctorSynth,
+  runError,
+}: {
+  info: SynthProviderInfo;
+  presence: SynthSecretsPresence | null;
+  verifyResult: ModelVerifyResult | null;
+  doctorSynth: DoctorSynthProvider | null;
+  runError?: string | null;
+}) {
+  if (info.route === "login") {
+    const checked = doctorSynth != null && canonicalSynthProvider(doctorSynth.provider ?? "") === info.id;
+    return (
+      <p className="choice-key">
+        <span>
+          Runs the <code>{info.binary}</code> you are already signed into; no key is stored.
+          {checked ? "" : " Save models, then the health report checks it is on this Mac."}
+        </span>
+      </p>
+    );
+  }
+  if (info.route === "local") {
+    return (
+      <p className="choice-key">
+        <span>
+          If the endpoint asks for a key, add it as Local endpoint in Keys below. Save models, then use Check now
+          there.
+          {runError ? ` The check could not run (${runError}).` : ""}
+        </span>
+      </p>
+    );
+  }
+  const keyId = PROVIDER_KEY[info.id];
+  const k = keyInfo(keyId);
+  const st = keyStatus(presence, verifyResult, keyId);
+  let phrase: string;
+  if (st.source === "unknown") phrase = "not read yet";
+  else if (st.source === "none") phrase = "not stored";
+  else if (runError) phrase = `the check could not run (${runError})`;
+  else if (st.check === "ok") phrase = "works";
+  else if (st.check === "failed") phrase = "the check failed";
+  else if (st.source === "env") phrase = "set in the environment";
+  else phrase = "stored, not checked yet";
+  const link =
+    st.source === "none"
+      ? "Add it in Keys below"
+      : st.check === "failed" || runError || (st.check == null && st.source !== "unknown")
+        ? "Check it in Keys below"
+        : "Show it in Keys below";
+  return (
+    <p className="choice-key">
+      <span>
+        Uses the {k.name} key: {phrase}.
+      </span>
+      <button type="button" className="link sm" onClick={() => showKeyRow(keyId)}>
+        {link}
+      </button>
+    </p>
+  );
+}
+
+function ChoiceBody({
+  info,
+  providerId,
   row,
   onChange,
   presence,
+  verifyResult,
   doctorSynth,
-  onKeySaved,
+  runError,
 }: {
+  info: SynthProviderInfo | undefined;
+  providerId: string;
   row: SynthRow;
   onChange: (patch: Partial<SynthRow>) => void;
   presence: SynthSecretsPresence | null;
+  verifyResult: ModelVerifyResult | null;
   doctorSynth: DoctorSynthProvider | null;
-  onKeySaved?: () => Promise<void> | void;
+  runError?: string | null;
 }) {
-  const provider = canonicalSynthProvider(row.provider);
-  const info = synthProviderInfo(provider);
-  const modelError = synthModelError(provider, row.model_id);
+  const endpointId = useId();
+  const modelId = useId();
+  const modelError = synthModelError(providerId, row.model_id);
+  const help = info?.defaultModel
+    ? `Default ${info.defaultModel}.`
+    : info?.exampleModel
+      ? `Required, for example ${info.exampleModel}.`
+      : undefined;
   return (
-    <div className="rows" style={{ marginBottom: 12 }}>
-      <div className="rows-head">Session summaries</div>
-      <div className="toolbar">
-        <label className="muted" htmlFor="models-synth-provider">
-          Provider
-        </label>
-        <select
-          id="models-synth-provider"
-          value={provider}
-          onChange={(e) =>
-            onChange({ provider: e.target.value, model_id: defaultSynthModel(e.target.value) })
-          }
-        >
-          {info ? null : <option value={provider}>{provider}</option>}
-          {SYNTH_PROVIDERS.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.label}
-            </option>
-          ))}
-        </select>
-      </div>
-      <SynthQualityNote />
-      <div className="toolbar">
-        <input
-          className="mono"
-          disabled={provider !== "local"}
-          value={row.endpoint}
-          aria-label="Summariser endpoint"
-          onChange={(e) => onChange({ endpoint: e.target.value })}
-          placeholder="http://127.0.0.1:11434"
-        />
-        <input
-          className="mono"
-          value={row.model_id}
-          aria-label="Summariser model id"
-          aria-invalid={modelError ? true : undefined}
-          onChange={(e) => onChange({ model_id: e.target.value })}
-          placeholder={info?.exampleModel ?? info?.defaultModel ?? "model id"}
-        />
+    <div className="choice-body">
+      {providerId === "local" ? (
+        <div className="set-field">
+          <div className="set-labelrow">
+            <label className="set-label" htmlFor={endpointId}>
+              Endpoint
+            </label>
+          </div>
+          <div className="toolbar">
+            <input
+              id={endpointId}
+              className="mono"
+              value={row.endpoint}
+              aria-describedby={`${endpointId}-help`}
+              onChange={(e) => onChange({ endpoint: e.target.value })}
+              placeholder="http://127.0.0.1:11434"
+            />
+          </div>
+          <p id={`${endpointId}-help`} className="set-help">
+            Any OpenAI-compatible address, such as Ollama on this Mac.
+          </p>
+        </div>
+      ) : null}
+      <div className="set-field">
+        <div className="set-labelrow">
+          <label className="set-label" htmlFor={modelId}>
+            Model id
+          </label>
+        </div>
+        <div className="toolbar">
+          <input
+            id={modelId}
+            className="mono"
+            value={row.model_id}
+            aria-invalid={modelError ? true : undefined}
+            aria-describedby={help ? `${modelId}-help` : undefined}
+            onChange={(e) => onChange({ model_id: e.target.value })}
+            placeholder={info?.exampleModel ?? info?.defaultModel ?? "model id"}
+          />
+        </div>
+        {help ? (
+          <p id={`${modelId}-help`} className="set-help">
+            {help}
+          </p>
+        ) : null}
       </div>
       {modelError ? (
         <p className="set-error" role="alert">
           {modelError}
         </p>
       ) : null}
-      <SynthAccess
-        key={provider}
-        provider={provider}
-        presence={presence}
-        doctorSynth={doctorSynth}
-        onKeySaved={onKeySaved}
-      />
-      <SynthFallbackField provider={provider} doctorSynth={doctorSynth} onSaved={onKeySaved} />
+      {info ? (
+        <KeyLine
+          info={info}
+          presence={presence}
+          verifyResult={verifyResult}
+          doctorSynth={doctorSynth}
+          runError={runError}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/** The provider as a list of choices, one row each. Only the chosen row
+ *  opens, and shows what that provider needs. Changing the provider prefills
+ *  its default model id. */
+export function SynthProviderChoices({
+  row,
+  onChange,
+  presence,
+  verifyResult,
+  doctorSynth,
+  runError,
+}: {
+  row: SynthRow;
+  onChange: (patch: Partial<SynthRow>) => void;
+  presence: SynthSecretsPresence | null;
+  verifyResult: ModelVerifyResult | null;
+  doctorSynth: DoctorSynthProvider | null;
+  /** A verify run that could not execute; shown on every stored key route. */
+  runError?: string | null;
+}) {
+  const provider = canonicalSynthProvider(row.provider);
+  const known = synthProviderInfo(provider);
+  const legendId = useId();
+  const body = (info: SynthProviderInfo | undefined) => (
+    <ChoiceBody
+      info={info}
+      providerId={provider}
+      row={row}
+      onChange={onChange}
+      presence={presence}
+      verifyResult={verifyResult}
+      doctorSynth={doctorSynth}
+      runError={runError}
+    />
+  );
+  return (
+    <div className="choices" role="radiogroup" aria-labelledby={legendId} aria-describedby="synth-help">
+      <span className="sr-only" id={legendId}>
+        Which model writes the summaries
+      </span>
+      {known ? null : (
+        <div className="choice on">
+          <label className="choice-head">
+            <input type="radio" name="synth-provider" value={provider} checked readOnly />
+            <span className="choice-text">
+              <span className="choice-name">{provider}</span>
+              <span className="choice-line">Not a provider this version of Khipu lists</span>
+            </span>
+            <Tag tone="neutral">Not checked</Tag>
+          </label>
+          {body(undefined)}
+        </div>
+      )}
+      {SYNTH_PROVIDERS.map((p) => {
+        const on = p.id === provider;
+        const tag = providerTag(p, presence, verifyResult, doctorSynth, runError);
+        return (
+          <div key={p.id} className={on ? "choice on" : "choice"}>
+            <label className="choice-head">
+              <input
+                type="radio"
+                name="synth-provider"
+                value={p.id}
+                checked={on}
+                onChange={() => onChange({ provider: p.id, model_id: defaultSynthModel(p.id) })}
+              />
+              <span className="choice-text">
+                <span className="choice-name">
+                  {p.name}
+                  {p.kind ? (
+                    <>
+                      {" "}
+                      <span className="meta">{p.kind}</span>
+                    </>
+                  ) : null}
+                </span>
+                <span className="choice-line">{p.line}</span>
+              </span>
+              <Tag tone={tag.tone} dot={tag.dot}>
+                {tag.text}
+              </Tag>
+            </label>
+            {on ? body(p) : null}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -357,13 +563,28 @@ export function SynthProviderFields({
 export function SynthFallbackField({
   provider,
   doctorSynth,
+  presence = null,
+  verifyResult = null,
   onSaved,
 }: {
   provider: string;
   doctorSynth: DoctorSynthProvider | null;
+  presence?: SynthSecretsPresence | null;
+  verifyResult?: ModelVerifyResult | null;
   onSaved?: () => Promise<void> | void;
 }) {
-  const stored = synthFallbackSetting(doctorSynth);
+  const cfg = useCliState<ConfigShape>("khipu_config_show", true);
+  const configured = cfg.data?.config?.synth_fallback;
+  // The stored word, read through config; doctor's copy only when that read fails.
+  // null when neither source can be read: no radio is then shown as chosen.
+  const stored: SynthFallback | null =
+    cfg.data != null
+      ? String(configured ?? "").trim().toLowerCase() === "none"
+        ? "none"
+        : "gemini"
+      : doctorSynth?.fallback != null
+        ? synthFallbackSetting(doctorSynth)
+        : null;
   const [pending, setPending] = useState<SynthFallback | null>(null);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -371,11 +592,14 @@ export function SynthFallbackField({
   const value = pending ?? stored;
 
   async function save(next: SynthFallback) {
+    if (value != null && next === value) return;
     setPending(next);
     setSaving(true);
     setErr(null);
     const res = await callCli("khipu_config_set", { key: "synth_fallback", value: next });
     if (res.ok) {
+      const fresh = await cfg.reload();
+      if (fresh) setPending(null);
       await onSaved?.();
     } else {
       setErr(res.error);
@@ -386,40 +610,68 @@ export function SynthFallbackField({
 
   const noKey =
     !isGemini && value === "gemini" && doctorSynth?.fallback != null && doctorSynth.fallback.gemini_key === false;
-
+  const refused = keyStatus(presence, verifyResult, "gemini").check === "failed";
+  const off = isGemini || saving;
+  const reading = pending == null && cfg.data == null && cfg.error == null && doctorSynth?.fallback == null;
+  if (reading) {
+    return (
+      <fieldset className="set-field">
+        <legend className="set-label">If the provider fails</legend>
+        <p className="set-help">Reading…</p>
+      </fieldset>
+    );
+  }
   return (
-    <div className="set-field">
-      <div className="toolbar">
-        <label className="muted" htmlFor="models-synth-fallback">
-          If the provider fails
+    <fieldset className="set-field">
+      <legend className="set-label">If the provider fails</legend>
+      <div className="radio-stack">
+        <label className="radio-choice">
+          <input
+            type="radio"
+            name="synth-fallback"
+            value="gemini"
+            checked={value === "gemini"}
+            disabled={off}
+            onChange={() => void save("gemini")}
+          />
+          Retry on Gemini Flash
         </label>
-        <select
-          id="models-synth-fallback"
-          value={value}
-          disabled={isGemini || saving}
-          onChange={(e) => void save(e.target.value as SynthFallback)}
-        >
-          <option value="gemini">Retry that window on Gemini Flash</option>
-          <option value="none">Do not fall back; the capture waits and is retried later</option>
-        </select>
-        {noKey ? (
-          <Tag tone="warn" dot>
-            No Gemini key
-          </Tag>
-        ) : null}
+        <label className="radio-choice">
+          <input
+            type="radio"
+            name="synth-fallback"
+            value="none"
+            checked={value === "none"}
+            disabled={off}
+            onChange={() => void save("none")}
+          />
+          Wait and retry later on the same provider
+        </label>
       </div>
+      {cfg.data == null && cfg.error != null ? (
+        <p className="set-help">Can't read the stored choice ({cfg.error}). Choosing one still saves it.</p>
+      ) : null}
       {isGemini ? (
         <p className="set-help">Gemini is the provider; there is nothing to fall back to.</p>
+      ) : value == null ? (
+        <p className="set-help">Nothing is dropped either way: a failed capture waits and is retried. Saved when you choose.</p>
+      ) : value === "gemini" ? (
+        <p className="set-help">
+          Fallback uses the Gemini key, about $0.002 a conversation. Nothing is dropped either way. Saved when you
+          choose.
+          {refused ? " While that key is refused, a failed capture waits and is retried; nothing is dropped." : ""}
+        </p>
       ) : (
         <p className="set-help">
-          Fallback calls are billed to the Gemini key, about $0.002 per window, and count under By provider
-          as gemini. Nothing is ever dropped either way: with no fallback the capture waits in the queue and is
-          retried.
+          Nothing is dropped: a failed capture waits and is retried. Saved when you choose.
         </p>
       )}
       {noKey ? (
         <p className="set-help">
-          Set a Gemini key (choose Gemini Flash above to see its key field) or the fallback cannot run.
+          <Tag tone="warn" dot>
+            No Gemini key
+          </Tag>{" "}
+          Add a Gemini key in Keys below, or the fallback cannot run.
         </p>
       ) : null}
       {err ? (
@@ -427,7 +679,7 @@ export function SynthFallbackField({
           {err}
         </p>
       ) : null}
-    </div>
+    </fieldset>
   );
 }
 
@@ -468,9 +720,10 @@ export function synthCallsLine(b: SynthBudget): string {
   const calls = typeof b.calls === "number" ? b.calls.toLocaleString("en-US") : "?";
   const source = b.cap_source ? CAP_SOURCE[b.cap_source] ?? b.cap_source : null;
   const unlimited = b.unlimited === true || b.cap === 0;
-  if (unlimited) return `${calls} calls today, no ceiling${source ? ` (${source})` : ""}`;
+  const plural = (n: number | null | undefined) => (n === 1 ? "call" : "calls");
+  if (unlimited) return `${calls} ${plural(b.calls)} today, no ceiling${source ? ` (${source})` : ""}`;
   const cap = typeof b.cap === "number" ? b.cap.toLocaleString("en-US") : "?";
-  return `${calls} of ${cap} calls today${source ? ` (${source})` : ""}`;
+  return `${calls} of ${cap} ${plural(b.cap)} today${source ? ` (${source})` : ""}`;
 }
 
 /** One line per provider used today: calls and cost, or "subscription". */
@@ -484,12 +737,25 @@ export function usageByProviderLines(by: Record<string, ProviderUsage> | undefin
   });
 }
 
-export function SummariserBudgetCard({ active }: { active: boolean }) {
+function nextUtcMidnightHere(): string {
+  const n = new Date();
+  return fmtClock(new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate() + 1)));
+}
+
+function fmtCount(n: number | null | undefined): string {
+  return typeof n === "number" ? n.toLocaleString("en-US") : "?";
+}
+
+/** "Calls today: 12 of 5,000, about $0.03", with Change… for the daily limit
+ *  and Lift for today. Lives inside the Session summaries card. */
+export function SummariserCalls({ active }: { active: boolean }) {
   const st = useCliState<{ synth?: SynthBudget }>("khipu_budget_status", active);
   const b = st.data?.synth;
   const [lifting, setLifting] = useState(false);
   const [liftMsg, setLiftMsg] = useState<string | null>(null);
   const [liftErr, setLiftErr] = useState<string | null>(null);
+  const [changing, setChanging] = useState(false);
+  const limitId = useId();
 
   async function liftToday() {
     setLifting(true);
@@ -502,63 +768,95 @@ export function SummariserBudgetCard({ active }: { active: boolean }) {
     setLifting(false);
   }
 
-  const lines = usageByProviderLines(b?.usage_by_provider);
+  const midnight = nextUtcMidnightHere();
+  const unlimited = b != null && (b.unlimited === true || b.cap === 0);
+  const exhausted = b?.exhausted === true && !unlimited;
+  const cost = b && typeof b.estimated_usd_today === "number" ? formatUsd(b.estimated_usd_today) : null;
+  const source = b?.cap_source ? CAP_SOURCE[b.cap_source] ?? b.cap_source : null;
+  const by = b?.usage_by_provider ? Object.entries(b.usage_by_provider) : [];
+  const byText = by
+    .map(([id, u]) => `${synthProviderInfo(id)?.name ?? id} ${fmtCount(u?.calls ?? 0)}`)
+    .join(", ");
+
+  let main: string;
+  let sub: string | null = null;
+  if (b) {
+    if (exhausted) {
+      main = `Calls today: ${fmtCount(b.calls)} of ${fmtCount(b.cap)}. Captures wait until midnight UTC; nothing is dropped.`;
+      sub = `Midnight UTC is ${midnight} here.${cost ? ` About ${cost} today.` : ""}`;
+    } else {
+      main = unlimited
+        ? `Calls today: ${fmtCount(b.calls)}, no daily limit${cost ? `, about ${cost}` : ""}`
+        : `Calls today: ${fmtCount(b.calls)} of ${fmtCount(b.cap)}${cost ? `, about ${cost}` : ""}`;
+      const limit = unlimited
+        ? `No daily limit${source ? ` (${source})` : ""}.`
+        : `Daily limit ${fmtCount(b.cap)}${source ? ` (${source})` : ""}; 0 means no limit.`;
+      sub = `${byText ? `By provider: ${byText}. ` : ""}${limit} It starts again at midnight UTC, ${midnight} here.`;
+    }
+  } else if (st.error) {
+    main = `Can't read today's calls: ${st.error}`;
+  } else {
+    main = "Calls today: Reading…";
+  }
+
   return (
-    <div className="section-card">
-      <div className="section-head">Summariser calls per day</div>
-      <div className="section-body">
-        {st.error && !b ? (
-          <p className="set-error" role="alert">
-            Could not read the ceiling: {st.error}
-          </p>
-        ) : null}
-        {b ? (
-          <div className="rows">
-            <div className="row-item">
-              <span className="row-main">Today</span>
-              <span className="row-meta">{synthCallsLine(b)}</span>
-              {b.exhausted ? <Tag tone="warn">Reached</Tag> : null}
-            </div>
-            <div className="row-item">
-              <span className="row-main">Estimated cost today</span>
-              <span className="row-meta">{formatUsd(b.estimated_usd_today)}</span>
-            </div>
-            {lines.map((line) => (
-              <div key={line} className="row-item">
-                <span className="row-main">By provider</span>
-                <span className="row-meta wrap">{line}</span>
-              </div>
-            ))}
-          </div>
-        ) : null}
-        <SettingField
-          label="Daily ceiling"
-          mono
-          narrow
-          inputMode="decimal"
-          value={b && typeof b.cap === "number" ? String(b.cap) : ""}
-          help="0 means no ceiling. When the ceiling is reached, captures wait in the queue until UTC midnight; nothing is dropped."
-          onSave={async (v) => {
-            if (!/^\s*\d+\s*$/.test(v)) return "Enter a whole number, 0 or more.";
-            const res = await callCli("khipu_config_set", { key: "synth_daily_calls", value: v.trim() });
-            await st.reload();
-            return res.ok ? null : res.error;
-          }}
-        />
-        <div className="toolbar">
-          <button type="button" disabled={lifting} onClick={() => void liftToday()}>
-            {lifting ? <Loader2 size={14} className="spin" aria-hidden /> : null}
-            Lift for today
-          </button>
-          <span className="muted">Resets today's count, so the full ceiling is available again until UTC midnight.</span>
-        </div>
-        {liftMsg ? <p className="set-help">{liftMsg}</p> : null}
-        {liftErr ? (
-          <p className="set-error" role="alert">
-            {liftErr}
-          </p>
-        ) : null}
+    <>
+      <div className={exhausted ? "calls warn" : "calls"} role="group" aria-label="Calls today">
+        <span className="calls-text">
+          <span className="calls-main">{main}</span>
+          {sub ? <span className="calls-sub">{sub}</span> : null}
+        </span>
+          <span className="calls-acts">
+            <button
+              type="button"
+              className="sm"
+              aria-label="Change the daily limit"
+              aria-expanded={changing}
+              aria-controls={limitId}
+              onClick={() => setChanging((c) => !c)}
+            >
+              Change…
+            </button>
+            <button
+              type="button"
+              className={exhausted ? "sm primary" : "sm"}
+              disabled={lifting}
+              onClick={() => void liftToday()}
+            >
+              {lifting ? <Loader2 size={12} className="spin" aria-hidden /> : null}
+              Lift for today
+            </button>
+          </span>
       </div>
-    </div>
+      {exhausted ? (
+        <p className="set-help">
+          Lift for today starts today's count again, so the full limit is there until midnight UTC.
+        </p>
+      ) : null}
+      {liftMsg ? <p className="set-help">{liftMsg}</p> : null}
+      {liftErr ? (
+        <p className="set-error" role="alert">
+          {liftErr}
+        </p>
+      ) : null}
+      {changing ? (
+        <div id={limitId}>
+          <SettingField
+            label="Daily limit"
+            mono
+            narrow
+            inputMode="decimal"
+            value={b && typeof b.cap === "number" ? String(b.cap) : ""}
+            help="0 means no limit. When the limit is reached, captures wait until midnight UTC; nothing is dropped."
+            onSave={async (v) => {
+              if (!/^\s*\d+\s*$/.test(v)) return "Enter a whole number, 0 or more.";
+              const res = await callCli("khipu_config_set", { key: "synth_daily_calls", value: v.trim() });
+              await st.reload();
+              return res.ok ? null : res.error;
+            }}
+          />
+        </div>
+      ) : null}
+    </>
   );
 }

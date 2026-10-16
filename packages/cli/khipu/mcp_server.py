@@ -166,8 +166,12 @@ def mark_gateway_active() -> None:
 
 
 def _via_https_gateway() -> bool:
-    """True when this tools/call arrived through ``khipu.gateway`` (HTTPS)."""
-    if _GATEWAY_ACTIVE:
+    """True when this tools/call arrived through ``khipu.gateway`` (HTTPS):
+    the request carries a token label. The process-wide flag stays as the
+    fallback for threads a request starts, which do not inherit its label."""
+    from khipu.request_context import gateway_label
+
+    if gateway_label() or _GATEWAY_ACTIVE:
         return True
     return (os.environ.get(GATEWAY_ACTIVE_ENV) or "").strip().lower() in {
         "1", "true", "yes", "on",
@@ -581,11 +585,20 @@ TOOLS: list[dict] = [
             "legacy file. Use it for a capture that was wrong, a test, or "
             "something that should not have been remembered. Through the "
             "HTTPS gateway only episodes captured by a cloud harness can be "
-            "forgotten; local captures are forgotten from the Mac that owns them."
+            "forgotten; local captures are forgotten from the Mac that owns them. "
+            "A ledger id (ledger:<project>#<row id>) removes that ledger row, the "
+            "same as `khipu ledger remove`: it leaves every list at once and the "
+            "owner can restore it in the app for 30 days."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "integer", "description": "Episode id (khipu_capture returns it)"}},
+            "properties": {
+                "id": {"type": ["integer", "string"],
+                       "description": "Episode id (khipu_capture returns it), or ledger:<project>#<row id>"},
+                "note": {"type": "string", "description": "Ledger rows only: why it is removed"},
+                "children": {"type": "string", "enum": ["remove", "move-up"],
+                             "description": "Ledger rows with children only: remove them too, or move them up"},
+            },
             "required": ["id"],
         },
     },
@@ -1109,7 +1122,9 @@ def _tool_status_light(args: dict) -> dict:
         except Exception as exc:  # noqa: BLE001 — best-effort; prior_work
             # (on its own threads below) must land regardless.
             probe["hub_ok"] = False
-            probe["hub_error"] = f"{type(exc).__name__}: {exc}"
+            from khipu import agent_view
+
+            probe["hub_error"] = agent_view.error_text(exc)
 
     routing: dict = {}
 
@@ -1212,7 +1227,9 @@ def _tool_status(args: dict) -> dict:
         payload = status_payload_snapshot()
         if args.get("include_drift"):
             payload["drift_error"] = "hub unreachable; drift omitted"
-        payload["hub_error"] = f"{type(exc).__name__}: {exc}"
+        from khipu import agent_view
+
+        payload["hub_error"] = agent_view.error_text(exc)
     _attach_prior_work(payload, args)
     _attach_contract(payload)
     _attach_plan_warnings(payload)
@@ -1230,6 +1247,10 @@ def _attach_plan_warnings(payload: dict) -> None:
         warnings = usage.doctor_block()["warnings"]
     except Exception:  # noqa: BLE001
         return
+    with contextlib.suppress(Exception):
+        from khipu import agent_view
+
+        warnings = agent_view.scrub(warnings)
     payload["warnings"] = [*(payload.get("warnings") or []), *warnings]
 
 
@@ -1509,6 +1530,15 @@ def _tool_forget(args: dict) -> dict:
     """Complete forget of one episode (khipu.forget). From the gateway only a
     cloud harness's own captures may be forgotten: a local episode belongs to
     the Mac that captured it and is forgotten there."""
+    if isinstance(args.get("id"), str) and args["id"].startswith("ledger:"):
+        _ensure_path()
+        from khipu import ledger
+
+        try:
+            return ledger.remove_ref(args["id"], note=str(args.get("note") or ""),
+                                     children=args.get("children"), source="mcp")
+        except ledger.LedgerError as exc:
+            raise ValueError(str(exc)) from None
     eid = _positive_id(args.get("id"), "id")
     _ensure_path()
     from khipu.forget import LOCAL_HARNESSES, forget_everywhere
@@ -1699,7 +1729,9 @@ def _tool_usage(args: dict) -> dict:
     if max_age is None or isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
         max_age = usage.DEFAULT_MAX_AGE_S
     # Cache-first: never waits on a probe; at most one refresh runs in the background.
-    return usage.report(fresh=bool(args.get("fresh")), max_age=max(0.0, float(max_age)), background=True)
+    # Projected: a conversation never sees a login folder (the app's own command keeps them).
+    return usage.public_report(usage.report(fresh=bool(args.get("fresh")), max_age=max(0.0, float(max_age)),
+                                            background=True))
 
 
 def _tool_route(args: dict) -> dict:
@@ -1804,6 +1836,26 @@ TOOL_FUNCS = {
 
 def _result(req_id, payload: dict) -> dict:
     return {"jsonrpc": "2.0", "id": req_id, "result": payload}
+
+
+# Tools whose whole answer an agent reads about this Mac's accounts and
+# setup: scrubbed at the boundary (agent_view), over stdio and the gateway.
+# Memory content (khipu_search, khipu_get, khipu_status's prior work) is
+# never scrubbed: that would alter what was remembered.
+_AGENT_SCRUBBED = frozenset({"khipu_usage", "khipu_route", "khipu_route_report", "khipu_route_rule",
+                             "khipu_route_priority", "khipu_status"})
+_MEMORY_FIELDS = ("prior_work", "prior_work_text", "prior_work_meta")
+
+
+def _scrub_for_agents(name: str, payload):
+    from khipu import agent_view
+
+    if not isinstance(payload, dict):
+        return agent_view.scrub(payload)
+    memory = {k: payload[k] for k in _MEMORY_FIELDS if k in payload}
+    out = agent_view.scrub({k: v for k, v in payload.items() if k not in memory})
+    out.update(memory)
+    return out
 
 
 def _error(req_id, code: int, message: str) -> dict:
@@ -1986,12 +2038,16 @@ def _dispatch_message(msg: dict) -> dict | None:
             return _error(req_id, -32602, f"unknown tool: {name}")
         if _RELOAD_ON_CHANGE:
             _drop_modules_if_code_changed()
+        from khipu import agent_view
+
         try:
             payload = func(params.get("arguments") or {})
+            if name in _AGENT_SCRUBBED:
+                payload = _scrub_for_agents(name, payload)
         except _ToolFailure as exc:
-            return _result(req_id, _tool_text(exc.payload, is_error=True))
+            return _result(req_id, _tool_text(agent_view.scrub(exc.payload), is_error=True))
         except ValueError as exc:  # argument/mode rejections → tool error, not crash
-            return _result(req_id, _tool_text({"error": str(exc)}, is_error=True))
+            return _result(req_id, _tool_text({"error": agent_view.scrub(str(exc))}, is_error=True))
         except KeyboardInterrupt:
             raise
         except BaseException as exc:  # noqa: BLE001 — DB down, or SystemExit from
@@ -1999,11 +2055,9 @@ def _dispatch_message(msg: dict) -> dict | None:
             # which inside a long-lived MCP server killed the whole process and
             # took every other client's session with it — audit 2026-09-04).
             # A tool failing is a tool error; only the transport may end us.
-            if isinstance(exc, SystemExit):
-                detail = f"SystemExit: capture rejected the payload (exit {exc.code})"
-            else:
-                detail = f"{type(exc).__name__}: {exc}"
-            return _result(req_id, _tool_text({"error": detail}, is_error=True))
+            # Its own text may name a file: fixed words for a filesystem
+            # error, anything else scrubbed (agent_view.error_text).
+            return _result(req_id, _tool_text({"error": agent_view.error_text(exc)}, is_error=True))
         finally:
             if _RELOAD_ON_CHANGE:
                 _note_loaded_modules()

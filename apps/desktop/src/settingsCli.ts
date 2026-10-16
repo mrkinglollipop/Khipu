@@ -98,6 +98,7 @@ export type ConfigShape = {
   user_aliases?: string[];
   float_settings?: Record<string, { value: number; source: string; default: number }>;
   relevance_cosine_floor?: { value: number; source: string; default: number };
+  graph_backup_remote?: { value: string; source: "env" | "config" | "default"; default: string; error?: string };
   config?: Record<string, unknown>;
 };
 

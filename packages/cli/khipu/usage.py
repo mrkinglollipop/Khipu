@@ -122,6 +122,22 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return f"This sign-in reports no plan limits. Open {name}{folder} and sign in again (/login)"
     if code == E_PENDING:
         return "Reading for the first time; ask again in a few seconds"
+    # Every other code the probes can return gets its plain cause too, so the
+    # app shows Khipu's words for every failure and never invents its own.
+    if code == E_TIMEOUT:
+        return f"{name} didn't answer in time"
+    if code == E_NO_ANSWER or (code and re.fullmatch(r"(exit|signal)_\d+", code)):
+        return f"{name} didn't answer"
+    if code == E_CLI:
+        return f"{name} reported an error when asked"
+    if code == E_BAD:
+        return f"{name} answered in a way Khipu can't read"
+    if code == E_START:
+        return f"{name} could not be started"
+    if code == E_INVALID:
+        return "This account entry is not valid"
+    if code == E_INTERNAL:
+        return "Khipu could not run the check"
     return None
 
 
@@ -1247,12 +1263,80 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
             for i, row in zip(due, merged):
                 rows[i] = dict(row, cached=False)
     now = _now()
-    for row in rows:
+    for account, row in zip(accounts, rows):
+        # The identity the routing record keys this account by, so the app
+        # matches the two by login, never by a name that may be reused.
+        row["key"] = _key(account)
         age = _age_s(row, now)
         row["stale"] = bool((not row.get("ok") and row.get("last_good_at"))
                             or (age is not None and age > max_age))
     return {"generated_at": _iso(now.timestamp()), "max_age_s": max_age, "refreshing": refreshing,
             "accounts": rows, "summary_text": [summary_line(r) for r in rows]}
+
+
+# What a conversation sees of a row (``khipu_usage``): an allowlist, so a field
+# added to the owner's rows later stays out until named here. Never ``home``
+# or any path: conversations reach other model providers (slice 9A).
+_PUBLIC_ROW_FIELDS = ("harness", "account", "plan", "ok", "error", "live_error", "last_error", "version",
+                      "source", "observed_at", "probed_at", "last_attempt_at", "last_good_at", "ms", "cached",
+                      "stale", "refreshing")
+_PUBLIC_WINDOW_FIELDS = ("name", "used_pct", "resets_at", "window_mins", "model")
+INVALID_PUBLIC_NOTE = "This account entry is not valid; the owner can fix it in Khipu's Settings"
+
+
+def public_row(row: dict) -> dict:
+    """One report row as a conversation may see it: the account by its
+    label and its ``khipu_route`` id, its state and figures, and a note in
+    Khipu's own words with no login folder in it."""
+    from khipu import routing
+
+    harness, home = row.get("harness"), row.get("home")
+    out = {k: row[k] for k in _PUBLIC_ROW_FIELDS if k in row}
+    out["id"] = routing.account_id(_key({"harness": harness, "home": home}))
+    out["harness"] = harness if harness in HARNESSES else "?"
+    for field in ("error", "live_error", "last_error"):
+        if field in out and out[field] is not None and not _is_code(out[field]):
+            out[field] = E_INTERNAL
+    out["windows"] = [{k: w[k] for k in _PUBLIC_WINDOW_FIELDS if k in w}
+                      for w in row.get("windows") or [] if isinstance(w, dict)]
+    credits = row.get("credits")
+    out["credits"] = ({k: v for k, v in credits.items() if isinstance(v, (bool, int, float))} or None
+                      if isinstance(credits, dict) else None)
+    error = out.get("error")
+    if row.get("error") == E_INVALID:
+        # The owner's reason names the entry as typed (a folder included).
+        note = INVALID_PUBLIC_NOTE
+    else:
+        # Only a note Khipu itself writes for this row passes; any other text
+        # (a cache edited by hand, a field from elsewhere) is written again.
+        note = row.get("note")
+        own = {_note(error, harness, home), _note(error, harness, None),
+               _rollout_note(out.get("live_error") or error or "", home), ROLLOUT_NOTE, "no turn observed yet"}
+        if note is not None and note not in own:
+            note = _note(error, harness, home)
+    out["note"] = note
+    return out
+
+
+_EXIT_CODE = re.compile(r"(?:exit|signal)_\d{1,4}")
+
+
+def _is_code(value) -> bool:
+    """Whether ``value`` is one of Khipu's own fixed error codes (``E_*``,
+    or ``exit_N`` / ``signal_N`` from ``_exit_code``)."""
+    if not isinstance(value, str):
+        return False
+    codes = {v for k, v in globals().items() if k.startswith("E_") and isinstance(v, str)}
+    return value in codes or bool(_EXIT_CODE.fullmatch(value))
+
+
+def public_report(rep: dict) -> dict:
+    """``report`` as ``khipu_usage`` answers it: every row through
+    ``public_row`` and each summary line rebuilt from the public row."""
+    rows = [public_row(r) for r in rep.get("accounts") or []]
+    return {"generated_at": rep.get("generated_at"), "max_age_s": rep.get("max_age_s"),
+            "refreshing": bool(rep.get("refreshing")), "accounts": rows,
+            "summary_text": [summary_line(r) for r in rows]}
 
 
 def account_key(account: dict) -> str:

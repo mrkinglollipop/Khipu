@@ -10,6 +10,7 @@ import { Loader2 } from "lucide-react";
 import { Tag } from "./ui";
 import { callCli, useCliState } from "./settingsCli";
 import { fmtAgo } from "./time";
+import "./CaptureModels.css";
 import type { ConfigShape, JobsShape } from "./settingsCli";
 
 // ---------------------------------------------------------------------------
@@ -179,33 +180,30 @@ const CAPTURE_MODE_OPTIONS: ReadonlyArray<readonly [string, string, string]> = [
   ["hub", "Khipu only", "Khipu stores each capture. The session files are rebuilt from Khipu."],
 ];
 
-const SIMILARITY_FIELDS: ReadonlyArray<{
-  key: "dedup_similarity" | "commitment_close_similarity";
-  env: string;
-  label: string;
-  help: string;
-}> = [
-  {
-    key: "dedup_similarity",
-    env: "KHIPU_DEDUP_SIMILARITY",
-    label: "Merge near-duplicate captures at",
-    help: "Sets the meaning-based threshold from 0 to 1. An independent word matching rule can also merge close captures.",
-  },
-  {
-    key: "commitment_close_similarity",
-    env: "KHIPU_COMMITMENT_CLOSE_SIMILARITY",
-    label: "Close an open commitment at",
-    help: "Sets the meaning-based closure threshold from 0 to 1. A separate word and completion rule can also close a commitment.",
-  },
-];
+const SIMILARITY_ENV = {
+  dedup_similarity: "KHIPU_DEDUP_SIMILARITY",
+  commitment_close_similarity: "KHIPU_COMMITMENT_CLOSE_SIMILARITY",
+} as const;
 
-export function CaptureTuningCard({ active }: { active: boolean }) {
+/** Two cards that share one read of the config: when and where a
+ *  conversation is saved, and how commitments are owned and closed. */
+export function CaptureTuningCard({
+  active,
+  turns = 5,
+  minutes = 20,
+}: {
+  active: boolean;
+  /** The engine's own cadence, shown read-only. */
+  turns?: number;
+  minutes?: number;
+}) {
   const cfg = useCliState<ConfigShape>("khipu_config_show", active);
   const modeId = useId();
   const [modeError, setModeError] = useState<string | null>(null);
   const [modeBusy, setModeBusy] = useState(false);
   const c = cfg.data;
-  const mode = c?.capture_mode ?? "dual";
+  const readFailed = cfg.error != null && !c;
+  const mode = c ? (c.capture_mode ?? "dual") : "";
   const modeLocked = c?.capture_mode_source === "env";
   const fileAliases = Array.isArray(c?.config?.user_aliases) ? (c?.config?.user_aliases as string[]) : [];
   const aliases = c?.user_aliases ?? [];
@@ -217,96 +215,128 @@ export function CaptureTuningCard({ active }: { active: boolean }) {
     setModeBusy(false);
   }
 
+  function similarity(
+    key: "dedup_similarity" | "commitment_close_similarity",
+    label: string,
+    help: string,
+  ) {
+    const row = c?.float_settings?.[key];
+    return (
+      <SettingField
+        label={label}
+        mono
+        narrow
+        inputMode="decimal"
+        value={fmtNumber(row?.value)}
+        lockedBy={row?.source === "env" ? SIMILARITY_ENV[key] : null}
+        help={row?.default != null ? `${help} Default ${fmtNumber(row.default)}.` : help}
+        onSave={async (v) => {
+          const bad = unitRangeError(v, true);
+          return bad ?? writeConfig(key, v, cfg.reload);
+        }}
+      />
+    );
+  }
+
   return (
-    <div className="section-card">
-      <div className="section-head">How captures are stored</div>
-      <div className="section-body">
-        {cfg.error && !c ? (
-          <p className="set-error" role="alert">
-            Could not read the settings: {cfg.error}
-          </p>
-        ) : null}
-        <div className="set-field">
-          <div className="set-labelrow">
-            <label className="set-label" htmlFor={modeId}>
-              Where a capture is written
-            </label>
-            {modeLocked ? <Tag tone="neutral">Locked</Tag> : null}
-          </div>
-          {modeLocked ? (
-            <p className="set-help">
-              Set by the environment variable <code>KHIPU_CAPTURE_MODE</code>. Unset it to change this here.
-            </p>
-          ) : null}
-          <div className="toolbar">
-            <select
-              id={modeId}
-              value={mode}
-              disabled={!c || modeLocked || modeBusy}
-              aria-describedby={`${modeId}-help`}
-              onChange={(e) => void changeMode(e.target.value)}
-            >
-              {CAPTURE_MODE_OPTIONS.map(([value, label]) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
-            </select>
-            {modeBusy ? <Loader2 size={14} className="spin" aria-hidden /> : null}
-          </div>
-          <p id={`${modeId}-help`} className="set-help">
-            {CAPTURE_MODE_OPTIONS.find(([v]) => v === mode)?.[2]}
-          </p>
-          {modeError ? (
+    <>
+      <div className="section-card">
+        <div className="section-head">When Khipu saves a conversation</div>
+        <div className="section-body">
+          {readFailed ? (
             <p className="set-error" role="alert">
-              {modeError}
+              Could not read the settings: {cfg.error}
             </p>
           ) : null}
+          <p className="cm-readonly">
+            After {turns} turns or {minutes} minutes, before a conversation is compacted, and when it ends. The same
+            on every harness.
+          </p>
+          <p className="set-help">Keys, tokens and passwords are masked before anything is summarised or stored.</p>
+          <div className="set-field">
+            <div className="set-labelrow">
+              <label className="set-label" htmlFor={modeId}>
+                Where captures are written
+              </label>
+              {modeLocked ? <Tag tone="neutral">Locked</Tag> : null}
+            </div>
+            {modeLocked ? (
+              <p className="set-help">
+                Set by the environment variable <code>KHIPU_CAPTURE_MODE</code>. Unset it to change this here.
+              </p>
+            ) : null}
+            <div className="toolbar">
+              <select
+                id={modeId}
+                value={c ? mode : ""}
+                disabled={!c || modeLocked || modeBusy}
+                aria-describedby={c ? `${modeId}-help` : undefined}
+                onChange={(e) => void changeMode(e.target.value)}
+              >
+                {c ? (
+                  CAPTURE_MODE_OPTIONS.map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
+                  ))
+                ) : (
+                  <option value="">{readFailed ? "Could not read" : "Reading…"}</option>
+                )}
+              </select>
+              {modeBusy ? <Loader2 size={14} className="spin" aria-hidden /> : null}
+            </div>
+            {c ? (
+              <p id={`${modeId}-help`} className="set-help">
+                {CAPTURE_MODE_OPTIONS.find(([v]) => v === mode)?.[2]}
+              </p>
+            ) : null}
+            {modeError ? (
+              <p className="set-error" role="alert">
+                {modeError}
+              </p>
+            ) : null}
+          </div>
+          {similarity(
+            "dedup_similarity",
+            "Merge near-duplicate captures at",
+            "From 0 to 1; higher merges only closer matches. A word matching rule can also merge close captures.",
+          )}
         </div>
-
-        {SIMILARITY_FIELDS.map((f) => {
-          const row = c?.float_settings?.[f.key];
-          return (
-            <SettingField
-              key={f.key}
-              label={f.label}
-              mono
-              narrow
-              inputMode="decimal"
-              value={fmtNumber(row?.value)}
-              lockedBy={row?.source === "env" ? f.env : null}
-              help={
-                <>
-                  {f.help} Default {fmtNumber(row?.default)}.
-                </>
-              }
-              onSave={async (v) => {
-                const bad = unitRangeError(v, true);
-                return bad ?? writeConfig(f.key, v, cfg.reload);
-              }}
-            />
-          );
-        })}
-
-        <SettingField
-          label="Your names"
-          value={aliases.join(", ")}
-          placeholder="matt, matthew"
-          help={
-            <>
-              Names that mean you when Khipu decides who owns a commitment. Separate them with commas.
-              {aliasesFromEnv ? (
-                <>
-                  {" "}
-                  The environment variable <code>KHIPU_USER_ALIASES</code> is overriding what is saved here.
-                </>
-              ) : null}
-            </>
-          }
-          onSave={(v) => writeConfig("user_aliases", v, cfg.reload)}
-        />
       </div>
-    </div>
+
+      <div className="section-card">
+        <div className="section-head">Commitments</div>
+        <div className="section-body">
+          <p className="set-help">
+            A commitment is something a conversation said is still owed: a follow-up, a blocker, a question or a
+            promise. They are listed on Owed.
+          </p>
+          <SettingField
+            label="Your names"
+            value={aliases.join(", ")}
+            placeholder="matt, matthew"
+            help={
+              <>
+                Names that mean you when Khipu decides who owns a commitment. Separate them with commas. Default:
+                none.
+                {aliasesFromEnv ? (
+                  <>
+                    {" "}
+                    The environment variable <code>KHIPU_USER_ALIASES</code> is overriding what is saved here.
+                  </>
+                ) : null}
+              </>
+            }
+            onSave={(v) => writeConfig("user_aliases", v, cfg.reload)}
+          />
+          {similarity(
+            "commitment_close_similarity",
+            "Close a commitment when a later capture matches it at",
+            "From 0 to 1. A word and completion rule can also close a commitment.",
+          )}
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -418,6 +448,67 @@ export function PathOverridesCard({ active }: { active: boolean }) {
 }
 
 // ---------------------------------------------------------------------------
+// Data: where the graph backup's off-site copy goes.
+// ---------------------------------------------------------------------------
+
+/** Same shape the Tauri command and the CLI enforce: `remote:path`, one token,
+ *  the remote name first. This only saves a round trip. */
+export function backupRemoteError(raw: string): string | null {
+  const v = raw.trim().replace(/\/+$/, "");
+  const i = v.indexOf(":");
+  const remote = i > 0 ? v.slice(0, i) : "";
+  const path = i > 0 ? v.slice(i + 1) : "";
+  if (!remote || !path || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(remote) || /\s/.test(v)) {
+    return "Enter an rclone remote and folder, such as r2:my-bucket/khipu-graph.";
+  }
+  return null;
+}
+
+const BACKUP_SOURCE_WORDS: Record<string, string> = {
+  env: "the environment variable KHIPU_GRAPH_BACKUP_REMOTE",
+  config: "this Mac's settings",
+  default: "the default",
+};
+
+export function GraphBackupRemoteCard({ active }: { active: boolean }) {
+  const cfg = useCliState<ConfigShape>("khipu_config_show", active);
+  const row = cfg.data?.graph_backup_remote;
+  const source = row?.source ?? "default";
+  return (
+    <div className="section-card">
+      <div className="section-head">Graph backup destination</div>
+      <div className="section-body">
+        <p className="set-help">
+          On the Mac that builds the graph, a copy of the latest graph snapshot goes here about once a week, through
+          rclone. The remote must be named r2.
+        </p>
+        {cfg.error && !cfg.data ? (
+          <p className="set-error" role="alert">
+            Could not read the settings: {cfg.error}
+          </p>
+        ) : null}
+        <SettingField
+          label="Off-site copy goes to"
+          mono
+          value={row?.value ?? ""}
+          placeholder={row?.default ?? "r2:khipu-backups/khipu-graph"}
+          lockedBy={source === "env" ? "KHIPU_GRAPH_BACKUP_REMOTE" : null}
+          canReset={source === "config"}
+          resetLabel="Use the default"
+          onReset={() => unsetConfig("graph_backup_remote", cfg.reload)}
+          help={
+            row
+              ? `Comes from ${BACKUP_SOURCE_WORDS[source] ?? source}.${row.error ? ` Not usable: ${row.error}` : ""}`
+              : "Reading the setting…"
+          }
+          onSave={async (v) => backupRemoteError(v) ?? writeConfig("graph_backup_remote", v.trim(), cfg.reload)}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Advanced: per-job install / remove.
 // ---------------------------------------------------------------------------
 
@@ -454,9 +545,9 @@ const JOB_ROWS: ReadonlyArray<readonly [string, string, string]> = [
 ];
 
 function jobWhen(iso: string | null | undefined): string {
-  if (!iso) return "not run yet";
+  if (!iso) return "no run on record";
   const t = Date.parse(iso);
-  if (Number.isNaN(t)) return "not run yet";
+  if (Number.isNaN(t)) return "no run on record";
   const seconds = (Date.now() - t) / 1000;
   if (seconds < 3600) return "ran within the hour";
   return `ran ${fmtAgo(seconds)}`;
