@@ -913,8 +913,8 @@ export function PlansSettingsCard({ state, active, routing }: {
 // ---------------------------------------------------------------------------
 
 export type UsageAccountEntry = { label: string; harness: string; home?: string | null; invalid?: string };
-type UsageAccountsStatus = {
-  value: UsageAccountEntry[] | null;
+export type UsageAccountsStatus = {
+  value: unknown[] | null;
   source: "file" | "default";
   accounts: UsageAccountEntry[];
   /** The owner's own folder, so "~/.x" and "/Users/me/.x" compare as one login. */
@@ -1025,11 +1025,19 @@ export function accountClash(
 
 type StoredEntry = { label: string; harness: string; home?: string };
 
-/** The list to store: the valid entries shown, as `{label, harness, home?}`. */
-function storable(entries: UsageAccountEntry[]): StoredEntry[] {
-  return entries
-    .filter((e) => !e.invalid)
-    .map((e) => (e.home ? { label: e.label, harness: e.harness, home: e.home } : { label: e.label, harness: e.harness }));
+function shownAs(e: UsageAccountEntry): StoredEntry {
+  return e.home ? { label: e.label, harness: e.harness, home: e.home } : { label: e.label, harness: e.harness };
+}
+
+/** The list to store, one entry per entry in `entries`: one shown from
+ *  `status` goes back exactly as stored, an invalid one too (only Khipu
+ *  decides what is valid); one added here as `{label, harness, home?}`. */
+export function storable(entries: UsageAccountEntry[], status?: UsageAccountsStatus | null): unknown[] {
+  const raw = status?.source === "file" && Array.isArray(status.value) ? status.value : null;
+  return entries.map((e) => {
+    const at = status ? status.accounts.indexOf(e) : -1;
+    return raw && at >= 0 && at < raw.length ? raw[at] : shownAs(e);
+  });
 }
 
 /** What a refusal is about: the entry at fault (null when the list as a
@@ -1151,7 +1159,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
     setSaving(true);
     setErr(null);
     setClash(null);
-    const list = next == null ? [] : storable(next);
+    const list = next == null ? [] : storable(next, status);
     // The version of the list this editor loaded, not one fetched now.
     const expect = status?.version ?? null;
     const res = list.length
@@ -1161,7 +1169,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
     await cfg.reload();
     setSaving(false);
     if (!res.ok) {
-      const problem = accountsRefusal(res, list, added);
+      const problem = accountsRefusal(res, (next ?? []).map(shownAs), added);
       setErr(problem.message);
       setClash(problem.field);
       if (problem.field) (problem.field === "name" ? nameRef : homeRef).current?.focus();
@@ -1173,7 +1181,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
 
   async function add(e: FormEvent) {
     e.preventDefault();
-    if (storable(entries).length >= ACCOUNTS_MAX) {
+    if (entries.length >= ACCOUNTS_MAX) {
       // Checked before anything is sent: the refusal would otherwise come
       // from the app's own command, with no code to say it by.
       setErr(TOO_MANY);
@@ -1200,7 +1208,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
         setLabel("");
         setHome("");
       },
-      storable(next).length - 1,
+      next.length - 1,
     );
   }
 

@@ -388,16 +388,17 @@ def test_a_stale_version_is_refused_and_changes_nothing(mac, capsys):
 
 
 def test_the_priority_takes_its_version(mac, capsys):
-    assert routing.read_view()["priority_version"] == "p0"
+    first = routing.read_view()["priority_version"]
+    assert first.startswith("p0.")
     rc, out = _cli(["route", "priority", "set", "Codex", "--from-app", "--expect=p-stale"], capsys)
     assert rc == 2 and out["code"] == "version_moved" and routing.read_view()["priority"] is None
-    rc, out = _cli(["route", "priority", "set", "Codex", "--from-app", "--expect=p0"], capsys)
+    rc, out = _cli(["route", "priority", "set", "Codex", "--from-app", f"--expect={first}"], capsys)
     assert rc == 0
     view = routing.read_view()
     version = view["priority_version"]
-    assert version != "p0" and view["priority"]["version"] == version
+    assert version != first and view["priority"]["version"] == version
     assert routing.conversation_view()["priority"]["version"] == version
-    rc, out = _cli(["route", "priority", "clear", "--from-app", "--expect=p0"], capsys)
+    rc, out = _cli(["route", "priority", "clear", "--from-app", f"--expect={first}"], capsys)
     assert rc == 2 and out["code"] == "version_moved"
     rc, out = _cli(["route", "priority", "clear", "--from-app", f"--expect={version}"], capsys)
     assert rc == 0 and routing.read_view()["priority"] is None
@@ -407,12 +408,13 @@ def test_the_route_view_names_the_priority_version_with_no_priority_set(mac, cap
     # Setup's first order is saved with the version read even when no priority
     # is set, and after a clear the version is no longer p0.
     rc, out = _cli(["route", "--json"], capsys)
-    assert rc == 0 and out["priority"] is None and out["priority_version"] == "p0"
-    assert _cli(["route", "priority", "set", "Codex", "--from-app", "--expect=p0"], capsys)[0] == 0
+    first = out["priority_version"]
+    assert rc == 0 and out["priority"] is None and first.startswith("p0.")
+    assert _cli(["route", "priority", "set", "Codex", "--from-app", f"--expect={first}"], capsys)[0] == 0
     version = _cli(["route", "--json"], capsys)[1]["priority_version"]
     assert _cli(["route", "priority", "clear", "--from-app", f"--expect={version}"], capsys)[0] == 0
     rc, out = _cli(["route", "--json"], capsys)
-    assert out["priority"] is None and out["priority_version"] not in ("p0", version)
+    assert out["priority"] is None and out["priority_version"] not in (first, version)
     assert _cli(["route", "priority", "set", "Codex", "--from-app", f"--expect={out['priority_version']}"],
                 capsys)[0] == 0
 
@@ -1032,3 +1034,53 @@ def test_a_generic_save_moving_a_folder_under_the_same_name_is_a_move(mac, capsy
     assert rc == 0, out
     assert _entry(routing.read_view(), new)["state"] == "limited"
     assert config.load_config()["routing_lane_map"] == {"jobs": {"r": new}}
+
+
+def test_a_save_keeps_an_untouched_invalid_entry(mac):
+    odd = {"harness": "claude", "label": "Untouched", "home": ".claude-legacy"}
+    _set(usage_accounts=[{"harness": "codex", "label": "Codex"}, odd])
+    status = usage.accounts_status()
+    rows = list(status["value"]) + [{"harness": "claude", "label": "New", "home": "~/.claude-client"}]
+    accounts.save_list(rows, expect=status["version"])
+    assert odd in _stored()
+
+
+def test_a_save_through_a_symlink_under_a_new_name_is_a_rename(mac):
+    old = _key("~/.claude-client")
+    _set(usage_accounts=[{"harness": "claude", "label": "Client", "home": "~/.claude-client"},
+                         {"harness": "codex", "label": "Codex"}],
+         routing_lane_map={"jobs": {"r": old}})
+    routing.pause(old, via="app")
+    routing.set_priority([{"account": old}, {"account": "codex|"}], via="app", expect=routing.priority_version())
+    accounts.save_list([{"harness": "claude", "label": "Renamed", "home": str(mac["home"] / "client-link")},
+                        {"harness": "codex", "label": "Codex"}], expect=_version())
+    view = routing.read_view()
+    tracked = [a for a in view["accounts"] if a.get("configured") and a["harness"] == "claude"]
+    assert [(a["key"], a["state"]) for a in tracked] == [(old, "paused")]
+    assert _stored()[0] == {"harness": "claude", "label": "Renamed", "home": "~/.claude-client"}
+    assert config.load_config()["routing_lane_map"] == {"jobs": {"r": old}}
+    assert view["priority"]["entries"][0]["account"] == old
+
+
+def test_the_default_name_with_its_default_folder_spelt_out_is_kept(mac):
+    _set(usage_accounts=[{"harness": "claude", "label": "Claude"}, {"harness": "codex", "label": "Codex"}])
+    accounts.save_list([{"harness": "claude", "label": "Claude", "home": str(mac["home"] / ".claude")},
+                        {"harness": "codex", "label": "Codex"}], expect=_version())
+    assert _stored()[0] == {"harness": "claude", "label": "Claude"}
+
+
+def test_a_priority_read_before_a_move_is_refused_after_the_old_folder_is_tracked_again(mac):
+    old, new = _key("~/.claude-client"), _key("~/.claude-office")
+    (mac["home"] / ".claude-office").mkdir()
+    _set(usage_accounts=[{"harness": "claude", "label": "Client", "home": "~/.claude-client"},
+                         {"harness": "codex", "label": "Codex"}])
+    routing.set_priority([{"account": old}, {"account": "codex|"}], via="app", expect=routing.priority_version())
+    stale = routing.read_view()["priority"]
+    accounts.move(old, "~/.claude-office", expect=_version())
+    accounts.track([{"harness": "claude", "label": "New tenant", "home": "~/.claude-client"}],
+                   expect=_version(), read=False)
+    assert routing.read_view()["priority"]["entries"][0]["account"] == new
+    with pytest.raises(routing.PriorityMoved):
+        routing.set_priority([{"account": e["account"]} for e in reversed(stale["entries"])],
+                             via="app", expect=stale["version"])
+    assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == [new, "codex|"]

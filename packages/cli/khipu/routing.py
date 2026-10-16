@@ -1617,6 +1617,11 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     # "Read no accounts" (settings clarity decision 14): no default login
     # counts as read while it holds.
     cfg["_accounts_none"] = usage.reads_none(config)
+    # Part of the priority's version: an account move, track or stop can
+    # change what a priority entry's key refers to.
+    from khipu.config import accounts_version
+
+    cfg["_accounts_version"] = accounts_version(config)
     seed = cfg.get("routing_rules_seed")
     fingerprint = {"events": events_stat, "config": config_stat, "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
@@ -2603,6 +2608,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                           "written_by": note["written_by"], "via": note["via"]}
     labels = {e["key"]: e["label"] for e in entries}
     in_settings = {e["key"]: e["configured"] for e in entries}
+    if cfg.get("_accounts_version"):
+        priority_version = f"{priority_version}.{cfg['_accounts_version']}"
     priority_out, priority_ended = _fold_priority(priority, now, labels, in_settings, known_keys, none=none)
     if priority_out is not None:
         priority_out["version"] = priority_version

@@ -340,17 +340,33 @@ def _settle(res: dict) -> None:
         _set_declined(account["harness"], _account_path(account), STOPPED_WHY)
 
 
-def _home_less(entries: list, stored) -> list:
-    """Each new or changed entry that names its CLI's default login folder
-    (by real folder: a full path, a symlink) stored home-less, as
-    ``canonical_home`` stores it, so its key stays ``harness|``."""
+def _canonical(raw, stored):
+    """Each new or changed entry's home as ``canonical_home`` stores it (its
+    real folder; none for its CLI's default login), before the list is
+    checked: a symlink or a full path then names the same account as the
+    folder it reaches, and the naming rules judge the home the entry is
+    stored with. An entry kept as stored, and one whose folder cannot be
+    made canonical, goes on as given for ``usage.parse_usage_accounts``."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return raw
+    if not isinstance(raw, list):
+        return raw
     kept = [e for e in stored or [] if isinstance(e, dict)]
     out = []
-    for entry in entries:
-        if entry.get("home") and not any(usage._same_entry(entry, k) for k in kept) \
-                and usage.login_identity(usage._account_from_entry(entry)) \
-                == usage.login_identity({"harness": entry["harness"]}):
+    for entry in raw:
+        if isinstance(entry, dict) and isinstance(entry.get("home"), str) and entry["home"].strip() \
+                and isinstance(entry.get("harness"), str) and not any(usage._same_entry(entry, k) for k in kept):
+            harness = entry["harness"].strip().lower()
+            try:
+                home = canonical_home(harness, entry["home"]) if harness in usage.HARNESSES else entry["home"]
+            except AccountsError:
+                home = entry["home"]
             entry = {k: v for k, v in entry.items() if k != "home"}
+            if home:
+                entry["home"] = home
         out.append(entry)
     return out
 
@@ -366,7 +382,7 @@ def save_list(raw, *, expect, via: str = "app", request: dict | None = None) -> 
             raise AccountsError("a conversation's change to the account list is still waiting for the owner; "
                                 "he confirms or undoes it in Settings first", "request_waiting")
         stored, base = current_list(data)
-        parsed = [] if raw is None else _home_less(usage.parse_usage_accounts(raw, previous=stored), stored)
+        parsed = [] if raw is None else usage.parse_usage_accounts(_canonical(raw, stored), previous=stored)
         res = _commit(data, stored, base, parsed, via=via, request=request)
     _settle(res)
     out = {"ok": True, "version": res["version"], "lane_repairs": res["repairs"]}

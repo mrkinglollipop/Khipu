@@ -625,8 +625,14 @@ describe("PlansSettingsCard", () => {
     expect(screen.getByText('not valid: Khipu does not read the CLI "gemini"')).toBeTruthy();
     calls.length = 0;
     fireEvent.click(screen.getByRole("button", { name: "Remove Claude" }));
-    // Nothing valid is left, so the list goes back to the default.
-    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "usage_accounts", expect: "av2" }]));
+    // The invalid entry was not touched, so it goes back as stored: only Khipu
+    // decides what is valid.
+    await waitFor(() =>
+      expect(calls).toContainEqual([
+        "khipu_config_set",
+        { key: "usage_accounts", value: JSON.stringify([{ label: "Odd", harness: "gemini" }]), expect: "av2" },
+      ]),
+    );
 
     refuse = { error: "usage_accounts holds at most 32 entries, got 33", code: "too_many", index: null, field: null };
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -730,6 +736,50 @@ describe("adding an account", () => {
     expect((addButton() as HTMLButtonElement).disabled).toBe(false);
     release("khipu_usage_status");
     await waitFor(() => expect(exposed?.loading).toBe(false));
+  });
+});
+
+describe("entries the editor did not change go back as stored (review round 4)", () => {
+  const untouched = { harness: "claude", label: "Untouched", home: ".claude-legacy" };
+  const sent = () => {
+    const sets = calls.filter(([c]) => c === "khipu_config_set");
+    return JSON.parse((sets[sets.length - 1][1] as { value: string }).value);
+  };
+
+  beforeEach(() => {
+    configShow = {
+      usage_accounts: {
+        value: [{ label: " Codex ", harness: "codex" }, untouched],
+        source: "file",
+        version: "av2",
+        accounts: [
+          { label: "Codex", harness: "codex", home: null },
+          { label: "Untouched", harness: "claude", home: ".claude-legacy", invalid: "relative folder" },
+        ],
+      },
+    };
+  });
+
+  it("adding an account keeps an invalid entry and the others exactly as stored", async () => {
+    render(<Settings />);
+    await waitFor(() => expect(screen.getByText("Your list")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Client" } });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.claude-client" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() => expect(calls.some(([c]) => c === "khipu_config_set")).toBe(true));
+    expect(sent()).toEqual([
+      { label: " Codex ", harness: "codex" },
+      untouched,
+      { label: "Client", harness: "claude", home: "~/.claude-client" },
+    ]);
+  });
+
+  it("removing one account keeps an invalid entry as stored", async () => {
+    render(<Settings />);
+    await waitFor(() => expect(screen.getByText("Your list")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Remove Codex" }));
+    await waitFor(() => expect(calls.some(([c]) => c === "khipu_config_set")).toBe(true));
+    expect(sent()).toEqual([untouched]);
   });
 });
 
@@ -863,7 +913,7 @@ describe("the account cap and failures that are not about an entry (fix round 4)
     expect(configSets()).toHaveLength(0);
     expect(screen.getByLabelText("Name").getAttribute("aria-invalid")).toBeNull();
     expect(screen.getByLabelText("Login folder").getAttribute("aria-invalid")).toBeNull();
-    // An entry marked not valid is left out of what is stored, so it does not count.
+    // An entry marked not valid is stored as it is, so it counts too.
     const withInvalid = [...accounts.slice(1), { label: "Odd", harness: "gemini", home: null, invalid: "not read" }];
     configShow = { usage_accounts: { value: withInvalid, source: "file", user_home: "/Users/me", accounts: withInvalid } };
     cleanup();
@@ -873,8 +923,8 @@ describe("the account cap and failures that are not about an entry (fix round 4)
     fireEvent.change(screen.getByLabelText("CLI"), { target: { value: "codex" } });
     fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.codex-work" } });
     fireEvent.click(screen.getByRole("button", { name: "Add" }));
-    await waitFor(() => expect(configSets()).toHaveLength(1));
-    expect(screen.queryByText(TOO_MANY)).toBeNull();
+    expect(await screen.findByText(TOO_MANY)).toBeTruthy();
+    expect(configSets()).toHaveLength(0);
   });
 
   it("says the cap when the app's own command refuses a list over it, with no code", () => {

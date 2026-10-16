@@ -34,6 +34,8 @@ import type { UsageAccount, UsageAccountEntry } from "./PlansCard";
 /** `version` names the list as read: a save carries it (`expect`) and is
  *  refused (`version_moved`) when the list changed after it was read. */
 type AccountsStatus = {
+  /** The list as stored (null when unset), one entry per row of `accounts`. */
+  value?: unknown[] | null;
   source: "file" | "default";
   accounts: UsageAccountEntry[];
   user_home?: string | null;
@@ -131,37 +133,51 @@ type Move = { key: string; past: string; dir: -1 | 1 };
 
 /** The account list once the read operations are applied to `status`, the
  *  list saved now: unchecking removes that account, checking adds it back
- *  (as its plan row names it) only when it is missing. `changed` is false
- *  when every operation is already satisfied. */
+ *  (as its plan row names it) only when it is missing. An entry no operation
+ *  touches goes back exactly as stored, an invalid one too: only Khipu
+ *  decides what is valid. `labels` names each entry of `list`; `changed` is
+ *  false when every operation is already satisfied. */
 export function planAccountList(
   status: AccountsStatus,
   readOps: Map<string, boolean>,
   rows: UsageAccount[],
-): { list: StoredEntry[]; ids: Set<string>; changed: boolean } {
+): { list: unknown[]; labels: string[]; ids: Set<string>; changed: boolean } {
   const uh = status.user_home ?? null;
-  const list: StoredEntry[] = status.accounts
-    .filter((e) => !e.invalid)
-    .map((e) => (e.home ? { label: e.label, harness: e.harness, home: e.home } : { label: e.label, harness: e.harness }));
+  const raw = status.source === "file" && Array.isArray(status.value) ? status.value : null;
+  type Item = { stored: unknown; label: string; id: string | null };
+  const items: Item[] = status.accounts.map((e, i) => ({
+    stored: raw && i < raw.length ? raw[i] : storedOf(e),
+    label: e.label,
+    id: e.invalid ? null : accountId(e.harness, e.home, uh),
+  }));
   let changed = false;
   for (const [id, on] of readOps) {
-    const at = list.findIndex((e) => accountId(e.harness, e.home, uh) === id);
+    const at = items.findIndex((e) => e.id === id);
     if (!on && at >= 0) {
-      list.splice(at, 1);
+      items.splice(at, 1);
       changed = true;
     } else if (on && at < 0) {
       const r = rows.find((row) => accountId(row.harness, row.home, uh) === id);
       if (r?.harness) {
         const label = r.account || cliTitle(r.harness);
-        list.push(r.home ? { label, harness: r.harness, home: r.home } : { label, harness: r.harness });
+        items.push({ stored: storedOf({ label, harness: r.harness, home: r.home }), label, id });
         changed = true;
       }
     }
   }
-  return { list, ids: new Set(list.map((e) => accountId(e.harness, e.home, uh))), changed };
+  const ids = new Set(items.flatMap((e) => (e.id == null ? [] : [e.id])));
+  return { list: items.map((e) => e.stored), labels: items.map((e) => e.label), ids, changed };
+}
+
+function storedOf(e: { label: string; harness: string; home?: string | null }): StoredEntry {
+  return e.home ? { label: e.label, harness: e.harness, home: e.home } : { label: e.label, harness: e.harness };
 }
 
 type ListStart = { source: "file" | "default"; ids: Set<string> };
-type ListWrite = { kind: "none" } | { kind: "set"; list: StoredEntry[] } | { kind: "unset"; list: StoredEntry[] };
+type ListWrite =
+  | { kind: "none" }
+  | { kind: "set"; list: unknown[]; labels: string[] }
+  | { kind: "unset"; list: unknown[]; labels: string[] };
 
 /** What Next writes to the account list given `status`, the list saved now.
  *  When this step turned the default list into an explicit one and the
@@ -177,9 +193,9 @@ export function planListWrite(
   const plan = planAccountList(status, readOps, rows);
   const sameAsStart = start != null && plan.ids.size === start.ids.size && [...plan.ids].every((id) => start.ids.has(id));
   if (convertedHere && status.source === "file" && start?.source === "default" && sameAsStart) {
-    return { kind: "unset", list: plan.list };
+    return { kind: "unset", list: plan.list, labels: plan.labels };
   }
-  if (plan.changed && plan.list.length) return { kind: "set", list: plan.list };
+  if (plan.changed && plan.list.length) return { kind: "set", list: plan.list, labels: plan.labels };
   return { kind: "none" };
 }
 
@@ -585,7 +601,7 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
               {listWrite.kind === "unset"
                 ? "Next goes back to reading every account Khipu finds on this Mac."
                 : listWrite.kind === "set"
-                  ? `Next saves the account list as: ${listOf(listWrite.list.map((e) => e.label))}.`
+                  ? `Next saves the account list as: ${listOf(listWrite.labels)}.`
                   : listPlan.list.length === 0
                     ? "With none chosen, Next leaves the account list as it is saved."
                     : "The account list is already saved this way."}
