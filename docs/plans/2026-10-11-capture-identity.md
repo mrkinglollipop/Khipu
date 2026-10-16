@@ -347,9 +347,14 @@ forgotten row, and a scrub that cannot run leaves the current replica as it was.
 incomplete. A drainer's later checkpoint raises `JobForgotten` instead of writing a forgotten or removed
 claim back.
 
-**Migration 0030 order.** One transaction: `LOCK episodes`, then `LOCK episode_sources` (SHARE ROW
-EXCLUSIVE, the order writers take them: episode row, then source row), then the table, functions and
-triggers, then the backfill. No forget can commit between the backfill's scan and the triggers going
+**Migration 0030 order.** One transaction: both tables locked ACCESS EXCLUSIVE first (the lock DROP
+TRIGGER needs, so the migration never upgrades a lock it holds), then the table, functions and triggers,
+then the backfill. The migration waits for `episodes` while it holds nothing and asks for
+`episode_sources` with NOWAIT; when a writer holds that, it lets go and tries again within 5 s, so it
+never waits while holding a lock a writer needs. Round 11 found that the earlier SHARE ROW EXCLUSIVE
+lock, upgraded at DROP TRIGGER, deadlocked against a merge writer holding its target row lock;
+`test_migration_runs_while_a_merge_writer_loops_without_deadlock` re-applies the migration while the
+real merge writer loops on a second connection. No forget can commit between the backfill's scan and the triggers going
 live. The backfill covers source keys and payload hashes of deleted episodes, the natural key of every
 deleted episode (so one with no source row is covered) and each merge receipt's id and natural key.
 `lock_timeout` is 5 s; `migrate._run_migrations` retries a step that raises `LockNotAvailable` up to
@@ -437,7 +442,19 @@ entry with the reason it holds no capture data. A new writer therefore cannot sh
 | conversation media | data folder `media/conversation_memory/<sha256>.<ext>` | images found in transcripts, shared by content hash | kept: content-addressed, can belong to several episodes |
 | extraction scratch | data folder `state/synth-cli/work-*/` and its output temp | a model call's working folder and output | kept: removed by the call that made it |
 | commitments backup | hygiene backup folder `commitments-<time>/commitments.bin` | a binary copy of the commitments table | kept: closed commitments remain by design |
-| local backup | a backup folder or archive the owner chose | a copy of the data folder | kept: backups are kept for recovery; an import scrubs them |
+| local backup | a backup folder or archive the owner chose | a copy of the data folder | kept: backups are kept for recovery; an import restores only what a store allows, through its scrub |
+
+**Import is an allow-list.** `capture_stores` says which stores a backup may restore and the exact file
+patterns each owns (`Store.restore`, plus `OTHER_DATA` for settings, the forget registry and waiting
+ledger writes). Each restored file goes through its entry's scrub (`paths.RESTORE_SCRUBS`): a queued job
+for a forgotten source is left out, the replica is staged and scrubbed, the registry is merged. Every
+other file in a backup (temps such as a crash-left `.job.json.<random>.tmp`, sidecars, locks, writer
+records, unknown names) is left out and listed in the report's `not_restored`.
+
+**Writer records fail closed.** A `.legacy_writers` record that cannot be read or parsed is kept and
+keeps the forget partial (`legacy_writer`, state "not checked") until a sweep can read it or no process
+of the group its file name gives is running. Its group is never stopped, since without the start time it
+cannot be told from an unrelated process that reused the number.
 
 **Import scrubs by every identity the registry holds.** The registry (`tombstones`) now also holds
 forgotten episode ids (`publish_episode_ids`, `forgotten_episode_ids`, `Gate.episode_ids`; old files without

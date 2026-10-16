@@ -8,7 +8,8 @@ So every group is recorded here before it may run, and a forget, holding the
 lock exclusive, stops every recorded group that is still alive before it
 looks at the legacy logs. A record whose group is gone, or whose number now
 belongs to an unrelated process (its leader started at another time), is
-stale and is cleared.
+stale and is cleared. A record that cannot be read is kept and keeps the
+forget open until it can be read or the group its file name gives is gone.
 
 A record is written atomically and names the group id and the start time of
 its leader. The group's leader is the process the capture started; a group id
@@ -104,6 +105,16 @@ def _ours(pgid: int, started: str) -> bool:
     return now is None or now == started
 
 
+def _named_group(path: Path) -> int | None:
+    """The group id a record's file name gives (``record`` names it
+    ``<pgid>.json``), or None when the name is not one."""
+    try:
+        pgid = int(path.stem)
+    except ValueError:
+        return None
+    return pgid if pgid > 1 and path.name == f"{pgid}.json" else None
+
+
 def _wait_gone(pgid: int, seconds: float) -> bool:
     deadline = time.monotonic() + seconds
     while group_alive(pgid):
@@ -150,10 +161,23 @@ def sweep() -> dict[str, Any]:
             if pgid <= 1:
                 raise ValueError("invalid group id")
         except (OSError, ValueError, KeyError, TypeError):
-            # Records are replaced atomically, so one that cannot be parsed
-            # never described a group this Mac started.
-            path.unlink(missing_ok=True)
-            locations.append({"place": "legacy writer", "path": str(path), "state": "clean"})
+            # A record damaged after it was written still names a group that
+            # may be running, so it fails closed: kept, and the forget stays
+            # open, until a sweep reads it or the group its name gives is gone.
+            # Its group is never stopped: without the start time it cannot be
+            # told apart from an unrelated process that reused the number.
+            named = _named_group(path)
+            if named is not None and not group_alive(named):
+                path.unlink(missing_ok=True)
+                locations.append({"place": "legacy writer", "path": str(path), "state": "clean"})
+                continue
+            ok = False
+            until = (f"a sweep can read it or no process of group {named} runs"
+                     if named is not None else "the owner removes it (its name gives no group)")
+            locations.append({"place": "legacy writer", "path": str(path), "state": "not checked",
+                              "why": (f"legacy writer record {path.name} could not be read, so "
+                                      "its writer may still write a copy; the forget stays open "
+                                      f"until {until}")})
             continue
         if not group_alive(pgid) or not _ours(pgid, started):
             path.unlink(missing_ok=True)

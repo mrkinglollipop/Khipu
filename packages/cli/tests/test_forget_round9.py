@@ -183,10 +183,12 @@ def test_backup_import_does_not_restore_forgotten_snapshot_temp(tmp_path, monkey
     imported = paths.import_local(source=backup)
 
     state = Path(os.environ["KHIPU_DATA_DIR"])
-    assert imported["ok"] and imported["imported"] == 1
+    assert imported["ok"] and imported["imported"] == 0
     assert sorted(imported["skipped_replica_temps"]) == sorted(TEMP_NAMES)
     assert "temporary replica files" in imported["notes"][0]
-    assert (state / "notes.txt").read_text() == "kept"
+    # Round 11: a name no store claims is never restored either.
+    assert not (state / "notes.txt").exists()
+    assert "notes.txt" in {r["path"] for r in imported["not_restored"]}
     for name in TEMP_NAMES:
         assert not (state / name).exists(), name
 

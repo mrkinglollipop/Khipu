@@ -97,12 +97,13 @@ def test_symlinked_folder_cannot_alias_the_registry(tmp_path):
 
 
 def test_safe_nested_members_still_import(tmp_path):
-    backup = _zip(tmp_path / "ok.zip", {"notes/a.txt": "a", "./b.txt": "b"})
+    # Names a store may restore (round 11: nothing else is restored).
+    backup = _zip(tmp_path / "ok.zip", {"ledger-outbox/a.json": "a", "./config.json": "b"})
     result = paths.import_local(source=backup)
     assert result["imported"] == 2
     target = paths.ensure_data_dir()
-    assert (target / "notes" / "a.txt").read_text() == "a"
-    assert (target / "b.txt").read_text() == "b"
+    assert (target / "ledger-outbox" / "a.json").read_text() == "a"
+    assert (target / "config.json").read_text() == "b"
 
 
 def _wait_file(path: Path, seconds: float = 10) -> None:

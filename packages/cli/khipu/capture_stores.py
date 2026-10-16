@@ -15,15 +15,49 @@ inventory").
 store forget leaves by design (named in the forget result's ``kept`` text or
 the scope doc's known boundaries), or ``none: <why>`` for a store that holds
 no capture source.
+
+Backup import is an allow-list read from here. A store whose ``restore`` is
+set may be restored from a backup: only files matching its patterns, and
+each through the scrub it names (``RESTORE_SCRUBS``, implemented in
+khipu/paths.py). ``OTHER_DATA`` lists the data-folder files that hold no
+capture text but are worth restoring (settings, the forget registry, waiting
+ledger writes). Any other file in a backup (a temp, a sidecar, a lock, a
+writer record, a name nobody claims) is left out and listed in the import
+report.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 # The scans forget runs, by the name a store gives.
 FORGET_SCANS = ("native jobs", "outbox", "legacy logs", "replica", "replica temps",
                 "legacy writers")
+
+
+# The scrubs a restored file may go through, by the name an entry gives.
+RESTORE_SCRUBS = ("queued job", "replica staging", "content addressed", "registry merge",
+                  "no capture text")
+
+
+@dataclass(frozen=True)
+class Restore:
+    """Which files of a backup a store owns, as data-folder-relative paths
+    with ``*`` wildcards per part, and the scrub each goes through."""
+    patterns: tuple[str, ...]
+    scrub: str
+
+    def claims(self, parts: tuple[str, ...]) -> bool:
+        # A hidden part (a temp, a lock, a record folder) is never claimed,
+        # whatever a wildcard would match.
+        if any(part.startswith(".") for part in parts):
+            return False
+        for pattern in self.patterns:
+            want = tuple(pattern.split("/"))
+            if len(want) == len(parts) and all(map(fnmatchcase, parts, want)):
+                return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -33,6 +67,7 @@ class Store:
     holds: str
     forget: str
     writers: frozenset[str]
+    restore: Restore | None = None
 
     @property
     def scanned(self) -> bool:
@@ -54,7 +89,9 @@ STORES: tuple[Store, ...] = (
     Store("outbox job", "outbox/, outbox/dead/, outbox/quarantine/: *.json and .*.tmp",
           "whole capture payloads waiting for the hub", "outbox",
           _w("outbox._atomic_write", "outbox._bury", "outbox._quarantine", "outbox.drain",
-             "outbox.enqueue", "outbox.retry_dead")),
+             "outbox.enqueue", "outbox.retry_dead"),
+          Restore(("outbox/*.json", "outbox/dead/*.json", "outbox/quarantine/*.json"),
+                  "queued job")),
     Store("legacy log", "memory root: episodes*.jsonl, their .bak copies, .khipu-forget-backups/, "
           "and .tmp files beside them",
           "one capture per line, summary text", "legacy logs",
@@ -66,7 +103,8 @@ STORES: tuple[Store, ...] = (
              "hub_snapshot.sync_decision_changes", "hub_snapshot.ledger_write_snapshot",
              "hub_snapshot.forget_episode_in_snapshot", "hub_snapshot.scrub_forgotten_snapshot",
              "hub_snapshot.publish_imported_snapshot", "hub_snapshot.purge_topic_in_snapshot",
-             "hub_snapshot.ensure_edge_indexes")),
+             "hub_snapshot.ensure_edge_indexes"),
+          Restore(("hub_snapshot.sqlite",), "replica staging")),
     Store("replica temp", "data folder .hub_snapshot.<random>.sqlite and its journal and WAL",
           "a refresh dump or a staged backup replica", "replica temps",
           _w("hub_snapshot.staging_path")),
@@ -87,7 +125,8 @@ STORES: tuple[Store, ...] = (
           "images found in transcripts, shared by content hash",
           "kept: images are content-addressed and can belong to several episodes; a known "
           "boundary in the scope doc",
-          _w("session_capture.land_transcript_images")),
+          _w("session_capture.land_transcript_images"),
+          Restore(("media/conversation_memory/*",), "content addressed")),
     Store("extraction scratch", "data folder state/synth-cli/work-*/ and its output temp",
           "a model call's working folder and output, removed when the call returns",
           "kept: removed by the call that made it; one a killed call left behind is a known "
@@ -99,10 +138,52 @@ STORES: tuple[Store, ...] = (
           _w("hygiene.backup_commitments")),
     Store("local backup", "a backup folder or archive the owner chose",
           "a copy of the data folder", "kept: backups are kept for recovery (forget's kept text); "
-          "an import scrubs them by every identity the registry holds",
-          _w("paths.backup_local", "paths._import_local", "paths.stage", "paths.copy_sensitive",
+          "an import restores only what a store here says it may, each file through that "
+          "store's scrub, which checks every identity the registry holds",
+          _w("paths.backup_local", "paths.restore", "paths.stage", "paths.copy_sensitive",
              "paths.write_sensitive_bytes", "paths.sensitive_writer")),
 )
+
+
+@dataclass(frozen=True)
+class DataFiles:
+    """Data-folder files that hold no capture text and that a backup may
+    restore."""
+    name: str
+    holds: str
+    restore: Restore
+
+
+OTHER_DATA: tuple[DataFiles, ...] = (
+    DataFiles("settings", "settings, credentials and source lists",
+              Restore(("config.json", "dsn", "root.crt", "gateway-token", "graph_sources.json",
+                       "graph_sources.resolved.json", "migrate_lock_notes.json",
+                       "recall-golden.jsonl"), "no capture text")),
+    DataFiles("forget registry", "identities and ids of forgotten sources, never their text",
+              Restore(("forgotten_sources.json",), "registry merge")),
+    DataFiles("ledger outbox", "ledger writes waiting for the hub, the owner's work rows",
+              Restore(("ledger-outbox/*.json",), "no capture text")),
+)
+
+
+@dataclass(frozen=True)
+class Restorable:
+    name: str
+    patterns: tuple[str, ...]
+    scrub: str
+    restore: Restore
+
+
+def restorable() -> list[Restorable]:
+    """Every entry a backup may restore, capture stores first."""
+    entries = [(s.name, s.restore) for s in STORES if s.restore is not None]
+    entries += [(d.name, d.restore) for d in OTHER_DATA]
+    return [Restorable(name, r.patterns, r.scrub, r) for name, r in entries]
+
+
+def restore_entry(parts: tuple[str, ...]) -> Restorable | None:
+    """The entry that claims a backed-up file, or None when none does."""
+    return next((e for e in restorable() if e.restore.claims(parts)), None)
 
 
 def store(name: str) -> Store:

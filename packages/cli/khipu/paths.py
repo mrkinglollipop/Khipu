@@ -262,9 +262,13 @@ def _forgotten_job(data: bytes, gate) -> bool:
 def import_local(*, source: Path, merge: bool = True) -> dict:
     """Copy a backup (a directory or a .zip) into the data folder.
 
-    A completed forget must survive the restore of a backup taken before it:
-    the backup's tombstone registry is merged into this one, never copied
-    over it, and every queued job naming a forgotten source is left behind.
+    Only what a store in khipu/capture_stores.py says a backup may restore
+    is copied, each file through that store's scrub; anything else (temps,
+    sidecars, locks, records, unknown names) is left out and listed in
+    ``not_restored``. A completed forget must survive the restore of a
+    backup taken before it: the backup's tombstone registry is merged into
+    this one, never copied over it, and every queued job naming a forgotten
+    source is left behind.
     The backup's replica is written to a staging copy, scrubbed there, and
     only then atomically made the replica, so no reader sees it unscrubbed.
     The whole import holds the memory lock shared, so it never interleaves
@@ -356,21 +360,54 @@ def _checked_zip_members(zf: zipfile.ZipFile, target: Path) -> list[tuple[tuple[
     return members
 
 
+def _not_restored_why(parts: tuple[str, ...]) -> str:
+    reason = _skip_reason(parts)
+    if reason == "replica_temp":
+        return ("a temporary replica a crashed refresh left; it never went through staging "
+                "and scrubbing, so it can hold a forgotten row")
+    if reason == "lock":
+        return "a lock, journal or writer record of the Mac that made the backup"
+    if any(part.startswith(".") for part in parts):
+        return "a temporary or hidden file, such as one a crashed write left behind"
+    return "no store in the capture store inventory claims this file, so it is never restored"
+
+
+# How each restore scrub treats a file a store claims (khipu/capture_stores.py,
+# RESTORE_SCRUBS): "copy" restores it as it is, "job" leaves it out when it is
+# a queued job for a forgotten source, "stage" scrubs the replica in a staging
+# copy before it becomes the replica, "merged" means the file was merged
+# before the copy loop and is not copied.
+RESTORE_SCRUBS = {
+    "queued job": "job",
+    "replica staging": "stage",
+    "content addressed": "copy",  # images shared by hash: a known boundary of forget
+    "registry merge": "merged",
+    "no capture text": "copy",
+}
+
+
 def _import_local(*, source: Path, merge: bool) -> dict:
     from khipu import hub_snapshot, tombstones
+    from khipu.capture_stores import restore_entry
 
     source = source.expanduser()
     target = ensure_data_dir()
     imported = 0
     skipped_forgotten = 0
     skipped_replica_temps: list[str] = []
+    not_restored: list[dict[str, str]] = []
     staged: Path | None = None
 
-    def skipped(parts: tuple[str, ...]) -> bool:
-        reason = _skip_reason(parts)
-        if reason == "replica_temp":
-            skipped_replica_temps.append("/".join(parts))
-        return reason is not None
+    def scrub_for(parts: tuple[str, ...]) -> str | None:
+        """The scrub a backed-up file goes through, or None (and listed in
+        the report) when no store claims it."""
+        entry = restore_entry(parts)
+        if entry is None or _skip_reason(parts) is not None:
+            if _skip_reason(parts) == "replica_temp":
+                skipped_replica_temps.append("/".join(parts))
+            not_restored.append({"path": "/".join(parts), "why": _not_restored_why(parts)})
+            return None
+        return RESTORE_SCRUBS[entry.scrub]
 
     def stage(reader) -> None:
         nonlocal staged
@@ -378,17 +415,37 @@ def _import_local(*, source: Path, merge: bool) -> dict:
             staged = hub_snapshot.staging_path()
         copy_sensitive(reader, staged)
 
+    def restore(scrub: str, dest: Path, read_bytes, open_source, gate) -> None:
+        nonlocal imported, skipped_forgotten
+        if scrub == "merged":
+            return
+        if scrub == "job" and _forgotten_job(read_bytes(), gate):
+            skipped_forgotten += 1
+            return
+        with open_source() as source_file:
+            if scrub == "stage":
+                stage(source_file)
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if dest.name in SENSITIVE_FILENAMES:
+                    copy_sensitive(source_file, dest)
+                else:
+                    with open(dest, "wb") as out:
+                        shutil.copyfileobj(source_file, out)
+        imported += 1
+
     try:
         if source.is_dir():
             registry = source / _REGISTRY_NAME
             if registry.is_file():
                 tombstones.merge_registry_bytes(registry.read_bytes())
             with tombstones.write_gate() as gate:
-                for p in source.rglob("*"):
+                for p in sorted(source.rglob("*")):
                     if not p.is_file():
                         continue
                     rel = p.relative_to(source)
-                    if skipped(rel.parts):
+                    scrub = scrub_for(rel.parts)
+                    if scrub is None:
                         continue
                     dst = target / rel
                     if _aliases_protected(target.resolve(), rel.parts, dst.resolve()):
@@ -397,21 +454,7 @@ def _import_local(*, source: Path, merge: bool) -> dict:
                         continue
                     if dst.exists() and p.samefile(dst):
                         raise shutil.SameFileError(f"{p!s} and {dst!s} are the same file")
-                    if p.suffix == ".json" and _forgotten_job(p.read_bytes(), gate):
-                        skipped_forgotten += 1
-                        continue
-                    if rel.parts == (_SNAPSHOT_NAME,):
-                        with p.open("rb") as source_file:
-                            stage(source_file)
-                        imported += 1
-                        continue
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    if dst.name in SENSITIVE_FILENAMES:
-                        with p.open("rb") as source_file:
-                            copy_sensitive(source_file, dst)
-                    else:
-                        shutil.copy2(p, dst)
-                    imported += 1
+                    restore(scrub, dst, p.read_bytes, lambda p=p: p.open("rb"), gate)
         elif source.is_file() and source.suffix.lower() == ".zip":
             with zipfile.ZipFile(source, "r") as zf:
                 members = _checked_zip_members(zf, target)
@@ -420,26 +463,13 @@ def _import_local(*, source: Path, merge: bool) -> dict:
                         tombstones.merge_registry_bytes(zf.read(info))
                 with tombstones.write_gate() as gate:
                     for parts, info, dest in members:
-                        if skipped(parts):
+                        scrub = scrub_for(parts)
+                        if scrub is None:
                             continue
                         if dest.exists() and not merge:
                             continue
-                        if parts[-1].endswith(".json") and _forgotten_job(zf.read(info), gate):
-                            skipped_forgotten += 1
-                            continue
-                        if parts == (_SNAPSHOT_NAME,):
-                            with zf.open(info) as source_file:
-                                stage(source_file)
-                            imported += 1
-                            continue
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        with zf.open(info) as source_file:
-                            if dest.name in SENSITIVE_FILENAMES:
-                                copy_sensitive(source_file, dest)
-                            else:
-                                with open(dest, "wb") as out:
-                                    shutil.copyfileobj(source_file, out)
-                        imported += 1
+                        restore(scrub, dest, lambda info=info: zf.read(info),
+                                lambda info=info: zf.open(info), gate)
         else:
             raise RuntimeError("import source must be a .zip or a directory")
         scrub = None
@@ -458,11 +488,20 @@ def _import_local(*, source: Path, merge: bool) -> dict:
         "source": str(source),
         "merge": merge,
         "skipped_replica_temps": skipped_replica_temps,
+        "not_restored": not_restored,
     }
+    notes = []
     if skipped_replica_temps:
-        out["notes"] = [f"left out {len(skipped_replica_temps)} temporary replica "
-                        f"{'file' if len(skipped_replica_temps) == 1 else 'files'} a crashed "
-                        "refresh left behind; those are never restored"]
+        notes.append(f"left out {len(skipped_replica_temps)} temporary replica "
+                     f"{'file' if len(skipped_replica_temps) == 1 else 'files'} a crashed "
+                     "refresh left behind; those are never restored")
+    others = len(not_restored) - len(skipped_replica_temps)
+    if others:
+        notes.append(f"left out {others} {'file' if others == 1 else 'files'} that no store "
+                     "may restore (temporary files, locks, records or unknown names); "
+                     "see not_restored")
+    if notes:
+        out["notes"] = notes
     if scrub is not None:
         out["snapshot_scrub"] = scrub
     return out

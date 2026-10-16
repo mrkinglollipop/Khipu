@@ -256,6 +256,84 @@ def test_migration_does_not_deadlock_normal_two_table_writer(hub):  # noqa: F811
     assert cur.fetchone()[0] == 1
 
 
+@pytest.mark.parametrize("reapply", [False, True])
+def test_migration_does_not_deadlock_a_merge_holding_its_row_lock(hub, reapply):  # noqa: F811
+    """The merge writer locks its target row (SELECT ... FOR UPDATE) before
+    it updates it. A migration that took a weaker table lock and then needed
+    a stronger one for DROP TRIGGER waited on that row lock while the merge
+    waited on the migration's table lock. Re-applied, the triggers exist, so
+    DROP TRIGGER really drops one."""
+    if reapply:
+        assert hub.migrate(conn=hub.connect())["ran"] == [VERSION]
+    seed = hub.connect()
+    target = insert_episode(seed.cursor(), {**P, "session_id": "codex:target"})
+    seed.commit()
+    writer = hub.connect()
+    wcur = writer.cursor()
+    wcur.execute("SELECT id FROM episodes WHERE id = %s FOR UPDATE", (target,))
+    migration = hub.connect()
+
+    def migrate_it():
+        migration.cursor().execute(migration_sql())
+        migration.commit()
+
+    thread, errors = run_in_thread(migrate_it)
+    thread.join(0.5)
+    merged = {**P, "session_id": "codex:merged", "summary": "merged while migrating"}
+    with _not_forgotten_by_the_python_check():
+        assert capture._merge_into_episode(wcur, target, merged, matched_via="test",
+                                           score=0.9) is True
+    writer.commit()
+    thread.join(15)
+    assert not thread.is_alive(), "migration and merge writer deadlocked"
+    assert not errors, [f"{type(e).__name__}: {e}" for e in errors]
+
+
+def test_migration_runs_while_a_merge_writer_loops_without_deadlock(hub):  # noqa: F811
+    """A second connection runs the normal merge writer in a loop while the
+    migration is applied, then re-applied, several times. Neither side may
+    see a deadlock, and every merge either lands or waits its turn."""
+    import time
+
+    seed = hub.connect()
+    target = insert_episode(seed.cursor(), {**P, "session_id": "codex:target"})
+    seed.commit()
+    stop = threading.Event()
+    merges = [0]
+
+    def writer_loop():
+        conn = hub.connect()
+        cur = conn.cursor()
+        i = 0
+        while not stop.is_set():
+            i += 1
+            merged = {**P, "session_id": f"codex:merged-{i}", "summary": f"merged {i}"}
+            with _not_forgotten_by_the_python_check():
+                assert capture._merge_into_episode(cur, target, merged, matched_via="loop",
+                                                   score=0.9) is True
+            conn.commit()
+            merges[0] += 1
+
+    thread, errors = run_in_thread(writer_loop)
+    migration = hub.connect()
+    deadline = time.monotonic() + 1.0
+    while merges[0] < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    try:
+        first = hub.migrate(conn=migration)
+        assert first["ran"] == [VERSION], first
+        cur = migration.cursor()
+        for _ in range(8):
+            cur.execute(migration_sql())
+            migration.commit()
+    finally:
+        stop.set()
+        thread.join(15)
+    assert not thread.is_alive(), "the merge writer never finished"
+    assert not errors, [f"{type(e).__name__}: {e}" for e in errors]
+    assert merges[0] > 3, merges
+
+
 # ---------------------------------------------------------------------------
 # the writers, with the real code against the real triggers
 # ---------------------------------------------------------------------------

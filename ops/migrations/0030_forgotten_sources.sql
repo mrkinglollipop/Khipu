@@ -33,16 +33,21 @@
 -- nothing (older code) is still refused on the natural key.
 --
 -- Order, all in this file's one transaction: lock both tables, create the
--- table and the triggers, then backfill. The locks come first, episodes then
--- episode_sources, the order every writer takes them (an episode row, then
--- its source row), so this migration and a writer cannot deadlock. SHARE ROW
--- EXCLUSIVE blocks inserts, updates and deletes on both tables until commit,
--- so no forget can commit between the backfill's scan and the triggers going
--- live: the backfill sees every forget committed before this migration, and
--- every later forget runs under the triggers. Reads are not blocked.
--- lock_timeout makes a long transaction holding either table fail this
--- migration after 5 s instead of queueing every capture behind it; the next
--- khipu migrate run retries it from the start.
+-- table and the triggers, then backfill. Both tables are locked ACCESS
+-- EXCLUSIVE first, the lock DROP TRIGGER needs, so the migration never
+-- upgrades a lock it holds. An earlier version took SHARE ROW EXCLUSIVE and
+-- upgraded at DROP TRIGGER; a merge writer holding its target row lock (FOR
+-- UPDATE) then waited on the migration's lock while the migration waited on
+-- the row lock, and the hub aborted one of them as a deadlock. The migration
+-- waits for episodes while it holds nothing, then asks for episode_sources
+-- without waiting; if a writer holds that, it lets go of episodes and tries
+-- again, so it never waits while holding a lock a writer needs. The locks
+-- block reads too, for as long as the backfill runs; no forget can commit
+-- between the backfill's scan and the triggers going live, so the backfill
+-- sees every forget committed before this migration, and every later forget
+-- runs under the triggers. lock_timeout and the 5 s deadline make a long
+-- transaction holding either table fail this migration instead of queueing
+-- every capture behind it; khipu migrate retries it from the start.
 --
 -- Additive only: a new table, five new functions, three new triggers and a
 -- backfill into the new table. No existing table, column, constraint or row
@@ -60,8 +65,25 @@
 
 SET LOCAL lock_timeout = '5s';
 
-LOCK TABLE episodes IN SHARE ROW EXCLUSIVE MODE;
-LOCK TABLE episode_sources IN SHARE ROW EXCLUSIVE MODE;
+DO $$
+DECLARE
+    deadline TIMESTAMPTZ := clock_timestamp() + interval '5 seconds';
+BEGIN
+    LOOP
+        BEGIN
+            LOCK TABLE episodes IN ACCESS EXCLUSIVE MODE;
+            LOCK TABLE episode_sources IN ACCESS EXCLUSIVE MODE NOWAIT;
+            RETURN;
+        EXCEPTION WHEN lock_not_available THEN
+            -- Leaving the block released whatever it took.
+            IF clock_timestamp() >= deadline THEN
+                RAISE;
+            END IF;
+            PERFORM pg_sleep(0.02);
+        END;
+    END LOOP;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS forgotten_sources (
     identity      TEXT PRIMARY KEY,
