@@ -40,12 +40,14 @@ NOT_CAPTURE = {
                      "memory_lock._take", "outbox._locked_outbox", "promote._lock",
                      "recall_prompt._session_lock", "routing._lock", "session_capture._beat_lock",
                      "session_capture._capture_now_lock", "session_capture._claim_lock",
-                     "usage._open_lock", "discover._try_lock"), _LOCKS),
+                     "usage._open_lock", "discover._try_lock", "config.config_write_lock",
+                     "accounts._declined_lock"), _LOCKS),
     # Account discovery (9A): which login folders exist and when they were checked,
     # and a throwaway folder a status check runs in. Folder names and counts only.
     "discover._save_store": "account discovery results: folder names, CLI kinds and check times",
     "discover.run_once": "a temporary empty folder a CLI status check runs in, removed after",
-    **dict.fromkeys(("config.save_config", "integrations._backup", "integrations._cursor_install",
+    "accounts._save_declined": "the logins the owner chose not to be offered again: folder names and CLI kinds",
+    **dict.fromkeys(("config._write_config", "integrations._backup", "integrations._cursor_install",
                      "integrations._grok_bot_install", "integrations._write_json",
                      "integrations._write_toml", "integrations.set_gateway_token",
                      "join._import_kit", "join._restore_file", "join._write_dsn_file",
@@ -77,7 +79,10 @@ NOT_CAPTURE = {
                     "search queries as typed into search, or their hash; not capture sources"),
     **dict.fromkeys(("ledger._migrate_outcomes", "ledger._prune_outcomes", "ledger._record_outcome",
                      "ledger._record_rejected", "ledger._refuse_job", "ledger._replica_pending",
-                     "ledger._set_aside", "ledger.cmd", "ledger.enqueue"), _LEDGER),
+                     "ledger._set_aside", "ledger.enqueue"), _LEDGER),
+    # The one way a ledger or work answer leaves Khipu; only ``khipu ledger ... --out``
+    # names a file, and it gets the ledger board or ledger rows.
+    "agent_view.emit": "a ledger board or ledger rows, to a file the owner names with --out; not captures",
     **dict.fromkeys(("routing._append_locked", "routing._fold_turn", "routing._id_salt",
                      "routing._save_view", "routing_replay._routing_quiet", "routing_replay._seed",
                      "routing_replay.replay"), _ROUTING),

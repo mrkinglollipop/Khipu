@@ -276,8 +276,13 @@ def read_nofollow(base: Path, parts: tuple[str, ...]) -> str | None:
 
 
 def _load_store() -> dict:
-    with _data_state() as dfd:
-        text = _read_at(dfd, STORE_NAME)
+    # No store yet (no run so far): nothing is opened, so a reader that must
+    # open nothing (a refused import projecting its report) can call this.
+    # The answer is the one the walk would give, since it finds no file.
+    text = None
+    if os.path.lexists(store_file()):
+        with _data_state() as dfd:
+            text = _read_at(dfd, STORE_NAME)
     try:
         data = json.loads(text) if text is not None else None
     except ValueError:

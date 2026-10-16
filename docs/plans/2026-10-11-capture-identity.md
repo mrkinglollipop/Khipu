@@ -438,6 +438,7 @@ entry with the reason it holds no capture data. A new writer therefore cannot sh
 | replica temp | data folder `.hub_snapshot.<random>.sqlite` and its journal and WAL | a refresh dump or a staged backup replica | scan "replica temps" |
 | legacy writer | data folder `.legacy_writers/<pgid>.json` | the process group of a legacy writer that may still append | scan "legacy writers" |
 | recall golden set | data folder `recall-golden.jsonl`, or the file `KHIPU_RECALL_GOLDEN` names | recall test queries, which usually quote a captured episode's private text, with the episode ids each expects | scan "recall golden": every line naming the episode in `expect` or `stale` is dropped; a file that cannot be read or judged keeps the forget open |
+| work view | data folder `state/work/view.json` and `.view.json.*.tmp` rewrites beside it (the same writer, `work._write_json`, saves `last/*.json`, `links.json` and `hidden.json` there: job summaries, ids and hashes only) | the Work view's read model, which lists open commitments' text | scan "work view": the saved view and its temps are removed, since forget has just closed the commitments the episode opened; the next `khipu work` writes it again without them; a file that cannot be listed or removed keeps the forget open |
 | recall eval record | a file the owner names with `khipu recall eval --record` | the golden queries, quoted text included, and the ids each returned | kept: an owner-chosen file outside the data folder that forget cannot find |
 | session state | capture home `state/<harness>--<session>.json` and `.capture-now.json` | offsets and hashes; carried text and a capture note not yet queued | none: the carried text belongs to the next window, which is refused when queued if its source is forgotten |
 | capture log | capture home `logs/session-capture.log` | drain and hook events: file names, counts and lengths | none: it never holds summary or transcript text |
@@ -445,6 +446,13 @@ entry with the reason it holds no capture data. A new writer therefore cannot sh
 | extraction scratch | data folder `state/synth-cli/work-*/` and its output temp | a model call's working folder and output | kept: removed by the call that made it |
 | commitments backup | hygiene backup folder `commitments-<time>/commitments.bin` | a binary copy of the commitments table | kept: closed commitments remain by design |
 | local backup | a backup folder or archive the owner chose | a copy of the data folder | kept: backups are kept for recovery; an import restores only what a store allows, through its scrub |
+
+Writers that hold no capture data are listed in the test's `NOT_CAPTURE` with what they write. The Work
+view and the account settings added these (2026-10-16): `config._write_config` (settings) and
+`config.config_write_lock` (a lock), the one config write path since every settings writer goes through
+`config.mutate_config`; `accounts._save_declined` (the logins not offered again: folder names and CLI
+kinds) and its lock `accounts._declined_lock`; and `agent_view.emit`, the one way a ledger or work answer
+leaves Khipu, which writes a file only for `khipu ledger ... --out` (a ledger board or ledger rows).
 
 **Import is an allow-list.** `capture_stores` says which stores a backup may restore and the exact file
 patterns each owns (`Store.restore`, plus `OTHER_DATA` for settings, the forget registry and waiting
@@ -469,7 +477,9 @@ forgotten episode id under older raw.
 
 **Known boundaries.** Conversation media is kept (shared by content hash). Extraction scratch left behind
 by a killed call is not swept. Local backups and the commitments backup are kept for recovery. Session
-state carry and capture notes are not sources until a window is queued.
+state carry and capture notes are not sources until a window is queued. A `khipu work` build that read the
+commitments before the forget closed them and saves after its scan can write the view once more; the next
+build replaces it.
 
 **Tests that pin it.** `tests/test_forget_round10.py`:
 `test_job_archived_to_empty_is_removed_by_a_completed_forget`,

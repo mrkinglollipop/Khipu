@@ -177,9 +177,9 @@ def _config_whole() -> None:
     """Raise when the config file is there but can't be read or parsed (or
     isn't an object): the login folders it names are then unknown, so the
     table ``_homes`` builds is incomplete and nothing may lean on it."""
-    from khipu.config import _load_config_for_mutation
+    from khipu.config import check_config_readable
 
-    _load_config_for_mutation()
+    check_config_readable()
 
 
 def strict_table():

@@ -33,7 +33,7 @@ from pathlib import Path
 
 # The scans forget runs, by the name a store gives.
 FORGET_SCANS = ("native jobs", "outbox", "legacy logs", "replica", "replica temps",
-                "legacy writers", "recall golden")
+                "legacy writers", "recall golden", "work view")
 
 
 # The scrubs a restored file may go through, by the name an entry gives.
@@ -117,6 +117,11 @@ STORES: tuple[Store, ...] = (
           "with the episode ids it expects", "recall golden",
           _w("forget._scrub_golden_file"),
           Restore(("recall-golden.jsonl",), "recall golden")),
+    Store("work view", "data folder state/work/view.json and .view.json.*.tmp rewrites beside it; "
+          "the same writer saves state/work/last/*.json, links.json and hidden.json there, which "
+          "hold job summaries, ids and hashes only",
+          "the Work view's read model, which lists open commitments' text", "work view",
+          _w("work._write_json")),
     Store("recall eval record", "a file the owner names with khipu recall eval --record",
           "the golden queries, quoted text included, and the ids each one returned",
           "kept: an owner-chosen file outside the data folder that forget cannot find; a known "

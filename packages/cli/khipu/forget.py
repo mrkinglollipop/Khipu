@@ -1241,6 +1241,44 @@ def _remove_golden_temps(directory: Path) -> list[dict[str, str]]:
     return locations
 
 
+def _remove_work_view() -> dict[str, Any]:
+    """Remove the Work view's saved read model and any rewrite temp a crash
+    left beside it: it lists open commitments' text, and the forget has just
+    closed the ones this episode opened. It is a copy of what ``khipu work``
+    builds, so the next build writes it again without them. A file that
+    cannot be listed or removed keeps the forget open."""
+    from khipu import work
+
+    place = "work view"
+    path = work.view_file()
+    try:
+        names = [n for n in _listing(path.parent)
+                 if n == path.name or (n.startswith(f".{path.name}.") and n.endswith(".tmp"))]
+    except OSError as exc:
+        return {"ok": False, "locations": [{
+            "place": place, "path": str(path.parent), "state": "unreadable",
+            "why": f"the Work view folder could not be listed ({type(exc).__name__}), so its saved "
+                   "view may still list this episode's commitments"}]}
+    locations: list[dict[str, str]] = []
+    for name in names:
+        target = path.parent / name
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            locations.append({"place": place, "path": str(target), "state": "copy remains",
+                              "why": f"the saved Work view {target} could not be removed "
+                                     f"({type(exc).__name__}), so it may still list this "
+                                     "episode's commitments"})
+        else:
+            locations.append({"place": place, "path": str(target), "state": "removed"})
+    if not locations:
+        locations.append({"place": place, "path": str(path), "state": "clean"})
+    return {"ok": not any(loc["state"] in INCOMPLETE_STATES for loc in locations),
+            "locations": locations}
+
+
 def _scrub_golden_file(path: Path, episode_id: int) -> dict[str, Any]:
     import tempfile
 
@@ -1648,12 +1686,15 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
     out["recall_golden"] = _scrub_recall_golden(episode_id)
     if not out["recall_golden"]["ok"]:
         partial.append("recall_golden")
+    out["work_view"] = _remove_work_view()
+    if not out["work_view"]["ok"]:
+        partial.append("work_view")
     # Every store the inventory says forget scans must be one of the scans
     # above; a store added without its scan keeps the forget open.
     from khipu.capture_stores import STORES
 
     ran = {"native jobs", "outbox", "legacy logs", "replica", "replica temps", "legacy writers",
-           "recall golden"}
+           "recall golden", "work view"}
     unscanned = [{"place": st.name, "path": None, "state": "not checked",
                   "why": (f"{st.name} ({st.where}) is in the store inventory but forget has no "
                           "scan for it, so the forget stays open")}
@@ -1664,7 +1705,7 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
     out["locations"] = _merge_locations(
         legacy_locs, *(item.get("inspected", []) for item in out["outboxes"]),
         out["replica_temps"]["locations"], out["native_jobs"]["inspected"],
-        writers["locations"], out["recall_golden"]["locations"], unscanned)
+        writers["locations"], out["recall_golden"]["locations"], out["work_view"]["locations"], unscanned)
     out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
                      "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
     if not out["outbox"]["ok"]:
@@ -1690,6 +1731,8 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         "store_inventory": [loc["why"] for loc in unscanned],
         "recall_golden": [loc.get("why") for loc in out["recall_golden"]["locations"]
                           if loc["state"] in INCOMPLETE_STATES],
+        "work_view": [loc.get("why") for loc in out["work_view"]["locations"]
+                      if loc["state"] in INCOMPLETE_STATES],
     }
     if out.get("unidentified_sources", 0) > 0:
         out["partial_errors"]["legacy_file"] = [

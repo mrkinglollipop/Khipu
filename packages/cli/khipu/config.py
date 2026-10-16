@@ -112,6 +112,13 @@ def _load_config_for_mutation() -> dict:
     return data
 
 
+def check_config_readable() -> None:
+    """Raise ``InvalidConfigDocument`` when config.json is there but can't be
+    read or parsed (or isn't an object): for a reader that must not lean on
+    the empty document ``load_config`` returns then. Writes nothing."""
+    _load_config_for_mutation()
+
+
 # The one write path for config.json. Every writer in the package changes the
 # document inside ``mutate_config()``: it takes ``config_write_lock``, reads the
 # file as it is now, hands the writer that copy and writes it back when the

@@ -164,16 +164,17 @@ def settings_status() -> dict[str, dict]:
 
 def set_setting(key: str, raw: Any) -> Path:
     """Store a work setting (``None`` removes it: the default again)."""
-    from khipu.config import _load_config_for_mutation, save_config
+    from khipu.config import config_file, mutate_config
 
     if key not in SETTINGS:
         raise KeyError(f"unknown work setting {key!r}")
-    data = _load_config_for_mutation()
-    if raw is None:
-        data.pop(key, None)
-    else:
-        data[key] = _coerce(SETTINGS[key][0], raw, key)
-    return save_config(data)
+    value = None if raw is None else _coerce(SETTINGS[key][0], raw, key)
+    with mutate_config() as data:
+        if raw is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+    return config_file()
 
 
 # ---- time, text and state files ----------------------------------------------------
