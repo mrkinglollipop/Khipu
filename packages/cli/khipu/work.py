@@ -14,10 +14,11 @@ refused. Nothing here writes a project's files or sends anything to a runner.
 need the user and the routing record into one document, ``khipu-work-view``
 version 1, kept at ``state/work/view.json``. It carries no path, login folder,
 account key or pre-formatted local time, so a later phone or web view needs
-only it and the ledger reads. Every string leaves through ``_project``: its
+only it and the ledger reads. Every string leaves through ``_Scan``: its
 free text cleaned where it is read, then one fail-closed scan of the finished
 document that withholds any field still holding a path, a login folder, an
-account key or a secret.
+account key or a secret (and, when the login-folder list can't be loaded,
+every string that is not a time or work.py's own words, saying so).
 """
 from __future__ import annotations
 
@@ -58,7 +59,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "work_max_jobs": ("count", 50, "Most jobs shown per project (0: no limit)"),
     "work_max_prs": ("count", 200, "Most pull requests shown per project (0: no limit)"),
     "work_max_trains": ("count", 20, "Most release trains shown per project (0: no limit)"),
-    "work_max_runs": ("count", 20, "Most test runs shown per train (0: no limit)"),
+    "work_max_runs": ("count", 20, "Most test runs shown per project (0: no limit)"),
     "work_line_chars": ("count", 200, "Longest summary line (0: no limit)"),
     "work_stale_after": ("auto_duration", "auto",
                          "A summary counts as out of date after (auto: five of the runner's intervals; 0: never)"),
@@ -302,31 +303,69 @@ def _word(value: Any, shape: re.Pattern = _ID_RE) -> str | None:
     return None
 
 
+PRIVACY_INCOMPLETE = ("Khipu couldn't load its list of login folders and user names, so every name, title "
+                      "and line that could hold one is left out of this view.")
+_Z_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_SCHEMA_KEY = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+
+
+def _fixed_words() -> frozenset[str]:
+    """Every string work.py itself writes into a view: the only strings a
+    view may keep when the login-folder table can't be loaded."""
+    words = {VIEW_FORMAT, UNKNOWN_STATE, WITHHELD_WORDS, PRIVACY_INCOMPLETE, *JOB_KINDS, *JOB_ENDED, *VERDICTS,
+             *RUN_STATES, *SOURCE_PROBLEMS.values(), *STATE_APP_WORDS, *STATE_APP_WORDS.values(),
+             "ok", "stale", "gone", "missing", "refused", "off", "none", "unreadable", "too_big", "wrong_project",
+             "newer_format", "open", "needs", "done", "dropped", "ledger", "commitment", "routing", "rule", "hold",
+             "seeded", "same", "not_same", "snooze", "hide", "drop", "answered", "open_ledger", "open_link",
+             "open_owed", "open_routing", "Confirm a standing rule a conversation changed"}
+    for table in (JOB_STATES, PR_STAGES, TRAIN_STATES):
+        words.update(table)
+        words.update(table.values())
+    return frozenset(words)
+
+
 class _Scan:
     """The fail-closed last pass over everything work.py hands out: any
     string still private is withheld (None in an object, left out of a
-    list; an object key that is private drops its entry)."""
+    list; an object key that is private drops its entry).
+
+    Without the login-folder table (``degraded``) a name can't be told
+    from other words, so only times and work.py's own words are kept, and
+    only object keys shaped like the view's own field names."""
 
     def __init__(self) -> None:
         try:
             from khipu import agent_view
 
             self.table = agent_view._table(None)
-        except Exception:  # noqa: BLE001  (the shape checks still run)
+        except Exception:  # noqa: BLE001  (fail closed: see __call__)
             self.table = None
+        self.degraded = self.table is None
+        if self.degraded:
+            self.fixed = _fixed_words()
+            from khipu import agent_view
+
+            home = agent_view._home_dir()
+            self.names = {n.casefold() for n in (os.path.basename(home or ""), os.environ.get("USER", "")) if n}
+
+    def _keep(self, text: str, key: bool) -> bool:
+        if self.degraded:
+            if key:
+                return bool(_SCHEMA_KEY.match(text) or text in self.fixed) and text.casefold() not in self.names
+            return text in self.fixed or bool(_Z_TIME.match(text))
+        try:
+            return not _private_text(text, self.table)
+        except Exception:  # noqa: BLE001  (unsure is private)
+            return False
 
     def __call__(self, value: Any) -> Any:
         if isinstance(value, str):
-            return None if _private_text(value, self.table) else value
+            return value if self._keep(value, False) else None
         if isinstance(value, dict):
-            return {k: self(v) for k, v in value.items() if not (isinstance(k, str) and self(k) is None)}
+            return {k: self(v) for k, v in value.items() if not isinstance(k, str) or self._keep(k, True)}
         if isinstance(value, (list, tuple)):
-            return [self(v) for v in value if not (isinstance(v, str) and self(v) is None)]
+            return [self(v) for v in value if not isinstance(v, str) or self._keep(v, False)]
         return value
-
-
-def _project(value: Any) -> Any:
-    return _Scan()(value)
 
 
 def _clean_link(value: Any) -> str | None:
@@ -494,7 +533,6 @@ def _train(item: dict, r: _Reading) -> dict:
         except (_Drop, TypeError, ValueError, OverflowError):
             r.dropped += 1
     ident = r.ident(item.get("id"))
-    runs = _newest(runs, "at", r.cfg["work_max_runs"], r, f"runs of {ident}")
     prs = [w for w in map(_word, item["prs"]) if w] if isinstance(item.get("prs"), list) else []
     return {"id": ident, "name": r.text(item.get("name"), 40, required=True), "state": state,
             "state_known": known, "state_words": TRAIN_STATES.get(state or "", UNKNOWN_STATE),
@@ -573,6 +611,11 @@ def parse_summary(data: bytes, project: str | None, cfg: dict, now: datetime) ->
             except (_Drop, TypeError, ValueError, OverflowError):
                 r.dropped += 1
         out[key] = _newest(items, newest, cfg[cap_key], r, key)
+    # work_max_runs counts every run of the trains shown, not each train's.
+    runs = [run for t in out["trains"] for run in t["runs"]]
+    kept = {id(run) for run in _newest(runs, "at", cfg["work_max_runs"], r, "runs")}
+    for t in out["trains"]:
+        t["runs"] = [run for run in t["runs"] if id(run) in kept]
     waiting = doc.get("waiting_on_owner")
     out["waiting_list_ignored"] = 0 if waiting is None else (len(waiting) if isinstance(waiting, list) else 1)
     out.update(dropped=r.dropped, other_project=r.other_project, clamped=r.clamped, capped=r.capped)
@@ -647,16 +690,34 @@ def _private_place(path: str) -> bool:
         return True
 
 
+def _system_links_resolved(folder: str) -> str:
+    """``folder`` with only its first name resolved, and only when that is a
+    link the system owns at the top of the disk (``/tmp``, ``/var`` and
+    ``/etc`` on macOS). Every other link stays, so the walk refuses it."""
+    parts = Path(folder).parts
+    if len(parts) < 2:
+        return folder
+    top = os.path.join("/", parts[1])
+    try:
+        st = os.lstat(top)
+    except OSError:
+        return folder
+    if not stat.S_ISLNK(st.st_mode) or st.st_uid != 0:
+        return folder
+    real = os.path.realpath(top)
+    return os.path.join(real, *parts[2:]) if real != top else folder
+
+
 def _open_summary(path: Path) -> int:
     """A read-only descriptor for the summary file at ``path``. Its folder is
-    resolved and checked, then reached one folder at a time from ``/`` with
+    checked (only a system link at the top resolved), then reached one folder at a time from ``/`` with
     ``O_NOFOLLOW``, and the file opened by name from that folder's
     descriptor with ``O_NOFOLLOW``: a link anywhere on the way, put there
     before or after the checks, is refused, never followed."""
     path = Path(os.path.abspath(os.fspath(path.expanduser())))
     if _private_place(str(path)):
         raise _Refused
-    folder = os.path.realpath(path.parent)
+    folder = _system_links_resolved(str(path.parent))
     if _private_place(os.path.join(folder, path.name)):
         raise _Refused
     nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -735,7 +796,11 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
     except OSError:
         return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last)
     try:
-        stamp = [st.st_mtime_ns, st.st_size, _cfg_digest(cfg)]
+        # Which file was read (its name as set, device and inode) as well as
+        # its times and size: another file with the same time and size is
+        # read afresh. The name is kept only as a hash.
+        stamp = [hashlib.sha256(os.fsencode(str(path))).hexdigest()[:16], st.st_dev, st.st_ino,
+                 st.st_mtime_ns, st.st_ctime_ns, st.st_size, _cfg_digest(cfg)]
         if last is not None and last.get("stamp") == stamp:
             parsed = last["contents"]
         else:
@@ -798,7 +863,8 @@ def _ledger_projects(conn) -> list[dict]:
 
 
 def _entered(conn, project: str, rows: list[dict], history: list[dict] | None) -> dict[str, datetime]:
-    """When each of ``rows`` last entered its current state, from its history."""
+    """When each of ``rows`` last entered its current state, from its history.
+    An entry that keeps the state (a note or an edit) is not an entering."""
     if not rows:
         return {}
     states = {r["row_id"]: r["state"] for r in rows}
@@ -806,11 +872,13 @@ def _entered(conn, project: str, rows: list[dict], history: list[dict] | None) -
     if conn is not None:
         with conn.cursor() as cur:
             cur.execute("SELECT row_id, to_state, max(at) FROM ledger_history WHERE project = %s "
-                        "AND row_id = ANY(%s) GROUP BY row_id, to_state", (project, list(states)))
+                        "AND row_id = ANY(%s) AND from_state IS DISTINCT FROM to_state "
+                        "GROUP BY row_id, to_state", (project, list(states)))
             found = cur.fetchall()
         conn.rollback()
     else:
-        found = [(h.get("row_id"), h.get("to_state"), h.get("at")) for h in history or []]
+        found = [(h.get("row_id"), h.get("to_state"), h.get("at")) for h in history or []
+                 if h.get("from_state") != h.get("to_state")]
     for row_id, to_state, at in found:
         at = _parse_time(at)
         if row_id in states and states[row_id] == to_state and at is not None \
@@ -1010,10 +1078,13 @@ def _row_out(row: dict, vocab: dict) -> dict:
             "updated_at": _z(_parse_time(row.get("updated_at")))}
 
 
-def _ledger_part(rows: list[dict], vocab: dict, now: datetime) -> dict:
+def _ledger_part(rows: list[dict], vocab: dict, now: datetime, times: list[datetime] | None = None) -> dict:
     """A board's ledger parts: counts by state, open goals with their
     children's counts, loose ends newest-changed first (at most 10), and the
-    rows changed in the last 24 hours (in ledger order)."""
+    rows changed in the last 24 hours (in ledger order). Each time one of
+    these changes on its own (a row leaves the last 24 hours, a loose end
+    goes stale) is added to ``times``."""
+    times = times if times is not None else []
     from khipu import ledger
 
     stale_after = ledger.settings()["ledger_stale_after"]
@@ -1038,9 +1109,12 @@ def _ledger_part(rows: list[dict], vocab: dict, now: datetime) -> dict:
     for r in loose[:10]:
         item = _row_out(r, vocab)
         item["stale"] = bool(stale_after and (now - _when(r)).total_seconds() > stale_after)
+        if stale_after and not item["stale"]:
+            times.append(_when(r) + timedelta(seconds=stale_after))
         item["parent_missing"] = bool(r["parent"]) and r["parent"] not in ids
         loose_out.append(item)
     recent = [_row_out(r, vocab) for r in ordered if (now - _when(r)).total_seconds() <= 86400]
+    times.extend(_when(r) + timedelta(seconds=86400) for r in ordered if (now - _when(r)).total_seconds() <= 86400)
     return {"rows": len(rows), "by_state": counts, "goals": goals, "loose_ends": loose_out,
             "loose_end_count": len(loose), "changed_today": recent}
 
@@ -1086,14 +1160,21 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime) -
                     "actions": ["done", "drop", "answered", "open_ledger"] + (["open_link"] if row.get("link") else [])}
             items.append(item)
             needs.append((project, row, item))
+    explicit = {id(item): {x for x in (str((row.get("refs") or {}).get("commitment") or ""),
+                                       same.get((p, row["row_id"])) or "") if x}
+                for p, row, item in needs}
     for c in owed.get("items") or []:
         cid, project, text = str(c.get("id")), c.get("project") or None, c.get("text") or ""
         if hidden.get(cid) == _hide_mark(c):
             continue
-        linked = next((item for p, row, item in needs if p == project and (
-            str((row.get("refs") or {}).get("commitment") or "") == cid
-            or same.get((p, row["row_id"])) == cid
-            or content_hash(project, row["title"]) == content_hash(project, text))), None)
+        # An explicit link (the row's reference or a remembered "Same") wins;
+        # equal words link only a row with no explicit link, never a pair
+        # remembered as "Not the same".
+        linked = next((item for p, row, item in needs if p == project and cid in explicit[id(item)]), None)
+        if linked is None:
+            linked = next((item for p, row, item in needs if p == project and not explicit[id(item)]
+                           and item["also_owed"] is None and (p, row["row_id"], cid) not in not_same
+                           and content_hash(project, row["title"]) == content_hash(project, text)), None)
         if linked is not None:
             linked["also_owed"] = cid
             linked["blocking"] = linked["blocking"] or c.get("kind") == "blocker"
@@ -1169,7 +1250,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
         rows = (ldata or {}).get("rows") or []
         vocab = (ldata or {}).get("vocab") or {"state": [], "kind": []}
         if ldata is not None:
-            board["ledger"] = _ledger_part(rows, vocab, now)
+            board["ledger"] = _ledger_part(rows, vocab, now, times)
         if contents:
             written = _parse_time(contents["written_at"])
             if source["state"] in ("ok", "stale") and _stale_after(cfg, contents):
@@ -1235,7 +1316,8 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
     except Exception:  # noqa: BLE001
         outbox = 0
     future = [t for t in times if t is not None and t > now]
-    return _project({
+    scan = _Scan()
+    view = scan({
         "format": VIEW_FORMAT, "version": VIEW_VERSION, "generated_at": _z(now),
         "valid_until": _z(min(future)) if future else None,
         "projects": projects, "live": live, "waiting": waiting, "accounts": routing_info.get("accounts") or [],
@@ -1249,6 +1331,9 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
         "ledger_offline": bool(ledger_data.get("offline")), "ledger_as_of": ledger_data.get("as_of"),
         "refresh_s": cfg["work_refresh"],
     })
+    if scan.degraded:
+        view["problems"]["privacy"] = PRIVACY_INCOMPLETE
+    return view
 
 
 def write_view(view: dict) -> None:
@@ -1287,7 +1372,11 @@ def doctor_block(now: datetime | None = None) -> dict[str, Any]:
         if item["clamped"]:
             out["warnings"].append(f"work: {entry['project']}: {item['clamped']} time(s) ahead of this Mac's clock "
                                    "shown as now")
-    return _project(out)
+    scan = _Scan()
+    out = scan(out)
+    if scan.degraded:
+        out["warnings"].append(f"work: {PRIVACY_INCOMPLETE}")
+    return out
 
 
 # ---- the CLI ------------------------------------------------------------------------

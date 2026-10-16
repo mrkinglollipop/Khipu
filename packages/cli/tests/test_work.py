@@ -315,9 +315,10 @@ def test_caps_keep_the_newest_and_say_so(tmp_path):
     assert [j["id"] for j in c["jobs"]] == ["job-2", "job-3"]
     assert [p["id"] for p in c["prs"]] == ["2", "3"]
     assert [t["id"] for t in c["trains"]] == ["t1", "t2"]
-    assert [r["name"] for r in c["trains"][0]["runs"]] == ["run 2", "run 3"]
+    # The run cap counts the runs of every train shown: the two newest are each train's run 3.
+    assert [[r["name"] for r in t["runs"]] for t in c["trains"]] == [["run 3"], ["run 3"]]
     assert c["capped"]["jobs"] == {"shown": 2, "of": 4} and c["capped"]["prs"] == {"shown": 2, "of": 4}
-    assert c["capped"]["trains"] == {"shown": 2, "of": 3} and c["capped"]["runs of t0"] == {"shown": 2, "of": 4}
+    assert c["capped"]["trains"] == {"shown": 2, "of": 3} and c["capped"]["runs"] == {"shown": 2, "of": 8}
     assert board(view_for(path, work_max_jobs=2))["source"]["capped"]["jobs"] == {"shown": 2, "of": 4}
     # 0 lifts each cap.
     c = read(path, work_max_jobs=0, work_max_prs=0, work_max_trains=0, work_max_runs=0)["contents"]
@@ -785,4 +786,83 @@ def test_a_symlink_is_never_followed_even_when_swapped_after_the_checks(tmp_path
 
     monkeypatch.setattr(os, "open", swap)
     got = read(link)
+    assert got["state"] == "refused" and got["contents"] is None
+
+
+# ---- review regressions, round 2 (cross-family review of 0e8d5b3) ----------------------------
+
+
+def test_a_failed_privacy_table_withholds_every_name_and_says_so(tmp_path, monkeypatch):
+    from khipu import agent_view, config
+
+    login_name = "fictional-login-home"
+    monkeypatch.setattr(config, "load_config", lambda: {"usage_accounts": [
+        {"harness": "claude", "label": "Synthetic", "home": str(tmp_path / login_name)}]})
+    path = put(tmp_path, summary(jobs=[job(login_name, account=login_name, summary=login_name)]))
+
+    def broken(*args):
+        raise OSError("synthetic privacy-table read failure")
+
+    monkeypatch.setattr(agent_view, "_table", broken)
+    for document in cli_and_saved(monkeypatch, cfg(work_projects=[entry(path)])):
+        assert login_name not in json.dumps(document)
+        assert document["problems"]["privacy"] and document["format"] == "khipu-work-view"
+        assert document["counts"]["running"] == 1  # the shape and counts stay
+
+
+def test_an_explicit_commitment_link_beats_a_text_match(env):
+    rows = [row("text-match", "Approve licence", state="NEEDS OWNER"),
+            row("explicit", "Approve the release", state="NEEDS OWNER", refs={"commitment": "c1"})]
+    by_id = {w["id"]: w for w in waiting(rows, [commitment("c1", "Approve licence")])}
+    assert by_id["explicit"]["also_owed"] == "c1" and by_id["text-match"]["also_owed"] is None
+
+
+def test_not_the_same_holds_even_when_the_words_later_match(env):
+    rows = [row("n1", "Approve the licence", state="NEEDS OWNER")]
+    assert len(waiting(rows, [commitment("c1", "Approve licence")])) == 2
+    work.set_link("atlas", "n1", "c1", False)
+    assert len(waiting(rows, [commitment("c1", "Approve the licence")])) == 2
+
+
+def test_the_run_cap_is_per_project(tmp_path):
+    runs = [{"name": f"Run {i}", "state": "passed", "at": _t(30 + i)} for i in range(2)]
+    path = put(tmp_path, summary(trains=[train("t1", runs=runs), train("t2", runs=runs)]))
+    b = board(view_for(path, work_max_runs=2))
+    assert sum(len(t["runs"]) for t in b["trains"]) == 2
+    assert b["source"]["capped"]["runs"] == {"shown": 2, "of": 4}
+
+
+def test_a_note_only_history_entry_does_not_reset_when_a_row_entered_needs_you():
+    rows = [row("n1", "Approve licence", state="NEEDS OWNER")]
+    history = [{"row_id": "n1", "from_state": "IN FLIGHT", "to_state": "NEEDS OWNER", "at": _t(86400)},
+               {"row_id": "n1", "from_state": "NEEDS OWNER", "to_state": "NEEDS OWNER", "at": _t(30)}]
+    assert work._entered(None, "atlas", rows, history)["n1"] == work._parse_time(_t(86400))
+
+
+def test_another_file_with_the_same_time_and_size_is_read_again(tmp_path):
+    first = put(tmp_path, summary(jobs=[job("job-one")]), name="first.json")
+    second = put(tmp_path, summary(jobs=[job("job-two")]), name="second.json")
+    os.utime(second, ns=(first.stat().st_atime_ns, first.stat().st_mtime_ns))
+    assert first.stat().st_size == second.stat().st_size
+    assert read(first)["contents"]["jobs"][0]["id"] == "job-one"
+    assert read(second)["contents"]["jobs"][0]["id"] == "job-two"
+
+
+def test_valid_until_counts_the_ledger_changed_today_clock():
+    rows = [row("n1", "Check the release", ago=86399)]
+
+    def at(now):
+        return work.build_view(now, cfg=cfg(), ledger_data=ledger_data(rows), owed=NO_OWED, routing_info=ROUTING)
+
+    view = at(NOW)
+    assert view["projects"][0]["ledger"]["changed_today"]
+    assert not at(NOW + timedelta(seconds=2))["projects"][0]["ledger"]["changed_today"]
+    assert view["valid_until"] == _t(-1)
+
+
+def test_a_link_in_a_parent_folder_is_refused(tmp_path):
+    target = put(tmp_path, summary())
+    alias = tmp_path / "alias"
+    alias.symlink_to(target.parent, target_is_directory=True)
+    got = read(alias / target.name)
     assert got["state"] == "refused" and got["contents"] is None
