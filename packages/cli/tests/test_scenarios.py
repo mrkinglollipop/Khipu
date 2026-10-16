@@ -59,7 +59,10 @@ def test_explicit_reversal_marks_the_earlier_decision_superseded(tmp_path):
 
 def test_an_as_of_question_returns_the_historical_value(tmp_path):
     as_of_now = datetime(2026, 10, 15, tzinfo=timezone.utc)
-    with corpus.installed_corpus(tmp_path, now=as_of_now), \
+    # The questions are asked as of a fixed day, but the snapshot is built
+    # now: stamping it with the fixed day goes stale a day later.
+    with corpus.installed_corpus(tmp_path, now=as_of_now,
+                                 refreshed_at=datetime.now(timezone.utc)), \
          mock.patch("khipu.features.enabled", side_effect=lambda name: name == "time_interpretation"):
         result = rp.prior_work_for_prompt(
             "what was the rocket launch fee as of September 2026", cwd=None
