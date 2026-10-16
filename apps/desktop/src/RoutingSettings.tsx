@@ -31,6 +31,7 @@ import {
   paceWords,
   pastWords,
   priorityPendingWords,
+  ruleResultLines,
   saidWhen,
   useRouting,
   whenLocal,
@@ -46,6 +47,7 @@ import type {
   RouteRule,
   RouteRunner,
   RouteView,
+  RuleResult,
 } from "./routing";
 import {
   agoSpan,
@@ -1119,6 +1121,7 @@ function ruleRemoveButton(n: number): HTMLElement | null {
 function RuleRow({
   r,
   watched,
+  result,
   ask,
   setAsk,
   w,
@@ -1128,6 +1131,7 @@ function RuleRow({
 }: {
   r: RouteRule;
   watched: boolean;
+  result: RuleResult | undefined;
   ask: RuleAsk;
   setAsk: (a: RuleAsk) => void;
   w: Writer;
@@ -1157,8 +1161,9 @@ function RuleRow({
     }
   };
   const origin = ruleOrigin(r.source, r.date, now);
+  const checks = ruleResultLines(watched, result, now.getTime());
   return (
-    <li className="row-item route-rule">
+    <li className={`row-item route-rule${watched && result?.result === "broken" ? " broken" : ""}`}>
       <span className="route-rule-n" aria-hidden>
         {r.n}.
       </span>
@@ -1169,7 +1174,6 @@ function RuleRow({
           {pending ? <Tag tone="warn">{r.pending_kind === "changed" ? "Changed, reconfirm" : "Added, confirm"}</Tag> : null}
           {!pending && toConfirm ? <Tag tone="warn">Seeded, confirm</Tag> : null}
           {r.seeded && r.confirmed ? <Tag tone="ok">Confirmed</Tag> : null}
-          <Tag>{watched ? "Watched" : "Not watched by Khipu"}</Tag>
           {pending ? (
             <span className="set-help">
               {`${r.pending_kind === "changed" ? "Changed" : "Added"} by ${r.pending_by ?? "a conversation"} at the owner's request; the owner has not confirmed it yet.`}
@@ -1177,6 +1181,9 @@ function RuleRow({
             </span>
           ) : null}
         </span>
+        {checks.map((c) => (
+          <span key={c.text} className={`rule-result${c.tone ? ` ${c.tone}` : ""}`}>{c.text}</span>
+        ))}
       </span>
       <span className="route-acts">
         {toConfirm ? (
@@ -1307,8 +1314,26 @@ function RuleRow({
   );
 }
 
+type RuleFilter = "all" | "confirm" | "checked" | "broken";
+
+const RULE_FILTERS: { key: RuleFilter; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "confirm", label: "To confirm" },
+  { key: "checked", label: "Checked by Khipu" },
+  { key: "broken", label: "May be broken" },
+];
+
+const rulesWord = (n: number) => `${n} rule${n === 1 ? "" : "s"}`;
+
 function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }) {
   const rules = data.rules ?? [];
+  const results = data.rule_results ?? [];
+  // Which rules Khipu checks: those with a result (the same matrix the lines
+  // come from); an older Khipu without results names them in watched_rules.
+  const watchedRules = data.rule_results ? results.map((x) => x.rule) : (data.watched_rules ?? []);
+  const resultOf = (n: number) => results.find((x) => x.rule === n);
+  const [filter, setFilter] = useState<RuleFilter>("all");
+  const filterLabel = useId();
   const [ask, setAsk] = useState<RuleAsk>(null);
   const [removed, setRemoved] = useState<RouteRule | null>(null);
   const [draft, setDraft] = useState("");
@@ -1316,6 +1341,15 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
   const fieldId = useId();
   const addBtn = useRef<HTMLButtonElement>(null);
   const toConfirm = rules.filter((r) => r.pending || (r.seeded && !r.confirmed)).length;
+  const inFilter: Record<RuleFilter, (r: RouteRule) => boolean> = {
+    all: () => true,
+    confirm: (r) => !!r.pending || (!!r.seeded && !r.confirmed),
+    checked: (r) => watchedRules.includes(r.n),
+    broken: (r) => watchedRules.includes(r.n) && resultOf(r.n)?.result === "broken",
+  };
+  const counts = Object.fromEntries(RULE_FILTERS.map((f) => [f.key, rules.filter(inFilter[f.key]).length])) as Record<RuleFilter, number>;
+  const shown = rules.filter(inFilter[filter]);
+  const checkable = rules.filter((r) => watchedRules.includes(r.n)).length;
   async function add(e: FormEvent) {
     e.preventDefault();
     if (!draft.trim()) {
@@ -1344,19 +1378,54 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
       </div>
       <div className="section-body">
         <p className="set-help">
-          Every conversation sees these first, in full, before anything else. They are never shortened or cut, and
-          Khipu sets no limit on their length (the app hands over up to {WORDS_MOST_KB} KB of text at once). Rules
-          marked Seeded were copied from your routing table and your instructions. A conversation can add or change a
-          rule at your request; those rows show what changed and stay pending until you confirm or undo them.
+          {"Every conversation sees these rules first, in full. "}
+          {checkable
+            ? `Khipu can check ${checkable} of them by reading your job runners' settings; if one looks broken you get a warning.`
+            : "Khipu can check rules about -fast models, the paid xAI API and Grok work by reading your job runners' settings; none of these is one."}
+          {" Khipu never stops any work."}
+        </p>
+        <p className="set-help">
+          Rules marked Seeded were copied from your routing table and your instructions; confirm each one, or edit or
+          remove it. A conversation can add or change a rule at your request; those rows show what changed and stay
+          pending until you confirm or undo them. Rules are never shortened or cut, and Khipu sets no limit on their
+          length (the app hands over up to {WORDS_MOST_KB} KB of text at once).
         </p>
         {rules.length ? (
+          <div className="route-filter">
+            <span className="lbl" id={filterLabel}>
+              Show rules
+            </span>
+            <div className="chips" role="group" aria-labelledby={filterLabel}>
+              {RULE_FILTERS.map((f) => (
+                <button
+                  key={f.key}
+                  type="button"
+                  className={`chip${filter === f.key ? " on" : ""}`}
+                  aria-pressed={filter === f.key}
+                  aria-label={`${f.label}, ${rulesWord(counts[f.key])}`}
+                  onClick={() => setFilter(f.key)}
+                >
+                  {f.label} <span className="n" aria-hidden>{counts[f.key]}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {shown.length ? (
           <ol className="rows route-rule-list" role="list" aria-label="Standing rules">
-            {rules.map((r) => (
-              <RuleRow key={r.n} r={r} watched={(data.watched_rules ?? []).includes(r.n)} ask={ask} setAsk={setAsk} w={w} now={now} onRemoved={setRemoved} back={() => addBtn.current} />
+            {shown.map((r) => (
+              <RuleRow key={r.n} r={r} watched={watchedRules.includes(r.n)} result={resultOf(r.n)} ask={ask} setAsk={setAsk} w={w} now={now} onRemoved={setRemoved} back={() => addBtn.current} />
             ))}
           </ol>
+        ) : rules.length ? (
+          <p className="set-help">
+            {`No rules here. `}
+            <button type="button" className="sm link" onClick={() => setFilter("all")}>
+              Show all {rulesWord(rules.length)}
+            </button>
+          </p>
         ) : (
-          <p className="set-help">No standing rules yet.</p>
+          <p className="set-help">No standing rules yet. Add one below.</p>
         )}
         {removed && !rules.some((r) => r.n === removed.n) ? (
           <div className="route-undo" role="status">
@@ -1413,9 +1482,8 @@ function RulesSection({ data, w, now }: { data: RouteView; w: Writer; now: Date 
           <WriteError w={w} id="rule-add" />
         </form>
         <p className="set-help">
-          Khipu doesn't enforce rules. A rule marked Watched has a check: when it looks broken you get a warning on
-          Home and in the health report, and nothing is stopped. A rule marked Not watched by Khipu has no check Khipu
-          can run.
+          Khipu doesn't enforce rules. A rule Checked by Khipu that looks broken shows a warning here, on Home and in
+          the health report; nothing is stopped.
         </p>
       </div>
     </div>
