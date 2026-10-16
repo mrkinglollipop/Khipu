@@ -93,7 +93,8 @@ def _state(key: str) -> str:
 
 
 def _log() -> list[dict]:
-    return [line for line in owner_direction.read_log() if line.get("kind") == "action"]
+    """The owner actions as they stand (each written ahead, then completed)."""
+    return owner_direction.actions()
 
 
 # ---- the words: normalising and matching ---------------------------------------------------
@@ -213,14 +214,18 @@ def test_tightening_the_check_takes_one_turn(world):
 
 
 def test_a_change_with_no_undo_is_applied_by_direction_and_logged_as_such(world):
-    token = world.say("clear Codex it is fine")
-    rc, out = world.run(["route", "clear", "Codex"], "clear Codex it is fine", token)
-    assert rc == 0 and out["ok"] is True
+    # A clear has an Undo now (tests/test_owner_undo.py); confirming a seeded
+    # rule still has none.
+    routing._write({"type": "rule_add", "n": 1, "text": "never run the fast tier", "seeded": True,
+                    "written_by": {"kind": "seed", "file": "rules.json"}, "via": "seed"})
+    token = world.say("keep rule 1 it is fine")
+    rc, out = world.run(["route", "rule", "confirm", "1"], "keep rule 1 it is fine", token)
+    assert rc == 0 and out["ok"] is True, out
     (line,) = _log()
-    assert line["action"] == "route.clear" and line["auth"] == "direction"
+    assert line["action"] == "route.rule.confirm" and line["auth"] == "direction"
     assert line["undo"] is None and "can't be undone" in line["no_undo"]
-    undo = world.say("undo that clear of Codex")
-    rc, out = world.run(["owner-direction", "undo", line["id"]], "undo that clear of Codex", undo)
+    undo = world.say("undo that confirm of rule 1")
+    rc, out = world.run(["owner-direction", "undo", line["id"]], "undo that confirm of rule 1", undo)
     assert rc == 2 and "can't be undone" in out["error"]
 
 
@@ -463,8 +468,8 @@ def test_a_pause_by_direction_is_stamped_logged_and_undone(world):
     undo = world.say("undo that pause on Codex")
     rc, out = world.run(["owner-direction", "undo", line["id"]], "undo that pause on Codex", undo)
     assert rc == 0 and out["ok"] is True and _state("codex|") != "paused"
-    undo_line = owner_direction.read_log()[-1]
-    assert undo_line["kind"] == "undo" and undo_line["undoes"] == line["id"]
+    (undo_line,) = [x for x in owner_direction.read_log() if x.get("kind") == "undo"]
+    assert undo_line["undoes"] == line["id"] and owner_direction.line_state(undo_line["id"]) == "applied"
     rc, out = world.run(["owner-direction", "undo", line["id"], "--from-app"])
     assert rc == 2 and "already undone" in out["error"]
 

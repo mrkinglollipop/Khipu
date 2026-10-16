@@ -1593,7 +1593,7 @@ _AUTH_OF_VIA = {"app": "app", "cli": "terminal", "direction": "direction"}
 # (owner direction). Anything else is outside the app (doctor warns).
 _OWNERS_OWN = ("app", "direction")
 # Lines only the owner writes; the fold counts one with no author as his.
-_OWNER_ONLY = frozenset({"pause", "lift", "clear", "dismiss", "note_set", "note_end", "rule_confirm", "rule_retire",
+_OWNER_ONLY = frozenset({"pause", "lift", "clear", "clear_undo", "dismiss", "undismiss", "note_set", "note_end", "rule_confirm", "rule_retire",
                          "rule_restore", "rule_undo", "rule_dismiss", "priority_confirm", "priority_undo",
                          "priority_clear", "priority_drop", "account_move", "account_note"})
 
@@ -2390,6 +2390,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     evidence: list[dict] = []
     owner: dict[str, Any] = {"pauses": {}, "lifts": {}, "clears": {}, "dismissed": set()}
     dismissals: list[dict] = []
+    # Each account's clears in order: undoing one (``clear_undo``) drops it,
+    # and the newest left (the one it superseded, unless it was older) counts.
+    clear_stacks: dict[str, list[dict]] = {}
     holds: dict[str, dict] = {}
     rules: dict[int, dict] = {}
     note: dict | None = None
@@ -2477,9 +2480,21 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 causes[touched].update(auth=event["auth"], harness=event.get("harness"))
         if kind in ("pause", "lift", "clear") and info["account"]:
             owner[{"pause": "pauses", "lift": "lifts", "clear": "clears"}[kind]][info["account"]] = info
+            if kind == "clear":
+                clear_stacks.setdefault(info["account"], []).append(info)
+        elif kind == "clear_undo" and info["account"] and info["target"]:
+            stack = [c for c in clear_stacks.get(info["account"], []) if str(c["id"]) != str(info["target"])]
+            clear_stacks[info["account"]] = stack
+            if stack:
+                owner["clears"][info["account"]] = stack[-1]
+            else:
+                owner["clears"].pop(info["account"], None)
         elif kind == "dismiss" and info["target"]:
             owner["dismissed"].add(str(info["target"]))
             dismissals.append(info)
+        elif kind == "undismiss" and info["target"]:
+            owner["dismissed"].discard(str(info["target"]))
+            dismissals = [d for d in dismissals if str(d["target"]) != str(info["target"])]
         elif kind == "hold" and event.get("id"):
             scope = event.get("scope") if isinstance(event.get("scope"), dict) else {"kind": "all"}
             holds[str(event["id"])] = {
@@ -3288,7 +3303,7 @@ def run_due_reset_checks(now: datetime | None = None, *, probe=None, load=None,
 def _touched(kind: str | None, event: dict, info: dict) -> str | None:
     """The entity a written (non-evidence) line changes, as the view's
     ``effective`` names it, or None."""
-    if kind in ("pause", "lift", "clear", "dismiss", "account_note") and info["account"]:
+    if kind in ("pause", "lift", "clear", "clear_undo", "dismiss", "undismiss", "account_note") and info["account"]:
         return f"account:{info['account']}"
     if kind == "account_move" and info["target"]:
         return f"account:{info['target']}"
@@ -4078,6 +4093,47 @@ def clear(account: str, *, report_id: str | None = None, via: str, now: datetime
             raise RouteError(f"{report_id!r} is not a report about that account")
         return dict(_owner_write({"type": "dismiss", "account": key, "target": report_id}, via), account=key)
     return dict(_owner_write({"type": "clear", "account": key}, via), account=key)
+
+
+def _owner_lines_about(key: str) -> list[dict]:
+    return [e for e in _in_write_order(read_events()[0]) if e.get("account") == key]
+
+
+def current_clear(account: str) -> str | None:
+    """The id of the clear that counts for the account now (the newest not
+    undone), or None."""
+    key = resolve_account(account)
+    stack: list[str] = []
+    for e in _owner_lines_about(key):
+        if e.get("type") == "clear":
+            stack.append(str(e.get("id")))
+        elif e.get("type") == "clear_undo":
+            stack = [c for c in stack if c != str(e.get("target"))]
+    return stack[-1] if stack else None
+
+
+def undo_clear(account: str, clear_id: str, *, via: str, now: datetime | None = None) -> dict:
+    """Undo the owner's clear ``clear_id``: the fold drops it, and the clear
+    before it, if any, counts again."""
+    key = resolve_account(account)
+    lines = _owner_lines_about(key)
+    if not any(e.get("type") == "clear" and str(e.get("id")) == clear_id for e in lines):
+        raise RouteError(f"{clear_id!r} is not a clear of that account")
+    if any(e.get("type") == "clear_undo" and str(e.get("target")) == clear_id for e in lines):
+        raise RouteError(f"the clear {clear_id} was already undone")
+    return dict(_owner_write({"type": "clear_undo", "account": key, "target": clear_id}, via), account=key)
+
+
+def undismiss(account: str, report_id: str, *, via: str, now: datetime | None = None) -> dict:
+    """Bring back a report the owner dismissed."""
+    key = resolve_account(account)
+    dismissed = False
+    for e in _owner_lines_about(key):
+        if str(e.get("target")) == report_id and e.get("type") in ("dismiss", "undismiss"):
+            dismissed = e["type"] == "dismiss"
+    if not dismissed:
+        raise RouteError(f"report {report_id!r} is not dismissed for that account")
+    return dict(_owner_write({"type": "undismiss", "account": key, "target": report_id}, via), account=key)
 
 
 def _shown_report_ids(entry: dict) -> set[str]:
@@ -4914,7 +4970,8 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
 
 
 _DIRECTION_VERBS = {"pause": "Paused {a}", "lift": "Lifted the pause on {a}", "clear": "Cleared the report on {a}",
-                    "dismiss": "Dismissed a report on {a}", "account_move": "Moved {a} to another login folder",
+                    "dismiss": "Dismissed a report on {a}", "clear_undo": "Undid the clear on {a}",
+                    "undismiss": "Brought back a dismissed report on {a}", "account_move": "Moved {a} to another login folder",
                     "hold": "Added a hold", "hold_end": "Ended a hold", "note_set": "Set the note",
                     "note_end": "Ended the note", "rule_add": "Added standing rule {n}",
                     "rule_edit": "Changed standing rule {n}", "rule_retire": "Retired standing rule {n}",
@@ -5650,7 +5707,8 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
 # convention (Khipu holds no credential), and a tool call is never the owner.
 CONVERSATION_ACTIONS = ("report", "hold", "end_hold")
 OWNER_ACTIONS = {"pause": "Pausing an account", "lift": "Lifting a pause", "clear": "Clearing an account",
-                 "dismiss": "Dismissing a report", "note": "The owner's note", "set_note": "The owner's note",
+                 "dismiss": "Dismissing a report", "clear_undo": "Undoing a clear",
+                 "undismiss": "Bringing back a dismissed report", "note": "The owner's note", "set_note": "The owner's note",
                  "end_note": "The owner's note", "rule": "A standing rule", "add_rule": "A standing rule",
                  "edit_rule": "A standing rule", "retire_rule": "A standing rule",
                  "confirm_rule": "A standing rule", "undo_rule": "A standing rule",

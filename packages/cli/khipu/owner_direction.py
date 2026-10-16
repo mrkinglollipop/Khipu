@@ -1087,29 +1087,67 @@ def _new_id() -> str:
 
 
 def find_done(session: str, turn: str, action: str, target: str) -> dict | None:
-    for line in read_log():
-        if (line.get("kind") == "action" and line.get("auth") == "direction" and line.get("session") == session
-                and line.get("turn") == turn and line.get("action") == action and line.get("target") == target):
+    for line in actions():
+        if (line.get("auth") == "direction" and line.get("session") == session and line.get("turn") == turn
+                and line.get("action") == action and line.get("target") == target and line["state"] != "failed"):
             return line
     return None
 
 
+# What a state line may add to the line it completes (``finish``).
+_LINE_FIELDS = ("kind", "id", "at", "target", "state", "prev", "hash", "words", "words_sha", "scrubbed")
+
+
+def _merged(rows: list[dict]) -> dict[str, dict]:
+    """Every action and undo line by id as it stands now: its completion's
+    fields merged in and ``state`` resolved. A line written ahead that was
+    never completed is ``unconfirmed``; an action is ``undone`` by an undo
+    that was applied, and unconfirmed by one that is (whether it is undone
+    is not known). The undo this process is making now (``_PENDING``) does
+    not count yet."""
+    inflight = ((_PENDING.get() or {}).get("line") or {}).get("id")
+    lines: dict[str, dict] = {}
+    for row in rows:
+        kind = row.get("kind")
+        if kind in ("action", "undo") and isinstance(row.get("id"), str):
+            lines[row["id"]] = dict(row, state=row.get("state") or ("applied" if kind == "undo" else None))
+            if kind == "action" and lines[row["id"]]["state"] is None:
+                lines[row["id"]]["state"] = "applied"
+        elif kind == "state" and row.get("target") in lines:
+            line = lines[row["target"]]
+            line.update({k: v for k, v in row.items() if k not in _LINE_FIELDS})
+            line["state"] = row.get("state")
+    for line in lines.values():
+        if line["state"] == "pending":
+            line["state"] = "unconfirmed"
+    for row in rows:
+        if (row.get("kind") != "undo" or row.get("undoes") not in lines or row.get("id") not in lines
+                or row["id"] == inflight):
+            continue
+        undo_state, line = lines[row["id"]]["state"], lines[row["undoes"]]
+        if line["state"] in ("cancelled", "done", "failed") or undo_state == "failed":
+            continue
+        line["state"] = "unconfirmed" if undo_state == "unconfirmed" else "undone"
+    return lines
+
+
+def actions() -> list[dict]:
+    """The owner actions in log order, each as it stands now (``_merged``)."""
+    return [line for line in _merged(read_log()).values() if line.get("kind") == "action"]
+
+
 def line_state(line_id: str) -> str | None:
-    """A logged action's state now: ``applied``, ``scheduled``, ``done``,
-    ``cancelled``, ``undone``, or None when there is no such line."""
-    state = None
-    for line in read_log():
-        if line.get("kind") == "action" and line.get("id") == line_id:
-            state = line.get("state") or "applied"
-        elif line.get("kind") == "state" and line.get("target") == line_id:
-            state = line.get("state")
-        elif line.get("kind") == "undo" and line.get("undoes") == line_id and state != "cancelled":
-            state = "undone"
-    return state
+    """A logged action's (or undo's) state now: ``applied``, ``scheduled``,
+    ``done``, ``cancelled``, ``undone``, ``failed`` (it did not happen),
+    ``unconfirmed`` (written ahead, never completed), or None when there is
+    no such line."""
+    line = _merged(read_log()).get(line_id)
+    return line["state"] if line else None
 
 
 def _find(line_id: str) -> dict | None:
-    return next((x for x in read_log() if x.get("kind") == "action" and x.get("id") == line_id), None)
+    line = _merged(read_log()).get(line_id)
+    return line if line and line.get("kind") == "action" else None
 
 
 # ---- around an owner write (every gate) --------------------------------------------------------
@@ -1143,20 +1181,36 @@ def gate(args, want: dict | None, *, env=None, now: float | None = None) -> dict
         raise DirectionRefused("before_unreadable",
                                "Khipu can't read what this would change right now, so it could not be undone; "
                                "nothing was changed. Try again when the database is back.")
-    _PENDING.set({"intent": want, "stamp": stamp, "before": before})
+    _abandon()
+    pend = {"intent": want, "stamp": stamp, "before": before}
+    try:
+        pend["line"] = _append(_ahead_line(want, stamp, before))
+    except OSError as err:
+        raise DirectionRefused("log_unwritable",
+                               "Khipu can't write the owner-actions log, where this change's Undo is kept "
+                               f"({err.strerror or err}), so nothing was changed. Try again once the disk can be "
+                               "written.") from None
+    _PENDING.set(pend)
     return stamp
 
 
 def noted(want: dict | None, stamp: dict) -> None:
-    """The app's or a terminal's owner action, to be logged once it is done."""
+    """The app's or a terminal's owner action, to be logged once it is done:
+    written ahead like a direction's when the log can be written, and never
+    holding up the owner's own change when it can't."""
+    _abandon()
     if want is None:
-        _PENDING.set(None)
         return
     try:
         before = _before(want)
     except Exception:  # noqa: BLE001 - the log never stops the owner's own change
         before = None
-    _PENDING.set({"intent": want, "stamp": dict(stamp), "before": before})
+    pend = {"intent": want, "stamp": dict(stamp), "before": before}
+    try:
+        pend["line"] = _append(_ahead_line(want, pend["stamp"], before))
+    except Exception:  # noqa: BLE001 - the whole line is tried again once the change is done
+        pass
+    _PENDING.set(pend)
 
 
 def pending_direction() -> dict | None:
@@ -1164,43 +1218,83 @@ def pending_direction() -> dict | None:
     return pend["stamp"] if pend and pend["stamp"].get("auth") == "direction" else None
 
 
+def _ahead_line(want: dict, stamp: dict, before) -> dict:
+    """The line written before an owner change (state ``pending``): what it
+    is, who asked and how, and ``before``, so Undo works whatever happens to
+    the change after. ``direction.undo`` writes an ``undo`` line."""
+    if want["action"] == "direction.undo":
+        undone = _find(want["target"]) or {}
+        line = {"kind": "undo", "id": _new_id(), "at": _iso(_clock()), "undoes": want["target"],
+                "action": undone.get("action"), "target": undone.get("target"), "auth": stamp.get("auth")}
+    else:
+        line = {"kind": "action", "id": _new_id(), "at": _iso(_clock()), "action": want["action"],
+                "target": want["target"], "before": None if before in (_NO_UNDO, _UNREADABLE) else before,
+                "auth": stamp.get("auth")}
+        why = _no_undo(want["action"], before)
+        if why:
+            line.update(undo=None, no_undo=why)
+        if want.get("facts"):
+            line["facts"] = want["facts"]
+    for key in ("words", "harness", "session", "via_session", "turn", "binding", "auth_chain"):
+        if stamp.get(key) is not None:
+            line[key] = stamp[key]
+    line["state"] = "pending"
+    return line
+
+
+def _abandon() -> None:
+    """End a written-ahead owner action that never reached ``finish``: the
+    change raised, so it is marked failed (best effort: unmarked, it reads
+    as unconfirmed, and Undo still works)."""
+    pend = _PENDING.get()
+    _PENDING.set(None)
+    if pend and pend.get("line"):
+        try:
+            _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": pend["line"]["id"],
+                     "state": "failed"})
+        except OSError:
+            pass
+
+
+_INCOMPLETE = ("The change was made and its Undo is recorded, but Khipu could not write that it finished, so "
+               "Owner actions shows it as unconfirmed.")
+
+
 def finish(result: dict | None, **extra) -> dict | None:
-    """Log the owner action ``gate``/``noted`` set up, now that it is done;
+    """Complete the owner action ``gate``/``noted`` wrote ahead, now that it
+    is done (a ``state`` line: applied, or failed when the result refused);
     the result, with the log line's id when it was a direction."""
     pend = _PENDING.get()
     if pend is None:
         return result
     _PENDING.set(None)
     want, stamp = pend["intent"], pend["stamp"]
-    before = pend["before"]
-    why = _no_undo(want["action"], before)
-    line = {"kind": "action", "id": _new_id(), "at": _iso(_clock()), "action": want["action"],
-            "target": want["target"], "before": None if before in (_NO_UNDO, _UNREADABLE) else before,
-            "after": _after(want, result), "auth": stamp.get("auth")}
-    if why:
-        line.update(undo=None, no_undo=why)
-    if want.get("facts"):
-        line["facts"] = want["facts"]
-    for key in ("words", "harness", "session", "via_session", "turn", "binding", "auth_chain"):
-        if stamp.get(key) is not None:
-            line[key] = stamp[key]
-    line.update(extra)
+    refused = isinstance(result, dict) and result.get("ok") is False
+    done = {"after": _after(want, result), **extra}
     if isinstance(result, dict):
-        line["result"] = {k: v for k, v in result.items() if k != "owner_action"}
+        done["result"] = {k: v for k, v in result.items() if k != "owner_action"}
+    line = pend.get("line")
+    incomplete = False
     try:
-        _append(line)
+        if line is None:
+            # The app's or a terminal's change whose line could not be
+            # written ahead: the whole line, now.
+            line = dict(_ahead_line(want, stamp, pend["before"]), **done)
+            line["state"] = "failed" if refused else extra.get("state", "applied")
+            _append(line)
+        else:
+            _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
+                     **done, "state": "failed" if refused else extra.get("state", "applied")})
     except OSError:
-        return result
-    if stamp.get("auth") == "direction" and isinstance(result, dict):
-        return dict(result, owner_action=line["id"])
+        if pend.get("line") is None:
+            return result
+        incomplete = True
+    if stamp.get("auth") == "direction" and isinstance(result, dict) and not refused:
+        out = dict(result, owner_action=line["id"])
+        if incomplete:
+            out["record_incomplete"] = _INCOMPLETE
+        return out
     return result
-
-
-def stamp_of(via: str | None) -> dict:
-    """The routing stamp for an owner gate that ran (``routing._OWNER_AUTH``)."""
-    from khipu import routing
-
-    return dict(routing._OWNER_AUTH.get() or {"auth": {"app": "app", "cli": "terminal"}.get(via or "", via)})
 
 
 # ---- before, after and undo, per action ----------------------------------------------------
@@ -1210,7 +1304,6 @@ _UNREADABLE = object()  # what it changes can't be read now: a direction is refu
 
 # Why a change has no undo, in words the app shows beside it.
 _NO_UNDO_WHY = {
-    "route.clear": "A clear or a dismissed report can't be undone; a new report about the account replaces it.",
     "ledger.import": "An import can't be undone; the rows it brought in can be removed one by one.",
     "route.rule.confirm": "Confirming a seeded rule can't be undone; the rule can be retired.",
 }
@@ -1256,6 +1349,8 @@ def _before(want: dict):
         return {"paused": paused, "until": entry.get("until") if paused else None}
     if action == "route.lift":
         return {"until": _entry(target).get("until")}
+    if action == "route.clear":
+        return {"clear": routing.current_clear(target), "report": (want.get("facts") or {}).get("report")}
     if action in ("route.note.set", "route.note.end"):
         note = routing.read_view().get("note")
         return {"text": note["text"] if note else None}
@@ -1493,6 +1588,25 @@ def _b(line: dict) -> dict:
     return line.get("before") or {}
 
 
+def _undo_clear(line, via):
+    """A dismissed report comes back; a clear is dropped, and the clear
+    before it (``before``) counts again (the fold keeps them in order)."""
+    from khipu import routing
+
+    report = (line.get("facts") or {}).get("report")
+    if report:
+        return routing.undismiss(line["target"], report, via=via)
+    clear_id = (line.get("after") or {}).get("id")
+    if clear_id is None:
+        # Unconfirmed: the clear's own id was never recorded, but a clear
+        # newer than the one it superseded can only be this one.
+        now = routing.current_clear(line["target"])
+        clear_id = now if now != _b(line).get("clear") else None
+    if clear_id is None:
+        raise ValueError("Khipu can't tell which clear this was, so it can't undo it")
+    return routing.undo_clear(line["target"], clear_id, via=via)
+
+
 def _undo_lift(line, via):
     from khipu import routing
 
@@ -1581,6 +1695,7 @@ def _ledger_undo(verb: str):
 _UNDO = {
     "route.pause": _undo_pause,
     "route.lift": _undo_lift,
+    "route.clear": _undo_clear,
     "route.note.set": _undo_note_set,
     "route.note.end": _undo_note_end,
     "route.rule.add": _retire_rule(lambda line: (line.get("after") or {}).get("n")),
@@ -1659,13 +1774,13 @@ def run_due(now: float | None = None) -> list[str]:
     now = _clock() if now is None else now
     done: list[str] = []
     try:
-        lines = read_log()
+        lines = actions()
     except Exception:  # noqa: BLE001
         return done
     for line in lines:
-        if line.get("kind") != "action" or line.get("action") != "ledger.purge" or line.get("state") != "scheduled":
+        if line.get("action") != "ledger.purge" or line["state"] != "scheduled":
             continue
-        if line_state(line["id"]) != "scheduled" or float(line.get("runs_at_ts") or 0) > now:
+        if float(line.get("runs_at_ts") or 0) > now:
             continue
         try:
             from khipu import ledger
@@ -1702,23 +1817,36 @@ def undo_names(line: dict) -> list[list[str]]:
     return [names]
 
 
-def undo(line_id: str, via: str) -> dict:
-    """Apply the inverse of a logged action and log it (``undoes``)."""
-    line = _find(line_id)
+def _undo_refusal(line: dict | None, line_id: str) -> str | None:
+    """Why the logged action ``line_id`` can't be undone now, or None."""
     if line is None:
-        raise ValueError(f"no owner action {line_id} is in the log")
-    state = line_state(line_id)
+        return f"no owner action {line_id} is in the log"
+    state = line["state"]
     if state in ("undone", "cancelled"):
-        raise ValueError(f"owner action {line_id} was already undone")
+        return f"owner action {line_id} was already undone"
+    if state == "failed":
+        return f"owner action {line_id} did not happen, so there is nothing to undo"
     if line["action"] == "ledger.purge":
         if state != "scheduled":
-            raise ValueError(f"the purge {line_id} already ran; a row removed for good can't come back")
+            return f"the purge {line_id} already ran; a row removed for good can't come back"
+        return None
+    if _UNDO.get(line["action"]) is None or "no_undo" in line:
+        return line.get("no_undo") or f"owner action {line_id} ({line['action']}) can't be undone"
+    return None
+
+
+def undo(line_id: str, via: str) -> dict:
+    """Apply the inverse of a logged action. Its ``undo`` line is written
+    ahead by the owner gate (``gate``/``noted``) and completed by
+    ``finish``."""
+    line = _find(line_id)
+    why = _undo_refusal(line, line_id)
+    if why:
+        raise ValueError(why)
+    if line["action"] == "ledger.purge":
         _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line_id, "state": "cancelled"})
-        return finish({"ok": True, "undid": line_id, "state": "cancelled"}) or {"ok": True}
-    fn = _UNDO.get(line["action"])
-    if fn is None or "no_undo" in line:
-        raise ValueError(line.get("no_undo") or f"owner action {line_id} ({line['action']}) can't be undone")
-    out = fn(line, via)
+        return {"ok": True, "undid": line_id, "state": "cancelled"}
+    out = _UNDO[line["action"]](line, via)
     result = dict(out) if isinstance(out, dict) else {"ok": True}
     result.update(ok=True, undid=line_id)
     return result
@@ -1766,7 +1894,7 @@ def run_cli(args) -> int:
         return 0
     if cmd == "actions":
         run_due()
-        rows = [dict(x, state=line_state(x["id"])) for x in read_log() if x.get("kind") == "action"]
+        rows = actions()
         rows.reverse()
         chain = verify_log()
         if getattr(args, "json", False):
@@ -1784,11 +1912,11 @@ def run_cli(args) -> int:
     try:
         if cmd == "undo":
             line = _find(args.id)
-            if line is None:
-                _print({"ok": False, "error": f"no owner action {args.id} is in the log", "code": "not_found"})
-                return 2
-            if line_state(args.id) in ("undone", "cancelled"):
-                _print({"ok": False, "error": f"owner action {args.id} was already undone", "code": "undone"})
+            why = _undo_refusal(line, args.id)
+            if why:
+                code = "not_found" if line is None else "undone" if line["state"] in ("undone", "cancelled") \
+                    else "refused"
+                _print({"ok": False, "error": why, "code": code})
                 return 2
             widening = False
             if line["action"] in ("direction.set", "direction.off"):
@@ -1800,11 +1928,7 @@ def run_cli(args) -> int:
                 _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
                 return 2
             out = undo(args.id, via)
-            _PENDING.set(None)
-            _append({"kind": "undo", "id": _new_id(), "at": _iso(_clock()), "undoes": args.id,
-                     "action": line["action"], "target": line["target"], **{k: v for k, v in stamp_of(via).items()
-                                                                            if k != "confirms"}})
-            _print(out)
+            _print(finish(out) or out)
             return 0
         if cmd == "on":
             via = routing._owner_via(args, None)
@@ -1851,7 +1975,7 @@ def run_cli(args) -> int:
         _print({"ok": False, "error": str(err), "code": getattr(err, "code", None) or "refused"})
         return 2
     finally:
-        _PENDING.set(None)
+        _abandon()
         routing._OWNER_AUTH.reset(auth)
 
 

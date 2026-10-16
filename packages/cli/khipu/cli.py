@@ -6348,6 +6348,11 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # noqa: BLE001 — CLI surface
         print(f"error: {e}", file=sys.stderr)
         return 1
+    finally:
+        # An owner change written ahead that never completed (its command
+        # raised) is marked failed, whichever command it was.
+        if "khipu.owner_direction" in sys.modules:
+            sys.modules["khipu.owner_direction"]._abandon()
 
 
 if __name__ == "__main__":

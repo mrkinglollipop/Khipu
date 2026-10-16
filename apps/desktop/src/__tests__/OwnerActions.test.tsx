@@ -31,9 +31,9 @@ function fresh(): Backend {
         runs_at: "2026-10-17T14:05:00Z",
       },
       {
-        id: "c3", at: "2026-10-16T14:03:00Z", action: "route.clear", target: "codex|", auth: "direction",
-        words: "clear Codex please", harness: "claude_code", binding: "token", state: "applied",
-        no_undo: "A clear or a dismissed report can't be undone; a new report about the account replaces it.",
+        id: "c3", at: "2026-10-16T14:03:00Z", action: "route.rule.confirm", target: "2", auth: "direction",
+        words: "keep rule 2 please", harness: "claude_code", binding: "token", state: "applied",
+        no_undo: "Confirming a seeded rule can't be undone; the rule can be retired.",
       },
       {
         id: "a1", at: "2026-10-16T14:02:00Z", action: "route.pause", target: "codex|", auth: "direction",
@@ -132,6 +132,37 @@ describe("Owner actions", () => {
     await waitFor(() => expect(within(items[4]).getByText("Undone")).toBeTruthy());
     expect(calls).toContainEqual(["khipu_owner_direction_undo", { id: "t7" }]);
     expect(within(items[3]).getByRole("button", { name: "Undo: Set the note" })).toBeTruthy();
+  });
+
+  it("an unconfirmed change says so and keeps its Undo", async () => {
+    backend.actions[2].state = "unconfirmed";
+    render(<OwnerActions active />);
+    const items = within(await list()).getAllByRole("listitem");
+    expect(items[2].textContent).toContain("Unconfirmed");
+    fireEvent.click(within(items[2]).getByRole("button", { name: "Undo: Paused Codex" }));
+    await waitFor(() => expect(within(items[2]).getByText("Undone")).toBeTruthy());
+  });
+
+  it("a change that did not happen has no Undo", async () => {
+    backend.actions[2].state = "failed";
+    render(<OwnerActions active />);
+    const items = within(await list()).getAllByRole("listitem");
+    expect(items[2].textContent).toContain("Did not happen");
+    expect(within(items[2]).queryByRole("button")).toBeNull();
+  });
+
+  it("a clear and a dismissed report each have an Undo", async () => {
+    backend.actions.push(
+      { id: "k1", at: "2026-10-16T11:00:00Z", action: "route.clear", target: "codex|", auth: "app", state: "applied" },
+      {
+        id: "k2", at: "2026-10-16T10:00:00Z", action: "route.clear", target: "codex|", auth: "app", state: "applied",
+        facts: { report: "e12" },
+      },
+    );
+    render(<OwnerActions active />);
+    const items = within(await list()).getAllByRole("listitem");
+    expect(within(items[5]).getByRole("button", { name: "Undo: Cleared the report on Codex" })).toBeTruthy();
+    expect(within(items[6]).getByRole("button", { name: "Undo: Dismissed a report on Codex" })).toBeTruthy();
   });
 
   it("no banner while the log's chain holds", async () => {

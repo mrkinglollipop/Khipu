@@ -46,6 +46,7 @@ export type OwnerAction = {
   runs_at?: string;
   no_undo?: string;
   after?: Record<string, unknown> | null;
+  facts?: Record<string, unknown> | null;
 };
 
 const HARNESS: Record<string, string> = { claude_code: "Claude Code", codex: "Codex", aegis: "Aegis" };
@@ -95,7 +96,9 @@ export function actionWords(a: OwnerAction): string {
     case "route.lift":
       return `Lifted the pause on ${accountWords(t)}`;
     case "route.clear":
-      return `Cleared the report on ${accountWords(t)}`;
+      return a.facts && typeof a.facts.report === "string"
+        ? `Dismissed a report on ${accountWords(t)}`
+        : `Cleared the report on ${accountWords(t)}`;
     case "route.note.set":
       return "Set the note";
     case "route.note.end":
@@ -201,8 +204,16 @@ function conversationWords(a: OwnerAction): string {
 }
 
 function stateTag(a: OwnerAction) {
+  // Failed before no undo: a change that did not happen has nothing to undo either way.
+  if (a.state === "failed") return <Tag tone="neutral">Did not happen</Tag>;
   if (a.no_undo) return <Tag tone="neutral">No undo</Tag>;
   switch (a.state) {
+    case "unconfirmed":
+      return (
+        <Tag tone="warn" dot title="Khipu wrote this change's Undo before making it, but not that it finished. Check the account, and undo it if it is not what you want.">
+          Unconfirmed
+        </Tag>
+      );
     case "undone":
       return <Tag tone="neutral">Undone</Tag>;
     case "cancelled":
@@ -223,7 +234,10 @@ function stateTag(a: OwnerAction) {
 }
 
 function canUndo(a: OwnerAction): boolean {
-  return !a.no_undo && (a.state === "applied" || a.state === "scheduled" || a.state == null);
+  return (
+    !a.no_undo &&
+    (a.state === "applied" || a.state === "scheduled" || a.state === "unconfirmed" || a.state == null)
+  );
 }
 
 /** The log's hash chain (`owner-direction actions --json`, `chain`). */
