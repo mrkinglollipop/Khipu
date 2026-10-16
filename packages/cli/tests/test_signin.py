@@ -531,6 +531,28 @@ def test_a_folder_that_signed_in_is_never_removed_or_reused(box):
     assert signin.start("claude", folder, **box.kw())["error"] == signin.E_REFUSED
 
 
+def test_a_sign_in_saves_no_account_and_the_folder_is_tracked_only_with_a_version(box, khipu_app):
+    from khipu import accounts
+
+    read = accounts.status()["version"]
+    stored = usage.configured_accounts()
+    folder = _folder()
+    out = signin.start("claude", folder, **box.kw())
+    box.end(1_000_001)
+    res = signin.status(out["attempt"]["id"], ps=box.ps, check=lambda cli, path: signin.SIGNED_IN)
+    assert res["state"] == signin.SIGNED_IN
+    # Signing in writes no config: the account list and its version are as read.
+    assert usage.configured_accounts() == stored and accounts.status()["version"] == read
+    entry = [{"harness": "claude", "home": folder, "label": "Claude client"}]
+    for expect, code in ((None, "version_needed"), ("stale", "version_moved")):
+        with pytest.raises(usage.AccountsError) as err:
+            accounts.track(entry, expect=expect, read=False)
+        assert err.value.code == code
+    saved = accounts.track(entry, expect=read, read=False)
+    assert saved["accounts"] == [{"key": f"claude|{box.home / '.claude-client'}", "label": "Claude client"}]
+    assert saved["version"] != read
+
+
 # ---- a real process -----------------------------------------------------------------------------------------
 
 

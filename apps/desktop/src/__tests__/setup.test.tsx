@@ -372,6 +372,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
       expect(screen.getByText("Set up another Mac")).toBeInTheDocument(),
     );
     const section = within(screen.getByText("Set up another Mac").closest(".section-card") as HTMLElement);
+    fireEvent.change(section.getByLabelText("Join kit passphrase"), { target: { value: "phrase" } });
     expect(section.getByRole("button", { name: /Save join kit/ })).not.toBeDisabled();
     expect(screen.queryByText(/This database lives only on this Mac/)).not.toBeInTheDocument();
   });

@@ -31,14 +31,15 @@ class ImportLocalSemanticsTest(unittest.TestCase):
             root = Path(td)
             source = root / "source"
             source.mkdir()
-            (source / "collision.txt").write_text("source", encoding="utf-8")
+            # A name a store may restore (round 11: nothing else is restored).
+            (source / "config.json").write_text("source", encoding="utf-8")
             archive = root / "source.zip"
             with zipfile.ZipFile(archive, "w") as zf:
-                zf.writestr("collision.txt", "zip-source")
+                zf.writestr("config.json", "zip-source")
             for incoming, expected in ((source, "source"), (archive, "zip-source")):
                 data_dir = root / f"target-{incoming.suffix or 'directory'}"
                 data_dir.mkdir()
-                target = data_dir / "collision.txt"
+                target = data_dir / "config.json"
                 target.write_text("existing", encoding="utf-8")
                 with mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(data_dir)}), redirect_stdout(io.StringIO()):
                     self.assertEqual(cli.main(["import-local", "--source", str(incoming)]), 0)

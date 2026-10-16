@@ -37,8 +37,11 @@ from khipu import embed as embed_mod
 from khipu import keychain
 from khipu import models as models_mod
 
-CHECK_IDS = ("gemini_embed", "gemini_generate", "openai_compat_generate")
-WHICH_VALUES = ("all", "gemini", "openai")
+CHECK_IDS = (
+    "gemini_embed", "gemini_generate", "openai_compat_generate",
+    "anthropic_models", "openai_models", "openrouter_models",
+)
+WHICH_VALUES = ("all", "gemini", "openai", "anthropic", "openai_key", "openrouter")
 
 EMBED_PROBE_TEXT = "prove the key"  # exactly three words
 GENERATE_PROBE_PROMPT = "Reply with the single word ok"
@@ -54,6 +57,11 @@ _RATE_LIMIT_DETAIL = (
 _RATE_LIMIT_FIX = "Wait a minute and try again"
 _NETWORK_DETAIL = "Could not reach the provider — check the connection"
 _NETWORK_FIX = "Check the connection"
+
+_BAD_KEY_DETAIL = "This key has characters a key can't have. Replace it."
+_BAD_KEY_FIX = "Replace it"
+_UNEXPECTED_DETAIL = "The check could not be completed — try again"
+_MAX_KEY_LEN = 1024
 
 _HTTP_CODE_RE = re.compile(r"HTTP (\d+)")
 
@@ -131,6 +139,34 @@ def _fail_network(check_id: str, *, model: str, start: float) -> dict[str, Any]:
     )
 
 
+def _key_is_sane(key: object) -> bool:
+    """True only for a non-empty run of visible ASCII, short enough to be a key.
+
+    Anything else (CR/LF, NUL, spaces, non-Latin-1, a huge paste) would make the
+    HTTP layer raise an error whose text can echo the key, so such a key is
+    refused here, before any header is built or request made."""
+    return (
+        isinstance(key, str)
+        and 0 < len(key) <= _MAX_KEY_LEN
+        and all(0x21 <= ord(ch) <= 0x7E for ch in key)
+    )
+
+
+def _fail_bad_key(check_id: str, *, model: str | None, start: float) -> dict[str, Any]:
+    return _result(
+        check_id, ok=False, title="Key check failed", detail=_BAD_KEY_DETAIL,
+        model=model, seconds=_elapsed(start), fix=_BAD_KEY_FIX,
+    )
+
+
+def _fail_unexpected(check_id: str, *, model: str | None, start: float) -> dict[str, Any]:
+    """Fixed text for any error we did not foresee; never the exception's own."""
+    return _result(
+        check_id, ok=False, title="Key check failed", detail=_UNEXPECTED_DETAIL,
+        model=model, seconds=_elapsed(start),
+    )
+
+
 def _fail_from_embed_exc(check_id: str, exc: Exception, *, model: str, start: float) -> dict[str, Any]:
     msg = str(exc)
     if "budget exhausted" in msg:
@@ -169,9 +205,11 @@ def _active_embed_profile() -> str:
 
 def _check_gemini_embed(*, timeout: float) -> dict[str, Any]:
     try:
-        keychain.resolve_gemini_key()
+        embed_key = keychain.resolve_gemini_key()
     except RuntimeError:
         return _skip("gemini_embed", "Gemini embeddings")
+    if not _key_is_sane(embed_key):
+        return _fail_bad_key("gemini_embed", model=None, start=time.monotonic())
     try:
         active = embed_mod._profiles.resolve_spec(_active_embed_profile())
     except Exception:  # noqa: BLE001 - key verification must survive hub lookup failure
@@ -246,6 +284,8 @@ def _check_gemini_generate(*, timeout: float) -> dict[str, Any]:
         key = keychain.resolve_gemini_key()
     except RuntimeError:
         return _skip("gemini_generate", "Gemini generation")
+    if not _key_is_sane(key):
+        return _fail_bad_key("gemini_generate", model=None, start=time.monotonic())
     settings = models_mod.synth_settings()
     provider = (settings.get("provider") or "cloud").strip().lower()
     model = (
@@ -270,6 +310,8 @@ def _check_gemini_generate(*, timeout: float) -> dict[str, Any]:
         code, text = _post_once(url, body, headers, timeout)
     except (urllib.error.URLError, TimeoutError, OSError):
         return _fail_network("gemini_generate", model=model, start=start)
+    except Exception:  # noqa: BLE001 - never surface text that may hold the key
+        return _fail_unexpected("gemini_generate", model=model, start=start)
     if code == 200 and _has_generated_text("gemini", text):
         return _pass("gemini_generate", model=model, start=start)
     if code == 200:
@@ -288,6 +330,8 @@ def _check_openai_compat_generate(*, timeout: float) -> dict[str, Any]:
     headers = {"Content-Type": "application/json"}
     bearer = keychain.get_openai_compat_key()
     if bearer:
+        if not _key_is_sane(bearer):
+            return _fail_bad_key("openai_compat_generate", model=model, start=time.monotonic())
         headers["Authorization"] = f"Bearer {bearer}"
     body = json.dumps({
         "model": model,
@@ -300,6 +344,8 @@ def _check_openai_compat_generate(*, timeout: float) -> dict[str, Any]:
         code, text = _post_once(url, body, headers, timeout)
     except (urllib.error.URLError, TimeoutError, OSError):
         return _fail_network("openai_compat_generate", model=model, start=start)
+    except Exception:  # noqa: BLE001 - never surface text that may hold the key
+        return _fail_unexpected("openai_compat_generate", model=model, start=start)
     if code == 200 and _has_generated_text("openai", text):
         return _pass("openai_compat_generate", model=model, start=start)
     if code == 200:
@@ -307,12 +353,76 @@ def _check_openai_compat_generate(*, timeout: float) -> dict[str, Any]:
     return _fail_http("openai_compat_generate", code=code, model=model, start=start)
 
 
+def _get_once(url: str, headers: dict[str, str], timeout: float) -> tuple[int, str]:
+    """One GET, no retries. Same contract as ``_post_once``."""
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+
+
+def _check_key_listing(
+    check_id: str, *, resolve: Any, url: str, headers: dict[str, str], label: str,
+    timeout: float,
+) -> dict[str, Any]:
+    """Free, no-generation key proof: one GET that the provider only answers
+    200 to for a valid key. The key lives in a local variable only."""
+    try:
+        key = resolve()
+    except RuntimeError:
+        return _skip(check_id, label)
+    start = time.monotonic()
+    if not _key_is_sane(key):
+        return _fail_bad_key(check_id, model=label, start=start)
+    try:
+        code, _text = _get_once(
+            url, {k: v.replace("{key}", key) for k, v in headers.items()}, timeout,
+        )
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return _fail_network(check_id, model=label, start=start)
+    except Exception:  # noqa: BLE001 - never surface text that may hold the key
+        return _fail_unexpected(check_id, model=label, start=start)
+    if code == 200:
+        return _pass(check_id, model=label, start=start)
+    return _fail_http(check_id, code=code, model=label, start=start)
+
+
+def _check_anthropic_models(*, timeout: float) -> dict[str, Any]:
+    return _check_key_listing(
+        "anthropic_models", resolve=keychain.resolve_anthropic_key,
+        url="https://api.anthropic.com/v1/models?limit=1",
+        headers={"x-api-key": "{key}", "anthropic-version": "2023-06-01"},
+        label="Claude API", timeout=timeout,
+    )
+
+
+def _check_openai_models(*, timeout: float) -> dict[str, Any]:
+    return _check_key_listing(
+        "openai_models", resolve=keychain.resolve_openai_key,
+        url="https://api.openai.com/v1/models",
+        headers={"Authorization": "Bearer {key}"},
+        label="OpenAI", timeout=timeout,
+    )
+
+
+def _check_openrouter_models(*, timeout: float) -> dict[str, Any]:
+    return _check_key_listing(
+        "openrouter_models", resolve=keychain.resolve_openrouter_key,
+        url="https://openrouter.ai/api/v1/key",
+        headers={"Authorization": "Bearer {key}"},
+        label="OpenRouter", timeout=timeout,
+    )
+
+
 def check_model_keys(*, which: str = "all", timeout: float = 20.0) -> dict[str, Any]:
     """Prove every configured model key with one real, cheap call each.
 
     ``which``: "all" (default) — every configured provider; "gemini" — the
     Gemini embed + generate checks only; "openai" — the OpenAI-compatible
-    local synth check only.
+    local synth check only; "anthropic", "openai_key", "openrouter" — that
+    provider's free key check only.
 
     Returns ``{"ok": bool, "checks": [...]}`` — ``ok`` is True iff no attempted
     check failed (a provider with nothing configured is skipped, not failed,
@@ -322,10 +432,24 @@ def check_model_keys(*, which: str = "all", timeout: float = 20.0) -> dict[str, 
     if which not in WHICH_VALUES:
         raise ValueError(f"unknown which={which!r}; expected one of {WHICH_VALUES}")
     checks: list[dict[str, Any]] = []
+
+    def run(check_id: str, fn: Any) -> None:
+        start = time.monotonic()
+        try:
+            checks.append(fn(timeout=timeout))
+        except Exception:  # noqa: BLE001 - one check must never sink the rest or echo a key
+            checks.append(_fail_unexpected(check_id, model=None, start=start))
+
     if which in ("all", "gemini"):
-        checks.append(_check_gemini_embed(timeout=timeout))
-        checks.append(_check_gemini_generate(timeout=timeout))
+        run("gemini_embed", _check_gemini_embed)
+        run("gemini_generate", _check_gemini_generate)
     if which in ("all", "openai"):
-        checks.append(_check_openai_compat_generate(timeout=timeout))
+        run("openai_compat_generate", _check_openai_compat_generate)
+    if which in ("all", "anthropic"):
+        run("anthropic_models", _check_anthropic_models)
+    if which in ("all", "openai_key"):
+        run("openai_models", _check_openai_models)
+    if which in ("all", "openrouter"):
+        run("openrouter_models", _check_openrouter_models)
     ok = all(c["ok"] for c in checks)
     return {"ok": ok, "checks": checks}

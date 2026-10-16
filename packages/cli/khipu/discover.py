@@ -159,7 +159,7 @@ def _is_dir(path) -> bool:
     """A stat of the folder itself (symlinks followed); nothing inside it."""
     try:
         return stat.S_ISDIR(os.stat(path).st_mode)
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         return False
 
 
@@ -276,8 +276,13 @@ def read_nofollow(base: Path, parts: tuple[str, ...]) -> str | None:
 
 
 def _load_store() -> dict:
-    with _data_state() as dfd:
-        text = _read_at(dfd, STORE_NAME)
+    # No store yet (no run so far): nothing is opened, so a reader that must
+    # open nothing (a refused import projecting its report) can call this.
+    # The answer is the one the walk would give, since it finds no file.
+    text = None
+    if os.path.lexists(store_file()):
+        with _data_state() as dfd:
+            text = _read_at(dfd, STORE_NAME)
     try:
         data = json.loads(text) if text is not None else None
     except ValueError:
@@ -286,8 +291,20 @@ def _load_store() -> dict:
         data = {"version": STORE_VERSION}
     if not isinstance(data.get("candidates"), dict):
         data["candidates"] = {}
-    data["candidates"] = {k: v for k, v in data["candidates"].items() if isinstance(v, dict)}
+    data["candidates"] = {k: v for k, v in data["candidates"].items() if _well_formed(k, v)}
     return data
+
+
+def _well_formed(cid, rec) -> bool:
+    """A stored candidate every reader can use as is: a hand-edited or
+    half-written entry is dropped, never a crash on the Looking… path."""
+    if not (isinstance(rec, dict) and isinstance(cid, str) and rec.get("id") == cid
+            and rec.get("cli") in CLIS and isinstance(rec.get("identity"), str)):
+        return False
+    sources = rec.get("sources")
+    if not (isinstance(sources, list) and all(isinstance(x, str) for x in sources)):
+        return False
+    return all(rec.get(k) is None or isinstance(rec.get(k), str) for k in ("abs", "path", "name", "state", "reason"))
 
 
 def _save_store(data: dict) -> None:
@@ -685,7 +702,7 @@ def _run_checks(recs: list[dict], now_ts: float) -> dict:
     the overall deadline cut off keeps its previous result, is counted as
     left for later and is marked ``cut_off`` so it goes first next run.
     Returns the counts."""
-    stats = {"checked": 0, "couldnt_check": 0, "left_for_later": 0}
+    stats = {"checked": 0, "couldnt_check": 0, "timed_out": 0, "left_for_later": 0}
     if not recs:
         return stats
     run = usage._Run()
@@ -739,6 +756,8 @@ def _run_checks(recs: list[dict], now_ts: float) -> dict:
         stats["checked"] += 1
         if state == COULDNT_CHECK:
             stats["couldnt_check"] += 1
+            if reason in _TIMEOUT_CODES:
+                stats["timed_out"] += 1
     return stats
 
 

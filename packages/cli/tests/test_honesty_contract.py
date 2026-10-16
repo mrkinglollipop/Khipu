@@ -192,6 +192,21 @@ class TopicsEmbedLagTest(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["lag_minutes"], 0)
 
+    def test_wait_is_measured_from_the_last_write_not_the_event_date(self):
+        # Live 2026-10-15: a note about an event on 2026-10-09 was edited
+        # today and Home said it had waited 8979 minutes. The wait starts no
+        # earlier than the topic's last write or its newest vector.
+        from khipu import embed
+
+        conn, cur = self._mock_connect((None,))
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(embed, "_resolve_profile", return_value="p1"), \
+                mock.patch.object(embed, "memory_gaps", return_value=({}, [], [])):
+            embed.topics_embed_lag_minutes()
+        sql = " ".join(cur.execute.call_args_list[-1][0][0].split())
+        self.assertNotIn("event_at", sql)
+        self.assertIn("built_at", sql)
+
     def test_over_an_hour_is_red(self):
         from datetime import datetime, timedelta, timezone
 

@@ -102,7 +102,7 @@ class ModelsCliTest(unittest.TestCase):
         self.assertFalse((self.dir / "config.json").exists())
 
     def test_corrupt_merge_refuses_no_write(self):
-        config.save_config({"models": "not-an-object"})
+        config._write_config({"models": "not-an-object"})
         rc, raw = _run([
             "models",
             "set",

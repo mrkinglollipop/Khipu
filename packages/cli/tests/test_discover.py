@@ -138,7 +138,13 @@ def _by_path(out: dict) -> dict[str, dict]:
 
 
 def _accounts(*entries) -> None:
-    config.set_usage_accounts(json.dumps(list(entries)))
+    # The list as a hand-edited config holds it: a save through the app
+    # would stop (and turn down) the default logins it leaves out.
+    path = config.config_file()
+    data = json.loads(path.read_text()) if path.is_file() else {}
+    data["usage_accounts"] = list(entries)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
 
 
 # ---- source 1: names in the home folder ------------------------------------------------
@@ -331,7 +337,8 @@ def test_forget_clears_every_file_and_leaves_the_rest_untouched(mac, capsys):
     _write_state(d / "claude_code--b.json", b, 2222)
     plain = _write_state(d / "aegis--c.json", {"seen_ts": 1.0, "offset": 2}, 3333)
     assert main(["usage", "--forget-login-paths"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"ok": True, "finished": True, "cleared": 2, "pending": 0}
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "finished": True, "cleared": 2, "pending": 0,
+                                                   "failed": 0, "unreachable": False}
     assert json.loads((d / "codex--a.json").read_text()) == {k: v for k, v in a.items() if k != sc.LOGIN_HOME_FIELD}
     assert json.loads((d / "claude_code--b.json").read_text()) == {k: v for k, v in b.items()
                                                                      if k != sc.LOGIN_HOME_FIELD}
@@ -364,7 +371,7 @@ def test_discovery_forgets_sessions_past_retention_or_before_forget(mac, monkeyp
     discover.discover(check="~/.codex-mine", at=NOW + 10)
     derived_bytes = derived.read_bytes()
     # (b) Forget stamps the time; every session seen at or before it is ignored.
-    assert sc.forget_login_homes(now=NOW + 20) == {"cleared": 3, "pending": 0}
+    assert sc.forget_login_homes(now=NOW + 20) == {"cleared": 3, "pending": 0, "failed": 0, "unreachable": False}
     assert sc.login_homes_forgotten_at() == NOW + 20
     assert derived.read_bytes() == derived_bytes, "a file without the field is never rewritten"
     assert discover._source_sessions(NOW + 60) == []
@@ -391,7 +398,7 @@ def test_clearing_takes_the_hooks_lock_and_never_loses_its_save(mac, monkeypatch
     assert lock == sc._state_file("claude_code", "held").with_suffix(".lock")
     lock.mkdir()
     try:
-        assert sc.forget_login_homes() == {"cleared": 0, "pending": 1}
+        assert sc.forget_login_homes() == {"cleared": 0, "pending": 1, "failed": 0, "unreachable": False}
         assert sc.sweep_login_homes(force=True) == 0
         assert path.read_bytes() == held and path.stat().st_mtime == 1000
         assert lock.is_dir(), "someone else's lock is left alone"
@@ -1160,7 +1167,7 @@ def test_a_symlinked_state_folder_never_redirects_a_read_into_a_login_folder(mac
     (capture / "state").symlink_to(login)
     touched = _forbid_reads(monkeypatch, [login])
     assert discover._source_sessions(NOW) == []
-    assert sc.forget_login_homes() == {"cleared": 0, "pending": 0}
+    assert sc.forget_login_homes() == {"cleared": 0, "pending": 0, "failed": 0, "unreachable": True}
     assert sc.sweep_login_homes(force=True) == 0
     discover.discover(now=True)
     assert touched == []
@@ -1177,7 +1184,7 @@ def test_a_symlinked_state_folder_never_redirects_a_read_into_a_login_folder(mac
     monkeypatch.setenv("KHIPU_DATA_DIR", str(mac.tmp / "data"))
     touched = _forbid_reads(monkeypatch, [login])
     assert discover._source_sessions(NOW) == []
-    assert sc.forget_login_homes() == {"cleared": 0, "pending": 0}
+    assert sc.forget_login_homes() == {"cleared": 0, "pending": 0, "failed": 0, "unreachable": True}
     assert touched == []
 
 
@@ -1205,7 +1212,7 @@ def test_a_state_entry_swapped_for_a_symlink_after_listing_is_never_followed(mac
     swapped.unlink()
     swapped.symlink_to(target)
     monkeypatch.setattr(sc, "_state_names", real_names)
-    assert sc.forget_login_homes() == {"cleared": 1, "pending": 0}  # the good file only
+    assert sc.forget_login_homes() == {"cleared": 1, "pending": 0, "failed": 0, "unreachable": False}  # the good file only
     assert touched == []
     assert sc.LOGIN_HOME_FIELD not in json.loads(good.read_text())
     monkeypatch.undo()  # the test itself may now look inside the fake login folder
@@ -1223,7 +1230,7 @@ def test_forget_on_a_busy_session_is_not_finished_until_the_next_sweep(mac, caps
     sc.sweep_login_homes(force=True)  # the daily sweep has just run
     assert main(["usage", "--forget-login-paths"]) == 1
     out = json.loads(capsys.readouterr().out)
-    assert out == {"ok": True, "finished": False, "cleared": 1, "pending": 1,
+    assert out == {"ok": True, "finished": False, "cleared": 1, "pending": 1, "failed": 0, "unreachable": False,
                    "note": "Not finished: 1 conversation was busy; Khipu clears it when it is free"}
     assert sc.LOGIN_HOME_FIELD in json.loads(path.read_text())
     assert sc.LOGIN_HOME_FIELD not in json.loads(free.read_text())
@@ -1251,7 +1258,7 @@ def test_the_hook_applies_a_pending_erasure_after_its_own_lock_is_released(mac, 
     assert json.loads(path.read_text())[sc.LOGIN_HOME_FIELD] == str(folder)
     lock = path.with_suffix(".lock")
     lock.mkdir()
-    assert sc.forget_login_homes() == {"cleared": 0, "pending": 1}
+    assert sc.forget_login_homes() == {"cleared": 0, "pending": 1, "failed": 0, "unreachable": False}
     lock.rmdir()
     monkeypatch.delenv("CLAUDE_CONFIG_DIR")
     sc.hook_main(payload, "claude_code")  # loads the old state, saves it, then releases its lock
@@ -1275,3 +1282,119 @@ def test_version_checks_run_at_most_two_at_a_time(mac, monkeypatch):
     assert len(rows) == 4
     most = max(sum(1 for s, e in rows if s <= t < e) for t, _ in rows)
     assert most <= discover.PARALLEL == 2
+
+
+# ---- review fixes (2026-10-15) -----------------------------------------------------------
+
+
+def test_the_agent_scrub_knows_folders_discovery_found_but_nobody_tracks(mac, monkeypatch):
+    from khipu import agent_view
+
+    mac.install("codex")
+    mac.folder(".codex-work")
+    out = discover.discover(now=True)
+    assert "~/.codex-work" in {c["path"] for c in out["candidates"]}
+    monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
+    for text in ("limit hit on .codex-work", "running on codex-work now"):
+        assert "work" not in agent_view.scrub(text), text
+    # A default login found by the name scan stays home-less: the CLI's own
+    # word is never taken for a folder name.
+    mac.folder(".grok")
+    monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
+    assert agent_view.scrub("Grok (heavy) week at 90%") == "Grok (heavy) week at 90%"
+
+
+def test_a_relative_cli_path_in_a_hand_edited_config_is_never_honoured(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    _launchd_lookup(monkeypatch, home)
+    work = tmp_path / "cwd"
+    (work / "rel").mkdir(parents=True)
+    for name in ("codex", "node"):
+        planted = work / "rel" / name
+        planted.write_text("#!/bin/sh\nexit 0\n")
+        planted.chmod(0o755)
+    with config.mutate_config() as data:
+        data["cli_path.codex"] = "rel/codex"
+        data["node_folder"] = "rel"
+    monkeypatch.chdir(work)
+    assert config.cli_setting("cli_path.codex") is None
+    assert config.cli_setting("node_folder") is None
+    got = synth_cli.binary("codex")
+    assert got is None or Path(got).is_absolute(), got
+
+
+def test_a_symlinked_capture_home_records_no_login_path_and_forget_says_not_finished(mac, monkeypatch, capsys):
+    from khipu.cli import main
+
+    real = mac.tmp / "real-capture"
+    real.mkdir()
+    link = mac.tmp / "capture-link"
+    link.symlink_to(real)
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(link))
+    folder = mac.folder(".claude-client")
+    transcript = _claude_transcript(folder / "projects" / "p" / "s9.jsonl")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(folder))
+    sc.hook_main(json.dumps({"hook_event_name": "Stop", "session_id": "s9", "transcript_path": str(transcript),
+                             "cwd": str(mac.tmp)}), "claude_code")
+    state = sc.state_dir() / "claude_code--s9.json"
+    assert sc.LOGIN_HOME_FIELD not in json.loads(state.read_text())
+    # One written before the home became a link (or by hand) is never claimed cleared.
+    state.write_text(json.dumps({"seen_ts": NOW, sc.LOGIN_HOME_FIELD: "/x/.claude-client"}))
+    assert main(["usage", "--forget-login-paths"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["finished"] is False and out["unreachable"] is True and "could not open" in out["note"]
+
+
+def test_forget_is_not_finished_when_a_record_cannot_be_rewritten_and_retries_it(mac, monkeypatch, capsys):
+    import errno
+
+    from khipu.cli import main
+
+    state = mac.session("codex", "a", login_home="/x/.codex-a")
+    real_write = sc._write_at
+
+    def disk_full(dfd, name, *a, **k):
+        if name.endswith(".json"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_write(dfd, name, *a, **k)
+
+    monkeypatch.setattr(sc, "_write_at", disk_full)
+    assert main(["usage", "--forget-login-paths"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["finished"] is False and out["failed"] == 1 and out["cleared"] == 0
+    assert sc.LOGIN_HOME_FIELD in json.loads(state.read_text())
+    monkeypatch.setattr(sc, "_write_at", real_write)
+    assert sc.sweep_login_homes() == 1  # the next capture's sweep retries it
+    assert sc.LOGIN_HOME_FIELD not in json.loads(state.read_text())
+
+
+def test_the_last_run_counts_folders_that_timed_out(mac, monkeypatch):
+    monkeypatch.setattr(discover, "CHILD_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(usage, "OVERALL_GRACE_S", 0.5)
+    mac.install("claude", "/bin/sleep 10\n")
+    folder = mac.folder(".claude-slow")
+    mac.session("claude_code", "s", login_home=str(folder))
+    out = discover.discover(at=NOW)
+    row = next(c for c in out["candidates"] if c["path"] == "~/.claude-slow")
+    assert row["state"] == "couldnt_check" and row["reason"] == "timeout"
+    assert out["last_run"]["timed_out"] == 1 and out["last_run"]["couldnt_check"] >= 1
+
+
+@pytest.mark.parametrize("entry", [{}, {"id": "x"}, {"id": "x", "cli": "claude", "identity": 3, "sources": []},
+                                   {"id": "x", "cli": "claude", "identity": "path:x", "sources": "conversation"},
+                                   {"id": "x", "cli": "claude", "identity": "path:x", "sources": [],
+                                    "abs": {"not": "a path"}}])
+def test_a_malformed_stored_candidate_is_dropped_never_a_crash(mac, entry):
+    store = discover.store_file()
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(json.dumps({"version": 1, "candidates": {"x": entry}}))
+    fd = discover._try_lock()  # another run is looking
+    assert fd is not None
+    try:
+        out = discover.discover(at=NOW)
+    finally:
+        usage._release(fd)
+    assert out["looking"] is True and out["candidates"] == []
+    assert discover.discover(at=NOW)["looking"] is False  # and a real run gets past it too

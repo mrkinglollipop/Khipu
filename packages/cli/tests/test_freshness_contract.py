@@ -110,6 +110,8 @@ class TopicsCatchupContractTest(unittest.TestCase):
                 elif "FROM topics t WHERE t.deleted_at IS NULL" in s:
                     self._result = [("note:fresh", "Fresh", "body text",
                                      {"slug": "note:fresh", "title": "Fresh", "body": "body text"})]
+                elif s.startswith("SELECT 1 FROM topics") and "FOR SHARE" in s:
+                    self._result = [(1,)]  # the topic is still live
                 elif s.startswith("INSERT INTO memory_embeddings"):
                     self.inserts.append(params)
                     self._result = [(datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc),)]  # RETURNING built_at
@@ -152,6 +154,112 @@ class TopicsCatchupContractTest(unittest.TestCase):
             out = em.embed_recent_missing(limit=10)
         self.assertEqual(out["topics_embedded"], 1)
         self.assertTrue(any(p[1] == "topic" and p[2] == "note:fresh" for p in cur.inserts))
+
+    def test_bulk_edits_with_old_dates_are_all_re_embedded_across_runs(self):
+        # Codex 2026-10-15: 51 already-embedded notes whose bodies changed
+        # but kept old frontmatter dates, next to 50 healthy newer ones. A
+        # fixed top-50 window re-picked the same rows forever and stranded
+        # one. The catch-up must find every changed body, a few per run.
+        class _Cur:
+            def __init__(self):
+                self.topics: dict[str, dict] = {}
+                self.hashes: dict[tuple, str] = {}
+                self.embedded: list[str] = []
+                self._result: list = []
+
+            def add(self, slug, body, embedded_body):
+                self.topics[slug] = {"title": slug, "body": body, "xid": str(len(self.topics))}
+                for i, c in em.chunk_text_indexed(em.topic_text(slug, slug, embedded_body)):
+                    self.hashes[("topic", slug, i)] = em._md5(c)
+
+            def stale(self):
+                out = []
+                for slug, t in self.topics.items():
+                    cur_h = {i: em._md5(c) for i, c in
+                             em.chunk_text_indexed(em.topic_text(slug, t["title"], t["body"]))}
+                    have = {i: h for (k, r, i), h in self.hashes.items() if r == slug}
+                    if cur_h != have:
+                        out.append(slug)
+                return out
+
+            def execute(self, sql, params=None):
+                s = " ".join(sql.split())
+                self._result = []
+                if s.startswith("SELECT 'topic'") and "xmin" in s:
+                    self._result = [("topic", None, slug, t["xid"])
+                                    for slug, t in sorted(self.topics.items())]
+                elif s.startswith("SELECT slug FROM topics"):
+                    self._result = [(r,) for r in params[0] if r in self.topics]
+                elif s.startswith("SELECT slug, title, body FROM topics"):
+                    want = set(params[0])
+                    self._result = [(slug, t["title"], t["body"])
+                                    for slug, t in sorted(self.topics.items()) if slug in want]
+                elif s.startswith("SELECT t.slug, t.title, t.body, row_to_json(t) FROM topics t"):
+                    want = set(params[0])
+                    self._result = [(slug, t["title"], t["body"], {"slug": slug})
+                                    for slug, t in sorted(self.topics.items()) if slug in want]
+                elif s.startswith("SELECT 1 FROM topics") and "FOR SHARE" in s:
+                    self._result = [(1,)] if params[0] in self.topics else []
+                elif s.startswith("SELECT kind, ref, chunk_idx, content_hash FROM memory_embeddings"):
+                    refs = set(params[2]) if len(params) > 2 else None
+                    self._result = [(k, r, i, h) for (k, r, i), h in self.hashes.items()
+                                    if k == "topic" and (refs is None or r in refs)]
+                elif s.startswith("INSERT INTO memory_embeddings"):
+                    _p, kind, ref, idx, _text, h = params[:6]
+                    self.hashes[(kind, ref, idx)] = h
+                    self.embedded.append(ref)
+                    self._result = [(datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc),)]
+                elif s.startswith("DELETE FROM memory_embeddings"):
+                    _p, ref, keep = params
+                    for key in list(self.hashes):
+                        if key[1] == ref and key[2] not in keep:
+                            del self.hashes[key]
+
+            def fetchall(self):
+                return list(self._result)
+
+            def fetchone(self):
+                return self._result[0] if self._result else None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class _Conn:
+            def __init__(self, cur):
+                self._cur = cur
+
+            def cursor(self):
+                return self._cur
+
+            def commit(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        cur = _Cur()
+        for i in range(50):
+            cur.add(f"healthy-{i:03}", "same", "same")
+        for i in range(51):
+            cur.add(f"edited-{i:03}", "changed", "old")
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch("khipu.db.connect", return_value=_Conn(cur)), \
+                mock.patch.object(em, "_plan_cache_file", return_value=Path(td) / "plan.json"), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"), \
+                mock.patch("khipu.hub_snapshot.upsert_embeddings", return_value={"ok": True}), \
+                mock.patch.object(em, "embed_batch",
+                                  side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]):
+            counts = [em.embed_recent_missing(limit=10)["topics_embedded"] for _ in range(12)]
+        self.assertEqual(cur.stale(), [])
+        self.assertEqual(sum(counts), 51)
+        self.assertTrue(all(c <= em.COMMITMENT_CATCHUP_LIMIT for c in counts))
+        self.assertFalse(any(r.startswith("healthy-") for r in cur.embedded))
 
 
 # ---- R7: event_at, never now() -----------------------------------------------
@@ -218,6 +326,8 @@ class PerChunkIsolationContractTest(unittest.TestCase):
                     self._result = []
                 elif s.startswith("SELECT slug, title, body FROM topics"):
                     self._result = self.rows
+                elif s.startswith("SELECT slug FROM topics") and "FOR SHARE" in s:
+                    self._result = [(slug,) for slug, _title, _body in self.rows if slug in params[0]]
                 elif s.startswith("INSERT INTO memory_embeddings"):
                     self.inserts.append(params)
                 else:
@@ -299,7 +409,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
         self.assertEqual(
             names,
             {"sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
-             "query_cache_prune", "commitments_mark_stale", "commitments_hygiene",
+             "query_cache_prune", "commitments_mark_stale", "commitments_hygiene", "ledger",
              "snapshot_refresh"},
         )
         for step in payload["steps"]:

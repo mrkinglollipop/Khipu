@@ -114,7 +114,9 @@ class RedactionPrivacyTest(unittest.TestCase):
             def execute(self, _sql, params): self.params = params
 
         cur = RecordingCursor()
-        with mock.patch("khipu.db.has_columns", return_value=False):
+        # A pre-0030 hub: the gate's hub-table probe finds no forgotten_sources.
+        with mock.patch("khipu.db.has_columns", return_value=False), \
+                mock.patch("khipu.db.has_table", return_value=False):
             mirror._upsert_episode(cur, payload)
         sql_blob = json.dumps(cur.params, default=str)
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz0123456789", sql_blob)
@@ -405,19 +407,23 @@ class PathsPrivacyTest(unittest.TestCase):
             for incoming in (source, archive):
                 target = root / f"target-{incoming.suffix or 'dir'}"
                 target.mkdir()
-                observed = []
-                original = paths.copy_sensitive
-                def spy(reader, destination):
-                    observed.append(destination.name)
-                    return original(reader, destination)
+                # The mode of every file at the moment its bytes are copied in
+                # (the staging copies and the restored files alike).
+                modes = []
+                original = paths.shutil.copyfileobj
+                def spy(reader, writer, *args):
+                    modes.append(stat.S_IMODE(os.fstat(writer.fileno()).st_mode))
+                    return original(reader, writer, *args)
                 with mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(target)}), \
-                     mock.patch.object(paths, "copy_sensitive", side_effect=spy):
+                     mock.patch.object(paths.shutil, "copyfileobj", side_effect=spy):
                     old = os.umask(0o022)
                     try:
                         paths.import_local(source=incoming)
                     finally:
                         os.umask(old)
-                self.assertEqual(set(observed), {"dsn", "gateway-token"})
+                self.assertGreaterEqual(len(modes), 4)
+                self.assertEqual(set(modes), {0o600})
+                self.assertEqual(stat.S_IMODE((target / "dsn").stat().st_mode), 0o600)
                 self.assertEqual(stat.S_IMODE((target / "gateway-token").stat().st_mode), 0o600)
 
     def test_gateway_token_is_created_private_before_its_bytes_are_written(self):
@@ -451,6 +457,9 @@ class ForgetPrivacyTest(unittest.TestCase):
 
         class Cur:
             rowcount = 1
+
+            def fetchall(self):
+                return []
 
             def execute(self, sql, _params=None):
                 self.sql = sql
@@ -488,6 +497,9 @@ class ForgetPrivacyTest(unittest.TestCase):
         class Cur:
             rowcount = 1
 
+            def fetchall(self):
+                return []
+
             def execute(self, sql, _params=None):
                 self.sql = sql
 
@@ -523,6 +535,9 @@ class ForgetPrivacyTest(unittest.TestCase):
         class Cur:
             rowcount = 1
 
+            def fetchall(self):
+                return []
+
             def execute(self, sql, _params=None):
                 self.sql = sql
 
@@ -549,6 +564,7 @@ class ForgetPrivacyTest(unittest.TestCase):
     def test_absent_unconfigured_stores_are_complete_but_existing_failed_replica_is_partial(self):
         ts = datetime(2026, 10, 10, tzinfo=timezone.utc)
         cur = mock.Mock()
+        cur.fetchall.return_value = []
         cur.fetchone.return_value = (ts, "forget me", "codex:session")
         cur.rowcount = 1
         conn = mock.MagicMock()
@@ -561,13 +577,20 @@ class ForgetPrivacyTest(unittest.TestCase):
                      "ok": False, "error": "hub snapshot missing",
                  }), \
                  mock.patch("khipu.hub_snapshot.snapshot_path", return_value=replica), \
-                 mock.patch("khipu.config.path_setting", return_value=None), \
                  mock.patch("khipu.forget._outbox_remainder", return_value={"ok": True, "removed": 0}):
-                absent = forget.forget_everywhere(1)
+                with mock.patch("khipu.config.path_setting", return_value=Path(td)):
+                    absent = forget.forget_everywhere(1)
+                # No memory root: the legacy logs were not checked, so the
+                # forget is not complete; the absent replica is still fine.
+                with mock.patch("khipu.config.path_setting", return_value=None):
+                    unrooted = forget.forget_everywhere(1)
                 replica.write_bytes(b"private replica content")
-                existing = forget.forget_everywhere(1)
+                with mock.patch("khipu.config.path_setting", return_value=Path(td)):
+                    existing = forget.forget_everywhere(1)
         self.assertTrue(absent["ok"])
         self.assertTrue(absent["complete"])
+        self.assertFalse(unrooted["complete"])
+        self.assertEqual(unrooted["partial"], ["legacy_file"])
         self.assertFalse(existing["ok"])
         self.assertIn("snapshot", existing["partial"])
         self.assertIn("snapshot", existing["error"])
@@ -575,6 +598,7 @@ class ForgetPrivacyTest(unittest.TestCase):
     def test_unidentifiable_legacy_records_withhold_complete_forget(self):
         ts = datetime(2026, 10, 10, tzinfo=timezone.utc)
         cur = mock.Mock()
+        cur.fetchall.return_value = []
         cur.fetchone.return_value = (ts, "forget me", "codex:session")
         cur.rowcount = 1
         conn = mock.MagicMock()
@@ -636,6 +660,9 @@ class ForgetPrivacyTest(unittest.TestCase):
         class Cur:
             rowcount = 1
 
+            def fetchall(self):
+                return []
+
             def execute(self, sql, _params=None):
                 self.sql = sql
 
@@ -658,6 +685,9 @@ class ForgetPrivacyTest(unittest.TestCase):
 
         class Cur:
             rowcount = 1
+
+            def fetchall(self):
+                return []
             sql = ""
             def execute(self, sql, _params=None): self.sql = sql
             def fetchone(self):
@@ -693,6 +723,7 @@ class ForgetPrivacyTest(unittest.TestCase):
     def test_snapshot_or_unconfigured_legacy_makes_completion_partial(self):
         ts = datetime(2026, 10, 10, tzinfo=timezone.utc)
         cur = mock.Mock()
+        cur.fetchall.return_value = []
         cur.fetchone.return_value = (ts, "forget me", "codex:session")
         cur.rowcount = 1
         conn = mock.MagicMock()

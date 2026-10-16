@@ -135,6 +135,19 @@ def run(mem_root: str, harness: str, sid: str) -> None:
     except Exception as e:  # noqa: BLE001
         _say(sid, harness, f"outbox drain skipped: {type(e).__name__}: {e}")
     try:
+        # Ledger writes made while the hub was away. One listdir when empty.
+        from khipu.ledger import _outbox_jobs as ledger_jobs
+        from khipu.ledger import drain as ledger_drain
+
+        if ledger_jobs(strict=True):  # a folder that cannot be listed is reported, not skipped
+            _say(sid, harness, f"ledger outbox drain {ledger_drain()}")
+        from khipu.ledger import catch_up_offline_copy, replica_pending
+
+        if replica_pending():
+            _say(sid, harness, f"ledger offline copy catch-up {catch_up_offline_copy()}")
+    except Exception as e:  # noqa: BLE001
+        _say(sid, harness, f"ledger outbox drain skipped: {type(e).__name__}: {e}")
+    try:
         # A note edited this session becomes a topic now, not after the nightly.
         t0 = time.monotonic()
         from khipu.notes import reconcile

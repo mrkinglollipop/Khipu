@@ -269,6 +269,13 @@ class ParseTopicFileDatesTest(unittest.TestCase):
         self.assertIsNone(parsed["updated_at"])
 
 
+def _episode_insert_args(cur):
+    """The (sql, params) of the INSERT INTO episodes call; savepoint statements
+    follow it, so ``call_args`` is not the insert."""
+    return next(c.args for c in cur.execute.call_args_list
+                if " ".join(str(c.args[0]).split()).startswith("INSERT INTO episodes"))
+
+
 class UpsertEpisodeIdentityColumnsTest(unittest.TestCase):
     """W1.1/W1.3: _upsert_episode persists the new identity columns and the
     W5.1 tags column; a legacy capture_v2-shaped payload (none of these
@@ -289,9 +296,12 @@ class UpsertEpisodeIdentityColumnsTest(unittest.TestCase):
             "parent_session_id": "claude_code:parent",
             "transcript_range": "0:1234",
         }
-        inserted = mirror._upsert_episode(cur, payload)
+        # A bare Mock answers no schema probe; the gate is covered in
+        # test_forget_write_gate.py.
+        with mock.patch("khipu.tombstones.hub_source_forgotten", return_value=False):
+            inserted = mirror._upsert_episode(cur, payload)
         self.assertTrue(inserted)
-        sql, params = cur.execute.call_args.args
+        sql, params = _episode_insert_args(cur)
         self.assertIn("harness", sql)
         self.assertIn("repo_root", sql)
         self.assertIn("project", sql)
@@ -309,8 +319,9 @@ class UpsertEpisodeIdentityColumnsTest(unittest.TestCase):
         cur = mock.Mock()
         cur.rowcount = 1
         payload = {"ts": "2026-09-03T00:00:00Z", "session_id": "legacy", "summary": "x"}
-        self.assertTrue(mirror._upsert_episode(cur, payload))
-        sql, params = cur.execute.call_args.args
+        with mock.patch("khipu.tombstones.hub_source_forgotten", return_value=False):
+            self.assertTrue(mirror._upsert_episode(cur, payload))
+        sql, params = _episode_insert_args(cur)
         # harness/repo_root/project/parent_session_id/transcript_range -> None
         self.assertEqual(params[-6:-1], (None, None, None, None, None))
 
@@ -522,7 +533,7 @@ class UpsertEpisodeSchemaGateTest(unittest.TestCase):
             self.statements.append(s)
             self.params.append(params)
             if "information_schema.columns" in s:
-                self._result = [(c,) for c in self.columns]
+                self._result = [(c,) for c in self.columns] if params == ("episodes",) else []
             else:
                 self._result = []
 
@@ -535,6 +546,12 @@ class UpsertEpisodeSchemaGateTest(unittest.TestCase):
     def _insert_sql(self, cur):
         return [s for s in cur.statements if s.startswith("INSERT INTO episodes")][0]
 
+    def _insert_params(self, cur):
+        """The params of the INSERT INTO episodes call (savepoint statements
+        follow it, so the last call is not the insert)."""
+        return [p for s, p in zip(cur.statements, cur.params)
+                if s.startswith("INSERT INTO episodes")][0]
+
     def test_a_pre_migration_hub_gets_only_the_base_columns(self):
         cur = self._Cur(self.BASE)
         self.assertTrue(mirror._upsert_episode(cur, {
@@ -546,7 +563,7 @@ class UpsertEpisodeSchemaGateTest(unittest.TestCase):
                     "transcript_range", "tags"):
             self.assertNotIn(col, sql, col)
         # 10 base values, no more.
-        self.assertEqual(len(cur.params[-1]), 10)
+        self.assertEqual(len(self._insert_params(cur)), 10)
 
     def test_a_hub_with_0008_but_not_0010_omits_only_tags(self):
         cur = self._Cur(self.BASE + ("harness", "repo_root", "project",
@@ -555,7 +572,7 @@ class UpsertEpisodeSchemaGateTest(unittest.TestCase):
         sql = self._insert_sql(cur)
         self.assertIn("harness", sql)
         self.assertNotIn("tags", sql)
-        self.assertEqual(len(cur.params[-1]), 15)
+        self.assertEqual(len(self._insert_params(cur)), 15)
 
     def test_a_fully_migrated_hub_is_unchanged(self):
         cur = self._Cur(self.BASE + ("harness", "repo_root", "project",
@@ -563,7 +580,7 @@ class UpsertEpisodeSchemaGateTest(unittest.TestCase):
         mirror._upsert_episode(cur, {"ts": "t", "session_id": "s", "summary": "x"})
         sql = self._insert_sql(cur)
         self.assertIn("tags", sql)
-        self.assertEqual(len(cur.params[-1]), 16)
+        self.assertEqual(len(self._insert_params(cur)), 16)
 
 
 class UnterminatedFrontmatterTest(unittest.TestCase):

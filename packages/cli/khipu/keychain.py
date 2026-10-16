@@ -5,6 +5,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from khipu.output_guard import secret_result
+
 SERVICE = os.environ.get("KHIPU_KEYCHAIN_SERVICE") or os.environ.get(
     "ALZY_KEYCHAIN_SERVICE", "Khipu"
 )
@@ -39,6 +41,7 @@ def keychain_available() -> bool:
     return Path("/usr/bin/security").is_file()
 
 
+@secret_result("secret")
 def get_password(account: str, *, service: str = SERVICE) -> str | None:
     if not keychain_available():
         return None

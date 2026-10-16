@@ -42,7 +42,9 @@ class EpisodesMissingOneStatementTest(unittest.TestCase):
     def test_1200_keys_are_one_statement_in_input_order(self):
         keys = [(f"2026-10-15T00:{i // 60:02d}:{i % 60:02d}Z", f"{i:032x}") for i in range(1200)]
         cur = _RecordingCursor(rows=[keys[7], keys[3]])
-        out = drift.episodes_missing_in_pg(cur, keys)
+        # Pre-0027 shape; the episode_sources probe is its own statement.
+        with mock.patch("khipu.capture_identity.sources_ready", return_value=False):
+            out = drift.episodes_missing_in_pg(cur, keys)
         self.assertEqual(len(cur.calls), 1, "one round trip, not one per 500 keys")
         sql, params = cur.calls[0]
         self.assertIn("unnest(%s::text[], %s::text[]) WITH ORDINALITY", sql)
@@ -161,7 +163,7 @@ class MemoryPlannedOnceTest(unittest.TestCase):
             out = embed.topics_embed_lag_minutes(gaps=kept)
         self.assertTrue(out["ok"])
         sql, params = cur.execute.call_args[0]
-        self.assertEqual(params, (["t1"], "p@1"))
+        self.assertEqual(params, ("p@1", ["t1"], "p@1"))
 
     def test_gaps_for_another_profile_are_not_reused(self):
         cur = mock.MagicMock()

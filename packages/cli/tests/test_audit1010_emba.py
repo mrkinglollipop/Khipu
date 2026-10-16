@@ -194,6 +194,8 @@ class _BackfillCursor:
             self._result = []
         elif statement.startswith("SELECT slug, title, body FROM topics"):
             self._result = self.rows
+        elif statement.startswith("SELECT slug FROM topics") and "FOR SHARE" in statement:
+            self._result = [(slug,) for slug, _title, _body in self.rows if slug in params[0]]
         elif statement.startswith("DELETE FROM memory_embeddings"):
             self.rowcount = 0
         else:
@@ -767,7 +769,7 @@ class CatchupStalenessTest(unittest.TestCase):
             out = embed.topics_embed_lag_minutes(profile="prof")
         self.assertFalse(out["ok"])
         self.assertIn("slug = ANY", cur.sql)
-        self.assertEqual(cur.params, (["stale"], "prof"))
+        self.assertEqual(cur.params, ("prof", ["stale"], "prof"))
 
     def test_recent_catchup_selects_stale_topic_even_when_a_vector_exists(self) -> None:
         class Cur:
@@ -776,7 +778,9 @@ class CatchupStalenessTest(unittest.TestCase):
                 self.topic_sql = []
             def execute(self, sql, params=None):
                 text = " ".join(sql.split())
-                if text.startswith("SELECT kind, ref, chunk_idx"):
+                if text.startswith("SELECT 1 FROM topics") and "FOR SHARE" in text:
+                    self.result = [(1,)]  # the topic is still live
+                elif text.startswith("SELECT kind, ref, chunk_idx"):
                     self.result = [("topic", "stale", 0, "old")]
                 elif "FROM episodes e" in text or "FROM commitments c" in text:
                     self.result = []
@@ -786,6 +790,7 @@ class CatchupStalenessTest(unittest.TestCase):
                 else:
                     self.result = []
             def fetchall(self): return list(self.result)
+            def fetchone(self): return self.result[0] if self.result else None
             def __enter__(self): return self
             def __exit__(self, *_): return False
         cur = Cur()
@@ -804,7 +809,9 @@ class CatchupStalenessTest(unittest.TestCase):
             def __init__(self): self.result = []
             def execute(self, sql, params=None):
                 text = " ".join(sql.split())
-                if "FROM episodes e" in text and "NOT EXISTS" not in text:
+                if text.startswith("SELECT id FROM episodes") and "FOR SHARE" in text:
+                    self.result = [(7,)] if 7 in params[0] else []
+                elif "FROM episodes e" in text and "NOT EXISTS" not in text:
                     self.result = [(7, "summary", [], [], [], [])]
                 else:
                     self.result = []
@@ -943,7 +950,12 @@ class ReplicaCatchupTest(unittest.TestCase):
                         self.rows = [row]
                     if existing and "FROM episodes e" in sql and "NOT EXISTS" not in sql:
                         self.rows = [(7, "A", [], [], [], [])]
+                    if sql.startswith("SELECT id FROM episodes") and "FOR SHARE" in sql:
+                        self.rows = [(7,)] if existing and 7 in params[0] else []
+                    if sql.startswith("SELECT 1 FROM topics") and "FOR SHARE" in sql:
+                        self.rows = [(1,)]  # the topic is still live
                 def fetchall(self): return self.rows
+                def fetchone(self): return self.rows[0] if self.rows else None
                 def __enter__(self): return self
                 def __exit__(self, *_): return False
             def hashes(_cur, _profile, kind, refs):
@@ -952,6 +964,7 @@ class ReplicaCatchupTest(unittest.TestCase):
                  mock.patch("khipu.db.has_columns", return_value=False), \
                  mock.patch.object(embed, "_active_profile", return_value="prof"), \
                  mock.patch.object(embed, "_existing_hashes_for_refs", side_effect=hashes), \
+                 mock.patch.object(embed, "_changed_topic_refs", return_value=["note"]), \
                  mock.patch.object(embed, "episode_text", return_value="" if empty else "A"), \
                  mock.patch.object(embed, "topic_text", return_value="" if empty else "A"), \
                  mock.patch.object(embed, "chunk_text", return_value=[] if empty else ["A"]), \

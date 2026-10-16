@@ -5,7 +5,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { AccountReach, PlansSettingsCard, liveWords, signInOffer, signInOutcome } from "../PlansCard";
+import { PlansSettingsCard, SignInControl, liveWords, signInOffer, signInOutcome } from "../PlansCard";
 import type { PlanUsageState, UsageAccount } from "../PlansCard";
 import { RoutingCard } from "../RoutingCard";
 import { RoutingSettings } from "../RoutingSettings";
@@ -30,7 +30,27 @@ function row(extra: Partial<UsageAccount>): UsageAccount {
 type Answer = string | object | ((args: Record<string, unknown> | undefined) => unknown);
 let answers: Record<string, Answer>;
 
+// Settings clarity phase 3 folds Settings -> Accounts and routing into
+// groups; these tests read every group and account line open.
+const ALL_OPEN = [
+  "accounts", "priority", "rules", "holds", "telling", "resets", "runners", "table", "changes", "sub:hears", "sub:sizes",
+  ...["claude|", SECOND, "codex|", "grok|"].map((k) => `account:${k}`),
+];
+
+// jsdom here has no usable localStorage; an in-memory one stands in.
+function memoryStorage() {
+  const m = new Map<string, string>();
+  return {
+    getItem: (k: string) => m.get(k) ?? null,
+    setItem: (k: string, v: string) => void m.set(k, String(v)),
+    removeItem: (k: string) => void m.delete(k),
+    clear: () => m.clear(),
+  };
+}
+
 beforeEach(() => {
+  vi.stubGlobal("localStorage", memoryStorage());
+  localStorage.setItem("khipu.routing.open", JSON.stringify(ALL_OPEN));
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(NOW);
   answers = {};
@@ -43,6 +63,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   vi.useRealTimers();
   invokeMock.mockReset();
 });
@@ -68,27 +89,33 @@ describe("each account says whether Khipu can read it", () => {
 
   it("offers Sign in again for Claude and Codex, and says where to sign in for Grok and Muse", () => {
     expect(signInOffer(row({}))).toBeNull();
+    expect(signInOffer(row({ ok: false, error: "no_plan_figures", home: "~/.claude-second" }))).toBeNull();
+    expect(liveWords(row({ ok: false, error: "no_plan_figures" })).text).toBe(
+      "Can't be read just now (didn't send its plan figures)");
     expect(signInOffer(row({ ok: false, error: "not_signed_in" }))).toBe("button");
     expect(signInOffer(row({ ok: false, error: "no_plan_limits", home: "~/.claude-second" }))).toBe("button");
     expect(signInOffer(row({ harness: "codex", ok: false, error: "not_signed_in" }))).toBe("button");
     expect(signInOffer(row({ ok: false, error: "not_installed" }))).toBeNull();
     expect(signInOffer(row({ harness: "grok", ok: false, error: "not_signed_in" }))).toBe("elsewhere");
-    render(<AccountReach row={row({ harness: "grok", account: "Grok", ok: false, error: "not_signed_in" })} />);
+    // Settings clarity phase 2: only a sign-in problem offers a sign-in.
+    for (const error of ["timeout", "cli_error", "bad_reply", "no_answer", "pending", "invalid_account"]) {
+      expect(signInOffer(row({ harness: "grok", ok: false, error }))).toBeNull();
+    }
+    render(<SignInControl row={row({ harness: "grok", account: "Grok", ok: false, error: "not_signed_in" })} />);
     expect(screen.getByText("Sign in from Grok Build")).toBeTruthy();
     expect(screen.queryByRole("button")).toBeNull();
     cleanup();
-    render(<AccountReach row={row({ harness: "muse", account: "Muse", ok: false, error: "no_plan_limits" })} />);
+    render(<SignInControl row={row({ harness: "muse", account: "Muse", ok: false, error: "no_plan_limits" })} />);
     expect(screen.getByText("Sign in from Muse")).toBeTruthy();
     cleanup();
-    render(<AccountReach row={row({})} />);
-    expect(screen.getByText("Live: read 2 min ago")).toBeTruthy();
-    expect(screen.queryByRole("button")).toBeNull();
+    const { container } = render(<SignInControl row={row({})} />);
+    expect(container.textContent).toBe("");
   });
 
   it("sends only the account's CLI and login folder, then reads again and shows the new state", async () => {
     const second = row({ account: "Claude second", home: "~/.claude-second", ok: false, error: "no_plan_limits" });
     const state: PlanUsageState = {
-      data: { accounts: [row({ ok: false, error: "not_signed_in" }), second] }, error: null, loading: false,
+      data: { accounts: [row({ ok: false, error: "not_signed_in" }), second] }, error: null, errorAt: null, loading: false,
       refreshing: false, load: vi.fn(), refresh: vi.fn(), reread: vi.fn(async () => undefined),
     };
     answers.khipu_config_show = { usage_accounts: { value: null, source: "default", accounts: [] } };
@@ -124,7 +151,7 @@ const PRIORITY: RoutePriority = {
     { account: "codex|", label: "Codex", role: "cross-family reviews", until: null, in_settings: true },
     { account: "claude|", label: "Claude", role: "orchestration only", until: null, in_settings: true },
   ],
-  until: null, at: "2026-10-15T13:00:00Z", via: "app", pending: false, confirmed: true,
+  until: null, at: "2026-10-15T13:00:00Z", via: "app", pending: false, confirmed: true, version: "p7",
 };
 
 function view(priority: RoutePriority | null = PRIORITY): RouteView {
@@ -170,10 +197,10 @@ describe("the priority on Home", () => {
     expect(screen.getByText("Not confirmed")).toBeTruthy();
     expect(screen.getByText("Set by a Claude Code conversation at your request; you haven't confirmed it yet.")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
-    await waitFor(() => expect(calls("khipu_route_priority")).toEqual([{ action: "confirm" }]));
+    await waitFor(() => expect(calls("khipu_route_priority")).toEqual([{ action: "confirm", expect: "p7" }]));
     await waitFor(() => expect(load).toHaveBeenCalledWith(true));
     fireEvent.click(screen.getByRole("button", { name: "Undo" }));
-    await waitFor(() => expect(calls("khipu_route_priority")[1]).toEqual({ action: "undo" }));
+    await waitFor(() => expect(calls("khipu_route_priority")[1]).toEqual({ action: "undo", expect: "p7" }));
   });
 });
 
@@ -199,7 +226,7 @@ describe("the priority and the pace in Settings -> Routing", () => {
     expect(within(list).getAllByRole("listitem").map((li) => li.textContent?.split(".")[1]?.trim().split(/all|cross|orch/)[0]))
       .toEqual(["Claude second", "Codex", "Claude"]);
     fireEvent.click(screen.getByRole("button", { name: "Move Codex up" }));
-    await waitFor(() => expect(sent()[0]).toEqual({ action: "set", until: null, entries: [
+    await waitFor(() => expect(sent()[0]).toEqual({ action: "set", until: null, expect: "p7", entries: [
       { account: "codex|", role: "cross-family reviews", until: null },
       { account: SECOND, role: "all Claude work first", until: "2026-10-17T19:00:00Z" },
       { account: "claude|", role: "orchestration only", until: null },
@@ -227,6 +254,15 @@ describe("the priority and the pace in Settings -> Routing", () => {
     expect(last.account).toBe("claude|");
     expect(last.role).toBe("--from-app -- clear");
     expect(last.until).toMatch(/^2026-10-16T09:00:00/);
+    expect((sent()[0] as { expect: string }).expect).toBe("p7");
+  });
+
+  it("shows a plain sentence, not the CLI's text, when the priority moved since it was read", async () => {
+    await page();
+    answers.khipu_route_priority = () => ({ ok: false, code: "version_moved", error: "priority version moved" });
+    fireEvent.click(screen.getByRole("button", { name: "Move Codex up" }));
+    expect(await screen.findByText(/changed somewhere else after this page read it/)).toBeTruthy();
+    expect(screen.queryByText(/priority version moved/)).toBeNull();
   });
 
   it("clears the whole priority after asking, and confirms or undoes one a conversation set", async () => {
@@ -236,12 +272,12 @@ describe("the priority and the pace in Settings -> Routing", () => {
     expect(screen.getByText(/It replaced: 1\. Claude: orchestration only/)).toBeTruthy();
     const group = screen.getByRole("group", { name: "A conversation set your priority" });
     fireEvent.click(within(group).getByRole("button", { name: "Confirm" }));
-    await waitFor(() => expect(sent()).toEqual([{ action: "confirm" }]));
+    await waitFor(() => expect(sent()).toEqual([{ action: "confirm", expect: "p7" }]));
     fireEvent.click(within(group).getByRole("button", { name: "Undo" }));
-    await waitFor(() => expect(sent()[1]).toEqual({ action: "undo" }));
+    await waitFor(() => expect(sent()[1]).toEqual({ action: "undo", expect: "p7" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear the priority" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear it" }));
-    await waitFor(() => expect(sent()[2]).toEqual({ action: "clear" }));
+    await waitFor(() => expect(sent()[2]).toEqual({ action: "clear", expect: "p7" }));
   });
 
   it("shows each account's pace beside it, and the ordering switch and its warning setting", async () => {

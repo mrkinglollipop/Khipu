@@ -67,6 +67,7 @@ from khipu.mcp_server import (
     mark_gateway_active,
     take_message_error,
 )
+from khipu.request_context import gateway_request
 
 MAX_BODY = 1024 * 1024
 REQUEST_TIMEOUT_S = 15
@@ -440,15 +441,18 @@ class Handler(BaseHTTPRequestHandler):
                     params = m.get("params")
                     name = params.get("name") if isinstance(params, dict) else None
                     tool = name if isinstance(name, str) else ""
-                r = handle_message(m)
+                with gateway_request(label):
+                    r = handle_message(m)
             except KeyboardInterrupt:
                 raise
             except BaseException as exc:  # noqa: BLE001 — never let one message kill
                 # the server. BaseException, not Exception: capture.load_payload
                 # raises SystemExit on a malformed payload, which used to unwind
                 # straight through the request thread (audit 2026-09-04).
-                detail = (f"SystemExit: capture rejected the payload (exit {exc.code})"
-                          if isinstance(exc, SystemExit) else f"{type(exc).__name__}: {exc}")
+                # Its own text may name a file: fixed words or scrubbed.
+                from khipu import agent_view
+
+                detail = agent_view.error_text(exc)
                 r = {"jsonrpc": "2.0", "id": m.get("id") if isinstance(m, dict) else None,
                      "error": {"code": -32603, "message": detail}}
                 if isinstance(m, dict) and "id" not in m:

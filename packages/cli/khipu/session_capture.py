@@ -145,6 +145,11 @@ def queue_dir() -> Path:
     return khipu_home() / "queue"
 
 
+def empty_dir() -> Path:
+    """Where a claimed job whose window yielded no episode is kept."""
+    return khipu_home() / "empty"
+
+
 def log_path() -> Path:
     return khipu_home() / "logs" / "session-capture.log"
 
@@ -1109,8 +1114,9 @@ def iter_states():
 def _clear_at(dfd: int, name: str, *, older_than: float | None) -> str:
     """Drop the login folder from one state file under the hook's own lock
     for it, keeping everything else, its mode and its mtime. Returns
-    ``cleared``, ``busy`` (the lock is held) or ``unchanged`` (no field, too
-    recent, corrupt, gone or not a regular file: never rewritten)."""
+    ``cleared``, ``busy`` (the lock is held), ``failed`` (the rewrite could
+    not be written) or ``unchanged`` (no field, too recent, corrupt, gone or
+    not a regular file: never rewritten)."""
     lock = name[: -len(".json")] + ".lock"
     with _lock_at(dfd, lock) as acquired:
         if not acquired:
@@ -1134,10 +1140,13 @@ def _clear_at(dfd: int, name: str, *, older_than: float | None) -> str:
             info = os.stat(name, dir_fd=dfd, follow_symlinks=False)
             if not stat.S_ISREG(info.st_mode):
                 return "unchanged"
+        except OSError:
+            return "unchanged"
+        try:
             _write_at(dfd, name, json.dumps(st), mode=stat.S_IMODE(info.st_mode),
                       times_ns=(info.st_atime_ns, info.st_mtime_ns))
         except OSError:
-            return "unchanged"
+            return "failed"
         return "cleared"
 
 
@@ -1180,9 +1189,10 @@ def _apply_pending(dfd: int) -> int:
     for name in pending:
         result = _clear_at(dfd, name, older_than=None)
         cleared += result == "cleared"
-        if result == "busy":
+        if result in ("busy", "failed"):
             busy.append(name)
-    _save_pending_at(dfd, busy)
+    with contextlib.suppress(OSError):
+        _save_pending_at(dfd, busy)
     return cleared
 
 
@@ -1217,21 +1227,34 @@ def forget_login_homes(*, now: float | None = None) -> dict:
     stamp the time, so discovery also stops deriving a folder for any session
     seen at or before it. A session whose hook holds its lock is recorded as
     pending and cleared by the next sweep (the hook runs one after releasing
-    its lock); ``pending`` says how many are left."""
+    its lock); ``pending`` says how many are left. ``failed`` counts files
+    that could not be rewritten (and the stamp, if it could not be written),
+    and ``unreachable`` says the state folder could not be opened at all:
+    either means the paths may still be on disk."""
     now = time.time() if now is None else now
     with _state_dir_fd(create=True) as dfd:
         if dfd is None:
-            return {"cleared": 0, "pending": 0}
-        with contextlib.suppress(OSError):
+            return {"cleared": 0, "pending": 0, "failed": 0, "unreachable": True}
+        failed = 0
+        try:
             _write_at(dfd, LOGIN_FORGOTTEN_STAMP, repr(float(now)))
-        cleared, busy = 0, []
+        except OSError:
+            failed += 1
+        cleared, busy, retry = 0, [], []
         for name in _state_names(dfd):
             result = _clear_at(dfd, name, older_than=None)
             cleared += result == "cleared"
             if result == "busy":
                 busy.append(name)
-        _save_pending_at(dfd, busy)
-        return {"cleared": cleared, "pending": len(busy)}
+            elif result == "failed":
+                retry.append(name)
+        failed += len(retry)
+        try:
+            # A file that failed is retried by the next sweep, like a busy one.
+            _save_pending_at(dfd, busy + retry)
+        except OSError:
+            failed += 1
+        return {"cleared": cleared, "pending": len(busy), "failed": failed, "unreachable": False}
 
 
 def login_homes_forgotten_at() -> float | None:
@@ -1590,6 +1613,29 @@ def decide(event: str, *, user_turns: int, chars: int, elapsed_s: float, stop_ho
 
 # ---- queue ----------------------------------------------------------------------
 
+class JobForgotten(OSError):
+    """A queued job's source was forgotten; it must not be written again."""
+
+
+def job_source_identity(job: dict) -> dict | None:
+    """The source identity fields the capture of this job will carry, built
+    the way ``drain`` builds its payload, or None when the job has no
+    natural key (no session id or transcript range). Forget matches native
+    jobs on this, and checkpoints refuse a job whose key is forgotten."""
+    if not isinstance(job, dict):
+        return None
+    harness = str(job.get("harness") or "aegis")
+    sid = job.get("session_id")
+    span = job.get("transcript_range") or (
+        f"{job.get('offset_before')}:{job.get('offset_after')}"
+        if job.get("offset_before") is not None and job.get("offset_after") is not None
+        else None)
+    if not sid or not span:
+        return None
+    return {"harness": harness, "session_id": f"{harness}:{sid}", "transcript_range": span,
+            "window_id": job.get("window_id") or None, "part": job.get("part") or None}
+
+
 def enqueue(job: dict) -> Path:
     """Write a job durably (temp + rename) so a drain can never read a partial one."""
     q = queue_dir()
@@ -1597,6 +1643,11 @@ def enqueue(job: dict) -> Path:
     stamp = job["ts"].replace(":", "").replace("-", "")
     dst = q / f"{stamp}-{_safe(job.get('harness', 'x'))}-{_safe(job['session_id'])[:40]}-{uuid.uuid4().hex[:8]}.json"
     tmp = dst.with_suffix(".tmp")
+    # No memory lock here, on purpose: enqueue runs inside the Aegis sandbox,
+    # which cannot write the data folder, and it holds the transcript, not an
+    # episode. Forget's native-job scan takes the same claim lock, so an
+    # enqueue lands either before the scan (and is removed) or after it, where
+    # its drain is refused by the checkpoint and the hub.
     with _claim_lock() as acquired:
         if not acquired:
             raise OSError("queue transition lock unavailable")
@@ -1683,7 +1734,9 @@ def _claim(job: Path) -> Path | None:
     can all drain at once, and each drain runs its OWN model extraction — two
     winners would mean two different summaries, i.e. two episodes for one
     session that no identity upsert can dedup (audit 2026-08-17: reproduced)."""
-    with _claim_lock() as acquired:
+    from khipu import memory_lock
+
+    with memory_lock.shared(), _claim_lock() as acquired:
         if not acquired:
             return None
         try:
@@ -1711,40 +1764,65 @@ def _release_unlocked(claimed: Path) -> None:
 
 def _release(claimed: Path) -> None:
     """Put a job back for a later retry (extraction/capture failed)."""
-    with _claim_lock() as acquired:
+    from khipu import memory_lock
+
+    with memory_lock.shared(), _claim_lock() as acquired:
         if acquired:
             _release_unlocked(claimed)
 
 
 def _discard_claim(claimed: Path) -> None:
     """Remove a delivered claim while sibling inspection is excluded."""
-    with _claim_lock() as acquired:
+    from khipu import memory_lock
+
+    with memory_lock.shared(), _claim_lock() as acquired:
         if acquired:
             claimed.unlink(missing_ok=True)
 
 
 def _save_claimed_job(claimed: Path, job: dict) -> None:
-    """Durably checkpoint model output before attempting delivery."""
+    """Durably checkpoint model output before attempting delivery.
+
+    Raises ``JobForgotten`` instead of writing when the job's source is
+    forgotten, or when a forget already removed the claim: a checkpoint must
+    never recreate a copy a completed forget erased."""
+    from khipu import memory_lock
+    from khipu.tombstones import write_gate
+
     # Keep partial checkpoints outside ``*.claimed.*`` discovery: a crash after
     # this write must not create an immortal fake claimant that blocks siblings.
     tmp = claimed.with_name(f".extract-{uuid.uuid4().hex}.tmp")
-    try:
-        tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, claimed)
-    finally:
+    with memory_lock.shared(), write_gate() as gate:
+        ident = job_source_identity(job)
+        if ident is not None and not gate.allows(ident):
+            claimed.unlink(missing_ok=True)
+            raise JobForgotten(f"forgotten source: {claimed.name}")
+        if not claimed.exists():
+            raise JobForgotten(f"claim removed: {claimed.name}")
         try:
-            tmp.unlink()
-        except OSError:
-            pass
+            tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, claimed)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _archive_empty(claimed: Path, job: dict) -> None:
     job["disposition"] = "empty"
-    _save_claimed_job(claimed, job)
+    from khipu import memory_lock
+
+    with memory_lock.shared():
+        _save_claimed_job(claimed, job)
+        _archive_claimed(claimed)
+
+
+def _archive_claimed(claimed: Path) -> None:
     with _claim_lock() as acquired:
         if not acquired:
             raise OSError("queue transition lock unavailable")
-        archive = khipu_home() / "empty"
+        archive = empty_dir()
         archive.mkdir(parents=True, exist_ok=True)
         destination = archive / claimed.with_suffix("").with_suffix(".json").name
         with claimed.open("rb") as stream:
@@ -2180,7 +2258,10 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 # with no turn in it (2026-08-24 false red).
                 st.update(seen_end=new_off, seen_ts=time.time(), transcript_path=str(path),
                           host_pids=ancestor_pids())
-                recorded = login_home(harness)
+                # Retention, Forget and discovery never follow a capture home
+                # that is a symlink, so a path recorded through one could
+                # never be cleared: record none there.
+                recorded = None if os.path.islink(khipu_home()) else login_home(harness)
                 if recorded:
                     st[LOGIN_HOME_FIELD] = recorded
                 if session_cwd(env):
@@ -2529,6 +2610,9 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
             else:
                 try:
                     _archive_empty(jp, job)
+                except JobForgotten:
+                    out["forgotten"] = out.get("forgotten", 0) + 1
+                    continue
                 except OSError as e:
                     out["failed"] += 1
                     _release(jp)
@@ -2541,6 +2625,9 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
             job["extracted_payload"] = payload
             try:
                 _save_claimed_job(jp, job)
+            except JobForgotten:
+                out["forgotten"] = out.get("forgotten", 0) + 1
+                continue
             except OSError as e:
                 out["failed"] += 1
                 _release(jp)
@@ -2600,7 +2687,9 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         _discard_claim(jp)
         out["captured"] += 1
         _record_drain(harness, captured=True)
-        _log(f"drain: captured {original.name} -> {payload['summary'][:90]!r}")
+        # Never the summary itself: the log is not in forget's scan
+        # (khipu/capture_stores.py), so it must hold no capture text.
+        _log(f"drain: captured {original.name} ({len(payload['summary'])} chars)")
     if deadline is not None and time.monotonic() >= deadline:
         out["time_budget_exhausted"] = True
     if out["captured"] and not dry_run and not out.get("time_budget_exhausted"):

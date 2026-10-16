@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   ACCOUNTS_MAX,
+  MUSE_NO_TURN,
   PLAN_READ_FAILED,
   PlansCard,
   PlansSettingsCard,
@@ -17,10 +18,15 @@ import {
   fmtPct,
   fmtResetLocal,
   formProblem,
+  isPassingGap,
   liveReadFailures,
   loginKey,
   meterTone,
+  needsOwner,
+  passingGapHeld,
   planAttention,
+  planPauses,
+  planStatus,
   plansHealthDetail,
   resetPhrase,
   tightestOverall,
@@ -31,6 +37,7 @@ import {
 } from "../PlansCard";
 import type { PlanUsageState, UsageAccount, UsageReport } from "../PlansCard";
 import { HealthReportRows, plansHealthRow } from "../healthRows";
+import type { RouteView } from "../routing";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -54,7 +61,7 @@ function realReport(): UsageReport {
     refreshing: false,
     accounts: [
       {
-        harness: "claude", account: "Claude", home: null, plan: "max",
+        key: "claude|", harness: "claude", account: "Claude", home: null, plan: "max",
         windows: [
           { name: "five_hour", used_pct: 16, resets_at: "2026-10-14T18:00:00Z", window_mins: 300 },
           { name: "weekly", used_pct: 17, resets_at: "2026-10-17T12:00:00Z", window_mins: 10080 },
@@ -66,7 +73,7 @@ function realReport(): UsageReport {
         cached: false, stale: false,
       },
       {
-        harness: "codex", account: "Codex", home: null, plan: "pro",
+        key: "codex|", harness: "codex", account: "Codex", home: null, plan: "pro",
         windows: [
           { name: "weekly", used_pct: 40, resets_at: CODEX_RESET, window_mins: 10080, slot: "primary" },
         ],
@@ -76,7 +83,7 @@ function realReport(): UsageReport {
         cached: false, stale: false,
       },
       {
-        harness: "grok", account: "Grok", home: null, plan: "SuperGrok Heavy",
+        key: "grok|", harness: "grok", account: "Grok", home: null, plan: "SuperGrok Heavy",
         windows: [{ name: "weekly", used_pct: 43.5, resets_at: GROK_RESET }],
         credits: { prepaid_balance: 44.0 }, version: "1.0.52", source: "live", observed_at: null,
         error: null, note: null, ok: true, probed_at: "2026-10-14T13:57:29Z", ms: 0,
@@ -84,7 +91,7 @@ function realReport(): UsageReport {
         cached: false, stale: false,
       },
       {
-        harness: "muse", account: "Muse", home: null, plan: null, windows: [], credits: null,
+        key: "muse|", harness: "muse", account: "Muse", home: null, plan: null, windows: [], credits: null,
         version: "1.4.6", source: "last_observed", observed_at: null, error: null,
         note: "no turn observed yet", ok: true, probed_at: "2026-10-14T13:57:29Z", ms: 0,
         last_attempt_at: "2026-10-14T13:57:29Z", last_error: null, last_good_at: "2026-10-14T13:57:29Z",
@@ -137,7 +144,7 @@ beforeEach(() => {
   refuse = null;
   configShow = {
     usage_accounts: {
-      value: null, source: "default",
+      value: null, source: "default", version: "av1",
       accounts: [
         { label: "Claude", harness: "claude", home: null },
         { label: "Codex", harness: "codex", home: null },
@@ -211,18 +218,15 @@ describe("PlansCard on Home", () => {
     expect(screen.getAllByRole("meter")).toHaveLength(3);
   });
 
-  it("shows Muse's note when no turn has been observed, not 0% and never Live", async () => {
+  it("says Muse has no figures yet when no turn has been observed, not 0% and not Live", async () => {
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("no turn observed yet")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(MUSE_NO_TURN)).toBeTruthy());
     const muse = within(rowFor("Muse"));
     expect(muse.queryByRole("meter")).toBeNull();
     expect(muse.queryByText(/0%/)).toBeNull();
-    // A read that worked but brought no figures says when it was checked,
-    // never "Live", and asks nobody to sign in.
     expect(muse.queryByText(/Live/)).toBeNull();
-    expect(muse.getByText(/^Checked .*, no figures yet$/)).toBeTruthy();
+    expect(screen.queryByText(/Live/)).toBeNull();
     expect(muse.queryByText(/Sign in/)).toBeNull();
-    expect(within(rowFor("Codex")).getByText(/^Live: read /)).toBeTruthy();
   });
 
   it("warns at 75% and alerts at 90%", async () => {
@@ -243,18 +247,18 @@ describe("PlansCard on Home", () => {
       timeout: "didn't answer in time",
       not_signed_in: "not signed in",
       not_installed: "not installed",
-      bad_reply: "unreadable reply",
+      bad_reply: "answered in a way Khipu can't read",
       no_plan_limits: "no plan limits reported",
       invalid_account: "not a valid account entry",
-      no_answer: "stopped without answering",
+      no_answer: "didn't answer",
       start_failed: "could not be started",
-      cli_error: "reported an error",
+      cli_error: "reported an error when asked",
       internal_error: "Khipu could not run the check",
       pending: "first read still running",
     };
     for (const [code, phrase] of Object.entries(phrases)) expect(usageErrorPhrase(code)).toBe(phrase);
-    expect(usageErrorPhrase("exit_3")).toBe("stopped without answering");
-    expect(usageErrorPhrase("signal_9")).toBe("stopped without answering");
+    expect(usageErrorPhrase("exit_3")).toBe("didn't answer");
+    expect(usageErrorPhrase("signal_9")).toBe("didn't answer");
     expect(usageErrorPhrase("something_new")).toBe("couldn't read");
     expect(usageErrorPhrase(undefined)).toBe("couldn't read");
     status = {
@@ -264,10 +268,17 @@ describe("PlansCard on Home", () => {
       })),
     };
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("didn't answer in time")).toBeTruthy());
-    for (const phrase of Object.values(phrases)) expect(screen.getAllByText(phrase).length).toBeGreaterThan(0);
+    // A row cached before every code had a note says the CLI's name and the
+    // code's phrase; each row says it once.
+    await waitFor(() => expect(screen.getByText("Can't read its plan: Claude Code didn't answer in time")).toBeTruthy());
+    expect(within(rowFor("Acct not_signed_in")).getByText("Not signed in")).toBeTruthy();
+    expect(within(rowFor("Acct no_plan_limits")).getByText("Its sign-in reports no plan limits")).toBeTruthy();
+    expect(within(rowFor("Acct pending")).getByText("Reading it for the first time")).toBeTruthy();
+    expect(within(rowFor("Acct internal_error")).getByText("Can't read its plan: Khipu could not run the check")).toBeTruthy();
+    expect(within(rowFor("Acct exit_3")).getByText("Can't read its plan: Claude Code didn't answer")).toBeTruthy();
+    for (const el of document.querySelectorAll(".plan-row")) expect(el.querySelectorAll(".plan-say")).toHaveLength(1);
     expect(screen.queryByText("exit_3")).toBeNull();
-    expect(screen.queryByText("couldn't read")).toBeNull();
+    expect(screen.queryByText(/couldn't read/)).toBeNull();
   });
 
   it("keeps the last figures of a failed probe with its phrase and their age", async () => {
@@ -282,9 +293,9 @@ describe("PlansCard on Home", () => {
     render(<Home />);
     await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
     const codex = within(rowFor("Codex"));
-    expect(codex.getByText("didn't answer in time")).toBeTruthy();
-    expect(codex.getByText("figures from 2 days ago")).toBeTruthy();
-    expect(within(rowFor("Muse")).getByText("as of the last turn, 2 h ago")).toBeTruthy();
+    expect(codex.getByText("Can't read it now; figures from 2 days ago")).toBeTruthy();
+    expect(codex.getByRole("meter").classList.contains("dim")).toBe(true);
+    expect(within(rowFor("Muse")).getByText("as of its last turn, 2 h ago")).toBeTruthy();
   });
 
   it("Refresh calls the refresh command, spins while it runs, then shows the new figures", async () => {
@@ -352,14 +363,14 @@ describe("PlansCard on Home", () => {
   it("shows an empty state when no account is configured", async () => {
     status = { generated_at: "2026-10-14T13:57:29Z", max_age_s: 120, refreshing: false, accounts: [], summary_text: [] };
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("No plans to show")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("No accounts to read yet")).toBeTruthy());
     expect(screen.queryByRole("meter")).toBeNull();
   });
 
   it("a window that has reset shows no old figure and no bar", async () => {
     status = withMuseResetAt95();
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("every limit has reset since it was read")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Every limit has reset since it was read")).toBeTruthy());
     const muse = within(rowFor("Muse"));
     expect(muse.queryByRole("meter")).toBeNull();
     expect(muse.queryByText("95%")).toBeNull();
@@ -492,10 +503,12 @@ describe("PlansSettingsCard", () => {
     const c = within(claude);
     for (const label of ["five-hour", "week", "Fable week"]) expect(c.getByText(label)).toBeTruthy();
     expect(c.getAllByText(/^resets /)).toHaveLength(3);
-    expect(c.getByText(/figures from .* ago/)).toBeTruthy();
-    expect(within(screen.getByRole("group", { name: "Muse" })).getByText("no turn observed yet")).toBeTruthy();
-    expect(within(screen.getByRole("group", { name: "Muse" })).queryByText(/Live/)).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Probe now" }));
+    expect(c.getByText(/^Live: read .* ago$/)).toBeTruthy();
+    const muse = within(screen.getByRole("group", { name: "Muse" }));
+    expect(muse.getByText(MUSE_NO_TURN)).toBeTruthy();
+    expect(muse.queryByText(/Live/)).toBeNull();
+    expect(muse.getByText(/^Checked .* ago$/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Check all now" }));
     await waitFor(() => expect(usageCalls()).toContain("khipu_usage_refresh"));
     await act(async () => release("khipu_usage_refresh"));
     await waitFor(() => expect(screen.getByText("94%")).toBeTruthy());
@@ -505,7 +518,7 @@ describe("PlansSettingsCard", () => {
     holdStatus = true;
     render(<Settings />);
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Reading plan usage…"));
-    expect(screen.getByRole("button", { name: "Probe now" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Check all now" })).toBeDisabled();
     await act(async () => release("khipu_usage_status"));
     await screen.findByRole("group", { name: "Claude" });
     expect(screen.queryByText("Reading plan usage…")).toBeNull();
@@ -527,15 +540,39 @@ describe("PlansSettingsCard", () => {
     status = r;
     render(<Settings />);
     const typo = within(await screen.findByRole("group", { name: "Typo" }));
-    expect(typo.getByText("not a valid account entry")).toBeTruthy();
-    expect(typo.getByText(/Khipu does not read the CLI "cluade"/)).toBeTruthy();
+    expect(typo.getByText(/^Can't read its plan: this account entry is not valid: Khipu does not read the CLI "cluade"/)).toBeTruthy();
     expect(
       within(screen.getByRole("group", { name: "Claude second" })).getByText(
         /Open Claude Code with this login folder and sign in again \(\/login\)/,
       ),
     ).toBeTruthy();
     const codex = within(screen.getByRole("group", { name: "Codex" }));
-    expect(codex.getByText(/figures from 2 days ago · last tried 30s ago/)).toBeTruthy();
+    expect(codex.getByText("Codex is not signed in.")).toBeTruthy();
+    expect(codex.getByText("Figures from 2 days ago")).toBeTruthy();
+    expect(codex.getByRole("button", { name: "Sign Codex in again" })).toBeTruthy();
+    const details = codex.getByRole("button", { name: "Details" });
+    expect(details.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(details);
+    expect(details.getAttribute("aria-expanded")).toBe("true");
+    expect(codex.getByText("not_signed_in")).toBeTruthy();
+    expect(codex.getByText(/, 30s ago$/)).toBeTruthy();
+  });
+
+  it("keeps the last figures and offers no sign-in when Claude sent no plan figures", async () => {
+    const r = realReport();
+    const claude = r.accounts!.find((a) => a.harness === "claude")!;
+    r.accounts!.push({
+      ...claude, account: "Claude second", home: "~/.claude-second", ok: false, error: "no_plan_figures",
+      stale: true, last_good_at: claude.probed_at, last_attempt_at: claude.probed_at,
+      note: "Claude Code did not send its plan figures just now; Khipu keeps the last ones and asks again",
+    });
+    status = r;
+    render(<Settings />);
+    const second = within(await screen.findByRole("group", { name: "Claude second" }));
+    expect(second.getByText(/did not send its plan figures just now/)).toBeTruthy();
+    expect(second.getAllByRole("meter").length).toBeGreaterThan(0);
+    expect(second.queryByRole("button", { name: /Sign .* in again/ })).toBeNull();
+    expect(second.queryByText(/sign in again|no plan limits/i)).toBeNull();
   });
 
   it("shows a reset that has passed as such, with no warning colour", async () => {
@@ -564,6 +601,7 @@ describe("PlansSettingsCard", () => {
             { label: "Codex", harness: "codex" },
             { label: "Claude second", harness: "claude", home: "~/.claude-second" },
           ]),
+          expect: "av1",
         },
       ]),
     );
@@ -573,6 +611,7 @@ describe("PlansSettingsCard", () => {
       usage_accounts: {
         value: [{ label: "Claude", harness: "claude" }, { label: "Odd", harness: "gemini" }],
         source: "file",
+        version: "av2",
         accounts: [
           { label: "Claude", harness: "claude", home: null },
           { label: "Odd", harness: "gemini", home: null, invalid: 'Khipu does not read the CLI "gemini"' },
@@ -589,8 +628,14 @@ describe("PlansSettingsCard", () => {
     expect(screen.getByText('not valid: Khipu does not read the CLI "gemini"')).toBeTruthy();
     calls.length = 0;
     fireEvent.click(screen.getByRole("button", { name: "Remove Claude" }));
-    // Nothing valid is left, so the list goes back to the default.
-    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "usage_accounts" }]));
+    // The invalid entry was not touched, so it goes back as stored: only Khipu
+    // decides what is valid.
+    await waitFor(() =>
+      expect(calls).toContainEqual([
+        "khipu_config_set",
+        { key: "usage_accounts", value: JSON.stringify([{ label: "Odd", harness: "gemini" }]), expect: "av2" },
+      ]),
+    );
 
     refuse = { error: "usage_accounts holds at most 32 entries, got 33", code: "too_many", index: null, field: null };
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -637,6 +682,7 @@ describe("adding an account", () => {
             { label: "Codex", harness: "codex" },
             { label: "Codex (~/.codex-work)", harness: "codex", home: "~/.codex-work" },
           ]),
+          expect: "av1",
         },
       ]),
     );
@@ -696,6 +742,50 @@ describe("adding an account", () => {
   });
 });
 
+describe("entries the editor did not change go back as stored (review round 4)", () => {
+  const untouched = { harness: "claude", label: "Untouched", home: ".claude-legacy" };
+  const sent = () => {
+    const sets = calls.filter(([c]) => c === "khipu_config_set");
+    return JSON.parse((sets[sets.length - 1][1] as { value: string }).value);
+  };
+
+  beforeEach(() => {
+    configShow = {
+      usage_accounts: {
+        value: [{ label: " Codex ", harness: "codex" }, untouched],
+        source: "file",
+        version: "av2",
+        accounts: [
+          { label: "Codex", harness: "codex", home: null },
+          { label: "Untouched", harness: "claude", home: ".claude-legacy", invalid: "relative folder" },
+        ],
+      },
+    };
+  });
+
+  it("adding an account keeps an invalid entry and the others exactly as stored", async () => {
+    render(<Settings />);
+    await waitFor(() => expect(screen.getByText("Your list")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Client" } });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.claude-client" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() => expect(calls.some(([c]) => c === "khipu_config_set")).toBe(true));
+    expect(sent()).toEqual([
+      { label: " Codex ", harness: "codex" },
+      untouched,
+      { label: "Client", harness: "claude", home: "~/.claude-client" },
+    ]);
+  });
+
+  it("removing one account keeps an invalid entry as stored", async () => {
+    render(<Settings />);
+    await waitFor(() => expect(screen.getByText("Your list")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Remove Codex" }));
+    await waitFor(() => expect(calls.some(([c]) => c === "khipu_config_set")).toBe(true));
+    expect(sent()).toEqual([untouched]);
+  });
+});
+
 describe("a refused account list, in plain words (fix round 3)", () => {
   const addButton = () => screen.getByRole("button", { name: "Add" });
   const configSets = () => calls.filter(([c]) => c === "khipu_config_set");
@@ -705,7 +795,7 @@ describe("a refused account list, in plain words (fix round 3)", () => {
     spy = vi.spyOn(console, "error").mockImplementation(() => {});
     configShow = {
       usage_accounts: {
-        value: null, source: "default", user_home: "/Users/me",
+        value: null, source: "default", user_home: "/Users/me", version: "av3",
         accounts: [
           { label: "Claude", harness: "claude", home: null },
           { label: "Codex", harness: "codex", home: null },
@@ -826,7 +916,7 @@ describe("the account cap and failures that are not about an entry (fix round 4)
     expect(configSets()).toHaveLength(0);
     expect(screen.getByLabelText("Name").getAttribute("aria-invalid")).toBeNull();
     expect(screen.getByLabelText("Login folder").getAttribute("aria-invalid")).toBeNull();
-    // An entry marked not valid is left out of what is stored, so it does not count.
+    // An entry marked not valid is stored as it is, so it counts too.
     const withInvalid = [...accounts.slice(1), { label: "Odd", harness: "gemini", home: null, invalid: "not read" }];
     configShow = { usage_accounts: { value: withInvalid, source: "file", user_home: "/Users/me", accounts: withInvalid } };
     cleanup();
@@ -836,8 +926,8 @@ describe("the account cap and failures that are not about an entry (fix round 4)
     fireEvent.change(screen.getByLabelText("CLI"), { target: { value: "codex" } });
     fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.codex-work" } });
     fireEvent.click(screen.getByRole("button", { name: "Add" }));
-    await waitFor(() => expect(configSets()).toHaveLength(1));
-    expect(screen.queryByText(TOO_MANY)).toBeNull();
+    expect(await screen.findByText(TOO_MANY)).toBeTruthy();
+    expect(configSets()).toHaveLength(0);
   });
 
   it("says the cap when the app's own command refuses a list over it, with no code", () => {
@@ -883,13 +973,15 @@ describe("a Codex whose live read failed (fix round 3)", () => {
     const { unmount } = render(<Home />);
     await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
     const codex = within(rowFor("Codex"));
-    expect(codex.getByText("not signed in")).toBeTruthy();
-    expect(codex.getByText("as of the last turn, 3 days ago")).toBeTruthy();
+    expect(codex.getByText("Not signed in")).toBeTruthy();
+    expect(rowFor("Codex").querySelectorAll(".plan-say")).toHaveLength(1);
     unmount();
     render(<Settings />);
     const group = within(await screen.findByRole("group", { name: "Codex" }));
-    expect(group.getByText("not signed in")).toBeTruthy();
-    expect(group.getByText(/Open Codex and sign in again/)).toBeTruthy();
+    expect(group.getByText(/^Codex is not signed in, so these figures are from its last turn. Open Codex and sign in again/)).toBeTruthy();
+    // The note already says the figures are from its last turn: said once.
+    expect(group.queryByText(/^As of its last turn/)).toBeNull();
+    expect(group.getAllByText(/last turn/)).toHaveLength(1);
   });
 
   it("names it in the health report's Plans row", () => {
@@ -937,5 +1029,207 @@ describe("the 90% item while Home stays open", () => {
     late.accounts![0].windows![0] = { name: "five_hour", used_pct: 97, resets_at: "2026-10-14T15:00:00Z", window_mins: 300 };
     rerender(<AttentionProbe report={late} />);
     expect(screen.getByTestId("plan-attention").textContent).toBe("");
+  });
+});
+
+describe("one status phrase per account (settings clarity, phase 2)", () => {
+  const PAUSED_UNTIL = "2026-10-21T21:26:00Z";
+  const pausedGrok: RouteView = {
+    accounts: [{ key: "grok|", label: "Grok", harness: "grok", state: "paused", until: PAUSED_UNTIL }],
+  };
+
+  /** Every state in the scope's table, one account each. */
+  function tableReport(): UsageReport {
+    const r = realReport();
+    const [claude, codex, grok] = r.accounts!;
+    return {
+      ...r,
+      accounts: [
+        claude,
+        { ...codex, account: "Kept", ok: false, error: "timeout", stale: true, probed_at: "2026-10-12T14:00:00Z",
+          last_good_at: "2026-10-12T14:00:00Z", last_attempt_at: "2026-10-14T13:59:30Z",
+          note: "Codex didn't answer in time" },
+        { ...grok, windows: [], ok: false, error: "no_answer", note: "Grok Build didn't answer", last_good_at: null },
+        { ...codex, account: "Signed out", windows: [], ok: false, error: "not_signed_in",
+          note: "Codex is not signed in. Open Codex and sign in again" },
+        r.accounts![3],
+        { ...r.accounts![3], account: "Muse two", plan: "pro", note: null, observed_at: "2026-10-14T12:00:00Z",
+          windows: [{ name: "five_hour", used_pct: 12, resets_at: "2026-10-14T15:00:00Z", window_mins: 300 }] },
+      ],
+    };
+  }
+
+  function HomeWith({ routing }: { routing: RouteView | null }) {
+    const state = usePlanUsage(true);
+    return <PlansCard state={state} routing={routing} />;
+  }
+
+  it("renders each row of the table with exactly one status phrase", async () => {
+    status = tableReport();
+    render(<HomeWith routing={null} />);
+    await waitFor(() => expect(screen.getByText(MUSE_NO_TURN)).toBeTruthy());
+    const said = (name: string) => [...rowFor(name).querySelectorAll(".plan-say")].map((n) => n.textContent);
+    expect(said("Claude")).toEqual([]);
+    expect(within(rowFor("Claude")).getByRole("meter")).toBeTruthy();
+    expect(said("Kept")).toEqual(["Can't read it now; figures from 2 days ago"]);
+    expect(within(rowFor("Kept")).getByRole("meter").className).toBe("plan-meter dim");
+    expect(said("Grok")).toEqual(["Can't read its plan: Grok Build didn't answer"]);
+    expect(within(rowFor("Grok")).queryByText(/Sign in/)).toBeNull();
+    expect(said("Signed out")).toEqual(["Not signed in"]);
+    expect(within(rowFor("Signed out")).getByRole("button", { name: "Sign Signed out in again" })).toBeTruthy();
+    expect(said("Muse")).toEqual([MUSE_NO_TURN]);
+    expect(said("Muse two")).toEqual(["as of its last turn, 2 h ago"]);
+    expect(screen.queryByText(/Live/)).toBeNull();
+    expect(screen.queryByText(/The last read failed/)).toBeNull();
+  });
+
+  it("shows the owner's pause first, from the routing record", async () => {
+    status = tableReport();
+    render(<HomeWith routing={pausedGrok} />);
+    const pause = planPauses(pausedGrok, new Date()).get("grok|")!;
+    expect(pause).toMatch(/^Paused by you until /);
+    await waitFor(() => expect(within(rowFor("Grok")).getByText(pause)).toBeTruthy());
+    const tail = rowFor("Grok").querySelector(".plan-none")!;
+    expect(tail.firstElementChild!.textContent).toBe(pause);
+    expect(tail.querySelectorAll(".plan-say")).toHaveLength(1);
+    expect(within(rowFor("Claude")).queryByText(/Paused/)).toBeNull();
+  });
+
+  it("shows no pause when the routing record could not be read", async () => {
+    status = tableReport();
+    render(<HomeWith routing={null} />);
+    await waitFor(() => expect(rowFor("Grok")).toBeTruthy());
+    expect(screen.queryByText(/Paused by you/)).toBeNull();
+    expect(planPauses(null).size).toBe(0);
+  });
+
+  it("says in the card's head when the whole last read failed, with no loose footer", async () => {
+    render(<Home />);
+    await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
+    invokeMock.mockImplementation(async () => {
+      throw "khipu exited 1";
+    });
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    await act(async () => {
+      await exposed!.reread();
+    });
+    expect(screen.getByText(/^Last read failed .*; showing earlier figures$/)).toBeTruthy();
+    expect(screen.getByText("40%")).toBeTruthy();
+    expect(screen.queryByText(/these figures are from the read before it/)).toBeNull();
+    spy.mockRestore();
+  });
+
+  it("keeps every line about an account inside its block in Settings, the pause first", async () => {
+    status = tableReport();
+    function SettingsWith() {
+      const state = usePlanUsage("settings");
+      return <PlansSettingsCard state={state} active routing={pausedGrok} />;
+    }
+    const { container } = render(<SettingsWith />);
+    const grok = await screen.findByRole("group", { name: "Grok" });
+    const head = grok.querySelector("h2")!;
+    expect(head.textContent).toBe("GrokSuperGrok Heavy plan");
+    expect(head.nextElementSibling!.className).toBe("plan-paused");
+    expect(within(grok).getByText("Can't read its plan: Grok Build didn't answer. No figures to show.")).toBeTruthy();
+    expect(grok.className).toBe("plan-block warn");
+    const outside = (sel: string) => [...container.querySelectorAll(sel)].filter((n) => !n.closest(".plan-block"));
+    for (const sel of ['[role="meter"]', ".plan-fail", ".plan-reads", ".plan-paused", ".plan-empty", ".plan-details"]) {
+      expect(outside(sel)).toEqual([]);
+    }
+    expect(outside("button").map((b) => b.textContent)).toEqual(
+      expect.not.arrayContaining(["Details", "Sign in again"]),
+    );
+    expect(container.querySelectorAll(".plan-block")).toHaveLength(6);
+    expect(container.querySelector(".plan-account")).toBeNull();
+  });
+
+  it("judges the status from the report alone", () => {
+    const r = tableReport();
+    expect(planStatus(r.accounts![0], NOW)).toEqual({ figures: "live", say: null, tone: null, code: null });
+    expect(planStatus(r.accounts![1], NOW).figures).toBe("kept");
+    expect(planStatus(r.accounts![2], NOW).figures).toBe("none");
+  });
+});
+
+describe("per-account lookups use the backend's stable key, never the label (review P2)", () => {
+  // Claude was paused, then removed from the list, and its name reused for a
+  // Codex login: the record still holds the paused "claude|" account.
+  const record: RouteView = {
+    accounts: [
+      { key: "claude|", label: "Work", harness: "claude", state: "paused", until: "2026-10-21T21:26:00Z" },
+      { key: "claude|/logins/second", label: "Old name", harness: "claude", state: "paused", until: null },
+    ],
+  };
+  function reused(): UsageReport {
+    const r = realReport();
+    return {
+      ...r,
+      accounts: [
+        { ...r.accounts![1], account: "Work", key: "codex|" },
+        { ...r.accounts![0], account: "Claude second", home: "~/.claude-second", key: "claude|/logins/second" },
+      ],
+    };
+  }
+
+  it("never gives a pause to another account that carries the paused one's name", async () => {
+    status = reused();
+    function Both() {
+      const state = usePlanUsage("settings");
+      return (
+        <>
+          <PlansCard state={state} routing={record} />
+          <PlansSettingsCard state={state} active routing={record} />
+        </>
+      );
+    }
+    render(<Both />);
+    const work = await screen.findByRole("group", { name: "Work" });
+    expect(within(work).queryByText(/Paused by you/)).toBeNull();
+    expect(within(rowFor("Work")).queryByText(/Paused by you/)).toBeNull();
+    // Matched by key, the renamed account keeps its own pause.
+    expect(within(screen.getByRole("group", { name: "Claude second" })).getByText("Paused by you until you clear it")).toBeTruthy();
+    expect(within(rowFor("Claude second")).getByText("Paused by you until you clear it")).toBeTruthy();
+  });
+
+  it("shows no pause for a row with no key rather than guessing by name", () => {
+    expect(planPauses(record).get("Work")).toBeUndefined();
+    expect(planPauses(record).get("claude|")).toMatch(/^Paused by you until /);
+  });
+});
+
+describe("one rule for passing gaps and codes that need the owner (shared with Settings)", () => {
+  const NOW = new Date("2026-10-14T15:40:00Z");
+  const kept = (extra: Partial<UsageAccount> = {}): UsageAccount => ({
+    harness: "claude", account: "Claude second", ok: false, error: "no_plan_figures", stale: true,
+    windows: [{ name: "weekly", used_pct: 40, resets_at: "2026-10-17T19:00:00Z" }],
+    last_good_at: "2026-10-14T08:40:00Z", probed_at: "2026-10-14T15:38:00Z", ...extra,
+  });
+
+  it("sorts the codes: sign-in trouble needs the owner, every other failure but pending passes", () => {
+    for (const c of ["not_signed_in", "no_plan_limits"]) {
+      expect(needsOwner(c)).toBe(true);
+      expect(isPassingGap(c)).toBe(false);
+    }
+    for (const c of ["no_plan_figures", "timeout", "no_answer", "exit_1", "cli_error", "bad_reply"]) {
+      expect(needsOwner(c)).toBe(false);
+      expect(isPassingGap(c)).toBe(true);
+    }
+    for (const c of ["pending", null, undefined, ""]) expect(isPassingGap(c)).toBe(false);
+  });
+
+  it("says Home's kept-figures words for a passing gap and holds it until the stale setting", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    try {
+      expect(planStatus(kept(), NOW)).toMatchObject({ figures: "kept", say: "Can't read it now; figures from 7 h ago", code: "no_plan_figures" });
+      expect(passingGapHeld(kept(), 12 * 3600, NOW)).toBe(true);
+      expect(passingGapHeld(kept(), 6 * 3600, NOW)).toBe(false);
+      expect(passingGapHeld(kept(), 0, NOW)).toBe(true);
+      expect(passingGapHeld(kept({ windows: [] }), 12 * 3600, NOW)).toBe(false);
+      expect(passingGapHeld(kept({ error: "not_signed_in" }), 12 * 3600, NOW)).toBe(false);
+      expect(planStatus(kept({ error: "not_signed_in" }), NOW).say).toBe("Not signed in");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from khipu.search_text import search_tokens
+from khipu.output_guard import guard_output, remember
 
 
 def _env(*names: str, default: str = "") -> str:
@@ -209,7 +210,7 @@ LOCAL_GATES = (
     "outbox_ok", "capture_liveness_ok", "git_sync_ok", "dsn_file_ok", "synth_provider_ok",
     "jobs_ok", "index_freshness_ok", "synth_budget_ok", "graph_backup_ok", "bundle_seal_ok",
     "prompt_recall_snapshot_ok", "prompt_recall_outcomes_ok", "recall_daemon_ok",
-    "nightly_steps_ok", "degraded_rate_ok", "launchers_ok",
+    "nightly_steps_ok", "degraded_rate_ok", "launchers_ok", "ledger_outbox_ok",
 )
 
 
@@ -408,8 +409,18 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         launchers = integ.launcher_health()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         launchers = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The ledger's own outbox: a queued ledger write is one the hub does not
+    # have yet. Red while it holds anything, as the capture outbox is.
+    try:
+        from khipu.ledger import outbox_status as ledger_outbox_status
+
+        ledger_outbox = ledger_outbox_status()
+    except Exception as e:  # noqa: BLE001  (a failed check must not look like a pass)
+        ledger_outbox = {"pending": -1, "error": f"{type(e).__name__}: {e}"}
+    ledger_outbox_ok = ledger_outbox.get("pending") == 0 and not ledger_outbox.get("refused")
     return {
         "outbox": outbox, "outbox_ok": outbox_ok,
+        "ledger_outbox": ledger_outbox, "ledger_outbox_ok": ledger_outbox_ok,
         "capture_liveness": liveness, "capture_liveness_ok": bool(liveness.get("ok")),
         "git_sync": git_sync, "git_sync_ok": bool(git_sync.get("ok")),
         "secrets": secrets, "dsn_file_ok": dsn_file_ok,
@@ -466,8 +477,17 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
         "dsn_present": bool(local["secrets"].get("dsn")) and not local["secrets"].get("error"),
         "skipped": "hub, network and probe checks (run plain `khipu doctor` for those)",
     }
+    # The one hub read --quick makes: the code this gate is about to promote
+    # may ship a migration the hub has not had. An unreachable hub is not
+    # gated here (--quick skips reachability); a pending migration is.
+    from khipu.migrate import doctor_check as _schema_check
+
+    schema = _schema_check()
+    out["schema_migrations"] = schema
+    out["schema_migrations_ok"] = not schema.get("pending")
+    out["warnings"] = list(schema.get("warnings") or [])
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
-                 and all(bool(local[k]) for k in LOCAL_GATES))
+                 and all(bool(local[k]) for k in LOCAL_GATES) and out["schema_migrations_ok"])
     print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
 
@@ -486,7 +506,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # 2026-10-15, most of it waiting on the network).
     from concurrent.futures import ThreadPoolExecutor
 
-    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="khipu-doctor")
+    pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="khipu-doctor")
     try:
         workers = _doctor_start_workers(pool, args, mem, sample_drift)
         return _cmd_doctor_body(args, workers, mem, status_payload, backup_health)
@@ -570,6 +590,9 @@ def _doctor_start_workers(pool, args, mem, sample_drift) -> dict:
     # Every check that reads only this Mac; `doctor --quick` gates on the same
     # set (khipu.promote's first gate step).
     workers["local"] = pool.submit(_doctor_local_checks, mem)
+    from khipu.migrate import doctor_check as _schema_check
+
+    workers["schema"] = pool.submit(_schema_check)
     return workers
 
 
@@ -689,6 +712,14 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         notes_organise = organise.last_run()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         notes_organise = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The last migration run's table lock hold times: info only, never gates
+    # `ok`. None when no migration that locks tables has run on this Mac.
+    try:
+        from khipu import migrate as _migrate
+
+        notes_migrate = _migrate.last_lock_notes()
+    except Exception as e:  # noqa: BLE001
+        notes_migrate = {"error": f"{type(e).__name__}: {e}"}
     # K9: gateway per-token liveness, read over the network from the
     # deployed gateway's own /healthz (never deployed by doctor itself).
     # Applicable only when a gateway_url is configured.
@@ -797,6 +828,12 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     else:
         graph = graph_error
     embed_coverage, embed_coverage_ok, topics_lag = embed_future.result()
+    # Pending migrations: red. With the hub down the read fails too; hub_ok
+    # is already red for that, so the schema row says why it was not checked.
+    schema = workers["schema"].result()
+    if not hub_ok and schema.get("error"):
+        schema = {**schema, "ok": True, "skipped": "the database did not answer"}
+    schema_ok = bool(schema.get("ok"))
     liveness.setdefault("harnesses", {})["gateway"] = gw_liveness
     if not gw_liveness.get("ok", True):
         liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
@@ -827,6 +864,21 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         routing_block = _routing.doctor_block()
     except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
         routing_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # The ledger (Work view phase 1): counts per project, removed rows waiting
+    # to purge, purged markers, offline copy. Only the outbox gates (above).
+    try:
+        from khipu import ledger as _ledger
+
+        ledger_block = _ledger.doctor_block()
+    except Exception as e:  # noqa: BLE001  (a failed check must not crash doctor)
+        ledger_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # The live view's summary files (Work view phase 3): warns, never gates `ok`.
+    try:
+        from khipu import work as _work
+
+        work_block = _work.doctor_block()
+    except Exception as e:  # noqa: BLE001  (a failed check must not crash doctor)
+        work_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -836,6 +888,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "drift": drift,
         "graph_drift": graph,
         "outbox": outbox,
+        "ledger_outbox": local["ledger_outbox"],
         "capture_liveness": liveness,
         "git_sync": git_sync,
         "backup": backup,
@@ -855,6 +908,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
         "notes_organise": notes_organise,
+        "notes_migrate": notes_migrate,
         "nightly_steps": nightly_steps,
         "topics_embed_lag": topics_lag,
         "topics_embed_lag_minutes": topics_lag.get("lag_minutes"),
@@ -867,8 +921,13 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "decision_links": decision_links_block,
         "plan_usage": plan_usage_block,
         "routing": routing_block,
-        # Warnings that never gate `ok` (plans nearly used up; routing).
-        "warnings": list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or []),
+        "ledger": ledger_block,
+        "schema_migrations": schema,
+        "work": work_block,
+        # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
+        "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
+                     + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
+                     + list(schema.get("warnings") or [])),
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -916,6 +975,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             # (`launchers["consistent"]`) is a warning, folded in separately
             # below, and never reaches this aggregate.
             and bool(launchers.get("ok"))
+            and local["ledger_outbox_ok"]
+            and schema_ok
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
@@ -947,6 +1008,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "degraded_rate_ok": bool(degraded_rate.get("ok")),
         "launchers_ok": bool(launchers.get("ok")),
         "nightly_steps_ok": local["nightly_steps_ok"],
+        "ledger_outbox_ok": local["ledger_outbox_ok"],
+        "schema_migrations_ok": schema_ok,
     }
     print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
@@ -2043,8 +2106,14 @@ def cmd_usage(args: argparse.Namespace) -> int:
         # A conversation busy at that moment is cleared by its next sweep;
         # until then this says it is not finished and how many are left.
         result = session_capture.forget_login_homes()
-        out = {"ok": True, "finished": not result["pending"], **result}
-        if result["pending"]:
+        out = {"ok": True, "finished": not (result["pending"] or result.get("failed")
+                                             or result.get("unreachable")), **result}
+        if result.get("unreachable"):
+            out["note"] = "Not finished: Khipu could not open its conversation records, so nothing was cleared"
+        elif result.get("failed"):
+            out["note"] = ("Not finished: Khipu could not rewrite some conversation records; "
+                           "it tries again on the next capture")
+        elif result["pending"]:
             n = result["pending"]
             out["note"] = (f"Not finished: {n} conversation{' was' if n == 1 else 's were'} busy; "
                            f"Khipu clears {'it' if n == 1 else 'them'} when {'it is' if n == 1 else 'they are'} free")
@@ -2094,6 +2163,11 @@ def cmd_usage(args: argparse.Namespace) -> int:
         out = discover.discover(now=bool(getattr(args, "now", False)), check=getattr(args, "check", None))
         if getattr(args, "check", None) is None:
             out["clis"] = discover.cli_states()
+        # The owner's automatic-tracking switch (off by default): what Home
+        # would offer is tracked through the one save path.
+        from khipu import accounts
+
+        out["auto_tracked"] = accounts.auto_track(out)
         if args.json:
             print(json.dumps(out, indent=2))
         else:
@@ -2141,6 +2215,14 @@ def cmd_usage(args: argparse.Namespace) -> int:
     else:
         print(usage.table(rep))
     return 0
+
+
+def cmd_accounts(args: argparse.Namespace) -> int:
+    """`khipu accounts`: track, rename, stop tracking, move and decline the
+    accounts plan usage reads (settings clarity phase 9, 9B). Owner only."""
+    from khipu import accounts
+
+    return accounts.run_cli(args)
 
 
 def cmd_route(args: argparse.Namespace) -> int:
@@ -2342,8 +2424,11 @@ def _reembed_episode(cur, episode_id: int) -> bool:
 
     cols = ("summary", "decisions", "preferences", "topics", "people")
     verbatim_col = _episode_verbatim_select(cur)
+    # A forgotten episode's vectors were removed on purpose; an edit of its
+    # tombstone must not put them back.
     cur.execute(
-        f"SELECT {', '.join(cols)}, {verbatim_col} AS verbatim FROM episodes WHERE id = %s",
+        f"SELECT {', '.join(cols)}, {verbatim_col} AS verbatim FROM episodes "
+        f"WHERE {_episode_live_clause(cur)}id = %s",
         (episode_id,),
     )
     row = cur.fetchone()
@@ -2382,7 +2467,10 @@ def _cmd_episode_edit(args: argparse.Namespace) -> int:
     reembedded = False
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE episodes SET summary = %s WHERE id = %s", (summary, eid))
+            # A forgotten episode is not edited: its re-embed would bring a
+            # vector back for a row every reader skips.
+            cur.execute("UPDATE episodes SET summary = %s WHERE id = %s AND deleted_at IS NULL",
+                        (summary, eid))
             updated = cur.rowcount > 0
             if updated:
                 try:
@@ -2409,10 +2497,12 @@ def cmd_episode(args: argparse.Namespace) -> int:
             "error": "usage: khipu episode forget ID | khipu episode edit ID --summary TEXT",
         }))
         return 2
-    from khipu.forget import forget_everywhere
+    from khipu.forget import forget_everywhere, plain_summary
 
     out = forget_everywhere(int(args.id))
     print(json.dumps(out, default=str))
+    # The JSON is for scripts; the same result in plain words goes to stderr.
+    print(out.get("message") or plain_summary(out), file=sys.stderr)
     snapshot_ok = (out.get("snapshot") or {}).get("ok", True)
     legacy_reason = str((out.get("legacy_file") or {}).get("reason") or "")
     legacy_ok = not legacy_reason.startswith("unreadable:")
@@ -2434,7 +2524,9 @@ def cmd_topic(args: argparse.Namespace) -> int:
     slug = args.slug
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT deleted_at FROM topics WHERE slug = %s", (slug,))
+            # Locked first: an embedding catch-up holds this row shared while it
+            # writes vectors, so neither can leave vectors for a purged topic.
+            cur.execute("SELECT deleted_at FROM topics WHERE slug = %s FOR UPDATE", (slug,))
             row = cur.fetchone()
             if row is None:
                 print(json.dumps({"ok": False, "error": f"no such topic: {slug}"}))
@@ -2453,11 +2545,31 @@ def cmd_topic(args: argparse.Namespace) -> int:
             revisions_removed = cur.rowcount
             cur.execute("DELETE FROM topics WHERE slug = %s", (slug,))
         conn.commit()
+    # The hub delete is durable from here; this Mac's replica would keep
+    # serving the topic until the next full refresh unless it is purged too.
+    from khipu.hub_snapshot import purge_topic_in_snapshot
+
+    replica = purge_topic_in_snapshot(slug)
+    replica_ok = bool(replica.get("ok"))
     print(json.dumps({
-        "ok": True, "slug": slug, "revisions_removed": revisions_removed,
+        "ok": replica_ok, "slug": slug, "revisions_removed": revisions_removed,
         "embeddings_removed": embeddings_removed,
+        "hub": {"ok": True, "revisions_removed": revisions_removed,
+                "embeddings_removed": embeddings_removed},
+        "replica": replica,
     }))
-    return 0
+    if not replica_ok:
+        message = (
+            f"Purged topic {slug} from the hub, but this Mac's local replica still "
+            f"has it ({replica.get('reason')}) and can still return it. The "
+            "replica drops it at its next full refresh, which copies the hub."
+        )
+    elif not replica.get("applicable", True):
+        message = f"Purged topic {slug} from the hub. This Mac has no local replica."
+    else:
+        message = f"Purged topic {slug} from the hub and from this Mac's local replica."
+    print(message, file=sys.stderr)
+    return 0 if replica_ok else 1
 
 
 def cmd_backfill(args: argparse.Namespace) -> int:
@@ -2729,9 +2841,12 @@ def cmd_secrets_verify(args: argparse.Namespace) -> int:
         which = "all"
     try:
         result = check_model_keys(which=which)
-    except ValueError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}))
+    except ValueError:
+        print(json.dumps({"ok": False, "error": "Unknown check selection."}))
         return 2
+    except Exception:  # noqa: BLE001 - fixed text: an error here could echo a key
+        print(json.dumps({"ok": False, "error": "The key check could not be completed."}))
+        return 1
     print(json.dumps(result, indent=2))
     return 0 if result["ok"] else 1
 
@@ -2920,6 +3035,30 @@ def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
         offset = nxt
 
 
+def _owner_or_request(args: argparse.Namespace) -> "dict | int":
+    """{} for the owner's write (the app, or a typed yes on a terminal), a
+    conversation's request with ``--at-owner-request``, or the exit code
+    after a refusal was printed."""
+    from khipu import routing
+
+    if getattr(args, "at_owner_request", None) is not None:
+        words = routing._one_line(args.at_owner_request)
+        if not words:
+            print(json.dumps({"ok": False, "error": "describe the owner's request in one line",
+                              "code": "request_needs_words"}))
+            return 2
+        return {"request": words, "by": routing.conversation_author(), "at": routing._iso(routing._now())}
+    auth = routing._OWNER_AUTH.set(None)
+    try:
+        via = routing._owner_via(args)
+    finally:
+        routing._OWNER_AUTH.reset(auth)
+    if via is None:
+        print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
+        return 2
+    return {}
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     from khipu.config import (
         CHOICE_SETTINGS,
@@ -3001,11 +3140,34 @@ def cmd_config(args: argparse.Namespace) -> int:
         # `--set usage_accounts '[{"label": "Claude second", "harness":
         # "claude", "home": "~/.claude-second"}]'`; `--unset` (or `[]`) goes
         # back to every installed CLI with its default login.
-        from khipu import usage
-        from khipu.config import set_usage_accounts
+        from khipu import accounts, routing, usage
+        from khipu.config import config_file
 
+        # Decision 15: the owner's (the app, or a typed yes on a terminal),
+        # or a conversation's at his request, marked until he answers it.
+        request = via = None
+        # The owner's check stays set through the save, so the record's
+        # lines about it say how it was authorised.
+        auth = routing._OWNER_AUTH.set(None)
         try:
-            path = set_usage_accounts(args.set[1] if args.set else None)
+            if getattr(args, "at_owner_request", None) is not None:
+                words = routing._one_line(args.at_owner_request)
+                if not words:
+                    print(json.dumps({"ok": False, "error": "describe the owner's request in one line",
+                                      "code": "request_needs_words"}))
+                    return 2
+                request = {"request": words, "by": routing.conversation_author(),
+                           "at": routing._iso(routing._now())}
+            else:
+                via = routing._owner_via(args)
+                if via is None:
+                    print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
+                    return 2
+            # One write path for the list: the save becomes the account
+            # operations it implies (track, rename, stop, move), each with
+            # its lines in the routing record, on the version it read.
+            saved = accounts.save_list(args.set[1] if args.set else None, expect=getattr(args, "expect", None),
+                                       via=via or "cli", request=request)
         except usage.AccountsError as err:
             # A fixed code, the entry and the field at fault: the app says it
             # in its own words and never shows the text.
@@ -3014,7 +3176,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
-        print(json.dumps({"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(path)}))
+        finally:
+            routing._OWNER_AUTH.reset(auth)
+        print(json.dumps({"ok": True, "version": saved["version"], "usage_accounts": usage.accounts_status(),
+                          "config_file": str(config_file())}))
         return 0
     from khipu.config import CLI_SETTINGS
 
@@ -3032,17 +3197,85 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps({"ok": True, "cli_settings": cli_settings_status(), "config_file": str(path)}))
         return 0
+    if (args.set and args.set[0] == "graph_backup_remote") or args.unset == "graph_backup_remote":
+        # Where `graph-backup offsite` copies the graph snapshot (rclone
+        # remote:path); `--unset` goes back to the default.
+        from khipu.config import graph_backup_remote_status, set_graph_backup_remote
+
+        try:
+            path = set_graph_backup_remote(args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, "graph_backup_remote": graph_backup_remote_status(),
+                          "config_file": str(path)}))
+        return 0
+    from khipu import ledger as _ledger
+
+    if (args.set and args.set[0] in _ledger.SETTINGS) or args.unset in _ledger.SETTINGS:
+        # Every ledger limit and time (Work view, rule 7): `--set
+        # ledger_title_chars 0` lifts it, `--unset` for the default again.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _ledger.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _ledger.settings_status()[key], "config_file": str(path)}))
+        return 0
+    from khipu import work as _work
+
+    if (args.set and args.set[0] in _work.SETTINGS) or args.unset in _work.SETTINGS:
+        # Every work-view limit and time (rule 7): `--set work_max_jobs 0`
+        # lifts it, `--unset` for the default again.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _work.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _work.settings_status()[key], "config_file": str(path)}))
+        return 0
     from khipu import routing as _routing
 
+    if isinstance(getattr(args, "answer_request", None), (list, tuple)):
+        # The owner's answer to a conversation's change to a routing setting.
+        key, action = args.answer_request
+        auth = _routing._OWNER_AUTH.set(None)
+        try:
+            via = _routing._owner_via(args)
+        finally:
+            _routing._OWNER_AUTH.reset(auth)
+        if via is None:
+            print(json.dumps({"ok": False, "error": _routing._REFUSED, "code": "owner_only"}))
+            return 2
+        try:
+            path = _routing.answer_setting_request(key, action)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err), "code": getattr(err, "code", None)}))
+            return 2
+        print(json.dumps({"ok": True, "action": action, key: _routing.settings_status().get(key),
+                          "config_file": str(path)}))
+        return 0
     if (args.set and args.set[0] in _routing.SETTINGS) or args.unset in _routing.SETTINGS:
         # Every size, time and switch of the routing record (routing truth
         # scope, decision 13): `--set routing_stale_after 12h`, `--unset` for
         # the default again.
         key = args.set[0] if args.set else args.unset
+        # Decision 15, as for the account list: the owner's (the app, or a
+        # typed yes on a terminal), or a conversation's at his request,
+        # marked until he answers it. A lane map or a job runner folder
+        # decides whose limits a report counts against.
+        request = _owner_or_request(args)
+        if isinstance(request, int):
+            return request
         try:
-            path = _routing.set_setting(key, args.set[1] if args.set else None)
+            path = _routing.set_setting(key, args.set[1] if args.set else None, request=request or None)
         except ValueError as err:
-            print(json.dumps({"ok": False, "error": str(err)}))
+            out = {"ok": False, "error": str(err)}
+            if getattr(err, "code", None):
+                out["code"] = err.code
+            print(json.dumps(out))
             return 2
         print(json.dumps({"ok": True, key: _routing.settings_status()[key], "config_file": str(path)}))
         return 0
@@ -3126,7 +3359,13 @@ def cmd_config(args: argparse.Namespace) -> int:
         )
         return 0
     from khipu import relevance, usage
-    from khipu.config import cli_settings_status, float_settings_status, list_setting, path_settings_status
+    from khipu.config import (
+        cli_settings_status,
+        float_settings_status,
+        graph_backup_remote_status,
+        list_setting,
+        path_settings_status,
+    )
 
     out = {
         "capture_mode": capture_mode(),
@@ -3146,6 +3385,9 @@ def cmd_config(args: argparse.Namespace) -> int:
         "usage_accounts": usage.accounts_status(),
         "cli_settings": cli_settings_status(),
         "routing": _routing.settings_status(),
+        "ledger": _ledger.settings_status(),
+        "work": _work.settings_status(),
+        "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
         "config": load_config(),
     }
@@ -3218,7 +3460,7 @@ def cmd_budget(args: argparse.Namespace) -> int:
 def cmd_migrate(args: argparse.Namespace) -> int:
     from khipu.migrate import run
 
-    out = run(dry_run=bool(args.dry_run))
+    out = run(dry_run=bool(args.dry_run), claim_local_rows=True)
     print(json.dumps(out, indent=2))
     # A pending list after a real run means a migration failed to apply.
     return 0 if args.dry_run or not out["pending"] else 1
@@ -3325,30 +3567,78 @@ def cmd_db(args: argparse.Namespace) -> int:
     return 2
 
 
+def _add_passphrase_args(parser: argparse.ArgumentParser) -> None:
+    """A join kit passphrase never travels as a literal argument (other
+    processes can read argv): env, stdin, a file descriptor or the prompt."""
+    parser.add_argument("--passphrase", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--passphrase-stdin",
+        action="store_true",
+        help="Read the join kit passphrase from the first line of stdin "
+        "(or set KHIPU_JOIN_PASSPHRASE; a terminal asks)",
+    )
+    parser.add_argument(
+        "--passphrase-fd",
+        type=int,
+        default=None,
+        metavar="FD",
+        help="Read the join kit passphrase from the first line of this open file descriptor",
+    )
+
+
+@guard_output
 def cmd_join(args: argparse.Namespace) -> int:
     from khipu.join import (
         export_kit,
         import_kit,
-        resolve_passphrase,
         verify_live_counts,
         write_kit_file,
     )
 
+    from khipu.join import LITERAL_PASSPHRASE_REFUSAL, public_error, read_passphrase
+
+    if getattr(args, "passphrase", None) is not None:
+        print(json.dumps({"ok": False, "error": LITERAL_PASSPHRASE_REFUSAL}))
+        return 2
+    allow_unencrypted = bool(getattr(args, "allow_unencrypted", False))
     try:
-        passphrase = resolve_passphrase(getattr(args, "passphrase", None))
-    except ValueError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}))
+        passphrase = read_passphrase(
+            stdin=bool(getattr(args, "passphrase_stdin", False)),
+            fd=getattr(args, "passphrase_fd", None),
+        )
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"ok": False, "error": f"could not read the passphrase: {type(exc).__name__}"}))
+        return 2
+    remember(passphrase, "passphrase")
+    if (
+        args.join_cmd in ("export", "advertise")
+        and not passphrase
+        and not allow_unencrypted
+        and sys.stdin.isatty()
+    ):
+        import getpass
+
+        first = remember(getpass.getpass("Join kit passphrase: ").strip(), "passphrase")
+        if first and remember(getpass.getpass("Type it again: ").strip(), "passphrase") != first:
+            print(json.dumps({"ok": False, "error": "the two passphrases did not match"}))
+            return 2
+        passphrase = first
+
+    if args.join_cmd in ("export", "advertise") and not passphrase and not allow_unencrypted:
+        from khipu.join import UNENCRYPTED_REFUSAL
+
+        print(json.dumps({"ok": False, "error": UNENCRYPTED_REFUSAL}))
         return 2
 
     if args.join_cmd == "export":
         try:
-            blob = export_kit(passphrase)
+            blob = export_kit(passphrase, allow_unencrypted=allow_unencrypted)
             out_path = write_kit_file(Path(args.out), blob)
             from khipu.join import decrypt_payload
 
             payload = decrypt_payload(blob, passphrase)
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join export")}))
             return 1
         print(
             json.dumps(
@@ -3369,14 +3659,17 @@ def cmd_join(args: argparse.Namespace) -> int:
             blob = Path(args.file).expanduser().read_bytes()
             summary = import_kit(blob, passphrase)
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join import")}))
             return 1
         migrate_out: dict | None = None
         counts = verify_live_counts(summary.get("expected") or {})
         if not getattr(args, "skip_migrate_check", False) and not counts.get("error"):
             from khipu.migrate import run
 
-            migrate_out = run(dry_run=False)
+            try:
+                migrate_out = run(dry_run=False)
+            except Exception as exc:  # noqa: BLE001 — its text can quote the DSN
+                migrate_out = {"ok": False, "error": public_error(exc, "Applying migrations")}
         hub_ok = bool(counts.get("ok"))
         result = {
             "ok": True,
@@ -3403,9 +3696,10 @@ def cmd_join(args: argparse.Namespace) -> int:
                 passphrase,
                 timeout=int(getattr(args, "timeout", 600) or 600),
                 pin=getattr(args, "pin", None),
+                allow_unencrypted=allow_unencrypted,
             )
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join advertise")}))
             return 1
         print(json.dumps(out, indent=2))
         return 0 if out.get("ok") else 1
@@ -3419,7 +3713,7 @@ def cmd_join(args: argparse.Namespace) -> int:
             out_path = Path(out_arg).expanduser() if out_arg else None
             result = receive_join_kit(passphrase, pin, out_path=out_path)
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "error": public_error(exc, "Join receive")}))
             return 1
         print(json.dumps(result, indent=2))
         return 0 if result.get("kit_imported") or result.get("ok") else 2
@@ -4077,27 +4371,30 @@ def cmd_sources(args: argparse.Namespace) -> int:
         return 2
 
 
+@guard_output
 def cmd_graph_backup(args: argparse.Namespace) -> int:
     from khipu import graph_backup
+    from khipu.join_errors import redact_connection_text
 
     action = getattr(args, "graph_backup_cmd", None)
-    if action == "record-local":
-        out = graph_backup.record_local()
-    elif action == "offsite":
-        out = graph_backup.run_offsite()
-    elif action == "drill":
-        out = graph_backup.scratch_drill()
-    elif action == "status":
-        out = graph_backup.status_payload()
-        print(json.dumps(out, indent=2, default=str))
-        return 0
-    else:
+    actions = {
+        "record-local": graph_backup.record_local,
+        "offsite": graph_backup.run_offsite,
+        "drill": graph_backup.scratch_drill,
+        "status": graph_backup.status_payload,
+    }
+    if action not in actions:
         print(
             json.dumps({"ok": False, "error": f"unknown graph-backup action: {action}"})
         )
         return 2
-    print(json.dumps(out, indent=2, default=str))
-    return 0 if out.get("ok", False) else 2
+    try:
+        out = actions[action]()
+    except Exception:  # noqa: BLE001 — backup failures can quote credentials
+        print(json.dumps({"ok": False, "error": f"graph backup {action} failed"}))
+        return 2
+    print(redact_connection_text(json.dumps(out, indent=2, default=str)))
+    return 0 if action == "status" or out.get("ok", False) else 2
 
 
 def cmd_import_local(args: argparse.Namespace) -> int:
@@ -4189,8 +4486,18 @@ def cmd_components(args: argparse.Namespace) -> int:
     return 1
 
 
+class _Parser(argparse.ArgumentParser):
+    """Usage errors quote what was typed; a key-shaped value is masked first.
+    Subparsers inherit the class."""
+
+    def error(self, message: str):
+        from khipu.redact import redact_secrets
+
+        super().error(redact_secrets(message, force=True)[0])
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="khipu", description="Khipu memory hub CLI")
+    p = _Parser(prog="khipu", description="Khipu memory hub CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("status", help="PG counts + optional drift")
@@ -4537,6 +4844,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--memory-root", default=_memory_root_default())
     r.set_defaults(func=cmd_regen_memory)
 
+    from khipu import ledger as _ledger
+
+    _ledger.add_parser(sub)
+    from khipu import work as _work
+
+    _work.add_parser(sub)
+
     nt = sub.add_parser("nightly", help="Run consolidate_nightly.py (memory wiki)")
     nt.set_defaults(func=cmd_nightly)
 
@@ -4697,7 +5011,7 @@ def build_parser() -> argparse.ArgumentParser:
     ).set_defaults(func=cmd_graph_backup)
     gbu_sub.add_parser(
         "offsite",
-        help="rclone copyto latest snapshot to r2:matt-db-backups/khipu-graph",
+        help="rclone copyto latest snapshot to graph_backup_remote (default r2:khipu-backups/khipu-graph)",
     ).set_defaults(func=cmd_graph_backup)
     gbu_sub.add_parser(
         "status", help="Local + offsite health and last ops_events"
@@ -4865,6 +5179,8 @@ def build_parser() -> argparse.ArgumentParser:
     rprio.add_argument("--at-owner-request", default=None, metavar="REQUEST",
                        help="A conversation: the owner's request, in one line (set only; stays unconfirmed)")
     rprio.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    rprio.add_argument("--expect", default=None, metavar="V",
+                       help="The priority's version as read; refused if it changed since")
     rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire, restore or confirm a standing rule", parents=[rt_json])
     rrule.add_argument("action", choices=("add", "edit", "retire", "restore", "confirm", "undo", "dismiss"))
     rrule.add_argument("params", nargs="*")
@@ -5216,16 +5532,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     join = sub.add_parser(
         "join",
-        help="Export/import hub join kits (optional passphrase; never prints secrets)",
+        help="Export/import hub join kits (passphrase required to export; never prints secrets)",
     )
     join_sub = join.add_subparsers(dest="join_cmd", required=True)
     join_export = join_sub.add_parser(
         "export", help="Write a join kit from this Mac's Keychain/config"
     )
+    _add_passphrase_args(join_export)
     join_export.add_argument(
-        "--passphrase",
-        default=None,
-        help="Optional encryption passphrase (omit for plaintext; or KHIPU_JOIN_PASSPHRASE)",
+        "--allow-unencrypted",
+        action="store_true",
+        help="I understand: make an unencrypted kit anyone with the file can read",
     )
     join_export.add_argument(
         "--out",
@@ -5236,11 +5553,7 @@ def build_parser() -> argparse.ArgumentParser:
     join_import = join_sub.add_parser(
         "import", help="Apply a join kit's hub credentials on this Mac"
     )
-    join_import.add_argument(
-        "--passphrase",
-        default=None,
-        help="Passphrase if the kit was saved encrypted (or KHIPU_JOIN_PASSPHRASE)",
-    )
+    _add_passphrase_args(join_import)
     join_import.add_argument(
         "--file",
         required=True,
@@ -5256,10 +5569,11 @@ def build_parser() -> argparse.ArgumentParser:
         "advertise",
         help="Advertise join kit on LAN via Bonjour + TLS (macOS dns-sd)",
     )
+    _add_passphrase_args(join_advertise)
     join_advertise.add_argument(
-        "--passphrase",
-        default=None,
-        help="Optional encryption passphrase (omit for plaintext; or KHIPU_JOIN_PASSPHRASE)",
+        "--allow-unencrypted",
+        action="store_true",
+        help="I understand: make an unencrypted kit anyone with the file can read",
     )
     join_advertise.add_argument(
         "--timeout",
@@ -5277,11 +5591,7 @@ def build_parser() -> argparse.ArgumentParser:
         "receive",
         help="Find nearby Mac, send PIN, import join kit",
     )
-    join_receive.add_argument(
-        "--passphrase",
-        default=None,
-        help="Passphrase if the kit was saved encrypted (or KHIPU_JOIN_PASSPHRASE)",
-    )
+    _add_passphrase_args(join_receive)
     join_receive.add_argument(
         "--pin",
         required=True,
@@ -5309,11 +5619,13 @@ def build_parser() -> argparse.ArgumentParser:
         "summariser fallback (synth_fallback gemini|none: what a failed "
         "window does on a provider other than Gemini), the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew") '
+        "the graph backup destination (graph_backup_remote, an rclone "
+        "remote:path, default r2:khipu-backups/khipu-graph) "
         "or the plan usage accounts as JSON (usage_accounts "
         '\'[{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}]\')',
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting, a daily call ceiling, synth_fallback or usage_accounts, or "
+                     help="Remove a path setting, a daily call ceiling, synth_fallback, graph_backup_remote or usage_accounts, or "
                      "relevance.cosine_floor / "
                      "relevance.cosine_floor_by_profile.<profile> to restore its default")
     cfg.add_argument(
@@ -5326,7 +5638,58 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("legacy", "dual", "hub"),
         help="Persist capture_mode to the Hub config file",
     )
+    cfg.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    cfg.add_argument("--expect", default=None, metavar="V",
+                     help="With usage_accounts: the list's version as read; refused if it changed since")
+    cfg.add_argument("--at-owner-request", default=None, metavar="REQUEST",
+                     help="With usage_accounts or a routing setting, a conversation: the owner's request, in one "
+                          "line (the change stays unconfirmed until he answers it)")
+    cfg.add_argument("--answer-request", nargs=2, default=None, metavar=("KEY", "ANSWER"),
+                     help="The owner's answer (confirm or undo) to a conversation's change to a routing setting")
     cfg.set_defaults(func=cmd_config)
+
+    acc = sub.add_parser("accounts", help="The accounts plan usage reads: track, rename, stop tracking, move "
+                                          "(owner only; for the app)")
+    acc.set_defaults(func=cmd_accounts, accounts_cmd=None)
+    acc_owner = argparse.ArgumentParser(add_help=False)
+    acc_owner.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    acc_cas = argparse.ArgumentParser(add_help=False)
+    acc_cas.add_argument("--expect", default=None, metavar="V",
+                         help="The list's version as read (accounts status); refused if it changed since")
+    acc_sub = acc.add_subparsers(dest="accounts_cmd")
+    acc_sub.add_parser("status", help="The tracked accounts, the list's version and what is not offered again")
+    atrack = acc_sub.add_parser("track", parents=[acc_owner, acc_cas], help="Track one or more logins")
+    atrack.add_argument("--entries", required=True, metavar="JSON",
+                        help='[{"harness": "claude", "home": "~/.claude-work" or null, "label": "..." or null}]')
+    atrack.add_argument("--shown-defaults", default=None, metavar="JSON",
+                        help="The default accounts as the app showed them (written out when no list is saved)")
+    atrack.add_argument("--no-read", action="store_true", help="Do not read the new accounts once")
+    aren = acc_sub.add_parser("rename", parents=[acc_owner, acc_cas], help="Rename an account (its key stays)")
+    aren.add_argument("--account", required=True, metavar="KEY")
+    aren.add_argument("--name", required=True)
+    astop = acc_sub.add_parser("stop", parents=[acc_owner, acc_cas], help="Stop tracking an account")
+    astop.add_argument("--account", required=True, metavar="KEY")
+    astop.add_argument("--keep-priority", action="store_true", help="Leave it in your priority")
+    astop.add_argument("--keep-pause", action="store_true", help="Leave its pause until its end")
+    astop.add_argument("--keep-lanes", action="store_true", help="Leave the lanes that point at it")
+    astop.add_argument("--end-hold", action="append", default=None, metavar="ID", help="End this hold on it too")
+    astop.add_argument("--confirm-last", action="store_true",
+                       help="It is the last account: track none (Read no accounts)")
+    amove = acc_sub.add_parser("move", parents=[acc_owner, acc_cas],
+                               help="The account's login folder moved: carry everything to the new folder")
+    amove.add_argument("--account", required=True, metavar="KEY")
+    amove.add_argument("--folder", required=True, metavar="F")
+    for name, words in (("decline", "Not this one: do not offer this login again"),
+                        ("offer-again", "Offer a login turned down again")):
+        adec = acc_sub.add_parser(name, parents=[acc_owner], help=words)
+        adec.add_argument("--harness", required=True, choices=("claude", "codex", "grok", "muse"))
+        adec.add_argument("--folder", default=None, metavar="F", help="The login folder; none = the default login")
+    aauto = acc_sub.add_parser("auto-track", parents=[acc_owner],
+                               help="Track found logins a conversation used without asking (on this Mac)")
+    aauto.add_argument("state", choices=("on", "off"))
+    areq = acc_sub.add_parser("request", parents=[acc_owner, acc_cas],
+                              help="Answer a conversation's change to the account list")
+    areq.add_argument("action", choices=("confirm", "undo"))
 
     bud = sub.add_parser("budget", help="Daily call ceilings: status, and lifting one")
     bud_sub = bud.add_subparsers(dest="budget_cmd", required=True)
@@ -5724,10 +6087,21 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+@guard_output
+def _dispatch_guarded_command(args: argparse.Namespace) -> int:
+    try:
+        return int(args.func(args))
+    except Exception as exc:  # noqa: BLE001 — the final stderr printer is guarded too
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     _add_paths()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.func in (cmd_join, cmd_graph_backup):
+        return _dispatch_guarded_command(args)
     try:
         return int(args.func(args))
     except Exception as e:  # noqa: BLE001 — CLI surface

@@ -1125,7 +1125,7 @@ def _upsert_media_asset(
     nbytes: int,
 ) -> str:
     cur.execute(
-        "SELECT id, sha256 FROM media_assets WHERE source_id = %s AND path = %s",
+        "SELECT id, sha256 FROM media_assets WHERE source_id = %s AND path = %s FOR UPDATE",
         (source_id, path),
     )
     row = cur.fetchone()
@@ -1447,6 +1447,31 @@ def _existing_hashes_many(cur, profiles: list[str] | None) -> dict[str, dict[tup
     return out
 
 
+def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]]) -> set[tuple[str, str]]:
+    """Lock sources until the caller commits their vectors.
+
+    Provider calls happen before this check. Forget/purge either wins first
+    and excludes the source, or waits for the vectors and then removes them.
+    """
+    from khipu.db import has_columns
+
+    refs = set(refs)
+    live_refs = {(kind, ref) for kind, ref in refs if kind not in {"episode", "topic"}}
+    for kind, table, column in (("episode", "episodes", "id"), ("topic", "topics", "slug")):
+        wanted = sorted(ref for k, ref in refs if k == kind)
+        if not wanted:
+            continue
+        live = " AND deleted_at IS NULL" if kind == "topic" or has_columns(cur, table, "deleted_at") else ""
+        values = [int(ref) for ref in wanted] if kind == "episode" else wanted
+        cur.execute(
+            f"SELECT {column} FROM {table} WHERE {column} = ANY(%s){live} "
+            f"ORDER BY {column} FOR SHARE",
+            (values,),
+        )
+        live_refs.update((kind, str(row[0])) for row in cur.fetchall())
+    return live_refs
+
+
 def _upsert_chunks(
     cur, profile: str, rows: list[tuple[str, str, int, str, str, list[float]]]
 ) -> list[Any]:
@@ -1538,15 +1563,15 @@ def _plan_code_stamp() -> str:
     return _md5("\n".join(parts))
 
 
-def _plan_cache_file(cur) -> Path:
+def _plan_cache_file(cur, suffix: str = "") -> Path:
     from khipu import paths
 
     info = getattr(getattr(cur, "connection", None), "info", None)
     hub = f"{getattr(info, 'host', '')}:{getattr(info, 'port', '')}/{getattr(info, 'dbname', '')}"
-    return paths.pycache_dir().parent / f"memory-plan-{_md5(hub)[:12]}.json"
+    return paths.pycache_dir().parent / f"memory-plan-{_md5(hub)[:12]}{suffix}.json"
 
 
-def _row_fingerprints(cur) -> list[tuple[str, str, str]]:
+def _row_fingerprints(cur, *, topics_only: bool = False) -> list[tuple[str, str, str]]:
     """``(kind, ref, fingerprint)`` for every row the plan covers, in plan order
     (episodes by id, then topics by slug). The fingerprint is the row version's
     ``xmin``: every UPDATE writes a new version under a new transaction id, so
@@ -1554,6 +1579,11 @@ def _row_fingerprints(cur) -> list[tuple[str, str, str]]:
     the database no text (hashing the 28 MB of episode text server-side took
     longer than the rest of the screen). A row rewritten with the same text
     only costs one re-read."""
+    if topics_only:
+        cur.execute(
+            "SELECT 'topic', NULL, slug, xmin::text FROM topics WHERE deleted_at IS NULL ORDER BY slug"
+        )
+        return [(k, slug, fp) for k, _i, slug, fp in cur.fetchall()]
     from khipu.db import has_columns
 
     live = " WHERE deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
@@ -1585,11 +1615,15 @@ def _save_plan_cache(path: Path, stamp: str, rows: dict[str, Any]) -> None:
         pass  # a cache that cannot be written is only a slower next open
 
 
-def _cached_memory_chunk_plan(cur) -> dict[tuple[str, str, int], tuple[str, int]]:
+def _cached_memory_chunk_plan(
+    cur, *, topics_only: bool = False
+) -> dict[tuple[str, str, int], tuple[str, int]]:
     stamp = _plan_code_stamp()
-    path = _plan_cache_file(cur)
+    # The topics-only plan keeps its own file so saving it never drops the
+    # episode rows the full plan cached.
+    path = _plan_cache_file(cur, "-topics") if topics_only else _plan_cache_file(cur)
     cache = _load_plan_cache(path, stamp)
-    fps = _row_fingerprints(cur)
+    fps = _row_fingerprints(cur, topics_only=True) if topics_only else _row_fingerprints(cur)
     stale: dict[str, list[str]] = {"episode": [], "topic": []}
     for k, ref, fp in fps:
         entry = cache.get(f"{k}:{ref}")
@@ -1618,6 +1652,43 @@ def _cached_memory_chunk_plan(cur) -> dict[tuple[str, str, int], tuple[str, int]
     if fresh or len(rows) != len(cache):
         _save_plan_cache(path, stamp, rows)
     return plan
+
+
+def _changed_topic_refs(cur, profile: str) -> list[str]:
+    """Slugs whose current chunks differ from the vectors stored under
+    ``profile``: a chunk missing, a chunk whose hash changed, or a vector left
+    at an index the text no longer has. Re-chunks only the topics written
+    since this Mac last looked (the xmin fingerprint cache)."""
+    plan = _cached_memory_chunk_plan(cur, topics_only=True)
+    cur.execute(
+        "SELECT kind, ref, chunk_idx, content_hash FROM memory_embeddings "
+        "WHERE profile = %s AND kind = 'topic'",
+        (profile,),
+    )
+    have = {(k, r, i): h for k, r, i, h in cur.fetchall()}
+    missing, stale = _gaps(plan, have)
+    # A vector at an index the plan lacks: the text shrank, or emptied (an
+    # empty topic has no plan rows at all). Tombstoned topics are left to the
+    # backfill's orphan sweep, which the catch-up does not do.
+    leftover = sorted({ref for k, ref, i in have if (k, ref, i) not in plan})
+    if leftover:
+        cur.execute(
+            "SELECT slug FROM topics WHERE deleted_at IS NULL AND slug = ANY(%s)",
+            (leftover,),
+        )
+        leftover = [row[0] for row in cur.fetchall()]
+    return sorted({ref for _k, ref, _i in [*missing, *stale]} | set(leftover))
+
+
+def _rotated(refs: list[str]) -> list[str]:
+    """Start the list at a random place, so a topic the provider keeps
+    rejecting can never hold the same front slots run after run."""
+    import random
+
+    if len(refs) < 2:
+        return refs
+    k = random.randrange(len(refs))
+    return refs[k:] + refs[:k]
 
 
 def _gaps(plan, have: dict[tuple[str, str, int], str]):
@@ -1821,13 +1892,16 @@ def backfill(
                         if start + BATCH < len(todo):
                             time.sleep(BACKFILL_PAUSE_S)
                         continue
+                    live_refs = _lock_live_embedding_refs(cur, ((k, r) for k, r, *_ in batch))
+                    writable = [row for row in batch if row[:2] in live_refs]
                     _upsert_chunks(
                         cur, profile,
                         [(k, r, i, chunk, h, v)
-                         for (k, r, i, chunk, h, _title), v in zip(batch, vecs)],
+                         for (k, r, i, chunk, h, _title), v in zip(batch, vecs)
+                         if (k, r) in live_refs],
                     )
                     conn.commit()
-                    stats["embedded"] += len(batch)
+                    stats["embedded"] += len(writable)
                     stats["batches"] += 1
                     if job is not None:
                         job.update(stats["embedded"], len(todo), stats["failed_chunks"])
@@ -1923,8 +1997,12 @@ def activate_welcome_embed(*, provider: str, profile: str | None = None) -> dict
     return activate(target, force=True)
 
 
-def embed_on_capture(payload: dict[str, Any]) -> bool:
-    """Embed one just-captured episode by identity. Fail-open; returns True on success."""
+def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) -> bool:
+    """Embed one just-captured episode. Fail-open; returns True on success.
+
+    ``episode_id`` is the row the writer reported; without one (a caller that
+    has no id, such as the legacy file mirror) the row is found by the legacy
+    (ts, md5(summary)) identity, which an edit or merge can move."""
     if os.environ.get("KHIPU_EMBED_ON_CAPTURE", "1").strip().lower() in {"0", "false", "off"}:
         return False
     try:
@@ -1938,12 +2016,19 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
         with connect() as conn:
             with conn.cursor() as cur:
                 profile = _active_profile(cur)
-                cur.execute(
-                    "SELECT row_to_json(e) FROM episodes e "
-                    "WHERE e.ts = %s::timestamptz AND md5(e.summary) = %s "
-                    "AND e.deleted_at IS NULL",
-                    (ts, _md5(summary)),
-                )
+                if episode_id is not None:
+                    cur.execute(
+                        "SELECT row_to_json(e) FROM episodes e "
+                        "WHERE e.id = %s AND e.deleted_at IS NULL",
+                        (int(episode_id),),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT row_to_json(e) FROM episodes e "
+                        "WHERE e.ts = %s::timestamptz AND md5(e.summary) = %s "
+                        "AND e.deleted_at IS NULL",
+                        (ts, _md5(summary)),
+                    )
                 row = cur.fetchone()
                 source_row = row[0] if row else None
                 if isinstance(source_row, str):
@@ -1958,7 +2043,7 @@ def embed_on_capture(payload: dict[str, Any]) -> bool:
                 vecs = embed_batch(api, profile=profile)
                 cur.execute(
                     "SELECT row_to_json(e) FROM episodes e "
-                    "WHERE e.id = %s AND e.deleted_at IS NULL",
+                    "WHERE e.id = %s AND e.deleted_at IS NULL FOR SHARE",
                     (eid,),
                 )
                 live = cur.fetchone()
@@ -3142,14 +3227,21 @@ def topics_embed_lag_minutes(
             else:
                 _plan, missing, stale = memory_gaps(cur, profile, cached=gaps is not None)
             gap_refs = sorted({ref for kind, ref, _idx in [*missing, *stale] if kind == "topic"})
+            # The wait starts when the text changed, which the hub does not
+            # record. event_at is when the note's event happened, not a write.
+            # Its last updated_at/created_at or its newest vector bounds the
+            # change from below, so this never under-reports the wait.
             cur.execute(
-                "SELECT MIN(COALESCE(t.event_at, t.updated_at)) FROM topics t "
+                "SELECT MIN(GREATEST(t.updated_at, t.created_at, ("
+                "SELECT MAX(m.built_at) FROM memory_embeddings m "
+                "WHERE m.profile = %s AND m.kind = 'topic' AND m.ref = t.slug"
+                "))) FROM topics t "
                 "WHERE t.deleted_at IS NULL AND ("
                 "t.slug = ANY(%s) OR NOT EXISTS ("
                 "SELECT 1 FROM memory_embeddings m "
                 "WHERE m.profile = %s AND m.kind = 'topic' AND m.ref = t.slug"
                 "))",
-                (gap_refs, profile),
+                (profile, gap_refs, profile),
             )
             row = cur.fetchone()
     oldest = row[0] if row else None
@@ -3369,14 +3461,16 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 batch = todo[start : start + BATCH]
                 api = _api_texts(profile, [("", t) for _, _, _, t, _ in batch])
                 vecs = embed_batch(api, profile=profile)
+                live_refs = _lock_live_embedding_refs(cur, ((k, r) for k, r, *_ in batch))
+                writable = [(row, vec) for row, vec in zip(batch, vecs) if row[:2] in live_refs]
                 built = _upsert_chunks(cur, profile,
-                                       [(k, r, i, t, h, v) for (k, r, i, t, h), v in zip(batch, vecs)])
+                                       [(k, r, i, t, h, v) for (k, r, i, t, h), v in writable])
                 conn.commit()
-                out["chunks"] += len(batch)
+                out["chunks"] += len(writable)
                 episode_snapshot_rows.extend(
                     {"profile": profile, "kind": k, "ref": r, "chunk_idx": i,
                      "chunk_text": t, "content_hash": h, "embedding": v, "built_at": b}
-                    for (k, r, i, t, h), v, b in zip(batch, vecs, _stamps(built, len(batch)))
+                    for ((k, r, i, t, h), v), b in zip(writable, _stamps(built, len(writable)))
                 )
             for ref, indices in episode_replacements.items():
                 cur.execute(
@@ -3452,24 +3546,19 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             # findable by meaning in the same Stop.
             out["topics_embedded"] = 0
             out["topics_chunks"] = 0
+            # Every topic whose current chunks differ from what was embedded
+            # (missing, changed, or with leftover chunks), found by hash, not
+            # by a date window: a note edited in place keeps its frontmatter
+            # updated_at. Each embedded topic drops out of the next run's
+            # list, so a bulk edit drains a few per Stop and none is stranded.
             try:
+                changed = _changed_topic_refs(cur, profile)
                 cur.execute(
                     "SELECT t.slug, t.title, t.body, row_to_json(t) FROM topics t WHERE t.deleted_at IS NULL "
-                    " ORDER BY t.updated_at DESC NULLS LAST LIMIT %s",
-                    (max(COMMITMENT_CATCHUP_LIMIT * 10, 50),),
+                    "AND t.slug = ANY(%s) ORDER BY t.slug",
+                    (_rotated(changed)[: COMMITMENT_CATCHUP_LIMIT * 2],),
                 )
                 topic_rows = list(cur.fetchall())
-                cur.execute(
-                    "SELECT t.slug, t.title, t.body, row_to_json(t) FROM topics t WHERE t.deleted_at IS NULL "
-                    "AND NOT EXISTS (SELECT 1 FROM memory_embeddings m WHERE m.profile = %s "
-                    "AND m.kind = 'topic' AND m.ref = t.slug) "
-                    "ORDER BY t.updated_at DESC NULLS LAST LIMIT %s",
-                    (profile, COMMITMENT_CATCHUP_LIMIT),
-                )
-                seen_topic_slugs = {str(row[0]) for row in topic_rows}
-                topic_rows.extend(
-                    row for row in cur.fetchall() if str(row[0]) not in seen_topic_slugs
-                )
             except Exception as exc:  # noqa: BLE001 — never lets a topics-leg problem break the rest
                 _log(f"topic embed catch-up skipped: {type(exc).__name__}: {exc}")
                 topic_rows = []
@@ -3490,12 +3579,29 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 previous = {i: h for (k, r, i), h in topic_existing.items() if k == "topic" and r == str(slug)}
                 if current == previous:
                     continue
-                out["topics_embedded"] += 1
                 chunks = [c for _i, c in indexed_chunks]
                 api = _api_texts(profile, [(title or slug or "", c) for c in chunks])
-                vecs = embed_batch(api, profile=profile) if api else []
+                try:
+                    vecs = embed_batch(api, profile=profile) if api else []
+                except RuntimeError as exc:
+                    if "budget exhausted" in str(exc):
+                        raise
+                    # One topic the provider rejects must not hold back the
+                    # rest; it stays in the changed list for the next run.
+                    _log(f"topic embed catch-up: {slug}: {type(exc).__name__}: {exc}")
+                    continue
+                out["topics_embedded"] += 1
                 rows = [("topic", slug, i, c, _md5(c), v)
                         for (i, c), v in zip(indexed_chunks, vecs)]
+                # The topic may have been tombstoned or purged while the
+                # embedding call ran. Held shared until the commit below, so a
+                # purge (which locks the row first) waits or has already won.
+                cur.execute("SELECT 1 FROM topics WHERE slug = %s AND deleted_at IS NULL FOR SHARE",
+                            (slug,))
+                if cur.fetchone() is None:
+                    conn.commit()
+                    out["topics_embedded"] -= 1
+                    continue
                 built = _upsert_chunks(cur, profile, rows)
                 cur.execute(
                     "DELETE FROM memory_embeddings WHERE profile = %s AND kind = 'topic' "

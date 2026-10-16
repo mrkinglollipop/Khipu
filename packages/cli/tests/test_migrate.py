@@ -140,6 +140,173 @@ class RunTest(unittest.TestCase):
         self.assertIn("0000_a", cur.applied)
 
 
+    def test_a_file_split_into_steps_commits_each_step_and_records_last(self):
+        d = _dir([])
+        (d / "0000_a.sql").write_text(
+            "-- header\n-- khipu:step 1\nSELECT 'one', current_setting('khipu.local_origin');\n"
+            "-- khipu:step 2\nSELECT 'two';\n")
+        cur = FakeCursor(applied=set())
+        conn = FakeConn(cur)
+        commits_at = []
+        conn.commit = lambda: commits_at.append(len(cur.executed))
+        with mock.patch("khipu.db.connect", return_value=conn):
+            migrate.run(directory=d)
+        sqls = [s for s, _ in cur.executed]
+        one = next(i for i, s in enumerate(sqls) if "'one'" in s)
+        two = next(i for i, s in enumerate(sqls) if "'two'" in s)
+        record = next(i for i, s in enumerate(sqls) if s.startswith("INSERT INTO schema_migrations"))
+        self.assertNotIn("'two'", sqls[one], "each step is its own statement batch")
+        self.assertTrue(one < commits_at[0] <= two < record < commits_at[1])
+        self.assertEqual(len(commits_at), 2)
+        # The transaction-local identity is set again before every step.
+        self.assertEqual(sum(1 for s in sqls if "set_config" in s), 2)
+        self.assertEqual(sqls[one - 1].startswith("SELECT set_config"), True)
+        self.assertEqual(sqls[two - 1].startswith("SELECT set_config"), True)
+
+    def test_0029_runs_its_exclusive_lock_alone_with_a_lock_timeout(self):
+        path = dict(migrate.available())["0029_episode_origin"]
+        parts = migrate.steps(path.read_text(encoding="utf-8"))
+        self.assertEqual(len(parts), 3)
+        for part in parts:
+            self.assertIn("SET LOCAL lock_timeout", part)
+        self.assertIn("ALTER TABLE episodes ADD COLUMN", parts[0])
+        self.assertNotIn("CREATE INDEX", parts[0])
+        self.assertNotIn("UPDATE episodes", parts[0])
+        self.assertIn("CREATE INDEX", parts[1])
+        self.assertIn("UPDATE episodes", parts[2])
+        self.assertIn("schema_migrations", parts[2])
+        self.assertNotIn("schema_migrations", parts[0] + parts[1])
+
+
+
+class StepMarkerLexingTest(unittest.TestCase):
+    """A "-- khipu:step" line splits a migration only at top level. Inside a
+    string, a quoted identifier, a dollar-quoted body or a block comment it is
+    data, and the runner refuses the file rather than guess."""
+
+    NESTED = {
+        "multiline string": "INSERT INTO t VALUES ('a\n-- khipu:step 2\nb');\n",
+        "dollar-quoted body": "DO $body$\nBEGIN\n-- khipu:step 2\nPERFORM 1;\nEND\n$body$;\n",
+        "block comment": "/* outer /* nested */\n-- khipu:step 2\n*/\nSELECT 1;\n",
+        "quoted identifier": 'SELECT 1 AS "x\n-- khipu:step 2\ny";\n',
+        "untagged dollar quote": "SELECT $$\n-- khipu:step 2\n$$;\n",
+        "escape string": "SELECT E'it\\'s\n-- khipu:step 2\n';\n",
+        "inside a top-level comment": "SELECT 1; -- see -- khipu:step 2\n",
+    }
+
+    def test_a_marker_that_is_not_at_top_level_refuses_the_file(self):
+        for name, sql in self.NESTED.items():
+            with self.subTest(name):
+                with self.assertRaises(migrate.MigrationStepError):
+                    migrate.steps(sql)
+
+    def test_the_runner_refuses_before_running_any_part_of_the_file(self):
+        d = _dir([])
+        (d / "0000_a.sql").write_text("SELECT 1;\n-- khipu:step 2\n" + self.NESTED["dollar-quoted body"])
+        cur = FakeCursor(applied=set())
+        conn = FakeConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                self.assertRaises(migrate.MigrationStepError):
+            migrate.run(directory=d)
+        self.assertEqual(conn.commits, 0)
+        self.assertFalse(any("SELECT 1" in s for s, _ in cur.executed))
+
+    def test_top_level_markers_split_around_quoted_and_commented_text(self):
+        sql = ("-- header only\n"
+               "-- khipu:step 1\n"
+               "SELECT 'a -- not a comment; ''still'' text', \"col\"\"name\";\n"
+               "/* a /* nested */ comment */ SELECT $t$ $$ ' $t$;\n"
+               "-- khipu:step 2\n"
+               "SELECT $1, a$b FROM x;\n"
+               "-- khipu:step 3\n"
+               "/* only a comment */\n")
+        parts = migrate.steps(sql)
+        self.assertEqual(len(parts), 2, "the header and the comment-only step are not transactions")
+        self.assertIn("$t$ $$ ' $t$", parts[0])
+        self.assertIn("SELECT $1, a$b", parts[1])
+
+    def test_an_escape_string_keeps_escape_mode_across_a_continuation(self):
+        # E'a' then whitespace with a newline then 'more' is one E string
+        # (PostgreSQL concatenates it), so \' in the continuation is an escape.
+        top = "SELECT E'a'\n'it\\'s';\n-- khipu:step 2\nSELECT 2;\n"
+        self.assertEqual(len(migrate.steps(top)), 2, "the marker after the string is top level")
+        for name, sql in (
+                ("newline", "SELECT E'a'\n'b\\'\n-- khipu:step 2\n';\n"),
+                ("line comment", "SELECT E'a' -- note\n'b\\'\n-- khipu:step 2\n';\n"),
+                ("marker between the parts", "SELECT E'a'\n-- khipu:step 2\n'b';\n")):
+            with self.subTest(name), self.assertRaises(migrate.MigrationStepError):
+                migrate.steps(sql)
+
+    def test_a_dollar_tag_may_hold_any_non_ascii_character(self):
+        for tag in ("\U00010400", "a\U00010400", "\u00e9t\u00e9", "_\U0001F600x", "\u4e2d1"):
+            with self.subTest(tag=tag), self.assertRaises(migrate.MigrationStepError):
+                migrate.steps(f"SELECT ${tag}$\n-- khipu:step 2\n${tag}$;\n")
+
+    def test_random_sql_never_splits_inside_a_quoted_or_commented_region(self):
+        import random
+
+        marker = "\n-- khipu:step x\n"
+        pieces = ["a", " ", "\n", "--", "/", "*", ";", "$", "'", '"', "\\", marker]
+        tags = ["", "t", "tag_1", "_x9", "\u00e9", "\U00010400", "a\U00010400", "\u4e2d"]
+
+        def body(rng, bad):
+            return "".join(p for p in rng.choices(pieces, k=rng.randint(0, 8)) if p not in bad)
+
+        def region(rng):
+            """One quoted or commented region, and whether marker text is in it."""
+            kind = rng.choice(["str", "estr", "cont", "ident", "dollar", "block", "line"])
+            if kind == "str":
+                text = "'" + body(rng, {"'", "\\"}).replace("'", "''") + "'"
+            elif kind in ("estr", "cont"):
+                inner = body(rng, {"'", "\\"}) + rng.choice(["", "\\'", "\\\\", "''"])
+                text = "E'" + inner + "'"
+                if kind == "cont":
+                    text += rng.choice(["\n", " \n ", " -- c\n"]) + "'" + rng.choice(
+                        ["", "\\'", "x"]) + body(rng, {"'", "\\"}) + "'"
+            elif kind == "ident":
+                text = '"' + body(rng, {'"'}) + '"'
+            elif kind == "dollar":
+                tag = rng.choice(tags)
+                inner = body(rng, {"$"}) + rng.choice(["", "$$" if tag else "", "'"])
+                text = f"${tag}$" + inner + f"${tag}$"
+            elif kind == "block":
+                text = "/*" + body(rng, {"/", "*"}) + "/* " + body(rng, {"/", "*"}) + " */*/"
+            else:
+                text = "-- " + body(rng, {"\n", marker}) + "\n"
+                if rng.random() < 0.3:
+                    text = "-- note -- khipu:step y\n"
+            return text, "khipu:step" in text
+
+        rng = random.Random(20261015)
+        for case in range(3000):
+            sections, embedded = [], False
+            for _ in range(rng.randint(1, 4)):
+                tokens = ["SELECT 1"]
+                for _ in range(rng.randint(0, 4)):
+                    text, has = region(rng)
+                    embedded |= has
+                    tokens.append(text)
+                    tokens.append(rng.choice([" ", " x$y ", " $1 ", ", "]))
+                sections.append(" ".join(tokens) + ";")
+            sql = "".join(s + (f"\n-- khipu:step {k}\n" if k < len(sections) - 1 else "\n")
+                          for k, s in enumerate(sections))
+            with self.subTest(case=case, sql=sql):
+                if embedded:
+                    with self.assertRaises(migrate.MigrationStepError):
+                        migrate.steps(sql)
+                else:
+                    self.assertEqual([p.strip() for p in migrate.steps(sql)], sections)
+
+    def test_a_file_without_markers_is_one_step_unchanged(self):
+        sql = "SELECT 'x';\n"
+        self.assertEqual(migrate.steps(sql), [sql])
+
+    def test_every_repo_migration_splits_cleanly(self):
+        for version, path in migrate.available():
+            with self.subTest(version):
+                self.assertTrue(migrate.steps(path.read_text(encoding="utf-8")))
+
+
 class RepoMigrationsTest(unittest.TestCase):
     def test_the_repo_migrations_are_discoverable_and_self_recording(self):
         files = migrate.available()
@@ -339,3 +506,34 @@ class DecisionEvidenceMigrationTest(unittest.TestCase):
         ):
             with self.subTest(target=target):
                 self.assertIn(target, sql)
+
+
+class LockNoteTest(unittest.TestCase):
+    """0030 holds both write-blocking table locks for its whole backfill: a
+    step that held a table lock longer than a second gets a note in the
+    runner's output and in doctor's ``notes_migrate`` row."""
+
+    def _run(self, held_s):
+        d = tempfile.mkdtemp()
+        (Path(d) / "0030_x.sql").write_text(
+            "-- version: 0030_x\nLOCK TABLE episodes IN SHARE ROW EXCLUSIVE MODE;\n")
+        clock = mock.Mock()
+        clock.monotonic.side_effect = [100.0, 100.0 + held_s]
+        state = tempfile.mkdtemp()
+        with mock.patch.dict("os.environ", {"KHIPU_DATA_DIR": state}), \
+                mock.patch.object(migrate, "time", clock):
+            out = migrate.run(directory=Path(d), conn=FakeConn(FakeCursor(applied=set())))
+            return out, migrate.last_lock_notes()
+
+    def test_a_long_lock_is_noted_for_doctor(self):
+        out, doctor = self._run(1.5)
+        self.assertEqual(len(out["notes"]), 1)
+        self.assertIn("0030_x held write-blocking table locks for 1.50 s", out["notes"][0])
+        self.assertEqual(doctor["notes"], out["notes"])
+        self.assertEqual(doctor["steps"][0]["held_s"], 1.5)
+
+    def test_a_short_lock_is_recorded_without_a_note(self):
+        out, doctor = self._run(0.41)
+        self.assertEqual(out["notes"], [])
+        self.assertEqual(doctor["notes"], [])
+        self.assertEqual(doctor["steps"][0]["held_s"], 0.41)
