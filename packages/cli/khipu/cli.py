@@ -2930,6 +2930,30 @@ def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
         offset = nxt
 
 
+def _owner_or_request(args: argparse.Namespace) -> "dict | int":
+    """{} for the owner's write (the app, or a typed yes on a terminal), a
+    conversation's request with ``--at-owner-request``, or the exit code
+    after a refusal was printed."""
+    from khipu import routing
+
+    if getattr(args, "at_owner_request", None) is not None:
+        words = routing._one_line(args.at_owner_request)
+        if not words:
+            print(json.dumps({"ok": False, "error": "describe the owner's request in one line",
+                              "code": "request_needs_words"}))
+            return 2
+        return {"request": words, "by": routing.conversation_author(), "at": routing._iso(routing._now())}
+    auth = routing._OWNER_AUTH.set(None)
+    try:
+        via = routing._owner_via(args)
+    finally:
+        routing._OWNER_AUTH.reset(auth)
+    if via is None:
+        print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
+        return 2
+    return {}
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     from khipu.config import (
         CHOICE_SETTINGS,
@@ -3090,15 +3114,44 @@ def cmd_config(args: argparse.Namespace) -> int:
         return 0
     from khipu import routing as _routing
 
+    if isinstance(getattr(args, "answer_request", None), (list, tuple)):
+        # The owner's answer to a conversation's change to a routing setting.
+        key, action = args.answer_request
+        auth = _routing._OWNER_AUTH.set(None)
+        try:
+            via = _routing._owner_via(args)
+        finally:
+            _routing._OWNER_AUTH.reset(auth)
+        if via is None:
+            print(json.dumps({"ok": False, "error": _routing._REFUSED, "code": "owner_only"}))
+            return 2
+        try:
+            path = _routing.answer_setting_request(key, action)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err), "code": getattr(err, "code", None)}))
+            return 2
+        print(json.dumps({"ok": True, "action": action, key: _routing.settings_status().get(key),
+                          "config_file": str(path)}))
+        return 0
     if (args.set and args.set[0] in _routing.SETTINGS) or args.unset in _routing.SETTINGS:
         # Every size, time and switch of the routing record (routing truth
         # scope, decision 13): `--set routing_stale_after 12h`, `--unset` for
         # the default again.
         key = args.set[0] if args.set else args.unset
+        # Decision 15, as for the account list: the owner's (the app, or a
+        # typed yes on a terminal), or a conversation's at his request,
+        # marked until he answers it. A lane map or a job runner folder
+        # decides whose limits a report counts against.
+        request = _owner_or_request(args)
+        if isinstance(request, int):
+            return request
         try:
-            path = _routing.set_setting(key, args.set[1] if args.set else None)
+            path = _routing.set_setting(key, args.set[1] if args.set else None, request=request or None)
         except ValueError as err:
-            print(json.dumps({"ok": False, "error": str(err)}))
+            out = {"ok": False, "error": str(err)}
+            if getattr(err, "code", None):
+                out["code"] = err.code
+            print(json.dumps(out))
             return 2
         print(json.dumps({"ok": True, key: _routing.settings_status()[key], "config_file": str(path)}))
         return 0
@@ -5443,8 +5496,10 @@ def build_parser() -> argparse.ArgumentParser:
     cfg.add_argument("--expect", default=None, metavar="V",
                      help="With usage_accounts: the list's version as read; refused if it changed since")
     cfg.add_argument("--at-owner-request", default=None, metavar="REQUEST",
-                     help="With usage_accounts, a conversation: the owner's request, in one line "
-                          "(the change stays unconfirmed until he answers it)")
+                     help="With usage_accounts or a routing setting, a conversation: the owner's request, in one "
+                          "line (the change stays unconfirmed until he answers it)")
+    cfg.add_argument("--answer-request", nargs=2, default=None, metavar=("KEY", "ANSWER"),
+                     help="The owner's answer (confirm or undo) to a conversation's change to a routing setting")
     cfg.set_defaults(func=cmd_config)
 
     acc = sub.add_parser("accounts", help="The accounts plan usage reads: track, rename, stop tracking, move "

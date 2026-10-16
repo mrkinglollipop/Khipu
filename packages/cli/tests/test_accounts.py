@@ -580,3 +580,144 @@ def test_b1_automatic_tracking_leaves_a_conversations_request_waiting(mac, capsy
     rc, out = _cli(["accounts", "request", "undo", "--from-app"], capsys)
     assert rc == 0, out
     assert [e["harness"] for e in _stored()] == ["codex"]
+
+
+# ---- review round 2: one uniqueness check, forwarding that ends, lanes, holds ------------------
+
+
+def _two_claudes() -> None:
+    _set(usage_accounts=[{"label": "First", "harness": "claude"},
+                         {"label": "Second", "harness": "claude", "home": "~/.claude-client"}])
+
+
+def test_rename_cannot_take_a_later_accounts_name(mac, capsys):
+    _two_claudes()
+    rc, out = _cli(["accounts", "rename", "--from-app", f"--expect={_version()}", "--account=claude|",
+                    "--name=Second"], capsys)
+    assert rc == 2 and out["code"] == "name_taken" and out["index"] == 0 and out["other"] == 1
+    assert [e["label"] for e in _stored()] == ["First", "Second"]
+
+
+def test_move_cannot_take_a_later_accounts_login(mac, capsys):
+    _two_claudes()
+    rc, out = _cli(["accounts", "move", "--from-app", f"--expect={_version()}", "--account=claude|",
+                    "--folder=~/.claude-client"], capsys)
+    assert rc == 2 and out["code"] == "login_taken"
+    assert _stored()[0] == {"label": "First", "harness": "claude"}
+
+
+def test_saving_an_entry_already_tracked_cannot_duplicate_it(mac, capsys):
+    _two_claudes()
+    rc, out = _track(capsys, {"harness": "claude", "home": "~/.claude-client", "label": "Second"})
+    assert rc == 2 and out["code"] in ("name_taken", "login_taken")
+    assert len(_stored()) == 2
+
+
+def test_a_moved_accounts_old_folder_tracked_again_keeps_its_own_reports(mac, capsys):
+    _two_claudes()
+    (mac["home"] / ".claude-office").mkdir()
+    old, new = _key("~/.claude-client"), _key("~/.claude-office")
+    rc, out = _cli(["accounts", "move", "--from-app", f"--expect={_version()}", f"--account={old}",
+                    "--folder=~/.claude-office"], capsys)
+    assert rc == 0, out
+    routing.report(state="limited", account=old, until="2h", author=ME)
+    assert _entry(routing.read_view(), new)["state"] == "limited"
+    rc, out = _track(capsys, {"harness": "claude", "home": "~/.claude-client", "label": "New tenant"})
+    assert rc == 0, out
+    mac["clock"].now = T0 + timedelta(hours=3)
+    routing.report(state="limited", account="New tenant", until="2h", author=ME)
+    view = routing.read_view()
+    # The report before the old folder was tracked again still belongs to the
+    # moved account (expired by now); the new one is the new tenant's alone.
+    assert _entry(view, old)["state"] == "limited"
+    assert _entry(view, new)["state"] != "limited"
+    assert old not in view["forwards"]
+
+
+def test_renaming_one_of_two_same_names_leaves_the_lanes_old_reports_unmatched(mac, capsys):
+    _set(usage_accounts=[{"label": "Same", "harness": "claude"},
+                         {"label": "Same", "harness": "claude", "home": "~/.claude-client"}],
+         routing_lane_map={"jobs": {"r": "Same"}})
+    routing.report(state="limited", runner="jobs", lane="r", until="2h", author=ME)
+    assert all(a["state"] != "limited" for a in routing.read_view()["accounts"])
+    rc, out = _cli(["accounts", "rename", "--from-app", f"--expect={_version()}", "--account=claude|",
+                    "--name=Renamed"], capsys)
+    assert rc == 0, out
+    assert all(a["state"] != "limited" for a in routing.read_view()["accounts"])
+    # A report after the rename reaches the one account the lane names now.
+    routing.report(state="limited", runner="jobs", lane="r", until="2h", author=ME)
+    assert _entry(routing.read_view(), _key("~/.claude-client"))["state"] == "limited"
+
+
+def test_stop_cannot_end_another_accounts_hold(mac, capsys):
+    _two_claudes()
+    hold = routing.add_hold("Keep Second", reason="keep", scope="account", account="Second", owner=True,
+                            via="app")["id"]
+    rc, out = _stop(capsys, "claude|", f"--end-hold={hold}")
+    assert rc == 2 and out["code"] == "no_such_hold"
+    assert any(h["id"] == hold for h in routing.read_view()["holds"])
+    assert len(_stored()) == 2
+
+
+# ---- routing settings are the owner's ------------------------------------------------------
+
+
+LANES = json.dumps({"jobs": {"r": "Codex"}})
+
+
+@pytest.mark.parametrize("key, value", [("routing_lane_map", LANES),
+                                        ("routing_sources", '[{"name": "a", "kind": "lanes", "path": "/x/r"}]'),
+                                        ("routing_conversation_hold_max", "0"),
+                                        ("routing_stale_after", "1h"), ("routing_push_prompt", "off")])
+def test_a_conversations_shell_cannot_write_a_routing_setting(mac, capsys, key, value):
+    mac["callers"].as_shell("/usr/local/bin/claude")
+    for argv in (["config", "--set", key, value], ["config", "--from-app", "--set", key, value]):
+        rc, out = _cli(argv, capsys)
+        assert rc == 2 and out["code"] == "owner_only"
+        assert key not in config.load_config()
+    _set(**{key: json.loads(value) if value.startswith(("{", "[")) else value})
+    rc, out = _cli(["config", "--unset", key], capsys)
+    assert rc == 2 and out["code"] == "owner_only" and key in config.load_config()
+
+
+def test_a_conversations_lane_map_at_the_owners_request_waits_for_him(mac, capsys):
+    _set(routing_lane_map={"jobs": {"r": "claude|"}})
+    mac["callers"].as_shell("/usr/local/bin/claude")
+    rc, out = _cli(["config", "--at-owner-request", "Matt asked to send lane r to Codex",
+                    "--set", "routing_lane_map", LANES], capsys)
+    assert rc == 0, out
+    waiting = out["routing_lane_map"]["request"]
+    assert waiting["request"] == "Matt asked to send lane r to Codex" and waiting["prior"] == {"jobs": {"r": "claude|"}}
+    rc, out = _cli(["config", "--at-owner-request", "again", "--set", "routing_lane_map", "{}"], capsys)
+    assert rc == 2 and out["code"] == "request_waiting"
+    # Only the owner answers it.
+    rc, out = _cli(["config", "--answer-request", "routing_lane_map", "undo"], capsys)
+    assert rc == 2 and out["code"] == "owner_only"
+    mac["callers"].as_app()
+    rc, out = _cli(["config", "--from-app", "--answer-request", "routing_lane_map", "undo"], capsys)
+    assert rc == 0 and out["routing_lane_map"]["request"] is None
+    assert config.load_config()["routing_lane_map"] == {"jobs": {"r": "claude|"}}
+    assert routing.SETTINGS_REQUEST_KEY not in config.load_config()
+
+
+def test_the_owner_confirms_a_conversations_change_in_the_app(mac, capsys):
+    mac["callers"].as_shell("/usr/local/bin/claude")
+    rc, out = _cli(["config", "--at-owner-request", "Matt asked", "--set", "routing_stale_after", "1h"], capsys)
+    assert rc == 0 and out["routing_stale_after"]["request"]["prior"] is None
+    mac["callers"].as_app()
+    rc, out = _cli(["config", "--from-app", "--answer-request", "routing_stale_after", "confirm"], capsys)
+    assert rc == 0 and routing.settings()["routing_stale_after"] == 3600
+    rc, out = _cli(["config", "--from-app", "--answer-request", "routing_stale_after", "confirm"], capsys)
+    assert rc == 2 and out["code"] == "no_request"
+
+
+def test_the_apps_own_save_is_one_step_and_ends_a_waiting_request(mac, capsys):
+    mac["callers"].as_shell("/usr/local/bin/claude")
+    _cli(["config", "--at-owner-request", "Matt asked", "--set", "routing_lane_map", LANES], capsys)
+    mac["callers"].as_app()
+    rc, out = _cli(["config", "--from-app", "--set", "routing_lane_map", json.dumps({"jobs": {"r": "Claude"}})],
+                   capsys)
+    assert rc == 0 and out["routing_lane_map"]["request"] is None
+    assert config.load_config()["routing_lane_map"] == {"jobs": {"r": "claude|"}}
+    rc, out = _cli(["config", "--from-app", "--unset", "routing_lane_map"], capsys)
+    assert rc == 0 and "routing_lane_map" not in config.load_config()

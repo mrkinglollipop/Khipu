@@ -468,7 +468,8 @@ def rename(key, name, *, expect=None, via: str = "app") -> dict:
         config.save_config(data)
         version = config.accounts_version(data)
         lanes = len(_lanes_on(data.get("routing_lane_map") or {}, key, known_of(parsed)))
-        record = _notes([{"type": "account_note", "account": key, "state": "renamed", "text": old}], via)
+        record = _notes([dict({"type": "account_note", "account": key, "state": "renamed", "text": old},
+                              **_cuts(repairs))], via)
     out = {"ok": True, "version": version, "key": key, "label": name, "was": old, "mentions": _mentions(old),
            "lanes": lanes, "lane_repairs": repairs}
     if not record.get("ok"):
@@ -476,8 +477,16 @@ def rename(key, name, *, expect=None, via: str = "app") -> dict:
     return out
 
 
+def _cuts(repairs: list[dict]) -> dict:
+    """The lanes whose label two or more accounts carried before this change
+    (``lanes_cut`` on its note): what they reported while it named no one
+    account stays unmatched once one name is left."""
+    pairs = [[r["runner"], r["lane"]] for r in repairs if (r.get("matches") or 0) >= 2]
+    return {"lanes_cut": pairs} if pairs else {}
+
+
 def _stop_events(view: dict, key: str, label: str, *, keep_priority: bool, keep_pause: bool,
-                 end_holds: list[str]) -> tuple[list[dict], dict]:
+                 end_holds: list[str], cuts: dict | None = None) -> tuple[list[dict], dict]:
     """The routing record's lines for a Stop tracking, from the view read
     before it: the priority without it (or cleared), its pause lifted, the
     holds the owner ticked ended, and the note."""
@@ -505,7 +514,7 @@ def _stop_events(view: dict, key: str, label: str, *, keep_priority: bool, keep_
             events.append({"type": "lift", "account": key})
             done["pause"] = "ended"
     events += [{"type": "hold_end", "target": hold} for hold in end_holds]
-    events.append({"type": "account_note", "account": key, "state": "untracked", "text": label})
+    events.append(dict({"type": "account_note", "account": key, "state": "untracked", "text": label}, **(cuts or {})))
     return events, done
 
 
@@ -526,6 +535,9 @@ def stop(key, *, expect=None, keep_priority: bool = False, keep_pause: bool = Fa
         live = {h["id"] for h in view.get("holds") or []}
         if any(hold not in live for hold in end_holds):
             raise AccountsError("that hold is not in effect", "no_such_hold")
+        if any(hold not in holds_on for hold in end_holds):
+            # Stop ends only this account's own holds; another's is its own.
+            raise AccountsError("that hold is not on this account", "no_such_hold")
         stored, base = current_list(data)
         i = _find(base, key)
         account = usage._account_from_entry(base[i])
@@ -549,7 +561,7 @@ def stop(key, *, expect=None, keep_priority: bool = False, keep_pause: bool = Fa
             _store(data, [])
             data["usage_accounts_none"] = True
         events, done = _stop_events(view, key, account["label"], keep_priority=keep_priority,
-                                    keep_pause=keep_pause, end_holds=end_holds)
+                                    keep_pause=keep_pause, end_holds=end_holds, cuts=_cuts(repairs))
         config.save_config(data)
         version = config.accounts_version(data)
         _drop_row(key)

@@ -1017,17 +1017,15 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
     ids = _account_ids(raw) if any(isinstance(e, dict) and str(e.get("label") or "").strip().startswith("acct-")
                                    for e in raw) else set()
     out: list[dict] = []
-    labels: dict[str, int] = {}
-    logins: dict[str, int] = {}
+    # (account, kept) per entry: every entry is checked against every other
+    # for its name and its real folder after the per-entry rules, kept ones
+    # too, so a rename, a move or a repeated entry cannot reach a later one.
+    checked: list[tuple[dict, bool]] = []
     for i, entry in enumerate(raw):
         where = f"usage_accounts entry {i + 1}"
         if any(_same_entry(entry, old) for old in kept):
-            # Stored as it is: kept whatever rule it breaks today, and it
-            # still claims its name and its login for the entries after it.
-            account = _account_from_entry(entry)
-            labels.setdefault(account["label"].casefold(), i)
-            if not account.get("invalid"):
-                logins.setdefault(login_identity(account), i)
+            # Stored as it is: kept whatever per-entry rule it breaks today.
+            checked.append((_account_from_entry(entry), True))
             out.append(dict(entry))
             continue
         if not isinstance(entry, dict):
@@ -1056,23 +1054,54 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
             code, field, reason = problem
             raise AccountsError(f"{where}: {reason}", code, index=i, field=field)
         account = _account_from_entry(entry)
-        name = account["label"].casefold()
-        if name in labels:
-            raise AccountsError(f"two usage_accounts entries are named {account['label']!r}", "name_taken",
-                                index=i, field="label", other=labels[name])
-        named = _name_problem(account["label"], harness, home, (ids - {account_id_of(account)}) if ids else ids)
-        if named:
-            raise AccountsError(f"{where}: {named[1]}", named[0], index=i, field="label")
-        key = login_identity(account)
-        if key in logins:
-            raise AccountsError(f"{where} ({account['label']}) reads the same login as an earlier entry",
-                                "login_taken", index=i, field="home", other=logins[key])
-        labels[name] = i
-        logins[key] = i
+        checked.append((account, False))
         stored = {"label": account["label"], "harness": account["harness"]}
         if account["home"]:
             stored["home"] = account["home"]
         out.append(stored)
+    def marks(account: dict) -> tuple[str, str | None]:
+        return account["label"].casefold(), None if account.get("invalid") else login_identity(account)
+
+    # A clash the stored list already holds between entries kept as they are
+    # (a hand-edited list) is left for the owner to fix; no save adds one.
+    before: dict[tuple[str, str | None], int] = {}
+    for old in kept:
+        name, key = marks(_account_from_entry(old))
+        for mark in (("name", name), ("login", key)):
+            before[mark] = before.get(mark, 0) + 1
+    after: dict[tuple[str, str | None], int] = {}
+    for account, _was_kept in checked:
+        name, key = marks(account)
+        for mark in (("name", name), ("login", key)):
+            after[mark] = after.get(mark, 0) + 1
+    labels: dict[str, int] = {}
+    logins: dict[str, int] = {}
+    for i, (account, was_kept) in enumerate(checked):
+        name, key = marks(account)
+        for seen, mark, code, field in ((labels, name, "name_taken", "label"), (logins, key, "login_taken", "home")):
+            if mark is None or mark not in seen:
+                continue
+            kind = "name" if code == "name_taken" else "login"
+            if was_kept and checked[seen[mark]][1] and after[(kind, mark)] <= before.get((kind, mark), 0):
+                continue
+            j = seen[mark]
+            # Point at the entry the owner changed, not the one kept as stored.
+            at, other = (j, i) if was_kept and not checked[j][1] else (i, j)
+            if code == "name_taken":
+                raise AccountsError(f"two usage_accounts entries are named {account['label']!r}", code,
+                                    index=at, field=field, other=other)
+            raise AccountsError(f"usage_accounts entry {at + 1} ({checked[at][0]['label']}) reads the same login "
+                                f"as another entry", code, index=at, field=field, other=other)
+        labels.setdefault(name, i)
+        if key is not None:
+            logins.setdefault(key, i)
+    for i, (account, was_kept) in enumerate(checked):
+        if was_kept:
+            continue
+        named = _name_problem(account["label"], account["harness"], account["home"],
+                              (ids - {account_id_of(account)}) if ids else ids)
+        if named:
+            raise AccountsError(f"usage_accounts entry {i + 1}: {named[1]}", named[0], index=i, field="label")
     return out
 
 

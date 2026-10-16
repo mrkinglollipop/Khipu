@@ -425,13 +425,33 @@ def settings(config: dict | None = None) -> dict[str, Any]:
     return out
 
 
+# A conversation's change to a routing setting, at the owner's request,
+# waiting for him (decision 15, as for the account list and the priority):
+# {key: {request, by, at, prior, prior_set}}. The change is made and marked;
+# he confirms it or undoes it (the value it replaced comes back).
+SETTINGS_REQUEST_KEY = "routing_settings_request"
+
+
+class SettingError(ValueError):
+    def __init__(self, message: str, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _setting_requests(config: dict) -> dict[str, dict]:
+    raw = config.get(SETTINGS_REQUEST_KEY)
+    return {k: v for k, v in raw.items() if k in SETTINGS and isinstance(v, dict)} if isinstance(raw, dict) else {}
+
+
 def settings_status() -> dict[str, dict]:
-    """What ``khipu config`` shows: each setting's value, default, words and
-    whether it comes from the file."""
+    """What ``khipu config`` shows: each setting's value, default, words,
+    whether it comes from the file, and a conversation's change waiting for
+    the owner (``request``)."""
     from khipu.config import load_config
 
     config = load_config()
     values = settings(config)
+    requests = _setting_requests(config)
     out = {}
     for key, (kind, default, words) in SETTINGS.items():
         source = "default"
@@ -441,14 +461,22 @@ def settings_status() -> dict[str, dict]:
                 source = "file"
             except (ValueError, TypeError):
                 source = "invalid"
-        out[key] = {"value": values[key], "default": default, "kind": kind, "source": source, "words": words}
+        waiting = requests.get(key)
+        out[key] = {"value": values[key], "default": default, "kind": kind, "source": source, "words": words,
+                    "request": {"request": waiting.get("request"), "by": waiting.get("by"), "at": waiting.get("at"),
+                                "by_words": author_words(waiting.get("by") if isinstance(waiting.get("by"), dict)
+                                                         else None, push=True),
+                                "prior": waiting.get("prior")} if waiting else None}
     return out
 
 
-def set_setting(key: str, raw) -> Path:
+def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
     """Store a routing setting (``None`` removes it: the default again).
     Read, converted and saved under the locks the account writers take, in
-    their order (routing, then config), so neither write loses the other."""
+    their order (routing, then config), so neither write loses the other.
+    Only the owner's write (the app, or a typed yes) or a conversation's at
+    his request (``request``: kept with the value it replaced until he
+    answers it) reaches here; the owner's own write ends such a request."""
     from khipu.config import _load_config_for_mutation, config_write_lock, save_config
 
     if key not in SETTINGS:
@@ -456,6 +484,11 @@ def set_setting(key: str, raw) -> Path:
     kind = SETTINGS[key][0]
     with _lock(), config_write_lock():
         data = _load_config_for_mutation()
+        requests = _setting_requests(data)
+        if request is not None and key in requests:
+            raise SettingError(f"a conversation's change to {key} is still waiting for the owner; he confirms or "
+                               "undoes it in Settings first", "request_waiting")
+        prior, prior_set = data.get(key), key in data
         if raw is None:
             data.pop(key, None)
         else:
@@ -467,6 +500,39 @@ def set_setting(key: str, raw) -> Path:
                 # Stored by account key from 9B on (settings clarity decision 7),
                 # converted against the accounts known now.
                 data[key] = convert_lane_map(data[key], accounts())[0]
+        if request is not None:
+            requests[key] = dict(request, prior=prior, prior_set=prior_set)
+        else:
+            requests.pop(key, None)
+        if requests:
+            data[SETTINGS_REQUEST_KEY] = requests
+        else:
+            data.pop(SETTINGS_REQUEST_KEY, None)
+        return save_config(data)
+
+
+def answer_setting_request(key: str, action: str) -> Path:
+    """The owner's answer to a conversation's change to ``key``: confirm
+    keeps it; undo puts back the value it replaced."""
+    from khipu.config import _load_config_for_mutation, config_write_lock, save_config
+
+    if action not in ("confirm", "undo"):
+        raise SettingError("answer confirm or undo", "bad_answer")
+    with _lock(), config_write_lock():
+        data = _load_config_for_mutation()
+        requests = _setting_requests(data)
+        waiting = requests.pop(key, None)
+        if waiting is None:
+            raise SettingError(f"no conversation's change to {key} is waiting", "no_request")
+        if action == "undo":
+            if waiting.get("prior_set"):
+                data[key] = waiting.get("prior")
+            else:
+                data.pop(key, None)
+        if requests:
+            data[SETTINGS_REQUEST_KEY] = requests
+        else:
+            data.pop(SETTINGS_REQUEST_KEY, None)
         return save_config(data)
 
 
@@ -1365,6 +1431,13 @@ def _checked(data: dict) -> dict | None:
         if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
             return None
         out["used_pct"] = used
+    cuts = data.get("lanes_cut")
+    if cuts is not None:
+        # An account note's lanes, each [runner, lane]: text pairs only.
+        if out["type"] != "account_note" or not isinstance(cuts, list) or not all(
+                isinstance(p, list) and len(p) == 2 and all(isinstance(x, str) for x in p) for p in cuts):
+            return None
+        out["lanes_cut"] = [[_no_surrogates(x) for x in p] for p in cuts]
     if "entries" in data:
         entries = _checked_entries(out["type"], data["entries"])
         if entries is None:
@@ -1652,21 +1725,75 @@ def _lane_repair_line(item: dict) -> str:
 ACCOUNT_NOTE_STATES = ("tracked", "renamed", "untracked")
 
 
-def forwarding(events: list[dict]) -> dict[str, str]:
-    """Old key -> new key for every login folder the owner moved
-    (``account_move``), in write order. A later move back ends the earlier
-    forward, so the map has no cycle."""
-    forward: dict[str, str] = {}
+def _owner_move(event: dict) -> tuple[str, str] | None:
+    if event.get("type") != "account_move":
+        return None
+    old, new = event.get("account"), event.get("target")
+    by = event.get("written_by") or OWNER
+    if not old or not new or old == new or by.get("kind") != "owner":
+        return None
+    return old, new
+
+
+def _owner_tracked(event: dict) -> str | None:
+    by = event.get("written_by") or OWNER
+    if event.get("type") == "account_note" and event.get("state") == "tracked" and by.get("kind") == "owner":
+        return event.get("account") or None
+    return None
+
+
+def _forward_walk(events: list[dict], known_keys: set[str] | None = None) -> tuple[dict[str, str], list[dict]]:
+    """(``forwarding``'s map, ``events`` with each key forwarded as of when
+    it was written). A key's records forward to where its login folder moved
+    only until the key belongs to another account again: the owner tracks
+    that folder (an ``account_note`` "tracked"), or moves an account into it.
+    Each of those starts a new era for the key; a record forwards by the
+    move made in its own era. ``known_keys`` (the accounts tracked now) ends
+    the current era's forward of a key tracked again with no note."""
+    era: dict[str, int] = {}
+    moves: dict[tuple[str, int], tuple[str, int]] = {}
+    tagged: list[tuple[dict, dict[str, int]]] = []
     for event in events:
-        if event.get("type") != "account_move":
+        move = _owner_move(event)
+        if move:
+            old, new = move
+            era[new] = era.get(new, 0) + 1
+            moves[(old, era.get(old, 0))] = (new, era[new])
+            tagged.append((event, {}))
             continue
-        old, new = event.get("account"), event.get("target")
-        by = event.get("written_by") or OWNER
-        if not old or not new or old == new or by.get("kind") != "owner":
-            continue
-        forward.pop(new, None)
-        forward[old] = new
-    return forward
+        tracked = _owner_tracked(event)
+        if tracked and (tracked, era.get(tracked, 0)) in moves:
+            era[tracked] = era.get(tracked, 0) + 1
+        keys = {k for k in _event_keys(event)}
+        tagged.append((event, {k: era.get(k, 0) for k in keys}))
+    ended = {(k, era.get(k, 0)) for k in (known_keys or ())}
+
+    def resolve(key: str, at: int) -> str:
+        seen = set()
+        while (key, at) in moves and (key, at) not in ended and (key, at) not in seen:
+            seen.add((key, at))
+            key, at = moves[(key, at)]
+        return key
+
+    forward = {old: resolve(old, at) for (old, at) in moves if at == era.get(old, 0) and (old, at) not in ended}
+    out = []
+    for event, eras in tagged:
+        mapping = {k: resolve(k, at) for k, at in eras.items()}
+        out.append(_rekey_event(event, {k: v for k, v in mapping.items() if v != k}))
+    return forward, out
+
+
+def forwarding(events: list[dict], known_keys: set[str] | None = None) -> dict[str, str]:
+    """Old key -> new key for every login folder the owner moved
+    (``account_move``) whose key no account holds again since: a later move
+    back, or the owner tracking the old folder as another account, ends it."""
+    return _forward_walk(events, known_keys)[0]
+
+
+def forward_events(events: list[dict], known_keys: set[str] | None = None) -> tuple[dict[str, str], list[dict]]:
+    """``forwarding`` and ``events`` (in write order) with every account key
+    each holds forwarded as of when it was written."""
+    return _forward_walk(events, known_keys)
 
 
 def _forwarded(key: str | None, forward: dict | None) -> str | None:
@@ -1677,20 +1804,33 @@ def _forwarded(key: str | None, forward: dict | None) -> str | None:
     return key
 
 
-def _forward_event(event: dict, forward: dict) -> dict:
+def _event_keys(event: dict) -> list[str]:
+    out = []
+    if isinstance(event.get("account"), str):
+        out.append(event["account"])
+    scope = event.get("scope")
+    if isinstance(scope, dict) and isinstance(scope.get("account"), str):
+        out.append(scope["account"])
+    for e in event.get("entries") if isinstance(event.get("entries"), list) else ():
+        if isinstance(e, dict) and isinstance(e.get("account"), str):
+            out.append(e["account"])
+    return out
+
+
+def _rekey_event(event: dict, forward: dict) -> dict:
     """``event`` with every account key it holds forwarded (its account, a
     hold's scope, a priority's entries); an ``account_move`` as written."""
     if not forward or event.get("type") == "account_move":
         return event
     out = event
     if event.get("account") in forward:
-        out = dict(out, account=_forwarded(event["account"], forward))
+        out = dict(out, account=forward[event["account"]])
     scope = event.get("scope")
     if isinstance(scope, dict) and scope.get("account") in forward:
-        out = dict(out, scope=dict(scope, account=_forwarded(scope["account"], forward)))
+        out = dict(out, scope=dict(scope, account=forward[scope["account"]]))
     entries = event.get("entries")
     if isinstance(entries, list) and any(isinstance(e, dict) and e.get("account") in forward for e in entries):
-        out = dict(out, entries=[dict(e, account=_forwarded(e["account"], forward))
+        out = dict(out, entries=[dict(e, account=forward[e["account"]])
                                  if isinstance(e, dict) and e.get("account") in forward else e for e in entries])
     return out
 
@@ -2143,8 +2283,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     events = _in_write_order(events)
     # A moved login folder's records, those written under its old key after
     # the move included, belong to the account it moved to.
-    forward = forwarding(events)
-    events = [_forward_event(e, forward) for e in events]
+    forward, events = forward_events(events, {a["key"] for a in known})
     evidence: list[dict] = []
     owner: dict[str, Any] = {"pauses": {}, "lifts": {}, "clears": {}, "dismissed": set()}
     dismissals: list[dict] = []
@@ -2156,6 +2295,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # priority write hands back to be refused once it moved.
     priority_version = "p0"
     notes: dict[str, dict] = {}
+    lane_cuts: dict[tuple[str, str], int] = {}
     seed: dict | None = None
     reset_checks: dict[tuple[str, str, str | None, str | None], dict] = {}
     # The newest written change to each entity (an owner's pause, lift,
@@ -2317,6 +2457,11 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 and info["written_by"].get("kind") == "owner":
             notes[info["account"]] = {"state": event["state"], "text": event.get("text"), "at": info["at"],
                                       "seq": info["seq"]}
+            # Lanes whose label two accounts carried until this change: what
+            # they reported before it stays unmatched, never the one left.
+            for pair in event.get("lanes_cut") if isinstance(event.get("lanes_cut"), list) else ():
+                if isinstance(pair, list) and len(pair) == 2 and all(isinstance(x, str) for x in pair):
+                    lane_cuts[(pair[0], pair[1])] = info["seq"]
         elif kind == "seed_import":
             seed = {"at": _iso(info["at"]), "file": event.get("file"), "count": event.get("count")}
     evidence.extend(dict(item, seq=item.get("seq", -1)) for item in extra)
@@ -2325,7 +2470,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     per_account: dict[str, list[dict]] = {}
     unmatched_raw: list[dict] = []
     for item in evidence:
-        key = _evidence_account(item, lane_map, known, forward)
+        cut = lane_cuts.get((item.get("runner") or "", item.get("lane") or ""))
+        before_cut = (cut is not None and not item.get("account") and 0 <= item.get("seq", -1) < cut)
+        key = None if before_cut else _evidence_account(item, lane_map, known, forward)
         if not key:
             # A conversation's runner and lane count only as a pair the lane
             # map names (the owner's words); never its own text as a lane.
@@ -3738,7 +3885,7 @@ def clear(account: str, *, report_id: str | None = None, via: str, now: datetime
         events, _bad = read_events()
         _fp, cfg, known = _inputs()
         lane_map = cfg.get("routing_lane_map") or {}
-        forward = forwarding(events)
+        forward, events = forward_events(_in_write_order(events), {a["key"] for a in known})
         ids = {str(e.get("id")) for e in events
                if e.get("type") == "evidence" and _evidence_account(e, lane_map, known, forward) == key}
         if report_id not in ids:

@@ -985,8 +985,15 @@ fn config_set_argv_expect(key: &str, value: &str, expect: Option<&str>) -> Resul
     if expect.is_some() {
         return Err(format!("{key} takes no version to check"));
     }
+    // A routing setting is the owner's (decision 15): the app's own save
+    // says so, or the CLI refuses it as a conversation's.
     let set = |k: &str, v: String| {
-        vec!["config".to_string(), "--set".to_string(), k.to_string(), v]
+        let mut argv = vec!["config".to_string()];
+        if routing_key(k) {
+            argv.push("--from-app".to_string());
+        }
+        argv.extend(["--set".to_string(), k.to_string(), v]);
+        argv
     };
     match key {
         "capture_mode" => {
@@ -1058,7 +1065,22 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
     {
         return Err(format!("not a resettable key: {key:?}"));
     }
+    if routing_key(key) {
+        return Ok(vec!["config".to_string(), "--from-app".to_string(), format!("--unset={key}")]);
+    }
     Ok(vec!["config".to_string(), format!("--unset={key}")])
+}
+
+/// The owner's answer to a conversation's change to a routing setting.
+fn config_request_argv(key: &str, action: &str) -> Result<Vec<String>, String> {
+    if !routing_key(key) {
+        return Err(format!("not a routing setting: {key:?}"));
+    }
+    if !matches!(action, "confirm" | "undo") {
+        return Err(format!("not an answer to a request: {action:?}"));
+    }
+    Ok(vec!["config".to_string(), "--from-app".to_string(), "--answer-request".to_string(), key.to_string(),
+            action.to_string()])
 }
 
 /// Embedding profile ids look like `gemini-embedding-2@768`; the CLI also
@@ -1128,6 +1150,11 @@ async fn khipu_config_set(key: String, value: String, expect: Option<String>) ->
 #[tauri::command]
 async fn khipu_config_unset(key: String, expect: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(config_unset_argv_expect(&key, expect.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_config_request(key: String, action: String) -> Result<String, String> {
+    run_khipu_cli_async(config_request_argv(&key, &action)?).await
 }
 
 #[tauri::command]
@@ -3432,6 +3459,7 @@ pub fn run() {
             khipu_feature_set,
             khipu_config_show,
             khipu_config_set,
+            khipu_config_request,
             khipu_config_unset,
             khipu_budget_status,
             khipu_budget_lift_synth_today,
@@ -4085,46 +4113,46 @@ mod settings_command_tests {
 
     #[test]
     fn routing_settings_are_reprinted_or_refused() {
-        assert_eq!(config_set_argv("routing_stale_after", "43200").unwrap(), v(&["config", "--set", "routing_stale_after", "43200"]));
-        assert_eq!(config_set_argv("routing_summary_chars", " 0 ").unwrap(), v(&["config", "--set", "routing_summary_chars", "0"]));
-        assert_eq!(config_set_argv("routing_push_prompt", "off").unwrap(), v(&["config", "--set", "routing_push_prompt", "off"]));
+        assert_eq!(config_set_argv("routing_stale_after", "43200").unwrap(), v(&["config", "--from-app", "--set", "routing_stale_after", "43200"]));
+        assert_eq!(config_set_argv("routing_summary_chars", " 0 ").unwrap(), v(&["config", "--from-app", "--set", "routing_summary_chars", "0"]));
+        assert_eq!(config_set_argv("routing_push_prompt", "off").unwrap(), v(&["config", "--from-app", "--set", "routing_push_prompt", "off"]));
         // Every limit Khipu enforces on the owner's words or a line can be
         // raised from Settings -> Routing (fix round 1, F3).
-        assert_eq!(config_set_argv("routing_hold_chars", "0").unwrap(), v(&["config", "--set", "routing_hold_chars", "0"]));
-        assert_eq!(config_set_argv("routing_line_chars", "400").unwrap(), v(&["config", "--set", "routing_line_chars", "400"]));
+        assert_eq!(config_set_argv("routing_hold_chars", "0").unwrap(), v(&["config", "--from-app", "--set", "routing_hold_chars", "0"]));
+        assert_eq!(config_set_argv("routing_line_chars", "400").unwrap(), v(&["config", "--from-app", "--set", "routing_line_chars", "400"]));
         for (k, bad) in [("routing_stale_after", "-1"), ("routing_stale_after", "12h"), ("routing_prompt_chars", "--x"),
                          ("routing_push_start", "yes"), ("routing_summary_chars", "1e3"),
                          ("routing_stale_after", "999999999999")] {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
-        assert_eq!(config_set_argv("routing_reset_check", "on").unwrap(), v(&["config", "--set", "routing_reset_check", "on"]));
-        assert_eq!(config_set_argv("routing_reset_check_wait", "120").unwrap(), v(&["config", "--set", "routing_reset_check_wait", "120"]));
-        assert_eq!(config_set_argv("routing_reset_check_retries", "[600,1800]").unwrap(), v(&["config", "--set", "routing_reset_check_retries", "[600,1800]"]));
+        assert_eq!(config_set_argv("routing_reset_check", "on").unwrap(), v(&["config", "--from-app", "--set", "routing_reset_check", "on"]));
+        assert_eq!(config_set_argv("routing_reset_check_wait", "120").unwrap(), v(&["config", "--from-app", "--set", "routing_reset_check_wait", "120"]));
+        assert_eq!(config_set_argv("routing_reset_check_retries", "[600,1800]").unwrap(), v(&["config", "--from-app", "--set", "routing_reset_check_retries", "[600,1800]"]));
         // The retries can be removed, or kept to one (fix round 1, F7).
-        assert_eq!(config_set_argv("routing_reset_check_retries", "[]").unwrap(), v(&["config", "--set", "routing_reset_check_retries", "[]"]));
-        assert_eq!(config_set_argv("routing_reset_check_retries", "[600]").unwrap(), v(&["config", "--set", "routing_reset_check_retries", "[600]"]));
-        assert_eq!(config_set_argv("routing_busy_load", "0").unwrap(), v(&["config", "--set", "routing_busy_load", "0"]));
-        assert_eq!(config_set_argv("routing_busy_load", "75").unwrap(), v(&["config", "--set", "routing_busy_load", "75"]));
-        assert_eq!(config_set_argv("routing_busy_wait", "300").unwrap(), v(&["config", "--set", "routing_busy_wait", "300"]));
-        assert_eq!(config_set_argv("routing_busy_tries", "3").unwrap(), v(&["config", "--set", "routing_busy_tries", "3"]));
+        assert_eq!(config_set_argv("routing_reset_check_retries", "[]").unwrap(), v(&["config", "--from-app", "--set", "routing_reset_check_retries", "[]"]));
+        assert_eq!(config_set_argv("routing_reset_check_retries", "[600]").unwrap(), v(&["config", "--from-app", "--set", "routing_reset_check_retries", "[600]"]));
+        assert_eq!(config_set_argv("routing_busy_load", "0").unwrap(), v(&["config", "--from-app", "--set", "routing_busy_load", "0"]));
+        assert_eq!(config_set_argv("routing_busy_load", "75").unwrap(), v(&["config", "--from-app", "--set", "routing_busy_load", "75"]));
+        assert_eq!(config_set_argv("routing_busy_wait", "300").unwrap(), v(&["config", "--from-app", "--set", "routing_busy_wait", "300"]));
+        assert_eq!(config_set_argv("routing_busy_tries", "3").unwrap(), v(&["config", "--from-app", "--set", "routing_busy_tries", "3"]));
         for (k, bad) in [("routing_reset_check", "yes"), ("routing_reset_check_wait", "-1"),
                          ("routing_reset_check_retries", "[600,600]"), ("routing_reset_check_retries", "[600,\n1800]"),
                          ("routing_reset_check_retries", "[0]"), ("routing_reset_check_retries", "[1,2,3]"),
                          ("routing_busy_load", "-1"), ("routing_busy_wait", "one"), ("routing_busy_tries", "-3")] {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
-        assert_eq!(config_unset_argv("routing_reset_check").unwrap(), v(&["config", "--unset=routing_reset_check"]));
+        assert_eq!(config_unset_argv("routing_reset_check").unwrap(), v(&["config", "--from-app", "--unset=routing_reset_check"]));
         // Phase 6: the push before handing work to another agent, and the
         // owner's dispatch scripts, by file name only.
-        assert_eq!(config_set_argv("routing_push_delegation", "off").unwrap(), v(&["config", "--set", "routing_push_delegation", "off"]));
-        assert_eq!(config_unset_argv("routing_push_delegation").unwrap(), v(&["config", "--unset=routing_push_delegation"]));
+        assert_eq!(config_set_argv("routing_push_delegation", "off").unwrap(), v(&["config", "--from-app", "--set", "routing_push_delegation", "off"]));
+        assert_eq!(config_unset_argv("routing_push_delegation").unwrap(), v(&["config", "--from-app", "--unset=routing_push_delegation"]));
         assert!(config_set_argv("routing_push_delegation", "yes").is_err());
         assert_eq!(
             config_set_argv("routing_dispatch_scripts", r#"[" dispatch.py ", "run-job.sh", "dispatch.py"]"#).unwrap(),
-            v(&["config", "--set", "routing_dispatch_scripts", r#"["dispatch.py","run-job.sh"]"#])
+            v(&["config", "--from-app", "--set", "routing_dispatch_scripts", r#"["dispatch.py","run-job.sh"]"#])
         );
-        assert_eq!(config_set_argv("routing_dispatch_scripts", "[]").unwrap(), v(&["config", "--set", "routing_dispatch_scripts", "[]"]));
-        assert_eq!(config_unset_argv("routing_dispatch_scripts").unwrap(), v(&["config", "--unset=routing_dispatch_scripts"]));
+        assert_eq!(config_set_argv("routing_dispatch_scripts", "[]").unwrap(), v(&["config", "--from-app", "--set", "routing_dispatch_scripts", "[]"]));
+        assert_eq!(config_unset_argv("routing_dispatch_scripts").unwrap(), v(&["config", "--from-app", "--unset=routing_dispatch_scripts"]));
         for bad in [r#"["/bin/dispatch.py"]"#, r#"["a b"]"#, r#"[".."]"#, r#"["-x"]"#, r#"["-c"]"#, r#"["a\nb"]"#, r#"[3]"#,
                     "dispatch.py", r#"{"a": 1}"#] {
             assert!(config_set_argv("routing_dispatch_scripts", bad).is_err(), "{bad}");
@@ -4136,19 +4164,19 @@ mod settings_command_tests {
             assert!(config_set_argv(k, "on").is_err(), "{k}");
             assert!(config_unset_argv(k).is_err(), "{k}");
         }
-        assert_eq!(config_unset_argv("routing_stale_after").unwrap(), v(&["config", "--unset=routing_stale_after"]));
+        assert_eq!(config_unset_argv("routing_stale_after").unwrap(), v(&["config", "--from-app", "--unset=routing_stale_after"]));
         let sources = config_set_argv(
             "routing_sources",
             r#"[{"name": " Project A ", "kind": "anything", "path": "/runners/a"}]"#,
         )
         .unwrap();
-        assert_eq!(sources[3], r#"[{"kind":"lanes","name":"Project A","path":"/runners/a"}]"#);
+        assert_eq!(sources[4], r#"[{"kind":"lanes","name":"Project A","path":"/runners/a"}]"#);
         for bad in [r#"[{"name": "a", "path": "relative/a"}]"#, r#"[{"name": "a", "path": "/a", "extra": 1}]"#,
                     r#"[{"name": "a\n--x", "path": "/a"}]"#, r#"{"name": "a"}"#, "-x"] {
             assert!(config_set_argv("routing_sources", bad).is_err(), "{bad}");
         }
         let map = config_set_argv("routing_lane_map", r#"{"Project B": {"opus-batch": "Claude main"}}"#).unwrap();
-        assert_eq!(map[3], r#"{"Project B":{"opus-batch":"Claude main"}}"#);
+        assert_eq!(map[4], r#"{"Project B":{"opus-batch":"Claude main"}}"#);
         for bad in [r#"{"B": {"lane": 3}}"#, r#"{"B": ["lane"]}"#, r#"{"B": {"la\nne": "x"}}"#, "[]"] {
             assert!(config_set_argv("routing_lane_map", bad).is_err(), "{bad}");
         }
@@ -4169,8 +4197,8 @@ mod settings_command_tests {
             ("routing_slow_read_pct", "2", "2"),
             ("routing_slow_read_pct", "0", "0"),
         ] {
-            assert_eq!(config_set_argv(k, raw).unwrap(), v(&["config", "--set", k, out]), "{k}={raw}");
-            assert_eq!(config_unset_argv(k).unwrap(), v(&["config", &format!("--unset={k}")]));
+            assert_eq!(config_set_argv(k, raw).unwrap(), v(&["config", "--from-app", "--set", k, out]), "{k}={raw}");
+            assert_eq!(config_unset_argv(k).unwrap(), v(&["config", "--from-app", &format!("--unset={k}")]));
         }
         for (k, bad) in [("routing_slow_read_pct", "-1"), ("routing_slow_read_pct", "1e2"), ("routing_slow_read_pct", "NaN"),
                          ("routing_slow_read_pct", "inf"), ("routing_slow_read_pct", "1.2.3"), ("routing_slow_read_pct", "."),
@@ -4181,17 +4209,33 @@ mod settings_command_tests {
     }
 
     #[test]
+    fn a_routing_setting_is_saved_and_answered_as_the_owner() {
+        // A conversation's shell is refused a routing setting; the app's own
+        // save carries --from-app, one step, and answers a waiting request.
+        assert_eq!(config_set_argv("routing_lane_map", "{}").unwrap(), v(&["config", "--from-app", "--set", "routing_lane_map", "{}"]));
+        assert_eq!(config_set_argv("synth_fallback", "none").unwrap()[1], "--set");
+        assert_eq!(
+            config_request_argv("routing_lane_map", "confirm").unwrap(),
+            v(&["config", "--from-app", "--answer-request", "routing_lane_map", "confirm"])
+        );
+        assert_eq!(config_request_argv("routing_stale_after", "undo").unwrap()[4], "undo");
+        assert!(config_request_argv("routing_lane_map", "--x").is_err());
+        assert!(config_request_argv("usage_accounts", "confirm").is_err());
+        assert!(config_request_argv("--from-app", "confirm").is_err());
+    }
+
+    #[test]
     fn the_routing_table_file_is_offered_as_a_full_path() {
         // Fix round 2, R2-1: Settings -> Routing chooses and clears the table file.
         assert_eq!(
             config_set_argv("routing_table", " ~/notes/ROUTING-NOW.md ").unwrap(),
-            v(&["config", "--set", "routing_table", "~/notes/ROUTING-NOW.md"])
+            v(&["config", "--from-app", "--set", "routing_table", "~/notes/ROUTING-NOW.md"])
         );
         assert_eq!(
             config_set_argv("routing_table", "/notes/routing/ROUTING-NOW.md").unwrap(),
-            v(&["config", "--set", "routing_table", "/notes/routing/ROUTING-NOW.md"])
+            v(&["config", "--from-app", "--set", "routing_table", "/notes/routing/ROUTING-NOW.md"])
         );
-        assert_eq!(config_unset_argv("routing_table").unwrap(), v(&["config", "--unset=routing_table"]));
+        assert_eq!(config_unset_argv("routing_table").unwrap(), v(&["config", "--from-app", "--unset=routing_table"]));
         let long = format!("/{}", "a".repeat(1024));
         for bad in ["", "   ", "notes/ROUTING-NOW.md", "~notes", "-x", "--from-app", "/a\n--x", "/a\rb", long.as_str()] {
             assert!(config_set_argv("routing_table", bad).is_err(), "{bad:?}");

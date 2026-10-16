@@ -550,7 +550,7 @@ def test_a_check_now_nothing_will_retry_promises_nothing(home, monkeypatch):
 
 def test_the_retries_can_be_removed(home, capsys):
     # F7: decision 13, every interval can be removed: an empty list is no retries.
-    rc, out = _cli(["config", "--set", "routing_reset_check_retries", "[]"], capsys)
+    rc, out = _cli(["config", "--from-app", "--set", "routing_reset_check_retries", "[]"], capsys)
     assert rc == 0 and json.loads(out)["routing_reset_check_retries"]["value"] == []
     until = T0 + timedelta(minutes=20)
     _report(account="Claude", state="limited", message=f"Limit reached, resets at {routing._iso(until)}")
@@ -1049,19 +1049,19 @@ def test_route_check_passes_one_literal_account_argument(home, capsys, monkeypat
 
 
 def test_routing_settings_are_checked_and_refuse_private_folders(home, capsys):
-    rc, out = _cli(["config", "--set", "routing_stale_after", "6h"], capsys)
+    rc, out = _cli(["config", "--from-app", "--set", "routing_stale_after", "6h"], capsys)
     assert rc == 0 and json.loads(out)["routing_stale_after"]["value"] == 21600
     assert routing.settings()["routing_stale_after"] == 21600
-    rc, out = _cli(["config", "--set", "routing_summary_chars", "-1"], capsys)
+    rc, out = _cli(["config", "--from-app", "--set", "routing_summary_chars", "-1"], capsys)
     assert rc == 2
     for raw in ('[{"name": "a", "kind": "lanes", "path": "/x/API Keys/runner"}]',
                 '[{"name": "a", "kind": "lanes", "path": "/x/My Portfolio"}]',
                 '[{"name": "a", "kind": "lanes", "path": "/x/codex/auth.json"}]'):
-        rc, out = _cli(["config", "--set", "routing_sources", raw], capsys)
+        rc, out = _cli(["config", "--from-app", "--set", "routing_sources", raw], capsys)
         assert rc == 2 and "private folder" in json.loads(out)["error"]
-    rc, out = _cli(["config", "--set", "routing_rules_seed", "/x/API Keys/rules.json"], capsys)
+    rc, out = _cli(["config", "--from-app", "--set", "routing_rules_seed", "/x/API Keys/rules.json"], capsys)
     assert rc == 2
-    rc, out = _cli(["config", "--unset", "routing_stale_after"], capsys)
+    rc, out = _cli(["config", "--from-app", "--unset", "routing_stale_after"], capsys)
     assert rc == 0 and routing.settings()["routing_stale_after"] == 12 * 3600
     _set(home, routing_line_chars="lots")  # a hand-edited bad value reads as the default
     assert routing.settings()["routing_line_chars"] == 200
@@ -1628,9 +1628,9 @@ def test_a_path_setting_is_a_full_path(home, capsys, monkeypatch):
     keys = home["tmp"] / "API Keys"
     keys.mkdir()
     monkeypatch.chdir(keys)
-    rc, out = _cli(["config", "--set", "routing_rules_seed", "keys.json"], capsys)
+    rc, out = _cli(["config", "--from-app", "--set", "routing_rules_seed", "keys.json"], capsys)
     assert rc == 2 and "full path" in json.loads(out)["error"]
-    rc, out = _cli(["config", "--set", "routing_table", "table.md"], capsys)
+    rc, out = _cli(["config", "--from-app", "--set", "routing_table", "table.md"], capsys)
     assert rc == 2
     _set(home, routing_rules_seed="rules.json")  # typed by hand into config.json: read as no seed
     assert routing.settings()["routing_rules_seed"] is None
@@ -1720,7 +1720,7 @@ def test_a_message_time_beyond_the_named_window_comes_back_as_an_estimated_repor
 ])
 def test_a_hold_length_setting_too_long_to_add_never_stops_a_conversations_hold(home, capsys, setting, until):
     # R2-2: now + the setting overflowed, so every conversation hold crashed and nothing was recorded.
-    rc, out = _cli(["config", "--set", setting, "3000000d"], capsys)
+    rc, out = _cli(["config", "--from-app", "--set", setting, "3000000d"], capsys)
     assert rc == 0
     rc, out = _cli(["route", "hold", "x", "--reason", "other", "--all"], capsys)
     assert rc == 0 and json.loads(out)["until"] == routing._iso(until)
@@ -1729,7 +1729,7 @@ def test_a_hold_length_setting_too_long_to_add_never_stops_a_conversations_hold(
 
 def test_a_default_limit_setting_too_long_to_add_never_stops_an_untimed_report(home, capsys):
     # R2-2: the untimed limited report added the setting to now and overflowed.
-    rc, _out = _cli(["config", "--set", "routing_report_default_limit", "3000000d"], capsys)
+    rc, _out = _cli(["config", "--from-app", "--set", "routing_report_default_limit", "3000000d"], capsys)
     assert rc == 0
     rc, out = _cli(["route", "report", "--account", "Codex", "--state", "limited"], capsys)
     data = json.loads(out)
