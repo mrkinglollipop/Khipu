@@ -4,14 +4,14 @@ Asked by Matt 2026-10-16: "khipu is supposed to be the ssot of our ledger now...
 need to fix that." Two problems were reported from a busy orchestrated project (called **project A** here,
 because this repo is public): its Owed list is flooded, and its ledger in Khipu is empty while the real
 ledger is still the old tracker file. This page is the scope: findings with evidence, a design, single-session
-slices with their oracles, and questions for Matt. Read `2026-10-15-work-view.md` first; this page builds on
+slices with their oracles, and Matt's decisions. Read `2026-10-15-work-view.md` first; this page builds on
 it and changes none of its decisions except where it says so.
 
 ## Status
 
 | Slice | What | Size | State |
 |---|---|---|---|
-| 0 | This scope | S | written, waiting for Matt |
+| 0 | This scope | S | approved by Matt 2026-10-16 |
 | 1 | Owner and origin at capture | M | open |
 | 2 | Auto-close by pull request and by decision | M | open |
 | 3 | Paging, filters and bulk changes in `khipu_owed`, `khipu_owed_update` and `khipu owed` | M | open |
@@ -138,7 +138,8 @@ the app, and Khipu reports and never routes.
 
 ### (a) Capture only real commitments, with the right owner
 
-**Two new facts on every commitment** (migration `0028_commitment_owner.sql`, additive):
+**Two new facts on every commitment** (migration `0033_commitment_owner.sql`, additive; 0028 to 0032 were taken
+by the time this was built):
 
 - `origin`: `conversation` or `job`. A capture is a job when its payload has a `parent_session_id`, or its
   runner set `KHIPU_PARENT_SESSION` or a new `KHIPU_JOB=1`, or the harness reports a non-interactive run
@@ -154,8 +155,9 @@ the app, and Khipu reports and never routes.
    owner. A new `agent_actor_re` holds the third-party words; it is checked before the user words, so "the
    owner of PR #12 to rebase" is the PR author's.
 2. From a **job**: a question or a decision ask with no named actor, and anything the model declared
-   `"user"`, goes to `agent` with label "orchestrator", because a job's user is its dispatcher. Only text
-   that names Matt (an alias, not "the user" or "owner") stays Matt's.
+   `"user"`, goes to `agent` with label "orchestrator", because a job's user is its dispatcher. A job's
+   "Matt to decide X" also goes to the orchestrator (decision 3): the orchestrator asks Matt itself if it
+   really needs him.
 3. From a **conversation**: today's rules, except a question that names a non-user actor follows rule 1.
 4. The extractor prompt asks for `owner` as one of `user`, `assistant` or `other`, plus `owner_label`, and
    is told whether the transcript is a job's. The deterministic result still wins on conflict.
@@ -188,8 +190,9 @@ next to "PR", and a GitHub pull link) into `prs int[]` on the row. Slice 2 backf
 2. The ledger: a row whose `refs.pr` names the PR in a state that means done (merged, verified, done).
 3. A later capture in the same project whose decisions, closed loops or summary say "PR #N merged" or
    "closed #N" (a narrow pattern; a match on "will merge" or "before #N merges" does not count).
-4. Only with Matt's yes (question 1): a read-only `gh pr view` lookup, as a setting off by default, because
-   the Work view scope says Khipu does not read a project's pull requests on GitHub.
+4. A read-only `gh pr view` lookup on GitHub (decision 1), on by default and switchable in Settings. This
+   changes the Work view scope's "Khipu does not read a project's pull requests on GitHub" for this one
+   read.
 
 **The rule.** An open item closes when **every** PR it names is merged or closed, with
 `close_reason` "pull request #366 merged (from the runner's summary)" or similar, `closed_by` "Khipu, by
@@ -220,8 +223,9 @@ conversation", "Khipu, by rule"), so no close is silent again.
   `reassign` (`owner` plus `owner_label`), and a required `reason` for a list. One transaction, one result per
   id, through `owner_writes` so a queued write replays whole. The most ids per call is the setting
   `owed_bulk_max` (default 500, 0 for no limit). A conversation may close or reassign items it or its jobs
-  own in bulk; **items owned by the user are closed in bulk only from the app** (question 6), single closes
-  by id stay as today for "the user says it is done".
+  own in bulk; **a bulk change to items owned by the user passes the owner gate** (decision 6): the app, or
+  the owner's direction through the agent once `2026-10-16-owner-direction.md` lands; single closes by id
+  stay as today for "the user says it is done".
 - `khipu owed`: the same filters, `--cursor`, `--close ID[,ID...]`, `--reassign`, `--reason`, and `--json`
   accepted as a no-op so callers that pass it keep working.
 
@@ -301,7 +305,7 @@ Inspect `commitments.py` (`resolve_owner`, `_user_signal`, `open_from_episode`, 
   `agent_actor_re`; the job rules; the prompt change; the relay close; the slice and Waiting on you filters.
 - Tests: the brief's examples ("The orchestrator must resolve the rebase conflict", "PR #234 author to
   renumber migration 115") are `agent`; a job's unnamed question is the orchestrator's; a job's "Matt to
-  decide X" stays Matt's; a conversation's question stays Matt's; no item is dropped by the new rules (counts
+  decide X" is the orchestrator's (decision 3); a conversation's question stays Matt's; no item is dropped by the new rules (counts
   in equal counts out); a pre-migration hub still answers.
 - Stop: if the near-duplicate relay test closes a conversation item, stop and ask.
 
@@ -315,7 +319,8 @@ Inspect `auto_close`, `set_status`, `work.py`'s summary reader and `ledger.py`'s
 - Tests: one merged of two named stays open; both merged closes with the reason; "before #N merges" closes
   on merge; "will merge #N" in a later capture does not count; a reopened item is not closed again by the
   same evidence; a hand close records reason and author.
-- Stop: no GitHub call in this slice unless Matt said yes to question 1.
+- GitHub (decision 1): read-only `gh pr view`, on by default, a setting to switch it off; tests use a fake
+  `gh`; a missing or failing `gh` leaves items open and says why.
 
 ### Slice 3: paging, filters and bulk in the tools (M)
 
@@ -364,20 +369,19 @@ reports the dry run; Matt imports in the app; Matt reviews and applies the tidy 
 ledger check --project <key>` shows the tracker's row count, and Needs you for project A shows only Matt's
 items within one refresh.
 
-## Questions for Matt
+## Decisions (Matt, 2026-10-16)
 
-1. **Pull request state from GitHub.** The Work view says Khipu does not read a project's pull requests on
-   GitHub. May Khipu run a read-only `gh pr view` for PRs that open items name, as a setting off by default?
-   Without it, items close only when a runner's summary, the ledger or a later capture says the PR merged.
-   Recommended: yes, as an opt-in setting.
-2. **Where job items show.** Should items for the orchestrator appear in the orchestrator's session-start
-   slice (at most 3, a setting), or only in Owed under For agents and jobs? Recommended: in the slice.
-3. **A job's "Matt to decide".** Keep it as yours (and close it when the orchestrator relays it), or send it
-   to the orchestrator until the orchestrator asks you? Recommended: keep it yours when it names you.
-4. **The clean-up.** Run the deterministic rules plus a capped model pass on items no rule decides, preview
-   first? Recommended: yes, with the model pass off for items that name you.
-5. **The tracker's move.** Is the ledger inbox (inside Khipu's data folder) the right place for the
-   orchestrator to put the copy, and may the orchestrator do the copy at the switch moment?
-6. **Bulk closes of your items.** Only from the app, or may a conversation bulk-close your items when you
-   say so in chat? Recommended: only from the app; a conversation still closes one by id when you say it is
-   done.
+Matt approved this scope and answered its questions:
+
+1. **Pull request state from GitHub.** Khipu checks a named PR's state on GitHub, read-only (`gh pr view`),
+   on by default and switchable in Settings.
+2. **Where job items show.** Items for the orchestrator show in the orchestrator's session-start list (at
+   most 3, a setting). The owner sees only his own items as "needs the user".
+3. **A job's "Matt to decide X".** It belongs to the orchestrator, which asks Matt itself if it really needs
+   him.
+4. **The clean-up.** Rules first, then a capped model pass for what the rules cannot sort; the cap is
+   liftable; a preview before anything changes; nothing deleted, and every change reversible.
+5. **The tracker's move.** The ledger inbox is the right place, and the orchestrator does the copy.
+6. **Bulk closes of the owner's items.** They work by chat on his direction, like every owner action
+   (`2026-10-16-owner-direction.md`); nothing is app-only. Until that lands, a bulk change to the owner's
+   items passes the existing owner gate, so the new path plugs in there.
