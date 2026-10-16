@@ -1865,6 +1865,238 @@ async fn khipu_route_hold_end(id: String) -> Result<String, String> {
     run_khipu_cli_async(route_hold_end_argv(&id)?).await
 }
 
+// ---- Work: the live view and the ledger (docs/plans/2026-10-15-work-view.md, phase 4)
+//
+// Fixed argv for the Work tab and a project's ledger page. `work` and
+// `ledger` stay out of `ALLOWED_SUBCOMMANDS`: the webview names one of these
+// commands and its checked fields, never an argv. Every value that takes a
+// flag travels joined to it (`--project=...`), and a row id travels after
+// `--`, so nothing the webview sends can become a flag. Every write carries
+// `--from-app`, so the ledger records it as "you, in the app".
+
+/// The most text the app hands the CLI in one ledger field, in bytes. Not a
+/// limit on the ledger (the CLI applies the owner's `ledger_*` limits); it
+/// keeps one argument well inside what a program can be started with.
+const LEDGER_TEXT_MAX_BYTES: usize = 64 * 1024;
+/// `--children` choices `khipu ledger remove` accepts.
+const LEDGER_CHILDREN: &[&str] = &["remove", "move-up"];
+
+/// A ledger project key (`owner/repo`, a name): one line of at most 200
+/// characters without `#`, as `ledger._check_project` takes it.
+fn checked_ledger_project(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() || v.chars().count() > 200 || v.contains('#') || has_control(v) {
+        return Err("that is not a ledger project Khipu knows".to_string());
+    }
+    Ok(v.to_string())
+}
+
+/// A ledger row id: a letter or digit, then letters, digits and `. _ : / -`.
+/// Not trimmed: ids are kept exactly as stored, so a stray space or line
+/// break is refused rather than quietly naming another row.
+fn checked_ledger_id(raw: &str) -> Result<String, String> {
+    let v = raw;
+    let ok = !v.is_empty()
+        && v.len() <= 1024
+        && v.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'));
+    if ok {
+        Ok(v.to_string())
+    } else {
+        Err("that is not a ledger row Khipu knows".to_string())
+    }
+}
+
+/// The owner's words for one field. `lines` allows line breaks (a note);
+/// every other control character is refused.
+fn checked_ledger_text(raw: &str, lines: bool) -> Result<String, String> {
+    if raw.len() > LEDGER_TEXT_MAX_BYTES {
+        return Err(format!(
+            "this is longer than the app can hand over in one change ({} KB of text); shorten it",
+            LEDGER_TEXT_MAX_BYTES / 1024
+        ));
+    }
+    if raw.chars().any(|c| c.is_control() && !(lines && (c == '\n' || c == '\t'))) {
+        return Err(if lines {
+            "the words hold a character Khipu can't keep".to_string()
+        } else {
+            "keep it to one line".to_string()
+        });
+    }
+    Ok(raw.to_string())
+}
+
+/// A commitment's id (`khipu owed`): digits only.
+fn checked_commitment_id(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if !v.is_empty() && v.len() <= 20 && v.chars().all(|c| c.is_ascii_digit()) {
+        Ok(v.to_string())
+    } else {
+        Err("that is not a commitment Khipu knows".to_string())
+    }
+}
+
+fn ledger_base(verb: &str, project: &str, write: bool) -> Result<Vec<String>, String> {
+    let mut argv = vec!["ledger".to_string(), verb.to_string(), "--json".to_string()];
+    if write {
+        argv.push("--from-app".to_string());
+    }
+    argv.push(format!("--project={}", checked_ledger_project(project)?));
+    Ok(argv)
+}
+
+fn work_view_argv() -> Vec<String> {
+    vec!["work".to_string(), "--json".to_string()]
+}
+
+fn ledger_list_argv(project: &str) -> Result<Vec<String>, String> {
+    ledger_base("list", project, false)
+}
+
+fn ledger_get_argv(project: &str, id: &str) -> Result<Vec<String>, String> {
+    let mut argv = ledger_base("get", project, false)?;
+    argv.extend(["--".to_string(), checked_ledger_id(id)?]);
+    Ok(argv)
+}
+
+fn ledger_removed_argv(project: &str) -> Result<Vec<String>, String> {
+    ledger_base("removed", project, false)
+}
+
+/// One change to a row from the app. A field left out (None) is not
+/// changed; `if_state` is the state the app showed, so a row another writer
+/// moved meanwhile is refused instead of overwritten.
+#[derive(serde::Deserialize, Debug, Clone, Default)]
+struct LedgerChange {
+    state: Option<String>,
+    evidence: Option<String>,
+    owner: Option<String>,
+    title: Option<String>,
+    link: Option<String>,
+    note: Option<String>,
+    if_state: Option<String>,
+}
+
+fn ledger_set_argv(project: &str, id: &str, change: &LedgerChange) -> Result<Vec<String>, String> {
+    let mut argv = ledger_base("set", project, true)?;
+    let mut any = false;
+    for (flag, value) in [
+        ("state", &change.state),
+        ("evidence", &change.evidence),
+        ("owner", &change.owner),
+        ("title", &change.title),
+        ("link", &change.link),
+    ] {
+        if let Some(v) = value {
+            argv.push(format!("--{flag}={}", checked_ledger_text(v, false)?));
+            any = true;
+        }
+    }
+    if let Some(n) = change.note.as_deref().filter(|n| !n.trim().is_empty()) {
+        argv.push(format!("--note={}", checked_ledger_text(n, true)?));
+        any = true;
+    }
+    if !any {
+        return Err("change a field or write a note first".to_string());
+    }
+    if let Some(s) = change.if_state.as_deref().filter(|s| !s.trim().is_empty()) {
+        argv.push(format!("--if-state={}", checked_ledger_text(s, false)?));
+    }
+    argv.extend(["--".to_string(), checked_ledger_id(id)?]);
+    Ok(argv)
+}
+
+fn ledger_remove_argv(project: &str, id: &str, note: Option<&str>, children: Option<&str>) -> Result<Vec<String>, String> {
+    let mut argv = ledger_base("remove", project, true)?;
+    if let Some(c) = children.filter(|c| !c.is_empty()) {
+        if !LEDGER_CHILDREN.contains(&c) {
+            return Err(format!("not a choice for the rows under it: {c:?}"));
+        }
+        argv.push(format!("--children={c}"));
+    }
+    if let Some(n) = note.filter(|n| !n.trim().is_empty()) {
+        argv.push(format!("--note={}", checked_ledger_text(n, true)?));
+    }
+    argv.extend(["--".to_string(), checked_ledger_id(id)?]);
+    Ok(argv)
+}
+
+fn ledger_restore_argv(project: &str, id: &str) -> Result<Vec<String>, String> {
+    let mut argv = ledger_base("restore", project, true)?;
+    argv.extend(["--".to_string(), checked_ledger_id(id)?]);
+    Ok(argv)
+}
+
+/// `work hide|unhide -- ID`: Khipu's own record of a commitment hidden from
+/// Waiting on you until its words change.
+fn work_hide_argv(id: &str, hide: bool) -> Result<Vec<String>, String> {
+    let verb = if hide { "hide" } else { "unhide" };
+    Ok(vec!["work".to_string(), verb.to_string(), "--".to_string(), checked_commitment_id(id)?])
+}
+
+/// `work same|not-same -- PROJECT#ROW COMMITMENT`: the owner's answer to
+/// "Looks like".
+fn work_same_argv(project: &str, row: &str, commitment: &str, same: bool) -> Result<Vec<String>, String> {
+    let verb = if same { "same" } else { "not-same" };
+    Ok(vec![
+        "work".to_string(),
+        verb.to_string(),
+        "--".to_string(),
+        format!("{}#{}", checked_ledger_project(project)?, checked_ledger_id(row)?),
+        checked_commitment_id(commitment)?,
+    ])
+}
+
+#[tauri::command]
+async fn khipu_work_view() -> Result<String, String> {
+    run_khipu_cli_async(work_view_argv()).await
+}
+
+#[tauri::command]
+async fn khipu_ledger_list(project: String) -> Result<String, String> {
+    run_khipu_cli_async(ledger_list_argv(&project)?).await
+}
+
+#[tauri::command]
+async fn khipu_ledger_get(project: String, id: String) -> Result<String, String> {
+    run_khipu_cli_async(ledger_get_argv(&project, &id)?).await
+}
+
+#[tauri::command]
+async fn khipu_ledger_set(project: String, id: String, change: LedgerChange) -> Result<String, String> {
+    run_khipu_cli_async(ledger_set_argv(&project, &id, &change)?).await
+}
+
+#[tauri::command]
+async fn khipu_ledger_remove(
+    project: String,
+    id: String,
+    note: Option<String>,
+    children: Option<String>,
+) -> Result<String, String> {
+    run_khipu_cli_async(ledger_remove_argv(&project, &id, note.as_deref(), children.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_ledger_removed(project: String) -> Result<String, String> {
+    run_khipu_cli_async(ledger_removed_argv(&project)?).await
+}
+
+#[tauri::command]
+async fn khipu_ledger_restore(project: String, id: String) -> Result<String, String> {
+    run_khipu_cli_async(ledger_restore_argv(&project, &id)?).await
+}
+
+#[tauri::command]
+async fn khipu_work_hide(id: String, hide: bool) -> Result<String, String> {
+    run_khipu_cli_async(work_hide_argv(&id, hide)?).await
+}
+
+#[tauri::command]
+async fn khipu_work_same(project: String, row: String, commitment: String, same: bool) -> Result<String, String> {
+    run_khipu_cli_async(work_same_argv(&project, &row, &commitment, same)?).await
+}
+
 #[tauri::command]
 async fn khipu_route_priority(
     action: String,
@@ -3533,6 +3765,15 @@ pub fn run() {
             khipu_route_hold_add,
             khipu_route_hold_end,
             khipu_route_priority,
+            khipu_work_view,
+            khipu_ledger_list,
+            khipu_ledger_get,
+            khipu_ledger_set,
+            khipu_ledger_remove,
+            khipu_ledger_removed,
+            khipu_ledger_restore,
+            khipu_work_hide,
+            khipu_work_same,
             khipu_account_sign_in,
             khipu_accounts_status,
             khipu_accounts_track,
@@ -5388,5 +5629,109 @@ mod priority_and_sign_in_tests {
         assert!(sign_in_argv(&c, "muse", None).is_err());
         assert!(sign_in_argv(&c, "--sign-in", None).is_err());
         assert!(sign_in_argv(&serde_json::json!({}), "claude", None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod work_command_tests {
+    use super::*;
+
+    fn change() -> LedgerChange {
+        LedgerChange::default()
+    }
+
+    #[test]
+    fn work_and_ledger_stay_off_the_generic_path() {
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"work"));
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"ledger"));
+    }
+
+    #[test]
+    fn reads_are_fixed_and_join_the_project_to_its_flag() {
+        assert_eq!(work_view_argv(), vec!["work", "--json"]);
+        assert_eq!(ledger_list_argv("owner/atlas").unwrap(), vec!["ledger", "list", "--json", "--project=owner/atlas"]);
+        assert_eq!(
+            ledger_get_argv("atlas", "s-3.2").unwrap(),
+            vec!["ledger", "get", "--json", "--project=atlas", "--", "s-3.2"]
+        );
+        assert_eq!(ledger_removed_argv("atlas").unwrap(), vec!["ledger", "removed", "--json", "--project=atlas"]);
+    }
+
+    #[test]
+    fn a_set_carries_from_app_its_fields_and_the_state_it_was_shown() {
+        let c = LedgerChange {
+            state: Some("DONE".into()),
+            note: Some("Use the provider we pay for.\nKeep email as the fallback.".into()),
+            if_state: Some("NEEDS OWNER".into()),
+            ..change()
+        };
+        assert_eq!(
+            ledger_set_argv("atlas", "n-7", &c).unwrap(),
+            vec![
+                "ledger", "set", "--json", "--from-app", "--project=atlas", "--state=DONE",
+                "--note=Use the provider we pay for.\nKeep email as the fallback.", "--if-state=NEEDS OWNER",
+                "--", "n-7",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_value_starting_with_a_dash_stays_a_value() {
+        let c = LedgerChange { evidence: Some("--state=DROPPED".into()), ..change() };
+        let argv = ledger_set_argv("atlas", "s-1", &c).unwrap();
+        assert!(argv.contains(&"--evidence=--state=DROPPED".to_string()));
+        assert!(!argv.contains(&"--state=DROPPED".to_string()));
+    }
+
+    #[test]
+    fn an_empty_field_clears_it_but_a_change_needs_something() {
+        let c = LedgerChange { link: Some(String::new()), ..change() };
+        assert!(ledger_set_argv("atlas", "s-1", &c).unwrap().contains(&"--link=".to_string()));
+        assert!(ledger_set_argv("atlas", "s-1", &change()).is_err());
+        let blank_note = LedgerChange { note: Some("   ".into()), ..change() };
+        assert!(ledger_set_argv("atlas", "s-1", &blank_note).is_err());
+    }
+
+    #[test]
+    fn one_line_fields_refuse_a_line_break_and_bad_ids_are_refused() {
+        let c = LedgerChange { title: Some("one\ntwo".into()), ..change() };
+        assert!(ledger_set_argv("atlas", "s-1", &c).is_err());
+        for bad in ["", "-x", "--state", "a b", "a#b", "s-1\n"] {
+            assert!(checked_ledger_id(bad).is_err(), "{bad:?}");
+        }
+        for bad in ["", "a#b", "a\nb"] {
+            assert!(checked_ledger_project(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn remove_asks_for_a_known_children_choice() {
+        assert_eq!(
+            ledger_remove_argv("atlas", "g-1", Some("duplicate"), Some("move-up")).unwrap(),
+            vec!["ledger", "remove", "--json", "--from-app", "--project=atlas", "--children=move-up",
+                 "--note=duplicate", "--", "g-1"]
+        );
+        assert_eq!(
+            ledger_remove_argv("atlas", "s-1", None, None).unwrap(),
+            vec!["ledger", "remove", "--json", "--from-app", "--project=atlas", "--", "s-1"]
+        );
+        assert!(ledger_remove_argv("atlas", "g-1", None, Some("--all")).is_err());
+        assert_eq!(
+            ledger_restore_argv("atlas", "s-1").unwrap(),
+            vec!["ledger", "restore", "--json", "--from-app", "--project=atlas", "--", "s-1"]
+        );
+    }
+
+    #[test]
+    fn hide_and_same_take_only_ids() {
+        assert_eq!(work_hide_argv("42", true).unwrap(), vec!["work", "hide", "--", "42"]);
+        assert_eq!(work_hide_argv("42", false).unwrap(), vec!["work", "unhide", "--", "42"]);
+        assert!(work_hide_argv("--json", true).is_err());
+        assert_eq!(
+            work_same_argv("owner/atlas", "n-7", "42", true).unwrap(),
+            vec!["work", "same", "--", "owner/atlas#n-7", "42"]
+        );
+        assert_eq!(work_same_argv("atlas", "n-7", "42", false).unwrap()[1], "not-same");
+        assert!(work_same_argv("atlas", "n-7", "4 2", true).is_err());
     }
 }

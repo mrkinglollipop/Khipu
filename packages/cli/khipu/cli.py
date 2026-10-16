@@ -872,6 +872,13 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         ledger_block = _ledger.doctor_block()
     except Exception as e:  # noqa: BLE001  (a failed check must not crash doctor)
         ledger_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # The live view's summary files (Work view phase 3): warns, never gates `ok`.
+    try:
+        from khipu import work as _work
+
+        work_block = _work.doctor_block()
+    except Exception as e:  # noqa: BLE001  (a failed check must not crash doctor)
+        work_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -916,9 +923,10 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "routing": routing_block,
         "ledger": ledger_block,
         "schema_migrations": schema,
-        # Warnings that never gate `ok` (plans nearly used up; routing; ledger).
+        "work": work_block,
+        # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
-                     + list(ledger_block.get("warnings") or [])
+                     + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
                      + list(schema.get("warnings") or [])),
         "not_configured": not_configured,
         "ok": (
@@ -3179,6 +3187,19 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps({"ok": True, key: _ledger.settings_status()[key], "config_file": str(path)}))
         return 0
+    from khipu import work as _work
+
+    if (args.set and args.set[0] in _work.SETTINGS) or args.unset in _work.SETTINGS:
+        # Every work-view limit and time (rule 7): `--set work_max_jobs 0`
+        # lifts it, `--unset` for the default again.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _work.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _work.settings_status()[key], "config_file": str(path)}))
+        return 0
     from khipu import routing as _routing
 
     if isinstance(getattr(args, "answer_request", None), (list, tuple)):
@@ -3329,6 +3350,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "cli_settings": cli_settings_status(),
         "routing": _routing.settings_status(),
         "ledger": _ledger.settings_status(),
+        "work": _work.settings_status(),
         "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
         "config": load_config(),
@@ -4789,6 +4811,9 @@ def build_parser() -> argparse.ArgumentParser:
     from khipu import ledger as _ledger
 
     _ledger.add_parser(sub)
+    from khipu import work as _work
+
+    _work.add_parser(sub)
 
     nt = sub.add_parser("nightly", help="Run consolidate_nightly.py (memory wiki)")
     nt.set_defaults(func=cmd_nightly)

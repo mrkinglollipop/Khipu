@@ -6378,16 +6378,24 @@ def _owner_via(args) -> str | None:
             return None
         _OWNER_AUTH.set({"auth": "app", "auth_chain": " < ".join(caller["chain"] + [caller["where"]])})
         return "app"
-    try:
-        if not sys.stdin.isatty():
-            return None
-        answer = input("This is an owner's change to the routing record. Type yes to confirm: ")
-    except (EOFError, OSError):
-        return None
-    if answer.strip().lower() != "yes":
+    if not typed_yes("This is an owner's change to the routing record. Type yes to confirm: "):
         return None
     _OWNER_AUTH.set({"auth": "terminal", "auth_chain": " < ".join(_caller()["chain"])})
     return "cli"
+
+
+def typed_yes(prompt: str) -> bool:
+    """The owner's typed confirmation: a yes typed on an interactive
+    terminal. A piped or redirected answer (stdin not a terminal) is never
+    asked for and never counts. Routing's and the ledger's owner commands
+    both use this one rule."""
+    try:
+        if not sys.stdin.isatty():
+            return False
+        answer = input(prompt)
+    except (EOFError, OSError):
+        return False
+    return answer.strip().lower() == "yes"
 
 
 def _owner_stamp(event: dict) -> dict:

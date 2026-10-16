@@ -47,6 +47,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -878,6 +879,47 @@ TOOLS: list[dict] = [
             "required": ["entries", "owner_request"],
         },
     },
+    {
+        "name": "khipu_ledger",
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "description": (
+            "The project's ledger of what work is done and what is not, with "
+            "the old tracker script's verbs: add, set, get, list, loose-ends, "
+            "needs-owner (needs-matt is the same), render (the markdown board), "
+            "check, remove and removed. Writes keep the old and new value of "
+            "every field in the row's history; pass if_state to write only if "
+            "the row is still in that state, and op_id to retry a write safely. "
+            "Rows carry titles and short plain-words lines about the work, "
+            "never code, diffs, file contents, command output, logs, prompts, "
+            "briefs, customer or financial details. Restoring a removed row, "
+            "removing it for good and importing an old tracker are the "
+            "owner's, in the app."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "verb": {"type": "string", "enum": ["add", "set", "get", "list", "loose-ends", "needs-owner",
+                                                    "needs-matt", "render", "check", "remove", "removed"]},
+                "project": {"type": "string", "description": "Project key (default: this folder's project)"},
+                "id": {"type": "string", "description": "add, set, get, remove: the row id"},
+                "title": {"type": "string"},
+                "kind": {"type": "string", "description": "add: one of the project's kinds"},
+                "parent": {"type": "string", "description": "add: the parent row's id"},
+                "state": {"type": "string", "description": "add, set: one of the project's states; list: filter"},
+                "evidence": {"type": "string", "description": "A short plain-words line, such as a PR number"},
+                "owner": {"type": "string"},
+                "note": {"type": "string", "description": "A short plain-words line for the row's history"},
+                "link": {"type": "string", "description": "An https link"},
+                "if_state": {"type": "string", "description": "set: write only if the row is still in this state"},
+                "children": {"type": "string", "enum": ["remove", "move-up"],
+                             "description": "remove: what happens to the row's children"},
+                "op_id": {"type": "string", "description": "Pass the same id to retry a write safely"},
+                "stale_hours": {"type": "number", "description": "list: only rows unchanged for this long"},
+                "summary": {"type": "boolean", "description": "loose-ends: counts per state only"},
+            },
+            "required": ["verb"],
+        },
+    },
 ]
 
 
@@ -1236,10 +1278,22 @@ def _tool_status(args: dict) -> dict:
         from khipu import agent_view
 
         payload["hub_error"] = agent_view.error_text(exc)
+    _attach_ledger(payload)
     _attach_prior_work(payload, args)
     _attach_contract(payload)
     _attach_plan_warnings(payload)
     return payload
+
+
+def _attach_ledger(payload: dict) -> None:
+    """The ledger line: rows, loose ends, rows waiting on the owner and
+    waiting writes, across every project. When the hub already failed above
+    it reports the outbox alone, without trying the hub again. Optional: a
+    failure costs only this field."""
+    with contextlib.suppress(Exception):
+        from khipu import ledger
+
+        payload["ledger"] = ledger.status_line(hub="hub_error" not in payload)
 
 
 def _attach_plan_warnings(payload: dict) -> None:
@@ -1525,13 +1579,15 @@ def _tool_forget(args: dict) -> dict:
     the Mac that captured it and is forgotten there."""
     if isinstance(args.get("id"), str) and args["id"].startswith("ledger:"):
         _ensure_path()
-        from khipu import ledger
+        from khipu import agent_view, ledger
 
+        # A ledger answer, whichever tool gives it, leaves through
+        # agent_view.project, like khipu_ledger's.
         try:
-            return ledger.remove_ref(args["id"], note=str(args.get("note") or ""),
-                                     children=args.get("children"), source="mcp")
+            return agent_view.project(ledger.remove_ref(args["id"], note=str(args.get("note") or ""),
+                                                        children=args.get("children"), source="mcp"))
         except ledger.LedgerError as exc:
-            raise ValueError(str(exc)) from None
+            raise _ToolFailure(agent_view.project({"ok": False, "error": str(exc), "reason": exc.reason})) from None
     eid = _positive_id(args.get("id"), "id")
     _ensure_path()
     from khipu.forget import KEPT, LOCAL_HARNESSES, forget_everywhere, plain_summary
@@ -1813,6 +1869,120 @@ def _tool_route_priority(args: dict) -> dict:
                                          author=routing.conversation_author(), expect_current=True)
 
 
+_LEDGER_VERBS = ("add", "set", "get", "list", "loose-ends", "needs-owner", "needs-matt", "render", "check",
+                 "remove", "removed")
+_LEDGER_TEXT = ("project", "id", "title", "kind", "parent", "state", "evidence", "owner", "note", "link", "if_state",
+                "children", "op_id")
+
+
+# Fields that name a row or a project: cutting a path in one would point at
+# another, so a path there is refused instead. A link is not a path.
+_LEDGER_NAMES = ("project", "id", "parent", "children", "if_state", "op_id", "link")
+# A path at a word's start ("/x", "~/x", a backslash path, a drive letter)
+# or a word holding two or more folder separators.
+_LEDGER_PATH_START = r"^(?:~[/\\]|/(?=[\w.~-])|\\|[A-Za-z]:[/\\])"
+_LEDGER_PATH = re.compile(_LEDGER_PATH_START + r"|[^/\\]+[/\\][^/\\]*[/\\]")
+
+
+def _ledger_args(args: dict) -> dict:
+    """The one check every text field of ``khipu_ledger`` passes before
+    anything is written or queued (rule 4: titles and short plain words,
+    never code, file contents, logs or private paths). Text only; nothing
+    key-shaped; one line with no control characters and no code fence; in a
+    field naming a row or project no word starting as a path; and in every
+    other field each path-shaped word cut to its last name. Returns the
+    fields as they will be saved."""
+    from khipu import ledger
+
+    for key in _LEDGER_TEXT:
+        if args.get(key) is not None and not isinstance(args[key], str):
+            raise ValueError(f"{key} must be text")
+    ledger.refuse_secrets([args.get(k) for k in _LEDGER_TEXT])
+    out = dict(args)
+    for key in _LEDGER_TEXT:
+        value = args.get(key)
+        if value is None:
+            continue
+        if "```" in value or any(ord(c) < 32 or 0x7F <= ord(c) <= 0x9F or c in "\u2028\u2029" for c in value):
+            raise ledger.LedgerError(f"{key} must be one line of plain words about the work: no code, file "
+                                     "contents, command output or logs. Nothing was saved", "not_one_line")
+        if key in _LEDGER_NAMES:
+            if key != "link" and any(re.match(_LEDGER_PATH_START, w) for w in value.split()):
+                raise ledger.LedgerError(f"{key} must not be a file path. Nothing was saved", "path")
+        else:
+            words = []
+            for word in value.split(" "):
+                if not word.startswith("https://") and _LEDGER_PATH.search(word):
+                    word = re.split(r"[/\\]+", word.rstrip("/\\"))[-1] or word
+                words.append(word)
+            out[key] = " ".join(words)
+    return out
+
+
+def _tool_ledger(args: dict) -> dict:
+    """``khipu ledger`` as a tool: the same verbs and fields, JSON back. A
+    refusal is a tool error carrying the error and its reason word. Restore,
+    purge and import are the owner's, in the app, so they are not verbs here."""
+    verb = args.get("verb")
+    if verb not in _LEDGER_VERBS:
+        raise ValueError(f"verb must be one of: {', '.join(_LEDGER_VERBS)}")
+    stale = args.get("stale_hours")
+    if stale is not None and (isinstance(stale, bool) or not isinstance(stale, (int, float))):
+        raise ValueError("stale_hours must be a number")
+    _ensure_path()
+    import argparse
+
+    from khipu import ledger
+
+    try:
+        args = _ledger_args(args)
+        ledger.require(f"ledger {verb}")
+        project = ledger._project_for(argparse.Namespace(project=args.get("project") or None))
+        row_id = args.get("id") or ""
+        if verb in ("add", "set", "remove"):
+            if verb == "add" and not (args.get("title") and args.get("kind")):
+                raise ledger.LedgerError("add needs a title and a kind", "missing")
+            if verb == "add":
+                fields = {k: args.get(k) or "" for k in ("title", "kind", "parent", "evidence", "link")}
+                fields.update(state=args.get("state"), owner=args.get("owner") or "none")
+            elif verb == "set":
+                fields = {k: args.get(k) for k in ("state", "evidence", "owner", "title", "link")}
+            else:
+                fields = {}
+            op = ledger.new_op(verb, project, row_id, fields=fields, note=args.get("note") or "",
+                               if_state=args.get("if_state") if verb == "set" else None,
+                               children=args.get("children") if verb == "remove" else None,
+                               op_id=args.get("op_id"), source="mcp")
+            result = ledger.write(op)
+            return {**result, "op_id": op["op_id"], "project": project}
+        if verb == "get":
+            got = ledger.get(project, row_id)
+            out = {"ok": True, "row": ledger.row_json(got["row"], got["history"], project)}
+            if got.get("offline"):
+                out["offline_as_of"] = got.get("as_of")
+            return out
+        if verb == "removed":
+            return {"ok": True, "project": project, "removed": ledger.removed_rows(project)}
+        view = ledger.load(project)
+        head = {"ok": True, "project": project, "offline": view["offline"], "as_of": view.get("as_of")}
+        if verb == "render":
+            return {**head, "board": ledger.render_board(view)}
+        if verb == "check":
+            return {**head, **ledger.check(view)}
+        if verb == "list":
+            rows, _text = ledger.render_list(view, state=args.get("state"), kind=args.get("kind"),
+                                             owner=args.get("owner"), stale_hours=stale)
+        elif verb == "loose-ends":
+            rows, text = ledger.render_loose_ends(view, summary=bool(args.get("summary")))
+            if args.get("summary"):
+                return {**head, "summary": text}
+        else:
+            rows, _text = ledger.render_needs(view)
+        return {**head, "rows": [ledger.row_json(r, [], project) for r in rows]}
+    except ledger.LedgerError as exc:
+        raise _ToolFailure({"ok": False, "error": str(exc), "reason": exc.reason}) from None
+
+
 TOOL_FUNCS = {
     "khipu_search": _tool_search,
     "khipu_get": _tool_get,
@@ -1831,6 +2001,7 @@ TOOL_FUNCS = {
     "khipu_route_report": _tool_route_report,
     "khipu_route_rule": _tool_route_rule,
     "khipu_route_priority": _tool_route_priority,
+    "khipu_ledger": _tool_ledger,
 }
 
 
@@ -1844,6 +2015,9 @@ def _result(req_id, payload: dict) -> dict:
 # never scrubbed: that would alter what was remembered.
 _AGENT_SCRUBBED = frozenset({"khipu_usage", "khipu_route", "khipu_route_report", "khipu_route_rule",
                              "khipu_route_priority", "khipu_status"})
+# The ledger's answers leave through agent_view.project (its stricter final
+# scan: account keys and secrets as well as paths).
+_AGENT_PROJECTED = frozenset({"khipu_ledger"})
 _MEMORY_FIELDS = ("prior_work", "prior_work_text", "prior_work_meta")
 
 
@@ -2040,14 +2214,19 @@ def _dispatch_message(msg: dict) -> dict | None:
             _drop_modules_if_code_changed()
         from khipu import agent_view
 
+        # Every error leaves through the tool's own pass: a projected tool's
+        # through agent_view.project, whatever raised it.
+        scrub = agent_view.project if name in _AGENT_PROJECTED else agent_view.scrub
         try:
             payload = func(params.get("arguments") or {})
             if name in _AGENT_SCRUBBED:
                 payload = _scrub_for_agents(name, payload)
+            elif name in _AGENT_PROJECTED:
+                payload = agent_view.project(payload)
         except _ToolFailure as exc:
-            return _result(req_id, _tool_text(agent_view.scrub(exc.payload), is_error=True))
+            return _result(req_id, _tool_text(scrub(exc.payload), is_error=True))
         except ValueError as exc:  # argument/mode rejections → tool error, not crash
-            return _result(req_id, _tool_text({"error": agent_view.scrub(str(exc))}, is_error=True))
+            return _result(req_id, _tool_text(scrub({"error": str(exc)}), is_error=True))
         except KeyboardInterrupt:
             raise
         except BaseException as exc:  # noqa: BLE001 — DB down, or SystemExit from
@@ -2057,7 +2236,8 @@ def _dispatch_message(msg: dict) -> dict | None:
             # A tool failing is a tool error; only the transport may end us.
             # Its own text may name a file: fixed words for a filesystem
             # error, anything else scrubbed (agent_view.error_text).
-            return _result(req_id, _tool_text({"error": agent_view.error_text(exc)}, is_error=True))
+            error = {"error": agent_view.error_text(exc)}
+            return _result(req_id, _tool_text(scrub(error) if name in _AGENT_PROJECTED else error, is_error=True))
         finally:
             if _RELOAD_ON_CHANGE:
                 _note_loaded_modules()
