@@ -1047,3 +1047,30 @@ def test_the_apps_same_and_unhide_argv_parse():
     with redirect_stdout(io.StringIO()):
         assert args.func(args) == 0
     assert work.read_links() == {"same": [], "not_same": [["owner/atlas", "n-7", "42"]]}
+
+
+def test_a_parent_folder_replaced_after_the_open_is_refused(tmp_path, monkeypatch):
+    # The folder is swapped right after its descriptor is taken: reading the
+    # old file through the old descriptor would return bytes no longer at
+    # the named path.
+    parent = tmp_path / "public"
+    parent.mkdir()
+    (parent / "tracker.json").write_text("old-file")
+    real_open = os.open
+    swapped = []
+
+    def race(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if path == "public" and not swapped:
+            swapped.append(True)
+            parent.rename(tmp_path / "moved")
+            parent.mkdir()
+            (parent / "tracker.json").write_text("named-file")
+        return fd
+
+    monkeypatch.setattr(os, "open", race)
+    try:
+        data, _st = safe_read.read_file(parent / "tracker.json")
+    except safe_read.Refused:
+        return
+    assert data == b"named-file", data

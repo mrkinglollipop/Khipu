@@ -10,7 +10,9 @@ expanded, resolved, in its ~/ form and by its folder name), replaced by the
 account's id as khipu_route gives it; the other configured folders and files;
 this Mac's home folder; the user names those paths carry; and anything else
 shaped like a private path. The app and the owner's own `khipu usage --json`
-never pass through here and keep their paths. Memory content (khipu_search,
+never pass through here and keep their paths. The ledger's and the Work
+view's agent-facing and JSON outputs leave through ``project``: this scrub,
+account keys first, and a stricter final scan. Memory content (khipu_search,
 khipu_get, khipu_status's prior work) never passes through here either: a
 scrub would alter what was remembered.
 
@@ -483,6 +485,68 @@ def scrub(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] | None =
     table = _table(extra_keys)
     words = sorted({w for w in [*keep, *table.owner] if isinstance(w, str) and w}, key=len, reverse=True)
     return _walk(value, table, words)
+
+
+# A routing account key, "harness|login folder" (the folder may be empty).
+_ACCOUNT_KEY = re.compile(r"(?i)(?<![\w-])(claude|codex|grok|muse)\|")
+_KEY_HOME = re.compile(r"[^\s\"'`,;)\]}]*")
+
+
+def _account_keys(text: str, table: _Table) -> str:
+    """Each account key in ``text`` replaced by the account's id. A folder
+    Khipu knows is taken whole, spaces included; any other runs to the
+    first space."""
+    out, last = [], 0
+    for m in _ACCOUNT_KEY.finditer(text):
+        if m.start() < last:
+            continue
+        found = table.roots.match(text, m.end()) if table.roots is not None else None
+        end = found.end() if found else _KEY_HOME.match(text, m.end()).end()
+        out += [text[last:m.start()], str(_Id(m.group(1).lower(), text[m.end():end] or None))]
+        last = end
+    return "".join(out) + text[last:]
+
+
+def _project_text(text: str, table: _Table) -> str:
+    from khipu.redact import redact_secrets
+
+    text = _scrub_text(_account_keys(text, table), table, [])
+    # Fail closed: an account key or a key-shaped secret still in the
+    # finished value, in any decoding of it, withholds the whole value.
+    for variant in _decoded_variants(text):
+        if _ACCOUNT_KEY.search(variant) or redact_secrets(variant, force=True)[1]:
+            return WITHHELD
+    return text
+
+
+def _project_walk(value, table):
+    if isinstance(value, str):
+        return _project_text(value, table)
+    if isinstance(value, dict):
+        return {(_project_text(k, table) if isinstance(k, str) else k): _project_walk(v, table)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_project_walk(v, table) for v in value)
+    return value
+
+
+def project(value):
+    """``value`` as the ledger and the Work view hand it to an agent or a
+    JSON reader (khipu_ledger, ``khipu ledger ... --json``, ``khipu work
+    --json``, ``khipu work check --json``, view.json): account keys become
+    account ids, then ``scrub``'s replacements, then a final scan that
+    withholds any string still holding an account key, a secret or a
+    private path. No owner's words are kept whole here.
+
+    When the replacement table can't be built, the final scan still runs
+    over an empty one (paths, account keys and secrets are still withheld);
+    the Work view's own last pass has already withheld every name it could
+    not tell from a login folder's."""
+    try:
+        table = _table(None)
+    except Exception:  # noqa: BLE001
+        table = _Table(None, [], None, {}, [], set())
+    return _project_walk(value, table)
 
 
 def error_text(exc: BaseException) -> str:

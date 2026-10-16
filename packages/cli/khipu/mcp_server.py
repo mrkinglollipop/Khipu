@@ -2012,6 +2012,9 @@ def _result(req_id, payload: dict) -> dict:
 # never scrubbed: that would alter what was remembered.
 _AGENT_SCRUBBED = frozenset({"khipu_usage", "khipu_route", "khipu_route_report", "khipu_route_rule",
                              "khipu_route_priority", "khipu_status"})
+# The ledger's answers leave through agent_view.project (its stricter final
+# scan: account keys and secrets as well as paths).
+_AGENT_PROJECTED = frozenset({"khipu_ledger"})
 _MEMORY_FIELDS = ("prior_work", "prior_work_text", "prior_work_meta")
 
 
@@ -2212,8 +2215,11 @@ def _dispatch_message(msg: dict) -> dict | None:
             payload = func(params.get("arguments") or {})
             if name in _AGENT_SCRUBBED:
                 payload = _scrub_for_agents(name, payload)
+            elif name in _AGENT_PROJECTED:
+                payload = agent_view.project(payload)
         except _ToolFailure as exc:
-            return _result(req_id, _tool_text(agent_view.scrub(exc.payload), is_error=True))
+            scrub = agent_view.project if name in _AGENT_PROJECTED else agent_view.scrub
+            return _result(req_id, _tool_text(scrub(exc.payload), is_error=True))
         except ValueError as exc:  # argument/mode rejections → tool error, not crash
             return _result(req_id, _tool_text({"error": agent_view.scrub(str(exc))}, is_error=True))
         except KeyboardInterrupt:

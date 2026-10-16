@@ -1316,8 +1316,10 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
 
 
 def write_view(view: dict) -> None:
+    from khipu import agent_view
+
     try:
-        _write_json(view_file(), view)
+        _write_json(view_file(), agent_view.project(view))
     except OSError:
         pass  # the saved copy is for a later reader; the answer stands without it
 
@@ -1434,13 +1436,20 @@ def render_text(view: dict) -> str:
     return "\n".join(lines)
 
 
+def _json_out(payload: Any, indent: int | None = 2) -> str:
+    """Every --json answer leaves through agent_view.project."""
+    from khipu import agent_view
+
+    return json.dumps(agent_view.project(payload), indent=indent, default=str)
+
+
 def cmd(args: argparse.Namespace) -> int:
     sub = getattr(args, "work_cmd", None)
     if sub == "check":
         ok, problems, parsed = check_file(args.file)
         if args.json:
-            print(json.dumps({"ok": ok, "problems": problems,
-                              "counts": {k: len(parsed[k]) for k in _TOP_LISTS} if parsed else None}, indent=2))
+            print(_json_out({"ok": ok, "problems": problems,
+                             "counts": {k: len(parsed[k]) for k in _TOP_LISTS} if parsed else None}))
         else:
             if parsed:
                 print(f"Read {len(parsed['jobs'])} job(s), {len(parsed['prs'])} pull request(s) and "
@@ -1452,23 +1461,23 @@ def cmd(args: argparse.Namespace) -> int:
         if sub == "hide":
             owed = {str(c.get("id")): c for c in read_owed()["items"]}
             if args.id not in owed:
-                print(json.dumps({"ok": False, "error": f"no open commitment {args.id} needs you"}))
+                print(_json_out({"ok": False, "error": f"no open commitment {args.id} needs you"}, indent=None))
                 return 1
             item = owed[args.id]
         set_hidden(args.id, item)
-        print(json.dumps({"ok": True, "hidden": sorted(read_hidden())}))
+        print(_json_out({"ok": True, "hidden": sorted(read_hidden())}, indent=None))
         return 0
     if sub in ("same", "not-same"):
         project, _, row_id = args.row.partition("#")
         if not project or not row_id:
-            print(json.dumps({"ok": False, "error": "name the ledger row as <project>#<row id>"}))
+            print(_json_out({"ok": False, "error": "name the ledger row as <project>#<row id>"}, indent=None))
             return 1
         set_link(project, row_id, args.commitment, sub == "same")
-        print(json.dumps({"ok": True}))
+        print(_json_out({"ok": True}, indent=None))
         return 0
     view = build_view()
     write_view(view)
-    print(json.dumps(view, indent=2, default=str) if args.json else render_text(view))
+    print(_json_out(view) if args.json else render_text(view))
     return 0
 
 

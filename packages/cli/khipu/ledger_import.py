@@ -498,10 +498,11 @@ def _unchanged(before: dict[str, Any], after: dict[str, Any], skip: set[str]) ->
 
 
 def _verify(cur, project: str, expected: dict[str, dict], counts: dict[str, Any],
-            before: dict[str, Any]) -> dict[str, Any]:
+            before: dict[str, Any], order: list[str] | None = None) -> dict[str, Any]:
     """The whole project against the file, inside the import's transaction:
-    the rows that were not here before are exactly the file's rows, each
-    reading back field by field with its history in order, then one
+    the rows that were not here before are exactly the file's rows, in
+    ``order`` (the order they were written; the file's own when not given),
+    each reading back field by field with its history in order, then one
     "Imported from" line; every row that was here before, live or removed,
     reads as it did, history and all."""
     after = _snapshot(cur, project)
@@ -509,6 +510,10 @@ def _verify(cur, project: str, expected: dict[str, dict], counts: dict[str, Any]
     got = {i: r for i, r in after["rows"].items() if i in new}
     differs = _ids_differ(before, after, new, "in the file")
     differs += _compare(expected, got)
+    want = [i for i in (order if order is not None else expected) if i in new]
+    stored = sorted((i for i in want if i in after["all"]), key=lambda i: after["all"][i]["seq"])
+    if stored != [i for i in want if i in after["all"]]:
+        differs.append("rows: stored out of order")
     for row_id in sorted(new):
         hist = after["hist"].get(row_id, [])
         own = [h for h in hist if not h["has_raw"]]
@@ -656,7 +661,7 @@ def _import_in(cur, project: str, src: dict[str, Any], report: dict[str, Any], *
     import_id = cur.fetchone()[0]
     event = f"Imported from {src['name']} on {ledger._date_words(now)}"
     _insert_history(cur, project, [(i, _note_entry(event, now), f"{MARKER_OP}{import_id}") for i in order])
-    check = _verify(cur, project, rows, report["counts_in_file"], before)
+    check = _verify(cur, project, rows, report["counts_in_file"], before, order)
     report["check"] = check
     if not check["ok"]:
         raise _Mismatch("Nothing was imported: the check after writing found differences, so it was undone. ")

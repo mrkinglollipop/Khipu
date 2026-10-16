@@ -23,6 +23,7 @@ class RedactSecretsTest(unittest.TestCase):
             "slack xoxb-1234567890-abcdefghij": "xoxb-",
             "google AIzaSyA-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456": "AIzaSy",
             "stripe sk_live_ABCDEFGHIJKLMNOPQRST": "sk_live_",
+            "grok " + "xai-" + "Ab12" * 12: "xai-Ab12",
         }
         for text, must_vanish in cases.items():
             out = self._one(text)

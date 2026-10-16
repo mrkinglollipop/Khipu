@@ -11,7 +11,10 @@ resolved), and the file is opened by name from that folder's descriptor with
 with one name: a second name could be a hard link to a file inside a login
 folder. After reading, the name is looked up again in the same folder and must
 still be that file (device and inode) with one name, so a name unlinked or
-swapped between the open and the ``fstat`` is caught. Nothing is ever written.
+swapped between the open and the ``fstat`` is caught. The path is then walked
+again from ``/`` the same way, and its folder and its file must be the very
+folder and file that were opened, so a parent folder moved or replaced after
+the open is caught too. Nothing is ever written.
 """
 from __future__ import annotations
 
@@ -66,8 +69,8 @@ class Opened:
     """An open file from ``open_file``; ``st`` is its ``fstat`` at the open.
     Use as a context manager, or call ``close``."""
 
-    def __init__(self, fd: int, st: os.stat_result, dir_fd: int, name: str):
-        self.fd, self.st, self._dir_fd, self._name = fd, st, dir_fd, name
+    def __init__(self, fd: int, st: os.stat_result, dir_fd: int, name: str, folder: str):
+        self.fd, self.st, self._dir_fd, self._name, self._folder = fd, st, dir_fd, name, folder
 
     def read(self, most: int = 0) -> bytes:
         """Up to ``most`` bytes (0: all of it)."""
@@ -83,14 +86,24 @@ class Opened:
 
     def recheck(self) -> None:
         """Raise ``Refused`` unless the name still names the opened file, and
-        that file still has one name."""
+        that file still has one name, and the path walked again from ``/``
+        reaches the same folder and the same file."""
         try:
             now = os.fstat(self.fd)
             named = os.stat(self._name, dir_fd=self._dir_fd, follow_symlinks=False)
-        except OSError:
+            held = os.fstat(self._dir_fd)
+            again = _walk(self._folder)
+            try:
+                folder = os.fstat(again)
+                found = os.stat(self._name, dir_fd=again, follow_symlinks=False)
+            finally:
+                os.close(again)
+        except (OSError, Refused):
             raise Refused from None
+        same = (self.st.st_dev, self.st.st_ino)
         if now.st_nlink != 1 or named.st_nlink != 1 or not stat.S_ISREG(named.st_mode) \
-                or (named.st_dev, named.st_ino) != (self.st.st_dev, self.st.st_ino):
+                or (named.st_dev, named.st_ino) != same or (found.st_dev, found.st_ino) != same \
+                or (folder.st_dev, folder.st_ino) != (held.st_dev, held.st_ino):
             raise Refused
 
     def close(self) -> None:
@@ -108,6 +121,28 @@ class Opened:
         self.close()
 
 
+def _walk(folder: str) -> int:
+    """A descriptor for ``folder``, reached one folder at a time from ``/``
+    without following a link. Raises ``Refused`` for a link on the way."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    dir_fd = os.open("/", os.O_RDONLY | directory)
+    try:
+        for part in Path(folder).parts[1:]:
+            step = os.open(part, os.O_RDONLY | directory | nofollow, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = step
+    except OSError as exc:
+        os.close(dir_fd)
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise Refused from None
+        raise
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return dir_fd
+
+
 def open_file(path: str | os.PathLike, limit: int = 0) -> Opened:
     """Open ``path`` read-only as the module text says. Raises ``Refused``,
     ``FileNotFoundError``, ``IsADirectoryError``, ``TooBig`` (over ``limit``
@@ -118,16 +153,11 @@ def open_file(path: str | os.PathLike, limit: int = 0) -> Opened:
     folder = system_links_resolved(str(p.parent))
     if private_place(os.path.join(folder, p.name)):
         raise Refused
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    directory = getattr(os, "O_DIRECTORY", 0)
-    dir_fd = os.open("/", os.O_RDONLY | directory)
+    dir_fd = _walk(folder)
     try:
         try:
-            for part in Path(folder).parts[1:]:
-                step = os.open(part, os.O_RDONLY | directory | nofollow, dir_fd=dir_fd)
-                os.close(dir_fd)
-                dir_fd = step
-            fd = os.open(p.name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | nofollow, dir_fd=dir_fd)
+            fd = os.open(p.name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0),
+                         dir_fd=dir_fd)
         except OSError as exc:
             if exc.errno in (errno.ELOOP, errno.ENOTDIR):
                 raise Refused from None
@@ -135,7 +165,7 @@ def open_file(path: str | os.PathLike, limit: int = 0) -> Opened:
     except BaseException:
         os.close(dir_fd)
         raise
-    opened = Opened(fd, os.fstat(fd), dir_fd, p.name)
+    opened = Opened(fd, os.fstat(fd), dir_fd, p.name, folder)
     try:
         st = opened.st
         if stat.S_ISDIR(st.st_mode):

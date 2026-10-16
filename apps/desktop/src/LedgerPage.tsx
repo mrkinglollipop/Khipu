@@ -5,7 +5,7 @@
    history newest first and Remove…; the Removed list restores a row for 30
    days. Every change is written as "you, in the app" and re-read at once. */
 
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Callout, Dialog } from "./ui";
 import { callCli } from "./settingsCli";
@@ -169,6 +169,10 @@ export function LedgerPage({
   const [selected, setSelected] = useState<string | null>(initialRow ?? null);
   const [detail, setDetail] = useState<LedgerRow | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
+  // The row open now: a detail answer for any other row arrived late and is
+  // dropped, so it can never become the target of a change or a removal.
+  const openRow = useRef(selected);
+  openRow.current = selected;
   const [form, setForm] = useState<Form | null>(null);
   const [saving, setSaving] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
@@ -193,6 +197,7 @@ export function LedgerPage({
   const loadDetail = useCallback(
     async (id: string) => {
       const res = await callCli<LedgerRow>("khipu_ledger_get", { project, id });
+      if (openRow.current !== id) return null;
       if (res.ok && res.data && typeof res.data.id === "string") {
         setDetail(res.data);
         setDetailError(null);

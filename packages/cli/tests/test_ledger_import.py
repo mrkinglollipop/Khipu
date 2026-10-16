@@ -779,3 +779,29 @@ def test_a_catch_up_that_reorders_imported_history_rolls_back(hub, tmp_path, mon
     rc, report = _import(path, "--catch-up")
     assert rc == 1 and report["result"] == "rolled back", report
     assert [e.get("event") for e in _export()["a"]["history"]] == ["first", "second"]
+
+
+def test_the_check_after_writing_refuses_rows_stored_in_reverse_order(monkeypatch):
+    from khipu import ledger_import
+
+    expected = {"a": _row("a"), "b": _row("b")}
+    before = {"ids": set(), "all": {}, "hist": {}, "rows": {}}
+    # The writer gave the rows their places backwards: b first, then a.
+    after = {"ids": set(expected), "all": {"a": {"seq": 2}, "b": {"seq": 1}},
+             "hist": {i: [{"has_raw": False, "op_id": "import:1"}] for i in expected},
+             "rows": {i: expected[i] for i in ("b", "a")}}
+    monkeypatch.setattr(ledger_import, "_snapshot", lambda *a: after)
+    report = ledger_import._verify(None, P, expected, ledger_import.tracker_counts(expected), before)
+    assert not report["ok"], report
+    assert any("order" in d for d in report["fields_differ"]), report
+
+
+def test_an_xai_shaped_key_is_masked_on_reading_and_reported(tmp_path):
+    from khipu import ledger_import
+
+    token = "xai-" + "Ab12" * 12
+    source = _row("a")
+    source["evidence"] = token
+    src = ledger_import.read_tracker(_write(tmp_path, {"rows": {"a": source}}))
+    assert token not in json.dumps(src)
+    assert src["masked"] == ["a.evidence"], src["masked"]

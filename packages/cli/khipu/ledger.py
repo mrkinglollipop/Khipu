@@ -2300,9 +2300,16 @@ def _project_for(args: argparse.Namespace) -> str:
     return _check_project(resolve_repo_root(cwd).get("project"))
 
 
+def _json_out(payload: Any, **kw: Any) -> str:
+    """Every --json answer leaves through agent_view.project."""
+    from khipu import agent_view
+
+    return json.dumps(agent_view.project(payload), default=str, **kw)
+
+
 def _emit(args: argparse.Namespace, payload: dict[str, Any], text: str | None) -> None:
     if getattr(args, "json", False):
-        print(json.dumps(payload, indent=2, default=str))
+        print(_json_out(payload, indent=2))
     elif text is not None:
         print(text)
 
@@ -2338,7 +2345,7 @@ def cmd(args: argparse.Namespace) -> int:
             payload = row_json(got["row"], got["history"], project)
             if got.get("offline"):
                 payload["offline_as_of"] = got.get("as_of")
-            print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+            print(_json_out(payload, indent=2, sort_keys=True))
             return 0
         view = load(project)
         note = _offline_note(view)
@@ -2379,7 +2386,7 @@ def cmd(args: argparse.Namespace) -> int:
         return rc
     except LedgerError as exc:
         if getattr(args, "json", False):
-            print(json.dumps({"ok": False, "error": str(exc), "reason": exc.reason}))
+            print(_json_out({"ok": False, "error": str(exc), "reason": exc.reason}))
         else:
             print(f"error: {exc}", file=sys.stderr)
         return 1
