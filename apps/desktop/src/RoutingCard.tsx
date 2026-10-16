@@ -112,7 +112,7 @@ function PriorityRow({ p, now, reload }: { p: RoutePriority; now: Date; reload: 
     setBusy(action);
     setError(null);
     try {
-      const out = await callCli("khipu_route_priority", { action });
+      const out = await callCli("khipu_route_priority", { action, expect: p.version ?? null });
       if (!out.ok) setError(out.error);
       await reload();
     } finally {

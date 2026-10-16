@@ -3073,10 +3073,8 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         finally:
             routing._OWNER_AUTH.reset(auth)
-        out = {"ok": True, "usage_accounts": usage.accounts_status(), "config_file": str(config_file())}
-        if saved.get("record_error"):
-            out["record_error"] = saved["record_error"]
-        print(json.dumps(out))
+        print(json.dumps({"ok": True, "version": saved["version"], "usage_accounts": usage.accounts_status(),
+                          "config_file": str(config_file())}))
         return 0
     from khipu.config import CLI_SETTINGS
 
@@ -5549,7 +5547,7 @@ def build_parser() -> argparse.ArgumentParser:
     aauto = acc_sub.add_parser("auto-track", parents=[acc_owner],
                                help="Track found logins a conversation used without asking (on this Mac)")
     aauto.add_argument("state", choices=("on", "off"))
-    areq = acc_sub.add_parser("request", parents=[acc_owner],
+    areq = acc_sub.add_parser("request", parents=[acc_owner, acc_cas],
                               help="Answer a conversation's change to the account list")
     areq.add_argument("action", choices=("confirm", "undo"))
 

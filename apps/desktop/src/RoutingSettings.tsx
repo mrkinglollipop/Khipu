@@ -877,12 +877,12 @@ function PrioritySection({
           </span>
           <div className="toolbar">
             <button type="button" className="sm primary" disabled={w.isBusy("priority:confirm")}
-              onClick={() => void w.run("priority:confirm", "khipu_route_priority", { action: "confirm" })}>
+              onClick={() => void w.run("priority:confirm", "khipu_route_priority", { action: "confirm", expect })}>
               <Busy on={w.isBusy("priority:confirm")} />
               Confirm
             </button>
             <button type="button" className="sm" disabled={w.isBusy("priority:undo")}
-              onClick={() => void w.run("priority:undo", "khipu_route_priority", { action: "undo" }, null, () => addSelect.current)}>
+              onClick={() => void w.run("priority:undo", "khipu_route_priority", { action: "undo", expect }, null, () => addSelect.current)}>
               <Busy on={w.isBusy("priority:undo")} />
               Undo
             </button>

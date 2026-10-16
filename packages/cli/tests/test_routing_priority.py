@@ -183,11 +183,11 @@ def test_set_at_the_owners_request_is_live_marked_and_shows_what_it_replaced(hom
     with pytest.raises(routing.RouteError, match="another conversation"):
         routing.request_priority([{"account": "Claude"}], owner_request="other", author=OTHER, expect=routing.priority_version())
     # The owner's Undo puts his own priority back; Confirm makes a request his.
-    routing.undo_priority(via="app")
+    routing.undo_priority(via="app", expect=routing.priority_version())
     view = routing.read_view()
     assert _labels(view) == ["Claude second", "Codex", "Claude"] and view["priority"]["confirmed"]
     routing.request_priority([{"account": "Codex"}], owner_request="again", author=OTHER, expect=routing.priority_version())
-    routing.confirm_priority(via="app")
+    routing.confirm_priority(via="app", expect=routing.priority_version())
     view = routing.read_view()
     assert _labels(view) == ["Codex"] and view["priority"]["confirmed"] and view["priority"]["replaced"] is None
     routing.clear_priority(via="app", expect=routing.priority_version())
@@ -197,7 +197,7 @@ def test_set_at_the_owners_request_is_live_marked_and_shows_what_it_replaced(hom
 def test_undo_of_a_first_request_leaves_no_priority(home):
     routing.request_priority([{"account": "Codex"}], owner_request="use Codex", author=ME, expect=routing.priority_version())
     assert "It replaced: no priority." in _summary(home)
-    routing.undo_priority(via="app")
+    routing.undo_priority(via="app", expect=routing.priority_version())
     assert routing.read_view().get("priority") is None
 
 
@@ -494,7 +494,7 @@ def test_a_conversations_role_cannot_read_as_more_entries(home):
 
 def test_a_confirmed_request_is_the_owners_and_doctor_does_not_call_it_outside_the_app(home):
     routing.request_priority([{"account": "Codex"}], owner_request="the owner asked", author=ME, expect=routing.priority_version())
-    routing.confirm_priority(via="app")
+    routing.confirm_priority(via="app", expect=routing.priority_version())
     view = routing.read_view()
     assert view["priority"]["via"] == "app" and view["priority"]["written_by"] == {"kind": "owner"}
     assert "priority" not in view["outside_app"]
@@ -586,7 +586,7 @@ def test_an_owner_line_records_how_it_was_authorised(home, capsys):
     from khipu import cli
 
     _owner_world(home, capsys)
-    assert cli.main(["route", "priority", "--from-app", "--", "confirm"]) == 0
+    assert cli.main(["route", "priority", "--from-app", f"--expect={routing.priority_version()}", "--", "confirm"]) == 0
     events, _bad = routing.read_events()
     line = events[-1]
     assert line["type"] == "priority_confirm" and line["via"] == "app" and line["auth"] == "app"
@@ -601,7 +601,7 @@ def test_an_owner_write_that_skipped_the_check_shows_as_unchecked(home, capsys):
     _owner_world(home, capsys)
     assert cli.main(["route", "rule", "--from-app", "--", "confirm", "1"]) == 0
     # Imported and called directly, as a conversation could: no check ran.
-    routing.confirm_priority(via="app")
+    routing.confirm_priority(via="app", expect=routing.priority_version())
     routing.confirm_rule(2, via="app")
     view = routing.read_view()
     assert view["priority"]["via"] == "app-unchecked"

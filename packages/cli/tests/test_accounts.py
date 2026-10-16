@@ -442,13 +442,13 @@ def test_a_conversation_at_the_owners_request_and_its_undo(mac, capsys):
     assert request["request"] == "add my Claude login" and request["by"]["kind"] == "conversation"
     rc, out = _cli(["config", "--at-owner-request=again", f"--expect={_version()}", "--set", "usage_accounts", "[]"], capsys)
     assert rc == 2 and out["code"] == "request_waiting" and len(_stored()) == 2
-    rc, out = _cli(["accounts", "request", "undo", "--from-app"], capsys)
+    rc, out = _cli(["accounts", "request", "undo", "--from-app", f"--expect={_version()}"], capsys)
     assert rc == 2 and out["code"] == "owner_only"
     mac["callers"].as_app()
-    rc, out = _cli(["accounts", "request", "undo", "--from-app"], capsys)
+    rc, out = _cli(["accounts", "request", "undo", "--from-app", f"--expect={_version()}"], capsys)
     assert rc == 0 and _stored() == [{"label": "Codex", "harness": "codex"}]
     assert accounts.status()["request"] is None
-    rc, out = _cli(["accounts", "request", "confirm", "--from-app"], capsys)
+    rc, out = _cli(["accounts", "request", "confirm", "--from-app", f"--expect={_version()}"], capsys)
     assert rc == 2 and out["code"] == "no_request"
 
 
@@ -579,7 +579,7 @@ def test_b1_automatic_tracking_leaves_a_conversations_request_waiting(mac, capsy
     assert rc == 0
     assert accounts.status()["request"] is not None, "automatic tracking ended a request waiting for the owner"
     mac["callers"].as_app()
-    rc, out = _cli(["accounts", "request", "undo", "--from-app"], capsys)
+    rc, out = _cli(["accounts", "request", "undo", "--from-app", f"--expect={_version()}"], capsys)
     assert rc == 0, out
     assert [e["harness"] for e in _stored()] == ["codex"]
 
@@ -1084,3 +1084,152 @@ def test_a_priority_read_before_a_move_is_refused_after_the_old_folder_is_tracke
         routing.set_priority([{"account": e["account"]} for e in reversed(stale["entries"])],
                              via="app", expect=stale["version"])
     assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == [new, "codex|"]
+
+
+# ---- review round 5: one transaction per account change ---------------------------------------
+
+
+def _limited_client(mac) -> str:
+    """Client (~/.claude-client) and Codex tracked; Client limited; a free
+    ~/.claude-office to move it to. Its key."""
+    old = _key("~/.claude-client")
+    (mac["home"] / ".claude-office").mkdir()
+    _set(usage_accounts=[{"harness": "claude", "label": "Client", "home": "~/.claude-client"},
+                         {"harness": "codex", "label": "Codex"}])
+    routing.report(state="limited", account=old, until="2h", author=ME)
+    usage._save_cache({old: {"harness": "claude", "account": "Client", "ok": True, "windows": []}})
+    return old
+
+
+def _as_before(old: str) -> None:
+    new = _key("~/.claude-office")
+    view = routing.read_view()
+    assert _stored()[0] == {"harness": "claude", "label": "Client", "home": "~/.claude-client"}
+    assert _entry(view, old)["state"] == "limited" and _entry(view, new) is None
+    assert old not in view.get("forwards", {}) and old in usage._load_cache()
+    assert not routing.account_txns_open()
+
+
+def _fail_append(monkeypatch, call: int) -> None:
+    """The routing record's ``call``-th append from now fails, as a full disk would."""
+    real, seen = routing._append_locked, []
+
+    def append(*lines):
+        seen.append(lines)
+        if len(seen) == call:
+            raise OSError(28, "No space left on device")
+        return real(*lines)
+
+    monkeypatch.setattr(routing, "_append_locked", append)
+
+
+def test_a_move_whose_intent_cannot_be_written_changes_nothing(mac, monkeypatch):
+    old = _limited_client(mac)
+    with monkeypatch.context() as m:
+        _fail_append(m, 1)
+        with pytest.raises(usage.AccountsError) as err:
+            accounts.move(old, "~/.claude-office", expect=_version())
+    assert err.value.code == "record_failed"
+    _as_before(old)
+
+
+def test_a_move_whose_done_line_cannot_be_written_is_rolled_back(mac, monkeypatch):
+    old = _limited_client(mac)
+    _fail_append(monkeypatch, 2)
+    with pytest.raises(usage.AccountsError) as err:
+        accounts.move(old, "~/.claude-office", expect=_version())
+    assert err.value.code == "record_failed"
+    _as_before(old)
+
+
+def test_a_change_cut_off_after_its_config_write_is_finished_on_the_next_read(mac, monkeypatch):
+    old, new = _limited_client(mac), _key("~/.claude-office")
+
+    def stopped(txn, state):
+        raise KeyboardInterrupt  # the process ends between the config write and the done line
+
+    with monkeypatch.context() as m, pytest.raises(KeyboardInterrupt):
+        m.setattr(routing, "account_txn_end", stopped)
+        accounts.move(old, "~/.claude-office", expect=_version())
+    assert _stored()[0]["home"] == "~/.claude-office" and len(routing.account_txns_open()) == 1
+    view = routing.read_view()
+    assert not routing.account_txns_open()
+    assert _entry(view, old) is None and _entry(view, new)["state"] == "limited"
+    assert new in usage._load_cache() and old not in usage._load_cache()
+
+
+def test_a_change_cut_off_before_its_config_write_is_rolled_back_on_the_next_read(mac, monkeypatch):
+    old = _limited_client(mac)
+
+    def stopped(data):
+        raise KeyboardInterrupt  # the process ends after the intent, before the config write
+
+    with monkeypatch.context() as m, pytest.raises(KeyboardInterrupt):
+        m.setattr(config, "save_config", stopped)
+        accounts.move(old, "~/.claude-office", expect=_version())
+    assert len(routing.account_txns_open()) == 1
+    _as_before(old)
+    assert accounts.status()["accounts"][0]["home"] == "~/.claude-client"
+
+
+def test_a_renamed_symlink_account_keeps_its_stored_folder_key_and_lanes(mac):
+    old = _key("~/client-link")
+    _set(usage_accounts=[{"harness": "claude", "label": "Work", "home": "~/client-link"},
+                         {"harness": "codex", "label": "Codex"}],
+         routing_lane_map={"jobs": {"review": old}})
+    accounts.save_list([{"harness": "claude", "label": "Office", "home": "~/client-link"},
+                        {"harness": "codex", "label": "Codex"}], expect=_version())
+    assert _stored()[0] == {"harness": "claude", "label": "Office", "home": "~/client-link"}
+    assert config.load_config()["routing_lane_map"] == {"jobs": {"review": old}}
+    assert [a["key"] for a in routing.accounts()] == [old, "codex|"]
+
+
+def test_an_answer_to_a_conversations_account_change_needs_the_version_it_read(mac):
+    _set(usage_accounts=[{"harness": "claude", "label": "First", "home": "~/.claude-client"},
+                         {"harness": "codex", "label": "Second"}])
+    base = _stored()
+    first = [dict(base[0], label="First A"), base[1]]
+    accounts.save_list(first, expect=_version(), request={"by": ME, "request": "first"})
+    stale = _version()
+    with pytest.raises(usage.AccountsError) as err:
+        accounts.answer_request("confirm")
+    assert err.value.code == "version_needed"
+    accounts.answer_request("confirm", expect=stale)
+    second = [first[0], dict(base[1], label="Second B")]
+    accounts.save_list(second, expect=_version(), request={"by": ME, "request": "second"})
+    with pytest.raises(usage.AccountsError) as err:
+        accounts.answer_request("undo", expect=stale)
+    assert err.value.code == "version_moved"
+    assert _stored() == second and config.load_config()["usage_accounts_request"]["request"] == "second"
+
+
+def test_a_priority_confirm_or_undo_needs_the_version_it_read(mac):
+    routing.request_priority([{"account": "Codex"}], owner_request="first", author=ME,
+                             expect=routing.priority_version())
+    stale = routing.priority_version()
+    routing.confirm_priority(via="app", expect=stale)
+    routing.request_priority([{"account": "Claude"}], owner_request="second", author=ME,
+                             expect=routing.priority_version())
+    for answer in (routing.confirm_priority, routing.undo_priority):
+        with pytest.raises(routing.PriorityVersionNeeded):
+            answer(via="app")
+        with pytest.raises(routing.PriorityMoved):
+            answer(via="app", expect=stale)
+    held = routing.read_view()["priority"]
+    assert held["pending"] and held["entries"][0]["account"] == "claude|"
+
+
+def test_stop_takes_the_account_out_of_a_waiting_priority_request_and_what_it_replaced(mac):
+    old = _key("~/.claude-client")
+    _set(usage_accounts=[{"harness": "claude", "label": "First", "home": "~/.claude-client"},
+                         {"harness": "codex", "label": "Second"}])
+    routing.set_priority([{"account": old}, {"account": "codex|"}], via="app", expect=routing.priority_version())
+    routing.request_priority([{"account": "First"}, {"account": "Second"}], owner_request="keep order", author=ME,
+                             expect=routing.priority_version())
+    out = accounts.stop(old, expect=_version())
+    assert out["priority"] == "removed"
+    held = routing.read_view()["priority"]
+    assert held["pending"] and [e["account"] for e in held["entries"]] == ["codex|"]
+    assert [e["account"] for e in held["replaced"]["entries"]] == ["codex|"]
+    routing.undo_priority(via="app", expect=held["version"])
+    assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == ["codex|"]

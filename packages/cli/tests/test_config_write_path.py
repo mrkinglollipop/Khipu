@@ -28,8 +28,8 @@ PRIVATE_READS = {("join.py", "_load_config_for_mutation"):
 # Writers that may call save_config: inside these blocks the document is the held one.
 HOLDERS = {"mutate_config", "_locked"}
 # Functions that save the document their caller holds: (module, name); every
-# call of one must itself be inside a HOLDERS block.
-HELD_SAVERS = {("accounts.py", "_commit")}
+# call of one must itself be inside a HOLDERS block or another of these.
+HELD_SAVERS = {("accounts.py", "_commit"), ("accounts.py", "_transact")}
 WRITES = {"write_text", "write_bytes", "replace", "rename", "unlink", "write_private_file", "_restore_file",
           "open", "dump"}
 # Modules writing a config.json that is not this install's: module -> why.
@@ -76,7 +76,7 @@ def test_every_save_is_inside_the_one_write_path():
                 found.append(f"{path.relative_to(PACKAGE)}:{node.lineno}")
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and (path.name, _name(node.func)) in HELD_SAVERS \
-                    and not _held(node, parents, None):
+                    and not _held(node, parents, path.name):
                 found.append(f"{path.relative_to(PACKAGE)}:{node.lineno} {_name(node.func)}")
     assert not found, "save_config outside a mutate_config block: " + ", ".join(found)
 

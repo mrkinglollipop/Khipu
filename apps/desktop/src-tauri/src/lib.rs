@@ -740,7 +740,36 @@ fn checked_operand(key: &str, raw: &str, allow_empty: bool) -> Result<String, St
 /// The account list parsed and re-serialised, so only a JSON list of
 /// `{label, harness, home}` text fields ever reaches argv. The CLI checks the
 /// rest (a home that names no user, two entries for one login or one label).
+#[cfg(test)]
 fn checked_usage_accounts(raw: &str) -> Result<String, String> {
+    checked_usage_accounts_kept(raw, &[])
+}
+
+/// An entry's account fields as `khipu.usage._same_entry` compares them:
+/// text trimmed, a missing or empty field left out, any other field ignored.
+fn same_entry_fields(entry: &Value) -> Option<serde_json::Map<String, Value>> {
+    let obj = entry.as_object()?;
+    let mut out = serde_json::Map::new();
+    for field in ["label", "harness", "home"] {
+        match obj.get(field) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) if s.is_empty() => {}
+            Some(Value::String(s)) => {
+                out.insert(field.to_string(), Value::String(s.trim().to_string()));
+            }
+            Some(other) => {
+                out.insert(field.to_string(), other.clone());
+            }
+        }
+    }
+    Some(out)
+}
+
+/// As `checked_usage_accounts`, with `stored` the list saved now: an entry
+/// the owner left as it is stored goes through exactly as stored, whatever
+/// rule it breaks today (as the CLI keeps it); only entries he added or
+/// changed are checked here.
+fn checked_usage_accounts_kept(raw: &str, stored: &[Value]) -> Result<String, String> {
     let not_a_list = || "usage_accounts must be a JSON list of accounts".to_string();
     let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|_| not_a_list())?;
     let entries = value.as_array().ok_or_else(not_a_list)?;
@@ -750,6 +779,12 @@ fn checked_usage_accounts(raw: &str) -> Result<String, String> {
     let mut out = Vec::with_capacity(entries.len());
     for (i, entry) in entries.iter().enumerate() {
         let n = i + 1;
+        if let Some(fields) = same_entry_fields(entry) {
+            if let Some(kept) = stored.iter().find(|s| same_entry_fields(s).as_ref() == Some(&fields)) {
+                out.push(kept.clone());
+                continue;
+            }
+        }
         let obj = entry
             .as_object()
             .ok_or_else(|| format!("usage_accounts entry {n} is not an object"))?;
@@ -969,15 +1004,23 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
 
 /// `expect` is the account list's version, required for `usage_accounts`
 /// alone: a save made on a stale read is refused by the CLI (decision 15).
+#[cfg(test)]
 fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
     config_set_argv_expect(key, value, None)
 }
 
+#[cfg(test)]
 fn config_set_argv_expect(key: &str, value: &str, expect: Option<&str>) -> Result<Vec<String>, String> {
+    config_set_argv_kept(key, value, expect, &[])
+}
+
+/// `stored` is the account list saved now (`usage_accounts`'s `value` in
+/// `khipu config`): entries kept as stored go through as they are.
+fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[Value]) -> Result<Vec<String>, String> {
     if key == USAGE_ACCOUNTS_KEY {
         let mut argv = vec!["config".to_string(), "--from-app".to_string()];
         argv.push(format!("--expect={}", required_expect(expect, "the account list save")?));
-        argv.extend(["--set".to_string(), USAGE_ACCOUNTS_KEY.to_string(), checked_usage_accounts(value)?]);
+        argv.extend(["--set".to_string(), USAGE_ACCOUNTS_KEY.to_string(), checked_usage_accounts_kept(value, stored)?]);
         return Ok(argv);
     }
     if expect.is_some() {
@@ -1140,7 +1183,17 @@ async fn khipu_config_show() -> Result<String, String> {
 
 #[tauri::command]
 async fn khipu_config_set(key: String, value: String, expect: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(config_set_argv_expect(&key, &value, expect.as_deref())?).await
+    let mut stored = Vec::new();
+    if key == USAGE_ACCOUNTS_KEY {
+        // The list as saved now; the CLI refuses the save anyway when it
+        // moved after `expect` was read.
+        let raw = run_khipu_cli_async(fixed_argv(CONFIG_SHOW_ARGV)).await?;
+        let config: Value = serde_json::from_str(raw.trim()).map_err(|_| "Khipu couldn't read the account list".to_string())?;
+        if let Some(list) = config.pointer("/usage_accounts/value").and_then(Value::as_array) {
+            stored = list.clone();
+        }
+    }
+    run_khipu_cli_async(config_set_argv_kept(&key, &value, expect.as_deref(), &stored)?).await
 }
 
 #[tauri::command]
@@ -1432,11 +1485,7 @@ fn route_priority_argv_expect(
             argv.push(format!("--until={}", checked_route_until(t)?));
         }
     }
-    if matches!(action, "set" | "clear") {
-        argv.push(format!("--expect={}", required_expect(expect, "the priority save")?));
-    } else if let Some(e) = expect {
-        argv.push(format!("--expect={}", checked_expect(e)?));
-    }
+    argv.push(format!("--expect={}", required_expect(expect, "the priority change")?));
     argv.extend(["--".to_string(), action.to_string()]);
     Ok(argv)
 }
@@ -1635,11 +1684,14 @@ fn accounts_auto_track_argv(on: bool) -> Vec<String> {
     argv
 }
 
-fn accounts_request_argv(action: &str) -> Result<Vec<String>, String> {
+/// `expect` is the list's version as the owner read it, required: his
+/// answer never lands on a newer request than the one he saw.
+fn accounts_request_argv(action: &str, expect: &str) -> Result<Vec<String>, String> {
     if !matches!(action, "confirm" | "undo") {
         return Err(format!("not an answer to a request: {action:?}"));
     }
     let mut argv = accounts_base("request");
+    argv.push(format!("--expect={}", required_expect(Some(expect), "the answer to a request")?));
     argv.push(action.to_string());
     Ok(argv)
 }
@@ -1707,8 +1759,8 @@ async fn khipu_accounts_auto_track(on: bool) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn khipu_accounts_request(action: String) -> Result<String, String> {
-    run_khipu_cli_async(accounts_request_argv(&action)?).await
+async fn khipu_accounts_request(action: String, expect: String) -> Result<String, String> {
+    run_khipu_cli_async(accounts_request_argv(&action, &expect)?).await
 }
 
 /// The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
@@ -5076,10 +5128,10 @@ mod priority_and_sign_in_tests {
         assert!(route_priority_argv("set", &[], None).is_err());
         let many: Vec<PriorityEntry> = (0..65).map(|_| entry("Codex", None, None)).collect();
         assert!(route_priority_argv("set", &many, None).is_err());
-        // Confirm, undo and clear carry nothing but their verb, whatever is sent.
+        // Confirm, undo and clear carry nothing but their version and verb, whatever is sent.
         for action in ["confirm", "undo"] {
-            let argv = route_priority_argv_expect(action, &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), None).unwrap();
-            assert_eq!(argv, v(&["route", "priority", "--from-app", "--", action]));
+            let argv = route_priority_argv_expect(action, &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), Some("p1")).unwrap();
+            assert_eq!(argv, v(&["route", "priority", "--from-app", "--expect=p1", "--", action]));
         }
         let clear = route_priority_argv_expect("clear", &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), Some("p1")).unwrap();
         assert_eq!(clear, v(&["route", "priority", "--from-app", "--expect=p1", "--", "clear"]));
@@ -5097,17 +5149,35 @@ mod priority_and_sign_in_tests {
     }
 
     #[test]
-    fn a_priority_set_or_clear_without_its_version_is_refused() {
+    fn a_priority_change_without_its_version_is_refused() {
         for missing in [None, Some(""), Some("  ")] {
             let clear = route_priority_argv_expect("clear", &[], None, missing).unwrap_err();
             assert!(clear.contains("needs the version it read"), "{clear}");
             assert!(route_priority_argv_expect("set", &[entry("Codex", None, None)], None, missing).is_err());
+            // Confirm and undo answer the request the owner saw, so a newer one is never answered unseen.
+            assert!(route_priority_argv_expect("confirm", &[], None, missing).is_err());
+            assert!(route_priority_argv_expect("undo", &[], None, missing).is_err());
         }
-        // Confirm and undo answer a pending priority and take no version.
-        assert_eq!(
-            route_priority_argv_expect("confirm", &[], None, None).unwrap(),
-            v(&["route", "priority", "--from-app", "--", "confirm"])
-        );
+    }
+
+    #[test]
+    fn an_account_left_as_stored_goes_through_as_stored() {
+        let stored: Vec<Value> = serde_json::from_str(
+            r#"[{"harness": "codex", "label": "Codex"}, {"harness": "legacy-cli", "label": "Legacy", "note": 1}]"#,
+        )
+        .unwrap();
+        // The app sends the untouched entry back and adds one: Add is not blocked by it.
+        let sent = r#"[{"harness": "codex", "label": "Codex"}, {"harness": "legacy-cli", "label": " Legacy ", "note": 1},
+                       {"harness": "Claude", "label": "Work", "home": "~/.claude-work"}]"#;
+        let out: Value = serde_json::from_str(&checked_usage_accounts_kept(sent, &stored).unwrap()).unwrap();
+        assert_eq!(out[1], stored[1]);
+        assert_eq!(out[2], serde_json::json!({"harness": "claude", "label": "Work", "home": "~/.claude-work"}));
+        let argv = config_set_argv_kept(USAGE_ACCOUNTS_KEY, sent, Some("a1"), &stored).unwrap();
+        assert_eq!(argv[..5], v(&["config", "--from-app", "--expect=a1", "--set", USAGE_ACCOUNTS_KEY])[..]);
+        // Changed, or with nothing stored, it is checked as any new entry.
+        let changed = r#"[{"harness": "legacy-cli", "label": "Renamed"}]"#;
+        assert!(checked_usage_accounts_kept(changed, &stored).is_err());
+        assert!(checked_usage_accounts(r#"[{"harness": "legacy-cli", "label": "Legacy"}]"#).is_err());
     }
 
     fn acct(harness: &str, home: Option<&str>, label: Option<&str>) -> AccountEntry {
@@ -5219,10 +5289,13 @@ mod priority_and_sign_in_tests {
         assert!(accounts_offer_argv("decline", "claude", Some("--folder")).is_err());
         assert_eq!(accounts_auto_track_argv(true), v(&["accounts", "auto-track", "--from-app", "on"]));
         assert_eq!(accounts_auto_track_argv(false), v(&["accounts", "auto-track", "--from-app", "off"]));
-        assert_eq!(accounts_request_argv("confirm").unwrap(), v(&["accounts", "request", "--from-app", "confirm"]));
-        assert_eq!(accounts_request_argv("undo").unwrap(), v(&["accounts", "request", "--from-app", "undo"]));
-        assert!(accounts_request_argv("--x").is_err());
-        assert!(accounts_request_argv("clear").is_err());
+        assert_eq!(accounts_request_argv("confirm", "a1b2").unwrap(), v(&["accounts", "request", "--from-app", "--expect=a1b2", "confirm"]));
+        assert_eq!(accounts_request_argv("undo", "a1b2").unwrap(), v(&["accounts", "request", "--from-app", "--expect=a1b2", "undo"]));
+        for missing in ["", "  ", "-x"] {
+            assert!(accounts_request_argv("undo", missing).is_err(), "{missing:?}");
+        }
+        assert!(accounts_request_argv("--x", "a1").is_err());
+        assert!(accounts_request_argv("clear", "a1").is_err());
         assert_eq!(accounts_status_argv(), v(&["accounts", "status"]));
     }
 
