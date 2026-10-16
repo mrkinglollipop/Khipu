@@ -343,6 +343,109 @@ fn khipu_app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// The app keys its "hub not reachable" state on this prefix: keep it.
+const CLI_TIMEOUT_PREFIX: &str = "Khipu did not answer within";
+const CLI_TIMEOUT_DEFAULT_SECS: u64 = 60;
+
+fn cli_timeout_message(secs: u64) -> String {
+    format!("{CLI_TIMEOUT_PREFIX} {secs} seconds. The hub may be unreachable.")
+}
+
+enum CliWaitError {
+    Spawn(std::io::Error),
+    TimedOut(u64),
+}
+
+/// `Command::output()` with a deadline: the child is killed when it passes.
+/// `None` waits as long as the child runs, as `.output()` did.
+fn output_with_timeout(mut cmd: Command, timeout: Option<std::time::Duration>) -> Result<std::process::Output, CliWaitError> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(CliWaitError::Spawn)?;
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let out_t = drain(child.stdout.take());
+    let err_t = drain(child.stderr.take());
+    let deadline = timeout.map(|t| std::time::Instant::now() + t);
+    let status = loop {
+        match child.try_wait().map_err(CliWaitError::Spawn)? {
+            Some(st) => break st,
+            None => {
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Readers are left to end on their own: a grandchild may
+                    // still hold the pipe open, and we must not wait on it.
+                    return Err(CliWaitError::TimedOut(timeout.map_or(0, |t| t.as_secs())));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_t.join().unwrap_or_default(),
+        stderr: err_t.join().unwrap_or_default(),
+    })
+}
+
+/// Seconds the app waits for one CLI answer: `app_cli_timeout` in the data
+/// dir's config.json (0: no limit; missing or invalid: 60).
+fn app_cli_timeout_secs_from(raw: Option<&str>) -> u64 {
+    let Some(v) = raw.and_then(|r| serde_json::from_str::<Value>(r).ok()).and_then(|v| v.get("app_cli_timeout").cloned()) else {
+        return CLI_TIMEOUT_DEFAULT_SECS;
+    };
+    match v.as_u64() {
+        Some(n) if n <= 10 * 366 * 86_400 => n,
+        _ => CLI_TIMEOUT_DEFAULT_SECS,
+    }
+}
+
+fn app_cli_timeout_secs() -> u64 {
+    let dir = data_dir_from_pointer().or_else(|| {
+        std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config/khipu"))
+    });
+    let raw = dir.and_then(|d| std::fs::read_to_string(d.join("config.json")).ok());
+    app_cli_timeout_secs_from(raw.as_deref())
+}
+
+/// Long user actions that must never be cut short by the hub timeout: a
+/// backup or import, `doctor` (a healthy one can run past a minute and must
+/// never be reported as the hub being away), the job runners the app starts and waits on, and the
+/// database move, preflight and connect (they copy data or dial a new hub).
+/// The join and export paths run their own process and never come here.
+fn cli_has_no_time_limit(args: &[String]) -> bool {
+    let first = args.first().map(String::as_str).unwrap_or("");
+    match first {
+        "backup-local" | "import-local" | "doctor" | "nightly" | "graph-build" | "monthly" | "embed-backfill"
+        | "library-backfill" | "join" => true,
+        "db" => matches!(args.get(1).map(String::as_str), Some("move" | "preflight" | "connect")),
+        _ => false,
+    }
+}
+
+fn cli_timeout_for(args: &[String]) -> Option<std::time::Duration> {
+    if cli_has_no_time_limit(args) {
+        return None;
+    }
+    match app_cli_timeout_secs() {
+        0 => None,
+        n => Some(std::time::Duration::from_secs(n)),
+    }
+}
+
 fn run_khipu_cli(args: &[String]) -> Result<String, String> {
     run_khipu_cli_with_env(args, &[])
 }
@@ -370,9 +473,11 @@ fn run_khipu_cli_with_env(args: &[String], extra_env: &[(String, String)]) -> Re
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let output = cmd
-        .output()
-        .map_err(|e| format!("spawn khipu CLI failed ({py:?}): {e}"))?;
+    let output = match output_with_timeout(cmd, cli_timeout_for(args)) {
+        Ok(o) => o,
+        Err(CliWaitError::Spawn(e)) => return Err(format!("spawn khipu CLI failed ({py:?}): {e}")),
+        Err(CliWaitError::TimedOut(secs)) => return Err(cli_timeout_message(secs)),
+    };
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if !stderr.trim().is_empty() {
@@ -533,6 +638,7 @@ const JOB_NAMES: &[&str] = &[
     "notes_watch",
     "queue_drain",
     "recall_daemon",
+    "replica_refresh",
 ];
 
 const CAPTURE_MODES: &[&str] = &["legacy", "dual", "hub"];
@@ -616,6 +722,30 @@ fn checked_backup_remote(value: &str) -> Result<String, String> {
         Err(format!("graph_backup_remote must look like r2:bucket/folder, got {value:?}"))
     }
 }
+/// Settings -> Data, "This Mac's copy": how old the copy may get before the
+/// background job updates it, how often the job looks, and how long a failed
+/// database connection is remembered. Lengths of time in
+/// whole seconds (the page shows minutes); `config --set KEY N` or
+/// `config --unset=KEY` (the default again).
+const REPLICA_DURATION_KEYS: &[&str] = &["replica_refresh_after", "replica_check_every", "hub_down_memo_for"];
+
+/// A whole number of seconds: digits only, at most ten years, and the check
+/// interval at least a minute (the CLI's own floor).
+fn replica_setting_value(key: &str, value: &str) -> Result<String, String> {
+    let v = value.trim();
+    let n: u64 = if !v.is_empty() && v.len() <= 12 && v.chars().all(|c| c.is_ascii_digit()) {
+        v.parse().unwrap_or(u64::MAX)
+    } else {
+        u64::MAX
+    };
+    if n > 10 * 366 * 86_400 {
+        return Err(format!("{key} must be a whole number of seconds, got {value:?}"));
+    }
+    if key == "replica_check_every" && n < 60 {
+        return Err(format!("{key} must be at least 60 seconds"));
+    }
+    Ok(n.to_string())
+}
 const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse"];
 const USAGE_ACCOUNTS_MAX: usize = 32;
 /// Settings -> Routing (routing truth phase 4): the sizes, times and switches
@@ -638,6 +768,11 @@ const ROUTING_DURATION_KEYS: &[&str] = &[
     "routing_busy_wait",
     "routing_priority_unconfirmed_warn_after",
 ];
+/// "When the hub is away" (offline slice 6): lengths of time in whole
+/// seconds, set and reset like the routing durations but by the app's own
+/// save of an ordinary setting (no `--from-app`). Mirrors
+/// `offline.SETTINGS` in the CLI.
+const OFFLINE_DURATION_KEYS: &[&str] = &["hub_statement_timeout", "hub_dead_connection_after", "app_cli_timeout"];
 /// Whole numbers of 0 or more.
 const ROUTING_COUNT_KEYS: &[&str] = &[
     "routing_summary_chars",
@@ -725,6 +860,54 @@ fn parse_daily_calls(key: &str, raw: &str) -> Result<String, String> {
         .map_err(|_| format!("{key} must be a whole number of 0 or more, got {raw:?}"))?;
     if v > 10_000_000 {
         return Err(format!("{key} is too large, got {raw:?}"));
+    }
+    Ok(v.to_string())
+}
+
+/// `config --set KEY N` / `config --unset=KEY` for a length of time in whole
+/// minutes (`khipu.config.MINUTE_SETTINGS`), with each key's allowed range.
+const MINUTE_KEYS: &[(&str, u64, u64)] =
+    &[("doctor_rate_window_minutes", 5, 7 * 24 * 60), ("promote_hub_wait_minutes", 0, 240)];
+
+/// The owner's one-time "Update anyway" (`khipu.config` key
+/// `promote_gate_ignore`): the red checks, comma-separated, that the next
+/// promotion skips once. It clears itself after that run, or after a day.
+/// The owner's only, so the app's save carries `--from-app`.
+const GATE_IGNORE_KEY: &str = "promote_gate_ignore";
+
+/// A setting only the owner changes: the app's save says `--from-app`.
+fn owner_key(key: &str) -> bool {
+    routing_key(key) || key == GATE_IGNORE_KEY
+}
+
+fn parse_gate_ignore(raw: &str) -> Result<String, String> {
+    let names: Vec<&str> = raw.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+    if names.is_empty() {
+        return Err(format!("{GATE_IGNORE_KEY} must name at least one check; cancel it to clear it"));
+    }
+    if names.len() > 32 {
+        return Err(format!("{GATE_IGNORE_KEY} names too many checks"));
+    }
+    for n in &names {
+        if n.is_empty() || n.len() > 40 || !n.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+            return Err(format!("not a check name: {n:?}"));
+        }
+    }
+    Ok(names.join(","))
+}
+
+fn minute_key(key: &str) -> Option<(u64, u64)> {
+    MINUTE_KEYS.iter().find(|(k, _, _)| *k == key).map(|(_, low, high)| (*low, *high))
+}
+
+fn parse_minutes(key: &str, raw: &str) -> Result<String, String> {
+    let (low, high) = minute_key(key).ok_or_else(|| format!("not a minutes setting: {key:?}"))?;
+    let v: u64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{key} must be a whole number of minutes, got {raw:?}"))?;
+    if !(low..=high).contains(&v) {
+        return Err(format!("{key} must be between {low} and {high} minutes, got {raw:?}"));
     }
     Ok(v.to_string())
 }
@@ -999,7 +1182,7 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     let n: u64 = v
         .parse()
         .map_err(|_| format!("{key} must be a whole number of 0 or more, got {value:?}"))?;
-    let most: u64 = if ROUTING_DURATION_KEYS.contains(&key) { 10 * 366 * 86_400 } else { 100_000_000 };
+    let most: u64 = if ROUTING_DURATION_KEYS.contains(&key) || OFFLINE_DURATION_KEYS.contains(&key) { 10 * 366 * 86_400 } else { 100_000_000 };
     if n > most {
         return Err(format!("{key} is too large"));
     }
@@ -1030,11 +1213,12 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
     if expect.is_some() {
         return Err(format!("{key} takes no version to check"));
     }
-    // A routing setting is the owner's (decision 15): the app's own save
-    // says so, or the CLI refuses it as a conversation's.
+    // A routing setting and the one-time "Update anyway" are the owner's
+    // (decision 15): the app's own save says so, or the CLI refuses it as a
+    // conversation's.
     let set = |k: &str, v: String| {
         let mut argv = vec!["config".to_string()];
-        if routing_key(k) {
+        if owner_key(k) {
             argv.push("--from-app".to_string());
         }
         argv.extend(["--set".to_string(), k.to_string(), v]);
@@ -1068,6 +1252,8 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
         }
         "user_aliases" => Ok(set("user_aliases", checked_operand(key, value, true)?)),
         k if DAILY_CALL_KEYS.contains(&k) => Ok(set(k, parse_daily_calls(k, value)?)),
+        k if minute_key(k).is_some() => Ok(set(k, parse_minutes(k, value)?)),
+        GATE_IGNORE_KEY => Ok(set(GATE_IGNORE_KEY, parse_gate_ignore(value)?)),
         "synth_fallback" => {
             let v = value.trim();
             if !SYNTH_FALLBACKS.contains(&v) {
@@ -1079,6 +1265,8 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
         k if cli_setting_key(k) => Ok(set(k, checked_cli_setting_path(k, value)?)),
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
+        k if REPLICA_DURATION_KEYS.contains(&k) => Ok(set(k, replica_setting_value(k, value)?)),
+        k if OFFLINE_DURATION_KEYS.contains(&k) => Ok(set(k, routing_setting_value(k, value)?)),
         _ => Err(format!("not a settable key: {key:?}")),
     }
 }
@@ -1104,13 +1292,17 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
         && key != COSINE_FLOOR_KEY
         && key != USAGE_ACCOUNTS_KEY
         && key != GRAPH_BACKUP_REMOTE_KEY
+        && minute_key(key).is_none()
+        && key != GATE_IGNORE_KEY
         && !cli_setting_key(key)
         && !routing_key(key)
+        && !REPLICA_DURATION_KEYS.contains(&key)
+        && !OFFLINE_DURATION_KEYS.contains(&key)
         && !by_profile
     {
         return Err(format!("not a resettable key: {key:?}"));
     }
-    if routing_key(key) {
+    if owner_key(key) {
         return Ok(vec!["config".to_string(), "--from-app".to_string(), format!("--unset={key}")]);
     }
     Ok(vec!["config".to_string(), format!("--unset={key}")])
@@ -3070,6 +3262,16 @@ fn run_khipu_cli_with_stdin(args: &[String], stdin_text: &str) -> Result<String,
     Ok(stdout)
 }
 
+/// Rebuild this Mac's offline copy of memory now (the fix doctor names for
+/// prompt-time recall). `snapshot` stays out of `ALLOWED_SUBCOMMANDS`; this
+/// command fixes the argv to exactly `snapshot refresh`.
+const SNAPSHOT_REFRESH_ARGV: &[&str] = &["snapshot", "refresh"];
+
+#[tauri::command]
+async fn khipu_snapshot_refresh() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(SNAPSHOT_REFRESH_ARGV)).await
+}
+
 /// Apply (or plan) the schema. `migrate` is a state-changing subcommand and is
 /// deliberately NOT in `ALLOWED_SUBCOMMANDS`; this command fixes the argv to
 /// exactly `migrate` / `migrate --dry-run` so the UI can offer setup without
@@ -4128,6 +4330,7 @@ pub fn run() {
             khipu_feature_set,
             khipu_config_show,
             khipu_config_set,
+            khipu_snapshot_refresh,
             khipu_config_request,
             khipu_config_unset,
             khipu_budget_status,
@@ -4804,6 +5007,24 @@ mod settings_command_tests {
     }
 
     #[test]
+    fn replica_settings_are_whole_seconds() {
+        assert_eq!(config_set_argv("replica_refresh_after", "1200").unwrap(), v(&["config", "--set", "replica_refresh_after", "1200"]));
+        assert_eq!(config_set_argv("replica_refresh_after", " 0 ").unwrap(), v(&["config", "--set", "replica_refresh_after", "0"]));
+        assert_eq!(config_set_argv("replica_check_every", "60").unwrap(), v(&["config", "--set", "replica_check_every", "60"]));
+        assert_eq!(config_unset_argv("replica_check_every").unwrap(), v(&["config", "--unset=replica_check_every"]));
+        assert_eq!(config_set_argv("hub_down_memo_for", "90").unwrap(), v(&["config", "--set", "hub_down_memo_for", "90"]));
+        assert_eq!(config_set_argv("hub_down_memo_for", "0").unwrap(), v(&["config", "--set", "hub_down_memo_for", "0"]));
+        assert_eq!(config_unset_argv("hub_down_memo_for").unwrap(), v(&["config", "--unset=hub_down_memo_for"]));
+        for bad in ["-1", "1.5", "abc", ""] {
+            assert!(config_set_argv("hub_down_memo_for", bad).is_err(), "{bad}");
+        }
+        for bad in ["-1", "abc", "1e3", ""] {
+            assert!(config_set_argv("replica_refresh_after", bad).is_err(), "{bad}");
+        }
+        assert!(config_set_argv("replica_check_every", "30").is_err());
+    }
+
+    #[test]
     fn routing_settings_are_reprinted_or_refused() {
         assert_eq!(config_set_argv("routing_stale_after", "43200").unwrap(), v(&["config", "--from-app", "--set", "routing_stale_after", "43200"]));
         assert_eq!(config_set_argv("routing_summary_chars", " 0 ").unwrap(), v(&["config", "--from-app", "--set", "routing_summary_chars", "0"]));
@@ -4980,6 +5201,38 @@ mod settings_command_tests {
     }
 
     #[test]
+    fn the_doctor_rate_window_is_whole_minutes_in_range() {
+        let key = "doctor_rate_window_minutes";
+        assert_eq!(config_set_argv(key, " 90 ").unwrap(), v(&["config", "--set", key, "90"]));
+        assert_eq!(config_set_argv(key, "5").unwrap(), v(&["config", "--set", key, "5"]));
+        for bad in ["", "0", "4", "-5", "1.5", "abc", "--unset", "10081"] {
+            assert!(config_set_argv(key, bad).is_err(), "accepted {bad:?}");
+        }
+        assert_eq!(config_unset_argv(key).unwrap(), v(&["config", "--unset=doctor_rate_window_minutes"]));
+        assert_eq!(SNAPSHOT_REFRESH_ARGV, &["snapshot", "refresh"]);
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"snapshot"));
+    }
+
+    #[test]
+    fn the_promotion_gate_settings_are_checked() {
+        let wait = "promote_hub_wait_minutes";
+        assert_eq!(config_set_argv(wait, "0").unwrap(), v(&["config", "--set", wait, "0"]));
+        assert_eq!(config_set_argv(wait, "240").unwrap(), v(&["config", "--set", wait, "240"]));
+        assert!(config_set_argv(wait, "241").is_err());
+        let key = "promote_gate_ignore";
+        assert_eq!(
+            config_set_argv(key, " outbox , degraded_rate ").unwrap(),
+            v(&["config", "--from-app", "--set", key, "outbox,degraded_rate"])
+        );
+        for bad in ["", " , ", "Outbox", "out box", "--unset", "a-b", &"x".repeat(41)] {
+            assert!(config_set_argv(key, bad).is_err(), "accepted {bad:?}");
+        }
+        let many = (0..33).map(|_| "a").collect::<Vec<_>>().join(",");
+        assert!(config_set_argv(key, &many).is_err());
+        assert_eq!(config_unset_argv(key).unwrap(), v(&["config", "--from-app", "--unset=promote_gate_ignore"]));
+    }
+
+    #[test]
     fn the_graph_backup_remote_is_one_remote_path() {
         assert_eq!(
             config_set_argv("graph_backup_remote", " r2:my-bucket/graph/ ").unwrap(),
@@ -5099,7 +5352,7 @@ mod settings_command_tests {
         for n in JOB_NAMES {
             assert!(job_argv("install", n).is_ok());
         }
-        assert_eq!(JOB_NAMES.len(), 6);
+        assert_eq!(JOB_NAMES.len(), 7);
     }
 
     #[test]
@@ -5209,6 +5462,70 @@ mod settings_command_tests {
     }
 
     #[test]
+    fn a_slow_cli_is_killed_at_the_timeout_and_says_so() {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("5");
+        let started = std::time::Instant::now();
+        match output_with_timeout(cmd, Some(std::time::Duration::from_millis(300))) {
+            Err(CliWaitError::TimedOut(secs)) => {
+                assert!(cli_timeout_message(secs).starts_with("Khipu did not answer within"));
+            }
+            _ => panic!("expected a timeout"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "child was not killed");
+    }
+
+    #[test]
+    fn a_fast_cli_returns_its_output_and_no_limit_waits() {
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("hello");
+        let out = output_with_timeout(cmd, Some(std::time::Duration::from_secs(5))).ok().unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+        let mut slow = Command::new("/bin/sh");
+        slow.args(["-c", "sleep 0.3; echo done"]);
+        let out = output_with_timeout(slow, None).ok().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+    }
+
+    #[test]
+    fn the_cli_timeout_reads_the_config_and_falls_back_to_sixty() {
+        assert_eq!(app_cli_timeout_secs_from(None), 60);
+        assert_eq!(app_cli_timeout_secs_from(Some("not json")), 60);
+        assert_eq!(app_cli_timeout_secs_from(Some("{}")), 60);
+        assert_eq!(app_cli_timeout_secs_from(Some(r#"{"app_cli_timeout": "x"}"#)), 60);
+        assert_eq!(app_cli_timeout_secs_from(Some(r#"{"app_cli_timeout": -3}"#)), 60);
+        assert_eq!(app_cli_timeout_secs_from(Some(r#"{"app_cli_timeout": 12}"#)), 12);
+        assert_eq!(app_cli_timeout_secs_from(Some(r#"{"app_cli_timeout": 0}"#)), 0);
+    }
+
+    #[test]
+    fn long_user_actions_have_no_time_limit() {
+        for argv in [
+            v(&["backup-local"]), v(&["import-local", "x"]), v(&["doctor", "--probe"]), v(&["nightly"]), v(&["embed-backfill"]),
+            v(&["db", "move"]), v(&["db", "preflight"]), v(&["db", "connect", "--use-stored"]),
+        ] {
+            assert!(cli_timeout_for(&argv).is_none(), "{argv:?} should have no limit");
+        }
+        assert!(!cli_has_no_time_limit(&v(&["owed", "--envelope"])));
+        assert!(!cli_has_no_time_limit(&v(&["db", "status"])));
+    }
+
+    #[test]
+    fn the_offline_durations_are_ordinary_settings() {
+        for key in OFFLINE_DURATION_KEYS {
+            assert_eq!(config_set_argv(key, "45").unwrap(), v(&["config", "--set", key, "45"]));
+            assert_eq!(config_set_argv(key, "0").unwrap(), v(&["config", "--set", key, "0"]));
+            assert_eq!(config_unset_argv(key).unwrap(), v(&["config", &format!("--unset={key}")]));
+            assert!(config_set_argv(key, "-1").is_err());
+            assert!(config_set_argv(key, "abc").is_err());
+            assert!(config_set_argv(key, "1e3").is_err());
+            assert!(config_set_argv(key, &(10 * 366 * 86_400 + 1).to_string()).is_err());
+            assert!(config_set_argv_expect(key, "5", Some("v1")).is_err());
+        }
+    }
+
+    #[test]
     fn the_config_key_lists_match_the_python_settings() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../packages/cli/khipu/config.py");
@@ -5221,6 +5538,14 @@ mod settings_command_tests {
         for k in UNIT_FLOAT_KEYS {
             assert!(floats.contains(&format!("\"{k}\":")), "{k} missing from FLOAT_SETTINGS");
         }
+        let offline_src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/khipu/offline.py"),
+        ).unwrap();
+        let offline = offline_src.split("SETTINGS: dict").nth(1).unwrap().split("\n}").next().unwrap();
+        for k in OFFLINE_DURATION_KEYS {
+            assert!(offline.contains(&format!("\"{k}\":")), "{k} missing from offline.SETTINGS");
+        }
+        assert_eq!(offline.matches("\"duration\"").count(), OFFLINE_DURATION_KEYS.len());
         let cli = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/khipu/cli.py"),
         ).unwrap();

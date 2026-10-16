@@ -7,6 +7,17 @@ import unittest
 from unittest import mock
 
 from khipu import mcp_server as srv
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_hub_record(monkeypatch):
+    # The fake connections here model the write itself; the record of applied
+    # owner writes (migration 0031) is tested in test_owner_writes_exactly_once.
+    from khipu import owner_writes
+
+    monkeypatch.setattr(owner_writes, "record_on_hub", lambda cur, tool, args: True)
+    monkeypatch.setattr(owner_writes, "_refuse_on_hub", lambda conn, cur, tool, args, error: None)
 
 
 class _FakeCur:

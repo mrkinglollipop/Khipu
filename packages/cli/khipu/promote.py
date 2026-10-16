@@ -36,6 +36,22 @@ from khipu.lines import read_lines, split_lines
 LIVE_NAME = "live"
 SLOT_NAMES = ("live-a", "live-b")
 GATE_ORDER = ("doctor", "recall", "capture", "version")
+# The steps that need the hub. After an outage they wait for it (bounded by
+# the owner's `promote_hub_wait_minutes`) instead of refusing; a refusal that
+# is only the hub being out of reach queues the promotion, and the next
+# queue-drain run retries it once the hub answers
+# (docs/plans/2026-10-16-offline-and-self-healing.md, E).
+HUB_STEPS = ("recall", "capture")
+HUB_WAIT_KEY = "promote_hub_wait_minutes"
+HUB_POLL_S = 10.0
+HUB_PROBE_TIMEOUT_S = 3
+# The owner's one-time override ("Update anyway"): red doctor checks the next
+# promotion skips once. It is named in that run's record, then clears itself,
+# and lapses unused after OVERRIDE_TTL_S.
+GATE_IGNORE_KEY = "promote_gate_ignore"
+OVERRIDE_TTL_S = 24 * 60 * 60
+# Never part of the doctor step's red list (gate_doctor skips them).
+_DOCTOR_NOT_GATED = ("jobs_ok", "synth_provider_ok")
 # launchd starts a job with this PATH and nothing else (no plist sets one).
 LAUNCHD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 RECALL_BUDGET_MS = 1200.0
@@ -64,7 +80,7 @@ _SUMMARY_RE = re.compile(
 # The summary line's last field when the routing push is on (phase 3b), and
 # the search's degraded note before it.
 _ROUTING_FIELD_RE = re.compile(r" routing=(?P<status>\S+)\s*$")
-_DEGRADED_RE = re.compile(r" degraded=(?P<degraded>.*?)(?= stage=| routing=|\s*$)")
+_DEGRADED_RE = re.compile(r" degraded=(?P<degraded>.*?)(?= stage=| offline=| routing=|\s*$)")
 _LEGS_RE = re.compile(r" legs=(?P<legs>\[.*?\]) degraded=")
 # Routing statuses a candidate's replay with the push on may log and still
 # pass: it waited for another fold past its budget (``fold-busy``: on a live
@@ -515,16 +531,19 @@ def _fetch_and_resolve(repo: Path, ref: str) -> dict[str, Any]:
 # ---- the gate ----------------------------------------------------------------
 
 
-def _step(fn: Callable[..., tuple[bool, str]]) -> Callable[..., dict[str, Any]]:
-    """Wrap a check returning (ok, detail) into ``{"ok", "ms", "detail"}``;
-    a crash is a failed step, never a pass."""
+def _step(fn: Callable[..., tuple[Any, ...]]) -> Callable[..., dict[str, Any]]:
+    """Wrap a check returning (ok, detail) or (ok, detail, extra) into
+    ``{"ok", "ms", "detail", **extra}``; a crash is a failed step, never a
+    pass."""
     def wrapped(*args: Any, **kwargs: Any) -> dict[str, Any]:
         t0 = time.monotonic()
+        extra: dict[str, Any] = {}
         try:
-            ok, detail = fn(*args, **kwargs)
+            ok, detail, *rest = fn(*args, **kwargs)
+            extra = dict(rest[0]) if rest else {}
         except Exception as exc:  # noqa: BLE001 — a crashed check must not look like a pass
             ok, detail = False, f"{type(exc).__name__}: {exc}"
-        return {"ok": bool(ok), "ms": round((time.monotonic() - t0) * 1000), "detail": detail}
+        return {"ok": bool(ok), "ms": round((time.monotonic() - t0) * 1000), "detail": detail, **extra}
     wrapped.__name__ = fn.__name__
     wrapped.__doc__ = fn.__doc__
     return wrapped
@@ -547,13 +566,194 @@ def _launchd_env(ctx: dict[str, str]) -> dict[str, str]:
     return env
 
 
+# ---- the owner's override and the hub wait (offline slice 7) -----------------
+
+
+def gate_ignorable() -> tuple[str, ...]:
+    """The doctor checks the owner may have the next update skip once: every
+    local check doctor --quick gates on, plus pending database updates."""
+    from khipu.cli import LOCAL_GATES
+
+    return (*(k[:-3] for k in LOCAL_GATES if k not in _DOCTOR_NOT_GATED), "schema_migrations")
+
+
+def _override_age_s(stored: dict[str, Any]) -> float | None:
+    try:
+        at = datetime.fromisoformat(str(stored.get("set_at")).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if at.tzinfo is None:
+        return None
+    return (datetime.now(timezone.utc) - at).total_seconds()
+
+
+def _held_by_queue(stored: dict[str, Any]) -> bool:
+    """True when a promotion waiting for the hub was queued with this very
+    override: it keeps the owner's approval for its retry past the day."""
+    entry = queued()
+    return bool(entry and stored.get("set_at") and entry.get("override_set_at") == stored.get("set_at"))
+
+
+def gate_override() -> dict[str, Any] | None:
+    """The owner's one-time "Update anyway" (``promote_gate_ignore``):
+    ``{"checks", "set_at", "by"}``, or None when there is none, it is older
+    than ``OVERRIDE_TTL_S``, or the stored value is not one (a standing list
+    from before is never read). Only the gate's doctor step reads it."""
+    from khipu.config import load_config
+
+    stored = load_config().get(GATE_IGNORE_KEY)
+    if not isinstance(stored, dict) or not isinstance(stored.get("checks"), list):
+        return None
+    age = _override_age_s(stored)
+    if age is None or age < -60:
+        return None
+    if age > OVERRIDE_TTL_S and not _held_by_queue(stored):
+        return None
+    known = gate_ignorable()
+    checks = [name for name in stored["checks"] if isinstance(name, str) and name in known]
+    if not checks:
+        return None
+    return {"checks": checks, "set_at": stored.get("set_at"), "by": stored.get("by")}
+
+
+def gate_ignore() -> list[str]:
+    """The checks the next promotion skips once (empty when none)."""
+    found = gate_override()
+    return list(found["checks"]) if found else []
+
+
+def set_gate_ignore(value: "str | list[str] | None", *, by: str | None = None) -> Path:
+    """Store the owner's one-time override for these checks (comma-separated
+    text or a list), stamped now; empty or None removes it. ``by`` is how
+    the owner said so ("app" or "terminal"); the only caller outside this
+    module is the config command, after its owner check. ValueError names
+    an unknown check."""
+    from khipu.config import config_file, mutate_config
+
+    if isinstance(value, str):
+        value = [part.strip() for part in value.split(",")]
+    names = list(dict.fromkeys(n.strip() for n in (value or []) if n and n.strip()))
+    known = gate_ignorable()
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        raise ValueError(f"{GATE_IGNORE_KEY}: not a check the gate runs: {', '.join(unknown)}; "
+                         f"one of {', '.join(known)}")
+    with mutate_config() as data:
+        if names:
+            data[GATE_IGNORE_KEY] = {"checks": names, "set_at": _now(), "by": by or "?"}
+        else:
+            data.pop(GATE_IGNORE_KEY, None)
+        return config_file()
+
+
+def clear_gate_override(set_at: Any) -> bool:
+    """Remove the override a promotion just used, only if it is still the
+    one stamped ``set_at`` (a newer choice made meanwhile stays)."""
+    from khipu.config import mutate_config
+
+    with mutate_config() as data:
+        stored = data.get(GATE_IGNORE_KEY)
+        if isinstance(stored, dict) and stored.get("set_at") == set_at:
+            data.pop(GATE_IGNORE_KEY, None)
+            return True
+    return False
+
+
+def _blocked_by() -> list[str]:
+    """The red checks that held the latest gated run back at the doctor
+    step, when an override could let it through (nothing else was wrong)."""
+    for row in reversed(records()):
+        step = next((s for s in row.get("gate") or [] if isinstance(s, dict) and s.get("step") == "doctor"), None)
+        if step is None:
+            continue
+        if step.get("ok") or step.get("other_problems") or not step.get("red_checks"):
+            return []
+        known = gate_ignorable()
+        reds = [str(n) for n in step["red_checks"]]
+        return reds if all(n in known for n in reds) else []
+    return []
+
+
+def gate_ignore_status() -> dict[str, Any]:
+    found = gate_override()
+    expires = None
+    held = False
+    if found:
+        held = _held_by_queue({"set_at": found["set_at"]})
+    if found and not held:
+        at = datetime.fromisoformat(str(found["set_at"]).replace("Z", "+00:00"))
+        expires = (at.timestamp() + OVERRIDE_TTL_S)
+        expires = datetime.fromtimestamp(expires, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return {"value": list(found["checks"]) if found else [], "set_at": found["set_at"] if found else None,
+            "by": found["by"] if found else None, "expires_at": expires,
+            "held_by_queue": held,
+            "blocked_by": _blocked_by(), "choices": list(gate_ignorable())}
+
+
+def hub_reachable(*, timeout: int = HUB_PROBE_TIMEOUT_S) -> bool | None:
+    """True when the hub answers a connect, False when it cannot be reached,
+    None when no hub is configured here or the probe failed for another
+    reason (no wait and no queue then: the refusal stands as it is)."""
+    try:
+        from khipu.hub_snapshot import hub_connection_failed, try_hub_connect
+
+        from khipu.db import resolve_dsn
+
+        resolve_dsn()
+    except Exception:  # noqa: BLE001 — no DSN: nothing to wait for
+        return None
+    try:
+        conn = try_hub_connect(connect_timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return False if hub_connection_failed(exc) else None
+    try:
+        conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def hub_wait_s() -> int:
+    from khipu.config import minute_setting
+
+    try:
+        return minute_setting(HUB_WAIT_KEY) * 60
+    except Exception:  # noqa: BLE001
+        return 10 * 60
+
+
+def _wait_for_hub(budget_s: float) -> bool:
+    """Poll the hub until it answers or ``budget_s`` runs out."""
+    end = time.monotonic() + max(0.0, budget_s)
+    while True:
+        if hub_reachable() is True:
+            return True
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(HUB_POLL_S, left))
+
+
+def _offline_only(out: dict[str, Any], okey: str) -> bool:
+    block = out.get(okey[:-3])
+    return isinstance(block, dict) and block.get("offline_only") is True
+
+
 @_step
-def gate_doctor(candidate: Path) -> tuple[bool, str]:
+def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str, Any]]:
     """1. ``khipu doctor --quick`` from the candidate under the environment a
     launchd job rendered for it would get, so a missing binary or module
-    shows here and not at the next scheduled run."""
+    shows here and not at the next scheduled run.
+
+    A red check whose block says ``offline_only`` (its evidence is all from
+    a time the hub could not be reached) does not refuse a candidate, and
+    nor does a check the owner's one-time override names (``gate_override``);
+    both are named in the step's record, with the override itself, so the
+    promotion can clear it after this one use."""
     from khipu import launchd_gen
 
+    override = gate_override()
+    used = {"override": override} if override else {}
     ctx = launchd_gen.render_context(root=Path(candidate))
     r = _run([ctx["KHIPU_PYTHON"], "-m", "khipu", "doctor", "--quick"], env=_launchd_env(ctx),
              cwd=ctx["WORKING_DIRECTORY"], timeout=90)
@@ -562,7 +762,8 @@ def gate_doctor(candidate: Path) -> tuple[bool, str]:
     except ValueError:
         out = {}
     if r.returncode == 0 and out.get("ok") is True:
-        return True, f"doctor --quick ok ({ctx['KHIPU_PYTHON']}, PATH={LAUNCHD_PATH})"
+        return True, f"doctor --quick ok ({ctx['KHIPU_PYTHON']}, PATH={LAUNCHD_PATH})", used
+    hard = r.returncode not in (0, 2) or not out
     problems = []
     failed_imports = (out.get("imports") or {}).get("failed") or {}
     if failed_imports:
@@ -575,13 +776,27 @@ def gate_doctor(candidate: Path) -> tuple[bool, str]:
         problems.append(f"jobs failing: {out['job_failures']}")
     if out and not out.get("synth_provider_ok", True):
         problems.append(f"summariser provider: {out.get('synth_provider')}")
-    red = [key[:-3] for key, value in out.items()
-           if key.endswith("_ok") and value is False and key not in ("jobs_ok", "synth_provider_ok")]
+    reds = [key for key, value in out.items()
+            if key.endswith("_ok") and value is False and key not in _DOCTOR_NOT_GATED]
+    offline = [k[:-3] for k in reds if _offline_only(out, k)]
+    ignore = set(override["checks"]) if override else set()
+    ignored = [k[:-3] for k in reds if k[:-3] in ignore and k[:-3] not in offline]
+    red = [k[:-3] for k in reds if k[:-3] not in offline and k[:-3] not in ignored]
+    other = bool(problems) or hard
     if red:
         problems.append("red: " + ", ".join(red))
     if not out:
         problems.append(f"exit {r.returncode}: {_tail(r.stderr or r.stdout)}")
-    return False, "; ".join(problems) or f"exit {r.returncode}"
+    if not problems and not hard and (offline or ignored):
+        notes = []
+        if offline:
+            notes.append("red only from a time the hub was out of reach: " + ", ".join(offline))
+        if ignored:
+            notes.append("skipped once, as the owner chose Update anyway: " + ", ".join(ignored))
+        extra = {k: v for k, v in (("offline_reds", offline), ("ignored_reds", ignored)) if v}
+        return True, "doctor --quick ok; " + "; ".join(notes), {**extra, **used}
+    return False, "; ".join(problems) or f"exit {r.returncode}", {
+        **({"red_checks": red} if red else {}), **({"other_problems": True} if other else {}), **used}
 
 
 def _parse_summary(line: str) -> dict[str, Any] | None:
@@ -1096,10 +1311,23 @@ GATE_STEPS: dict[str, Callable[[Path], dict[str, Any]]] = {
 
 
 def run_gate(candidate: Path) -> list[dict[str, Any]]:
-    """Every step in order; the first failure stops the rest."""
+    """Every step in order; the first failure stops the rest. A step that
+    needs the hub and failed while the hub was out of reach waits for it
+    (``promote_hub_wait_minutes``) and runs once more; if the hub never
+    answers, the step is marked ``hub_unreachable``."""
     results = []
     for name in GATE_ORDER:
         res = {"step": name, **GATE_STEPS[name](Path(candidate))}
+        if not res["ok"] and name in HUB_STEPS and hub_reachable() is False:
+            budget = hub_wait_s()
+            t0 = time.monotonic()
+            if _wait_for_hub(budget):
+                res = {"step": name, **GATE_STEPS[name](Path(candidate)),
+                       "waited_for_hub_s": round(time.monotonic() - t0)}
+            else:
+                res = {**res, "hub_unreachable": True, "waited_for_hub_s": round(time.monotonic() - t0),
+                       "detail": f"the hub could not be reached (waited {round(budget / 60)} min): "
+                                 f"{res.get('detail')}"}
         results.append(res)
         if not res["ok"]:
             break
@@ -1143,6 +1371,48 @@ def records() -> list[dict[str, Any]]:
         if isinstance(row, dict):
             out.append(row)
     return out
+
+
+def queue_file() -> Path:
+    """A promotion the gate refused only because the hub was out of reach."""
+    return config_dir() / "state" / "promote-queued.json"
+
+
+def queued() -> dict[str, Any] | None:
+    try:
+        data = json.loads(queue_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data.get("ref") else None
+
+
+def _write_queue(data: dict[str, Any]) -> None:
+    path = queue_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _clear_queue() -> None:
+    try:
+        queue_file().unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _queue(ref: str, commit: str | None, error: str, previous: dict[str, Any] | None,
+           override_set_at: Any = None) -> dict[str, Any]:
+    """Queue (or re-queue) a promotion. The file is replaced atomically, so a
+    crash leaves the old entry or the new one, never neither. A re-queue
+    carries the override the first run used (``override_set_at``)."""
+    held = override_set_at or (previous or {}).get("override_set_at")
+    data = {"ref": ref, "commit": commit, "error": error,
+            "queued_at": (previous or {}).get("queued_at") or _now(),
+            "attempts": int((previous or {}).get("attempts") or 0) + 1, "last_attempt_at": _now(),
+            **({"override_set_at": held} if held else {})}
+    _write_queue(data)
+    return data
 
 
 @contextmanager
@@ -1204,48 +1474,120 @@ def _after_flip() -> dict[str, Any]:
 # ---- commands ----------------------------------------------------------------
 
 
-def promote(ref: str = "origin/main") -> dict[str, Any]:
+def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None) -> dict[str, Any]:
     """Fetch, check the inactive slot out at ``ref``, gate it, and on a pass
-    flip ``live`` to it. A failure anywhere leaves the link as it was."""
+    flip ``live`` to it. A failure anywhere leaves the link as it was.
+
+    Every run replaces a queued promotion; a run the gate refused only
+    because the hub was out of reach is queued again (``queue_file``) for
+    ``retry_queued``. ``retry_of`` is the queued entry a retry runs for.
+
+    The queued entry is removed in one place, after the run returned and only
+    when the run is not queued again (a re-queue replaces it in one atomic
+    write): a run that dies part way leaves it queued for the next retry. The owner's
+    one-time override the doctor step read is cleared at the same point,
+    unless the run is queued again (the retry is the same attempt)."""
     t0 = time.monotonic()
     with _lock() as held:
         if not held:
             return {"ok": False, "action": "promote", "error": "another promotion is running"}
-        repo = _repo()
-        from_slot = active_slot()
-        entry: dict[str, Any] = {"action": "promote", "ref": ref,
-                                 "from_slot": str(from_slot) if from_slot else None,
-                                 "from_commit": _head(from_slot)}
-        cleanups = retry_cleanups()
-        if cleanups:
-            entry["cleanups"] = cleanups
-        resolved = _fetch_and_resolve(repo, ref)
-        if not resolved["ok"]:
-            return record({**entry, "ok": False, "error": resolved["error"],
-                           "ms": round((time.monotonic() - t0) * 1000)})
-        slot = inactive_slot()
-        entry.update(commit=resolved["commit"], slot=str(slot))
-        prepared = _prepare_slot(slot, resolved["commit"], repo)
-        if not prepared["ok"]:
-            return record({**entry, "ok": False, "error": f"slot: {prepared['error']}",
-                           "ms": round((time.monotonic() - t0) * 1000)})
-        # The gate's replay runs the slot's hooks by the slot's own path.
-        entry["precompile"] = precompile(slot)
-        gate = run_gate(slot)
-        entry["gate"] = gate
-        entry["gate_ms"] = sum(step["ms"] for step in gate)
-        failed = next((step for step in gate if not step["ok"]), None)
-        if failed is not None:
-            return record({**entry, "ok": False, "failed_step": failed["step"],
-                           "error": f"{failed['step']}: {failed['detail']}",
-                           "ms": round((time.monotonic() - t0) * 1000)})
-        entry["precompile_live"] = _before_flip()
-        flipped = flip(slot)
-        if not flipped["ok"]:
-            return record({**entry, "ok": False, "error": f"flip: {flipped['error']}",
-                           "ms": round((time.monotonic() - t0) * 1000)})
-        entry["after"] = _after_flip()
-        return record({**entry, "ok": True, "ms": round((time.monotonic() - t0) * 1000)})
+        previous = queued()
+        out = _promote_locked(ref, t0)
+        failed = next((step for step in out.get("gate") or [] if not step["ok"]), None)
+        doctor = next((step for step in out.get("gate") or [] if step.get("step") == "doctor"), None)
+        override = (doctor or {}).get("override")
+        if not out.get("ok") and failed is not None and failed.get("hub_unreachable"):
+            # Written first (an atomic replace): a crash here keeps the old entry.
+            out["queued"] = _queue((retry_of or {}).get("ref") or ref, out.get("commit"), out.get("error") or "",
+                                   retry_of or previous, (override or {}).get("set_at"))
+        else:
+            _clear_queue()
+        if override:
+            cleared = False if out.get("queued") else clear_gate_override(override.get("set_at"))
+            out["override"] = {**override, "skipped": doctor.get("ignored_reds") or [], "cleared": cleared}
+        if retry_of is not None:
+            out["retry_of"] = retry_of.get("queued_at")
+        return record(out)
+
+
+def _promote_locked(ref: str, t0: float) -> dict[str, Any]:
+    """The promotion itself, under the lock; the caller records the result."""
+    repo = _repo()
+    from_slot = active_slot()
+    entry: dict[str, Any] = {"action": "promote", "ref": ref,
+                             "from_slot": str(from_slot) if from_slot else None,
+                             "from_commit": _head(from_slot)}
+    cleanups = retry_cleanups()
+    if cleanups:
+        entry["cleanups"] = cleanups
+    resolved = _fetch_and_resolve(repo, ref)
+    if not resolved["ok"]:
+        return {**entry, "ok": False, "error": resolved["error"],
+                "ms": round((time.monotonic() - t0) * 1000)}
+    slot = inactive_slot()
+    entry.update(commit=resolved["commit"], slot=str(slot))
+    prepared = _prepare_slot(slot, resolved["commit"], repo)
+    if not prepared["ok"]:
+        return {**entry, "ok": False, "error": f"slot: {prepared['error']}",
+                "ms": round((time.monotonic() - t0) * 1000)}
+    # The gate's replay runs the slot's hooks by the slot's own path.
+    entry["precompile"] = precompile(slot)
+    gate = run_gate(slot)
+    entry["gate"] = gate
+    entry["gate_ms"] = sum(step["ms"] for step in gate)
+    failed = next((step for step in gate if not step["ok"]), None)
+    if failed is not None:
+        return {**entry, "ok": False, "failed_step": failed["step"],
+                "error": f"{failed['step']}: {failed['detail']}",
+                "ms": round((time.monotonic() - t0) * 1000)}
+    entry["precompile_live"] = _before_flip()
+    flipped = flip(slot)
+    if not flipped["ok"]:
+        return {**entry, "ok": False, "error": f"flip: {flipped['error']}",
+                "ms": round((time.monotonic() - t0) * 1000)}
+    entry["after"] = _after_flip()
+    return {**entry, "ok": True, "ms": round((time.monotonic() - t0) * 1000)}
+
+
+def retry_queued() -> dict[str, Any]:
+    """Run a queued promotion again once the hub answers. While the hub is
+    still out of reach it stays queued and nothing runs."""
+    entry = queued()
+    if entry is None:
+        return {"ok": True, "action": "retry-queued", "queued": None}
+    if hub_reachable() is False:
+        return {"ok": False, "action": "retry-queued", "waiting": True, "queued": entry,
+                "error": "the hub is still out of reach; the promotion stays queued"}
+    return promote(entry.get("commit") or entry["ref"], retry_of=entry)
+
+
+RETRY_KICK_MIN_S = 4 * 60
+
+
+def kick_queued_retry() -> dict[str, Any] | None:
+    """Called at the end of each queue-drain run: when a promotion is
+    queued, start ``khipu promote --retry-queued`` in its own session, so
+    the restart a successful promotion makes of queue-drain cannot stop it.
+    Never raises; None when nothing is queued."""
+    try:
+        entry = queued()
+        if entry is None:
+            return None
+        last = entry.get("kicked_at")
+        if last:
+            age = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(str(last).replace("Z", "+00:00"))).total_seconds()
+            if 0 <= age < RETRY_KICK_MIN_S:
+                return {"kicked": False, "reason": "kicked recently"}
+        _write_queue({**entry, "kicked_at": _now()})
+        log = config_dir() / "state" / "promote-retry.log"
+        with open(log, "a", encoding="utf-8") as fh:
+            proc = subprocess.Popen([sys.executable, "-m", "khipu", "promote", "--retry-queued", "--json"],
+                                    stdin=subprocess.DEVNULL, stdout=fh, stderr=fh,
+                                    cwd=str(Path.home()), start_new_session=True)
+        return {"kicked": True, "pid": proc.pid}
+    except Exception as exc:  # noqa: BLE001 — the drain must never fail on this
+        return {"kicked": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def rollback() -> dict[str, Any]:
@@ -1352,6 +1694,7 @@ def status() -> dict[str, Any]:
         "last_live": last_live(),
         "cleanups": cleanups,
         "cleanup_pending": [str(r["session_id"]) for r in pending_cleanups()],
+        "queued": queued(),
     }
 
 
@@ -1368,7 +1711,14 @@ def format_result(out: dict[str, Any]) -> str:
                          f"{'ok' if gate.get('ok') else 'FAILED'} {(gate.get('commit') or '')[:12]}")
         if out.get("cleanup_pending"):
             lines.append(f"gate episodes not yet confirmed forgotten: {out['cleanup_pending']}")
+        if out.get("queued"):
+            q = out["queued"]
+            lines.append(f"queued until the hub answers: {q.get('ref')} since {q.get('queued_at')}")
         return "\n".join(lines)
+    if action == "retry-queued" and not out.get("gate"):
+        if out.get("queued") is None:
+            return "retry-queued: nothing is queued"
+        return f"retry-queued: {out.get('error')}"
     head = f"{action}"
     if out.get("ref"):
         head += f" {out['ref']}"
@@ -1379,6 +1729,11 @@ def format_result(out: dict[str, Any]) -> str:
     lines.append(head)
     for step in out.get("gate") or []:
         lines.append(f"  {step['step']:<8} {'ok  ' if step['ok'] else 'FAIL'} {step['ms']:>6} ms  {step['detail']}")
+    override = out.get("override")
+    if override:
+        lines.append(f"Update anyway ({', '.join(override.get('checks') or [])}): "
+                     + ("used, and now cleared" if override.get("cleared")
+                        else "kept for the retry" if out.get("queued") else "not cleared"))
     if out.get("ok"):
         if action in ("promote", "rollback"):
             lines.append(f"live is now {Path(out['slot']).name}. {MCP_NOTE}")
@@ -1389,4 +1744,6 @@ def format_result(out: dict[str, Any]) -> str:
         lines.append(f"not done: {out.get('error')}")
         if action == "promote":
             lines.append("live is unchanged")
+        if out.get("queued"):
+            lines.append("queued: it runs again by itself once the hub answers")
     return "\n".join(lines)

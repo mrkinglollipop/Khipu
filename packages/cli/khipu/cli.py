@@ -28,7 +28,7 @@ def _env(*names: str, default: str = "") -> str:
 # was an unconditional NameError on every `khipu jobs install/refresh/
 # uninstall <name>` call with explicit names — a different function's scope
 # does not see a parser-builder's locals. Module level so both see it.
-_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain", "recall_daemon")
+_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain", "recall_daemon", "replica_refresh")
 
 
 def _memory_root_default() -> str | None:
@@ -441,6 +441,17 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         "launchers": launchers, "launchers_ok": bool(launchers.get("ok")),
         "not_configured": not_configured,
     }
+
+
+def _promotion_block() -> dict:
+    """A promotion waiting for the hub (khipu.promote.queued), for the app.
+    Never gates ``ok``."""
+    try:
+        from khipu.promote import queued
+
+        return {"queued": queued()}
+    except Exception as e:  # noqa: BLE001
+        return {"queued": None, "error": f"{type(e).__name__}: {e}"}
 
 
 def _cmd_doctor_quick(args: argparse.Namespace) -> int:
@@ -924,6 +935,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "ledger": ledger_block,
         "schema_migrations": schema,
         "work": work_block,
+        "promotion": _promotion_block(),
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
@@ -2235,9 +2247,12 @@ def cmd_route(args: argparse.Namespace) -> int:
 
 
 def cmd_owed(args: argparse.Namespace) -> int:
-    """W3.4: `khipu owed` — list, close, reopen, or snooze commitments."""
+    """W3.4: `khipu owed` — list, close, reopen, or snooze commitments. With
+    the hub away a close, reopen or snooze waits on this Mac and replays when
+    it answers (`waiting_to_sync`), and the list comes from this Mac's copy."""
+    from khipu import commitments, offline, offline_reads, owner_writes
     from khipu.db import connect
-    from khipu import commitments
+    from khipu.hub_snapshot import hub_connection_failed
 
     snooze_id = getattr(args, "snooze", None)
     if snooze_id:
@@ -2248,49 +2263,61 @@ def cmd_owed(args: argparse.Namespace) -> int:
                 "error": "--until must be a date (2026-09-30) or a window (7d, 2 weeks)",
             }))
             return 2
-        expr, param = parsed
         cid = int(snooze_id)
-        params = ([param] if param is not None else []) + [cid]
-        with connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"UPDATE commitments SET due_after = {expr} WHERE id = %s",
-                    tuple(params),
-                )
-                ok = cur.rowcount > 0
-            conn.commit()
-        print(json.dumps({
-            "ok": ok, "id": cid,
-            "until": (getattr(args, "until", None) or "").strip(),
-        }))
-        return 0 if ok else 1
+        until = (getattr(args, "until", None) or "").strip()
+        try:
+            res = owner_writes.run("owed_update", {"id": cid, "action": "snooze", "until": until})
+        except ValueError:
+            print(json.dumps({"ok": False, "id": cid, "until": until}))
+            return 1
+        print(json.dumps({"ok": True, "id": cid, "until": until,
+                          **({"waiting_to_sync": True} if res.get("waiting_to_sync") else {})}))
+        return 0
 
     close_id = getattr(args, "close", None)
     reopen_id = getattr(args, "reopen", None)
     if close_id or reopen_id:
         cid = int(close_id or reopen_id)
         new_status = "closed" if close_id else "open"
-        with connect() as conn:
-            with conn.cursor() as cur:
-                ok = commitments.set_status(cur, cid, new_status)
-            conn.commit()
-        print(json.dumps({"ok": ok, "id": cid, "status": new_status}))
-        return 0 if ok else 1
+        try:
+            res = owner_writes.run("owed_update", {"id": cid, "action": "close" if close_id else "reopen"})
+        except ValueError:
+            print(json.dumps({"ok": False, "id": cid, "status": new_status}))
+            return 1
+        print(json.dumps({"ok": True, "id": cid, "status": new_status,
+                          **({"waiting_to_sync": True} if res.get("waiting_to_sync") else {})}))
+        return 0
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            rows = commitments.list_owed(
-                cur,
-                project=getattr(args, "project", None),
-                status=getattr(args, "status", None) or "open",
-                limit=int(getattr(args, "limit", None) or 50),
-            )
-            # Ages counted on the hub's own clock, so a Mac clock that runs
-            # ahead of or behind the hub can't make an age negative.
-            cur.execute("SELECT now()")
-            hub_now = (cur.fetchone() or [None])[0]
+    project = getattr(args, "project", None)
+    status = getattr(args, "status", None) or "open"
+    limit = int(getattr(args, "limit", None) or 50)
+    stale: dict = {}
+    try:
+        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+            with conn.cursor() as cur:
+                rows = commitments.list_owed(cur, project=project, status=status, limit=limit)
+                # Ages counted on the hub's own clock, so a Mac clock that runs
+                # ahead of or behind the hub can't make an age negative.
+                cur.execute("SELECT now()")
+                hub_now = (cur.fetchone() or [None])[0]
+    except Exception as exc:  # noqa: BLE001
+        if not hub_connection_failed(exc):
+            raise
+        copy = offline_reads.owed(project, status, limit)
+        if copy is None:
+            raise
+        rows = copy["results"]
+        stale = {"stale": True, "snapshot_refreshed_at": copy.get("snapshot_refreshed_at")}
+        from datetime import datetime, timezone
+
+        hub_now = datetime.now(timezone.utc)
     commitments.add_hub_ages(rows, hub_now)
-    print(json.dumps(rows, indent=2, default=str))
+    owner_writes.annotate(rows, "owed_update")
+    if getattr(args, "envelope", False):
+        print(json.dumps({"results": rows, "stale": bool(stale), "snapshot_refreshed_at": stale.get("snapshot_refreshed_at"),
+                          "waiting_to_sync": owner_writes.status()}, indent=2, default=str))
+    else:
+        print(json.dumps(rows, indent=2, default=str))
     return 0
 
 
@@ -3048,6 +3075,17 @@ def _owner_or_request(args: argparse.Namespace) -> "dict | int":
                               "code": "request_needs_words"}))
             return 2
         return {"request": words, "by": routing.conversation_author(), "at": routing._iso(routing._now())}
+    via = _owner_only(args)
+    return via if isinstance(via, int) else {}
+
+
+def _owner_only(args: argparse.Namespace) -> "str | int":
+    """The owner check for a config change only the owner makes (the app,
+    or a typed yes on a terminal; ``routing._owner_via``): how it was
+    authorised ("app" or "cli"), or the exit code after a refusal was
+    printed."""
+    from khipu import routing
+
     auth = routing._OWNER_AUTH.set(None)
     try:
         via = routing._owner_via(args)
@@ -3056,7 +3094,7 @@ def _owner_or_request(args: argparse.Namespace) -> "dict | int":
     if via is None:
         print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
         return 2
-    return {}
+    return via
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -3065,6 +3103,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         FLOAT_SETTINGS,
         INT_SETTINGS,
         LIST_SETTINGS,
+        MINUTE_SETTINGS,
         capture_mode,
         config_file,
         gateway_url,
@@ -3210,6 +3249,25 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": True, "graph_backup_remote": graph_backup_remote_status(),
                           "config_file": str(path)}))
         return 0
+    from khipu import replica_heal
+
+    if (args.set and args.set[0] in replica_heal.SETTINGS) or args.unset in replica_heal.SETTINGS:
+        # This Mac's copy (offline design A): how old before the background
+        # job updates it, and how often it looks. The check interval is baked
+        # into the job's plist, so changing it re-renders the job.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = replica_heal.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        reply = {"ok": True, key: replica_heal.settings_status()[key], "config_file": str(path)}
+        if key == "replica_check_every":
+            from khipu import launchd_gen
+
+            reply["job"] = launchd_gen.rerender_replica_job()
+        print(json.dumps(reply))
+        return 0
     from khipu import ledger as _ledger
 
     if (args.set and args.set[0] in _ledger.SETTINGS) or args.unset in _ledger.SETTINGS:
@@ -3236,18 +3294,25 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps({"ok": True, key: _work.settings_status()[key], "config_file": str(path)}))
         return 0
+    from khipu import offline as _offline
+
+    if (args.set and args.set[0] in _offline.SETTINGS) or args.unset in _offline.SETTINGS:
+        # How long the hub is waited on before this Mac's copy is used: `--set
+        # hub_statement_timeout 0` lifts it, `--unset` for the default again.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _offline.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _offline.settings_status()[key], "config_file": str(path)}))
+        return 0
     from khipu import routing as _routing
 
     if isinstance(getattr(args, "answer_request", None), (list, tuple)):
         # The owner's answer to a conversation's change to a routing setting.
         key, action = args.answer_request
-        auth = _routing._OWNER_AUTH.set(None)
-        try:
-            via = _routing._owner_via(args)
-        finally:
-            _routing._OWNER_AUTH.reset(auth)
-        if via is None:
-            print(json.dumps({"ok": False, "error": _routing._REFUSED, "code": "owner_only"}))
+        if isinstance(_owner_only(args), int):
             return 2
         try:
             path = _routing.answer_setting_request(key, action)
@@ -3290,6 +3355,19 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         value, source = choice_setting(key)
         print(json.dumps({"ok": True, key: value, "source": source, "config_file": str(path)}))
+        return 0
+    if (args.set and args.set[0] == "promote_gate_ignore") or args.unset == "promote_gate_ignore":
+        return _config_gate_override(args)
+    if (args.set and args.set[0] in MINUTE_SETTINGS) or args.unset in MINUTE_SETTINGS:
+        from khipu.config import minute_settings_status, set_minute_setting
+
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = set_minute_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: minute_settings_status()[key], "config_file": str(path)}))
         return 0
     if (args.set and args.set[0] in INT_SETTINGS) or args.unset in INT_SETTINGS:
         # Daily call ceilings (synth_daily_calls, embed_daily_calls,
@@ -3364,6 +3442,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         float_settings_status,
         graph_backup_remote_status,
         list_setting,
+        minute_settings_status,
         path_settings_status,
     )
 
@@ -3380,19 +3459,53 @@ def cmd_config(args: argparse.Namespace) -> int:
         "paths": path_settings_status(),
         "user_aliases": list(list_setting("user_aliases")),
         "float_settings": float_settings_status(),
+        "minute_settings": minute_settings_status(),
+        "promote_gate_ignore": _promote_gate_ignore_status(),
         "relevance_cosine_floor": relevance.cosine_floor_status(),
         "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
         "usage_accounts": usage.accounts_status(),
         "cli_settings": cli_settings_status(),
         "routing": _routing.settings_status(),
         "ledger": _ledger.settings_status(),
+        "replica": replica_heal.settings_status(),
         "work": _work.settings_status(),
+        "offline": _offline.settings_status(),
         "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
         "config": load_config(),
     }
     print(json.dumps(out, indent=2))
     return 0
+
+
+def _config_gate_override(args: argparse.Namespace) -> int:
+    """`config --set promote_gate_ignore CHECKS` / `--unset`: the owner's
+    one-time "Update anyway". The next promotion skips these red checks
+    once, names them in its record, then clears it; unused, it lapses after
+    a day. Only the owner sets or cancels it (the app, or a typed yes)."""
+    from khipu import promote as _promote
+
+    via = _owner_only(args)
+    if isinstance(via, int):
+        return via
+    try:
+        path = _promote.set_gate_ignore(args.set[1] if args.set else None,
+                                        by="app" if via == "app" else "terminal")
+    except ValueError as err:
+        print(json.dumps({"ok": False, "error": str(err)}))
+        return 2
+    print(json.dumps({"ok": True, "promote_gate_ignore": _promote.gate_ignore_status(),
+                      "config_file": str(path)}))
+    return 0
+
+
+def _promote_gate_ignore_status() -> dict:
+    try:
+        from khipu.promote import gate_ignore_status
+
+        return gate_ignore_status()
+    except Exception as e:  # noqa: BLE001 — showing config must not fail on this
+        return {"value": [], "choices": [], "error": f"{type(e).__name__}: {e}"}
 
 
 BUDGET_LIFT_SCOPES = ("synth", "memory", "library")
@@ -3746,14 +3859,16 @@ def cmd_promote(args: argparse.Namespace) -> int:
     khipu.promote and docs/plans/2026-10-14-promotion-gate.md)."""
     from khipu import promote as pm
 
-    chosen = [flag for flag in ("rollback", "status", "gate_only") if getattr(args, flag, None)]
+    chosen = [flag for flag in ("rollback", "status", "gate_only", "retry_queued") if getattr(args, flag, None)]
     if len(chosen) > 1:
-        print(json.dumps({"ok": False, "error": "choose one of --rollback, --status, --gate-only"}))
+        print(json.dumps({"ok": False, "error": "choose one of --rollback, --status, --gate-only, --retry-queued"}))
         return 2
-    if (args.rollback or args.status) and args.ref:
+    if (args.rollback or args.status or args.retry_queued) and args.ref:
         print(json.dumps({"ok": False, "error": "a ref applies to a promotion or --gate-only only"}))
         return 2
-    if args.status:
+    if args.retry_queued:
+        out = pm.retry_queued()
+    elif args.status:
         out = pm.status()
     elif args.rollback:
         out = pm.rollback()
@@ -3798,6 +3913,14 @@ def cmd_jobs(args: argparse.Namespace) -> int:
 def cmd_snapshot(args: argparse.Namespace) -> int:
     from khipu.hub_snapshot import refresh, snapshot_freshness
 
+    if args.snapshot_cmd == "heal":
+        from khipu import jobs, replica_heal
+
+        out = replica_heal.run()
+        rc = 0 if out.get("ok") else 1
+        jobs._write_job_state("replica_refresh", rc)
+        print(json.dumps(out, indent=2))
+        return rc
     if args.snapshot_cmd == "status":
         # Local evidence only (no hub connection): the state, per-table
         # cursors and the last measurement status or doctor made.
@@ -4018,6 +4141,14 @@ def cmd_sessions(args: argparse.Namespace) -> int:
         print(json.dumps(sc.sweep_idle(limit=args.limit, dry_run=args.dry_run), indent=2))
         return 0
     out = sc.drain(limit=args.limit, dry_run=args.dry_run, sweep=True)
+    if not args.dry_run:
+        # A promotion queued while the hub was out of reach is retried from
+        # here, in its own process (khipu.promote.kick_queued_retry).
+        from khipu.promote import kick_queued_retry
+
+        kicked = kick_queued_retry()
+        if kicked is not None:
+            out["promotion_retry"] = kicked
     print(json.dumps(out, indent=2))
     return 0 if out["failed"] == 0 else 2
 
@@ -5040,6 +5171,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--until", default=None,
         help="With --snooze: a date (2026-09-30) or a window (7d, 2w, 3m, 2 weeks)",
     )
+    owed.add_argument(
+        "--envelope", action="store_true",
+        help="Print {results, stale, snapshot_refreshed_at, waiting_to_sync} instead of the bare list",
+    )
     owed.set_defaults(func=cmd_owed)
 
     us = sub.add_parser(
@@ -5620,12 +5755,17 @@ def build_parser() -> argparse.ArgumentParser:
         "window does on a provider other than Gemini), the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew") '
         "the graph backup destination (graph_backup_remote, an rclone "
-        "remote:path, default r2:khipu-backups/khipu-graph) "
+        "remote:path, default r2:khipu-backups/khipu-graph), how far back "
+        "doctor's rate checks look (doctor_rate_window_minutes, default 60), "
+        "how long the promotion gate waits for an unreachable hub "
+        "(promote_hub_wait_minutes, default 10), the red doctor checks the "
+        "next promotion skips once (promote_gate_ignore, comma-separated "
+        "check names; the owner's only, it clears after one use or a day) "
         "or the plan usage accounts as JSON (usage_accounts "
         '\'[{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}]\')',
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting, a daily call ceiling, synth_fallback, graph_backup_remote or usage_accounts, or "
+                     help="Remove a path setting, a daily call ceiling, a minutes setting, synth_fallback, graph_backup_remote or usage_accounts, or "
                      "relevance.cosine_floor / "
                      "relevance.cosine_floor_by_profile.<profile> to restore its default")
     cfg.add_argument(
@@ -5821,14 +5961,14 @@ def build_parser() -> argparse.ArgumentParser:
     jb_sub = jb.add_subparsers(dest="jobs_cmd", required=True)
     jb_sub.add_parser("status", help="Print khipu.jobs.job_status() as JSON")
     jbi = jb_sub.add_parser("install", help="Render + load the named jobs (default: all)")
-    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon}")
+    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon,replica_refresh}")
     jbr = jb_sub.add_parser(
         "refresh",
         help="Re-render + reload installed jobs whose plist is stale (default: all installed)",
     )
-    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon}")
+    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon,replica_refresh}")
     jbu = jb_sub.add_parser("uninstall", help="Unload + remove the named jobs (default: all)")
-    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon}")
+    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon,replica_refresh}")
     jb.set_defaults(func=cmd_jobs)
 
     pmt = sub.add_parser(
@@ -5840,6 +5980,8 @@ def build_parser() -> argparse.ArgumentParser:
     pmt.add_argument("--status", action="store_true", help="Live commit, main commit, drift, last gate result")
     pmt.add_argument("--gate-only", choices=("doctor", "recall", "capture", "version"), default=None,
                      metavar="STEP", help="Run one gate step (doctor, recall, capture, version); never flips")
+    pmt.add_argument("--retry-queued", action="store_true",
+                     help="Run the promotion queued while the hub was out of reach, if the hub answers now")
     pmt.add_argument("--json", action="store_true", help="Print the full result as JSON")
     pmt.set_defaults(func=cmd_promote)
 
@@ -5850,6 +5992,10 @@ def build_parser() -> argparse.ArgumentParser:
     snap_sub = snap.add_subparsers(dest="snapshot_cmd", required=True)
     snap_sub.add_parser(
         "refresh", help="Dump hub tables into hub_snapshot.sqlite (hub must be up)"
+    )
+    snap_sub.add_parser(
+        "heal",
+        help="Bring this Mac's copy up to date when it needs it (what the replica_refresh job runs)",
     )
     snap_sub.add_parser("status", help="Snapshot age, size, and row counts from meta")
     snap.set_defaults(func=cmd_snapshot)

@@ -341,6 +341,57 @@ export function CaptureTuningCard({
 }
 
 // ---------------------------------------------------------------------------
+// When the hub is away, waits: three waits, in whole seconds.
+// ---------------------------------------------------------------------------
+
+const OFFLINE_ROWS: ReadonlyArray<readonly [string, string]> = [
+  ["hub_statement_timeout", "Wait on the hub for a read or write (seconds)"],
+  ["hub_dead_connection_after", "Give up on a silent hub connection after (seconds)"],
+  ["app_cli_timeout", "Wait for an answer in this app (seconds)"],
+];
+
+export function OfflineWaitsCard({ active }: { active: boolean }) {
+  const cfg = useCliState<ConfigShape>("khipu_config_show", active);
+  const rows = cfg.data?.offline ?? {};
+  return (
+    <>
+      <div className="section-head">Waiting on the hub</div>
+      <div className="section-body">
+        <p className="set-help">
+          How long Khipu waits before it uses this Mac's copy of Owed and Decisions. 0 means no limit.
+        </p>
+        {cfg.error && !cfg.data ? (
+          <p className="set-error" role="alert">
+            Could not read the settings: {cfg.error}
+          </p>
+        ) : null}
+        {OFFLINE_ROWS.map(([key, label]) => {
+          const row = rows[key];
+          return (
+            <SettingField
+              key={key}
+              label={label}
+              mono
+              narrow
+              inputMode="decimal"
+              value={row ? String(row.value) : ""}
+              canReset={row?.source === "file"}
+              onReset={() => unsetConfig(key, cfg.reload)}
+              help={row ? `${row.words}. Default ${row.default}.` : undefined}
+              onSave={async (v) => {
+                const t = v.trim();
+                if (!/^\d+$/.test(t)) return "Enter a whole number of seconds, 0 or more.";
+                return writeConfig(key, t, cfg.reload);
+              }}
+            />
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Another Mac: gateway_url.
 // ---------------------------------------------------------------------------
 
@@ -509,6 +560,107 @@ export function GraphBackupRemoteCard({ active }: { active: boolean }) {
 }
 
 // ---------------------------------------------------------------------------
+// Data: how current this Mac's copy of the hub is kept.
+// ---------------------------------------------------------------------------
+
+/** Minutes the field shows for a CLI value in seconds. */
+function minutesText(seconds: number): string {
+  return String(Math.round((seconds / 60) * 100) / 100);
+}
+
+/** Whole minutes only, at least `min`; the CLI re-checks in seconds. */
+export function replicaMinutesError(raw: string, min: number): string | null {
+  const v = raw.trim();
+  if (!/^\d{1,7}$/.test(v) || Number(v) < min) {
+    return min > 0 ? `Enter a whole number of minutes, ${min} or more.` : "Enter a whole number of minutes, 0 or more.";
+  }
+  return null;
+}
+
+const REPLICA_ROWS: ReadonlyArray<readonly [string, string, string, number]> = [
+  [
+    "replica_refresh_after",
+    "Bring the copy up to date after (minutes)",
+    "While the database answers, a background job brings this Mac's copy up to date when its last update is this old. 0 updates it at every check. Default 15.",
+    0,
+  ],
+  [
+    "replica_check_every",
+    "Check every (minutes)",
+    "How often the background job looks. At least 1. Default 5.",
+    1,
+  ],
+];
+
+export function ReplicaCopyCard({ active }: { active: boolean }) {
+  const cfg = useCliState<ConfigShape>("khipu_config_show", active);
+  return (
+    <>
+      <div className="section-head">This Mac's copy</div>
+      <div className="section-body">
+        {cfg.error && !cfg.data ? (
+          <p className="set-error" role="alert">
+            Could not read the settings: {cfg.error}
+          </p>
+        ) : null}
+        {REPLICA_ROWS.map(([key, label, help, min]) => {
+          const row = cfg.data?.replica?.[key];
+          return (
+            <SettingField
+              key={key}
+              label={label}
+              help={help}
+              narrow
+              inputMode="decimal"
+              value={row ? minutesText(row.value) : ""}
+              canReset={row?.source === "file"}
+              onReset={() => unsetConfig(key, cfg.reload)}
+              onSave={async (v) =>
+                replicaMinutesError(v, min) ?? writeConfig(key, String(Number(v.trim()) * 60), cfg.reload)
+              }
+            />
+          );
+        })}
+        <SettingField
+          label="Skip the database after a failed connection for (seconds)"
+          help="After a connection to the database fails, recall and search use this Mac's copy without trying again for this long. 0 always tries. Default 60."
+          narrow
+          inputMode="decimal"
+          value={cfg.data?.replica?.hub_down_memo_for ? String(cfg.data.replica.hub_down_memo_for.value) : ""}
+          canReset={cfg.data?.replica?.hub_down_memo_for?.source === "file"}
+          onReset={() => unsetConfig("hub_down_memo_for", cfg.reload)}
+          onSave={async (v) =>
+            /^\d{1,7}$/.test(v.trim())
+              ? writeConfig("hub_down_memo_for", String(Number(v.trim())), cfg.reload)
+              : "Enter a whole number of seconds, 0 or more."
+          }
+        />
+      </div>
+    </>
+  );
+}
+
+/** Settings -> Data: every offline setting in one card. The copy group says how
+ *  current this Mac's copy is kept and how long a failed connection is
+ *  remembered; the waits group says how long a hub call may take before the
+ *  copy answers instead. */
+export function HubAwayCard({ active }: { active: boolean }) {
+  return (
+    <section className="section-card" aria-label="When the hub is away">
+      <div className="section-head">When the hub is away</div>
+      <div className="section-body">
+        <p className="set-help">
+          Khipu answers from this Mac's copy of your memory whenever the hub is out of reach, and catches up by
+          itself when it answers again.
+        </p>
+      </div>
+      <ReplicaCopyCard active={active} />
+      <OfflineWaitsCard active={active} />
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Advanced: per-job install / remove.
 // ---------------------------------------------------------------------------
 
@@ -536,6 +688,11 @@ const JOB_ROWS: ReadonlyArray<readonly [string, string, string]> = [
     "queue_drain",
     "Queued captures",
     "Every 5 minutes, saves captures that another harness queued but could not store right away.",
+  ],
+  [
+    "replica_refresh",
+    "This Mac's copy",
+    "Keeps this Mac's copy of your memory current between nightly runs, so recall stays fast and works offline.",
   ],
   [
     "recall_daemon",

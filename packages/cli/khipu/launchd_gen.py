@@ -20,11 +20,13 @@ from khipu.jobs import (
     PLIST_NOTES_WATCH,
     PLIST_QUEUE_DRAIN,
     PLIST_RECALL_DAEMON,
+    PLIST_REPLICA_REFRESH,
     _JOB_SPECS,
     _launchagents_dir,
     _log_paths,
     _plist_path,
 )
+from khipu import replica_heal
 from khipu.lines import split_lines
 
 TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "launchd"
@@ -36,6 +38,7 @@ _JOB_TEMPLATE: dict[str, str] = {
     "notes_watch": "com.khipu.notes-watch.plist",
     "queue_drain": "com.khipu.queue-drain.plist",
     "recall_daemon": "com.khipu.recall-daemon.plist",
+    "replica_refresh": "com.khipu.replica-refresh.plist",
 }
 
 # What a fresh install schedules. The recall service is opt-in
@@ -51,6 +54,7 @@ _LABELS = {
     "notes_watch": PLIST_NOTES_WATCH,
     "queue_drain": PLIST_QUEUE_DRAIN,
     "recall_daemon": PLIST_RECALL_DAEMON,
+    "replica_refresh": PLIST_REPLICA_REFRESH,
 }
 
 _REQUIRED_DRIVER_ENV = {
@@ -278,6 +282,9 @@ def render_plist(job: str, environ: dict[str, str] | None = None) -> bytes:
     text = text.replace("{{STDERR_LOG}}", escape(str(err_log)))
     if job == "notes_watch":
         text = text.replace("{{WATCH_PATHS}}", render_watch_paths_xml())
+    if job == "replica_refresh":
+        text = text.replace("{{REPLICA_CHECK_EVERY}}", str(replica_heal.check_every_s()))
+        text = text.replace("{{REPLICA_WAKE}}", escape(str(replica_heal.wake_path())))
     if job == "queue_drain":
         data = plistlib.loads(text.encode("utf-8"))
         data["ProgramArguments"] = _queue_drain_arguments(ctx["KHIPU_PYTHON"])
@@ -375,6 +382,8 @@ def install_job(job: str, *, environ: dict[str, str] | None = None) -> dict[str,
     agents = _launchagents_dir()
     agents.mkdir(parents=True, exist_ok=True)
     dest = _plist_path(label)
+    if job == "replica_refresh":
+        replica_heal.ensure_wake_file()  # launchd watches a file that exists
     dest.write_bytes(render_plist(job, environ))
     loaded = _launchctl_load(label, dest)
     if not loaded.get("ok"):
@@ -528,6 +537,18 @@ def _refresh_environ(job: str) -> dict[str, str]:
             if key not in env and str(baked.get(key) or "").strip():
                 env[key] = str(baked[key])
     return env
+
+
+def rerender_replica_job() -> dict[str, Any]:
+    """Re-render and reload the replica job after its check interval changed
+    (the interval is baked into the plist). A job this app does not manage is
+    left as it is."""
+    dest = _plist_path(PLIST_REPLICA_REFRESH)
+    if not dest.is_file():
+        return {"ok": True, "skipped": "not installed"}
+    if plist_external("replica_refresh"):
+        return {"ok": True, "skipped": "external"}
+    return install_job("replica_refresh", environ=_refresh_environ("replica_refresh"))
 
 
 def plist_current(job: str) -> bool | None:

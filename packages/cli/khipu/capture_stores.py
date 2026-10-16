@@ -97,13 +97,13 @@ STORES: tuple[Store, ...] = (
           "one capture per line, summary text", "legacy logs",
           _w("forget._rewrite_log", "forget._scrub_copy")),
     Store("replica", "data folder hub_snapshot.sqlite",
-          "episode rows, vectors, decisions and deliverables", "replica",
+          "episode rows, vectors, decisions, deliverables, topics and commitments", "replica",
           _w("hub_snapshot._refresh_locked", "hub_snapshot._upsert_episode_unfenced",
              "hub_snapshot.upsert_embeddings", "hub_snapshot.apply_decision_changes",
              "hub_snapshot.sync_decision_changes", "hub_snapshot.ledger_write_snapshot",
              "hub_snapshot.forget_episode_in_snapshot", "hub_snapshot.scrub_forgotten_snapshot",
              "hub_snapshot.publish_imported_snapshot", "hub_snapshot.purge_topic_in_snapshot",
-             "hub_snapshot.ensure_edge_indexes"),
+             "hub_snapshot.ensure_edge_indexes", "hub_snapshot._write_pulled_tables"),
           Restore(("hub_snapshot.sqlite",), "replica staging")),
     Store("replica temp", "data folder .hub_snapshot.<random>.sqlite and its journal and WAL",
           "a refresh dump or a staged backup replica", "replica temps",
@@ -179,6 +179,8 @@ OTHER_DATA: tuple[DataFiles, ...] = (
               Restore(("forgotten_sources.json",), "registry merge")),
     DataFiles("ledger outbox", "ledger writes waiting for the hub, the owner's work rows",
               Restore(("ledger-outbox/*.json",), "no capture text")),
+    DataFiles("owner writes", "owner writes waiting for the hub: closing an owed item, superseding a decision",
+              Restore(("owner-writes/*.json",), "no capture text")),
 )
 
 

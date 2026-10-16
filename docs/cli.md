@@ -214,7 +214,7 @@ Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `-
 
 ### jobs
 
-Job names: `nightly`, `monthly`, `graph_build`, `notes_watch`, `queue_drain`, `recall_daemon`. `install` with no name schedules the first five (the default set). `refresh` with no name re-renders every installed job whose plist is stale and never installs a new one. `uninstall` with no name removes all six, including `recall_daemon`. `recall_daemon` is opt-in: `khipu jobs install recall_daemon`.
+Job names: `nightly`, `monthly`, `graph_build`, `notes_watch`, `queue_drain`, `recall_daemon`, `replica_refresh`. `install` with no name schedules the six jobs other than `recall_daemon` (the default set). `refresh` with no name re-renders every installed job whose plist is stale and never installs a new one. `uninstall` with no name removes all seven, including `recall_daemon`. `recall_daemon` is opt-in: `khipu jobs install recall_daemon`.
 
 ### promote
 

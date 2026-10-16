@@ -717,7 +717,7 @@ class HubAuditRegressionTest(unittest.TestCase):
 
             inserts = ["_insert_episodes", "_insert_topics", "_insert_topic_revisions", "_insert_nodes",
                        "_insert_edges", "_insert_profiles", "_insert_memory_embeddings",
-                       "_insert_decisions", "_insert_deliverables", "_insert_ledger"]
+                       "_insert_decisions", "_insert_deliverables", "_insert_commitments", "_insert_ledger"]
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch.object(hs, "meta_path", return_value=sidecar), \
                  mock.patch("khipu.paths.ensure_data_dir", return_value=data), \

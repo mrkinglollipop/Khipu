@@ -1992,6 +1992,27 @@ class _SnapshotUnusable(Exception):
     hub. Carries the reason so it can be logged (never silently)."""
 
 
+def _stale_marker(health: dict[str, Any], *, why: str | None = None) -> dict[str, Any]:
+    """The one stale marker for an answer from this Mac's copy that is not
+    trusted, or that stands in for the hub (Matt, 2026-10-16, decision 1:
+    every stale answer carries its age). ``render_block`` turns it into the
+    one line ``_stale_line`` words; every such answer path builds it here
+    (tests/test_replica_pull_integrity.py enumerates them)."""
+    return {
+        "age_seconds": health.get("age_seconds"), "refreshed_at": health.get("refreshed_at"),
+        "why": why or health.get("distrusted_by") or "overdue",
+    }
+
+
+def _wake_replica_job() -> None:
+    try:
+        from khipu import replica_heal
+
+        replica_heal.wake()
+    except Exception:  # noqa: BLE001 - waking the job is a courtesy
+        pass
+
+
 def _snapshot_search_hits(
     prompt: str, *, project: str | None, tz: str | None = None,
     started: float | None = None, progress: dict[str, Any] | None = None,
@@ -2029,10 +2050,18 @@ def _snapshot_search_hits(
     from khipu.search_text import search_tokens, token_hit_count
 
     fresh, health = hub_snapshot.snapshot_is_fresh()
+    stale: dict[str, Any] | None = None
     if not fresh:
-        raise _SnapshotUnusable(
-            "missing" if not health.get("exists") else f"stale ({health.get('age_seconds')}s)"
-        )
+        # Matt, 2026-10-16: a copy with a dump time on record answers even when
+        # it is hours behind, marked stale; only a missing one gives way to the hub.
+        if not health.get("exists") or health.get("age_seconds") is None:
+            raise _SnapshotUnusable(
+                "missing" if not health.get("exists") else f"stale ({health.get('age_seconds')}s)"
+            )
+        stale = _stale_marker(health)
+        if progress is not None:
+            progress["replica_stale"] = stale
+        _wake_replica_job()
 
     tokens = search_tokens(prompt)
     # `started` is when the caller's own TIMEOUT_S clock began. Counting from
@@ -2100,13 +2129,14 @@ def _snapshot_search_hits(
         else:
             degraded = "embedding late"
         if "rows" not in cosine_box and provisional is not None:
-            return {**provisional, "degraded": degraded}
+            return {**provisional, "degraded": degraded, **({"replica_stale": stale} if stale else {})}
 
     _enter_stage(progress, "finish")
-    return _fuse_and_annotate(
+    out = _fuse_and_annotate(
         prompt, tokens=tokens, project=project, tz=tz,
         lexical_rows=lexical_rows, cosine_rows=cosine_rows, legs=legs, degraded=degraded,
     )
+    return {**out, "replica_stale": stale} if stale else out
 
 
 def _fuse_and_annotate(
@@ -2298,7 +2328,22 @@ def _trim_result(result: dict[str, Any], limit: int) -> dict[str, Any]:
         out["degraded_legs"] = result["degraded_legs"]
     if "time_interpretation" in result:
         out["time_interpretation"] = result["time_interpretation"]
+    if "replica_stale" in result:
+        out["replica_stale"] = result["replica_stale"]
     return out
+
+
+def _hub_known_down() -> dict[str, Any] | None:
+    """The reachability memo, when the hub is known to be down; the hub leg is
+    then skipped (logged once) and the call answers with nothing, tagged
+    offline so doctor's rate checks count it apart from lane failures."""
+    from khipu import hub_reach
+
+    memo = hub_reach.known_unreachable()
+    if memo is not None:
+        _log(f"hub unreachable since {memo.get('since')} — skipping the hub leg")
+        return {"hits": [], "legs": [], "degraded": "hub unreachable", "offline": True}
+    return None
 
 
 def _search_hits(
@@ -2339,6 +2384,11 @@ def _search_hits(
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls back
         _log(f"snapshot search failed ({type(exc).__name__}: {exc}) — falling back to hub")
 
+    skipped = _hub_known_down()
+    if skipped is not None:
+        return skipped
+
+    from khipu import hub_reach, hub_snapshot
     from khipu.embed import hybrid_search
     from khipu.redact import redact_secrets
 
@@ -2346,10 +2396,16 @@ def _search_hits(
     # include_libraries=False: this lane has a latency budget and must never
     # wait on a second embedding provider (library search is explicit-only).
     sanitized, _ = redact_secrets(prompt)
-    payload = hybrid_search(
-        sanitized, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project,
-        include_libraries=False,
-    )
+    try:
+        payload = hybrid_search(
+            sanitized, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project,
+            include_libraries=False,
+        )
+    except Exception as exc:
+        if hub_snapshot.hub_connection_failed(exc):
+            hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
+        raise
+    hub_reach.note_reachable()
     rows = _apply_score_floor(payload.get("results") or [])
     return {"hits": rows[:limit], "legs": ["hub"], "degraded": None}
 
@@ -2576,11 +2632,16 @@ def _search_hits_budgeted(
         result = _snapshot_search_hits(prompt, project=project, started=started,
                                        deadline=deadline, progress=progress)
         hits = _apply_score_floor(result["hits"])[:limit]
-        return {"hits": hits, "legs": result["legs"], "degraded": result["degraded"]}
+        return {"hits": hits, "legs": result["legs"], "degraded": result["degraded"],
+                **({"replica_stale": result["replica_stale"]} if "replica_stale" in result else {})}
     except _SnapshotUnusable as exc:
         _log(f"snapshot unusable ({exc}) — hub budgeted path")
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls through
         _log(f"snapshot search failed ({type(exc).__name__}: {exc}) — hub budgeted path")
+
+    skipped = _hub_known_down()
+    if skipped is not None:
+        return skipped
 
     from khipu.search_text import search_tokens
 
@@ -2617,7 +2678,20 @@ def _row_tag(row: dict[str, Any]) -> str:
     return " · ".join(bits)
 
 
-def render_block(hits: list[dict[str, Any]], *, produced: str = "") -> str:
+def _stale_line(stale: dict[str, Any]) -> str:
+    seconds = stale.get("age_seconds")
+    if not isinstance(seconds, (int, float)) or seconds < 0:
+        age = "out of date"
+    elif seconds < 3600:
+        age = f"{max(1, int(seconds // 60))} minutes old"
+    elif seconds < 2 * 86400:
+        age = f"{int(seconds // 3600)} hours old"
+    else:
+        age = f"{int(seconds // 86400)} days old"
+    return f"This Mac's copy of memory is {age}; newer work may be missing."
+
+
+def render_block(hits: list[dict[str, Any]], *, produced: str = "", stale: dict[str, Any] | None = None) -> str:
     """The untrusted-data-fenced block, hard-capped at BLOCK_CHAR_BUDGET.
 
     Drops whole trailing hit lines rather than mid-truncating one — same
@@ -2631,6 +2705,10 @@ def render_block(hits: list[dict[str, Any]], *, produced: str = "") -> str:
     out = [_HEADING]
     if len(f"{_HEADING}\n{_FOOTER}") > BLOCK_CHAR_BUDGET:
         return ""
+    if stale:
+        line = _stale_line(stale)
+        if len("\n".join([*out, line, _FOOTER])) <= BLOCK_CHAR_BUDGET:
+            out.append(line)
     for h in hits:
         snippet = clip_snippet(str(h.get("snippet") or h.get("label") or ""), 90)
         line = f"- [{_row_tag(h)}] {snippet}"
@@ -2707,19 +2785,23 @@ def _thread_memory_hits(thread: str, *, progress: dict | None = None) -> list[di
             con.execute("PRAGMA busy_timeout = 2")
             cols = hub_snapshot._snapshot_table_columns(con, "decisions")
             retracted = "AND d.retracted_at IS NULL" if "retracted_at" in cols else ""
+            fence = hub_snapshot.forget_fence_sql(con, "d", "episode_id")
             rows = con.execute(
                 "SELECT 'decision', d.id, d.text, d.episode_id, d.decided_at "
                 "FROM decisions d JOIN episodes e ON e.id = d.episode_id "
                 "WHERE CASE WHEN json_valid(e.raw) THEN "
                 "json_extract(e.raw, '$.t3_thread_id') END = ? "
                 "AND e.deleted_at IS NULL AND d.superseded_by IS NULL "
-                f"{retracted} ORDER BY d.decided_at DESC, d.id DESC LIMIT 3", (thread,),
+                f"{retracted}{fence} ORDER BY d.decided_at DESC, d.id DESC LIMIT 3", (thread,),
             ).fetchall()
             local_hits = rows_to_hits(rows)
             for hit in local_hits:
                 hit["status"] = "standing (replica)"
-            if progress is not None:
-                progress["hits"] = local_hits
+            if progress is not None and local_hits:
+                # Published before the hub leg, as one value: a caller whose
+                # deadline passes first answers from these, and an answer
+                # from this Mac's copy in place of the hub carries its age.
+                progress["local"] = (local_hits, _stale_marker(hub_snapshot.snapshot_health(), why="hub not reached"))
         finally:
             con.close()
     except Exception:  # noqa: BLE001 — old/missing replicas cannot block the hub leg
@@ -2774,7 +2856,9 @@ def prior_work_for_prompt(
     ``_snapshot_search_hits``), or ``["hub"]`` on the TIMEOUT_S path's hub
     fallback. A gated or timed-out call reports ``[]``/``None`` or
     ``"timeout"`` respectively — never absent, so callers (the hook's log
-    line among them) can read them unconditionally. When TIMEOUT_S passes
+    line among them) can read them unconditionally. ``replica_stale`` (age,
+    refresh time, why) is present only when this Mac's copy answered while not
+    trusted; the context then carries a line saying so. When TIMEOUT_S passes
     after the keyword leg finished, the keyword-only rows are returned with
     reason ``ok`` and ``degraded`` ``"embedding late (limit)"``; only when
     nothing was ready is it a timeout, and that result carries ``stage``, the
@@ -2800,16 +2884,21 @@ def prior_work_for_prompt(
     thread = handoff_thread(prompt or "")
     prompt = strip_handoff(prompt or "", prefer_last=True).strip()
 
+    replica_stale: dict[str, Any] | None = None
+
     def _meta(
         *, legs: list[str] = (), degraded: str | None = None, reason: str,
         ms: float = 0.0, hits: list[Any] = (),
     ):
         if budget_ms is None:
             return None
-        return {
+        meta = {
             "legs": list(legs), "ms": ms, "degraded": degraded, "reason": reason,
             "outcome": _outcome_for(reason, list(hits)),
         }
+        if replica_stale:
+            meta["replica_stale"] = replica_stale
+        return meta
 
     def _gated(reason: str) -> dict[str, Any]:
         out = {"context": "", "hits": [], "reason": reason, "ms": 0.0}
@@ -2840,6 +2929,9 @@ def prior_work_for_prompt(
     degraded_legs: list[str] = []
     interpretation: dict[str, Any] | None = None
     stage: str | None = None
+    # The hub could not be reached during this call: doctor counts it as an
+    # offline call, not as a failure of the lane.
+    offline = False
     progress: dict[str, Any] = {}
     search_deadline = t0 + (max(0.05, budget_ms / 1000.0) + _BUDGET_SAFETY_SLACK_S
                             if budget_ms is not None else TIMEOUT_S)
@@ -2867,7 +2959,9 @@ def prior_work_for_prompt(
             hits = result.get("hits") or []
             legs = result.get("legs") or []
             degraded = result.get("degraded")
+            replica_stale = result.get("replica_stale")
             reason = result.get("reason") or reason
+            offline = bool(result.get("offline"))
         else:
             result = _run_with_timeout(
                 _search_hits, max(0, deadline - time.monotonic()), prompt, cwd=cwd, limit=limit, tz=tz,
@@ -2878,9 +2972,12 @@ def prior_work_for_prompt(
             degraded = result.get("degraded")
             degraded_legs = result.get("degraded_legs") or []
             interpretation = result.get("time_interpretation")
+            offline = bool(result.get("offline"))
+            replica_stale = result.get("replica_stale")
     except _TimedOut:
         # Read once: the search thread may still publish after this point.
         provisional = progress.get("provisional")
+        replica_stale = progress.get("replica_stale")
         if provisional is not None:
             result = _trim_result(provisional, limit)
             hits = result["hits"]
@@ -2897,9 +2994,18 @@ def prior_work_for_prompt(
     except Exception as exc:  # noqa: BLE001 — fail open on any search failure
         reason = f"error: {type(exc).__name__}: {exc}"
         hits = []
+        offline = _hub_unreachable_error(exc)
     if thread_worker is not None:
         thread_worker.join(max(0, deadline - time.monotonic()))
-        priority = thread_box.get("hits") or []
+        # The final answer first, then the replica's: the replica's is
+        # published before the hub leg runs, so it is never missed here.
+        priority = thread_box.get("hits")
+        local = thread_box.get("local")
+        if priority is None and local:
+            priority = local[0]
+        if local and priority is local[0]:
+            replica_stale = replica_stale or local[1]
+        priority = priority or []
         if priority:
             hits = priority + (hits or [])
             legs = ["t3_thread", *legs]
@@ -2907,13 +3013,17 @@ def prior_work_for_prompt(
         if thread_worker.is_alive():
             degraded_legs.append("t3_thread")
     produced = ""
+    produced_box: dict[str, Any] = {}
     remaining = min(DELIVERABLE_LINE_TIMEOUT_S, max(0, deadline - time.monotonic()))
     if remaining > 0:
         try:
-            produced = _run_with_timeout(_deliverable_context_line, remaining, tokens, cwd=cwd)
+            produced = _run_with_timeout(_deliverable_context_line, remaining, tokens, cwd=cwd,
+                                         stale_box=produced_box)
         except Exception:  # noqa: BLE001 — optional evidence cannot discard completed search
             pass
-    context = render_block(hits or [], produced=produced)
+    if produced:
+        replica_stale = replica_stale or produced_box.get("replica_stale")
+    context = render_block(hits or [], produced=produced, stale=replica_stale)
 
     if hits and session_id and not thread and context:
         try:
@@ -2926,6 +3036,8 @@ def prior_work_for_prompt(
             dedup_out = {"context": "", "hits": [], "reason": "dedup", "ms": ms}
             dedup_out["legs"] = legs
             dedup_out["degraded"] = degraded
+            if offline:
+                dedup_out["offline"] = True
             dedup_meta = _meta(legs=legs, degraded=degraded, reason="dedup", ms=ms, hits=hits)
             if dedup_meta is not None:
                 dedup_out["prior_work_meta"] = dedup_meta
@@ -2941,26 +3053,32 @@ def prior_work_for_prompt(
     out["degraded"] = degraded
     if stage:
         out["stage"] = stage
+    if offline:
+        out["offline"] = True
     if degraded_legs:
         out["degraded_legs"] = degraded_legs
     if interpretation:
         out["time_interpretation"] = interpretation
+    if replica_stale:
+        out["replica_stale"] = replica_stale
     meta = _meta(legs=legs, degraded=degraded, reason=reason, ms=ms, hits=hits or [])
     if meta is not None:
         out["prior_work_meta"] = meta
     return out
 
 
-def _replica_deliverable_line(project: str, tokens: list[str]) -> str | None:
+def _replica_deliverable_line(project: str, tokens: list[str], *,
+                              stale_box: dict[str, Any] | None = None) -> str | None:
     """The line from the local replica ("" when nothing matches), or None
-    when the replica cannot answer (stale, missing, an older dump with no
-    ``deliverables`` table, unreadable). Imports neither the Postgres driver
-    nor ``khipu.db``."""
+    when the replica cannot answer (missing, no dump time on record, an older
+    dump with no ``deliverables`` table, unreadable). Imports neither the Postgres driver
+    nor ``khipu.db``. A line from a copy that is not trusted puts its stale
+    marker in ``stale_box["replica_stale"]``."""
     from khipu import deliverables as _deliverables
     from khipu import hub_snapshot
 
-    fresh, _health = hub_snapshot.snapshot_is_fresh()
-    if not fresh:
+    fresh, health = hub_snapshot.snapshot_is_fresh()
+    if not fresh and (not health.get("exists") or health.get("age_seconds") is None):
         return None
     try:
         con = hub_snapshot.open_snapshot()
@@ -2972,10 +3090,14 @@ def _replica_deliverable_line(project: str, tokens: list[str]) -> str | None:
         con.close()
     if rows is None:
         return None
-    return _deliverables.line_from_rows(rows, tokens) or ""
+    line = _deliverables.line_from_rows(rows, tokens) or ""
+    if line and not fresh and stale_box is not None:
+        stale_box["replica_stale"] = _stale_marker(health)
+    return line
 
 
-def _deliverable_context_line(tokens: list[str], *, cwd: str | None) -> str:
+def _deliverable_context_line(tokens: list[str], *, cwd: str | None,
+                              stale_box: dict[str, Any] | None = None) -> str:
     """The O4 "You produced …" line for this prompt's tokens, or "". Never
     raises: a resolve/DB failure here degrades to no line, same fail-open
     posture as every other step in this module. The local replica answers
@@ -2987,12 +3109,16 @@ def _deliverable_context_line(tokens: list[str], *, cwd: str | None) -> str:
         if not project:
             return ""
         try:
-            local = _replica_deliverable_line(project, tokens)
+            local = _replica_deliverable_line(project, tokens, stale_box=stale_box)
         except Exception as exc:  # noqa: BLE001 — an unusable replica falls back to the hub
             _log(f"deliverable replica unusable ({type(exc).__name__}: {exc})")
             local = None
         if local is not None:
             return local
+        from khipu import hub_reach
+
+        if hub_reach.known_unreachable() is not None:
+            return ""
         from khipu.db import connect
         from khipu import deliverables as _deliverables
 
@@ -3012,6 +3138,17 @@ def _stdin_payload(raw: str) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except ValueError:
         return {}
+
+
+def _hub_unreachable_error(exc: BaseException) -> bool:
+    """Whether a failed search failed because the hub could not be reached.
+    Never raises."""
+    try:
+        from khipu.hub_snapshot import hub_connection_failed
+
+        return hub_connection_failed(exc)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def log_terminal_outcome(raw: str, reason: str, *, ms: float = 0.0) -> None:
@@ -3034,8 +3171,9 @@ def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | 
         session = payload.get("session_id") or payload.get("sessionId") or "?"
         hit_ids = [f"{h.get('kind')}:{h.get('id')}" for h in result["hits"]]
         stage = f" stage={result['stage']}" if result.get("stage") else ""
+        stage += " offline=1" if result.get("offline") else ""
         ms = round((time.monotonic() - delivery["started"]) * 1000, 1) if "started" in delivery else result["ms"]
-        # routing= goes last, after degraded= and stage=, so every reader of
+        # routing= goes last, after degraded=, stage= and offline=, so every reader of
         # this line (doctor's outcome rate, the promotion gate) still parses it.
         _log(f"session={session} reason={result['reason']} ms={ms} hits={hit_ids} "
              f"legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}{routed}")
@@ -3079,6 +3217,7 @@ def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
         ctx, routed = result["context"], {"status": "skipped:error"}
     hit_ids = [f"{h.get('kind')}:{h.get('id')}" for h in result["hits"]]
     stage = f" stage={result['stage']}" if result.get("stage") else ""
+    stage += " offline=1" if result.get("offline") else ""
     if delivery is not None:
         delivery.update(result=result, raw=raw, started=started)
         if routed:
@@ -3165,6 +3304,15 @@ _LOG_LINE_RE = re.compile(
     r"^(?P<stamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) \[khipu-prompt-recall\] "
     r"session=.*? reason=(?P<reason>.*?) ms=(?P<ms>[0-9.]+) hits="
 )
+# A call made while the hub could not be reached: reported apart, never as a
+# failure of the lane (the lane did its job if it answered from the replica).
+_OFFLINE_FIELD_RE = re.compile(r" offline=1(?= |$)")
+
+# The button the app shows beside this check (Home and the health report).
+OUTCOMES_FIX = (
+    "press Refresh offline copy on this check in the app; if it stays red, "
+    "this Mac cannot answer inside the deadline and per-prompt recall is effectively off"
+)
 
 
 def _classify_call_reason(reason: str) -> str | None:
@@ -3195,18 +3343,40 @@ def _tail_text(path: Path, *, max_bytes: int) -> str:
         return f.read().decode("utf-8", errors="replace")
 
 
-def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
+def _rate_window_s() -> int:
+    """Doctor's rate window (``doctor_rate_window_minutes``, set in the app's
+    Settings), in seconds. Never raises."""
+    try:
+        from khipu.config import minute_setting
+
+        return minute_setting("doctor_rate_window_minutes") * 60
+    except Exception:  # noqa: BLE001 — a broken config must not break doctor
+        return 60 * 60
+
+
+def prompt_recall_outcomes(*, now: datetime | None = None,
+                           window_s: int | None = None) -> dict[str, Any]:
     """Doctor's real evidence for the per-prompt lane (finding B10): count,
     timeout rate and median latency of actually-searched calls (reason ok,
     dedup, timeout or error — a gated call never reached a search leg and
-    does not count) over the last 7 days, read from the hook's own log.
+    does not count), read from the hook's own log.
 
-    Not ok when at least half of 20 or more attempts failed or timed out.
-    Fewer observations report insufficient evidence, rather than measured
-    health. Missing or unreadable telemetry reports available=False.
+    Only calls inside the rate window (``doctor_rate_window_minutes``,
+    default an hour) are judged, so a past outage ages out by itself on an
+    idle Mac. Calls tagged ``offline=1`` (the hub could not be reached) are
+    counted apart as ``offline`` and never as failures.
+
+    Not ok when at least half of 20 or more judged calls failed or timed
+    out. Fewer judged calls in the window is not a verdict: green with
+    ``quiet`` when the lane answered at least 20 calls in the last 7 days
+    (it runs, it has just been quiet), otherwise insufficient evidence.
+    Missing or unreadable telemetry reports available=False.
     """
     now = now or datetime.now(timezone.utc)
-    cutoff = now.timestamp() - _OUTCOMES_WINDOW_S
+    window_s = _rate_window_s() if window_s is None else int(window_s)
+    lookback_cutoff = now.timestamp() - _OUTCOMES_WINDOW_S
+    window_cutoff = now.timestamp() - window_s
+    window_minutes = round(window_s / 60)
     path = _log_path()
     try:
         if not path.is_file():
@@ -3216,6 +3386,8 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
         return {"ok": False, "available": False, "insufficient": True, "count": 0}
 
     calls: list[tuple[str, float]] = []
+    offline = 0
+    lookback = 0
     for line in split_lines(raw):
         m = _LOG_LINE_RE.match(line)
         if not m:
@@ -3226,18 +3398,27 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
             )
         except ValueError:
             continue
-        if stamp.timestamp() < cutoff:
+        if stamp.timestamp() < lookback_cutoff:
             continue
         category = _classify_call_reason(m.group("reason"))
         if category is None:
+            continue
+        lookback += 1
+        if stamp.timestamp() < window_cutoff:
+            continue
+        if _OFFLINE_FIELD_RE.search(line):
+            offline += 1
             continue
         calls.append((category, float(m.group("ms"))))
 
     # The log is append-only, so the end of the list is the most recent calls.
     calls = calls[-_OUTCOMES_MAX_CALLS:]
     total = len(calls)
+    base = {"available": True, "count": total, "offline": offline, "window_minutes": window_minutes}
     if total < _OUTCOMES_MIN_CALLS:
-        return {"ok": False, "available": True, "insufficient": True, "count": total}
+        if lookback >= _OUTCOMES_MIN_CALLS:
+            return {**base, "ok": True, "insufficient": True, "quiet": True}
+        return {**base, "ok": False, "insufficient": True}
 
     timeouts = sum(1 for category, _ms in calls if category == "timeout")
     errors = sum(1 for category, _ms in calls if category == "error")
@@ -3251,10 +3432,9 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
         else (ms_values[mid - 1] + ms_values[mid]) / 2
     )
     out: dict[str, Any] = {
+        **base,
         "ok": failure_rate < _OUTCOMES_TIMEOUT_RATE_RED,
-        "available": True,
         "insufficient": False,
-        "count": total,
         "timeout_rate": round(timeout_rate, 4),
         "error_rate": round(errors / total, 4),
         "failure_rate": round(failure_rate, 4),
@@ -3262,13 +3442,10 @@ def prompt_recall_outcomes(*, now: datetime | None = None) -> dict[str, Any]:
     }
     if not out["ok"]:
         out["reason"] = (
-            f"{timeouts + errors} of the last {total} recall attempts failed: "
-            f"{errors} errors and {timeouts} missed the deadline"
+            f"{timeouts + errors} of the last {total} recall attempts in the last "
+            f"{window_minutes} minutes failed: {errors} errors and {timeouts} missed the deadline"
         )
-        out["fix"] = (
-            "run `khipu snapshot refresh`; if this stays red the machine cannot "
-            "answer inside the deadline and per-prompt recall is effectively off"
-        )
+        out["fix"] = OUTCOMES_FIX
     return out
 
 

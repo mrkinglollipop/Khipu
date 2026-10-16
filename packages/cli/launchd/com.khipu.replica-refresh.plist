@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template — render per machine before install (see Task 6 launchd generator). -->
+<!-- Keeps this Mac's copy of the hub current between nightlies. `khipu
+     snapshot heal` runs every replica_check_every seconds (rendered into
+     StartInterval) and decides from local evidence whether anything is due;
+     it opens a connection only when it is. WatchPaths names a wake file that
+     a later change touches to start a check now, and RunAtLoad makes a fresh
+     install check at once. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.khipu.replica-refresh</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{KHIPU_PYTHON}}</string>
+		<string>-m</string>
+		<string>khipu</string>
+		<string>snapshot</string>
+		<string>heal</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>KHIPU_ROOT</key>
+		<string>{{KHIPU_ROOT}}</string>
+		<key>PYTHONPATH</key>
+		<string>{{PYTHONPATH}}</string>
+		<key>PYTHONPYCACHEPREFIX</key>
+		<string>{{PYTHONPYCACHEPREFIX}}</string>{{EXTRA_ENV}}
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>{{WORKING_DIRECTORY}}</string>
+	<key>StartInterval</key>
+	<integer>{{REPLICA_CHECK_EVERY}}</integer>
+	<key>WatchPaths</key>
+	<array>
+		<string>{{REPLICA_WAKE}}</string>
+	</array>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>{{STDOUT_LOG}}</string>
+	<key>StandardErrorPath</key>
+	<string>{{STDERR_LOG}}</string>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>

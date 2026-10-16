@@ -52,6 +52,10 @@ NOT_CAPTURE = {
     "signin._write_json": "the sign-in attempt (id, folder, pid, start times, argv) and the login folders "
                           "Khipu made; no capture text",
     "signin.start": "a temporary empty folder the login process runs in, removed when the attempt ends",
+    # The replica job (offline design A): run counters and the wake file; no capture text.
+    "replica_heal._write_state": "the replica job's counters and health: times, error words, no capture text",
+    "replica_heal.ensure_wake_file": "an empty file the replica job's plist watches",
+    "hub_reach.note_unreachable": "the hub-unreachable memo: two times and a short error word, no capture text",
     **dict.fromkeys(("config._write_config", "integrations._backup", "integrations._cursor_install",
                      "integrations._grok_bot_install", "integrations._write_json",
                      "integrations._write_toml", "integrations.set_gateway_token",
@@ -70,7 +74,7 @@ NOT_CAPTURE = {
                      "jobs._nightly_log", "jobs._offsite_if_due", "jobs._record_nightly_step",
                      "jobs._run_script", "jobs._write_job_state", "migrate._save_lock_notes",
                      "probe._persist_result", "probe._write_state", "promote._recall_once",
-                     "promote._run",
+                     "promote._run", "promote._write_queue", "promote.kick_queued_retry",
                      "recall_prompt._dedup_transaction", "recall_prompt._detach_child",
                      "recall_prompt._log", "recall_prompt._prompt_routing_child",
                      "recall_prompt._query_embed_cache_connect",
@@ -85,6 +89,10 @@ NOT_CAPTURE = {
     **dict.fromkeys(("ledger._migrate_outcomes", "ledger._prune_outcomes", "ledger._record_outcome",
                      "ledger._record_rejected", "ledger._refuse_job", "ledger._replica_pending",
                      "ledger._set_aside", "ledger.enqueue"), _LEDGER),
+    # Owner writes queued while the hub is away: the tool name and its arguments (ids, an action,
+    # a decision's text the owner typed), a lock file, and the refused copies.
+    "owner_writes._write": "owner writes waiting for the hub: ids, actions, a decision's text; not captures",
+    **dict.fromkeys(("owner_writes.drain", "owner_writes._reserve", "owner_writes._claim"), _LOCKS),
     # The one way a ledger or work answer leaves Khipu; only ``khipu ledger ... --out``
     # names a file, and it gets the ledger board or ledger rows.
     "agent_view.emit": "a ledger board or ledger rows, to a file the owner names with --out; not captures",
@@ -101,7 +109,9 @@ NOT_CAPTURE = {
                      "integrations._probe_aegis_refusal", "integrations._probe_extract",
                      "integrations._probe_hook", "integrations._probe_native_extract"), _TOOLS),
     **dict.fromkeys(("hub_snapshot._mark_purged_topic", "hub_snapshot._queue_erasure",
-                     "hub_snapshot._write_last_known", "hub_snapshot._write_meta"), _REPLICA_META),
+                     "hub_snapshot._write_last_known", "hub_snapshot._write_meta",
+                     "hub_snapshot._queue_missed_patch", "hub_snapshot._clear_missed_patches"),
+                    _REPLICA_META),
     **dict.fromkeys(("tombstones._atomic_write", "tombstones._locked_registry",
                      "tombstones.publish_identities"), _REGISTRY),
 }

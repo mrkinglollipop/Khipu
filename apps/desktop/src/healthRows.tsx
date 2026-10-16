@@ -77,6 +77,8 @@ const LABELS: Record<string, string> = {
   // D6/F2/F4: topic-embedding lag and the search-degrade rate.
   topics_embed_lag_ok: "Search index catching up on time",
   degraded_rate_ok: "Search rarely falls back to keyword-only",
+  prompt_recall_outcomes_ok: "Recall answers before each prompt in time",
+  prompt_recall_snapshot_ok: "Recall before each prompt reads this Mac's copy",
   // Not a doctor field: read from `khipu usage --json` (plansHealthRow).
   plans: "Plans",
   // Not a doctor field: read from `khipu route --json` (routingHealthRow).
@@ -103,6 +105,11 @@ function humanize(key: string): string {
   return words
     .map((w, i) => (i === 0 ? w.charAt(0).toUpperCase() + w.slice(1) : w))
     .join(" ");
+}
+
+/** A check's plain-words name from its bare name ("outbox"), as the rows show it. */
+export function healthCheckLabel(name: string): string {
+  return LABELS[`${name}_ok`] ?? humanize(`${name}_ok`);
 }
 
 function isNotConfigured(key: string, notConfigured: string[]): boolean {

@@ -976,6 +976,7 @@ def _tool_search(args: dict) -> dict:
     via = (args.get("via") or "").strip() or None
     tz = args.get("tz") or None
 
+    offline = False
     try:
         from khipu.embed import hybrid_search
 
@@ -991,6 +992,7 @@ def _tool_search(args: dict) -> dict:
             raise ValueError(
                 "library search needs the hub; the offline snapshot holds no libraries"
             ) from exc
+        offline = True
         payload = search_stale_payload(
             query, max(1, limit), semantic=(mode == "semantic"), kind=kind,
             since=since, until=until, project=project, session_id=session_id,
@@ -1005,6 +1007,7 @@ def _tool_search(args: dict) -> dict:
         # The gateway host is public: it keeps a hash of the query, never the text.
         redact=_GATEWAY_ACTIVE or os.environ.get(GATEWAY_ACTIVE_ENV) == "1",
         degraded=payload.get("degraded"),
+        offline=offline,
     )
     return payload
 
@@ -1515,56 +1518,90 @@ def _captured_episode_id(written: dict) -> int | None:
 
 
 def _tool_owed(args: dict) -> dict:
-    """W3.4: list commitments. Read-only; goes straight at the hub (no
-    snapshot fallback yet — commitments are new and small, same posture as
-    khipu_capture rather than the read tools' stale-snapshot degrade)."""
+    """W3.4: list commitments. Read-only. When the hub is away it answers from
+    this Mac's replica, marked stale (``offline_reads``); with no replica to
+    read the hub's own error stands. Rows with a write still waiting to sync
+    say so (``pending_sync``)."""
     status = (args.get("status") or "open").strip().lower()
     if status not in ("open", "closed", "stale"):
         raise ValueError("status must be 'open', 'closed', or 'stale'")
     limit = min(max(1, int(args.get("limit") or 50)), 200)
+    project = args.get("project") or None
     _ensure_path()
-    from khipu import commitments
+    from khipu import commitments, offline, offline_reads, owner_writes
     from khipu.db import connect
+    from khipu.hub_snapshot import hub_connection_failed
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            rows = commitments.list_owed(
-                cur, project=args.get("project") or None, status=status, limit=limit
-            )
-    return {"status": status, "project": args.get("project") or None, "results": rows}
+    try:
+        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+            with conn.cursor() as cur:
+                rows = commitments.list_owed(cur, project=project, status=status, limit=limit)
+        out = {"status": status, "project": project, "results": rows}
+    except Exception as exc:  # noqa: BLE001
+        if not hub_connection_failed(exc):
+            raise
+        out = offline_reads.owed(project, status, limit)
+        if out is None:
+            raise
+    out.update(owner_writes.annotate(out["results"], "owed_update"))
+    return out
 
 
 def _tool_owed_update(args: dict) -> dict:
     """Close / reopen / snooze one commitment — the write half of khipu_owed,
     so a cloud agent can close what it opened (audit 2026-09-04: cloud
-    clients could open commitments they could never close)."""
+    clients could open commitments they could never close). With the hub away
+    a local call queues the write (``owner_writes``) and says it is waiting to
+    sync; the gateway never queues."""
     cid = _positive_id(args.get("id"), "id")
     action = (args.get("action") or "").strip().lower()
     if action not in ("close", "reopen", "snooze"):
         raise ValueError("action must be 'close', 'reopen' or 'snooze'")
+    if action == "snooze":
+        from khipu.cli import _snooze_until_sql
+
+        if _snooze_until_sql(str(args.get("until") or "")) is None:
+            raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
     _ensure_path()
-    from khipu import commitments
+    from khipu import owner_writes
+
+    return owner_writes.run("owed_update", {**args, "id": cid, "action": action},
+                            queue_ok=not _via_https_gateway())
+
+
+def _owed_update_on_hub(args: dict) -> dict:
+    """The hub half of ``_tool_owed_update``, also what a queued write
+    replays. The write's id and outcome are recorded in the same transaction
+    (``owner_writes.apply_on_hub``); an id the hub already answered applies
+    nothing again."""
+    cid = _positive_id(args.get("id"), "id")
+    action = (args.get("action") or "").strip().lower()
+    _ensure_path()
+    from khipu import commitments, offline, owner_writes
     from khipu.db import connect
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            if action == "snooze":
-                from khipu.cli import _snooze_until_sql
-
-                parsed = _snooze_until_sql(str(args.get("until") or ""))
-                if parsed is None:
-                    raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
-                expr, param = parsed
-                params = ([param] if param is not None else []) + [cid]
-                cur.execute(f"UPDATE commitments SET due_after = {expr} WHERE id = %s", tuple(params))
-                ok = cur.rowcount > 0
-            else:
-                ok = commitments.set_status(cur, cid, "closed" if action == "close" else "open")
-        conn.commit()
-    if not ok:
-        raise ValueError(f"no such commitment: {cid}")
-    return {"ok": True, "id": cid, "action": action,
+    echo = {"id": cid, "action": action,
             **({"until": str(args.get("until") or "")} if action == "snooze" else {})}
+    with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+        with conn.cursor() as cur:
+            def write() -> dict:
+                if action == "snooze":
+                    from khipu.cli import _snooze_until_sql
+
+                    parsed = _snooze_until_sql(str(args.get("until") or ""))
+                    if parsed is None:
+                        raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
+                    expr, param = parsed
+                    params = ([param] if param is not None else []) + [cid]
+                    cur.execute(f"UPDATE commitments SET due_after = {expr} WHERE id = %s", tuple(params))
+                    ok = cur.rowcount > 0
+                else:
+                    ok = commitments.set_status(cur, cid, "closed" if action == "close" else "open")
+                if not ok:
+                    raise ValueError(f"no such commitment: {cid}")
+                return {"ok": True, **echo}
+
+            return owner_writes.apply_on_hub(conn, cur, "owed_update", args, write, echo)
 
 
 class _ToolFailure(ValueError):
@@ -1606,7 +1643,24 @@ def _tool_forget(args: dict) -> dict:
                 f"episode {eid} was captured by {harness} on a Mac; forget it there "
                 "(khipu episode forget) — the gateway forgets only cloud captures"
             )
-    out = forget_everywhere(eid)
+    from khipu.hub_snapshot import hub_connection_failed
+
+    try:
+        out = forget_everywhere(eid)
+    except Exception as exc:  # noqa: BLE001
+        if not hub_connection_failed(exc):
+            raise
+        # Never queued, and nothing on this Mac is touched before the hub write:
+        # a forget that only looked done would leave the text readable. A
+        # connection lost during the commit leaves the hub's side unknown, so
+        # the message never claims it did not happen there.
+        raise _ToolFailure({
+            "ok": False, "complete": False, "waiting": True, "id": eid,
+            "error": "the hub is not reachable, so episode %d was not forgotten" % eid,
+            "message": (f"Episode {eid} is NOT forgotten yet: the hub is not reachable. Nothing was changed "
+                        "on this Mac and the request was not saved. Ask again when the hub answers; asking "
+                        "twice is safe."),
+        }) from None
     out.pop("identity", None)
     # Said plainly in every result, a partial one above all: what is kept by
     # design, and what still holds a copy or could not be checked.
@@ -1619,8 +1673,10 @@ def _tool_forget(args: dict) -> dict:
 
 def _tool_decisions(args: dict) -> dict:
     """Read half of the decisions tool pair (khipu_decisions). Reachable
-    through stdio and the gateway exactly like khipu_owed — no snapshot
-    fallback (decisions are hub-only, same posture as commitments)."""
+    through stdio and the gateway exactly like khipu_owed. When the hub is
+    away it answers from this Mac's replica, marked stale (conflicts need the
+    hub); with no replica to read the hub's own error stands. Rows with a
+    write still waiting to sync say so (``pending_sync``)."""
     status = (args.get("status") or "standing").strip().lower()
     valid_status = ("standing", "superseded", "retracted", "conflicts", "all")
     if status not in valid_status:
@@ -1635,17 +1691,29 @@ def _tool_decisions(args: dict) -> dict:
         since = parse_time_filter(since_raw)
     _ensure_path()
     from khipu import decisions as _decisions
+    from khipu import offline, offline_reads, owner_writes
     from khipu.db import connect
+    from khipu.hub_snapshot import hub_connection_failed
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            if status == "conflicts":
-                results = _decisions.list_links(cur, state="candidate", project=project, limit=limit)
-            else:
-                results = _decisions.list_decisions(
-                    cur, project=project, since=since, limit=limit, status=status,
-                )
-    return {"status": status, "project": project, "results": results}
+    try:
+        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+            with conn.cursor() as cur:
+                if status == "conflicts":
+                    results = _decisions.list_links(cur, state="candidate", project=project, limit=limit)
+                else:
+                    results = _decisions.list_decisions(
+                        cur, project=project, since=since, limit=limit, status=status,
+                    )
+        out = {"status": status, "project": project, "results": results}
+    except Exception as exc:  # noqa: BLE001
+        if not hub_connection_failed(exc):
+            raise
+        out = offline_reads.decisions(project, since, status, limit)
+        if out is None:
+            raise
+    if status != "conflicts":
+        out.update(owner_writes.annotate(out["results"], "decisions_update"))
+    return out
 
 
 def _tool_decisions_update(args: dict) -> dict:
@@ -1660,75 +1728,89 @@ def _tool_decisions_update(args: dict) -> dict:
         raise ValueError(f"action must be one of {valid_actions}")
 
     if action in ("confirm", "reject"):
-        link_id = _positive_id(args.get("link_id"), "link_id")
+        _positive_id(args.get("link_id"), "link_id")
     else:
-        decision_id = _positive_id(args.get("id"), "id")
-
-    by = new_id_arg = new_text = None
+        _positive_id(args.get("id"), "id")
     if action == "supersede":
-        by = args.get("by")
-        new_text = args.get("new_text")
+        by, new_text = args.get("by"), args.get("new_text")
         if (by is None) == (not new_text):
             raise ValueError("supersede needs exactly one of 'by' or 'new_text'")
         if by is not None:
-            new_id_arg = _positive_id(by, "by")
+            _positive_id(by, "by")
 
     _ensure_path()
+    from khipu import owner_writes
+
+    return owner_writes.run("decisions_update", dict(args), queue_ok=not _via_https_gateway())
+
+
+def _decisions_update_on_hub(args: dict) -> dict:
+    """The hub half of ``_tool_decisions_update`` (validated already), also
+    what a queued write replays."""
+    action = (args.get("action") or "").strip().lower()
+    if action in ("confirm", "reject"):
+        link_id = _positive_id(args.get("link_id"), "link_id")
+    else:
+        decision_id = _positive_id(args.get("id"), "id")
+    new_id_arg = _positive_id(args["by"], "by") if action == "supersede" and args.get("by") is not None else None
+    new_text = args.get("new_text")
+    _ensure_path()
     from khipu import decisions as _decisions
+    from khipu import offline, owner_writes
     from khipu.db import connect
     from khipu.redact import redact_secrets
 
     reason = redact_secrets(str(args.get("reason") or ""))[0] or None
 
-    with connect() as conn:
+    key = "link_id" if action in ("confirm", "reject") else "id"
+    echo = {"action": action, key: link_id if key == "link_id" else decision_id}
+
+    with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
         with conn.cursor() as cur:
-            evidence_ready = _decisions._evidence_ready(cur)
-            degrade_note = (
-                None if evidence_ready
-                else "evidence fields were not recorded (migration 0024 not applied)"
-            )
-            if action in ("confirm", "reject"):
-                out = _decisions.resolve_link(cur, link_id, action, source="agent")
-                conn.commit()
-                return out
-            if action == "restore":
-                ok = _decisions.restore(cur, decision_id)
-                conn.commit()
-                return {"ok": ok, "id": decision_id, "action": "restore"}
-            if action == "retract":
-                ok = _decisions.retract(cur, decision_id, reason)
-                conn.commit()
-                out = {"ok": ok, "id": decision_id, "action": "retract"}
+            # A reply with ok false is a refusal: apply_on_hub undoes the
+            # write (a decision made for new_text included) and records it.
+            def write() -> dict:
+                evidence_ready = _decisions._evidence_ready(cur)
+                degrade_note = (
+                    None if evidence_ready
+                    else "evidence fields were not recorded (migration 0024 not applied)"
+                )
+                if action in ("confirm", "reject"):
+                    return _decisions.resolve_link(cur, link_id, action, source="agent")
+                if action == "restore":
+                    ok = _decisions.restore(cur, decision_id)
+                    return {"ok": ok, "id": decision_id, "action": "restore"}
+                if action == "retract":
+                    ok = _decisions.retract(cur, decision_id, reason)
+                    out = {"ok": ok, "id": decision_id, "action": "retract"}
+                    if degrade_note:
+                        out["note"] = degrade_note
+                    return out
+                # action == "supersede"
+                if new_id_arg is not None:
+                    new_id = new_id_arg
+                else:
+                    original = _decisions._fetch_decision_row(cur, decision_id)
+                    if original is None:
+                        raise ValueError(f"no such decision: {decision_id}")
+                    if original.get("superseded_by") is not None:
+                        return {"ok": False, "id": decision_id,
+                                "superseded_by": original["superseded_by"], "action": "supersede"}
+                    new_id = _decisions.create_decision(
+                        cur, project=args.get("project") or original.get("project"),
+                        text=redact_secrets(str(new_text))[0],
+                        session_id=args.get("session_id") or None,
+                        source_kind=args.get("source_kind") or "assistant",
+                    )
+                ok = _decisions.supersede(cur, decision_id, new_id, source="agent", reason=reason)
+                out = {"ok": ok, "id": decision_id, "action": "supersede"}
+                if ok or new_id_arg is not None:
+                    out["superseded_by"] = new_id
                 if degrade_note:
                     out["note"] = degrade_note
                 return out
-            # action == "supersede"
-            if new_id_arg is not None:
-                new_id = new_id_arg
-            else:
-                original = _decisions._fetch_decision_row(cur, decision_id)
-                if original is None:
-                    raise ValueError(f"no such decision: {decision_id}")
-                if original.get("superseded_by") is not None:
-                    return {"ok": False, "id": decision_id,
-                            "superseded_by": original["superseded_by"], "action": "supersede"}
-                new_id = _decisions.create_decision(
-                    cur, project=args.get("project") or original.get("project"),
-                    text=redact_secrets(str(new_text))[0],
-                    session_id=args.get("session_id") or None,
-                    source_kind=args.get("source_kind") or "assistant",
-                )
-            ok = _decisions.supersede(cur, decision_id, new_id, source="agent", reason=reason)
-            if not ok and new_id_arg is None:
-                conn.rollback()
-            else:
-                conn.commit()
-            out = {"ok": ok, "id": decision_id, "action": "supersede"}
-            if ok or new_id_arg is not None:
-                out["superseded_by"] = new_id
-            if degrade_note:
-                out["note"] = degrade_note
-            return out
+
+            return owner_writes.apply_on_hub(conn, cur, "decisions_update", args, write, echo)
 
 
 def _tool_brief(args: dict) -> dict:

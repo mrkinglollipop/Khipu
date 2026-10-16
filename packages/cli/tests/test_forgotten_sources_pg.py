@@ -62,6 +62,11 @@ def identities(cur, episode_id: int | None = None) -> set[str]:
     return {r[0] for r in cur.fetchall()}
 
 
+def _to_0030(pg, conn):
+    """Apply the chain through 0030 only: later migrations are not this file's."""
+    return pg.migrate(directory=chain_dir(pg.cluster.root, "0030"), conn=conn)
+
+
 def forget(cur, payload: dict, episode_id: int) -> None:
     """What forget.py does on the hub: tombstone, then publish the identities."""
     cur.execute("UPDATE episodes SET deleted_at = now() WHERE id = %s", (episode_id,))
@@ -86,7 +91,7 @@ def run_in_thread(fn):
 @pytest.fixture
 def at_0030(hub):  # noqa: F811
     conn = hub.connect()
-    result = hub.migrate(conn=conn)
+    result = _to_0030(hub, conn=conn)
     assert result["ran"] == [VERSION], result
     db._TABLE_COLUMNS_CACHE.clear()
     return hub
@@ -100,7 +105,7 @@ def test_the_full_chain_applies_and_0030_is_safe_to_run_twice(hub, tmp_path):  #
     conn = hub.connect()
     first = hub.migrate(directory=chain_dir(tmp_path, "0030"), conn=conn)
     assert first["ran"] == [VERSION] and first["pending"] == []
-    assert hub.migrate(conn=conn)["ran"] == []        # recorded, so the runner skips it
+    assert _to_0030(hub, conn=conn)["ran"] == []        # recorded, so the runner skips it
     cur = conn.cursor()
     cur.execute(migration_sql())                        # the SQL itself, applied again
     cur.execute(migration_sql())
@@ -169,7 +174,7 @@ def test_a_forget_committed_before_the_migration_is_backfilled(hub):  # noqa: F8
     insert_source(cur, eid, P)
     cur.execute("UPDATE episodes SET deleted_at = now() WHERE id = %s", (eid,))
     conn.commit()
-    hub.migrate(conn=conn)
+    _to_0030(hub, conn=conn)
     s = ci.source_identity(P)
     assert {s["source_key"], s["payload_sha256"]} <= identities(conn.cursor(), eid)
 
@@ -179,7 +184,7 @@ def test_backfill_covers_historic_forgotten_episode_without_source_row(hub):  # 
     cur = conn.cursor()
     eid = insert_episode(cur, {**P, "session_id": "codex:old"}, deleted=True)
     conn.commit()
-    hub.migrate(conn=conn)
+    _to_0030(hub, conn=conn)
     natural = ci.source_key({**P, "session_id": "codex:old"})
     assert natural in identities(conn.cursor(), eid)
     # The SQL formula and the Python one are the same function.
@@ -196,7 +201,7 @@ def test_backfill_covers_the_merge_receipt_of_a_forgotten_episode(hub):  # noqa:
                "ts": merged["ts"], "payload": merged}
     eid = insert_episode(cur, P, deleted=True, raw={**P, "merged_from": [receipt]})
     conn.commit()
-    hub.migrate(conn=conn)
+    _to_0030(hub, conn=conn)
     found = identities(conn.cursor(), eid)
     assert ci.payload_sha256(merged) in found
     assert ci.source_key(merged) in found
@@ -264,7 +269,7 @@ def test_migration_does_not_deadlock_a_merge_holding_its_row_lock(hub, reapply):
     waited on the migration's table lock. Re-applied, the triggers exist, so
     DROP TRIGGER really drops one."""
     if reapply:
-        assert hub.migrate(conn=hub.connect())["ran"] == [VERSION]
+        assert _to_0030(hub, conn=hub.connect())["ran"] == [VERSION]
     seed = hub.connect()
     target = insert_episode(seed.cursor(), {**P, "session_id": "codex:target"})
     seed.commit()
@@ -320,7 +325,7 @@ def test_migration_runs_while_a_merge_writer_loops_without_deadlock(hub):  # noq
     while merges[0] < 3 and time.monotonic() < deadline:
         time.sleep(0.01)
     try:
-        first = hub.migrate(conn=migration)
+        first = _to_0030(hub, conn=migration)
         assert first["ran"] == [VERSION], first
         cur = migration.cursor()
         for _ in range(8):

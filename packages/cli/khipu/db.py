@@ -97,14 +97,53 @@ def conninfo_with_local_root_cert(dsn: str) -> str:
     return make_conninfo(**params)
 
 
-def connect(*, autocommit: bool = False):
-    """Bound connection setup; SQL timeouts belong to the operation's caller."""
+def _keepalive_kwargs() -> dict:
+    """TCP keepalives so a connection a network change silenced is given up
+    after ``hub_dead_connection_after`` seconds, not the system's hours."""
+    from khipu import offline
+
+    after = int(offline.setting("hub_dead_connection_after") or 0)
+    if after <= 0:
+        return {}
+    return {
+        "keepalives": 1,
+        "keepalives_idle": max(1, after // 2),
+        "keepalives_interval": max(1, after // 6),
+        "keepalives_count": 3,
+    }
+
+
+def _with_statement_timeout(conninfo: str, seconds: float) -> str:
+    """``conninfo`` with ``-c statement_timeout`` added to its options."""
+    params = {key: val for key, val in conninfo_to_dict(conninfo).items() if val is not None}
+    flag = f"-c statement_timeout={int(seconds * 1000)}"
+    existing = (params.get("options") or "").strip()
+    params["options"] = f"{existing} {flag}" if existing else flag
+    return make_conninfo(**params)
+
+
+def connect(*, autocommit: bool = False, statement_timeout_s: float | None = None):
+    """Bound connection setup; SQL timeouts belong to the operation's caller
+    (``statement_timeout_s`` is how a caller asks for one)."""
     conninfo = conninfo_with_local_root_cert(resolve_dsn())
-    return psycopg.connect(
-        conninfo,
-        autocommit=autocommit,
-        connect_timeout=CONNECT_TIMEOUT_SECONDS,
-    )
+    if statement_timeout_s is not None and statement_timeout_s > 0:
+        conninfo = _with_statement_timeout(conninfo, statement_timeout_s)
+    from khipu import hub_reach
+
+    # A failed connect writes the hub-down memo and a success clears it, so the
+    # prompt hook and the search tools skip a connect they know will fail.
+    try:
+        conn = psycopg.connect(
+            conninfo,
+            autocommit=autocommit,
+            connect_timeout=CONNECT_TIMEOUT_SECONDS,
+            **_keepalive_kwargs(),
+        )
+    except psycopg.OperationalError as exc:
+        hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
+        raise
+    hub_reach.note_reachable()
+    return conn
 
 
 def dsn_configured() -> bool:

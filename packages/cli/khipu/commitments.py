@@ -1295,6 +1295,12 @@ def list_owed(cur, *, project: str | None = None, parent_session_id: str | None 
         params,
     )
     rows = [dict(zip(select_cols, row)) for row in cur.fetchall()]
+    return finish_owed_rows(rows, limit)
+
+
+def finish_owed_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
+    """Owner, trigger, priority and order for raw commitment rows, the same
+    for a hub read and an offline read of the replica (``offline_reads``)."""
     for row in rows:
         row.setdefault("last_seen_at", None)
         row["seen_count"] = int(row.get("seen_count") or 1)

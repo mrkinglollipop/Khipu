@@ -1338,6 +1338,8 @@ def test_both_installers_match_main_byte_for_byte_without_a_live_link(home, monk
         monkeypatch.setattr(mod, "_bundled_python", lambda *a: py)
     assert pm.live_root() is None
     for job in launchd_gen._JOB_TEMPLATE:
+        if job not in main_ld._JOB_TEMPLATE:
+            continue  # a job this branch adds has nothing on main to match yet
         assert launchd_gen.render_plist(job) == main_ld.render_plist(job), job
     monkeypatch.setattr(main_in, "HOME", home)
     for mod in (integrations, main_in):
