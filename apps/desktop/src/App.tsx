@@ -1592,6 +1592,21 @@ export default function App() {
     }
   }, [loadDoctor]);
 
+  /** `khipu migrate` through the same fixed-argv command Welcome's
+   *  Database step uses: applies the updates doctor named as pending. */
+  const applyMigrations = useCallback(async () => {
+    setProbeBusy(true);
+    setError(null);
+    try {
+      await invoke<string>("khipu_migrate", { dryRun: false });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setProbeBusy(false);
+      await loadDoctor(true);
+    }
+  }, [loadDoctor]);
+
   /** `khipu owed` — the commitments a session left behind, cached per status
    *  so the rail badge, Home's preview and this screen's table are one fetch
    *  rather than three racing over one array. */
@@ -3600,6 +3615,8 @@ export default function App() {
                             setTab("revisions");
                           } else if (a.fix?.kind === "open-harnesses") {
                             setTab("harnesses");
+                          } else if (a.fix?.kind === "apply-migrations") {
+                            void applyMigrations();
                           }
                         }}
                       >
@@ -3922,6 +3939,8 @@ export default function App() {
                     void runRecallProbe();
                   } else if (fix.kind === "revisions") {
                     setTab("revisions");
+                  } else if (fix.kind === "apply-migrations") {
+                    void applyMigrations();
                   }
                 }}
               />

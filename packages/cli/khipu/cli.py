@@ -477,8 +477,17 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
         "dsn_present": bool(local["secrets"].get("dsn")) and not local["secrets"].get("error"),
         "skipped": "hub, network and probe checks (run plain `khipu doctor` for those)",
     }
+    # The one hub read --quick makes: the code this gate is about to promote
+    # may ship a migration the hub has not had. An unreachable hub is not
+    # gated here (--quick skips reachability); a pending migration is.
+    from khipu.migrate import doctor_check as _schema_check
+
+    schema = _schema_check()
+    out["schema_migrations"] = schema
+    out["schema_migrations_ok"] = not schema.get("pending")
+    out["warnings"] = list(schema.get("warnings") or [])
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
-                 and all(bool(local[k]) for k in LOCAL_GATES))
+                 and all(bool(local[k]) for k in LOCAL_GATES) and out["schema_migrations_ok"])
     print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
 
@@ -497,7 +506,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # 2026-10-15, most of it waiting on the network).
     from concurrent.futures import ThreadPoolExecutor
 
-    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="khipu-doctor")
+    pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="khipu-doctor")
     try:
         workers = _doctor_start_workers(pool, args, mem, sample_drift)
         return _cmd_doctor_body(args, workers, mem, status_payload, backup_health)
@@ -581,6 +590,9 @@ def _doctor_start_workers(pool, args, mem, sample_drift) -> dict:
     # Every check that reads only this Mac; `doctor --quick` gates on the same
     # set (khipu.promote's first gate step).
     workers["local"] = pool.submit(_doctor_local_checks, mem)
+    from khipu.migrate import doctor_check as _schema_check
+
+    workers["schema"] = pool.submit(_schema_check)
     return workers
 
 
@@ -816,6 +828,12 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     else:
         graph = graph_error
     embed_coverage, embed_coverage_ok, topics_lag = embed_future.result()
+    # Pending migrations: red. With the hub down the read fails too; hub_ok
+    # is already red for that, so the schema row says why it was not checked.
+    schema = workers["schema"].result()
+    if not hub_ok and schema.get("error"):
+        schema = {**schema, "ok": True, "skipped": "the database did not answer"}
+    schema_ok = bool(schema.get("ok"))
     liveness.setdefault("harnesses", {})["gateway"] = gw_liveness
     if not gw_liveness.get("ok", True):
         liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
@@ -897,9 +915,11 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "plan_usage": plan_usage_block,
         "routing": routing_block,
         "ledger": ledger_block,
+        "schema_migrations": schema,
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
-                     + list(ledger_block.get("warnings") or [])),
+                     + list(ledger_block.get("warnings") or [])
+                     + list(schema.get("warnings") or [])),
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -948,6 +968,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             # below, and never reaches this aggregate.
             and bool(launchers.get("ok"))
             and local["ledger_outbox_ok"]
+            and schema_ok
         ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
@@ -980,6 +1001,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "launchers_ok": bool(launchers.get("ok")),
         "nightly_steps_ok": local["nightly_steps_ok"],
         "ledger_outbox_ok": local["ledger_outbox_ok"],
+        "schema_migrations_ok": schema_ok,
     }
     print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
