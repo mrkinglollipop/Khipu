@@ -147,7 +147,14 @@ def sweep() -> dict[str, Any]:
     locations: list[dict[str, str]] = []
     try:
         directory = records_dir()
-        paths = sorted(directory.glob("*.json")) if directory.is_dir() else []
+        # scandir, never glob: glob hides a folder it may not list, which
+        # would read as no records while a recorded writer still runs.
+        try:
+            with os.scandir(directory) as listing:
+                names = [entry.name for entry in listing]
+        except FileNotFoundError:
+            names = []
+        paths = sorted(directory / name for name in names if name.endswith(".json"))
     except OSError as exc:
         why = f"legacy writer records could not be read ({type(exc).__name__}), so the forget stays open"
         return {"ok": False, "stopped": 0, "locations": [

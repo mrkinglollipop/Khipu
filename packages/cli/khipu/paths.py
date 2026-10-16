@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import stat as stat_module
 import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -248,15 +249,22 @@ _SNAPSHOT_NAME = "hub_snapshot.sqlite"  # khipu.hub_snapshot.SNAPSHOT_NAME
 _MEMORY_LOCK_NAME = ".memory.lock"  # khipu.memory_lock.LOCK_NAME
 
 
-def _forgotten_job(data: bytes, gate) -> bool:
-    """Whether a backed-up file is a queued job (outbox, dead letter,
-    quarantine) whose payload is a forgotten source."""
+def _job_refusal(data: bytes, gate) -> str | None:
+    """Why a backed-up queued job (outbox, dead letter, quarantine) may not
+    be restored, or None when it may. Fails closed: a job that cannot be
+    parsed, or whose payload cannot be judged against the registry, is never
+    treated as allowed, since it can still hold a forgotten source's text."""
     try:
         value = json.loads(data.decode("utf-8"))
     except (UnicodeError, ValueError):
-        return False
-    return (isinstance(value, dict) and isinstance(value.get("payload"), dict)
-            and not gate.allows(value["payload"]))
+        return "unreadable"
+    if not isinstance(value, dict) or not isinstance(value.get("payload"), dict):
+        return "unreadable"
+    try:
+        allowed = gate.allows(value["payload"])
+    except Exception:  # noqa: BLE001 (a job the gate cannot judge is not restored)
+        return "unreadable"
+    return None if allowed else "forgotten"
 
 
 def import_local(*, source: Path, merge: bool = True) -> dict:
@@ -386,17 +394,99 @@ RESTORE_SCRUBS = {
 }
 
 
+# Read flags for a backed-up file: never follow a link, never wait on a FIFO.
+_READ_NO_FOLLOW = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+_DIR_NO_FOLLOW = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
+def _refuse_same_file(st: os.stat_result, dest: Path) -> None:
+    try:
+        known = dest.stat()
+    except OSError:
+        return
+    if (known.st_dev, known.st_ino) == (st.st_dev, st.st_ino):
+        raise shutil.SameFileError(f"{dest!s} is the same file as its backup copy")
+
+
+def _write_staged(source, staged: Path) -> None:
+    """The one write of a backup file's bytes into its private staging copy."""
+    with sensitive_writer(staged) as handle:
+        shutil.copyfileobj(source, handle)
+
+
+def _stage_fd(fd: int, staged: Path) -> None:
+    """Copy an opened backup file into its staging copy. Takes ownership of
+    ``fd``. Raises OSError when it is not a regular file."""
+    with os.fdopen(fd, "rb") as handle:
+        if not stat_module.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError("not a regular file")
+        _write_staged(handle, staged)
+
+
+def _walk_backup(dir_fd: int, parts: tuple[str, ...], visit, unreadable) -> None:
+    """Every entry under an opened backup folder, through folder descriptors
+    opened without following links, so a folder swapped for a link after
+    the walk began cannot redirect a read. ``visit(parts, dir_fd, name, st)``
+    gets each entry that is not a folder; ``unreadable(parts, why)`` gets each
+    folder or entry that cannot be listed or examined. Nothing is skipped
+    silently."""
+    try:
+        with os.scandir(dir_fd) as listing:
+            names = sorted(entry.name for entry in listing)
+    except OSError as exc:
+        unreadable(parts, f"its folder could not be listed ({type(exc).__name__}), so nothing "
+                          "in it was restored")
+        return
+    for name in names:
+        child = (*parts, name)
+        try:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError as exc:
+            unreadable(child, f"it could not be examined ({type(exc).__name__}), so it was "
+                              "not restored")
+            continue
+        if not stat_module.S_ISDIR(st.st_mode):
+            visit(child, dir_fd, name, st)
+            continue
+        try:
+            sub = os.open(name, _DIR_NO_FOLLOW, dir_fd=dir_fd)
+        except OSError as exc:
+            unreadable(child, f"its folder could not be opened ({type(exc).__name__}), so "
+                              "nothing in it was restored")
+            continue
+        try:
+            _walk_backup(sub, child, visit, unreadable)
+        finally:
+            os.close(sub)
+
+
 def _import_local(*, source: Path, merge: bool) -> dict:
+    """Two phases. Staging reads every candidate file of the backup exactly
+    once, opened without following links, into a private staging folder (the
+    replica straight into its own staging copy). Checking and restoring then
+    use only those staged bytes, so a backup file replaced after it was read
+    cannot change what is restored. A file that cannot be read or judged is
+    left out and listed in ``not_restored``."""
+    import tempfile
+
     from khipu import hub_snapshot, tombstones
     from khipu.capture_stores import restore_entry
 
     source = source.expanduser()
     target = ensure_data_dir()
+    root = target.resolve()
     imported = 0
     skipped_forgotten = 0
     skipped_replica_temps: list[str] = []
     not_restored: list[dict[str, str]] = []
-    staged: Path | None = None
+    replica: Path | None = None
+    registry: Path | None = None
+    # (scrub, staged copy, destination, backup path) for each file to restore.
+    candidates: list[tuple[str, Path, Path, str]] = []
+    private = Path(tempfile.mkdtemp(prefix="khipu-import-"))
+
+    def left_out(parts: tuple[str, ...], why: str) -> None:
+        not_restored.append({"path": "/".join(parts), "why": why})
 
     def scrub_for(parts: tuple[str, ...]) -> str | None:
         """The scrub a backed-up file goes through, or None (and listed in
@@ -405,81 +495,141 @@ def _import_local(*, source: Path, merge: bool) -> dict:
         if entry is None or _skip_reason(parts) is not None:
             if _skip_reason(parts) == "replica_temp":
                 skipped_replica_temps.append("/".join(parts))
-            not_restored.append({"path": "/".join(parts), "why": _not_restored_why(parts)})
+            left_out(parts, _not_restored_why(parts))
             return None
         return RESTORE_SCRUBS[entry.scrub]
 
-    def stage(reader) -> None:
-        nonlocal staged
-        if staged is None:
-            staged = hub_snapshot.staging_path()
-        copy_sensitive(reader, staged)
+    def staging_for(scrub: str) -> Path:
+        nonlocal replica
+        if scrub == "stage":
+            if replica is None:
+                replica = hub_snapshot.staging_path()
+            return replica
+        return private / str(len(candidates))
 
-    def restore(scrub: str, dest: Path, read_bytes, open_source, gate) -> None:
-        nonlocal imported, skipped_forgotten
-        if scrub == "merged":
+    def claim(parts: tuple[str, ...], dest: Path) -> str | None:
+        """The scrub for a member that is to be staged, or None."""
+        if parts == (_REGISTRY_NAME,):
+            return None
+        scrub = scrub_for(parts)
+        if scrub is None or scrub == "merged":
+            return None
+        if _aliases_protected(root, parts, dest.resolve()):
+            raise RuntimeError(f"refusing backup path that aliases a protected file: "
+                               f"{'/'.join(parts)}")
+        if dest.exists() and not merge:
+            return None
+        return scrub
+
+    def visit(parts: tuple[str, ...], dir_fd: int, name: str, st: os.stat_result) -> None:
+        nonlocal registry
+        dest = target.joinpath(*parts)
+        if parts == (_REGISTRY_NAME,):
+            staged, scrub = private / "registry", None
+        else:
+            scrub = claim(parts, dest)
+            if scrub is None:
+                return
+            staged = staging_for(scrub)
+        if stat_module.S_ISLNK(st.st_mode):
+            # A link is never followed; one that points at the very file it
+            # would restore over is the same-file case, refused loudly.
+            try:
+                pointed = os.stat(name, dir_fd=dir_fd)
+            except OSError:
+                pointed = None
+            if pointed is not None:
+                _refuse_same_file(pointed, dest)
+            left_out(parts, "a link, which a restore never follows")
             return
-        if scrub == "job" and _forgotten_job(read_bytes(), gate):
-            skipped_forgotten += 1
+        try:
+            fd = os.open(name, _READ_NO_FOLLOW, dir_fd=dir_fd)
+        except OSError as exc:
+            left_out(parts, f"it could not be read ({type(exc).__name__}), so it was not restored")
             return
-        with open_source() as source_file:
-            if scrub == "stage":
-                stage(source_file)
-            else:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                if dest.name in SENSITIVE_FILENAMES:
-                    copy_sensitive(source_file, dest)
-                else:
-                    with open(dest, "wb") as out:
-                        shutil.copyfileobj(source_file, out)
-        imported += 1
+        try:
+            _refuse_same_file(os.fstat(fd), dest)
+        except BaseException:
+            os.close(fd)
+            raise
+        try:
+            _stage_fd(fd, staged)
+        except OSError as exc:
+            staged.unlink(missing_ok=True)
+            left_out(parts, f"it could not be read ({type(exc).__name__}), so it was not restored")
+            return
+        if scrub is None:
+            registry = staged
+            scrub_for(parts)  # still listed: the registry is merged, never copied
+        else:
+            candidates.append((scrub, staged, dest, "/".join(parts)))
 
     try:
         if source.is_dir():
-            registry = source / _REGISTRY_NAME
-            if registry.is_file():
-                tombstones.merge_registry_bytes(registry.read_bytes())
-            with tombstones.write_gate() as gate:
-                for p in sorted(source.rglob("*")):
-                    if not p.is_file():
-                        continue
-                    rel = p.relative_to(source)
-                    scrub = scrub_for(rel.parts)
-                    if scrub is None:
-                        continue
-                    dst = target / rel
-                    if _aliases_protected(target.resolve(), rel.parts, dst.resolve()):
-                        raise RuntimeError(f"refusing backup path that aliases a protected file: {rel}")
-                    if dst.exists() and not merge:
-                        continue
-                    if dst.exists() and p.samefile(dst):
-                        raise shutil.SameFileError(f"{p!s} and {dst!s} are the same file")
-                    restore(scrub, dst, p.read_bytes, lambda p=p: p.open("rb"), gate)
+            top = os.open(str(source), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                _walk_backup(top, (), visit, left_out)
+            finally:
+                os.close(top)
         elif source.is_file() and source.suffix.lower() == ".zip":
-            with zipfile.ZipFile(source, "r") as zf:
-                members = _checked_zip_members(zf, target)
-                for parts, info, _dest in members:
+            with open(source, "rb") as archive, zipfile.ZipFile(archive, "r") as zf:
+                for parts, info, dest in _checked_zip_members(zf, target):
                     if parts == (_REGISTRY_NAME,):
-                        tombstones.merge_registry_bytes(zf.read(info))
-                with tombstones.write_gate() as gate:
-                    for parts, info, dest in members:
-                        scrub = scrub_for(parts)
+                        staged, scrub = private / "registry", None
+                    else:
+                        scrub = claim(parts, dest)
                         if scrub is None:
                             continue
-                        if dest.exists() and not merge:
-                            continue
-                        restore(scrub, dest, lambda info=info: zf.read(info),
-                                lambda info=info: zf.open(info), gate)
+                        staged = staging_for(scrub)
+                    try:
+                        with zf.open(info) as member:
+                            _write_staged(member, staged)
+                    except (OSError, zipfile.BadZipFile, ValueError, EOFError) as exc:
+                        staged.unlink(missing_ok=True)
+                        left_out(parts, f"it could not be read ({type(exc).__name__}), so it "
+                                        "was not restored")
+                        continue
+                    if scrub is None:
+                        registry = staged
+                        scrub_for(parts)
+                    else:
+                        candidates.append((scrub, staged, dest, "/".join(parts)))
         else:
             raise RuntimeError("import source must be a .zip or a directory")
+        # Nothing below reads the backup again: only the staged copies.
+        if registry is not None:
+            tombstones.merge_registry_bytes(registry.read_bytes())
+        with tombstones.write_gate() as gate:
+            for scrub, staged, dest, rel in candidates:
+                if scrub == "job":
+                    refusal = _job_refusal(staged.read_bytes(), gate)
+                    if refusal == "forgotten":
+                        skipped_forgotten += 1
+                        continue
+                    if refusal is not None:
+                        not_restored.append({"path": rel, "why": (
+                            "a queued job that could not be read or checked against the "
+                            "forget registry, so it may hold a forgotten source and was not "
+                            "restored")})
+                        continue
+                if scrub != "stage":
+                    with open(staged, "rb") as staged_file:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        if dest.name in SENSITIVE_FILENAMES:
+                            copy_sensitive(staged_file, dest)
+                        else:
+                            with open(dest, "wb") as out:
+                                shutil.copyfileobj(staged_file, out)
+                imported += 1
         scrub = None
-        if staged is not None:
+        if replica is not None and any(c[0] == "stage" for c in candidates):
             # After the gate is released: publishing takes the registry and
             # then the refresh lock, the order every replica writer uses.
-            scrub = hub_snapshot.publish_imported_snapshot(staged)
+            scrub = hub_snapshot.publish_imported_snapshot(replica)
     finally:
-        if staged is not None:
-            staged.unlink(missing_ok=True)
+        shutil.rmtree(private, ignore_errors=True)
+        if replica is not None:
+            replica.unlink(missing_ok=True)
     out = {
         "ok": True,
         "imported": imported,
@@ -497,9 +647,9 @@ def _import_local(*, source: Path, merge: bool) -> dict:
                      "refresh left behind; those are never restored")
     others = len(not_restored) - len(skipped_replica_temps)
     if others:
-        notes.append(f"left out {others} {'file' if others == 1 else 'files'} that no store "
-                     "may restore (temporary files, locks, records or unknown names); "
-                     "see not_restored")
+        notes.append(f"left out {others} {'file' if others == 1 else 'files'} that could not "
+                     "be restored (temporary files, locks, records, unknown names, or files "
+                     "that could not be read or checked); see not_restored")
     if notes:
         out["notes"] = notes
     if scrub is not None:

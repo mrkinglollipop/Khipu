@@ -656,6 +656,19 @@ def legacy_locations(memory_root: Path) -> list[tuple[str, Path]]:
     return out
 
 
+def _listing(directory: Path) -> list[str]:
+    """The names in one folder a forget scan reads, sorted; empty only when
+    the folder does not exist. Every other error (a folder that may not be
+    listed, a file where a folder should be) raises, so the caller reports
+    the store not checked instead of reading it as empty, which glob and
+    rglob would."""
+    try:
+        with os.scandir(directory) as listing:
+            return sorted(entry.name for entry in listing)
+    except FileNotFoundError:
+        return []
+
+
 def _present_file(path: Path) -> bool:
     """A regular file, or an entry that cannot be stat'ed: a directory that
     lists names but denies stat must not hide a copy, so its entries count as
@@ -901,11 +914,7 @@ def _outbox_entries() -> list[dict[str, Any]]:
 
     entries: list[dict[str, Any]] = []
     for directory in outbox_folders():
-        try:
-            paths = sorted(directory.iterdir())
-        except FileNotFoundError:
-            continue
-        for path in paths:
+        for path in (directory / name for name in _listing(directory)):
             # A crash in the atomic writer leaves ".<job>.<random>.tmp" holding
             # a whole or torn job. A quarantine ".error" file (and its temp)
             # holds only an error string.
@@ -1141,10 +1150,7 @@ def _replica_temp_remainder(episode_id: int) -> dict[str, Any]:
             "why": "a replica refresh is running, so its temporary files could not be checked"}]}
     locations: list[dict[str, str]] = []
     try:
-        try:
-            names = sorted(path.name for path in directory.iterdir())
-        except FileNotFoundError:
-            names = []
+        names = _listing(directory)
         temps = [n for n in names if n.startswith(".hub_snapshot.")
                  and not n.startswith(".hub_snapshot.meta.")]
         states: dict[str, str] = {}
@@ -1236,8 +1242,44 @@ def plain_summary(out: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _identityless_job_state(job: dict[str, Any], path: Path, session_id: str | None,
+                            source_rows: list[dict[str, Any]] | None,
+                            has_merged_sources: bool) -> tuple[str, str | None]:
+    """A native job with no natural identity (no session id or transcript
+    range, as the first release wrote them) is judged by content. Its
+    extracted episode matching a source row exactly is a copy, so it is
+    removed. Otherwise it is clean only when its session is known and is
+    not the episode's, and the episode has no merged source from another
+    session: a transcript belongs to one session. Anything else cannot be
+    decided, so the job is kept and the forget stays open."""
+    extracted = job.get("extracted_payload")
+    if extracted is not None:
+        if not isinstance(extracted, dict):
+            return "unreadable", (f"native capture job {path} has no identity and its extracted "
+                                  "episode could not be read, so it was kept")
+        try:
+            match = _source_match(extracted, source_rows or [])
+        except (UnicodeError, ValueError, TypeError):
+            return "unreadable", (f"native capture job {path} has no identity and its extracted "
+                                  "episode could not be hashed, so it was kept")
+        if match == "exact":
+            return "removed", None
+        if match == "identity":
+            return "copy remains", (f"native capture job {path} has no identity and its extracted "
+                                    "episode matches this episode by time and summary, so it "
+                                    "was kept")
+    sid = job.get("session_id")
+    job_session = f"{job.get('harness') or 'aegis'}:{sid}" if isinstance(sid, str) and sid else None
+    if job_session and session_id and job_session != session_id and not has_merged_sources:
+        return "clean", None
+    return "unidentified records", (
+        f"native capture job {path} has no source identity, and its transcript could not be "
+        "told apart from this episode's source, so it was kept")
+
+
 def _native_job_remainder(session_id: str | None,
-                          source_rows: list[dict[str, Any]] | None) -> dict[str, Any]:
+                          source_rows: list[dict[str, Any]] | None,
+                          has_merged_sources: bool = False) -> dict[str, Any]:
     """Remove native capture jobs (queued, claimed, a crash-left checkpoint,
     or archived as empty) that will capture, or did capture, one of the
     episode's sources, and report every job kept. The folders come from the
@@ -1267,11 +1309,7 @@ def _native_job_remainder(session_id: str | None,
                 raise OSError("queue claim lock unavailable")
             listed: list[tuple[str, Path]] = []
             for place, directory in native_job_folders():
-                try:
-                    listed += [(place, directory / name)
-                               for name in sorted(p.name for p in directory.iterdir())]
-                except FileNotFoundError:
-                    continue
+                listed += [(place, directory / name) for name in _listing(directory)]
             for place, path in listed:
                 name = path.name
                 if not (name.endswith(".json") or ".claimed." in name or name.endswith(".tmp")):
@@ -1281,6 +1319,8 @@ def _native_job_remainder(session_id: str | None,
                 state, why = "clean", None
                 try:
                     job = json.loads(path.read_text(encoding="utf-8"))
+                    if not isinstance(job, dict):
+                        raise ValueError("job is not an object")
                     ident = sc.job_source_identity(job)
                 except FileNotFoundError:
                     continue
@@ -1289,7 +1329,21 @@ def _native_job_remainder(session_id: str | None,
                     why = (f"native capture job {path} could not be read "
                            f"({type(exc).__name__}), so it was kept")
                     ident = None
-                if state == "clean" and ident is not None:
+                if state == "clean" and ident is None:
+                    state, why = _identityless_job_state(job, path, session_id, source_rows,
+                                                         has_merged_sources)
+                    if state == "removed":
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            continue
+                        except OSError as exc:
+                            state = "copy remains"
+                            why = (f"native capture job {path} could not be removed "
+                                   f"({type(exc).__name__}), so it was kept")
+                        else:
+                            removed += 1
+                elif state == "clean":
                     if keys and source_key(ident) in keys:
                         try:
                             path.unlink()
@@ -1435,7 +1489,8 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
     out["replica_temps"] = _replica_temp_remainder(episode_id)
     if not out["replica_temps"]["ok"]:
         partial.append("replica_temp")
-    out["native_jobs"] = _native_job_remainder(out.get("session_id"), out.get("source_rows"))
+    out["native_jobs"] = _native_job_remainder(out.get("session_id"), out.get("source_rows"),
+                                               out.get("has_merged_sources", False))
     if not out["native_jobs"]["ok"]:
         partial.append("native_jobs")
     out["legacy_writers"] = writers

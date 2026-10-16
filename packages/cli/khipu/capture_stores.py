@@ -140,7 +140,7 @@ STORES: tuple[Store, ...] = (
           "a copy of the data folder", "kept: backups are kept for recovery (forget's kept text); "
           "an import restores only what a store here says it may, each file through that "
           "store's scrub, which checks every identity the registry holds",
-          _w("paths.backup_local", "paths.restore", "paths.stage", "paths.copy_sensitive",
+          _w("paths.backup_local", "paths._import_local", "paths._write_staged", "paths.copy_sensitive",
              "paths.write_sensitive_bytes", "paths.sensitive_writer")),
 )
 
