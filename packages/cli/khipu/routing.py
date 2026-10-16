@@ -5692,22 +5692,30 @@ def _conversation_write(args: dict, *, author: dict, now: datetime | None = None
 
 
 def conversation_priority(entries, *, until=None, owner_request: str, author: dict, expect=None,
-                          now: datetime | None = None, lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+                          expect_current: bool = False, now: datetime | None = None,
+                          lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
     """What MCP ``khipu_route_priority`` writes (``request_priority``), with
     a conversation's fixed messages and lock budget, answered field by field:
     each account by its label and its id, never its key. ``expect``, the
     priority's version as read when the request was built, is required: a
-    request never lands on a newer priority it was not built on."""
+    request never lands on a newer priority it was not built on. With
+    ``expect_current`` that version is read here, inside the same lock
+    budget, so a held lock answers busy in time."""
     by = dict(author or {})
     if by.get("harness") in (None, "", SHELL):
         by["harness"] = UNKNOWN_HARNESS
     with _for_a_conversation(), lock_budget(lock_wait):
-        # Under the routing lock it can replace only the owner's priority, as
-        # of ``expect``, or this conversation's own request, never another
-        # conversation's waiting one.
-        _needs_version(expect)
-        written = _request_priority(entries, until=until, owner_request=owner_request, author=by, via="mcp", now=now,
-                                    expect=expect)
+        try:
+            if expect_current:
+                expect = priority_version(now)
+            # Under the routing lock it can replace only the owner's priority, as
+            # of ``expect``, or this conversation's own request, never another
+            # conversation's waiting one.
+            _needs_version(expect)
+            written = _request_priority(entries, until=until, owner_request=owner_request, author=by, via="mcp",
+                                        now=now, expect=expect)
+        except LockBusy:
+            raise RouteError("Khipu's routing record is busy; try again in a moment") from None
         view = read_view(now)
         held = _public_priority(view, now or _now(), plan_facts(view, now or _now()))
         out = {k: written[k] for k in _WRITE_FIELDS if k in written}

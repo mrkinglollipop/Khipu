@@ -568,6 +568,11 @@ def save_list(raw, *, expect, via: str = "app", request: dict | None = None) -> 
                                 "he confirms or undoes it in Settings first", "request_waiting")
         stored, base = current_list(data)
         parsed = [] if raw is None else usage.parse_usage_accounts(_canonical(raw, stored), previous=stored)
+        # Stop's rule: a list left with only invalid entries reads no account,
+        # which only Stop tracking with its confirmation may do.
+        if parsed and known_of(base) and not known_of(parsed):
+            raise AccountsError("this leaves no account Khipu can read on this Mac; Stop tracking on the last "
+                                "account asks first", "last_account")
         res = _commit(data, stored, base, parsed, via=via, request=request)
     out = {"ok": True, "version": res["version"], "lane_repairs": res["repairs"]}
     return out

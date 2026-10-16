@@ -1434,14 +1434,14 @@ def test_a_conversations_priority_request_needs_the_version_it_was_built_on(mac)
     assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == ["codex|", "claude|"]
 
 
-def test_the_mcp_priority_tool_passes_the_version_it_read(mac, monkeypatch):
+def test_the_mcp_priority_tool_reads_the_version_inside_its_lock_budget(mac, monkeypatch):
     from khipu import mcp_server
 
     _set(usage_accounts=_TWO)
     seen = {}
     monkeypatch.setattr(routing, "conversation_priority", lambda entries, **kw: seen.update(kw) or {"ok": True})
     mcp_server._tool_route_priority({"entries": [{"account": "First"}], "owner_request": "First first"})
-    assert seen["expect"] == routing.priority_version()
+    assert seen["expect_current"] is True and "expect" not in seen
 
 
 def test_undo_of_a_lane_request_never_gives_a_stopped_account_its_lanes_back(mac):
@@ -1590,3 +1590,53 @@ def test_only_invalid_entries_left_read_a_kept_default_as_not_tracked(mac):
     row = next(a for a in view["accounts"] if a["key"] == "claude|")
     assert row["configured"] is False
     assert view["priority"]["entries"][0]["in_settings"] is False
+
+
+def test_a_whole_list_save_cannot_stop_the_last_valid_account_without_its_confirmation(mac):
+    _set(usage_accounts=[{"harness": "claude", "label": "First"}, None])
+    # The app's save after removing the valid row, keeping the untouched null beside it.
+    with pytest.raises(usage.AccountsError) as err:
+        accounts.save_list([None], expect=_version(), via="app")
+    assert err.value.code == "last_account"
+
+
+def test_the_mcp_priority_tool_answers_busy_within_its_lock_budget(mac, monkeypatch):
+    from khipu import mcp_server
+
+    _set(usage_accounts=_TWO)
+    routing.pause("claude|", via="app")
+    # A stale view, so reading the priority's version needs the routing lock.
+    _set(routing_stale_after="2h")
+    monkeypatch.setattr(mcp_server, "_ensure_path", lambda: None)
+    monkeypatch.setattr(mcp_server, "_via_https_gateway", lambda: False)
+    monkeypatch.setattr(routing, "conversation_author", lambda: ME)
+    locked, release, finished = threading.Event(), threading.Event(), threading.Event()
+    result = []
+
+    def holder():
+        with routing._lock():
+            locked.set()
+            release.wait(8)
+
+    def caller():
+        try:
+            result.append(mcp_server._tool_route_priority({"entries": [{"account": "First"}],
+                                                           "owner_request": "put First first"}))
+        except Exception as exc:  # noqa: BLE001 - the answer under test
+            result.append(exc)
+        finally:
+            finished.set()
+
+    lock_thread = threading.Thread(target=holder, daemon=True)
+    call_thread = threading.Thread(target=caller, daemon=True)
+    lock_thread.start()
+    assert locked.wait(2)
+    try:
+        call_thread.start()
+        answered = finished.wait(routing.CONVERSATION_LOCK_BUDGET + 1.0)
+    finally:
+        release.set()
+        lock_thread.join(3)
+        call_thread.join(3)
+    assert answered
+    assert isinstance(result[0], routing.RouteError) and "busy" in str(result[0]) and "try again" in str(result[0])
