@@ -392,6 +392,13 @@ rows, hermetic local cluster with fsync off, `hub_source_forgotten` unpatched. M
 **1.20 ms at 0029 (no triggers), 1.60 ms at 0030 (triggers, `khipu.source_identities`, 200 forgotten
 identities), +0.41 ms**. Fsync is off, so the commit on a real hub adds the same cost to both sides.
 
+Migration 0030 as a whole (both table locks, the table, the triggers and the backfill, through
+`khipu migrate`), on 20,000 seeded episodes and 20,000 source rows with a merge receipt on every tenth
+episode, same hermetic cluster (PostgreSQL 16, fsync off), median of 3 fresh databases: **14 ms with 200
+forgotten episodes (640 identities backfilled)** and **0.41 s with all 20,000 forgotten (64,000
+identities)**, the worst case. Both table locks are held for that whole time, so captures wait at most
+that long; it is well inside the 5 s `lock_timeout`.
+
 ### Remaining boundary
 
 A writer from older code on another Mac that names no identities and has no natural key (no session id or

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import zipfile
 from contextlib import contextmanager
@@ -283,6 +284,57 @@ def _skipped_name(parts: tuple[str, ...]) -> bool:
             or (len(parts) == 1 and parts[0].startswith(_SNAPSHOT_NAME + "-")))
 
 
+_DRIVE = re.compile(r"^[A-Za-z]:")
+
+
+def _aliases_protected(root: Path, parts: tuple[str, ...], dest: Path) -> bool:
+    """Whether a member other than the exact top-level name resolves onto the
+    registry, a lock, the replica or its journal. Those exact names go through
+    their merge, staging or skip paths; nothing may plainly copy over them."""
+    if len(parts) == 1:
+        return False
+    protected = {(root / name).resolve()
+                 for name in (_REGISTRY_NAME, _REGISTRY_LOCK_NAME, _MEMORY_LOCK_NAME, _SNAPSHOT_NAME)}
+    return dest in protected or (dest.parent == root and dest.name.startswith(_SNAPSHOT_NAME + "-"))
+
+
+def _checked_zip_members(zf: zipfile.ZipFile, target: Path) -> list[tuple[tuple[str, ...], zipfile.ZipInfo, Path]]:
+    """Every file member as (normalised parts, info, resolved destination).
+
+    The whole import is refused before anything is written when one member
+    is unsafe. A member is classified only by its normalised name, so an
+    alias such as nested/../forgotten_sources.json cannot reach the registry
+    or the replica by a route that skips their merge or staging paths.
+    """
+    root = target.resolve()
+    seen: set[tuple[str, ...]] = set()
+    members = []
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        name = info.filename
+        raw = name.split("/")
+        if (not name or name.startswith("/") or "\\" in name or _DRIVE.match(name)
+                or ".." in raw or "\0" in name):
+            raise RuntimeError(f"refusing unsafe zip path: {name!r}")
+        parts = tuple(part for part in raw if part not in ("", "."))
+        if not parts:
+            raise RuntimeError(f"refusing unsafe zip path: {name!r}")
+        if parts in seen:
+            raise RuntimeError(f"refusing duplicate zip path: {name!r}")
+        seen.add(parts)
+        # Zip-slip guard. Compare by path components, not by string prefix:
+        # with target /a/b, "/a/bc/evil".startswith("/a/b") is True, so a
+        # sibling directory escaped the old check entirely (audit 2026-08-17).
+        dest = root.joinpath(*parts).resolve()
+        if not dest.is_relative_to(root):
+            raise RuntimeError(f"refusing unsafe zip path: {name!r}")
+        if _aliases_protected(root, parts, dest):
+            raise RuntimeError(f"refusing zip path that aliases a protected file: {name!r}")
+        members.append((parts, info, dest))
+    return members
+
+
 def _import_local(*, source: Path, merge: bool) -> dict:
     from khipu import hub_snapshot, tombstones
 
@@ -311,6 +363,8 @@ def _import_local(*, source: Path, merge: bool) -> dict:
                     if _skipped_name(rel.parts):
                         continue
                     dst = target / rel
+                    if _aliases_protected(target.resolve(), rel.parts, dst.resolve()):
+                        raise RuntimeError(f"refusing backup path that aliases a protected file: {rel}")
                     if dst.exists() and not merge:
                         continue
                     if dst.exists() and p.samefile(dst):
@@ -332,28 +386,17 @@ def _import_local(*, source: Path, merge: bool) -> dict:
                     imported += 1
         elif source.is_file() and source.suffix.lower() == ".zip":
             with zipfile.ZipFile(source, "r") as zf:
-                infos = [info for info in zf.infolist() if not info.is_dir()]
-                for info in infos:
-                    # Zip-slip guard. Compare by path components, not by string
-                    # prefix: with target /a/b, "/a/bc/evil".startswith("/a/b") is
-                    # True, so a sibling directory escaped the old check entirely
-                    # (audit 2026-08-17).
-                    dest = (target / info.filename).resolve()
-                    if not dest.is_relative_to(target.resolve()):
-                        raise RuntimeError(f"refusing unsafe zip path: {info.filename}")
-                for info in infos:
-                    if Path(info.filename).parts == (_REGISTRY_NAME,):
+                members = _checked_zip_members(zf, target)
+                for parts, info, _dest in members:
+                    if parts == (_REGISTRY_NAME,):
                         tombstones.merge_registry_bytes(zf.read(info))
                 with tombstones.write_gate() as gate:
-                    for info in infos:
-                        parts = Path(info.filename).parts
+                    for parts, info, dest in members:
                         if _skipped_name(parts):
                             continue
-                        dest = (target / info.filename).resolve()
                         if dest.exists() and not merge:
                             continue
-                        if (info.filename.endswith(".json")
-                                and _forgotten_job(zf.read(info), gate)):
+                        if parts[-1].endswith(".json") and _forgotten_job(zf.read(info), gate):
                             skipped_forgotten += 1
                             continue
                         if parts == (_SNAPSHOT_NAME,):

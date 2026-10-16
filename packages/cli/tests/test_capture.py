@@ -239,8 +239,8 @@ class PayloadRobustnessTest(unittest.TestCase):
             fake = pathlib.Path(td) / "capture_v2.py"
             fake.write_text("import time\ntime.sleep(30)\n")
             with mock.patch.object(cap, "_capture_v2", return_value=fake), \
-                 mock.patch("subprocess.run",
-                            side_effect=subprocess.TimeoutExpired(cmd="capture_v2", timeout=300)):
+                 mock.patch.object(cap, "_run_legacy_group",
+                                   side_effect=subprocess.TimeoutExpired(cmd="capture_v2", timeout=300)):
                 rc = cap.run_capture_v2({"summary": "s"}, suppress_mirror=True)
         self.assertEqual(rc, cap.EX_SOFTWARE)
 
@@ -249,7 +249,7 @@ class PayloadRobustnessTest(unittest.TestCase):
             fake = pathlib.Path(td) / "capture_v2.py"
             fake.write_text("x")
             with mock.patch.object(cap, "_capture_v2", return_value=fake), \
-                 mock.patch("subprocess.run", side_effect=OSError("exec format error")):
+                 mock.patch.object(cap, "_run_legacy_group", side_effect=OSError("exec format error")):
                 rc = cap.run_capture_v2({"summary": "s"}, suppress_mirror=True)
         self.assertEqual(rc, cap.EX_SOFTWARE)
 

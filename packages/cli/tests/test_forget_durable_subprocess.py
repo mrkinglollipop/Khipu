@@ -37,14 +37,14 @@ def test_legacy_child_enqueues_without_deadlocking_parent_write_guard(tmp_path, 
     monkeypatch.setenv("KHIPU_OUTBOX", str(outbox_root))
     monkeypatch.setenv("TEST_REGISTRY", str(registry))
     monkeypatch.setenv("TEST_KHIPU_CLI", str(Path(__file__).parents[1]))
-    real_run_text = capture.run_text
+    real_run = capture._run_legacy_group
 
     def short_child_timeout(*args, **kwargs):
         kwargs["timeout"] = 3
-        return real_run_text(*args, **kwargs)
+        return real_run(*args, **kwargs)
 
     with mock.patch.object(capture, "_capture_v2", return_value=child), \
-            mock.patch.object(capture, "run_text", side_effect=short_child_timeout):
+            mock.patch.object(capture, "_run_legacy_group", side_effect=short_child_timeout):
         assert capture.run_capture_v2(_payload(), suppress_mirror=False) == 0
     jobs = outbox.jobs()
     assert len(jobs) == 1
@@ -61,9 +61,9 @@ def test_forgotten_source_never_launches_the_legacy_child(tmp_path, monkeypatch)
     monkeypatch.setenv("KHIPU_OUTBOX", str(outbox_root))
     tombstones.publish_payloads([payload])
     with mock.patch.object(capture, "_capture_v2", return_value=child), \
-            mock.patch.object(capture, "run_text") as run_text:
+            mock.patch.object(capture, "_run_legacy_group") as run_legacy:
         assert capture.run_capture_v2(payload, suppress_mirror=False) == 0
-    run_text.assert_not_called()
+    run_legacy.assert_not_called()
     assert outbox.jobs() == []
 
 

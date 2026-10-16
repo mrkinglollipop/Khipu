@@ -25,14 +25,15 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from khipu import wire
-from khipu.lines import run_text
 from khipu.config import capture_mode
 
 # ---- W1.4 ingest dedup ------------------------------------------------------
@@ -1072,6 +1073,62 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Darwin answers EPERM while the group holds only a zombie that has
+        # not been reaped yet: something is still there, so keep waiting.
+        return True
+    return True
+
+
+def _kill_group(proc: subprocess.Popen, grace: float = 30.0) -> None:
+    """SIGKILL every process in the writer's group, then wait until none is
+    left, so the caller releases its locks only after the last one is gone."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.communicate()
+    deadline = time.monotonic() + grace
+    while _group_alive(proc.pid):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"legacy writer group {proc.pid} survived SIGKILL")
+        time.sleep(0.02)
+
+
+def _run_legacy_group(argv: list[str], *, input: str, env: dict[str, str],
+                      timeout: float, pass_fds: tuple[int, ...]) -> subprocess.CompletedProcess:
+    """Run the legacy file writer in its own process group and return only
+    when no process in that group remains.
+
+    The real legacy script starts the mechanical writer without forwarding
+    the lock descriptors, so descriptor inheritance cannot cover that
+    grandchild: if the intermediary dies, the grandchild keeps writing.
+    Waiting on the whole group keeps the caller's locks held until it is
+    done. On timeout or cancel the whole group is killed and waited for.
+    A process that leaves the group on purpose (setsid) is not covered.
+    """
+    deadline = time.monotonic() + timeout
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=env, pass_fds=pass_fds,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(input.encode("utf-8"), timeout=timeout)
+        while _group_alive(proc.pid):
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            time.sleep(0.05)
+    except BaseException:
+        _kill_group(proc)
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out.decode("utf-8", "replace"),
+                                       err.decode("utf-8", "replace"))
+
+
 def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
     from khipu.paths import isolated_dir
 
@@ -1091,9 +1148,10 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
     env = dict(os.environ)
     if suppress_mirror:
         env["KHIPU_MIRROR"] = "0"
-    # The registry flock is the file writer's write lock: hold it through the
-    # child process so a forget cannot complete after this final check and
-    # before the legacy writer appends its line.
+    # The registry flock and the memory lock are the file writer's write
+    # locks: hold them until every process the legacy writer started is gone,
+    # so a forget cannot complete after this final check and before any of
+    # them appends its line.
     try:
         from khipu.tombstones import RegistryError, subprocess_lock_handoff, write_guard
 
@@ -1109,7 +1167,7 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
                 env.pop(name, None)
             env.update(handoff_env)
             try:
-                proc = run_text(
+                proc = _run_legacy_group(
                     [sys.executable, str(capture_v2)],
                     input=wire.dumps(payload),
                     env=env,
