@@ -1005,6 +1005,13 @@ def _empty_by_timing(live: dict[str, Any] | None, cand: dict[str, Any]) -> bool:
             and "'cosine'" in str(live.get("legs") or "") and "'cosine'" not in str(cand.get("legs") or ""))
 
 
+def _embedding_failed(live: dict[str, Any] | None, cand: dict[str, Any]) -> bool:
+    """Whether the candidate's embedding failed (not merely ran late) on a
+    prompt where live ran the cosine leg."""
+    return (str(cand.get("degraded") or "").startswith("embedding error")
+            and "'cosine'" in str((live or {}).get("legs") or ""))
+
+
 def _off_problem(label: str, live: dict[str, Any] | None, cand: dict[str, Any]) -> str | None:
     """Why the candidate's run with routing off fails the step, or None: its
     own search fails (``_search_problem``), or it answered nothing where the
@@ -1069,7 +1076,8 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     candidate's embedding being late or failed (no cosine leg where live ran
     one) replays live and the candidate once more; if it is still that, it
     is noted, not failed (a query whose words match nothing finds its hits
-    on the cosine leg alone). A failing pair, or one whose legs or degraded note differ, is
+    on the cosine leg alone), unless the candidate's embedding failed on
+    every replayed prompt while live's ran: that refuses. A failing pair, or one whose legs or degraded note differ, is
     replayed once more first, so a search or a read that was late once is
     not taken for the candidate's routing, and both replayed runs are held
     to their tests (the run with routing off to the search and empty-answer
@@ -1091,6 +1099,7 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     live_legacy = live_root is None or not _honours_isolation(live_root)
     cand_legacy = not _honours_isolation(Path(candidate))
     routed_runs = 0
+    embed_failed: dict[int, bool] = {}
     for i, sample in enumerate(samples):
         live = (_recall_once(live_hook, sample, f"khipu-gate-{nonce}-live-{i}", legacy=live_legacy, routing=False)
                 if live_hook.exists() else None)
@@ -1106,6 +1115,7 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
                                 routing=False)
             problem = _off_problem(label, live, cand)
         live_hits = (live or {}).get("hits") or []
+        embed_failed[i] = _embedding_failed(live, cand)
         if problem:
             problems.append(problem)
             continue
@@ -1125,6 +1135,7 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
             # Both replayed runs are tested: the one with routing off
             # replaces the first, so it is held to the first one's tests.
             problem = _off_problem(label, live, cand) or _routing_problem(label, cand, on)
+            embed_failed[i] = _embedding_failed(live, cand)
         if problem:
             problems.append(problem)
             continue
@@ -1140,6 +1151,10 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
         if not _comparable(cand, on):
             note += ", answers not compared (their legs or degraded note differed twice: timing, not routing)"
         notes.append(note)
+    if len(embed_failed) == len(samples) and all(embed_failed.values()):
+        # Once in a while is the provider; on every prompt while live's
+        # embedding ran is the candidate's code.
+        problems.append(f"the candidate's embedding failed on all {len(samples)} prompt(s) while live's ran")
     if problems:
         return False, "; ".join(problems)
     tail = "" if routed_runs else " (routing did not run: the candidate has no routing push, or it is switched off here)"
