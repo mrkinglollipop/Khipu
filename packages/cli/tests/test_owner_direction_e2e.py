@@ -11,6 +11,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -82,6 +83,13 @@ def _state(label: str) -> str:
     return next(a for a in routing.read_view()["accounts"] if a["label"] == label)["state"]
 
 
+def _five_pm() -> str:
+    """The owner's "until 5pm" as --until: the next 5 pm on this Mac."""
+    now = datetime.now().astimezone()
+    then = now.replace(hour=17, minute=0, second=0, microsecond=0)
+    return (then if then > now else then + timedelta(days=1)).isoformat()
+
+
 def _log() -> list[dict]:
     return owner_direction.read_log()
 
@@ -97,7 +105,7 @@ def test_a_direction_goes_from_the_hook_to_the_record_and_back(world, khipu_app)
     seen = {"version": marker["version"], "epoch": marker["epoch"], "full_at": routing._iso(routing._now())}
     token = _hook("pause Codex until 5pm")
 
-    is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex until 5pm", token)
+    is_error, out = _act("route.pause", {"account": "Codex", "until": _five_pm()}, "pause Codex until 5pm", token)
     assert not is_error and out["ok"] is True, out
     assert _state("Codex") == "paused"
     (line,) = [x for x in _log() if x.get("kind") == "action"]
@@ -118,7 +126,7 @@ def test_a_direction_goes_from_the_hook_to_the_record_and_back(world, khipu_app)
 
 def test_a_second_direction_lifts_it(world):
     token = _hook("pause Codex until 5pm")
-    assert not _act("route.pause", {"account": "Codex"}, "pause Codex until 5pm", token)[0]
+    assert not _act("route.pause", {"account": "Codex", "until": _five_pm()}, "pause Codex until 5pm", token)[0]
     token = _hook("lift Codex now")
     is_error, out = _act("route.lift", {"account": "Codex"}, "lift Codex now", token)
     assert not is_error and out["ok"] is True, out

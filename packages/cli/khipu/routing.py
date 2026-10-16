@@ -6667,7 +6667,8 @@ def _priority_intent(args, action: str) -> dict | None:
             keys.append(resolve_account(item["account"]))
             if isinstance(item.get("role"), str) and item["role"].strip():
                 roles.append(item["role"])
-    return owner_direction.intent("route.priority.set", ",".join(keys), stored=roles or None)
+    return owner_direction.intent("route.priority.set", ",".join(keys), stored=roles or None, timed=True,
+                                  until=getattr(args, "until", None))
 
 
 def _route_intent(cmd: str, args) -> dict | None:
@@ -6677,7 +6678,8 @@ def _route_intent(cmd: str, args) -> dict | None:
 
     if cmd in ("pause", "lift", "clear"):
         facts = {"report": args.report} if cmd == "clear" and getattr(args, "report", None) else None
-        return owner_direction.intent(f"route.{cmd}", resolve_account(args.account), facts=facts)
+        return owner_direction.intent(f"route.{cmd}", resolve_account(args.account), facts=facts,
+                                      timed=cmd == "pause", until=getattr(args, "until", None))
     if cmd == "note":
         if args.action == "set":
             return owner_direction.intent("route.note.set", "note", stored=[args.text or ""])
@@ -6727,7 +6729,8 @@ def _hold_intent(args, words: list[str]) -> dict | None:
         target = "all"
     else:
         return None
-    return owner_direction.intent("route.hold.add", target, stored=[" ".join(words)])
+    return owner_direction.intent("route.hold.add", target, stored=[" ".join(words)], timed=True,
+                                  until=getattr(args, "until", None))
 
 
 def run_cli(args) -> int:

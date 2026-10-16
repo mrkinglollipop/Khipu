@@ -102,7 +102,8 @@ ACTIONS: dict[str, dict[str, Any]] = {
     "route.hold.add": {"verbs": ("hold",), "target": "hold_scope", "stores": True},
     "route.hold.end": {"verbs": ("hold+end", "hold+lift", "hold+remove", "hold+drop", "hold+clear"),
                        "target": "given"},
-    "route.priority.set": {"verbs": ("priority", "first", "before", "prioritize", "prioritise", "order"),
+    "route.priority.set": {"verbs": ("priority", "first", "before", "after", "behind", "ahead of", "prioritize",
+                                     "prioritise", "order"),
                            "target": "accounts"},
     "route.priority.confirm": {"verbs": ("confirm", "keep", "approve", "yes"), "target": "priority"},
     "route.priority.undo": {"verbs": ("undo", "put back", "revert"), "target": "priority"},
@@ -136,14 +137,22 @@ ACTIONS: dict[str, dict[str, Any]] = {
     "work.unhide": {"verbs": ("unhide", "show again", "show it again", "bring back"), "target": "commitment"},
     "work.same": {"verbs": ("same", "merge", "one thing"), "not": ("not the same", "not same", "aren't the same",
                                                                     "are not the same"), "target": "pair"},
-    "work.not_same": {"verbs": ("not the same", "not same", "aren't the same", "different", "split"),
+    "work.not_same": {"verbs": ("not the same", "not same", "aren't the same", "are not the same", "different",
+                                "split"),
                       "target": "pair"},
-    "direction.off": {"verbs": ("off", "disable", "stop"), "target": "direction"},
-    "direction.set": {"verbs": ("set", "change", "make", "shorten", "lengthen", "trust", "untrust", "stop trusting",
-                                "turn on", "turn off"), "target": "direction_setting", "stores": True},
+    "direction.off": {"verbs": ("off", "turn off", "disable", "stop"), "target": "direction"},
+    # Trusting and untrusting a front end take their own verbs (TRUST_VERBS, UNTRUST_VERBS).
+    "direction.set": {"verbs": ("set", "change", "make", "shorten", "lengthen", "turn on", "turn off"),
+                      "target": "direction_setting", "stores": True},
     "direction.undo": {"verbs": ("undo", "put back", "revert", "reverse", "take back", "cancel"),
                        "target": "given"},
 }
+
+# direction.set's verbs follow its key: "trust X" widens what counts as the
+# owner's word and "untrust X" narrows it, so neither may read as the other.
+TRUST_VERBS = ("trust", "start trusting", "count", "allow", "accept")
+UNTRUST_VERBS = ("untrust", "stop trusting", "don't trust", "do not trust", "dont trust", "no longer trust",
+                 "distrust", "remove")
 
 _DIRECTION_NAMES = {
     "latest_window_h": ["latest window", "latest turn window", "latest owner turn window"],
@@ -292,38 +301,320 @@ def _without(words: str, phrases: list[str]) -> str:
     return words
 
 
-def _asks_for(action: str, target: str, quote: str, *, stored, names, exclude) -> None:
+# ---- the parser: which action, on what, asked for or against -------------------------------
+#
+# The words are cut into statements at these separators; a statement with no
+# verb inherits the verb of the one before it ("pause Codex and Grok"). Verb
+# phrases are found over one lexicon of every action's phrases, longest first
+# and never overlapping, so "stop trusting" is never "trust" and "unpause"
+# never "pause". A verb after a negator in its statement asks for nothing.
+
+_SEPARATORS = re.compile(r"\s*(?:[,;]|\.(?=\s|$)|(?<!\w)(?:and then|then|and|but|also)(?!\w))\s*")
+_NEGATOR = re.compile(r"(?<!\w)(?:no need to|do not|don't|dont|won't|wont|shouldn't|never|not|no|without)(?!\w)")
+# "lift the pause on Codex": after one of these a verb of an account action
+# is a noun, and asks for nothing.
+_DETERMINERS = frozenset(("the", "a", "an", "that", "this", "my", "your", "its", "their", "any", "each"))
+_PART = "+part"  # the first word of a two-word verb ("rule+add"): starts a statement, credits nothing alone
+_ORDER_REVERSED = re.compile(r"(?<!\w)(?:after|behind|below|under)(?!\w)")
+
+
+def _verbs(action: str, target: str) -> tuple[str, ...]:
+    if action == "direction.set" and target.startswith("trust "):
+        return TRUST_VERBS
+    if action == "direction.set" and target.startswith("untrust "):
+        return UNTRUST_VERBS
+    return tuple(ACTIONS[action]["verbs"])
+
+
+_LEXICON: dict[str, frozenset[str]] = {}
+
+
+def _lexicon() -> dict[str, frozenset[str]]:
+    """Every contiguous verb phrase, with the actions it asks for."""
+    if not _LEXICON:
+        lex: dict[str, set[str]] = {}
+        for action, spec in ACTIONS.items():
+            for verb in spec["verbs"]:
+                if "+" in verb:
+                    lex.setdefault(_quote(verb.split("+")[0]), set()).add(_PART)
+                else:
+                    lex.setdefault(_quote(verb), set()).add(action)
+            for verb in spec.get("not", ()):
+                lex.setdefault(_quote(verb), set())
+        for verb in TRUST_VERBS + UNTRUST_VERBS:
+            lex.setdefault(_quote(verb), set()).add("direction.set")
+        _LEXICON.update({k: frozenset(v) for k, v in lex.items()})
+    return _LEXICON
+
+
+def _occurrences(text: str) -> list[tuple[int, int, str]]:
+    found = []
+    for phrase in _lexicon():
+        for m in re.finditer(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text):
+            found.append((m.start(), m.end(), phrase))
+    found.sort(key=lambda o: (o[0] - o[1], o[0]))
+    taken: list[tuple[int, int, str]] = []
+    for occ in found:
+        if all(occ[1] <= t[0] or occ[0] >= t[1] for t in taken):
+            taken.append(occ)
+    return sorted(taken)
+
+
+def _kinds(actions) -> set[str]:
+    return {ACTIONS[a]["target"] for a in actions if a in ACTIONS}
+
+
+def _clauses(words: str) -> list[dict]:
+    """The words as clauses: each with its verb occurrences, whether each is
+    a noun here, and whether a negator stands before it."""
+    lex = _lexicon()
+    out = []
+    for statement in _SEPARATORS.split(words):
+        statement = statement.strip()
+        if not statement:
+            continue
+        occs = []
+        prev_end = 0
+        for start, end, phrase in _occurrences(statement):
+            before = statement[:start].split()
+            occs.append({"start": start, "phrase": phrase, "acts": lex[phrase],
+                         "noun": bool(before) and before[-1] in _DETERMINERS,
+                         "neg": _NEGATOR.search(statement, prev_end, start) is not None,
+                         "window": prev_end})
+            prev_end = end
+        # One statement with verbs of different actions on the same kind of
+        # target ("lift Codex pause Grok") is cut before each such verb (and
+        # before any negator that leads it).
+        cuts, last = [0], None
+        for occ in occs:
+            acts = occ["acts"] - {_PART}
+            if occ["noun"] or not acts:
+                continue
+            if last is not None and not (acts & last) and _kinds(acts) & _kinds(last):
+                neg = _NEGATOR.search(statement, occ["window"], occ["start"])
+                cuts.append(neg.start() if neg else occ["start"])
+            last = acts
+        cuts.append(len(statement))
+        for a, b in zip(cuts, cuts[1:]):
+            mine = [dict(o, start=o["start"] - a) for o in occs if a <= o["start"] < b]
+            text = statement[a:b].strip()
+            if text:
+                out.append({"text": statement[a:b], "occs": mine,
+                            "verbal": any(o["acts"] and not o["noun"] for o in mine)})
+    return out
+
+
+def _chains(words: str) -> list[dict]:
+    """Clauses grouped by the verb they share: a verb clause, then the
+    verbless clauses after it. A verbless clause with a negator ("but not
+    Grok") inherits the verb as a refusal; verbless clauses before any verb
+    lead the first verb clause."""
+    chains: list[dict] = []
+    lead: list[dict] = []
+    for clause in _clauses(words):
+        if clause["verbal"]:
+            chains.append({"clauses": lead + [clause], "neg": False})
+            lead = []
+        elif _NEGATOR.search(clause["text"]):
+            if chains:
+                chains.append({"clauses": [clause], "neg": True})
+        elif chains:
+            chains[-1]["clauses"].append(clause)
+        else:
+            lead.append(clause)
+    if not chains and lead:  # no verb anywhere: two-word verbs alone
+        chains.append({"clauses": lead, "neg": False})
+    for chain in chains:
+        chain["text"] = " | ".join(c["text"] for c in chain["clauses"])
+    return chains
+
+
+def _verdict(chain: dict, action: str, target: str) -> str | None:
+    """'ok' when ``chain`` asks for ``action``, 'neg' when it asks against
+    it, 'not:<phrase>' when one of its phrases rules it out, else None."""
+    spec, verbs = ACTIONS[action], _verbs(action, target)
+    text = chain["text"]
+    for phrase in spec.get("not", ()):
+        if _verb_in(text, phrase):
+            return f"not:{phrase}"
+    plain = {_quote(v) for v in verbs if "+" not in v}
+    noun_ok = spec["target"] != "account"
+    hits = [o for c in chain["clauses"] for o in c["occs"] if o["phrase"] in plain and (noun_ok or not o["noun"])]
+    if chain["neg"] and (hits or any(_verb_in(text, v) for v in verbs if "+" in v)):
+        return "neg"
+    if hits:
+        return "neg" if any(o["neg"] for o in hits) else "ok"
+    for verb in [v for v in verbs if "+" in v]:
+        if _verb_in(text, verb):
+            first = min(re.search(r"(?<!\w)" + re.escape(_quote(p)) + r"(?!\w)", text).start()
+                        for p in verb.split("+"))
+            return "neg" if _NEGATOR.search(text, 0, first) else "ok"
+    return None
+
+
+def _named_at(plain: str, group: list[str]) -> int | None:
+    spots = [m.start() for n in group if n
+             for m in [re.search(r"(?<!\w)" + re.escape(_quote(n)) + r"(?!\w)", plain)] if m]
+    return min(spots) if spots else None
+
+
+def _order_ok(plain: str, groups: list[list[str]]) -> bool:
+    """The groups, in the order the command gives them, are the one order
+    the words give: mention order, with "after", "behind", "below" or
+    "under" between two names putting the later-named first."""
+    import itertools
+
+    if len(groups) < 2:
+        return True
+    if len(groups) > 7:
+        return False
+    spots = [_named_at(plain, g) for g in groups]
+    if any(s is None for s in spots):
+        return False
+    mentioned = sorted(range(len(groups)), key=lambda i: spots[i])
+    rules = []
+    for a, b in zip(mentioned, mentioned[1:]):
+        rules.append((b, a) if _ORDER_REVERSED.search(plain, spots[a], spots[b]) else (a, b))
+    fits = [p for p in itertools.permutations(range(len(groups)))
+            if all(p.index(x) < p.index(y) for x, y in rules)]
+    return fits == [tuple(range(len(groups)))]
+
+
+def _asks_for(action: str, target: str, quote: str, *, stored, names, exclude) -> str:
     """Step 4: the words ask for this action on this target, and any words
-    the action stores are the owner's own."""
+    the action stores are the owner's own. The words that asked for it."""
     spec = ACTIONS[action]
     words = _quote(quote)
-    blocked = [v for v in spec.get("not", ()) if _verb_in(words, v)]
-    if blocked:
-        raise DirectionRefused("words_do_not_ask_for_this",
-                               f"The owner's words say \"{blocked[0]}\", which does not ask for this. Ask the owner "
-                               "to say what they want in their own words.")
-    if not any(_verb_in(words, v) for v in spec["verbs"]):
-        first = spec["verbs"][0].replace("+", " ")
+    kept = [_quote(t) for t in (stored or []) if isinstance(t, str) and t.strip()]
+    # The words an action stores are not the owner asking ("add a rule: never
+    # run the fast tier" does not negate "add"), nor do they name its target
+    # ("rename Grok to Codex main" does not name Codex); nor do other
+    # accounts' longer names.
+    chains = _chains(_without(words, kept))
+    groups, auto_exclude = _names(action, target, names)
+    others = [_quote(e) for e in list(exclude or []) + auto_exclude]
+    verdicts = [(c, _verdict(c, action, target)) for c in chains]
+    asked = [c for c, v in verdicts if v == "ok"]
+    first = _verbs(action, target)[0].replace("+", " ")
+    if not asked:
+        blocked = next((v[4:] for _c, v in verdicts if v and v.startswith("not:")), None)
+        if blocked:
+            raise DirectionRefused("words_do_not_ask_for_this",
+                                   f"The owner's words say \"{blocked}\", which does not ask for this. Ask the owner "
+                                   "to say what they want in their own words.")
+        if any(v == "neg" for _c, v in verdicts):
+            raise DirectionRefused("words_do_not_ask_for_this",
+                                   f"The owner's words say not to {first}. Ask the owner to say what they want in "
+                                   "their own words.")
         raise DirectionRefused("words_do_not_ask_for_this",
                                f"The owner's words do not ask to {first}. Quote the part where the owner asks for "
                                "it, or ask the owner to say it again.")
-    groups, auto_exclude = _names(action, target, names)
-    # Words the action stores never name its target ("rename Grok to Codex
-    # main" does not name Codex), nor do other accounts' longer names.
-    kept = [_quote(t) for t in (stored or []) if isinstance(t, str) and t.strip()]
-    plain = _without(words, kept + [_quote(e) for e in list(exclude or []) + auto_exclude])
-    for group in groups:
-        if not any(_has(plain, n) for n in group if n):
-            shown = next((n for n in group if n and not re.fullmatch(r"[0-9a-f]{12,}", n)), group[0] if group
-                         else target)
-            raise DirectionRefused("words_do_not_ask_for_this",
-                                   f"The words do not name {_title(shown)}. Quote the part where the owner "
-                                   "names it, or ask the owner to say it again.")
+    missing = None
+    for chain in asked:
+        plain = _without(chain["text"], others)
+        gap = next((g for g in groups if not any(_has(plain, n) for n in g if n)), None)
+        if gap is None:
+            if spec["target"] == "accounts" and not _order_ok(plain, groups):
+                raise DirectionRefused("words_do_not_ask_for_this",
+                                       "The owner's words give a different order. Pass the accounts in the order "
+                                       "the owner said them, or ask the owner to say the order again.")
+            break
+        missing = missing or gap
+    else:
+        group = missing or [target]
+        shown = next((n for n in group if n and not re.fullmatch(r"[0-9a-f]{12,}", n)), group[0] if group
+                     else target)
+        raise DirectionRefused("words_do_not_ask_for_this",
+                               f"The words do not name {_title(shown)}. Quote the part where the owner "
+                               "names it, or ask the owner to say it again.")
     for text in [s for s in (stored or []) if isinstance(s, str) and s.strip()]:
         if not _has(words, text):
             raise DirectionRefused("words_do_not_ask_for_this",
                                    f"\"{text.strip()}\" is not in the owner's words. What Khipu keeps must be the owner's "
                                    "own words: use them exactly, or ask the owner to say it again.")
+    return " | ".join([chain["text"]] + kept)
+
+
+# ---- times: a timed change keeps the owner's time ------------------------------------------
+
+_COUNT = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+          "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20,
+          "thirty": 30, "forty five": 45, "forty-five": 45, "ninety": 90}
+_UNIT_S = {"minute": 60, "min": 60, "hour": 3600, "hr": 3600, "day": 86400, "week": 604800}
+_FOR = re.compile(r"(?<!\w)for (?:(?P<half>half an? hour|a half hour)|(?P<n>\d+(?:\.\d+)?|"
+                  + "|".join(re.escape(k) for k in sorted(_COUNT, key=len, reverse=True))
+                  + r")(?P<and_half> and a half)? (?P<unit>minute|min|hour|hr|day|week)s?)(?!\w)")
+_UNTIL = re.compile(r"(?<!\w)(?:until|till|til|'til)\s+"
+                    r"(?:(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<half>am|pm|a\.m\.|p\.m\.)"
+                    r"|(?P<h24>\d{1,2}):(?P<m24>\d{2})|(?P<named>noon|midday|midnight)|(?P<vague>tomorrow))(?!\w)")
+TIME_SLACK_S = 300
+
+
+def word_time(text: str, now: float) -> tuple[str | None, float | None]:
+    """The time the words name, as (the words, the epoch time it resolves
+    to, or None when Khipu can't resolve it); (None, None) when they name
+    none. "For now" and "until I say" name no time."""
+    m = _FOR.search(text)
+    if m:
+        if m.group("half"):
+            return m.group(0), now + 1800
+        n = float(m.group("n")) if m.group("n")[0].isdigit() else float(_COUNT[m.group("n")])
+        if m.group("and_half"):
+            n += 0.5
+        return m.group(0), now + n * _UNIT_S[m.group("unit")]
+    m = _UNTIL.search(text)
+    if not m:
+        return None, None
+    if m.group("vague"):
+        return m.group(0), None
+    if m.group("named"):
+        hour, minute = (0, 0) if m.group("named") == "midnight" else (12, 0)
+    elif m.group("h24"):
+        hour, minute = int(m.group("h24")), int(m.group("m24"))
+    else:
+        hour, minute = int(m.group("h")), int(m.group("m") or 0)
+        if not 1 <= hour <= 12:
+            return m.group(0), None
+        hour = hour % 12 + (12 if m.group("half").startswith("p") else 0)
+    if hour > 23 or minute > 59:
+        return m.group(0), None
+    from datetime import timedelta
+
+    local = datetime.fromtimestamp(now).astimezone()
+    then = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if then <= local:
+        then += timedelta(days=1)
+    return m.group(0), then.timestamp()
+
+
+def _same_time(asked: str, until, now: float) -> None:
+    """A timed change (a pause, a hold, a priority) carries ``--until`` when
+    the owner's words name a time, agreeing with it, and none when they
+    don't: an agent can neither drop the owner's time nor add its own."""
+    said, when = word_time(asked, now)
+    given = str(until).strip() if until is not None else ""
+    if not given:
+        if said:
+            raise DirectionRefused("time_not_the_owners",
+                                   f"The owner said \"{said}\", so pass that time with --until (for example 2h or "
+                                   "an ISO time); without it the change would never end.")
+        return
+    if not said:
+        raise DirectionRefused("time_not_the_owners",
+                               "The owner's words do not name a time, so leave --until out, or ask the owner how "
+                               "long it should last.")
+    if when is None:
+        return
+    from khipu import routing
+
+    try:
+        cmd = routing.parse_until(given, datetime.fromtimestamp(now, timezone.utc)).timestamp()
+    except routing.RouteError:
+        return  # the command itself refuses a time it can't read
+    if abs(cmd - when) > TIME_SLACK_S:
+        raise DirectionRefused("time_not_the_owners",
+                               f"The owner said \"{said}\", which is not the time given with --until. Pass the "
+                               "owner's time.")
 
 
 def _title(name: str) -> str:
@@ -335,14 +626,17 @@ def _title(name: str) -> str:
 
 def check(action: str, target: str, words: str, *, turn_token: str | None = None, stored=None, names=None,
           exclude=None, env=None, now: float | None = None, widening: bool = False, value=None,
-          owner_session: str | None = None) -> dict:
+          owner_session: str | None = None, timed: bool = False, until=None) -> dict:
     """The owner-direction check (scope 2.3 with decision 1). The auth stamp
     for the record, or ``DirectionRefused``; ``AlreadyDone`` with the first
     result when this turn already took this action on this target.
 
     ``owner_session`` (a dispatched job, scope 2.4): the session the job was
     started from, whose turns the words must then be in. Accepted only when
-    a turn of the caller's own session is that session's recorded brief."""
+    a turn of the caller's own session is that session's recorded brief.
+
+    ``timed`` (a pause, a hold, a priority): the change can carry an end,
+    ``until`` (its ``--until``), which must keep the owner's time."""
     if action not in ACTIONS:
         raise DirectionRefused("not_by_direction", "That change can't be made by direction.")
     now = _clock() if now is None else now
@@ -361,11 +655,14 @@ def check(action: str, target: str, words: str, *, turn_token: str | None = None
     turn = _the_turn(session, turn_token, quote, conf, now, short_ok=widening)  # steps 1 to 3
     _from_the_hook(turn, ancestry=via_session is None)
     if widening:  # step 6 (decision 1): a later turn confirms it
-        if _confirms_pending(action, target, value, session, turn, quote, conf, now):
+        if _confirms_pending(action, target, value, session, turn, quote, conf, now,
+                             asks={"stored": stored, "names": names, "exclude": exclude}):
             return _stamp(turn, session, quote, turn_token, confirms=True, via_session=via_session)
         if len(_quote(quote).split()) < MIN_WORDS:
             _verbatim(quote, {"text": ""})
-    _asks_for(action, target, quote, stored=stored, names=names, exclude=exclude)  # step 4
+    asked = _asks_for(action, target, quote, stored=stored, names=names, exclude=exclude)  # step 4
+    if timed:
+        _same_time(asked, until, now)
     done = find_done(session, turn["turn"], action, target)  # step 5
     if done is not None:
         raise AlreadyDone(done.get("result") or {})
@@ -542,21 +839,51 @@ def _note_pending(action, target, value, session, turn, quote, now) -> None:
     _save_pending(rows)
 
 
-def _confirms_pending(action, target, value, session, turn, quote, conf, now) -> bool:
+# A whole turn that is a confirmation, once these trailing words are dropped
+# ("yes do it now", "Yes please, thanks").
+_POLITE = re.compile(r"(?:\s+(?:please|now|thanks|thank you|ok|okay))+$")
+
+
+def _whole_turn_confirm(quote: str, turn: dict) -> bool:
+    q = _quote(quote)
+    return q == _quote(turn.get("text") or "") and _POLITE.sub("", q).strip(_EDGE) in WHOLE_TURN_CONFIRMS
+
+
+def _confirms_pending(action, target, value, session, turn, quote, conf, now, *, asks: dict) -> bool:
+    """Whether this turn confirms the widening it was asked about: the very
+    next owner turn after the one that asked for it, with that widening the
+    only one noted between the two turns, and words that are a whole-turn
+    confirmation or a confirmation that itself asks for this change."""
     words = _quote(quote)
     if not any(_has(words, w) for w in CONFIRM_WORDS):
         return False
+    usable = [t for t in owner_turns.turns(session, now) if owner_turns.eligible(t, conf)[0]]
+    at = next((i for i, t in enumerate(usable) if t.get("turn") == turn["turn"]), None)
+    if not at:
+        return False
+    asked_in = usable[at - 1]
+    since, until = float(asked_in.get("ts") or 0), float(turn.get("ts") or 0)
     rows = _pending()
-    for p in rows:
-        if (p.get("session"), p.get("action"), p.get("target"), p.get("value")) != (session, action, target, value):
-            continue
-        if p.get("turn") == turn["turn"] or float(turn.get("ts") or 0) <= float(p.get("turn_ts") or 0):
-            continue
-        if now - float(p.get("turn_ts") or 0) > conf["earlier_window_min"] * 60:
-            continue
-        _save_pending([r for r in rows if r is not p])
-        return True
-    return False
+    waiting = [p for p in rows if p.get("session") == session and since <= float(p.get("ts") or 0) <= until]
+    if len(waiting) > 1:
+        raise DirectionRefused("needs_second_turn",
+                               "More than one change is waiting for the owner's yes, so a yes can't say which. Ask "
+                               "the owner to confirm in words that name the change.")
+    if not waiting:
+        return False
+    p = waiting[0]
+    if p.get("turn") != asked_in.get("turn") or (p.get("action"), p.get("target"), p.get("value")) != (
+            action, target, value):
+        return False
+    if now - since > conf["earlier_window_min"] * 60:
+        return False
+    if not _whole_turn_confirm(quote, turn):
+        try:
+            _asks_for(action, target, quote, **asks)
+        except DirectionRefused:
+            return False
+    _save_pending([r for r in rows if r is not p])
+    return True
 
 
 # ---- the owner-actions log -------------------------------------------------------------------
@@ -782,10 +1109,11 @@ _PENDING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_ow
 
 
 def intent(action: str, target: str, *, stored=None, names=None, exclude=None, widening: bool = False,
-           value=None, facts: dict | None = None) -> dict:
-    """What an owner command is about to do, for the check and the log."""
+           value=None, facts: dict | None = None, timed: bool = False, until=None) -> dict:
+    """What an owner command is about to do, for the check and the log.
+    ``timed``: the command can carry an end, ``until`` as it was given."""
     return {"action": action, "target": str(target), "stored": stored, "names": names, "exclude": exclude,
-            "widening": widening, "value": value, "facts": dict(facts or {})}
+            "widening": widening, "value": value, "facts": dict(facts or {}), "timed": timed, "until": until}
 
 
 def gate(args, want: dict | None, *, env=None, now: float | None = None) -> dict:
@@ -799,7 +1127,8 @@ def gate(args, want: dict | None, *, env=None, now: float | None = None) -> dict
     stamp = check(want["action"], want["target"], getattr(args, "owner_words", None) or "",
                   turn_token=getattr(args, "owner_turn", None), stored=want.get("stored"), names=want.get("names"),
                   exclude=want.get("exclude"), env=env, now=now, widening=bool(want.get("widening")),
-                  value=want.get("value"), owner_session=getattr(args, "owner_session", None))
+                  value=want.get("value"), owner_session=getattr(args, "owner_session", None),
+                  timed=bool(want.get("timed")), until=want.get("until"))
     before = _before(want)
     if before is _UNREADABLE:
         raise DirectionRefused("before_unreadable",
