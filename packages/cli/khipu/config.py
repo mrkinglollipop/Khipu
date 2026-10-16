@@ -16,6 +16,8 @@ Modes:
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import os
 import re
@@ -419,20 +421,94 @@ def set_graph_backup_remote(value: "str | None") -> Path:
     return save_config(data)
 
 
-def set_usage_accounts(raw: "str | list | None") -> Path:
+CONFIG_LOCK_NAME = ".config.lock"
+# What a version of the account list is made of: the list, "Read no
+# accounts", and a conversation's request still waiting for the owner.
+_ACCOUNT_STATE_KEYS = ("usage_accounts", "usage_accounts_none", "usage_accounts_request")
+
+
+@contextlib.contextmanager
+def config_write_lock():
+    """One read-compare-write of config.json at a time across processes
+    (flock; released if the holder dies). Every compare-and-swap write holds
+    it from its read to its save."""
+    import fcntl  # here, not at the top: config is imported where fcntl isn't (the Windows lock backend)
+
+    path = config_file().with_name(CONFIG_LOCK_NAME)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def accounts_version(data: dict | None = None) -> str:
+    """The version of the stored account list: a short digest of what
+    ``_ACCOUNT_STATE_KEYS`` hold. A write that carries the version it read
+    (``expect``) is refused once it moved."""
+    data = load_config() if data is None else data
+    body = {k: data.get(k) for k in _ACCOUNT_STATE_KEYS}
+    text = json.dumps(body, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return "a" + hashlib.sha256(text.encode("ascii")).hexdigest()[:16]
+
+
+def check_accounts_version(data: dict, expect: "str | None") -> None:
+    """Refuse (``AccountsError`` ``version_moved``) when ``expect`` is given
+    and the stored list is no longer the one it names."""
+    from khipu.usage import AccountsError
+
+    if expect is not None and str(expect).strip() != accounts_version(data):
+        raise AccountsError("the account list changed after it was read; read it again and redo the change",
+                            "version_moved")
+
+
+def set_usage_accounts(raw: "str | list | None", *, expect: "str | None" = None,
+                       request: "dict | None" = None) -> Path:
     """Store ``usage_accounts``, the accounts ``khipu usage`` reads (JSON text
     or a list of ``{label, harness, home?}``, checked by
-    ``khipu.usage.parse_usage_accounts``). None or an empty list removes the
-    key: every installed CLI with its default login."""
-    from khipu.usage import parse_usage_accounts
+    ``khipu.usage.parse_usage_accounts`` against the list stored now, so an
+    untouched entry is never dropped). None or an empty list removes the
+    key: every installed CLI with its default login. ``expect`` is the
+    version the writer read (``accounts_version``); a write is refused when
+    the stored one moved. ``request`` marks the write as a conversation's at
+    the owner's request (kept, with the list it replaced, until the owner
+    confirms or undoes it); an owner's write ends any such request."""
+    from khipu import accounts
+    from khipu.usage import AccountsError, parse_usage_accounts
 
-    entries = [] if raw is None else parse_usage_accounts(raw)
-    data = _load_config_for_mutation()
-    if entries:
-        data["usage_accounts"] = entries
-    else:
-        data.pop("usage_accounts", None)
-    return save_config(data)
+    with config_write_lock():
+        data = _load_config_for_mutation()
+        check_accounts_version(data, expect)
+        if request is not None and isinstance(data.get("usage_accounts_request"), dict):
+            raise AccountsError("a conversation's change to the account list is still waiting for the owner; "
+                                "he confirms or undoes it in Settings first", "request_waiting")
+        previous = data.get("usage_accounts") if isinstance(data.get("usage_accounts"), list) else None
+        entries = [] if raw is None else parse_usage_accounts(raw, previous=previous)
+        # Lanes name accounts by key before any label in the list changes.
+        accounts.convert_lanes(data, accounts.known_of(accounts.current_list(data)[1]))
+        if request is not None:
+            data["usage_accounts_request"] = dict(request, prior=previous, prior_none=data.get("usage_accounts_none"))
+        else:
+            data.pop("usage_accounts_request", None)
+        if entries:
+            data["usage_accounts"] = entries
+        else:
+            data.pop("usage_accounts", None)
+        data.pop("usage_accounts_none", None)
+        return save_config(data)
+
+
+AUTO_TRACK_KEY = "usage_auto_track"
+
+
+def auto_track() -> bool:
+    """Whether found accounts a conversation used are tracked without asking
+    (settings clarity phase 9; per Mac, off by default)."""
+    return load_config().get(AUTO_TRACK_KEY) is True
 
 
 # ---------------------------------------------------------------------------

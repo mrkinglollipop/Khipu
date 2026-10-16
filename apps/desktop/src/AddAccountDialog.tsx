@@ -68,6 +68,10 @@ export function AccountsDialog({
   const giveBack = useRef<HTMLElement | null>(null);
   const returnFocus = () => {
     const el = giveBack.current;
+    // A control that closed the dialog to move on (an Edit link) has already
+    // put focus where it belongs; only a focus left on nothing goes back.
+    const now = document.activeElement;
+    if (now && now !== document.body && now !== el && !body.current?.contains(now)) return true;
     if (el && el.isConnected) el.focus();
     return el != null && document.activeElement === el;
   };

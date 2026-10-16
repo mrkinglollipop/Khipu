@@ -5,19 +5,15 @@
    Khipu finds each CLI (`cli_path.<cli>`, `node_folder`), and the account
    writes.
 
-   The writes that need slice 9B (`khipu accounts ...`: track, rename, stop,
-   move, decline, offer again, the automatic-tracking switch) are typed here
-   with 9B's own argument names and return shapes. Whether this build has
-   them is read at run time (`khipu_accounts_status`): a missing command means
-   "not here yet", and the control that needs it shows disabled with words
-   saying so. Track and Sign in now fall back to the save path the Plans
-   card's account list uses (`khipu_config_set usage_accounts`) until 9B is
-   here. */
+   Every account write is slice 9B's (`khipu accounts ...`: track, rename,
+   stop, move, decline, offer again, the automatic-tracking switch), each
+   carrying the version of the list it read (`khipu accounts status`). Track
+   and Sign in now save through `khipu_accounts_track`, the one save path; no
+   surface here writes `usage_accounts` any other way. */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { callCli } from "./settingsCli";
 import type { CliResult } from "./settingsCli";
-import { accountClash, accountsRefusal } from "./PlansCard";
 import type { UsageAccount, UsageAccountEntry } from "./PlansCard";
 
 // ---------------------------------------------------------------------------
@@ -340,19 +336,14 @@ export function normalDiscover(d: DiscoverResult | null | undefined): DiscoverRe
 }
 
 // ---------------------------------------------------------------------------
-// Whether this build has 9B's account commands
+// The account list as 9B reads it (`khipu accounts status`): every write
+// carries its `version`
 // ---------------------------------------------------------------------------
 
 export type Support =
   | { state: "reading" }
-  | { state: "absent" }
   | { state: "here"; status: AccountsStatus9B }
   | { state: "error"; error: string };
-
-/** A command this build of the app doesn't have (Tauri: "Command x not found"). */
-export function isMissingCommand(error: string): boolean {
-  return /not found|unknown command|no such command/i.test(error);
-}
 
 function shaped9B(d: unknown): d is AccountsStatus9B {
   const s = d as AccountsStatus9B | null;
@@ -361,8 +352,8 @@ function shaped9B(d: unknown): d is AccountsStatus9B {
 
 export async function readSupport(): Promise<Support> {
   const res = await callCli<AccountsStatus9B>("khipu_accounts_status");
-  if (res.ok) return shaped9B(res.data) ? { state: "here", status: res.data } : { state: "absent" };
-  return isMissingCommand(res.error) ? { state: "absent" } : { state: "error", error: res.error };
+  if (res.ok) return shaped9B(res.data) ? { state: "here", status: res.data } : { state: "error", error: "unreadable account status" };
+  return { state: "error", error: res.error };
 }
 
 export function useAccountsSupport(active: boolean) {
@@ -380,22 +371,21 @@ export function useAccountsSupport(active: boolean) {
   return { support, reload };
 }
 
-/** Words for a control that needs a later update, by what it does. */
+/** Words for a control that needs a later update (slice 9D), by what it does. */
 export const COMING = {
-  rename: "Rename comes in a later update.",
-  stop: "Stop tracking comes in a later update.",
-  decline: "Not this one comes in a later update.",
-  offerAgain: "Offer again comes in a later update.",
-  autoTrack: "Tracking new accounts automatically comes in a later update.",
-  move: "Moving an account to its new folder comes in a later update.",
   signInNew: "Signing in to another account from Khipu comes in a later update.",
   codeSignIn: "Signing in with a code comes in a later update; sign in from the program itself for now.",
-  notOffered: "The list of logins you said no to comes in a later update.",
 } as const;
 
 // ---------------------------------------------------------------------------
 // Discovery as a hook
 // ---------------------------------------------------------------------------
+
+/** A Check answers for one folder and may leave out where each CLI is; the
+ *  last full run's `clis` stay until the next run reads them again. */
+function withClis(d: DiscoverResult, prev: DiscoverResult | null): DiscoverResult {
+  return d.clis || !prev?.clis ? d : { ...d, clis: prev.clis };
+}
 
 /** Discovery for a screen: one run when `active` turns on and every
  *  `intervalMs` after (Home: 6 hours), Look for accounts now, and the owner's
@@ -429,11 +419,11 @@ export function useDiscovery(active: boolean, intervalMs?: number) {
       if (!res.ok) {
         console.error("khipu usage --discover --check failed:", res.error);
         const d = normalDiscover(res.refusal as DiscoverResult | undefined);
-        if (d && d.candidates.length) setData(d);
+        if (d && d.candidates.length) setData((prev) => withClis(d, prev));
         return { ok: false as const, error: (d?.check?.error ?? null) as string | null };
       }
       const d = normalDiscover(res.data);
-      if (d) setData(d);
+      if (d) setData((prev) => withClis(d, prev));
       return d?.check?.ok ? { ok: true as const, candidate: d.check.candidate ?? null } : { ok: false as const, error: d?.check?.error ?? null };
     } finally {
       setChecking(null);
@@ -502,78 +492,43 @@ export function trackRefusalWords(code: string, entry: NewAccount, other?: strin
   }
 }
 
-function storableOf(list: UsageAccountEntry[]): Array<{ label: string; harness: string; home?: string }> {
-  return list
-    .filter((e) => !e.invalid)
-    .map((e) => (e.home ? { label: e.label, harness: e.harness, home: e.home } : { label: e.label, harness: e.harness }));
-}
-
-/** Saves one new account. With 9B: `khipu_accounts_track` (the defaults the
- *  app showed are written out first when no list is saved). Without it: the
- *  Plans card's own save, `khipu_config_set usage_accounts` with the list
- *  shown (the defaults written out first) plus the new account. Nothing else
- *  runs when the save is refused. */
+/** Saves one new account through 9B's one save path, `khipu_accounts_track`
+ *  (the defaults the app showed are written out first when no list is
+ *  saved). The CLI keeps every stored entry, a hand-edited invalid one too;
+ *  only the new entry is sent. Nothing else runs when the save is refused. */
 export async function saveNewAccount(
   entry: NewAccount,
   support: Support,
   shownDefaults: UsageAccountEntry[] | null,
 ): Promise<SaveOutcome> {
-  if (support.state === "here") {
-    const st = support.status;
-    const args: Record<string, unknown> = {
-      entries: [{ harness: entry.harness, home: entry.home, label: entry.label }],
-      expect: st.version,
-    };
-    if (st.value == null && !st.none) {
-      args.shownDefaults = (shownDefaults ?? st.accounts)
-        .filter((e) => !e.invalid)
-        .map((e) => ({ harness: e.harness, home: e.home ?? null, label: e.label }));
-    }
-    const res = await callCli<TrackResult9B>("khipu_accounts_track", args);
-    if (!res.ok) {
-      console.error("khipu accounts track refused:", res.error);
-      const r = res.refusal ?? {};
-      const code = typeof r.code === "string" ? r.code : "";
-      const otherIdx = typeof r.other === "number" ? r.other : null;
-      const other = otherIdx != null ? (st.accounts[otherIdx]?.label ?? null) : null;
-      return { ok: false, problem: trackRefusalWords(code, entry, other) };
-    }
-    const added = res.data.accounts?.[0];
-    const key = added?.key ?? null;
-    const home = key ? key.slice(key.indexOf("|") + 1) || null : entry.home;
-    return { ok: true, harness: entry.harness, home, label: added?.label ?? entry.label, key };
-  }
-  // main: the Plans card's save path.
-  const cfg = await callCli<{ usage_accounts?: ConfigAccounts }>("khipu_config_show");
-  const status = cfg.ok ? cfg.data.usage_accounts : undefined;
-  if (!status || !Array.isArray(status.accounts)) {
-    if (!cfg.ok) console.error("khipu config failed:", cfg.error);
+  const known = support.state === "here" ? support : await readSupport();
+  if (known.state !== "here") {
+    if (known.state === "error") console.error("khipu accounts status failed:", known.error);
     return { ok: false, problem: { code: "not_read", field: null, message: "Khipu couldn't read the account list, so nothing was saved. Try again in a minute." } };
   }
-  const base = status.source === "file" ? status.accounts : (shownDefaults ?? status.accounts);
-  const clash = accountClash(base, { label: entry.label, harness: entry.harness, home: entry.home }, status.user_home);
-  if (clash) {
-    const taken = clash.field === "home";
-    const other = taken
-      ? base.find((e) => !e.invalid && e.harness === entry.harness && (e.home ?? "") === (entry.home ?? ""))?.label ?? null
-      : null;
-    return {
-      ok: false,
-      problem: taken
-        ? trackRefusalWords("login_taken", entry, other)
-        : { code: "name_taken", field: "name", message: clash.message },
-    };
+  const st = known.status;
+  const args: Record<string, unknown> = {
+    entries: [{ harness: entry.harness, home: entry.home, label: entry.label }],
+    expect: st.version,
+  };
+  if (st.value == null && !st.none) {
+    args.shownDefaults = (shownDefaults ?? st.accounts)
+      .filter((e) => !e.invalid)
+      .map((e) => ({ harness: e.harness, home: e.home ?? null, label: e.label }));
   }
-  const list = [...storableOf(base), entry.home ? { label: entry.label, harness: entry.harness, home: entry.home } : { label: entry.label, harness: entry.harness }];
-  const res = await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list) });
+  const res = await callCli<TrackResult9B>("khipu_accounts_track", args);
   if (!res.ok) {
-    const problem = accountsRefusal(res, list, list.length - 1);
+    console.error("khipu accounts track refused:", res.error);
     const r = res.refusal ?? {};
-    const code = typeof r.code === "string" ? r.code : "not_saved";
+    const code = typeof r.code === "string" ? r.code : "";
     const otherIdx = typeof r.other === "number" ? r.other : null;
-    return { ok: false, problem: { code, field: problem.field, message: problem.message, other: otherIdx != null ? list[otherIdx]?.label ?? null : null } };
+    const other = otherIdx != null ? (st.accounts[otherIdx]?.label ?? null) : null;
+    return { ok: false, problem: trackRefusalWords(code, entry, other) };
   }
-  return { ok: true, harness: entry.harness, home: entry.home, label: entry.label, key: `${entry.harness}|${entry.home ?? ""}` };
+  const added = res.data.accounts?.[0];
+  const key = added?.key ?? null;
+  const home = key ? key.slice(key.indexOf("|") + 1) || null : entry.home;
+  return { ok: true, harness: entry.harness, home, label: added?.label ?? entry.label, key };
 }
 
 export type SignInNowOutcome =

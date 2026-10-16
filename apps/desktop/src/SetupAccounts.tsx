@@ -10,7 +10,9 @@
    nothing, and a change made elsewhere while setup is open (an account
    renamed, removed or added) is kept. Skip for now writes nothing. The
    writes are the ones Settings makes: `config --set usage_accounts`,
-   `route priority set` and the `routing_push` feature switch. */
+   `route priority set` and the `routing_push` feature switch. The first two
+   carry the version they read, so a change saved elsewhere between that read
+   and the write is refused, never overwritten. */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
@@ -34,7 +36,14 @@ import { AddAccountDialog } from "./AddAccountDialog";
 import { AutoTrackSwitch, addQuietLogins } from "./FoundAccounts";
 import { signInOutcome } from "./PlansCard";
 
-type AccountsStatus = { source: "file" | "default" | "none"; accounts: UsageAccountEntry[]; user_home?: string | null };
+/** `version` names the list as read: a save carries it (`expect`) and is
+ *  refused (`version_moved`) when the list changed after it was read. */
+type AccountsStatus = {
+  source: "file" | "default" | "none";
+  accounts: UsageAccountEntry[];
+  user_home?: string | null;
+  version?: string | null;
+};
 
 /** A login discovery found that Khipu doesn't track yet, as a plan row the
  *  step can list and tick (phase 9): signed in starts ticked, the rest off. */
@@ -362,7 +371,19 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
   }
   const convertedHere = useRef(false);
   const listPlan = status && readOps.size ? planAccountList(status, readOps, found) : null;
-  const listWrite = status && readOps.size ? planListWrite(status, readOps, found, startList.current, convertedHere.current) : null;
+  // Ticked found logins are saved by Track (`khipu_accounts_track`, the one
+  // save path); the list write covers only the accounts Khipu already reads.
+  const foundIds = useMemo(() => new Set(extra.map((r) => accountId(r.harness, r.home, userHome))), [extra, userHome]);
+  const listOps = useMemo(() => new Map([...readOps].filter(([id]) => !foundIds.has(id))), [readOps, foundIds]);
+  const trackRows = (st: AccountsStatus) => {
+    const listed = planAccountList(st, listOps, found).ids;
+    return extra.filter((r) => {
+      const id = accountId(r.harness, r.home, st.user_home ?? null);
+      return readOps.get(id) === true && !listed.has(id);
+    });
+  };
+  const listWrite = status && readOps.size ? planListWrite(status, listOps, found, startList.current, convertedHere.current) : null;
+  const trackWrite = status ? trackRows(status).map((r) => r.found.id) : [];
 
   const held = route.data?.priority ?? null;
   const visible = visibleRows(status, readOps, found);
@@ -378,9 +399,29 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
 
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Set when a save was refused because what it read changed meanwhile: the
+  // error then offers Reload, which reads both again.
+  const [moved, setMoved] = useState(false);
+  const [reloading, setReloading] = useState(false);
   useEffect(() => {
-    if (!active) setErr(null);
+    if (!active) {
+      setErr(null);
+      setMoved(false);
+    }
   }, [active]);
+
+  async function reload() {
+    setReloading(true);
+    try {
+      const [c, r] = await Promise.all([cfg.read(), route.read()]);
+      if (c.ok && r.ok) {
+        setErr(null);
+        setMoved(false);
+      }
+    } finally {
+      setReloading(false);
+    }
+  }
 
   const move = (i: number, by: -1 | 1) => {
     const key = order[i];
@@ -416,10 +457,12 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
   async function next() {
     setSaving(true);
     setErr(null);
+    setMoved(false);
     // What the screen promised when Next was pressed: the help line's list
     // and the order shown. A fresh read that gives a different plan writes
     // nothing; the screen then shows the new plan and Next is pressed again.
     const promisedList = listWrite;
+    const promisedTrack = trackWrite;
     const promisedOrder = order;
     const done: string[] = [];
     let advanced = false;
@@ -427,6 +470,15 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
       setErr(
         `${done.length ? `Khipu saved ${listOf(done)}, but` : "Khipu"} couldn't ${cant}. Try Next again, or Skip for now and change it later in Settings.`,
       );
+    const refusedAsMoved = (res: { refusal?: Record<string, unknown> }, what: string): boolean => {
+      if (res.refusal?.code !== "version_moved") return false;
+      setErr(
+        `${done.length ? `Khipu saved ${listOf(done)}, but ` : ""}${what} was changed somewhere else after setup read it, ` +
+          "so Khipu didn't save over it. Reload to see what is saved now, then press Next again.",
+      );
+      setMoved(true);
+      return true;
+    };
     const changedElsewhere = (what: string) =>
       setErr(
         `${done.length ? `Khipu saved ${listOf(done)}. ` : ""}${what} changed while setup was open, so Khipu saved nothing more. ` +
@@ -443,17 +495,19 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
           say("read the account list, so which accounts to read was not saved");
           return;
         }
-        const plan = planListWrite(fresh, readOps, found, startList.current, convertedHere.current);
-        if (!sameWrite(plan, promisedList)) {
+        const plan = planListWrite(fresh, listOps, found, startList.current, convertedHere.current);
+        const toTrack = trackRows(fresh);
+        if (!sameWrite(plan, promisedList) || JSON.stringify(toTrack.map((r) => r.found.id)) !== JSON.stringify(promisedTrack)) {
           changedElsewhere("The account list");
           return;
         }
         if (plan.kind !== "none") {
           const res =
             plan.kind === "unset"
-              ? await callCli("khipu_config_unset", { key: "usage_accounts" })
-              : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(plan.list) });
+              ? await callCli("khipu_config_unset", { key: "usage_accounts", expect: fresh.version ?? null })
+              : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(plan.list), expect: fresh.version ?? null });
           if (!res.ok) {
+            if (refusedAsMoved(res, "the account list")) return;
             console.error("khipu config usage_accounts failed:", res.error);
             say("save which accounts to read");
             return;
@@ -473,6 +527,26 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
           listNow = back;
         } else {
           listNow = fresh;
+        }
+        if (toTrack.length) {
+          const st = listNow ?? fresh;
+          const args: Record<string, unknown> = {
+            entries: toTrack.map((r) => ({ harness: r.harness, home: r.home ?? null, label: r.account || cliTitle(r.harness) })),
+            expect: st.version ?? "",
+          };
+          if (st.source === "default") {
+            args.shownDefaults = st.accounts.filter((e) => !e.invalid).map((e) => ({ harness: e.harness, home: null, label: e.label }));
+          }
+          const res = await callCli("khipu_accounts_track", args);
+          if (!res.ok) {
+            if (refusedAsMoved(res, "the account list")) return;
+            console.error("khipu accounts track failed:", res.error);
+            say(`track ${listOf(toTrack.map((r) => r.account || cliTitle(r.harness)))}`);
+            return;
+          }
+          done.push(listOf(toTrack.map((r) => r.account || cliTitle(r.harness))));
+          const after = await cfg.read();
+          listNow = after.ok ? after.data.usage_accounts ?? listNow : listNow;
         }
       }
       if (moves.length) {
@@ -495,8 +569,14 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
         }
         const plan = planPriority(r.data.priority ?? null, vis, moves, uh);
         if (plan) {
-          const res = await callCli("khipu_route_priority", { action: "set", entries: plan.entries, until: plan.until });
+          const res = await callCli("khipu_route_priority", {
+            action: "set",
+            entries: plan.entries,
+            until: plan.until,
+            expect: r.data.priority?.version ?? r.data.priority_version ?? null,
+          });
           if (!res.ok) {
+            if (refusedAsMoved(res, "your order")) return;
             console.error("khipu route priority failed:", res.error);
             say("save the order");
             return;
@@ -518,7 +598,7 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
       }
       // A found login left unticked stays in Settings only, never on Home
       // (decision 12).
-      addQuietLogins(extra.filter((r) => !isChecked(r)).map((r) => r.found.id));
+      addQuietLogins(extra.filter((r) => !isChecked(r)).map((r) => r.found));
       if (tell != null) {
         const f = await features.read();
         const sw = f.ok ? f.data.features?.routing_push : undefined;
@@ -684,8 +764,8 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
             <p className="set-help" role="status">
               {listWrite.kind === "unset"
                 ? "Next goes back to reading every account Khipu finds on this Mac."
-                : listWrite.kind === "set"
-                  ? `Next saves the account list as: ${listOf(listWrite.list.map((e) => e.label))}.`
+                : listWrite.kind === "set" || trackWrite.length
+                  ? `Next saves the account list as: ${listOf(listPlan.list.map((e) => e.label))}.`
                   : listPlan.list.length === 0
                     ? "With none chosen, Next leaves the account list as it is saved."
                     : "The account list is already saved this way."}
@@ -805,7 +885,17 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
             void disc.run(false);
           }} />
       ) : null}
-      {err ? <p className="set-error" role="alert">{err}</p> : null}
+      {err ? (
+        <div className="set-error" role="alert">
+          <p>{err}</p>
+          {moved ? (
+            <button type="button" className="sm" onClick={() => void reload()} disabled={reloading || saving} aria-busy={reloading || undefined}>
+              {reloading ? <Loader2 size={14} className="spin" aria-hidden /> : null}
+              Reload
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="toolbar welcome-nav">
         <button type="button" onClick={onBack} disabled={saving}>

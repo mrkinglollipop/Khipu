@@ -38,6 +38,7 @@ import os
 import re
 import select
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -104,6 +105,8 @@ E_CLI = "cli_error"
 E_INVALID = "invalid_account"
 E_INTERNAL = "internal_error"
 E_PENDING = "pending"
+E_NO_FOLDER = "login_folder_missing"
+NO_FOLDER_NOTE = "Khipu can't find this account's login folder on this Mac"
 # The CLIs by the names the app's form gives them.
 CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok Build", "muse": "Muse"}
 # Plain words only: the app shows notes as written to an owner who is not
@@ -141,6 +144,8 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return f"{name} could not be started"
     if code == E_INVALID:
         return "This account entry is not valid"
+    if code == E_NO_FOLDER:
+        return NO_FOLDER_NOTE
     if code == E_INTERNAL:
         return "Khipu could not run the check"
     return None
@@ -187,6 +192,16 @@ def _home_path(home: str) -> Path | None:
         return Path(home).expanduser()
     except RuntimeError:
         return None
+
+
+def _login_folder_there(home: str) -> bool:
+    """Whether ``home`` is a folder: a stat of the folder itself (a symlink
+    to a folder counts), never a look inside it."""
+    path = _home_path(home)
+    try:
+        return path is not None and stat.S_ISDIR(os.stat(path).st_mode)
+    except (OSError, ValueError):
+        return False
 
 
 def _probe_path(inherited: str | None, binary: str | None) -> str:
@@ -875,24 +890,117 @@ def _account_from_entry(entry) -> dict:
     return account
 
 
+def reads_none(config: dict | None = None) -> bool:
+    """The owner's "Read no accounts" (``usage_accounts_none``, settings
+    clarity decision 14): stored apart from an unset list, which reads every
+    installed CLI's default login instead."""
+    if config is None:
+        from khipu.config import load_config
+
+        config = load_config()
+    raw = config.get("usage_accounts")
+    return config.get("usage_accounts_none") is True and not (isinstance(raw, list) and raw)
+
+
 def configured_accounts() -> list[dict]:
     """Config ``usage_accounts`` (``[{label, harness, home?}]``), or by default
-    every installed CLI with its default home. Invalid entries come back with
-    an ``invalid`` reason so the report shows them instead of hiding them."""
+    every installed CLI with its default home, or none after the owner chose
+    "Read no accounts". Invalid entries come back with an ``invalid`` reason
+    so the report shows them instead of hiding them."""
     from khipu.config import load_config
 
-    raw = load_config().get("usage_accounts")
+    config = load_config()
+    raw = config.get("usage_accounts")
     if not isinstance(raw, list) or not raw:
+        if reads_none(config):
+            return []
         return [{"label": LABELS[h], "harness": h, "home": None} for h in HARNESSES if _command(h)]
     return [_account_from_entry(entry) for entry in raw]
 
 
-def parse_usage_accounts(raw) -> list[dict]:
+def default_login(harness: str) -> Path | None:
+    """The CLI's own default login folder (``~/.claude``, ``~/.codex``,
+    ``~/.grok``); None for Muse, which has one sign-in and no folder."""
+    if harness not in _HOME_VARS:
+        return None
+    raw = os.environ.get("HOME")
+    return (Path(raw) if raw else Path.home()) / f".{harness}"
+
+
+def login_identity(account: dict) -> str:
+    """The real folder an account reads, as ``claude_homes.path_identity``
+    gives it (the inode when the folder exists, else the resolved path), so
+    a symlink, a trailing slash, ``..`` or ``~`` against the full path all
+    name one login. A home-less account stands for its CLI's default folder;
+    Muse is one login."""
+    from khipu import claude_homes
+
+    harness = account.get("harness")
+    if harness == "muse":
+        return "muse|"
+    home = account.get("home")
+    path = _home_path(home) if home else default_login(harness)
+    if path is None:
+        return f"{harness}|{home}"
+    ident = claude_homes.path_identity(path)
+    return f"{harness}|" + ":".join(str(part) for part in ident)
+
+
+# Names an account may not take (settings clarity, section 5): a CLI's bare
+# name belongs to its default login, whose bare word conversations use.
+NAME_CODES = {"name_has_bar": "a name can't hold |", "name_is_cli": "that name is a CLI's own name",
+              "name_is_id": "that name is another account's id"}
+
+
+def _name_problem(label: str, harness: str, home: str | None, ids: set[str]) -> tuple[str, str] | None:
+    if "|" in label:
+        return "name_has_bar", f"the name {label!r} holds |, which Khipu uses between a CLI and its folder"
+    word = label.casefold()
+    if word in HARNESSES and not (word == harness and not home):
+        return "name_is_cli", (f"{label!r} is the name of a CLI; only that CLI's own default login is called "
+                               f"{LABELS.get(word, word)}")
+    if label in ids:
+        return "name_is_id", f"{label!r} is another account's id"
+    return None
+
+
+def account_id_of(account: dict) -> str:
+    from khipu.routing import account_id
+
+    return account_id(_key(account))
+
+
+def _account_ids(entries: list) -> set[str]:
+    """The ids ``khipu_route`` gives these entries' accounts (a name may not
+    equal one, or a conversation naming the id would reach the wrong one)."""
+    out = set()
+    for entry in entries:
+        if isinstance(entry, dict):
+            account = _account_from_entry(entry)
+            if not account.get("invalid"):
+                out.add(account_id_of(account))
+    return out
+
+
+def _same_entry(a, b) -> bool:
+    def norm(e):
+        return {k: (e.get(k).strip() if isinstance(e.get(k), str) else e.get(k)) for k in _ACCOUNT_FIELDS
+                if e.get(k) not in (None, "")}
+    return isinstance(a, dict) and isinstance(b, dict) and norm(a) == norm(b)
+
+
+def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
     """``raw`` (JSON text or a list) as the ``usage_accounts`` entries to store,
     or ``AccountsError`` (a ValueError) naming the first problem with a fixed
     code. Stricter than ``configured_accounts``, which shows a hand-edited bad
     entry rather than refusing it: ``khipu config --set usage_accounts``
-    stores only entries that can be probed, each login once, each label once."""
+    stores only entries that can be probed, each real login folder once, each
+    name once (ignoring case), names by the naming rules (``NAME_CODES``).
+
+    ``previous`` is the list stored now: an entry kept exactly as it is stored
+    there is kept even when it breaks a rule (a hand-edited relative folder,
+    an unknown CLI, an older name), so no save drops an entry the owner has
+    not touched. Only new or changed entries are refused."""
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
@@ -903,11 +1011,23 @@ def parse_usage_accounts(raw) -> list[dict]:
         raise AccountsError('usage_accounts must be a list of {"label", "harness", "home"} entries', "bad_list")
     if len(raw) > ACCOUNTS_MAX:
         raise AccountsError(f"usage_accounts holds at most {ACCOUNTS_MAX} entries, got {len(raw)}", "too_many")
+    kept = [e for e in (previous or []) if isinstance(e, dict)]
+    # Ids all start "acct-" (``routing.account_id``): only a name that does
+    # needs them worked out (which makes this install's id secret).
+    ids = _account_ids(raw) if any(isinstance(e, dict) and str(e.get("label") or "").strip().startswith("acct-")
+                                   for e in raw) else set()
     out: list[dict] = []
-    labels: dict[str, int] = {}
-    logins: dict[str, int] = {}
+    # (account, kept) per entry: every entry is checked against every other
+    # for its name and its real folder after the per-entry rules, kept ones
+    # too, so a rename, a move or a repeated entry cannot reach a later one.
+    checked: list[tuple[dict, bool]] = []
     for i, entry in enumerate(raw):
         where = f"usage_accounts entry {i + 1}"
+        if any(_same_entry(entry, old) for old in kept):
+            # Stored as it is: kept whatever per-entry rule it breaks today.
+            checked.append((_account_from_entry(entry), True))
+            out.append(dict(entry))
+            continue
         if not isinstance(entry, dict):
             raise AccountsError(f"{where} is not an object", "bad_entry", index=i)
         extra = sorted(str(k) for k in entry if k not in _ACCOUNT_FIELDS)
@@ -934,20 +1054,54 @@ def parse_usage_accounts(raw) -> list[dict]:
             code, field, reason = problem
             raise AccountsError(f"{where}: {reason}", code, index=i, field=field)
         account = _account_from_entry(entry)
-        name = account["label"].casefold()
-        if name in labels:
-            raise AccountsError(f"two usage_accounts entries are named {account['label']!r}", "name_taken",
-                                index=i, field="label", other=labels[name])
-        key = _key(account)
-        if key in logins:
-            raise AccountsError(f"{where} ({account['label']}) reads the same login as an earlier entry",
-                                "login_taken", index=i, field="home", other=logins[key])
-        labels[name] = i
-        logins[key] = i
+        checked.append((account, False))
         stored = {"label": account["label"], "harness": account["harness"]}
         if account["home"]:
             stored["home"] = account["home"]
         out.append(stored)
+    def marks(account: dict) -> tuple[str, str | None]:
+        return account["label"].casefold(), None if account.get("invalid") else login_identity(account)
+
+    # A clash the stored list already holds between entries kept as they are
+    # (a hand-edited list) is left for the owner to fix; no save adds one.
+    before: dict[tuple[str, str | None], int] = {}
+    for old in kept:
+        name, key = marks(_account_from_entry(old))
+        for mark in (("name", name), ("login", key)):
+            before[mark] = before.get(mark, 0) + 1
+    after: dict[tuple[str, str | None], int] = {}
+    for account, _was_kept in checked:
+        name, key = marks(account)
+        for mark in (("name", name), ("login", key)):
+            after[mark] = after.get(mark, 0) + 1
+    labels: dict[str, int] = {}
+    logins: dict[str, int] = {}
+    for i, (account, was_kept) in enumerate(checked):
+        name, key = marks(account)
+        for seen, mark, code, field in ((labels, name, "name_taken", "label"), (logins, key, "login_taken", "home")):
+            if mark is None or mark not in seen:
+                continue
+            kind = "name" if code == "name_taken" else "login"
+            if was_kept and checked[seen[mark]][1] and after[(kind, mark)] <= before.get((kind, mark), 0):
+                continue
+            j = seen[mark]
+            # Point at the entry the owner changed, not the one kept as stored.
+            at, other = (j, i) if was_kept and not checked[j][1] else (i, j)
+            if code == "name_taken":
+                raise AccountsError(f"two usage_accounts entries are named {account['label']!r}", code,
+                                    index=at, field=field, other=other)
+            raise AccountsError(f"usage_accounts entry {at + 1} ({checked[at][0]['label']}) reads the same login "
+                                f"as another entry", code, index=at, field=field, other=other)
+        labels.setdefault(name, i)
+        if key is not None:
+            logins.setdefault(key, i)
+    for i, (account, was_kept) in enumerate(checked):
+        if was_kept:
+            continue
+        named = _name_problem(account["label"], account["harness"], account["home"],
+                              (ids - {account_id_of(account)}) if ids else ids)
+        if named:
+            raise AccountsError(f"usage_accounts entry {i + 1}: {named[1]}", named[0], index=i, field="label")
     return out
 
 
@@ -956,16 +1110,24 @@ def accounts_status() -> dict:
     unset), where the list comes from, and the accounts it resolves to."""
     from khipu.config import load_config
 
-    raw = load_config().get("usage_accounts")
+    from khipu.config import accounts_version
+
+    config = load_config()
+    raw = config.get("usage_accounts")
     stored = raw if isinstance(raw, list) and raw else None
     try:
         user_home = str(Path.home())
     except RuntimeError:
         user_home = None
+    none = reads_none(config)
     # ``user_home`` lets the app compare "~/.x" with "/Users/me/.x" the way
-    # the stored list is checked, before anything is saved.
-    return {"value": stored, "source": "file" if stored is not None else "default",
-            "accounts": configured_accounts(), "user_home": user_home}
+    # the stored list is checked, before anything is saved. ``version`` is
+    # what a write hands back (``--expect``) so it is refused when the list
+    # changed after it was read.
+    request = config.get("usage_accounts_request")
+    return {"value": stored, "source": "file" if stored is not None else "none" if none else "default",
+            "accounts": configured_accounts(), "user_home": user_home, "version": accounts_version(config),
+            "none": none, "request": request if isinstance(request, dict) else None}
 
 
 def _key(account: dict) -> str:
@@ -997,6 +1159,11 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
         if account.get("invalid"):
             data = {"ok": False, "error": E_INVALID,
                     "note": f"This account entry is not valid: {account['invalid']}"}
+        elif home and harness in _HOME_VARS and not _login_folder_there(home):
+            # Checked on the folder itself (nothing inside it is read): a CLI
+            # pointed at a missing folder answers "not signed in", which a
+            # sign-in can't fix when the folder moved or was removed.
+            data = {"ok": False, "error": E_NO_FOLDER, "note": NO_FOLDER_NOTE}
         elif harness == "claude":
             data = probe_claude(home, timeout=timeout)
         elif harness == "codex":

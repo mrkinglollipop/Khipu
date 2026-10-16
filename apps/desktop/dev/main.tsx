@@ -50,14 +50,14 @@ import {
 } from "../src/__tests__/accountsFixtures";
 import type { Fake } from "./fakeTauri";
 
-const ABSENT: Support = { state: "absent" };
+const READING: Support = { state: "reading" };
 const HERE: Support = { state: "here", status: status9B() };
 
 function setFake(f: Fake) {
   (window as unknown as { __khipuFake?: Fake }).__khipuFake = f;
 }
 
-function Dlg({ start, disc, support = ABSENT, tracked = TRACKED }: { start?: AddAccountStart; disc?: DiscoverResult; support?: Support; tracked?: typeof TRACKED }) {
+function Dlg({ start, disc, support = HERE, tracked = TRACKED }: { start?: AddAccountStart; disc?: DiscoverResult; support?: Support; tracked?: typeof TRACKED }) {
   return (
     <AddAccountDialog open onClose={() => {}} discovery={disc ?? discovery()} onRediscover={async () => discovery()}
       onCheck={async () => ({ ok: true, candidate: { ...CODEX_WORK, state: "signed_in", plan: "plus" } })} tracked={tracked}
@@ -118,7 +118,7 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   "dialog-step3-name-taken": { title: "Dialog, step 3: name already used", render: () => <Dlg start={{ candidate: { ...CODEX_LAB, state: "signed_in" }, name: "Codex", read: { ok: true, row: liveRow({ harness: "codex" }) } }} /> },
   "dialog-step3-folder-missing": { title: "Dialog, step 3: login folder not found", render: () => <Dlg start={{ candidate: CLIENT, read: { ok: false, error: "folder_not_found" } }} /> },
   "found-rows": { title: "Found rows: Found, not checked, couldn't check", render: () => <FoundRows candidates={[CLIENT, CODEX_WORK, CODEX_LAB]} support={HERE} now={NOW} onTrack={() => {}} onCheck={() => {}} onDecline={() => {}} /> },
-  "found-rows-no-9b": { title: "Found rows while 9B is not here", render: () => <FoundRows candidates={[CLIENT, CODEX_WORK]} support={ABSENT} now={NOW} onTrack={() => {}} onCheck={() => {}} onDecline={() => {}} /> },
+  "found-rows-reading": { title: "Found rows while the account list is read", render: () => <FoundRows candidates={[CLIENT, CODEX_WORK]} support={READING} now={NOW} onTrack={() => {}} onCheck={() => {}} onDecline={() => {}} /> },
   "found-moved": {
     title: "Found row: moved?",
     render: () => (
@@ -139,7 +139,7 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
       ] }) }} />
     ),
   },
-  "auto-switch": { title: "Track new accounts automatically (9B here, then not)", render: () => <><AutoTrackSwitch support={HERE} onChange={() => {}} /><AutoTrackSwitch support={ABSENT} onChange={() => {}} /></> },
+  "auto-switch": { title: "Track new accounts automatically (read, then reading)", render: () => <><AutoTrackSwitch support={HERE} onChange={() => {}} /><AutoTrackSwitch support={READING} onChange={() => {}} /></> },
   "cli-settings": {
     title: "Where Khipu finds each program",
     render: () => (
@@ -156,7 +156,7 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
     title: "Account: signed out (the whole account, as Settings shows it)",
     render: () => <WholeAccount label="Claude second" home="~/.claude-second" row={{ harness: "claude", account: "Claude second", home: "~/.claude-second", ok: false, error: "not_signed_in", last_good_at: "2026-10-13T15:00:00Z", windows: [{ name: "weekly", used_pct: 60, window_mins: 10080, resets_at: "2026-10-19T15:00:00Z" }] }} />,
   },
-  "account-no-9b": { title: "Account: Rename and Stop tracking while 9B is not here", render: () => <AccountExtras label="Claude work" harness="claude" home="~/.claude-work" support={ABSENT} onRename={() => {}} onStop={() => {}} /> },
+  "account-reading": { title: "Account: Rename and Stop tracking while the account list is read", render: () => <AccountExtras label="Claude work" harness="claude" home="~/.claude-work" support={READING} onRename={() => {}} onStop={() => {}} /> },
   rename: { title: "Rename dialog", render: () => <RenameDialog open account={ACCT} refs={REFS} taken={["Claude client", "Claude main", "Codex"]} support={HERE} onClose={() => {}} onRenamed={() => {}} /> },
   stop: { title: "Stop tracking dialog", render: () => <StopTrackingDialog open account={ACCT} refs={REFS} support={HERE} onClose={() => {}} onStopped={() => {}} /> },
   "stop-last": {

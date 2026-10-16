@@ -5,7 +5,7 @@
 // checks the slice names (no check before Check, Close turns nothing down,
 // automatic tracking off saves nothing, Sign in now saves first).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { AddAccountDialog } from "../AddAccountDialog";
 import type { AddAccountStart } from "../AddAccountDialog";
@@ -23,11 +23,14 @@ import {
   NotOfferedAgain,
   RenameDialog,
   StopTrackingDialog,
+  addQuietLogins,
+  homeOffersOf,
   movedPairs,
+  quietLogins,
   useAccountsFinder,
 } from "../FoundAccounts";
 import type { AccountRefs } from "../FoundAccounts";
-import { COMING, discoverAccounts, lastRunLine, normalDiscover, signInNow } from "../accountsApi";
+import { COMING, discoverAccounts, lastRunLine, normalDiscover, saveNewAccount, signInNow, useDiscovery } from "../accountsApi";
 import type { DiscoverResult, Support } from "../accountsApi";
 import { SetupAccountsStep } from "../SetupAccounts";
 import { POST_UPDATE_NOTICES as NOTICES } from "../postUpdateNotices";
@@ -59,7 +62,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   save: vi.fn(async () => null),
 }));
 
-const ABSENT: Support = { state: "absent" };
+const READING: Support = { state: "reading" };
 const HERE: Support = { state: "here", status: status9B() };
 
 const calls = (name: string) => invokeMock.mock.calls.filter((c) => c[0] === name);
@@ -84,8 +87,9 @@ afterEach(() => {
   pickerMock.mockImplementation(async () => null);
 });
 
-/** A fake Khipu: discovery, the 9B probe (absent unless `nineB`), the
- *  account list and the writes, each answered as the CLI prints it. */
+/** A fake Khipu: discovery, `khipu accounts status` (failing when `nineB`
+ *  is false), the account list and the writes, each answered as the CLI
+ *  prints it. */
 function fakeKhipu(o: {
   disc?: DiscoverResult;
   nineB?: boolean;
@@ -101,7 +105,7 @@ function fakeKhipu(o: {
       case "khipu_accounts_check":
         return JSON.stringify(o.check ?? o.disc ?? discovery());
       case "khipu_accounts_status":
-        if (!o.nineB) throw new Error("Command khipu_accounts_status not found");
+        if (o.nineB === false) throw new Error("khipu accounts status failed");
         return JSON.stringify(o.status ?? status9B());
       case "khipu_config_show":
         return JSON.stringify({
@@ -127,7 +131,7 @@ function Dialog(props: { start?: AddAccountStart; disc?: DiscoverResult | null; 
   return (
     <AddAccountDialog open onClose={() => {}} discovery={props.disc === undefined ? discovery() : props.disc}
       onRediscover={props.onRediscover ?? (async () => null)} onCheck={async () => ({ ok: false, error: "folder_not_found" })}
-      tracked={props.tracked ?? TRACKED} shownDefaults={TRACKED} support={props.support ?? ABSENT} start={props.start}
+      tracked={props.tracked ?? TRACKED} shownDefaults={TRACKED} support={props.support ?? HERE} start={props.start}
       onSaved={() => {}} canSignInNew={props.canSignInNew} />
   );
 }
@@ -302,33 +306,47 @@ describe("Add an account: step 3, check and save", () => {
 });
 
 describe("Sign in now on a login Khipu doesn't track yet", () => {
-  it("saves first, then calls khipu_account_sign_in for it (main's save path)", async () => {
-    fakeKhipu();
-    const out = await signInNow({ harness: "claude", home: "~/.claude-old", label: "Claude old" }, ABSENT, TRACKED);
+  it("saves through khipu_accounts_track first, then signs in; the app never writes the list itself", async () => {
+    fakeKhipu({ status: status9B({ value: null }) });
+    const out = await signInNow({ harness: "claude", home: "~/.claude-old", label: "Claude old" }, READING, TRACKED);
     expect(out.saved).toBe(true);
     const order = names().filter((n) => ["khipu_config_set", "khipu_accounts_track", "khipu_account_sign_in"].includes(n));
-    expect(order).toEqual(["khipu_config_set", "khipu_account_sign_in"]);
-    const saved = JSON.parse(String(calls("khipu_config_set")[0][1].value));
-    // The defaults as shown are written out first, then the new account.
-    expect(saved).toEqual([...TRACKED.map((t) => ({ ...t })), { label: "Claude old", harness: "claude", home: "~/.claude-old" }]);
+    expect(order).toEqual(["khipu_accounts_track", "khipu_account_sign_in"]);
+    // The defaults as shown go along for the CLI to write out first.
+    expect(calls("khipu_accounts_track")[0][1]).toEqual({
+      entries: [{ harness: "claude", home: "~/.claude-old", label: "Claude old" }],
+      expect: "v12",
+      shownDefaults: TRACKED.map((t) => ({ harness: t.harness, home: t.home ?? null, label: t.label })),
+    });
     expect(calls("khipu_account_sign_in")[0][1]).toEqual({ harness: "claude", home: "~/.claude-old" });
   });
 
-  it("a refused save starts no sign-in", async () => {
-    fakeKhipu({ setRefusal: { ok: false, error: "name taken", code: "name_taken", index: 4, field: "label", other: 1 } });
-    const out = await signInNow({ harness: "claude", home: "~/.claude-old", label: "Claude old" }, ABSENT, TRACKED);
+  it("Add keeps an existing invalid entry: only the new account is sent, and no list is written", async () => {
+    const invalid = { label: "Old custom", harness: "claude", home: "relative/login", invalid: "home_not_absolute" };
+    fakeKhipu({ status: status9B({ accounts: [...status9B().accounts, invalid] }) });
+    const out = await saveNewAccount({ harness: "claude", home: "~/.claude-new", label: "Claude new" }, READING, null);
+    expect(out.ok).toBe(true);
+    expect(calls("khipu_config_set")).toHaveLength(0);
+    expect(calls("khipu_config_unset")).toHaveLength(0);
+    expect(calls("khipu_accounts_track")[0][1]).toEqual({ entries: [{ harness: "claude", home: "~/.claude-new", label: "Claude new" }], expect: "v12" });
+  });
+
+  it("an unread account list saves nothing", async () => {
+    fakeKhipu({ nineB: false });
+    const out = await signInNow({ harness: "claude", home: "~/.claude-old", label: "Claude old" }, READING, TRACKED);
     expect(out.saved).toBe(false);
-    expect(calls("khipu_config_set")).toHaveLength(1);
+    expect(calls("khipu_accounts_track")).toHaveLength(0);
+    expect(calls("khipu_config_set")).toHaveLength(0);
     expect(calls("khipu_account_sign_in")).toHaveLength(0);
   });
 
   it("with 9B here: khipu_accounts_track first, then the sign-in; a refused track signs nothing in", async () => {
-    fakeKhipu({ nineB: true });
+    fakeKhipu();
     await signInNow({ harness: "claude", home: "~/.claude-old", label: "Claude old" }, HERE, null);
     expect(names().filter((n) => n === "khipu_accounts_track" || n === "khipu_account_sign_in")).toEqual(["khipu_accounts_track", "khipu_account_sign_in"]);
     expect(calls("khipu_accounts_track")[0][1]).toMatchObject({ entries: [{ harness: "claude", home: "~/.claude-old", label: "Claude old" }], expect: "v12" });
     invokeMock.mockReset();
-    fakeKhipu({ nineB: true, trackRefusal: { ok: false, error: "taken", code: "name_taken" } });
+    fakeKhipu({ trackRefusal: { ok: false, error: "taken", code: "name_taken" } });
     const out = await signInNow({ harness: "claude", home: "~/.claude-old", label: "Claude old" }, HERE, null);
     expect(out.saved).toBe(false);
     expect(calls("khipu_account_sign_in")).toHaveLength(0);
@@ -339,16 +357,16 @@ describe("Sign in now on a login Khipu doesn't track yet", () => {
     render(<Dialog start={{ candidate: OLD, read: { ok: false, row: { harness: "claude", ok: false, error: "not_signed_in", windows: [] } } }} />);
     fireEvent.click(screen.getByRole("button", { name: "Sign in now" }));
     await waitFor(() => expect(calls("khipu_account_sign_in")).toHaveLength(1));
-    const order = names().filter((n) => n === "khipu_config_set" || n === "khipu_account_sign_in");
-    expect(order).toEqual(["khipu_config_set", "khipu_account_sign_in"]);
+    const order = names().filter((n) => n === "khipu_config_set" || n === "khipu_accounts_track" || n === "khipu_account_sign_in");
+    expect(order).toEqual(["khipu_accounts_track", "khipu_account_sign_in"]);
     expect(await screen.findByText(/Claude old is tracked\./)).toBeInTheDocument();
   });
 
   it("from the dialog: a refused save shows why and starts no sign-in", async () => {
-    fakeKhipu({ setRefusal: { ok: false, error: "taken", code: "name_taken", index: 4, field: "label", other: 0 } });
+    fakeKhipu({ trackRefusal: { ok: false, error: "taken", code: "name_taken", index: 4, field: "label", other: 0 } });
     render(<Dialog start={{ candidate: OLD, read: { ok: false, row: { harness: "claude", ok: false, error: "not_signed_in", windows: [] } } }} />);
     fireEvent.click(screen.getByRole("button", { name: "Sign in now" }));
-    await waitFor(() => expect(calls("khipu_config_set")).toHaveLength(1));
+    await waitFor(() => expect(calls("khipu_accounts_track")).toHaveLength(1));
     await waitFor(() => expect(screen.getByLabelText("Name")).toHaveAttribute("aria-invalid", "true"));
     expect(calls("khipu_account_sign_in")).toHaveLength(0);
   });
@@ -364,7 +382,7 @@ describe("the dialog keeps focus", () => {
         </button>
         {open ? (
           <AddAccountDialog open onClose={() => setOpen(false)} discovery={discovery()} onRediscover={async () => null}
-            onCheck={async () => ({ ok: false, error: "folder_not_found" })} tracked={TRACKED} shownDefaults={TRACKED} support={ABSENT}
+            onCheck={async () => ({ ok: false, error: "folder_not_found" })} tracked={TRACKED} shownDefaults={TRACKED} support={HERE}
             start={{ cli: "claude", step: 2 }} onSaved={() => {}} />
         ) : null}
       </>
@@ -440,7 +458,7 @@ describe("the dialog keeps focus", () => {
     render(
       <AddAccountDialog open onClose={() => {}} discovery={discovery()} onRediscover={async () => null}
         onCheck={async () => ({ ok: true, candidate: { ...CODEX_WORK, id: "codex:team", path: "~/.codex-team", state: "signed_in", plan: "plus" } })}
-        tracked={TRACKED} shownDefaults={TRACKED} support={ABSENT} start={{ cli: "codex", step: 2 }} onSaved={() => {}} />,
+        tracked={TRACKED} shownDefaults={TRACKED} support={HERE} start={{ cli: "codex", step: 2 }} onSaved={() => {}} />,
     );
     const choose = screen.getByRole("button", { name: "Choose another folder…" });
     choose.focus();
@@ -496,11 +514,10 @@ describe("Found rows", () => {
   it("moved?: a tracked account's folder is gone and a new login is signed in", () => {
     const rows = [{ harness: "claude", account: "Claude work", home: "~/.claude-work", key: "claude|~/.claude-work", ok: false, error: "login_folder_missing", windows: [] }];
     const moved = movedPairs(rows, [OFFICE]);
-    render(<FoundRows candidates={[OFFICE]} moved={moved} support={ABSENT} onTrack={() => {}} onCheck={() => {}} onDecline={() => {}} />);
+    render(<FoundRows candidates={[OFFICE]} moved={moved} support={HERE} onTrack={() => {}} onCheck={() => {}} onDecline={() => {}} />);
     expect(screen.getByText(/Is this Claude work, moved\?/)).toBeInTheDocument();
     expect(screen.getByText("Claude work's folder ~/.claude-work is gone, and this new Claude login is signed in (Max 20x).")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Yes, ~/.claude-office is Claude work, moved" })).toBeDisabled();
-    expect(screen.getByText(COMING.move)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Yes, ~/.claude-office is Claude work, moved" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "No, track ~/.claude-office as a new account" })).toBeEnabled();
   });
 
@@ -519,11 +536,28 @@ describe("Found rows", () => {
     expect(calls("khipu_accounts_check")[0][1]).toEqual({ folder: "~/.codex-work" });
   });
 
-  it("Not this one is disabled with words while 9B is not here", () => {
-    render(<FoundRows candidates={[CLIENT]} support={ABSENT} onTrack={() => {}} onCheck={() => {}} onDecline={() => {}} />);
+  it("Not this one waits only for the account list to be read, with no later-update words", () => {
+    render(<FoundRows candidates={[CLIENT]} support={READING} onTrack={() => {}} onCheck={() => {}} onDecline={() => {}} />);
     const no = screen.getByRole("button", { name: "Not this one: never offer ~/.claude-client again" });
     expect(no).toBeDisabled();
-    expect(no).toHaveAccessibleDescription(COMING.decline);
+    expect(screen.queryByText(/later update/)).toBeNull();
+    cleanup();
+    render(<FoundRows candidates={[CLIENT]} support={HERE} onTrack={() => {}} onCheck={() => {}} onDecline={() => {}} />);
+    expect(screen.getByRole("button", { name: "Not this one: never offer ~/.claude-client again" })).toBeEnabled();
+  });
+
+  it("a one-shot Check keeps where each program is, so going back never reads forever", async () => {
+    const checked = { ...CODEX_WORK, state: "signed_in" as const, needs_owner_check: false };
+    const reply = discovery({ candidates: [checked], check: { ok: true, candidate: checked } });
+    delete reply.clis;
+    invokeMock.mockImplementation(async (cmd: string) => JSON.stringify(cmd === "khipu_accounts_discover" ? discovery() : reply));
+    const { result } = renderHook(() => useDiscovery(true));
+    await waitFor(() => expect(result.current.data?.clis?.codex?.state).toBe("installed"));
+    await act(async () => {
+      await result.current.check(CODEX_WORK.path!);
+    });
+    expect(result.current.data?.candidates).toEqual([checked]);
+    expect(result.current.data?.clis?.codex?.state).toBe("installed");
   });
 });
 
@@ -579,19 +613,19 @@ describe("Not offered again, the switch, programs and no accounts", () => {
     expect(screen.getByText(/1 login you said no to/)).toBeInTheDocument();
   });
 
-  it("Not offered again and the switch say they are coming while 9B is not here", () => {
+  it("Not offered again and the switch wait only for the account list to be read", () => {
     render(
       <>
-        <NotOfferedAgain support={ABSENT} onOfferAgain={() => {}} />
-        <AutoTrackSwitch support={ABSENT} onChange={() => {}} />
+        <NotOfferedAgain support={READING} onOfferAgain={() => {}} />
+        <AutoTrackSwitch support={READING} onChange={() => {}} />
       </>,
     );
     fireEvent.click(screen.getByRole("button", { name: /Not offered again/ }));
-    expect(screen.getByText(COMING.notOffered)).toBeInTheDocument();
+    expect(screen.getByText("Reading…")).toBeInTheDocument();
     const sw = screen.getByRole("switch", { name: "Track new accounts automatically" });
     expect(sw).toBeDisabled();
     expect(sw).not.toBeChecked();
-    expect(screen.getByText(new RegExp(COMING.autoTrack.replace(/\./g, "\\.")))).toBeInTheDocument();
+    expect(screen.queryByText(/later update/)).toBeNull();
   });
 
   it("the switch with 9B: its value and Off in words", () => {
@@ -627,12 +661,15 @@ describe("Not offered again, the switch, programs and no accounts", () => {
 });
 
 describe("one tracked account", () => {
-  it("Rename… and Stop tracking… are disabled with words while 9B is not here", () => {
-    render(<AccountExtras label="Claude work" harness="claude" home="~/.claude-work" support={ABSENT} onRename={() => {}} onStop={() => {}} />);
+  it("Rename… and Stop tracking… wait only for the account list to be read", () => {
+    render(<AccountExtras label="Claude work" harness="claude" home="~/.claude-work" support={READING} onRename={() => {}} onStop={() => {}} />);
     expect(screen.getByRole("button", { name: "Rename Claude work" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Rename Claude work" })).toHaveAccessibleDescription(COMING.rename);
     expect(screen.getByRole("button", { name: "Stop tracking Claude work" })).toBeDisabled();
-    expect(screen.getByText(COMING.stop)).toBeInTheDocument();
+    expect(screen.queryByText(/later update/)).toBeNull();
+    cleanup();
+    render(<AccountExtras label="Claude work" harness="claude" home="~/.claude-work" support={HERE} onRename={() => {}} onStop={() => {}} />);
+    expect(screen.getByRole("button", { name: "Rename Claude work" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Stop tracking Claude work" })).toBeEnabled();
   });
 
   it("login folder not found: says so, never Not signed in, with Choose the folder… and Stop tracking…", () => {
@@ -714,6 +751,51 @@ describe("one tracked account", () => {
     expect(screen.getByText(/Claude main is the only account Khipu tracks on this Mac/)).toBeInTheDocument();
     expect(screen.getByText("Khipu won't go back to reading every installed program on its own.")).toBeInTheDocument();
   });
+
+  it("Stop tracking the last account still lists its holds, kept unless ticked, and the other choices", async () => {
+    fakeKhipu();
+    render(<StopTrackingDialog open account={acct} refs={{ ...refs, last: true }} support={HERE} onClose={() => {}} onStopped={() => {}} />);
+    expect(screen.getByRole("heading", { name: /Stop tracking your last account\?/ })).toBeInTheDocument();
+    const hold = screen.getByRole("checkbox", { name: /End the hold “client work only”/ });
+    expect(hold).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /Remove it from your priority list/ })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /End its pause now/ })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Remove it from 2 lanes: review-1, docs" })).toBeChecked();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Remove it from 2 lanes/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop tracking" }));
+    await waitFor(() => expect(calls("khipu_accounts_stop")).toHaveLength(1));
+    expect(calls("khipu_accounts_stop")[0][1]).toEqual({
+      account: "claude|~/.claude-client", expect: "v12", keepPriority: false, keepPause: false, keepLanes: true,
+      endHolds: [], confirmLast: true,
+    });
+  });
+
+  it("Edit rule leaves the Rename dialog, so focus can reach the editor behind it", async () => {
+    const onEdit = vi.fn();
+    function Host() {
+      const [open, setOpen] = useState(true);
+      return (
+        <>
+          <button type="button">Rule editor</button>
+          {open ? (
+            <RenameDialog open account={acct} refs={refs} taken={[]} support={HERE} onClose={() => setOpen(false)} onRenamed={() => {}}
+              onEdit={() => {
+                onEdit();
+                screen.getByRole("button", { name: "Rule editor", hidden: true }).focus();
+              }} />
+          ) : null}
+        </>
+      );
+    }
+    render(<Host />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit rule 4" }));
+    expect(onEdit).toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 10));
+    });
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Rule editor" }));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -748,7 +830,7 @@ describe("Home's cards", () => {
   });
 
   it("Close never turns anything down, and the card stays closed for the same folder", async () => {
-    fakeKhipu({ disc: discovery({ candidates: [CLIENT] }), nineB: true });
+    fakeKhipu({ disc: discovery({ candidates: [CLIENT] }) });
     render(<HomeAccountCards active />);
     const card = await screen.findByRole("region", { name: "Found an account" });
     fireEvent.click(within(card).getByRole("button", { name: /^Close this card/ }));
@@ -768,8 +850,29 @@ describe("Home's cards", () => {
     expect(await screen.findByRole("region", { name: "Found accounts" })).toBeInTheDocument();
   });
 
+  it("a login left unticked in setup reaches Home once a later conversation uses it", () => {
+    addQuietLogins([CLIENT]);
+    const d = (n: number) => discovery({ candidates: [{ ...CLIENT, conversations_7d: n, offer_on_home: true }] });
+    expect(homeOffersOf(d(4), quietLogins())).toEqual([]);
+    const later = { ...CLIENT, conversations_7d: 5, offer_on_home: true };
+    expect(homeOffersOf(discovery({ candidates: [later] }), quietLogins())).toEqual([later]);
+  });
+
+  it("the week's count falling then rising still brings a quiet login to Home", async () => {
+    addQuietLogins([CLIENT]);
+    fakeKhipu({ disc: discovery({ candidates: [{ ...CLIENT, conversations_7d: 1 }] }) });
+    render(<HomeAccountCards active />);
+    await waitFor(() => expect(calls("khipu_accounts_discover").length).toBeGreaterThan(0));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    expect(screen.queryByRole("region", { name: "Found an account" })).toBeNull();
+    expect(quietLogins()).toEqual([{ id: CLIENT.id, seen: 1 }]);
+    expect(homeOffersOf(discovery({ candidates: [{ ...CLIENT, conversations_7d: 2 }] }), quietLogins())).toHaveLength(1);
+  });
+
   it("automatic tracking off saves nothing", async () => {
-    fakeKhipu({ disc: discovery({ candidates: [CLIENT, OFFICE] }), nineB: true, status: status9B({ auto_track: false }) });
+    fakeKhipu({ disc: discovery({ candidates: [CLIENT, OFFICE] }), status: status9B({ auto_track: false }) });
     render(<HomeAccountCards active />);
     await screen.findByRole("region", { name: "Found accounts" });
     await act(async () => {
@@ -807,7 +910,7 @@ describe("setup's Accounts step with what discovery found", () => {
         case "khipu_accounts_discover":
           return JSON.stringify(disc);
         case "khipu_accounts_status":
-          throw new Error("Command khipu_accounts_status not found");
+          throw new Error("khipu accounts status failed");
         default:
           return JSON.stringify({ ok: true });
       }
@@ -835,9 +938,12 @@ describe("setup's Accounts step with what discovery found", () => {
     fireEvent.click(within(grok).getByRole("checkbox"));
     fireEvent.click(screen.getByRole("button", { name: /Next/ }));
     await waitFor(() => expect(next).toHaveBeenCalled());
-    const saved = JSON.parse(String(calls("khipu_config_set")[0][1].value));
-    expect(saved).toContainEqual({ label: "Claude client", harness: "claude", home: "~/.claude-client" });
-    expect(saved.some((e: { home?: string }) => e.home === "~/.grok-second")).toBe(false);
+    // The one save path: the ticked login goes to Track, never into a list
+    // the app writes itself.
+    expect(calls("khipu_config_set")).toHaveLength(0);
+    const sent = calls("khipu_accounts_track")[0][1] as { entries: Array<{ home?: string | null; label?: string }>; shownDefaults?: unknown };
+    expect(sent.entries).toEqual([{ harness: "claude", home: "~/.claude-client", label: "Claude client" }]);
+    expect(sent.shownDefaults).toEqual([{ harness: "claude", home: null, label: "Claude Code" }]);
     cleanup();
     fakeKhipu({ disc: discovery({ candidates: [GROK_SECOND] }) });
     render(<HomeAccountCards active />);
@@ -864,7 +970,7 @@ describe("setup's Accounts step with what discovery found", () => {
       if (cmd === "khipu_usage_status" || cmd === "khipu_usage_refresh") return JSON.stringify({ accounts: [] });
       if (cmd === "khipu_config_show") return JSON.stringify({ usage_accounts: { source: "default", accounts: [], user_home: "/home/someone" } });
       if (cmd === "khipu_accounts_discover") return JSON.stringify(discovery({ candidates: [], clis: CLIS_NONE }));
-      if (cmd === "khipu_accounts_status") throw new Error("Command khipu_accounts_status not found");
+      if (cmd === "khipu_accounts_status") throw new Error("khipu accounts status failed");
       return JSON.stringify({ ok: true });
     });
     render(<SetupAccountsStep active onBack={() => {}} onNext={() => {}} />);
@@ -885,7 +991,7 @@ describe("setup's Accounts step with what discovery found", () => {
         return JSON.stringify({ usage_accounts: { source: "default", accounts: [{ label: "Claude Code", harness: "claude" }, { label: "Grok Build", harness: "grok" }], user_home: "/home/someone" } });
       }
       if (cmd === "khipu_accounts_discover") return JSON.stringify(discovery({ candidates: [] }));
-      if (cmd === "khipu_accounts_status") throw new Error("Command khipu_accounts_status not found");
+      if (cmd === "khipu_accounts_status") throw new Error("khipu accounts status failed");
       if (cmd === "khipu_account_sign_in") return JSON.stringify({ ok: true });
       return JSON.stringify({ ok: true });
     });

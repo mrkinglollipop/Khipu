@@ -74,7 +74,17 @@ import {
 } from "./routingWords";
 import type { LimitUnit } from "./routingWords";
 
-type RouteSetting = { value: unknown; default: unknown; kind: string; source: string };
+/** A conversation's change to a routing setting at your request, made and
+ *  marked until you confirm it or undo it (the CLI's ``request``). */
+type SettingRequest = { request?: string | null; by_words?: string | null; at?: string | null; prior?: unknown };
+type RouteSetting = {
+  value: unknown;
+  default: unknown;
+  kind: string;
+  source: string;
+  words?: string;
+  request?: SettingRequest | null;
+};
 type RouteConfig = { routing?: Record<string, RouteSetting> };
 
 /** Where focus goes when the control that made a change is gone. */
@@ -585,6 +595,43 @@ function AccountRow({
   );
 }
 
+/** Each routing setting a conversation changed at your request: what it
+ *  said you asked, and Confirm or Undo (the value it replaced comes back). */
+function SettingRequests({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
+  const waiting = Object.entries(cfg?.routing ?? {}).filter(([, s]) => s.request);
+  if (!waiting.length) return null;
+  return (
+    <>
+      {waiting.map(([key, s]) => (
+        <div key={key} className="route-disagree" role="group" aria-label={`A conversation changed: ${s.words ?? key}`}
+          data-route-item={`setting:${key}`} tabIndex={-1}>
+          <span>
+            <b>
+              {s.words ?? key}: changed by {s.request?.by_words || "a conversation"} at your request; you haven't
+              confirmed it yet.
+            </b>
+          </span>
+          {s.request?.request ? <span>What it said you asked: “{s.request.request}”</span> : null}
+          <div className="toolbar">
+            <button type="button" className="sm primary" disabled={w.isBusy(`setting:${key}:confirm`)}
+              onClick={() => void w.run(`setting:${key}:confirm`, "khipu_config_request", { key, action: "confirm" }, reread)}>
+              <Busy on={w.isBusy(`setting:${key}:confirm`)} />
+              Confirm
+            </button>
+            <button type="button" className="sm" disabled={w.isBusy(`setting:${key}:undo`)}
+              onClick={() => void w.run(`setting:${key}:undo`, "khipu_config_request", { key, action: "undo" }, reread)}>
+              <Busy on={w.isBusy(`setting:${key}:undo`)} />
+              Undo
+            </button>
+          </div>
+          <WriteError w={w} id={`setting:${key}:confirm`} />
+          <WriteError w={w} id={`setting:${key}:undo`} />
+        </div>
+      ))}
+    </>
+  );
+}
+
 function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteView | null; cfg: RouteConfig | null; cfgError?: string | null; w: Writer; reread: () => Promise<unknown> }) {
   const enabled = cfg?.routing?.routing_reset_check?.value === true;
   const next = (data?.accounts ?? []).filter((a) => a.next_check).map((a) => `${a.label}: ${whenLocal(a.next_check!, new Date())}`);
@@ -848,7 +895,7 @@ function PrioritySection({
                 <span>{e.role ? e.role : "No role written"}</span>
                 <span className="route-src">
                   {endText(e.until, now)}
-                  {e.in_settings === false ? " · not in Settings → Models" : ""}
+                  {e.in_settings === false ? " · no longer tracked" : ""}
                 </span>
               </span>
               <span className="route-acts">
@@ -3436,6 +3483,7 @@ export function RoutingSettings({
           </button>
         </div>
       </div>
+      <SettingRequests cfg={config.data} w={w} reread={rereadConfig} />
       {route.error ? (
         <div className="set-error err-inline" role="alert">
           <span>

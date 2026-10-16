@@ -1648,4 +1648,26 @@ describe("Settings -> Routing: nothing shows a false off while it is read", () =
     await screen.findByRole("list", { name: "Accounts" });
     await waitFor(() => expect(screen.queryByText(/Looking for job runner lanes/)).toBeNull());
   });
+
+  it("shows a conversation's change to a routing setting and answers it as the owner", async () => {
+    const lanes = setting({ jobs: { r: "codex|" } }, {});
+    answers.khipu_config_show = config({
+      routing_lane_map: { ...lanes, words: "Which account each job lane uses",
+        request: { request: "send lane r to Codex", by_words: "a Claude Code conversation in project-a", prior: {} } },
+    });
+    await page();
+    const box = screen.getByRole("group", { name: "A conversation changed: Which account each job lane uses" });
+    expect(box).toHaveTextContent("changed by a Claude Code conversation in project-a at your request");
+    expect(box).toHaveTextContent("What it said you asked: “send lane r to Codex”");
+    fireEvent.click(within(box).getByRole("button", { name: "Undo" }));
+    await waitFor(() => expect(calls("khipu_config_request")).toEqual([{ key: "routing_lane_map", action: "undo" }]));
+    fireEvent.click(within(box).getByRole("button", { name: "Confirm" }));
+    await waitFor(() => expect(calls("khipu_config_request")).toHaveLength(2));
+    expect(calls("khipu_config_request")[1]).toEqual({ key: "routing_lane_map", action: "confirm" });
+  });
+
+  it("shows no request box when nothing waits", async () => {
+    await page();
+    expect(screen.queryByRole("group", { name: /^A conversation changed:/ })).toBeNull();
+  });
 });

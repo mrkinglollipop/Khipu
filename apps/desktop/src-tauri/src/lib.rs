@@ -980,9 +980,33 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     Ok(n.to_string())
 }
 
+/// `expect` is the account list's version, kept for `usage_accounts` alone: a
+/// save made on a stale read is refused by the CLI (decision 15).
 fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
+    config_set_argv_expect(key, value, None)
+}
+
+fn config_set_argv_expect(key: &str, value: &str, expect: Option<&str>) -> Result<Vec<String>, String> {
+    if key == USAGE_ACCOUNTS_KEY {
+        let mut argv = vec!["config".to_string(), "--from-app".to_string()];
+        if let Some(e) = expect {
+            argv.push(format!("--expect={}", checked_expect(e)?));
+        }
+        argv.extend(["--set".to_string(), USAGE_ACCOUNTS_KEY.to_string(), checked_usage_accounts(value)?]);
+        return Ok(argv);
+    }
+    if expect.is_some() {
+        return Err(format!("{key} takes no version to check"));
+    }
+    // A routing setting is the owner's (decision 15): the app's own save
+    // says so, or the CLI refuses it as a conversation's.
     let set = |k: &str, v: String| {
-        vec!["config".to_string(), "--set".to_string(), k.to_string(), v]
+        let mut argv = vec!["config".to_string()];
+        if routing_key(k) {
+            argv.push("--from-app".to_string());
+        }
+        argv.extend(["--set".to_string(), k.to_string(), v]);
+        argv
     };
     match key {
         "capture_mode" => {
@@ -1019,7 +1043,6 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
             }
             Ok(set("synth_fallback", v.to_string()))
         }
-        USAGE_ACCOUNTS_KEY => Ok(set(USAGE_ACCOUNTS_KEY, checked_usage_accounts(value)?)),
         GRAPH_BACKUP_REMOTE_KEY => Ok(set(GRAPH_BACKUP_REMOTE_KEY, checked_backup_remote(value)?)),
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
         k if cli_setting_key(k) => Ok(set(k, checked_cli_setting_path(k, value)?)),
@@ -1029,6 +1052,21 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
 }
 
 fn config_unset_argv(key: &str) -> Result<Vec<String>, String> {
+    config_unset_argv_expect(key, None)
+}
+
+fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<String>, String> {
+    if key == USAGE_ACCOUNTS_KEY {
+        let mut argv = vec!["config".to_string(), "--from-app".to_string()];
+        if let Some(e) = expect {
+            argv.push(format!("--expect={}", checked_expect(e)?));
+        }
+        argv.push(format!("--unset={key}"));
+        return Ok(argv);
+    }
+    if expect.is_some() {
+        return Err(format!("{key} takes no version to check"));
+    }
     let by_profile = key
         .strip_prefix(COSINE_FLOOR_BY_PROFILE_PREFIX)
         .is_some_and(|id| checked_profile(id).is_ok());
@@ -1042,7 +1080,22 @@ fn config_unset_argv(key: &str) -> Result<Vec<String>, String> {
     {
         return Err(format!("not a resettable key: {key:?}"));
     }
+    if routing_key(key) {
+        return Ok(vec!["config".to_string(), "--from-app".to_string(), format!("--unset={key}")]);
+    }
     Ok(vec!["config".to_string(), format!("--unset={key}")])
+}
+
+/// The owner's answer to a conversation's change to a routing setting.
+fn config_request_argv(key: &str, action: &str) -> Result<Vec<String>, String> {
+    if !routing_key(key) {
+        return Err(format!("not a routing setting: {key:?}"));
+    }
+    if !matches!(action, "confirm" | "undo") {
+        return Err(format!("not an answer to a request: {action:?}"));
+    }
+    Ok(vec!["config".to_string(), "--from-app".to_string(), "--answer-request".to_string(), key.to_string(),
+            action.to_string()])
 }
 
 /// Embedding profile ids look like `gemini-embedding-2@768`; the CLI also
@@ -1105,13 +1158,18 @@ async fn khipu_config_show() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn khipu_config_set(key: String, value: String) -> Result<String, String> {
-    run_khipu_cli_async(config_set_argv(&key, &value)?).await
+async fn khipu_config_set(key: String, value: String, expect: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(config_set_argv_expect(&key, &value, expect.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_config_unset(key: String) -> Result<String, String> {
-    run_khipu_cli_async(config_unset_argv(&key)?).await
+async fn khipu_config_unset(key: String, expect: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(config_unset_argv_expect(&key, expect.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_config_request(key: String, action: String) -> Result<String, String> {
+    run_khipu_cli_async(config_request_argv(&key, &action)?).await
 }
 
 #[tauri::command]
@@ -1137,8 +1195,7 @@ async fn khipu_usage_refresh() -> Result<String, String> {
 // --- Settings clarity phase 9 (9C): finding and adding accounts. Reads for
 // the app only (they carry login-folder paths); each is a fixed argv built
 // here, every value joined to its flag with `=` so it can never read as a
-// flag of its own. The writes to the account list stay `khipu_config_set
-// usage_accounts` (and 9B's `khipu_accounts_*` once it lands).
+// flag of its own. The app's account writes are 9B's `khipu_accounts_*`.
 
 fn cli_setting_key(key: &str) -> bool {
     CLI_PATH_KEYS.contains(&key) || key == NODE_FOLDER_KEY
@@ -1447,6 +1504,17 @@ struct PriorityEntry {
 /// webview sends can become a flag or an argument of its own; their order is
 /// the owner's, kept as sent.
 fn route_priority_argv(action: &str, entries: &[PriorityEntry], until: Option<&str>) -> Result<Vec<String>, String> {
+    route_priority_argv_expect(action, entries, until, None)
+}
+
+/// `expect` is the priority's version as the owner read it (`--expect=V`,
+/// before the `--`): a change made on a stale read is refused.
+fn route_priority_argv_expect(
+    action: &str,
+    entries: &[PriorityEntry],
+    until: Option<&str>,
+    expect: Option<&str>,
+) -> Result<Vec<String>, String> {
     if !ROUTE_PRIORITY_ACTIONS.contains(&action) {
         return Err(format!("not a change to the priority: {action:?}"));
     }
@@ -1479,8 +1547,272 @@ fn route_priority_argv(action: &str, entries: &[PriorityEntry], until: Option<&s
             argv.push(format!("--until={}", checked_route_until(t)?));
         }
     }
+    if let Some(e) = expect {
+        argv.push(format!("--expect={}", checked_expect(e)?));
+    }
     argv.extend(["--".to_string(), action.to_string()]);
     Ok(argv)
+}
+
+/// The version of the account list or the priority as the app read it: one
+/// short token, so it can never read as a flag or carry a second argument.
+fn checked_expect(raw: &str) -> Result<&str, String> {
+    let v = raw.trim();
+    if !v.is_empty() && v.len() <= 40 && v.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Ok(v)
+    } else {
+        Err("that is not a version Khipu knows; read the accounts again".to_string())
+    }
+}
+
+fn accounts_base(verb: &str) -> Vec<String> {
+    vec!["accounts".to_string(), verb.to_string(), "--from-app".to_string()]
+}
+
+fn checked_harness(raw: &str) -> Result<String, String> {
+    let h = raw.trim().to_lowercase();
+    if USAGE_HARNESSES.contains(&h.as_str()) {
+        Ok(h)
+    } else {
+        Err("harness must be claude, codex, grok or muse".to_string())
+    }
+}
+
+/// An account key, `harness|login folder` (`claude|` for a default login).
+fn checked_account_key(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    let harness_ok = v.split_once('|').is_some_and(|(h, _)| USAGE_HARNESSES.contains(&h));
+    if !harness_ok || v.starts_with('-') || has_control(v) || v.chars().count() > 1100 {
+        return Err("that is not an account Khipu knows".to_string());
+    }
+    Ok(v.to_string())
+}
+
+/// A login folder: `~/...` or an absolute path, one line. Joined to its flag
+/// with `=`, so it is never read as an option of its own.
+fn checked_account_folder(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if !(v.starts_with("~/") || v.starts_with('/')) {
+        return Err("a login folder starts with ~/ or is a full path starting with /".to_string());
+    }
+    if has_control(v) || v.chars().count() > 1024 {
+        return Err("a login folder must be one line of plain text".to_string());
+    }
+    Ok(v.to_string())
+}
+
+fn checked_account_name(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Err("give the account a name".to_string());
+    }
+    if has_control(v) {
+        return Err("a name must be one line of plain text".to_string());
+    }
+    if v.chars().count() > 64 {
+        return Err("a name is at most 64 characters".to_string());
+    }
+    Ok(v.to_string())
+}
+
+/// One account as the webview sends it to Track (or as it showed a default).
+#[derive(serde::Deserialize, Debug, Clone)]
+struct AccountEntry {
+    harness: String,
+    home: Option<String>,
+    label: Option<String>,
+}
+
+/// The entries rebuilt from checked fields into one JSON list. `home` and
+/// `label` are left out when empty; the CLI decides the rest.
+fn checked_account_entries(entries: &[AccountEntry]) -> Result<String, String> {
+    if entries.len() > USAGE_ACCOUNTS_MAX {
+        return Err(format!("Khipu tracks at most {USAGE_ACCOUNTS_MAX} accounts"));
+    }
+    let mut clean = Vec::with_capacity(entries.len());
+    for e in entries {
+        let mut item = serde_json::Map::new();
+        item.insert("harness".to_string(), Value::String(checked_harness(&e.harness)?));
+        if let Some(h) = e.home.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+            item.insert("home".to_string(), Value::String(checked_account_folder(h)?));
+        }
+        if let Some(l) = e.label.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+            item.insert("label".to_string(), Value::String(checked_account_name(l)?));
+        }
+        clean.push(Value::Object(item));
+    }
+    Ok(Value::Array(clean).to_string())
+}
+
+fn accounts_status_argv() -> Vec<String> {
+    vec!["accounts".to_string(), "status".to_string()]
+}
+
+fn accounts_track_argv(
+    entries: &[AccountEntry],
+    expect: &str,
+    shown_defaults: Option<&[AccountEntry]>,
+    no_read: bool,
+) -> Result<Vec<String>, String> {
+    if entries.is_empty() {
+        return Err("choose at least one account to track".to_string());
+    }
+    let mut argv = accounts_base("track");
+    argv.push(format!("--expect={}", checked_expect(expect)?));
+    argv.push(format!("--entries={}", checked_account_entries(entries)?));
+    if let Some(d) = shown_defaults {
+        argv.push(format!("--shown-defaults={}", checked_account_entries(d)?));
+    }
+    if no_read {
+        argv.push("--no-read".to_string());
+    }
+    Ok(argv)
+}
+
+fn accounts_rename_argv(account: &str, name: &str, expect: &str) -> Result<Vec<String>, String> {
+    let mut argv = accounts_base("rename");
+    argv.push(format!("--expect={}", checked_expect(expect)?));
+    argv.push(format!("--account={}", checked_account_key(account)?));
+    argv.push(format!("--name={}", checked_account_name(name)?));
+    Ok(argv)
+}
+
+/// The most holds one Stop tracking ends at once.
+const ACCOUNTS_END_HOLDS_MOST: usize = 64;
+
+fn accounts_stop_argv(
+    account: &str,
+    expect: &str,
+    keep_priority: bool,
+    keep_pause: bool,
+    keep_lanes: bool,
+    end_holds: &[String],
+    confirm_last: bool,
+) -> Result<Vec<String>, String> {
+    if end_holds.len() > ACCOUNTS_END_HOLDS_MOST {
+        return Err(format!("end at most {ACCOUNTS_END_HOLDS_MOST} holds at once"));
+    }
+    let mut argv = accounts_base("stop");
+    argv.push(format!("--expect={}", checked_expect(expect)?));
+    argv.push(format!("--account={}", checked_account_key(account)?));
+    for (on, flag) in [
+        (keep_priority, "--keep-priority"),
+        (keep_pause, "--keep-pause"),
+        (keep_lanes, "--keep-lanes"),
+        (confirm_last, "--confirm-last"),
+    ] {
+        if on {
+            argv.push(flag.to_string());
+        }
+    }
+    for id in end_holds {
+        argv.push(format!("--end-hold={}", checked_route_id(id)?));
+    }
+    Ok(argv)
+}
+
+fn accounts_move_argv(account: &str, folder: &str, expect: &str) -> Result<Vec<String>, String> {
+    let mut argv = accounts_base("move");
+    argv.push(format!("--expect={}", checked_expect(expect)?));
+    argv.push(format!("--account={}", checked_account_key(account)?));
+    argv.push(format!("--folder={}", checked_account_folder(folder)?));
+    Ok(argv)
+}
+
+/// `decline` (Not this one) and `offer-again`: the CLI and, with no folder,
+/// the default login.
+fn accounts_offer_argv(verb: &str, harness: &str, folder: Option<&str>) -> Result<Vec<String>, String> {
+    if !matches!(verb, "decline" | "offer-again") {
+        return Err(format!("not a change to the offers: {verb:?}"));
+    }
+    let mut argv = accounts_base(verb);
+    argv.push(format!("--harness={}", checked_harness(harness)?));
+    if let Some(f) = folder.map(str::trim).filter(|f| !f.is_empty()) {
+        argv.push(format!("--folder={}", checked_account_folder(f)?));
+    }
+    Ok(argv)
+}
+
+fn accounts_auto_track_argv(on: bool) -> Vec<String> {
+    let mut argv = accounts_base("auto-track");
+    argv.push(if on { "on" } else { "off" }.to_string());
+    argv
+}
+
+fn accounts_request_argv(action: &str) -> Result<Vec<String>, String> {
+    if !matches!(action, "confirm" | "undo") {
+        return Err(format!("not an answer to a request: {action:?}"));
+    }
+    let mut argv = accounts_base("request");
+    argv.push(action.to_string());
+    Ok(argv)
+}
+
+#[tauri::command]
+async fn khipu_accounts_status() -> Result<String, String> {
+    run_khipu_cli_async(accounts_status_argv()).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_track(
+    entries: Vec<AccountEntry>,
+    expect: String,
+    shown_defaults: Option<Vec<AccountEntry>>,
+    no_read: Option<bool>,
+) -> Result<String, String> {
+    run_khipu_cli_async(accounts_track_argv(&entries, &expect, shown_defaults.as_deref(), no_read.unwrap_or(false))?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_rename(account: String, name: String, expect: String) -> Result<String, String> {
+    run_khipu_cli_async(accounts_rename_argv(&account, &name, &expect)?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_stop(
+    account: String,
+    expect: String,
+    keep_priority: Option<bool>,
+    keep_pause: Option<bool>,
+    keep_lanes: Option<bool>,
+    end_holds: Option<Vec<String>>,
+    confirm_last: Option<bool>,
+) -> Result<String, String> {
+    run_khipu_cli_async(accounts_stop_argv(
+        &account,
+        &expect,
+        keep_priority.unwrap_or(false),
+        keep_pause.unwrap_or(false),
+        keep_lanes.unwrap_or(false),
+        end_holds.as_deref().unwrap_or(&[]),
+        confirm_last.unwrap_or(false),
+    )?)
+    .await
+}
+
+#[tauri::command]
+async fn khipu_accounts_move(account: String, folder: String, expect: String) -> Result<String, String> {
+    run_khipu_cli_async(accounts_move_argv(&account, &folder, &expect)?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_decline(harness: String, folder: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(accounts_offer_argv("decline", &harness, folder.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_offer_again(harness: String, folder: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(accounts_offer_argv("offer-again", &harness, folder.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_auto_track(on: bool) -> Result<String, String> {
+    run_khipu_cli_async(accounts_auto_track_argv(on)).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_request(action: String) -> Result<String, String> {
+    run_khipu_cli_async(accounts_request_argv(&action)?).await
 }
 
 /// The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
@@ -1521,7 +1853,7 @@ fn sign_in_argv(config: &Value, harness: &str, home: Option<&str>) -> Result<Vec
             .map(|h| expand_home(h, user_home));
         same_cli && a.get("invalid").map_or(true, Value::is_null) && theirs == wanted
     });
-    let account = found.ok_or("that login folder is not one of the accounts in Settings → Capture & models → Plans")?;
+    let account = found.ok_or("that login folder is not one of the accounts in Settings → Accounts and routing → Accounts")?;
     let label = account.get("label").and_then(Value::as_str).unwrap_or("").trim();
     if label.is_empty() || has_control(label) {
         return Err("that account has no label Khipu can name".to_string());
@@ -1594,8 +1926,12 @@ async fn khipu_route_priority(
     action: String,
     entries: Option<Vec<PriorityEntry>>,
     until: Option<String>,
+    expect: Option<String>,
 ) -> Result<String, String> {
-    run_khipu_cli_async(route_priority_argv(&action, entries.as_deref().unwrap_or(&[]), until.as_deref())?).await
+    run_khipu_cli_async(
+        route_priority_argv_expect(&action, entries.as_deref().unwrap_or(&[]), until.as_deref(), expect.as_deref())?,
+    )
+    .await
 }
 
 /// Sign in again: the CLI starts the account's own login (it opens the
@@ -3236,6 +3572,7 @@ pub fn run() {
             khipu_feature_set,
             khipu_config_show,
             khipu_config_set,
+            khipu_config_request,
             khipu_config_unset,
             khipu_budget_status,
             khipu_budget_lift_synth_today,
@@ -3257,6 +3594,15 @@ pub fn run() {
             khipu_route_hold_end,
             khipu_route_priority,
             khipu_account_sign_in,
+            khipu_accounts_status,
+            khipu_accounts_track,
+            khipu_accounts_rename,
+            khipu_accounts_stop,
+            khipu_accounts_move,
+            khipu_accounts_decline,
+            khipu_accounts_offer_again,
+            khipu_accounts_auto_track,
+            khipu_accounts_request,
             khipu_jobs_status,
             khipu_job_install,
             khipu_job_uninstall,
@@ -3884,46 +4230,46 @@ mod settings_command_tests {
 
     #[test]
     fn routing_settings_are_reprinted_or_refused() {
-        assert_eq!(config_set_argv("routing_stale_after", "43200").unwrap(), v(&["config", "--set", "routing_stale_after", "43200"]));
-        assert_eq!(config_set_argv("routing_summary_chars", " 0 ").unwrap(), v(&["config", "--set", "routing_summary_chars", "0"]));
-        assert_eq!(config_set_argv("routing_push_prompt", "off").unwrap(), v(&["config", "--set", "routing_push_prompt", "off"]));
+        assert_eq!(config_set_argv("routing_stale_after", "43200").unwrap(), v(&["config", "--from-app", "--set", "routing_stale_after", "43200"]));
+        assert_eq!(config_set_argv("routing_summary_chars", " 0 ").unwrap(), v(&["config", "--from-app", "--set", "routing_summary_chars", "0"]));
+        assert_eq!(config_set_argv("routing_push_prompt", "off").unwrap(), v(&["config", "--from-app", "--set", "routing_push_prompt", "off"]));
         // Every limit Khipu enforces on the owner's words or a line can be
         // raised from Settings -> Routing (fix round 1, F3).
-        assert_eq!(config_set_argv("routing_hold_chars", "0").unwrap(), v(&["config", "--set", "routing_hold_chars", "0"]));
-        assert_eq!(config_set_argv("routing_line_chars", "400").unwrap(), v(&["config", "--set", "routing_line_chars", "400"]));
+        assert_eq!(config_set_argv("routing_hold_chars", "0").unwrap(), v(&["config", "--from-app", "--set", "routing_hold_chars", "0"]));
+        assert_eq!(config_set_argv("routing_line_chars", "400").unwrap(), v(&["config", "--from-app", "--set", "routing_line_chars", "400"]));
         for (k, bad) in [("routing_stale_after", "-1"), ("routing_stale_after", "12h"), ("routing_prompt_chars", "--x"),
                          ("routing_push_start", "yes"), ("routing_summary_chars", "1e3"),
                          ("routing_stale_after", "999999999999")] {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
-        assert_eq!(config_set_argv("routing_reset_check", "on").unwrap(), v(&["config", "--set", "routing_reset_check", "on"]));
-        assert_eq!(config_set_argv("routing_reset_check_wait", "120").unwrap(), v(&["config", "--set", "routing_reset_check_wait", "120"]));
-        assert_eq!(config_set_argv("routing_reset_check_retries", "[600,1800]").unwrap(), v(&["config", "--set", "routing_reset_check_retries", "[600,1800]"]));
+        assert_eq!(config_set_argv("routing_reset_check", "on").unwrap(), v(&["config", "--from-app", "--set", "routing_reset_check", "on"]));
+        assert_eq!(config_set_argv("routing_reset_check_wait", "120").unwrap(), v(&["config", "--from-app", "--set", "routing_reset_check_wait", "120"]));
+        assert_eq!(config_set_argv("routing_reset_check_retries", "[600,1800]").unwrap(), v(&["config", "--from-app", "--set", "routing_reset_check_retries", "[600,1800]"]));
         // The retries can be removed, or kept to one (fix round 1, F7).
-        assert_eq!(config_set_argv("routing_reset_check_retries", "[]").unwrap(), v(&["config", "--set", "routing_reset_check_retries", "[]"]));
-        assert_eq!(config_set_argv("routing_reset_check_retries", "[600]").unwrap(), v(&["config", "--set", "routing_reset_check_retries", "[600]"]));
-        assert_eq!(config_set_argv("routing_busy_load", "0").unwrap(), v(&["config", "--set", "routing_busy_load", "0"]));
-        assert_eq!(config_set_argv("routing_busy_load", "75").unwrap(), v(&["config", "--set", "routing_busy_load", "75"]));
-        assert_eq!(config_set_argv("routing_busy_wait", "300").unwrap(), v(&["config", "--set", "routing_busy_wait", "300"]));
-        assert_eq!(config_set_argv("routing_busy_tries", "3").unwrap(), v(&["config", "--set", "routing_busy_tries", "3"]));
+        assert_eq!(config_set_argv("routing_reset_check_retries", "[]").unwrap(), v(&["config", "--from-app", "--set", "routing_reset_check_retries", "[]"]));
+        assert_eq!(config_set_argv("routing_reset_check_retries", "[600]").unwrap(), v(&["config", "--from-app", "--set", "routing_reset_check_retries", "[600]"]));
+        assert_eq!(config_set_argv("routing_busy_load", "0").unwrap(), v(&["config", "--from-app", "--set", "routing_busy_load", "0"]));
+        assert_eq!(config_set_argv("routing_busy_load", "75").unwrap(), v(&["config", "--from-app", "--set", "routing_busy_load", "75"]));
+        assert_eq!(config_set_argv("routing_busy_wait", "300").unwrap(), v(&["config", "--from-app", "--set", "routing_busy_wait", "300"]));
+        assert_eq!(config_set_argv("routing_busy_tries", "3").unwrap(), v(&["config", "--from-app", "--set", "routing_busy_tries", "3"]));
         for (k, bad) in [("routing_reset_check", "yes"), ("routing_reset_check_wait", "-1"),
                          ("routing_reset_check_retries", "[600,600]"), ("routing_reset_check_retries", "[600,\n1800]"),
                          ("routing_reset_check_retries", "[0]"), ("routing_reset_check_retries", "[1,2,3]"),
                          ("routing_busy_load", "-1"), ("routing_busy_wait", "one"), ("routing_busy_tries", "-3")] {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
-        assert_eq!(config_unset_argv("routing_reset_check").unwrap(), v(&["config", "--unset=routing_reset_check"]));
+        assert_eq!(config_unset_argv("routing_reset_check").unwrap(), v(&["config", "--from-app", "--unset=routing_reset_check"]));
         // Phase 6: the push before handing work to another agent, and the
         // owner's dispatch scripts, by file name only.
-        assert_eq!(config_set_argv("routing_push_delegation", "off").unwrap(), v(&["config", "--set", "routing_push_delegation", "off"]));
-        assert_eq!(config_unset_argv("routing_push_delegation").unwrap(), v(&["config", "--unset=routing_push_delegation"]));
+        assert_eq!(config_set_argv("routing_push_delegation", "off").unwrap(), v(&["config", "--from-app", "--set", "routing_push_delegation", "off"]));
+        assert_eq!(config_unset_argv("routing_push_delegation").unwrap(), v(&["config", "--from-app", "--unset=routing_push_delegation"]));
         assert!(config_set_argv("routing_push_delegation", "yes").is_err());
         assert_eq!(
             config_set_argv("routing_dispatch_scripts", r#"[" dispatch.py ", "run-job.sh", "dispatch.py"]"#).unwrap(),
-            v(&["config", "--set", "routing_dispatch_scripts", r#"["dispatch.py","run-job.sh"]"#])
+            v(&["config", "--from-app", "--set", "routing_dispatch_scripts", r#"["dispatch.py","run-job.sh"]"#])
         );
-        assert_eq!(config_set_argv("routing_dispatch_scripts", "[]").unwrap(), v(&["config", "--set", "routing_dispatch_scripts", "[]"]));
-        assert_eq!(config_unset_argv("routing_dispatch_scripts").unwrap(), v(&["config", "--unset=routing_dispatch_scripts"]));
+        assert_eq!(config_set_argv("routing_dispatch_scripts", "[]").unwrap(), v(&["config", "--from-app", "--set", "routing_dispatch_scripts", "[]"]));
+        assert_eq!(config_unset_argv("routing_dispatch_scripts").unwrap(), v(&["config", "--from-app", "--unset=routing_dispatch_scripts"]));
         for bad in [r#"["/bin/dispatch.py"]"#, r#"["a b"]"#, r#"[".."]"#, r#"["-x"]"#, r#"["-c"]"#, r#"["a\nb"]"#, r#"[3]"#,
                     "dispatch.py", r#"{"a": 1}"#] {
             assert!(config_set_argv("routing_dispatch_scripts", bad).is_err(), "{bad}");
@@ -3935,19 +4281,19 @@ mod settings_command_tests {
             assert!(config_set_argv(k, "on").is_err(), "{k}");
             assert!(config_unset_argv(k).is_err(), "{k}");
         }
-        assert_eq!(config_unset_argv("routing_stale_after").unwrap(), v(&["config", "--unset=routing_stale_after"]));
+        assert_eq!(config_unset_argv("routing_stale_after").unwrap(), v(&["config", "--from-app", "--unset=routing_stale_after"]));
         let sources = config_set_argv(
             "routing_sources",
             r#"[{"name": " Project A ", "kind": "anything", "path": "/runners/a"}]"#,
         )
         .unwrap();
-        assert_eq!(sources[3], r#"[{"kind":"lanes","name":"Project A","path":"/runners/a"}]"#);
+        assert_eq!(sources[4], r#"[{"kind":"lanes","name":"Project A","path":"/runners/a"}]"#);
         for bad in [r#"[{"name": "a", "path": "relative/a"}]"#, r#"[{"name": "a", "path": "/a", "extra": 1}]"#,
                     r#"[{"name": "a\n--x", "path": "/a"}]"#, r#"{"name": "a"}"#, "-x"] {
             assert!(config_set_argv("routing_sources", bad).is_err(), "{bad}");
         }
         let map = config_set_argv("routing_lane_map", r#"{"Project B": {"opus-batch": "Claude main"}}"#).unwrap();
-        assert_eq!(map[3], r#"{"Project B":{"opus-batch":"Claude main"}}"#);
+        assert_eq!(map[4], r#"{"Project B":{"opus-batch":"Claude main"}}"#);
         for bad in [r#"{"B": {"lane": 3}}"#, r#"{"B": ["lane"]}"#, r#"{"B": {"la\nne": "x"}}"#, "[]"] {
             assert!(config_set_argv("routing_lane_map", bad).is_err(), "{bad}");
         }
@@ -3968,8 +4314,8 @@ mod settings_command_tests {
             ("routing_slow_read_pct", "2", "2"),
             ("routing_slow_read_pct", "0", "0"),
         ] {
-            assert_eq!(config_set_argv(k, raw).unwrap(), v(&["config", "--set", k, out]), "{k}={raw}");
-            assert_eq!(config_unset_argv(k).unwrap(), v(&["config", &format!("--unset={k}")]));
+            assert_eq!(config_set_argv(k, raw).unwrap(), v(&["config", "--from-app", "--set", k, out]), "{k}={raw}");
+            assert_eq!(config_unset_argv(k).unwrap(), v(&["config", "--from-app", &format!("--unset={k}")]));
         }
         for (k, bad) in [("routing_slow_read_pct", "-1"), ("routing_slow_read_pct", "1e2"), ("routing_slow_read_pct", "NaN"),
                          ("routing_slow_read_pct", "inf"), ("routing_slow_read_pct", "1.2.3"), ("routing_slow_read_pct", "."),
@@ -3980,17 +4326,33 @@ mod settings_command_tests {
     }
 
     #[test]
+    fn a_routing_setting_is_saved_and_answered_as_the_owner() {
+        // A conversation's shell is refused a routing setting; the app's own
+        // save carries --from-app, one step, and answers a waiting request.
+        assert_eq!(config_set_argv("routing_lane_map", "{}").unwrap(), v(&["config", "--from-app", "--set", "routing_lane_map", "{}"]));
+        assert_eq!(config_set_argv("synth_fallback", "none").unwrap()[1], "--set");
+        assert_eq!(
+            config_request_argv("routing_lane_map", "confirm").unwrap(),
+            v(&["config", "--from-app", "--answer-request", "routing_lane_map", "confirm"])
+        );
+        assert_eq!(config_request_argv("routing_stale_after", "undo").unwrap()[4], "undo");
+        assert!(config_request_argv("routing_lane_map", "--x").is_err());
+        assert!(config_request_argv("usage_accounts", "confirm").is_err());
+        assert!(config_request_argv("--from-app", "confirm").is_err());
+    }
+
+    #[test]
     fn the_routing_table_file_is_offered_as_a_full_path() {
         // Fix round 2, R2-1: Settings -> Routing chooses and clears the table file.
         assert_eq!(
             config_set_argv("routing_table", " ~/notes/ROUTING-NOW.md ").unwrap(),
-            v(&["config", "--set", "routing_table", "~/notes/ROUTING-NOW.md"])
+            v(&["config", "--from-app", "--set", "routing_table", "~/notes/ROUTING-NOW.md"])
         );
         assert_eq!(
             config_set_argv("routing_table", "/notes/routing/ROUTING-NOW.md").unwrap(),
-            v(&["config", "--set", "routing_table", "/notes/routing/ROUTING-NOW.md"])
+            v(&["config", "--from-app", "--set", "routing_table", "/notes/routing/ROUTING-NOW.md"])
         );
-        assert_eq!(config_unset_argv("routing_table").unwrap(), v(&["config", "--unset=routing_table"]));
+        assert_eq!(config_unset_argv("routing_table").unwrap(), v(&["config", "--from-app", "--unset=routing_table"]));
         let long = format!("/{}", "a".repeat(1024));
         for bad in ["", "   ", "notes/ROUTING-NOW.md", "~notes", "-x", "--from-app", "/a\n--x", "/a\rb", long.as_str()] {
             assert!(config_set_argv("routing_table", bad).is_err(), "{bad:?}");
@@ -4076,12 +4438,13 @@ mod settings_command_tests {
             argv,
             v(&[
                 "config",
+                "--from-app",
                 "--set",
                 "usage_accounts",
                 r#"[{"harness":"claude","home":"~/.claude-second","label":"Claude second"},{"harness":"grok"}]"#,
             ])
         );
-        assert_eq!(config_set_argv("usage_accounts", "[]").unwrap(), v(&["config", "--set", "usage_accounts", "[]"]));
+        assert_eq!(config_set_argv("usage_accounts", "[]").unwrap(), v(&["config", "--from-app", "--set", "usage_accounts", "[]"]));
         let many = format!("[{}]", vec![r#"{"harness":"claude"}"#; 33].join(","));
         let long_label = format!(r#"[{{"harness":"claude","label":"{}"}}]"#, "x".repeat(65));
         for bad in [
@@ -4101,7 +4464,22 @@ mod settings_command_tests {
         ] {
             assert!(config_set_argv("usage_accounts", bad).is_err(), "accepted {bad:?}");
         }
-        assert_eq!(config_unset_argv("usage_accounts").unwrap(), v(&["config", "--unset=usage_accounts"]));
+        assert_eq!(config_unset_argv("usage_accounts").unwrap(), v(&["config", "--from-app", "--unset=usage_accounts"]));
+        assert_eq!(
+            config_set_argv_expect("usage_accounts", "[]", Some("v3a")).unwrap(),
+            v(&["config", "--from-app", "--expect=v3a", "--set", "usage_accounts", "[]"])
+        );
+        assert_eq!(
+            config_unset_argv_expect("usage_accounts", Some("v3a")).unwrap(),
+            v(&["config", "--from-app", "--expect=v3a", "--unset=usage_accounts"])
+        );
+        for bad in ["", "--x", "a b", "a=b", "v\n1", &"a".repeat(41)] {
+            assert!(config_set_argv_expect("usage_accounts", "[]", Some(bad)).is_err(), "{bad:?}");
+            assert!(config_unset_argv_expect("usage_accounts", Some(bad)).is_err(), "{bad:?}");
+        }
+        // Other keys take no version.
+        assert!(config_set_argv_expect("capture_mode", "hub", Some("v1")).is_err());
+        assert!(config_unset_argv_expect("memory_root", Some("v1")).is_err());
     }
 
     #[test]
@@ -4804,6 +5182,133 @@ mod priority_and_sign_in_tests {
             let argv = route_priority_argv(action, &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z")).unwrap();
             assert_eq!(argv, v(&["route", "priority", "--from-app", "--", action]));
         }
+    }
+
+    #[test]
+    fn the_priority_version_joins_its_flag_before_the_verb() {
+        let argv = route_priority_argv_expect("clear", &[], None, Some("p9f")).unwrap();
+        assert_eq!(argv, v(&["route", "priority", "--from-app", "--expect=p9f", "--", "clear"]));
+        let set = route_priority_argv_expect("set", &[entry("Codex", None, None)], None, Some("p0")).unwrap();
+        assert_eq!(set[set.len() - 3], "--expect=p0");
+        for bad in ["", "--x", "p 1", "p=1", "p\n1", "p|1"] {
+            assert!(route_priority_argv_expect("clear", &[], None, Some(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    fn acct(harness: &str, home: Option<&str>, label: Option<&str>) -> AccountEntry {
+        AccountEntry { harness: harness.into(), home: home.map(Into::into), label: label.map(Into::into) }
+    }
+
+    #[test]
+    fn track_rebuilds_its_entries_from_checked_fields() {
+        let argv = accounts_track_argv(
+            &[acct("Claude", Some("~/.claude-work"), Some(" Work ")), acct("muse", None, Some(""))],
+            "v7",
+            Some(&[acct("claude", None, Some("Claude"))]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            v(&[
+                "accounts",
+                "track",
+                "--from-app",
+                "--expect=v7",
+                r#"--entries=[{"harness":"claude","home":"~/.claude-work","label":"Work"},{"harness":"muse"}]"#,
+                r#"--shown-defaults=[{"harness":"claude","label":"Claude"}]"#,
+                "--no-read",
+            ])
+        );
+        let plain = accounts_track_argv(&[acct("codex", None, None)], "v7", None, false).unwrap();
+        assert_eq!(plain.len(), 5);
+        assert!(accounts_track_argv(&[], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("cluade", None, None)], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", Some("relative"), None)], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", Some("~/a\nb"), None)], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", None, Some("a\nb"))], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", None, Some(&"x".repeat(65)))], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", None, None)], "--x", None, false).is_err());
+        let many: Vec<AccountEntry> = (0..33).map(|_| acct("claude", None, None)).collect();
+        assert!(accounts_track_argv(&many, "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", None, None)], "v7", Some(&many), false).is_err());
+    }
+
+    #[test]
+    fn rename_and_move_check_the_key_name_folder_and_version() {
+        assert_eq!(
+            accounts_rename_argv("claude|~/.claude-work", " Work Mac ", "v2").unwrap(),
+            v(&["accounts", "rename", "--from-app", "--expect=v2", "--account=claude|~/.claude-work", "--name=Work Mac"])
+        );
+        assert_eq!(
+            accounts_move_argv("claude|", "/opt/x/.claude-new", "v2").unwrap(),
+            v(&["accounts", "move", "--from-app", "--expect=v2", "--account=claude|", "--folder=/opt/x/.claude-new"])
+        );
+        for key in ["", "--from-app", "claude", "other|", "-claude|", "claude|a\nb", "Claude"] {
+            assert!(accounts_rename_argv(key, "Work", "v2").is_err(), "{key:?}");
+            assert!(accounts_move_argv(key, "~/x", "v2").is_err(), "{key:?}");
+        }
+        for name in ["", "   ", "a\nb", &"n".repeat(65)] {
+            assert!(accounts_rename_argv("claude|", name, "v2").is_err(), "{name:?}");
+        }
+        for folder in ["", "relative", "--x", "~/a\nb", "~"] {
+            assert!(accounts_move_argv("claude|", folder, "v2").is_err(), "{folder:?}");
+        }
+        assert!(accounts_rename_argv("claude|", "Work", "").is_err());
+        assert!(accounts_move_argv("claude|", "~/x", "v 2").is_err());
+    }
+
+    #[test]
+    fn stop_carries_only_the_kept_flags_and_checked_hold_ids() {
+        assert_eq!(
+            accounts_stop_argv("codex|", "v4", false, false, false, &[], false).unwrap(),
+            v(&["accounts", "stop", "--from-app", "--expect=v4", "--account=codex|"])
+        );
+        assert_eq!(
+            accounts_stop_argv("codex|", "v4", true, true, true, &["h1a2b".to_string(), "runner:x".to_string()], true).unwrap(),
+            v(&[
+                "accounts",
+                "stop",
+                "--from-app",
+                "--expect=v4",
+                "--account=codex|",
+                "--keep-priority",
+                "--keep-pause",
+                "--keep-lanes",
+                "--confirm-last",
+                "--end-hold=h1a2b",
+                "--end-hold=runner:x",
+            ])
+        );
+        assert!(accounts_stop_argv("codex|", "v4", false, false, false, &["--x".to_string()], false).is_err());
+        assert!(accounts_stop_argv("codex|", "v4", false, false, false, &["a\nb".to_string()], false).is_err());
+        let many: Vec<String> = (0..65).map(|i| format!("h{i}")).collect();
+        assert!(accounts_stop_argv("codex|", "v4", false, false, false, &many, false).is_err());
+        assert!(accounts_stop_argv("--confirm-last", "v4", false, false, false, &[], false).is_err());
+        assert!(accounts_stop_argv("codex|", "", false, false, false, &[], false).is_err());
+    }
+
+    #[test]
+    fn offers_switch_and_request_answers_build_fixed_argv() {
+        assert_eq!(
+            accounts_offer_argv("decline", "Codex", None).unwrap(),
+            v(&["accounts", "decline", "--from-app", "--harness=codex"])
+        );
+        assert_eq!(
+            accounts_offer_argv("offer-again", "claude", Some("~/.claude-old")).unwrap(),
+            v(&["accounts", "offer-again", "--from-app", "--harness=claude", "--folder=~/.claude-old"])
+        );
+        assert_eq!(accounts_offer_argv("decline", "claude", Some("  ")).unwrap().len(), 4);
+        assert!(accounts_offer_argv("track", "claude", None).is_err());
+        assert!(accounts_offer_argv("decline", "--x", None).is_err());
+        assert!(accounts_offer_argv("decline", "claude", Some("--folder")).is_err());
+        assert_eq!(accounts_auto_track_argv(true), v(&["accounts", "auto-track", "--from-app", "on"]));
+        assert_eq!(accounts_auto_track_argv(false), v(&["accounts", "auto-track", "--from-app", "off"]));
+        assert_eq!(accounts_request_argv("confirm").unwrap(), v(&["accounts", "request", "--from-app", "confirm"]));
+        assert_eq!(accounts_request_argv("undo").unwrap(), v(&["accounts", "request", "--from-app", "undo"]));
+        assert!(accounts_request_argv("--x").is_err());
+        assert!(accounts_request_argv("clear").is_err());
+        assert_eq!(accounts_status_argv(), v(&["accounts", "status"]));
     }
 
     fn config() -> Value {

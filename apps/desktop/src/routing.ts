@@ -206,6 +206,8 @@ export type RoutePriority = {
   pending_by?: string | null;
   owner_request?: string | null;
   replaced?: { entries: RoutePriorityEntry[]; until?: string | null } | null;
+  /** The priority as read; a write that carries it is refused once it moved. */
+  version?: string | null;
 };
 
 /** What Khipu read of an account's plan (`routing.plan_fact`): its longest
@@ -226,6 +228,8 @@ export type PlanFact = {
 export type RouteView = {
   record?: boolean;
   version?: number;
+  /** The priority's version, also when none is set (`version_moved` guard). */
+  priority_version?: string | null;
   checked_at?: string;
   accounts?: RouteAccount[];
   holds?: RouteHold[];
@@ -408,7 +412,7 @@ export function accountState(a: RouteAccount, now: Date): { text: string; tone: 
       text = a.reset_check?.reason
         ? `Its reset time passed ${pastWords(a.until, now)}; ${midSentence(a.reset_check.reason)}`
         : a.configured === false
-          ? `Probably open: its limit was due to end ${pastWords(a.until, now)}; Khipu can't check this account: it isn't in Settings \u2192 Models`
+          ? `Probably open: its limit was due to end ${pastWords(a.until, now)}; Khipu can't check this account: it isn't tracked in Accounts and routing`
           : a.checkable === false
             ? `Its reset time passed ${pastWords(a.until, now)}; this account can't be checked without using a turn`
             : `Probably open: its limit was due to end ${pastWords(a.until, now)}, not checked yet`;

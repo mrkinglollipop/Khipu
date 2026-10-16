@@ -14,8 +14,8 @@
    new and the attention callouts. Close hides it on this Mac until a
    different folder is found; it turns nothing down.
 
-   Controls that need slice 9B's commands render disabled with words saying
-   they come in a later update (accountsApi.ts COMING). */
+   Every write is slice 9B's `khipu accounts ...`; a control that writes is
+   off only until the account list has been read. */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -90,20 +90,42 @@ function writeList(key: string, v: unknown[]): void {
 }
 
 const isString = (v: unknown): v is string => typeof v === "string";
+/** A login left unticked in setup and its conversation count then. */
+export type QuietLogin = { id: string; seen: number };
+const isQuiet = (v: unknown): v is QuietLogin | string =>
+  typeof v === "string" || (!!v && typeof v === "object" && typeof (v as QuietLogin).id === "string" && typeof (v as QuietLogin).seen === "number");
 type AutoCard = { key: string; label: string; path?: string | null; conversations?: number | null };
 const isAutoCard = (v: unknown): v is AutoCard =>
   !!v && typeof v === "object" && typeof (v as AutoCard).key === "string" && typeof (v as AutoCard).label === "string";
 
-/** Logins left unticked in setup: Settings only, never Home (decision 12). */
-export function quietLogins(): string[] {
-  return readList(QUIET_KEY, isString);
+/** Logins left unticked in setup: Settings only, not Home, until a
+ *  conversation uses them (decision 12). An entry without a count reads as
+ *  "not used since" until Home first sees its count. */
+export function quietLogins(): QuietLogin[] {
+  return readList(QUIET_KEY, isQuiet).map((q) => (typeof q === "string" ? { id: q, seen: Number.MAX_SAFE_INTEGER } : q));
 }
 
-export function addQuietLogins(ids: string[]): void {
-  if (!ids.length) return;
-  const now = new Set(quietLogins());
-  ids.forEach((id) => now.add(id));
-  writeList(QUIET_KEY, [...now]);
+export function addQuietLogins(logins: Array<{ id: string; conversations_7d?: number | null }>): void {
+  if (!logins.length) return;
+  const now = new Map(quietLogins().map((q) => [q.id, q]));
+  logins.forEach((c) => now.set(c.id, { id: c.id, seen: c.conversations_7d ?? 0 }));
+  writeList(QUIET_KEY, [...now.values()]);
+}
+
+/** The week's count is rolling, so it can fall: keep each quiet login's
+ *  count at the lowest seen, so that any later conversation raises it. */
+function lowerQuiet(d: DiscoverResult | null | undefined): QuietLogin[] {
+  const quiet = quietLogins();
+  let moved = false;
+  const next = quiet.map((q) => {
+    const c = (d?.candidates ?? []).find((x) => x.id === q.id);
+    const n = c?.conversations_7d ?? 0;
+    if (!c || n >= q.seen) return q;
+    moved = true;
+    return { id: q.id, seen: n };
+  });
+  if (moved) writeList(QUIET_KEY, next);
+  return next;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,9 +139,13 @@ export function foundRowsOf(d: DiscoverResult | null | undefined): Candidate[] {
 }
 
 /** Home's Found card: signed-in finds a conversation used, minus the logins
- *  setup left unticked. */
-export function homeOffersOf(d: DiscoverResult | null | undefined, quiet: string[] = []): Candidate[] {
-  return (d?.candidates ?? []).filter((c) => c.offer_on_home && !quiet.includes(c.id));
+ *  setup left unticked that no conversation used since. */
+export function homeOffersOf(d: DiscoverResult | null | undefined, quiet: QuietLogin[] = []): Candidate[] {
+  return (d?.candidates ?? []).filter((c) => {
+    if (!c.offer_on_home) return false;
+    const q = quiet.find((x) => x.id === c.id);
+    return !q || (c.conversations_7d ?? 0) > q.seen;
+  });
 }
 
 /** A tracked account whose login folder is gone, paired with an untracked
@@ -202,11 +228,9 @@ export function FoundRows({
 }) {
   const uid = useId().replace(/:/g, "");
   const here = support.state === "here";
-  const comingId = `${uid}-decline-coming`;
-  const moveComingId = `${uid}-move-coming`;
   if (!candidates.length) return null;
   const decline = (c: Candidate) => (
-    <button type="button" className="sm" disabled={!here} aria-describedby={here ? undefined : comingId}
+    <button type="button" className="sm" disabled={!here}
       aria-label={`Not this one: never offer ${shownPath(c)} again`} onClick={() => onDecline(c)}>
       Not this one
     </button>
@@ -227,10 +251,9 @@ export function FoundRows({
                   {m.account.label}'s folder {m.account.home ?? "its login folder"} is gone, and this new {serviceName(c.cli)} login is
                   signed in{planWord(c.plan) ? ` (${planWord(c.plan)})` : ""}.
                 </span>
-                {here ? null : <ComingNote id={moveComingId} text={COMING.move} />}
               </span>
               <span className="aa-btns">
-                <button type="button" className="sm primary" disabled={!here} aria-describedby={here ? undefined : moveComingId}
+                <button type="button" className="sm primary" disabled={!here}
                   aria-label={`Yes, ${c.path} is ${m.account.label}, moved`} onClick={() => onMove?.(m)}>
                   Yes, it moved
                 </button>
@@ -318,11 +341,6 @@ export function FoundRows({
           </div>
         );
       })}
-      {here ? null : (
-        <span className="aa-coming" id={comingId}>
-          {COMING.decline}
-        </span>
-      )}
     </div>
   );
 }
@@ -433,7 +451,7 @@ export function NotOfferedAgain({
       <div className="fold-body" id={`${id}-body`} hidden={!open}>
         <div className="disclose-body">
           {!here ? (
-            <p className="set-help">{COMING.notOffered}</p>
+            <p className="set-help">{support.state === "error" ? "Khipu couldn't read this list just now." : "Reading…"}</p>
           ) : list.length === 0 ? (
             <p className="set-help">No logins. When you choose Not this one or stop tracking an account, its login is listed here.</p>
           ) : (
@@ -498,7 +516,6 @@ export function AutoTrackSwitch({
             {setup
               ? "Off: when Khipu later finds another signed-in account your conversations use, it asks on Home first."
               : "When Khipu finds a signed-in account that your conversations use, it starts reading its plan and tells you on Home, with Undo. Off: it asks first."}
-            {here ? "" : ` ${COMING.autoTrack}`}
           </p>
         </div>
       </div>
@@ -652,12 +669,9 @@ export function AccountExtras({
   const code = row?.ok === false ? row.error ?? null : null;
   const missing = code === "login_folder_missing";
   const signedOut = code === "not_signed_in" && !!row?.last_good_at;
-  const comingStop = `${id}-stop-coming`;
-  const comingRename = `${id}-rename-coming`;
-  const comingMove = `${id}-move-coming`;
   const comingNew = `${id}-new-coming`;
   const stop = (
-    <button type="button" className="sm" disabled={!here} aria-describedby={here ? undefined : comingStop}
+    <button type="button" className="sm" disabled={!here}
       aria-label={`Stop tracking ${label}`} onClick={onStop}>
       Stop tracking…
     </button>
@@ -678,7 +692,7 @@ export function AccountExtras({
       ) : null}
       {missing ? (
         <>
-          <button type="button" className="sm" disabled={!here} aria-describedby={here ? undefined : comingMove}
+          <button type="button" className="sm" disabled={!here}
             aria-label={`Choose the folder for ${label}`} onClick={(e) => onChooseFolder?.(e.currentTarget)}>
             Choose the folder…
           </button>
@@ -690,19 +704,12 @@ export function AccountExtras({
           ) : null}
         </>
       ) : (
-        <button type="button" className="sm" disabled={!here} aria-describedby={here ? undefined : comingRename}
+        <button type="button" className="sm" disabled={!here}
           aria-label={`Rename ${label}`} onClick={onRename}>
           Rename…
         </button>
       )}
       {stop}
-      {here ? null : (
-        <>
-          <ComingNote id={comingRename} text={COMING.rename} />
-          <ComingNote id={comingStop} text={COMING.stop} />
-          {missing ? <ComingNote id={comingMove} text={COMING.move} /> : null}
-        </>
-      )}
       {missing && (harness === "claude" || harness === "codex") ? <ComingNote id={comingNew} text={COMING.signInNew} /> : null}
     </div>
   );
@@ -770,16 +777,24 @@ function whenLocal(iso: string | null | undefined): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
 }
 
-function mentionLinks(rules: Array<{ n: number }>, note: boolean, onEdit?: (what: Mention) => void): ReactNode {
+/** Each Edit link closes the dialog first: the editor it opens is behind the
+ *  modal, which keeps it inert while the dialog is open. */
+function mentionLinks(rules: Array<{ n: number }>, note: boolean, onClose: () => void, onEdit?: (what: Mention) => void): ReactNode {
   return (
     <>
       {rules.map((r) => (
-        <button key={r.n} type="button" className="link sm" onClick={() => onEdit?.({ kind: "rule", n: r.n })}>
+        <button key={r.n} type="button" className="link sm" onClick={() => {
+            onClose();
+            onEdit?.({ kind: "rule", n: r.n });
+          }}>
           Edit rule {r.n}
         </button>
       ))}{" "}
       {note ? (
-        <button type="button" className="link sm" onClick={() => onEdit?.({ kind: "note" })}>
+        <button type="button" className="link sm" onClick={() => {
+            onClose();
+            onEdit?.({ kind: "note" });
+          }}>
           Edit your note
         </button>
       ) : null}
@@ -863,7 +878,7 @@ export function RenameDialog({
         {named.length ? (
           <li>
             <b>Not changed:</b> {listOf(named)} still {named.length === 1 ? "says" : "say"} {account.label}.{" "}
-            {mentionLinks(refs.rules, refs.note, onEdit)}
+            {mentionLinks(refs.rules, refs.note, onClose, onEdit)}
           </li>
         ) : null}
         <li>
@@ -871,7 +886,6 @@ export function RenameDialog({
         </li>
       </ul>
       {err ? <p className="set-error" role="alert">{err}</p> : null}
-      {here ? null : <p className="aa-note">{COMING.rename}</p>}
       <div className="aa-actions">
         <button type="button" className="aa-left" onClick={onClose}>
           Cancel
@@ -945,84 +959,87 @@ export function StopTrackingDialog({
         {title}
       </h2>
       {refs.last ? (
-        <>
-          <p>
-            {account.label} is the only account Khipu tracks on this Mac. After this, Khipu reads no plans, and your conversations
-            hear about no accounts until you add one.
-          </p>
-          <ul className="aa-dos">
-            <li>
-              <b>Not changed:</b> {account.home ? "the login folder" : ""} <span className="aa-mono">{folder}</span> and its sign-in.
-            </li>
-            <li>Khipu won't go back to reading every installed program on its own.</li>
-          </ul>
-        </>
+        <p>
+          {account.label} is the only account Khipu tracks on this Mac. After this, Khipu reads no plans, and your conversations
+          hear about no accounts until you add one.
+        </p>
       ) : (
-        <>
-          <p>Khipu stops reading its plan on this Mac and stops telling your conversations about it.</p>
-          {refs.priority || refs.pausedUntil !== undefined || refs.lanes.length || refs.holds.length ? (
-            <fieldset className="aa-checks">
-              <legend>Also</legend>
-              {refs.priority ? (
-                <div>
-                  <input type="checkbox" id={`${id}-p`} checked={prio} onChange={(e) => setPrio(e.target.checked)} />
-                  <label htmlFor={`${id}-p`}>
-                    Remove it from your priority list (it is {ordinal(refs.priority.place)}
-                    {refs.priority.next ? `; ${refs.priority.next} moves up` : ""})
-                  </label>
-                </div>
-              ) : null}
-              {refs.pausedUntil !== undefined ? (
-                <div>
-                  <input type="checkbox" id={`${id}-z`} checked={pause} onChange={(e) => setPause(e.target.checked)} />
-                  <label htmlFor={`${id}-z`}>
-                    End its pause now{whenLocal(refs.pausedUntil) ? ` (paused until ${whenLocal(refs.pausedUntil)})` : ""}
-                  </label>
-                </div>
-              ) : null}
-              {refs.lanes.length ? (
-                <div>
-                  <input type="checkbox" id={`${id}-l`} checked={lanes} onChange={(e) => setLanes(e.target.checked)} />
-                  <label htmlFor={`${id}-l`}>
-                    Remove it from {plural(refs.lanes.length, "lane", "lanes")}: {refs.lanes.join(", ")}
-                  </label>
-                </div>
-              ) : null}
-              {refs.holds.map((h) => (
-                <div key={h.id}>
-                  <input type="checkbox" id={`${id}-h-${h.id}`} checked={holds.includes(h.id)}
-                    onChange={(e) => setHolds((prev) => (e.target.checked ? [...prev, h.id] : prev.filter((x) => x !== h.id)))} />
-                  <label htmlFor={`${id}-h-${h.id}`}>
-                    End the hold “{h.text}”{whenLocal(h.until) ? ` (ends ${whenLocal(h.until)})` : ""}
-                  </label>
-                </div>
-              ))}
-            </fieldset>
+        <p>Khipu stops reading its plan on this Mac and stops telling your conversations about it.</p>
+      )}
+      {refs.priority || refs.pausedUntil !== undefined || refs.lanes.length || refs.holds.length ? (
+        <fieldset className="aa-checks">
+          <legend>Also</legend>
+          {refs.priority ? (
+            <div>
+              <input type="checkbox" id={`${id}-p`} checked={prio} onChange={(e) => setPrio(e.target.checked)} />
+              <label htmlFor={`${id}-p`}>
+                Remove it from your priority list (it is {ordinal(refs.priority.place)}
+                {refs.priority.next ? `; ${refs.priority.next} moves up` : ""})
+              </label>
+            </div>
           ) : null}
-          <ul className="aa-dos">
+          {refs.pausedUntil !== undefined ? (
+            <div>
+              <input type="checkbox" id={`${id}-z`} checked={pause} onChange={(e) => setPause(e.target.checked)} />
+              <label htmlFor={`${id}-z`}>
+                End its pause now{whenLocal(refs.pausedUntil) ? ` (paused until ${whenLocal(refs.pausedUntil)})` : ""}
+              </label>
+            </div>
+          ) : null}
+          {refs.lanes.length ? (
+            <div>
+              <input type="checkbox" id={`${id}-l`} checked={lanes} onChange={(e) => setLanes(e.target.checked)} />
+              <label htmlFor={`${id}-l`}>
+                Remove it from {plural(refs.lanes.length, "lane", "lanes")}: {refs.lanes.join(", ")}
+              </label>
+            </div>
+          ) : null}
+          {refs.holds.map((h) => (
+            <div key={h.id}>
+              <input type="checkbox" id={`${id}-h-${h.id}`} checked={holds.includes(h.id)}
+                onChange={(e) => setHolds((prev) => (e.target.checked ? [...prev, h.id] : prev.filter((x) => x !== h.id)))} />
+              <label htmlFor={`${id}-h-${h.id}`}>
+                End the hold “{h.text}”{whenLocal(h.until) ? ` (ends ${whenLocal(h.until)})` : ""}
+              </label>
+            </div>
+          ))}
+        </fieldset>
+      ) : null}
+      <ul className="aa-dos">
+        {refs.last ? (
+          <>
             <li>
               <b>Not changed:</b> {account.home ? "the login folder " : ""}
-              <span className="aa-mono">{folder}</span> and its sign-in. Conversations that run on it keep working, and Khipu still
-              saves them.
+              <span className="aa-mono">{folder}</span> and its sign-in.
             </li>
-            {refs.rules.length || refs.note ? (
-              <li>
-                <b>Not changed:</b>{" "}
-                {listOf([...refs.rules.map((r) => `standing rule ${r.n}`), ...(refs.note ? ["your note"] : [])])}, which name it.{" "}
-                {mentionLinks(refs.rules, refs.note, onEdit)}
-              </li>
-            ) : null}
+            <li>Khipu won't go back to reading every installed program on its own.</li>
+          </>
+        ) : (
+          <li>
+            <b>Not changed:</b> {account.home ? "the login folder " : ""}
+            <span className="aa-mono">{folder}</span> and its sign-in. Conversations that run on it keep working, and Khipu still
+            saves them.
+          </li>
+        )}
+        {refs.rules.length || refs.note ? (
+          <li>
+            <b>Not changed:</b>{" "}
+            {listOf([...refs.rules.map((r) => `standing rule ${r.n}`), ...(refs.note ? ["your note"] : [])])}, which name it.{" "}
+            {mentionLinks(refs.rules, refs.note, onClose, onEdit)}
+          </li>
+        ) : null}
+        {refs.last ? null : (
+          <>
             <li>
               <b>Kept:</b> its history in Recent changes. Anything left unticked keeps it in routing as “no longer tracked” until it ends.
             </li>
             <li>
               <b>Not offered again</b> as a found account, until you choose Offer again.
             </li>
-          </ul>
-        </>
-      )}
+          </>
+        )}
+      </ul>
       {err ? <p className="set-error" role="alert">{err}</p> : null}
-      {here ? null : <p className="aa-note">{COMING.stop}</p>}
       <div className="aa-actions">
         <button type="button" className="aa-left" onClick={onClose}>
           Cancel
@@ -1054,7 +1071,6 @@ export function HomeFoundCard({
   onDecline: (c: Candidate) => void;
   onClose: () => void;
 }) {
-  const id = useId().replace(/:/g, "");
   const here = support.state === "here";
   if (!offers.length) return null;
   const close = (
@@ -1067,13 +1083,12 @@ export function HomeFoundCard({
       <button type="button" className="sm primary" aria-label={`Track the ${serviceName(c.cli)} account at ${shownPath(c)}`} onClick={() => onTrack(c)}>
         Track…
       </button>
-      <button type="button" className="sm" disabled={!here} aria-describedby={here ? undefined : `${id}-coming`}
+      <button type="button" className="sm" disabled={!here}
         aria-label={`Not this one: never offer ${shownPath(c)} again`} onClick={() => onDecline(c)}>
         Not this one
       </button>
     </>
   );
-  const coming = here ? null : <ComingNote id={`${id}-coming`} text={COMING.decline} />;
   if (offers.length === 1) {
     const c = offers[0];
     const plan = planWord(c.plan);
@@ -1087,7 +1102,6 @@ export function HomeFoundCard({
             {c.conversations_7d != null ? `${plural(c.conversations_7d, "of your conversations", "of your conversations")} this week ran on it, and it` : "It"} is
             signed in{plan ? ` (${plan})` : ""}. Track it to see its plan here and tell your agents when it has room.
           </span>
-          {coming}
         </div>
         <div className="cta">
           {close}
@@ -1113,7 +1127,6 @@ export function HomeFoundCard({
             </li>
           ))}
         </ul>
-        {coming}
       </div>
       <div className="cta">{close}</div>
     </div>
@@ -1496,7 +1509,8 @@ export function HomeAccountCards({
       return next;
     });
   }, [d]);
-  const offers = homeOffersOf(d, quietLogins());
+  const quiet = useMemo(() => lowerQuiet(d), [d]);
+  const offers = homeOffersOf(d, quiet);
   const showFound = offers.some((c) => !closed.includes(c.id));
   const dropAuto = (key: string) =>
     setAutos((prev) => {
