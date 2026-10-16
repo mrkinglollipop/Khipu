@@ -276,8 +276,8 @@ def test_an_account_not_in_settings_is_kept_and_named_so(home):
     view = routing.read_view()
     assert _labels(view)[1] == "Codex"
     assert view["priority"]["entries"][0]["in_settings"] is False
-    assert "(not in Settings → Models)" in _summary(home)
-    assert any("which isn't in Settings → Models" in w for w in routing.doctor_block()["warnings"])
+    assert "(no longer tracked)" in _summary(home)
+    assert any("which isn't tracked in Accounts and routing" in w for w in routing.doctor_block()["warnings"])
 
 
 def test_doctor_warns_when_a_conversations_priority_waits_more_than_a_day(home):

@@ -363,7 +363,7 @@ export function accountState(a: RouteAccount, now: Date): { text: string; tone: 
       text = a.reset_check?.reason
         ? `Its reset time passed ${pastWords(a.until, now)}; ${midSentence(a.reset_check.reason)}`
         : a.configured === false
-          ? `Probably open: its limit was due to end ${pastWords(a.until, now)}; Khipu can't check this account: it isn't in Settings \u2192 Models`
+          ? `Probably open: its limit was due to end ${pastWords(a.until, now)}; Khipu can't check this account: it isn't tracked in Accounts and routing`
           : a.checkable === false
             ? `Its reset time passed ${pastWords(a.until, now)}; this account can't be checked without using a turn`
             : `Probably open: its limit was due to end ${pastWords(a.until, now)}, not checked yet`;

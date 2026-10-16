@@ -948,7 +948,24 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     Ok(n.to_string())
 }
 
+/// `expect` is the account list's version, kept for `usage_accounts` alone: a
+/// save made on a stale read is refused by the CLI (decision 15).
 fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
+    config_set_argv_expect(key, value, None)
+}
+
+fn config_set_argv_expect(key: &str, value: &str, expect: Option<&str>) -> Result<Vec<String>, String> {
+    if key == USAGE_ACCOUNTS_KEY {
+        let mut argv = vec!["config".to_string(), "--from-app".to_string()];
+        if let Some(e) = expect {
+            argv.push(format!("--expect={}", checked_expect(e)?));
+        }
+        argv.extend(["--set".to_string(), USAGE_ACCOUNTS_KEY.to_string(), checked_usage_accounts(value)?]);
+        return Ok(argv);
+    }
+    if expect.is_some() {
+        return Err(format!("{key} takes no version to check"));
+    }
     let set = |k: &str, v: String| {
         vec!["config".to_string(), "--set".to_string(), k.to_string(), v]
     };
@@ -987,7 +1004,6 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
             }
             Ok(set("synth_fallback", v.to_string()))
         }
-        USAGE_ACCOUNTS_KEY => Ok(set(USAGE_ACCOUNTS_KEY, checked_usage_accounts(value)?)),
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
         _ => Err(format!("not a settable key: {key:?}")),
@@ -995,6 +1011,21 @@ fn config_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
 }
 
 fn config_unset_argv(key: &str) -> Result<Vec<String>, String> {
+    config_unset_argv_expect(key, None)
+}
+
+fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<String>, String> {
+    if key == USAGE_ACCOUNTS_KEY {
+        let mut argv = vec!["config".to_string(), "--from-app".to_string()];
+        if let Some(e) = expect {
+            argv.push(format!("--expect={}", checked_expect(e)?));
+        }
+        argv.push(format!("--unset={key}"));
+        return Ok(argv);
+    }
+    if expect.is_some() {
+        return Err(format!("{key} takes no version to check"));
+    }
     let by_profile = key
         .strip_prefix(COSINE_FLOOR_BY_PROFILE_PREFIX)
         .is_some_and(|id| checked_profile(id).is_ok());
@@ -1069,13 +1100,13 @@ async fn khipu_config_show() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn khipu_config_set(key: String, value: String) -> Result<String, String> {
-    run_khipu_cli_async(config_set_argv(&key, &value)?).await
+async fn khipu_config_set(key: String, value: String, expect: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(config_set_argv_expect(&key, &value, expect.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_config_unset(key: String) -> Result<String, String> {
-    run_khipu_cli_async(config_unset_argv(&key)?).await
+async fn khipu_config_unset(key: String, expect: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(config_unset_argv_expect(&key, expect.as_deref())?).await
 }
 
 #[tauri::command]
@@ -1312,6 +1343,17 @@ struct PriorityEntry {
 /// webview sends can become a flag or an argument of its own; their order is
 /// the owner's, kept as sent.
 fn route_priority_argv(action: &str, entries: &[PriorityEntry], until: Option<&str>) -> Result<Vec<String>, String> {
+    route_priority_argv_expect(action, entries, until, None)
+}
+
+/// `expect` is the priority's version as the owner read it (`--expect=V`,
+/// before the `--`): a change made on a stale read is refused.
+fn route_priority_argv_expect(
+    action: &str,
+    entries: &[PriorityEntry],
+    until: Option<&str>,
+    expect: Option<&str>,
+) -> Result<Vec<String>, String> {
     if !ROUTE_PRIORITY_ACTIONS.contains(&action) {
         return Err(format!("not a change to the priority: {action:?}"));
     }
@@ -1344,8 +1386,272 @@ fn route_priority_argv(action: &str, entries: &[PriorityEntry], until: Option<&s
             argv.push(format!("--until={}", checked_route_until(t)?));
         }
     }
+    if let Some(e) = expect {
+        argv.push(format!("--expect={}", checked_expect(e)?));
+    }
     argv.extend(["--".to_string(), action.to_string()]);
     Ok(argv)
+}
+
+/// The version of the account list or the priority as the app read it: one
+/// short token, so it can never read as a flag or carry a second argument.
+fn checked_expect(raw: &str) -> Result<&str, String> {
+    let v = raw.trim();
+    if !v.is_empty() && v.len() <= 40 && v.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Ok(v)
+    } else {
+        Err("that is not a version Khipu knows; read the accounts again".to_string())
+    }
+}
+
+fn accounts_base(verb: &str) -> Vec<String> {
+    vec!["accounts".to_string(), verb.to_string(), "--from-app".to_string()]
+}
+
+fn checked_harness(raw: &str) -> Result<String, String> {
+    let h = raw.trim().to_lowercase();
+    if USAGE_HARNESSES.contains(&h.as_str()) {
+        Ok(h)
+    } else {
+        Err("harness must be claude, codex, grok or muse".to_string())
+    }
+}
+
+/// An account key, `harness|login folder` (`claude|` for a default login).
+fn checked_account_key(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    let harness_ok = v.split_once('|').is_some_and(|(h, _)| USAGE_HARNESSES.contains(&h));
+    if !harness_ok || v.starts_with('-') || has_control(v) || v.chars().count() > 1100 {
+        return Err("that is not an account Khipu knows".to_string());
+    }
+    Ok(v.to_string())
+}
+
+/// A login folder: `~/...` or an absolute path, one line. Joined to its flag
+/// with `=`, so it is never read as an option of its own.
+fn checked_account_folder(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if !(v.starts_with("~/") || v.starts_with('/')) {
+        return Err("a login folder starts with ~/ or is a full path starting with /".to_string());
+    }
+    if has_control(v) || v.chars().count() > 1024 {
+        return Err("a login folder must be one line of plain text".to_string());
+    }
+    Ok(v.to_string())
+}
+
+fn checked_account_name(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Err("give the account a name".to_string());
+    }
+    if has_control(v) {
+        return Err("a name must be one line of plain text".to_string());
+    }
+    if v.chars().count() > 64 {
+        return Err("a name is at most 64 characters".to_string());
+    }
+    Ok(v.to_string())
+}
+
+/// One account as the webview sends it to Track (or as it showed a default).
+#[derive(serde::Deserialize, Debug, Clone)]
+struct AccountEntry {
+    harness: String,
+    home: Option<String>,
+    label: Option<String>,
+}
+
+/// The entries rebuilt from checked fields into one JSON list. `home` and
+/// `label` are left out when empty; the CLI decides the rest.
+fn checked_account_entries(entries: &[AccountEntry]) -> Result<String, String> {
+    if entries.len() > USAGE_ACCOUNTS_MAX {
+        return Err(format!("Khipu tracks at most {USAGE_ACCOUNTS_MAX} accounts"));
+    }
+    let mut clean = Vec::with_capacity(entries.len());
+    for e in entries {
+        let mut item = serde_json::Map::new();
+        item.insert("harness".to_string(), Value::String(checked_harness(&e.harness)?));
+        if let Some(h) = e.home.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+            item.insert("home".to_string(), Value::String(checked_account_folder(h)?));
+        }
+        if let Some(l) = e.label.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+            item.insert("label".to_string(), Value::String(checked_account_name(l)?));
+        }
+        clean.push(Value::Object(item));
+    }
+    Ok(Value::Array(clean).to_string())
+}
+
+fn accounts_status_argv() -> Vec<String> {
+    vec!["accounts".to_string(), "status".to_string()]
+}
+
+fn accounts_track_argv(
+    entries: &[AccountEntry],
+    expect: &str,
+    shown_defaults: Option<&[AccountEntry]>,
+    no_read: bool,
+) -> Result<Vec<String>, String> {
+    if entries.is_empty() {
+        return Err("choose at least one account to track".to_string());
+    }
+    let mut argv = accounts_base("track");
+    argv.push(format!("--expect={}", checked_expect(expect)?));
+    argv.push(format!("--entries={}", checked_account_entries(entries)?));
+    if let Some(d) = shown_defaults {
+        argv.push(format!("--shown-defaults={}", checked_account_entries(d)?));
+    }
+    if no_read {
+        argv.push("--no-read".to_string());
+    }
+    Ok(argv)
+}
+
+fn accounts_rename_argv(account: &str, name: &str, expect: &str) -> Result<Vec<String>, String> {
+    let mut argv = accounts_base("rename");
+    argv.push(format!("--expect={}", checked_expect(expect)?));
+    argv.push(format!("--account={}", checked_account_key(account)?));
+    argv.push(format!("--name={}", checked_account_name(name)?));
+    Ok(argv)
+}
+
+/// The most holds one Stop tracking ends at once.
+const ACCOUNTS_END_HOLDS_MOST: usize = 64;
+
+fn accounts_stop_argv(
+    account: &str,
+    expect: &str,
+    keep_priority: bool,
+    keep_pause: bool,
+    keep_lanes: bool,
+    end_holds: &[String],
+    confirm_last: bool,
+) -> Result<Vec<String>, String> {
+    if end_holds.len() > ACCOUNTS_END_HOLDS_MOST {
+        return Err(format!("end at most {ACCOUNTS_END_HOLDS_MOST} holds at once"));
+    }
+    let mut argv = accounts_base("stop");
+    argv.push(format!("--expect={}", checked_expect(expect)?));
+    argv.push(format!("--account={}", checked_account_key(account)?));
+    for (on, flag) in [
+        (keep_priority, "--keep-priority"),
+        (keep_pause, "--keep-pause"),
+        (keep_lanes, "--keep-lanes"),
+        (confirm_last, "--confirm-last"),
+    ] {
+        if on {
+            argv.push(flag.to_string());
+        }
+    }
+    for id in end_holds {
+        argv.push(format!("--end-hold={}", checked_route_id(id)?));
+    }
+    Ok(argv)
+}
+
+fn accounts_move_argv(account: &str, folder: &str, expect: &str) -> Result<Vec<String>, String> {
+    let mut argv = accounts_base("move");
+    argv.push(format!("--expect={}", checked_expect(expect)?));
+    argv.push(format!("--account={}", checked_account_key(account)?));
+    argv.push(format!("--folder={}", checked_account_folder(folder)?));
+    Ok(argv)
+}
+
+/// `decline` (Not this one) and `offer-again`: the CLI and, with no folder,
+/// the default login.
+fn accounts_offer_argv(verb: &str, harness: &str, folder: Option<&str>) -> Result<Vec<String>, String> {
+    if !matches!(verb, "decline" | "offer-again") {
+        return Err(format!("not a change to the offers: {verb:?}"));
+    }
+    let mut argv = accounts_base(verb);
+    argv.push(format!("--harness={}", checked_harness(harness)?));
+    if let Some(f) = folder.map(str::trim).filter(|f| !f.is_empty()) {
+        argv.push(format!("--folder={}", checked_account_folder(f)?));
+    }
+    Ok(argv)
+}
+
+fn accounts_auto_track_argv(on: bool) -> Vec<String> {
+    let mut argv = accounts_base("auto-track");
+    argv.push(if on { "on" } else { "off" }.to_string());
+    argv
+}
+
+fn accounts_request_argv(action: &str) -> Result<Vec<String>, String> {
+    if !matches!(action, "confirm" | "undo") {
+        return Err(format!("not an answer to a request: {action:?}"));
+    }
+    let mut argv = accounts_base("request");
+    argv.push(action.to_string());
+    Ok(argv)
+}
+
+#[tauri::command]
+async fn khipu_accounts_status() -> Result<String, String> {
+    run_khipu_cli_async(accounts_status_argv()).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_track(
+    entries: Vec<AccountEntry>,
+    expect: String,
+    shown_defaults: Option<Vec<AccountEntry>>,
+    no_read: Option<bool>,
+) -> Result<String, String> {
+    run_khipu_cli_async(accounts_track_argv(&entries, &expect, shown_defaults.as_deref(), no_read.unwrap_or(false))?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_rename(account: String, name: String, expect: String) -> Result<String, String> {
+    run_khipu_cli_async(accounts_rename_argv(&account, &name, &expect)?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_stop(
+    account: String,
+    expect: String,
+    keep_priority: Option<bool>,
+    keep_pause: Option<bool>,
+    keep_lanes: Option<bool>,
+    end_holds: Option<Vec<String>>,
+    confirm_last: Option<bool>,
+) -> Result<String, String> {
+    run_khipu_cli_async(accounts_stop_argv(
+        &account,
+        &expect,
+        keep_priority.unwrap_or(false),
+        keep_pause.unwrap_or(false),
+        keep_lanes.unwrap_or(false),
+        end_holds.as_deref().unwrap_or(&[]),
+        confirm_last.unwrap_or(false),
+    )?)
+    .await
+}
+
+#[tauri::command]
+async fn khipu_accounts_move(account: String, folder: String, expect: String) -> Result<String, String> {
+    run_khipu_cli_async(accounts_move_argv(&account, &folder, &expect)?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_decline(harness: String, folder: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(accounts_offer_argv("decline", &harness, folder.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_offer_again(harness: String, folder: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(accounts_offer_argv("offer-again", &harness, folder.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_auto_track(on: bool) -> Result<String, String> {
+    run_khipu_cli_async(accounts_auto_track_argv(on)).await
+}
+
+#[tauri::command]
+async fn khipu_accounts_request(action: String) -> Result<String, String> {
+    run_khipu_cli_async(accounts_request_argv(&action)?).await
 }
 
 /// The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
@@ -1386,7 +1692,7 @@ fn sign_in_argv(config: &Value, harness: &str, home: Option<&str>) -> Result<Vec
             .map(|h| expand_home(h, user_home));
         same_cli && a.get("invalid").map_or(true, Value::is_null) && theirs == wanted
     });
-    let account = found.ok_or("that login folder is not one of the accounts in Settings → Capture & models → Plans")?;
+    let account = found.ok_or("that login folder is not one of the accounts in Settings → Accounts and routing → Accounts")?;
     let label = account.get("label").and_then(Value::as_str).unwrap_or("").trim();
     if label.is_empty() || has_control(label) {
         return Err("that account has no label Khipu can name".to_string());
@@ -1459,8 +1765,12 @@ async fn khipu_route_priority(
     action: String,
     entries: Option<Vec<PriorityEntry>>,
     until: Option<String>,
+    expect: Option<String>,
 ) -> Result<String, String> {
-    run_khipu_cli_async(route_priority_argv(&action, entries.as_deref().unwrap_or(&[]), until.as_deref())?).await
+    run_khipu_cli_async(
+        route_priority_argv_expect(&action, entries.as_deref().unwrap_or(&[]), until.as_deref(), expect.as_deref())?,
+    )
+    .await
 }
 
 /// Sign in again: the CLI starts the account's own login (it opens the
@@ -3088,6 +3398,15 @@ pub fn run() {
             khipu_route_hold_end,
             khipu_route_priority,
             khipu_account_sign_in,
+            khipu_accounts_status,
+            khipu_accounts_track,
+            khipu_accounts_rename,
+            khipu_accounts_stop,
+            khipu_accounts_move,
+            khipu_accounts_decline,
+            khipu_accounts_offer_again,
+            khipu_accounts_auto_track,
+            khipu_accounts_request,
             khipu_jobs_status,
             khipu_job_install,
             khipu_job_uninstall,
@@ -3895,12 +4214,13 @@ mod settings_command_tests {
             argv,
             v(&[
                 "config",
+                "--from-app",
                 "--set",
                 "usage_accounts",
                 r#"[{"harness":"claude","home":"~/.claude-second","label":"Claude second"},{"harness":"grok"}]"#,
             ])
         );
-        assert_eq!(config_set_argv("usage_accounts", "[]").unwrap(), v(&["config", "--set", "usage_accounts", "[]"]));
+        assert_eq!(config_set_argv("usage_accounts", "[]").unwrap(), v(&["config", "--from-app", "--set", "usage_accounts", "[]"]));
         let many = format!("[{}]", vec![r#"{"harness":"claude"}"#; 33].join(","));
         let long_label = format!(r#"[{{"harness":"claude","label":"{}"}}]"#, "x".repeat(65));
         for bad in [
@@ -3920,7 +4240,22 @@ mod settings_command_tests {
         ] {
             assert!(config_set_argv("usage_accounts", bad).is_err(), "accepted {bad:?}");
         }
-        assert_eq!(config_unset_argv("usage_accounts").unwrap(), v(&["config", "--unset=usage_accounts"]));
+        assert_eq!(config_unset_argv("usage_accounts").unwrap(), v(&["config", "--from-app", "--unset=usage_accounts"]));
+        assert_eq!(
+            config_set_argv_expect("usage_accounts", "[]", Some("v3a")).unwrap(),
+            v(&["config", "--from-app", "--expect=v3a", "--set", "usage_accounts", "[]"])
+        );
+        assert_eq!(
+            config_unset_argv_expect("usage_accounts", Some("v3a")).unwrap(),
+            v(&["config", "--from-app", "--expect=v3a", "--unset=usage_accounts"])
+        );
+        for bad in ["", "--x", "a b", "a=b", "v\n1", &"a".repeat(41)] {
+            assert!(config_set_argv_expect("usage_accounts", "[]", Some(bad)).is_err(), "{bad:?}");
+            assert!(config_unset_argv_expect("usage_accounts", Some(bad)).is_err(), "{bad:?}");
+        }
+        // Other keys take no version.
+        assert!(config_set_argv_expect("capture_mode", "hub", Some("v1")).is_err());
+        assert!(config_unset_argv_expect("memory_root", Some("v1")).is_err());
     }
 
     #[test]
@@ -4623,6 +4958,133 @@ mod priority_and_sign_in_tests {
             let argv = route_priority_argv(action, &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z")).unwrap();
             assert_eq!(argv, v(&["route", "priority", "--from-app", "--", action]));
         }
+    }
+
+    #[test]
+    fn the_priority_version_joins_its_flag_before_the_verb() {
+        let argv = route_priority_argv_expect("clear", &[], None, Some("p9f")).unwrap();
+        assert_eq!(argv, v(&["route", "priority", "--from-app", "--expect=p9f", "--", "clear"]));
+        let set = route_priority_argv_expect("set", &[entry("Codex", None, None)], None, Some("p0")).unwrap();
+        assert_eq!(set[set.len() - 3], "--expect=p0");
+        for bad in ["", "--x", "p 1", "p=1", "p\n1", "p|1"] {
+            assert!(route_priority_argv_expect("clear", &[], None, Some(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    fn acct(harness: &str, home: Option<&str>, label: Option<&str>) -> AccountEntry {
+        AccountEntry { harness: harness.into(), home: home.map(Into::into), label: label.map(Into::into) }
+    }
+
+    #[test]
+    fn track_rebuilds_its_entries_from_checked_fields() {
+        let argv = accounts_track_argv(
+            &[acct("Claude", Some("~/.claude-work"), Some(" Work ")), acct("muse", None, Some(""))],
+            "v7",
+            Some(&[acct("claude", None, Some("Claude"))]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            v(&[
+                "accounts",
+                "track",
+                "--from-app",
+                "--expect=v7",
+                r#"--entries=[{"harness":"claude","home":"~/.claude-work","label":"Work"},{"harness":"muse"}]"#,
+                r#"--shown-defaults=[{"harness":"claude","label":"Claude"}]"#,
+                "--no-read",
+            ])
+        );
+        let plain = accounts_track_argv(&[acct("codex", None, None)], "v7", None, false).unwrap();
+        assert_eq!(plain.len(), 5);
+        assert!(accounts_track_argv(&[], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("cluade", None, None)], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", Some("relative"), None)], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", Some("~/a\nb"), None)], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", None, Some("a\nb"))], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", None, Some(&"x".repeat(65)))], "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", None, None)], "--x", None, false).is_err());
+        let many: Vec<AccountEntry> = (0..33).map(|_| acct("claude", None, None)).collect();
+        assert!(accounts_track_argv(&many, "v7", None, false).is_err());
+        assert!(accounts_track_argv(&[acct("claude", None, None)], "v7", Some(&many), false).is_err());
+    }
+
+    #[test]
+    fn rename_and_move_check_the_key_name_folder_and_version() {
+        assert_eq!(
+            accounts_rename_argv("claude|~/.claude-work", " Work Mac ", "v2").unwrap(),
+            v(&["accounts", "rename", "--from-app", "--expect=v2", "--account=claude|~/.claude-work", "--name=Work Mac"])
+        );
+        assert_eq!(
+            accounts_move_argv("claude|", "/opt/x/.claude-new", "v2").unwrap(),
+            v(&["accounts", "move", "--from-app", "--expect=v2", "--account=claude|", "--folder=/opt/x/.claude-new"])
+        );
+        for key in ["", "--from-app", "claude", "other|", "-claude|", "claude|a\nb", "Claude"] {
+            assert!(accounts_rename_argv(key, "Work", "v2").is_err(), "{key:?}");
+            assert!(accounts_move_argv(key, "~/x", "v2").is_err(), "{key:?}");
+        }
+        for name in ["", "   ", "a\nb", &"n".repeat(65)] {
+            assert!(accounts_rename_argv("claude|", name, "v2").is_err(), "{name:?}");
+        }
+        for folder in ["", "relative", "--x", "~/a\nb", "~"] {
+            assert!(accounts_move_argv("claude|", folder, "v2").is_err(), "{folder:?}");
+        }
+        assert!(accounts_rename_argv("claude|", "Work", "").is_err());
+        assert!(accounts_move_argv("claude|", "~/x", "v 2").is_err());
+    }
+
+    #[test]
+    fn stop_carries_only_the_kept_flags_and_checked_hold_ids() {
+        assert_eq!(
+            accounts_stop_argv("codex|", "v4", false, false, false, &[], false).unwrap(),
+            v(&["accounts", "stop", "--from-app", "--expect=v4", "--account=codex|"])
+        );
+        assert_eq!(
+            accounts_stop_argv("codex|", "v4", true, true, true, &["h1a2b".to_string(), "runner:x".to_string()], true).unwrap(),
+            v(&[
+                "accounts",
+                "stop",
+                "--from-app",
+                "--expect=v4",
+                "--account=codex|",
+                "--keep-priority",
+                "--keep-pause",
+                "--keep-lanes",
+                "--confirm-last",
+                "--end-hold=h1a2b",
+                "--end-hold=runner:x",
+            ])
+        );
+        assert!(accounts_stop_argv("codex|", "v4", false, false, false, &["--x".to_string()], false).is_err());
+        assert!(accounts_stop_argv("codex|", "v4", false, false, false, &["a\nb".to_string()], false).is_err());
+        let many: Vec<String> = (0..65).map(|i| format!("h{i}")).collect();
+        assert!(accounts_stop_argv("codex|", "v4", false, false, false, &many, false).is_err());
+        assert!(accounts_stop_argv("--confirm-last", "v4", false, false, false, &[], false).is_err());
+        assert!(accounts_stop_argv("codex|", "", false, false, false, &[], false).is_err());
+    }
+
+    #[test]
+    fn offers_switch_and_request_answers_build_fixed_argv() {
+        assert_eq!(
+            accounts_offer_argv("decline", "Codex", None).unwrap(),
+            v(&["accounts", "decline", "--from-app", "--harness=codex"])
+        );
+        assert_eq!(
+            accounts_offer_argv("offer-again", "claude", Some("~/.claude-old")).unwrap(),
+            v(&["accounts", "offer-again", "--from-app", "--harness=claude", "--folder=~/.claude-old"])
+        );
+        assert_eq!(accounts_offer_argv("decline", "claude", Some("  ")).unwrap().len(), 4);
+        assert!(accounts_offer_argv("track", "claude", None).is_err());
+        assert!(accounts_offer_argv("decline", "--x", None).is_err());
+        assert!(accounts_offer_argv("decline", "claude", Some("--folder")).is_err());
+        assert_eq!(accounts_auto_track_argv(true), v(&["accounts", "auto-track", "--from-app", "on"]));
+        assert_eq!(accounts_auto_track_argv(false), v(&["accounts", "auto-track", "--from-app", "off"]));
+        assert_eq!(accounts_request_argv("confirm").unwrap(), v(&["accounts", "request", "--from-app", "confirm"]));
+        assert_eq!(accounts_request_argv("undo").unwrap(), v(&["accounts", "request", "--from-app", "undo"]));
+        assert!(accounts_request_argv("--x").is_err());
+        assert!(accounts_request_argv("clear").is_err());
+        assert_eq!(accounts_status_argv(), v(&["accounts", "status"]));
     }
 
     fn config() -> Value {

@@ -84,6 +84,7 @@ const ERROR_PHRASE: Record<string, string> = {
   ambiguous_account: "shares its name with another account",
   no_sign_in: "signs in from its own CLI",
   sign_in_timeout: "sign-in not finished in time",
+  login_folder_missing: "login folder not found on this Mac",
 };
 
 export function usageErrorPhrase(code: string | null | undefined): string {
@@ -899,6 +900,23 @@ const ACCOUNT_REFUSAL: Record<string, (c: RefusalCtx) => string> = {
     const other = c.other?.label ?? "an account already listed";
     return `${harnessName(c.entry?.harness ?? "")} with ${where} reads the same sign-in as ${other}. Choose a different Login folder.`;
   },
+  name_has_bar: () => "A name cannot contain the | sign. Type a different Name.",
+  name_is_cli: () => "That name is the name of a CLI. Type a different Name.",
+  name_is_id: () => "That name is the id of another account. Type a different Name.",
+  version_moved: () => "The account list changed while you were working. Khipu read it again; check it and try once more.",
+  last_account: () => "This is the last account Khipu reads. Confirm to stop reading accounts altogether.",
+  name_needed: () => "Give this account a name.",
+  folder_not_found: () => "Khipu cannot find that login folder. Check the folder and try again.",
+  owner_only: () => "Only you can change this, from Khipu's Settings.",
+  request_waiting: () => "A request to change the account list is already waiting for your answer.",
+  not_tracked: () => "Khipu does not track that account.",
+  no_such_hold: () => "That hold has already ended.",
+  no_request: () => "No request to change the account list is waiting.",
+  bad_folder: () => "Give the login folder starting with ~/ or its full path starting with /.",
+  bad_command: () => ACCOUNTS_NOT_SAVED,
+  write_failed: () => ACCOUNTS_NOT_SAVED,
+  config_unreadable: () => "Khipu cannot read its settings file, so it changed nothing.",
+  record_refused: () => "Khipu's routing record could not take this change. Open Accounts and routing to see what is saved now.",
 };
 
 /** A failed save in plain words, never the text the CLI or the app's own

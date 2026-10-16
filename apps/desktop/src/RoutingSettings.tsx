@@ -843,7 +843,7 @@ function PrioritySection({
                 <span>{e.role ? e.role : "No role written"}</span>
                 <span className="route-src">
                   {endText(e.until, now)}
-                  {e.in_settings === false ? " · not in Settings → Models" : ""}
+                  {e.in_settings === false ? " · no longer tracked" : ""}
                 </span>
               </span>
               <span className="route-acts">

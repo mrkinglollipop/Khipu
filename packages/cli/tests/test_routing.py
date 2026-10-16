@@ -433,9 +433,9 @@ def test_an_account_removed_from_settings_while_limited_is_never_checked(home, c
     rc, out = _cli(["route", "--json"], capsys)
     claude = _account(json.loads(out), "claude|")
     assert rc == 0 and claude["configured"] is False and claude.get("next_check") is None
-    assert claude["line"].endswith("Khipu can't check this account: it isn't in Settings → Models")
+    assert claude["line"].endswith("Khipu can't check this account: it isn't tracked in Accounts and routing")
     assert _account(json.loads(out), "codex|")["configured"] is True
-    with pytest.raises(routing.RouteError, match="isn't in Settings"):
+    with pytest.raises(routing.RouteError, match="isn't tracked in Accounts and routing"):
         routing.check_account("claude|", now=home["clock"](), probe=lambda _a: pytest.fail("no probe"),
                               load=lambda: 0)
     probed: list[str] = []
@@ -466,7 +466,7 @@ def test_a_due_account_that_cannot_be_checked_never_strands_the_next_one(home, m
     out = routing.run_due_reset_checks(home["clock"](), probe=probe, load=lambda: 0, max_checks=1)
     assert [o["outcome"] for o in out] == ["not_checked", "same_limit"] and probed == ["Codex"]
     entry = _account(routing.read_view(home["clock"]()), "claude|")
-    assert entry["reset_check"]["reason"] == "Khipu can't check this account: it isn't in Settings → Models"
+    assert entry["reset_check"]["reason"] == "Khipu can't check this account: it isn't tracked in Accounts and routing"
     assert entry.get("next_check") is None
     assert routing.run_due_reset_checks(home["clock"](), probe=probe, load=lambda: 0) == []
 
