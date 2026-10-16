@@ -138,6 +138,20 @@ def _homes(extra_keys: Iterable[str] | None, view: dict) -> list[tuple[str, str 
 
         for found in claude_homes.discover():
             out.append(("claude", None if found.is_default else str(found.path)))
+    with contextlib.suppress(Exception):
+        # Account discovery's finds (settings clarity phase 9): its last
+        # stored run, which carries every source, and the login-shaped names
+        # in the home folder now, so a folder is scrubbed before any run.
+        from khipu import discover
+
+        for rec in discover._load_store()["candidates"].values():
+            if rec["cli"] in _DEFAULT_FOLDERS and rec.get("abs") and not rec.get("default"):
+                out.append((rec["cli"], rec["abs"]))
+        for cli, folder in discover._source_names():
+            # A default login stays home-less (its name is the CLI's own
+            # word, which agents must still read): it is already in ``out``.
+            if folder.name != _DEFAULT_FOLDERS.get(cli):
+                out.append((cli, str(folder)))
     keys = list(extra_keys or [])
     keys += [a.get("key") for a in view.get("accounts") or [] if isinstance(a, dict)]
     for key in keys:

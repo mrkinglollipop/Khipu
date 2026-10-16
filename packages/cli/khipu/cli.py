@@ -2067,8 +2067,14 @@ def cmd_usage(args: argparse.Namespace) -> int:
         # A conversation busy at that moment is cleared by its next sweep;
         # until then this says it is not finished and how many are left.
         result = session_capture.forget_login_homes()
-        out = {"ok": True, "finished": not result["pending"], **result}
-        if result["pending"]:
+        out = {"ok": True, "finished": not (result["pending"] or result.get("failed")
+                                             or result.get("unreachable")), **result}
+        if result.get("unreachable"):
+            out["note"] = "Not finished: Khipu could not open its conversation records, so nothing was cleared"
+        elif result.get("failed"):
+            out["note"] = ("Not finished: Khipu could not rewrite some conversation records; "
+                           "it tries again on the next capture")
+        elif result["pending"]:
             n = result["pending"]
             out["note"] = (f"Not finished: {n} conversation{' was' if n == 1 else 's were'} busy; "
                            f"Khipu clears {'it' if n == 1 else 'them'} when {'it is' if n == 1 else 'they are'} free")

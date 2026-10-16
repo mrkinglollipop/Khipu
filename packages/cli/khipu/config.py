@@ -467,6 +467,10 @@ def cli_setting(key: str) -> str | None:
         path = Path(stored.strip()).expanduser()
     except RuntimeError:
         return None
+    if not path.is_absolute():
+        # A hand-edited relative value would resolve against whatever the
+        # caller's working folder is: the writer refuses it, so does this.
+        return None
     usable = _executable_file(path / "node") if key == "node_folder" else _executable_file(path)
     return str(path) if usable else None
 
