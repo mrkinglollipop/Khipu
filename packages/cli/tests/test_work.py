@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -160,12 +161,12 @@ def test_ok_source_reads_and_cleans_everything(tmp_path):
 
 
 def test_stale_and_gone(tmp_path):
-    path = put(tmp_path, summary(written_at=_t(5 * 60)))
-    assert read(path)["state"] == "stale"
     path = put(tmp_path, summary(written_at=_t(2 * 86400)))
     assert read(path)["state"] == "gone"
     # 0 turns "gone" off: it stays stale.
     assert read(path, work_gone_after=0)["state"] == "stale"
+    path = put(tmp_path, summary(written_at=_t(5 * 60)))
+    assert read(path)["state"] == "stale"
 
 
 def test_missing(tmp_path):
@@ -240,10 +241,27 @@ def test_the_file_is_opened_read_only(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "open", spy)
     assert read(path)["state"] == "ok"
-    mine = [flags for p, flags in calls if p == str(path)]
+    # Opened by its name from its folder's descriptor, never through a link.
+    mine = [flags for p, flags in calls if p in (str(path), path.name)]
     assert mine
     for flags in mine:
         assert not flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+        assert (flags & os.O_ACCMODE) == os.O_RDONLY and flags & os.O_NONBLOCK and flags & os.O_NOFOLLOW
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    assert read(fifo)["state"] == "unreadable"
+    assert read(Path("/dev/null"))["state"] == "unreadable"
+    private = tmp_path / "API Keys" / "never-opened.json"
+    link = tmp_path / "private-link"
+    link.symlink_to(private)
+    calls.clear()
+    assert read(private)["state"] == "refused" and read(link)["state"] == "refused"
+    assert not calls
+    # Too big is decided from the open file's own size: nothing is read.
+    reads = []
+    real_read = os.read
+    monkeypatch.setattr(os, "read", lambda fd, n: (reads.append(n), real_read(fd, n))[1])
+    assert read(path, work_file_max_bytes=1)["state"] == "too_big" and not reads
 
 
 def test_projects_setting_refuses_a_private_or_relative_path(tmp_path):
@@ -362,6 +380,9 @@ def test_a_gone_source_leaves_running_and_old_finished_jobs_leave(tmp_path):
     assert [j["id"] for j in board(v)["jobs"]] == ["job-run", "job-new"]
     assert [j["id"] for j in v["live"]] == ["job-run"] and v["counts"]["running"] == 1
     assert v["live"][0]["account_ref"] == {"id": ACCT_ID, "label": "Claude second", "matched": True}
+    # A runner's clock never goes back: forget the newer read before
+    # standing in an older file for one that stopped being written.
+    shutil.rmtree(work.state_dir() / "last")
     gone = put(tmp_path, summary(jobs=jobs, written_at=_t(2 * 86400)))
     v = view_for(gone)
     assert board(v)["source"]["state"] == "gone" and v["live"] == []
@@ -597,3 +618,171 @@ def test_hide_and_same_commands(env, monkeypatch):
     links = work.read_links()
     assert links["same"] == [["atlas", "n-1", "c5"]] and links["not_same"] == []
     assert run("same", "nohash", "c5")[0] == 1
+
+
+# ---- review regressions (cross-family review of 01813f1) -------------------------------------
+
+
+def cli_and_saved(monkeypatch, config, ledger=NO_LEDGER, owed=NO_OWED):
+    """`khipu work --json` and the saved view, from synthetic inputs only."""
+    monkeypatch.setattr(work, "settings", lambda: config)
+    monkeypatch.setattr(work, "_now", lambda: NOW)
+    monkeypatch.setattr(work, "read_ledger", lambda: ledger)
+    monkeypatch.setattr(work, "read_owed", lambda: owed)
+    monkeypatch.setattr(work, "read_routing", lambda now: ROUTING)
+    rc, out, _ = run("--json")
+    assert rc == 0
+    return [json.loads(out), json.loads(work.view_file().read_text())]
+
+
+@pytest.mark.parametrize("field", ["id", "state", "target_pr", "target_ledger", "train_pr", "target_path"])
+def test_identifiers_states_and_references_never_carry_a_key_or_path(tmp_path, monkeypatch, field):
+    doc = summary()
+    secret = "tmp/fictional-login-home/private.txt" if field == "target_path" else KEY
+    if field in ("id", "state"):
+        doc["jobs"][0][field] = secret
+    elif field == "train_pr":
+        doc["trains"][0]["prs"] = [secret]
+    else:
+        doc["jobs"][0]["for"] = {"pr" if field == "target_pr" else "ledger": secret}
+    path = put(tmp_path, doc)
+    for result in cli_and_saved(monkeypatch, cfg(work_projects=[entry(path)])):
+        assert secret not in json.dumps(result)
+
+
+@pytest.mark.parametrize("source", ["name", "ledger", "commitment", "account_key"])
+def test_names_ledger_titles_and_commitments_lose_paths_and_account_keys(tmp_path, monkeypatch, source):
+    config = cfg(work_projects=[entry(put(tmp_path, summary()))])
+    needle = "/tmp/fictional-login-home/private.txt"
+    ledger, owed = NO_LEDGER, NO_OWED
+    if source == "account_key":
+        config["work_projects"][0]["name"] = needle = ACCT_KEY
+    elif source == "name":
+        config["work_projects"][0]["name"] = needle + " --password invented-probe-password"
+    elif source == "ledger":
+        ledger = ledger_data([row("n-1", "Read " + needle, state="NEEDS OWNER")])
+    else:
+        owed = {"items": [commitment(text="Read " + needle + " --password invented-probe-password")],
+                "error": None}
+    for result in cli_and_saved(monkeypatch, config, ledger, owed):
+        assert needle not in json.dumps(result) and "invented-probe-password" not in json.dumps(result)
+
+
+def test_the_final_scan_withholds_any_private_string_left(tmp_path):
+    # A ledger project key is the owner's free text: a path-shaped one is
+    # withheld by the last pass over the finished view, not shown.
+    rows = [row("n-1", "Choose a name", state="NEEDS OWNER")]
+    data = ledger_data(rows, project="/tmp/fictional-login-home/project")
+    v = work.build_view(NOW, cfg=cfg(), ledger_data=data, owed=NO_OWED, routing_info=ROUTING)
+    assert "fictional-login-home" not in json.dumps(v)
+    assert v["waiting"] and v["waiting"][0]["id"] == "n-1"
+
+
+@pytest.mark.parametrize("case", ["job_kind", "verdict_outcome", "time_overflow"])
+def test_a_list_valued_field_or_an_overflowing_time_drops_only_its_item(tmp_path, case):
+    doc = summary()
+    if case == "job_kind":
+        doc["jobs"] = [job("bad", kind=[]), job("good")]
+    elif case == "verdict_outcome":
+        doc["prs"] = [pr("1", verdict={"outcome": []}), pr("2")]
+    else:
+        doc["jobs"] = [job("bad", updated_at="0001-01-01T00:00:00+23:59"), job("good")]
+    got = read(put(tmp_path, doc))
+    assert got["state"] == "ok"
+    c = got["contents"]
+    if case == "job_kind":  # a kind that is not text counts as no kind
+        assert [(j["id"], j["kind"]) for j in c["jobs"]] == [("bad", None), ("good", "fix")]
+    elif case == "verdict_outcome":  # an outcome that is not text counts as no verdict
+        assert [(p["id"], p["verdict"]) for p in c["prs"]] == [("1", None), ("2", None)]
+    else:  # updated_at is required: only that job is left out
+        assert [j["id"] for j in c["jobs"]] == ["good"] and c["dropped"] == 1
+
+
+def test_an_older_summary_never_replaces_the_last_good_read(tmp_path):
+    path = put(tmp_path, summary(jobs=[job("new")]))
+    assert read(path)["contents"]["jobs"][0]["id"] == "new"
+    put(tmp_path, summary(written_at=_t(3600), jobs=[job("old")]))
+    got = read(path)
+    assert got["contents"]["jobs"][0]["id"] == "new" and got["state"] == "unreadable"
+    assert "older" in got["problem"]
+
+
+@pytest.mark.parametrize("broken", ["unreadable", "too_big"])
+def test_a_failed_source_stops_showing_jobs_live_once_gone(tmp_path, broken):
+    path = put(tmp_path, summary())
+    assert read(path)["state"] == "ok"
+    over = {}
+    if broken == "unreadable":
+        path.write_text("{")
+    else:
+        over["work_file_max_bytes"] = 1
+    later = NOW + timedelta(days=2)
+    v = work.build_view(later, cfg=cfg(work_projects=[entry(path)], **over), ledger_data=NO_LEDGER,
+                        owed=NO_OWED, routing_info=ROUTING)
+    assert v["live"] == [] and v["counts"]["running"] == 0
+    # Within work_gone_after the last good read still shows live.
+    v = work.build_view(NOW, cfg=cfg(work_projects=[entry(path)], **over), ledger_data=NO_LEDGER,
+                        owed=NO_OWED, routing_info=ROUTING)
+    assert [j["id"] for j in v["live"]] == ["job-1"]
+
+
+@pytest.mark.parametrize("which", ["stale", "finished", "merged"])
+def test_zero_lifts_the_stale_finished_and_merged_limits(tmp_path, which):
+    if which == "stale":
+        path = put(tmp_path, summary(written_at=_t(3600)))
+        assert read(path, work_stale_after=0)["state"] == "ok"
+    elif which == "finished":
+        path = put(tmp_path, summary(jobs=[job(state="done", ended_at=_t(3600))]))
+        assert board(view_for(path, work_finished_for=0))["jobs"]
+    else:
+        path = put(tmp_path, summary(prs=[pr(stage="merged", merged_at=_t(9 * 86400))]))
+        assert board(view_for(path, work_merged_for=0))["merged"]
+
+
+def test_a_shipped_or_dropped_train_ages_out_with_merged_pull_requests(tmp_path):
+    old = [train("t1", state="shipped", updated_at=_t(9 * 86400)),
+           train("t2", state="dropped", updated_at=_t(9 * 86400)), train("t3", state="shipped", updated_at=_t(60))]
+    path = put(tmp_path, summary(trains=old))
+    assert [t["id"] for t in board(view_for(path))["trains"]] == ["t3"]
+    assert len(board(view_for(path, work_merged_for=0))["trains"]) == 3
+
+
+def test_a_linked_blocker_commitment_keeps_its_blocking_priority(env):
+    rows = [row("n-1", "Approve licence", state="NEEDS OWNER")]
+    got = waiting(rows, [commitment("c1", "Approve licence", kind="blocker")])
+    assert len(got) == 1 and got[0]["blocking"] and got[0]["also_owed"] == "c1"
+
+
+def test_a_summary_inside_a_configured_login_folder_is_refused(tmp_path, monkeypatch):
+    from khipu import config
+
+    login = tmp_path / "fictional-login-home"
+    login.mkdir()
+    path = login / "work-summary.json"
+    path.write_text(json.dumps(summary()))
+    monkeypatch.setattr(config, "load_config", lambda: {"usage_accounts": [
+        {"label": "Synthetic", "harness": "claude", "home": str(login)}]})
+    opened = []
+    real = os.open
+    monkeypatch.setattr(os, "open", lambda p, *a, **k: (opened.append(os.fspath(p)), real(p, *a, **k))[1])
+    assert read(path)["state"] == "refused"
+    assert path.name not in opened and str(path) not in opened
+
+
+def test_a_symlink_is_never_followed_even_when_swapped_after_the_checks(tmp_path, monkeypatch):
+    public = put(tmp_path, summary())
+    target = tmp_path / "auth.json"  # synthetic, holds no credential
+    target.write_text(json.dumps(summary(jobs=[job("credential-target")])))
+    link = tmp_path / "summary-link.json"
+    link.symlink_to(public)
+    real = os.open
+
+    def swap(p, flags, *a, **k):
+        if os.fspath(p) in (str(link), link.name):
+            link.unlink()
+            link.symlink_to(target)
+        return real(p, flags, *a, **k)
+
+    monkeypatch.setattr(os, "open", swap)
+    got = read(link)
+    assert got["state"] == "refused" and got["contents"] is None

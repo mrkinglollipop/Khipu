@@ -3,25 +3,32 @@ docs/plans/2026-10-15-work-view.md, Part B).
 
 Each project's job runner writes a summary file (``work-summary.json``,
 format 1, schema in ``docs/formats/work-summary-1.schema.json``). Khipu only
-reads it, exactly as routing reads runner folders: the private-folder check
-before anything is opened, then ``routing_sources.read_only`` (``O_RDONLY |
-O_NONBLOCK``, a regular file only, size checked, no lock, no temp file).
-Nothing here writes a project's files or sends anything to a runner.
+reads it: the private-folder and login-folder checks before anything is
+opened, then one open (``O_RDONLY | O_NONBLOCK | O_NOFOLLOW``) by name from a
+descriptor of its folder, reached one folder at a time without following a
+link, and ``fstat`` on what was opened (a regular file with one name, size
+checked; no lock, no temp file). A summary file reached through a link is
+refused. Nothing here writes a project's files or sends anything to a runner.
 
 ``build_view`` folds the summaries, the ledger, Khipu's open commitments that
 need the user and the routing record into one document, ``khipu-work-view``
 version 1, kept at ``state/work/view.json``. It carries no path, login folder,
 account key or pre-formatted local time, so a later phone or web view needs
-only it and the ledger reads.
+only it and the ledger reads. Every string leaves through ``_project``: its
+free text cleaned where it is read, then one fail-closed scan of the finished
+document that withholds any field still holding a path, a login folder, an
+account key or a secret.
 """
 from __future__ import annotations
 
 import argparse
 import difflib
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -54,11 +61,12 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "work_max_runs": ("count", 20, "Most test runs shown per train (0: no limit)"),
     "work_line_chars": ("count", 200, "Longest summary line (0: no limit)"),
     "work_stale_after": ("auto_duration", "auto",
-                         "A summary counts as out of date after (auto: five of the runner's intervals)"),
+                         "A summary counts as out of date after (auto: five of the runner's intervals; 0: never)"),
     "work_job_quiet_after": ("duration", 15 * 60, "A running job counts as quiet after (0: never)"),
     "work_gone_after": ("duration", 24 * 3600, "A project counts as not reporting after (0: never)"),
-    "work_finished_for": ("duration", 30 * 60, "Show finished jobs for"),
-    "work_merged_for": ("duration", 7 * 86400, "Show merged pull requests for"),
+    "work_finished_for": ("duration", 30 * 60, "Show finished jobs for (0: always)"),
+    "work_merged_for": ("duration", 7 * 86400,
+                        "Show merged pull requests and shipped or dropped trains for (0: always)"),
     "work_clock_slack": ("duration", 5 * 60, "A time this far ahead of this Mac's clock is shown as now"),
     "work_refresh": ("duration", 5, "How often the open Work tab asks for the view"),
 }
@@ -186,9 +194,9 @@ def _parse_time(value: Any) -> datetime | None:
         text = text[:-1] + "+00:00"
     try:
         dt = datetime.fromisoformat(text)
-    except ValueError:
+        return dt.astimezone(timezone.utc) if dt.tzinfo else None
+    except (ValueError, OverflowError):
         return None
-    return dt.astimezone(timezone.utc) if dt.tzinfo else None
 
 
 def state_dir() -> Path:
@@ -256,12 +264,69 @@ def clean_text(value: Any, cap: int) -> str | None:
     text = unicodedata.normalize("NFC", value)
     text = _CONTROL.sub(" ", text)
     text = " ".join(text.split())
-    if not text or _trips_redaction(text):
+    if not text or _trips_redaction(text) or _ACCOUNT_KEY.search(text):
         return None
     text = _cut_paths(text)
     if cap and len(text) > cap:
         text = text[: max(1, cap - 1)].rstrip() + "…"
     return text
+
+
+# A routing account key ("harness|login folder"); a path at a word's start
+# ("/x", "~/x", a backslash path, a drive letter); or a word holding two or more folder
+# separators. A link's own path is not a local path: links are cut out first.
+_ACCOUNT_KEY = re.compile(r"(?i)(?<![\w-])(?:claude|codex|grok|muse)\|")
+_PATH_SHAPE = re.compile(r"(?:^|[^\w.-])(?:~[/\\]|/(?=[\w.~-])|\\)|\b[A-Za-z]:[/\\]|[^\s/\\]+[/\\][^\s/\\]*[/\\]")
+_LINK = re.compile(r"https://\S+")
+
+
+def _private_text(text: str, table: Any = None) -> bool:
+    """Whether ``text`` may not leave work.py: it trips secret redaction,
+    holds an account key or is path-shaped, or (given agent_view's table)
+    names a login folder, the home folder or a user name."""
+    one = " ".join(text.split())
+    if _trips_redaction(one) or _ACCOUNT_KEY.search(text) or _PATH_SHAPE.search(_LINK.sub(" ", text)):
+        return True
+    if table is not None:
+        from khipu import agent_view
+
+        return agent_view._scrub_text(text, table, []) != text
+    return False
+
+
+def _word(value: Any, shape: re.Pattern = _ID_RE) -> str | None:
+    """An id, state or reference a file gives: the value when it has
+    ``shape`` and nothing private in it, else None."""
+    if isinstance(value, str) and shape.match(value) and not _private_text(value):
+        return value
+    return None
+
+
+class _Scan:
+    """The fail-closed last pass over everything work.py hands out: any
+    string still private is withheld (None in an object, left out of a
+    list; an object key that is private drops its entry)."""
+
+    def __init__(self) -> None:
+        try:
+            from khipu import agent_view
+
+            self.table = agent_view._table(None)
+        except Exception:  # noqa: BLE001  (the shape checks still run)
+            self.table = None
+
+    def __call__(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return None if _private_text(value, self.table) else value
+        if isinstance(value, dict):
+            return {k: self(v) for k, v in value.items() if not (isinstance(k, str) and self(k) is None)}
+        if isinstance(value, (list, tuple)):
+            return [self(v) for v in value if not (isinstance(v, str) and self(v) is None)]
+        return value
+
+
+def _project(value: Any) -> Any:
+    return _Scan()(value)
 
 
 def _clean_link(value: Any) -> str | None:
@@ -330,9 +395,10 @@ class _Reading:
         return _z(dt)
 
     def ident(self, value: Any) -> str:
-        if not isinstance(value, str) or not _ID_RE.match(value):
+        word = _word(value)
+        if word is None:
             raise _Drop
-        return value
+        return word
 
     def text(self, value: Any, cap: int, *, required: bool = False) -> str | None:
         text = clean_text(value, cap)
@@ -354,7 +420,7 @@ def _state(value: Any, words) -> tuple[str | None, bool]:
     word = value.strip()
     if word in words:
         return word, True
-    return (word if _ID_RE.match(word) else None), False
+    return _word(word), False
 
 
 def _job(item: dict, r: _Reading) -> dict:
@@ -366,15 +432,14 @@ def _job(item: dict, r: _Reading) -> dict:
         "started_at": r.time(item.get("started_at")), "updated_at": r.time(item.get("updated_at")),
         "summary": r.text(item.get("summary"), r.cfg["work_line_chars"], required=True),
     }
-    kind = item.get("kind")
-    out["kind"] = kind if kind in JOB_KINDS else ("other" if isinstance(kind, str) and kind else None)
+    kind = item.get("kind") if isinstance(item.get("kind"), str) else None
+    out["kind"] = kind if kind in JOB_KINDS else ("other" if kind else None)
     target: dict[str, str] = {}
     raw_for = item.get("for") if isinstance(item.get("for"), dict) else {}
-    for key in ("pr", "train"):
-        if isinstance(raw_for.get(key), str) and _ID_RE.match(raw_for[key]):
-            target[key] = raw_for[key]
-    if isinstance(raw_for.get("ledger"), str) and _LEDGER_ID_RE.match(raw_for["ledger"]):
-        target["ledger"] = raw_for["ledger"]
+    for key, shape in (("pr", _ID_RE), ("train", _ID_RE), ("ledger", _LEDGER_ID_RE)):
+        word = _word(raw_for.get(key), shape)
+        if word:
+            target[key] = word
     task = r.text(raw_for.get("task"), 80)
     if task:
         target["task"] = task
@@ -407,7 +472,7 @@ def _pr(item: dict, r: _Reading) -> dict:
         "verdict": None,
     }
     verdict = item.get("verdict")
-    if isinstance(verdict, dict) and verdict.get("outcome") in VERDICTS:
+    if isinstance(verdict, dict) and isinstance(verdict.get("outcome"), str) and verdict["outcome"] in VERDICTS:
         out["verdict"] = {"outcome": verdict["outcome"], "first_line": clean_text(verdict.get("first_line"), 200),
                           "by": _label(verdict.get("by")), "at": r.time(verdict.get("at"), required=False)}
     return out
@@ -426,12 +491,11 @@ def _train(item: dict, r: _Reading) -> dict:
             runs.append({"name": r.text(run.get("name"), 60, required=True), "state": run_state,
                          "state_known": run_known, "at": r.time(run.get("at")),
                          "summary": r.text(run.get("summary"), r.cfg["work_line_chars"])})
-        except _Drop:
+        except (_Drop, TypeError, ValueError, OverflowError):
             r.dropped += 1
     ident = r.ident(item.get("id"))
     runs = _newest(runs, "at", r.cfg["work_max_runs"], r, f"runs of {ident}")
-    prs = [p for p in item["prs"] if isinstance(p, str) and _ID_RE.match(p)] \
-        if isinstance(item.get("prs"), list) else []
+    prs = [w for w in map(_word, item["prs"]) if w] if isinstance(item.get("prs"), list) else []
     return {"id": ident, "name": r.text(item.get("name"), 40, required=True), "state": state,
             "state_known": known, "state_words": TRAIN_STATES.get(state or "", UNKNOWN_STATE),
             "updated_at": r.time(item.get("updated_at")), "prs": prs, "runs": runs,
@@ -506,7 +570,7 @@ def parse_summary(data: bytes, project: str | None, cfg: dict, now: datetime) ->
                 if not isinstance(item, dict):
                     raise _Drop
                 items.append(reader(item, r))
-            except _Drop:
+            except (_Drop, TypeError, ValueError, OverflowError):
                 r.dropped += 1
         out[key] = _newest(items, newest, cfg[cap_key], r, key)
     waiting = doc.get("waiting_on_owner")
@@ -517,14 +581,16 @@ def parse_summary(data: bytes, project: str | None, cfg: dict, now: datetime) ->
 
 SOURCE_PROBLEMS = {
     "missing": "No summary file yet at the place you set.",
-    "refused": "Not read: the file is inside a private folder.",
+    "refused": "Not read: the file is inside a private or login folder, or is reached through a link.",
     "off": "Turned off",
     "none": "No job runner reports for this project",
     "unreadable": "Couldn't read the newest summary; showing what it said last.",
+    "older": "The newest summary is older than the last one read; showing the last one.",
 }
 
 
 def _stale_after(cfg: dict, parsed: dict | None) -> float:
+    """Seconds until a summary counts as out of date (0: never)."""
     if cfg["work_stale_after"] != "auto":
         return float(cfg["work_stale_after"])
     interval = ((parsed or {}).get("runner") or {}).get("interval_s")
@@ -546,58 +612,157 @@ def _failed(state: str, problem: str, last: dict | None, **detail: Any) -> dict:
     return {"state": state, "problem": problem, "contents": (last or {}).get("contents"), **detail}
 
 
+class _Refused(Exception):
+    """A private or login folder, or a link on the way to the file."""
+
+
+def _login_folder(path: str) -> bool:
+    """Whether ``path`` is in a login folder Khipu knows (configured,
+    discovered, in the routing record or a harness default), decided from
+    names and links alone: nothing inside one is listed or opened."""
+    from khipu import agent_view
+
+    home = agent_view._home_dir()
+    target = agent_view._fold(path.rstrip("/"))
+    for harness, raw in agent_view._homes(None, agent_view._saved_view()):
+        if raw is None:
+            folder = agent_view._DEFAULT_FOLDERS.get(harness)
+            if not folder or not home:
+                continue
+            raw = os.path.join(home, folder)
+        for form in agent_view._forms(raw, home):
+            form = agent_view._fold(form.rstrip("/"))
+            if not form.startswith("~") and (target == form or target.startswith(form + "/")):
+                return True
+    return False
+
+
+def _private_place(path: str) -> bool:
+    from khipu import routing_sources
+
+    try:
+        return routing_sources.private_path(path) or _login_folder(path) \
+            or _login_folder(os.path.realpath(path))
+    except Exception:  # noqa: BLE001  (unsure is private)
+        return True
+
+
+def _open_summary(path: Path) -> int:
+    """A read-only descriptor for the summary file at ``path``. Its folder is
+    resolved and checked, then reached one folder at a time from ``/`` with
+    ``O_NOFOLLOW``, and the file opened by name from that folder's
+    descriptor with ``O_NOFOLLOW``: a link anywhere on the way, put there
+    before or after the checks, is refused, never followed."""
+    path = Path(os.path.abspath(os.fspath(path.expanduser())))
+    if _private_place(str(path)):
+        raise _Refused
+    folder = os.path.realpath(path.parent)
+    if _private_place(os.path.join(folder, path.name)):
+        raise _Refused
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        try:
+            for part in Path(folder).parts[1:]:
+                step = os.open(part, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow, dir_fd=fd)
+                os.close(fd)
+                fd = step
+            return os.open(path.name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | nofollow, dir_fd=fd)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise _Refused from None
+            raise
+    finally:
+        os.close(fd)
+
+
+def _read_fd(fd: int, most: int) -> bytes:
+    chunks: list[bytes] = []
+    got = 0
+    while got < most:
+        chunk = os.read(fd, min(65536, most - got))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        got += len(chunk)
+    return b"".join(chunks)
+
+
+def _open_checked(path: Path, limit: int) -> tuple[int, os.stat_result]:
+    """``_open_summary`` and ``fstat`` on what it opened: a regular file
+    with one name (a hard link could be another name for a private file),
+    no larger than ``limit`` (0: no limit). Raises ``_Refused``,
+    ``FileNotFoundError``, ``Unreadable`` (``too_big``) or ``OSError``."""
+    fd = _open_summary(path)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        if st.st_nlink > 1:
+            raise _Refused
+        if limit and st.st_size > limit:
+            raise Unreadable("too_big", f"The summary file is {_kb(st.st_size)}, over the {_kb(limit)} limit.",
+                             size=st.st_size, limit=limit)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, st
+
+
 def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
     """One project's summary source: its state, the contents to show (this
     read, or the last good read when this one failed) and the counts. A file
     whose time and size are unchanged since the last good read is not parsed
-    again."""
-    from khipu import routing_sources
-
+    again, and a file older than the last good read never replaces it."""
     if entry is None:
         return {"state": "none", "problem": SOURCE_PROBLEMS["none"], "contents": None}
     if not entry.get("on", True):
         return {"state": "off", "problem": SOURCE_PROBLEMS["off"], "contents": None}
     project, path = entry["project"], Path(entry["file"])
-    if routing_sources.private_path(path):
+    if _private_place(str(path)):
         return {"state": "refused", "problem": SOURCE_PROBLEMS["refused"], "contents": None}
     last = _read_json(_last_file(project))
     last = last if isinstance(last, dict) and last.get("project_key") == project else None
     limit = cfg["work_file_max_bytes"]
     try:
-        st = os.stat(path)
+        fd, st = _open_checked(path, limit)
+    except _Refused:
+        return {"state": "refused", "problem": SOURCE_PROBLEMS["refused"], "contents": None}
     except FileNotFoundError:
         return {"state": "missing", "problem": SOURCE_PROBLEMS["missing"], "contents": None}
+    except Unreadable as exc:
+        return _failed(exc.state, exc.problem, last, **exc.detail)
     except OSError:
         return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last)
-    if limit and st.st_size > limit:
-        return _failed("too_big", f"The summary file is {_kb(st.st_size)}, over the {_kb(limit)} limit.", last,
-                       size=st.st_size, limit=limit)
-    stamp = [st.st_mtime_ns, st.st_size, _cfg_digest(cfg)]
-    if last is not None and last.get("stamp") == stamp:
-        parsed = last["contents"]
-    else:
-        try:
-            data, _mtime = routing_sources.read_only(path, limit=limit or (1 << 62))
-        except PermissionError:
-            return {"state": "refused", "problem": SOURCE_PROBLEMS["refused"], "contents": None}
-        except FileNotFoundError:
-            return {"state": "missing", "problem": SOURCE_PROBLEMS["missing"], "contents": None}
-        except OSError:
-            return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last)
-        try:
-            parsed = parse_summary(data, project, cfg, now)
-        except Unreadable as exc:
-            if exc.state in ("wrong_project", "newer_format"):
-                return {"state": exc.state, "problem": exc.problem, "contents": None, **exc.detail}
-            return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last)
-        try:
-            _write_json(_last_file(project), {"project_key": project, "stamp": stamp, "contents": parsed})
-        except OSError:
-            pass  # the last good read is a convenience; this read still shows
+    try:
+        stamp = [st.st_mtime_ns, st.st_size, _cfg_digest(cfg)]
+        if last is not None and last.get("stamp") == stamp:
+            parsed = last["contents"]
+        else:
+            try:
+                data = _read_fd(fd, limit or st.st_size or 1)
+            except OSError:
+                return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last)
+            try:
+                parsed = parse_summary(data, project, cfg, now)
+            except Unreadable as exc:
+                if exc.state in ("wrong_project", "newer_format"):
+                    return {"state": exc.state, "problem": exc.problem, "contents": None, **exc.detail}
+                return _failed("unreadable", SOURCE_PROBLEMS["unreadable"], last)
+            before = _parse_time(((last or {}).get("contents") or {}).get("written_at"))
+            if before is not None and _parse_time(parsed["written_at"]) < before:
+                return _failed("unreadable", SOURCE_PROBLEMS["older"], last)
+            try:
+                _write_json(_last_file(project), {"project_key": project, "stamp": stamp, "contents": parsed})
+            except OSError:
+                pass  # the last good read is a convenience; this read still shows
+    finally:
+        os.close(fd)
     age = (now - _parse_time(parsed["written_at"])).total_seconds()
+    stale = _stale_after(cfg, parsed)
     if cfg["work_gone_after"] and age > cfg["work_gone_after"]:
         state = "gone"
-    elif age > _stale_after(cfg, parsed):
+    elif stale and age > stale:
         state = "stale"
     else:
         state = "ok"
@@ -811,6 +976,7 @@ STATE_APP_WORDS = {"VERIFIED": "Verified", "MERGED-UNVERIFIED": "Merged, not ver
                    "NOT STARTED": "Not started", "NEEDS OWNER": "Needs you", "NEEDS MATT": "Needs you",
                    "DROPPED": "Dropped", "DONE": "Done"}
 _MERGED_WORDS = frozenset({"MERGED-UNVERIFIED", "VERIFIED"})
+TITLE_CHARS = 200
 
 
 def state_words(word: str) -> str:
@@ -838,9 +1004,9 @@ def _when(row: dict) -> datetime:
 def _row_out(row: dict, vocab: dict) -> dict:
     from khipu import ledger
 
-    return {"id": row["row_id"], "title": row["title"], "kind": row["kind"], "parent": row["parent"] or None,
-            "state": row["state"], "state_words": state_words(row["state"]),
-            "meaning": ledger._meaning(vocab, row["state"]), "owner": row["owner"],
+    return {"id": row["row_id"], "title": clean_text(row["title"], TITLE_CHARS), "kind": row["kind"],
+            "parent": row["parent"] or None, "state": row["state"], "state_words": state_words(row["state"]),
+            "meaning": ledger._meaning(vocab, row["state"]), "owner": clean_text(row["owner"], 80),
             "updated_at": _z(_parse_time(row.get("updated_at")))}
 
 
@@ -913,8 +1079,9 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime) -
                 continue
             since = (data.get("entered") or {}).get(row["row_id"]) or _parse_time(row.get("updated_at"))
             item = {"source": "ledger", "key": f"ledger:{project}#{row['row_id']}", "project": project,
-                    "id": row["row_id"], "title": row["title"], "kind": row["kind"], "since": _z(since),
-                    "evidence": row.get("evidence") or None, "link": row.get("link") or None,
+                    "id": row["row_id"], "title": clean_text(row["title"], TITLE_CHARS), "kind": row["kind"],
+                    "since": _z(since), "evidence": clean_text(row.get("evidence"), TITLE_CHARS),
+                    "link": _clean_link(row.get("link")),
                     "blocking": row["row_id"] in parents, "also_owed": None,
                     "actions": ["done", "drop", "answered", "open_ledger"] + (["open_link"] if row.get("link") else [])}
             items.append(item)
@@ -929,14 +1096,16 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime) -
             or content_hash(project, row["title"]) == content_hash(project, text))), None)
         if linked is not None:
             linked["also_owed"] = cid
+            linked["blocking"] = linked["blocking"] or c.get("kind") == "blocker"
             linked["actions"] = list(dict.fromkeys([*linked["actions"], "open_owed"]))
             continue
-        looks_like = next(({"id": row["row_id"], "title": row["title"]} for p, row, _item in needs
+        looks_like = next(({"id": row["row_id"], "title": clean_text(row["title"], TITLE_CHARS)}
+                           for p, row, _item in needs
                            if p == project and (p, row["row_id"], cid) not in not_same
                            and _alike(_norm(row["title"]), _norm(text))), None)
         opened = _parse_time(c.get("opened_at"))
         items.append({"source": "commitment", "key": f"commitment:{cid}", "project": project, "id": cid,
-                      "title": text, "kind": c.get("kind"), "since": _z(opened),
+                      "title": clean_text(text, TITLE_CHARS), "kind": c.get("kind"), "since": _z(opened),
                       "blocking": c.get("kind") == "blocker", "looks_like": looks_like,
                       "actions": ["done", "snooze", "open_owed", "hide"] + (["same", "not_same"] if looks_like else [])})
     rules = routing_info.get("rules") or []
@@ -957,7 +1126,8 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime) -
             days = int((now - at).total_seconds() // 86400) if at else 0
             items.append({"source": "routing", "key": f"routing:hold:{h.get('id')}", "project": None,
                           "id": f"hold:{h.get('id')}",
-                          "title": f"Your hold on {h.get('scope_label') or 'an account'} has been on for {days} days",
+                          "title": f"Your hold on {clean_text(h.get('scope_label'), 60) or 'an account'} "
+                                   f"has been on for {days} days",
                           "kind": "hold", "since": h.get("at"), "blocking": False, "actions": ["open_routing"]})
     items.sort(key=lambda i: (not i["blocking"], i.get("since") or "9999"))
     return items
@@ -985,7 +1155,8 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
         source = read_source(entry, cfg, now)
         contents = source.pop("contents") or {}
         board: dict[str, Any] = {
-            "project": key, "name": (entry or {}).get("name") or (ldata or {}).get("name") or key,
+            "project": key, "name": clean_text((entry or {}).get("name"), 80)
+            or clean_text((ldata or {}).get("name"), 80) or key,
             "source": {"state": source["state"], "problem": source.get("problem"),
                        "as_of": contents.get("written_at"),
                        "dropped": contents.get("dropped", 0),
@@ -1001,9 +1172,12 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
             board["ledger"] = _ledger_part(rows, vocab, now)
         if contents:
             written = _parse_time(contents["written_at"])
-            if source["state"] in ("ok", "stale"):
+            if source["state"] in ("ok", "stale") and _stale_after(cfg, contents):
                 times.append(written + timedelta(seconds=_stale_after(cfg, contents)))
-            if cfg["work_gone_after"] and source["state"] != "gone":
+            # A failed read shows the last good one: its jobs stop showing
+            # live once that read is older than work_gone_after.
+            gone = bool(cfg["work_gone_after"]) and (now - written).total_seconds() > cfg["work_gone_after"]
+            if cfg["work_gone_after"] and not gone:
                 times.append(written + timedelta(seconds=cfg["work_gone_after"]))
             runner = (contents.get("runner") or {}).get("name")
             for raw_job in contents.get("jobs") or []:
@@ -1011,7 +1185,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                 if not (entry or {}).get("show_now", True):
                     job["now"] = []
                 updated = _parse_time(job["updated_at"])
-                if job["state"] in JOB_ENDED:
+                if job["state"] in JOB_ENDED and cfg["work_finished_for"]:
                     ended = _parse_time(job.get("ended_at")) or updated
                     if (now - ended).total_seconds() > cfg["work_finished_for"]:
                         continue
@@ -1022,7 +1196,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                     times.append(updated + timedelta(seconds=quiet))
                 job["account_ref"] = _account_ref(job, runner, routing_info)
                 board["jobs"].append(job)
-                if job["state"] in ("running", "queued", "waiting") and source["state"] != "gone":
+                if job["state"] in ("running", "queued", "waiting") and source["state"] != "gone" and not gone:
                     live.append(job)
             by_pr: dict[str, list[dict]] = {}
             for r in rows:
@@ -1031,7 +1205,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                     by_pr.setdefault(ref, []).append(r)
             for raw_pr in contents.get("prs") or []:
                 pr = dict(raw_pr)
-                if pr["stage"] in ("merged", "closed"):
+                if pr["stage"] in ("merged", "closed") and cfg["work_merged_for"]:
                     done_at = _parse_time(pr.get("merged_at") or pr["stage_at"])
                     if (now - done_at).total_seconds() > cfg["work_merged_for"]:
                         continue
@@ -1044,7 +1218,13 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                 if pr["stage"] == "merged":
                     board["merged"].append({"id": pr["id"], "title": pr["title"], "merged_at": pr["merged_at"],
                                             "link": pr["link"]})
-            board["trains"] = list(contents.get("trains") or [])
+            for train in contents.get("trains") or []:
+                if train["state"] in ("shipped", "dropped") and cfg["work_merged_for"]:
+                    at = _parse_time(train["updated_at"])
+                    if (now - at).total_seconds() > cfg["work_merged_for"]:
+                        continue
+                    times.append(at + timedelta(seconds=cfg["work_merged_for"]))
+                board["trains"].append(train)
         board["flagged"] = sum(1 for p in board["prs"]
                                if p["stage"] == "flagged" or (p.get("verdict") or {}).get("outcome") == "flagged")
         projects.append(board)
@@ -1055,7 +1235,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
     except Exception:  # noqa: BLE001
         outbox = 0
     future = [t for t in times if t is not None and t > now]
-    return {
+    return _project({
         "format": VIEW_FORMAT, "version": VIEW_VERSION, "generated_at": _z(now),
         "valid_until": _z(min(future)) if future else None,
         "projects": projects, "live": live, "waiting": waiting, "accounts": routing_info.get("accounts") or [],
@@ -1068,7 +1248,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                                        ("routing", routing_info.get("error"))) if v},
         "ledger_offline": bool(ledger_data.get("offline")), "ledger_as_of": ledger_data.get("as_of"),
         "refresh_s": cfg["work_refresh"],
-    }
+    })
 
 
 def write_view(view: dict) -> None:
@@ -1107,7 +1287,7 @@ def doctor_block(now: datetime | None = None) -> dict[str, Any]:
         if item["clamped"]:
             out["warnings"].append(f"work: {entry['project']}: {item['clamped']} time(s) ahead of this Mac's clock "
                                    "shown as now")
-    return out
+    return _project(out)
 
 
 # ---- the CLI ------------------------------------------------------------------------
@@ -1119,15 +1299,23 @@ def check_file(path: str) -> tuple[bool, list[str], dict | None]:
     from khipu import routing_sources
 
     cfg = settings()
-    if routing_sources.private_path(path):
-        return False, [SOURCE_PROBLEMS["refused"]], None
+    limit = cfg["work_file_max_bytes"]
     try:
-        data, _mtime = routing_sources.read_only(Path(path).expanduser(),
-                                                 limit=cfg["work_file_max_bytes"] or (1 << 62))
+        fd, st = _open_checked(Path(path), limit)
+    except _Refused:
+        return False, [SOURCE_PROBLEMS["refused"]], None
     except FileNotFoundError:
         return False, ["No file at that path."], None
+    except Unreadable as exc:
+        return False, [exc.problem], None
     except OSError as exc:
         return False, [f"The file can't be read ({routing_sources._short_error(exc)})."], None
+    try:
+        data = _read_fd(fd, limit or st.st_size or 1)
+    except OSError as exc:
+        return False, [f"The file can't be read ({routing_sources._short_error(exc)})."], None
+    finally:
+        os.close(fd)
     try:
         parsed = parse_summary(data, None, cfg, _now())
     except Unreadable as exc:
@@ -1150,22 +1338,25 @@ def check_file(path: str) -> tuple[bool, list[str], dict | None]:
     return not problems, problems, parsed
 
 
+WITHHELD_WORDS = "(left out: it held a path or a secret)"
+
+
 def render_text(view: dict) -> str:
     c = view["counts"]
     lines = [f"Waiting on you: {c['waiting']} ({c['blocking']} blocking)"]
     for w in view["waiting"][:8]:
-        lines.append(f"  - {'[blocking] ' if w['blocking'] else ''}{w['title']}"
+        lines.append(f"  - {'[blocking] ' if w['blocking'] else ''}{w['title'] or WITHHELD_WORDS}"
                      + (f" ({w['project']})" if w.get("project") else ""))
     lines.append(f"Running now: {c['running']}")
     for j in view["live"]:
         acct = (j.get("account_ref") or {}).get("label") or "an account not named"
-        line = f"  - {j['project']}: {j['summary']} · {j['state_words']} · {acct}"
+        line = f"  - {j['project'] or WITHHELD_WORDS}: {j['summary'] or WITHHELD_WORDS} · {j['state_words']} · {acct}"
         if j.get("now"):
             line += f" · {j['now'][-1]['text']}"
         lines.append(line)
     for p in view["projects"]:
         src = p["source"]
-        lines.append(f"{p['name']}: {src['problem'] or 'reporting'}"
+        lines.append(f"{p['name'] or WITHHELD_WORDS}: {src['problem'] or 'reporting'}"
                      + (f"; {len(p['prs'])} pull request(s), {p['flagged']} flagged" if p["prs"] else ""))
         if p["ledger"]:
             lines.append(f"  ledger: {p['ledger']['rows']} row(s), {p['ledger']['loose_end_count']} loose end(s)")
