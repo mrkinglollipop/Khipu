@@ -483,6 +483,12 @@ state carry and capture notes are not sources until a window is queued.
 `test_forget_reads_its_folders_from_the_inventory`,
 `test_a_store_without_a_forget_scan_keeps_the_forget_open`.
 
+**Placed when merging with main (2026-10-16).** Account discovery (settings clarity 9A) arrived on main
+after this list was written. Its writers hold no capture text and sit in the test's not-capture table: the
+discovery results (folder names, CLI kinds, check times), its lock, and the temporary empty folder a CLI
+status check runs in. 9A's `session_capture._write_at` writes the session state files and is listed as a
+writer of the session state store.
+
 ## Known boundaries and follow-ups (2026-10-16)
 
 Limits accepted for this merge, each a follow-up rather than a blocker:
