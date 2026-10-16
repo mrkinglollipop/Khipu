@@ -3918,6 +3918,14 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
 
         out = replica_heal.run()
         rc = 0 if out.get("ok") else 1
+        try:
+            from khipu import storage
+
+            swept = storage.sweep_if_due()
+            if swept is not None:
+                out["storage_sweep"] = swept
+        except Exception as e:  # noqa: BLE001 — housekeeping never fails the replica job
+            out["storage_sweep"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         jobs._write_job_state("replica_refresh", rc)
         print(json.dumps(out, indent=2))
         return rc

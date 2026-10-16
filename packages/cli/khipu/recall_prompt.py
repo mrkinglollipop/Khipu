@@ -1860,7 +1860,7 @@ QUERY_EMBED_LOCAL_TIMEOUT_S = 0.7
 # one hook process can ever wait on another's lock; every failure (locked,
 # corrupt, missing directory) degrades to "not cached" below, never raises.
 # Deliberately a NEW filename, not a migration of the old
-# prompt-query-embed-cache.json — that file is left alone, untouched.
+# prompt-query-embed-cache.json; the storage sweep removes that file.
 _QUERY_EMBED_CACHE_CONNECT_TIMEOUT_S = 0.1
 
 

@@ -75,3 +75,39 @@ def test_the_sweep_keeps_a_young_temp_and_never_the_replica(data_dir):
 
     assert out == {"ok": True, "removed": [old.name]}
     assert young.exists() and replica.exists() and meta.exists()
+
+
+def test_the_sweep_removes_the_replaced_query_cache_and_keeps_its_successor(data_dir):
+    from khipu import storage
+
+    state = data_dir / "state"
+    state.mkdir()
+    legacy = state / "prompt-query-embed-cache.json"
+    legacy.write_text("{}" * 100)
+    current = state / "prompt-query-embed-cache.sqlite3"
+    current.write_bytes(b"cache")
+
+    out = storage.sweep()
+
+    assert out["ok"] and "state/prompt-query-embed-cache.json" in out["removed"]
+    assert out["freed_bytes"] >= 200
+    assert not legacy.exists() and current.exists()
+
+
+def test_the_replica_job_sweeps_once_a_day(data_dir, monkeypatch, capsys):
+    import argparse
+
+    from khipu import cli, jobs, replica_heal, storage
+
+    monkeypatch.setattr(replica_heal, "run", lambda: {"ok": True, "action": "none"})
+    monkeypatch.setattr(jobs, "_write_job_state", lambda *a, **k: None)
+    calls = []
+    monkeypatch.setattr(storage, "sweep", lambda: calls.append(1) or {"ok": True, "removed": [],
+                                                                      "freed_bytes": 0, "errors": []})
+    args = argparse.Namespace(snapshot_cmd="heal")
+
+    assert cli.cmd_snapshot(args) == 0
+    assert cli.cmd_snapshot(args) == 0
+
+    assert calls == [1]
+    assert '"storage_sweep"' in capsys.readouterr().out
