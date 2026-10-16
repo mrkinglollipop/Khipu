@@ -383,6 +383,69 @@ def disk_space(limits: Mapping[str, Any] | None = None) -> dict[str, Any]:
             "fix": {"label": "Open storage report", "kind": "storage-report"}}
 
 
+# ---- what Khipu holds --------------------------------------------------------
+
+
+def _human(n: int) -> str:
+    if n < 1000:
+        return f"{n} B"
+    if n < 1000 ** 2:
+        return f"{n // 1000} KB"
+    if n < GB:
+        return f"{round(n / 1000 ** 2)} MB"
+    return f"{n / GB:.1f} GB"
+
+
+def _tree_bytes(path: Path) -> int:
+    total = 0
+    for dirpath, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+_PLACE_WORDS = {"replica": "replica", "logs": "logs", "backups": "backups", "temp": "temporary files"}
+
+
+def usage() -> dict[str, Any]:
+    """How much Khipu holds and where: the replica and its sidecars, the
+    logs, the commitments backups and leftover temporary files. Kept fast:
+    it never walks the memory root or the hub."""
+    from khipu import hub_snapshot, hygiene, synth_cli
+
+    replica_path = hub_snapshot.snapshot_path()
+    replica = sum(_size(Path(str(replica_path) + suffix)) for suffix in ("", "-journal", "-wal", "-shm"))
+    replica += _size(hub_snapshot.meta_path())
+    logs = 0
+    folders = log_dirs()
+    for log in log_files():
+        logs += _size(log) + _size(log.with_name(log.name + ".1"))
+    backups_dir = hygiene.commitments_backup_dir()
+    backups = sum(_tree_bytes(p) for p in _children(backups_dir) if hygiene._BACKUP_NAME.fullmatch(p.name))
+    temp = sum(_size(p) for p in _children(replica_path.parent) if hub_snapshot.is_replica_temp(p.name))
+    temp += sum(_tree_bytes(p) for p in _children(synth_cli.root()) if p.name.startswith("work-"))
+    places = [
+        {"name": "replica", "bytes": replica, "path": str(replica_path)},
+        {"name": "logs", "bytes": logs, "path": str(folders[0]) if folders else None},
+        {"name": "backups", "bytes": backups, "path": str(backups_dir)},
+        {"name": "temp", "bytes": temp, "path": str(replica_path.parent)},
+    ]
+    total = sum(p["bytes"] for p in places)
+    line = f"Khipu holds {_human(total)}: " + ", ".join(
+        f"{_PLACE_WORDS[p['name']]} {_human(p['bytes'])}" for p in places) + "."
+    return {"total_bytes": total, "places": places, "line": line}
+
+
+def _children(directory: Path) -> list[Path]:
+    try:
+        return [p for p in directory.iterdir() if not p.is_symlink()]
+    except OSError:
+        return []
+
+
 def _sweep_state_path() -> Path:
     return _state_dir() / SWEEP_STATE_NAME
 

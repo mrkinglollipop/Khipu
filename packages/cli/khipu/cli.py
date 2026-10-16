@@ -426,6 +426,13 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         disk_space = storage.disk_space()
     except Exception as e:  # noqa: BLE001  (a failed check must not look like a pass)
         disk_space = {"ok": False, "level": "red", "volumes": [], "error": f"{type(e).__name__}: {e}"}
+    # What Khipu holds and where: a line in the report, never a gate.
+    try:
+        from khipu import storage
+
+        storage_block = storage.usage()
+    except Exception as e:  # noqa: BLE001
+        storage_block = {"error": f"{type(e).__name__}: {e}"}
     return {
         "outbox": outbox, "outbox_ok": outbox_ok,
         "ledger_outbox": ledger_outbox, "ledger_outbox_ok": ledger_outbox_ok,
@@ -448,6 +455,7 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         "degraded_rate": degraded_rate, "degraded_rate_ok": bool(degraded_rate.get("ok")),
         "launchers": launchers, "launchers_ok": bool(launchers.get("ok")),
         "disk_space": disk_space, "disk_space_ok": bool(disk_space.get("ok")),
+        "storage": storage_block,
         "not_configured": not_configured,
     }
 
@@ -916,6 +924,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "outbox": outbox,
         "ledger_outbox": local["ledger_outbox"],
         "disk_space": local["disk_space"],
+        "storage": local["storage"],
         "capture_liveness": liveness,
         "git_sync": git_sync,
         "backup": backup,
@@ -4337,6 +4346,15 @@ def cmd_paths(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_storage(_args: argparse.Namespace) -> int:
+    """`khipu storage`: free disk space and what Khipu holds, for the app's
+    storage report. Read-only."""
+    from khipu import storage
+
+    print(json.dumps({"disk_space": storage.disk_space(), "storage": storage.usage()}, indent=2))
+    return 0
+
+
 def cmd_backup_local(args: argparse.Namespace) -> int:
     from khipu.paths import backup_local
 
@@ -4717,6 +4735,9 @@ def build_parser() -> argparse.ArgumentParser:
         "no hub, network or probe checks (the promotion gate's first step)",
     )
     d.set_defaults(func=cmd_doctor)
+
+    storage_p = sub.add_parser("storage", help="Free disk space and what Khipu holds, as JSON (read-only)")
+    storage_p.set_defaults(func=cmd_storage)
 
     rv = sub.add_parser(
         "revisions",

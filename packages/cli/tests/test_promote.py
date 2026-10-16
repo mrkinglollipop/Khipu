@@ -1432,6 +1432,8 @@ def test_a_red_disk_fails_both_doctors_and_amber_is_only_a_warning(home, monkeyp
     assert quick["disk_space_ok"] is ok and full["disk_space_ok"] is ok
     assert quick["ok"] is ok and full["ok"] is ok, (quick, full)
     assert full["disk_space"]["level"] == ("amber" if ok else "red")
+    # What Khipu holds rides along in both, never as a gate.
+    assert "line" in quick["storage"] and "line" in full["storage"] and "storage_ok" not in full
     warned = [w for w in full["warnings"] + quick["warnings"] if "is free on the disk" in w]
     assert len(warned) == (2 if ok else 0)
 

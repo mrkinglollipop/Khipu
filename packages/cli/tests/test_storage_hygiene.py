@@ -393,3 +393,40 @@ def test_a_commitments_backup_on_a_full_disk_says_so(data_dir, tmp_path, monkeyp
     with pytest.raises(OSError, match="commitments backup could not be written: the disk is full"):
         hygiene.backup_commitments(_FullConn(), dest_root=tmp_path / "backups")
     assert list((tmp_path / "backups").iterdir()) == []
+
+
+# ---- what Khipu holds ----------------------------------------------------------
+
+
+def test_usage_measures_the_replica_logs_backups_and_temps(data_dir, logs, tmp_path, monkeypatch):
+    from khipu import hygiene, storage
+
+    (data_dir / "hub_snapshot.sqlite").write_bytes(b"r" * 3000)
+    (data_dir / "hub_snapshot.sqlite-wal").write_bytes(b"w" * 1000)
+    (data_dir / ".hub_snapshot.left1.sqlite").write_bytes(b"t" * 500)
+    (logs / "a.log").write_bytes(b"l" * 200)
+    (logs / "a.log.1").write_bytes(b"l" * 100)
+    root = tmp_path / "backups"
+    (root / "commitments-20260101T000000Z").mkdir(parents=True)
+    (root / "commitments-20260101T000000Z" / "commitments.bin").write_bytes(b"b" * 2_000_000)
+    (root / "not-a-backup").mkdir()
+    (root / "not-a-backup" / "x").write_bytes(b"x" * 999)
+    monkeypatch.setattr(hygiene, "commitments_backup_dir", lambda: root)
+
+    out = storage.usage()
+
+    by = {p["name"]: p["bytes"] for p in out["places"]}
+    assert [p["name"] for p in out["places"]] == ["replica", "logs", "backups", "temp"]
+    assert by["replica"] >= 4000 and by["logs"] == 300 and by["backups"] == 2_000_000 and by["temp"] == 500
+    assert out["total_bytes"] == sum(by.values())
+    assert out["line"].startswith("Khipu holds 2 MB: replica ") and out["line"].endswith("temporary files 500 B.")
+
+
+def test_the_storage_command_prints_disk_space_and_usage(data_dir, capsys):
+    import json
+
+    from khipu import cli
+
+    assert cli.main(["storage"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert set(out) == {"disk_space", "storage"} and "line" in out["storage"]
