@@ -32,6 +32,7 @@ import hashlib
 import html
 import os
 import re
+import stat
 import threading
 import time
 import unicodedata
@@ -158,12 +159,10 @@ def _homes(extra_keys: Iterable[str] | None, view: dict) -> list[tuple[str, str 
     return out
 
 
-def in_login_folder(path: str) -> bool:
-    """Whether ``path`` is in one of the login folders ``_homes`` knows (in
-    any of its spellings), decided from names and links alone: nothing
-    inside one is listed or opened."""
+def _login_forms():
+    """Each spelling (``_forms``, without a trailing slash or ``~``) of each
+    login folder ``_homes`` knows."""
     home = _home_dir()
-    target = _fold(path.rstrip("/"))
     for harness, raw in _homes(None, _saved_view()):
         if raw is None:
             folder = _DEFAULT_FOLDERS.get(harness)
@@ -171,10 +170,31 @@ def in_login_folder(path: str) -> bool:
                 continue
             raw = os.path.join(home, folder)
         for form in _forms(raw, home):
-            form = _fold(form.rstrip("/"))
-            if not form.startswith("~") and (target == form or target.startswith(form + "/")):
-                return True
-    return False
+            form = form.rstrip("/")
+            if not form.startswith("~"):
+                yield form
+
+
+def in_login_folder(path: str) -> bool:
+    """Whether ``path`` is in one of the login folders ``_homes`` knows (in
+    any of its spellings), decided from names and links alone: nothing
+    inside one is listed or opened."""
+    target = _fold(path.rstrip("/"))
+    return any(target == form or target.startswith(form + "/") for form in map(_fold, _login_forms()))
+
+
+def login_folder_ids() -> frozenset[tuple[int, int]]:
+    """The (device, inode) of each login folder ``_homes`` knows that is
+    there, so a folder is known as one whatever name reached it (macOS's
+    ``/System/Volumes/Data/...`` is the same folder as its plain path). Only
+    each folder itself is looked at, never anything inside it."""
+    ids = set()
+    for form in set(_login_forms()):
+        with contextlib.suppress(OSError, ValueError):
+            st = os.stat(form)
+            if stat.S_ISDIR(st.st_mode):
+                ids.add((st.st_dev, st.st_ino))
+    return frozenset(ids)
 
 
 class _Id:

@@ -6,7 +6,9 @@ it is in a private place or in a login folder (``agent_view.in_login_folder``:
 the same list the scrubs use, each harness's own variable included). Then its
 folder is reached one folder at a time from ``/`` with ``O_NOFOLLOW`` (only a
 link the system owns at the top of the disk, ``/tmp`` or ``/var`` on macOS, is
-resolved), and the file is opened by name from that folder's descriptor with
+resolved), each folder on the way refused when it is a login folder by device
+and inode (another name for the same folder, such as macOS's
+``/System/Volumes/Data/...``, passes a name check), and the file is opened by name from that folder's descriptor with
 ``O_RDONLY | O_NONBLOCK | O_NOFOLLOW``. What was opened must be a regular file
 with one name: a second name could be a hard link to a file inside a login
 folder. After reading, the name is looked up again in the same folder and must
@@ -121,17 +123,33 @@ class Opened:
         self.close()
 
 
+def _login_ids() -> frozenset[tuple[int, int]]:
+    """``agent_view.login_folder_ids``; unsure refuses every walk."""
+    from khipu import agent_view
+
+    try:
+        return agent_view.login_folder_ids()
+    except Exception:  # noqa: BLE001
+        raise Refused from None
+
+
 def _walk(folder: str) -> int:
     """A descriptor for ``folder``, reached one folder at a time from ``/``
-    without following a link. Raises ``Refused`` for a link on the way."""
+    without following a link. Raises ``Refused`` for a link on the way, or
+    for a folder on the way that is a login folder by its device and inode,
+    whatever name reached it, before anything inside it is opened."""
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
+    logins = _login_ids()
     dir_fd = os.open("/", os.O_RDONLY | directory)
     try:
         for part in Path(folder).parts[1:]:
             step = os.open(part, os.O_RDONLY | directory | nofollow, dir_fd=dir_fd)
             os.close(dir_fd)
             dir_fd = step
+            st = os.fstat(dir_fd)
+            if (st.st_dev, st.st_ino) in logins:
+                raise Refused
     except OSError as exc:
         os.close(dir_fd)
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):

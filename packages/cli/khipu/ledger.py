@@ -670,14 +670,16 @@ def _restore(cur, op: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "verb": "restore", "id": row_id, "line": f"restored {row_id}", "affected": [row_id]}
 
 
-def _purge_row(cur, project: str, row_id: str) -> bool:
+def _purge_row(cur, project: str, row_id: str, *, removed_before: datetime | None = None) -> bool:
     """Remove a removed row for good: its row, history and ops go, and the bare
     marker (project, id, who removed it, when) stays. The only DELETEs in this
-    module are here."""
+    module are here. With ``removed_before`` (the nightly), only a row still
+    removed before then, as read under the lock: one restored and removed
+    again since the nightly looked is a fresh removal and stays."""
     cur.execute("SELECT removed_by, removed_at FROM ledger_rows WHERE project = %s AND row_id = %s "
                 "AND removed_at IS NOT NULL FOR UPDATE", (project, row_id))
     got = cur.fetchone()
-    if got is None:
+    if got is None or (removed_before is not None and not got[1] < removed_before):
         return False
     from psycopg.types.json import Jsonb
 
@@ -806,7 +808,7 @@ def purge_due(conn, *, now: datetime | None = None) -> dict[str, Any]:
         try:
             with conn.cursor() as cur:
                 lock_project(cur, project)
-                purged += int(_purge_row(cur, project, row_id))
+                purged += int(_purge_row(cur, project, row_id, removed_before=cutoff))
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -2325,6 +2327,8 @@ def cmd(args: argparse.Namespace) -> int:
     verb = args.ledger_cmd
     try:
         refuse_secrets([v for k, v in vars(args).items() if k != "func"])
+        if getattr(args, "from_app", False):
+            _check_from_app()
         project = _project_for(args)
         if verb in ("add", "set", "remove", "restore"):
             return _cmd_write(args, verb, project)
@@ -2390,6 +2394,18 @@ def cmd(args: argparse.Namespace) -> int:
         else:
             print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+def _check_from_app() -> None:
+    """``--from-app`` is the owner's own word (a write recorded as "you, in
+    the app", a restore, a removal for good), so it counts only when the app
+    itself started this process, by the same check routing's owner commands
+    make (``routing._caller``)."""
+    from khipu import routing
+
+    if not routing._caller()["app"]:
+        raise LedgerError("only the Khipu app can make this change as you; it was not the app that asked, "
+                          "so nothing was changed", "not_app")
 
 
 def _cmd_write(args: argparse.Namespace, verb: str, project: str) -> int:

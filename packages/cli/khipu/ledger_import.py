@@ -43,6 +43,11 @@ IMPORT_AUTHOR = {"kind": "import"}
 MARKER_OP = "import:"
 BOTH_OP = "import-both:"
 CATCH_UP_OP = "import-catch-up:"
+# A row the ledger added itself that the old file also holds keeps, in its
+# ``refs`` under this key, the digest of the file's version a catch-up last
+# noted as changed in both places (an imported row keeps it in its import
+# record). Khipu's own note: never given back by the export.
+SEEN_REF = "tracker_seen"
 _SHOWN = 20  # ids listed by name in a refusal before "and N more"
 
 # A word new to the standard list gets the meaning its name suggests; the
@@ -273,7 +278,7 @@ def _tracker_row(row: dict[str, Any], history: list[dict[str, Any]]) -> dict[str
         del out["history"]
     if row.get("link"):
         out["link"] = row["link"]
-    refs = {k: v for k, v in (row.get("refs") or {}).items() if k != "imported"}
+    refs = {k: v for k, v in (row.get("refs") or {}).items() if k not in ("imported", SEEN_REF)}
     if refs:
         out["refs"] = refs
     out.update(imported.get("extra") or {})
@@ -739,8 +744,8 @@ def _catch_up(cur, project: str, src: dict[str, Any], report: dict[str, Any], he
                 "AND (i.op_id LIKE %s OR i.op_id LIKE %s)), 0)",
                 (project, live, f"{MARKER_OP}%", f"{CATCH_UP_OP}%"))
     touched = {r[0] for r in cur.fetchall()}
-    cur.execute("SELECT row_id, refs->'imported'->>'file' FROM ledger_rows WHERE project = %s "
-                "AND row_id = ANY(%s)", (project, live))
+    cur.execute(f"SELECT row_id, coalesce(refs->'imported'->>'file', refs->>'{SEEN_REF}') FROM ledger_rows "
+                "WHERE project = %s AND row_id = ANY(%s)", (project, live))
     seen_as = dict(cur.fetchall())
     adds: dict[str, list] = {}
     history_only: list[str] = []
@@ -798,9 +803,13 @@ def _catch_up(cur, project: str, src: dict[str, Any], report: dict[str, Any], he
                      "ledger was not changed. Settle it in the app.")
         _insert_history(cur, project, [(row_id, _note_entry(event, now), f"{BOTH_OP}{import_id}")])
         # Seen now: the same change is not raised again by the next catch-up.
+        # A row the ledger added itself has no import record to note it in.
         cur.execute("UPDATE ledger_rows SET refs = jsonb_set(refs, '{imported,file}', %s, true) "
                     "WHERE project = %s AND row_id = %s AND refs ? 'imported'",
                     (Jsonb(_row_digest(rows[row_id])), project, row_id))
+        cur.execute("UPDATE ledger_rows SET refs = jsonb_set(refs, %s, %s, true) "
+                    "WHERE project = %s AND row_id = %s AND NOT refs ? 'imported'",
+                    ([SEEN_REF], Jsonb(_row_digest(rows[row_id])), project, row_id))
     check = _verify_catch_up(cur, project, rows, plan, adds, before)
     report["check"] = check
     if not check["ok"]:
@@ -879,6 +888,8 @@ def _verify_catch_up(cur, project: str, rows: dict[str, dict], plan: dict[str, A
             refs = dict(row["refs"] or {})
             if row_id in plan["both"] and isinstance(refs.get("imported"), dict):
                 refs["imported"] = {k: v for k, v in refs["imported"].items() if k != "file"}
+            if row_id in plan["both"]:
+                refs.pop(SEEN_REF, None)
             return {**row, "refs": refs}
         if plain(was) != plain(now_row):
             differs.append(f"{row_id}: fields")

@@ -1074,3 +1074,38 @@ def test_a_parent_folder_replaced_after_the_open_is_refused(tmp_path, monkeypatc
     except safe_read.Refused:
         return
     assert data == b"named-file", data
+
+
+# ---- review regressions, round 4 ------------------------------------------------------------
+
+_DATA_VOLUME = "/System/Volumes/Data"
+
+
+def _login_on_the_data_volume(tmp_path, monkeypatch):
+    """A fake login folder (``CODEX_HOME``) under tmp_path with a summary in
+    it, when tmp_path can also be reached through macOS's Data volume."""
+    from khipu import agent_view
+
+    real = os.path.realpath(tmp_path)
+    if not os.path.isdir(_DATA_VOLUME + real):
+        pytest.skip("tmp_path is not reachable through the Data volume")
+    login = Path(real) / "fictional-login-531"
+    login.mkdir()
+    inside = login / "work-summary.json"
+    inside.write_text(json.dumps(summary()))
+    monkeypatch.setenv("CODEX_HOME", str(login))
+    agent_view._TABLE.update(sig=None, at=0.0, table=None)
+    return inside
+
+
+def test_a_login_folder_reached_through_another_name_for_the_disk_is_refused(tmp_path, monkeypatch):
+    # /System/Volumes/Data/<path> is the very folder at <path>: a name check
+    # alone misses it, the folder's identity does not.
+    inside = _login_on_the_data_volume(tmp_path, monkeypatch)
+    alias = _DATA_VOLUME + str(inside)
+    assert os.path.samefile(alias, inside)
+    with pytest.raises(safe_read.Refused):
+        safe_read.read_file(inside)
+    with pytest.raises(safe_read.Refused):
+        safe_read.read_file(alias)
+    assert read(Path(alias))["state"] == "refused"

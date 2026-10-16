@@ -91,7 +91,9 @@ def pg_dsn():
 
 
 @pytest.fixture
-def hub(pg_dsn, monkeypatch, tmp_path):
+def hub(pg_dsn, monkeypatch, tmp_path, khipu_app):
+    """The scratch cluster, empty; a ``--from-app`` write is started by the
+    app (``khipu_app``), as the desktop's own argv is."""
     import psycopg
 
     monkeypatch.setattr(psycopg, "connect", psycopg.Connection.connect)
@@ -2208,3 +2210,48 @@ def test_the_apps_argv_shapes_parse_and_are_recorded_as_the_app(hub):
     assert app("remove", "--json", "--from-app", f"--project={P}", "--note=duplicate", "--", "n-1")["ok"]
     assert [r["id"] for r in app("removed", "--json", f"--project={P}")["removed"]] == ["n-1"]
     assert app("restore", "--json", "--from-app", f"--project={P}", "--", "n-1")["ok"]
+
+
+@pytest.mark.parametrize("argv", [["purge", "s-1"], ["restore", "s-1"], ["set", "s-1", "--state", "DONE"],
+                                  ["remove", "s-1"]])
+def test_from_app_is_refused_when_the_app_did_not_start_the_call(hub, khipu_app, argv):
+    """A conversation passing ``--from-app`` itself can neither remove a row
+    for good, restore one, nor be recorded as "you, in the app"."""
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    if argv[0] in ("purge", "restore"):
+        ok("remove", "s-1")
+    before = _sql(hub, "SELECT count(*) FROM ledger_history")[0][0]
+    khipu_app.as_shell("/usr/local/bin/claude")
+    rc, out, err = run(*argv, "--from-app", "--project", P)
+    assert rc == 1 and "only the Khipu app" in err, (out, err)
+    assert _sql(hub, "SELECT count(*) FROM ledger_rows WHERE row_id = 's-1'")[0][0] == 1
+    assert _sql(hub, "SELECT count(*) FROM ledger_history")[0][0] == before
+    assert _sql(hub, "SELECT count(*) FROM ledger_history WHERE author->>'kind' = 'owner'")[0][0] == 0
+    khipu_app.as_app()
+    assert run(*argv, "--from-app", "--project", P)[0] == 0
+
+
+def test_the_nightly_never_purges_a_row_removed_again_after_it_looked(hub, monkeypatch):
+    """The nightly finds the rows removed long enough ago, then purges each
+    under the project lock. A row restored and removed again in between is a
+    fresh removal, owed its days of restore, and stays."""
+    from khipu import ledger
+
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    ok("remove", "s-1")
+    _sql(hub, "UPDATE ledger_rows SET removed_at = now() - interval '31 days' WHERE row_id = 's-1'")
+    real_lock = ledger.lock_project
+    raced = []
+
+    def racing_lock(cur, project):
+        if not raced:
+            raced.append(True)
+            ok("restore", "s-1", "--from-app")
+            ok("remove", "s-1")
+        return real_lock(cur, project)
+
+    monkeypatch.setattr(ledger, "lock_project", racing_lock)
+    with _real_connect(hub) as conn:
+        got = ledger.purge_due(conn)
+    assert raced and got["purged"] == 0, got
+    assert _sql(hub, "SELECT row_id, removed_at > now() - interval '1 day' FROM ledger_rows") == [("s-1", True)]

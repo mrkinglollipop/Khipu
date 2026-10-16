@@ -805,3 +805,32 @@ def test_an_xai_shaped_key_is_masked_on_reading_and_reported(tmp_path):
     src = ledger_import.read_tracker(_write(tmp_path, {"rows": {"a": source}}))
     assert token not in json.dumps(src)
     assert src["masked"] == ["a.evidence"], src["masked"]
+
+
+def test_a_ledger_row_changed_in_both_places_is_noted_once_per_change_in_the_file(hub, tmp_path):
+    """A row the ledger added itself (no import record) that the old file
+    also holds, with other values: the first catch-up notes it as changed in
+    both places; the same file again has nothing new and adds no history; a
+    new change in the file is noted again. The note keeps nothing the export
+    gives back."""
+    rc, report = _import(_write(tmp_path, {"rows": {"a-1": _row("a-1")}}))
+    assert rc == 0 and report["result"] == "done", report
+    ok("add", "b-1", "--title", "The ledger's own", "--kind", "slice")
+    doc = {"rows": {"a-1": _row("a-1"), "b-1": _row("b-1", state="IN FLIGHT")}}
+    rc, first = _import(_write(tmp_path, doc, "t2.json"), "--catch-up")
+    assert rc == 0 and first["result"] == "caught up" and first["plan"]["both"] == ["b-1"], first
+
+    def notes():
+        return _sql(hub, "SELECT count(*) FROM ledger_history WHERE row_id = 'b-1'")[0][0]
+
+    n1 = notes()
+    # The same rows, written another way (a new digest for the file).
+    path3 = tmp_path / "t3.json"
+    path3.write_text(json.dumps(doc, indent=4), encoding="utf-8")
+    rc, second = _import(path3, "--catch-up")
+    assert rc == 0 and second["result"] == "nothing new" and notes() == n1, (second, n1, notes())
+    doc["rows"]["b-1"]["state"] = "QUEUED"
+    rc, third = _import(_write(tmp_path, doc, "t4.json"), "--catch-up")
+    assert rc == 0 and third["plan"]["both"] == ["b-1"] and notes() == n1 + 1, third
+    b1 = _export()["b-1"]
+    assert "refs" not in b1 and b1["title"] == "The ledger's own", b1
