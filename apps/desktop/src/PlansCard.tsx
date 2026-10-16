@@ -78,6 +78,7 @@ const ERROR_PHRASE: Record<string, string> = {
   not_installed: "not installed",
   bad_reply: "answered in a way Khipu can't read",
   no_plan_limits: "no plan limits reported",
+  no_plan_figures: "didn't send its plan figures",
   invalid_account: "not a valid account entry",
   no_answer: "didn't answer",
   start_failed: "could not be started",

@@ -97,6 +97,9 @@ E_SIGNIN = "not_signed_in"
 E_BAD = "bad_reply"
 E_NO_ANSWER = "no_answer"
 E_NO_LIMITS = "no_plan_limits"
+# Signed in on a plan with limits, but this reply left the figures out: a
+# passing gap, not a sign-in problem, so the last figures stay shown.
+E_NO_FIGURES = "no_plan_figures"
 E_CLI = "cli_error"
 E_INVALID = "invalid_account"
 E_INTERNAL = "internal_error"
@@ -120,6 +123,8 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return f"{name} is not signed in{folder}. Open {name}{folder} and sign in again"
     if code == E_NO_LIMITS:
         return f"This sign-in reports no plan limits. Open {name}{folder} and sign in again (/login)"
+    if code == E_NO_FIGURES:
+        return f"{name} did not send its plan figures just now; Khipu keeps the last ones and asks again"
     if code == E_PENDING:
         return "Reading for the first time; ask again in a few seconds"
     # Every other code the probes can return gets its plain cause too, so the
@@ -515,7 +520,7 @@ def parse_claude(frames: list[dict]) -> dict:
         raise ProbeError(_classify(usage.get("error"), E_CLI))
     body = _dict(usage, "response", required=True)
     if body.get("rate_limits") is None:
-        raise ProbeError(E_NO_LIMITS)
+        raise ProbeError(E_NO_FIGURES if body.get("rate_limits_available") is True else E_NO_LIMITS)
     limits = _dict(body, "rate_limits")
     five, week = _dict(limits, "five_hour"), _dict(limits, "seven_day")
     windows = [

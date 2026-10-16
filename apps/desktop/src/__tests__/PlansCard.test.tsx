@@ -555,6 +555,23 @@ describe("PlansSettingsCard", () => {
     expect(codex.getByText(/, 30s ago$/)).toBeTruthy();
   });
 
+  it("keeps the last figures and offers no sign-in when Claude sent no plan figures", async () => {
+    const r = realReport();
+    const claude = r.accounts!.find((a) => a.harness === "claude")!;
+    r.accounts!.push({
+      ...claude, account: "Claude second", home: "~/.claude-second", ok: false, error: "no_plan_figures",
+      stale: true, last_good_at: claude.probed_at, last_attempt_at: claude.probed_at,
+      note: "Claude Code did not send its plan figures just now; Khipu keeps the last ones and asks again",
+    });
+    status = r;
+    render(<Settings />);
+    const second = within(await screen.findByRole("group", { name: "Claude second" }));
+    expect(second.getByText(/did not send its plan figures just now/)).toBeTruthy();
+    expect(second.getAllByRole("meter").length).toBeGreaterThan(0);
+    expect(second.queryByRole("button", { name: /Sign .* in again/ })).toBeNull();
+    expect(second.queryByText(/sign in again|no plan limits/i)).toBeNull();
+  });
+
   it("shows a reset that has passed as such, with no warning colour", async () => {
     status = withMuseResetAt95();
     render(<Settings />);
