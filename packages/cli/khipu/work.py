@@ -183,6 +183,14 @@ def _z(dt: datetime | None) -> str | None:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _z_up(dt: datetime | None) -> str | None:
+    """``_z`` for a deadline: a part second rounds up, so the deadline is
+    never at or before the instant it was worked out from."""
+    if dt is not None and dt.microsecond:
+        dt = dt.replace(microsecond=0) + timedelta(seconds=1)
+    return _z(dt)
+
+
 def _parse_time(value: Any) -> datetime | None:
     """An RFC 3339 time with ``Z`` or an offset; anything else is None."""
     if isinstance(value, datetime):
@@ -243,13 +251,28 @@ def _trips_redaction(text: str) -> bool:
     return routing_sources._redacted(text, len(text) + 1) != text
 
 
+PATH_WORDS = "(a path)"
+
+
+def _path_token(token: str) -> bool:
+    """Whether one space-free word is path-shaped once the quotes and
+    punctuation around it are set aside."""
+    return bool(_PATH_SHAPE.search(token.lstrip(_WRAP_OPEN).rstrip(_WRAP_CLOSE)))
+
+
+def _has_path(text: str) -> bool:
+    return any(_path_token(t) for t in _LINK.sub(" ", text).split())
+
+
 def _cut_paths(text: str) -> str:
-    """Each token holding a slash or a backslash cut to its last name."""
+    """Each path-shaped word replaced with PATH_WORDS (its quotes and
+    punctuation kept); links and every other word are left as they are."""
     out = []
     for token in text.split(" "):
-        if "/" in token or "\\" in token:
-            tail = re.split(r"[/\\]+", token.rstrip("/\\"))[-1]
-            token = tail or token.strip("/\\")
+        if not _LINK.search(token) and _path_token(token):
+            core = token.lstrip(_WRAP_OPEN).rstrip(_WRAP_CLOSE)
+            start = token.index(core)
+            token = token[:start] + PATH_WORDS + token[start + len(core):]
         out.append(token)
     return " ".join(out)
 
@@ -272,11 +295,17 @@ def clean_text(value: Any, cap: int) -> str | None:
     return text
 
 
-# A routing account key ("harness|login folder"); a path at a word's start
-# ("/x", "~/x", a backslash path, a drive letter); or a word holding two or more folder
-# separators. A link's own path is not a local path: links are cut out first.
+# A routing account key ("harness|login folder"). A word is path-shaped when it
+# starts with ~, ./, ../, / or \ (or a separator follows punctuation inside it,
+# as in "dir=/x"), is a drive path, holds two or more separators, or holds one
+# and ends in a file extension. So "a/b/c" and "source/private.txt" are paths;
+# "CI/CD", "and/or" and "3/4" are not. A link's own path is not a local path:
+# links are cut out first.
 _ACCOUNT_KEY = re.compile(r"(?i)(?<![\w-])(?:claude|codex|grok|muse)\|")
-_PATH_SHAPE = re.compile(r"(?:^|[^\w.-])(?:~[/\\]|/(?=[\w.~-])|\\)|\b[A-Za-z]:[/\\]|[^\s/\\]+[/\\][^\s/\\]*[/\\]")
+_PATH_SHAPE = re.compile(r"^~(?:[/\\]|[A-Za-z_]|$)|^\.{1,2}[/\\]|^[/\\](?=[\w.~-])|[^\w.-][/\\]"
+                         r"|[A-Za-z]:[/\\]|[/\\].*[/\\]|[/\\][^/\\]*\.[A-Za-z0-9]+$")
+_WRAP_OPEN = "\"'`([{<"
+_WRAP_CLOSE = "\"'`)]}>,;:!?."
 _LINK = re.compile(r"https://\S+")
 
 
@@ -285,7 +314,7 @@ def _private_text(text: str, table: Any = None) -> bool:
     holds an account key or is path-shaped, or (given agent_view's table)
     names a login folder, the home folder or a user name."""
     one = " ".join(text.split())
-    if _trips_redaction(one) or _ACCOUNT_KEY.search(text) or _PATH_SHAPE.search(_LINK.sub(" ", text)):
+    if _trips_redaction(one) or _ACCOUNT_KEY.search(text) or _has_path(text):
         return True
     if table is not None:
         from khipu import agent_view
@@ -884,7 +913,8 @@ def read_owed() -> dict[str, Any]:
         from khipu.commitments import list_owed
 
         with conn.cursor() as cur:
-            rows = list_owed(cur, status="open", limit=1000, hide_snoozed=True)
+            # No limit: the list is every open commitment, the user's picked after.
+            rows = list_owed(cur, status="open", limit=None, hide_snoozed=True)
         return {"items": [r for r in rows if r.get("owner") == "user"], "error": None}
     except Exception as exc:  # noqa: BLE001
         return {"items": [], "error": type(exc).__name__}
@@ -1111,7 +1141,9 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime) -
         # An explicit link (the row's reference or a remembered "Same") wins;
         # equal words link only a row with no explicit link, never a pair
         # remembered as "Not the same".
-        linked = next((item for p, row, item in needs if p == project and cid in explicit[id(item)]), None)
+        # A row shows one commitment: a second one linked to it shows on its own.
+        linked = next((item for p, row, item in needs if p == project and cid in explicit[id(item)]
+                       and item["also_owed"] in (None, cid)), None)
         if linked is None:
             linked = next((item for p, row, item in needs if p == project and not explicit[id(item)]
                            and item["also_owed"] is None and (p, row["row_id"], cid) not in not_same
@@ -1263,7 +1295,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
     scan = _Scan()
     view = scan({
         "format": VIEW_FORMAT, "version": VIEW_VERSION, "generated_at": _z(now),
-        "valid_until": _z(min(future)) if future else None,
+        "valid_until": _z_up(min(future)) if future else None,
         "projects": projects, "live": live, "waiting": waiting, "accounts": routing_info.get("accounts") or [],
         "counts": {"waiting": len(waiting), "blocking": sum(1 for w in waiting if w["blocking"]),
                    "running": sum(1 for j in live if j["state"] == "running"),

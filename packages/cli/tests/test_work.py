@@ -348,7 +348,7 @@ def test_text_is_cleaned_and_a_key_shaped_field_is_left_out_whole(tmp_path):
                   prs=[pr("41", summary=keyed, title="Fine title")])
     c = read(put(tmp_path, doc))["contents"]
     assert [j["id"] for j in c["jobs"]] == ["job-1"]  # a required text field that trips redaction drops the item
-    assert c["jobs"][0]["summary"] == "Editing bar.py now ok"
+    assert c["jobs"][0]["summary"] == "Editing (a path) now ok"
     assert c["prs"][0]["summary"] is None and c["prs"][0]["title"] == "Fine title"
     assert KEY not in json.dumps(c) and "*" not in json.dumps(c)
     assert work.clean_text(keyed, 200) is None
@@ -953,3 +953,81 @@ def test_a_refresh_at_the_exact_deadline_sees_the_change(tmp_path):
         following = work._parse_time(exact["valid_until"])
         assert following is not None and following <= deadline + timedelta(seconds=1)
     assert at(deadline + timedelta(seconds=1))["projects"][0]["source"]["state"] == "stale"
+
+
+# ---- review regressions, round 4 (cross-family review of 6287846) ----------------------------
+
+
+def test_a_relative_path_with_one_separator_never_leaves(tmp_path, monkeypatch):
+    path = put(tmp_path, summary(jobs=[job(**{"for": {"ledger": "source/private.txt"}})]))
+    for result in cli_and_saved(monkeypatch, cfg(work_projects=[entry(path)])):
+        assert "source/private.txt" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("words", ["Fix CI/CD", "Pick one and/or both", "Finish 3/4 of it", "Due 10/16",
+                                   "Open read/write access"])
+def test_ordinary_words_with_a_slash_stay_in_a_title(words):
+    data = ledger_data([row("n-1", words, state="NEEDS OWNER")])
+    v = work.build_view(NOW, cfg=cfg(), ledger_data=data, owed=NO_OWED, routing_info=ROUTING)
+    assert [w["title"] for w in v["waiting"]] == [words]
+
+
+def test_a_path_in_a_title_becomes_a_path_and_the_other_words_stay():
+    title = "Fix CI/CD after reading source/private.txt and /tmp/fictional-login-home/notes"
+    data = ledger_data([row("n-1", title, state="NEEDS OWNER")])
+    v = work.build_view(NOW, cfg=cfg(), ledger_data=data, owed=NO_OWED, routing_info=ROUTING)
+    assert [w["title"] for w in v["waiting"]] == ["Fix CI/CD after reading (a path) and (a path)"]
+    assert "private.txt" not in json.dumps(v) and "fictional-login-home" not in json.dumps(v)
+
+
+def test_a_reference_and_a_remembered_same_keep_both_commitments(env):
+    linked = row("n-1", "Approve the licence", state="NEEDS OWNER", refs={"commitment": "c1"})
+    work.set_link("atlas", "n-1", "c2", True)
+    got = waiting([linked], [commitment("c1", "Approve the licence"), commitment("c2", "Approve the release")])
+    shown = [w["id"] for w in got if w["source"] == "commitment"]
+    shown += [w["also_owed"] for w in got if w["source"] == "ledger" and w["also_owed"]]
+    assert sorted(shown) == ["c1", "c2"]
+
+
+def test_a_fractional_deadline_is_rounded_up_past_now():
+    rows = [row("n1", "Check the release", updated_at=NOW - timedelta(seconds=86399.5))]
+    view = work.build_view(NOW, cfg=cfg(), ledger_data=ledger_data(rows), owed=NO_OWED, routing_info=ROUTING)
+    assert view["projects"][0]["ledger"]["changed_today"]
+    assert work._parse_time(view["valid_until"]) > NOW
+
+
+def test_every_open_user_commitment_is_read(monkeypatch):
+    from khipu import commitments, hub_snapshot
+
+    cols = ["id", "text", "project", "owner", "kind", "opened_episode", "opened_at", "due_after", "status",
+            "closed_episode", "closed_at", "close_reason"]
+    rows = [(i, "Approve the licence", "atlas", "user", "blocker", None, NOW - timedelta(days=i), None, "open",
+             None, None, None) for i in range(1, 1202)]
+    assert len(cols) == len(rows[0])
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, *a):
+            pass
+
+        def fetchall(self):
+            return rows
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hub_snapshot, "try_hub_connect", lambda **kw: Connection())
+    monkeypatch.setattr(commitments, "_not_forgotten_clause", lambda cur: "TRUE")
+    monkeypatch.setattr(commitments, "_seen_columns_ready", lambda cur: False)
+    monkeypatch.setattr(commitments, "_future_trigger_ready", lambda cur: False)
+    got = work.read_owed()
+    assert got["error"] is None and len(got["items"]) == len(rows)
