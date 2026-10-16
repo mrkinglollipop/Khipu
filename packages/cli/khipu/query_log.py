@@ -49,6 +49,7 @@ def log_query(
     harness: str | None = None,
     redact: bool = False,
     degraded: str | None = None,
+    offline: bool = False,
 ) -> None:
     """Append one search to the log. Never raises.
 
@@ -66,6 +67,10 @@ def log_query(
     stored so ``degraded_count`` (and ``khipu status``'s
     ``search_degraded_last_24h``) can aggregate it instead of it staying a
     buried key nothing ever reads.
+
+    ``offline`` marks a search answered from the replica because the hub
+    could not be reached: ``degraded_rate`` reports it apart, not as a
+    failure of search.
     """
     try:
         from khipu.paths import ensure_data_dir
@@ -83,6 +88,7 @@ def log_query(
             **({"query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest()[:16],
                 "query_len": len(query)} if redact else {}),
             **({"degraded": degraded} if degraded else {}),
+            **({"offline": True} if offline else {}),
             "top": [
                 {"kind": r.get("kind"), "id": r.get("id"), "score": r.get("score")}
                 for r in (top or [])[:3]
@@ -118,18 +124,50 @@ def degraded_count(*, hours: int = 24) -> int:
     return n
 
 
-def degraded_rate(*, n: int = 50) -> dict[str, Any]:
+def _rate_window_minutes() -> int:
+    """Doctor's rate window (``doctor_rate_window_minutes``, set in the app's
+    Settings). Never raises."""
+    try:
+        from khipu.config import minute_setting
+
+        return minute_setting("doctor_rate_window_minutes")
+    except Exception:  # noqa: BLE001 — a broken config must not break doctor
+        return 60
+
+
+def _stamp(entry: dict[str, Any]) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(entry.get("ts")).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def degraded_rate(*, n: int = 50, window_minutes: int | None = None,
+                  now: datetime | None = None) -> dict[str, Any]:
     """D6/F4: fraction of the last `n` searches that degraded — a rate, not
     just `degraded_count`'s raw 24h total, so a burst of degraded searches
-    shows even on a day with heavy volume. Red past 20% (D6's threshold); no
-    searches yet reports unavailable evidence and a 0 sample."""
-    entries = tail(n)
+    shows even on a day with heavy volume. Red past 20% (D6's threshold).
+
+    Only searches inside the rate window (``doctor_rate_window_minutes``,
+    default an hour) are judged, so a past outage ages out by itself on an
+    idle Mac; searches logged ``offline`` (the hub could not be reached) are
+    counted apart and never judged. A log with searches but none judged in
+    the window is green and ``quiet``; no searches at all reports unavailable
+    evidence and a 0 sample."""
+    entries = tail(max(int(n), 1) * 20)
     if not entries:
         return {"ok": False, "available": False, "rate": None, "sampled": 0, "degraded": 0}
-    degraded = sum(1 for e in entries if e.get("degraded"))
-    rate = degraded / len(entries)
-    return {"ok": rate <= 0.20, "available": True,
-            "rate": rate, "sampled": len(entries), "degraded": degraded}
+    window_minutes = _rate_window_minutes() if window_minutes is None else int(window_minutes)
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(minutes=window_minutes)
+    recent = [e for e in entries if (ts := _stamp(e)) is not None and ts >= cutoff]
+    offline = sum(1 for e in recent if e.get("offline"))
+    judged = [e for e in recent if not e.get("offline")][-max(1, int(n)):]
+    base = {"available": True, "offline": offline, "window_minutes": window_minutes}
+    if not judged:
+        return {**base, "ok": True, "quiet": True, "rate": None, "sampled": 0, "degraded": 0}
+    degraded = sum(1 for e in judged if e.get("degraded"))
+    rate = degraded / len(judged)
+    return {**base, "ok": rate <= 0.20, "rate": rate, "sampled": len(judged), "degraded": degraded}
 
 
 def _observations() -> tuple[list[str], bool]:

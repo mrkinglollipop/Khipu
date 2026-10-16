@@ -947,7 +947,7 @@ class PromptRecallSnapshotStatusTest(unittest.TestCase):
         self.assertEqual(
             out["reason"],
             "prompt-time recall is running against the hub and may time out; "
-            "run `khipu snapshot refresh`",
+            "press Refresh offline copy in the app",
         )
 
     def test_stale_snapshot_reports_its_age(self) -> None:

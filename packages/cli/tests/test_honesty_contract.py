@@ -10,6 +10,7 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -233,6 +234,9 @@ class TopicsEmbedLagTest(unittest.TestCase):
         self.assertTrue(out["ok"])
 
 
+_NOW_TS = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class DegradedRateTest(unittest.TestCase):
     """D6/F4: fraction of the last N searches that degraded, not just a raw
     24h count — a rate makes a burst show on a high-volume day."""
@@ -248,7 +252,7 @@ class DegradedRateTest(unittest.TestCase):
     def test_over_20_percent_degraded_is_red(self):
         from khipu import query_log
 
-        entries = [{"degraded": "no-embedding"}] * 3 + [{"degraded": None}] * 7
+        entries = [{"ts": _NOW_TS, "degraded": "no-embedding"}] * 3 + [{"ts": _NOW_TS, "degraded": None}] * 7
         with mock.patch.object(query_log, "tail", return_value=entries):
             out = query_log.degraded_rate(n=10)
         self.assertFalse(out["ok"])
@@ -258,7 +262,7 @@ class DegradedRateTest(unittest.TestCase):
     def test_under_20_percent_degraded_is_green(self):
         from khipu import query_log
 
-        entries = [{"degraded": "no-embedding"}] + [{"degraded": None}] * 9
+        entries = [{"ts": _NOW_TS, "degraded": "no-embedding"}] + [{"ts": _NOW_TS, "degraded": None}] * 9
         with mock.patch.object(query_log, "tail", return_value=entries):
             out = query_log.degraded_rate(n=10)
         self.assertTrue(out["ok"])

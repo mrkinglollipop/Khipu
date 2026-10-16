@@ -976,6 +976,7 @@ def _tool_search(args: dict) -> dict:
     via = (args.get("via") or "").strip() or None
     tz = args.get("tz") or None
 
+    offline = False
     try:
         from khipu.embed import hybrid_search
 
@@ -991,6 +992,7 @@ def _tool_search(args: dict) -> dict:
             raise ValueError(
                 "library search needs the hub; the offline snapshot holds no libraries"
             ) from exc
+        offline = True
         payload = search_stale_payload(
             query, max(1, limit), semantic=(mode == "semantic"), kind=kind,
             since=since, until=until, project=project, session_id=session_id,
@@ -1005,6 +1007,7 @@ def _tool_search(args: dict) -> dict:
         # The gateway host is public: it keeps a hash of the query, never the text.
         redact=_GATEWAY_ACTIVE or os.environ.get(GATEWAY_ACTIVE_ENV) == "1",
         degraded=payload.get("degraded"),
+        offline=offline,
     )
     return payload
 

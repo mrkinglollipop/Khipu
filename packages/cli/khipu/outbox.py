@@ -316,6 +316,7 @@ def status() -> dict[str, Any]:
     oldest_age: int | None = None
     oldest_job: str | None = None
     unreadable = 0
+    offline = 0
     now = datetime.now(timezone.utc)
     for jp in js:
         try:
@@ -335,12 +336,31 @@ def status() -> dict[str, Any]:
             unreadable += 1
         if age is not None and (oldest_age is None or age > oldest_age):
             oldest_age, oldest_job = age, jp.name
+        if _hub_unreachable_text(str(job.get("last_error") or job.get("reason") or "")):
+            offline += 1
     quarantined = len(list(quarantine_dir().glob("*.json"))) if quarantine_dir().is_dir() else 0
     # Existing doctor callers use ``dead`` to detect work that cannot replay.
+    dead = len(dead_jobs()) + quarantined
+    # Every waiting capture is waiting only because the hub could not be
+    # reached: the promotion gate does not refuse a candidate on that.
+    offline_only = bool(js) and offline == len(js) and not unreadable and not dead
     return {"dir": str(outbox_dir()), "pending": len(js), "oldest_age_s": oldest_age,
             "oldest_job": oldest_job, "unreadable": unreadable,
-            "dead": len(dead_jobs()) + quarantined, "quarantined": quarantined,
-            "max_attempts": MAX_ATTEMPTS}
+            "dead": dead, "quarantined": quarantined,
+            "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only}
+
+
+def _hub_unreachable_text(text: str) -> bool:
+    """Whether a queued job's recorded error (``last_error``, else the
+    ``reason`` it was queued with: an exception's class name and message)
+    says the hub could not be reached. Matches the shapes
+    ``hub_snapshot.hub_connection_failed`` treats as connection failures."""
+    if not text:
+        return False
+    name = text.split(":", 1)[0]
+    lowered = text.lower()
+    return ("Operational" in name or "Connection" in name or "Timeout" in name
+            or any(word in lowered for word in ("connect", "timeout", "timed out", "refused")))
 
 
 def _retry_order(jp: Path) -> tuple[bool, str, str]:

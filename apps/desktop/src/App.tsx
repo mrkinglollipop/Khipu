@@ -41,7 +41,7 @@ import type { ClaudeHomesReport } from "./railHealth";
 import { RightNowCard } from "./RightNow";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
-import { buildAttention, harnessLabel, routingAttention, type Attention } from "./doctorAttention";
+import { buildAttention, harnessLabel, promotionAttention, routingAttention, type Attention } from "./doctorAttention";
 import { HealthReportRows } from "./healthRows";
 import { SummariserCalls, SynthFallbackField, SynthProviderChoices, synthModelError } from "./SynthProvider";
 import { KeysCard } from "./KeysCard";
@@ -66,6 +66,7 @@ import {
   PathOverridesCard,
   GraphBackupRemoteCard,
 } from "./SettingsControls";
+import { HealthChecksCard } from "./HealthChecksCard";
 import {
   launchWhatsNew,
   recordVersionOnSetupFinish,
@@ -1610,6 +1611,21 @@ export default function App() {
     }
   }, [loadDoctor]);
 
+  /** `khipu snapshot refresh` through its fixed-argv command: rebuilds this
+   *  Mac's offline copy, the fix doctor names for prompt-time recall. */
+  const refreshSnapshot = useCallback(async () => {
+    setProbeBusy(true);
+    setError(null);
+    try {
+      await invoke<string>("khipu_snapshot_refresh");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setProbeBusy(false);
+      await loadDoctor(true);
+    }
+  }, [loadDoctor]);
+
   /** `khipu owed` — the commitments a session left behind, cached per status
    *  so the rail badge, Home's preview and this screen's table are one fetch
    *  rather than three racing over one array. */
@@ -2423,9 +2439,10 @@ export default function App() {
   const [noneTracked, setNoneTracked] = useState(false);
   const [addAccountSignal, setAddAccountSignal] = useState(0);
   const routingItems = useMemo(() => routingAttention(routing.data), [routing.data]);
+  const promotionItems = useMemo(() => promotionAttention(doctorParsed), [doctorParsed]);
   const homeAttention = useMemo(
-    () => [...attention, ...planItems, ...routingItems],
-    [attention, planItems, routingItems],
+    () => [...attention, ...planItems, ...routingItems, ...promotionItems],
+    [attention, planItems, routingItems, promotionItems],
   );
   // "Connect to a server you run or another Mac…" reopens the first-run flow
   // at the Database step rather than restarting it — `welcomeInitialStepKey`
@@ -3656,6 +3673,8 @@ export default function App() {
                             setTab("harnesses");
                           } else if (a.fix?.kind === "apply-migrations") {
                             void applyMigrations();
+                          } else if (a.fix?.kind === "refresh-snapshot") {
+                            void refreshSnapshot();
                           }
                         }}
                       >
@@ -3982,6 +4001,8 @@ export default function App() {
                     setTab("revisions");
                   } else if (fix.kind === "apply-migrations") {
                     void applyMigrations();
+                  } else if (fix.kind === "refresh-snapshot") {
+                    void refreshSnapshot();
                   }
                 }}
               />
@@ -5928,6 +5949,8 @@ export default function App() {
                     </div>
 
                     <JobsCard active={tab === "settings" && settingsSection === "advanced"} />
+
+                    <HealthChecksCard active={tab === "settings" && settingsSection === "advanced"} />
 
                     <RawJson
                       text={settingsRawText}

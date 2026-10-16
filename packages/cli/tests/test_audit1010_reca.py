@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -373,9 +374,10 @@ class QueryLogAuditTest(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     def test_rotated_failures_remain_in_health_window(self):
-        entries = [{"degraded": "embed-unavailable"}] * 50
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        entries = [{"ts": now, "degraded": "embed-unavailable"}] * 50
         self.path.with_suffix(".jsonl.1").write_text("\n".join(map(json.dumps, entries)) + "\n")
-        self.path.write_text('{"result_count":1}\n')
+        self.path.write_text(json.dumps({"ts": now, "result_count": 1}) + "\n")
         out = ql.degraded_rate()
         self.assertFalse(out["ok"])
         self.assertEqual(out["sampled"], 50)

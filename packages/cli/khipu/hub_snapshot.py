@@ -4374,7 +4374,7 @@ def prompt_recall_snapshot_status() -> dict[str, Any]:
         "fresh": False,
         "reason": (
             "prompt-time recall is running against the hub and may time "
-            "out; run `khipu snapshot refresh`"
+            "out; press Refresh offline copy in the app"
         ),
         "exists": bool(health.get("exists")),
         "age_seconds": health.get("age_seconds"),
