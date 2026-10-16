@@ -918,7 +918,7 @@ describe("the account cap and failures that are not about an entry (fix round 4)
     expect(screen.getByLabelText("Login folder").getAttribute("aria-invalid")).toBeNull();
     // An entry marked not valid is stored as it is, so it counts too.
     const withInvalid = [...accounts.slice(1), { label: "Odd", harness: "gemini", home: null, invalid: "not read" }];
-    configShow = { usage_accounts: { value: withInvalid, source: "file", user_home: "/Users/me", accounts: withInvalid } };
+    configShow = { usage_accounts: { value: withInvalid, source: "file", user_home: "/Users/me", accounts: withInvalid, version: "v1" } };
     cleanup();
     render(<Settings />);
     await waitFor(() => expect(screen.getByText("Your list")).toBeTruthy());
@@ -927,6 +927,19 @@ describe("the account cap and failures that are not about an entry (fix round 4)
     fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.codex-work" } });
     fireEvent.click(screen.getByRole("button", { name: "Add" }));
     expect(await screen.findByText(TOO_MANY)).toBeTruthy();
+    expect(configSets()).toHaveLength(0);
+  });
+
+  it("a list read with no version is never saved over: nothing is sent and it says so in plain words", async () => {
+    const accounts = [{ label: "Claude", harness: "claude", home: null }];
+    configShow = { usage_accounts: { value: accounts, source: "file", user_home: "/Users/me", accounts } };
+    render(<Settings />);
+    await waitFor(() => expect(screen.getByText("Your list")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Codex work" } });
+    fireEvent.change(screen.getByLabelText("CLI"), { target: { value: "codex" } });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.codex-work" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    expect(await screen.findByText(/The account list changed while you were working\. Khipu read it again/)).toBeTruthy();
     expect(configSets()).toHaveLength(0);
   });
 
@@ -982,6 +995,19 @@ describe("a Codex whose live read failed (fix round 3)", () => {
     // The note already says the figures are from its last turn: said once.
     expect(group.queryByText(/^As of its last turn/)).toBeNull();
     expect(group.getAllByText(/last turn/)).toHaveLength(1);
+  });
+
+  it("labels figures from Codex's session-file fallback as from its last conversation in Settings", async () => {
+    const r = realReport();
+    Object.assign(r.accounts![1], {
+      ok: true, source: "rollout", observed_at: "2026-10-11T14:00:00Z", live_error: "no_answer",
+      note: "Codex did not answer just now; these figures are from its last turn",
+    });
+    status = r;
+    render(<Settings />);
+    const group = within(await screen.findByRole("group", { name: "Codex" }));
+    expect(group.getByText(/^From its last conversation/)).toBeTruthy();
+    expect(group.queryByText(/^As of its last turn/)).toBeNull();
   });
 
   it("names it in the health report's Plans row", () => {

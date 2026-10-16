@@ -963,7 +963,7 @@ def test_codex_rollout_off_opens_nothing_under_the_folder_and_returns_the_live_c
     assert not [p for p in opened if p.startswith(str(home))]
     row = usage.probe_account({"label": "X", "harness": "codex", "home": str(home)}, rollout=False)
     assert row["ok"] is False and row["error"] == "not_signed_in" and row["source"] is None
-    # With the fallback on (tracked accounts, open question 9) it still reads the last turn.
+    # With the fallback on (tracked accounts, decision 21) it still reads the last turn.
     row = usage.probe_codex(str(home))
     assert row["ok"] is True and row["source"] == "rollout" and row["live_error"] == "not_signed_in"
 

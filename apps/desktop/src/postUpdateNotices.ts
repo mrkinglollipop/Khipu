@@ -186,7 +186,7 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
       {
         requires: "routing-overview",
         title: "Accounts and routing",
-        text: "Khipu tells your conversations which accounts have room.",
+        text: "Khipu tells your conversations which accounts have room. It also finds your other logins and lets you add one.",
         target: { kind: "settings", section: "routing", group: "accounts" },
         setUp: "routing",
       },

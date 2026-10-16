@@ -1,0 +1,118 @@
+/* Finding and adding accounts (settings clarity phase 9, 9C). The classes are
+   the approved mocks' (docs/mockups/2026-10-15-settings-clarity/add-account.css),
+   less the mock page's own frame; tokens and components come from App.css. */
+
+.kit-dialog.aa-dialog { max-width: min(560px, calc(100vw - 32px)); }
+.aa-dialog .kit-dialog-body { gap: var(--s3); max-height: calc(100vh - 64px); overflow-y: auto; }
+.aa-dialog .kit-dialog-body h2 { display: flex; flex-direction: column; gap: 2px; }
+.aa-step { font-size: var(--t-xs); font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+
+.aa-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: var(--r-sm); }
+.aa-opt { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; column-gap: var(--s3); align-items: center; min-height: 44px; padding: var(--s2) var(--s3); border-bottom: 1px solid var(--border); font-size: var(--t-sm); }
+.aa-opt:last-child { border-bottom: 0; }
+.aa-opt input[type=radio] { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); }
+.aa-opt label { display: flex; flex-direction: column; gap: 2px; min-width: 0; cursor: pointer; }
+.aa-opt label b { color: var(--text); font-size: var(--t-md); font-weight: 600; }
+.aa-opt .t2, .aa-opt .meta { line-height: 1.4; }
+.aa-opt.chosen { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.aa-opt.off label { cursor: default; }
+.aa-opt.off b { color: var(--text-2); }
+.aa-opt .tag { white-space: nowrap; }
+.aa-opt-end { display: inline-flex; align-items: center; gap: var(--s2); flex-wrap: wrap; justify-content: flex-end; }
+.aa-opt .aa-sub { grid-column: 2 / -1; margin-top: var(--s1); }
+.aa-mono { font-family: var(--mono); font-size: var(--t-sm); color: var(--text); overflow-wrap: anywhere; }
+
+.aa-ways { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s2); }
+.aa-way { display: flex; gap: var(--s2); align-items: flex-start; padding: var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); min-height: 44px; font-size: var(--t-sm); color: var(--text-2); }
+.aa-way.chosen { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.aa-way.off { opacity: .8; }
+.aa-way input { margin: 3px 0 0; accent-color: var(--accent); }
+.aa-way label { display: flex; flex-direction: column; gap: 2px; cursor: pointer; }
+.aa-way.off label { cursor: default; }
+.aa-way b { color: var(--text); font-size: var(--t-md); }
+
+.aa-field { display: flex; flex-direction: column; gap: var(--s1); }
+.aa-field label { font-size: var(--t-sm); font-weight: 600; color: var(--text); }
+.aa-field input { height: 32px; padding: 0 var(--s2); border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg); color: var(--text); font: inherit; font-size: var(--t-sm); }
+.aa-field input[aria-invalid=true] { border-color: var(--err); }
+.aa-field .set-help { margin: 0; }
+.aa-field .aa-err { color: var(--err); }
+
+.aa-result { --bar-track: color-mix(in srgb, var(--text-2) 55%, var(--surface-2)); display: flex; flex-direction: column; gap: var(--s2); padding: var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); }
+.aa-result-head { display: flex; align-items: center; gap: var(--s2); font-size: var(--t-sm); color: var(--text); }
+.aa-result-head b { font-size: var(--t-md); }
+.aa-result .aa-plan { display: grid; grid-template-columns: minmax(6rem, 10rem) minmax(4rem, 1fr) 3.5rem minmax(0, auto); column-gap: var(--s3); align-items: center; font-size: var(--t-sm); }
+.aa-result p { margin: 0; font-size: var(--t-sm); color: var(--text-2); }
+
+.aa-wait { display: flex; align-items: center; gap: var(--s2); font-size: var(--t-sm); color: var(--text-2); }
+.aa-spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--accent); flex: none; animation: spin 1s linear infinite; }
+@media (prefers-reduced-motion: reduce) { .aa-spin { animation: none; } }
+
+.aa-actions { display: flex; gap: 6px; justify-content: flex-end; align-items: center; flex-wrap: wrap; padding-top: var(--s1); }
+.aa-actions .aa-left { margin-right: auto; }
+.aa-note { margin: 0; font-size: var(--t-sm); color: var(--text-2); }
+.aa-dos { margin: 0; padding-left: 1.2em; font-size: var(--t-sm); color: var(--text-2); display: flex; flex-direction: column; gap: 2px; }
+.aa-dos li b { color: var(--text); }
+.aa-dialog .callout { flex-direction: column; align-items: stretch; }
+.aa-dialog .callout .cta { flex-wrap: wrap; justify-content: flex-start; }
+.aa-coming { font-size: var(--t-xs); color: var(--muted); }
+
+/* Found rows and the Accounts group bar */
+.aa-groupbar { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; padding: var(--s2) 0; }
+.aa-groupbar .spacer { flex: 1; }
+.aa-groupbar .t2 { font-size: var(--t-sm); color: var(--text-2); }
+.aa-found-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-sm); margin: var(--s2) 0; overflow: hidden; }
+.aa-found { display: grid; grid-template-columns: 9.5rem minmax(0, 1fr) auto; column-gap: var(--s3); align-items: center; padding: var(--s3) var(--s4); border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--accent) 6%, transparent); font-size: var(--t-sm); }
+.aa-found:last-child { border-bottom: 0; }
+.aa-found > .tag { justify-self: start; }
+.aa-found-list > .aa-coming { padding: var(--s2) var(--s4); }
+a.btn-link { display: inline-flex; align-items: center; min-height: 28px; padding: 0 var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: var(--t-sm); text-decoration: none; }
+a.btn-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.aa-found .aa-ft { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.aa-found .aa-ft b { color: var(--text); font-size: var(--t-md); }
+.aa-found .aa-btns { display: inline-flex; gap: var(--s2); flex-wrap: wrap; justify-content: flex-end; }
+.aa-found .t2 { color: var(--text-2); }
+.aa-switch { border-top: 1px solid var(--border); margin-top: var(--s2); }
+.aa-switch .opt-row { padding: var(--s3) 0; }
+.aa-home-found .txt span { line-height: 1.45; }
+.aa-home-found ul { margin: var(--s1) 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; column-gap: var(--s2); row-gap: var(--s2); align-items: center; }
+/* Each find lays its text and its two buttons on the list's grid, so the
+   Track… and Not this one columns line up from row to row. */
+.aa-home-found li { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; row-gap: var(--s1); }
+.aa-rows { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-sm); }
+.aa-row { display: grid; grid-template-columns: minmax(8rem, 12rem) minmax(0, 1fr) auto; column-gap: var(--s3); align-items: center; padding: var(--s2) var(--s3); border-bottom: 1px solid var(--border); font-size: var(--t-sm); }
+.aa-row:last-child { border-bottom: 0; }
+.aa-row .aa-what { display: flex; flex-direction: column; gap: 2px; color: var(--text-2); min-width: 0; }
+.aa-row .aa-acts { display: inline-flex; gap: var(--s2); flex-wrap: wrap; justify-content: flex-end; }
+.aa-acct-acts { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; padding: var(--s2) 0; }
+.aa-acct-acts .aa-state { display: inline-flex; align-items: center; gap: var(--s2); font-size: var(--t-sm); color: var(--text); }
+.aa-confirm { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; font-size: var(--t-sm); color: var(--text-2); }
+
+.aa-checks { margin: 0; padding: var(--s2) var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); display: flex; flex-direction: column; gap: var(--s2); font-size: var(--t-sm); color: var(--text-2); }
+.aa-checks legend { padding: 0 var(--s1); font-weight: 600; color: var(--text); }
+.aa-checks div { display: flex; gap: var(--s2); align-items: flex-start; min-height: 24px; }
+.aa-checks input { margin: 2px 0 0; accent-color: var(--accent); }
+
+.aa-dialog button:focus-visible, .aa-found button:focus-visible, .aa-row button:focus-visible,
+.aa-groupbar button:focus-visible, .aa-home-found button:focus-visible, .aa-acct-acts button:focus-visible,
+.aa-field input:focus-visible, .aa-checks input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* A focused radio rings its whole option, so its dot stays easy to see. */
+.aa-opt input:focus-visible, .aa-way input:focus-visible { outline: none; }
+.aa-opt:has(input:focus-visible), .aa-way:has(input:focus-visible) { box-shadow: inset 0 0 0 2px var(--accent); }
+.aa-way:has(input:focus-visible) { border-color: var(--accent); }
+.aa-dialog h2[tabindex="-1"]:focus { outline: none; }
+
+@media (max-width: 760px) {
+  .aa-ways { grid-template-columns: minmax(0, 1fr); }
+  .aa-home-found ul { grid-template-columns: auto auto minmax(0, 1fr); }
+  .aa-home-found li > span:first-child { grid-column: 1 / -1; }
+  .aa-found { grid-template-columns: minmax(0, 1fr); row-gap: var(--s1); }
+  .aa-found .aa-btns { grid-column: 1; }
+  .aa-found .aa-btns { justify-content: flex-start; margin-top: var(--s1); }
+  .aa-row { grid-template-columns: minmax(0, 1fr); row-gap: var(--s1); }
+  .aa-row .aa-acts { justify-content: flex-start; }
+  .aa-result .aa-plan { grid-template-columns: minmax(0, 1fr) 3.5rem; }
+}
