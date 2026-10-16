@@ -141,6 +141,20 @@ export type WaitItem = {
   looks_like?: { id: string | null; title: string | null } | null;
   actions: WaitAction[];
 };
+// The keys each kind of item needs before the app offers any action on it.
+// An item missing one (a withheld id, a routing item with no key) is shown
+// with no buttons at all, whatever its actions list says.
+const NEEDS: Record<WaitItem["source"], Array<"key" | "project" | "id">> = {
+  ledger: ["key", "project", "id"],
+  commitment: ["key", "id"],
+  routing: ["key"],
+};
+
+export function canAct(item: WaitItem): boolean {
+  const needs = NEEDS[item.source];
+  return needs !== undefined && needs.every((k) => item[k] != null && item[k] !== "");
+}
+
 export type WorkCounts = {
   waiting: number;
   blocking: number;

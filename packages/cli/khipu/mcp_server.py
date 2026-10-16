@@ -1586,13 +1586,15 @@ def _tool_forget(args: dict) -> dict:
     the Mac that captured it and is forgotten there."""
     if isinstance(args.get("id"), str) and args["id"].startswith("ledger:"):
         _ensure_path()
-        from khipu import ledger
+        from khipu import agent_view, ledger
 
+        # A ledger answer, whichever tool gives it, leaves through
+        # agent_view.project, like khipu_ledger's.
         try:
-            return ledger.remove_ref(args["id"], note=str(args.get("note") or ""),
-                                     children=args.get("children"), source="mcp")
+            return agent_view.project(ledger.remove_ref(args["id"], note=str(args.get("note") or ""),
+                                                        children=args.get("children"), source="mcp"))
         except ledger.LedgerError as exc:
-            raise ValueError(str(exc)) from None
+            raise _ToolFailure(agent_view.project({"ok": False, "error": str(exc), "reason": exc.reason})) from None
     eid = _positive_id(args.get("id"), "id")
     _ensure_path()
     from khipu.forget import LOCAL_HARNESSES, forget_everywhere
@@ -1934,6 +1936,7 @@ def _tool_ledger(args: dict) -> dict:
 
     try:
         args = _ledger_args(args)
+        ledger.require(f"ledger {verb}")
         project = ledger._project_for(argparse.Namespace(project=args.get("project") or None))
         row_id = args.get("id") or ""
         if verb in ("add", "set", "remove"):

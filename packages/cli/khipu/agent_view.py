@@ -575,6 +575,28 @@ def project(value):
     return _project_walk(value, table)
 
 
+def emit(payload=None, text: str | None = None, *, as_json: bool = False, stream=None, to_file=None,
+         indent: int | None = 2, sort_keys: bool = False) -> None:
+    """The one way a ``khipu ledger`` or ``khipu work`` answer leaves Khipu,
+    on stdout, stderr or a file the caller named: ``payload`` as JSON when
+    ``as_json``, else ``text``; either way through ``project`` first. Text is
+    projected line by line, so one withheld line never blanks the rest."""
+    import json
+    import sys
+
+    if as_json:
+        out = json.dumps(project(payload), indent=indent, sort_keys=sort_keys, default=str, ensure_ascii=False)
+    elif text is not None:
+        out = "\n".join(project(str(text).split("\n")))
+    else:
+        return
+    if to_file is not None:
+        with open(to_file, "w", encoding="utf-8") as fh:
+            fh.write(out + "\n")
+        return
+    print(out, file=stream or sys.stdout)
+
+
 def error_text(exc: BaseException) -> str:
     """An exception as an agent may read it: a filesystem error in fixed
     words (its own text names the file), anything else scrubbed."""

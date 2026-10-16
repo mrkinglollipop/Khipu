@@ -108,13 +108,19 @@ def _coerce_projects(value: Any, key: str) -> list[dict]:
         seen.add(project)
         name = entry.get("name")
         name = routing._short_text(name, f"{where}: name") if name not in (None, "") else project
-        path = Path(routing._short_text(entry.get("file"), f"{where}: file", 1024)).expanduser()
-        if not path.is_absolute():
-            raise ValueError(f"{where}: give the summary file's full path")
-        if routing.credential_location(path):
+        # Kept exactly as given: safe_read parses it, here and at each read.
+        path = routing._short_text(entry.get("file"), f"{where}: file", 1024)
+        try:
+            folder, file_name = safe_read.parse(path, full=True)
+        except safe_read.NotFullPath:
+            raise ValueError(f"{where}: give the summary file's full path") from None
+        except safe_read.Refused:
+            raise ValueError(f"{where}: give the summary file's full path, with no \".\" or \"..\" "
+                             "folder and no \"/\" at the end") from None
+        if routing.credential_location(Path(folder, file_name)):
             raise ValueError(f"{where}: a summary file can't be inside a private folder (API Keys, My Portfolio, "
                              "a keychain or an auth.json)")
-        out.append({"project": project, "name": name, "file": str(path),
+        out.append({"project": project, "name": name, "file": path,
                     "on": routing._coerce("switch", entry.get("on", True), f"{where}: on"),
                     "show_now": routing._coerce("switch", entry.get("show_now", True), f"{where}: show_now")})
     return out
@@ -260,20 +266,38 @@ def _path_token(token: str) -> bool:
     return bool(_PATH_SHAPE.search(token.lstrip(_WRAP_OPEN).rstrip(_WRAP_CLOSE)))
 
 
+def _pieces(token: str) -> list[tuple[str, bool]]:
+    """``token`` split into (piece, is_link): each link by its exact span,
+    and the words around it split again at "=", "," and ";" (kept as their
+    own pieces), so a path joined to a link or a value is still seen."""
+    out: list[tuple[str, bool]] = []
+    last = 0
+    for m in _LINK.finditer(token):
+        out += [(p, False) for p in _JOINS.split(token[last:m.start()]) if p]
+        out.append((m.group(), True))
+        last = m.end()
+    out += [(p, False) for p in _JOINS.split(token[last:]) if p]
+    return out
+
+
 def _has_path(text: str) -> bool:
-    return any(_path_token(t) for t in _LINK.sub(" ", text).split())
+    return any(not link and _path_token(p) for t in text.split() for p, link in _pieces(t))
 
 
 def _cut_paths(text: str) -> str:
-    """Each path-shaped word replaced with PATH_WORDS (its quotes and
-    punctuation kept); links and every other word are left as they are."""
+    """Each path-shaped piece of a word replaced with PATH_WORDS (its quotes
+    and punctuation kept); links, cut out by their exact span, and every
+    other piece are left as they are."""
     out = []
     for token in text.split(" "):
-        if not _LINK.search(token) and _path_token(token):
-            core = token.lstrip(_WRAP_OPEN).rstrip(_WRAP_CLOSE)
-            start = token.index(core)
-            token = token[:start] + PATH_WORDS + token[start + len(core):]
-        out.append(token)
+        parts = []
+        for piece, link in _pieces(token):
+            if not link and _path_token(piece):
+                core = piece.lstrip(_WRAP_OPEN).rstrip(_WRAP_CLOSE)
+                start = piece.index(core)
+                piece = piece[:start] + PATH_WORDS + piece[start + len(core):]
+            parts.append(piece)
+        out.append("".join(parts))
     return " ".join(out)
 
 
@@ -306,7 +330,10 @@ _PATH_SHAPE = re.compile(r"^~(?:[/\\]|[A-Za-z_]|$)|^\.{1,2}[/\\]|^[/\\](?=[\w.~-
                          r"|[A-Za-z]:[/\\]|[/\\].*[/\\]|[/\\][^/\\]*\.[A-Za-z0-9]+$")
 _WRAP_OPEN = "\"'`([{<"
 _WRAP_CLOSE = "\"'`)]}>,;:!?."
-_LINK = re.compile(r"https://\S+")
+# A link's exact span: it ends at a space, a quote or a bracket, so text
+# joined to its end is checked on its own.
+_LINK = re.compile(r"https://[^\s\"'`<>()\[\]{}]+")
+_JOINS = re.compile(r"([=,;])")
 
 
 def _private_text(text: str, table: Any = None) -> bool:
@@ -723,7 +750,7 @@ def _private_place(path: str) -> bool:
     return safe_read.private_place(path)
 
 
-def _open_checked(path: Path, limit: int) -> safe_read.Opened:
+def _open_checked(path: str, limit: int) -> safe_read.Opened:
     """``safe_read.open_file``, with a file over ``limit`` as ``Unreadable``
     (``too_big``). Raises ``safe_read.Refused``, ``FileNotFoundError`` or
     ``OSError`` otherwise."""
@@ -743,12 +770,12 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
         return {"state": "none", "problem": SOURCE_PROBLEMS["none"], "contents": None}
     if not entry.get("on", True):
         return {"state": "off", "problem": SOURCE_PROBLEMS["off"], "contents": None}
-    project, path = entry["project"], Path(entry["file"])
-    if _private_place(str(path)):
+    project, path = entry["project"], entry["file"]
+    if _private_place(path):
         return {"state": "refused", "problem": SOURCE_PROBLEMS["refused"], "contents": None}
     # The last good read stands in only for the same file (its name as set,
     # kept as a hash): a source set to another file never shows this one's.
-    name = hashlib.sha256(os.fsencode(str(path))).hexdigest()[:16]
+    name = hashlib.sha256(os.fsencode(path)).hexdigest()[:16]
     last = _read_json(_last_file(project))
     last = last if isinstance(last, dict) and last.get("project_key") == project \
         and isinstance(last.get("stamp"), list) and last["stamp"][:1] == [name] else None
@@ -1382,7 +1409,7 @@ def check_file(path: str) -> tuple[bool, list[str], dict | None]:
     cfg = settings()
     limit = cfg["work_file_max_bytes"]
     try:
-        opened = _open_checked(Path(path), limit)
+        opened = _open_checked(path, limit)
     except safe_read.Refused:
         return False, [SOURCE_PROBLEMS["refused"]], None
     except FileNotFoundError:
@@ -1447,48 +1474,57 @@ def render_text(view: dict) -> str:
     return "\n".join(lines)
 
 
-def _json_out(payload: Any, indent: int | None = 2) -> str:
-    """Every --json answer leaves through agent_view.project."""
+def _emit(payload: Any = None, text: str | None = None, *, as_json: bool = True, indent: int | None = 2) -> None:
+    """Every answer of ``khipu work`` (``agent_view.emit``: projected first)."""
     from khipu import agent_view
 
-    return json.dumps(agent_view.project(payload), indent=indent, default=str)
+    agent_view.emit(payload, text, as_json=as_json, indent=indent)
 
 
 def cmd(args: argparse.Namespace) -> int:
+    from khipu import ledger
+
     sub = getattr(args, "work_cmd", None)
+    try:
+        ledger.require(f"work {sub}" if sub else "work")
+    except ledger.LedgerError as exc:
+        _emit({"ok": False, "error": str(exc), "reason": exc.reason}, indent=None)
+        return 1
     if sub == "check":
         ok, problems, parsed = check_file(args.file)
         if args.json:
-            print(_json_out({"ok": ok, "problems": problems,
-                             "counts": {k: len(parsed[k]) for k in _TOP_LISTS} if parsed else None}))
+            _emit({"ok": ok, "problems": problems,
+                   "counts": {k: len(parsed[k]) for k in _TOP_LISTS} if parsed else None})
         else:
+            lines = []
             if parsed:
-                print(f"Read {len(parsed['jobs'])} job(s), {len(parsed['prs'])} pull request(s) and "
-                      f"{len(parsed['trains'])} release train(s) for {parsed['project']}.")
-            print("OK: Khipu reads this file as it is." if ok else "\n".join(f"- {p}" for p in problems))
+                lines.append(f"Read {len(parsed['jobs'])} job(s), {len(parsed['prs'])} pull request(s) and "
+                             f"{len(parsed['trains'])} release train(s) for {parsed['project']}.")
+            lines.append("OK: Khipu reads this file as it is." if ok else "\n".join(f"- {p}" for p in problems))
+            _emit(text="\n".join(lines), as_json=False)
         return 0 if ok else 1
     if sub in ("hide", "unhide"):
         item = None
         if sub == "hide":
             owed = {str(c.get("id")): c for c in read_owed()["items"]}
             if args.id not in owed:
-                print(_json_out({"ok": False, "error": f"no open commitment {args.id} needs you"}, indent=None))
+                _emit({"ok": False, "error": f"no open commitment {args.id} needs you"}, indent=None)
                 return 1
             item = owed[args.id]
         set_hidden(args.id, item)
-        print(_json_out({"ok": True, "hidden": sorted(read_hidden())}, indent=None))
+        _emit({"ok": True, "hidden": sorted(read_hidden())}, indent=None)
         return 0
     if sub in ("same", "not-same"):
         project, _, row_id = args.row.partition("#")
         if not project or not row_id:
-            print(_json_out({"ok": False, "error": "name the ledger row as <project>#<row id>"}, indent=None))
+            _emit({"ok": False, "error": "name the ledger row as <project>#<row id>"}, indent=None)
             return 1
         set_link(project, row_id, args.commitment, sub == "same")
-        print(_json_out({"ok": True}, indent=None))
+        _emit({"ok": True}, indent=None)
         return 0
     view = build_view()
     write_view(view)
-    print(_json_out(view) if args.json else render_text(view))
+    _emit(view, None if args.json else render_text(view), as_json=bool(args.json))
     return 0
 
 

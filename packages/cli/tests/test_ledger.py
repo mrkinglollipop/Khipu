@@ -204,7 +204,8 @@ def test_the_printed_lines_match_the_trackers_for_the_same_input(hub, monkeypatc
     assert "- NEEDS MATT: 1" in board and "- needs-matt: 1" in board
     assert "**parent: g-1: Ship the thing**" in board
     out = Path(os.environ["KHIPU_DATA_DIR"]) / "board.md"
-    assert ok("render", "--out", str(out)).strip() == f"rendered 3 rows -> {out}"
+    # the printed line leaves through the projection, which names a path only as "a folder"
+    assert ok("render", "--out", str(out)).strip() == "rendered 3 rows -> a folder"
     assert out.read_text(encoding="utf-8").startswith("# Orchestrator Tracker")
     got = json.loads(ok("get", "s-1"))
     assert {"id", "title", "kind", "parent", "state", "evidence", "owner", "updated", "history"} <= set(got)

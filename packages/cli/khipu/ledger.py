@@ -878,7 +878,7 @@ def _replica_sync(conn, project: str, row_ids: list[str]) -> None:
     except Exception as exc:  # noqa: BLE001  (the hub write already landed)
         # The row's own marker was written before the commit (the drain), so
         # the offline check still leaves it to the hub.
-        print(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}", file=sys.stderr)
+        _say(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}")
         return
     replica_catch_up(conn)
 
@@ -950,8 +950,8 @@ def _replica_catch_up_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
             if got.get("ok") or got.get("missing"):
                 done += [f"{project}#{i}" for i in ids]
             else:
-                print(f"[khipu-ledger] offline copy not updated yet ({got.get('error')}); "
-                      "the next ledger call retries it", file=sys.stderr)
+                _say(f"[khipu-ledger] offline copy not updated yet ({got.get('error')}); "
+                     "the next ledger call retries it")
         with _replica_pending() as pending:
             for key in done:
                 if pending.get(key) == seen[key]:
@@ -959,7 +959,7 @@ def _replica_catch_up_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
             out["left"] = len(pending)
         out["copied"] = len(done)
     except Exception as exc:  # noqa: BLE001  (the hub write already landed)
-        print(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}", file=sys.stderr)
+        _say(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}")
         out["error"] = f"{type(exc).__name__}: {exc}"[:200]
     return out
 
@@ -1582,7 +1582,7 @@ def _tidy(step, *args: Any, **kw: Any) -> None:
     try:
         step(*args, **kw)
     except OSError as exc:
-        print(f"[khipu-ledger] left for the next drain: {type(exc).__name__}", file=sys.stderr)
+        _say(f"[khipu-ledger] left for the next drain: {type(exc).__name__}")
 
 
 def _set_aside(path: Path) -> None:
@@ -2196,6 +2196,7 @@ def remove_ref(ref: str, *, note: str = "", children: str | None = None, source:
     if parsed is None:
         raise LedgerError("a ledger id looks like ledger:<project>#<row id>", "bad_ref")
     project, row_id = parsed
+    require("ledger remove")
     return write(new_op("remove", project, row_id, note=note, children=children, source=source))
 
 
@@ -2302,18 +2303,17 @@ def _project_for(args: argparse.Namespace) -> str:
     return _check_project(resolve_repo_root(cwd).get("project"))
 
 
-def _json_out(payload: Any, **kw: Any) -> str:
-    """Every --json answer leaves through agent_view.project."""
+def _emit(args: argparse.Namespace | None, payload: Any = None, text: str | None = None, **kw: Any) -> None:
+    """Every answer this module gives (``agent_view.emit``: projected first)."""
     from khipu import agent_view
 
-    return json.dumps(agent_view.project(payload), default=str, **kw)
+    kw.setdefault("as_json", bool(getattr(args, "json", False)))
+    agent_view.emit(payload, text, **kw)
 
 
-def _emit(args: argparse.Namespace, payload: dict[str, Any], text: str | None) -> None:
-    if getattr(args, "json", False):
-        print(_json_out(payload, indent=2))
-    elif text is not None:
-        print(text)
+def _say(text: str) -> None:
+    """A note on stderr, projected like every other answer."""
+    _emit(None, text=text, stream=sys.stderr)
 
 
 def _offline_note(view: dict[str, Any]) -> str | None:
@@ -2327,10 +2327,8 @@ def cmd(args: argparse.Namespace) -> int:
     verb = args.ledger_cmd
     try:
         refuse_secrets([v for k, v in vars(args).items() if k != "func"])
-        if getattr(args, "from_app", False):
-            _check_from_app()
-        if verb == "import" and not args.dry_run:
-            _check_owner()
+        require(f"ledger {verb}", from_app=getattr(args, "from_app", False),
+                dry_run=getattr(args, "dry_run", False))
         project = _project_for(args)
         if verb in ("add", "set", "remove", "restore"):
             return _cmd_write(args, verb, project)
@@ -2351,7 +2349,7 @@ def cmd(args: argparse.Namespace) -> int:
             payload = row_json(got["row"], got["history"], project)
             if got.get("offline"):
                 payload["offline_as_of"] = got.get("as_of")
-            print(_json_out(payload, indent=2, sort_keys=True))
+            _emit(None, payload, as_json=True, sort_keys=True)
             return 0
         view = load(project)
         note = _offline_note(view)
@@ -2370,7 +2368,7 @@ def cmd(args: argparse.Namespace) -> int:
         elif verb == "render":
             board = render_board(view)
             if args.out:
-                Path(args.out).write_text(board, encoding="utf-8")
+                _emit(None, text=board, to_file=args.out)
                 _emit(args, {"ok": True, "rows": len(view["rows"]), "out": args.out},
                       f"rendered {len(view['rows'])} rows -> {args.out}")
             else:
@@ -2388,14 +2386,65 @@ def cmd(args: argparse.Namespace) -> int:
             _emit(args, {**result, "project": project, "vocab": view["vocab"]}, text)
             rc = 0 if result["ok"] else 1
         if note and not args.json:
-            print(note)
+            _emit(args, text=note)
         return rc
     except LedgerError as exc:
         if getattr(args, "json", False):
-            print(_json_out({"ok": False, "error": str(exc), "reason": exc.reason}))
+            _emit(args, {"ok": False, "error": str(exc), "reason": exc.reason})
         else:
-            print(f"error: {exc}", file=sys.stderr)
+            _say(f"error: {exc}")
         return 1
+
+
+# Who may run each verb of ``khipu ledger`` and ``khipu work`` that changes
+# anything (and ``khipu_ledger``'s, which are a subset). "writer": any writer
+# (a conversation, a runner, the app), and a --from-app claim must come from
+# the app itself. "app": the app only. "owner": the app, or the owner's yes
+# typed on an interactive terminal (routing.typed_yes, routing's own rule).
+# Every verb not listed only reads; tests check that every verb of both
+# parsers is either here or in READ_VERBS, and that each one here calls
+# ``require`` before it does anything.
+WRITE_POLICY: dict[str, str] = {
+    "ledger add": "writer", "ledger set": "writer", "ledger remove": "writer",
+    "ledger restore": "app", "ledger purge": "app", "ledger import": "owner",
+    "work hide": "owner", "work unhide": "owner", "work same": "owner", "work not-same": "owner",
+}
+READ_VERBS = frozenset({"ledger get", "ledger list", "ledger loose-ends", "ledger needs-owner", "ledger needs-matt",
+                        "ledger render", "ledger check", "ledger removed", "ledger export", "work", "work check"})
+_APP_ONLY = {
+    "ledger restore": "a removed row is restored in the Khipu app (Settings, Work, Removed rows)",
+    "ledger purge": "removing a row for good is done in the Khipu app (Settings, Work, Removed rows)",
+}
+
+
+def require(command: str, *, from_app: bool = False, dry_run: bool = False) -> None:
+    """The one owner check for every verb that changes anything (see
+    ``WRITE_POLICY``); raises ``LedgerError`` when this caller may not run
+    ``command``. ``dry_run`` (an import that writes nothing) only reads. A
+    verb in neither table is refused: a new verb must be classified."""
+    policy = WRITE_POLICY.get(command)
+    if policy is None and command not in READ_VERBS:
+        raise LedgerError(f"{command} is not a known verb; nothing was changed", "unknown_verb")
+    if policy is None or dry_run or policy == "writer":
+        if from_app:
+            _check_from_app()
+        return
+    if policy == "app":
+        if not from_app:
+            raise LedgerError(_APP_ONLY[command], "app_only")
+        _check_from_app()
+        return
+    from khipu import routing
+
+    if from_app:
+        _check_from_app()
+        return
+    if routing._caller()["app"]:
+        return
+    if routing.typed_yes(f"This is the owner's change ({command}). Type yes to confirm: "):
+        return
+    raise LedgerError("only the Khipu app, or the owner's yes typed on a terminal, can make this change; "
+                      "nothing was changed", "not_app")
 
 
 def _check_from_app() -> None:
@@ -2410,27 +2459,7 @@ def _check_from_app() -> None:
                           "so nothing was changed", "not_app")
 
 
-def _check_owner() -> None:
-    """An import (or a catch-up) is the owner's change, with or without
-    ``--from-app``: it runs when the app itself started this process
-    (``routing._caller``), or after a typed yes on a terminal."""
-    from khipu import routing
-
-    if routing._caller()["app"]:
-        return
-    try:
-        answer = input("Importing a tracker is the owner's change. Type yes to confirm: ") \
-            if sys.stdin.isatty() else ""
-    except (EOFError, OSError):
-        answer = ""
-    if answer.strip().lower() != "yes":
-        raise LedgerError("only the Khipu app, or a typed yes on a terminal, can import a tracker; "
-                          "nothing was changed", "not_app")
-
-
 def _cmd_write(args: argparse.Namespace, verb: str, project: str) -> int:
-    if verb == "restore" and not args.from_app:
-        raise LedgerError("a removed row is restored in the Khipu app (Settings, Work, Removed rows)", "app_only")
     fields: dict[str, Any] = {}
     if verb == "add":
         fields = {"title": args.title, "kind": args.kind, "parent": args.parent or "", "state": args.state,
@@ -2448,9 +2477,6 @@ def _cmd_write(args: argparse.Namespace, verb: str, project: str) -> int:
 
 
 def _cmd_purge(args: argparse.Namespace, project: str) -> int:
-    if not args.from_app:
-        raise LedgerError("removing a row for good is done in the Khipu app (Settings, Work, Removed rows)",
-                          "app_only")
     try:
         conn = _connect()
     except HubAway as exc:
@@ -2485,12 +2511,13 @@ def _cmd_export(args: argparse.Namespace, project: str) -> int:
         conn.rollback()
     finally:
         conn.close()
-    text = json.dumps({"rows": rows}, indent=2, ensure_ascii=False, default=str)
+    # The export is an answer like any other: projected, in the file or on
+    # stdout, with --json or without.
     if args.out:
-        Path(args.out).write_text(text + "\n", encoding="utf-8")
-        print(f"exported {len(rows)} rows -> {args.out}")
+        _emit(None, {"rows": rows}, as_json=True, to_file=args.out)
+        _emit(args, {"ok": True, "rows": len(rows), "out": args.out}, f"exported {len(rows)} rows -> {args.out}")
     else:
-        print(text)
+        _emit(None, {"rows": rows}, as_json=True)
     return 0
 
 

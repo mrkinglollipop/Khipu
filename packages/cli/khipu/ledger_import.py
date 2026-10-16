@@ -29,7 +29,6 @@ import json
 import os
 from collections import Counter
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from khipu import ledger, safe_read
@@ -119,9 +118,10 @@ def read_tracker(path: str | os.PathLike) -> dict[str, Any]:
     from khipu.redact import redact_secrets
     from khipu.routing_sources import _short_error
 
-    p = Path(os.path.abspath(Path(path).expanduser()))
+    # The path goes to safe_read exactly as given: only it parses a path.
     try:
-        data, _st = safe_read.read_file(p)
+        _folder, file_name = safe_read.parse(path)
+        data, _st = safe_read.read_file(path)
     except safe_read.Refused:
         raise LedgerError("Not read: the file is inside a private folder or a login folder, or is reached through a link.",
                           "refused") from None
@@ -166,7 +166,7 @@ def read_tracker(path: str | os.PathLike) -> dict[str, Any]:
     other = sorted(k for k in doc if k != "rows")
     # The name goes into reports and ledger_imports.file_name: a key-shaped
     # name is masked like any other string from the file.
-    return {"name": redact_secrets(p.name, force=True)[0], "digest": hashlib.sha256(data).hexdigest(), "rows": rows, "masked": masked,
+    return {"name": redact_secrets(file_name, force=True)[0], "digest": hashlib.sha256(data).hexdigest(), "rows": rows, "masked": masked,
             "other_keys": [redact_secrets(k, force=True)[0] for k in other]}
 
 
@@ -476,10 +476,6 @@ _ALL_HIST = ("id", "at", "at_text", "author", "shape", "from_state", "to_state",
              "has_raw", "op_id", "source")
 
 
-def _history_counter(row: dict[str, Any] | None) -> Counter:
-    return Counter(_entry_key(e) for e in (row or {}).get("history") or [])
-
-
 def _fields(row: dict[str, Any] | None) -> dict[str, Any]:
     return {k: v for k, v in (row or {}).items() if k != "history"}
 
@@ -749,15 +745,18 @@ def _catch_up(cur, project: str, src: dict[str, Any], report: dict[str, Any], he
     seen_as = dict(cur.fetchall())
     adds: dict[str, list] = {}
     history_only: list[str] = []
+    rewritten: list[str] = []
     for row_id in live:
-        have = _history_counter(current.get(row_id))
-        fresh = []
-        for entry in rows[row_id].get("history") or []:
-            k = _entry_key(entry)
-            if have[k]:
-                have[k] -= 1
-            else:
-                fresh.append(entry)
+        # An old tracker only appends history. The ledger's whole ordered
+        # history from the file must be where the file's history begins;
+        # what follows it is new. Anything else (an entry reordered, changed
+        # or taken out) is refused, never matched up as a delta.
+        had = [_entry_key(e) for e in (current.get(row_id) or {}).get("history") or []]
+        theirs_hist = rows[row_id].get("history") or []
+        if [_entry_key(e) for e in theirs_hist[:len(had)]] != had:
+            rewritten.append(row_id)
+            continue
+        fresh = theirs_hist[len(had):]
         if fresh:
             adds[row_id] = fresh
             plan["new_entries"] += len(fresh)
@@ -773,6 +772,11 @@ def _catch_up(cur, project: str, src: dict[str, Any], report: dict[str, Any], he
         elif fresh and row_id in touched:
             plan["both"].append(row_id)
             history_only.append(row_id)
+    if rewritten:
+        return {**report, "ok": False, "result": "refused", "reason": "history_rewritten", "rewritten": rewritten,
+                "words": "Nothing was brought in: in the old tracker, the history of these rows no longer starts "
+                         "with what was brought in before (an entry was moved, changed or taken out), and Khipu "
+                         f"only brings in entries added at the end: {_listed(rewritten)}."}
     plan["new_entries"] += sum(len(rows[i].get("history") or []) for i in new_ids)
     report["plan"] = plan
     if not (new_ids or plan["new_entries"] or plan["updated"] or plan["both"]):
@@ -871,11 +875,6 @@ def _verify_catch_up(cur, project: str, rows: dict[str, dict], plan: dict[str, A
         ops = [CATCH_UP_OP] * (row_id in plan["updated"]) + [BOTH_OP] * (row_id in plan["both"])
         if has[:len(had)] != had:
             differs.append(f"{row_id}.history: the entries it had changed")
-        elif added and [_entry_key(h["raw"]) for h in has if h["has_raw"]] \
-                != [_entry_key(e) for e in rows[row_id].get("history") or []]:
-            # Compared in order: the file's entries must read back as the
-            # file lists them, not merely all be there.
-            differs.append(f"{row_id}.history: not the file's entries in the file's order")
         elif [_entry_key(h["raw"]) for h in tail[:len(added)] if h["has_raw"]] != added \
                 or len(tail) != len(added) + len(ops) \
                 or any(h["has_raw"] or not (h["op_id"] or "").startswith(op) for h, op in zip(tail[len(added):], ops)):
@@ -898,6 +897,12 @@ def _verify_catch_up(cur, project: str, rows: dict[str, dict], plan: dict[str, A
             return {**row, "refs": refs}
         if plain(was) != plain(now_row):
             differs.append(f"{row_id}: fields")
+    # Every live row the file has, touched or not: its whole history from
+    # the file reads back as the file lists it, every entry in order.
+    for row_id in sorted(i for i in rows if i in after["rows"]):
+        if [_entry_key(e) for e in after["rows"][row_id].get("history") or []] \
+                != [_entry_key(e) for e in rows[row_id].get("history") or []]:
+            differs.append(f"{row_id}.history: not the file's entries in the file's order")
     differs += _unchanged(before, after, new | touched)
     return {"ok": not differs, "fields_differ": differs[:_SHOWN], "fields_differ_count": len(differs),
             "counts_differ": []}

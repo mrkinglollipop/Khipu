@@ -22,6 +22,7 @@ import {
   ageWords,
   boardFolds,
   boardMeta,
+  canAct,
   changedWords,
   daysSince,
   foldedMeta,
@@ -436,7 +437,7 @@ function WaitingCard({
               const long = (daysSince(item.since, now) ?? 0) >= 2;
               const isBusy = item.key != null && busy === item.key;
               // A change needs the item's key, id and (for a ledger row) project.
-              const canWrite = item.key != null && item.id != null;
+              const canWrite = canAct(item);
               return (
                 <div key={item.key ?? `withheld-${i}`} className="row wk-wait" role="listitem">
                   <span className="wk-wait-main">
@@ -489,7 +490,7 @@ function WaitingCard({
                   </span>
                   <span className={long ? "wk-age long" : "wk-age"}>{age}</span>
                   <span className="wk-acts">
-                    {item.source === "ledger" && item.project && canWrite ? (
+                    {item.source === "ledger" && canWrite ? (
                       <>
                         <button type="button" className="sm primary" disabled={busy !== null} onClick={() => done(item)}>
                           {isBusy ? "Saving…" : "Done"}
@@ -527,7 +528,7 @@ function WaitingCard({
                         </button>
                       </>
                     ) : null}
-                    {item.source === "routing" ? (
+                    {item.source === "routing" && canWrite ? (
                       <button type="button" className="sm" onClick={onOpenRouting}>
                         Open Routing settings
                       </button>

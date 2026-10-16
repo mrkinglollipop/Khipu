@@ -894,7 +894,8 @@ def test_catch_up_rejects_history_inserted_before_an_existing_entry(hub, tmp_pat
     _write(tmp_path, doc)
     rc, report = _import(path, "--catch-up")
 
-    assert rc == 1 and report["result"] == "rolled back", report
+    # the file's history no longer begins with the ledger's whole ordered history
+    assert rc == 1 and report["result"] == "refused" and report["reason"] == "history_rewritten", report
     raw = [h for h in _export()["a"]["history"] if "by" not in h]
     assert raw == [first, third]
 

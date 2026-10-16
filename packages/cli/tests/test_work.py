@@ -609,7 +609,7 @@ def test_work_json_writes_the_view(tmp_path, env, monkeypatch):
     assert rc == 0 and "Waiting on you" in text and str(tmp_path) not in text
 
 
-def test_hide_and_same_commands(env, monkeypatch):
+def test_hide_and_same_commands(env, monkeypatch, khipu_app):
     item = commitment("c5", "Pick a colour")
     monkeypatch.setattr(work, "read_owed", lambda: {"items": [item], "error": None})
     assert run("hide", "c5")[0] == 0 and "c5" in work.read_hidden()
@@ -1034,7 +1034,7 @@ def test_every_open_user_commitment_is_read(monkeypatch):
     assert got["error"] is None and len(got["items"]) == len(rows)
 
 
-def test_the_apps_same_and_unhide_argv_parse():
+def test_the_apps_same_and_unhide_argv_parse(khipu_app):
     """The desktop's fixed argv (src-tauri lib.rs, work_command_tests)."""
     from khipu import cli
 

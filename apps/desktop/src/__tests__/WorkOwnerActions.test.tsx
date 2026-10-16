@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { LedgerPage } from "../LedgerPage";
 import { WorkView } from "../WorkView";
+import { canAct } from "../work";
 import type { LedgerRow, WorkView as Doc } from "../work";
 
 // Owner actions on the Work view and the ledger page: a change goes only to
@@ -118,4 +119,37 @@ it("a ledger need offers Drop beside Done, and Drop sets the project's word for 
   fireEvent.click(screen.getByRole("button", { name: "Drop" }));
   await waitFor(() => expect(changes().length).toBe(1));
   expect(changes()[0][1]).toMatchObject({ project: "atlas", id: "decision-7", change: { state: "DROPPED" } });
+});
+
+// Review 2c61369: a routing item with no key still offered Open Routing
+// settings. Every source, each needed key missing in turn: no action at all.
+it("no item missing a key it needs offers any action, routing items included", () => {
+  const full = {
+    ledger: { key: "ledger:atlas#n-1", project: "atlas", id: "n-1", actions: ["done", "drop", "answered", "open_ledger"] },
+    commitment: { key: "owed:42", project: "atlas", id: "42", actions: ["done", "snooze", "hide", "same", "not_same"],
+      looks_like: { id: "n-1", title: "Row n-1" } },
+    routing: { key: "routing:rule:1", project: null, id: null, actions: ["open_routing"] },
+  } as const;
+  const needs = { ledger: ["key", "project", "id"], commitment: ["key", "id"], routing: ["key"] } as const;
+  for (const source of ["ledger", "commitment", "routing"] as const) {
+    for (const missing of needs[source]) {
+      const item = { ...full[source], source, title: "Synthetic item", blocking: false, [missing]: null };
+      const doc = {
+        format: "khipu-work-view", version: 1, generated_at: "2026-10-15T12:00:00Z",
+        projects: [{ project: "atlas", name: "Atlas", source: { state: "none" }, jobs: [], prs: [], trains: [],
+          merged: [], flagged: 0, ledger: { rows: 1, by_state: {}, goals: [], loose_ends: [], loose_end_count: 0,
+            changed_today: [], vocab } }],
+        live: [], waiting: [item],
+        counts: { waiting: 1, blocking: 0, running: 0, flagged: 0, stale_sources: 0, ledger_outbox: 0 },
+      } as unknown as Doc;
+      render(<WorkView work={{ data: doc, error: null, loading: false, readAt: null, load: async () => {} }}
+        routing={{ data: null, error: null, loading: false, lastOkAt: null, firstRead: false, load: async () => {} }}
+        owedSection={null} owedFocusKey={0} onOwedClose={async () => {}} onSnooze={() => {}} onOpenRouting={() => {}} />);
+      const list = screen.getByRole("list", { name: "Waiting on you" });
+      const listItem = list.querySelector('[role="listitem"]')!;
+      expect(listItem.querySelectorAll("button, a").length, `${source} without ${missing}`).toBe(0);
+      cleanup();
+    }
+    expect(canAct({ ...full[source], source, title: "x", blocking: false } as never)).toBe(true);
+  }
 });

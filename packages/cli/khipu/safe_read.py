@@ -161,26 +161,59 @@ def _walk(folder: str) -> int:
     return dir_fd
 
 
+class NotFullPath(ValueError):
+    """A path that does not start at the top of the disk (or at ``~``)."""
+
+
+def parse(path: str | os.PathLike, *, full: bool = False) -> tuple[str, str]:
+    """(folder, file name) for a path exactly as the owner or a caller gave
+    it. This is the only place Khipu turns such a string into a place to
+    read: callers hand over the raw string and never normalise it first.
+
+    Nothing is collapsed: normalising "." or ".." away would name a different
+    file than the one given when a link sits before it ("link/.." is the
+    link's parent, not this folder), and dropping a trailing "/" would read a
+    file the caller named as a folder. So a path holding a "." or ".."
+    segment, an empty segment ("a//b") or a trailing separator is refused
+    (``Refused``). ``~`` at the start is the home folder. A relative path is
+    taken from the current folder, or refused with ``NotFullPath`` when
+    ``full``."""
+    raw = os.fspath(path)
+    if isinstance(raw, bytes):
+        raw = os.fsdecode(raw)
+    if not raw or "\x00" in raw:
+        raise Refused
+    if raw == "~" or raw.startswith("~" + os.sep):
+        home = os.path.expanduser("~")
+        if home == "~":
+            raise Refused
+        raw = home.rstrip(os.sep) + raw[1:]
+    if not os.path.isabs(raw):
+        if full:
+            raise NotFullPath
+        raw = os.getcwd().rstrip(os.sep) + os.sep + raw
+    parts = raw.split(os.sep)[1:]
+    if raw.endswith(os.sep) or any(part in ("", ".", "..") for part in parts):
+        raise Refused
+    folder, name = raw.rsplit(os.sep, 1)
+    return folder or os.sep, name
+
+
 def open_file(path: str | os.PathLike, limit: int = 0) -> Opened:
-    """Open ``path`` read-only as the module text says. Raises ``Refused``,
-    ``FileNotFoundError``, ``IsADirectoryError``, ``TooBig`` (over ``limit``
-    bytes; 0 is no limit) or ``OSError``."""
-    raw = os.path.expanduser(os.fspath(path))
-    # Normalising "." or ".." away would open a different file than the one
-    # named when a link sits before it ("link/.." is the link's parent, not
-    # this folder), so a path holding either is refused, never collapsed.
-    if any(part in (".", "..") for part in raw.split(os.sep)):
+    """Open ``path`` (the raw string, see ``parse``) read-only as the module
+    text says. Raises ``Refused``, ``FileNotFoundError``,
+    ``IsADirectoryError``, ``TooBig`` (over ``limit`` bytes; 0 is no limit)
+    or ``OSError``."""
+    folder, name = parse(path)
+    if private_place(os.path.join(folder, name)):
         raise Refused
-    p = Path(os.path.abspath(raw))
-    if private_place(str(p)):
-        raise Refused
-    folder = system_links_resolved(str(p.parent))
-    if private_place(os.path.join(folder, p.name)):
+    folder = system_links_resolved(folder)
+    if private_place(os.path.join(folder, name)):
         raise Refused
     dir_fd = _walk(folder)
     try:
         try:
-            fd = os.open(p.name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0),
+            fd = os.open(name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0),
                          dir_fd=dir_fd)
         except OSError as exc:
             if exc.errno in (errno.ELOOP, errno.ENOTDIR):
@@ -189,7 +222,7 @@ def open_file(path: str | os.PathLike, limit: int = 0) -> Opened:
     except BaseException:
         os.close(dir_fd)
         raise
-    opened = Opened(fd, os.fstat(fd), dir_fd, p.name, folder)
+    opened = Opened(fd, os.fstat(fd), dir_fd, name, folder)
     try:
         st = opened.st
         if stat.S_ISDIR(st.st_mode):
