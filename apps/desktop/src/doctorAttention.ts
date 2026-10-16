@@ -31,7 +31,7 @@ export type Attention = {
   cause: string;
   fix?: {
     label: string;
-    kind: "reinstall-hook" | "recall-probe" | "revisions" | "open-harnesses" | "apply-migrations" | "refresh-snapshot";
+    kind: "reinstall-hook" | "recall-probe" | "revisions" | "open-harnesses" | "apply-migrations" | "refresh-snapshot" | "storage-report";
   };
   harness?: string;
 };
@@ -440,6 +440,20 @@ export function buildAttention(parsed: Record<string, unknown>): {
       title: "The offline copy of your memory is out of date",
       cause: `${why} Recall reads it first, and turns to the slower database once a full rebuild is more than a day old.`,
       fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
+    });
+  }
+
+  // Disk space: amber warns while doctor's flag is still true, red is an error.
+  const ds = (parsed as { disk_space?: { level?: string; message?: string } }).disk_space;
+  if (ds && (ds.level === "amber" || ds.level === "red")) {
+    const red = ds.level === "red";
+    issues.push(red ? "Disk space is critically low" : "Disk space is running low");
+    items.push({
+      key: "disk_space",
+      tone: red ? "err" : "warn",
+      title: red ? "This Mac is almost out of disk space" : "This Mac is running low on disk space",
+      cause: ds.message || "Free space is below the level Khipu watches for.",
+      fix: { label: "Open storage report", kind: "storage-report" },
     });
   }
 

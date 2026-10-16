@@ -58,6 +58,7 @@ import { useModelVerify } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
+import { StorageReportDialog } from "./StorageReportDialog";
 import { OptionalFeatures } from "./OptionalFeatures";
 import { EmbeddingsPanel } from "./EmbeddingsPanel";
 import { fmtAgo, fmtAgoFromRead, fmtClock } from "./time";
@@ -2406,6 +2407,7 @@ export default function App() {
   const [noticeDialog, setNoticeDialog] = useState<LaunchPlan["dialog"]>(null);
   const [noticeCard, setNoticeCard] = useState<CardState | null>(null);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [storageReportOpen, setStorageReportOpen] = useState(false);
   const [feedbackSending, setFeedbackSending] = useState(false);
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -3698,6 +3700,8 @@ export default function App() {
                             void applyMigrations();
                           } else if (a.fix?.kind === "refresh-snapshot") {
                             void refreshSnapshot();
+                          } else if (a.fix?.kind === "storage-report") {
+                            setStorageReportOpen(true);
                           }
                         }}
                       >
@@ -4026,9 +4030,14 @@ export default function App() {
                     void applyMigrations();
                   } else if (fix.kind === "refresh-snapshot") {
                     void refreshSnapshot();
+                  } else if (fix.kind === "storage-report") {
+                    setStorageReportOpen(true);
                   }
                 }}
               />
+              {(doctorParsed?.storage as { line?: string } | undefined)?.line ? (
+                <p className="muted">{(doctorParsed?.storage as { line: string }).line}</p>
+              ) : null}
               <Disclosure label="Raw report">
                 <div className="rows-head">Doctor report</div>
                 <RawBlock text={doctorText} />
@@ -6000,6 +6009,12 @@ export default function App() {
         onClose={() => setFeedbackOpen(false)}
         onSendingChange={setFeedbackSending}
         returnFocusRef={feedbackButtonRef}
+      />
+
+      <StorageReportDialog
+        open={storageReportOpen}
+        run={runKhipu}
+        onClose={() => setStorageReportOpen(false)}
       />
 
       <PostUpdateNoticeDialog
