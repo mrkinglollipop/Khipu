@@ -997,6 +997,19 @@ describe("a Codex whose live read failed (fix round 3)", () => {
     expect(group.getAllByText(/last turn/)).toHaveLength(1);
   });
 
+  it("labels figures from Codex's session-file fallback as from its last conversation in Settings", async () => {
+    const r = realReport();
+    Object.assign(r.accounts![1], {
+      ok: true, source: "rollout", observed_at: "2026-10-11T14:00:00Z", live_error: "no_answer",
+      note: "Codex did not answer just now; these figures are from its last turn",
+    });
+    status = r;
+    render(<Settings />);
+    const group = within(await screen.findByRole("group", { name: "Codex" }));
+    expect(group.getByText(/^From its last conversation/)).toBeTruthy();
+    expect(group.queryByText(/^As of its last turn/)).toBeNull();
+  });
+
   it("names it in the health report's Plans row", () => {
     const r = signedOutCodex();
     expect(liveReadFailures(r)).toEqual(["Codex is showing its last turn (not signed in)"]);

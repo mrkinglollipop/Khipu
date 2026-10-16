@@ -871,6 +871,10 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
           <Tag tone="ok" dot>
             {triedAge ? `Live: read ${triedAge}` : "Live"}
           </Tag>
+        ) : row.source === "rollout" && windows.length && !fail?.includes("last turn") ? (
+          // Codex's session-file fallback, kept for tracked accounts only (decision
+          // 21); a failure line that already says "last turn" says it once.
+          <span>{figuresAge ? `From its last conversation, ${figuresAge}` : "From its last conversation"}</span>
         ) : row.observed_at && windows.length && !fail?.includes("last turn") ? (
           <span>{figuresAge ? `As of its last turn, ${figuresAge}` : "As of its last turn"}</span>
         ) : windows.length ? (
