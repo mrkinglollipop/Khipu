@@ -289,6 +289,7 @@ def project_slice(
     episode_limit: int = 5,
     topic_limit: int = 3,
     decision_limit: int = 5,
+    job: bool = False,
 ) -> dict[str, Any]:
     """W4 pushed-slice reads for a resolved repo: open commitments, recent
     episodes for the project, the topic pages those episodes actually link
@@ -308,6 +309,11 @@ def project_slice(
     hub_snapshot degrade and the visible ``stale`` line; this function stays
     a plain read with no fail-open of its own, same posture as every other
     function in this module.
+
+    Items for the orchestrator (owner ``agent``, from its jobs) follow the
+    ``commitment_limit`` others, at most ``owed_orchestrator_slice_max`` of
+    them (0: no limit), and only for a conversation: a ``job`` session sees
+    none (owed scope, decision 2).
     """
     from khipu import commitments as _commitments
     from khipu import decisions as _decisions
@@ -324,10 +330,17 @@ def project_slice(
                 # must not reappear in the session-start slice before its
                 # due date, even though `khipu owed`/the desktop still list
                 # it so it can be managed.
-                owed = _commitments.list_owed(
-                    cur, project=project, status="open", limit=commitment_limit,
+                rows = _commitments.list_owed(
+                    cur, project=project, status="open", limit=None,
                     hide_snoozed=True,
                 )
+                owed = [r for r in rows if r.get("owner") != _commitments.OWNER_AGENT][:commitment_limit]
+                if not job:
+                    from khipu.config import count_setting
+
+                    cap = count_setting("owed_orchestrator_slice_max")
+                    agents = [r for r in rows if r.get("owner") == _commitments.OWNER_AGENT]
+                    owed += agents[:cap] if cap else agents
                 from datetime import timedelta
 
                 decisions = _decisions.standing_decisions(

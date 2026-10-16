@@ -284,7 +284,7 @@ class DrainTest(unittest.TestCase):
                 "parent_session_id": "aegis:parent-1",
             })
             captured = []
-            with mock.patch("khipu.extract.extract_memory", lambda t, *, cwd="": {
+            with mock.patch("khipu.extract.extract_memory", lambda t, *, cwd="", **kw: {
                     "summary": "s", "topics": [], "decisions": [], "preferences": [],
                     "scope": "", "edges": [], "topic_pages": []}), \
                     mock.patch("khipu.capture.capture", lambda p, mode=None: captured.append(p) or 0), \

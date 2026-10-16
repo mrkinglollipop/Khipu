@@ -474,6 +474,64 @@ def minute_settings_status() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Counts: how many of something to show or take at once, whole numbers >= 0,
+# 0 = no limit (every limit Khipu enforces is liftable on the spot).
+# `owed_orchestrator_slice_max` is how many items for the orchestrator (owner
+# `agent`, from its jobs) a conversation's session-start list shows
+# (docs/plans/2026-10-16-owed-and-ledger-ssot.md, decision 2).
+# ---------------------------------------------------------------------------
+
+COUNT_SETTINGS: dict[str, int] = {
+    "owed_orchestrator_slice_max": 3,
+}
+
+
+def parse_count_setting(key: str, raw: "str | int") -> int:
+    """``raw`` as a whole number >= 0; ValueError names the key otherwise."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a whole number >= 0 (0 for no limit), got {raw!r}") from None
+    if value < 0:
+        raise ValueError(f"{key} must be a whole number >= 0 (0 for no limit), got {value}")
+    return value
+
+
+def count_setting(key: str) -> int:
+    """The stored count for ``key``, or its default when unset or invalid.
+    0 means no limit."""
+    if key not in COUNT_SETTINGS:
+        raise KeyError(f"unknown count setting {key!r}; known: {sorted(COUNT_SETTINGS)}")
+    stored = load_config().get(key)
+    if isinstance(stored, int) and not isinstance(stored, bool) and stored >= 0:
+        return stored
+    return COUNT_SETTINGS[key]
+
+
+def set_count_setting(key: str, value: "str | int | None") -> Path:
+    if key not in COUNT_SETTINGS:
+        raise KeyError(f"unknown count setting {key!r}; known: {sorted(COUNT_SETTINGS)}")
+    with mutate_config() as data:
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = parse_count_setting(key, value)
+        return config_file()
+
+
+def count_settings_status() -> dict:
+    """Every count setting with its value, source and default, for
+    ``khipu config``."""
+    stored = load_config()
+    out = {}
+    for key, default in COUNT_SETTINGS.items():
+        value = count_setting(key)
+        source = "file" if key in stored and stored.get(key) == value else "default"
+        out[key] = {"value": value, "source": source, "default": default, "no_limit": 0}
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Choice settings: one of a fixed set of words. `synth_fallback` says what
 # happens when a summariser provider other than Gemini fails a window
 # (account limit, not logged in, transport error, a reply that is not the

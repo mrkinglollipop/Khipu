@@ -955,7 +955,7 @@ def run_session_ended_pass(
     with or without migration 0013: the two fields are computed in memory and
     only written back when the column is there.
     """
-    from khipu.commitments import has_future_trigger, is_reporting_text, resolve_owner
+    from khipu.commitments import has_future_trigger, is_reporting_text, row_owner
     from khipu.db import has_columns
 
     rows = _select_open_with_session(cur, project=project, limit=limit, hours=hours)
@@ -970,11 +970,14 @@ def run_session_ended_pass(
     for row in rows:
         text = row["text"] or ""
         trigger = has_future_trigger(text)
-        owner = resolve_owner(text, kind=row.get("kind"), declared=row.get("owner"),
-                              future_trigger=trigger)
+        owner, _label = row_owner(row, future_trigger=trigger)
         ended = bool(row.get("aged")) or bool(row.get("end_event"))
         if owner == "user":
             verdict, reason = "keep", "user-owed"
+        elif owner == "agent":
+            # A job's item for its orchestrator (migration 0033) outlives the
+            # job's session, like the user's.
+            verdict, reason = "keep", "agent-owed"
         elif trigger:
             verdict, reason = "keep", "future trigger"
         elif ended:

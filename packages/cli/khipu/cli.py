@@ -3127,6 +3127,7 @@ def _owner_only(args: argparse.Namespace) -> "str | int":
 def cmd_config(args: argparse.Namespace) -> int:
     from khipu.config import (
         CHOICE_SETTINGS,
+        COUNT_SETTINGS,
         FLOAT_SETTINGS,
         INT_SETTINGS,
         LIST_SETTINGS,
@@ -3398,6 +3399,17 @@ def cmd_config(args: argparse.Namespace) -> int:
         return 0
     if (args.set and args.set[0] == "promote_gate_ignore") or args.unset == "promote_gate_ignore":
         return _config_gate_override(args)
+    if (args.set and args.set[0] in COUNT_SETTINGS) or args.unset in COUNT_SETTINGS:
+        from khipu.config import count_settings_status, set_count_setting
+
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = set_count_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: count_settings_status()[key], "config_file": str(path)}))
+        return 0
     if (args.set and args.set[0] in MINUTE_SETTINGS) or args.unset in MINUTE_SETTINGS:
         from khipu.config import minute_settings_status, set_minute_setting
 
@@ -3482,6 +3494,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         float_settings_status,
         graph_backup_remote_status,
         list_setting,
+        count_settings_status,
         minute_settings_status,
         path_settings_status,
     )
@@ -3500,6 +3513,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "user_aliases": list(list_setting("user_aliases")),
         "float_settings": float_settings_status(),
         "minute_settings": minute_settings_status(),
+        "count_settings": count_settings_status(),
         "promote_gate_ignore": _promote_gate_ignore_status(),
         "relevance_cosine_floor": relevance.cosine_floor_status(),
         "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),

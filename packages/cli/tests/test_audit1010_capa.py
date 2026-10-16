@@ -284,7 +284,7 @@ class CaptureCapaTest(unittest.TestCase):
                 effects.append(f"close:{part}")
                 return 0
 
-            with mock.patch("khipu.extract.extract_memory", lambda text, *, cwd="": {
+            with mock.patch("khipu.extract.extract_memory", lambda text, *, cwd="", **kw: {
                     "summary": text, "topics": [], "decisions": [], "preferences": [], "scope": "", "edges": [], "topic_pages": []}), \
                     mock.patch("khipu.capture.capture", capture), \
                     mock.patch("khipu.config.capture_mode", lambda: "hub"):

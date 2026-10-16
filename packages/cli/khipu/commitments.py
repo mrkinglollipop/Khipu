@@ -47,6 +47,13 @@ _GENERIC_USER_OWNER_WORDS = ("user", "operator", "human", "you", "owner")
 _GENERIC_USER_REGEX_PHRASES = ("the user", "user", "the operator", "you")
 OWNER_USER = "user"
 OWNER_ASSISTANT = "assistant"
+# A third party: the orchestrator that dispatched a job, a PR's author, the
+# reviewer, a builder. Stored with ``owner_label`` (migration 0033) naming
+# which; never "needs the user" and never retired by its job's session end.
+OWNER_AGENT = "agent"
+ORCHESTRATOR = "orchestrator"
+ORIGIN_CONVERSATION = "conversation"
+ORIGIN_JOB = "job"
 _DONE_PREFIX_RE = re.compile(r"^\s*done\s*:\s*", re.I)
 _ISO_Z_RE = re.compile(r"Z$")
 _RELATIVE_DUE_RE = re.compile(
@@ -370,6 +377,82 @@ def reset_user_patterns() -> None:
     _compile_user_patterns.cache_clear()
 
 
+# ---------------------------------------------------------------------------
+# Third-party actors (2026-10-16, owed-and-ledger scope slice 1). In a busy
+# orchestrated project most open items named neither the user nor the
+# assistant but "the orchestrator", "PR #234's author", "the reviewer"; with
+# only two owners they all became the user's. A third-party actor governing a
+# verb makes the item an ``agent`` item with that label. Checked BEFORE the
+# user words, so "the owner of PR #12 to rebase" is the PR author's, not the
+# user's ("owner" is one of the generic user words).
+# ---------------------------------------------------------------------------
+
+_ACTOR_VERBS = (
+    r"(?:to\s+\w+|will\s+\w+|must\b|should\b|needs?\s+to\b|has\s+to\b|have\s+to\b|"
+    r"owes?\b|owns?\b|decides?\b|approves?\b|confirms?\b|picks?\b|chooses?\b|"
+    r"reviews?\b|merges?\b|rebases?\b|renumbers?\b|resolves?\b|fixes\b|answers?\b|"
+    r"rules?\b|signs?\b)"
+)
+_PR = r"(?:PR|pull\s+request)(?:\s*#?\d+)?"
+_AGENT_ACTORS: tuple[tuple[str, str], ...] = (
+    ("PR author", rf"(?:the\s+)?(?:author|owner)\s+of\s+(?:the\s+)?{_PR}"
+                  rf"|(?:the\s+)?{_PR}(?:'s|’s)?\s+(?:author|owner)"),
+    (ORCHESTRATOR, r"(?:the\s+)?orchestrator"),
+    ("reviewer", r"(?:the\s+)?reviewers?"),
+    ("builder", r"(?:the\s+)?builder"),
+    ("Codex", r"codex"),
+    ("a job", r"(?:the|a|another|the\s+other|the\s+next)\s+job"),
+)
+
+
+@lru_cache(maxsize=1)
+def _agent_actor_res() -> tuple[tuple[str, "re.Pattern[str]"], ...]:
+    out = []
+    for label, actor in _AGENT_ACTORS:
+        out.append((label, re.compile(
+            rf"\b(?:{actor})(?:'s|’s)\s+(?:action|call|decision|approval|sign-?off|move|turn|job|task)\b"
+            rf"|\b(?:{actor})\s+{_ACTOR_VERBS}"
+            rf"|\bup\s+to\s+(?:{actor})\b"
+            rf"|\bfor\s+(?:{actor})\s+to\s+\w+",
+            re.I,
+        )))
+    return tuple(out)
+
+
+def agent_actor(text: str) -> str | None:
+    """The label of the third party the text names as its actor, or None.
+    The earliest match wins when several are named."""
+    s = (text or "").strip()
+    best: tuple[int, str] | None = None
+    for label, pattern in _agent_actor_res():
+        m = pattern.search(s)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), label)
+    return best[1] if best else None
+
+
+def clean_owner_label(raw: Any) -> str | None:
+    """A model- or caller-supplied owner label as a short plain name, or None."""
+    val = " ".join(str(raw or "").split()).strip(" .:")
+    return val[:40] or None
+
+
+def capture_origin(payload: dict[str, Any]) -> str:
+    """``job`` for a dispatched job's capture, else ``conversation``.
+
+    A job is a capture with lineage (``parent_session_id``: a Claude Code
+    child, a SubagentStop, or a runner that set ``KHIPU_PARENT_SESSION``) or
+    one its hook marked as a job (``session_origin: job``, from
+    ``KHIPU_JOB=1``; not ``origin``, which is the episode's server-stamped
+    owner and is dropped from every payload). Unknown stays
+    ``conversation``, the behaviour before origin existed."""
+    if str(payload.get("session_origin") or "").strip().lower() == ORIGIN_JOB:
+        return ORIGIN_JOB
+    if str(payload.get("parent_session_id") or "").strip():
+        return ORIGIN_JOB
+    return ORIGIN_CONVERSATION
+
+
 def has_future_trigger(text: str) -> bool:
     """True when the text carries an explicit CROSS-SESSION condition — the
     one thing that makes an assistant promise outlive its own session."""
@@ -454,26 +537,75 @@ def _user_signal(text: str, *, kind: str | None = None, future_trigger: bool | N
     return bool(patterns.actor_re.search(body) or patterns.decision_re.search(body))
 
 
-def resolve_owner(text: str, *, kind: str | None = None, declared: Any = None,
-                  future_trigger: bool | None = None) -> str:
-    """'user' or 'assistant' for one commitment.
+def _declared(raw: Any) -> str | None:
+    """The model's declared owner: 'user', 'assistant', 'other' or None."""
+    if str(raw or "").strip().lower().rstrip(":") == "other":
+        return "other"
+    return normalize_owner(raw)
 
-    User when the text names the user/Matt as the actor, asks for a decision /
-    approval / confirmation / review / merge / test by the user, or is a
-    question. Assistant otherwise. The deterministic signal WINS: a
+
+def resolve_owner_and_label(text: str, *, kind: str | None = None, declared: Any = None,
+                            future_trigger: bool | None = None,
+                            origin: str | None = None,
+                            declared_label: Any = None) -> tuple[str, str | None]:
+    """``(owner, owner_label)`` for one commitment, deterministically, in order:
+
+    1. A third party named as the actor ("the orchestrator must", "PR #234
+       author to") is that party's: ``agent`` with its label.
+    2. From a job (``origin == 'job'``): a user signal (a question, a
+       decision shape, "Matt to decide X") or a model-declared ``"user"``
+       goes to the orchestrator, because a job's user is its dispatcher. The
+       orchestrator asks the user itself if it really needs them.
+    3. Otherwise today's rule: a user signal is the user's; with no signal
+       and no future trigger, the model's declared owner ("other" with its
+       label becomes ``agent``); else the assistant's.
+    """
+    if future_trigger is None:
+        future_trigger = has_future_trigger(text)
+    s = (text or "").strip()
+    body = _without_trigger_clause(s) if future_trigger is not False else s
+    label = agent_actor(body)
+    if label:
+        return OWNER_AGENT, label
+    job = str(origin or "").strip().lower() == ORIGIN_JOB
+    if _user_signal(text, kind=kind, future_trigger=future_trigger):
+        return (OWNER_AGENT, ORCHESTRATOR) if job else (OWNER_USER, None)
+    if not future_trigger:
+        norm = _declared(declared)
+        if norm == "other":
+            return OWNER_AGENT, clean_owner_label(declared_label) or (ORCHESTRATOR if job else "other")
+        if norm == OWNER_USER:
+            return (OWNER_AGENT, ORCHESTRATOR) if job else (OWNER_USER, None)
+        if norm:
+            return norm, None
+    return OWNER_ASSISTANT, None
+
+
+def resolve_owner(text: str, *, kind: str | None = None, declared: Any = None,
+                  future_trigger: bool | None = None, origin: str | None = None) -> str:
+    """'user', 'assistant' or 'agent' for one commitment; see
+    :func:`resolve_owner_and_label`. The deterministic signal WINS: a
     model-supplied ``declared`` owner is consulted only when the text carries
     no signal at all and no future trigger (a trigger clause is exactly where
     a model picks up the wrong name — "When Matt says …" is not Matt's item).
     """
-    if future_trigger is None:
-        future_trigger = has_future_trigger(text)
-    if _user_signal(text, kind=kind, future_trigger=future_trigger):
-        return OWNER_USER
-    if not future_trigger:
-        norm = normalize_owner(declared)
-        if norm:
-            return norm
-    return OWNER_ASSISTANT
+    return resolve_owner_and_label(text, kind=kind, declared=declared,
+                                   future_trigger=future_trigger, origin=origin)[0]
+
+
+def row_owner(row: dict[str, Any], *, future_trigger: bool | None = None) -> tuple[str, str | None]:
+    """``(owner, owner_label)`` for a stored row. A stored ``agent`` owner is
+    authoritative (only the rules above, or an explicit reassign, write it,
+    and its text may no longer show why, as with a job's "Matt to decide X");
+    anything else is re-resolved from the text, with the row's origin."""
+    if str(row.get("owner") or "").strip().lower() == OWNER_AGENT:
+        return OWNER_AGENT, (clean_owner_label(row.get("owner_label"))
+                             or agent_actor(row.get("text") or "") or ORCHESTRATOR)
+    return resolve_owner_and_label(
+        row.get("text") or "", kind=row.get("kind"), declared=row.get("owner"),
+        future_trigger=future_trigger, origin=row.get("origin"),
+        declared_label=row.get("owner_label"),
+    )
 
 
 def is_reporting_text(text: str) -> bool:
@@ -546,7 +678,9 @@ def rejection_reason(text: str, *, owner: str | None = None,
         return "reporting"
     if len(re.findall(r"[A-Za-z0-9][A-Za-z0-9'./-]*", s)) < MIN_COMMITMENT_WORDS:
         return "too-short"
-    if not _has_action_verb(s):
+    if not _has_action_verb(s) and not agent_actor(s):
+        # A third party named as the actor of a verb ("PR #234 author to
+        # renumber migration 115") names its action by construction.
         return "no-action"
     return None
 
@@ -642,7 +776,7 @@ def _normalize_open_loop(item: Any) -> dict[str, Any] | None:
         if not text:
             return None
         return {"text": text, "kind": "followup", "due_after": None, "owner": None,
-                "future_trigger": None}
+                "owner_label": None, "future_trigger": None}
     if not isinstance(item, dict):
         return None
     text = str(item.get("text") or "").strip()
@@ -656,6 +790,7 @@ def _normalize_open_loop(item: Any) -> dict[str, Any] | None:
         "kind": kind,
         "due_after": item.get("due_after") or None,
         "owner": item.get("owner") or None,
+        "owner_label": item.get("owner_label") or None,
         # Asked for in the prompt, kept for the record — the deterministic
         # detector decides the stored value (see resolve_owner/has_future_trigger).
         "future_trigger": item.get("future_trigger"),
@@ -730,6 +865,19 @@ def _trigger_text_ready(cur) -> bool:
         return False
 
 
+def _owner_columns_ready(cur) -> bool:
+    """True when migration 0033 (commitments.origin / owner_label) has been
+    applied. Fail-closed like the others: a pre-migration hub still stores
+    the resolved owner (``agent`` included, the column is plain text) and
+    answers every read; it only lacks the origin, the label and the relay."""
+    try:
+        from khipu.db import has_columns
+
+        return has_columns(cur, "commitments", "origin", "owner_label")
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
 def _touch_seen(cur, commitment_id: int) -> None:
     """Record that a later capture restated an already-open commitment.
 
@@ -749,7 +897,8 @@ def _touch_seen(cur, commitment_id: int) -> None:
 
 def _near_duplicate_open(cur, scope: str | None, text: str, *,
                          payload: dict[str, Any] | None = None,
-                         episode_id: int | None = None) -> int | None:
+                         episode_id: int | None = None,
+                         rows: list[dict[str, Any]] | None = None) -> int | None:
     """id of an already-OPEN commitment in the same scope that says the same
     thing, or None.
 
@@ -760,7 +909,8 @@ def _near_duplicate_open(cur, scope: str | None, text: str, *,
     signal; cosine against the stored commitment embeddings is the semantic
     one, at the same bar ``auto_close`` uses to close on a paraphrase.
     """
-    rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id)
+    if rows is None:
+        rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id)
     if not rows:
         return None
     best_id, best_score = None, 0.0
@@ -805,8 +955,11 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     seen_ready = _seen_columns_ready(cur)
     trigger_ready = _future_trigger_ready(cur)
     trigger_text_ready = _trigger_text_ready(cur)
+    owner_ready = _owner_columns_ready(cur)
+    origin = capture_origin(payload)
     inserted = 0
     rejected = 0
+    relayed = 0
     for raw in items:
         norm = _normalize_open_loop(raw)
         if norm is None:
@@ -815,8 +968,9 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
         # anything else looks at the item: the reporting rule (rule 3) is
         # owner-dependent, and both fields are stored on the row.
         trigger = has_future_trigger(norm["text"])
-        owner = resolve_owner(
-            norm["text"], kind=norm["kind"], declared=norm["owner"], future_trigger=trigger
+        owner, owner_label = resolve_owner_and_label(
+            norm["text"], kind=norm["kind"], declared=norm["owner"], future_trigger=trigger,
+            origin=origin, declared_label=norm.get("owner_label"),
         )
         reason = rejection_reason(norm["text"], owner=owner, kind=norm["kind"])
         if reason is not None:
@@ -830,14 +984,48 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             lineage = payload.get("parent_session_id") or payload.get("session_id")
             lifecycle_scope = f"session:{lineage}" if lineage else f"episode:{episode_id}"
         h = content_hash(lifecycle_scope, norm["text"])
-        existing = _open_id_for_hash(cur, scope, h)
-        if existing is None:
-            existing = _near_duplicate_open(cur, scope, norm["text"],
-                                            payload=payload, episode_id=episode_id)
+        # The relay (owed scope, design (a)): a conversation's item that says
+        # what an open JOB item of the same project says is the orchestrator
+        # relaying it. The conversation's item is kept as its own row; the
+        # job's is closed as relayed by it. Dedup for a conversation item
+        # therefore looks at conversation rows only. Never the other way: a
+        # job item that matches a conversation item is folded into it, as
+        # before.
+        relay_ids: list[int] = []
+        if owner_ready and scope is not None and origin == ORIGIN_CONVERSATION:
+            rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id,
+                                     with_origin=True)
+            job_rows = [r for r in rows if r.get("origin") == ORIGIN_JOB]
+            own_rows = [r for r in rows if r.get("origin") != ORIGIN_JOB]
+            exact = _open_id_for_hash(cur, scope, h)
+            existing = exact if any(r["id"] == exact for r in own_rows) else None
+            if existing is None:
+                existing = _near_duplicate_open(cur, scope, norm["text"], rows=own_rows)
+            if existing is None and job_rows:
+                relay_ids = _relay_matches(cur, norm["text"], exact, scope, job_rows)
+        else:
+            existing = _open_id_for_hash(cur, scope, h)
+            if existing is None:
+                existing = _near_duplicate_open(cur, scope, norm["text"],
+                                                payload=payload, episode_id=episode_id)
         if existing is not None:
             if seen_ready:
                 _touch_seen(cur, existing)
             continue
+        for rid in relay_ids:
+            # Closed before the insert: an identical text shares the open
+            # (project, content_hash) slot the unique index guards. The
+            # reason names the new row once it exists (below).
+            cur.execute(
+                f"""
+                UPDATE commitments
+                SET status = 'closed', closed_episode = %s, closed_at = now(),
+                    close_reason = %s
+                WHERE id = %s AND status = 'open'
+                  AND {_not_forgotten_clause(cur)}
+                """,
+                (episode_id, "relayed-by a conversation item", rid),
+            )
         due_sql, due_param = _parse_due_after(norm["due_after"])
         stored_text = norm["text"]
         due_phrase = str(norm["due_after"] or "").strip()
@@ -858,33 +1046,63 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             cols += ", trigger_text"
             vals += ", %s"
             params = (*params, trigger_clause(norm["text"]) if trigger else None)
+        if owner_ready:
+            cols += ", origin, owner_label"
+            vals += ", %s, %s"
+            params = (*params, origin, owner_label)
+        returning = " RETURNING id" if owner_ready else ""
         cur.execute(
             f"""
             INSERT INTO commitments
               ({cols})
             VALUES ({vals})
-            ON CONFLICT (project, content_hash) WHERE status = 'open' DO NOTHING
+            ON CONFLICT (project, content_hash) WHERE status = 'open' DO NOTHING{returning}
             """,
             params,
         )
         if cur.rowcount > 0:
             inserted += 1
+            if relay_ids:
+                row = cur.fetchone()
+                if row:
+                    cur.execute("UPDATE commitments SET close_reason = %s WHERE id = ANY(%s)",
+                                (f"relayed-by {int(row[0])}", relay_ids))
+                relayed += len(relay_ids)
     if inserted or rejected:
         _log(
-            f"opened {inserted} commitment(s), rejected {rejected}, for episode "
-            f"{episode_id} (scope={scope!r})"
+            f"opened {inserted} commitment(s), rejected {rejected}, relayed {relayed}, for "
+            f"episode {episode_id} (scope={scope!r}, origin={origin})"
         )
     return inserted
 
 
+def _relay_matches(cur, text: str, exact: int | None, scope: str | None,
+                   job_rows: list[dict[str, Any]]) -> list[int]:
+    """Open job items this conversation item restates: the exact text, or
+    every one at or above today's near-duplicate bar, or else the best
+    cosine match at ``commitment_close_similarity`` (the same test
+    :func:`_near_duplicate_open` uses)."""
+    if exact is not None and any(r["id"] == exact for r in job_rows):
+        return [exact]
+    hits = [r["id"] for r in job_rows if _match_score(text, r["text"]) >= NEAR_DUP_MIN_SCORE]
+    if hits:
+        return hits
+    best = _near_duplicate_open(cur, scope, text, rows=job_rows)
+    return [best] if best is not None else []
+
+
 def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None = None,
-                      episode_id: int | None = None) -> list[dict[str, Any]]:
+                      episode_id: int | None = None,
+                      with_origin: bool = False) -> list[dict[str, Any]]:
     lineage, params = _lineage_clause(cur, payload or {"project": scope}, episode_id)
+    cols = "id, text, origin" if with_origin else "id, text"
     cur.execute(
-        "SELECT id, text FROM commitments WHERE status = 'open' AND project IS NOT DISTINCT FROM %s "
+        f"SELECT {cols} FROM commitments WHERE status = 'open' AND project IS NOT DISTINCT FROM %s "
         f"AND {lineage} AND {_not_forgotten_clause(cur)}",
         (scope, *params),
     )
+    if with_origin:
+        return [{"id": r[0], "text": r[1], "origin": r[2]} for r in cur.fetchall()]
     return [{"id": r[0], "text": r[1]} for r in cur.fetchall()]
 
 
@@ -1204,11 +1422,10 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
     closed = 0
     for row in rows:
         trigger = has_future_trigger(row["text"])
-        owner = resolve_owner(
-            row["text"], kind=row.get("kind"), declared=row.get("owner"),
-            future_trigger=trigger,
-        )
-        if _is_user_owed(row) or owner == OWNER_USER:
+        owner, _label = row_owner(row, future_trigger=trigger)
+        # Only the assistant's own items die with its session: the user's,
+        # and an agent's (a job's item for its orchestrator), outlive it.
+        if _is_user_owed(row) or owner != OWNER_ASSISTANT:
             continue
         if is_end and not trigger:
             # The session-ended rule: an assistant promise with no explicit
@@ -1284,6 +1501,8 @@ def list_owed(cur, *, project: str | None = None, parent_session_id: str | None 
     select_cols = list(cols) + (["last_seen_at", "seen_count"] if extra else [])
     if _future_trigger_ready(cur):
         select_cols.append("future_trigger")
+    if _owner_columns_ready(cur):
+        select_cols += ["origin", "owner_label"]
     cur.execute(
         f"""
         SELECT {', '.join(select_cols)}
@@ -1308,13 +1527,12 @@ def finish_owed_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict
         # before migration 0013 carry a model-supplied owner ("Peer 1",
         # "ASSISTANT", NULL) and no future_trigger at all, and the desktop's
         # "Needs you" section is exactly `owner == 'user'`. Deterministic
-        # detection wins, so a legacy row lists the same way a new one does.
+        # detection wins, so a legacy row lists the same way a new one does;
+        # a stored `agent` owner (migration 0033's third owner) is kept.
         trigger = has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
         row["future_trigger"] = trigger
-        row["owner"] = resolve_owner(
-            row.get("text") or "", kind=row.get("kind"),
-            declared=row.get("owner"), future_trigger=trigger,
-        )
+        row["owner"], row["owner_label"] = row_owner(row, future_trigger=trigger)
+        row.setdefault("origin", None)
         # Sort rank for the Owed surface: user-owed first (blocker → question →
         # everything else the user owes), then assistant promises with an
         # explicit future trigger, then the rest by kind. Computed here so the

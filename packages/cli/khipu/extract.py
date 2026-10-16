@@ -42,7 +42,7 @@ Output ONLY a single JSON object (no prose, no markdown fences) with these keys:
 - decisions: list of strings
 - preferences: list of strings
 - scope: short string
-- open_loops: list of objects {{text, kind, due_after, owner, future_trigger}}. BE STRICT —
+- open_loops: list of objects {{text, kind, due_after, owner, owner_label, future_trigger}}. BE STRICT —
   an empty list is the right answer for most sessions. Include an item ONLY if
   it is (a) something the USER must decide, provide, approve, or do, or (b)
   something you explicitly promised to do in a FUTURE session and cannot
@@ -67,7 +67,11 @@ Output ONLY a single JSON object (no prose, no markdown fences) with these keys:
   verdict is pending".
   kind is one of "followup", "blocker", "question", "promise".
   owner is "user" (the USER must decide/provide/approve/do it, or it is a
-  question for them) or "assistant" — always answer it.
+  question for them), "assistant", or "other" (someone else named as the
+  one who must act: the orchestrator, a pull request's author, a reviewer, a
+  builder, another job) — always answer it. owner_label is a short name for
+  that someone ("orchestrator", "PR author", "reviewer"), or null when owner
+  is not "other".
   future_trigger is true ONLY when the text names an explicit cross-session
   condition ("when Matt says the lane is re-authed, ...", "next session",
   "after the wave merges", "if attempt six dies"); false otherwise.
@@ -89,6 +93,19 @@ Session project (cwd): {cwd}
 
 Transcript:
 {transcript}
+"""
+
+# Spliced in before the "Session project (cwd):" block for a dispatched
+# job's transcript only (owed scope 2026-10-16, design (a) rule 4). The
+# person typing in a job is the orchestrator that dispatched it, so the
+# model must not record the orchestrator's asks as the user's. Khipu's own
+# deterministic owner rule still wins on conflict (khipu.commitments).
+JOB_SECTION = """
+This transcript is a dispatched job's: the "user" turns were written by the
+orchestrator that dispatched it, not by the person who owns the project.
+Something the orchestrator (or the person, through it) must decide, answer or
+do is owner "other" with owner_label "orchestrator", even when the text names
+the person ("Matt to decide X" in a job is the orchestrator's to raise).
 """
 
 # Appended after PROMPT, before the ``.format()`` call, ONLY when the
@@ -893,7 +910,7 @@ def _as_open_loops(v: Any) -> list[dict[str, Any]]:
         kind = str(item.get("kind") or "followup").strip().lower()
         if kind not in ("followup", "blocker", "question", "promise"):
             kind = "followup"
-        out.append({
+        loop = {
             "text": text,
             "kind": kind,
             "due_after": item.get("due_after") or None,
@@ -901,7 +918,13 @@ def _as_open_loops(v: Any) -> list[dict[str, Any]]:
             # Carried through for the record; khipu.commitments decides the
             # stored value deterministically (has_future_trigger wins).
             "future_trigger": item.get("future_trigger"),
-        })
+        }
+        label = item.get("owner_label")
+        if isinstance(label, str) and label.strip():
+            # Only for an "other" owner; khipu.commitments keeps it when no
+            # rule names the owner.
+            loop["owner_label"] = label.strip()[:40]
+        out.append(loop)
     return out
 
 
@@ -947,21 +970,25 @@ def _as_decision_details(v: Any, decisions: list[str]) -> list[dict[str, Any]]:
     return out
 
 
-def _build_prompt(*, cwd: str, transcript: str) -> str:
+def _build_prompt(*, cwd: str, transcript: str, job: bool = False) -> str:
     """PROMPT, plus DECISION_DETAILS_SECTION spliced in right before the
     trailing "Session project (cwd):" block, ONLY when the `decision_details`
-    switch is on. With the switch off this returns exactly
+    switch is on, and JOB_SECTION the same way for a dispatched job's
+    transcript. With the switch off, for a conversation, this returns exactly
     ``PROMPT.format(...)`` — the invariant every extraction test pins."""
+    marker = "\nSession project (cwd):"
     template = PROMPT
     try:
         from khipu import features
 
         if features.enabled("decision_details"):
-            marker = "\nSession project (cwd):"
-            idx = PROMPT.index(marker)
-            template = PROMPT[:idx] + DECISION_DETAILS_SECTION + PROMPT[idx:]
+            idx = template.index(marker)
+            template = template[:idx] + DECISION_DETAILS_SECTION + template[idx:]
     except Exception:  # noqa: BLE001 — the switch registry must never block extraction
         template = PROMPT
+    if job:
+        idx = template.index(marker)
+        template = template[:idx] + JOB_SECTION + template[idx:]
     return template.format(cwd=cwd or "(unknown)", transcript=transcript)
 
 
@@ -1015,13 +1042,14 @@ def _blank_capture(parsed: dict[str, Any]) -> bool:
         parsed.get(k) for k in ("decisions", "preferences", "open_loops", "closed_loops"))
 
 
-def extract_memory(transcript: str, *, cwd: str = "") -> dict[str, Any] | None:
+def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict[str, Any] | None:
     """Return a capture payload (without ts/session_id) or None when the model
     judged nothing durable. Raises on transport/model failure so the caller can
-    decide whether to retry later (it must NOT mark the window consumed)."""
+    decide whether to retry later (it must NOT mark the window consumed).
+    ``job``: the transcript is a dispatched job's (see JOB_SECTION)."""
     if not transcript.strip():
         return None
-    prompt = _build_prompt(cwd=cwd, transcript=transcript)
+    prompt = _build_prompt(cwd=cwd, transcript=transcript, job=job)
     from khipu.models import DEFAULT_SYNTH_MODEL
 
     def _gemini_retry() -> str:
