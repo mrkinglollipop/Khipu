@@ -1112,11 +1112,33 @@ def _run_legacy_group(argv: list[str], *, input: str, env: dict[str, str],
     done. On timeout or cancel the whole group is killed and waited for.
     A process that leaves the group on purpose (setsid) is not covered.
     """
+    from khipu import writer_groups
+
     deadline = time.monotonic() + timeout
-    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=env, pass_fds=pass_fds,
-                            start_new_session=True)
+    # The group is recorded durably before the writer runs, so a forget can
+    # stop it even if this process is killed while it runs. The child waits
+    # on a gate pipe until the record exists; if this process dies first,
+    # the gate closes unopened and the child exits without running the writer.
+    gate_r, gate_w = os.pipe()
     try:
+        proc = subprocess.Popen([sys.executable, "-c", _GATE, str(gate_r), *argv],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env,
+                                pass_fds=(*pass_fds, gate_r), start_new_session=True)
+    except BaseException:
+        os.close(gate_w)
+        raise
+    finally:
+        os.close(gate_r)
+    try:
+        try:
+            started = writer_groups.start_time(proc.pid)
+            if started is None:
+                raise OSError(f"legacy writer group {proc.pid} start time unavailable")
+            writer_groups.record(proc.pid, started)
+            os.write(gate_w, b"1")
+        finally:
+            os.close(gate_w)
         out, err = proc.communicate(input.encode("utf-8"), timeout=timeout)
         while _group_alive(proc.pid):
             if time.monotonic() >= deadline:
@@ -1125,8 +1147,22 @@ def _run_legacy_group(argv: list[str], *, input: str, env: dict[str, str],
     except BaseException:
         _kill_group(proc)
         raise
+    finally:
+        writer_groups.clear(proc.pid)
     return subprocess.CompletedProcess(argv, proc.returncode, out.decode("utf-8", "replace"),
                                        err.decode("utf-8", "replace"))
+
+
+# Waits for the go byte on the gate descriptor, then becomes the writer.
+_GATE = (
+    "import os, sys\n"
+    "fd = int(sys.argv[1])\n"
+    "go = os.read(fd, 1)\n"
+    "os.close(fd)\n"
+    "if go != b'1':\n"
+    "    os._exit(75)\n"
+    "os.execvp(sys.argv[2], sys.argv[2:])\n"
+)
 
 
 def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:

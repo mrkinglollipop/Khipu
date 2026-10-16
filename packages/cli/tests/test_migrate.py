@@ -506,3 +506,34 @@ class DecisionEvidenceMigrationTest(unittest.TestCase):
         ):
             with self.subTest(target=target):
                 self.assertIn(target, sql)
+
+
+class LockNoteTest(unittest.TestCase):
+    """0030 holds both write-blocking table locks for its whole backfill: a
+    step that held a table lock longer than a second gets a note in the
+    runner's output and in doctor's ``notes_migrate`` row."""
+
+    def _run(self, held_s):
+        d = tempfile.mkdtemp()
+        (Path(d) / "0030_x.sql").write_text(
+            "-- version: 0030_x\nLOCK TABLE episodes IN SHARE ROW EXCLUSIVE MODE;\n")
+        clock = mock.Mock()
+        clock.monotonic.side_effect = [100.0, 100.0 + held_s]
+        state = tempfile.mkdtemp()
+        with mock.patch.dict("os.environ", {"KHIPU_DATA_DIR": state}), \
+                mock.patch.object(migrate, "time", clock):
+            out = migrate.run(directory=Path(d), conn=FakeConn(FakeCursor(applied=set())))
+            return out, migrate.last_lock_notes()
+
+    def test_a_long_lock_is_noted_for_doctor(self):
+        out, doctor = self._run(1.5)
+        self.assertEqual(len(out["notes"]), 1)
+        self.assertIn("0030_x held write-blocking table locks for 1.50 s", out["notes"][0])
+        self.assertEqual(doctor["notes"], out["notes"])
+        self.assertEqual(doctor["steps"][0]["held_s"], 1.5)
+
+    def test_a_short_lock_is_recorded_without_a_note(self):
+        out, doctor = self._run(0.41)
+        self.assertEqual(out["notes"], [])
+        self.assertEqual(doctor["notes"], [])
+        self.assertEqual(doctor["steps"][0]["held_s"], 0.41)

@@ -700,6 +700,14 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         notes_organise = organise.last_run()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         notes_organise = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The last migration run's table lock hold times: info only, never gates
+    # `ok`. None when no migration that locks tables has run on this Mac.
+    try:
+        from khipu import migrate as _migrate
+
+        notes_migrate = _migrate.last_lock_notes()
+    except Exception as e:  # noqa: BLE001
+        notes_migrate = {"error": f"{type(e).__name__}: {e}"}
     # K9: gateway per-token liveness, read over the network from the
     # deployed gateway's own /healthz (never deployed by doctor itself).
     # Applicable only when a gateway_url is configured.
@@ -875,6 +883,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
         "notes_organise": notes_organise,
+        "notes_migrate": notes_migrate,
         "nightly_steps": nightly_steps,
         "topics_embed_lag": topics_lag,
         "topics_embed_lag_minutes": topics_lag.get("lag_minutes"),

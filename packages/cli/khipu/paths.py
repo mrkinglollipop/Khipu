@@ -284,6 +284,25 @@ def _skipped_name(parts: tuple[str, ...]) -> bool:
             or (len(parts) == 1 and parts[0].startswith(_SNAPSHOT_NAME + "-")))
 
 
+_REPLICA_TEMP = re.compile(r"^\.hub_snapshot\..+\.sqlite(-.+)?$")
+_WRITER_RECORDS = ".legacy_writers"  # khipu.writer_groups.DIR_NAME
+
+
+def _replica_temp(parts: tuple[str, ...]) -> bool:
+    """A temporary replica a crashed refresh left (``.hub_snapshot.<random>.sqlite``)
+    or a journal or WAL sidecar of one. Never restored: it never went
+    through staging and scrubbing, so it can hold a forgotten row."""
+    return len(parts) == 1 and bool(_REPLICA_TEMP.match(parts[0]))
+
+
+def _skip_reason(parts: tuple[str, ...]) -> str | None:
+    if _skipped_name(parts) or parts[0] == _WRITER_RECORDS:
+        return "lock"
+    if _replica_temp(parts):
+        return "replica_temp"
+    return None
+
+
 _DRIVE = re.compile(r"^[A-Za-z]:")
 
 
@@ -295,7 +314,9 @@ def _aliases_protected(root: Path, parts: tuple[str, ...], dest: Path) -> bool:
         return False
     protected = {(root / name).resolve()
                  for name in (_REGISTRY_NAME, _REGISTRY_LOCK_NAME, _MEMORY_LOCK_NAME, _SNAPSHOT_NAME)}
-    return dest in protected or (dest.parent == root and dest.name.startswith(_SNAPSHOT_NAME + "-"))
+    return dest in protected or (dest.parent == root and (dest.name.startswith(_SNAPSHOT_NAME + "-")
+                                                          or _replica_temp((dest.name,))
+                                                          or dest.name == _WRITER_RECORDS))
 
 
 def _checked_zip_members(zf: zipfile.ZipFile, target: Path) -> list[tuple[tuple[str, ...], zipfile.ZipInfo, Path]]:
@@ -342,7 +363,14 @@ def _import_local(*, source: Path, merge: bool) -> dict:
     target = ensure_data_dir()
     imported = 0
     skipped_forgotten = 0
+    skipped_replica_temps: list[str] = []
     staged: Path | None = None
+
+    def skipped(parts: tuple[str, ...]) -> bool:
+        reason = _skip_reason(parts)
+        if reason == "replica_temp":
+            skipped_replica_temps.append("/".join(parts))
+        return reason is not None
 
     def stage(reader) -> None:
         nonlocal staged
@@ -360,7 +388,7 @@ def _import_local(*, source: Path, merge: bool) -> dict:
                     if not p.is_file():
                         continue
                     rel = p.relative_to(source)
-                    if _skipped_name(rel.parts):
+                    if skipped(rel.parts):
                         continue
                     dst = target / rel
                     if _aliases_protected(target.resolve(), rel.parts, dst.resolve()):
@@ -392,7 +420,7 @@ def _import_local(*, source: Path, merge: bool) -> dict:
                         tombstones.merge_registry_bytes(zf.read(info))
                 with tombstones.write_gate() as gate:
                     for parts, info, dest in members:
-                        if _skipped_name(parts):
+                        if skipped(parts):
                             continue
                         if dest.exists() and not merge:
                             continue
@@ -429,7 +457,12 @@ def _import_local(*, source: Path, merge: bool) -> dict:
         "target": str(target),
         "source": str(source),
         "merge": merge,
+        "skipped_replica_temps": skipped_replica_temps,
     }
+    if skipped_replica_temps:
+        out["notes"] = [f"left out {len(skipped_replica_temps)} temporary replica "
+                        f"{'file' if len(skipped_replica_temps) == 1 else 'files'} a crashed "
+                        "refresh left behind; those are never restored"]
     if scrub is not None:
         out["snapshot_scrub"] = scrub
     return out

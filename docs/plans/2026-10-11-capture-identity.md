@@ -397,7 +397,10 @@ Migration 0030 as a whole (both table locks, the table, the triggers and the bac
 episode, same hermetic cluster (PostgreSQL 16, fsync off), median of 3 fresh databases: **14 ms with 200
 forgotten episodes (640 identities backfilled)** and **0.41 s with all 20,000 forgotten (64,000
 identities)**, the worst case. Both table locks are held for that whole time, so captures wait at most
-that long; it is well inside the 5 s `lock_timeout`.
+that long; it is well inside the 5 s `lock_timeout`. The migration stays one transaction on purpose, so
+**0.41 s is the expected write pause on this Mac's hub**: every capture on every Mac waits up to that long
+while 0030 applies. `khipu migrate` records how long each step held table locks, and when one held them
+longer than 1 s its output carries a note, which doctor shows as `notes_migrate`.
 
 ### Remaining boundary
 

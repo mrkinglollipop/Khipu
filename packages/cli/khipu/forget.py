@@ -1330,8 +1330,19 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
 
 def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
                        gateway: bool | None) -> dict[str, Any]:
+    from khipu import writer_groups
     from khipu.db import connect
 
+    # Before the legacy logs are read: a writer group whose capture was
+    # killed outlives that capture's locks, and could append after this
+    # forget checked the logs. Stop every recorded group still alive.
+    try:
+        writers = writer_groups.sweep()
+    except Exception as exc:  # noqa: BLE001 - an unchecked group keeps the forget open
+        writers = {"ok": False, "stopped": 0, "locations": [{
+            "place": "legacy writer", "path": None, "state": "not checked",
+            "why": f"legacy writer groups could not be checked ({type(exc).__name__}), "
+                   "so the forget stays open"}]}
     root_resolved = True
     if memory_root is None:
         try:
@@ -1416,9 +1427,13 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
     out["native_jobs"] = _native_job_remainder(out.get("session_id"), out.get("source_rows"))
     if not out["native_jobs"]["ok"]:
         partial.append("native_jobs")
+    out["legacy_writers"] = writers
+    if not writers["ok"]:
+        partial.append("legacy_writer")
     out["locations"] = _merge_locations(
         legacy_locs, *(item.get("inspected", []) for item in out["outboxes"]),
-        out["replica_temps"]["locations"], out["native_jobs"]["inspected"])
+        out["replica_temps"]["locations"], out["native_jobs"]["inspected"],
+        writers["locations"])
     out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
                      "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
     if not out["outbox"]["ok"]:
@@ -1439,6 +1454,8 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
                          for loc in out["replica_temps"]["locations"]
                          if loc["state"] in INCOMPLETE_STATES],
         "native_jobs": out["native_jobs"]["remaining"],
+        "legacy_writer": [loc.get("why") for loc in writers["locations"]
+                          if loc["state"] in INCOMPLETE_STATES],
     }
     if out.get("unidentified_sources", 0) > 0:
         out["partial_errors"]["legacy_file"] = [
