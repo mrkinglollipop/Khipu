@@ -52,7 +52,7 @@ import { RoutingCard } from "./RoutingCard";
 import { RoutingSettings } from "./RoutingSettings";
 import { useRouting } from "./routing";
 import { WorkView } from "./WorkView";
-import { WORK_LEDE, badgeLabel, useWork } from "./work";
+import { WORK_LEDE, badgeLabel, shortProject, useWork } from "./work";
 import type { DoctorSynthProvider } from "./SynthProvider";
 import { useModelVerify } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
@@ -538,21 +538,6 @@ function projectFromScope(scope: string | undefined | null): string | null {
   const codeAt = parts.lastIndexOf("Code");
   if (codeAt >= 0 && parts[codeAt + 1]) return parts[codeAt + 1];
   return parts[parts.length - 1] ?? null;
-}
-
-/** `commitments.project` is an owner/repo slug — or, when the capture could not
- *  resolve one, the raw `harness:uuid` session id it was opened under. The repo
- *  half identifies the first; the harness name identifies the second. The full
- *  value stays as the tooltip either way. */
-function shortProject(project: string): string {
-  if (project.includes(":")) {
-    // A commitment scoped to a session rather than a repo. The pill is
-    // 96px wide; "Claude Code session" overran it, so the label is the short
-    // word and the harness stays in the pill's title (2026-09-05).
-    return "Session";
-  }
-  const parts = project.split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? project;
 }
 
 /** `session_id` is `harness:uuid`, so the harness is the half before the
@@ -3402,18 +3387,20 @@ export default function App() {
                 {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
               </Tag>
             </span>
-            <span className="grow owed-text" title={c.text}>
-              {c.text}
+            <span className="grow owed-main">
+              <span className="owed-text" title={c.text}>
+                {c.text}
+              </span>
+              {seen ? (
+                <span
+                  className="meta owed-seen"
+                  title={`Restated by ${c.seen_count} captures`}
+                >
+                  seen {seen}
+                </span>
+              ) : null}
             </span>
             <WaitingToSync pending={c.pending_sync} />
-            {seen ? (
-              <span
-                className="meta owed-seen"
-                title={`Restated by ${c.seen_count} captures`}
-              >
-                seen {seen}
-              </span>
-            ) : null}
             <span className="w128">
               {c.project ? (
                 <Tag

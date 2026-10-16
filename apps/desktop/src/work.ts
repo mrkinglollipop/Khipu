@@ -139,6 +139,8 @@ export type WaitItem = {
   blocking: boolean;
   also_owed?: string | null;
   looks_like?: { id: string | null; title: string | null } | null;
+  /** The item has a project, but the view withheld its name. */
+  masked?: boolean;
   actions: WaitAction[];
 };
 // The keys each kind of item needs before the app offers any action on it.
@@ -254,6 +256,22 @@ export const WITHHELD = {
   summary: "Summary withheld",
   line: "Line withheld",
 } as const;
+
+/** One rule for a project's words, in Owed and in Work: `commitments.project`
+ *  is an owner/repo slug (its repo half), or the raw `harness:uuid` session id
+ *  a capture opened it under when it could not resolve one ("Session"). */
+export function shortProject(project: string): string {
+  if (project.includes(":")) {
+    // The Owed pill is 96px wide; "Claude Code session" overran it, so the
+    // label is the short word and the harness stays in the pill's title.
+    return "Session";
+  }
+  const parts = project.split("/").filter(Boolean);
+  return parts[parts.length - 1] ?? project;
+}
+
+/** Owed's words for an item with no project. */
+export const NO_PROJECT = "No project";
 
 /** "1 row", "1,120 rows". */
 export function plural(n: number, one: string, many?: string): string {
