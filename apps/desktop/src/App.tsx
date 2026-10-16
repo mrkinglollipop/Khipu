@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
@@ -59,6 +59,8 @@ import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
 import { StorageReportDialog } from "./StorageReportDialog";
+import { OwedChangeDialog, OwedSelectionBar, OwedTidyDialog, owedChange } from "./OwedBulk";
+import type { OwedOwner } from "./OwedBulk";
 import { OptionalFeatures } from "./OptionalFeatures";
 import { EmbeddingsPanel } from "./EmbeddingsPanel";
 import { fmtAgo, fmtAgoFromRead, fmtClock } from "./time";
@@ -425,6 +427,12 @@ type Commitment = {
   read_at_ms?: number;
   /** A change queued on this Mac while the hub was away (`khipu owed`). */
   pending_sync?: unknown;
+  /** Migration 0033: who an `agent` item is for ("orchestrator", "PR
+   *  author"), and whether a conversation or a job opened it. */
+  owner_label?: string | null;
+  origin?: string | null;
+  /** A looser decision match, offered and never applied (design (b)). */
+  looks_settled?: string | null;
 };
 
 /** How long ago `opened_at` / `last_seen_at` was, from the hub's age at the
@@ -435,41 +443,74 @@ function owedAgo(c: Commitment, which: "opened" | "last_seen"): string | null {
     : fmtAgoFromRead(c.last_seen_age_s, c.read_at_ms, c.last_seen_at);
 }
 
-/** The three Owed groups (phase 4 addendum + phase 5 brief). "Needs you" is
- *  exactly `owner === "user"`, which the CLI resolves; the app never
- *  re-derives it. */
-type OwedGroupId = "needs-you" | "promised" | "plan";
+/** The three Owed groups, one per owner (owed and ledger scope, design (a)).
+ *  The owner is what the CLI resolves; the app never re-derives it. Only
+ *  "Needs you" is the owner's to do. */
+type OwedGroupId = "needs-you" | "yours" | "agents";
 
 const OWED_GROUPS: ReadonlyArray<
-  readonly [OwedGroupId, string, string]
+  readonly [OwedGroupId, string, string, OwedOwner]
 > = [
   [
     "needs-you",
     "Needs you",
     "Questions and blockers first, then the follow-ups and promises you own.",
+    "user",
   ],
   [
-    "promised",
-    "Promised with a trigger",
-    "The agent said it would do these when something happens.",
+    "yours",
+    "Yours (the assistant's)",
+    "Promises and steps the assistant set itself. They close on their own when a later capture says so.",
+    "assistant",
   ],
   [
-    "plan",
-    "This session's plan",
-    "Steps the agent set itself. They close on their own when a later capture says so.",
+    "agents",
+    "For agents and jobs",
+    "Items a job left for its orchestrator, a reviewer or a builder. Not yours unless you take one.",
+    "agent",
   ],
 ] as const;
 
+function owedOwnerOf(c: Commitment): OwedOwner {
+  const o = (c.owner ?? "").toLowerCase();
+  return o === "user" ? "user" : o === "agent" ? "agent" : "assistant";
+}
+
 function owedGroupOf(c: Commitment): OwedGroupId {
-  if ((c.owner ?? "").toLowerCase() === "user") return "needs-you";
-  return c.future_trigger ? "promised" : "plan";
+  const o = owedOwnerOf(c);
+  return o === "user" ? "needs-you" : o === "agent" ? "agents" : "yours";
 }
 
 type OwedStatus = "open" | "closed" | "stale";
 
-/** How many commitments one screenful asks for. A count that lands exactly on
- *  the cap is shown as "N+", because it is a floor, not a total. */
-const OWED_LIMIT = 500;
+/** How many commitments one read asks for: `owed_page_max`'s default, so a
+ *  page is never cut short by the CLI. Show more reads the next page with
+ *  the cursor the last one returned (keyset, so nothing repeats or is
+ *  skipped while new items arrive). */
+const OWED_PAGE = 200;
+
+/** One list Owed reads by pages: each owner's open items, and the closed
+ *  and stale lists across owners. */
+type OwedListKey = "open:user" | "open:assistant" | "open:agent" | "closed" | "stale";
+const OWED_OPEN_KEYS: ReadonlyArray<OwedListKey> = ["open:user", "open:assistant", "open:agent"];
+
+type OwedPage = {
+  rows: Commitment[];
+  /** Every matching item, from the CLI; null from a bare-list answer. */
+  total: number | null;
+  next: string | null;
+  pages: number;
+};
+
+function owedListKeys(status: OwedStatus): ReadonlyArray<OwedListKey> {
+  return status === "open" ? OWED_OPEN_KEYS : [status];
+}
+
+/** Rows in order, each id once (a page read after a change can overlap). */
+function owedMerge(a: Commitment[], b: Commitment[]): Commitment[] {
+  const seen = new Set(a.map((c) => c.id));
+  return [...a, ...b.filter((c) => !seen.has(c.id) && seen.add(c.id))];
+}
 
 /** How many captures one page of Activity shows. `khipu activity` has no
  *  `--offset`, so "Show 40 more" re-asks for a longer window (`--limit`) and
@@ -1033,6 +1074,145 @@ function renderHealthRow(
   );
 }
 
+type OwedRowAction = "select" | "unselect" | "settle" | "activity" | "reopen" | "done" | "snooze";
+
+/** One Owed row. Memoised: a list of thousands re-renders only the rows
+ *  whose item, tick or busy state changed. `onAct` is stable. */
+const OwedRow = memo(function OwedRow({
+  c,
+  selectable,
+  checked,
+  busy,
+  onAct,
+}: {
+  c: Commitment;
+  selectable: boolean;
+  checked: boolean;
+  busy: boolean;
+  onAct: (action: OwedRowAction, c: Commitment) => void;
+}) {
+  // "Seen again" is evidence a later session re-stated the item; it is
+  // shown only when it actually happened (seen_count > 1), and a
+  // pre-migration hub answers 1 for every row.
+  const seen = (c.seen_count ?? 1) > 1 ? owedAgo(c, "last_seen") : null;
+  return (
+    <ListRow className="owed-row" dataId={c.id}>
+      {selectable ? (
+        <span className="w24">
+          <input
+            type="checkbox"
+            aria-label={`Select: ${c.text ?? `#${c.id}`}`}
+            checked={checked}
+            onChange={(e) => onAct(e.target.checked ? "select" : "unselect", c)}
+          />
+        </span>
+      ) : null}
+      <span className="w88">
+        <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
+          {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
+        </Tag>
+      </span>
+      <span className="grow owed-main">
+        <span className="owed-text" title={c.text}>
+          {c.owner === "agent" && c.owner_label ? (
+            <>
+              <Tag title="Who this is for">{c.owner_label}</Tag>{" "}
+            </>
+          ) : null}
+          {c.text}
+        </span>
+        {c.status === "closed" && c.close_reason ? (
+          <span className="meta owed-reason">Closed: {c.close_reason}</span>
+        ) : null}
+        {c.status !== "closed" && c.looks_settled ? (
+          <span className="inline owed-settled">
+            <span className="meta">{c.looks_settled}</span>
+            <button
+              type="button"
+              className="sm link"
+              disabled={busy}
+              onClick={() => onAct("settle", c)}
+            >
+              Close as settled
+            </button>
+          </span>
+        ) : null}
+        {seen ? (
+          <span
+            className="meta owed-seen"
+            title={`Restated by ${c.seen_count} captures`}
+          >
+            seen {seen}
+          </span>
+        ) : null}
+      </span>
+      <WaitingToSync pending={c.pending_sync} />
+      <span className="w128">
+        {c.project ? (
+          <Tag
+            title={
+              c.project.includes(":")
+                ? `${harnessLabel(c.project.split(":")[0] ?? "")} session · ${c.project}`
+                : c.project
+            }
+          >
+            {shortProject(c.project)}
+          </Tag>
+        ) : (
+          <span className="meta">—</span>
+        )}
+      </span>
+      <span className="meta w52">{shortDateLabel(c.opened_at)}</span>
+      <span className="meta w44">{shortDateLabel(c.due_after)}</span>
+      <span className="w50">
+        {c.opened_episode != null ? (
+          <button
+            type="button"
+            className="link sm mono"
+            title="Open the capture that opened this"
+            onClick={() => onAct("activity", c)}
+          >
+            #{c.opened_episode}
+          </button>
+        ) : (
+          <span className="meta mono">—</span>
+        )}
+      </span>
+      <span className="w132 acts-cell">
+        {c.status === "closed" ? (
+          <button
+            type="button"
+            className="sm"
+            disabled={busy}
+            onClick={() => onAct("reopen", c)}
+          >
+            Reopen
+          </button>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="sm"
+              disabled={busy}
+              onClick={() => onAct("done", c)}
+            >
+              Done
+            </button>
+            <button
+              type="button"
+              className="sm"
+              disabled={busy}
+              onClick={() => onAct("snooze", c)}
+            >
+              Snooze
+            </button>
+          </>
+        )}
+      </span>
+    </ListRow>
+  );
+});
+
 export default function App() {
   const [tab, setTab] = useState<Tab>("home");
   // Configuration presence lets setup proceed; it does not prove the database answers.
@@ -1246,9 +1426,24 @@ export default function App() {
   // screen's own table all read this, so a write that moves a row between two
   // statuses cannot leave one of them stale (phase 4: the segmented control
   // shows all three counts at once, so all three are fetched).
-  const [owedByStatus, setOwedByStatus] = useState<
-    Partial<Record<OwedStatus, Commitment[]>>
-  >({});
+  const [owedPages, setOwedPages] = useState<Partial<Record<OwedListKey, OwedPage>>>({});
+  const owedPagesRef = useRef(owedPages);
+  owedPagesRef.current = owedPages;
+  const owedByStatus = useMemo(() => {
+    const out: Partial<Record<OwedStatus, Commitment[]>> = {};
+    if (owedPages["open:user"]) {
+      out.open = OWED_OPEN_KEYS.reduce<Commitment[]>((acc, k) => owedMerge(acc, owedPages[k]?.rows ?? []), []);
+    }
+    if (owedPages.closed) out.closed = owedPages.closed.rows;
+    if (owedPages.stale) out.stale = owedPages.stale.rows;
+    return out;
+  }, [owedPages]);
+  const [owedMoreBusy, setOwedMoreBusy] = useState<OwedListKey | null>(null);
+  // Many at once (slice 5): the ids ticked in the open list, the dialog for
+  // Close… or Move to…, and Tidy this list….
+  const [owedSelected, setOwedSelected] = useState<ReadonlySet<number>>(new Set());
+  const [owedChangeMode, setOwedChangeMode] = useState<"close" | "move" | null>(null);
+  const [owedTidyOpen, setOwedTidyOpen] = useState(false);
   const [owedStatus, setOwedStatus] = useState<OwedStatus>("open");
   const [owedProject, setOwedProject] = useState<string | null>(null);
   const [owedKind, setOwedKind] = useState<string | null>(null);
@@ -1622,7 +1817,33 @@ export default function App() {
 
   /** `khipu owed` — the commitments a session left behind, cached per status
    *  so the rail badge, Home's preview and this screen's table are one fetch
-   *  rather than three racing over one array. */
+   *  rather than three racing over one array. The open list is read once per
+   *  owner, so the owner's own items are never behind thousands of a job's. */
+  const fetchOwedPage = useCallback(async (key: OwedListKey, cursor: string | null) => {
+    const [status, owner] = key.split(":") as [OwedStatus, string | undefined];
+    const raw = await runKhipu([
+      "owed",
+      "--envelope",
+      `--status=${status}`,
+      `--owner=${owner ?? "all"}`,
+      `--limit=${OWED_PAGE}`,
+      ...(cursor ? [`--cursor=${cursor}`] : []),
+    ]);
+    const parsed = parseJson(raw);
+    const answer = parseOwedAnswer(parsed);
+    const readAt = Date.now();
+    let rows = answer ? (answer.rows as Commitment[]).map((c) => ({ ...c, read_at_ms: readAt })) : [];
+    // A bare list (an older answer) is every owner's: keep this list's own.
+    if (owner) rows = rows.filter((c) => owedOwnerOf(c) === owner);
+    const o = (parsed ?? {}) as { total?: unknown; next_cursor?: unknown };
+    return {
+      answer,
+      rows,
+      total: typeof o.total === "number" ? o.total : null,
+      next: typeof o.next_cursor === "string" && o.next_cursor ? o.next_cursor : null,
+    };
+  }, []);
+
   const loadOwed = useCallback(
     async (status: OwedStatus, force = false) => {
       const at = owedFetchedAt[status];
@@ -1631,21 +1852,26 @@ export default function App() {
       const latest = () => owedSeq.current[status] === seq;
       setOwedInFlight((prev) => ({ ...prev, [status]: prev[status] + 1 }));
       try {
-        const raw = await runKhipu([
-          "owed",
-          "--envelope",
-          `--status=${status}`,
-          `--limit=${OWED_LIMIT}`,
-        ]);
-        const answer = parseOwedAnswer(parseJson(raw));
-        const readAt = Date.now();
-        const rows = answer ? (answer.rows as Commitment[]).map((c) => ({ ...c, read_at_ms: readAt })) : [];
+        let stale: OwedOffline | null = null;
+        const lists = await Promise.all(
+          owedListKeys(status).map(async (key): Promise<[OwedListKey, OwedPage]> => {
+            const had = owedPagesRef.current[key];
+            // A list read further than its first page is re-read only on a
+            // write or Refresh, so the timer never folds it back to one page.
+            if (!force && had && had.pages > 1) return [key, had];
+            const first = await fetchOwedPage(key, null);
+            if (first.answer?.stale) stale = { kind: "stale", refreshedAt: first.answer.refreshedAt };
+            let page: OwedPage = { rows: first.rows, total: first.total, next: first.next, pages: 1 };
+            while (page.pages < (had?.pages ?? 1) && page.next) {
+              const more = await fetchOwedPage(key, page.next);
+              page = { ...page, rows: owedMerge(page.rows, more.rows), next: more.next, pages: page.pages + 1 };
+            }
+            return [key, page];
+          }),
+        );
         if (!latest()) return;
-        setOwedOffline((prev) => ({
-          ...prev,
-          [status]: answer?.stale ? { kind: "stale", refreshedAt: answer.refreshedAt } : null,
-        }));
-        setOwedByStatus((prev) => ({ ...prev, [status]: rows }));
+        setOwedOffline((prev) => ({ ...prev, [status]: stale }));
+        setOwedPages((prev) => ({ ...prev, ...Object.fromEntries(lists) }));
         setOwedFetchedAt((prev) => ({ ...prev, [status]: Date.now() }));
         markLoaded(`owed:${status}`, true);
       } catch (e) {
@@ -1661,7 +1887,32 @@ export default function App() {
         setOwedInFlight((prev) => ({ ...prev, [status]: Math.max(0, prev[status] - 1) }));
       }
     },
-    [owedFetchedAt, markLoaded],
+    [owedFetchedAt, markLoaded, fetchOwedPage],
+  );
+
+  /** Show more: the next page of one list, by the cursor the last returned. */
+  const loadOwedMore = useCallback(
+    async (key: OwedListKey) => {
+      const had = owedPagesRef.current[key];
+      if (!had?.next) return;
+      setOwedMoreBusy(key);
+      try {
+        const more = await fetchOwedPage(key, had.next);
+        setOwedPages((prev) => {
+          const cur = prev[key];
+          if (!cur || cur.next !== had.next) return prev;
+          return {
+            ...prev,
+            [key]: { rows: owedMerge(cur.rows, more.rows), total: more.total ?? cur.total, next: more.next, pages: cur.pages + 1 },
+          };
+        });
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setOwedMoreBusy(null);
+      }
+    },
+    [fetchOwedPage],
   );
 
   /** Done / Reopen / Snooze. Every write refetches all three statuses, because
@@ -2436,6 +2687,23 @@ export default function App() {
   // badge otherwise. The Owed tab folded into Work as its own section
   // (Decision 14); `owedFocusKey` opens Work there.
   const work = useWork(tab === "work", dsnOk === true);
+
+  /** Close… or Move to… on the ticked items, or Close on one that looks
+   *  settled: one call with every id (`khipu_owed_change`), then every list
+   *  and Work read again. Resolves to null, or the words to show. */
+  const owedChangeMany = useCallback(
+    async (action: "close" | "reassign", ids: number[], reason: string, to: OwedOwner | null, label: string | null) => {
+      setOwedSaved(false);
+      const workLoad = work.load;
+      const res = await owedChange(action, ids, reason, to, label);
+      if (res.queued) setOwedSaved(true);
+      if (res.error === null) setOwedSelected(new Set());
+      await Promise.all([loadOwed("open", true), loadOwed("closed", true), loadOwed("stale", true), workLoad(true)]);
+      return res.error;
+    },
+    [loadOwed, work.load],
+  );
+
   const [owedFocusKey, setOwedFocusKey] = useState(0);
   const openOwedInWork = useCallback(() => {
     setTab("work");
@@ -3262,6 +3530,10 @@ export default function App() {
   const owedProjects = Array.from(
     new Set(owedRows.map((c) => c.project).filter((p): p is string => Boolean(p))),
   ).sort();
+  // Tidy this list… offers the projects that have open items.
+  const owedOpenProjects = Array.from(
+    new Set(owedOpenRows.map((c) => c.project).filter((p): p is string => Boolean(p))),
+  ).sort();
   const owedKinds = Array.from(
     new Set(owedRows.map((c) => c.kind).filter((k): k is string => Boolean(k))),
   ).sort();
@@ -3270,11 +3542,58 @@ export default function App() {
       (!owedProject || c.project === owedProject) &&
       (!owedKind || c.kind === owedKind),
   );
-  const owedCount = (status: OwedStatus): string => {
-    const rows = owedByStatus[status];
-    if (!rows) return "";
-    return ` · ${rows.length}${rows.length >= OWED_LIMIT ? "+" : ""}`;
+  /** Every item in a list, as the CLI counted it (a bare-list answer: the
+   *  rows read, marked "+" while more pages remain). */
+  const owedListTotal = (key: OwedListKey): number | null => {
+    const page = owedPages[key];
+    return page ? (page.total ?? page.rows.length) : null;
   };
+  const owedCount = (status: OwedStatus): string => {
+    const keys = owedListKeys(status);
+    if (!keys.every((k) => owedPages[k])) return "";
+    const total = keys.reduce((sum, k) => sum + (owedListTotal(k) ?? 0), 0);
+    const more = keys.some((k) => owedPages[k]?.total == null && owedPages[k]?.next);
+    return ` · ${total.toLocaleString()}${more ? "+" : ""}`;
+  };
+  const owedChipFilter = Boolean(owedProject || owedKind);
+  /** "Showing 200 of 2,800" and Show more, under one list. */
+  const renderOwedMore = (key: OwedListKey, shown: number) => {
+    const page = owedPages[key];
+    if (!page) return null;
+    const total = page.total ?? page.rows.length;
+    if (!page.next && (owedChipFilter || shown >= total)) return null;
+    const next = Math.min(OWED_PAGE, Math.max(0, total - page.rows.length)) || OWED_PAGE;
+    return (
+      <div className="inline owed-more">
+        {/* A chip narrows what is read so far; Show more still reads on. */}
+        <span className="meta">
+          {owedChipFilter
+            ? `${page.rows.length.toLocaleString()} of ${total.toLocaleString()} read`
+            : `Showing ${page.rows.length.toLocaleString()} of ${total.toLocaleString()}`}
+        </span>
+        {page.next ? (
+          <button
+            type="button"
+            className="sm"
+            disabled={owedMoreBusy != null}
+            onClick={() => void loadOwedMore(key)}
+          >
+            {owedMoreBusy === key ? <Spinner /> : null}
+            Show {next.toLocaleString()} more
+          </button>
+        ) : null}
+      </div>
+    );
+  };
+  const toggleOwed = (ids: number[], on: boolean) =>
+    setOwedSelected((prev) => {
+      const next = new Set(prev);
+      for (const id of ids) {
+        if (on) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
   // The mock's ok callout: commitments a later capture closed today. Built
   // only from `closed_at`, which `commitments.list_owed` returns.
   const closedToday = (owedByStatus.closed ?? []).filter((c) =>
@@ -3364,11 +3683,41 @@ export default function App() {
       ? []
       : owedOpenRows.filter((c) => c.opened_episode === episodeId);
 
+  // The rows' one action callback, stable across renders so a memoised row
+  // re-renders only when its own props change; it calls the latest handlers.
+  const owedActRef = useRef<(action: OwedRowAction, c: Commitment) => void>(() => {});
+  owedActRef.current = (action, c) => {
+    if (action === "select" || action === "unselect") toggleOwed([c.id], action === "select");
+    else if (action === "settle") void owedChangeMany("close", [c.id], c.looks_settled ?? "", null, null);
+    else if (action === "activity") openInActivity(c.opened_episode ?? 0);
+    else if (action === "reopen") void owedWrite(c.id, [`--reopen=${c.id}`]);
+    else if (action === "done") void owedWrite(c.id, [`--close=${c.id}`]);
+    else setSnoozeTarget(c);
+  };
+  const owedAct = useCallback((action: OwedRowAction, c: Commitment) => owedActRef.current(action, c), []);
+
   /** One Owed table. Same columns for every group and every status; only the
    *  actions differ (a closed row reopens, an open one closes or snoozes). */
-  const renderOwedTable = (rows: Commitment[]) => (
+  const renderOwedTable = (rows: Commitment[], groupTitle?: string) => {
+    const selectable = owedStatus === "open";
+    const allOn = rows.length > 0 && rows.every((c) => owedSelected.has(c.id));
+    return (
     <div className="card">
+      {selectable ? (
+        <ListRow className="owed-selall">
+          <label className="inline">
+            <input
+              type="checkbox"
+              aria-label={groupTitle ? `Select every item shown in ${groupTitle}` : "Select every item shown"}
+              checked={allOn}
+              onChange={(e) => toggleOwed(rows.map((c) => c.id), e.target.checked)}
+            />
+            <span className="meta">Select all {rows.length.toLocaleString()} shown</span>
+          </label>
+        </ListRow>
+      ) : null}
       <div className="card-head owed-head">
+        {selectable ? <span className="w24" /> : null}
         <span className="w88">Kind</span>
         <span className="grow">What you owe</span>
         <span className="w128">Project</span>
@@ -3377,99 +3726,19 @@ export default function App() {
         <span className="w50">From</span>
         <span className="w132" />
       </div>
-      {rows.map((c) => {
-        // "Seen again" is evidence a later session re-stated the item; it is
-        // shown only when it actually happened (seen_count > 1), and a
-        // pre-migration hub answers 1 for every row.
-        const seen = (c.seen_count ?? 1) > 1 ? owedAgo(c, "last_seen") : null;
-        return (
-          <ListRow key={c.id} className="owed-row">
-            <span className="w88">
-              <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
-                {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
-              </Tag>
-            </span>
-            <span className="grow owed-main">
-              <span className="owed-text" title={c.text}>
-                {c.text}
-              </span>
-              {seen ? (
-                <span
-                  className="meta owed-seen"
-                  title={`Restated by ${c.seen_count} captures`}
-                >
-                  seen {seen}
-                </span>
-              ) : null}
-            </span>
-            <WaitingToSync pending={c.pending_sync} />
-            <span className="w128">
-              {c.project ? (
-                <Tag
-                  title={
-                    c.project.includes(":")
-                      ? `${harnessLabel(c.project.split(":")[0] ?? "")} session · ${c.project}`
-                      : c.project
-                  }
-                >
-                  {shortProject(c.project)}
-                </Tag>
-              ) : (
-                <span className="meta">—</span>
-              )}
-            </span>
-            <span className="meta w52">{shortDateLabel(c.opened_at)}</span>
-            <span className="meta w44">{shortDateLabel(c.due_after)}</span>
-            <span className="w50">
-              {c.opened_episode != null ? (
-                <button
-                  type="button"
-                  className="link sm mono"
-                  title="Open the capture that opened this"
-                  onClick={() => openInActivity(c.opened_episode ?? 0)}
-                >
-                  #{c.opened_episode}
-                </button>
-              ) : (
-                <span className="meta mono">—</span>
-              )}
-            </span>
-            <span className="w132 acts-cell">
-              {c.status === "closed" ? (
-                <button
-                  type="button"
-                  className="sm"
-                  disabled={owedBusyId === c.id}
-                  onClick={() => void owedWrite(c.id, [`--reopen=${c.id}`])}
-                >
-                  Reopen
-                </button>
-              ) : (
-                <>
-                  <button
-                    type="button"
-                    className="sm"
-                    disabled={owedBusyId === c.id}
-                    onClick={() => void owedWrite(c.id, [`--close=${c.id}`])}
-                  >
-                    Done
-                  </button>
-                  <button
-                    type="button"
-                    className="sm"
-                    disabled={owedBusyId === c.id}
-                    onClick={() => setSnoozeTarget(c)}
-                  >
-                    Snooze
-                  </button>
-                </>
-              )}
-            </span>
-          </ListRow>
-        );
-      })}
+      {rows.map((c) => (
+        <OwedRow
+          key={c.id}
+          c={c}
+          selectable={selectable}
+          checked={owedSelected.has(c.id)}
+          busy={owedBusyId === c.id}
+          onAct={owedAct}
+        />
+      ))}
     </div>
-  );
+    );
+  };
 
   const renderOnDemandJobRow = (
     label: string,
@@ -5176,6 +5445,11 @@ export default function App() {
                     <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
                     Refresh
                   </button>
+                  {owedOpenProjects.length > 0 ? (
+                    <button type="button" className="sm" onClick={() => setOwedTidyOpen(true)}>
+                      Tidy this list…
+                    </button>
+                  ) : null}
                 </div>
                 <div className="inline">
                   <Segmented
@@ -5183,6 +5457,7 @@ export default function App() {
                     value={owedStatus}
                     onChange={(next) => {
                       setOwedStatus(next);
+                      setOwedSelected(new Set());
                       void loadOwed(next, false);
                     }}
                     options={[
@@ -5225,6 +5500,14 @@ export default function App() {
 
                 <OfflineBanner state={owedOffline[owedStatus] ?? null} />
                 <SavedOnThisMac show={owedSaved} />
+                {owedStatus === "open" && owedSelected.size > 0 ? (
+                  <OwedSelectionBar
+                    count={owedSelected.size}
+                    onClose={() => setOwedChangeMode("close")}
+                    onMove={() => setOwedChangeMode("move")}
+                    onClear={() => setOwedSelected(new Set())}
+                  />
+                ) : null}
 
                 {loadState[`owed:${owedStatus}`] !== "ok" ? (
                   loadState[`owed:${owedStatus}`] === "failed" && owedInFlight[owedStatus] === 0 ? (
@@ -5256,9 +5539,13 @@ export default function App() {
                   // Open items are grouped by who owes them: "Needs you" first and
                   // never buried under the agent's own plan steps, which is what
                   // made a 300-row list unusable (phase 4 addendum).
-                  OWED_GROUPS.map(([id, title, hint]) => {
+                  OWED_GROUPS.map(([id, title, hint, owner]) => {
+                    const key = `open:${owner}` as OwedListKey;
                     const rows = visibleOwed.filter((c) => owedGroupOf(c) === id);
-                    if (rows.length === 0) return null;
+                    // The heading counts every item the owner has, read or
+                    // not yet read; a chip filter counts what it shows.
+                    const count = owedChipFilter ? rows.length : (owedListTotal(key) ?? rows.length);
+                    if (rows.length === 0 && count === 0) return null;
                     return (
                       <Disclosure
                         key={id}
@@ -5267,17 +5554,21 @@ export default function App() {
                         label={
                           <>
                             <strong>{title}</strong>
-                            <span className="nav-count quiet">{rows.length}</span>
+                            <span className="nav-count quiet">{count.toLocaleString()}</span>
                             <span className="meta wrap">{hint}</span>
                           </>
                         }
                       >
-                        {renderOwedTable(rows)}
+                        {rows.length > 0 ? renderOwedTable(rows, title) : null}
+                        {renderOwedMore(key, rows.length)}
                       </Disclosure>
                     );
                   })
                 ) : (
-                  renderOwedTable(visibleOwed)
+                  <>
+                    {renderOwedTable(visibleOwed)}
+                    {renderOwedMore(owedStatus, visibleOwed.length)}
+                  </>
                 )}
 
                 {closedToday.length > 0 ? (
@@ -6098,6 +6389,34 @@ export default function App() {
           </div>
         </div>
       </Dialog>
+
+      {/* Owed, many at once: Close… / Move to… with a reason, and Tidy this
+          list…, each through its own fixed-argv command. */}
+      <OwedChangeDialog
+        mode={owedChangeMode}
+        count={owedSelected.size}
+        onCancel={() => setOwedChangeMode(null)}
+        onConfirm={async (reason, to, label) => {
+          const why = await owedChangeMany(
+            owedChangeMode === "move" ? "reassign" : "close",
+            Array.from(owedSelected),
+            reason,
+            to,
+            label,
+          );
+          if (why === null) setOwedChangeMode(null);
+          return why;
+        }}
+      />
+      <OwedTidyDialog
+        open={owedTidyOpen}
+        projects={owedOpenProjects}
+        defaultProject={owedProject}
+        onCancel={() => setOwedTidyOpen(false)}
+        onChanged={() =>
+          Promise.all([loadOwed("open", true), loadOwed("closed", true), loadOwed("stale", true), work.load(true)])
+        }
+      />
 
       {/* Snooze — `khipu owed --snooze ID --until`. Presets only: the CLI
           refuses free text rather than silently clearing a due date. */}

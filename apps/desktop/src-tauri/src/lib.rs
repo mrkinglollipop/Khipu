@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -432,6 +432,9 @@ fn cli_has_no_time_limit(args: &[String]) -> bool {
         "backup-local" | "import-local" | "doctor" | "nightly" | "graph-build" | "monthly" | "embed-backfill"
         | "library-backfill" | "join" => true,
         "db" => matches!(args.get(1).map(String::as_str), Some("move" | "preflight" | "connect")),
+        // The Owed clean-up: a plan may make its capped model calls, and an
+        // apply or undo changes thousands of rows in one transaction.
+        "owed" => args.get(1).map(String::as_str) == Some("tidy"),
         _ => false,
     }
 }
@@ -704,6 +707,11 @@ const SYNTH_FALLBACKS: &[&str] = &["gemini", "none"];
 /// accounts Home -> Plans reads (Settings -> Capture & models -> Plans).
 const USAGE_ACCOUNTS_KEY: &str = "usage_accounts";
 const GRAPH_BACKUP_REMOTE_KEY: &str = "graph_backup_remote";
+/// Owed's limits (`khipu.config.COUNT_SETTINGS`): whole numbers of 0 or
+/// more, 0 for no limit, each `config --set KEY N` or `config --unset=KEY`.
+const OWED_COUNT_KEYS: &[&str] = &["owed_orchestrator_slice_max", "owed_page_max", "owed_bulk_max", "owed_tidy_calls"];
+/// Whether Owed's close rules ask GitHub, read-only, if a pull request merged.
+const OWED_GITHUB_KEY: &str = "owed_pr_check_github";
 
 /// An rclone `remote:path` (the CLI checks it again): one token, the remote
 /// name first, so it can never read as a flag.
@@ -1304,6 +1312,14 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
             Ok(set("synth_fallback", v.to_string()))
         }
         GRAPH_BACKUP_REMOTE_KEY => Ok(set(GRAPH_BACKUP_REMOTE_KEY, checked_backup_remote(value)?)),
+        k if OWED_COUNT_KEYS.contains(&k) => Ok(set(k, parse_daily_calls(k, value)?)),
+        OWED_GITHUB_KEY => {
+            let v = value.trim();
+            if v != "on" && v != "off" {
+                return Err(format!("{OWED_GITHUB_KEY} must be on or off, got {value:?}"));
+            }
+            Ok(set(OWED_GITHUB_KEY, v.to_string()))
+        }
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
         k if cli_setting_key(k) => Ok(set(k, checked_cli_setting_path(k, value)?)),
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
@@ -1335,6 +1351,8 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
         && key != COSINE_FLOOR_KEY
         && key != USAGE_ACCOUNTS_KEY
         && key != GRAPH_BACKUP_REMOTE_KEY
+        && !OWED_COUNT_KEYS.contains(&key)
+        && key != OWED_GITHUB_KEY
         && minute_key(key).is_none()
         && key != GATE_IGNORE_KEY
         && !cli_setting_key(key)
@@ -2394,6 +2412,202 @@ fn work_same_argv(project: &str, row: &str, commitment: &str, same: bool) -> Res
         format!("{}#{}", checked_ledger_project(project)?, checked_ledger_id(row)?),
         checked_commitment_id(commitment)?,
     ])
+}
+
+// ---- Owed: several items at once, and the one-time clean-up
+// (docs/plans/2026-10-16-owed-and-ledger-ssot.md, slice 5)
+//
+// Fixed argv for the changes Owed makes to many commitments. `owed` has no
+// `--from-app` flag: the CLI knows the app started it by walking its own
+// parents (`routing._caller`), which is what lets a change to several of the
+// owner's own items pass the owner gate. Ids are digits only and travel
+// joined to their flag; the reason is one line joined to `--reason=`, so
+// nothing the webview sends can become a flag.
+
+/// The most ids one change carries, so the argument stays well inside what
+/// a program can be started with. Not Owed's own limit: the CLI applies
+/// `owed_bulk_max`, which the owner can lift in Settings.
+const OWED_IDS_MAX: usize = 10_000;
+/// The longest reason the app hands over, in characters.
+const OWED_REASON_MAX_CHARS: usize = 500;
+/// The longest label for an agent owner ("orchestrator", "PR author").
+const OWED_LABEL_MAX_CHARS: usize = 60;
+const OWED_OWNERS: &[&str] = &["user", "assistant", "agent"];
+
+/// `owed --close=IDS --reason=R` or `owed --reassign=IDS --to=OWNER
+/// [--label=L] --reason=R`: one call, one transaction, one result per id.
+fn owed_change_argv(
+    action: &str,
+    ids: &[String],
+    reason: &str,
+    to: Option<&str>,
+    label: Option<&str>,
+) -> Result<Vec<String>, String> {
+    if ids.is_empty() {
+        return Err("choose at least one item".to_string());
+    }
+    if ids.len() > OWED_IDS_MAX {
+        return Err(format!("the app changes at most {OWED_IDS_MAX} items at once; choose fewer"));
+    }
+    let mut seen: Vec<String> = Vec::with_capacity(ids.len());
+    for raw in ids {
+        let id = checked_commitment_id(raw)?;
+        if id.trim_start_matches('0').is_empty() {
+            return Err("that is not a commitment Khipu knows".to_string());
+        }
+        if !seen.contains(&id) {
+            seen.push(id);
+        }
+    }
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err("say why, in a few words".to_string());
+    }
+    if reason.chars().count() > OWED_REASON_MAX_CHARS || has_control(reason) {
+        return Err(format!("keep the reason to one line of at most {OWED_REASON_MAX_CHARS} characters"));
+    }
+    let joined = seen.join(",");
+    let mut argv = vec!["owed".to_string()];
+    match action {
+        "close" => {
+            if to.is_some() || label.is_some_and(|l| !l.trim().is_empty()) {
+                return Err("a close takes no new owner".to_string());
+            }
+            argv.push(format!("--close={joined}"));
+        }
+        "reassign" => {
+            let owner = to.map(str::trim).unwrap_or("");
+            if !OWED_OWNERS.contains(&owner) {
+                return Err("choose who it moves to".to_string());
+            }
+            argv.push(format!("--reassign={joined}"));
+            argv.push(format!("--to={owner}"));
+            if let Some(l) = label.map(str::trim).filter(|l| !l.is_empty()) {
+                if owner != "agent" {
+                    return Err("only an agent or a job takes a label".to_string());
+                }
+                if l.chars().count() > OWED_LABEL_MAX_CHARS || has_control(l) {
+                    return Err(format!("keep the label to one line of at most {OWED_LABEL_MAX_CHARS} characters"));
+                }
+                argv.push(format!("--label={l}"));
+            }
+        }
+        _ => return Err(format!("not a change Owed makes to several items: {action:?}")),
+    }
+    argv.push(format!("--reason={reason}"));
+    Ok(argv)
+}
+
+/// Where the app keeps a project's clean-up plan between Make a plan and
+/// Apply, inside Khipu's own data folder: the webview never names a path,
+/// and Apply applies exactly the plan it showed. The file name is the
+/// project's safe characters plus a hash of the whole key, so two projects
+/// never share one.
+fn owed_tidy_plan_path(data_dir: &Path, project: &str) -> PathBuf {
+    let safe: String = project
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .take(60)
+        .collect();
+    // FNV-1a, 64 bit: stable across builds, unlike the std hasher.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in project.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    data_dir.join("state").join("owed-tidy").join(format!("plan-{safe}-{h:016x}.json"))
+}
+
+fn owed_tidy_base(project: &str) -> Result<Vec<String>, String> {
+    Ok(vec!["owed".to_string(), "tidy".to_string(), format!("--project={}", checked_ledger_project(project)?)])
+}
+
+fn owed_tidy_plan_argv(project: &str, plan: &Path) -> Result<Vec<String>, String> {
+    let mut argv = owed_tidy_base(project)?;
+    argv.push(format!("--plan-out={}", plan.to_string_lossy()));
+    Ok(argv)
+}
+
+fn owed_tidy_apply_argv(project: &str, plan: &Path) -> Result<Vec<String>, String> {
+    let mut argv = owed_tidy_base(project)?;
+    argv.push(format!("--apply={}", plan.to_string_lossy()));
+    Ok(argv)
+}
+
+/// A clean-up batch id as `owed_tidy.apply` makes it (`tidy-<time>-<hex>`).
+fn owed_tidy_undo_argv(project: &str, batch: &str) -> Result<Vec<String>, String> {
+    let ok = batch.starts_with("tidy-")
+        && batch.len() <= 64
+        && batch.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !ok {
+        return Err("that is not a clean-up Khipu knows".to_string());
+    }
+    let mut argv = owed_tidy_base(project)?;
+    argv.push(format!("--undo={batch}"));
+    Ok(argv)
+}
+
+/// The plan document for the preview: totals, samples, notes and the model
+/// line, without the per-item list (thousands of rows the app never shows;
+/// Apply reads them from the file). `items_count` says how many there were.
+fn owed_tidy_plan_for_app(raw: &str) -> Result<String, String> {
+    let mut doc: Value = serde_json::from_str(raw).map_err(|_| "the clean-up plan could not be read".to_string())?;
+    if doc.get("format").and_then(Value::as_str) != Some("khipu-owed-tidy-plan") {
+        return Err("the clean-up plan is not in a form this app reads".to_string());
+    }
+    let obj = doc.as_object_mut().ok_or_else(|| "the clean-up plan could not be read".to_string())?;
+    let count = obj.remove("items").and_then(|i| i.as_array().map(Vec::len)).unwrap_or(0);
+    obj.insert("items_count".to_string(), Value::from(count));
+    serde_json::to_string(&doc).map_err(|e| e.to_string())
+}
+
+/// Khipu's data folder, as `app_cli_timeout_secs` finds it.
+fn khipu_data_dir() -> Result<PathBuf, String> {
+    data_dir_from_pointer()
+        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config/khipu")))
+        .ok_or_else(|| "Khipu's data folder could not be found".to_string())
+}
+
+#[tauri::command]
+async fn khipu_owed_change(
+    action: String,
+    ids: Vec<String>,
+    reason: String,
+    to: Option<String>,
+    label: Option<String>,
+) -> Result<String, String> {
+    run_khipu_cli_async(owed_change_argv(&action, &ids, &reason, to.as_deref(), label.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_owed_tidy_plan(project: String) -> Result<String, String> {
+    let path = owed_tidy_plan_path(&khipu_data_dir()?, &project);
+    let argv = owed_tidy_plan_argv(&project, &path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("could not make the folder for the plan: {e}"))?;
+    }
+    let _ = std::fs::remove_file(&path);
+    let out = run_khipu_cli_async(argv).await?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        // No file: the CLI said why on stdout (a refusal is JSON with ok false).
+        Err(_) => return Ok(out),
+    };
+    owed_tidy_plan_for_app(&raw)
+}
+
+#[tauri::command]
+async fn khipu_owed_tidy_apply(project: String) -> Result<String, String> {
+    let path = owed_tidy_plan_path(&khipu_data_dir()?, &project);
+    if !path.is_file() {
+        return Err("make a plan first; there is no plan for this project to apply".to_string());
+    }
+    run_khipu_cli_async(owed_tidy_apply_argv(&project, &path)?).await
+}
+
+#[tauri::command]
+async fn khipu_owed_tidy_undo(project: String, batch: String) -> Result<String, String> {
+    run_khipu_cli_async(owed_tidy_undo_argv(&project, &batch)?).await
 }
 
 #[tauri::command]
@@ -4405,6 +4619,10 @@ pub fn run() {
             khipu_ledger_restore,
             khipu_work_hide,
             khipu_work_same,
+            khipu_owed_change,
+            khipu_owed_tidy_plan,
+            khipu_owed_tidy_apply,
+            khipu_owed_tidy_undo,
             khipu_account_sign_in,
             khipu_account_sign_in_offers,
             khipu_account_new_folder,
@@ -6919,5 +7137,125 @@ mod work_command_tests {
         );
         assert_eq!(work_same_argv("atlas", "n-7", "42", false).unwrap()[1], "not-same");
         assert!(work_same_argv("atlas", "n-7", "4 2", true).is_err());
+    }
+
+    fn ids(n: usize) -> Vec<String> {
+        (1..=n).map(|i| i.to_string()).collect()
+    }
+
+    #[test]
+    fn a_bulk_close_is_one_call_with_every_id_and_the_reason() {
+        let argv = owed_change_argv("close", &ids(50), "Merged in the release", None, None).unwrap();
+        let joined = (1..=50).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        assert_eq!(argv, vec!["owed".to_string(), format!("--close={joined}"), "--reason=Merged in the release".to_string()]);
+        // The same id twice goes once; spaces round an id are dropped.
+        assert_eq!(
+            owed_change_argv("close", &["7".into(), " 8 ".into(), "7".into()], "done", None, None).unwrap(),
+            vec!["owed", "--close=7,8", "--reason=done"]
+        );
+    }
+
+    #[test]
+    fn a_move_names_the_new_owner_and_an_agent_s_label() {
+        assert_eq!(
+            owed_change_argv("reassign", &ids(2), "Job items", Some("agent"), Some("orchestrator")).unwrap(),
+            vec!["owed", "--reassign=1,2", "--to=agent", "--label=orchestrator", "--reason=Job items"]
+        );
+        assert_eq!(
+            owed_change_argv("reassign", &ids(1), "Mine after all", Some("user"), None).unwrap(),
+            vec!["owed", "--reassign=1", "--to=user", "--reason=Mine after all"]
+        );
+        // A label belongs only to an agent; a blank one is left out.
+        assert_eq!(
+            owed_change_argv("reassign", &ids(1), "x", Some("assistant"), Some("  ")).unwrap(),
+            vec!["owed", "--reassign=1", "--to=assistant", "--reason=x"]
+        );
+        assert!(owed_change_argv("reassign", &ids(1), "x", Some("assistant"), Some("builder")).is_err());
+        assert!(owed_change_argv("reassign", &ids(1), "x", None, None).is_err());
+        assert!(owed_change_argv("reassign", &ids(1), "x", Some("everyone"), None).is_err());
+        assert!(owed_change_argv("reassign", &ids(1), "x", Some("agent"), Some("a\nb")).is_err());
+        assert!(owed_change_argv("close", &ids(1), "x", Some("agent"), None).is_err());
+    }
+
+    #[test]
+    fn a_bulk_change_refuses_what_is_not_an_id_a_reason_or_an_action() {
+        for bad in [vec![], vec!["".to_string()], vec!["1,2".to_string()], vec!["-1".to_string()],
+                    vec!["--reopen=3".to_string()], vec!["0".to_string()], vec!["12a".to_string()]] {
+            assert!(owed_change_argv("close", &bad, "done", None, None).is_err(), "{bad:?}");
+        }
+        for reason in ["", "   ", "one\ntwo"] {
+            assert!(owed_change_argv("close", &ids(2), reason, None, None).is_err(), "{reason:?}");
+        }
+        assert!(owed_change_argv("close", &ids(1), &"x".repeat(OWED_REASON_MAX_CHARS + 1), None, None).is_err());
+        for action in ["delete", "reopen", "snooze", "--close", ""] {
+            assert!(owed_change_argv(action, &ids(1), "x", None, None).is_err(), "{action:?}");
+        }
+        assert!(owed_change_argv("close", &ids(OWED_IDS_MAX + 1), "x", None, None).is_err());
+        // A reason that looks like a flag stays the reason's value.
+        let argv = owed_change_argv("close", &ids(1), "--reopen=1", None, None).unwrap();
+        assert_eq!(argv.last().unwrap(), "--reason=--reopen=1");
+    }
+
+    #[test]
+    fn the_clean_up_runs_on_fixed_argv_with_the_plan_kept_where_khipu_chose() {
+        let dir = PathBuf::from("/data/khipu");
+        let path = owed_tidy_plan_path(&dir, "owner/atlas");
+        assert!(path.starts_with("/data/khipu/state/owed-tidy"));
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("json"));
+        assert_ne!(path, owed_tidy_plan_path(&dir, "owner_atlas"), "two projects never share a plan file");
+        assert_eq!(path, owed_tidy_plan_path(&dir, "owner/atlas"));
+        let shown = path.to_string_lossy().to_string();
+        assert_eq!(
+            owed_tidy_plan_argv("owner/atlas", &path).unwrap(),
+            vec!["owed".to_string(), "tidy".into(), "--project=owner/atlas".into(), format!("--plan-out={shown}")]
+        );
+        assert_eq!(
+            owed_tidy_apply_argv("owner/atlas", &path).unwrap(),
+            vec!["owed".to_string(), "tidy".into(), "--project=owner/atlas".into(), format!("--apply={shown}")]
+        );
+        assert_eq!(
+            owed_tidy_undo_argv("owner/atlas", "tidy-20261016T120000Z-a1b2c3").unwrap(),
+            vec!["owed", "tidy", "--project=owner/atlas", "--undo=tidy-20261016T120000Z-a1b2c3"]
+        );
+        for bad in ["", "--apply=x", "tidy 1", "../x", "tidy-1\n"] {
+            assert!(owed_tidy_undo_argv("atlas", bad).is_err(), "{bad:?}");
+        }
+        assert!(owed_tidy_plan_argv("a#b", &path).is_err());
+    }
+
+    #[test]
+    fn the_app_reads_the_plan_without_its_item_list() {
+        let raw = r#"{"format":"khipu-owed-tidy-plan","version":1,"project":"atlas",
+            "totals":{"open":3},"samples":{"move":[]},"items":[{"id":1},{"id":2}]}"#;
+        let shown: Value = serde_json::from_str(&owed_tidy_plan_for_app(raw).unwrap()).unwrap();
+        assert!(shown.get("items").is_none());
+        assert_eq!(shown["totals"]["open"], 3);
+        assert_eq!(shown["items_count"], 2);
+        assert!(owed_tidy_plan_for_app(r#"{"format":"something-else","version":1}"#).is_err());
+        assert!(owed_tidy_plan_for_app("not json").is_err());
+    }
+
+    #[test]
+    fn the_clean_up_is_not_cut_short_but_other_owed_calls_are() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(cli_has_no_time_limit(&v(&["owed", "tidy", "--project=atlas", "--plan-out=/x.json"])));
+        assert!(!cli_has_no_time_limit(&v(&["owed", "--close=1,2", "--reason=x"])));
+    }
+
+    #[test]
+    fn the_owed_limits_and_the_github_switch_are_settable_and_resettable() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for key in ["owed_orchestrator_slice_max", "owed_page_max", "owed_bulk_max", "owed_tidy_calls"] {
+            assert_eq!(config_set_argv(key, " 0 ").unwrap(), v(&["config", "--set", key, "0"]));
+            assert_eq!(config_set_argv(key, "750").unwrap(), v(&["config", "--set", key, "750"]));
+            assert_eq!(config_unset_argv(key).unwrap(), v(&["config", &format!("--unset={key}")]));
+            for bad in ["-1", "1.5", "", "lots"] {
+                assert!(config_set_argv(key, bad).is_err(), "{key}={bad:?}");
+            }
+        }
+        assert_eq!(config_set_argv("owed_pr_check_github", "off").unwrap(), v(&["config", "--set", "owed_pr_check_github", "off"]));
+        assert_eq!(config_set_argv("owed_pr_check_github", " on ").unwrap(), v(&["config", "--set", "owed_pr_check_github", "on"]));
+        assert!(config_set_argv("owed_pr_check_github", "maybe").is_err());
+        assert_eq!(config_unset_argv("owed_pr_check_github").unwrap(), v(&["config", "--unset=owed_pr_check_github"]));
     }
 }
