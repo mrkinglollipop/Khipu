@@ -185,6 +185,14 @@ def _z(dt: datetime | None) -> str | None:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _z_up(dt: datetime | None) -> str | None:
+    """``_z`` for a deadline: a part second rounds up, so the deadline is
+    never at or before the instant it was worked out from."""
+    if dt is not None and dt.microsecond:
+        dt = dt.replace(microsecond=0) + timedelta(seconds=1)
+    return _z(dt)
+
+
 def _parse_time(value: Any) -> datetime | None:
     """An RFC 3339 time with ``Z`` or an offset; anything else is None."""
     if isinstance(value, datetime):
@@ -275,10 +283,11 @@ def clean_text(value: Any, cap: int) -> str | None:
 
 
 # A routing account key ("harness|login folder"); a path at a word's start
-# ("/x", "~/x", a backslash path, a drive letter); or a word holding two or more folder
-# separators. A link's own path is not a local path: links are cut out first.
+# ("/x", "~/x", a backslash path, a drive letter); or a word holding any folder
+# separator, so a relative "folder/file" too. A link's own path is not a local
+# path: links are cut out first.
 _ACCOUNT_KEY = re.compile(r"(?i)(?<![\w-])(?:claude|codex|grok|muse)\|")
-_PATH_SHAPE = re.compile(r"(?:^|[^\w.-])(?:~[/\\]|/(?=[\w.~-])|\\)|\b[A-Za-z]:[/\\]|[^\s/\\]+[/\\][^\s/\\]*[/\\]")
+_PATH_SHAPE = re.compile(r"(?:^|[^\w.-])(?:~[/\\]|/(?=[\w.~-])|\\)|\b[A-Za-z]:[/\\]|[^\s/\\]+[/\\]")
 _LINK = re.compile(r"https://\S+")
 
 
@@ -963,7 +972,8 @@ def read_owed() -> dict[str, Any]:
         from khipu.commitments import list_owed
 
         with conn.cursor() as cur:
-            rows = list_owed(cur, status="open", limit=1000, hide_snoozed=True)
+            # No limit: the list is every open commitment, the user's picked after.
+            rows = list_owed(cur, status="open", limit=None, hide_snoozed=True)
         return {"items": [r for r in rows if r.get("owner") == "user"], "error": None}
     except Exception as exc:  # noqa: BLE001
         return {"items": [], "error": type(exc).__name__}
@@ -1190,7 +1200,9 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime) -
         # An explicit link (the row's reference or a remembered "Same") wins;
         # equal words link only a row with no explicit link, never a pair
         # remembered as "Not the same".
-        linked = next((item for p, row, item in needs if p == project and cid in explicit[id(item)]), None)
+        # A row shows one commitment: a second one linked to it shows on its own.
+        linked = next((item for p, row, item in needs if p == project and cid in explicit[id(item)]
+                       and item["also_owed"] in (None, cid)), None)
         if linked is None:
             linked = next((item for p, row, item in needs if p == project and not explicit[id(item)]
                            and item["also_owed"] is None and (p, row["row_id"], cid) not in not_same
@@ -1342,7 +1354,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
     scan = _Scan()
     view = scan({
         "format": VIEW_FORMAT, "version": VIEW_VERSION, "generated_at": _z(now),
-        "valid_until": _z(min(future)) if future else None,
+        "valid_until": _z_up(min(future)) if future else None,
         "projects": projects, "live": live, "waiting": waiting, "accounts": routing_info.get("accounts") or [],
         "counts": {"waiting": len(waiting), "blocking": sum(1 for w in waiting if w["blocking"]),
                    "running": sum(1 for j in live if j["state"] == "running"),
