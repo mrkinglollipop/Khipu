@@ -115,6 +115,24 @@ def _named_group(path: Path) -> int | None:
     return pgid if pgid > 1 and path.name == f"{pgid}.json" else None
 
 
+def _parse_record(path: Path) -> tuple[int, str]:
+    """The (group id, leader start time) of a record, validated against the
+    exact shape ``record`` writes: an object with only ``pgid`` (an integer
+    above 1 that matches the file name) and ``start`` (a non-empty string).
+    Anything else raises ValueError. Values are never coerced: a null or
+    numeric start turned into a string would read as a reused group id and
+    clear the record while its writer lives."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or set(data) != {"pgid", "start"}:
+        raise ValueError("not a writer record")
+    pgid, started = data["pgid"], data["start"]
+    if type(pgid) is not int or pgid <= 1 or path.name != f"{pgid}.json":
+        raise ValueError("invalid group id")
+    if not isinstance(started, str) or not started.strip():
+        raise ValueError("invalid start time")
+    return pgid, started
+
+
 def _wait_gone(pgid: int, seconds: float) -> bool:
     deadline = time.monotonic() + seconds
     while group_alive(pgid):
@@ -163,11 +181,8 @@ def sweep() -> dict[str, Any]:
     ok = True
     for path in paths:
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            pgid, started = int(data["pgid"]), str(data["start"])
-            if pgid <= 1:
-                raise ValueError("invalid group id")
-        except (OSError, ValueError, KeyError, TypeError):
+            pgid, started = _parse_record(path)
+        except (OSError, ValueError):
             # A record damaged after it was written still names a group that
             # may be running, so it fails closed: kept, and the forget stays
             # open, until a sweep reads it or the group its name gives is gone.

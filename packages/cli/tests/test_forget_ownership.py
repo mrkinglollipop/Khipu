@@ -159,6 +159,10 @@ class _WorldCur:
         elif s.startswith("SELECT ts, summary, session_id FROM episodes"):
             ep = eps.get(params[0])
             self._one = (ep["ts"], ep["summary"], ep["session_id"]) if ep else None
+        elif s.startswith("SELECT harness, session_id, transcript_range FROM episodes"):
+            ep = eps.get(params[0])
+            self._one = ((ep.get("harness"), ep["session_id"], ep.get("transcript_range"))
+                         if ep else None)
         elif s.startswith("SELECT raw FROM episodes"):
             self._one = (eps[params[0]]["raw"],)
         elif s.startswith("SELECT source_key, role, ts, summary_md5"):

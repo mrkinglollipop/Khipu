@@ -128,7 +128,8 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     registry_error: str | None = None
     try:
         for _round in range(_PUBLISH_ROUNDS):
-            publish_forget(read["source_rows"], read["tombstone_payloads"], read["candidates"])
+            publish_forget([*(read["source_rows"] or []), *read["column_sources"]],
+                           read["tombstone_payloads"], read["candidates"])
             again = _read_forget_sources(cur, episode_id, live)
             grown = bool(_read_identities(again) - _read_identities(read))
             read = again
@@ -177,7 +178,7 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     # visible to this transaction. Before it, the identities would be
     # silently skipped; the migration's own backfill covers a forget that
     # committed before it.
-    publish_hub_forget(cur, episode_id, [*(source_rows or []),
+    publish_hub_forget(cur, episode_id, [*(source_rows or []), *read["column_sources"],
                                          *_payload_identities(read["tombstone_payloads"])])
     cur.execute(
         "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
@@ -260,6 +261,46 @@ def _payload_identities(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _column_identity(cur, episode_id: int) -> dict[str, Any] | None:
+    """The natural source identity the episode's own columns hold (harness,
+    session id, transcript range, window id), or None when they name none.
+    Source rows fail open and raw can be partial, so a forget may find the
+    natural identity only here; without it a re-synthesis of the same source
+    could be queued again."""
+    from khipu.capture_identity import SOURCE_FIELDS, has_natural_key, source_key
+    from khipu.db import has_columns
+
+    names = ["harness", "session_id", "transcript_range"]
+    if has_columns(cur, "episodes", "window_id"):
+        names.append("window_id")
+    cur.execute(f"SELECT {', '.join(names)} FROM episodes WHERE id = %s", (episode_id,))
+    row = cur.fetchone()
+    if not isinstance(row, tuple) or len(row) != len(names):
+        return None
+    fields = {k: (None if v is None else str(v)) for k, v in zip(names, row)}
+    if not has_natural_key(fields):
+        return None
+    return {"source_key": source_key(fields), **{k: fields.get(k) for k in SOURCE_FIELDS}}
+
+
+def _natural_identities(raw: Any, column: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Every natural source identity an episode holds outside its source rows:
+    its own columns, and its columns completed by what raw still carries (a
+    part number, a window id). Raw itself is keyed through its payload."""
+    from khipu.capture_identity import SOURCE_FIELDS, source_key
+
+    if column is None:
+        return []
+    found = [column]
+    if isinstance(raw, dict):
+        merged = {k: column.get(k) if column.get(k) is not None else
+                  (None if raw.get(k) is None else str(raw.get(k))) for k in SOURCE_FIELDS}
+        key = source_key(merged)
+        if key != column["source_key"]:
+            found.append({"source_key": key, **merged})
+    return found
+
+
 def _read_forget_sources(cur, episode_id: int, live: dict[str, Any]) -> dict[str, Any]:
     """raw, the source rows, every legacy identity candidate and the payloads
     to tombstone, as the hub holds them now."""
@@ -315,7 +356,11 @@ def _read_forget_sources(cur, episode_id: int, live: dict[str, Any]) -> dict[str
         receipt["payload"] for receipt in (receipts if isinstance(receipts, list) else [])
         if isinstance(receipt, dict) and isinstance(receipt.get("payload"), dict)
     ] if isinstance(raw, dict) else []
+    # The episode's own columns are the third place a natural identity lives,
+    # read every round like the other two.
+    column_sources = _natural_identities(raw, _column_identity(cur, episode_id))
     return {"raw": raw, "sources": sources, "source_rows": source_rows,
+            "column_sources": column_sources,
             "candidates": candidates, "has_merged_sources": has_merged_sources,
             "unidentified_sources": unidentified_sources,
             "tombstone_payloads": tombstone_payloads,
@@ -329,6 +374,7 @@ def _read_identities(read: dict[str, Any]) -> set[str]:
 
     found = {str(row[k]) for row in read["source_rows"] or []
              for k in ("source_key", "payload_sha256") if row.get(k)}
+    found.update(str(row["source_key"]) for row in read["column_sources"])
     found.update(read["receipt_ids"])
     for payload in read["tombstone_payloads"]:
         try:

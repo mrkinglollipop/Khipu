@@ -407,19 +407,23 @@ class PathsPrivacyTest(unittest.TestCase):
             for incoming in (source, archive):
                 target = root / f"target-{incoming.suffix or 'dir'}"
                 target.mkdir()
-                observed = []
-                original = paths.copy_sensitive
-                def spy(reader, destination):
-                    observed.append(destination.name)
-                    return original(reader, destination)
+                # The mode of every file at the moment its bytes are copied in
+                # (the staging copies and the restored files alike).
+                modes = []
+                original = paths.shutil.copyfileobj
+                def spy(reader, writer, *args):
+                    modes.append(stat.S_IMODE(os.fstat(writer.fileno()).st_mode))
+                    return original(reader, writer, *args)
                 with mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(target)}), \
-                     mock.patch.object(paths, "copy_sensitive", side_effect=spy):
+                     mock.patch.object(paths.shutil, "copyfileobj", side_effect=spy):
                     old = os.umask(0o022)
                     try:
                         paths.import_local(source=incoming)
                     finally:
                         os.umask(old)
-                self.assertEqual(set(observed), {"dsn", "gateway-token"})
+                self.assertGreaterEqual(len(modes), 4)
+                self.assertEqual(set(modes), {0o600})
+                self.assertEqual(stat.S_IMODE((target / "dsn").stat().st_mode), 0o600)
                 self.assertEqual(stat.S_IMODE((target / "gateway-token").stat().st_mode), 0o600)
 
     def test_gateway_token_is_created_private_before_its_bytes_are_written(self):

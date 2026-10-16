@@ -408,6 +408,106 @@ def _refuse_same_file(st: os.stat_result, dest: Path) -> None:
         raise shutil.SameFileError(f"{dest!s} is the same file as its backup copy")
 
 
+_WRITE_NO_FOLLOW = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
+class UnsafeDestination(RuntimeError):
+    """A restore destination that is a link, a folder, a special file or a
+    file with more than one name. It is never written through."""
+
+
+def _destination_folder(root_fd: int, parts: tuple[str, ...], *, create: bool) -> int | None:
+    """A descriptor of the folder a restore destination lives in, reached from
+    the state folder's descriptor one component at a time without following
+    links. None when a folder is missing and ``create`` is False. Raises
+    UnsafeDestination when a component is a link or not a folder."""
+    fd = os.dup(root_fd)
+    try:
+        for name in parts[:-1]:
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if not create:
+                    os.close(fd)
+                    return None
+                os.mkdir(name, 0o700, dir_fd=fd)
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if not stat_module.S_ISDIR(st.st_mode):
+                raise UnsafeDestination(f"refusing to restore through {'/'.join(parts)}: "
+                                        f"{name} is not a plain folder")
+            sub = os.open(name, _DIR_NO_FOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = sub
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _check_destination(st: os.stat_result, parts: tuple[str, ...], registry: os.stat_result | None) -> None:
+    rel = "/".join(parts)
+    if not stat_module.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        raise UnsafeDestination(f"refusing to restore over {rel}: it exists as something other "
+                                "than a regular file with one name (a link, folder or shared file)")
+    if registry is not None and (st.st_dev, st.st_ino) == (registry.st_dev, registry.st_ino):
+        raise UnsafeDestination(f"refusing to restore over {rel}: it is the forget registry, "
+                                "which a restore only merges")
+
+
+def _registry_identity(root_fd: int) -> os.stat_result | None:
+    try:
+        return os.stat(_REGISTRY_NAME, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _preflight_destination(root_fd: int, parts: tuple[str, ...]) -> None:
+    """Refuse before anything is written when a destination already exists
+    as anything but a regular file with one name, or a folder on its way is
+    a link."""
+    if parts == (_REGISTRY_NAME,):
+        raise UnsafeDestination("refusing to restore over the forget registry, which a restore only merges")
+    fd = _destination_folder(root_fd, parts, create=False)
+    if fd is None:
+        return
+    try:
+        try:
+            st = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        _check_destination(st, parts, _registry_identity(root_fd))
+    finally:
+        os.close(fd)
+
+
+def _restore_file(root_fd: int, parts: tuple[str, ...], source) -> None:
+    """Write a restored file under the state folder, opened from the folder's
+    descriptor without following any link. The opened file must be a regular
+    file with one name that is not the forget registry, or nothing is written."""
+    if parts == (_REGISTRY_NAME,):
+        raise UnsafeDestination("refusing to restore over the forget registry, which a restore only merges")
+    sensitive = parts[-1] in SENSITIVE_FILENAMES
+    folder = _destination_folder(root_fd, parts, create=True)
+    try:
+        fd = os.open(parts[-1], _WRITE_NO_FOLLOW, 0o600 if sensitive else 0o666, dir_fd=folder)
+    except OSError as exc:
+        os.close(folder)
+        raise UnsafeDestination(f"refusing to restore over {'/'.join(parts)}: it could not be "
+                                f"opened as a plain file ({type(exc).__name__})") from exc
+    os.close(folder)
+    try:
+        _check_destination(os.fstat(fd), parts, _registry_identity(root_fd))
+        if sensitive:
+            os.fchmod(fd, 0o600)
+        os.ftruncate(fd, 0)
+        with os.fdopen(fd, "wb") as out:
+            fd = -1
+            shutil.copyfileobj(source, out)
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
 def _write_staged(source, staged: Path) -> None:
     """The one write of a backup file's bytes into its private staging copy."""
     with sensitive_writer(staged) as handle:
@@ -597,30 +697,34 @@ def _import_local(*, source: Path, merge: bool) -> dict:
         else:
             raise RuntimeError("import source must be a .zip or a directory")
         # Nothing below reads the backup again: only the staged copies.
-        if registry is not None:
-            tombstones.merge_registry_bytes(registry.read_bytes())
-        with tombstones.write_gate() as gate:
-            for scrub, staged, dest, rel in candidates:
-                if scrub == "job":
-                    refusal = _job_refusal(staged.read_bytes(), gate)
-                    if refusal == "forgotten":
-                        skipped_forgotten += 1
-                        continue
-                    if refusal is not None:
-                        not_restored.append({"path": rel, "why": (
-                            "a queued job that could not be read or checked against the "
-                            "forget registry, so it may hold a forgotten source and was not "
-                            "restored")})
-                        continue
+        root_fd = os.open(str(target), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+        try:
+            # Every destination is checked before anything is written, so an
+            # unsafe one refuses the whole restore rather than half of it.
+            for scrub, _staged, _dest, rel in candidates:
                 if scrub != "stage":
-                    with open(staged, "rb") as staged_file:
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        if dest.name in SENSITIVE_FILENAMES:
-                            copy_sensitive(staged_file, dest)
-                        else:
-                            with open(dest, "wb") as out:
-                                shutil.copyfileobj(staged_file, out)
-                imported += 1
+                    _preflight_destination(root_fd, tuple(rel.split("/")))
+            if registry is not None:
+                tombstones.merge_registry_bytes(registry.read_bytes())
+            with tombstones.write_gate() as gate:
+                for scrub, staged, _dest, rel in candidates:
+                    if scrub == "job":
+                        refusal = _job_refusal(staged.read_bytes(), gate)
+                        if refusal == "forgotten":
+                            skipped_forgotten += 1
+                            continue
+                        if refusal is not None:
+                            not_restored.append({"path": rel, "why": (
+                                "a queued job that could not be read or checked against the "
+                                "forget registry, so it may hold a forgotten source and was not "
+                                "restored")})
+                            continue
+                    if scrub != "stage":
+                        with open(staged, "rb") as staged_file:
+                            _restore_file(root_fd, tuple(rel.split("/")), staged_file)
+                    imported += 1
+        finally:
+            os.close(root_fd)
         scrub = None
         if replica is not None and any(c[0] == "stage" for c in candidates):
             # After the gate is released: publishing takes the registry and
