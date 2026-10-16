@@ -142,6 +142,11 @@ def queue_dir() -> Path:
     return khipu_home() / "queue"
 
 
+def empty_dir() -> Path:
+    """Where a claimed job whose window yielded no episode is kept."""
+    return khipu_home() / "empty"
+
+
 def log_path() -> Path:
     return khipu_home() / "logs" / "session-capture.log"
 
@@ -1486,7 +1491,7 @@ def _archive_claimed(claimed: Path) -> None:
     with _claim_lock() as acquired:
         if not acquired:
             raise OSError("queue transition lock unavailable")
-        archive = khipu_home() / "empty"
+        archive = empty_dir()
         archive.mkdir(parents=True, exist_ok=True)
         destination = archive / claimed.with_suffix("").with_suffix(".json").name
         with claimed.open("rb") as stream:
@@ -2342,7 +2347,9 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         _discard_claim(jp)
         out["captured"] += 1
         _record_drain(harness, captured=True)
-        _log(f"drain: captured {original.name} -> {payload['summary'][:90]!r}")
+        # Never the summary itself: the log is not in forget's scan
+        # (khipu/capture_stores.py), so it must hold no capture text.
+        _log(f"drain: captured {original.name} ({len(payload['summary'])} chars)")
     if deadline is not None and time.monotonic() >= deadline:
         out["time_budget_exhausted"] = True
     if out["captured"] and not dry_run and not out.get("time_budget_exhausted"):

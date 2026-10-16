@@ -409,3 +409,55 @@ transcript range) is not refused at its episode row. It is still refused at its 
 savepoint, and whether that undoes the episode row depends on that older code. The lock is per Mac: a
 forget on one Mac does not wait for a writer on another; the hub's advisory locks and triggers cover that
 case.
+
+## Durable forget: one store inventory (2026-10-16)
+
+Why. Ten review rounds each found one more place a copy of a source sits. Round 10 found two: the native
+`empty/` archive (transcript text of a window that yielded no episode) and a backup that restored a
+forgotten episode id under older raw. Listing places one review at a time does not end.
+
+**The model.** `khipu/capture_stores.py` is the one list (`STORES`): each store names where it is, what it
+holds, which functions write it and how a forget covers it. Forget's scans read their folders from it
+(`native_job_folders`, `outbox_folders`). A store with no forget scan keeps the forget open (partial
+`store_inventory`, location state "not checked"). `tests/test_capture_store_inventory.py` walks every
+function in the package that writes a file and fails unless it is a store's writer or a `NOT_CAPTURE`
+entry with the reason it holds no capture data. A new writer therefore cannot ship unplaced.
+
+| Store | Where | Holds | How forget covers it |
+|---|---|---|---|
+| native capture job | capture home `queue/`: `*.json`, `*.claimed.<pid>`, `*.tmp`, `.extract-*.tmp` | transcript text, and the extracted episode once checkpointed | scan "native jobs" |
+| native empty archive | capture home `empty/`: `*.json` | transcript text of a window that yielded no episode | scan "native jobs" |
+| outbox job | `outbox/`, `outbox/dead/`, `outbox/quarantine/`: `*.json` and `.*.tmp` | whole capture payloads waiting for the hub | scan "outbox" |
+| legacy log | memory root: `episodes*.jsonl`, their `.bak` copies, `.khipu-forget-backups/`, `.tmp` files beside them | one capture per line, summary text | scan "legacy logs" |
+| replica | data folder `hub_snapshot.sqlite` | episode rows, vectors, decisions and deliverables | scan "replica" |
+| replica temp | data folder `.hub_snapshot.<random>.sqlite` and its journal and WAL | a refresh dump or a staged backup replica | scan "replica temps" |
+| legacy writer | data folder `.legacy_writers/<pgid>.json` | the process group of a legacy writer that may still append | scan "legacy writers" |
+| session state | capture home `state/<harness>--<session>.json` and `.capture-now.json` | offsets and hashes; carried text and a capture note not yet queued | none: the carried text belongs to the next window, which is refused when queued if its source is forgotten |
+| capture log | capture home `logs/session-capture.log` | drain and hook events: file names, counts and lengths | none: it never holds summary or transcript text |
+| conversation media | data folder `media/conversation_memory/<sha256>.<ext>` | images found in transcripts, shared by content hash | kept: content-addressed, can belong to several episodes |
+| extraction scratch | data folder `state/synth-cli/work-*/` and its output temp | a model call's working folder and output | kept: removed by the call that made it |
+| commitments backup | hygiene backup folder `commitments-<time>/commitments.bin` | a binary copy of the commitments table | kept: closed commitments remain by design |
+| local backup | a backup folder or archive the owner chose | a copy of the data folder | kept: backups are kept for recovery; an import scrubs them |
+
+**Import scrubs by every identity the registry holds.** The registry (`tombstones`) now also holds
+forgotten episode ids (`publish_episode_ids`, `forgotten_episode_ids`, `Gate.episode_ids`; old files without
+the key still read). `forget_episode` publishes the id. `hub_snapshot._scrub_forgotten` refuses live rows
+whose id the registry holds as well as rows with a forgotten source key or hash, and
+`publish_imported_snapshot` applies pending erasures before the scrub. So a backup cannot bring back a
+forgotten episode id under older raw.
+
+**Known boundaries.** Conversation media is kept (shared by content hash). Extraction scratch left behind
+by a killed call is not swept. Local backups and the commitments backup are kept for recovery. Session
+state carry and capture notes are not sources until a window is queued.
+
+**Tests that pin it.** `tests/test_forget_round10.py`:
+`test_job_archived_to_empty_is_removed_by_a_completed_forget`,
+`test_unreadable_empty_archive_keeps_the_forget_open`,
+`test_backup_cannot_restore_a_forgotten_episode_id_under_older_raw`,
+`test_registry_merge_keeps_forgotten_episode_ids_and_reads_old_files`.
+`tests/test_capture_store_inventory.py`:
+`test_every_file_writer_is_a_store_writer_or_writes_no_capture_data`,
+`test_inventory_lists_no_writer_that_no_longer_writes`,
+`test_every_store_is_scanned_by_forget_or_says_why_not`,
+`test_forget_reads_its_folders_from_the_inventory`,
+`test_a_store_without_a_forget_scan_keeps_the_forget_open`.

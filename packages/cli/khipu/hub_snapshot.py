@@ -1855,8 +1855,10 @@ def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
     its vectors, decisions and deliverables. The hub can hold a copy of a
     forgotten source under another id (written before the forget, or by a
     Mac that never saw it), and a dump must not carry it into this replica.
-    Rows already marked forgotten keep their tombstone. ``RegistryError``
-    propagates. Caller commits."""
+    Rows already marked forgotten keep their tombstone. A live row whose id
+    the registry records as forgotten is refused too: a backup can hold that
+    episode under an older raw that no source identity matches.
+    ``RegistryError`` propagates. Caller commits."""
     cols = _snapshot_table_columns(con, "episodes")
     if "id" not in cols or gate.empty:
         return 0
@@ -1864,9 +1866,10 @@ def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
     cursor = con.execute(f"SELECT * FROM episodes{live}")
     names = [d[0] for d in cursor.description]
     refused = []
+    forgotten_ids = gate.episode_ids
     for values in cursor.fetchall():
         row = dict(zip(names, values, strict=True))
-        if not gate.allows_stored(_tombstone_payload_for_episode(row)):
+        if row["id"] in forgotten_ids or not gate.allows_stored(_tombstone_payload_for_episode(row)):
             refused.append(row["id"])
     has_decisions = "episode_id" in _snapshot_table_columns(con, "decisions")
     has_deliverables = "episode_id" in _snapshot_table_columns(con, "deliverables")
@@ -1939,6 +1942,9 @@ def publish_imported_snapshot(staged: Path) -> dict[str, Any]:
             try:
                 con = sqlite3.connect(str(staged))
                 try:
+                    # Erasures this Mac queued but has not applied yet name
+                    # episode ids the backup may hold live.
+                    _apply_pending_erasures(con, snapshot_path())
                     scrubbed = _scrub_forgotten(con, gate)
                     con.commit()
                 finally:

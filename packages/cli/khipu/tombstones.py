@@ -88,20 +88,26 @@ def _identity_values(payload: dict[str, Any], *, redact: bool = True) -> tuple[s
 
 
 def _empty() -> dict[str, Any]:
-    return {"version": 1, "source_keys": [], "payload_hashes": [], "legacy_identities": []}
+    return {"version": 1, "source_keys": [], "payload_hashes": [], "legacy_identities": [],
+            "episode_ids": []}
 
 
 def _validated(value: Any) -> dict[str, Any]:
     if isinstance(value, dict) and value.get("version") == 1 and "legacy_identities" not in value:
         # Registry files written during the first rollout remain readable.
         value = {**value, "legacy_identities": []}
+    if isinstance(value, dict) and value.get("version") == 1 and "episode_ids" not in value:
+        # Registries written before forgotten episode ids were recorded.
+        value = {**value, "episode_ids": []}
     if (not isinstance(value, dict) or value.get("version") != 1
             or not isinstance(value.get("source_keys"), list)
             or not isinstance(value.get("payload_hashes"), list)
             or not isinstance(value.get("legacy_identities"), list)
             or not all(isinstance(item, str) for item in value["source_keys"])
             or not all(isinstance(item, str) for item in value["payload_hashes"])
-            or not all(isinstance(item, str) for item in value["legacy_identities"])):
+            or not all(isinstance(item, str) for item in value["legacy_identities"])
+            or not isinstance(value.get("episode_ids"), list)
+            or not all(type(item) is int for item in value["episode_ids"])):
         raise RegistryError("tombstone registry is corrupt")
     return value
 
@@ -252,7 +258,12 @@ class Gate:
     def empty(self) -> bool:
         """Nothing has been forgotten, so a bulk scan can skip its checks."""
         return not (self._value["source_keys"] or self._value["payload_hashes"]
-                    or self._value["legacy_identities"])
+                    or self._value["legacy_identities"] or self._value["episode_ids"])
+
+    @property
+    def episode_ids(self) -> frozenset[int]:
+        """Episode ids a forget erased on this Mac or in an imported backup."""
+        return frozenset(self._value["episode_ids"])
 
 
 @contextmanager
@@ -354,9 +365,22 @@ def publish_forget(source_rows: list[dict[str, Any]] | None,
     publish_identities(keys, hashes, legacy)
 
 
-def publish_identities(keys: set[str], hashes: set[str], legacy: set[str] | None = None) -> None:
+def publish_episode_ids(episode_ids: set[int]) -> None:
+    """Record forgotten episode ids. A backup can hold an episode under an
+    older raw that no source identity matches; its import scrubs by id."""
+    publish_identities(set(), set(), episode_ids=episode_ids)
+
+
+def forgotten_episode_ids() -> set[int]:
+    with _locked_registry() as (_path, value, _lease):
+        return set(value["episode_ids"])
+
+
+def publish_identities(keys: set[str], hashes: set[str], legacy: set[str] | None = None,
+                       *, episode_ids: set[int] | None = None) -> None:
     legacy = legacy or set()
-    if not keys and not hashes and not legacy:
+    episode_ids = {int(i) for i in episode_ids or ()}
+    if not keys and not hashes and not legacy and not episode_ids:
         raise RegistryError("forget has no source identity to publish")
     # Publication from a borrowed child could let an outer writer that already
     # observed ``allowed=True`` survive a concurrent forget. Only the lock
@@ -369,6 +393,7 @@ def publish_identities(keys: set[str], hashes: set[str], legacy: set[str] | None
             "source_keys": sorted(set(current["source_keys"]) | keys),
             "payload_hashes": sorted(set(current["payload_hashes"]) | hashes),
             "legacy_identities": sorted(set(current["legacy_identities"]) | legacy),
+            "episode_ids": sorted(set(current["episode_ids"]) | episode_ids),
         }
         _atomic_write(path, next_value)
 
@@ -379,9 +404,10 @@ def merge_registry(value: dict[str, Any]) -> None:
     keys = set(incoming["source_keys"])
     hashes = set(incoming["payload_hashes"])
     legacy = set(incoming["legacy_identities"])
-    if not keys and not hashes and not legacy:
+    ids = set(incoming["episode_ids"])
+    if not keys and not hashes and not legacy and not ids:
         return
-    publish_identities(keys, hashes, legacy)
+    publish_identities(keys, hashes, legacy, episode_ids=ids)
 
 
 def merge_registry_bytes(data: bytes) -> None:

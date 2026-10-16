@@ -122,7 +122,7 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     # followed by a re-read: a source that reached this episode without the
     # row lock (a fail-open source row, an older writer) is fenced before the
     # forget can report itself complete.
-    from khipu.tombstones import RegistryError, publish_forget
+    from khipu.tombstones import RegistryError, publish_episode_ids, publish_forget
 
     read = _read_forget_sources(cur, episode_id, live)
     registry_error: str | None = None
@@ -137,6 +137,9 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         else:
             registry_error = ("the episode's sources kept changing while it was being "
                               "forgotten; run the forget again")
+        # The id too: a backup can hold this episode under an older raw whose
+        # hash no published identity matches, and its import scrubs by id.
+        publish_episode_ids({episode_id})
     except RegistryError as exc:
         # Keep the hub tombstone/cascade semantics intact, but absolutely do
         # not touch a local store when the writer fence could not be published.
@@ -894,10 +897,10 @@ def _outbox_entries() -> list[dict[str, Any]]:
     beside them, with its bytes and payload or the error reading it. The
     caller holds the outbox lock: every writer writes its temp under it, so a
     temp seen here was left by a crash."""
-    from khipu.outbox import dead_dir, outbox_dir, quarantine_dir
+    from khipu.capture_stores import outbox_folders
 
     entries: list[dict[str, Any]] = []
-    for directory in (outbox_dir(), dead_dir(), quarantine_dir()):
+    for directory in outbox_folders():
         try:
             paths = sorted(directory.iterdir())
         except FileNotFoundError:
@@ -1235,8 +1238,10 @@ def plain_summary(out: dict[str, Any]) -> str:
 
 def _native_job_remainder(session_id: str | None,
                           source_rows: list[dict[str, Any]] | None) -> dict[str, Any]:
-    """Remove native capture jobs (queued, claimed, or a crash-left checkpoint)
-    that will capture one of the episode's sources, and report every job kept.
+    """Remove native capture jobs (queued, claimed, a crash-left checkpoint,
+    or archived as empty) that will capture, or did capture, one of the
+    episode's sources, and report every job kept. The folders come from the
+    store inventory (``capture_stores.native_job_folders``).
 
     A job is matched on the source key its capture will carry
     (``session_capture.job_source_identity``). It holds the transcript, and a
@@ -1252,19 +1257,25 @@ def _native_job_remainder(session_id: str | None,
     remaining: list[str] = []
     inspected: list[dict[str, str]] = []
     removed = 0
+    from khipu.capture_stores import native_job_folders
+
     try:
-        directory = sc.queue_dir()
+        # One claim lock across every folder: a job moves from the queue to
+        # the empty archive under it, so it cannot slip past the scan.
         with sc._claim_lock() as acquired:
             if not acquired:
                 raise OSError("queue claim lock unavailable")
-            try:
-                names = sorted(path.name for path in directory.iterdir())
-            except FileNotFoundError:
-                names = []
-            for name in names:
+            listed: list[tuple[str, Path]] = []
+            for place, directory in native_job_folders():
+                try:
+                    listed += [(place, directory / name)
+                               for name in sorted(p.name for p in directory.iterdir())]
+                except FileNotFoundError:
+                    continue
+            for place, path in listed:
+                name = path.name
                 if not (name.endswith(".json") or ".claimed." in name or name.endswith(".tmp")):
                     continue
-                path = directory / name
                 if not _present_file(path):
                     continue
                 state, why = "clean", None
@@ -1295,7 +1306,7 @@ def _native_job_remainder(session_id: str | None,
                         state = "copy remains"
                         why = (f"native capture job {path} is from the same session, but with "
                                "no source rows it cannot be matched exactly, so it was kept")
-                loc = {"place": "native capture job", "path": str(path), "state": state}
+                loc = {"place": place, "path": str(path), "state": state}
                 if why:
                     loc["why"] = why
                     remaining.append(f"native jobs: {why}")
@@ -1430,10 +1441,22 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
     out["legacy_writers"] = writers
     if not writers["ok"]:
         partial.append("legacy_writer")
+    # Every store the inventory says forget scans must be one of the scans
+    # above; a store added without its scan keeps the forget open.
+    from khipu.capture_stores import STORES
+
+    ran = {"native jobs", "outbox", "legacy logs", "replica", "replica temps", "legacy writers"}
+    unscanned = [{"place": st.name, "path": None, "state": "not checked",
+                  "why": (f"{st.name} ({st.where}) is in the store inventory but forget has no "
+                          "scan for it, so the forget stays open")}
+                 for st in STORES
+                 if not st.forget.startswith(("kept:", "none:")) and st.forget not in ran]
+    if unscanned:
+        partial.append("store_inventory")
     out["locations"] = _merge_locations(
         legacy_locs, *(item.get("inspected", []) for item in out["outboxes"]),
         out["replica_temps"]["locations"], out["native_jobs"]["inspected"],
-        writers["locations"])
+        writers["locations"], unscanned)
     out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
                      "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
     if not out["outbox"]["ok"]:
@@ -1456,6 +1479,7 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         "native_jobs": out["native_jobs"]["remaining"],
         "legacy_writer": [loc.get("why") for loc in writers["locations"]
                           if loc["state"] in INCOMPLETE_STATES],
+        "store_inventory": [loc["why"] for loc in unscanned],
     }
     if out.get("unidentified_sources", 0) > 0:
         out["partial_errors"]["legacy_file"] = [
