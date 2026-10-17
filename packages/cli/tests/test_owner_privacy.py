@@ -154,7 +154,7 @@ def test_the_sweep_prunes_every_file_line_by_line_and_deletes_an_old_widenings_f
     both = owner_turns.session_file("s-both").read_text(encoding="utf-8")
     assert old_line not in both and new_line in both
     briefs = (owner_turns.folder() / "briefs.jsonl").read_text(encoding="utf-8")
-    assert "long ago" not in briefs and "just now" in briefs
+    assert [json.loads(b)["parent"] for b in briefs.splitlines()] == ["s-both"]
     assert out["pending"] == 1 and not widenings.exists()
 
 
@@ -469,3 +469,37 @@ def test_purge_cannot_run_early_or_be_cancelled_after_deadline(folders, monkeypa
     monkeypatch.setattr(owner_direction, "_clock", lambda: now + owner_direction.PURGE_DELAY_S + 1)
     with pytest.raises(ValueError, match="deadline"):
         owner_direction.undo(line_id, "direction")
+
+
+# ---- the fifth review's probes ----------------------------------------------------------------
+
+
+def test_a_brief_is_kept_as_hashes_and_forgetting_the_job_removes_it(folders):
+    """Fifth review, P1: no words of a delegation brief are kept, and
+    forgetting the dispatched job's session removes the brief its turn was."""
+    marker = "copied-private-owner-words-28c0"
+    brief = marker + " implement the delegated build task"
+    owner_turns.note_brief(brief, parent="owner-session", harness="claude_code")
+    assert marker not in (owner_turns.folder() / "briefs.jsonl").read_text(encoding="utf-8")
+    owner_turns.record({"session_id": "child", "prompt": brief, "cwd": str(folders)},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-cli"})
+    (turn,) = owner_turns.turns("child")
+    assert turn["delegated"] is True and turn["parent"] == "owner-session"
+    owner_turns.forget_sessions({"child"})
+    assert (owner_turns.folder() / "briefs.jsonl").read_text(encoding="utf-8") == ""
+
+
+def test_a_brief_after_other_words_is_still_known_without_its_words(folders):
+    brief = "build the parser slice from the scope doc and run the oracle"
+    owner_turns.note_brief(brief, parent="p", harness="claude_code")
+    assert owner_turns.brief_for("Context first. " + brief + " Then report.")["parent"] == "p"
+    assert owner_turns.brief_for("an unrelated message the owner typed today") is None
+
+
+def test_an_older_brief_line_loses_its_words_on_the_timer(folders):
+    owner_turns.folder().mkdir(parents=True)
+    old = {"ts": time.time(), "head": "words copied under the old design", "sha": "x", "parent": "p"}
+    (owner_turns.folder() / "briefs.jsonl").write_text(json.dumps(old) + "\n", encoding="utf-8")
+    owner_turns.sweep()
+    kept = (owner_turns.folder() / "briefs.jsonl").read_text(encoding="utf-8")
+    assert "copied" not in kept and json.loads(kept)["parent"] == "p"

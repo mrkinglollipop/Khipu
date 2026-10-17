@@ -181,23 +181,42 @@ def _norm(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+# A brief is known by hashes of its words, never the words: the whole brief,
+# and its first ``_HEAD`` characters, which a turn holding the brief after
+# other words (a wrapper the cleaning left) still contains at a word start
+# within its first ``_HEAD_SCAN`` characters.
+_HEAD = 200
+_HEAD_SCAN = 4096
+
+
+def _hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def note_brief(text: str, *, parent: str, harness: str, now: float | None = None) -> None:
     """A delegation's brief (the delegation hook calls this): a turn whose
     text is this brief is a dispatched job's, never the owner's, and the
-    brief names the parent session the job was started from."""
+    brief names the parent session the job was started from. Only hashes
+    of the brief are kept."""
     norm = _norm(text or "")
     # Kept while owner direction is off too: a turn that could turn it back
     # on is recorded then, and a brief must never pass for one.
     if len(norm) < 20 or not parent:
         return
-    line = {"ts": time.time() if now is None else now, "head": norm[:200],
-            "sha": hashlib.sha256(norm.encode()).hexdigest(), "parent": parent, "harness": harness}
+    head = norm[:_HEAD]
+    line = {"ts": time.time() if now is None else now, "sha": _hash(norm), "head_sha": _hash(head),
+            "head_len": len(head), "parent": parent, "harness": harness}
     try:
         path = _ensure_folder() / "briefs.jsonl"
         lines = [b for b in _read_lines(path) if line["ts"] - float(b.get("ts") or 0) < RETENTION_S]
-        _write_private(path, "".join(json.dumps(b) + "\n" for b in lines + [line]))
+        _write_private(path, "".join(json.dumps(_no_text(b)) + "\n" for b in lines + [line]))
     except OSError:
         pass
+
+
+def _no_text(brief: dict) -> dict:
+    """A brief line as it is kept now: an older line's copied words go."""
+    return {k: v for k, v in brief.items() if k != "head"}
 
 
 def brief_for(text: str, now: float | None = None) -> dict | None:
@@ -206,12 +225,20 @@ def brief_for(text: str, now: float | None = None) -> dict | None:
     if not norm:
         return None
     now = time.time() if now is None else now
+    whole = _hash(norm)
+    starts = [0] + [i + 1 for i, c in enumerate(norm[:_HEAD_SCAN]) if c == " "]
+    heads: dict[int, set[str]] = {}
     for b in reversed(_read_lines(folder() / "briefs.jsonl")):
         if now - float(b.get("ts") or 0) >= RETENTION_S:
             continue
-        head = str(b.get("head") or "")
-        if b.get("sha") == hashlib.sha256(norm.encode()).hexdigest() or (len(head) >= 20 and head in norm):
+        if b.get("sha") == whole:
             return b
+        size = b.get("head_len")
+        if isinstance(size, int) and size >= 20 and b.get("head_sha"):
+            if size not in heads:
+                heads[size] = {_hash(norm[i:i + size]) for i in starts if len(norm) - i >= size}
+            if b["head_sha"] in heads[size]:
+                return b
     return None
 
 
@@ -408,6 +435,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
     turn["delegated"] = brief is not None
     if brief is not None:
         turn["parent"] = brief.get("parent")
+        turn["brief"] = brief.get("sha")
     ok, why = eligible(turn, conf)
     turn["eligible"] = ok
     if why:
@@ -450,7 +478,8 @@ def _ts(row: dict) -> float:
 def _prune(path: Path, now: float) -> int:
     """Drop the lines of one file older than the retention, by each line's
     own time (a file's mtime says nothing about its oldest line); delete the
-    file when none remain. Returns how many lines went."""
+    file when none remain. Words an older line still holds (a brief's
+    ``head``, a turn's ``text``) go too. Returns how many lines went."""
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -458,7 +487,9 @@ def _prune(path: Path, now: float) -> int:
     rows = _read_lines(path) if raw else []
     kept = [r for r in rows if now - _ts(r) < RETENTION_S]
     gone = len(raw.splitlines()) - len(kept)
-    if not gone:
+    if any("head" in r or "text" in r for r in kept):
+        kept = [{k: v for k, v in r.items() if k not in ("head", "text")} for r in kept]
+    elif not gone:
         return 0
     if kept:
         _write_private(path, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept))
@@ -512,6 +543,15 @@ def sweep(now: float | None = None) -> dict:
     return out
 
 
+def _brief_keys(rows: list[dict]) -> set[str]:
+    """The brief hashes these turns name: the brief a dispatched job's turn
+    was (``brief``), and the hash of a turn's words on a line written under
+    the old design."""
+    keys = {r["brief"] for r in rows if isinstance(r.get("brief"), str)}
+    keys |= {_hash(_norm(str(r["text"]))) for r in rows if r.get("text")}
+    return keys
+
+
 def forget_sessions(sessions) -> dict:
     """Forget's owner words scan on the turn files: delete every recorded
     turn of these sessions (their files whole, whatever a crash left in
@@ -538,14 +578,14 @@ def forget_sessions(sessions) -> dict:
         if path.name in files:
             # The session's own file goes whole: a line a crash cut short
             # holds the words too, though it reads as no turn.
-            texts |= {hashlib.sha256(_norm(str(r.get("text") or "")).encode()).hexdigest() for r in rows}
+            texts |= _brief_keys(rows)
             path.unlink()
             out["files"] += 1
             continue
         mine = [r for r in rows if r.get("session") in names]
         if not mine:
             continue
-        texts |= {hashlib.sha256(_norm(str(r.get("text") or "")).encode()).hexdigest() for r in mine}
+        texts |= _brief_keys(mine)
         kept = [r for r in rows if r not in mine]
         if kept:
             _write_private(path, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept))
@@ -556,8 +596,8 @@ def forget_sessions(sessions) -> dict:
     briefs = d / "briefs.jsonl"
     rows = _read_lines(briefs)
     kept = [b for b in rows if b.get("parent") not in names and b.get("sha") not in texts]
-    if len(kept) != len(rows):
-        _write_private(briefs, "".join(json.dumps(b) + "\n" for b in kept))
+    if len(kept) != len(rows) or any("head" in b for b in kept):
+        _write_private(briefs, "".join(json.dumps(_no_text(b)) + "\n" for b in kept))
         out["briefs"] = len(rows) - len(kept)
     return out
 
