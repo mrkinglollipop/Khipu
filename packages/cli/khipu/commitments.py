@@ -110,8 +110,16 @@ _IN_PROGRESS_RE = re.compile(
     r"|\bcurrently\s+\w+ing\b",
     re.I,
 )
+# Waiting on another agent's output: "the agent's verdict", "a report from the
+# phase 2 agent", "poll the drive". The word "agent" alone ("fix agent
+# attribution") is not this shape. It never discards an item: it only moves
+# one the user would otherwise own to the agent that is waited on
+# (:func:`resolve_owner_and_label`), and it marks the assistant's own
+# session-plan rows (:func:`is_session_plan_text`).
 _AGENT_RE = re.compile(
-    r"\b(?:sub-?agents?|agents?|agent's)\b"
+    r"\b(?:sub-?agents?|agents?)(?:'s|s'|’s)?\s+(?:verdicts?|reports?|results?|outputs?|repl(?:y|ies)|"
+    r"answers?|responses?|finish\w*|return\w*|land\w*)\b"
+    r"|\b(?:from|by)\s+(?:the\s+|a\s+|an\s+)?(?:[\w-]+\s+){0,3}(?:sub-?)?agents?\b"
     r"|\bdrives?\s+\d+\b"
     r"|\bnotifications?\b"
     r"|\bpoll(?:s|ing)?\b"
@@ -143,10 +151,10 @@ _STATUS_SENTENCE_RE = re.compile(
 
 _EXCLUSION_RULES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("in-progress", _IN_PROGRESS_RE),
-    ("agent-or-infra", _AGENT_RE),
     ("coordination", _COORDINATION_RE),
     ("status-sentence", _STATUS_SENTENCE_RE),
 )
+_SESSION_PLAN_RULES = (*_EXCLUSION_RULES, ("agent-or-infra", _AGENT_RE))
 
 MIN_COMMITMENT_WORDS = 4
 
@@ -561,7 +569,10 @@ def resolve_owner_and_label(text: str, *, kind: str | None = None, declared: Any
        decision shape, "Matt to decide X") or a model-declared ``"user"``
        goes to the orchestrator, because a job's user is its dispatcher. The
        orchestrator asks the user itself if it really needs them.
-    3. Otherwise today's rule: a user signal is the user's; with no signal
+    3. Text that waits on another agent's output ("the agent's verdict",
+       "a report from the phase 2 agent") with no user named as its actor
+       goes to the orchestrator, not the user.
+    4. Otherwise today's rule: a user signal is the user's; with no signal
        and no future trigger, the model's declared owner ("other" with its
        label becomes ``agent``); else the assistant's.
     """
@@ -573,14 +584,17 @@ def resolve_owner_and_label(text: str, *, kind: str | None = None, declared: Any
     if label:
         return OWNER_AGENT, label
     job = str(origin or "").strip().lower() == ORIGIN_JOB
+    # Waiting on an agent's output is the orchestrator's, unless the user is
+    # named as the actor; it moves the item, never drops it.
+    waits_on_agent = bool(_AGENT_RE.search(body)) and not _compile_user_patterns().actor_re.search(body)
     if _user_signal(text, kind=kind, future_trigger=future_trigger):
-        return (OWNER_AGENT, ORCHESTRATOR) if job else (OWNER_USER, None)
+        return (OWNER_AGENT, ORCHESTRATOR) if job or waits_on_agent else (OWNER_USER, None)
     if not future_trigger:
         norm = _declared(declared)
         if norm == "other":
             return OWNER_AGENT, clean_owner_label(declared_label) or (ORCHESTRATOR if job else "other")
         if norm == OWNER_USER:
-            return (OWNER_AGENT, ORCHESTRATOR) if job else (OWNER_USER, None)
+            return (OWNER_AGENT, ORCHESTRATOR) if job or waits_on_agent else (OWNER_USER, None)
         if norm:
             return norm, None
     return OWNER_ASSISTANT, None
@@ -706,7 +720,7 @@ def is_session_plan_text(text: str) -> bool:
     s = (text or "").strip()
     if not s:
         return False
-    return any(pattern.search(s) for _, pattern in _EXCLUSION_RULES)
+    return any(pattern.search(s) for _, pattern in _SESSION_PLAN_RULES)
 
 
 def content_hash(scope: str | None, text: str) -> str:

@@ -475,3 +475,32 @@ def test_a_pre_migration_hub_still_answers_reads_and_writes(hub):  # noqa: F811
         rows = co.list_owed(cur, project="acme/widget", limit=None)
         assert len(rows) == 3
     conn.commit()
+
+
+# ---- the review's probe: a phrase never discards a real commitment ----------
+
+def test_supported_reviewer_actor_is_stored_not_dropped_for_agent_work():
+    """Slice 1: a supported third-party actor survives agent-word filtering."""
+    text = "The reviewer must fix agent attribution before PR #41 merges"
+    owner, label = co.resolve_owner_and_label(text)
+    assert (owner, label) == (co.OWNER_AGENT, "reviewer")
+    assert co.rejection_reason(text, owner=owner) is None
+
+
+def test_the_agent_classifier_reassigns_and_never_discards(monkeypatch):
+    monkeypatch.setenv("KHIPU_USER_ALIASES", "matt")
+    co.reset_user_patterns()
+    try:
+        # The owner's own commitment mentioning agents stays the owner's.
+        assert co.resolve_owner_and_label("Matt to fix agent attribution in the capture hook") == (
+            co.OWNER_USER, None)
+        assert co.rejection_reason("Matt to fix agent attribution in the capture hook") is None
+        # Waiting on an agent's output is the orchestrator's, not the owner's, and is kept.
+        text = "Did the phase 2 agent's report land?"
+        assert co.resolve_owner_and_label(text, kind="question") == (co.OWNER_AGENT, co.ORCHESTRATOR)
+        assert co.rejection_reason(text, owner=co.OWNER_AGENT, kind="question") is None
+        # The word alone moves nothing.
+        assert co.resolve_owner_and_label("Should we rename agent attribution?", kind="question") == (
+            co.OWNER_USER, None)
+    finally:
+        co.reset_user_patterns()

@@ -668,15 +668,27 @@ class PrecisionFilterTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNotNone(co.rejection_reason(text), text)
 
-    def test_agent_and_infra_chatter_is_rejected(self):
+    def test_agent_and_infra_chatter_is_kept_and_never_the_users(self):
+        # Status chatter about an agent is still rejected as status.
         for text in (
             "Visual check agent's verdict is pending",
-            "Receive report from the phase 1-2 agent",
-            "Poll the drive for the finished export",
             "Wait for notifications from the background job",
         ):
             with self.subTest(text=text):
                 self.assertIsNotNone(co.rejection_reason(text), text)
+        # The agent shape alone moves an item, it never drops one: the
+        # assistant's own stays the assistant's (and ends with its session),
+        # and what would read as the user's goes to the orchestrator.
+        for text in (
+            "Receive report from the phase 1-2 agent",
+            "Poll the drive for the finished export",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(co.rejection_reason(text), text)
+                self.assertEqual(co.resolve_owner(text), co.OWNER_ASSISTANT)
+                self.assertTrue(co.is_session_plan_text(text))
+        self.assertEqual(co.resolve_owner_and_label("Did the background agent's report land?"),
+                         (co.OWNER_AGENT, co.ORCHESTRATOR))
 
     def test_coordination_messages_are_rejected(self):
         for text in (
