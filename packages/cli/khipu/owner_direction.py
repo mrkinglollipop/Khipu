@@ -696,7 +696,7 @@ def gate(want: dict | None, *, env=None, now: float | None = None) -> dict:
                                "Khipu can't read what this would change right now, so it could not be undone; "
                                "nothing was changed. Try again when the database is back.")
     _abandon()
-    pend = {"intent": want, "stamp": stamp, "before": before}
+    pend = {"intent": want, "stamp": stamp, "before": before, "stamped": _routing_stamps()}
     try:
         pend["line"] = _append(_ahead_line(want, stamp, before))
     except OSError as err:
@@ -719,7 +719,7 @@ def noted(want: dict | None, stamp: dict) -> None:
         before = _before(want)
     except Exception:  # noqa: BLE001 - the log never stops the owner's own change
         before = None
-    pend = {"intent": want, "stamp": dict(stamp), "before": before}
+    pend = {"intent": want, "stamp": dict(stamp), "before": before, "stamped": _routing_stamps()}
     try:
         pend["line"] = _append(_ahead_line(want, pend["stamp"], before))
     except Exception:  # noqa: BLE001 - the whole line is tried again once the change is done
@@ -808,12 +808,61 @@ def finish(result: dict | None, **extra) -> dict | None:
         if pend.get("line") is None:
             return result
         incomplete = True
+    if not refused:
+        _name_in_push(want, stamp, line, pend.get("stamped"))
     if stamp.get("auth") == "direction" and isinstance(result, dict) and not refused:
         out = dict(result, owner_action=line["id"])
         if incomplete:
             out["record_incomplete"] = _INCOMPLETE
         return out
     return result
+
+
+def _routing_stamps() -> int:
+    from khipu import routing
+
+    return routing._owner_stamped[0]
+
+
+# The push's fixed words for an owner change the routing record does not
+# itself hold (``routing.owner_change``): never a target, which may name a
+# project or a row, since the push reaches every conversation.
+_PUSH_WORDS = {
+    "direction.on": "Turned owner direction on", "direction.off": "Turned owner direction off",
+    "direction.set": "Changed the owner-direction settings",
+    "direction.acknowledge": "Acknowledged the owner-actions tamper alarm",
+    "direction.undo": "Undid an owner change",
+    "ledger.import": "Imported a tracker into the ledger", "ledger.restore": "Brought back a removed ledger row",
+    "ledger.purge": "Removed a ledger row for good", "ledger.project": "Changed a ledger project",
+    "ledger.add": "Added a ledger row", "ledger.set": "Changed a ledger row", "ledger.remove": "Removed a ledger row",
+    "work.hide": "Hid a work item", "work.unhide": "Showed a hidden work item",
+    "work.same": "Marked a ledger row and a commitment as the same work",
+    "work.not_same": "Marked a ledger row and a commitment as different work",
+    "promote.gate_ignore": "Set Update anyway for the next promotion",
+    "promote.gate_ignore.cancel": "Cancelled Update anyway",
+    "config.routing_setting": "Changed a routing setting",
+    "config.answer_request.confirm": "Confirmed a conversation's change to a routing setting",
+    "config.answer_request.undo": "Undid a conversation's change to a routing setting",
+    "accounts.decline": "Stopped offering an account", "accounts.offer_again": "Offered an account again",
+    "accounts.auto_track": "Changed whether new accounts are tracked",
+}
+
+
+def _name_in_push(want: dict, stamp: dict, line: dict | None, stamped) -> None:
+    """Name an owner change in the next routing push when it wrote no owner's
+    line of the routing record itself (those are named from the record).
+    Never fails the change."""
+    if line is None or stamped is None or _routing_stamps() != stamped:
+        return
+    words = _PUSH_WORDS.get(want["action"], "Made an owner change")
+    if want["action"] == "ledger.purge" and stamp.get("auth") == "direction":
+        words = "Scheduled a ledger row to be removed for good in a day"
+    try:
+        from khipu import routing
+
+        routing.owner_change(words, line["id"], stamp.get("auth") or "terminal", stamp.get("harness"))
+    except Exception:  # noqa: BLE001 - the change is made and logged; the push line is extra
+        pass
 
 
 # ---- before, after and undo, per action ----------------------------------------------------

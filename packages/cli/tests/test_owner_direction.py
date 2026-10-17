@@ -534,3 +534,31 @@ def test_the_apps_own_change_is_in_the_log_and_can_be_undone_there(world, khipu_
     assert rc == 0, out
     assert not routing.read_view()["note"]
     assert owner_direction.verify_log()["ok"] is True
+
+
+# ---- the fifth review's probe: every owner change is in the routing push ------------------------
+
+
+def test_an_owner_change_outside_the_routing_record_is_named_in_the_next_push(world):
+    """Fifth review, P2: widening the window (an owner-direction setting) is
+    named once in the next routing push, with how it was made, and Undo is
+    named too. A routing change is named once, from its own line."""
+    world.say()
+    baseline = routing.read_view()
+    rc, out = world.run(["owner-direction", "set", "latest_window_h", "12"], True)
+    assert rc == 0, out
+    diff = routing.since(baseline["version"], routing.read_view())
+    assert len(diff["directions"]) == 1 and diff["directions"][0].startswith(
+        "Changed the owner-direction settings by your direction in "), diff
+    assert not [e for e in diff["entities"] if e.startswith("owner:")], diff
+    mark = routing.read_view()["version"]
+    rc, out = world.run(["route", "pause", "Codex"], True)
+    assert rc == 0, out
+    diff = routing.since(mark, routing.read_view())
+    assert len(diff["directions"]) == 1 and diff["directions"][0].startswith("Paused Codex"), diff
+    mark = routing.read_view()["version"]
+    line = next(a for a in _log() if a["action"] == "direction.set")
+    rc, out = world.run(["owner-direction", "undo", line["id"]], True)
+    assert rc == 0 and owner_turns.settings()["latest_window_h"] == 6.0, out
+    diff = routing.since(mark, routing.read_view())
+    assert [d.split(" by ")[0] for d in diff["directions"]] == ["Undid an owner change"], diff

@@ -2409,6 +2409,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # who wrote it and through what. A version's Recent changes names its
     # author from this, never from the state left after it (fix round 1).
     causes: dict[str, dict] = {}
+    owner_changes: list[dict] = []
     for event in events:
         kind = event.get("type")
         if kind == "evidence":
@@ -2478,6 +2479,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             if event.get("auth") in _OWNER_AUTHS:
                 # Named in the next push in fixed words (``direction_line``).
                 causes[touched].update(auth=event["auth"], harness=event.get("harness"))
+            if kind == "owner_change":
+                causes[touched]["text"] = event.get("text")
+                owner_changes.append(event)
         if kind in ("pause", "lift", "clear") and info["account"]:
             owner[{"pause": "pauses", "lift": "lifts", "clear": "clears"}[kind]][info["account"]] = info
             if kind == "clear":
@@ -2786,6 +2790,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                       for r in active_rules})
     if note_out is not None:
         effective["note"] = {"text": note_out["text"]}
+    # An owner change made outside this record, kept so the next push names
+    # it (``direction_line``); never a line of its own.
+    effective.update({f"owner:{e['target']}": {"text": e.get("text")}
+                      for e in owner_changes[-OWNER_CHANGES_KEPT:]})
     if priority_out is not None:
         effective["priority"] = _effective_priority(priority_out)
     effective.update({f"lane:{u['runner']}/{u['lane']}": {"state": u["state"], "until": u["until"],
@@ -3316,6 +3324,8 @@ def _touched(kind: str | None, event: dict, info: dict) -> str | None:
         return f"rule:{event['n']}"
     if kind in ("note_set", "note_end"):
         return "note"
+    if kind == "owner_change" and info["target"]:
+        return f"owner:{info['target']}"
     if kind in ("priority_set", "priority_confirm", "priority_undo", "priority_clear", "priority_drop"):
         return "priority"
     return None
@@ -3484,10 +3494,11 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
                              k.partition(":")[0], 5), k))
         changed = [k for k in changed if body["effective"].get(k) != prev_effective.get(k)]
         view_for_lines = dict(body, version=version)
-        change = {"version": version, "at": _iso(now), "entities": changed,
-                  "lines": [change_line(k, view_for_lines, now, prev_effective) for k in changed],
+        shown = [k for k in changed if not k.startswith("owner:")]
+        change = {"version": version, "at": _iso(now), "entities": shown,
+                  "lines": [change_line(k, view_for_lines, now, prev_effective) for k in shown],
                   "items": [_change_item(k, body, prev_effective, causes, since_at)
-                            for k in changed]}
+                            for k in shown]}
         directions = [direction_line(k, causes[k], body, prev_effective, now) for k in changed
                       if (causes.get(k) or {}).get("auth") in _OWNER_AUTHS
                       and (since_at is None or (_parse(causes[k].get("at")) or since_at) >= since_at)]
@@ -5001,7 +5012,10 @@ def direction_line(entity: str, cause: dict, body: dict, prev_effective: dict | 
         label = entry.get("label") or ((prev_effective or {}).get(entity) or {}).get("label") or _label_for_key(ident)
     verbs = _ACCOUNT_NOTE_VERBS if cause.get("type") == "account_note" else _DIRECTION_VERBS
     key = cause.get("state") if cause.get("type") == "account_note" else cause.get("type")
-    what = verbs.get(key, "Changed the routing record").format(a=label, n=ident)
+    if cause.get("type") == "owner_change":
+        what = cause.get("text") or "Made an owner change"
+    else:
+        what = verbs.get(key, "Changed the routing record").format(a=label, n=ident)
     if cause.get("auth") == "app":
         how = "in the app"
     elif cause.get("auth") == "terminal":
@@ -5140,7 +5154,7 @@ def since(version: int, view: dict | None = None, *, now: datetime | None = None
                 entities += [e for e in change["entities"] if e not in entities]
                 directions += [d for d in change.get("directions") or [] if isinstance(d, str)]
     else:
-        entities = list(view.get("effective") or {})
+        entities = [e for e in view.get("effective") or {} if not e.startswith("owner:")]
     lines = [_current_line(e, view, now) for e in entities]
     return {"since": version, "epoch": view.get("epoch"), "version": view["version"], "complete": complete,
             "entities": entities, "lines": lines, "directions": directions}
@@ -6530,7 +6544,28 @@ def typed_yes(prompt: str) -> bool:
 
 def _owner_stamp(event: dict) -> dict:
     """The owner's line with how it was authorised, when ``_owner_via`` did."""
-    return dict(event, **(_OWNER_AUTH.get() or {}))
+    auth = _OWNER_AUTH.get() or {}
+    if auth.get("auth"):
+        _owner_stamped[0] += 1
+    return dict(event, **auth)
+
+
+# How many owner's lines this process stamped: an owner change that wrote
+# none is named in the push by ``owner_change``.
+_owner_stamped = [0]
+OWNER_CHANGES_KEPT = 20
+
+
+def owner_change(text: str, line_id: str, auth: str, harness: str | None = None) -> dict:
+    """Record an owner change made outside this record (a ledger, Work view,
+    promotion or owner-direction change), so the next push names it once,
+    in ``text``'s fixed words, with how it was made."""
+    event = {"type": "owner_change", "target": line_id, "text": text, "auth": auth, "written_by": OWNER,
+             "via": {"direction": "direction", "app": "app", "terminal": "cli"}.get(auth, auth)}
+    if harness:
+        event["harness"] = harness
+    written, view = _write(event)
+    return _done(written, view)
 
 
 _REFUSED = ("This is the owner's command: it needs a typed confirmation on a terminal, or the app "

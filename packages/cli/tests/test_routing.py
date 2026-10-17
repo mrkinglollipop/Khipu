@@ -1767,7 +1767,8 @@ def test_a_hold_length_setting_too_long_to_add_never_stops_a_conversations_hold(
     assert rc == 0
     rc, out = _cli(["route", "hold", "x", "--reason", "other", "--all"], capsys)
     assert rc == 0 and json.loads(out)["until"] == routing._iso(until)
-    assert len(routing.read_events()[0]) == 1
+    # The setting change is named in the next push (``owner_change``), then the hold.
+    assert [e["type"] for e in routing.read_events()[0]] == ["owner_change", "hold"]
 
 
 def test_a_default_limit_setting_too_long_to_add_never_stops_an_untimed_report(home, capsys):
@@ -1777,7 +1778,7 @@ def test_a_default_limit_setting_too_long_to_add_never_stops_an_untimed_report(h
     rc, out = _cli(["route", "report", "--account", "Codex", "--state", "limited"], capsys)
     data = json.loads(out)
     assert rc == 0 and (data["until"], data["basis"]) == ("2026-10-14T20:00:00Z", "estimated")
-    assert len(routing.read_events()[0]) == 1
+    assert [e["type"] for e in routing.read_events()[0]] == ["owner_change", "evidence"]
 
 
 @pytest.mark.parametrize("raw", ["4000000d", "9999-12-31T23:59:00-05:00"])
