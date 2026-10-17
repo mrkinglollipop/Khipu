@@ -687,3 +687,45 @@ def test_a_loop_close_passes_when_every_named_pr_is_shown_finished():
     assert close_rules.evidence_problem(evidence + "\n✓ Reopened pull request #12", text, PROJECT)
     # An item naming no PR is not held by this check.
     assert close_rules.evidence_problem("Finished the release notes", "Write the release notes") is None
+
+
+# ---- the third cross-family review's probe: a long PR list is read whole ----
+
+def _round3_empty_sources(monkeypatch):
+    monkeypatch.setattr(close_rules, "_runner_states", lambda project: {})
+    monkeypatch.setattr(close_rules, "_ledger_states", lambda cur, project: {})
+    monkeypatch.setattr(close_rules, "_episode_states", lambda cur, project, after: {})
+
+
+def test_long_pr_list_does_not_close_when_its_unparsed_tail_is_open(monkeypatch):
+    """The parser cannot silently omit the later members of a PR list.
+
+    Omitting them turns an all-PRs-done check into an early close when the
+    retained prefix is merged but a later listed PR is still open.
+    """
+    _round3_empty_sources(monkeypatch)
+    numbers = list(range(1, 31))
+    text = "Land PR " + ", ".join(f"#{number}" for number in numbers) + " before release"
+    asked = []
+
+    class Github:
+        def state(self, repo, number):
+            asked.append(number)
+            return ("open", None) if number == 30 else ("merged", None)
+
+    item = {
+        "id": 1,
+        "text": text,
+        "project": "acme/widget",
+        "kind": "blocker",
+        "opened_episode": 1,
+        "prs": close_rules.parse_prs(text),
+        "reopened": [],
+        "pr_check": {},
+    }
+    planned = {}
+    report = {"closed_pr": 0, "kept_open_reopened": 0}
+    close_rules._pr_rule(None, [item], report, payload=None, episode_id=None, github=Github(), sink=planned)
+
+    assert planned == {}, f"An unfinished #30 was omitted and the item was planned closed: {planned}"
+    assert asked == numbers

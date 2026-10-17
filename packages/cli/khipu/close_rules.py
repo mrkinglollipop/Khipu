@@ -73,7 +73,9 @@ NOT_ASKED = "not checked on GitHub yet; the nightly asks"
 
 _PR_WORD = r"(?:PRs?|pull\s+requests?)"
 _PR_NUMBER_RE = re.compile(rf"\b{_PR_WORD}\s*#?\s*(\d{{1,7}})\b", re.I)
-_PR_LIST_RE = re.compile(rf"\b{_PR_WORD}\b([^.;:\n]{{0,60}})", re.I)
+# A PR list runs to the end of its clause, however long: a list cut short
+# would let an item close while a later PR it names is still open.
+_PR_LIST_RE = re.compile(rf"\b{_PR_WORD}\b([^.;:\n]*)", re.I)
 _HASH_RE = re.compile(r"(?<![\w&])#(\d{1,7})\b")
 _PULL_LINK_RE = re.compile(r"github\.com/([A-Za-z0-9][\w.-]*/[\w.-]+?)/pull/(\d{1,7})\b", re.I)
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
@@ -456,7 +458,12 @@ def _pr_reason(found: dict[str, tuple[str, str]]) -> str:
         named = refs[0] if len(refs) == 1 else ", ".join(refs[:-1]) + f" and {refs[-1]}"
         noun = "pull request" if len(refs) == 1 else "pull requests"
         parts.append(f"{noun} {named} {state} ({SOURCE_WORDS[source]})")
-    return "; ".join(parts)
+    reason = "; ".join(parts)
+    if len(reason) > 300:
+        # A stored reason is capped at 300 characters; a list cut there would
+        # read as complete. The evidence names every pull request.
+        reason = f"all {len(found)} pull requests it names are merged or closed (each one is in the evidence)"
+    return reason
 
 
 def _close(cur, cid: int, *, reason: str, key: str, evidence: dict, episode: int | None,
