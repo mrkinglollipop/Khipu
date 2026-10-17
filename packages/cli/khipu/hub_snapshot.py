@@ -3205,6 +3205,7 @@ def snapshot_health() -> dict[str, Any]:
         "size_bytes": st.st_size,
         "age_seconds": age_s,
         "counts": m.get("counts"),
+        "schema_version": m.get("schema_version"),
         **({"reason": "refresh_evidence_unknown"} if age_s is None else {}),
     }
 

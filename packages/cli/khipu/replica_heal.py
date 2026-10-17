@@ -6,6 +6,7 @@ design A). Each run decides from this Mac's own evidence whether the copy needs
 work, and does it only when the hub answers:
 
 - no copy, or the last full dump failed or is overdue: a full dump;
+- a copy at another schema version than this code's: a full dump;
 - a measurement made after the last update found the copy behind: a full dump;
 - the hub answers again after a run found it unreachable: an update at once;
 - the last update is ``replica_refresh_after`` old or more: an update.
@@ -217,12 +218,18 @@ def plan(
 ) -> tuple[str, str]:
     """``(action, reason)``: ``dump`` (a full dump), ``sync`` (bring the copy
     up to date) or ``none``. Local evidence only: no connection is opened."""
-    from khipu.hub_snapshot import SNAPSHOT_MAX_AGE_S, _ts_not_before
+    from khipu.hub_snapshot import SNAPSHOT_MAX_AGE_S, SNAPSHOT_SCHEMA_VERSION, _ts_not_before
 
-    if state.get("hub_unreachable_since"):
+    disk_schema = health.get("schema_version")
+    # Code promoted since the last dump reads a different layout; a pull only
+    # adds rows, so only a full dump rebuilds the copy at this code's schema.
+    wrong_schema = bool(health.get("exists")) and disk_schema is not None and disk_schema != SNAPSHOT_SCHEMA_VERSION
+    if state.get("hub_unreachable_since") and not wrong_schema:
         return "sync", "hub_back"
     if not health.get("exists") or health.get("age_seconds") is None:
         action, reason = "dump", "missing"
+    elif wrong_schema:
+        action, reason = "dump", "schema"
     elif health["age_seconds"] > SNAPSHOT_MAX_AGE_S:
         action, reason = "dump", "overdue"
     elif isinstance(sidecar.get("refresh_error"), dict) and _ts_not_before(

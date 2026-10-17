@@ -89,6 +89,39 @@ def test_a_fresh_replica_opens_no_connection(hub):
     assert hub.connects == 0 and hub.dumps == 0
 
 
+def test_a_replica_at_an_older_schema_is_rebuilt_at_once(hub):
+    """Promoted code at a newer schema: the copy is rebuilt on the next check,
+    not when a lag or the nightly happens to force a dump hours later."""
+    hub.up = True
+    hub.age(60)
+    hub.health["schema_version"] = hub_snapshot.SNAPSHOT_SCHEMA_VERSION - 1
+    out = replica_heal.run()
+    assert (out["action"], out["reason"]) == ("dump", "schema")
+    assert hub.dumps == 1
+    out = replica_heal.run()
+    assert (out["action"], out["reason"]) == ("none", "fresh")
+    assert hub.dumps == 1
+
+
+def test_a_schema_mismatch_is_a_dump_even_when_the_hub_just_came_back():
+    now = datetime.now(timezone.utc)
+    health = {"exists": True, "age_seconds": 60, "refreshed_at": (now - timedelta(seconds=60)).isoformat(),
+              "schema_version": hub_snapshot.SNAPSHOT_SCHEMA_VERSION - 1}
+    action = replica_heal.plan(now=now, state={"hub_unreachable_since": now.isoformat()}, health=health,
+                               sidecar={}, last_known=None, refresh_after=900)
+    assert action == ("dump", "schema")
+    health["schema_version"] = hub_snapshot.SNAPSHOT_SCHEMA_VERSION
+    action = replica_heal.plan(now=now, state={}, health=health, sidecar={}, last_known=None, refresh_after=900)
+    assert action == ("none", "fresh")
+
+
+def test_snapshot_health_reports_the_schema_on_disk(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
+    hub_snapshot.snapshot_path().write_bytes(b"")
+    hub_snapshot.meta_path().write_text(json.dumps({"schema_version": 5, "refreshed_at": "2026-10-16T18:00:00Z"}))
+    assert hub_snapshot.snapshot_health()["schema_version"] == 5
+
+
 def test_update_is_due_after_the_refresh_window(hub):
     hub.up = True
     replica_heal.set_setting("replica_refresh_after", 600)
