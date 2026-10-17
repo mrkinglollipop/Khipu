@@ -183,6 +183,7 @@ export type WorkCounts = {
   flagged: number;
   stale_sources: number;
   ledger_outbox: number;
+  ledger_refused?: number;
 };
 export type WorkView = {
   format: string;
@@ -225,11 +226,21 @@ export type HistoryEntry = {
   by?: string;
   changes?: Record<string, unknown>;
 };
+export type LedgerQueue = {
+  pending: number;
+  busy: boolean;
+  stopped_early: boolean;
+  refused: number;
+  unreadable: string | null;
+};
 export type LedgerList = {
   ok: boolean;
   project: string;
   offline: boolean;
   as_of?: string | null;
+  /** Writes saved on this Mac that have not reached the database yet. */
+  pending?: number;
+  queue?: LedgerQueue;
   vocab: Vocab;
   rows: LedgerRow[];
 };
@@ -606,9 +617,10 @@ export function goalBar(
 export const WORK_READ_FAILED = "Khipu couldn't read the work view. It tries again shortly.";
 export const WORK_READ_UNREADABLE = "The work view gave an answer Khipu could not read.";
 
-/** Polls `khipu_work_view` every refresh_s while the tab is open, once a
- *  minute otherwise (the rail badge). `load(true)` after a write waits for a
- *  read already under way, then reads again, so the badge moves at once. */
+/** Polls `khipu_work_view` refresh_s after the previous read ends while the
+ *  tab is open, a minute after otherwise (the rail badge): a slow read never
+ *  has another start behind it. `load(true)` after a write waits for a read
+ *  already under way, then reads again, so the badge moves at once. */
 export function useWork(active: boolean, enabled = true) {
   const [data, setData] = useState<WorkView | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -645,9 +657,16 @@ export function useWork(active: boolean, enabled = true) {
   const every = active ? Math.max(1, data?.refresh_s ?? 5) * 1000 : 60_000;
   useEffect(() => {
     if (!enabled) return;
-    void load();
-    const tick = window.setInterval(() => void load(), every);
-    return () => window.clearInterval(tick);
+    let stopped = false;
+    let timer: number | undefined;
+    const next = () => {
+      if (!stopped) timer = window.setTimeout(() => void load().then(next), every);
+    };
+    void load().then(next);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
   }, [enabled, every, load]);
 
   return { data, error, loading, readAt, load };

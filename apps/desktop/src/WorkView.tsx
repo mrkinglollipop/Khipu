@@ -14,7 +14,7 @@ import type { UsageReport } from "./PlansCard";
 import { accountState } from "./routing";
 import type { RoutingState } from "./routing";
 import { callCli } from "./settingsCli";
-import { LedgerPage, OutboxNotice } from "./LedgerPage";
+import { LedgerOfflineNotice, LedgerPage, OutboxNotice } from "./LedgerPage";
 import {
   WITHHELD,
   WORK_FOOT,
@@ -118,6 +118,8 @@ const PROBLEM_WORDS: Record<string, string> = {
   ledger: "The ledger couldn't be read just now; what shows from it may be out of date.",
   owed: "Owed couldn't be read just now; commitments may be missing from Waiting on you.",
   routing: "The routing record couldn't be read just now; routing items may be missing.",
+  outbox:
+    "Some ledger changes saved on this Mac couldn't be checked, or the database refused them. They are kept on this Mac, not lost.",
   privacy:
     "This view is incomplete: Khipu couldn't load its list of login folders and user names, so every name, title and line that could hold one is left out.",
 };
@@ -167,7 +169,7 @@ export function WorkView(props: WorkViewProps) {
 
   const header = (
     <DragHeader title="Work" lede={WORK_LEDE}>
-      {work.readAt != null ? <span className="meta">Updated {updatedWords(new Date(work.readAt).toISOString(), now)}</span> : null}
+      {view?.generated_at ? <span className="meta">Updated {updatedWords(view.generated_at, now)}</span> : null}
     </DragHeader>
   );
 
@@ -215,9 +217,12 @@ export function WorkView(props: WorkViewProps) {
     <>
       {header}
       <div className="panel-body wide wk-panel">
-        {view.counts.ledger_outbox > 0 || problems.length || work.error ? (
+        {view.counts.ledger_outbox > 0 || view.ledger_offline || problems.length || work.error ? (
           <div className="wk-notices">
             <OutboxNotice view={view} now={now} />
+            {view.ledger_offline && !(view.counts.ledger_outbox > 0) ? (
+              <LedgerOfflineNotice asOf={view.ledger_as_of} now={now} />
+            ) : null}
             {problems.map((k) => (
               <p key={k} className="wk-problem">
                 {PROBLEM_WORDS[k]}
@@ -283,7 +288,8 @@ export function WorkView(props: WorkViewProps) {
               <div className="wk-boards">
                 {view.projects.map((b, i) => (
                   <Board key={b.project ?? `withheld-${i}`} board={b} waiting={b.project ? (waitingBy.get(b.project) ?? 0) : 0}
-                    now={now} onOpenLedger={b.project ? () => openLedger(b.project!) : null}
+                    now={now} ledgerOffline={!!view.ledger_offline}
+                    onOpenLedger={b.project ? () => openLedger(b.project!) : null}
                     onOpenSettings={props.onOpenWorkSettings} />
                 ))}
               </div>
@@ -793,12 +799,14 @@ function Board({
   board,
   waiting,
   now,
+  ledgerOffline = false,
   onOpenLedger,
   onOpenSettings,
 }: {
   board: WorkBoard;
   waiting: number;
   now: Date;
+  ledgerOffline?: boolean;
   /** Null when the board's project key was withheld: its ledger can't be named. */
   onOpenLedger: (() => void) | null;
   onOpenSettings?: () => void;
@@ -854,7 +862,7 @@ function Board({
           {board.source.state === "stale" ? (
             <div className="row">
               <span className="meta">
-                Its jobs show with “as of {timeOnly(board.source.as_of)}”.{led ? " The ledger parts are live." : ""}
+                Its jobs show with “as of {timeOnly(board.source.as_of)}”.{led ? (ledgerOffline ? " The ledger parts are from the offline copy." : " The ledger parts are live.") : ""}
               </span>
             </div>
           ) : null}

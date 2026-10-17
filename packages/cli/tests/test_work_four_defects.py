@@ -27,10 +27,10 @@ def test_completed_forget_fences_inflight_work_writer(tmp_path, monkeypatch):
     real_write = work._write_json
     errors = []
 
-    def paused_write(path, value, *args):
+    def paused_write(path, value, *args, **kwargs):
         started.set()
         assert release.wait(10)
-        return real_write(path, value, *args)
+        return real_write(path, value, *args, **kwargs)
 
     monkeypatch.setattr(work, "_write_json", paused_write)
 

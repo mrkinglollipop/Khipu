@@ -45,6 +45,18 @@ export function OutboxNotice({ view, now }: { view: WorkView | null; now: Date }
   );
 }
 
+/** The ledger read from the offline copy: said whenever it is, waiting
+ *  writes or not, with the time the copy was made. */
+export function LedgerOfflineNotice({ asOf, now }: { asOf?: string | null; now: Date }) {
+  const at = asOf ? changedWords(asOf, now) : "";
+  return (
+    <Callout tone="warn" stripe title="The ledger is showing its offline copy">
+      The database didn't answer, so this is what the ledger held {at ? `at ${at}` : "when it was last copied"}. Changes
+      you make are saved on this Mac and sent when it answers.
+    </Callout>
+  );
+}
+
 const PAGE = 100;
 const STALE_DAYS = 7;
 const NO_OWNER = ["", "none", "unassigned", "unowned", "-", "n/a"];
@@ -66,6 +78,10 @@ function isNoOwner(owner: string): boolean {
 function finished(vocab: Vocab | null, state: string): boolean {
   const m = meaningOf(vocab, state);
   return m === "done" || m === "dropped";
+}
+
+function sameForm(a: Form, b: Form): boolean {
+  return (Object.keys(a) as Array<keyof Form>).every((k) => a[k] === b[k]);
 }
 
 function fieldValue(v: unknown): string {
@@ -126,6 +142,8 @@ function HistoryItem({ h, now }: { h: HistoryEntry; now: Date }) {
 
 type Form = { state: string; title: string; evidence: string; owner: string; link: string; note: string };
 
+type Sent = { rev: number; form: Form; refused?: boolean };
+
 function initialForm(row: LedgerRow, vocab: Vocab | null): Form {
   const needs = meaningOf(vocab, row.state) === "needs";
   return {
@@ -175,6 +193,20 @@ export function LedgerPage({
   const openRow = useRef(selected);
   openRow.current = selected;
   const [form, setForm] = useState<Form | null>(null);
+  // Bumped on every change typed into the form: a background read that
+  // started before the latest change is dropped instead of resetting it.
+  const editRev = useRef(0);
+  const resetRev = useRef(0);
+  const edit = (next: Form) => {
+    editRev.current += 1;
+    setForm(next);
+  };
+  // The refresh after a write takes the row's value only for fields still
+  // equal to this form and keeps the rest as typed. After a save that went
+  // through it is the form as sent (set only when typing went on during the
+  // save); after a refused one it is the form as last loaded, so nothing the
+  // user wrote is lost.
+  const rebase = useRef<Form | null>(null);
   const [saving, setSaving] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [removeOpen, setRemoveOpen] = useState(false);
@@ -196,10 +228,13 @@ export function LedgerPage({
   }, [project]);
 
   const loadDetail = useCallback(
-    async (id: string) => {
+    async (id: string, background = false, sent?: Sent) => {
+      const rev = editRev.current;
       const res = await callCli<LedgerRow>("khipu_ledger_get", { project, id });
       if (openRow.current !== id) return null;
+      if (background && editRev.current !== rev) return null;
       if (res.ok && res.data && typeof res.data.id === "string") {
+        rebase.current = sent && (sent.refused || editRev.current !== sent.rev) ? sent.form : null;
         setDetail(res.data);
         setDetailError(null);
         return res.data;
@@ -211,12 +246,65 @@ export function LedgerPage({
     [project],
   );
 
+  // One list read at a time, shared by the first read, the poll and the
+  // refreshes after a change. `fresh` waits out a read already under way
+  // and then reads again, so it sees what was just written.
+  const listRead = useRef<Promise<void> | null>(null);
+  const readList = useCallback(
+    (fresh = false): Promise<void> => {
+      const start = () => {
+        const p: Promise<void> = loadList()
+          .catch(() => {})
+          .finally(() => {
+            if (listRead.current === p) listRead.current = null;
+          });
+        listRead.current = p;
+        return p;
+      };
+      const under = listRead.current;
+      if (!under) return start();
+      return fresh ? under.then(() => listRead.current ?? start()) : under;
+    },
+    [loadList],
+  );
+
   useEffect(() => {
-    void loadList();
+    void readList();
     void loadRemoved();
-  }, [loadList, loadRemoved]);
+  }, [readList, loadRemoved]);
 
   const vocab = list?.vocab ?? null;
+  // A fresh list hands an equal vocab as a new object: the form resets on
+  // its words, never on its identity.
+  const vocabKey = JSON.stringify(vocab);
+
+  // What the poll may touch: an edit under way or a save keeps the open
+  // row's detail (and so the form) as it is.
+  const editing = useRef(false);
+  editing.current = saving || (!!form && !!detail && !sameForm(form, initialForm(detail, vocab)));
+
+  // The list (and the open row, when it is not being edited) is read again
+  // refresh_s after the previous read ends, so an open page follows changes
+  // made elsewhere and a slow read never has another start behind it.
+  const every = Math.max(1, view?.refresh_s ?? 5) * 1000;
+  useEffect(() => {
+    let stopped = false;
+    let timer: number | undefined;
+    const arm = () => {
+      if (!stopped) timer = window.setTimeout(() => void poll(), every);
+    };
+    const poll = async () => {
+      const id = openRow.current;
+      await Promise.all([readList(), usableRowId(id) && !editing.current ? loadDetail(id, true) : null]);
+      arm();
+    };
+    // The first timer starts once the read under way (the page's first) ends.
+    void (listRead.current ?? Promise.resolve()).then(arm);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [every, readList, loadDetail]);
   const rows = useMemo(() => list?.rows ?? [], [list]);
 
   useEffect(() => {
@@ -229,11 +317,29 @@ export function LedgerPage({
     void loadDetail(selected);
   }, [selected, loadDetail]);
 
+  // The form resets when another row opens or the row itself changed; a new
+  // vocab alone resets it only when nothing has been typed since.
+  const formFor = useRef<string | null>(null);
   useEffect(() => {
-    if (detail) setForm(initialForm(detail, vocab));
-    // The form resets when another row opens or the row itself changed.
+    if (!detail) return;
+    const key = JSON.stringify([detail.id, detail.updated, detail.state]);
+    const sent = rebase.current;
+    rebase.current = null;
+    if (key === formFor.current && editRev.current !== resetRev.current) return;
+    const fresh = initialForm(detail, vocab);
+    if (sent && key !== formFor.current) {
+      formFor.current = key;
+      // Fields the user changed keep their text and stay unsaved.
+      setForm((now) =>
+        now ? (Object.fromEntries((Object.keys(fresh) as Array<keyof Form>).map((k) => [k, now[k] !== sent[k] ? now[k] : fresh[k]])) as Form) : fresh,
+      );
+      return;
+    }
+    formFor.current = key;
+    resetRev.current = editRev.current;
+    setForm(fresh);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detail?.id, detail?.updated, detail?.state, vocab]);
+  }, [detail?.id, detail?.updated, detail?.state, vocabKey]);
 
   const byId = useMemo(() => new Map(rows.map((r) => [r.id, r])), [rows]);
   const owners = useMemo(
@@ -282,8 +388,8 @@ export function LedgerPage({
   const visible = filtered.slice(0, limit);
   const children = detail ? rows.filter((r) => r.parent === detail.id) : [];
 
-  const afterWrite = async (id: string | null) => {
-    await Promise.all([loadList(), id ? loadDetail(id) : Promise.resolve(null), onChanged()]);
+  const afterWrite = async (id: string | null, sent?: Sent) => {
+    await Promise.all([readList(true), id ? loadDetail(id, false, sent) : Promise.resolve(null), onChanged()]);
   };
 
   const save = async () => {
@@ -300,19 +406,21 @@ export function LedgerPage({
       return;
     }
     change.if_state = detail.state;
+    let sent: Sent = { rev: editRev.current, form };
     setSaving(true);
     setRefusal(null);
     try {
       const out = await callCli("khipu_ledger_set", { project, id: detail.id, change });
       if (!out.ok) {
         setRefusal(out.error);
+        sent = { rev: sent.rev, form: initialForm(detail, vocab), refused: true };
       } else {
         const commitment = detail.refs?.commitment;
         if (change.state && commitment != null && commitment !== "" && finished(vocab, change.state)) {
           await onOwedClose(Number(commitment));
         }
       }
-      await afterWrite(detail.id);
+      await afterWrite(detail.id, sent);
     } finally {
       setSaving(false);
     }
@@ -377,7 +485,11 @@ export function LedgerPage({
             <span className={stateTone(r.state, m)} aria-hidden />
             {stateWords(r.state)}
           </span>
-          <span className={old ? "lg-when old" : "lg-when"}>{when}</span>
+          {r.queued ? (
+            <span className="lg-when" title="Saved on this Mac; the database hasn't taken it yet">Not sent yet</span>
+          ) : (
+            <span className={old ? "lg-when old" : "lg-when"}>{when}</span>
+          )}
         </button>
       </div>,
     );
@@ -406,9 +518,18 @@ export function LedgerPage({
         </div>
       </header>
       <div className="panel-body wide lg-page">
-        {view && view.counts.ledger_outbox > 0 ? (
+        {(view && view.counts.ledger_outbox > 0) || list?.offline || (list?.pending ?? 0) > 0 ? (
           <div className="wk-notices">
             <OutboxNotice view={view} now={now} />
+            {list?.offline && !(view && view.counts.ledger_outbox > 0 && view.ledger_offline) ? (
+              <LedgerOfflineNotice asOf={list.as_of} now={now} />
+            ) : null}
+            {list && !list.offline && (list.pending ?? 0) > 0 ? (
+              <Callout tone="warn" stripe title={plural(list.pending ?? 0, "change is waiting to be sent", "changes are waiting to be sent")}>
+                Saved on this Mac and marked Not sent yet below until the database takes{" "}
+                {(list.pending ?? 0) === 1 ? "it" : "them"}.
+              </Callout>
+            ) : null}
           </div>
         ) : null}
         {listError ? (
@@ -590,7 +711,7 @@ export function LedgerPage({
                 >
                   <div className="toolbar">
                     <label htmlFor={`${ids}-to`}>New state</label>
-                    <select id={`${ids}-to`} value={form.state} onChange={(e) => setForm({ ...form, state: e.target.value })}>
+                    <select id={`${ids}-to`} value={form.state} onChange={(e) => edit({ ...form, state: e.target.value })}>
                       {(vocab?.state ?? [[detail.state, ""]]).map(([w]) => (
                         <option key={w} value={w}>
                           {stateWords(w)}
@@ -611,7 +732,7 @@ export function LedgerPage({
                       <input
                         id={`${ids}-${field}`}
                         value={form[field]}
-                        onChange={(e) => setForm({ ...form, [field]: e.target.value })}
+                        onChange={(e) => edit({ ...form, [field]: e.target.value })}
                       />
                     </div>
                   ))}
@@ -622,7 +743,7 @@ export function LedgerPage({
                     id={`${ids}-note`}
                     placeholder="Your note"
                     value={form.note}
-                    onChange={(e) => setForm({ ...form, note: e.target.value })}
+                    onChange={(e) => edit({ ...form, note: e.target.value })}
                   />
                   <div className="toolbar">
                     <button type="submit" className="sm primary" disabled={saving}>
@@ -630,11 +751,15 @@ export function LedgerPage({
                     </button>
                     <button type="button" className="sm" disabled={saving}
                       onClick={() => {
+                        resetRev.current = editRev.current;
                         setForm(initialForm(detail, vocab));
                         setRefusal(null);
                       }}>
                       Cancel
                     </button>
+                    {!saving && !sameForm(form, initialForm(detail, vocab)) ? (
+                      <span className="lg-unsaved">Unsaved changes</span>
+                    ) : null}
                     <span className="meta">
                       Saved as “you, in the app”.
                       {commitment != null && commitment !== "" && (formMeaning === "done" || formMeaning === "dropped")
@@ -674,7 +799,7 @@ export function LedgerPage({
                   onRemoved={async () => {
                     setRemoveOpen(false);
                     setSelected(null);
-                    await Promise.all([loadList(), loadRemoved(), onChanged()]);
+                    await Promise.all([readList(true), loadRemoved(), onChanged()]);
                   }}
                 />
               </>
@@ -688,7 +813,7 @@ export function LedgerPage({
           now={now}
           onClose={() => setRemovedOpen(false)}
           onRestored={async () => {
-            await Promise.all([loadList(), loadRemoved(), onChanged()]);
+            await Promise.all([readList(true), loadRemoved(), onChanged()]);
           }}
         />
       </div>

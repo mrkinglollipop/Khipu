@@ -2163,16 +2163,44 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
             "queue_added": added - set(removed)}
 
 
+def _queue_health(drained: dict[str, Any] | None, pending: int) -> dict[str, Any]:
+    """What a read says about the line of waiting writes: how many of this
+    project's still wait, what the drain this read ran answered, and what the
+    line holds on disk whether or not the hub answered: every refusal still
+    kept, and whether each waiting write can be read. A line that cannot be
+    read has no count (``pending: None``), never a healthy zero."""
+    drained = drained or {}
+    status = outbox_status()
+    unreadable = drained.get("unreadable") or status.get("unreadable")
+    if not unreadable:
+        try:
+            queued_ops(strict=True)
+        except LedgerError as exc:
+            unreadable = str(exc)[:200]
+    return {"pending": None if unreadable else pending, "busy": bool(drained.get("busy")),
+            "stopped_early": bool(drained.get("stopped_early")), "refused": status.get("refused"),
+            "unreadable": unreadable or None}
+
+
 def load(project: str, *, conn=None) -> dict[str, Any]:
     """A project's live rows and words: from the hub (after draining waiting
-    writes), or from the offline copy plus the waiting writes when it is away."""
+    writes), or from the offline copy plus the waiting writes when it is away.
+    Either way, writes still waiting show on top, marked ``queued``, and
+    ``pending``/``queue`` say how the line stands."""
     owned = conn is None
+    drained = None
     try:
         if owned:
             conn = _connect()
-        drain(conn)
+        drained = drain(conn)
         replica_catch_up(conn)
-        return _hub_view(conn, project)
+        view = _hub_view(conn, project)
+        # A drain that was busy (another writer holds the line) or stopped
+        # early leaves writes waiting: they show on top, as they do offline.
+        if any(op.get("project") == project for op in queued_ops()):
+            view = _overlay(view, project)
+        pending = int(view.get("pending") or 0)
+        return {**view, "pending": pending, "queue": _queue_health(drained, pending)}
     except Exception as exc:  # noqa: BLE001
         if _tables_missing(exc):
             raise LedgerError("the ledger tables are not in the database yet; run khipu migrate", "no_tables") from exc
@@ -2180,25 +2208,48 @@ def load(project: str, *, conn=None) -> dict[str, Any]:
             raise
         view = _offline_view(project) or {"vocab": {"state": [], "kind": []}, "rows": [], "as_of": None,
                                           "offline": True}
-        return _overlay(view, project)
+        view = _overlay(view, project)
+        return {**view, "queue": _queue_health(drained, view["pending"])}
     finally:
         if owned and conn is not None:
             conn.close()
 
 
+def _queued_row(view: dict[str, Any] | None, row_id: str) -> dict[str, Any] | None:
+    """``row_id`` as the waiting writes leave it, when one of them touches it."""
+    for row in (view or {}).get("rows", []):
+        if row["row_id"] == row_id and row.get("queued"):
+            return row
+    return None
+
+
 def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
+    """One row and its history, as ``load`` would show it: writes still
+    waiting show on it (marked ``queued``), and ``pending``/``queue`` say how
+    the line stands."""
     refuse_secrets(project, row_id)
     owned = conn is None
+    drained = None
     try:
         if owned:
             conn = _connect()
-        drain(conn)
+        drained = drain(conn)
         replica_catch_up(conn)
+        # A drain that was busy or stopped early leaves writes waiting: the
+        # row shows them, as the list does.
+        view = _overlay(_hub_view(conn, project), project) \
+            if any(op.get("project") == project for op in queued_ops()) else None
+        pending = int((view or {}).get("pending") or 0)
+        health = {"offline": False, "pending": pending, "queue": _queue_health(drained, pending)}
+        queued = _queued_row(view, row_id)
         with conn.cursor() as cur:
             cur.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s AND row_id = %s",
                         (project, row_id))
             got = cur.fetchone()
             if got is None:
+                if queued is not None:  # an addition still waiting to be sent
+                    conn.rollback()
+                    return {"row": queued, "history": [], **health}
                 marker = _marker(cur, project, row_id)
                 conn.rollback()
                 if marker:
@@ -2208,11 +2259,14 @@ def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
             if row["removed_at"] is not None:
                 conn.rollback()
                 raise _removed_error(row)
+            if view is not None and row_id in view["queue_removed"]:
+                conn.rollback()
+                raise LedgerError(f"row {row_id} is removed; the removal is waiting to be sent", "removed")
             cur.execute(f"SELECT {', '.join(_HIST_COLS)} FROM ledger_history WHERE project = %s AND row_id = %s "
                         "ORDER BY id", (project, row_id))
             history = [dict(zip(_HIST_COLS, h, strict=True)) for h in cur.fetchall()]
         conn.rollback()
-        return {"row": row, "history": history, "offline": False}
+        return {"row": queued or row, "history": history, **health}
     except LedgerError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -2223,7 +2277,8 @@ def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
         for row in merged["rows"]:
             if row["row_id"] == row_id:
                 history = [h for h in (view or {}).get("history", []) if h["row_id"] == row_id]
-                return {"row": row, "history": history, "offline": True, "as_of": merged.get("as_of")}
+                return {"row": row, "history": history, "offline": True, "as_of": merged.get("as_of"),
+                        "pending": merged["pending"], "queue": _queue_health(drained, merged["pending"])}
         raise LedgerError(f"no such row: {row_id}", "not_found") from exc
     finally:
         if owned and conn is not None:
@@ -2691,32 +2746,42 @@ def cmd(args: argparse.Namespace) -> int:
         if verb == "get":
             got = get(project, args.id)
             payload = row_json(got["row"], got["history"], project)
+            payload["offline"], payload["as_of"] = bool(got.get("offline")), got.get("as_of")
+            payload["pending"] = int(got.get("pending") or 0)
+            payload["queue"] = got.get("queue") or _queue_health(None, payload["pending"])
             if got.get("offline"):
                 payload["offline_as_of"] = got.get("as_of")
             _emit(None, payload, as_json=True, sort_keys=True)
             return 0
         view = load(project)
         note = _offline_note(view)
+        # Every read says where it came from and how the line of waiting
+        # writes stands, whether or not any are waiting.
+        fresh = {"offline": bool(view.get("offline")), "as_of": view.get("as_of"),
+                 "pending": int(view.get("pending") or 0),
+                 "queue": view.get("queue") or _queue_health(None, int(view.get("pending") or 0))}
         rc = 0
         if verb == "list":
             rows, text = render_list(view, state=args.state, kind=args.kind, owner=args.owner,
                                      stale_hours=args.stale_hours)
-            _emit(args, {"ok": True, "project": project, "offline": view["offline"], "as_of": view.get("as_of"),
+            _emit(args, {"ok": True, "project": project, **fresh,
                          "vocab": view["vocab"], "rows": [row_json(r, [], project) for r in rows]}, text)
         elif verb == "loose-ends":
             rows, text = render_loose_ends(view, summary=args.summary)
-            _emit(args, {"ok": True, "project": project, "rows": [row_json(r, [], project) for r in rows]}, text)
+            _emit(args, {"ok": True, "project": project, **fresh,
+                         "rows": [row_json(r, [], project) for r in rows]}, text)
         elif verb in ("needs-owner", "needs-matt"):
             rows, text = render_needs(view)
-            _emit(args, {"ok": True, "project": project, "rows": [row_json(r, [], project) for r in rows]}, text)
+            _emit(args, {"ok": True, "project": project, **fresh,
+                         "rows": [row_json(r, [], project) for r in rows]}, text)
         elif verb == "render":
             board = render_board(view)
             if args.out:
                 _emit(None, text=board, to_file=args.out)
-                _emit(args, {"ok": True, "rows": len(view["rows"]), "out": args.out},
+                _emit(args, {"ok": True, "rows": len(view["rows"]), "out": args.out, **fresh},
                       f"rendered {len(view['rows'])} rows -> {args.out}")
             else:
-                _emit(args, {"ok": True, "board": board}, board)
+                _emit(args, {"ok": True, "board": board, **fresh}, board)
         elif verb == "check":
             result = check(view)
             if result["ok"]:
@@ -2727,7 +2792,7 @@ def cmd(args: argparse.Namespace) -> int:
             if result["warnings"]:
                 text += "\n" + "\n".join([f"{len(result['warnings'])} warning(s):"]
                                          + [f"  - {w}" for w in result["warnings"]])
-            _emit(args, {**result, "project": project, "vocab": view["vocab"]}, text)
+            _emit(args, {**result, "project": project, "vocab": view["vocab"], **fresh}, text)
             rc = 0 if result["ok"] else 1
         if note and not args.json:
             _emit(args, text=note)
