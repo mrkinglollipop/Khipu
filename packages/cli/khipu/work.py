@@ -1557,12 +1557,17 @@ def cmd(args: argparse.Namespace) -> int:
 def _cmd(args: argparse.Namespace) -> int:
     from khipu import ledger
 
+    from khipu import owner_direction
+
     sub = getattr(args, "work_cmd", None)
+    command = f"work {sub}" if sub else "work"
     try:
-        ledger.require(f"work {sub}" if sub else "work")
+        ledger.require(command, by_direction=getattr(args, "by_direction", False),
+                       intent=ledger.direction_intent(command, args, None))
     except ledger.LedgerError as exc:
         _emit({"ok": False, "error": str(exc), "reason": exc.reason}, indent=None)
         return 1
+    owner_direction.run_due()
     if sub == "check":
         ok, problems, parsed = check_file(args.file)
         if args.json:
@@ -1590,7 +1595,7 @@ def _cmd(args: argparse.Namespace) -> int:
                 return 1
             item = owed[args.id]
         set_hidden(args.id, item)
-        _emit({"ok": True, "hidden": sorted(read_hidden())}, indent=None)
+        _emit(owner_direction.finish({"ok": True, "hidden": sorted(read_hidden())}), indent=None)
         return 0
     if sub in ("same", "not-same"):
         project, _, row_id = args.row.partition("#")
@@ -1598,7 +1603,7 @@ def _cmd(args: argparse.Namespace) -> int:
             _emit({"ok": False, "error": "name the ledger row as <project>#<row id>"}, indent=None)
             return 1
         set_link(project, row_id, args.commitment, sub == "same")
-        _emit({"ok": True}, indent=None)
+        _emit(owner_direction.finish({"ok": True}), indent=None)
         return 0
     view = build_view()
     write_view(view)
@@ -1609,6 +1614,8 @@ def _cmd(args: argparse.Namespace) -> int:
 def add_parser(sub) -> None:
     """``khipu work``: the live view (read-only), ``check`` for runner
     authors, and the app's hide and "Looks like" answers."""
+    from khipu import owner_direction
+
     p = sub.add_parser("work", help="What is done, what is running, and what is waiting on you")
     p.add_argument("--json", action="store_true")
     verbs = p.add_subparsers(dest="work_cmd")
@@ -1621,8 +1628,10 @@ def add_parser(sub) -> None:
                         ("unhide", "Show a hidden commitment again")):
         h = verbs.add_parser(name, help=words)
         h.add_argument("id")
+        owner_direction.add_owner_flags(h)
     for name in ("same", "not-same"):
         s = verbs.add_parser(name, help="Answer 'Looks like': a ledger row and a commitment are (not) the same")
         s.add_argument("row", help="<project>#<row id>")
         s.add_argument("commitment")
+        owner_direction.add_owner_flags(s)
     p.set_defaults(func=cmd)

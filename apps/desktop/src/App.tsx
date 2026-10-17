@@ -61,6 +61,7 @@ import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
 import { StorageReportDialog } from "./StorageReportDialog";
 import { OptionalFeatures } from "./OptionalFeatures";
+import { OwnerActions } from "./OwnerActions";
 import { EmbeddingsPanel } from "./EmbeddingsPanel";
 import { fmtAgo, fmtAgoFromRead, fmtClock } from "./time";
 import {
@@ -485,11 +486,12 @@ const ACTIVITY_PAGE = 40;
 const SEARCH_KINDS = ["episode", "topic"] as const;
 
 /** Settings sub-navigation (overhaul phase 5, `mocks/main.settings.html`).
- *  Ten sections, one per thing a person comes here to change. */
+ *  Eleven sections, one per thing a person comes here to change. */
 type SettingsSection =
   | "database"
   | "capture"
   | "routing"
+  | "owner"
   | "work"
   | "features"
   | "index"
@@ -503,6 +505,7 @@ const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["database", "Database"],
   ["capture", "Capture & models"],
   ["routing", "Accounts and routing"],
+  ["owner", "Owner actions"],
   ["work", "Work"],
   ["features", "Optional features"],
   ["index", "Embeddings"],
@@ -5541,6 +5544,10 @@ export default function App() {
                     plansState={plans}
                     onSetUpAccounts={openAccountsStepInFirstRun}
                   />
+                ) : null}
+
+                {settingsSection === "owner" ? (
+                  <OwnerActions active={tab === "settings" && settingsSection === "owner"} />
                 ) : null}
 
                 {settingsSection === "work" ? (

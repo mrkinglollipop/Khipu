@@ -116,6 +116,7 @@ class ProtocolTest(unittest.TestCase):
                 "khipu_route_rule",
                 "khipu_route_priority",
                 "khipu_ledger",
+                "khipu_owner_act",
             },
         )
         for tool in out["result"]["tools"]:

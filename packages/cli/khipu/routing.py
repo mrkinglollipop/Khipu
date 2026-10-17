@@ -1275,7 +1275,8 @@ def _append_locked(*events: dict) -> None:
 _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", "basis", "source", "window",
                 "evidence", "until", "written_at", "via", "text", "file", "date", "sha256", "clock_at",
                 "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
-                "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after")
+                "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
+                "harness")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries")
 _WHOLE_MOST = 2 ** 53
@@ -1587,10 +1588,13 @@ def _read_all_events() -> tuple[list[dict], int]:
     return events, bad
 
 
-_AUTH_OF_VIA = {"app": "app", "cli": "terminal"}
+_AUTH_OF_VIA = {"app": "app", "cli": "terminal", "direction": "direction"}
+# How the owner's own changes arrive: the app, or his words in a conversation
+# (owner direction). Anything else is outside the app (doctor warns).
+_OWNERS_OWN = ("app", "direction")
 # Lines only the owner writes; the fold counts one with no author as his.
-_OWNER_ONLY = frozenset({"pause", "lift", "clear", "dismiss", "note_set", "note_end", "rule_confirm", "rule_retire",
-                         "rule_restore", "rule_undo", "rule_dismiss", "priority_confirm", "priority_undo",
+_OWNER_ONLY = frozenset({"pause", "lift", "clear", "clear_undo", "dismiss", "undismiss", "note_set", "note_end", "rule_confirm", "rule_retire",
+                         "rule_restore", "rule_undo", "rule_unconfirm", "rule_dismiss", "priority_confirm", "priority_undo",
                          "priority_clear", "priority_drop", "account_move", "account_note"})
 
 
@@ -2386,6 +2390,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     evidence: list[dict] = []
     owner: dict[str, Any] = {"pauses": {}, "lifts": {}, "clears": {}, "dismissed": set()}
     dismissals: list[dict] = []
+    # Each account's clears in order: undoing one (``clear_undo``) drops it,
+    # and the newest left (the one it superseded, unless it was older) counts.
+    clear_stacks: dict[str, list[dict]] = {}
     holds: dict[str, dict] = {}
     rules: dict[int, dict] = {}
     note: dict | None = None
@@ -2402,6 +2409,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # who wrote it and through what. A version's Recent changes names its
     # author from this, never from the state left after it (fix round 1).
     causes: dict[str, dict] = {}
+    owner_changes: list[dict] = []
     for event in events:
         kind = event.get("type")
         if kind == "evidence":
@@ -2467,12 +2475,30 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         touched = _touched(kind, event, info)
         if touched:
             causes[touched] = {"at": info["at"], "seq": info["seq"], "written_by": info["written_by"],
-                               "via": info["via"]}
+                               "via": info["via"], "type": kind, "state": event.get("state")}
+            if event.get("auth") in _OWNER_AUTHS:
+                # Named in the next push in fixed words (``direction_line``).
+                causes[touched].update(auth=event["auth"], harness=event.get("harness"))
+            if kind == "owner_change":
+                causes[touched]["text"] = event.get("text")
+                owner_changes.append(event)
         if kind in ("pause", "lift", "clear") and info["account"]:
             owner[{"pause": "pauses", "lift": "lifts", "clear": "clears"}[kind]][info["account"]] = info
+            if kind == "clear":
+                clear_stacks.setdefault(info["account"], []).append(info)
+        elif kind == "clear_undo" and info["account"] and info["target"]:
+            stack = [c for c in clear_stacks.get(info["account"], []) if str(c["id"]) != str(info["target"])]
+            clear_stacks[info["account"]] = stack
+            if stack:
+                owner["clears"][info["account"]] = stack[-1]
+            else:
+                owner["clears"].pop(info["account"], None)
         elif kind == "dismiss" and info["target"]:
             owner["dismissed"].add(str(info["target"]))
             dismissals.append(info)
+        elif kind == "undismiss" and info["target"]:
+            owner["dismissed"].discard(str(info["target"]))
+            dismissals = [d for d in dismissals if str(d["target"]) != str(info["target"])]
         elif kind == "hold" and event.get("id"):
             scope = event.get("scope") if isinstance(event.get("scope"), dict) else {"kind": "all"}
             holds[str(event["id"])] = {
@@ -2492,7 +2518,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                  "pending_by": author_words(info["written_by"], push=True) if pending else None,
                                  "pending_author": info["written_by"] if pending else None,
                                  "written_by": info["written_by"], "via": info["via"], "at": info["at"]}
-        elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_dismiss") and event.get("n") in rules:
+        elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_unconfirm",
+                      "rule_dismiss") and event.get("n") in rules:
             rule = rules[event["n"]]
             if kind == "rule_edit" and isinstance(event.get("text"), str):
                 was_pending = bool(rule.get("pending"))
@@ -2522,6 +2549,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 rule.update(text=rule["prior_text"], pending=False, pending_kind=None, prior_text=None,
                             prior_confirmed=None, pending_by=None, pending_author=None,
                             confirmed=bool(rule.get("prior_confirmed")))
+            elif kind == "rule_unconfirm" and rule["seeded"]:
+                rule["confirmed"] = False
             elif kind == "rule_dismiss":
                 rule["retired"] = True
             rule.update(written_by=info["written_by"], via=info["via"], at=info["at"])
@@ -2703,20 +2732,20 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # Those whose line claims the app or a terminal but did not pass the
     # CLI's owner check (``_mark_unchecked``) are also listed as unchecked.
     odd: list[tuple[str, Any]] = []
-    if note is not None and note["via"] != "app":
+    if note is not None and note["via"] not in _OWNERS_OWN:
         odd.append(("note", note["via"]))
-    if priority_out is not None and not priority_out["pending"] and priority_out["via"] != "app":
+    if priority_out is not None and not priority_out["pending"] and priority_out["via"] not in _OWNERS_OWN:
         odd.append(("priority", priority_out["via"]))
     odd += [(f"rule {r['n']}", r["via"]) for r in active_rules
-            if r["written_by"].get("kind") == "owner" and r["via"] != "app"]
+            if r["written_by"].get("kind") == "owner" and r["via"] not in _OWNERS_OWN]
     odd += [(f"pause of {e['label']}", owner["pauses"][e["key"]]["via"]) for e in entries
-            if e["state"] == PAUSED and (owner["pauses"][e["key"]]["via"] != "app")]
+            if e["state"] == PAUSED and (owner["pauses"][e["key"]]["via"] not in _OWNERS_OWN)]
     odd += [(f"clear of {e['label']}", owner["clears"][e["key"]]["via"]) for e in entries
-            if (e.get("witness") or {}).get("cleared") and owner["clears"][e["key"]]["via"] != "app"]
+            if (e.get("witness") or {}).get("cleared") and owner["clears"][e["key"]]["via"] not in _OWNERS_OWN]
     targets = {item["id"]: item for item in evidence}
     for dis in dismissals:
         item = targets.get(dis["target"])
-        if dis["via"] == "app" or item is None:
+        if dis["via"] in _OWNERS_OWN or item is None:
             continue
         mattered = (item["until"] is not None and item["until"] > now) if item["state"] == LIMITED else not (
             stale_after > 0 and (now - item["at"]).total_seconds() >= stale_after)
@@ -2764,6 +2793,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                       for r in active_rules})
     if note_out is not None:
         effective["note"] = {"text": note_out["text"]}
+    # An owner change made outside this record, kept so the next push names
+    # it (``direction_line``); never a line of its own.
+    effective.update({f"owner:{e['target']}": {"text": e.get("text")}
+                      for e in owner_changes[-OWNER_CHANGES_KEPT:]})
     if priority_out is not None:
         effective["priority"] = _effective_priority(priority_out)
     effective.update({f"lane:{u['runner']}/{u['lane']}": {"state": u["state"], "until": u["until"],
@@ -3281,7 +3314,7 @@ def run_due_reset_checks(now: datetime | None = None, *, probe=None, load=None,
 def _touched(kind: str | None, event: dict, info: dict) -> str | None:
     """The entity a written (non-evidence) line changes, as the view's
     ``effective`` names it, or None."""
-    if kind in ("pause", "lift", "clear", "dismiss", "account_note") and info["account"]:
+    if kind in ("pause", "lift", "clear", "clear_undo", "dismiss", "undismiss", "account_note") and info["account"]:
         return f"account:{info['account']}"
     if kind == "account_move" and info["target"]:
         return f"account:{info['target']}"
@@ -3289,11 +3322,14 @@ def _touched(kind: str | None, event: dict, info: dict) -> str | None:
         return f"hold:{event['id']}"
     if kind == "hold_end" and info["target"]:
         return f"hold:{info['target']}"
-    if kind in ("rule_add", "rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_dismiss") \
+    if kind in ("rule_add", "rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_unconfirm",
+                "rule_dismiss") \
             and isinstance(event.get("n"), int):
         return f"rule:{event['n']}"
     if kind in ("note_set", "note_end"):
         return "note"
+    if kind == "owner_change" and info["target"]:
+        return f"owner:{info['target']}"
     if kind in ("priority_set", "priority_confirm", "priority_undo", "priority_clear", "priority_drop"):
         return "priority"
     return None
@@ -3462,10 +3498,17 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
                              k.partition(":")[0], 5), k))
         changed = [k for k in changed if body["effective"].get(k) != prev_effective.get(k)]
         view_for_lines = dict(body, version=version)
-        changes.append({"version": version, "at": _iso(now), "entities": changed,
-                        "lines": [change_line(k, view_for_lines, now, prev_effective) for k in changed],
-                        "items": [_change_item(k, body, prev_effective, causes, since_at)
-                                  for k in changed]})
+        shown = [k for k in changed if not k.startswith("owner:")]
+        change = {"version": version, "at": _iso(now), "entities": shown,
+                  "lines": [change_line(k, view_for_lines, now, prev_effective) for k in shown],
+                  "items": [_change_item(k, body, prev_effective, causes, since_at)
+                            for k in shown]}
+        directions = [direction_line(k, causes[k], body, prev_effective, now) for k in changed
+                      if (causes.get(k) or {}).get("auth") in _OWNER_AUTHS
+                      and (since_at is None or (_parse(causes[k].get("at")) or since_at) >= since_at)]
+        if directions:
+            change["directions"] = directions
+        changes.append(change)
         changes = changes[-CHANGES_KEPT:]
     out = dict(body, schema=SCHEMA, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
                record=record, bad_lines=bad, fingerprint=fingerprint, changes=changes)
@@ -3917,7 +3960,7 @@ _REASON_ARGS = {"machine-busy": "machine_busy", "disk-low": "disk_low", "keep": 
 
 def add_hold(text: str, *, reason: str, scope: str, account: str | None = None, until: str | None = None,
              owner: bool = False, author: dict | None = None, via: str = "cli",
-             now: datetime | None = None) -> dict:
+             now: datetime | None = None, hold_id: str | None = None) -> dict:
     """A short note about one account, the Mac or all work. A conversation's
     hold lasts 24 hours by default and at most 7 days (settings); the owner's
     lasts until he chooses, "until I clear it" included. Its words are at
@@ -3951,7 +3994,7 @@ def add_hold(text: str, *, reason: str, scope: str, account: str | None = None, 
         longest = cfg["routing_conversation_hold_max"]
         if longest:
             stop = min(stop, _after(now, longest))
-    event = {"type": "hold", "id": _new_id("h"), "scope": hold_scope, "reason": code,
+    event = {"type": "hold", "id": hold_id or _new_id("h"), "scope": hold_scope, "reason": code,
              "text": words if owner else _clean(words, most), "until": _iso(stop), "owner": owner,
              "written_by": OWNER if owner else (author or conversation_author()), "via": via}
     written, view = _write(_owner_stamp(event) if owner else event)
@@ -4069,6 +4112,47 @@ def clear(account: str, *, report_id: str | None = None, via: str, now: datetime
     return dict(_owner_write({"type": "clear", "account": key}, via), account=key)
 
 
+def _owner_lines_about(key: str) -> list[dict]:
+    return [e for e in _in_write_order(read_events()[0]) if e.get("account") == key]
+
+
+def current_clear(account: str) -> str | None:
+    """The id of the clear that counts for the account now (the newest not
+    undone), or None."""
+    key = resolve_account(account)
+    stack: list[str] = []
+    for e in _owner_lines_about(key):
+        if e.get("type") == "clear":
+            stack.append(str(e.get("id")))
+        elif e.get("type") == "clear_undo":
+            stack = [c for c in stack if c != str(e.get("target"))]
+    return stack[-1] if stack else None
+
+
+def undo_clear(account: str, clear_id: str, *, via: str, now: datetime | None = None) -> dict:
+    """Undo the owner's clear ``clear_id``: the fold drops it, and the clear
+    before it, if any, counts again."""
+    key = resolve_account(account)
+    lines = _owner_lines_about(key)
+    if not any(e.get("type") == "clear" and str(e.get("id")) == clear_id for e in lines):
+        raise RouteError(f"{clear_id!r} is not a clear of that account")
+    if any(e.get("type") == "clear_undo" and str(e.get("target")) == clear_id for e in lines):
+        raise RouteError(f"the clear {clear_id} was already undone")
+    return dict(_owner_write({"type": "clear_undo", "account": key, "target": clear_id}, via), account=key)
+
+
+def undismiss(account: str, report_id: str, *, via: str, now: datetime | None = None) -> dict:
+    """Bring back a report the owner dismissed."""
+    key = resolve_account(account)
+    dismissed = False
+    for e in _owner_lines_about(key):
+        if str(e.get("target")) == report_id and e.get("type") in ("dismiss", "undismiss"):
+            dismissed = e["type"] == "dismiss"
+    if not dismissed:
+        raise RouteError(f"report {report_id!r} is not dismissed for that account")
+    return dict(_owner_write({"type": "undismiss", "account": key, "target": report_id}, via), account=key)
+
+
 def _shown_report_ids(entry: dict) -> set[str]:
     """The ids of the reports an account's entry shows (what it says, the
     side that disagrees, the last one seen, each model's), the owner's own
@@ -4104,7 +4188,10 @@ def _rule(n, now) -> dict:
     return rule
 
 
-def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | None = None) -> dict:
+def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | None = None,
+             event_id: str | None = None) -> dict:
+    """``event_id``: the id an owner action chose for this line before it
+    was written, so its Undo finds this rule and no other."""
     now = now or _now()
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
@@ -4113,7 +4200,7 @@ def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | 
         n = _next_rules(events, 1)
         out = _owner_write({"type": "rule_add", "n": n, "text": text.strip(),
                             "source": _one_line(source) or "added by you", "date": now.date().isoformat(),
-                            "seeded": False}, via)
+                            "seeded": False, **({"id": event_id} if event_id else {})}, via)
     return dict(out, n=n)
 
 
@@ -4196,6 +4283,15 @@ def restore_rule(n, *, via: str, now: datetime | None = None) -> dict:
 def confirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
     return dict(_owner_write({"type": "rule_confirm", "n": rule["n"]}, via), n=rule["n"])
+
+
+def unconfirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
+    """Undo of confirming a seeded rule: it reads as seeded and unconfirmed
+    again."""
+    rule = _rule(n, now)
+    if not rule["seeded"]:
+        raise RouteError(f"standing rule {rule['n']} is not a seeded rule")
+    return dict(_owner_write({"type": "rule_unconfirm", "n": rule["n"]}, via), n=rule["n"])
 
 
 def undo_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
@@ -4902,6 +4998,53 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
     return entity
 
 
+_DIRECTION_VERBS = {"pause": "Paused {a}", "lift": "Lifted the pause on {a}", "clear": "Cleared the report on {a}",
+                    "dismiss": "Dismissed a report on {a}", "clear_undo": "Undid the clear on {a}",
+                    "undismiss": "Brought back a dismissed report on {a}", "account_move": "Moved {a} to another login folder",
+                    "hold": "Added a hold", "hold_end": "Ended a hold", "note_set": "Set the note",
+                    "note_end": "Ended the note", "rule_add": "Added standing rule {n}",
+                    "rule_edit": "Changed standing rule {n}", "rule_retire": "Retired standing rule {n}",
+                    "rule_restore": "Restored standing rule {n}", "rule_confirm": "Confirmed standing rule {n}",
+                    "rule_undo": "Undid the change to standing rule {n}",
+                    "rule_unconfirm": "Set standing rule {n} back to unconfirmed",
+                    "rule_dismiss": "Dismissed standing rule {n}", "priority_set": "Set the priority",
+                    "priority_confirm": "Confirmed the priority", "priority_undo": "Undid the priority change",
+                    "priority_clear": "Cleared the priority", "priority_drop": "Cleared the priority"}
+# How an owner change was authorised (``_owner_via``): every one is named in
+# the next push, so a change made any way shows up with its Undo.
+_OWNER_AUTHS = ("direction", "app", "terminal")
+_ACCOUNT_NOTE_VERBS = {"tracked": "Started tracking {a}", "renamed": "Renamed {a}", "untracked": "Stopped tracking {a}"}
+
+
+def direction_line(entity: str, cause: dict, body: dict, prev_effective: dict | None, now: datetime) -> str:
+    """The push's line for an owner change (owner direction scope 2.5 and
+    2.8): what was done, how (by direction in a harness's conversation, in
+    the app, on a terminal) and the time, in fixed words. Never the session,
+    the project or the owner's quoted words: a push reaches every
+    conversation (``author_words``)."""
+    kind, _, ident = entity.partition(":")
+    label = ""
+    if kind == "account":
+        entry = next((a for a in body.get("accounts") or [] if a["key"] == ident), None) or {}
+        label = entry.get("label") or ((prev_effective or {}).get(entity) or {}).get("label") or _label_for_key(ident)
+    verbs = _ACCOUNT_NOTE_VERBS if cause.get("type") == "account_note" else _DIRECTION_VERBS
+    key = cause.get("state") if cause.get("type") == "account_note" else cause.get("type")
+    if cause.get("type") == "owner_change":
+        what = cause.get("text") or "Made an owner change"
+    else:
+        what = verbs.get(key, "Changed the routing record").format(a=label, n=ident)
+    if cause.get("auth") == "app":
+        how = "in the app"
+    elif cause.get("auth") == "terminal":
+        how = "on a terminal"
+    else:
+        how = "by your direction in " + author_words({"kind": "conversation",
+                                                       "harness": cause.get("harness") or UNKNOWN_HARNESS})
+    at = _parse(cause.get("at"))
+    when = f", {_clock(at, now)}" if at else ""
+    return f"{what} {how}{when} (undo in Settings)."
+
+
 def summary(view: dict | None = None, *, now: datetime | None = None, brief: bool = False) -> dict:
     """The full summary (``khipu route --summary``, the session-start text):
     a heading with the time and version, the standing rules whole, the note
@@ -5020,16 +5163,18 @@ def since(version: int, view: dict | None = None, *, now: datetime | None = None
     oldest = changes[0]["version"] if changes else view["version"] + 1
     complete = (oldest - 1 <= version <= view["version"] and view.get("saved", True) is not False
                 and (epoch is None or epoch == view.get("epoch")))
+    directions: list[str] = []
     if complete:
         entities: list[str] = []
         for change in changes:
             if change["version"] > version:
                 entities += [e for e in change["entities"] if e not in entities]
+                directions += [d for d in change.get("directions") or [] if isinstance(d, str)]
     else:
-        entities = list(view.get("effective") or {})
+        entities = [e for e in view.get("effective") or {} if not e.startswith("owner:")]
     lines = [_current_line(e, view, now) for e in entities]
     return {"since": version, "epoch": view.get("epoch"), "version": view["version"], "complete": complete,
-            "entities": entities, "lines": lines}
+            "entities": entities, "lines": lines, "directions": directions}
 
 
 def _current_line(entity: str, view: dict, now: datetime) -> str:
@@ -5595,7 +5740,8 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
 # convention (Khipu holds no credential), and a tool call is never the owner.
 CONVERSATION_ACTIONS = ("report", "hold", "end_hold")
 OWNER_ACTIONS = {"pause": "Pausing an account", "lift": "Lifting a pause", "clear": "Clearing an account",
-                 "dismiss": "Dismissing a report", "note": "The owner's note", "set_note": "The owner's note",
+                 "dismiss": "Dismissing a report", "clear_undo": "Undoing a clear",
+                 "undismiss": "Bringing back a dismissed report", "note": "The owner's note", "set_note": "The owner's note",
                  "end_note": "The owner's note", "rule": "A standing rule", "add_rule": "A standing rule",
                  "edit_rule": "A standing rule", "retire_rule": "A standing rule",
                  "confirm_rule": "A standing rule", "undo_rule": "A standing rule",
@@ -6119,7 +6265,10 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
             head.append((line, "Standing rule " + rule_pointer(pending[entity]), THEIRS) if entity in pending
                         else (line, None, OWNERS))
     head += _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)
-    others = [_clip(line, width) for group, _, line in ranked if group != 0]
+    # What the owner did since (by direction, in the app, on a terminal),
+    # each named once and first among the budgeted lines: Khipu's fixed words (``direction_line``).
+    others = [_clip(line, width) for line in changed.get("directions") or []]
+    others += [_clip(line, width) for group, _, line in ranked if group != 0]
 
     def overflow(n: int) -> str:
         return f"{n} more change{'s' if n != 1 else ''}: `khipu_route` since {changed['since']}"
@@ -6364,25 +6513,35 @@ def _caller() -> dict:
     return {"app": False, "chain": chain}
 
 
-def _owner_via(args) -> str | None:
+def _owner_via(args, intent: dict | None = None) -> str | None:
     """'app' when the app itself started this ``--from-app`` call
-    (``_caller``), 'cli' after a typed confirmation on a terminal, else None
+    (``_caller``), 'direction' when ``--owner-direction`` passed the owner
+    direction check for ``intent`` (``owner_direction.gate``, which raises
+    its refusal), 'cli' after a typed confirmation on a terminal, else None
     (refused). Either way how it was authorised is set for the write
-    (``_OWNER_AUTH``).
+    (``_OWNER_AUTH``), and ``intent`` is set up for the owner-actions log
+    (``owner_direction.finish`` writes it once the change is done).
 
     Same-user processes can't be told apart for certain: the check stops a
     conversation from passing ``--from-app`` itself, not one that drives the
     app's window, edits the record file or answers the prompt on a terminal
     it opens."""
+    from khipu import owner_direction
+
     if getattr(args, "from_app", False):
         caller = _caller()
         if not caller["app"]:
             return None
         _OWNER_AUTH.set({"auth": "app", "auth_chain": " < ".join(caller["chain"] + [caller["where"]])})
+        owner_direction.noted(intent, _OWNER_AUTH.get())
         return "app"
+    if getattr(args, "by_direction", False):
+        _OWNER_AUTH.set(owner_direction.gate(intent))
+        return "direction"
     if not typed_yes("This is an owner's change to the routing record. Type yes to confirm: "):
         return None
     _OWNER_AUTH.set({"auth": "terminal", "auth_chain": " < ".join(_caller()["chain"])})
+    owner_direction.noted(intent, _OWNER_AUTH.get())
     return "cli"
 
 
@@ -6402,7 +6561,28 @@ def typed_yes(prompt: str) -> bool:
 
 def _owner_stamp(event: dict) -> dict:
     """The owner's line with how it was authorised, when ``_owner_via`` did."""
-    return dict(event, **(_OWNER_AUTH.get() or {}))
+    auth = _OWNER_AUTH.get() or {}
+    if auth.get("auth"):
+        _owner_stamped[0] += 1
+    return dict(event, **auth)
+
+
+# How many owner's lines this process stamped: an owner change that wrote
+# none is named in the push by ``owner_change``.
+_owner_stamped = [0]
+OWNER_CHANGES_KEPT = 20
+
+
+def owner_change(text: str, line_id: str, auth: str, harness: str | None = None) -> dict:
+    """Record an owner change made outside this record (a ledger, Work view,
+    promotion or owner-direction change), so the next push names it once,
+    in ``text``'s fixed words, with how it was made."""
+    event = {"type": "owner_change", "target": line_id, "text": text, "auth": auth, "written_by": OWNER,
+             "via": {"direction": "direction", "app": "app", "terminal": "cli"}.get(auth, auth)}
+    if harness:
+        event["harness"] = harness
+    written, view = _write(event)
+    return _done(written, view)
 
 
 _REFUSED = ("This is the owner's command: it needs a typed confirmation on a terminal, or the app "
@@ -6544,7 +6724,7 @@ def _priority_cli(args, now: datetime) -> int:
                                      owner_request=args.at_owner_request, author=conversation_author(),
                                      via="cli", now=now, expect=getattr(args, "expect", None)))
         return 0
-    via = _owner_via(args)
+    via = _owner_via(args, _intent_or_none(_priority_intent, args, action))
     if via is None:
         _print_json({"ok": False, "error": _REFUSED})
         return 2
@@ -6559,13 +6739,91 @@ def _priority_cli(args, now: datetime) -> int:
         out = undo_priority(via=via, now=now, expect=expect)
     else:
         out = clear_priority(via=via, now=now, expect=expect)
-    _print_json(out)
+    _print_json(_finish_owner(out))
     return 0
+
+
+def _finish_owner(out: dict) -> dict:
+    from khipu import owner_direction
+
+    return owner_direction.finish(out) or out
+
+
+def _intent_or_none(build, *args) -> dict | None:
+    """An owner command's intent, or None when its arguments don't name a
+    target Khipu knows: the command itself then says why, and a direction
+    is refused (``owner_direction.gate``)."""
+    try:
+        return build(*args)
+    except (RouteError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _priority_intent(args, action: str) -> dict | None:
+    """The owner's priority change, for owner direction and the log: a set
+    names each account it orders."""
+    from khipu import owner_direction
+
+    if action != "set":
+        return owner_direction.intent(f"route.priority.{action}", "priority")
+    entries = _priority_entries_arg(args)
+    keys = []
+    for item in entries if isinstance(entries, list) else []:
+        item = {"account": item} if isinstance(item, str) else item
+        if isinstance(item, dict) and isinstance(item.get("account"), str):
+            keys.append(resolve_account(item["account"]))
+    return owner_direction.intent("route.priority.set", ",".join(keys))
+
+
+def _route_intent(cmd: str, args) -> dict | None:
+    """What an owner's ``khipu route`` change is about, for owner direction
+    and the owner-actions log (``owner_direction.ACTIONS``)."""
+    from khipu import owner_direction
+
+    if cmd in ("pause", "lift", "clear"):
+        facts = {"report": args.report} if cmd == "clear" and getattr(args, "report", None) else None
+        return owner_direction.intent(f"route.{cmd}", resolve_account(args.account), facts=facts)
+    if cmd == "note":
+        return owner_direction.intent(f"route.note.{'set' if args.action == 'set' else 'end'}", "note")
+    if cmd == "rule":
+        params = [str(p) for p in args.params]
+        if args.action == "add":
+            return owner_direction.intent("route.rule.add", "new")
+        if args.action == "edit":
+            return owner_direction.intent("route.rule.edit", params[0]) if len(params) >= 2 else None
+        if len(params) != 1:
+            return None
+        return owner_direction.intent(f"route.rule.{args.action}", params[0].strip())
+    return None
+
+
+def _hold_intent(args, words: list[str]) -> dict | None:
+    from khipu import owner_direction
+
+    if len(words) == 2 and words[0] == "end":
+        return owner_direction.intent("route.hold.end", words[1])
+    if args.account:
+        target = f"account:{resolve_account(args.account)}"
+    elif args.machine:
+        target = "machine"
+    elif args.all:
+        target = "all"
+    else:
+        return None
+    return owner_direction.intent("route.hold.add", target)
+
+
+def _planned_id(action: str) -> str | None:
+    from khipu import owner_direction
+
+    return owner_direction.planned_id(action)
 
 
 def run_cli(args) -> int:
     """``khipu route``: read the record, or write one change to it. An
     owner's change is timed after its typed confirmation, not before."""
+    from khipu import owner_direction
+
     cmd = getattr(args, "route_cmd", None)
     now = _now()
     auth = _OWNER_AUTH.set(None)
@@ -6629,22 +6887,25 @@ def run_cli(args) -> int:
             return 0
         if cmd == "hold":
             words = list(args.words)
-            owner_flag = bool(args.owner or args.from_app)
+            owner_flag = bool(args.owner or args.from_app or getattr(args, "by_direction", False))
             via = "cli"
             if owner_flag:
-                via = _owner_via(args)
+                via = _owner_via(args, _intent_or_none(_hold_intent, args, words))
                 if via is None:
                     _print_json({"ok": False, "error": _REFUSED})
                     return 2
                 now = _now()
             if len(words) == 2 and words[0] == "end":
-                _print_json(end_hold(words[1], owner=owner_flag, via=via, now=now))
+                out = end_hold(words[1], owner=owner_flag, via=via, now=now)
+                _print_json(_finish_owner(out) if owner_flag else out)
                 return 0
             if not args.reason:
                 raise RouteError("--reason is needed: machine-busy, disk-low, keep, outage or other")
             scope = "account" if args.account else "machine" if args.machine else "all" if args.all else ""
-            _print_json(add_hold(" ".join(words), reason=args.reason, scope=scope, account=args.account,
-                                 until=args.until, owner=owner_flag, via=via, now=now))
+            out = add_hold(" ".join(words), reason=args.reason, scope=scope, account=args.account,
+                           until=args.until, owner=owner_flag, via=via, now=now,
+                           hold_id=_planned_id("route.hold.add") if owner_flag else None)
+            _print_json(_finish_owner(out) if owner_flag else out)
             return 0
         if cmd == "priority":
             return _priority_cli(args, now)
@@ -6664,7 +6925,7 @@ def run_cli(args) -> int:
                 raise RouteError("--at-owner-request is only for rule add or edit")
             _print_json(out)
             return 0
-        via = _owner_via(args)
+        via = _owner_via(args, _intent_or_none(_route_intent, cmd, args))
         if via is None:
             _print_json({"ok": False, "error": _REFUSED})
             return 2
@@ -6683,7 +6944,8 @@ def run_cli(args) -> int:
         elif cmd == "rule":
             params = list(args.params)
             if args.action == "add":
-                out = add_rule(" ".join(params), source=args.source, via=via, now=now)
+                out = add_rule(" ".join(params), source=args.source, via=via, now=now,
+                               event_id=_planned_id("route.rule.add"))
             elif args.action == "edit":
                 if len(params) < 2:
                     raise RouteError('rule edit takes the rule number and its new words: rule edit 3 "<words>"')
@@ -6702,7 +6964,7 @@ def run_cli(args) -> int:
                 out = confirm_rule(params[0], via=via, now=now)
         else:
             raise RouteError(f"unknown route command {cmd!r}")
-        _print_json(out)
+        _print_json(_finish_owner(out))
         return 0
     except RouteError as err:
         refusal = {"ok": False, "error": str(err)}
@@ -6710,5 +6972,9 @@ def run_cli(args) -> int:
             refusal["code"] = err.code
         _print_json(refusal)
         return 2
+    except owner_direction.DirectionRefused as err:
+        _print_json(err.refusal())
+        return 2
     finally:
+        owner_direction.noted(None, {})
         _OWNER_AUTH.reset(auth)

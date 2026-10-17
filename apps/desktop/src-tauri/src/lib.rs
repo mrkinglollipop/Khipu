@@ -2277,6 +2277,94 @@ async fn khipu_route_check(account: String) -> Result<String, String> {
     run_khipu_cli_async(route_check_argv(&account)?).await
 }
 
+// --- Settings -> Owner actions (owner direction, scope 2.5 and section 4).
+// The list of every owner change, one Undo per line,
+// and the check's own settings. The app is the owner, so every write carries
+// `--from-app` and applies at once; each value is checked here and travels
+// after `--`, so nothing the webview sends can become a flag.
+
+const OWNER_DIRECTION_SHOW_ARGV: &[&str] = &["owner-direction", "show"];
+const OWNER_DIRECTION_ACTIONS_ARGV: &[&str] = &["owner-direction", "actions", "--json"];
+const OWNER_DIRECTION_ACKNOWLEDGE_ARGV: &[&str] = &["owner-direction", "acknowledge", "--from-app"];
+/// The keys `khipu owner-direction set` takes.
+const OWNER_DIRECTION_KEYS: &[&str] = &["latest_window_h", "session_binding", "trust", "untrust"];
+
+/// An owner-actions log line's id: 8 lowercase hex characters.
+fn owner_direction_undo_argv(id: &str) -> Result<Vec<String>, String> {
+    let ok = id.len() == 8 && id.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+    if !ok {
+        return Err("that is not an owner action Khipu knows".to_string());
+    }
+    Ok(fixed_argv(&["owner-direction", "undo", "--from-app", "--", id]))
+}
+
+fn owner_direction_switch_argv(on: bool) -> Vec<String> {
+    fixed_argv(&["owner-direction", if on { "on" } else { "off" }, "--from-app"])
+}
+
+fn owner_direction_set_argv(key: &str, value: &str) -> Result<Vec<String>, String> {
+    if !OWNER_DIRECTION_KEYS.contains(&key) {
+        return Err(format!("not an owner direction setting: {key:?}"));
+    }
+    let value = value.trim();
+    let ok = match key {
+        "latest_window_h" => {
+            value.len() <= 12
+                && value.chars().all(|c| c.is_ascii_digit() || c == '.')
+                && value.parse::<f64>().is_ok_and(|n| n > 0.0)
+        }
+        "session_binding" => value == "on" || value == "off",
+        _ => match value.split_once(':') {
+            Some((harness, entry)) => {
+                value.len() <= 64
+                    && !harness.is_empty()
+                    && !entry.is_empty()
+                    && harness.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    && entry.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+            }
+            None => false,
+        },
+    };
+    if !ok {
+        return Err(match key {
+            "session_binding" => "choose on or off".to_string(),
+            "trust" | "untrust" => "that is not a front end Khipu knows".to_string(),
+            _ => "enter a number above 0".to_string(),
+        });
+    }
+    Ok(fixed_argv(&["owner-direction", "set", "--from-app", "--", key, value]))
+}
+
+#[tauri::command]
+async fn khipu_owner_direction_show() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(OWNER_DIRECTION_SHOW_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_owner_direction_actions() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(OWNER_DIRECTION_ACTIONS_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_owner_direction_acknowledge() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(OWNER_DIRECTION_ACKNOWLEDGE_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_owner_direction_undo(id: String) -> Result<String, String> {
+    run_khipu_cli_async(owner_direction_undo_argv(&id)?).await
+}
+
+#[tauri::command]
+async fn khipu_owner_direction_switch(on: bool) -> Result<String, String> {
+    run_khipu_cli_async(owner_direction_switch_argv(on)).await
+}
+
+#[tauri::command]
+async fn khipu_owner_direction_set(key: String, value: String) -> Result<String, String> {
+    run_khipu_cli_async(owner_direction_set_argv(&key, &value)?).await
+}
+
 #[tauri::command]
 async fn khipu_route_clear(account: String, report: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(route_clear_argv(&account, report.as_deref())?).await
@@ -4545,6 +4633,12 @@ pub fn run() {
             khipu_route_pause,
             khipu_route_lift,
             khipu_route_check,
+            khipu_owner_direction_show,
+            khipu_owner_direction_actions,
+            khipu_owner_direction_undo,
+            khipu_owner_direction_acknowledge,
+            khipu_owner_direction_switch,
+            khipu_owner_direction_set,
             khipu_route_clear,
             khipu_route_note_set,
             khipu_route_note_end,
@@ -5116,6 +5210,53 @@ mod settings_command_tests {
             assert!(!argv.iter().any(|a| a.starts_with("--max-age")));
         }
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"usage"));
+    }
+
+    #[test]
+    fn owner_direction_commands_are_fixed_verbs_marked_from_the_app() {
+        assert_eq!(fixed_argv(OWNER_DIRECTION_SHOW_ARGV), v(&["owner-direction", "show"]));
+        assert_eq!(fixed_argv(OWNER_DIRECTION_ACTIONS_ARGV), v(&["owner-direction", "actions", "--json"]));
+        assert_eq!(
+            fixed_argv(OWNER_DIRECTION_ACKNOWLEDGE_ARGV),
+            v(&["owner-direction", "acknowledge", "--from-app"])
+        );
+        assert_eq!(
+            owner_direction_undo_argv("a1b2c3d4").unwrap(),
+            v(&["owner-direction", "undo", "--from-app", "--", "a1b2c3d4"])
+        );
+        assert_eq!(owner_direction_switch_argv(true), v(&["owner-direction", "on", "--from-app"]));
+        assert_eq!(owner_direction_switch_argv(false), v(&["owner-direction", "off", "--from-app"]));
+        assert_eq!(
+            owner_direction_set_argv("latest_window_h", "2.5").unwrap(),
+            v(&["owner-direction", "set", "--from-app", "--", "latest_window_h", "2.5"])
+        );
+        assert_eq!(
+            owner_direction_set_argv("session_binding", "off").unwrap(),
+            v(&["owner-direction", "set", "--from-app", "--", "session_binding", "off"])
+        );
+        assert_eq!(
+            owner_direction_set_argv("trust", "claude_code:sdk-cli").unwrap(),
+            v(&["owner-direction", "set", "--from-app", "--", "trust", "claude_code:sdk-cli"])
+        );
+        // Nothing the webview sends becomes a flag or a key the CLI was not built for.
+        for (key, value) in [
+            ("enabled", "on"),
+            ("latest_window_h", "-1"),
+            ("latest_window_h", "0"),
+            ("latest_window_h", "six"),
+            ("latest_window_h", "1e3"),
+            ("earlier_window_min", "30"),
+            ("session_binding", "yes"),
+            ("trust", "--from-app"),
+            ("trust", "claude_code"),
+            ("untrust", "codex:x\n--y"),
+        ] {
+            assert!(owner_direction_set_argv(key, value).is_err(), "{key}={value}");
+        }
+        for id in ["", "-a1b2c3d", "a1b2c3d4e5", "a1b2 c3d", "A1B2C3D4"] {
+            assert!(owner_direction_undo_argv(id).is_err(), "{id:?}");
+        }
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"owner-direction"));
     }
 
     #[test]
@@ -6231,7 +6372,7 @@ mod audit_1010_regression_tests {
     #[test]
     fn bundle_stages_both_recall_launchers() {
         let script = include_str!("../../scripts/bundle_cli.sh");
-        for name in ["khipu-prompt-recall", "khipu-recall-client.py"] { assert!(script.contains(name), "{name}"); }
+        for name in ["khipu-prompt-recall", "khipu-recall-client.py", "khipu-owner-turn.py"] { assert!(script.contains(name), "{name}"); }
     }
 
     #[test]

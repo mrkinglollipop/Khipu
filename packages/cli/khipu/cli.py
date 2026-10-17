@@ -906,6 +906,23 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         routing_block = _routing.doctor_block()
     except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
         routing_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # Owner direction (docs/plans/2026-10-16-owner-direction.md, 2.6): turns
+    # the prompt hook recorded in the last day per harness. Red when the check
+    # is on and a harness with the hook installed recorded none; never gates `ok`.
+    try:
+        from khipu import owner_turns as _owner_turns
+
+        owner_direction_block = _owner_turns.doctor_block()
+    except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
+        owner_direction_block = {"ok": False, "warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # The owner-actions log's hash chain (2.8): red, naming the first bad
+    # line, when a line was written or changed outside Khipu; never gates `ok`.
+    try:
+        from khipu import owner_direction as _owner_direction
+
+        owner_actions_log_block = _owner_direction.doctor_block()
+    except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
+        owner_actions_log_block = {"ok": False, "warnings": [], "error": f"{type(e).__name__}: {e}"}
     # The ledger (Work view phase 1): counts per project, removed rows waiting
     # to purge, purged markers, offline copy. Only the outbox gates (above).
     try:
@@ -965,12 +982,16 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "decision_links": decision_links_block,
         "plan_usage": plan_usage_block,
         "routing": routing_block,
+        "owner_direction": owner_direction_block,
+        "owner_actions_log": owner_actions_log_block,
         "ledger": ledger_block,
         "schema_migrations": schema,
         "work": work_block,
         "promotion": _promotion_block(),
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
+                     + list(owner_direction_block.get("warnings") or [])
+                     + list(owner_actions_log_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
                      + list(schema.get("warnings") or []) + _disk_space_warnings(local)
                      + _replica_schema_warnings(local)),
@@ -3098,10 +3119,16 @@ def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
         offset = nxt
 
 
-def _owner_or_request(args: argparse.Namespace) -> "dict | int":
-    """{} for the owner's write (the app, or a typed yes on a terminal), a
-    conversation's request with ``--at-owner-request``, or the exit code
-    after a refusal was printed."""
+def _owner_flags(parser) -> None:
+    from khipu.owner_direction import add_owner_flags
+
+    add_owner_flags(parser)
+
+
+def _owner_or_request(args: argparse.Namespace, intent: "dict | None" = None) -> "dict | int":
+    """{} for the owner's write (the app, a typed yes on a terminal, or his
+    words by owner direction), a conversation's request with
+    ``--at-owner-request``, or the exit code after a refusal was printed."""
     from khipu import routing
 
     if getattr(args, "at_owner_request", None) is not None:
@@ -3111,20 +3138,24 @@ def _owner_or_request(args: argparse.Namespace) -> "dict | int":
                               "code": "request_needs_words"}))
             return 2
         return {"request": words, "by": routing.conversation_author(), "at": routing._iso(routing._now())}
-    via = _owner_only(args)
+    via = _owner_only(args, intent)
     return via if isinstance(via, int) else {}
 
 
-def _owner_only(args: argparse.Namespace) -> "str | int":
-    """The owner check for a config change only the owner makes (the app,
-    or a typed yes on a terminal; ``routing._owner_via``): how it was
-    authorised ("app" or "cli"), or the exit code after a refusal was
-    printed."""
-    from khipu import routing
+def _owner_only(args: argparse.Namespace, intent: "dict | None" = None) -> "str | int":
+    """The owner check for a config change only the owner makes (the app, a
+    typed yes on a terminal, or owner direction for ``intent``;
+    ``routing._owner_via``): how it was authorised ("app", "cli" or
+    "direction"), or the exit code after a refusal was printed. A
+    direction already done prints its first result (exit 0)."""
+    from khipu import owner_direction, routing
 
     auth = routing._OWNER_AUTH.set(None)
     try:
-        via = routing._owner_via(args)
+        via = routing._owner_via(args, intent)
+    except owner_direction.DirectionRefused as err:
+        print(json.dumps(err.refusal()))
+        return 2
     finally:
         routing._OWNER_AUTH.reset(auth)
     if via is None:
@@ -3215,7 +3246,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         # `--set usage_accounts '[{"label": "Claude second", "harness":
         # "claude", "home": "~/.claude-second"}]'`; `--unset` (or `[]`) goes
         # back to every installed CLI with its default login.
-        from khipu import accounts, routing, usage
+        from khipu import accounts, owner_direction, routing, usage
         from khipu.config import config_file
 
         # Decision 15: the owner's (the app, or a typed yes on a terminal),
@@ -3234,7 +3265,7 @@ def cmd_config(args: argparse.Namespace) -> int:
                 request = {"request": words, "by": routing.conversation_author(),
                            "at": routing._iso(routing._now())}
             else:
-                via = routing._owner_via(args)
+                via = routing._owner_via(args, _accounts_list_intent(args))
                 if via is None:
                     print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
                     return 2
@@ -3251,10 +3282,14 @@ def cmd_config(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
+        except owner_direction.DirectionRefused as err:
+            print(json.dumps(err.refusal()))
+            return 2
         finally:
             routing._OWNER_AUTH.reset(auth)
-        print(json.dumps({"ok": True, "version": saved["version"], "usage_accounts": usage.accounts_status(),
-                          "config_file": str(config_file())}))
+        out = {"ok": True, "version": saved["version"], "usage_accounts": usage.accounts_status(),
+               "config_file": str(config_file())}
+        print(json.dumps(owner_direction.finish(out) or out))
         return 0
     from khipu.config import CLI_SETTINGS
 
@@ -3361,15 +3396,21 @@ def cmd_config(args: argparse.Namespace) -> int:
     if isinstance(getattr(args, "answer_request", None), (list, tuple)):
         # The owner's answer to a conversation's change to a routing setting.
         key, action = args.answer_request
-        if isinstance(_owner_only(args), int):
-            return 2
+        from khipu import owner_direction
+
+        intent = None
+        if action in ("confirm", "undo"):
+            intent = owner_direction.intent(f"config.answer_request.{action}", key)
+        via = _owner_only(args, intent)
+        if isinstance(via, int):
+            return via if via == 0 else 2
         try:
             path = _routing.answer_setting_request(key, action)
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err), "code": getattr(err, "code", None)}))
             return 2
-        print(json.dumps({"ok": True, "action": action, key: _routing.settings_status().get(key),
-                          "config_file": str(path)}))
+        out = {"ok": True, "action": action, key: _routing.settings_status().get(key), "config_file": str(path)}
+        print(json.dumps(owner_direction.finish(out) or out))
         return 0
     if (args.set and args.set[0] in _routing.SETTINGS) or args.unset in _routing.SETTINGS:
         # Every size, time and switch of the routing record (routing truth
@@ -3380,7 +3421,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         # typed yes on a terminal), or a conversation's at his request,
         # marked until he answers it. A lane map or a job runner folder
         # decides whose limits a report counts against.
-        request = _owner_or_request(args)
+        from khipu import owner_direction
+
+        intent = owner_direction.intent("config.routing_setting", key)
+        request = _owner_or_request(args, intent)
         if isinstance(request, int):
             return request
         try:
@@ -3391,7 +3435,8 @@ def cmd_config(args: argparse.Namespace) -> int:
                 out["code"] = err.code
             print(json.dumps(out))
             return 2
-        print(json.dumps({"ok": True, key: _routing.settings_status()[key], "config_file": str(path)}))
+        out = {"ok": True, key: _routing.settings_status()[key], "config_file": str(path)}
+        print(json.dumps(owner_direction.finish(out) if not request else out))
         return 0
     if (args.set and args.set[0] in CHOICE_SETTINGS) or args.unset in CHOICE_SETTINGS:
         from khipu.config import choice_setting, set_choice_setting
@@ -3534,20 +3579,31 @@ def _config_gate_override(args: argparse.Namespace) -> int:
     one-time "Update anyway". The next promotion skips these red checks
     once, names them in its record, then clears it; unused, it lapses after
     a day. Only the owner sets or cancels it (the app, or a typed yes)."""
+    from khipu import owner_direction
     from khipu import promote as _promote
 
-    via = _owner_only(args)
+    checks = [c.strip() for c in (args.set[1] if args.set else "").split(",") if c.strip()]
+    intent = (owner_direction.intent("promote.gate_ignore", ",".join(checks)) if checks else
+              owner_direction.intent("promote.gate_ignore.cancel", "update anyway"))
+    via = _owner_only(args, intent)
     if isinstance(via, int):
         return via
     try:
         path = _promote.set_gate_ignore(args.set[1] if args.set else None,
-                                        by="app" if via == "app" else "terminal")
+                                        by={"app": "app", "direction": "direction"}.get(via, "terminal"))
     except ValueError as err:
         print(json.dumps({"ok": False, "error": str(err)}))
         return 2
-    print(json.dumps({"ok": True, "promote_gate_ignore": _promote.gate_ignore_status(),
-                      "config_file": str(path)}))
+    out = {"ok": True, "promote_gate_ignore": _promote.gate_ignore_status(), "config_file": str(path)}
+    print(json.dumps(owner_direction.finish(out) or out))
     return 0
+
+
+def _accounts_list_intent(args: argparse.Namespace) -> "dict | None":
+    """A save of the whole account list, for owner direction and the log."""
+    from khipu import owner_direction
+
+    return owner_direction.intent("config.usage_accounts", "list")
 
 
 def _promote_gate_ignore_status() -> dict:
@@ -3965,10 +4021,13 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     from khipu.hub_snapshot import refresh, snapshot_freshness
 
     if args.snapshot_cmd == "heal":
-        from khipu import jobs, replica_heal
+        from khipu import jobs, owner_direction, replica_heal
 
         out = replica_heal.run()
         rc = 0 if out.get("ok") else 1
+        # The replica-refresh job is Khipu's timer: the owner-turn retention
+        # and overdue purges ride on it. Never changes the heal's result.
+        out["owner_direction"] = owner_direction.timer()
         try:
             from khipu import storage
 
@@ -5054,6 +5113,9 @@ def build_parser() -> argparse.ArgumentParser:
     from khipu import work as _work
 
     _work.add_parser(sub)
+    from khipu import owner_direction as _owner_direction
+
+    _owner_direction.add_parser(sub)
 
     nt = sub.add_parser("nightly", help="Run consolidate_nightly.py (memory wiki)")
     nt.set_defaults(func=cmd_nightly)
@@ -5348,23 +5410,28 @@ def build_parser() -> argparse.ArgumentParser:
     hold_scope.add_argument("--all", action="store_true")
     hold.add_argument("--owner", action="store_true", help="The owner's hold (asks for a typed confirmation)")
     hold.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(hold)
     rpause = rt_sub.add_parser("pause", help="Owner: mark an account paused (asks for a typed confirmation)",
                                parents=[rt_json])
     rpause.add_argument("account")
     rpause.add_argument("--until", default=None, metavar="T")
     rpause.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rpause)
     rlift = rt_sub.add_parser("lift", help="Owner: lift a pause (asks for a typed confirmation)", parents=[rt_json])
     rlift.add_argument("account")
     rlift.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rlift)
     rclear = rt_sub.add_parser("clear", help="Owner: clear an account, or dismiss one report (--report ID)",
                                parents=[rt_json])
     rclear.add_argument("account")
     rclear.add_argument("--report", default=None, metavar="ID")
     rclear.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rclear)
     rnote = rt_sub.add_parser("note", help="Owner: set or end the note to every conversation", parents=[rt_json])
     rnote.add_argument("action", choices=("set", "end"))
     rnote.add_argument("text", nargs="?", default=None)
     rnote.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rnote)
     rt_sub.add_parser("sources", help="Each job runner folder with its last good read and any error",
                       parents=[rt_json])
     rwait = rt_sub.add_parser(
@@ -5387,6 +5454,7 @@ def build_parser() -> argparse.ArgumentParser:
     rprio.add_argument("--at-owner-request", default=None, metavar="REQUEST",
                        help="A conversation: the owner's request, in one line (set only; stays unconfirmed)")
     rprio.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rprio)
     rprio.add_argument("--expect", default=None, metavar="V",
                        help="The priority's version as read; refused if it changed since")
     rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire, restore or confirm a standing rule", parents=[rt_json])
@@ -5396,6 +5464,7 @@ def build_parser() -> argparse.ArgumentParser:
     rrule.add_argument("--at-owner-request", default=None, metavar="REQUEST",
                        help="A conversation: the owner's request, in one line (rule add or edit; stays unconfirmed)")
     rrule.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rrule)
 
     dec = sub.add_parser(
         "decisions", help="Decisions registry: list / supersede / restore / retract / links (O2, Phase 2A)"
@@ -5852,6 +5921,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Persist capture_mode to the Hub config file",
     )
     cfg.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(cfg)
     cfg.add_argument("--expect", default=None, metavar="V",
                      help="With usage_accounts: the list's version as read; refused if it changed since")
     cfg.add_argument("--at-owner-request", default=None, metavar="REQUEST",
@@ -5866,6 +5936,7 @@ def build_parser() -> argparse.ArgumentParser:
     acc.set_defaults(func=cmd_accounts, accounts_cmd=None)
     acc_owner = argparse.ArgumentParser(add_help=False)
     acc_owner.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(acc_owner)
     acc_cas = argparse.ArgumentParser(add_help=False)
     acc_cas.add_argument("--expect", default=None, metavar="V",
                          help="The list's version as read (accounts status); refused if it changed since")
@@ -6326,6 +6397,11 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # noqa: BLE001 — CLI surface
         print(f"error: {e}", file=sys.stderr)
         return 1
+    finally:
+        # An owner change written ahead that never completed (its command
+        # raised) is marked failed, whichever command it was.
+        if "khipu.owner_direction" in sys.modules:
+            sys.modules["khipu.owner_direction"]._abandon()
 
 
 if __name__ == "__main__":

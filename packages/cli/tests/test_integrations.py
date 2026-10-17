@@ -152,6 +152,14 @@ class AegisPackTest(_TempHomeCase):
             self.assertIn("khipu-aegis-capture", handlers[0]["command"])
             self.assertNotIn(" ", handlers[0]["command"])            # space-free shim paths (B8)
             self.assertEqual(handlers[0]["env"], {"KHIPU_HARNESS": "aegis"})  # pack signature
+        # Owner direction: one recorder-only prompt entry (Aegis discards its output).
+        prompt = t["hooks"]["UserPromptSubmit"][0]["hooks"]
+        self.assertEqual(len(prompt), 1)
+        self.assertIn("khipu-prompt-recall", prompt[0]["command"])
+        self.assertEqual(prompt[0]["env"], {"KHIPU_HARNESS": "aegis"})
+        self.assertLessEqual(prompt[0]["timeout"], 3)
+        self.assertEqual(sorted(t["hooks"]), ["PreCompact", "SessionEnd", "Stop", "UserPromptSubmit"])
+        self.assertEqual(integ.status("aegis")["prompt_recall"], "installed")
         self.assertNotIn("khipu-stop-hook", text)
         self.assertEqual(integ.status("aegis")["extract"], "installed")
         self.assertEqual(integ.status("claude_code")["extract"], "missing")   # nothing installed in this HOME
@@ -203,6 +211,29 @@ class AegisPackTest(_TempHomeCase):
         self.assertTrue(st["hook_stop"] and st["hook_precompact"])
         self.assertEqual(st["extract"], "installed")
         self.assertNotIn("khipu-pack", (self.home / ".grok" / "config.toml").read_text())
+
+    def test_the_native_prompt_recorder_is_seen_and_uninstalled(self):
+        """The owner-direction prompt entry in Aegis's rewritten table form."""
+        import tomllib
+
+        (self.home / ".grok").mkdir()
+        integ.AEGIS_TOML.write_text('model = "grok"\n')
+        integ.install("aegis")
+        prompt = integ.prompt_recall_hook()
+        integ.AEGIS_TOML.write_text(
+            'model = "grok"\n\n'
+            "[[hooks.UserPromptSubmit]]\n"
+            "[[hooks.UserPromptSubmit.hooks]]\n"
+            'type = "command"\n'
+            f'command = "{prompt}"\n'
+            "timeout = 2\n"
+            "[hooks.UserPromptSubmit.hooks.env]\n"
+            'KHIPU_HARNESS = "aegis"\n'
+        )
+        self.assertEqual(integ.status("aegis")["prompt_recall"], "installed")
+        integ.uninstall("aegis")
+        self.assertNotIn("hooks", tomllib.loads(integ.AEGIS_TOML.read_text()))
+        self.assertEqual(integ.status("aegis")["prompt_recall"], "missing")
 
 
 class ProbeTest(_TempHomeCase):

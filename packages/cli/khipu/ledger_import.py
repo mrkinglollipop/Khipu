@@ -674,6 +674,72 @@ def _import_in(cur, project: str, src: dict[str, Any], report: dict[str, Any], *
                      "gives the file back" + (" except the masked fields listed." if src["masked"] else ".")}
 
 
+def done_imports(project: str, digest: str) -> list[int]:
+    """The ids of the imports of the file with ``digest`` that landed and
+    were not undone (read before an import, so its Undo can tell which one
+    it made). Raises ``HubAway`` when the database is away."""
+    project = ledger._check_project(project)
+    conn = ledger._connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM ledger_imports WHERE project = %s AND digest = %s AND result = 'done'",
+                        (project, digest))
+            return sorted(r[0] for r in cur.fetchall())
+    finally:
+        conn.close()
+
+
+def undo_import(project: str, digest: str, had: list[int] | None = None) -> dict[str, Any]:
+    """Undo an import (owner direction's Undo): remove every row the latest
+    import of the file with ``digest`` (not one of ``had``, the imports
+    there before it) added that is still in the ledger,
+    each one restorable, children before their parents (a row the ledger
+    added under one since moves up), and mark that import undone. Its
+    history entries stay with the removed rows."""
+    project = ledger._check_project(project)
+    conn = ledger._connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, file_name FROM ledger_imports WHERE project = %s AND digest = %s "
+                        "AND result = 'done' AND NOT (id = ANY(%s)) ORDER BY id DESC LIMIT 1",
+                        (project, digest, list(had or [])))
+            found = cur.fetchone()
+            if found is None:
+                raise LedgerError("Khipu can't find that import in the ledger (or it was undone already), so there "
+                                  "is nothing to undo", "no_import")
+            import_id, name = found
+            cur.execute("SELECT row_id, parent FROM ledger_rows WHERE project = %s AND removed_at IS NULL AND row_id IN "
+                        "(SELECT row_id FROM ledger_history WHERE project = %s AND op_id = %s)",
+                        (project, project, f"{MARKER_OP}{import_id}"))
+            live = dict(cur.fetchall())
+        conn.rollback()
+    finally:
+        conn.close()
+
+    def depth(row_id: str) -> int:
+        n, seen = 0, {row_id}
+        while live.get(row_id) in live and live[row_id] not in seen:
+            row_id = live[row_id]
+            seen.add(row_id)
+            n += 1
+        return n
+
+    order = sorted(live, key=lambda r: (-depth(r), r))
+    for row_id in order:
+        op = ledger.new_op("remove", project, row_id, children="move-up", from_app=True,
+                           note=f"Undid the import of {name}")
+        ledger.write(op)
+    conn = ledger._connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE ledger_imports SET result = 'undone' WHERE id = %s", (import_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "import_id": import_id, "removed": order,
+            "line": f"removed the {len(order)} row{'s' if len(order) != 1 else ''} the import of {name} added"}
+
+
 class _Mismatch(Exception):
     """The check after writing found a difference; the import is undone."""
 
