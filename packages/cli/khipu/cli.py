@@ -466,6 +466,13 @@ def _disk_space_warnings(local: dict) -> list[str]:
     return [block["message"]] if block.get("level") == "amber" and block.get("message") else []
 
 
+def _replica_schema_warnings(local: dict) -> list[str]:
+    """A replica at another schema than this code's is a warning that clears
+    when the replica job rebuilds it; it never gates."""
+    block = local.get("prompt_recall_snapshot") or {}
+    return [block["message"]] if block.get("level") == "amber" and block.get("message") else []
+
+
 def _promotion_block() -> dict:
     """A promotion waiting for the hub (khipu.promote.queued), for the app.
     Never gates ``ok``."""
@@ -519,7 +526,8 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
     schema = _schema_check()
     out["schema_migrations"] = schema
     out["schema_migrations_ok"] = not schema.get("pending")
-    out["warnings"] = list(schema.get("warnings") or []) + _disk_space_warnings(local)
+    out["warnings"] = (list(schema.get("warnings") or []) + _disk_space_warnings(local)
+                       + _replica_schema_warnings(local))
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
                  and all(bool(local[k]) for k in LOCAL_GATES) and out["schema_migrations_ok"])
     print(_strict_json(out, indent=2, default=str))
@@ -964,7 +972,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
-                     + list(schema.get("warnings") or []) + _disk_space_warnings(local)),
+                     + list(schema.get("warnings") or []) + _disk_space_warnings(local)
+                     + _replica_schema_warnings(local)),
         "not_configured": not_configured,
         "ok": (
             hub_ok

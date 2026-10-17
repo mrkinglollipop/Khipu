@@ -348,7 +348,20 @@ export function buildAttention(parsed: Record<string, unknown>): {
     }
   }
 
-  const prs = (parsed as { prompt_recall_snapshot?: { fresh?: boolean } }).prompt_recall_snapshot;
+  const prs = (parsed as { prompt_recall_snapshot?: { fresh?: boolean; level?: string; message?: string } })
+    .prompt_recall_snapshot;
+  // Amber while the offline copy was built for another version: the replica
+  // job rebuilds it on its next check, so this clears by itself.
+  if (prs?.level === "amber" && prs.message) {
+    issues.push("The offline copy is being rebuilt for this version of Khipu");
+    items.push({
+      key: "replica_schema",
+      tone: "warn",
+      title: "The offline copy is being rebuilt for this version of Khipu",
+      cause: prs.message,
+      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
+    });
+  }
   if (prs && prs.fresh === false) {
     issues.push("Prompt-time recall is using the database, not the offline copy");
     items.push({

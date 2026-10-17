@@ -239,6 +239,10 @@ function detailFor(key: string, parsed: Record<string, unknown>): string | undef
     const ds = parsed.disk_space as { level?: string; message?: string } | undefined;
     return ds?.level === "amber" && ds.message ? ds.message : undefined;
   }
+  if (key === "prompt_recall_snapshot_ok") {
+    const prs = parsed.prompt_recall_snapshot as { level?: string; message?: string } | undefined;
+    return prs?.level === "amber" && prs.message ? prs.message : undefined;
+  }
   return undefined;
 }
 

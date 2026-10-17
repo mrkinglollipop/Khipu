@@ -5167,8 +5167,9 @@ def prompt_recall_snapshot_status() -> dict[str, Any]:
     happening. This is the sign.
     """
     fresh, health = snapshot_is_fresh()
+    schema = replica_schema_mismatch(health)
     if fresh:
-        return {"ok": True, "fresh": True}
+        return {"ok": True, "fresh": True, **schema}
     return {
         "ok": True,
         "fresh": False,
@@ -5178,6 +5179,29 @@ def prompt_recall_snapshot_status() -> dict[str, Any]:
         ),
         "exists": bool(health.get("exists")),
         "age_seconds": health.get("age_seconds"),
+        **schema,
+    }
+
+
+def replica_schema_mismatch(health: Mapping[str, Any]) -> dict[str, Any]:
+    """Amber, never red, while the replica on disk was built at another
+    schema than this code's: the replica job rebuilds it on its next check
+    (khipu.replica_heal), so the warning clears by itself. Empty when the
+    schemas match or the replica has none on record."""
+    disk = health.get("schema_version")
+    if not health.get("exists") or disk is None or disk == SNAPSHOT_SCHEMA_VERSION:
+        return {}
+    which = "an older" if isinstance(disk, int) and disk < SNAPSHOT_SCHEMA_VERSION else "a different"
+    return {
+        "level": "amber",
+        "schema_on_disk": disk,
+        "schema_expected": SNAPSHOT_SCHEMA_VERSION,
+        "message": (
+            f"This Mac's offline copy was built for {which} version of Khipu "
+            f"(layout {disk}; this version uses {SNAPSHOT_SCHEMA_VERSION}). "
+            "It is rebuilt at the next check of the offline copy; until then "
+            "recall before each prompt may miss recent work."
+        ),
     }
 
 
