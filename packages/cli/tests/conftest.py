@@ -182,6 +182,31 @@ def _reset_process_level_caches():
     _clear()
 
 
+# The harness that "ran the prompt hook" for turns tests record in this
+# process. The real issuer here would be pytest's own Python, which the
+# owner-direction check refuses; tests about the issuer pass their own.
+FAKE_HOOK_ISSUER = {"pid": 4_000_000, "start": 1.0, "exe": "claude"}
+
+
+@pytest.fixture(autouse=True)
+def _owner_turns_from_a_fake_harness(monkeypatch):
+    """In-process ``owner_turns.record`` calls get ``FAKE_HOOK_ISSUER``, and
+    the check's caller chain has it as the nearest harness above this
+    process. A shim run in a
+    subprocess still computes its real issuer."""
+    from khipu import owner_direction, owner_turns
+
+    real_record, real_chain = owner_turns.record, owner_direction._caller_chain
+
+    def record(payload, env=None, now=None, issuer=None):
+        return real_record(payload, env, now, dict(FAKE_HOOK_ISSUER) if issuer is None else issuer)
+
+    monkeypatch.setattr(owner_turns, "record", record)
+    monkeypatch.setattr(owner_direction, "_caller_chain",
+                        lambda: [(FAKE_HOOK_ISSUER["pid"], FAKE_HOOK_ISSUER["start"], FAKE_HOOK_ISSUER["exe"])]
+                        + real_chain())
+
+
 class FakeCallers:
     """The process tree the routing owner check walks (``routing._caller``),
     faked through its seams: this process's parent is an installed Khipu.app

@@ -1279,6 +1279,55 @@ def _remove_work_view() -> dict[str, Any]:
             "locations": locations}
 
 
+OWNER_WORDS_GATEWAY_WHY = ("this server is the HTTPS gateway; the owner's recorded words are kept only "
+                          "on the owner's Mac, so there are none here")
+
+
+def _session_forms(session_id: str) -> set[str]:
+    """The ids the owner-direction files may know a session by: the episode's
+    own and, for ``<harness>:<id>``, the bare id the prompt hook records."""
+    forms = {session_id}
+    if ":" in session_id:
+        forms.add(session_id.split(":", 1)[1])
+    return {f for f in forms if f}
+
+
+def _owner_words_scan(session_id: str | None, *, gateway: bool) -> dict[str, Any]:
+    """The owner's typed words recorded for the episode's session: its turn
+    files and briefs (``owner_turns.forget_sessions``), the old widenings
+    file, the words in its owner-actions lines (scrubbed, the chain and Undo
+    kept), and every rewrite temp a crash left that could hold them
+    (``owner_files.clean_temps``). Local files only: on the gateway there are none, and nothing remote
+    is touched. A part that can't be done keeps the forget open."""
+    place = "owner words"
+    if gateway:
+        return {"ok": True, "removed": {}, "locations": [{
+            "place": place, "path": None, "state": "not applicable", "why": OWNER_WORDS_GATEWAY_WHY}]}
+    if not session_id:
+        return {"ok": True, "removed": {}, "locations": [{"place": place, "path": None, "state": "clean"}]}
+    from khipu import owner_direction, owner_files, owner_turns
+
+    forms = _session_forms(str(session_id))
+    try:
+        removed = owner_turns.forget_sessions(forms)
+        removed["pending"] = owner_direction.remove_old_widenings()
+        removed["log_lines"] = owner_direction.scrub_words(forms)
+        temps = owner_files.clean_temps(forms)
+        removed["temps"] = temps["removed"]
+    except Exception as exc:  # noqa: BLE001 - an unfinished scan keeps the forget open
+        return {"ok": False, "removed": {}, "locations": [{
+            "place": place, "path": None, "state": "not checked",
+            "why": (f"the owner's recorded words for this session could not all be removed "
+                    f"({type(exc).__name__}), so the forget stays open")}]}
+    if temps["left"]:
+        return {"ok": False, "removed": removed, "locations": [{
+            "place": place, "path": None, "state": "not checked",
+            "why": ("a rewrite of the owner's recorded words was in progress, so its file could still hold "
+                    "this session's words; the forget stays open and the next run removes it")}]}
+    state = "removed" if any(removed.values()) else "clean"
+    return {"ok": True, "removed": removed, "locations": [{"place": place, "path": None, "state": state}]}
+
+
 def _scrub_golden_file(path: Path, episode_id: int) -> dict[str, Any]:
     import tempfile
 
@@ -1706,12 +1755,16 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
     out["work_view"] = _remove_work_view()
     if not out["work_view"]["ok"]:
         partial.append("work_view")
+    out["owner_words"] = _owner_words_scan(out.get("session_id"),
+                                           gateway=_is_gateway() if gateway is None else bool(gateway))
+    if not out["owner_words"]["ok"]:
+        partial.append("owner_words")
     # Every store the inventory says forget scans must be one of the scans
     # above; a store added without its scan keeps the forget open.
     from khipu.capture_stores import STORES
 
     ran = {"native jobs", "outbox", "legacy logs", "replica", "replica temps", "legacy writers",
-           "recall golden", "work view"}
+           "recall golden", "work view", "owner words"}
     unscanned = [{"place": st.name, "path": None, "state": "not checked",
                   "why": (f"{st.name} ({st.where}) is in the store inventory but forget has no "
                           "scan for it, so the forget stays open")}
@@ -1722,7 +1775,8 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
     out["locations"] = _merge_locations(
         legacy_locs, *(item.get("inspected", []) for item in out["outboxes"]),
         out["replica_temps"]["locations"], out["native_jobs"]["inspected"],
-        writers["locations"], out["recall_golden"]["locations"], out["work_view"]["locations"], unscanned)
+        writers["locations"], out["recall_golden"]["locations"], out["work_view"]["locations"],
+        out["owner_words"]["locations"], unscanned)
     out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
                      "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
     if not out["outbox"]["ok"]:
@@ -1750,6 +1804,8 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
                           if loc["state"] in INCOMPLETE_STATES],
         "work_view": [loc.get("why") for loc in out["work_view"]["locations"]
                       if loc["state"] in INCOMPLETE_STATES],
+        "owner_words": [loc.get("why") for loc in out["owner_words"]["locations"]
+                        if loc["state"] in INCOMPLETE_STATES],
     }
     if out.get("unidentified_sources", 0) > 0:
         out["partial_errors"]["legacy_file"] = [

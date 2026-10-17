@@ -2384,8 +2384,18 @@ def cmd(args: argparse.Namespace) -> int:
     verb = args.ledger_cmd
     try:
         refuse_secrets([v for k, v in vars(args).items() if k != "func"])
-        require(f"ledger {verb}", from_app=getattr(args, "from_app", False),
-                dry_run=getattr(args, "dry_run", False))
+        command = f"ledger {verb}"
+        intent = None
+        if command in WRITE_POLICY and verb != "projects":
+            try:
+                intent = direction_intent(command, args, _project_for(args))
+            except Exception:  # noqa: BLE001 - no intent: a direction is refused, the command says why
+                intent = None
+        stamp = require(command, from_app=getattr(args, "from_app", False), dry_run=getattr(args, "dry_run", False),
+                        by_direction=getattr(args, "by_direction", False), intent=intent)
+        from khipu import owner_direction
+
+        owner_direction.run_due()
         if verb == "projects":
             listed = project_list()
             _emit(args, {"ok": True, **listed},
@@ -2397,11 +2407,16 @@ def cmd(args: argparse.Namespace) -> int:
         if verb == "project":
             result = set_project(project, name=args.rename,
                                  hidden=True if args.hide else False if args.show else None)
+            result = owner_direction.finish(result) or result
             _emit(args, result, result["line"])
             return 0
         if verb in ("add", "set", "remove", "restore"):
-            return _cmd_write(args, verb, project)
+            return _cmd_write(args, verb, project, owner=stamp is not None)
         if verb == "purge":
+            if stamp is not None:
+                out = owner_direction.schedule_purge(project, args.id)
+                _emit(args, out, out["line"])
+                return 0
             return _cmd_purge(args, project)
         if verb == "import":
             return _cmd_import(args, project)
@@ -2495,34 +2510,99 @@ _APP_ONLY = {
 }
 
 
-def require(command: str, *, from_app: bool = False, dry_run: bool = False) -> None:
+# The owner-direction action each owner verb is (``owner_direction.ACTIONS``);
+# a writer verb is the owner's only when it is written as him (row 16 of the
+# owner-direction scope: --from-app, or his direction).
+DIRECTION_ACTIONS = {
+    "ledger import": "ledger.import", "ledger restore": "ledger.restore", "ledger purge": "ledger.purge",
+    "ledger project": "ledger.project",
+    "ledger add": "ledger.add", "ledger set": "ledger.set", "ledger remove": "ledger.remove",
+    "work hide": "work.hide", "work unhide": "work.unhide", "work same": "work.same", "work not-same": "work.not_same",
+}
+
+
+def require(command: str, *, from_app: bool = False, dry_run: bool = False, by_direction: bool = False,
+            intent: dict | None = None) -> dict | None:
     """The one owner check for every verb that changes anything (see
     ``WRITE_POLICY``); raises ``LedgerError`` when this caller may not run
     ``command``. ``dry_run`` (an import that writes nothing) only reads. A
-    verb in neither table is refused: a new verb must be classified."""
+    verb in neither table is refused: a new verb must be classified.
+
+    ``by_direction`` asks for the owner-direction check on ``intent`` in
+    place of the app or a typed yes: the owner's verbs, the app's (restore,
+    purge) and a write as the owner. Returns the direction's auth stamp
+    then, else None."""
     policy = WRITE_POLICY.get(command)
     if policy is None and command not in READ_VERBS:
         raise LedgerError(f"{command} is not a known verb; nothing was changed", "unknown_verb")
+    if by_direction and not from_app and not dry_run and policy is not None:
+        return _direction(command, intent)
     if policy is None or dry_run or policy == "writer":
         if from_app:
             _check_from_app()
-        return
+            _noted(intent, "app")
+        return None
     if policy == "app":
         if not from_app:
             raise LedgerError(_APP_ONLY[command], "app_only")
         _check_from_app()
-        return
+        _noted(intent, "app")
+        return None
     from khipu import routing
 
     if from_app:
         _check_from_app()
-        return
+        _noted(intent, "app")
+        return None
     if routing._caller()["app"]:
-        return
+        _noted(intent, "app")
+        return None
     if routing.typed_yes(f"This is the owner's change ({command}). Type yes to confirm: "):
-        return
-    raise LedgerError("only the Khipu app, or the owner's yes typed on a terminal, can make this change; "
-                      "nothing was changed", "not_app")
+        _noted(intent, "terminal")
+        return None
+    raise LedgerError("only the Khipu app, the owner's yes typed on a terminal, or a conversation the owner is "
+                      "typing in (owner direction) can make this change; nothing was changed", "not_app")
+
+
+def _direction(command: str, intent: dict | None) -> dict:
+    from khipu import owner_direction
+
+    if intent is not None and intent.get("action") != DIRECTION_ACTIONS.get(command):
+        intent = None
+    try:
+        return owner_direction.gate(intent)
+    except owner_direction.DirectionRefused as err:
+        raise LedgerError(err.message, err.code) from None
+
+
+def _noted(intent: dict | None, auth: str) -> None:
+    from khipu import owner_direction
+
+    owner_direction.noted(intent, {"auth": auth})
+
+
+def direction_intent(command: str, args: argparse.Namespace, project: str | None) -> dict | None:
+    """What an owner's ledger or work change is about, for owner direction
+    and the owner-actions log; None when it names nothing to check."""
+    from khipu import owner_direction
+
+    action = DIRECTION_ACTIONS.get(command)
+    if action is None:
+        return None
+    if action == "ledger.import":
+        facts = {"project": project} if project else {}
+        if getattr(args, "catch_up", False):
+            facts["catch_up"] = True
+        return owner_direction.intent(action, str(args.file), facts=facts or None)
+    if action == "ledger.project":
+        return owner_direction.intent(action, project) if project else None
+    if action.startswith("ledger."):
+        if not project or not getattr(args, "id", None):
+            return None
+        return owner_direction.intent(action, f"{project}#{args.id}")
+    if action in ("work.hide", "work.unhide"):
+        return owner_direction.intent(action, str(args.id))
+    return owner_direction.intent(action, f"{args.row}|{args.commitment}")
 
 
 def _check_from_app() -> None:
@@ -2537,7 +2617,7 @@ def _check_from_app() -> None:
                           "so nothing was changed", "not_app")
 
 
-def _cmd_write(args: argparse.Namespace, verb: str, project: str) -> int:
+def _cmd_write(args: argparse.Namespace, verb: str, project: str, *, owner: bool = False) -> int:
     fields: dict[str, Any] = {}
     if verb == "add":
         fields = {"title": args.title, "kind": args.kind, "parent": args.parent or "", "state": args.state,
@@ -2547,8 +2627,10 @@ def _cmd_write(args: argparse.Namespace, verb: str, project: str) -> int:
                   "link": args.link}
     op = new_op(verb, project, args.id, fields=fields, note=getattr(args, "note", "") or "",
                 if_state=getattr(args, "if_state", None), children=getattr(args, "children", None),
-                op_id=args.op_id, from_app=args.from_app)
-    result = write(op)
+                op_id=args.op_id, from_app=args.from_app or owner)
+    from khipu import owner_direction
+
+    result = owner_direction.finish(write(op))
     text = result["line"] + (f"\n{QUEUED_WORDS}" if result.get("queued") else "")
     _emit(args, {**result, "op_id": op["op_id"], "project": project}, text)
     return 0
@@ -2563,6 +2645,9 @@ def _cmd_purge(args: argparse.Namespace, project: str) -> int:
         result = purge(conn, project, args.id)
     finally:
         conn.close()
+    from khipu import owner_direction
+
+    result = owner_direction.finish(result) or result
     _emit(args, result, result["line"])
     return 0
 
@@ -2571,6 +2656,10 @@ def _cmd_import(args: argparse.Namespace, project: str) -> int:
     from khipu import ledger_import
 
     report = ledger_import.run_import(args.file, project, dry_run=args.dry_run, catch_up=args.catch_up)
+    if not args.dry_run:
+        from khipu import owner_direction
+
+        report = owner_direction.finish(report) or report
     _emit(args, report, ledger_import.report_text(report))
     return 0 if report["result"] in ("done", "caught up", "nothing new", "dry run") else 1
 
@@ -2631,6 +2720,12 @@ def status_line(*, hub: bool = True) -> dict[str, Any]:
     return out
 
 
+def _owner_flags(parser) -> None:
+    from khipu.owner_direction import add_owner_flags
+
+    add_owner_flags(parser)
+
+
 def add_parser(sub) -> None:
     """``khipu ledger <verb>``: the tracker's verbs and flags, plus remove."""
     p = sub.add_parser("ledger", help="The ledger of what work is done and not done (tracker verbs)")
@@ -2642,6 +2737,7 @@ def add_parser(sub) -> None:
         if write:
             sp.add_argument("--op-id", default=None, help="Pass the same id to retry a write safely")
             sp.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+            _owner_flags(sp)
 
     a = verbs.add_parser("add")
     a.add_argument("id")
@@ -2722,6 +2818,7 @@ def add_parser(sub) -> None:
     im.add_argument("--dry-run", action="store_true", help="Report what would be imported; write nothing")
     im.add_argument("--catch-up", action="store_true", help="Bring in only what changed since the last import")
     im.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(im)
     common(im)
 
     ex = verbs.add_parser("export", help="The project in the old tracker file's shape")

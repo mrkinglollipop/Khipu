@@ -990,6 +990,49 @@ def test_owner_commands_refuse_without_a_typed_confirmation(home, capsys, monkey
         in block["warnings"]
 
 
+def test_every_owner_command_takes_owner_direction(home):
+    """Owner direction (scope rows 1 to 10): each owner command of the
+    routing record, the account list, the routing settings and Update
+    anyway takes --owner-direction beside --from-app."""
+    import argparse
+
+    from khipu import cli
+
+    def sub(parser, *path):
+        for name in path:
+            parser = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices[name]
+        return parser
+
+    parser = cli.build_parser()
+    commands = [("route", c) for c in ("pause", "lift", "clear", "note", "priority", "rule", "hold")]
+    commands += [("accounts", c) for c in ("track", "rename", "stop", "move", "decline", "offer-again",
+                                            "auto-track", "request")]
+    commands += [("config",), ("owner-direction", "off"), ("owner-direction", "on"), ("owner-direction", "set"),
+                 ("owner-direction", "undo"), ("owner-direction", "acknowledge")]
+    for path in commands:
+        flags = {o for a in sub(parser, *path)._actions for o in a.option_strings}
+        assert {"--from-app", "--owner-direction"} <= flags, path
+
+
+def test_a_direction_from_a_session_with_no_owner_turn_is_refused(home, capsys, monkeypatch, tmp_path):
+    from khipu import owner_turns
+
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-one")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    owner_turns.write_settings({"enabled": False})
+    for argv in (["route", "pause", "Codex"], ["route", "note", "set", "Codex first"],
+                 ["route", "rule", "add", "Never a -fast tier."], ["route", "rule", "confirm", "1"]):
+        rc, out = _cli(argv + ["--owner-direction"], capsys)
+        assert rc == 2 and json.loads(out)["code"] == "direction_off", argv
+    owner_turns.write_settings({"enabled": True})
+    for argv in (["route", "pause", "Codex"], ["route", "note", "set", "Codex first"],
+                 ["route", "rule", "add", "Never a -fast tier."], ["route", "rule", "confirm", "1"]):
+        rc, out = _cli(argv + ["--owner-direction"], capsys)
+        assert rc == 2 and json.loads(out)["code"] == "no_recorded_turn", argv
+    assert not routing.events_file().exists()
+
+
 def test_rule_at_owner_request_is_live_without_terminal_confirmation_but_owner_actions_are_not(home, capsys, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     rc, out = _cli(["route", "rule", "add", "--at-owner-request", "The owner asked in review.", "--",
@@ -1724,7 +1767,8 @@ def test_a_hold_length_setting_too_long_to_add_never_stops_a_conversations_hold(
     assert rc == 0
     rc, out = _cli(["route", "hold", "x", "--reason", "other", "--all"], capsys)
     assert rc == 0 and json.loads(out)["until"] == routing._iso(until)
-    assert len(routing.read_events()[0]) == 1
+    # The setting change is named in the next push (``owner_change``), then the hold.
+    assert [e["type"] for e in routing.read_events()[0]] == ["owner_change", "hold"]
 
 
 def test_a_default_limit_setting_too_long_to_add_never_stops_an_untimed_report(home, capsys):
@@ -1734,7 +1778,7 @@ def test_a_default_limit_setting_too_long_to_add_never_stops_an_untimed_report(h
     rc, out = _cli(["route", "report", "--account", "Codex", "--state", "limited"], capsys)
     data = json.loads(out)
     assert rc == 0 and (data["until"], data["basis"]) == ("2026-10-14T20:00:00Z", "estimated")
-    assert len(routing.read_events()[0]) == 1
+    assert [e["type"] for e in routing.read_events()[0]] == ["owner_change", "evidence"]
 
 
 @pytest.mark.parametrize("raw", ["4000000d", "9999-12-31T23:59:00-05:00"])
