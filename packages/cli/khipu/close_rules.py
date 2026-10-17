@@ -125,18 +125,23 @@ def _repo(value: str | None) -> str | None:
 
 def pr_refs(text: str, project_repo: str | None) -> list[tuple[str | None, int]]:
     """The ``(repository, number)`` of each pull request ``text`` names, in
-    :func:`parse_prs` order. A GitHub pull link names its own repository (two
-    links with the same number in two repositories are two refs); any other
-    mention is the project's repository, None when that is not known."""
+    the order they appear, each once. A GitHub pull link names its own
+    repository; any other mention ("PR #41", "#41" in a PR list) is the
+    project's repository, None when that is not known. So "PR #41 and
+    github.com/other/repo/pull/41" is two refs, both required."""
     text = str(text or "")
-    links: dict[int, list[str]] = {}
+    project = _repo(project_repo)
+    found: list[tuple[int, str | None, int]] = []
+    for m in _PR_NUMBER_RE.finditer(text):
+        found.append((m.start(1), project, int(m.group(1))))
+    for m in _PR_LIST_RE.finditer(text):
+        for h in _HASH_RE.finditer(m.group(1)):
+            found.append((m.start(1) + h.start(1), project, int(h.group(1))))
     for m in _PULL_LINK_RE.finditer(text):
-        repos = links.setdefault(int(m.group(2)), [])
-        if _repo(m.group(1)) not in repos:
-            repos.append(_repo(m.group(1)))
+        found.append((m.start(2), _repo(m.group(1)), int(m.group(2))))
     out: list[tuple[str | None, int]] = []
-    for n in parse_prs(text):
-        for repo in links.get(n) or [_repo(project_repo)]:
+    for _, repo, n in sorted(found, key=lambda f: f[0]):
+        if n > 0 and (repo, n) not in out:
             out.append((repo, n))
     return out
 
@@ -400,30 +405,40 @@ class GitHub:
 
 _QUESTION_START_RE = re.compile(r"^\s*(?:was|were|is|are|did|does|do|has|have|had|can|could|should|will|"
                                 r"would|why|how|what|when|whether)\b", re.I)
-_PR_STATE_WORD_RE = re.compile(r"\b(?:merg\w*|clos\w*|reopen\w*)\b", re.I)
 
 
-def evidence_problem(text: str, item_text: str = "") -> str | None:
+def evidence_problem(text: str, item_text: str = "", project: str | None = None) -> str | None:
     """Why ``text`` (a closed loop, a ``done:`` line, a decision or a session
-    mention) is not evidence that closes an item reading ``item_text``, or
-    None when it is. The same check for every close path
+    mention) is not evidence that closes an item reading ``item_text`` in
+    ``project``, or None when it is. The same check for every close path
     (``commitments.auto_close``, ``commitments.close_session_plan`` and the
     decision rule here):
 
     * a question is never evidence ("Was PR #366 merged?");
-    * a claim about the state of a PR the item names is evidence only as a
-      line git or gh printed (:func:`capture_pr_records`); otherwise the PR
-      rule asks the PR's own sources, GitHub included."""
+    * an item that names pull requests closes only when EVERY one of them,
+      each resolved to its repository, is merged or closed in the newest
+      line about it in this evidence, and only a line git or gh printed
+      (:func:`capture_pr_records`) counts. A reopened PR, or any named PR the
+      evidence does not show finished, keeps the item open; the PR rule asks
+      the PR's own sources, GitHub included, and closes it when they are."""
     s = str(text or "").strip()
     if s.endswith("?") or _QUESTION_START_RE.match(s):
         return "a question is not evidence"
-    named = set(parse_prs(item_text))
-    if named and _PR_STATE_WORD_RE.search(s):
-        claimed = named & set(parse_prs(s))
-        trusted = {n for (_, n) in capture_pr_records([s])}
-        if claimed - trusted:
-            return "a pull request's state comes from GitHub or a git or gh line, not a sentence"
+    repo = _project_repo(project)
+    refs = pr_refs(item_text, repo)
+    if refs:
+        states = {_key(key, repo): state for key, state in capture_pr_records([s]).items()}
+        unfinished = [ref_label(ref, repo) for ref in refs if states.get(_key(ref, repo)) not in DONE_STATES]
+        if unfinished:
+            named = ", ".join(n if "#" in n else f"#{n}" for n in unfinished)
+            return (f"the item waits on every pull request it names, and {named} is not shown merged or "
+                    "closed by a git or gh line here")
     return None
+
+
+def _project_repo(project: str | None) -> str | None:
+    """The project key as a GitHub repository, or None when it is not one."""
+    return project if project and _REPO_RE.match(project) else None
 
 
 # ---- the rules --------------------------------------------------------------
@@ -519,7 +534,7 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
         later: dict[EvidenceKey, dict[str, Any]] = {}
         if payload is None:
             later = _episode_states(cur, project, min(int(r["opened_episode"] or 0) for r in rows))
-        repo = project if _REPO_RE.match(project) else None
+        repo = _project_repo(project)
         for item in rows:
             opened = int(item["opened_episode"] or 0)
             before = (item["pr_check"] or {}).get("waiting") or {}
@@ -591,7 +606,7 @@ def _settles(item: dict, decisions: list[tuple], threshold: float):
         if not _later(item, dep, decided_at):
             continue
         text = text or ""
-        if evidence_problem(text, item["text"]):
+        if evidence_problem(text, item["text"], item.get("project")):
             continue
         if any(int(m.group(1)) == item["id"] for m in _NAMES_ITEM_RE.finditer(text)):
             return ("strict", did, text, "names the item", 1.0, dep)

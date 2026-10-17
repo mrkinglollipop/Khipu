@@ -629,3 +629,61 @@ def test_every_close_path_goes_through_the_one_guarded_close():
     assert {("close_rules", "_close"), ("commitments", "auto_close"), ("commitments", "close_session_plan"),
             ("commitments", "open_from_episode"), ("owed_tidy", "apply")} <= callers, callers
     assert {m for m, _ in callers} >= {"hygiene"}, callers
+
+
+# ---- the second cross-family review: every named PR, each in its repository ----
+
+
+def test_bare_project_pr_and_other_repo_link_same_number_are_both_required(monkeypatch):
+    """The review's probe: "PR #41" is this project's, the link is another
+    repository's; the open first/repo#41 keeps the item open."""
+    class Github:
+        def state(self, repo, number):
+            return ("merged", None) if repo == "second/repo" else ("open", None)
+
+    monkeypatch.setattr(close_rules, "_runner_states", lambda project: {})
+    monkeypatch.setattr(close_rules, "_ledger_states", lambda cur, project: {})
+    monkeypatch.setattr(close_rules, "_episode_states", lambda cur, project, after: {})
+    text = "Land PR #41 in this project and https://github.com/second/repo/pull/41 before release"
+    assert close_rules.pr_refs(text, "first/repo") == [("first/repo", 41), ("second/repo", 41)]
+    item = dict(id=1, text=text, project="first/repo", kind="blocker", opened_episode=1,
+                prs=close_rules.parse_prs(text), reopened=[], pr_check={})
+    report = {"closed_pr": 0, "kept_open_reopened": 0}
+    planned: dict = {}
+    close_rules._pr_rule(None, [item], report, payload=None, episode_id=None, github=Github(), sink=planned)
+    assert planned == {}, "The open first/repo#41 must prevent closing this two-repository item"
+
+
+@pytest.mark.parametrize("text,evidence", [
+    ("Land PR #12 and PR #13 before the release", "Merge pull request #12 from acme/feature"),
+    ("Land PR #366 before the release", "Reopened pull request #366"),
+    ("Land PR #366 before the release", "Landed the release work for PR #366"),
+    ("Land PR #12 and https://github.com/other/repo/pull/12", "Merge pull request #12 from acme/feature"),
+])
+def test_loop_close_cannot_override_pr_state_requirements(monkeypatch, text, evidence):
+    """The review's probe and its kin: a legacy closed loop goes through the
+    same every-PR check."""
+    class Cursor:
+        rowcount = 1
+
+        def execute(self, sql, params=()):
+            pass
+
+    monkeypatch.setattr(co, "_open_commitments", lambda *args, **kwargs: [{"id": 7, "text": text}])
+    monkeypatch.setattr(co, "_close_columns_ready", lambda cur: True)
+    monkeypatch.setattr(co, "_not_forgotten_clause", lambda cur: "TRUE")
+    monkeypatch.setattr(co, "_has_commitment_embeddings", lambda *args: False)
+    monkeypatch.setattr("khipu.config.float_setting", lambda key: 0.8)
+    payload = {"project": "acme/widget", "closed_loops": [{"text": evidence, "commitment_id": 7}]}
+    assert co.auto_close(Cursor(), payload, episode_id=19) == 0
+
+
+def test_a_loop_close_passes_when_every_named_pr_is_shown_finished():
+    """The mirror: git's merge line for #12 and gh's close line for #13."""
+    text = "Land PR #12 and PR #13 before the release"
+    evidence = "Merge pull request #12 from acme/feature\n✓ Closed pull request #13"
+    assert close_rules.evidence_problem(evidence, text, PROJECT) is None
+    # The newest line about a PR wins: a reopen after the merge blocks.
+    assert close_rules.evidence_problem(evidence + "\n✓ Reopened pull request #12", text, PROJECT)
+    # An item naming no PR is not held by this check.
+    assert close_rules.evidence_problem("Finished the release notes", "Write the release notes") is None

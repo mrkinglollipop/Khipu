@@ -1289,13 +1289,13 @@ def evidence_key(rule: str, text: str) -> str:
     return f"{rule}:{hashlib.sha256(norm.encode('utf-8')).hexdigest()[:16]}"
 
 
-def evidence_problem(text: str, item_text: str = "") -> str | None:
+def evidence_problem(text: str, item_text: str = "", project: str | None = None) -> str | None:
     """Why ``text`` is not evidence that closes an item reading
-    ``item_text`` (``khipu.close_rules.evidence_problem``, the one check every
-    close path shares), or None."""
+    ``item_text`` in ``project`` (``khipu.close_rules.evidence_problem``, the
+    one check every close path shares), or None."""
     from khipu.close_rules import evidence_problem as check
 
-    return check(text, item_text)
+    return check(text, item_text, project)
 
 
 def close_by_rule(cur, commitment_id: int, *, reason: str, key: str, evidence: dict | None = None,
@@ -1383,7 +1383,7 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
         if best_id is None or tied or (best_via == "cosine" and semantic_matches > 1):
             continue
         best_text = next(r["text"] for r in open_rows if r["id"] == best_id)
-        why_not = evidence_problem(text, best_text)
+        why_not = evidence_problem(text, best_text, payload.get("project"))
         if why_not:
             _log(f"kept commitment {best_id} open: {why_not}")
             continue
@@ -1541,7 +1541,7 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
             # closed by the sessionend itself.
             hit = next(
                 (m for m in mentions if _match_score(m, row["text"]) >= DONE_MATCH_MIN_SCORE
-                 and not evidence_problem(m, row["text"])),
+                 and not evidence_problem(m, row["text"], row.get("project") or payload.get("project"))),
                 None,
             )
             if hit is None:
