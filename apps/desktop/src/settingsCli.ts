@@ -101,6 +101,8 @@ export type ConfigShape = {
   replica?: Record<string, { value: number; default: number; source: string }>;
   graph_backup_remote?: { value: string; source: "env" | "config" | "default"; default: string; error?: string };
   minute_settings?: Record<string, { value: number; source: "file" | "default"; default: number; min: number; max: number }>;
+  /** `config.count_settings_status()`: whole numbers of 0 or more, 0 for no limit. */
+  count_settings?: Record<string, { value: number; source: "file" | "default"; default: number; no_limit?: number }>;
   /** The owner's one-time "Update anyway": `value` is the checks the next
    *  update skips once (empty when none is set); `blocked_by` is the red
    *  checks that held the last update back, when that alone did. */

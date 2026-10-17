@@ -149,12 +149,20 @@ export function Dialog({
  *  the rhythm (height, gap, divider). */
 export function ListRow({
   className,
+  dataId,
   children,
 }: {
   className?: string;
+  /** The item the row shows, as `data-id` (a list's own key, for tests and
+   *  for finding a row again after a re-read). */
+  dataId?: string | number;
   children?: ReactNode;
 }) {
-  return <div className={className ? `row ${className}` : "row"}>{children}</div>;
+  return (
+    <div className={className ? `row ${className}` : "row"} data-id={dataId}>
+      {children}
+    </div>
+  );
 }
 
 /** One number with a label and a supporting line. `tone="err"` outlines it. */

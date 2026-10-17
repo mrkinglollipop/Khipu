@@ -72,6 +72,7 @@ class JobsRunTest(unittest.TestCase):
                     mock.patch.object(jobs, "_reconcile_notes_if_due"), \
                     mock.patch.object(jobs, "_embed_backfill"), \
                     mock.patch.object(jobs, "_prune_query_cache"), \
+                    mock.patch.object(jobs, "_commitment_close_rules"), \
                     mock.patch.object(jobs, "_mark_stale_commitments"), \
                     mock.patch.object(jobs, "_hygiene_commitments"), \
                     mock.patch.object(jobs, "_ledger_nightly"), \
@@ -80,7 +81,7 @@ class JobsRunTest(unittest.TestCase):
                 self.assertEqual(jobs.run_nightly(), expected)
             script.assert_called_once()
             self.assertFalse(record.call_args_list[0].kwargs["ok"])
-            self.assertEqual(record.call_count, 9)
+            self.assertEqual(record.call_count, 10)
 
     def test_run_nightly_writes_nightly_last_json_with_every_step(self):
         """F3/D1: nightly-last.json is the persisted evidence Phase 6 will
@@ -99,7 +100,8 @@ class JobsRunTest(unittest.TestCase):
         self.assertEqual(
             names,
             ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
-             "query_cache_prune", "commitments_mark_stale", "commitments_hygiene", "ledger",
+             "query_cache_prune", "commitments_close_rules", "commitments_mark_stale",
+             "commitments_hygiene", "ledger",
              "snapshot_refresh"],
         )
         for step in payload["steps"]:
@@ -182,6 +184,7 @@ class JobsRunTest(unittest.TestCase):
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch("khipu.db.connect", return_value=conn), \
                 mock.patch("khipu.commitments.mark_stale", return_value=4) as m_stale, \
+                mock.patch.object(jobs, "_commitment_close_rules"), \
                 mock.patch.object(jobs, "_hygiene_commitments"):
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
@@ -259,6 +262,7 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
+                mock.patch.object(jobs, "_commitment_close_rules"), \
                 mock.patch("khipu.db.connect", return_value=conn), \
                 mock.patch("khipu.hygiene.backup_commitments", return_value=Path("/tmp/backup")) as m_backup, \
                 mock.patch(

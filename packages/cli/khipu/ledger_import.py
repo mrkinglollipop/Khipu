@@ -545,6 +545,18 @@ def _existing(cur, project: str, ids: list[str]) -> tuple[dict[str, Any], dict[s
     return here, dict(cur.fetchall())
 
 
+def in_inbox(path: str | os.PathLike) -> bool:
+    """Whether ``path`` is a copy in the ledger inbox (``paths.ledger_inbox``).
+    A copy never changes, so catching up is not used for it."""
+    from khipu import paths, safe_read
+
+    try:
+        folder, _name = safe_read.parse(path)
+        return os.path.samefile(folder, paths.ledger_inbox())
+    except (safe_read.Refused, OSError):
+        return False
+
+
 def run_import(path: str | os.PathLike, project: str, *, dry_run: bool = False, catch_up: bool = False,
                conn=None) -> dict[str, Any]:
     """Import the tracker at ``path`` into ``project``; see the module text.
@@ -557,7 +569,7 @@ def run_import(path: str | os.PathLike, project: str, *, dry_run: bool = False, 
     counts = tracker_counts(src["rows"])
     report: dict[str, Any] = {"ok": True, "project": project, "file": src["name"], "digest": src["digest"],
                               "counts_in_file": counts, "masked": src["masked"], "other_keys": src["other_keys"],
-                              "catch_up": catch_up}
+                              "catch_up": catch_up, "in_inbox": in_inbox(path)}
     owned = conn is None
     try:
         if owned:
@@ -617,6 +629,13 @@ def _import_in(cur, project: str, src: dict[str, Any], report: dict[str, Any], *
     landed = cur.fetchall()
     here, purged = _existing(cur, project, ids)
     existing = ledger._vocab(cur, project)
+    if catch_up and report.get("in_inbox"):
+        # Scope (e)(3): a copy in the inbox never changes, so the switch from
+        # a login folder is a hard cut and a copy has no catch-up, changed or
+        # not.
+        return {**report, "ok": False, "result": "refused", "reason": "inbox_copy",
+                "words": "This is a copy in the ledger inbox, and a copy is never caught up: the switch from a "
+                         "login folder is a hard cut. Keep working in the ledger itself."}
     if src["digest"] in {d for d, _r in landed}:
         return {**report, "result": "nothing new", "words": "Nothing new: every row and history entry is already here."}
     if catch_up and not landed:
@@ -631,10 +650,12 @@ def _import_in(cur, project: str, src: dict[str, Any], report: dict[str, Any], *
         if plan["result"] == "nothing new":
             return plan
         taken = sorted(here)
+        hint = ("A copy in the ledger inbox is never caught up; keep working in the ledger itself."
+                if report.get("in_inbox") else
+                "If this tracker was imported before and changed since, bring the changes in with --catch-up; "
+                "otherwise choose a different project or a new one.")
         return {**report, "ok": False, "result": "refused", "reason": "exists", "existing_ids": taken,
-                "words": f"Nothing was imported: these ids already exist in {project}: {_listed(taken)}. If this "
-                         "tracker was imported before and changed since, bring the changes in with --catch-up; "
-                         "otherwise choose a different project or a new one."}
+                "words": f"Nothing was imported: these ids already exist in {project}: {_listed(taken)}. {hint}"}
     if purged:
         gone = sorted(purged)
         return {**report, "ok": False, "result": "refused", "reason": "purged", "purged_ids": gone,

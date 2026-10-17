@@ -2307,9 +2307,7 @@ def cmd_owed(args: argparse.Namespace) -> int:
     """W3.4: `khipu owed` — list, close, reopen, or snooze commitments. With
     the hub away a close, reopen or snooze waits on this Mac and replays when
     it answers (`waiting_to_sync`), and the list comes from this Mac's copy."""
-    from khipu import commitments, offline, offline_reads, owner_writes
-    from khipu.db import connect
-    from khipu.hub_snapshot import hub_connection_failed
+    from khipu import commitments, owner_writes
 
     snooze_id = getattr(args, "snooze", None)
     if snooze_id:
@@ -2333,11 +2331,22 @@ def cmd_owed(args: argparse.Namespace) -> int:
 
     close_id = getattr(args, "close", None)
     reopen_id = getattr(args, "reopen", None)
+    reassign_ids = getattr(args, "reassign", None)
+    if reassign_ids or (close_id and "," in str(close_id)) or (reopen_id and "," in str(reopen_id)):
+        return _owed_change_cli(args)
     if close_id or reopen_id:
         cid = int(close_id or reopen_id)
         new_status = "closed" if close_id else "open"
+        from khipu import routing
+
+        # "you, in the app" only when the app started this process, by the
+        # check ledger._check_from_app makes; any other caller is a
+        # conversation's command.
+        by = commitments.BY_APP if routing._caller()["app"] else commitments.BY_CONVERSATION
         try:
-            res = owner_writes.run("owed_update", {"id": cid, "action": "close" if close_id else "reopen"})
+            res = owner_writes.run("owed_update", {
+                "id": cid, "action": "close" if close_id else "reopen", "by": by,
+                **({"reason": args.reason} if close_id and getattr(args, "reason", None) else {})})
         except ValueError:
             print(json.dumps({"ok": False, "id": cid, "status": new_status}))
             return 1
@@ -2345,36 +2354,174 @@ def cmd_owed(args: argparse.Namespace) -> int:
                           **({"waiting_to_sync": True} if res.get("waiting_to_sync") else {})}))
         return 0
 
-    project = getattr(args, "project", None)
-    status = getattr(args, "status", None) or "open"
-    limit = int(getattr(args, "limit", None) or 50)
-    stale: dict = {}
-    try:
-        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
-            with conn.cursor() as cur:
-                rows = commitments.list_owed(cur, project=project, status=status, limit=limit)
-                # Ages counted on the hub's own clock, so a Mac clock that runs
-                # ahead of or behind the hub can't make an age negative.
-                cur.execute("SELECT now()")
-                hub_now = (cur.fetchone() or [None])[0]
-    except Exception as exc:  # noqa: BLE001
-        if not hub_connection_failed(exc):
-            raise
-        copy = offline_reads.owed(project, status, limit)
-        if copy is None:
-            raise
-        rows = copy["results"]
-        stale = {"stale": True, "snapshot_refreshed_at": copy.get("snapshot_refreshed_at")}
-        from datetime import datetime, timezone
+    return _owed_page_cli(args, getattr(args, "project", None), getattr(args, "status", None) or "open")
 
-        hub_now = datetime.now(timezone.utc)
-    commitments.add_hub_ages(rows, hub_now)
-    owner_writes.annotate(rows, "owed_update")
-    if getattr(args, "envelope", False):
-        print(json.dumps({"results": rows, "stale": bool(stale), "snapshot_refreshed_at": stale.get("snapshot_refreshed_at"),
-                          "waiting_to_sync": owner_writes.status()}, indent=2, default=str))
+
+def cmd_owed_tidy(args: argparse.Namespace) -> int:
+    """`khipu owed tidy --project P`: plan the clean-up (writes nothing),
+    `--apply PLAN` apply a plan in one batch, `--undo BATCH` undo one. Plain
+    JSON out, like the other owed commands (khipu.owed_tidy). With
+    ``--owner-direction`` an apply or undo passes the owner gate on the
+    owner's direction in this conversation, logged with an Undo, or is
+    refused with nothing changed."""
+    from khipu import offline, owed_tidy
+    from khipu.db import connect
+
+    project = args.project
+    if args.apply and args.undo:
+        print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
+        return 2
+    if getattr(args, "by_direction", False):
+        if not (args.apply or args.undo):
+            print(json.dumps({"ok": False, "error": "--owner-direction applies or undoes a clean-up; "
+                                                    "planning one needs no direction"}))
+            return 2
+        return _owed_tidy_by_direction(args, project)
+    if args.apply:
+        try:
+            doc = json.loads(Path(args.apply).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(json.dumps({"ok": False, "error": f"could not read the plan: {type(exc).__name__}"}))
+            return 2
+        if isinstance(doc, dict) and doc.get("project") != project:
+            print(json.dumps({"ok": False, "error": f"this plan is for project {doc.get('project')!r}, "
+                                                    f"not {project!r}; nothing was changed"}))
+            return 2
+        res = owed_tidy.apply(doc)
+        print(json.dumps(res, indent=2, default=str))
+        return 0 if res.get("ok") else 1
+    if args.undo:
+        # The batch's project is checked before anything changes, as --apply
+        # checks the plan's; undo checks it again under its lock.
+        try:
+            owner_project = owed_tidy.batch_project(args.undo)
+        except Exception as exc:  # noqa: BLE001 — not checked means not undone
+            print(json.dumps({"ok": False, "error": f"could not read the batch ({type(exc).__name__}); "
+                                                    "nothing was changed"}))
+            return 2
+        if owner_project != project:
+            why = (f"no clean-up batch {args.undo!r}" if owner_project is None
+                   else f"batch {args.undo!r} is for project {owner_project!r}, not {project!r}")
+            print(json.dumps({"ok": False, "error": why + "; nothing was changed"}))
+            return 2
+        res = owed_tidy.undo(args.undo, project=project)
+        print(json.dumps(res, indent=2, default=str))
+        return 0 if res.get("ok") else 1
+    with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+        with conn.cursor() as cur:
+            doc = owed_tidy.plan(cur, project, use_model=not args.no_model)
+    if args.plan_out:
+        Path(args.plan_out).write_text(json.dumps(doc, indent=2, default=str) + "\n", encoding="utf-8")
+        print(json.dumps({"ok": True, "plan_out": args.plan_out, "project": project,
+                          "totals": doc["totals"], "model": doc["model"], "notes": doc["notes"]},
+                         indent=2, default=str))
     else:
-        print(json.dumps(rows, indent=2, default=str))
+        print(json.dumps(doc, indent=2, default=str))
+    return 0
+
+
+def _owed_tidy_by_direction(args: argparse.Namespace, project: str) -> int:
+    """``owed tidy --apply/--undo --owner-direction``: the owner-direction
+    check (action ``owed.tidy``) before anything is read or changed, then the
+    same apply or undo with the gate passed as ``direction``."""
+    from khipu import owed_tidy, owner_direction
+
+    change = "apply" if args.apply else "undo"
+    facts = {"change": change, **({"plan": args.apply} if args.apply else {"batch": args.undo})}
+    want = owner_direction.intent("owed.tidy", project, facts=facts)
+    try:
+        owner_direction.gate(want)
+    except owner_direction.DirectionRefused as err:
+        print(json.dumps({**err.refusal(), "error": err.message + " Nothing was changed."}))
+        return 2
+    try:
+        if args.apply:
+            try:
+                doc = json.loads(Path(args.apply).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                res = {"ok": False, "error": f"could not read the plan: {type(exc).__name__}"}
+            else:
+                res = ({"ok": False, "error": f"this plan is for project {doc.get('project')!r}, not "
+                                              f"{project!r}; nothing was changed"}
+                       if isinstance(doc, dict) and doc.get("project") != project
+                       else owed_tidy.apply(doc, owner_gate="direction"))
+        else:
+            res = owed_tidy.undo(args.undo, project=project, owner_gate="direction")
+    except BaseException:
+        owner_direction._abandon()
+        raise
+    res = owner_direction.finish(res) or res
+    print(json.dumps(res, indent=2, default=str))
+    return 0 if res.get("ok") else 1
+
+
+def _owed_ids_arg(raw: str) -> list[int]:
+    ids: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip().lstrip("#")
+        if not part:
+            continue
+        cid = int(part)
+        if cid <= 0:
+            raise ValueError
+        if cid not in ids:
+            ids.append(cid)
+    if not ids:
+        raise ValueError
+    return ids
+
+
+def _owed_change_cli(args: argparse.Namespace) -> int:
+    """`khipu owed --close ID,ID`, `--reopen ID,ID` or `--reassign ID[,ID] --to
+    OWNER`: one owner write through ``mcp_server.owed_change`` (one
+    transaction, one result per id). More than one of the owner's own items
+    passes the owner gate: the app, a yes typed on this terminal, or with
+    ``--owner-direction`` the owner's direction in this conversation."""
+    from khipu import commitments, mcp_server, routing
+
+    if getattr(args, "reassign", None):
+        action, raw = "reassign", args.reassign
+    elif getattr(args, "close", None):
+        action, raw = "close", args.close
+    else:
+        action, raw = "reopen", args.reopen
+    try:
+        ids = _owed_ids_arg(raw)
+    except ValueError:
+        print(json.dumps({"ok": False, "error": f"ids must be whole numbers separated by commas, got {raw!r}"}))
+        return 2
+    by = commitments.BY_APP if routing._caller()["app"] else commitments.BY_CONVERSATION
+    try:
+        res = mcp_server.owed_change(ids, action, by=by, reason=getattr(args, "reason", None),
+                                     owner=getattr(args, "to", None), owner_label=getattr(args, "label", None),
+                                     by_direction=bool(getattr(args, "by_direction", False)))
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "ids": ids, "error": str(exc)}))
+        return 2
+    print(json.dumps(res, default=str))
+    return 0 if res.get("ok") else 1
+
+
+def _owed_page_cli(args: argparse.Namespace, project: str | None, status: str) -> int:
+    """`khipu owed`'s list: one page, the same listing khipu_owed gives
+    (``mcp_server.owed_listing``), at most ``owed_page_max`` rows with a
+    next_cursor for the rest. ``--envelope`` always says whether the list is
+    the stale copy and what waits to sync."""
+    from khipu import mcp_server, owner_writes
+
+    try:
+        out = mcp_server.owed_listing({
+            "project": project, "status": status, "limit": getattr(args, "limit", None),
+            **{k: getattr(args, k, None) for k in ("cursor", "owner", "kind", "origin", "query", "pr",
+                                                   "looks_done")}},
+            hub_ages=True)
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 2
+    if getattr(args, "envelope", False):
+        out = {**out, "stale": bool(out.get("stale")), "snapshot_refreshed_at": out.get("snapshot_refreshed_at"),
+               "waiting_to_sync": owner_writes.status()}
+    print(json.dumps(out, indent=2, default=str))
     return 0
 
 
@@ -3167,6 +3314,7 @@ def _owner_only(args: argparse.Namespace, intent: "dict | None" = None) -> "str 
 def cmd_config(args: argparse.Namespace) -> int:
     from khipu.config import (
         CHOICE_SETTINGS,
+        COUNT_SETTINGS,
         FLOAT_SETTINGS,
         INT_SETTINGS,
         LIST_SETTINGS,
@@ -3452,6 +3600,17 @@ def cmd_config(args: argparse.Namespace) -> int:
         return 0
     if (args.set and args.set[0] == "promote_gate_ignore") or args.unset == "promote_gate_ignore":
         return _config_gate_override(args)
+    if (args.set and args.set[0] in COUNT_SETTINGS) or args.unset in COUNT_SETTINGS:
+        from khipu.config import count_settings_status, set_count_setting
+
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = set_count_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: count_settings_status()[key], "config_file": str(path)}))
+        return 0
     if (args.set and args.set[0] in MINUTE_SETTINGS) or args.unset in MINUTE_SETTINGS:
         from khipu.config import minute_settings_status, set_minute_setting
 
@@ -3536,6 +3695,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         float_settings_status,
         graph_backup_remote_status,
         list_setting,
+        count_settings_status,
         minute_settings_status,
         path_settings_status,
     )
@@ -3554,6 +3714,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "user_aliases": list(list_setting("user_aliases")),
         "float_settings": float_settings_status(),
         "minute_settings": minute_settings_status(),
+        "count_settings": count_settings_status(),
         "promote_gate_ignore": _promote_gate_ignore_status(),
         "relevance_cosine_floor": relevance.cosine_floor_status(),
         "relevance_cosine_floor_by_profile": relevance.cosine_floor_by_profile(),
@@ -5296,8 +5457,28 @@ def build_parser() -> argparse.ArgumentParser:
     owed.add_argument("--project", default=None)
     owed.add_argument("--status", default="open", choices=("open", "closed", "stale"))
     owed.add_argument("--limit", type=int, default=50)
-    owed.add_argument("--close", metavar="ID", default=None, help="Close commitment ID")
-    owed.add_argument("--reopen", metavar="ID", default=None, help="Reopen commitment ID")
+    owed.add_argument("--owner", default=None, choices=("user", "assistant", "agent", "all"),
+                      help="Only items this owner owes (pages the list, like khipu_owed)")
+    owed.add_argument("--kind", default=None, choices=("followup", "blocker", "question", "promise"))
+    owed.add_argument("--origin", default=None, choices=("conversation", "job"))
+    owed.add_argument("--query", default=None, help="Only items whose text holds all these words")
+    owed.add_argument("--pr", type=int, default=None, help="Only items naming this pull request number")
+    owed.add_argument("--looks-done", dest="looks_done", action="store_true",
+                      help="Only the owner's items a rule found done, for him to close")
+    owed.add_argument("--cursor", default=None, help="next_cursor from the previous page")
+    owed.add_argument("--close", metavar="ID[,ID...]", default=None, help="Close commitment ID, or several")
+    owed.add_argument("--reopen", metavar="ID[,ID...]", default=None, help="Reopen commitment ID, or several")
+    owed.add_argument("--reassign", metavar="ID[,ID...]", default=None,
+                      help="Give commitment ID, or several, to another owner (needs --to)")
+    owed.add_argument("--to", default=None, choices=("user", "assistant", "agent"),
+                      help="With --reassign: the new owner")
+    owed.add_argument("--label", default=None, help="With --reassign --to agent: who (orchestrator, builder, reviewer)")
+    owed.add_argument("--reason", default=None,
+                      help="Why (kept on a closed item); required with more than one id")
+    owed.add_argument("--json", action="store_true", help="Accepted and ignored: the output is always JSON")
+    from khipu.owner_direction import add_owner_flags as _owed_owner_flags
+
+    _owed_owner_flags(owed)
     owed.add_argument(
         "--snooze", metavar="ID", default=None,
         help="Push commitment ID's due date out (needs --until)",
@@ -5308,8 +5489,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     owed.add_argument(
         "--envelope", action="store_true",
-        help="Print {results, stale, snapshot_refreshed_at, waiting_to_sync} instead of the bare list",
+        help="Always include stale, snapshot_refreshed_at and waiting_to_sync with the page",
     )
+    owed_sub = owed.add_subparsers(dest="owed_cmd")
+    tidy = owed_sub.add_parser(
+        "tidy", help="Plan the one-time clean-up of a project's Owed list; apply or undo a plan")
+    tidy.add_argument("--project", required=True)
+    tidy.add_argument("--plan-out", metavar="FILE", default=None,
+                      help="Write the plan to FILE and print only its totals")
+    tidy.add_argument("--apply", metavar="PLAN", default=None, help="Apply the plan in the file PLAN")
+    tidy.add_argument("--undo", metavar="BATCH", default=None, help="Undo the applied batch BATCH")
+    tidy.add_argument("--no-model", action="store_true",
+                      help="Rules only: no model pass for the items the rules cannot sort")
+    _owed_owner_flags(tidy)
+    tidy.set_defaults(func=cmd_owed_tidy)
     owed.set_defaults(func=cmd_owed)
 
     us = sub.add_parser(

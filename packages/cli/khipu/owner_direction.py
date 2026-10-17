@@ -80,7 +80,7 @@ ACTIONS: frozenset[str] = frozenset({
     "accounts.request.undo", "config.usage_accounts", "config.routing_setting", "config.answer_request.confirm",
     "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel", "ledger.import",
     "ledger.restore", "ledger.purge", "ledger.project", "ledger.add", "ledger.set", "ledger.remove", "work.hide", "work.unhide",
-    "work.same", "work.not_same", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
+    "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
     "direction.undo",
 })
 
@@ -854,6 +854,7 @@ _PUSH_WORDS = {
     "config.answer_request.undo": "Undid a conversation's change to a routing setting",
     "accounts.decline": "Stopped offering an account", "accounts.offer_again": "Offered an account again",
     "accounts.auto_track": "Changed whether new accounts are tracked",
+    "owed.tidy": "Applied or undid an Owed list clean-up",
 }
 
 
@@ -1038,6 +1039,20 @@ def _before(want: dict):
         except Exception:  # noqa: BLE001 - a row Khipu can't read now can't be put back
             return _UNREADABLE
         return {"fields": {k: row.get(k) for k in ("state", "evidence", "owner", "title", "link")}}
+    if action == "owed.change":
+        # Undo undoes the hub's batch for this change, named in its result;
+        # the hub has to answer now, as the change itself needs it to.
+        from khipu import mcp_server
+
+        try:
+            mine = mcp_server._owed_owners_items([int(cid) for cid in target.split(",")])
+        except Exception:  # noqa: BLE001 - what Khipu can't read now can't be put back
+            return _UNREADABLE
+        return _UNREADABLE if mine is None else {"owners_items": mine}
+    if action == "owed.tidy":
+        # An apply's Undo undoes the batch its result names; an undo's puts
+        # that batch's changes back (owed_tidy.redo).
+        return {"project": target, "change": (want.get("facts") or {}).get("change")}
     if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
     if action == "direction.acknowledge":
@@ -1344,6 +1359,39 @@ def _undo_import(line, via):
     return ledger_import.undo_import(before["project"], before["digest"], before.get("had"))
 
 
+def _undo_owed_change(line, via):
+    from khipu import owed_tidy
+
+    batches = (line.get("result") or {}).get("batches") or []
+    if not batches:
+        raise ValueError("Khipu has no record of which batch this change wrote, so it can't undo it")
+    restored, left_alone = 0, []
+    for batch in batches:
+        out = owed_tidy.undo(batch, owner_gate=_by(via))
+        if not out.get("ok"):
+            raise ValueError(out.get("error") or f"batch {batch} could not be undone")
+        restored += int(out.get("restored") or 0)
+        left_alone += out.get("left_alone") or []
+    return {"ok": True, "restored": restored, "left_alone": left_alone}
+
+
+def _undo_owed_tidy(line, via):
+    from khipu import owed_tidy
+
+    batch = (line.get("result") or {}).get("batch")
+    if not batch:
+        raise ValueError("Khipu has no record of which batch this clean-up wrote, so it can't undo it")
+    if _b(line).get("change") == "undo":
+        out = owed_tidy.redo(batch, project=line["target"], owner_gate=_by(via))
+        counted = {"reapplied": int(out.get("reapplied") or 0)}
+    else:
+        out = owed_tidy.undo(batch, project=line["target"], owner_gate=_by(via))
+        counted = {"restored": int(out.get("restored") or 0)}
+    if not out.get("ok"):
+        raise ValueError(out.get("error") or f"batch {batch} could not be undone")
+    return {"ok": True, **counted, "left_alone": out.get("left_alone") or []}
+
+
 def _ledger_undo(verb: str):
     def run(line, via):
         return _ledger_write(verb, line["target"])
@@ -1394,6 +1442,8 @@ _UNDO = {
     "work.unhide": _undo_hidden,
     "work.same": _undo_link,
     "work.not_same": _undo_link,
+    "owed.change": _undo_owed_change,
+    "owed.tidy": _undo_owed_tidy,
     "direction.off": _undo_direction,
     "direction.on": _undo_direction,
     "direction.set": _undo_direction,

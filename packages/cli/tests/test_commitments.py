@@ -136,10 +136,14 @@ class _CommitmentsCursor:
             ]
             self._result = [(hit[0],)] if hit else []
             return
-        if s.startswith("SELECT id, text FROM commitments WHERE status = 'open'"):
+        if s.startswith("SELECT id, text") and " FROM commitments WHERE status = 'open' AND project" in s:
+            # The open items of a scope, with whatever columns were asked for.
             project = params[0]
+            cols = s[len("SELECT "):s.index(" FROM commitments")].split(", ")
+            defaults = {"origin": "conversation"}
             self._result = [
-                (r["id"], r["text"]) for r in self.rows.values()
+                tuple(r.get(c) if r.get(c) is not None else defaults.get(c) for c in cols)
+                for r in self.rows.values()
                 if r["status"] == "open" and r["project"] == project
             ]
             return
@@ -162,10 +166,17 @@ class _CommitmentsCursor:
             else:
                 self.rowcount = 0
             return
+        if s.startswith("SELECT id, text, owner, kind, status") and "WHERE id = %s" in s and "FOR UPDATE" in s:
+            # commitments.row_at_write: one item, as it is now.
+            cols = s[len("SELECT "):s.index(" FROM commitments")].split(", ")
+            r = self.rows.get(params[0])
+            self._result = [tuple(r.get(c) for c in cols)] if r else []
+            return
         if s.startswith("UPDATE commitments") and "SET status = 'closed'" in s:
-            episode_id, close_reason, cid = params
+            # The stored owner the write read must still be the stored one.
+            episode_id, close_reason, cid, *same = params
             r = self.rows.get(cid)
-            if r and r["status"] == "open":
+            if r and r["status"] == "open" and (not same or same[0] == r["owner"]):
                 r["status"] = "closed"
                 r["closed_episode"] = episode_id
                 r["close_reason"] = close_reason
@@ -173,13 +184,17 @@ class _CommitmentsCursor:
             else:
                 self.rowcount = 0
             return
+        if s.startswith("SELECT id FROM commitments WHERE") and "due_after <= now()" in s:
+            # mark_stale's candidates; this fake ignores the silence window.
+            self._result = [(r["id"],) for r in self.rows.values() if r["status"] == "open"]
+            return
         if s.startswith("UPDATE commitments") and "'stale'" in s:
-            n = 0
-            for r in self.rows.values():
-                if r["status"] == "open":
-                    r["status"] = "stale"
-                    n += 1
-            self.rowcount = n
+            cid, *same = params
+            r = self.rows.get(cid)
+            self.rowcount = 0
+            if r and r["status"] == "open" and (not same or same[0] == r["owner"]):
+                r["status"] = "stale"
+                self.rowcount = 1
             return
         if s.startswith("SELECT id, text, project, owner, kind"):
             status = params[0]
@@ -230,10 +245,12 @@ class _CommitmentsCursor:
                 self.rowcount = 0
             return
         if s.startswith("UPDATE commitments SET status = %s"):
-            status, cid = params
+            status, *reason, cid = params
             r = self.rows.get(cid)
             if r:
                 r["status"] = status
+                if reason:
+                    r["close_reason"] = reason[0]
                 self.rowcount = 1
             else:
                 self.rowcount = 0
@@ -666,15 +683,27 @@ class PrecisionFilterTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNotNone(co.rejection_reason(text), text)
 
-    def test_agent_and_infra_chatter_is_rejected(self):
+    def test_agent_and_infra_chatter_is_kept_and_never_the_users(self):
+        # Status chatter about an agent is still rejected as status.
         for text in (
             "Visual check agent's verdict is pending",
-            "Receive report from the phase 1-2 agent",
-            "Poll the drive for the finished export",
             "Wait for notifications from the background job",
         ):
             with self.subTest(text=text):
                 self.assertIsNotNone(co.rejection_reason(text), text)
+        # The agent shape never drops an item and never decides its owner:
+        # the assistant's own stays the assistant's (and ends with its
+        # session); a question goes by lineage (the orchestrator's in a job).
+        for text in (
+            "Receive report from the phase 1-2 agent",
+            "Poll the drive for the finished export",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(co.rejection_reason(text), text)
+                self.assertEqual(co.resolve_owner(text), co.OWNER_ASSISTANT)
+                self.assertTrue(co.is_session_plan_text(text))
+        self.assertEqual(co.resolve_owner_and_label("Did the background agent's report land?", origin="job"),
+                         (co.OWNER_AGENT, co.ORCHESTRATOR))
 
     def test_coordination_messages_are_rejected(self):
         for text in (
@@ -1175,9 +1204,11 @@ class ConfigurableUserAliasesTest(unittest.TestCase):
     def test_matt_is_not_recognised_when_the_only_configured_alias_is_priya(self):
         with mock.patch.dict(os.environ, {"KHIPU_USER_ALIASES": "priya"}):
             co.reset_user_patterns()
+            # Not the user: with the alias priya, "Matt" is a third party named
+            # as the subject, so the item is his as an agent, never the user's.
             self.assertEqual(
-                co.resolve_owner("Matt to decide whether the release ships"),
-                co.OWNER_ASSISTANT,
+                co.resolve_owner_and_label("Matt to decide whether the release ships"),
+                (co.OWNER_AGENT, "Matt"),
             )
 
 

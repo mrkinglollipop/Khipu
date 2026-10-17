@@ -273,7 +273,7 @@ class CommitmentClosureTest(RegistryTest):
             self.assertEqual(co.auto_close(self.cur, {"project": "p", "closed_loops": ["the publication finished"]}, 3), 0)
 
     def test_rsn11_projectless_sessions_open_and_close_independently(self):
-        text = "Approve the privacy notice wording"
+        text = "Rebuild the deployment index"  # the assistant's: the owner's own never closes by rule
         for eid, session in ((1, "scratch-a"), (2, "scratch-b"), (3, "scratch-a")):
             self.cur.episode(eid, session)
         for eid, session in ((1, "scratch-a"), (2, "scratch-b")):
@@ -290,14 +290,17 @@ class CommitmentClosureTest(RegistryTest):
         self.cur.episode(2, "child", "root")
         self.cur.episode(3, "unrelated")
         self.cur.commitment(text, project=None, episode=1)
-        self.assertEqual(co.open_from_episode(self.cur, {"session_id": "child", "parent_session_id": "root", "open_loops": [text]}, 2), 0)
+        # The child is a job, so its restatement is the orchestrator's: a
+        # different owner from the root's item, kept beside it and never
+        # folded into it (third cross-family review).
+        self.assertEqual(co.open_from_episode(self.cur, {"session_id": "child", "parent_session_id": "root", "open_loops": [text]}, 2), 1)
         self.assertEqual(co.open_from_episode(self.cur, {"session_id": "unrelated", "open_loops": [text]}, 3), 1)
         self.assertEqual(co.auto_close(self.cur, {"session_id": "child", "parent_session_id": "root", "closed_loops": [text]}, 2), 1)
 
     def test_rsn11_no_lineage_does_not_close_other_episode(self):
         self.cur.episode(1, None)
         self.cur.episode(2, None)
-        text = "Approve the privacy notice wording"
+        text = "Rebuild the deployment index"  # the assistant's: the owner's own never closes by rule
         self.assertEqual(co.open_from_episode(self.cur, {"open_loops": [text]}, 1), 1)
         self.assertEqual(co.open_from_episode(self.cur, {"open_loops": [text]}, 2), 1)
         self.assertEqual(co.auto_close(self.cur, {"closed_loops": [text]}, 2), 1)

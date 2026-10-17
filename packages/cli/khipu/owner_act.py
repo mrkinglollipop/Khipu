@@ -64,16 +64,22 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "work.unhide": (("commitment",), ()),
     "work.same": (("row", "commitment"), ()),
     "work.not_same": (("row", "commitment"), ()),
+    # ``why`` is the change's reason (``reason`` is a hold's, from a fixed list).
+    "owed.change": (("ids", "change", "why"), ("to", "label")),
+    # The clean-up: ``plan`` (a file from ``khipu owed tidy --plan-out``, shown
+    # to the owner first) to apply, or ``batch`` to undo; one, not both.
+    "owed.tidy": (("project",), ("plan", "batch")),
     "direction.off": ((), ()),
     "direction.on": ((), ()),
     "direction.acknowledge": ((), ()),
     "direction.set": (("key", "value"), ()),
     "direction.undo": (("id",), ()),
 }
-_LISTS = {"entries", "list", "checks"}
+_LISTS = {"entries", "list", "checks", "ids"}
 _INTS = {"rule"}
 _FLAGS = {"catch_up", "hide", "show"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
+            "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
 _DIRECTION_KEYS = ("latest_window_h", "session_binding", "trust", "untrust")
 
@@ -116,6 +122,8 @@ def _values(action: str, args) -> dict:
                 raise _bad(f"{key} must be a list")
             if key == "checks" and not all(isinstance(c, str) and c and not c.startswith("-") for c in value):
                 raise _bad("checks must be the checks' names")
+            if key == "ids" and not all(type(c) is int and c > 0 for c in value):
+                raise _bad("ids must be the items' ids, whole numbers above 0")
         elif key in _INTS:
             if isinstance(value, str) and value.strip().isdigit():
                 value = int(value.strip())
@@ -241,6 +249,16 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["ledger", verb, "--json", *_opts(v, *keys)], [v["file"] if verb == "import" else v["id"]]
     if action in ("work.hide", "work.unhide"):
         return ["work", verb], [v["commitment"]]
+    if action == "owed.change":
+        if (v["change"] == "reassign") != ("to" in v):
+            raise _bad("a reassign names the new owner (to); close and reopen take none")
+        return ["owed", f"--{v['change']}={','.join(str(c) for c in v['ids'])}", f"--reason={v['why']}",
+                *_opts(v, "to", "label")], []
+    if action == "owed.tidy":
+        if ("plan" in v) == ("batch" in v):
+            raise _bad("owed.tidy names the plan to apply or the batch to undo, one of the two")
+        return ["owed", "tidy", *_opts(v, "project"), f"--apply={v['plan']}" if "plan" in v
+                else f"--undo={v['batch']}"], []
     if action in ("work.same", "work.not_same"):
         return ["work", verb.replace("_", "-")], [v["row"], v["commitment"]]
     if action in ("direction.off", "direction.on", "direction.acknowledge"):

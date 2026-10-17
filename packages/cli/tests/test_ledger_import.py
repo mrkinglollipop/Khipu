@@ -939,6 +939,114 @@ def test_catch_up_verifier_rejects_a_middle_entry_appended_out_of_order(monkeypa
     assert not check["ok"], check
 
 
+# ---- (n) the ledger inbox and the app's Import a tracker (slice 6) ----------------------------
+
+APP_REFUSAL = "Not read: the file is inside a private folder or a login folder, or is reached through a link."
+
+
+def _app_import(path: Path, *, dry_run: bool) -> tuple[int, dict]:
+    """The app's fixed argv (lib.rs ``ledger_import_argv``)."""
+    argv = ["import", "--json", "--from-app", f"--project={P}"] + (["--dry-run"] if dry_run else []) + ["--", str(path)]
+    rc, out, err = run(*argv)
+    return rc, (json.loads(out) if out.strip() else {"error": err})
+
+
+def test_the_ledger_inbox_is_made_inside_the_data_folder(tmp_path, monkeypatch):
+    from khipu import paths
+
+    monkeypatch.delenv(paths.ISOLATED_ENV, raising=False)
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    inbox = paths.ledger_inbox()
+    assert inbox == tmp_path / "data" / "ledger-inbox" and inbox.is_dir()
+    assert inbox.stat().st_mode & 0o777 == 0o700
+    assert paths.ledger_inbox() == inbox  # a second call keeps what is there
+    assert paths.paths_status()["ledger_inbox"] == str(inbox)
+
+
+def test_a_1068_row_tracker_in_the_inbox_checks_and_imports_from_the_app(hub, tmp_path):
+    from khipu import paths
+
+    copy = _write(paths.ledger_inbox(), _tracker(1068))
+    rc, report = _app_import(copy, dry_run=True)
+    assert rc == 0 and report["result"] == "dry run" and report["in_inbox"] is True, report
+    assert report["counts_in_file"]["rows"] == 1068 and _counts(hub) == (0, 0, 0)
+    rc, report = _app_import(copy, dry_run=False)
+    assert rc == 0 and report["result"] == "done", report
+    assert "every count matches and the round trip gives the file back" in report["words"]
+    history = report["counts_in_file"]["history"]
+    assert _counts(hub) == (1068, history + 1068, 1)
+    assert json.loads(copy.read_text(encoding="utf-8")) == _tracker(1068)  # the copy is never changed
+
+
+def test_a_tracker_outside_the_inbox_is_not_marked_as_a_copy(hub, tmp_path):
+    rc, report = _app_import(_write(tmp_path, _tracker(10)), dry_run=True)
+    assert rc == 0 and report["in_inbox"] is False, report
+
+
+def test_the_app_import_of_a_file_in_a_fake_login_folder_shows_the_plain_refusal(tmp_path, monkeypatch):
+    from khipu import config
+
+    login = tmp_path / "fake-login-home"
+    (login / "projects").mkdir(parents=True)
+    path = _write(login / "projects", _tracker(10))
+    monkeypatch.setattr(config, "load_config",
+                        lambda *a, **k: {"usage_accounts": [{"harness": "claude", "home": str(login)}]})
+    for dry_run in (True, False):
+        rc, report = _app_import(path, dry_run=dry_run)
+        assert rc == 1 and report == {"ok": False, "error": APP_REFUSAL, "reason": "refused"}, report
+
+
+# ---- the third cross-family review's probe: an inbox copy has no catch-up ----
+
+def test_inbox_copy_refuses_catch_up_before_any_catch_up_work(monkeypatch):
+    """Scope (e)(3): copied inbox trackers have no catch-up path."""
+    from khipu import ledger, ledger_import
+
+    class Cursor:
+        def execute(self, _sql, _params=()):
+            pass
+
+        def fetchall(self):
+            return [("already-imported", "done")]
+
+    called = []
+    monkeypatch.setattr(ledger_import, "_existing", lambda *_args: ({}, {}))
+    monkeypatch.setattr(ledger, "_vocab", lambda *_args: {"state": [], "kind": []})
+    monkeypatch.setattr(
+        ledger_import,
+        "_catch_up",
+        lambda *_args, **_kw: called.append(True) or {"result": "caught up"},
+    )
+    src = {"rows": {}, "digest": "changed-copy"}
+    report = {"in_inbox": True}
+
+    result = ledger_import._import_in(Cursor(), "project", src, report, dry_run=False, catch_up=True)
+
+    assert result["result"] == "refused"
+    assert called == []
+
+
+def test_an_unchanged_inbox_copy_still_refuses_catch_up(monkeypatch):
+    """The fourth review: a copy already imported, brought again unchanged
+    with catch-up, is refused like a changed one (the hard cut), never
+    answered "nothing new"."""
+    from khipu import ledger, ledger_import
+
+    class Cursor:
+        def execute(self, _sql, _params=()):
+            pass
+
+        def fetchall(self):
+            return [("already-imported-digest", "done")]
+
+    monkeypatch.setattr(ledger_import, "_existing", lambda *_args: ({}, {}))
+    monkeypatch.setattr(ledger, "_vocab", lambda *_args: {"state": [], "kind": []})
+    result = ledger_import._import_in(Cursor(), "project", {"rows": {}, "digest": "already-imported-digest"},
+                                      {"in_inbox": True}, dry_run=False, catch_up=True)
+    assert result["result"] == "refused"
+    assert result["reason"] == "inbox_copy"
+
+
 # ---- owner direction: an import has an Undo ----------------------------------------------------
 
 

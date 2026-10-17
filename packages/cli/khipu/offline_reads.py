@@ -10,6 +10,7 @@ The payload carries the stale marker MCP search uses
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any
 
@@ -31,6 +32,16 @@ def _open() -> sqlite3.Connection | None:
 def owed(project: str | None, status: str, limit: int) -> dict[str, Any] | None:
     from khipu import commitments
 
+    rows = owed_rows(project, status)
+    if rows is None:
+        return None
+    results = commitments.finish_owed_rows(rows, limit)
+    return {"status": status, "project": project or None, "results": results, **hub_snapshot.stale_fields()}
+
+
+def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
+    """The replica's raw commitment rows of one scope (owners not yet
+    resolved), for ``owed`` and the paged read (``commitments.page_owed``)."""
     con = _open()
     if con is None:
         return None
@@ -51,10 +62,16 @@ def owed(project: str | None, status: str, limit: int) -> dict[str, Any] | None:
     for row in rows:
         for col in ("opened_at", "due_after", "closed_at", "last_seen_at"):
             row[col] = hub_snapshot._utc(row.get(col))
+        if row.get("owner_reassigned_at"):
+            row["owner_reassigned_at"] = hub_snapshot._utc(row["owner_reassigned_at"])
+        if "linked_ids" in row:
+            try:
+                row["linked_ids"] = [int(v) for v in json.loads(row["linked_ids"] or "[]")]
+            except (TypeError, ValueError):
+                row["linked_ids"] = []
         row["future_trigger"] = bool(row.get("future_trigger"))
         row["stale"] = True
-    results = commitments.finish_owed_rows(rows, limit)
-    return {"status": status, "project": project or None, "results": results, **hub_snapshot.stale_fields()}
+    return rows
 
 
 def decisions(project: str | None, since: Any, status: str, limit: int) -> dict[str, Any] | None:

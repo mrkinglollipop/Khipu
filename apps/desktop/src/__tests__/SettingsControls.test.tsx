@@ -1,7 +1,7 @@
 // The other settings the CLI owns: capture mode and thresholds, gateway
 // address, file locations, background jobs, the gateway token (write-only).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   CaptureTuningCard,
   GatewayTokenCard,
@@ -188,6 +188,36 @@ describe("CaptureTuningCard", () => {
     expect(second.textContent).toContain("Your names");
     expect(second.textContent).toContain("Close a commitment when a later capture matches it at");
     expect(second.textContent).toContain("Default: none.");
+  });
+
+  it("offers every Owed limit with No limit, and the GitHub check as a switch", async () => {
+    config.count_settings = {
+      owed_orchestrator_slice_max: { value: 3, source: "default", default: 3, no_limit: 0 },
+      owed_page_max: { value: 200, source: "default", default: 200, no_limit: 0 },
+      owed_bulk_max: { value: 900, source: "file", default: 500, no_limit: 0 },
+      owed_tidy_calls: { value: 25, source: "default", default: 25, no_limit: 0 },
+    };
+    config.config = { ...(config.config as Record<string, unknown>), owed_pr_check_github: "on" };
+    render(<CaptureTuningCard active />);
+    const labels = [
+      "Items for the orchestrator at the start of a conversation",
+      "Most items on one page of Owed",
+      "Most items changed at once",
+      "Most model calls for one clean-up plan",
+    ];
+    for (const label of labels) expect(await screen.findByLabelText(label)).toBeInTheDocument();
+    const page = screen.getByLabelText("Most items on one page of Owed") as HTMLInputElement;
+    await waitFor(() => expect(page.value).toBe("200"));
+    fireEvent.change(page, { target: { value: "0" } });
+    fireEvent.submit(page.closest("form") as HTMLFormElement);
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "owed_page_max", value: "0" }]));
+    const bulk = screen.getByLabelText("Most items changed at once").closest("form") as HTMLElement;
+    fireEvent.click(within(bulk).getByRole("button", { name: "Reset" }));
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "owed_bulk_max" }]));
+    const gh = screen.getByLabelText("Ask GitHub whether a pull request merged") as HTMLSelectElement;
+    expect(gh.value).toBe("on");
+    fireEvent.change(gh, { target: { value: "off" } });
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "owed_pr_check_github", value: "off" }]));
   });
 
   it("reads the settings once for both cards", async () => {

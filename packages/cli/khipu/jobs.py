@@ -336,6 +336,7 @@ def run_nightly() -> int:
     _record_nightly_step(steps, "notes_reconcile", **_step_result(_reconcile_notes_if_due()))
     _record_nightly_step(steps, "embed_backfill", **_step_result(_embed_backfill()))
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
+    _record_nightly_step(steps, "commitments_close_rules", **_step_result(_commitment_close_rules()))
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
     _record_nightly_step(steps, "commitments_hygiene", **_step_result(_hygiene_commitments()))
     _record_nightly_step(steps, "ledger", **_step_result(_ledger_nightly()))
@@ -613,6 +614,29 @@ def _mark_stale_commitments() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
     _nightly_log(f"commitments-mark-stale: {json.dumps(out, default=str)[:300]}")
+    return out
+
+
+def _commitment_close_rules() -> dict[str, Any]:
+    """Owed slice 2: fill ``prs`` on rows from before migration 0034, then
+    run the PR and decision close rules over every open item
+    (``close_rules.run``). Before mark_stale, so an item whose PR merged
+    closes as done rather than aging out. Fail-open like its neighbours."""
+    try:
+        from khipu import close_rules
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                filled = close_rules.backfill_prs(cur)
+            conn.commit()
+            with conn.cursor() as cur:
+                report = close_rules.run(cur)
+            conn.commit()
+        out = {**report, "backfilled": int(filled)}
+    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
+        out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+    _nightly_log(f"commitments-close-rules: {json.dumps(out, default=str)[:300]}")
     return out
 
 

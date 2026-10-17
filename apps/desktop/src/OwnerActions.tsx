@@ -175,6 +175,12 @@ export function actionWords(a: OwnerAction): string {
       return "Marked two commitments as the same";
     case "work.not_same":
       return "Marked two commitments as different";
+    case "owed.change": {
+      const count = t.split(",").filter(Boolean).length;
+      const change = String(a.facts?.change ?? "");
+      const verb = change === "close" ? "Closed" : change === "reopen" ? "Reopened" : change === "reassign" ? "Moved" : "Changed";
+      return `${verb} ${count} Owed items`;
+    }
     case "direction.off":
       return "Turned owner direction off";
     case "direction.on":

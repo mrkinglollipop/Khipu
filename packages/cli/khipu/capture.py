@@ -535,6 +535,23 @@ def _merge_into_episode(
             pass
         _log(f"merge decision detection step failed ({type(exc).__name__}: {exc})")
 
+    # Owed close rules (slice 2): this capture's project, with this capture
+    # as the later evidence. After the decisions step, which they read.
+    try:
+        cur.execute("SAVEPOINT capture_merge_close_rules")
+    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
+        pass
+    try:
+        from khipu import close_rules
+
+        close_rules.run(cur, payload=payload, episode_id=target_id)
+    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_close_rules")
+        except Exception:  # noqa: BLE001
+            pass
+        _log(f"merge close rules step failed ({type(exc).__name__}: {exc})")
+
     # O4: same posture for the merged capture's own deliverables.
     try:
         cur.execute("SAVEPOINT capture_merge_deliverables")
@@ -1031,6 +1048,17 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
                         cur.execute("ROLLBACK TO SAVEPOINT capture_decision_detection")
                         _log(f"decision detection step failed ({type(exc).__name__}: {exc})")
+
+                    # Owed close rules (slice 2): PR and decision closes for
+                    # this capture's project, after the decisions they read.
+                    cur.execute("SAVEPOINT capture_close_rules")
+                    try:
+                        from khipu import close_rules
+
+                        close_rules.run(cur, payload=payload, episode_id=episode_id)
+                    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+                        cur.execute("ROLLBACK TO SAVEPOINT capture_close_rules")
+                        _log(f"close rules step failed ({type(exc).__name__}: {exc})")
 
                     # O4: files/PR-issue-URLs/release tags from payload['deliverables'].
                     cur.execute("SAVEPOINT capture_deliverables")

@@ -35,7 +35,7 @@ UNFENCED = {
 }
 # The readers the fence is known to guard: a scan that stops seeing them is broken.
 KNOWN = {("hub_snapshot.py", "decision_counts_snapshot"), ("hub_snapshot.py", "recent_deliverables_snapshot"),
-         ("offline_reads.py", "owed"), ("offline_reads.py", "decisions"),
+         ("offline_reads.py", "owed_rows"), ("offline_reads.py", "decisions"),
          ("recall_prompt.py", "_thread_memory_hits")}
 
 

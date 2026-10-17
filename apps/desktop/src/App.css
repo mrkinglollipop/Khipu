@@ -2154,6 +2154,39 @@ button.row.on {
 .owed-seen {
   font-size: var(--t-xs);
 }
+/* Owed, many at once (slice 5): the tick column, the bar over a selection,
+   Show more under a list, and the "Looks settled" line under its text. */
+.w24 {
+  width: 24px;
+  flex: none;
+  display: flex;
+  align-items: center;
+}
+.owed-selall label {
+  gap: var(--s1);
+  cursor: pointer;
+}
+.owed-selbar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+.owed-more {
+  justify-content: space-between;
+  padding: var(--s1) 0;
+}
+.owed-settled {
+  gap: var(--s1);
+  flex-wrap: wrap;
+  font-size: var(--t-xs);
+}
+.owed-reason {
+  font-size: var(--t-xs);
+}
+.owed-tidy .card .row .mono {
+  min-width: 64px;
+  text-align: right;
+}
 
 /* Under ~1040px the six fixed columns leave the text under 150px, so the row
    stacks: text on its own line, the columns beneath it. */
@@ -2168,6 +2201,12 @@ button.row.on {
   .owed-main {
     order: -1;
     flex: 1 1 100%;
+  }
+  .card .owed-row .w24 {
+    order: -2;
+  }
+  .card .owed-row .w24 ~ .owed-main {
+    flex: 1 1 calc(100% - 32px);
   }
   .card .owed-row .acts-cell {
     order: 2;

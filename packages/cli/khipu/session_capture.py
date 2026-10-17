@@ -245,6 +245,27 @@ def parent_session_id(env: dict, osenv: dict | None = None, *, harness: str = ""
     ) or "")
 
 
+def capture_origin(env: dict, osenv: dict | None = None, *, harness: str = "", sid: str = "") -> str:
+    """``job`` when this session is a dispatched job's, else ``conversation``
+    (owed scope 2026-10-16, design (a)). A job has lineage
+    (:func:`parent_session_id`: ``KHIPU_PARENT_SESSION``, a Claude Code child
+    whose host id differs from its own, a payload parent field) or a runner
+    that set ``KHIPU_JOB=1``. The host-id test needs this session's own id,
+    so without one only the explicit markers count.
+
+    No harness's own non-interactive marker is used: nothing in this repo
+    confirms what Claude Code print mode or ``codex exec`` hand the hook
+    (``CLAUDE_CODE_ENTRYPOINT`` is never interpreted here, and a Codex hook
+    payload carries no exec marker), so a run started by hand with ``-p`` and
+    no lineage stays a conversation."""
+    osenv = os.environ if osenv is None else osenv
+    if (osenv.get("KHIPU_JOB") or "").strip() == "1":
+        return "job"
+    if not sid:
+        osenv = {k: v for k, v in osenv.items() if k != "CLAUDE_CODE_HOST_SESSION_ID"}
+    return "job" if parent_session_id(env, osenv, harness=harness, sid=sid) else "conversation"
+
+
 def infer_harness(env: dict, osenv: dict | None = None) -> str:
     """Which harness invoked us. The hook command is identical in every harness
     (the packs re-point drifted entries to one canonical shim path), so the
@@ -2056,6 +2077,9 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
                "parent_session_id": job_parent,
                "transcript_range": f"{off_before}:{new_off}",
                "truncated_chars": part["truncated_chars"]}
+        if st.get("origin") == "job" and not job_parent:
+            # KHIPU_JOB=1 with no lineage; lineage alone already marks a job.
+            job["origin"] = "job"
         if window_id:
             job["window_id"] = window_id
             job["part"] = f"{i}/{len(parts)}"
@@ -2077,6 +2101,14 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     remember_seen(st, fresh_seen or [])
     save_state(harness, track_sid, st, preserve_mtime=preserve_mtime)
     return queued_names
+
+
+def _job_origin(job: dict) -> str:
+    """A queued job's origin; a job queued before origin existed is a job's
+    when it carries lineage, as commitments.capture_origin reads it."""
+    if str(job.get("origin") or "").strip().lower() == "job" or job.get("parent_session_id"):
+        return "job"
+    return "conversation"
 
 
 # ---- hook entrypoint (SANDBOX-SAFE) ----------------------------------------------
@@ -2240,6 +2272,9 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 st["session_id"] = track_sid if is_subagent_stop else sid
                 st["parent_session_id"] = sid if is_subagent_stop else (
                     parent_session_id(env, harness=harness, sid=sid) or None)
+                # A subagent is its parent's job; otherwise the session's markers decide.
+                st["origin"] = "job" if is_subagent_stop else capture_origin(
+                    env, harness=harness, sid=sid)
                 if is_subagent_stop:
                     st["subagent"] = True
                 if not due and turns:
@@ -2562,7 +2597,9 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
             payload = dict(cached)
         else:
             try:
-                payload = extract_memory(job.get("transcript", ""), cwd=job.get("cwd", ""))
+                # A job's transcript is told so: its "user" is the orchestrator.
+                payload = extract_memory(job.get("transcript", ""), cwd=job.get("cwd", ""),
+                                         **({"job": True} if _job_origin(job) == "job" else {}))
             except BudgetExhausted as e:
                 # Every later job would be refused the same way: stop here,
                 # keep them all, and say so once instead of once per job.
@@ -2629,6 +2666,10 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         payload["repo_root"] = job.get("repo_root")
         payload["project"] = job.get("project")
         payload["parent_session_id"] = job.get("parent_session_id")
+        if _job_origin(job) == "job" and not job.get("parent_session_id"):
+            # Not `origin`: that key is the episode's server-stamped owner and
+            # capture drops it from every payload.
+            payload["session_origin"] = "job"
         if job.get("t3_thread_id"):
             payload.update(t3_thread_id=job["t3_thread_id"], via="t3")
         payload["transcript_range"] = job.get("transcript_range") or (

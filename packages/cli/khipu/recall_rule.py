@@ -26,6 +26,7 @@ The rule text is one place (RULE_MD) so the shapes never drift.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import sqlite3
@@ -161,11 +162,17 @@ def cwd_search_term(cwd: str | None) -> str:
     return p.name.strip()
 
 
+# Whether the session being started is a dispatched job's, set by
+# session_start_main from the hook's payload for the one call it makes; a job
+# sees no items for the orchestrator in its slice (owed scope, decision 2).
+_START_IS_JOB: contextvars.ContextVar[bool] = contextvars.ContextVar("khipu_start_is_job", default=False)
+
+
 def session_start_context(cwd: str | None = None) -> str:
     """RULE_MD plus a fail-open pushed slice. Never raises."""
     body = RULE_MD.strip()
     try:
-        extra = _pushed_memory_slice(cwd)
+        extra = _pushed_memory_slice(cwd, job=_START_IS_JOB.get())
     except Exception:
         extra = ""
     if extra:
@@ -214,6 +221,13 @@ def _commitment_display_rows(owed: list[dict]) -> tuple[list[dict], int]:
     display: list[dict] = []
     blocker_shown = 0
     extra_blockers = 0
+    # Items for the orchestrator arrive already capped (activity.project_slice,
+    # `owed_orchestrator_slice_max`) and follow the five others.
+    def _is_agent(c: dict) -> bool:
+        return str(c.get("owner") or "").strip().lower() == "agent"
+
+    agents = [c for c in owed if _is_agent(c)]
+    owed = [c for c in owed if not _is_agent(c)]
     for c in owed:
         is_user_blocker = (
             str(c.get("owner") or "").strip().lower() == "user"
@@ -227,7 +241,7 @@ def _commitment_display_rows(owed: list[dict]) -> tuple[list[dict], int]:
                 extra_blockers += 1
             continue
         display.append(c)
-    return display[:5], extra_blockers
+    return display[:5] + agents, extra_blockers
 
 
 def _commitment_age_days(c: dict) -> int | None:
@@ -258,7 +272,8 @@ def _render_project_slice(label: str, slice_data: dict) -> str:
         for c in display:
             text = clip_snippet(str(c.get("text") or ""), 160)
             owner = str(c.get("owner") or "").strip()
-            who = " (needs the user)" if owner == "user" else (" (yours)" if owner == "assistant" else "")
+            who = {"user": " (needs the user)", "assistant": " (yours)",
+                   "agent": " (for the orchestrator)"}.get(owner, "")
             age_days = _commitment_age_days(c)
             age_txt = f" ({age_days}d old)" if age_days is not None and age_days > 7 else ""
             lines.append(f"- [{c.get('kind')}]{who}{age_txt} `{c.get('id')}`: {text}")
@@ -270,6 +285,12 @@ def _render_project_slice(label: str, slice_data: dict) -> str:
             "away with `khipu_owed_update` (or `khipu owed --close ID`) instead of "
             "waiting for the next capture to notice."
         )
+        if any(str(c.get("owner") or "").strip().lower() == "agent" for c in display):
+            lines.append(
+                "Items marked (for the orchestrator) came from jobs dispatched in this "
+                "project: yours to do, route or close. Ask the user only if one really "
+                "needs them."
+            )
     decisions = slice_data.get("decisions") or []
     if decisions:
         d_lines = ["### Decisions still standing (last 14 days)"]
@@ -372,7 +393,7 @@ def _stale_project_slice(project: str | None, host: str | None) -> str:
     return "\n".join(lines)
 
 
-def _pushed_memory_slice(cwd: str | None) -> str:
+def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
     """W4: repo-scoped first (commitments, then episodes, then linked
     topics), the cwd-token search only as a fallback when nothing repo-scoped
     resolved or came back empty — same precedence the plan's slice order
@@ -398,7 +419,7 @@ def _pushed_memory_slice(cwd: str | None) -> str:
         slice_data = None
         try:
             slice_data = activity.project_slice(
-                project=project, repo_root=repo_root, host_session_id=host
+                project=project, repo_root=repo_root, host_session_id=host, job=job
             )
         except Exception as exc:
             try:
@@ -450,6 +471,18 @@ def _pushed_memory_slice(cwd: str | None) -> str:
         snip = clip_snippet(str(r.get("snippet") or r.get("label") or ""), 220)
         lines.append(f"- {r.get('kind')} `{r.get('id')}`: {snip}")
     return "\n".join(lines)
+
+
+def _session_is_job(payload: dict) -> bool:
+    """Whether this session is a dispatched job's, by the same markers the
+    capture hook uses (session_capture.capture_origin). Never raises."""
+    try:
+        from khipu import session_capture as sc
+
+        sid = sc.session_id(payload)
+        return sc.capture_origin(payload, harness=sc.infer_harness(payload), sid=sid) == "job"
+    except Exception:  # noqa: BLE001 — unknown is a conversation, today's behaviour
+        return False
 
 
 def _session_start_payload() -> dict:
@@ -728,7 +761,12 @@ def session_start_main(*, shape: str | None = None) -> None:
         print("{}")  # T3's thread-title helper: no recall
         return
     routing = _RoutingAtStart().begin()
-    ctx, pushed = fit_start_context(session_start_context(cwd), routing.text())
+    token = _START_IS_JOB.set(_session_is_job(payload))
+    try:
+        memory = session_start_context(cwd)
+    finally:
+        _START_IS_JOB.reset(token)
+    ctx, pushed = fit_start_context(memory, routing.text())
     if shape is None:
         shape = "cursor" if "--cursor" in sys.argv[1:] else "claude"
     want = shape.strip().lower()
