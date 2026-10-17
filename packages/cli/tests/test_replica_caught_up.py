@@ -37,7 +37,7 @@ READERS = {
     ("recall_prompt.py", "_stale_marker"): "age: the marker, from caught_up_at",
     ("replica_heal.py", "last_update_at"): "age: from caught_up_at",
     ("replica_heal.py", "plan"): "dump: a failed dump, a measurement of this dump",
-    ("cli.py", "cmd_owed"): "age: passes stale_fields through",
+    ("cli.py", "_owed_page_cli"): "age: passes stale_fields through",
 }
 
 _KEYS = {"refreshed_at", "snapshot_refreshed_at"}
