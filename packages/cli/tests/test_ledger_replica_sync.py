@@ -26,6 +26,10 @@ class LedgerCursor(PullCursor):
         return False
 
     def execute(self, sql, params=()):
+        if 'set_config(' in sql or 'FROM ledger_ops' in sql:  # SQL deadlines; no op receipts here
+            self.hub.queries.append(sql)
+            self._rows = []
+            return
         if 'ledger_' not in sql:
             return super().execute(sql, params)
         self.hub.queries.append(sql)

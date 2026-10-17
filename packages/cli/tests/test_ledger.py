@@ -956,7 +956,9 @@ def test_an_older_catch_up_never_clears_a_newer_changes_retry(monkeypatch, tmp_p
     older.start()
     try:
         assert entered.wait(5)
-        assert ledger.replica_catch_up(_ReplicaHub(2)).get("busy")  # one catch-up at a time
+        # The older one copies after letting go of the ledger lock, so this
+        # one reads and copies meanwhile; the copy keeps the newest version.
+        assert ledger.replica_catch_up(_ReplicaHub(2))["copied"] == 1
         lock = hs._acquire_refresh_lock()  # the removal's copy is skipped and must be retried
         assert lock is not None
         try:
@@ -1235,12 +1237,13 @@ def test_an_older_catch_up_never_erases_history_added_without_a_new_version(monk
     try:
         assert entered.wait(5)
         # A late conditional write: history grows, the row's version does not.
-        ledger._replica_sync(_HistoryHub([1, 2]), "p", ["r"])  # its catch-up waits its turn
+        # Its catch-up copies while the older one waits to write its copy.
+        ledger._replica_sync(_HistoryHub([1, 2]), "p", ["r"])
     finally:
         release.set()
         older.join(5)
-    assert ledger.replica_pending() == 1  # the older one never clears the newer change's marker
-    ledger.replica_catch_up(_HistoryHub([1, 2]))
+    # The older copy, landing last, neither erases the newer history nor
+    # brings back the marker the newer catch-up cleared.
     assert [h["id"] for h in hs.ledger_read_snapshot("p")["history"]] == [1, 2]
     assert ledger.replica_pending() == 0
 

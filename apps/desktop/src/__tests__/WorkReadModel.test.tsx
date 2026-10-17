@@ -502,3 +502,197 @@ describe("LedgerPage offline and waiting writes", () => {
     expect(screen.getByText(/1 change is waiting to be sent/)).toBeInTheDocument();
   });
 });
+
+// The combined Work sync branch review (2026-10-17): a row that changed twice
+// in one second, Owed closed before the ledger change applied, queue refusals
+// that never showed, and a missing offline copy shown as an empty ledger.
+describe("LedgerPage follows the row version, not its second", () => {
+  const fake = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+  const form = () => screen.getByRole("form", { name: "Change this row" });
+  const field = (label: string) => within(form()).getByLabelText(label);
+
+  it("takes a change made elsewhere in the same second and keeps reading the row", async () => {
+    fake();
+    let current = row("s-1", { title: "Original", version: 1 });
+    serveLedger(() => [current]);
+    ledgerPage("s-1");
+    await tick(0);
+    current = { ...current, title: "Remote newer value", version: 2 };
+    await tick(5_100);
+    expect(field("Title")).toHaveValue("Remote newer value");
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+    const n = reads("khipu_ledger_get");
+    await tick(5_100);
+    expect(reads("khipu_ledger_get")).toBeGreaterThan(n);
+    current = { ...current, title: "Third value", version: 3 };
+    await tick(5_100);
+    expect(field("Title")).toHaveValue("Third value");
+    await act(async () => {
+      fireEvent.submit(form());
+    });
+    expect(reads("khipu_ledger_set")).toBe(0);
+  });
+
+  it("falls back to the row's fields when it has no version", async () => {
+    fake();
+    let current = row("s-1", { title: "Original" });
+    serveLedger(() => [current]);
+    ledgerPage("s-1");
+    await tick(0);
+    current = { ...current, title: "Remote newer value" };
+    await tick(5_100);
+    expect(field("Title")).toHaveValue("Remote newer value");
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+  });
+
+  it("keeps only the fields the user edited and sends only those", async () => {
+    fake();
+    let current = row("s-1", { title: "Original", version: 1 });
+    serveLedger(() => [current]);
+    ledgerPage("s-1");
+    await tick(0);
+    fireEvent.change(field("Evidence"), { target: { value: "My evidence" } });
+    current = { ...current, title: "Remote newer value", version: 2 };
+    await tick(5_100);
+    await tick(5_100);
+    expect(field("Title")).toHaveValue("Remote newer value");
+    expect(field("Evidence")).toHaveValue("My evidence");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.submit(form());
+    });
+    const sent = invokeMock.mock.calls.find(([cmd]) => cmd === "khipu_ledger_set");
+    expect(sent?.[1].change).toEqual({ evidence: "My evidence", if_state: "QUEUED" });
+  });
+
+  it("never steps back to an older version that answers late", async () => {
+    fake();
+    let current = row("s-1", { title: "Newer", version: 3 });
+    let gets = 0;
+    let late: (v: string) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_ledger_list") return JSON.stringify({ ok: true, offline: false, vocab: VOCAB, rows: [current] });
+      if (cmd === "khipu_ledger_get") {
+        if (++gets === 2) return new Promise<string>((resolve) => { late = resolve; });
+        return JSON.stringify(current);
+      }
+      return JSON.stringify({ removed: [] });
+    });
+    ledgerPage("s-1");
+    await tick(0);
+    await tick(5_100);
+    await act(async () => {
+      late(JSON.stringify({ ...current, title: "Older", version: 2 }));
+    });
+    expect(field("Title")).toHaveValue("Newer");
+  });
+});
+
+describe("Owed closes only on an applied finished state", () => {
+  function answer(reply: Record<string, unknown>) {
+    const current = row("s-1", { state: "NEEDS OWNER", kind: "needs-owner", refs: { commitment: 123 }, version: 1 });
+    const close = vi.fn(async () => {});
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_ledger_list") return JSON.stringify({ ok: true, offline: false, vocab: VOCAB, rows: [current] });
+      if (cmd === "khipu_ledger_get") return JSON.stringify(current);
+      if (cmd === "khipu_ledger_set") return JSON.stringify({ ok: true, ...reply });
+      return JSON.stringify({ removed: [] });
+    });
+    render(
+      <LedgerPage project="atlas" name="Atlas" initialRow="s-1" view={null} onBack={() => {}}
+        onChanged={async () => {}} onOwedClose={close} />,
+    );
+    return close;
+  }
+
+  it.each([
+    [{ queued: true, state: "DONE" }, /waiting to be sent/i],
+    [{ late: true, state: "NEEDS OWNER" }, /arrived late/i],
+    [{ retried: true, late: true, state: "IN FLIGHT" }, /arrived late/i],
+  ])("leaves Owed open for %o", async (reply, words) => {
+    const close = answer(reply);
+    const f = await screen.findByRole("form", { name: "Answer this" });
+    await act(async () => {
+      fireEvent.submit(f);
+    });
+    expect(invokeMock.mock.calls.some(([c]) => c === "khipu_ledger_set")).toBe(true);
+    expect(close).not.toHaveBeenCalled();
+    expect(await screen.findByText(words)).toBeInTheDocument();
+    expect(screen.getByText(/Owed item stays open/i)).toBeInTheDocument();
+  });
+
+  it("closes Owed when the change applied a finished state", async () => {
+    const close = answer({ state: "DONE" });
+    const f = await screen.findByRole("form", { name: "Answer this" });
+    await act(async () => {
+      fireEvent.submit(f);
+    });
+    expect(close).toHaveBeenCalledWith(123);
+  });
+
+  it("the Work tab's Done leaves Owed open while the change waits", async () => {
+    const close = vi.fn(async () => {});
+    const board = {
+      project: "atlas", name: "Atlas",
+      source: { state: "none", problem: null, as_of: null, dropped: 0, other_project: 0, capped: {}, clamped: 0, waiting_list_ignored: 0 },
+      jobs: [], prs: [], trains: [], merged: [], flagged: 0,
+      ledger: { rows: 1, by_state: { "NEEDS OWNER": 1 }, goals: [], loose_ends: [], loose_end_count: 0, changed_today: [], vocab: VOCAB },
+    } as unknown as WorkBoard;
+    const doc = view({
+      projects: [board],
+      waiting: [
+        {
+          key: "ledger:atlas#n-1", source: "ledger", project: "atlas", id: "n-1", title: "Pick a name", since: ago(H),
+          blocking: false, also_owed: "42", actions: ["done", "open_owed"],
+        } as unknown as WorkViewDoc["waiting"][number],
+      ],
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_work_view") return JSON.stringify(doc);
+      if (cmd === "khipu_ledger_set") return JSON.stringify({ ok: true, queued: true, state: "DONE" });
+      return JSON.stringify({ ok: true });
+    });
+    render(
+      <WorkView work={{ data: doc, error: null, loading: false, readAt: null, load: async () => {} } as never}
+        routing={stubRouting} plans={null} owedSection={null} owedFocusKey={0} onOwedClose={close}
+        onSnooze={() => {}} onOpenRouting={() => {}} onOpenWorkSettings={() => {}} />,
+    );
+    const list = await screen.findByRole("list", { name: "Waiting on you" });
+    await act(async () => {
+      fireEvent.click(within(list).getByRole("button", { name: "Done" }));
+    });
+    expect(invokeMock.mock.calls.some(([c]) => c === "khipu_ledger_set")).toBe(true);
+    expect(close).not.toHaveBeenCalled();
+    expect(await screen.findByText(/Owed item stays open/i)).toBeInTheDocument();
+  });
+});
+
+describe("LedgerPage queue health and a missing offline copy", () => {
+  it("says the ledger refused waiting changes even when none are pending", async () => {
+    serveLedger(() => [row("s-1")], { pending: 0, queue: { pending: 0, busy: false, stopped_early: false, refused: 1, unreadable: null } });
+    ledgerPage();
+    expect(await screen.findByText(/1 waiting change was refused/i)).toBeInTheDocument();
+  });
+
+  it("says the waiting changes couldn't be read", async () => {
+    serveLedger(() => [row("s-1")], { pending: null, queue: { pending: null, busy: false, stopped_early: false, refused: 0, unreadable: "a waiting write cannot be read" } });
+    ledgerPage();
+    expect(await screen.findByText(/couldn't be read/i)).toBeInTheDocument();
+  });
+
+  it("says there is no offline copy instead of showing an empty ledger", async () => {
+    serveLedger(() => [row("s-2", { queued: true })], { offline: true, as_of: null, copy_unavailable: true, pending: 1 });
+    ledgerPage();
+    expect(await screen.findByText(/no offline copy/i)).toBeInTheDocument();
+    expect(screen.queryByText(/showing its offline copy/i)).toBeNull();
+    expect(screen.getByText("Not sent yet")).toBeInTheDocument();
+    expect(screen.getByText(/1 change is waiting to be sent/i)).toBeInTheDocument();
+  });
+
+  it("the Work tab says there is no offline copy", async () => {
+    serveView(view({ ledger_offline: true, ledger_as_of: null, ledger_copy_unavailable: true, problems: { ledger: "no offline copy" } } as Partial<WorkViewDoc>));
+    render(<Harness />);
+    expect(await screen.findByText(/no offline copy/i)).toBeInTheDocument();
+    expect(screen.queryByText(/showing its offline copy/i)).toBeNull();
+  });
+});

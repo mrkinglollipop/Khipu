@@ -30,6 +30,7 @@ import {
   jobAccount,
   jobFor,
   jobTone,
+  appliedFinished,
   meaningOf,
   NO_PROJECT,
   plural,
@@ -40,9 +41,10 @@ import {
   stateWords,
   timeOnly,
   updatedWords,
+  unappliedWords,
   wordFor,
 } from "./work";
-import type { Vocab, WaitItem, WorkBoard, WorkJob, WorkPr, WorkState, WorkView as WorkViewDoc } from "./work";
+import type { LedgerSetReply, Vocab, WaitItem, WorkBoard, WorkJob, WorkPr, WorkState, WorkView as WorkViewDoc } from "./work";
 import "./Work.css";
 
 const FIRST_RUN_HINT =
@@ -206,7 +208,10 @@ export function WorkView(props: WorkViewProps) {
     );
   }
 
-  const problems = Object.keys(view.problems ?? {}).filter((k) => PROBLEM_WORDS[k]);
+  // A missing offline copy has its own notice below; the generic ledger line would repeat it.
+  const problems = Object.keys(view.problems ?? {}).filter(
+    (k) => PROBLEM_WORDS[k] && !(k === "ledger" && view.ledger_copy_unavailable),
+  );
   const firstRun = view.projects.length === 0 && view.waiting.length === 0;
   const waitingBy = new Map<string, number>();
   for (const w of view.waiting) {
@@ -220,8 +225,8 @@ export function WorkView(props: WorkViewProps) {
         {view.counts.ledger_outbox > 0 || view.ledger_offline || problems.length || work.error ? (
           <div className="wk-notices">
             <OutboxNotice view={view} now={now} />
-            {view.ledger_offline && !(view.counts.ledger_outbox > 0) ? (
-              <LedgerOfflineNotice asOf={view.ledger_as_of} now={now} />
+            {view.ledger_offline && (view.ledger_copy_unavailable || !(view.counts.ledger_outbox > 0)) ? (
+              <LedgerOfflineNotice asOf={view.ledger_as_of} now={now} unavailable={!!view.ledger_copy_unavailable} />
             ) : null}
             {problems.map((k) => (
               <p key={k} className="wk-problem">
@@ -343,6 +348,9 @@ function WaitingCard({
   const [all, setAll] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [refusal, setRefusal] = useState<string | null>(null);
+  // A change the ledger took but did not apply now (waiting to be sent, or
+  // arrived late and kept as history only): its Owed item stays open.
+  const [notice, setNotice] = useState<string | null>(null);
   const [answering, setAnswering] = useState<WaitItem | null>(null);
   const items = view.waiting;
   const nameOf = (w: WaitItem) => waitProject(view, w);
@@ -364,6 +372,7 @@ function WaitingCard({
     if (busy || key == null) return;
     setBusy(key);
     setRefusal(null);
+    setNotice(null);
     try {
       const out = await run();
       if (!out.ok) setRefusal(out.error ?? "Khipu refused the change.");
@@ -376,16 +385,16 @@ function WaitingCard({
   const setLedgerState = async (item: WaitItem, state: string, note?: string) => {
     const vocab = vocabOf(view, item.project);
     const ifState = needsWord(vocab);
-    const out = await callCli("khipu_ledger_set", {
+    const out = await callCli<LedgerSetReply>("khipu_ledger_set", {
       project: item.project,
       id: item.id,
       change: { state, ...(note && note.trim() ? { note } : {}), ...(ifState ? { if_state: ifState } : {}) },
     });
     if (!out.ok) return out;
     const meaning = meaningOf(vocab, state);
-    if (item.also_owed && (meaning === "done" || meaning === "dropped")) {
-      await onOwedClose(Number(item.also_owed));
-    }
+    const owed = !!item.also_owed && (meaning === "done" || meaning === "dropped");
+    if (owed && appliedFinished(out.data, vocab)) await onOwedClose(Number(item.also_owed));
+    setNotice(unappliedWords(out.data, owed));
     return out;
   };
 
@@ -427,6 +436,11 @@ function WaitingCard({
         ) : null}
         <span className="spacer" />
       </div>
+      {notice ? (
+        <p className="wk-problem wk-alert" role="status">
+          {notice}
+        </p>
+      ) : null}
       {items.length === 0 ? (
         <div className="row">
           <span className="hdot ok" aria-hidden />
@@ -458,6 +472,7 @@ function WaitingCard({
               Khipu didn't make that change: {refusal}
             </div>
           ) : null}
+
           <div role="list" aria-label="Waiting on you">
             {visible.map((item, i) => {
               const age = ageWords(item.since, now);

@@ -968,39 +968,51 @@ def _mark_lag(project: str, row_ids: list[str]) -> None:
 
 def replica_catch_up(conn) -> dict[str, Any]:
     """Copy every id still waiting for the offline copy from the hub as it is
-    now. Safe to repeat: the copy keeps the newest version of each row. Taken
-    under the ledger lock, as a write is: a write holds it from its lag marker
-    to its commit, so the hub is never read between the two. Busy when a
-    write holds it (the ids stay waiting). Fail-open."""
+    now. Safe to repeat: the copy keeps the newest version of each row. The
+    hub is read under the ledger lock, as a write is: a write holds it from
+    its lag marker to its commit, so the hub is never read between the two.
+    Those reads have the writes' own SQL deadlines, and the copying happens
+    after the lock is let go, so a catch-up holds up a writer no longer than
+    a write would. Busy when a write holds it (the ids stay waiting).
+    Fail-open."""
     out: dict[str, Any] = {"copied": 0, "left": 0}
     try:
         with _ledger_lock(wait_s=0):
-            return _replica_catch_up_locked(conn, out)
+            read = _replica_read_locked(conn)
     except LedgerError as exc:
         if exc.reason != "busy":
             raise
         return {**out, "busy": True, "left": replica_pending()}
     except Exception as exc:  # noqa: BLE001  (the hub write already landed)
+        _say(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}")
         out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        out["left"] = replica_pending()
         return out
+    if read is None:
+        return out
+    return _replica_copy(read, out)
 
 
-def _replica_catch_up_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
+def _replica_read_locked(conn) -> dict[str, Any] | None:
+    """With the ledger lock held: the ids waiting and, per project, the hub's
+    rows, removals, history and receipts for them, in one bounded
+    transaction each. None when nothing waits."""
+    with _replica_pending() as pending:
+        seen = dict(pending)
+    if not seen:
+        return None
+    by_project: dict[str, list[str]] = {}
+    for key in seen:
+        project, _sep, row_id = key.partition("#")
+        by_project.setdefault(project, []).append(row_id)
+    from khipu import hub_snapshot
+
+    reads = []
     try:
-        from khipu import hub_snapshot
-
-        with _replica_pending() as pending:
-            seen = dict(pending)
-        if not seen:
-            return out
-        by_project: dict[str, list[str]] = {}
-        for key in seen:
-            project, _sep, row_id = key.partition("#")
-            by_project.setdefault(project, []).append(row_id)
-        done: list[str] = []
         for project, ids in by_project.items():
             read_at = time.time()
             with conn.cursor() as cur:
+                _bound_waits(cur)
                 vocab = _vocab(cur, project)
                 cur.execute("SELECT name, hidden, created_at FROM ledger_projects WHERE project = %s", (project,))
                 proj = cur.fetchone()
@@ -1019,9 +1031,32 @@ def _replica_catch_up_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
                 cur.execute(f"SELECT {', '.join(_HIST_COLS)} FROM ledger_history WHERE project = %s "
                             "AND row_id = ANY(%s) ORDER BY id", (project, [r["row_id"] for r in rows]))
                 history = [dict(zip(_HIST_COLS, h, strict=True)) for h in cur.fetchall()]
+                receipts = hub_snapshot._read_ledger_receipts(cur, hub_snapshot._queued_op_ids(project, ids))
             conn.rollback()
-            got = hub_snapshot.ledger_write_snapshot(project, proj, vocab, rows, history, ids,
-                                                    gone=gone, read_at=read_at)
+            reads.append({"project": project, "ids": ids, "proj": proj, "vocab": vocab, "rows": rows,
+                          "history": history, "gone": gone, "receipts": receipts, "read_at": read_at})
+    except BaseException:
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    return {"seen": seen, "reads": reads}
+
+
+def _replica_copy(read: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
+    """Without the ledger lock: write what ``_replica_read_locked`` read to
+    the offline copy, and clear each id whose marker still holds the token
+    read before the hub was. A newer change's marker stays."""
+    try:
+        from khipu import hub_snapshot
+
+        seen, done = read["seen"], []
+        for part in read["reads"]:
+            project, ids = part["project"], part["ids"]
+            got = hub_snapshot.ledger_write_snapshot(project, part["proj"], part["vocab"], part["rows"],
+                                                    part["history"], ids, gone=part["gone"],
+                                                    read_at=part["read_at"], receipts=part["receipts"])
             # No offline copy and no refresh dumping one: the next refresh
             # starts after this change and copies everything.
             if got.get("ok") or got.get("missing"):
@@ -1474,6 +1509,9 @@ def outbox_status() -> dict[str, Any]:
     try:
         jobs = _outbox_jobs(strict=True)
         refused = [n for n in os.listdir(_refused_dir()) if n.endswith(".json")] if _refused_dir().is_dir() else []
+        # Each waiting write must read too: one that can't is never a
+        # healthy count.
+        queued_ops(strict=True)
     except (LedgerError, OSError) as exc:
         return {"pending": None, "refused": None, "oldest_age_s": None, "unreadable": str(exc)[:200]}
     oldest = None
@@ -2017,6 +2055,10 @@ def _hub_observation(conn, op: dict[str, Any]) -> dict[str, Any] | None:
             cur.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s AND row_id = %s "
                         "AND removed_at IS NULL", (project, row_id))
             got = cur.fetchone()
+            from khipu import hub_snapshot
+
+            receipts = {r[0] for r in hub_snapshot._read_ledger_receipts(
+                cur, hub_snapshot._queued_op_ids(project, [row_id]))}
         conn.rollback()
     except Exception:  # noqa: BLE001  (the write itself finds out what is wrong with the hub)
         try:
@@ -2024,7 +2066,8 @@ def _hub_observation(conn, op: dict[str, Any]) -> dict[str, Any] | None:
         except Exception:  # noqa: BLE001
             pass
         return None
-    return {"op_id": op["op_id"], "line": line, "vocab": vocab, "rows": [_row_dict(got)] if got else []}
+    return {"op_id": op["op_id"], "line": line, "vocab": vocab, "rows": [_row_dict(got)] if got else [],
+            "receipts": receipts}
 
 
 def _observe(op: dict[str, Any]) -> None:
@@ -2039,7 +2082,7 @@ def _observe(op: dict[str, Any]) -> None:
         try:
             if not hub["line"] - _line_ids(project, row_id):
                 merged = _overlay({"vocab": hub["vocab"], "rows": [dict(r) for r in hub["rows"]], "as_of": None,
-                                   "offline": False}, project)
+                                   "offline": False}, project, receipts=hub["receipts"])
                 rows = {r["row_id"]: r for r in merged["rows"]}
                 op["seen"], op["seen_from"] = _seen(rows.get(row_id), op["fields"]), "hub"
                 return
@@ -2099,12 +2142,80 @@ def _offline_view(project: str) -> dict[str, Any] | None:
              "refs": json.loads(r["refs"] or "{}") if isinstance(r["refs"], str) else (r["refs"] or {}),
              "removed_at": None, "removed_by": None, "removed_note": ""} for r in got["rows"]]
     return {"vocab": got["vocab"], "rows": rows, "history": got["history"], "gone": got.get("gone") or {},
-            "as_of": got.get("as_of"), "offline": True}
+            "receipts": got.get("receipts") or {}, "as_of": got.get("as_of"), "offline": True}
 
 
-def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
-    """Apply the waiting writes to an offline view, in the order they were made."""
+NO_COPY_WORDS = "the database can't be reached and this Mac has no offline copy of the ledger yet"
+
+
+def _no_copy_view() -> dict[str, Any]:
+    """The hub away and no offline copy to read: said, never an empty ledger.
+    The waiting writes still show on it."""
+    return {"vocab": {"state": [], "kind": []}, "rows": [], "as_of": None, "offline": True,
+            "copy_unavailable": True, "error": NO_COPY_WORDS}
+
+
+def _hub_receipts(conn, project: str) -> set[str]:
+    """The op ids of this project's waiting writes the hub already holds
+    (landed, kept as history, or refused): their answer never reached this
+    Mac, but the hub's rows already show them."""
+    from khipu import hub_snapshot
+
+    ids = hub_snapshot._queued_op_ids(project)
+    if not ids:
+        return set()
+    with conn.cursor() as cur:
+        _bound_waits(cur)
+        got = hub_snapshot._read_ledger_receipts(cur, ids)
+    conn.rollback()
+    return {op_id for op_id, _project, _ok in got}
+
+
+def _hub_overlay(conn, view: dict[str, Any], project: str) -> dict[str, Any]:
+    """The hub's view with the waiting writes the hub does not hold yet on top."""
+    return _overlay(view, project, receipts=_hub_receipts(conn, project))
+
+
+def _answered_here(op_id: Any) -> bool:
+    """This Mac recorded what became of ``op_id`` (its job had not left the
+    line yet). Unreadable counts as not answered."""
+    if not isinstance(op_id, str):
+        return False
+    try:
+        return _outcome(op_id, migrate=False) is not None
+    except LedgerError:
+        return False
+
+
+def _arrives_late(op: dict[str, Any], row: dict[str, Any], wanted: dict[str, Any], vocab: dict[str, list],
+                  ours: bool) -> bool:
+    """``_set``'s rule for a queued write, on a view: its --if-state no longer
+    holds, a field it saw has moved since, or a field it never saw holds
+    someone's value. Such a write is kept as history on the hub, never
+    applied, so it is not shown applied. ``ours``: the row is a waiting add
+    of this Mac's, so every field it holds is this Mac's own. A job an older
+    Khipu queued (no ``seen`` at all) is judged on the hub by who changed
+    each field last, which a view cannot tell: it shows as made."""
+    if op.get("if_state") and row["state"] != _word(vocab, "state", op["if_state"]):
+        return True
+    if not isinstance(op.get("seen"), dict):
+        return False
+    seen = op["seen"]
+    if any(k in _SET_FIELDS and row[k] != v for k, v in seen.items()):
+        return True
+    return any(k in _SET_FIELDS and k not in seen and row[k] != v and row[k] != "" and not ours
+               for k, v in wanted.items())
+
+
+def _overlay(view: dict[str, Any], project: str, *, receipts: set[str] | None = None) -> dict[str, Any]:
+    """Apply the waiting writes to a view, in the order they were made, by
+    the rules the hub applies them by. A write the hub already holds (its
+    receipt is in the view or ``receipts``, or this Mac recorded its outcome)
+    is in the view already and is never applied again; it still counts as
+    waiting until its job leaves the line."""
     rows = {r["row_id"]: r for r in view["rows"]}
+    gone = view.get("gone") or {}
+    held = set(view.get("receipts") or ()) | set(receipts or ())
     removed: dict[str, dict[str, Any]] = {}
     restored: set[str] = set()
     added: set[str] = set()
@@ -2114,9 +2225,11 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
         if op.get("project") != project:
             continue
         pending += 1
+        if op.get("op_id") in held or _answered_here(op.get("op_id")):
+            continue
         fields, row_id, at = op.get("fields") or {}, op.get("row_id"), _parse_time(op.get("at")) or _now()
         try:
-            if op["verb"] == "add" and row_id not in rows:
+            if op["verb"] == "add" and row_id not in rows and row_id not in removed and row_id not in gone:
                 added.add(row_id)
                 rows[row_id] = {"row_id": row_id, "title": fields.get("title", ""), "kind": fields.get("kind", ""),
                                 "parent": fields.get("parent", ""),
@@ -2124,14 +2237,14 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
                                 "owner": fields.get("owner") or "none", "evidence": fields.get("evidence", ""),
                                 "link": fields.get("link", ""), "refs": {},
                                 "seq": max([r["seq"] for r in rows.values()] + [0]) + 1,
-                                "created_at": at, "updated_at": at, "version": 1, "queued": True}
+                                "created_at": at, "updated_at": at, "version": None, "queued": True}
             elif op["verb"] == "set" and row_id in rows:
                 row = rows[row_id]
-                if op.get("if_state") and row["state"] != _word(vocab, "state", op["if_state"]):
+                wanted = {k: _word(vocab, "state", fields[k]) if k == "state" else fields[k]
+                          for k in _SET_FIELDS if k in fields}
+                if _arrives_late(op, row, wanted, vocab, row_id in added):
                     continue
-                for key in _SET_FIELDS:
-                    if key in fields:
-                        row[key] = _word(vocab, "state", fields[key]) if key == "state" else fields[key]
+                row.update(wanted)
                 row["updated_at"], row["queued"] = at, True
             elif op["verb"] == "restore" and row_id in removed and row_id not in rows:
                 rows[row_id] = removed.pop(row_id)
@@ -2148,13 +2261,13 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
                         if row["parent"] == row_id:
                             row["parent"] = parent
                 elif op.get("children") == "remove":
-                    gone = {row_id}
+                    cascade = {row_id}
                     while True:
-                        more = {k for k, r in rows.items() if r["parent"] in gone and k not in gone}
+                        more = {k for k, r in rows.items() if r["parent"] in cascade and k not in cascade}
                         if not more:
                             break
-                        gone |= more
-                    for k in gone - {row_id}:
+                        cascade |= more
+                    for k in cascade - {row_id}:
                         removed[k] = rows.pop(k)
         except LedgerError:
             continue
@@ -2198,7 +2311,7 @@ def load(project: str, *, conn=None) -> dict[str, Any]:
         # A drain that was busy (another writer holds the line) or stopped
         # early leaves writes waiting: they show on top, as they do offline.
         if any(op.get("project") == project for op in queued_ops()):
-            view = _overlay(view, project)
+            view = _hub_overlay(conn, view, project)
         pending = int(view.get("pending") or 0)
         return {**view, "pending": pending, "queue": _queue_health(drained, pending)}
     except Exception as exc:  # noqa: BLE001
@@ -2206,9 +2319,7 @@ def load(project: str, *, conn=None) -> dict[str, Any]:
             raise LedgerError("the ledger tables are not in the database yet; run khipu migrate", "no_tables") from exc
         if not _away(exc):
             raise
-        view = _offline_view(project) or {"vocab": {"state": [], "kind": []}, "rows": [], "as_of": None,
-                                          "offline": True}
-        view = _overlay(view, project)
+        view = _overlay(_offline_view(project) or _no_copy_view(), project)
         return {**view, "queue": _queue_health(drained, view["pending"])}
     finally:
         if owned and conn is not None:
@@ -2237,7 +2348,7 @@ def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
         replica_catch_up(conn)
         # A drain that was busy or stopped early leaves writes waiting: the
         # row shows them, as the list does.
-        view = _overlay(_hub_view(conn, project), project) \
+        view = _hub_overlay(conn, _hub_view(conn, project), project) \
             if any(op.get("project") == project for op in queued_ops()) else None
         pending = int((view or {}).get("pending") or 0)
         health = {"offline": False, "pending": pending, "queue": _queue_health(drained, pending)}
@@ -2273,12 +2384,15 @@ def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
         if not _away(exc):
             raise
         view = _offline_view(project)
-        merged = _overlay(view or {"vocab": {"state": [], "kind": []}, "rows": [], "as_of": None}, project)
+        merged = _overlay(view or _no_copy_view(), project)
         for row in merged["rows"]:
             if row["row_id"] == row_id:
                 history = [h for h in (view or {}).get("history", []) if h["row_id"] == row_id]
                 return {"row": row, "history": history, "offline": True, "as_of": merged.get("as_of"),
+                        "copy_unavailable": bool(merged.get("copy_unavailable")),
                         "pending": merged["pending"], "queue": _queue_health(drained, merged["pending"])}
+        if view is None:
+            raise LedgerError(f"{row_id}: {NO_COPY_WORDS}", "no_copy") from exc
         raise LedgerError(f"no such row: {row_id}", "not_found") from exc
     finally:
         if owned and conn is not None:
@@ -2546,7 +2660,7 @@ def row_json(row: dict[str, Any], history: list[dict[str, Any]], project: str) -
     out = {"id": row["row_id"], "title": row["title"], "kind": row["kind"], "parent": row["parent"],
            "state": row["state"], "evidence": row["evidence"], "owner": row["owner"], "updated": _updated(row),
            "link": row.get("link") or "", "refs": row.get("refs") or {}, "project": project,
-           "history": [_history_json(h) for h in history]}
+           "version": row.get("version"), "history": [_history_json(h) for h in history]}
     if row.get("queued"):
         out["queued"] = True
     return out
@@ -2691,6 +2805,8 @@ def _say(text: str) -> None:
 def _offline_note(view: dict[str, Any]) -> str | None:
     if not view.get("offline"):
         return None
+    if view.get("copy_unavailable"):
+        return f"({NO_COPY_WORDS}; {view.get('pending', 0)} waiting change(s) shown)"
     return (f"(the database is away: read from the offline copy as of {view.get('as_of') or 'an unknown time'}, "
             f"with {view.get('pending', 0)} waiting change(s) applied)")
 
@@ -2751,6 +2867,8 @@ def cmd(args: argparse.Namespace) -> int:
             payload["queue"] = got.get("queue") or _queue_health(None, payload["pending"])
             if got.get("offline"):
                 payload["offline_as_of"] = got.get("as_of")
+            if got.get("copy_unavailable"):
+                payload["copy_unavailable"] = True
             _emit(None, payload, as_json=True, sort_keys=True)
             return 0
         view = load(project)
@@ -2760,6 +2878,8 @@ def cmd(args: argparse.Namespace) -> int:
         fresh = {"offline": bool(view.get("offline")), "as_of": view.get("as_of"),
                  "pending": int(view.get("pending") or 0),
                  "queue": view.get("queue") or _queue_health(None, int(view.get("pending") or 0))}
+        if view.get("copy_unavailable"):
+            fresh["copy_unavailable"], fresh["error"] = True, view["error"]
         rc = 0
         if verb == "list":
             rows, text = render_list(view, state=args.state, kind=args.kind, owner=args.owner,

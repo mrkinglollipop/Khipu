@@ -11,6 +11,7 @@ import { Callout, Dialog } from "./ui";
 import { callCli } from "./settingsCli";
 import {
   ageWords,
+  appliedFinished,
   changedWords,
   daysSince,
   kindWords,
@@ -20,11 +21,12 @@ import {
   stampWords,
   stateTone,
   stateWords,
+  unappliedWords,
   updatedWords,
   usableRowId,
   wordFor,
 } from "./work";
-import type { HistoryEntry, LedgerList, LedgerRow, RemovedRow, Vocab, WorkView } from "./work";
+import type { HistoryEntry, LedgerList, LedgerQueue, LedgerRow, LedgerSetReply, RemovedRow, Vocab, WorkView } from "./work";
 
 /** The outbox notice, shown on the Work tab and the ledger page. */
 export function OutboxNotice({ view, now }: { view: WorkView | null; now: Date }) {
@@ -38,7 +40,9 @@ export function OutboxNotice({ view, now }: { view: WorkView | null; now: Date }
   return (
     <Callout tone="warn" stripe title={title}>
       They are saved on this Mac and reach the ledger when the database answers.{" "}
-      {view?.ledger_offline
+      {view?.ledger_copy_unavailable
+        ? "There is no offline copy on this Mac yet, so only these changes show. Nothing is lost."
+        : view?.ledger_offline
         ? `The ledger shows what it held${at ? ` at ${at}` : " last"}, with these changes on top. Nothing is lost.`
         : "What you see includes them."}
     </Callout>
@@ -46,14 +50,45 @@ export function OutboxNotice({ view, now }: { view: WorkView | null; now: Date }
 }
 
 /** The ledger read from the offline copy: said whenever it is, waiting
- *  writes or not, with the time the copy was made. */
-export function LedgerOfflineNotice({ asOf, now }: { asOf?: string | null; now: Date }) {
+ *  writes or not, with the time the copy was made. With no copy on this Mac
+ *  (``unavailable``) it says so, never showing an empty ledger as the copy. */
+export function LedgerOfflineNotice({ asOf, now, unavailable }: { asOf?: string | null; now: Date; unavailable?: boolean }) {
+  if (unavailable) {
+    return (
+      <Callout tone="warn" stripe title="The database can't be reached and this Mac has no offline copy yet">
+        Only changes saved on this Mac and waiting to be sent show here. The ledger's rows show again when the
+        database answers.
+      </Callout>
+    );
+  }
   const at = asOf ? changedWords(asOf, now) : "";
   return (
     <Callout tone="warn" stripe title="The ledger is showing its offline copy">
       The database didn't answer, so this is what the ledger held {at ? `at ${at}` : "when it was last copied"}. Changes
       you make are saved on this Mac and sent when it answers.
     </Callout>
+  );
+}
+
+/** The line of waiting writes as the last read found it, said whatever the
+ *  pending count: writes the ledger refused, or a line that couldn't be read. */
+export function QueueHealthNotice({ queue }: { queue?: LedgerQueue | null }) {
+  if (!queue) return null;
+  const refused = queue.refused ?? 0;
+  return (
+    <>
+      {queue.unreadable ? (
+        <Callout tone="warn" stripe title="The changes waiting on this Mac couldn't be read">
+          Khipu kept them as they are and sends nothing behind them until they read again. Nothing is lost.
+        </Callout>
+      ) : null}
+      {refused > 0 ? (
+        <Callout tone="warn" stripe
+          title={refused === 1 ? "1 waiting change was refused by the ledger" : `${refused.toLocaleString()} waiting changes were refused by the ledger`}>
+          {refused === 1 ? "It is" : "They are"} kept on this Mac for review, not lost.
+        </Callout>
+      ) : null}
+    </>
   );
 }
 
@@ -80,8 +115,16 @@ function finished(vocab: Vocab | null, state: string): boolean {
   return m === "done" || m === "dropped";
 }
 
-function sameForm(a: Form, b: Form): boolean {
-  return (Object.keys(a) as Array<keyof Form>).every((k) => a[k] === b[k]);
+/** The row to show when a read answers: an answer older than the row shown
+ *  (a lower version, a read that started earlier and came back later) is
+ *  dropped; an equal one is kept as it is unless what shows of it changed.
+ *  Without a version, every answer is taken. */
+function newerRow(prev: LedgerRow | null, next: LedgerRow): LedgerRow {
+  if (!prev || prev.id !== next.id || prev.version == null || next.version == null) return next;
+  if (next.version < prev.version) return prev;
+  if (next.version === prev.version && !!prev.queued === !!next.queued && !next.queued &&
+      (prev.history?.length ?? 0) === (next.history?.length ?? 0)) return prev;
+  return next;
 }
 
 function fieldValue(v: unknown): string {
@@ -142,7 +185,7 @@ function HistoryItem({ h, now }: { h: HistoryEntry; now: Date }) {
 
 type Form = { state: string; title: string; evidence: string; owner: string; link: string; note: string };
 
-type Sent = { rev: number; form: Form; refused?: boolean };
+type Edits = Partial<Form>;
 
 function initialForm(row: LedgerRow, vocab: Vocab | null): Form {
   const needs = meaningOf(vocab, row.state) === "needs";
@@ -192,23 +235,16 @@ export function LedgerPage({
   // dropped, so it can never become the target of a change or a removal.
   const openRow = useRef(selected);
   openRow.current = selected;
-  const [form, setForm] = useState<Form | null>(null);
-  // Bumped on every change typed into the form: a background read that
-  // started before the latest change is dropped instead of resetting it.
-  const editRev = useRef(0);
-  const resetRev = useRef(0);
-  const edit = (next: Form) => {
-    editRev.current += 1;
-    setForm(next);
-  };
-  // The refresh after a write takes the row's value only for fields still
-  // equal to this form and keeps the rest as typed. After a save that went
-  // through it is the form as sent (set only when typing went on during the
-  // save); after a refused one it is the form as last loaded, so nothing the
-  // user wrote is lost.
-  const rebase = useRef<Form | null>(null);
+  // Only the fields the user typed into. Every other field of the form is
+  // the row as last read, so a change made elsewhere shows at once and is
+  // never sent back as an edit.
+  const [edits, setEdits] = useState<Edits>({});
+  const edit = (field: keyof Form, value: string) => setEdits((e) => ({ ...e, [field]: value }));
   const [saving, setSaving] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
+  // A save the ledger took but did not apply now (waiting to be sent, or
+  // arrived late and kept as history only).
+  const [notice, setNotice] = useState<string | null>(null);
   const [removeOpen, setRemoveOpen] = useState(false);
   const [removedOpen, setRemovedOpen] = useState(false);
 
@@ -228,16 +264,14 @@ export function LedgerPage({
   }, [project]);
 
   const loadDetail = useCallback(
-    async (id: string, background = false, sent?: Sent) => {
-      const rev = editRev.current;
+    async (id: string) => {
       const res = await callCli<LedgerRow>("khipu_ledger_get", { project, id });
       if (openRow.current !== id) return null;
-      if (background && editRev.current !== rev) return null;
       if (res.ok && res.data && typeof res.data.id === "string") {
-        rebase.current = sent && (sent.refused || editRev.current !== sent.rev) ? sent.form : null;
-        setDetail(res.data);
+        const next = res.data;
+        setDetail((prev) => newerRow(prev, next));
         setDetailError(null);
-        return res.data;
+        return next;
       }
       setDetail(null);
       setDetailError(res.ok ? "Khipu could not read this row." : res.error);
@@ -274,14 +308,13 @@ export function LedgerPage({
   }, [readList, loadRemoved]);
 
   const vocab = list?.vocab ?? null;
-  // A fresh list hands an equal vocab as a new object: the form resets on
-  // its words, never on its identity.
-  const vocabKey = JSON.stringify(vocab);
+  const fresh = detail ? initialForm(detail, vocab) : null;
+  const form: Form | null = fresh ? { ...fresh, ...edits } : null;
+  const dirty = !!fresh && (Object.keys(edits) as Array<keyof Form>).some((k) => edits[k] !== fresh[k]);
 
-  // What the poll may touch: an edit under way or a save keeps the open
-  // row's detail (and so the form) as it is.
+  // A save under way keeps the open row as it is until its own re-read.
   const editing = useRef(false);
-  editing.current = saving || (!!form && !!detail && !sameForm(form, initialForm(detail, vocab)));
+  editing.current = saving;
 
   // The list (and the open row, when it is not being edited) is read again
   // refresh_s after the previous read ends, so an open page follows changes
@@ -295,7 +328,7 @@ export function LedgerPage({
     };
     const poll = async () => {
       const id = openRow.current;
-      await Promise.all([readList(), usableRowId(id) && !editing.current ? loadDetail(id, true) : null]);
+      await Promise.all([readList(), usableRowId(id) && !editing.current ? loadDetail(id) : null]);
       arm();
     };
     // The first timer starts once the read under way (the page's first) ends.
@@ -309,37 +342,12 @@ export function LedgerPage({
 
   useEffect(() => {
     setRefusal(null);
-    if (!usableRowId(selected)) {
-      setDetail(null);
-      setForm(null);
-      return;
-    }
+    setNotice(null);
+    setEdits({});
+    setDetail(null);
+    if (!usableRowId(selected)) return;
     void loadDetail(selected);
   }, [selected, loadDetail]);
-
-  // The form resets when another row opens or the row itself changed; a new
-  // vocab alone resets it only when nothing has been typed since.
-  const formFor = useRef<string | null>(null);
-  useEffect(() => {
-    if (!detail) return;
-    const key = JSON.stringify([detail.id, detail.updated, detail.state]);
-    const sent = rebase.current;
-    rebase.current = null;
-    if (key === formFor.current && editRev.current !== resetRev.current) return;
-    const fresh = initialForm(detail, vocab);
-    if (sent && key !== formFor.current) {
-      formFor.current = key;
-      // Fields the user changed keep their text and stay unsaved.
-      setForm((now) =>
-        now ? (Object.fromEntries((Object.keys(fresh) as Array<keyof Form>).map((k) => [k, now[k] !== sent[k] ? now[k] : fresh[k]])) as Form) : fresh,
-      );
-      return;
-    }
-    formFor.current = key;
-    resetRev.current = editRev.current;
-    setForm(fresh);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detail?.id, detail?.updated, detail?.state, vocabKey]);
 
   const byId = useMemo(() => new Map(rows.map((r) => [r.id, r])), [rows]);
   const owners = useMemo(
@@ -388,8 +396,8 @@ export function LedgerPage({
   const visible = filtered.slice(0, limit);
   const children = detail ? rows.filter((r) => r.parent === detail.id) : [];
 
-  const afterWrite = async (id: string | null, sent?: Sent) => {
-    await Promise.all([readList(true), id ? loadDetail(id, false, sent) : Promise.resolve(null), onChanged()]);
+  const afterWrite = async (id: string | null) => {
+    await Promise.all([readList(true), id ? loadDetail(id) : Promise.resolve(null), onChanged()]);
   };
 
   const save = async () => {
@@ -406,21 +414,31 @@ export function LedgerPage({
       return;
     }
     change.if_state = detail.state;
-    let sent: Sent = { rev: editRev.current, form };
+    const sent = form;
     setSaving(true);
     setRefusal(null);
+    setNotice(null);
     try {
-      const out = await callCli("khipu_ledger_set", { project, id: detail.id, change });
+      const out = await callCli<LedgerSetReply>("khipu_ledger_set", { project, id: detail.id, change });
       if (!out.ok) {
+        // Refused: everything typed stays, unsaved.
         setRefusal(out.error);
-        sent = { rev: sent.rev, form: initialForm(detail, vocab), refused: true };
       } else {
+        const reply = out.data;
         const commitment = detail.refs?.commitment;
-        if (change.state && commitment != null && commitment !== "" && finished(vocab, change.state)) {
-          await onOwedClose(Number(commitment));
+        const owed = !!change.state && commitment != null && commitment !== "" && finished(vocab, change.state);
+        if (owed && appliedFinished(reply, vocab)) await onOwedClose(Number(commitment));
+        setNotice(unappliedWords(reply, owed));
+        // Arrived late: nothing was applied, so what was typed stays. Otherwise
+        // what was sent is saved (or waiting to be sent) and only typing done
+        // during the save stays.
+        if (!reply?.late) {
+          setEdits((cur) =>
+            Object.fromEntries(Object.entries(cur).filter(([k, v]) => v !== sent[k as keyof Form])) as Edits,
+          );
         }
       }
-      await afterWrite(detail.id, sent);
+      await afterWrite(detail.id);
     } finally {
       setSaving(false);
     }
@@ -518,13 +536,15 @@ export function LedgerPage({
         </div>
       </header>
       <div className="panel-body wide lg-page">
-        {(view && view.counts.ledger_outbox > 0) || list?.offline || (list?.pending ?? 0) > 0 ? (
+        {(view && view.counts.ledger_outbox > 0) || list?.offline || (list?.pending ?? 0) > 0 ||
+        (list?.queue?.refused ?? 0) > 0 || list?.queue?.unreadable ? (
           <div className="wk-notices">
-            <OutboxNotice view={view} now={now} />
-            {list?.offline && !(view && view.counts.ledger_outbox > 0 && view.ledger_offline) ? (
-              <LedgerOfflineNotice asOf={list.as_of} now={now} />
+            {list?.copy_unavailable ? null : <OutboxNotice view={view} now={now} />}
+            {list?.offline && (list.copy_unavailable || !(view && view.counts.ledger_outbox > 0 && view.ledger_offline)) ? (
+              <LedgerOfflineNotice asOf={list.as_of} now={now} unavailable={!!list.copy_unavailable} />
             ) : null}
-            {list && !list.offline && (list.pending ?? 0) > 0 ? (
+            <QueueHealthNotice queue={list?.queue} />
+            {list && (!list.offline || list.copy_unavailable) && (list.pending ?? 0) > 0 ? (
               <Callout tone="warn" stripe title={plural(list.pending ?? 0, "change is waiting to be sent", "changes are waiting to be sent")}>
                 Saved on this Mac and marked Not sent yet below until the database takes{" "}
                 {(list.pending ?? 0) === 1 ? "it" : "them"}.
@@ -604,7 +624,11 @@ export function LedgerPage({
             </div>
             {list && visible.length === 0 ? (
               <div className="row">
-                <span className="grow t2">No rows match these filters.</span>
+                <span className="grow t2">
+                  {list.copy_unavailable && rows.length === 0
+                    ? "No rows to show: the database can't be reached and there is no offline copy on this Mac."
+                    : "No rows match these filters."}
+                </span>
               </div>
             ) : null}
             {!list && !listError ? (
@@ -711,7 +735,7 @@ export function LedgerPage({
                 >
                   <div className="toolbar">
                     <label htmlFor={`${ids}-to`}>New state</label>
-                    <select id={`${ids}-to`} value={form.state} onChange={(e) => edit({ ...form, state: e.target.value })}>
+                    <select id={`${ids}-to`} value={form.state} onChange={(e) => edit("state", e.target.value)}>
                       {(vocab?.state ?? [[detail.state, ""]]).map(([w]) => (
                         <option key={w} value={w}>
                           {stateWords(w)}
@@ -732,7 +756,7 @@ export function LedgerPage({
                       <input
                         id={`${ids}-${field}`}
                         value={form[field]}
-                        onChange={(e) => edit({ ...form, [field]: e.target.value })}
+                        onChange={(e) => edit(field, e.target.value)}
                       />
                     </div>
                   ))}
@@ -743,7 +767,7 @@ export function LedgerPage({
                     id={`${ids}-note`}
                     placeholder="Your note"
                     value={form.note}
-                    onChange={(e) => edit({ ...form, note: e.target.value })}
+                    onChange={(e) => edit("note", e.target.value)}
                   />
                   <div className="toolbar">
                     <button type="submit" className="sm primary" disabled={saving}>
@@ -751,13 +775,13 @@ export function LedgerPage({
                     </button>
                     <button type="button" className="sm" disabled={saving}
                       onClick={() => {
-                        resetRev.current = editRev.current;
-                        setForm(initialForm(detail, vocab));
+                        setEdits({});
                         setRefusal(null);
+                        setNotice(null);
                       }}>
                       Cancel
                     </button>
-                    {!saving && !sameForm(form, initialForm(detail, vocab)) ? (
+                    {!saving && dirty ? (
                       <span className="lg-unsaved">Unsaved changes</span>
                     ) : null}
                     <span className="meta">
@@ -770,6 +794,11 @@ export function LedgerPage({
                   {refusal ? (
                     <p className="set-error" role="alert">
                       Khipu didn't make that change: {refusal}
+                    </p>
+                  ) : null}
+                  {notice ? (
+                    <p className="wk-problem" role="status">
+                      {notice}
                     </p>
                   ) : null}
                 </form>

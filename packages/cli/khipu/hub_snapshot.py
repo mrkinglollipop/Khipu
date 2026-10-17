@@ -318,13 +318,20 @@ def caught_up_at(m: Mapping[str, Any] | None = None, *, ledger: bool = False) ->
     (``refreshed_at``) and the start of its last incremental pull that
     finished with every part ok, made against this same dump. A pull that
     copied nothing counts too: it asked the hub and found nothing new.
-    Ledger readers use only their own pull stamp, stored in the image.
+    Ledger readers use only their own stamp, stored in the image: the start
+    of the last ledger read (a dump's, a refresh's or a pull's).
     The one source for the replica's age; tests/test_replica_caught_up.py
     enumerates its readers."""
     m = meta() if m is None else m
-    stamps = [(_utc(m.get("refreshed_at")), m.get("refreshed_at"))]
     if ledger:
-        stamps.append((_utc(m.get("ledger_caught_up_at")), m.get("ledger_caught_up_at")))
+        # Never the later of it and the dump's end: a dump's snapshot is as
+        # old as its start (``ledger_caught_up_at``). A copy an older Khipu
+        # dumped has the hub's time at the dump's start, or only its end.
+        for key in ("ledger_caught_up_at", "hub_dumped_at", "refreshed_at"):
+            if _utc(m.get(key)) is not None:
+                return m.get(key)
+        return None
+    stamps = [(_utc(m.get("refreshed_at")), m.get("refreshed_at"))]
     side = {} if ledger else _read_sidecar()
     # A sidecar left from another dump (copied, or the dump replaced the
     # image but not the sidecar) says nothing about this copy.
@@ -1181,7 +1188,8 @@ def _read_ledger_pull(cur, limit: int) -> dict[str, Any] | None:
         cur.execute(f"SELECT {', '.join(_LEDGER_HIST_COLS)} FROM ledger_history "
                     "WHERE project = %s AND row_id = ANY(%s) ORDER BY id", (project, ids))
         history[project] = [dict(zip(_LEDGER_HIST_COLS, r, strict=True)) for r in cur.fetchall()]
-    return {"ok": True, "projects": projects, "vocab": vocab, "rows": rows, "history": history, "gone": gone}
+    return {"ok": True, "projects": projects, "vocab": vocab, "rows": rows, "history": history, "gone": gone,
+            "receipts": _read_ledger_receipts(cur, _queued_op_ids())}
 
 
 def _write_ledger_pull(payload: Mapping[str, Any] | None, *, read_at: float) -> dict[str, Any]:
@@ -1204,6 +1212,7 @@ def _apply_ledger_pull(con: sqlite3.Connection, payload: Mapping[str, Any], *,
             payload["vocab"].get(project),
             payload["rows"].get(project, []), payload["history"].get(project, []),
             payload["gone"].get(project, {}), read_at=read_at)
+    _write_ledger_receipts(con, payload.get("receipts"))
     if _held_read_at(con, "ledger", "*") < read_at:
         _record_read_at(con, "ledger", "*", read_at)
         con.execute("INSERT OR REPLACE INTO snapshot_meta(key,value) VALUES ('ledger_caught_up_at', ?)",
@@ -1849,6 +1858,9 @@ CREATE INDEX IF NOT EXISTS idx_snapshot_ledger_history_row ON ledger_history (pr
 CREATE TABLE IF NOT EXISTS ledger_gone (
     project TEXT, row_id TEXT, version INTEGER, PRIMARY KEY (project, row_id)
 );
+CREATE TABLE IF NOT EXISTS ledger_receipts (
+    op_id TEXT PRIMARY KEY, project TEXT, ok INTEGER
+);
 """
 # A purged id never comes back, so its marker outranks every version.
 LEDGER_PURGED_VERSION = 2**62
@@ -1874,6 +1886,34 @@ def _create_ledger_schema(con: sqlite3.Connection) -> None:
     for statement in _LEDGER_SCHEMA_SQL.split(";"):
         if statement.strip():
             con.execute(statement)
+
+
+def _queued_op_ids(project: str | None = None, row_ids: Sequence[str] | None = None) -> list[str]:
+    """The op ids of this Mac's waiting ledger writes (of ``project`` and
+    ``row_ids`` when given): the receipts worth copying."""
+    from khipu import ledger
+
+    wanted = set(row_ids) if row_ids is not None else None
+    return [op["op_id"] for op in ledger.queued_ops() if isinstance(op.get("op_id"), str)
+            and (project is None or op.get("project") == project)
+            and (wanted is None or op.get("row_id") in wanted)]
+
+
+def _read_ledger_receipts(cur, op_ids: Sequence[str]) -> list[tuple[str, str, int]]:
+    """Which of ``op_ids`` the hub has bound (``ledger_ops``), read in the
+    same transaction as the rows they touched: an op the hub holds is in
+    those rows already (or was refused), so a reader never applies it again
+    on top of them. A receipt never changes once written."""
+    if not op_ids:
+        return []
+    cur.execute("SELECT op_id, project, (result->>'ok') IS DISTINCT FROM 'false' FROM ledger_ops "
+                "WHERE op_id = ANY(%s) AND result <> '{}'::jsonb", (list(op_ids),))
+    return [(op_id, project, int(bool(ok))) for op_id, project, ok in cur.fetchall()]
+
+
+def _write_ledger_receipts(con: sqlite3.Connection, receipts: Sequence[Sequence[Any]] | None) -> None:
+    if receipts:
+        con.executemany("INSERT OR REPLACE INTO ledger_receipts VALUES (?, ?, ?)", [tuple(r) for r in receipts])
 
 
 def refresh_ledger() -> dict[str, Any]:
@@ -1944,6 +1984,7 @@ def _insert_ledger(cur, con: sqlite3.Connection) -> int:
     cur.execute("SELECT project, row_id FROM ledger_removed")
     gone += [(p, r, LEDGER_PURGED_VERSION) for p, r in cur.fetchall()]
     con.executemany("INSERT OR REPLACE INTO ledger_gone VALUES (?, ?, ?)", gone)
+    _write_ledger_receipts(con, _read_ledger_receipts(cur, _queued_op_ids()))
     return len(rows)
 
 
@@ -2033,7 +2074,8 @@ def _write_ledger_project(con: sqlite3.Connection, project: str, proj: Sequence[
 def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mapping[str, list],
                           rows: Sequence[Mapping[str, Any]], history: Sequence[Mapping[str, Any]],
                           row_ids: Sequence[str], gone: Mapping[str, int] | None = None, *,
-                          _pull: Mapping[str, Any] | None = None, read_at: float | None = None) -> dict[str, Any]:
+                          _pull: Mapping[str, Any] | None = None, read_at: float | None = None,
+                          receipts: Sequence[Sequence[Any]] | None = None) -> dict[str, Any]:
     """Write ``row_ids`` of ``project`` through to the replica: each live one
     in ``rows`` (with its whole ``history``), and each removed one in ``gone``
     at the version it was removed at (``LEDGER_PURGED_VERSION`` for a purge
@@ -2064,6 +2106,7 @@ def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mappi
             at = time.time() if read_at is None else read_at
             result = (_apply_ledger_pull(con, _pull, read_at=at) if _pull is not None else
                       _write_ledger_project(con, project, proj, vocab, rows, history, gone, read_at=at))
+            _write_ledger_receipts(con, receipts)
             if con.in_transaction:
                 con.commit()
         finally:
@@ -2145,13 +2188,18 @@ def ledger_read_snapshot(project: str) -> dict[str, Any] | None:
         rows = [r for r in rows if r["row_id"] not in gone or gone[r["row_id"]] < int(r["version"] or 0)]
         live = {r["row_id"] for r in rows}
         history = [h for h in history if h["row_id"] in live]
+        receipts: dict[str, bool] = {}
+        if _snapshot_table_columns(con, "ledger_receipts"):
+            receipts = {op_id: bool(ok) for op_id, ok in con.execute(
+                "SELECT op_id, ok FROM ledger_receipts WHERE project = ?", (project,))}
         image_meta = dict(con.execute("SELECT key, value FROM snapshot_meta")) if (
             _snapshot_table_columns(con, "snapshot_meta")) else {}
     except (sqlite3.Error, ValueError):
         return None
     finally:
         con.close()
-    return {"vocab": vocab, "rows": rows, "history": history, "gone": gone, "as_of": caught_up_at(image_meta, ledger=True)}
+    return {"vocab": vocab, "rows": rows, "history": history, "gone": gone, "receipts": receipts,
+            "as_of": caught_up_at(image_meta, ledger=True)}
 
 
 _EPISODE_FTS_COLS = ("summary", "topics", "decisions", "preferences", "people")
@@ -2616,6 +2664,12 @@ def _refresh_locked() -> dict[str, Any]:
                 if hub_dumped_at:
                     con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('hub_dumped_at', ?)",
                                 (hub_dumped_at,))
+                # The ledger is as fresh as the dump's start: its one
+                # repeatable-read snapshot was taken after this, and a change
+                # committed while the dump ran is not in it.
+                if counts.get("ledger_rows") is not None:
+                    con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('ledger_caught_up_at', ?)",
+                                (started_at,))
                 # Every row here was read after this: an older pull read
                 # never replaces one (the freshness rule, _held_read_at).
                 con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES (?, ?)",

@@ -270,7 +270,7 @@ def _fence() -> dict[str, int]:
     data = _read_json(_view_fence_file())
     data = data if isinstance(data, dict) else {}
     out = {}
-    for key in ("generation", "refresh_seq", "published_seq"):
+    for key in ("generation", "refresh_seq", "published_seq", "source_seq"):
         try:
             out[key] = max(int(data.get(key) or 0), 0)
         except (TypeError, ValueError):
@@ -292,6 +292,17 @@ def _begin_refresh() -> tuple[int, int]:
         fence["refresh_seq"] += 1
         _replace_json(_view_fence_file(), fence)
         return fence["generation"], fence["refresh_seq"]
+
+
+def _begin_source_read() -> int:
+    """A source read number larger than any given before, taken before the
+    file is read: a read that began earlier never replaces the last good
+    read of one that began later, whatever times the two documents carry."""
+    with _view_lock():
+        fence = _fence()
+        fence["source_seq"] += 1
+        _replace_json(_view_fence_file(), fence)
+        return fence["source_seq"]
 
 
 def invalidate_view() -> None:
@@ -400,7 +411,18 @@ def _pieces(token: str) -> list[tuple[str, bool]]:
     return out
 
 
+# Every path shape holds "~", "/" or "\\", and only a "%", "\\" or "&"
+# escape can decode to one: text holding none of these has no path piece.
+_PATH_CHARS = frozenset("~/\\%&")
+
+
+def _path_free(text: str) -> bool:
+    return _PATH_CHARS.isdisjoint(text)
+
+
 def _has_path(text: str) -> bool:
+    if _path_free(text):
+        return False
     return any(link is None or (not link and _path_token(p)) for t in text.split() for p, link in _pieces(t))
 
 
@@ -409,6 +431,8 @@ def _cut_paths(text: str) -> str:
     and punctuation kept); a link's path, query and fragment when they hold
     a path; links, cut out by their exact span, and every other piece are
     left as they are."""
+    if _path_free(text):
+        return text
     out = []
     for token in text.split(" "):
         parts = []
@@ -496,7 +520,7 @@ def _fixed_words() -> frozenset[str]:
              "newer_format", "open", "needs", "done", "dropped", "ledger", "commitment", "routing", "rule", "hold",
              "seeded", "same", "not_same", "snooze", "hide", "drop", "answered", "open_ledger", "open_link",
              "open_owed", "open_routing", "Confirm a standing rule a conversation changed",
-             OUTBOX_UNREADABLE, OUTBOX_REFUSED}
+             OUTBOX_UNREADABLE, OUTBOX_REFUSED, LEDGER_NO_COPY}
     for table in (JOB_STATES, PR_STAGES, TRAIN_STATES):
         words.update(table)
         words.update(table.values())
@@ -938,6 +962,10 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
     last = _same_file_last(_read_json(_last_file(project)), project, name)
     limit = cfg["work_file_max_bytes"]
     try:
+        read_seq = _begin_source_read()
+    except OSError:
+        read_seq = None  # the last good read is then left as it is
+    try:
         data, st = _read_checked(path, limit)
     except safe_read.Refused:
         return {"state": "refused", "problem": SOURCE_PROBLEMS["refused"], "contents": None}
@@ -972,7 +1000,14 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
                 newer = _parse_time(((held or {}).get("contents") or {}).get("written_at"))
                 if newer is not None and _parse_time(parsed["written_at"]) < newer:
                     return _failed("unreadable", SOURCE_PROBLEMS["older"], held, cfg)
-                _write_json(_last_file(project), {"project_key": project, "stamp": stamp, "contents": parsed})
+                held_seq = (held or {}).get("read_seq")
+                if isinstance(held_seq, int) and (read_seq is None or held_seq > read_seq):
+                    # A read that began after this one already kept its
+                    # document (the file changed meanwhile): it is the newer.
+                    parsed = held["contents"]
+                elif read_seq is not None:
+                    _write_json(_last_file(project), {"project_key": project, "stamp": stamp, "contents": parsed,
+                                                      "read_seq": read_seq})
         except OSError:
             pass  # the last good read is a convenience; this read still shows
     age = (now - _parse_time(parsed["written_at"])).total_seconds()
@@ -1060,9 +1095,18 @@ def read_ledger() -> dict[str, Any]:
     try:
         if conn is not None:
             try:
-                ledger.drain(conn)
+                drained = ledger.drain(conn)
+                # A line the drain could not read is a problem of its own
+                # (build_view), never a quiet "nothing waiting".
+                if drained.get("unreadable"):
+                    out["drain"] = {"unreadable": drained["unreadable"]}
             except Exception:  # noqa: BLE001  (waiting writes stay waiting; doctor says so)
                 conn.rollback()
+        else:
+            from khipu import hub_snapshot
+
+            if not hub_snapshot.ledger_in_snapshot():
+                out["error"], out["copy_unavailable"] = LEDGER_NO_COPY, True
         projects = {proj["project"]: proj for proj in _ledger_projects(conn)}
         # A queued add can name a project that has never reached the hub or
         # its offline snapshot. Work already reads this outbox through each
@@ -1083,10 +1127,9 @@ def read_ledger() -> dict[str, Any]:
                 # line, or it stopped early) still show, marked queued, so
                 # "What you see includes them" stays true online too.
                 if key in queued:
-                    view = ledger._overlay(view, key)
+                    view = ledger._hub_overlay(conn, view, key)
             else:
-                offline = ledger._offline_view(key) or {"vocab": {"state": [], "kind": []}, "rows": [],
-                                                        "as_of": None}
+                offline = ledger._offline_view(key) or ledger._no_copy_view()
                 view = ledger._overlay(offline, key)
                 history = offline.get("history")
                 out["as_of"] = view.get("as_of")
@@ -1293,16 +1336,39 @@ class _Alike:
 
     def __init__(self, text: str):
         self.text = text
-        self.matcher = difflib.SequenceMatcher(None)
-        self.matcher.set_seq2(text)
+        self.matcher: difflib.SequenceMatcher | None = None  # built once a pair needs the full comparison
+        # ``_ratio_bound``'s bit masks, over this text once rather than over
+        # each title per pair.
+        masks: dict[str, int] = {}
+        for i, ch in enumerate(text):
+            masks[ch] = masks.get(ch, 0) | (1 << i)
+        self.masks, self.full = masks, (1 << len(text)) - 1
+
+    def _lcs_bound_under(self, title: str) -> bool:
+        """Whether ``_ratio_bound(title, text) < ALIKE``. It stops once the
+        common subsequence so far plus every title character still to come
+        can't reach ALIKE, an exact bound, so the answer is the same."""
+        la, lb = len(self.text), len(title)
+        need = ALIKE * (la + lb) / 2.0  # the common length ALIKE takes
+        masks, full, v = self.masks, self.full, self.full
+        for k, ch in enumerate(title, 1):
+            u = v & masks.get(ch, 0)
+            v = ((v + u) | (v - u)) & full
+            if not k & 7 and la - v.bit_count() + (lb - k) < need:
+                return True
+        return 2.0 * (la - v.bit_count()) / (la + lb) < ALIKE
 
     def __call__(self, title: str) -> bool:
         if not (title and self.text):
             return False
-        m = self.matcher
-        m.set_seq1(title)
-        if m.real_quick_ratio() < ALIKE or _ratio_bound(title, self.text) < ALIKE:
+        la, lb = len(self.text), len(title)
+        if 2.0 * min(la, lb) / (la + lb) < ALIKE or self._lcs_bound_under(title):  # real_quick_ratio first
             return False
+        m = self.matcher
+        if m is None:
+            m = self.matcher = difflib.SequenceMatcher(None)
+            m.set_seq2(self.text)
+        m.set_seq1(title)
         return m.ratio() >= ALIKE
 
 
@@ -1500,6 +1566,7 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime,
 
 
 OUTBOX_UNREADABLE = "Khipu couldn't read the ledger changes waiting to be sent; doctor names the file."
+LEDGER_NO_COPY = "The database can't be reached and this Mac has no offline copy of the ledger yet."
 OUTBOX_REFUSED = "The ledger refused waiting changes; doctor lists them."
 
 
@@ -1636,7 +1703,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
         line = {"unreadable": type(exc).__name__}
     outbox = int(line.get("pending") or 0)
     refused = int(line.get("refused") or 0)
-    if line.get("unreadable"):
+    if line.get("unreadable") or (ledger_data.get("drain") or {}).get("unreadable"):
         line_problem = OUTBOX_UNREADABLE
     elif refused:
         line_problem = OUTBOX_REFUSED
@@ -1657,6 +1724,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
         "problems": {k: v for k, v in (("ledger", ledger_data.get("error")), ("owed", owed.get("error")),
                                        ("routing", routing_info.get("error")), ("outbox", line_problem)) if v},
         "ledger_offline": bool(ledger_data.get("offline")), "ledger_as_of": ledger_data.get("as_of"),
+        "ledger_copy_unavailable": bool(ledger_data.get("copy_unavailable")),
         "refresh_s": cfg["work_refresh"],
     }), fence, refresh_seq)
     # A project the scan withheld is still a project: the item says so

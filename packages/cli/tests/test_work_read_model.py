@@ -124,6 +124,55 @@ def test_lcs_bound_is_an_upper_bound_on_ratio():
     assert work._ratio_bound("", "") == 0.0
 
 
+def test_the_early_stopping_bound_answers_as_the_full_one():
+    rnd = random.Random(17)
+    for _ in range(1500):
+        text, title = _sentence(rnd).lower(), _sentence(rnd).lower()
+        if rnd.random() < 0.4:
+            words = title.split()
+            words[rnd.randrange(len(words))] = rnd.choice(_WORDS)
+            text = " ".join(words) + rnd.choice(["", " soon", " " + rnd.choice(_WORDS)])
+        alike = work._Alike(text)
+        assert alike._lcs_bound_under(title) == (work._ratio_bound(title, text) < work.ALIKE), (title, text)
+        assert alike(title) == work._alike(title, text), (title, text)
+    assert not work._Alike("")("x") and not work._Alike("x")("")
+
+
+def test_looks_like_builds_a_full_matcher_only_for_pairs_that_need_one(monkeypatch):
+    ledger_data, owed = _synthetic()
+    built = []
+    real = difflib.SequenceMatcher.set_seq2
+    monkeypatch.setattr(difflib.SequenceMatcher, "set_seq2", lambda self, b: built.append(1) or real(self, b))
+    work._waiting(ledger_data, owed, ROUTING, NOW)
+    assert len(built) < len(owed["items"]) // 4, len(built)
+
+
+def test_text_with_no_path_character_is_never_split():
+    calls = []
+    real = work._pieces
+    try:
+        work._pieces = lambda token: calls.append(token) or real(token)
+        plain = "Review the build, merge it; then (verify) the release: 3 of 4 = done!"
+        assert work._cut_paths(plain) == plain and not work._has_path(plain)
+        assert calls == []
+        assert work._cut_paths("see ~/notes.txt") == "see (a path)"
+        assert work._has_path("open %2Fopt%2Fx.txt") and work._has_path("C:\\temp\\x")
+    finally:
+        work._pieces = real
+
+
+def test_a_projection_checks_each_distinct_string_once(monkeypatch):
+    from khipu import agent_view
+
+    calls = []
+    real = agent_view._project_text
+    monkeypatch.setattr(agent_view, "_project_text", lambda text, table: calls.append(text) or real(text, table))
+    doc = {"waiting": [{"source": "ledger", "title": f"Row {i % 7}", "actions": ["done", "drop"]} for i in range(300)]}
+    out = agent_view.project(doc)
+    assert out["waiting"][8]["title"] == "Row 1"
+    assert len(calls) == len(set(calls)) and len(calls) < 20, len(calls)
+
+
 # ---- one owed read; the three sources at once; one projection ----------------------
 
 

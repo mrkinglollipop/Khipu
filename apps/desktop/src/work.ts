@@ -197,6 +197,8 @@ export type WorkView = {
   problems?: Record<string, string>;
   ledger_offline?: boolean;
   ledger_as_of?: string | null;
+  /** The hub is away and this Mac has no offline copy of the ledger yet. */
+  ledger_copy_unavailable?: boolean;
   refresh_s?: number;
 };
 
@@ -215,6 +217,8 @@ export type LedgerRow = {
   project: string;
   history: HistoryEntry[];
   queued?: boolean;
+  /** The hub's row version: it changes with every change, even two in one second. */
+  version?: number | null;
 };
 export type HistoryEntry = {
   ts?: string;
@@ -227,7 +231,7 @@ export type HistoryEntry = {
   changes?: Record<string, unknown>;
 };
 export type LedgerQueue = {
-  pending: number;
+  pending: number | null;
   busy: boolean;
   stopped_early: boolean;
   refused: number;
@@ -238,12 +242,39 @@ export type LedgerList = {
   project: string;
   offline: boolean;
   as_of?: string | null;
+  /** The hub is away and this Mac has no offline copy yet: only waiting writes show. */
+  copy_unavailable?: boolean;
   /** Writes saved on this Mac that have not reached the database yet. */
-  pending?: number;
+  pending?: number | null;
   queue?: LedgerQueue;
   vocab: Vocab;
   rows: LedgerRow[];
 };
+/** What `khipu ledger set --json` answered. */
+export type LedgerSetReply = { ok?: boolean; state?: string | null; queued?: boolean; late?: boolean; retried?: boolean };
+
+/** Whether a ledger set reply is a change the ledger applied, to a finished
+ *  (done or dropped) state: only then may the Owed item close. A change still
+ *  waiting to be sent, or one that arrived late and was kept as history only,
+ *  leaves it open. */
+export function appliedFinished(reply: LedgerSetReply | null | undefined, vocab: Vocab | null): boolean {
+  if (!reply || reply.ok === false || reply.queued || reply.late || !reply.state) return false;
+  const m = meaningOf(vocab, reply.state);
+  return m === "done" || m === "dropped";
+}
+
+/** Words for a set reply that did not apply now, or null. */
+export function unappliedWords(reply: LedgerSetReply | null | undefined, owed: boolean): string | null {
+  if (!reply) return null;
+  const tail = owed ? " The Owed item stays open until the ledger takes it." : "";
+  if (reply.queued) return `Saved on this Mac; the change is waiting to be sent to the database.${tail}`;
+  if (reply.late) {
+    const where = reply.state ? ` to ${stateWords(reply.state)}` : "";
+    return `That change arrived late: the row had moved${where}, so it was kept in the row's history and not applied.${tail}`;
+  }
+  return null;
+}
+
 export type RemovedRow = {
   project: string;
   id: string;
