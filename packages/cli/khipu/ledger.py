@@ -77,6 +77,9 @@ LEDGER_LOCK_WAIT_S = 30.0
 # on this Mac behind it. A write that times out waits in the outbox.
 LEDGER_LOCK_TIMEOUT_MS = 10_000
 LEDGER_STATEMENT_TIMEOUT_MS = 30_000
+# A read snapshot left idle this long (its reader stalled between
+# statements) is ended by the hub, never held open.
+LEDGER_IDLE_TIMEOUT_MS = 30_000
 
 # ---- settings -----------------------------------------------------------------
 
@@ -821,10 +824,15 @@ def apply_op(conn, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
     return result
 
 
-def _bound_waits(cur) -> None:
-    """Bound this transaction's lock waits and statements (``SET LOCAL``)."""
-    cur.execute("SELECT set_config('lock_timeout', %s, true), set_config('statement_timeout', %s, true)",
-                (f"{int(LEDGER_LOCK_TIMEOUT_MS)}ms", f"{int(LEDGER_STATEMENT_TIMEOUT_MS)}ms"))
+def _bound_waits(cur, *, idle: bool = False) -> None:
+    """Bound this transaction's lock waits and statements (``SET LOCAL``);
+    ``idle``: and how long it may sit idle between statements."""
+    sql = "SELECT set_config('lock_timeout', %s, true), set_config('statement_timeout', %s, true)"
+    args = [f"{int(LEDGER_LOCK_TIMEOUT_MS)}ms", f"{int(LEDGER_STATEMENT_TIMEOUT_MS)}ms"]
+    if idle:
+        sql += ", set_config('idle_in_transaction_session_timeout', %s, true)"
+        args.append(f"{int(LEDGER_IDLE_TIMEOUT_MS)}ms")
+    cur.execute(sql, args)
 
 
 @contextmanager
@@ -832,9 +840,10 @@ def _one_snapshot(conn, *, closing: bool = False, pipeline: bool = False):
     """A bounded read-only transaction at REPEATABLE READ: every statement in
     it sees the hub as of its first one, so a receipt (``ledger_ops``) read
     in it can never be newer than the rows, history and removals read beside
-    it. The op ids to look up are read from the outbox inside it, after that
-    first statement: a waiting write committed before the snapshot was queued
-    before it too. Rolled back on the way out; the connection keeps its own
+    it. Nothing is read from disk inside it: the waiting writes whose
+    receipts it reads are taken before it opens (``_line_now``), so no hub
+    transaction waits on a file, and one left idle anyway is ended by the hub
+    (``LEDGER_IDLE_TIMEOUT_MS``). Rolled back on the way out; the connection keeps its own
     isolation level for whatever runs next. ``closing``: the caller closes
     the connection next, which ends the transaction without the rollback's
     round trip to the hub. ``pipeline``: in psycopg's pipeline mode, so reads
@@ -847,7 +856,7 @@ def _one_snapshot(conn, *, closing: bool = False, pipeline: bool = False):
     conn.isolation_level = IsolationLevel.REPEATABLE_READ
     try:
         with conn.pipeline() if pipeline else nullcontext(), conn.cursor() as cur:
-            _bound_waits(cur)
+            _bound_waits(cur, idle=True)
             yield cur
     finally:
         if not closing:
@@ -1047,6 +1056,7 @@ def _replica_read_locked(conn) -> dict[str, Any] | None:
     try:
         for project, ids in by_project.items():
             read_at = time.time()
+            op_ids = hub_snapshot._queued_op_ids(project, ids)
             with _one_snapshot(conn) as cur:
                 vocab = _vocab(cur, project)
                 cur.execute("SELECT name, hidden, created_at FROM ledger_projects WHERE project = %s", (project,))
@@ -1066,7 +1076,7 @@ def _replica_read_locked(conn) -> dict[str, Any] | None:
                 cur.execute(f"SELECT {', '.join(_HIST_COLS)} FROM ledger_history WHERE project = %s "
                             "AND row_id = ANY(%s) ORDER BY id", (project, [r["row_id"] for r in rows]))
                 history = [dict(zip(_HIST_COLS, h, strict=True)) for h in cur.fetchall()]
-                receipts = hub_snapshot._read_ledger_receipts(cur, hub_snapshot._queued_op_ids(project, ids))
+                receipts = hub_snapshot._read_ledger_receipts(cur, op_ids)
             reads.append({"project": project, "ids": ids, "proj": proj, "vocab": vocab, "rows": rows,
                           "history": history, "gone": gone, "receipts": receipts, "read_at": read_at})
     except BaseException:
@@ -2091,7 +2101,7 @@ def _hub_observation(conn, op: dict[str, Any]) -> dict[str, Any] | None:
             from khipu import hub_snapshot
 
             receipts = {r[0] for r in hub_snapshot._read_ledger_receipts(
-                cur, hub_snapshot._queued_op_ids(project, [row_id]))}
+                cur, sorted(i for i in line if isinstance(i, str)))}
     except Exception:  # noqa: BLE001  (the write itself finds out what is wrong with the hub)
         try:
             conn.rollback()
@@ -2154,26 +2164,39 @@ def _pending_keys() -> set[str]:
 # ---- reading ------------------------------------------------------------------
 
 
-def _hub_view(conn, project: str) -> dict[str, Any]:
-    """The hub's live rows of ``project`` and the receipts of this Mac's
-    waiting writes to it, from one snapshot (``_one_snapshot``): ``_overlay``
-    then never takes a write as held that the rows do not show yet."""
+def _line_now(project: str | None = None) -> list[tuple[dict[str, Any], bool]]:
+    """This Mac's waiting writes (to ``project`` when given), in line order,
+    each with whether this Mac has recorded what became of it, read from
+    disk in one pass. An online read takes it before its hub snapshot opens:
+    a write in it that the hub held by then has its receipt in the snapshot
+    (shown by the rows), any other is shown on top of them, once; a drain
+    that lands one after the snapshot opened changes neither."""
+    return [(op, _answered_here(op.get("op_id"))) for op in queued_ops()
+            if project is None or op.get("project") == project]
+
+
+def _hub_view(conn, project: str, line: list[tuple[dict[str, Any], bool]]) -> dict[str, Any]:
+    """The hub's live rows of ``project`` and the receipts of the writes in
+    ``line`` (``_line_now``, read before this), from one snapshot
+    (``_one_snapshot``): ``_overlay`` then never takes a write as held that
+    the rows do not show yet."""
     with _one_snapshot(conn):
-        return _hub_rows(conn, project)
+        return _hub_rows(conn, project, line)
 
 
-def _hub_rows(conn, project: str) -> dict[str, Any]:
+def _hub_rows(conn, project: str, line: list[tuple[dict[str, Any], bool]]) -> dict[str, Any]:
     """``_hub_view`` read inside a snapshot of ``conn`` already open (its
     first statement run). The three reads go on three cursors and are
     fetched after, so a connection in pipeline mode sends them together."""
     from khipu import hub_snapshot
 
+    op_ids = [op["op_id"] for op, _answered in line
+              if op.get("project") == project and isinstance(op.get("op_id"), str)]
     with conn.cursor() as words, conn.cursor() as live, conn.cursor() as held:
         words.execute(_VOCAB_SQL, (project,))
         live.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s AND removed_at IS NULL "
                      "ORDER BY seq", (project,))
-        receipts = {op_id for op_id, _project, _ok in
-                    hub_snapshot._read_ledger_receipts(held, hub_snapshot._queued_op_ids(project))}
+        receipts = {op_id for op_id, _project, _ok in hub_snapshot._read_ledger_receipts(held, op_ids)}
         vocab = _vocab_of(words.fetchall())
         rows = [_row_dict(r) for r in live.fetchall()]
     return {"vocab": vocab, "rows": rows, "receipts": receipts, "as_of": None, "offline": False}
@@ -2202,11 +2225,11 @@ def _no_copy_view() -> dict[str, Any]:
             "copy_unavailable": True, "error": NO_COPY_WORDS}
 
 
-def _hub_overlay(conn, view: dict[str, Any], project: str) -> dict[str, Any]:
-    """The hub's view with the waiting writes the hub does not hold yet on
-    top. The receipts are the ones ``_hub_view`` read beside its rows; a
-    write queued since is in neither, so it shows on top."""
-    return _overlay(view, project)
+def _hub_overlay(conn, view: dict[str, Any], project: str,
+                 line: list[tuple[dict[str, Any], bool]]) -> dict[str, Any]:
+    """The hub's view with the writes of ``line`` (the one its receipts were
+    read for) the hub did not hold yet on top."""
+    return _overlay(view, project, line=line)
 
 
 def _answered_here(op_id: Any) -> bool:
@@ -2240,12 +2263,13 @@ def _arrives_late(op: dict[str, Any], row: dict[str, Any], wanted: dict[str, Any
                for k, v in wanted.items())
 
 
-def _overlay(view: dict[str, Any], project: str, *, receipts: set[str] | None = None) -> dict[str, Any]:
-    """Apply the waiting writes to a view, in the order they were made, by
-    the rules the hub applies them by. A write the hub already holds (its
-    receipt is in the view or ``receipts``, or this Mac recorded its outcome)
-    is in the view already and is never applied again; it still counts as
-    waiting until its job leaves the line."""
+def _overlay(view: dict[str, Any], project: str, *, receipts: set[str] | None = None,
+             line: list[tuple[dict[str, Any], bool]] | None = None) -> dict[str, Any]:
+    """Apply the waiting writes (``line``, read now when not given) to a view,
+    in the order they were made, by the rules the hub applies them by. A
+    write the hub already holds (its receipt is in the view or ``receipts``,
+    or this Mac recorded its outcome) is in the view already and is never
+    applied again; it still counts as waiting until its job leaves the line."""
     rows = {r["row_id"]: r for r in view["rows"]}
     gone = view.get("gone") or {}
     held = set(view.get("receipts") or ()) | set(receipts or ())
@@ -2254,11 +2278,11 @@ def _overlay(view: dict[str, Any], project: str, *, receipts: set[str] | None = 
     added: set[str] = set()
     vocab = view["vocab"] if view["vocab"]["state"] else default_vocab()
     pending = 0
-    for op in queued_ops():
+    for op, answered in _line_now(project) if line is None else line:
         if op.get("project") != project:
             continue
         pending += 1
-        if op.get("op_id") in held or _answered_here(op.get("op_id")):
+        if op.get("op_id") in held or answered:
             continue
         fields, row_id, at = op.get("fields") or {}, op.get("row_id"), _parse_time(op.get("at")) or _now()
         try:
@@ -2340,11 +2364,12 @@ def load(project: str, *, conn=None) -> dict[str, Any]:
             conn = _connect()
         drained = drain(conn)
         replica_catch_up(conn)
-        view = _hub_view(conn, project)
+        line = _line_now(project)
+        view = _hub_view(conn, project, line)
         # A drain that was busy (another writer holds the line) or stopped
         # early leaves writes waiting: they show on top, as they do offline.
-        if any(op.get("project") == project for op in queued_ops()):
-            view = _hub_overlay(conn, view, project)
+        if line:
+            view = _hub_overlay(conn, view, project, line)
         pending = int(view.get("pending") or 0)
         return {**view, "pending": pending, "queue": _queue_health(drained, pending)}
     except Exception as exc:  # noqa: BLE001
@@ -2381,31 +2406,33 @@ def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
         replica_catch_up(conn)
         # A drain that was busy or stopped early leaves writes waiting: the
         # row shows them, as the list does. The row, its history and the
-        # receipts the waiting writes are judged by are one snapshot.
+        # receipts the waiting writes are judged by are one snapshot; the
+        # line is read before it and the line's health after it.
+        line = _line_now(project)
+        history: list[dict[str, Any]] = []
         with _one_snapshot(conn) as cur:
-            view = _overlay(_hub_rows(conn, project), project) \
-                if any(op.get("project") == project for op in queued_ops()) else None
-            pending = int((view or {}).get("pending") or 0)
-            health = {"offline": False, "pending": pending, "queue": _queue_health(drained, pending)}
+            view = _overlay(_hub_rows(conn, project, line), project, line=line) if line else None
             queued = _queued_row(view, row_id)
             cur.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s AND row_id = %s",
                         (project, row_id))
             got = cur.fetchone()
             if got is None:
-                if queued is not None:  # an addition still waiting to be sent
-                    return {"row": queued, "history": [], **health}
-                marker = _marker(cur, project, row_id)
-                if marker:
-                    raise _purged_error(row_id, marker)
-                raise LedgerError(f"no such row: {row_id}", "not_found")
-            row = _row_dict(got)
-            if row["removed_at"] is not None:
-                raise _removed_error(row)
-            if view is not None and row_id in view["queue_removed"]:
-                raise LedgerError(f"row {row_id} is removed; the removal is waiting to be sent", "removed")
-            cur.execute(f"SELECT {', '.join(_HIST_COLS)} FROM ledger_history WHERE project = %s AND row_id = %s "
-                        "ORDER BY id", (project, row_id))
-            history = [dict(zip(_HIST_COLS, h, strict=True)) for h in cur.fetchall()]
+                if queued is None:  # not an addition still waiting to be sent
+                    marker = _marker(cur, project, row_id)
+                    if marker:
+                        raise _purged_error(row_id, marker)
+                    raise LedgerError(f"no such row: {row_id}", "not_found")
+            else:
+                row = _row_dict(got)
+                if row["removed_at"] is not None:
+                    raise _removed_error(row)
+                if view is not None and row_id in view["queue_removed"]:
+                    raise LedgerError(f"row {row_id} is removed; the removal is waiting to be sent", "removed")
+                cur.execute(f"SELECT {', '.join(_HIST_COLS)} FROM ledger_history WHERE project = %s "
+                            "AND row_id = %s ORDER BY id", (project, row_id))
+                history = [dict(zip(_HIST_COLS, h, strict=True)) for h in cur.fetchall()]
+        pending = int((view or {}).get("pending") or 0)
+        health = {"offline": False, "pending": pending, "queue": _queue_health(drained, pending)}
         return {"row": queued or row, "history": history, **health}
     except LedgerError:
         raise

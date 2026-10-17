@@ -1093,9 +1093,11 @@ def _hub_read(conn):
         yield cur
 
 
-def _read_boards(conn, cur, out: dict[str, Any]) -> None:
+def _read_boards(conn, cur, out: dict[str, Any], line: list[tuple[dict[str, Any], bool]]) -> None:
     """``read_ledger``'s boards into ``out["projects"]``: online from ``cur``
-    (the snapshot of ``conn``), offline (None) from the offline copy."""
+    (the snapshot of ``conn``), offline (None) from the offline copy, with
+    the waiting writes of ``line`` (``ledger._line_now``, read before the
+    snapshot opened) on top."""
     from khipu import ledger
 
     projects = {proj["project"]: proj for proj in _ledger_projects(cur)}
@@ -1103,7 +1105,7 @@ def _read_boards(conn, cur, out: dict[str, Any]) -> None:
     # its offline snapshot. Work already reads this outbox through each
     # offline view, so it must also make that project a board.
     queued = set()
-    for op in ledger.queued_ops():
+    for op, _answered in line:
         key = op.get("project")
         if isinstance(key, str) and key:
             queued.add(key)
@@ -1113,15 +1115,15 @@ def _read_boards(conn, cur, out: dict[str, Any]) -> None:
         key = proj["project"]
         history = None
         if cur is not None:
-            view = ledger._hub_rows(conn, key)
+            view = ledger._hub_rows(conn, key, line)
             # Writes the drain left waiting (another writer held the
             # line, or it stopped early) still show, marked queued, so
             # "What you see includes them" stays true online too.
             if key in queued:
-                view = ledger._hub_overlay(conn, view, key)
+                view = ledger._hub_overlay(conn, view, key, line)
         else:
             offline = ledger._offline_view(key) or ledger._no_copy_view()
-            view = ledger._overlay(offline, key)
+            view = ledger._overlay(offline, key, line=line)
             history = offline.get("history")
             out["as_of"] = view.get("as_of")
         needs = [r for r in view["rows"] if ledger._meaning(view["vocab"], r["state"]) == "needs"]
@@ -1159,8 +1161,9 @@ def read_ledger() -> dict[str, Any]:
 
             if not hub_snapshot.ledger_in_snapshot():
                 out["error"], out["copy_unavailable"] = LEDGER_NO_COPY, True
+        line = ledger._line_now()
         with _hub_read(conn) as cur:
-            _read_boards(conn, cur, out)
+            _read_boards(conn, cur, out, line)
     except Exception as exc:  # noqa: BLE001
         if not ledger._tables_missing(exc):
             out["error"] = type(exc).__name__

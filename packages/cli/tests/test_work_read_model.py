@@ -435,7 +435,7 @@ def test_an_online_read_shows_writes_still_waiting(monkeypatch):
     monkeypatch.setattr(ledger, "drain", lambda conn: {"jobs": 1, "landed": 0, "refused": 0,
                                                        "stopped_early": False, "busy": True})
     monkeypatch.setattr(ledger, "replica_catch_up", lambda conn: {})
-    monkeypatch.setattr(ledger, "_hub_view", lambda conn, project: {
+    monkeypatch.setattr(ledger, "_hub_view", lambda conn, project, line: {
         "rows": [dict(row("one", "Landed"), created_at=NOW, version=1)], "vocab": ledger.default_vocab(),
         "offline": False, "as_of": None})
     monkeypatch.setattr(ledger, "queued_ops", lambda **kw: [_queued()])
@@ -450,7 +450,7 @@ def test_an_online_read_with_an_empty_line_is_unchanged(monkeypatch):
     monkeypatch.setattr(ledger, "drain", lambda conn: {"jobs": 0, "landed": 0, "refused": 0,
                                                        "stopped_early": False})
     monkeypatch.setattr(ledger, "replica_catch_up", lambda conn: {})
-    monkeypatch.setattr(ledger, "_hub_view", lambda conn, project: {
+    monkeypatch.setattr(ledger, "_hub_view", lambda conn, project, line: {
         "rows": [], "vocab": ledger.default_vocab(), "offline": False, "as_of": None})
     monkeypatch.setattr(ledger, "queued_ops", lambda **kw: [])
     got = ledger.load("atlas")
@@ -490,7 +490,7 @@ def test_work_shows_writes_still_waiting_on_an_online_read(monkeypatch):
 
     monkeypatch.setattr(ledger, "_connect", lambda: Conn())
     monkeypatch.setattr(ledger, "drain", lambda conn: {"busy": True})
-    monkeypatch.setattr(ledger, "_hub_rows", lambda conn, project: {
+    monkeypatch.setattr(ledger, "_hub_rows", lambda conn, project, line: {
         "rows": [], "vocab": ledger.default_vocab(), "offline": False, "as_of": None})
     monkeypatch.setattr(ledger, "queued_ops", lambda **kw: [_queued()])
     got = work.read_ledger()
@@ -606,7 +606,7 @@ def _online_get(monkeypatch, *, hub_row, queued, drained=None):
     monkeypatch.setattr(ledger, "replica_catch_up", lambda conn: None)
     monkeypatch.setattr(ledger, "queued_ops", lambda **kw: list(queued))
     monkeypatch.setattr(ledger, "_marker", lambda cur, p, r: None)
-    def hub_rows(conn, project):
+    def hub_rows(conn, project, line):
         return {"vocab": ledger.default_vocab(), "rows": [copy.deepcopy(hub_row)] if hub_row else [],
                 "offline": False, "as_of": None}
 
@@ -666,7 +666,7 @@ def test_an_offline_read_with_an_unreadable_waiting_write_is_not_a_healthy_zero(
 def test_earlier_refusals_stay_in_the_next_reads_health(monkeypatch):
     monkeypatch.setattr(ledger, "_connect", lambda: _Conn())
     monkeypatch.setattr(ledger, "replica_catch_up", lambda c: None)
-    monkeypatch.setattr(ledger, "_hub_view", lambda c, p: {"rows": [], "vocab": ledger.default_vocab(),
+    monkeypatch.setattr(ledger, "_hub_view", lambda c, p, line: {"rows": [], "vocab": ledger.default_vocab(),
                                                           "offline": False})
     ledger._refused_dir().mkdir(parents=True)
     (ledger._refused_dir() / "refused.json").write_text("{}")

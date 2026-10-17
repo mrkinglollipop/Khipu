@@ -8,6 +8,9 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+import psycopg
+import pytest
+
 from khipu import hub_snapshot as hs
 from khipu import ledger, work
 from tests.test_ledger import P, _real_connect, _snapshot, hub, ok, pg_dsn  # noqa: F401
@@ -72,7 +75,8 @@ def test_the_overlay_keeps_a_queued_set_whose_field_moved_as_late(hub, tmp_path)
     ledger.enqueue(op)
     with _real_connect(hub) as c:
         _applied(c, "set", state="IN FLIGHT")
-        view = ledger._overlay(ledger._hub_view(c, P), P)
+        line = ledger._line_now(P)
+        view = ledger._overlay(ledger._hub_view(c, P, line), P, line=line)
         result = ledger.apply_op(c, op, late=True)
     assert result["late"] and result["state"] == "IN FLIGHT"
     assert view["rows"][0]["state"] == "IN FLIGHT"
@@ -285,7 +289,8 @@ def test_an_online_read_never_takes_a_receipt_newer_than_its_rows(hub, tmp_path,
     op = _waiting_done(tmp_path)
     calls = _land_during_receipt_read(hub, op, monkeypatch)
     with _real_connect(hub) as c:
-        shown = ledger._hub_overlay(c, ledger._hub_view(c, P), P)["rows"][0]
+        line = ledger._line_now(P)
+        shown = ledger._hub_overlay(c, ledger._hub_view(c, P, line), P, line)["rows"][0]
     assert calls and calls[0]["ok"]
     assert shown["state"] == "DONE" and shown["queued"]
 
@@ -293,9 +298,10 @@ def test_an_online_read_never_takes_a_receipt_newer_than_its_rows(hub, tmp_path,
 def test_an_online_read_and_its_overlay_share_one_snapshot(hub, tmp_path, monkeypatch):
     op = _waiting_done(tmp_path)
     with _real_connect(hub) as c:
-        view = ledger._hub_view(c, P)
+        line = ledger._line_now(P)
+        view = ledger._hub_view(c, P, line)
         _remote_apply(hub, op, monkeypatch)
-        shown = ledger._hub_overlay(c, view, P)["rows"][0]
+        shown = ledger._hub_overlay(c, view, P, line)["rows"][0]
     assert shown["state"] == "DONE" and shown["queued"]
 
 
@@ -313,6 +319,107 @@ def test_one_row_read_never_takes_a_receipt_newer_than_its_row(hub, tmp_path, mo
 def test_a_snapshot_read_leaves_the_connection_as_it_found_it(hub):
     with _real_connect(hub) as c:
         before = c.isolation_level
-        ledger._hub_view(c, P)
+        ledger._hub_view(c, P, ledger._line_now(P))
         assert c.isolation_level == before
         assert c.info.transaction_status == c.info.transaction_status.IDLE
+
+
+def _drain_during_receipt_read(hub, monkeypatch, *, keep_job):
+    """This Mac's own drain lands the waiting write after the read's snapshot
+    opened, then takes its job off the line, or (``keep_job``) records its
+    outcome and leaves the job for the next drain."""
+    real_drain, real, calls = ledger.drain, hs._read_ledger_receipts, []
+    monkeypatch.setattr(ledger, "drain", lambda *a, **k: {**ledger._drain_result(), "busy": True})
+
+    def racing(cur, ids):
+        if ids and not calls:
+            with monkeypatch.context() as m:
+                m.setattr(ledger, "_replica_sync", lambda *a: None)
+                if keep_job:
+                    tidy = ledger._tidy
+                    m.setattr(ledger, "_tidy", lambda step, *a, **k: None if getattr(step, "__name__", "") == "unlink"
+                              else tidy(step, *a, **k))
+                with _real_connect(hub) as writer:
+                    calls.append(real_drain(writer))
+        return real(cur, ids)
+
+    monkeypatch.setattr(hs, "_read_ledger_receipts", racing)
+    return calls
+
+
+@pytest.mark.parametrize("keep_job", [False, True])
+def test_a_local_drain_after_the_snapshot_still_shows_the_write(hub, tmp_path, monkeypatch, keep_job):
+    _waiting_done(tmp_path)
+    calls = _drain_during_receipt_read(hub, monkeypatch, keep_job=keep_job)
+    got = ledger.load(P)
+    assert calls and calls[0]["landed"] == 1
+    with _real_connect(hub) as c:
+        assert c.execute("SELECT state FROM ledger_rows WHERE row_id = 'r'").fetchone()[0] == "DONE"
+    assert got["rows"][0]["state"] == "DONE" and got["rows"][0]["queued"]
+    assert got["pending"] == 1
+
+
+@pytest.mark.parametrize("keep_job", [False, True])
+def test_a_local_drain_after_the_snapshot_still_shows_the_write_on_its_row(hub, tmp_path, monkeypatch, keep_job):
+    _waiting_done(tmp_path)
+    calls = _drain_during_receipt_read(hub, monkeypatch, keep_job=keep_job)
+    with _real_connect(hub) as c:
+        got = ledger.get(P, "r", conn=c)
+    assert calls and calls[0]["landed"] == 1
+    assert got["row"]["state"] == "DONE" and got["row"]["queued"] and got["pending"] == 1
+    assert all(h["to_state"] != "DONE" for h in got["history"])
+
+
+def _backend_state_at_each_file_read(hub, monkeypatch, conn):
+    """Every read of the line, an outcome or the outbox from disk stalls past
+    the SQL deadlines and records what ``conn``'s backend is doing then."""
+    monkeypatch.setattr(ledger, "LEDGER_STATEMENT_TIMEOUT_MS", 100)
+    observer = psycopg.Connection.connect(hub, autocommit=True)
+    pid, seen = conn.info.backend_pid, []
+
+    def watched(name, real):
+        def read(*a, **k):
+            state = observer.execute("SELECT state FROM pg_stat_activity WHERE pid = %s", (pid,)).fetchone()
+            seen.append((name, state[0] if state else None))
+            time.sleep(0.15)
+            return real(*a, **k)
+        return read
+
+    for name in ("queued_ops", "_outcome", "_outbox_jobs", "outbox_status"):
+        monkeypatch.setattr(ledger, name, watched(name, getattr(ledger, name)))
+    return seen, observer
+
+
+@pytest.mark.parametrize("reader", ["load", "get", "work"])
+def test_no_hub_transaction_is_open_while_the_line_is_read_from_disk(hub, tmp_path, monkeypatch, reader):
+    _waiting_done(tmp_path)
+    monkeypatch.setattr(ledger, "drain", lambda *a, **k: {**ledger._drain_result(), "busy": True})
+    c = _real_connect(hub)
+    seen, observer = _backend_state_at_each_file_read(hub, monkeypatch, c)
+    try:
+        if reader == "load":
+            shown = ledger.load(P, conn=c)["rows"][0]
+        elif reader == "get":
+            shown = ledger.get(P, "r", conn=c)["row"]
+        else:
+            monkeypatch.setattr(ledger, "_connect", lambda: c)
+            shown = work.read_ledger()["projects"][P]["rows"][0]
+    finally:
+        c.close()
+        observer.close()
+    assert shown["state"] == "DONE" and shown["queued"]
+    assert seen and all(state == "idle" for _name, state in seen), seen
+
+
+def test_a_snapshot_left_idle_is_ended_by_the_hub(hub, monkeypatch):
+    monkeypatch.setattr(ledger, "LEDGER_IDLE_TIMEOUT_MS", 200)
+    c = _real_connect(hub)
+    try:
+        with pytest.raises(psycopg.OperationalError):
+            with ledger._one_snapshot(c) as cur:
+                cur.execute("SHOW idle_in_transaction_session_timeout")
+                assert cur.fetchone()[0] == "200ms"
+                time.sleep(0.6)
+                cur.execute("SELECT 1")
+    finally:
+        c.close()
