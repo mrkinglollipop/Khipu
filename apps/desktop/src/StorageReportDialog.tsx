@@ -7,7 +7,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { Dialog } from "./ui";
 
-type Level = "ok" | "amber" | "red";
+export type Level = "ok" | "amber" | "red";
 export type StorageVolume = {
   label: string;
   path?: string;
@@ -32,7 +32,7 @@ const PLACE_WORDS: Record<string, string> = {
   temp: "Temporary files",
 };
 
-const LEVEL_WORDS: Record<Level, string> = {
+export const LEVEL_WORDS: Record<Level, string> = {
   ok: "Plenty of room",
   amber: "Running low",
   red: "Almost full",

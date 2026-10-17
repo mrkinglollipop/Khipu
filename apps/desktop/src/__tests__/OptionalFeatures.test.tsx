@@ -157,8 +157,11 @@ describe("OptionalFeatures", () => {
   it("locks an environment-sourced switch and names the variable", async () => {
     backend.features.rerank = { enabled: true, source: "env" };
     render(<OptionalFeatures active />);
-    await waitFor(() => expect(switchFor(/Reorder top results/)).toBeDisabled());
-    expect(switchFor(/Reorder top results/)).toBeChecked();
+    // The switch is also disabled while the first read runs, so wait for both.
+    await waitFor(() => {
+      expect(switchFor(/Reorder top results/)).toBeDisabled();
+      expect(switchFor(/Reorder top results/)).toBeChecked();
+    });
     expect(screen.getByText("KHIPU_FEATURE_RERANK")).toBeInTheDocument();
     fireEvent.click(switchFor(/Reorder top results/));
     expect(calls.some(([c]) => c === "khipu_feature_set")).toBe(false);

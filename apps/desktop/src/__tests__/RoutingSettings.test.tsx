@@ -687,7 +687,9 @@ describe("Settings -> Routing: standing rules", () => {
     undone = false;
     answers.khipu_route_rule = { ok: false, error: "the pending rule changed again" };
     await page();
-    const undoButtons = screen.getAllByRole("button", { name: "Undo pending rule 3" });
+    // page() returns once any Accounts list shows, and the first page's list is
+    // still there, so wait for the second page's Undo button itself.
+    const undoButtons = await screen.findAllByRole("button", { name: "Undo pending rule 3" });
     fireEvent.click(undoButtons[undoButtons.length - 1]);
     expect(await screen.findByRole("alert")).toHaveTextContent("the pending rule changed again");
   });

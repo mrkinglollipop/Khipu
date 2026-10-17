@@ -72,11 +72,12 @@ describe("HealthChecksCard", () => {
     await waitFor(() => expect(input).toHaveValue("60"));
     fireEvent.change(input, { target: { value: "90" } });
     fireEvent.click(screen.getAllByRole("button", { name: "Save" })[0]);
+    // The field already shows the typed value, so wait for the write itself.
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "doctor_rate_window_minutes", value: "90" }]));
     await waitFor(() => expect(input).toHaveValue("90"));
-    expect(calls).toContainEqual(["khipu_config_set", { key: "doctor_rate_window_minutes", value: "90" }]);
     fireEvent.click(screen.getByRole("button", { name: "Use default" }));
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "doctor_rate_window_minutes" }]));
     await waitFor(() => expect(input).toHaveValue("60"));
-    expect(calls).toContainEqual(["khipu_config_unset", { key: "doctor_rate_window_minutes" }]);
   });
 
   it("refuses a value out of range before calling Khipu", async () => {
@@ -201,5 +202,28 @@ describe("promotionAttention", () => {
     expect(promotionAttention({ promotion: { queued: null } })).toEqual([]);
     expect(promotionAttention({})).toEqual([]);
     expect(promotionAttention(null)).toEqual([]);
+  });
+});
+
+describe("HealthChecksCard: the Storage section's disk row (slice 8)", () => {
+  it("always shows the disk row with an Open storage report button, not only when the disk is low", async () => {
+    const open = vi.fn();
+    render(
+      <HealthChecksCard
+        active
+        diskSpace={{ level: "ok", message: "303.0 GB is free on the disk that holds Khipu's data." }}
+        onOpenStorageReport={open}
+      />,
+    );
+    expect(await screen.findByText("Disk space")).toBeInTheDocument();
+    expect(screen.getByText("Plenty of room. 303.0 GB is free on the disk that holds Khipu's data.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open storage report" }));
+    expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  it("says when doctor hasn't checked the disk and still offers the report", async () => {
+    render(<HealthChecksCard active diskSpace={null} onOpenStorageReport={() => {}} />);
+    expect(await screen.findByText("Doctor hasn't checked the disk yet. The storage report checks it now.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open storage report" })).toBeInTheDocument();
   });
 });

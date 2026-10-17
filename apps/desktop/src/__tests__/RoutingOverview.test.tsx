@@ -357,7 +357,7 @@ describe("Accounts and routing: every problem shows, once", () => {
     answers.khipu_route_view = () => new Promise((r) => (release = r));
     render(<RoutingSettings active plansState={plansOf([planRow({ key: "claude|" })])} />);
     expect(await screen.findByText("Reading what needs you…")).toHaveAttribute("role", "status");
-    expect(groupButton("Accounts")).toHaveTextContent("Reading…");
+    await waitFor(() => expect(groupButton("Accounts")).toHaveTextContent("Reading…"));
     await act(async () => release(calm()));
     expect(await screen.findByText("Nothing here needs you.")).toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Needs you" })).toBeNull();

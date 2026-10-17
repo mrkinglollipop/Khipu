@@ -127,7 +127,7 @@ describe("App — Recall edges", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open in Recall" }));
     await waitFor(() => expect(screen.queryByText("Searching…")).not.toBeInTheDocument());
     const recallPanel = screen.getByRole("heading", { name: "Recall" }).closest("section") as HTMLElement;
-    expect(within(recallPanel).getByText("Exact detail")).toBeInTheDocument();
+    expect(await within(recallPanel).findByText("Exact detail")).toBeInTheDocument();
     await act(async () => { releaseSearch?.(JSON.stringify({ results: [{ kind: "episode", id: 99, label: "Stale hit" }] })); });
     expect(screen.queryByText("Stale hit")).not.toBeInTheDocument();
   });

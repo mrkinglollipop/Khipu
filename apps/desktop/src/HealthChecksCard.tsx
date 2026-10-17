@@ -11,6 +11,7 @@ import { healthCheckLabel } from "./healthRows";
 import { SettingField } from "./SettingsControls";
 import { callCli, useCliState } from "./settingsCli";
 import type { ConfigShape } from "./settingsCli";
+import { LEVEL_WORDS, type Level } from "./StorageReportDialog";
 
 const WINDOW_KEY = "doctor_rate_window_minutes";
 const WAIT_KEY = "promote_hub_wait_minutes";
@@ -106,7 +107,25 @@ export function lapseTime(iso: string): string {
   return d.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
 }
 
-export function HealthChecksCard({ active }: { active: boolean }) {
+export type DiskSpace = { level?: Level; message?: string } | null | undefined;
+
+/** The disk row's sentence, from doctor's `disk_space` block. */
+export function diskWords(ds: DiskSpace): string {
+  if (!ds?.level) return "Doctor hasn't checked the disk yet. The storage report checks it now.";
+  return ds.message ? `${LEVEL_WORDS[ds.level]}. ${ds.message}` : `${LEVEL_WORDS[ds.level]}.`;
+}
+
+export function HealthChecksCard({
+  active,
+  diskSpace,
+  onOpenStorageReport,
+}: {
+  active: boolean;
+  /** Doctor's last `disk_space` block, for the Storage section's disk row. */
+  diskSpace?: DiskSpace;
+  /** Opens the read-only storage report (`khipu storage`). */
+  onOpenStorageReport?: () => void;
+}) {
   const cfg = useCliState<ConfigShape>("khipu_config_show", active);
   const row = cfg.data?.minute_settings?.[WINDOW_KEY];
   const min = row?.min ?? 5;
@@ -159,6 +178,17 @@ export function HealthChecksCard({ active }: { active: boolean }) {
       </div>
       <div className="section-head">Storage</div>
       <div className="section-body">
+        <div className="set-field">
+          <div className="set-label">Disk space</div>
+          <p className="set-help">{diskWords(diskSpace)}</p>
+          {onOpenStorageReport ? (
+            <div className="toolbar">
+              <button type="button" className="sm" onClick={onOpenStorageReport}>
+                Open storage report
+              </button>
+            </div>
+          ) : null}
+        </div>
         {STORAGE_SETTINGS.map((s) => {
           const row = cfg.data?.storage?.[s.key];
           return (
