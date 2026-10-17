@@ -1252,6 +1252,10 @@ def _remove_work_view() -> dict[str, Any]:
     place = "work view"
     path = work.view_file()
     try:
+        # A refresh that read before this Forget may be paused just before its
+        # replace. Advance the shared fence before deleting so it cannot put
+        # that stale document back after this cleanup returns.
+        work.invalidate_view()
         names = [n for n in _listing(path.parent)
                  if n == path.name or (n.startswith(f".{path.name}.") and n.endswith(".tmp"))]
     except OSError as exc:

@@ -1048,10 +1048,12 @@ def test_usage_accounts_are_set_shown_and_unset_through_config(fake, capsys, khi
                      {"label": "Grok", "harness": "grok", "home": None}],
         "user_home": str(Path.home()), "version": config.accounts_version(), "none": False, "request": None}
     assert "usage_accounts" not in json.loads(config.config_file().read_text())
-    # An empty list is the default too.
+    # An explicit empty list is distinct from an unset list: read none.
     assert _config_cli(["--set", "usage_accounts", json.dumps([{"harness": "codex"}])], capsys)[0] == 0
     rc, out = _config_cli(["--set", "usage_accounts", "[]"], capsys)
-    assert rc == 0 and out["usage_accounts"]["source"] == "default"
+    assert rc == 0 and out["usage_accounts"] == {
+        "value": [], "source": "file", "accounts": [], "user_home": str(Path.home()),
+        "version": config.accounts_version(), "none": False, "request": None}
 
 
 _TWO = [{"label": "Claude", "harness": "claude"}, {"label": "Codex", "harness": "codex"}]

@@ -786,6 +786,40 @@ describe("entries the editor did not change go back as stored (review round 4)",
   });
 });
 
+describe("the account-list empty state (review P2)", () => {
+  it.each([
+    ["missing", { value: null, source: "default", version: "av-empty-missing", accounts: [{ label: "Claude", harness: "claude", home: null }] }],
+    ["empty", { value: [], source: "file", version: "av-empty-file", accounts: [] }],
+  ])("keeps %s distinct from an explicit empty list", async (_case, usage_accounts) => {
+    configShow = { usage_accounts };
+    render(<Settings />);
+    await screen.findByText(usage_accounts.source === "default" ? "Default" : "Your list");
+    if (usage_accounts.source === "default") {
+      expect(screen.queryByRole("button", { name: "Go back to every installed CLI" })).toBeNull();
+    } else {
+      expect(screen.getByRole("button", { name: "Go back to every installed CLI" })).toBeInTheDocument();
+    }
+  });
+
+  it("removing the final explicitly configured account sets [] instead of unsetting it", async () => {
+    configShow = {
+      usage_accounts: {
+        value: [{ label: "Claude work", harness: "claude", home: "~/.claude-work" }],
+        source: "file", version: "av-empty-final",
+        accounts: [{ label: "Claude work", harness: "claude", home: "~/.claude-work" }],
+      },
+    };
+    render(<Settings />);
+    await screen.findByText("Your list");
+    fireEvent.click(screen.getByRole("button", { name: "Remove Claude work" }));
+    await waitFor(() => expect(calls).toContainEqual([
+      "khipu_config_set",
+      { key: "usage_accounts", value: "[]", expect: "av-empty-final" },
+    ]));
+    expect(calls.some(([cmd]) => cmd === "khipu_config_unset")).toBe(false);
+  });
+});
+
 describe("a refused account list, in plain words (fix round 3)", () => {
   const addButton = () => screen.getByRole("button", { name: "Add" });
   const configSets = () => calls.filter(([c]) => c === "khipu_config_set");

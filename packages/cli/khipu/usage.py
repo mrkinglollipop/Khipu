@@ -912,7 +912,7 @@ def configured_accounts() -> list[dict]:
 
     config = load_config()
     raw = config.get("usage_accounts")
-    if not isinstance(raw, list) or not raw:
+    if not isinstance(raw, list):
         if reads_none(config):
             return []
         return [{"label": LABELS[h], "harness": h, "home": None} for h in HARNESSES if _command(h)]
@@ -1118,7 +1118,7 @@ def accounts_status() -> dict:
 
     config = load_config()
     raw = config.get("usage_accounts")
-    stored = raw if isinstance(raw, list) and raw else None
+    stored = raw if isinstance(raw, list) else None
     try:
         user_home = str(Path.home())
     except RuntimeError:
@@ -1129,7 +1129,7 @@ def accounts_status() -> dict:
     # what a write hands back (``--expect``) so it is refused when the list
     # changed after it was read.
     request = config.get("usage_accounts_request")
-    return {"value": stored, "source": "file" if stored is not None else "none" if none else "default",
+    return {"value": stored, "source": "none" if none else "file" if stored is not None else "default",
             "accounts": configured_accounts(), "user_home": user_home, "version": accounts_version(config),
             "none": none, "request": request if isinstance(request, dict) else None}
 
