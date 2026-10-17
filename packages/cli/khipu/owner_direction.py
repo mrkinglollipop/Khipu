@@ -40,6 +40,11 @@ MIN_WORDS = 3
 PURGE_DELAY_S = 24 * 3600
 LOG_NAME = "owner-actions.jsonl"
 HEAD_NAME = "owner-actions.head.json"
+# A break found in the log (a changed line, lines cut from its end) is kept
+# here, apart from the log and its head, until the owner acknowledges it: a
+# later append rewrites the head and could otherwise make a cut end look
+# whole again.
+ALARM_NAME = "owner-actions.alarm.json"
 # Every line Khipu writes to the log carries this version. Lines without one
 # may lead the log (written before it was chained); after the first
 # versioned line, a line without it, or with an older one, is a break.
@@ -147,6 +152,10 @@ ACTIONS: dict[str, dict[str, Any]] = {
                                 "split"),
                       "target": "pair"},
     "direction.off": {"verbs": ("off", "turn off", "disable", "stop"), "target": "direction"},
+    # Turning it back on is itself an owner action, and always a widening.
+    "direction.on": {"verbs": ("on", "turn on", "switch on", "enable", "re-enable", "reenable"),
+                     "target": "direction"},
+    "direction.acknowledge": {"verbs": ("acknowledge", "acknowledged", "seen", "dismiss"), "target": "alarm"},
     # Trusting and untrusting a front end take their own verbs (TRUST_VERBS, UNTRUST_VERBS).
     "direction.set": {"verbs": ("set", "change", "make", "shorten", "lengthen", "turn on", "turn off"),
                       "target": "direction_setting", "stores": True},
@@ -1464,6 +1473,12 @@ def _append(line: dict) -> dict:
             line["words_sha"] = _sha(line["words"])
         else:
             line.pop("words_sha", None)
+        try:
+            before = _verify_chain()
+        except Exception:  # noqa: BLE001 - the check never stops an owner's change from being logged
+            before = None
+        if before is not None and before["first_bad"]:
+            _raise_alarm(before["first_bad"])
         line["v"] = LOG_VERSION
         line["prev"] = _prev_of(raw)
         line["hash"] = _line_hash(line)
@@ -1523,7 +1538,65 @@ def _head() -> dict | None | type:
     return data
 
 
+def alarm_path() -> Path:
+    return log_path().with_name(ALARM_NAME)
+
+
+def read_alarm() -> dict | None:
+    """The tamper alarm, while it waits for the owner's acknowledgement."""
+    try:
+        data = json.loads(alarm_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        # An alarm file that can't be read is still an alarm.
+        return {"at": None, "first_bad": {"line": 0, "id": None, "kind": None,
+                                          "why": "the record of an earlier break can't be read"}}
+    return data if isinstance(data, dict) and isinstance(data.get("first_bad"), dict) else None
+
+
+def _raise_alarm(bad: dict) -> None:
+    """Keep the first break found until the owner acknowledges it. Best
+    effort: the live check still shows a break it can see."""
+    if read_alarm() is not None:
+        return
+    try:
+        _write_private(alarm_path(), json.dumps({"at": _iso(_clock()), "first_bad": bad}) + "\n")
+    except OSError:
+        pass
+
+
+def acknowledge_alarm() -> dict | None:
+    """The owner has seen the tamper alarm: it is cleared (the alarm it was,
+    or None when none was raised). A break the log still shows raises it
+    again at the next check."""
+    alarm = read_alarm()
+    with contextlib.suppress(FileNotFoundError):
+        alarm_path().unlink()
+    return alarm
+
+
 def verify_log() -> dict:
+    """Whether the log holds: the chain as it stands (``_verify_chain``), and
+    no tamper alarm waiting for the owner. A break found now raises the
+    alarm; while it waits, the log reads as broken at the entry it named,
+    however the log looks since, and ``alarm`` carries it."""
+    out = _verify_chain()
+    if out["first_bad"]:
+        _raise_alarm(out["first_bad"])
+    alarm = read_alarm()
+    if alarm is None:
+        return out
+    if out["ok"]:
+        bad = dict(alarm["first_bad"])
+        bad["why"] = (f"{bad.get('why') or 'the log was changed'} (found {alarm.get('at') or 'earlier'}; this "
+                      "alarm stays until the owner acknowledges it)")
+        out = {"ok": False, "lines": out["lines"], "first_bad": bad}
+    out["alarm"] = alarm
+    return out
+
+
+def _verify_chain() -> dict:
     """Whether the log's hash chain holds: ``first_bad`` names the first line
     that has no hash or a wrong one, no version or an older one after the
     chain began, does not follow the line before it, or whose words do not
@@ -1996,8 +2069,10 @@ def _before(want: dict):
         except Exception:  # noqa: BLE001 - a row Khipu can't read now can't be put back
             return _UNREADABLE
         return {"fields": {k: row.get(k) for k in ("state", "evidence", "owner", "title", "link")}}
-    if action == "direction.off":
+    if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
+    if action == "direction.acknowledge":
+        return {"alarm": read_alarm()}
     if action == "direction.set":
         return {"settings": {k: owner_turns.settings()[k] for k in ("latest_window_h", "earlier_window_min",
                                                                    "trusted", "session_binding")}}
@@ -2144,9 +2219,17 @@ def _undo_ledger_set(line, via):
 
 def _undo_direction(line, via):
     before = line.get("before") or {}
-    if line["action"] == "direction.off":
+    if line["action"] in ("direction.off", "direction.on"):
         return {"ok": True, "settings": owner_turns.write_settings({"enabled": bool(before.get("enabled"))})}
     return {"ok": True, "settings": owner_turns.write_settings(dict(before.get("settings") or {}))}
+
+
+def _undo_acknowledge(line, via):
+    """The alarm the owner acknowledged comes back, as it was."""
+    alarm = (line.get("before") or {}).get("alarm")
+    if isinstance(alarm, dict) and read_alarm() is None:
+        _write_private(alarm_path(), json.dumps(alarm) + "\n")
+    return {"ok": True, "alarm": read_alarm()}
 
 
 def _b(line: dict) -> dict:
@@ -2300,7 +2383,9 @@ _UNDO = {
     "work.same": _undo_link,
     "work.not_same": _undo_link,
     "direction.off": _undo_direction,
+    "direction.on": _undo_direction,
     "direction.set": _undo_direction,
+    "direction.acknowledge": _undo_acknowledge,
 }
 
 
@@ -2470,7 +2555,8 @@ def _set_values(key: str, raw: str) -> dict:
 
 
 def run_cli(args) -> int:
-    """``khipu owner-direction``: show, set, on, off, actions, undo."""
+    """``khipu owner-direction``: show, set, on, off, acknowledge, actions,
+    undo."""
     from khipu import routing
 
     cmd = getattr(args, "od_cmd", None) or "show"
@@ -2507,7 +2593,7 @@ def run_cli(args) -> int:
                 _print({"ok": False, "error": why, "code": code})
                 return 2
             widening = False
-            if line["action"] in ("direction.set", "direction.off"):
+            if line["action"] in ("direction.set", "direction.off", "direction.on"):
                 widening = _widens(None, (line.get("before") or {}).get("settings")
                                    or {"enabled": (line.get("before") or {}).get("enabled")})
             want = intent("direction.undo", args.id, names=undo_names(line), widening=widening, value=args.id)
@@ -2519,11 +2605,32 @@ def run_cli(args) -> int:
             _print(finish(out) or out)
             return 0
         if cmd == "on":
-            via = routing._owner_via(args, None)
+            # Turning it on is an owner action like any other: logged, with an
+            # Undo, and by direction a widening (decision 1), so it needs the
+            # owner's yes in a later message.
+            want = intent("direction.on", "direction", widening=_widens(None, {"enabled": True}),
+                          value=json.dumps({"enabled": True}))
+            via = routing._owner_via(args, want)
             if via is None:
                 _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
                 return 2
-            _print({"ok": True, "settings": owner_turns.write_settings({"enabled": True})})
+            out = {"ok": True, "settings": owner_turns.write_settings({"enabled": True})}
+            _print(finish(out) or out)
+            return 0
+        if cmd == "acknowledge":
+            verify_log()  # a break the log shows now raises the alarm first
+            if read_alarm() is None:
+                _print({"ok": True, "acknowledged": None, "line": "No tamper alarm is waiting."})
+                return 0
+            want = intent("direction.acknowledge", "alarm")
+            via = routing._owner_via(args, want)
+            if via is None:
+                _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
+                return 2
+            alarm = acknowledge_alarm()
+            out = {"ok": True, "acknowledged": alarm, "chain": verify_log(),
+                   "line": "The tamper alarm is acknowledged."}
+            _print(finish(out) or out)
             return 0
         if cmd == "off":
             want = intent("direction.off", "direction")
@@ -2586,11 +2693,14 @@ def add_parser(sub) -> None:
     verbs.add_parser("show", help="The settings and how many turns and actions are recorded")
     act = verbs.add_parser("actions", help="The owner-actions log, newest first")
     act.add_argument("--json", action="store_true")
-    for name, words in (("on", "Turn owner direction on (the app, or a typed yes)"),
+    for name, words in (("on", "Turn owner direction on"),
                         ("off", "Turn owner direction off")):
         sp = verbs.add_parser(name, help=words)
         sp.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
         add_owner_flags(sp)
+    ack = verbs.add_parser("acknowledge", help="Acknowledge the tamper alarm on the owner-actions log")
+    ack.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
+    add_owner_flags(ack)
     st = verbs.add_parser("set", help="Change a setting: latest_window_h, earlier_window_min, session_binding, "
                                       "trust or untrust")
     st.add_argument("key")

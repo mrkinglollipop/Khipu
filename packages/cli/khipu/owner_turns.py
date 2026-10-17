@@ -180,6 +180,27 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str) -> str:
     return "unknown"
 
 
+_DIRECTION_WORD = re.compile(r"(?<!\w)direction(?!\w)")
+_SHORT_CONFIRM = re.compile(r"(?<!\w)(?:yes|confirm|confirmed|do it|go ahead|approve|approved)(?!\w)")
+_CONFIRM_MOST_WORDS = 8
+_CONFIRM_WITHIN_S = 3600
+
+
+def _may_turn_on(session: str, typed: str | None, now: float) -> bool:
+    """While owner direction is off, only the turns that could turn it back
+    on by chat are kept (decision 1's two turns): one that names owner
+    direction, and a short yes soon after a kept turn of the same session.
+    Everything else the owner types is not recorded."""
+    norm = _norm(typed or "")
+    if not norm:
+        return False
+    if _DIRECTION_WORD.search(norm):
+        return True
+    if len(norm.split()) > _CONFIRM_MOST_WORDS or not _SHORT_CONFIRM.search(norm):
+        return False
+    return any(now - float(t.get("ts") or 0) <= _CONFIRM_WITHIN_S for t in turns(session, now))
+
+
 def _norm(text: str) -> str:
     return " ".join(text.lower().split())
 
@@ -189,7 +210,9 @@ def note_brief(text: str, *, parent: str, harness: str, now: float | None = None
     text is this brief is a dispatched job's, never the owner's, and the
     brief names the parent session the job was started from."""
     norm = _norm(text or "")
-    if len(norm) < 20 or not parent or not settings()["enabled"]:
+    # Kept while owner direction is off too: a turn that could turn it back
+    # on is recorded then, and a brief must never pass for one.
+    if len(norm) < 20 or not parent:
         return
     line = {"ts": time.time() if now is None else now, "head": norm[:200],
             "sha": hashlib.sha256(norm.encode()).hexdigest(), "parent": parent, "harness": harness}
@@ -326,8 +349,6 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
     if not isinstance(payload, dict):
         return None
     conf = settings()
-    if not conf["enabled"]:
-        return None
     session = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
     prompt = payload.get("prompt")
     if not session or not isinstance(prompt, str):
@@ -336,6 +357,8 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
     typed = owner_text(prompt)
     machine = is_machine(clean_user_text(prompt, owner=True), anywhere=True)
+    if not conf["enabled"] and (machine or not _may_turn_on(session, typed, now)):
+        return None
     # A wrapper away from its harness's place: which words are the owner's
     # can't be told, so none are kept and the turn never counts.
     wrapped = typed is None and not machine

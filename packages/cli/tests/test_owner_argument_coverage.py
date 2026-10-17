@@ -4,8 +4,8 @@ An owner direction authorises a structured action only when every argument of th
 action itself, what it acts on, the project, the field, the value, the end, the order) is stated
 in the owner's own words, in the clause that asks for it. ``owner_direction.arguments`` lists
 them for every owner action and ``_read`` checks each one. The third review's probes and their
-mirror cases are the table here; selecting one of several waiting widenings by name is tested
-after it.
+mirror cases are the table here; the tamper alarm, turning direction on as an owner action and
+selecting one of several waiting widenings by name are tested after it.
 
 Hermetic: the ``world`` fixture from tests/test_owner_direction.py (temp data and capture
 folders, turns recorded the way the prompt hook records them)."""
@@ -234,3 +234,115 @@ def test_a_named_confirmation_with_another_number_is_refused(world):
     words = "yes, make the earlier window 90 minutes"
     rc, out = world.run(["owner-direction", "set", "earlier_window_min", "60"], words, world.say(words))
     assert rc == 2 and owner_turns.settings()["earlier_window_min"] == 30, out
+
+
+# ---- turning owner direction on is an owner action ------------------------------------------------
+
+
+def test_turning_it_on_in_the_app_is_logged_with_an_undo(world, khipu_app):
+    owner_turns.write_settings({"enabled": False})
+    khipu_app.as_app()
+    rc, out = world.run(["owner-direction", "on", "--from-app"])
+    assert rc == 0 and owner_turns.settings()["enabled"] is True, out
+    line = owner_direction.actions()[-1]
+    assert (line["action"], line["auth"], line["before"]) == ("direction.on", "app", {"enabled": False})
+    rc, out = world.run(["owner-direction", "undo", line["id"], "--from-app"])
+    assert rc == 0 and owner_turns.settings()["enabled"] is False, out
+
+
+def test_turning_it_back_on_by_chat_takes_two_turns(world):
+    words = "turn owner direction off please"
+    rc, out = world.run(["owner-direction", "off"], words, world.say(words))
+    assert rc == 0 and owner_turns.settings()["enabled"] is False, out
+    # Off: the owner's other words are not recorded, and they can't act.
+    kept = len(owner_turns.turns(base.OWNER))
+    env = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"}
+    assert owner_turns.record({"session_id": base.OWNER, "prompt": "pause Codex for now please",
+                               "cwd": str(world.tmp)}, env) is None
+    assert len(owner_turns.turns(base.OWNER)) == kept
+    words = "turn owner direction on please"
+    token = world.say(words)
+    rc, out = world.run(["owner-direction", "on"], words, token)
+    assert rc == 2 and out["code"] == SECOND and owner_turns.settings()["enabled"] is False, out
+    rc, out = world.run(["owner-direction", "on"], "yes", world.say("yes"))
+    assert rc == 0 and owner_turns.settings()["enabled"] is True, out
+    line = owner_direction.actions()[-1]
+    assert line["action"] == "direction.on" and line["auth"] == "direction" and line["before"] == {"enabled": False}
+
+
+def test_while_off_nothing_but_turning_it_on_goes_by_direction(world):
+    owner_turns.write_settings({"enabled": False})
+    words = "turn owner direction on and pause Codex"
+    token = world.say(words)
+    rc, out = world.run(["route", "pause", "Codex"], words, token)
+    assert rc == 2 and out["code"] == "direction_off", out
+
+
+# ---- the tamper alarm --------------------------------------------------------------------------
+
+
+def _cut_the_tail():
+    for number in range(2):
+        owner_direction._append({"kind": "action", "id": f"before-{number}", "auth": "app",
+                                 "action": "route.lift", "target": "codex|"})
+    path = owner_direction.log_path()
+    path.write_text("\n".join(path.read_text(encoding="utf-8").splitlines()[:-1]) + "\n", encoding="utf-8")
+
+
+def _later_append():
+    owner_direction._append({"kind": "action", "id": "after-tamper", "auth": "app", "action": "route.lift",
+                             "target": "codex|"})
+
+
+def test_a_later_append_does_not_launder_a_cut_tail(world):
+    _cut_the_tail()
+    assert owner_direction.verify_log()["ok"] is False
+    _later_append()
+    chain = owner_direction.verify_log()
+    assert chain["ok"] is False and chain["alarm"] and "missing from the end" in chain["first_bad"]["why"]
+    assert owner_direction.doctor_block()["ok"] is False
+
+
+def test_a_cut_tail_raises_the_alarm_even_when_nobody_checked_before_the_append(world):
+    _cut_the_tail()
+    _later_append()
+    assert owner_direction.verify_log()["ok"] is False
+
+
+def test_the_owner_acknowledges_the_alarm_by_chat(world):
+    _cut_the_tail()
+    _later_append()
+    words = "I have seen it, acknowledge the tamper alarm"
+    rc, out = world.run(["owner-direction", "acknowledge"], words, world.say(words))
+    assert rc == 0 and out["acknowledged"]["first_bad"], out
+    assert owner_direction.verify_log()["ok"] is True
+    line = owner_direction.actions()[-1]
+    assert line["action"] == "direction.acknowledge" and line["auth"] == "direction"
+    _later_append()
+    assert owner_direction.verify_log()["ok"] is True
+    # Undo brings the alarm back as it was.
+    words = "undo the acknowledge of the tamper alarm"
+    rc, out = world.run(["owner-direction", "undo", line["id"]], words, world.say(words))
+    assert rc == 0 and owner_direction.verify_log()["ok"] is False, out
+
+
+def test_the_owner_acknowledges_the_alarm_in_the_app(world, khipu_app):
+    _cut_the_tail()
+    _later_append()
+    khipu_app.as_app()
+    rc, out = world.run(["owner-direction", "acknowledge", "--from-app"])
+    assert rc == 0 and owner_direction.verify_log()["ok"] is True, out
+    assert owner_direction.actions()[-1]["auth"] == "app"
+
+
+def test_acknowledging_by_chat_needs_the_owners_words(world):
+    _cut_the_tail()
+    words = "pause Codex for now please"
+    rc, out = world.run(["owner-direction", "acknowledge"], words, world.say(words))
+    assert rc == 2 and owner_direction.verify_log()["ok"] is False, out
+
+
+def test_with_no_alarm_acknowledge_changes_nothing(world, khipu_app):
+    khipu_app.as_app()
+    rc, out = world.run(["owner-direction", "acknowledge", "--from-app"])
+    assert rc == 0 and out["acknowledged"] is None and owner_direction.actions() == []

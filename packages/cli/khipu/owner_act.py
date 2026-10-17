@@ -65,6 +65,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "work.same": (("row", "commitment"), ()),
     "work.not_same": (("row", "commitment"), ()),
     "direction.off": ((), ()),
+    "direction.on": ((), ()),
+    "direction.acknowledge": ((), ()),
     "direction.set": (("key", "value"), ()),
     "direction.undo": (("id",), ()),
 }
@@ -237,8 +239,8 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["work", verb], [v["commitment"]]
     if action in ("work.same", "work.not_same"):
         return ["work", verb.replace("_", "-")], [v["row"], v["commitment"]]
-    if action == "direction.off":
-        return ["owner-direction", "off"], []
+    if action in ("direction.off", "direction.on", "direction.acknowledge"):
+        return ["owner-direction", action.partition(".")[2]], []
     if action == "direction.set":
         if v["key"] not in _DIRECTION_KEYS:
             raise _bad(f"key must be one of: {', '.join(_DIRECTION_KEYS)}")

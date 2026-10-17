@@ -152,12 +152,21 @@ def test_a_turn_that_is_a_noted_brief_is_delegated_with_its_parent(home):
     assert (turn["delegated"], turn["parent"], turn["eligible"]) == (True, "parent-session", False)
 
 
-def test_disabled_records_nothing(home):
+def test_disabled_records_only_what_can_turn_it_back_on(home):
     owner_turns.write_settings({"enabled": False})
     assert _record("pause Codex until 5pm") is None
     assert owner_turns.turns(SESSION, now=T0 + 1) == []
+    assert _record("yes") is None  # a yes with no kept turn before it
+    assert owner_turns.turns(SESSION, now=T0 + 1) == []
+    # Decision 1's two turns by chat: the one naming owner direction, then a short yes.
+    assert _record("turn owner direction back on please", now=T0) is not None
+    assert _record("yes, do it", now=T0 + 60) is not None
+    assert _record("and pause Codex until 5pm too", now=T0 + 90) is None
+    texts = [t["text"] for t in owner_turns.turns(SESSION, now=T0 + 120)]
+    assert texts == ["turn owner direction back on please", "yes, do it"]
+    # A brief is noted while off too, so it never passes for the owner's turn.
     owner_turns.note_brief("a brief long enough to be recorded here", parent="p", harness="claude_code")
-    assert not (owner_turns.folder() / "briefs.jsonl").exists()
+    assert (owner_turns.folder() / "briefs.jsonl").exists()
 
 
 def test_files_are_private(home):

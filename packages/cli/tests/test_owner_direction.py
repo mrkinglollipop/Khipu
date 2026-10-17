@@ -8,6 +8,7 @@ a fake hook environment); the agent's command runs with a fake process
 environment carrying its session id. Nothing here starts a harness."""
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import sys
@@ -271,8 +272,12 @@ def test_a_short_quote_never_carries_any_other_action(world):
 
 def test_refusal_not_by_direction(world):
     token = world.say("turn owner direction on again")
-    rc, out = world.run(["owner-direction", "on"], "turn owner direction on", token)
-    assert rc == 2 and out["code"] == "not_by_direction"
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        owner_direction.gate(argparse.Namespace(owner_words="turn owner direction on", owner_turn=token), None)
+    assert err.value.code == "not_by_direction"
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        owner_direction.check("route.forget_everything", "x", "turn owner direction on", turn_token=token)
+    assert err.value.code == "not_by_direction"
 
 
 # ---- one passing and one refused case per action --------------------------------------------
@@ -343,6 +348,8 @@ CASES: dict[str, tuple] = {
     "work.not_same": ("atlas#T-12|42", "atlas T-12 and 42 are not the same", "atlas T-12 and 43 are not the same",
                       {}),
     "direction.off": ("direction", "turn owner direction off", "turn the note off", {}),
+    "direction.on": ("direction", "turn owner direction on", "turn the note on", {}),
+    "direction.acknowledge": ("alarm", "acknowledge the tamper alarm", "acknowledge the note please", {}),
     "direction.set": ("latest_window_h", "make the latest window 2 hours", "make the earlier window 2 hours",
                       {"stored": ["2"]}),
     "direction.undo": ("a1b2c3", "undo that pause please", "pause that one please", {"names": [["that"]]}),
