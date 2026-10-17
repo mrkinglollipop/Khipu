@@ -3692,6 +3692,9 @@ export default function App() {
                             void refreshSnapshot();
                           } else if (a.fix?.kind === "storage-report") {
                             setStorageReportOpen(true);
+                          } else if (a.fix?.kind === "work-settings") {
+                            setSettingsSection("work");
+                            setTab("settings");
                           }
                         }}
                       >
@@ -4022,6 +4025,9 @@ export default function App() {
                     void refreshSnapshot();
                   } else if (fix.kind === "storage-report") {
                     setStorageReportOpen(true);
+                  } else if (fix.kind === "work-settings") {
+                    setSettingsSection("work");
+                    setTab("settings");
                   }
                 }}
               />
@@ -5168,6 +5174,10 @@ export default function App() {
             }
             onOpenRouting={() => {
               setSettingsSection("routing");
+              setTab("settings");
+            }}
+            onOpenWorkSettings={() => {
+              setSettingsSection("work");
               setTab("settings");
             }}
             owedSection={

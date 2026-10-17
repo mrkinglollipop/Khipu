@@ -17,9 +17,11 @@ import {
   pastWords,
   ruleWords,
   spanWords,
+  whenLocal,
 } from "./routing";
 import type { RouteView } from "./routing";
 import { fmtAgo, fmtAgoSince } from "./time";
+import { shortProject } from "./work";
 
 /** A named red check, in plain words, with at most one fix. Callers render
  *  one callout per entry; `fix` is omitted where the app has no honest fix to
@@ -31,7 +33,7 @@ export type Attention = {
   cause: string;
   fix?: {
     label: string;
-    kind: "reinstall-hook" | "recall-probe" | "revisions" | "open-harnesses" | "apply-migrations" | "refresh-snapshot" | "storage-report";
+    kind: "reinstall-hook" | "recall-probe" | "revisions" | "open-harnesses" | "apply-migrations" | "refresh-snapshot" | "storage-report" | "work-settings";
   };
   harness?: string;
 };
@@ -454,6 +456,54 @@ export function buildAttention(parsed: Record<string, unknown>): {
       title: red ? "This Mac is almost out of disk space" : "This Mac is running low on disk space",
       cause: ds.message || "Free space is below the level Khipu watches for.",
       fix: { label: "Open storage report", kind: "storage-report" },
+    });
+  }
+
+  // Work (Work view phase 5): a project stopped reporting, a summary file
+  // over its limit or in a newer format, ledger changes waiting for the
+  // database. Each warns; doctor's `ok` never depends on them. (An old
+  // tracker changed after import joins with the import, on the
+  // owed-and-ledger branch.)
+  const work = (parsed as { work?: { sources?: Array<{ project?: string; state?: string; problem?: string | null; as_of?: string | null }> } }).work;
+  for (const s of work?.sources ?? []) {
+    const name = shortProject(s.project ?? "");
+    if (s.state === "gone") {
+      issues.push(`${name} stopped reporting`);
+      items.push({
+        key: `work:gone:${s.project}`,
+        tone: "warn",
+        title: `${name} stopped reporting`,
+        cause: `Its job runner's summary has not changed since ${s.as_of ? whenLocal(s.as_of, new Date()) : "a while ago"}. Its board is folded; its ledger is still shown.`,
+        fix: { label: "Open Work settings", kind: "work-settings" },
+      });
+    } else if (s.state === "too_big") {
+      issues.push(`The summary file for ${name} is over its limit`);
+      items.push({
+        key: `work:too_big:${s.project}`,
+        tone: "warn",
+        title: `The summary file for ${name} is over its size limit`,
+        cause: `${s.problem ?? "The summary file is over its size limit."} Khipu shows the last good read.`,
+        fix: { label: "Raise the limit", kind: "work-settings" },
+      });
+    } else if (s.state === "newer_format") {
+      issues.push(`The summary file for ${name} is in a newer format`);
+      items.push({
+        key: `work:newer_format:${s.project}`,
+        tone: "warn",
+        title: `The summary file for ${name} is in a newer format`,
+        cause: s.problem ?? "Written in a newer format than this Khipu reads. Update Khipu to see it.",
+      });
+    }
+  }
+  const pending = (parsed as { ledger?: { outbox?: { pending?: number | null } } }).ledger?.outbox?.pending ?? 0;
+  if (pending > 0) {
+    const what = `${pending.toLocaleString()} ledger ${pending === 1 ? "change is" : "changes are"} waiting for the database`;
+    issues.push(capitalise(what));
+    items.push({
+      key: "work:outbox",
+      tone: "warn",
+      title: capitalise(what),
+      cause: "They are saved on this Mac and reach the ledger when the database answers. Nothing is lost.",
     });
   }
 
