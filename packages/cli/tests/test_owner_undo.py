@@ -279,3 +279,71 @@ def test_an_undo_left_unconfirmed_shows_its_action_as_unconfirmed(world, monkeyp
     # Whether it is undone is not known, so it is neither applied nor undone.
     assert owner_direction.line_state(out["owner_action"]) == "unconfirmed"
     _chain_ok()
+
+
+# ---- the fifth review's probes: a finish that could not be written ------------------------------
+
+
+def _no_finish(monkeypatch):
+    real = owner_direction._append
+
+    def no_completion(line):
+        if line.get("kind") == "state":
+            raise OSError("simulated full disk")
+        return real(line)
+
+    monkeypatch.setattr(owner_direction, "_append", no_completion)
+    return lambda: monkeypatch.setattr(owner_direction, "_append", real)
+
+
+def test_an_added_rule_whose_finish_was_lost_can_still_be_undone(world, monkeypatch):
+    world.say()
+    restore = _no_finish(monkeypatch)
+    rc, out = world.run(["route", "rule", "add", "Never use fast mode"], True)
+    assert rc == 0 and out.get("record_incomplete"), out
+    restore()
+    assert owner_direction.line_state(out["owner_action"]) == "unconfirmed"
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
+    assert rc == 0, undone
+    assert "Never use fast mode" not in [r["text"] for r in routing.read_view()["rules"]]
+
+
+def test_an_owner_hold_whose_finish_was_lost_can_still_be_undone(world, monkeypatch):
+    world.say()
+    restore = _no_finish(monkeypatch)
+    rc, out = world.run(["route", "hold", "while the Mac updates", "--account", "Codex", "--reason", "keep"], True)
+    assert rc == 0 and out.get("record_incomplete"), out
+    restore()
+    assert [h for h in routing.read_view()["holds"] if h["owner"]]
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
+    assert rc == 0, undone
+    assert not [h for h in routing.read_view()["holds"] if h["owner"]]
+
+
+def test_a_purge_whose_finish_was_lost_is_scheduled_and_can_be_cancelled(world, monkeypatch):
+    world.say()
+    restore = _no_finish(monkeypatch)
+    rc, out = world.run(["ledger", "purge", "R1", "--project", "atlas", "--json"], True)
+    assert rc == 0, out
+    restore()
+    (line,) = owner_direction.actions()
+    assert line["state"] == "unconfirmed" and line["runs_at_ts"] > owner_direction._clock()
+    rc, undone = world.run(["owner-direction", "undo", line["id"]], True)
+    assert rc == 0 and undone["state"] == "cancelled", undone
+    assert owner_direction.run_due(line["runs_at_ts"] + 100) == []
+
+
+def test_a_lost_finish_purge_runs_on_its_day_and_then_says_it_ran(world, monkeypatch):
+    from khipu import ledger
+
+    world.say()
+    restore = _no_finish(monkeypatch)
+    rc, out = world.run(["ledger", "purge", "R1", "--project", "atlas", "--json"], True)
+    restore()
+    (line,) = owner_direction.actions()
+    purged = []
+    monkeypatch.setattr(ledger, "_connect", lambda: type("Fake", (), {"close": lambda self: None})())
+    monkeypatch.setattr(ledger, "purge", lambda c, p, r: purged.append((p, r)) or {"ok": True})
+    assert owner_direction.run_due(line["runs_at_ts"] + 1) == [line["id"]] and purged == [("atlas", "R1")]
+    rc, undone = world.run(["owner-direction", "undo", line["id"]], True)
+    assert rc == 2 and "already ran" in undone["error"], undone

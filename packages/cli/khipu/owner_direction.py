@@ -743,6 +743,11 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
         why = _no_undo(want["action"], before)
         if why:
             line.update(undo=None, no_undo=why)
+        if want["action"] == "ledger.purge" and stamp.get("auth") == "direction":
+            # Scheduled from the moment it is written, so Undo and the timer
+            # read the same day whether or not the finish is written.
+            runs_at = _clock() + PURGE_DELAY_S
+            line.update(runs_at=_iso(runs_at), runs_at_ts=runs_at)
         if want.get("facts"):
             line["facts"] = want["facts"]
     for key in ("words", "harness", "session", "via_session", "turn", "binding", "auth_chain"):
@@ -866,6 +871,12 @@ def _before(want: dict):
         return {"text": note["text"] if note else None}
     if action in ("route.rule.edit", "route.rule.undo"):
         return {"text": _rule_now(target).get("text")}
+    if action == "route.rule.add":
+        # The new rule's number is known only after; it is the first above
+        # every rule now, so Undo finds it if the finish was never written.
+        return {"rules": [r["n"] for r in routing.read_view()["rules"]]}
+    if action == "route.hold.add":
+        return {"holds": [h["id"] for h in routing.read_view()["holds"]]}
     if action == "route.rule.confirm":
         rule = _rule_now(target)
         if not rule.get("pending"):
@@ -1185,7 +1196,31 @@ def _undo_restore_rule(line, via):
 def _undo_hold_add(line, via):
     from khipu import routing
 
-    return routing.end_hold((line.get("after") or {}).get("id"), owner=True, via=via)
+    hold_id = (line.get("after") or {}).get("id")
+    if hold_id is None:
+        # Unconfirmed: the owner's hold that was not there before.
+        had = set(_b(line).get("holds") or [])
+        new = [h["id"] for h in routing.read_view()["holds"] if h.get("owner") and h["id"] not in had]
+        hold_id = new[0] if len(new) == 1 else None
+    if hold_id is None:
+        raise ValueError("Khipu can't tell which hold this was, so it can't undo it")
+    return routing.end_hold(hold_id, owner=True, via=via)
+
+
+def _added_rule(line) -> int:
+    from khipu import routing
+
+    n = (line.get("after") or {}).get("n")
+    if n is None:
+        # Unconfirmed: the first rule numbered above every rule there before.
+        had = _b(line).get("rules")
+        if isinstance(had, list):
+            top = max([x for x in had if isinstance(x, int)] or [0])
+            new = sorted(r["n"] for r in routing.read_view()["rules"] if isinstance(r["n"], int) and r["n"] > top)
+            n = new[0] if new else None
+    if n is None:
+        raise ValueError("Khipu can't tell which rule this added, so it can't undo it")
+    return n
 
 
 def _undo_priority(line, via):
@@ -1234,7 +1269,7 @@ _UNDO = {
     "route.clear": _undo_clear,
     "route.note.set": _undo_note_set,
     "route.note.end": _undo_note_end,
-    "route.rule.add": _retire_rule(lambda line: (line.get("after") or {}).get("n")),
+    "route.rule.add": _retire_rule(_added_rule),
     "route.rule.edit": _undo_rule_words,
     "route.rule.retire": _undo_restore_rule,
     "route.rule.restore": _retire_rule(lambda line: line["target"]),
@@ -1286,12 +1321,22 @@ def _by(via: str | None) -> str:
 
 
 def schedule_purge(project: str, row_id: str) -> dict:
-    """A purge by direction (decision 3): logged as scheduled a day out."""
-    runs_at = _clock() + PURGE_DELAY_S
+    """A purge by direction (decision 3): logged as scheduled a day out, the
+    day its line written ahead already holds."""
+    line = (_PENDING.get() or {}).get("line") or {}
+    runs_at = _float(line.get("runs_at_ts")) or _clock() + PURGE_DELAY_S
     out = {"ok": True, "verb": "purge", "id": row_id, "project": project, "state": "scheduled",
            "runs_at": _iso(runs_at),
            "line": f"{row_id} will be removed for good at {_iso(runs_at)}; Undo cancels it until then"}
     return finish(out, state="scheduled", runs_at=_iso(runs_at), runs_at_ts=runs_at) or out
+
+
+def _scheduled(line: dict) -> bool:
+    """A purge waiting for its day: completed as scheduled, or written ahead
+    by direction with its day and never completed (the finish could not be
+    written)."""
+    return line["state"] == "scheduled" or (line["state"] == "unconfirmed" and line.get("auth") == "direction"
+                                            and bool(_float(line.get("runs_at_ts"))))
 
 
 def run_due(now: float | None = None) -> list[str]:
@@ -1304,7 +1349,7 @@ def run_due(now: float | None = None) -> list[str]:
     except Exception:  # noqa: BLE001
         return done
     for line in lines:
-        if line.get("action") != "ledger.purge" or line["state"] != "scheduled":
+        if line.get("action") != "ledger.purge" or not _scheduled(line):
             continue
         if float(line.get("runs_at_ts") or 0) > now:
             continue
@@ -1355,8 +1400,11 @@ def _undo_refusal(line: dict | None, line_id: str) -> str | None:
     if state == "failed":
         return f"owner action {line_id} did not happen, so there is nothing to undo"
     if line["action"] == "ledger.purge":
-        if state != "scheduled":
+        if state == "done":
             return f"the purge {line_id} already ran; a row removed for good can't come back"
+        if not _scheduled(line):
+            return (f"the purge {line_id} was made in the app and ran at once (or Khipu can't tell that it did "
+                    "not); a row removed for good can't come back")
         # Due is due whether or not the timer has run it yet: Undo can't
         # race the purge, and what the owner sees can't depend on which won.
         if _float(line.get("runs_at_ts")) <= _clock():
