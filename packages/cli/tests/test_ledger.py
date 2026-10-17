@@ -2415,3 +2415,125 @@ def test_a_queued_set_never_silently_overwrites_a_newer_change(hub, monkeypatch,
     last = _history(hub, "s-1")[-1]
     assert last[3] == "arrived late; the row had moved to NOT STARTED"
     assert last[2] == {"requested": {"evidence": {"old": "online", "new": "offline"}}}
+
+
+def test_a_set_queued_behind_a_busy_lock_with_the_hub_up_never_overwrites_a_newer_change(hub, monkeypatch,
+                                                                                         tmp_path):
+    from khipu import ledger
+
+    _snapshot(tmp_path)
+    ok("add", "r", "--title", "Row", "--kind", "slice")
+    monkeypatch.setattr(ledger, "LEDGER_LOCK_WAIT_S", 0.1)
+    fd = _hold_ledger_lock(ledger)  # a hung writer: this one joins the line with the hub up
+    try:
+        assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "stale"}, op_id="busy-stale"))["queued"]
+    finally:
+        os.close(fd)
+    assert ledger.queued_ops()[0]["seen"] == {"evidence": ""}
+    with _real_connect(hub) as conn:  # meanwhile another Mac moved the field
+        ledger.apply_op(conn, ledger.new_op("set", P, "r", fields={"evidence": "newer"}))
+        assert ledger.drain(conn)["landed"] == 1
+    assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = 'r'") == [("newer",)]
+    assert _history(hub, "r")[-1][3].startswith("arrived late")
+
+
+def test_a_set_that_timed_out_on_the_hub_never_overwrites_a_newer_change(hub, monkeypatch, tmp_path):
+    from khipu import ledger
+
+    _snapshot(tmp_path)
+    ok("add", "r", "--title", "Row", "--kind", "slice")
+    monkeypatch.setattr(ledger, "LEDGER_LOCK_TIMEOUT_MS", 100)
+    with _real_connect(hub) as blocker:  # another writer holds the project's lock: this one times out
+        ledger.lock_project(blocker.cursor(), P)
+        assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "stale"}, op_id="timeout-stale"))[
+            "queued"]
+        blocker.rollback()
+    assert ledger.queued_ops()[0]["seen"] == {"evidence": ""}
+    with _real_connect(hub) as conn:
+        ledger.apply_op(conn, ledger.new_op("set", P, "r", fields={"evidence": "newer"}))
+        assert ledger.drain(conn)["landed"] == 1
+    assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = 'r'") == [("newer",)]
+    assert _history(hub, "r")[-1][3].startswith("arrived late")
+
+
+def test_a_queued_set_with_nothing_seen_lands_only_over_this_macs_own_change(hub, monkeypatch):
+    from khipu import ledger
+
+    # No offline copy: what the writer saw cannot be known.
+    ok("add", "mine", "--title", "Mine", "--kind", "slice")
+    ok("set", "mine", "--evidence", "step 1")  # this Mac's own earlier write
+    with _real_connect(hub) as conn:
+        ledger.apply_op(conn, ledger.new_op("add", P, "theirs", fields={"title": "Theirs", "kind": "slice"}))
+    ledger.enqueue(ledger.new_op("set", P, "mine", fields={"evidence": "step 2"}, op_id="q-mine"))
+    ledger.enqueue(ledger.new_op("set", P, "theirs", fields={"evidence": "mine now"}, op_id="q-theirs"))
+    assert [q["seen"] for q in ledger.queued_ops()] == [{}, {}]
+    with _real_connect(hub) as conn:  # another Mac changes the field the second write never saw
+        ledger.apply_op(conn, ledger.new_op("set", P, "theirs", fields={"evidence": "their work"}))
+        assert ledger.drain(conn)["landed"] == 2
+    assert _sql(hub, "SELECT row_id, evidence FROM ledger_rows ORDER BY row_id") == [
+        ("mine", "step 2"), ("theirs", "their work")]
+    assert _history(hub, "theirs")[-1][3].startswith("arrived late")
+
+
+def test_a_retry_of_a_queued_set_lands_as_the_queued_write_it_is(hub, monkeypatch, tmp_path):
+    from khipu import ledger
+
+    _snapshot(tmp_path)
+    ok("add", "r", "--title", "Row", "--kind", "slice")
+    stale = ledger.new_op("set", P, "r", fields={"evidence": "stale"}, op_id="retry-stale")
+    cond = ledger.new_op("set", P, "r", fields={"state": "DONE"}, if_state="NOT STARTED", op_id="retry-if")
+    _away(monkeypatch)
+    assert ledger.write(dict(stale))["queued"] and ledger.write(dict(cond))["queued"]
+    monkeypatch.setenv("KHIPU_DATABASE_URL", hub)
+    with _real_connect(hub) as conn:  # meanwhile another Mac moved the row
+        ledger.apply_op(conn, ledger.new_op("set", P, "r", fields={"evidence": "newer", "state": "IN FLIGHT"}))
+    got = ledger.write(dict(stale))  # the writer retries with the original op id
+    assert got["ok"] and got.get("late")
+    again = ledger.write(dict(cond))
+    assert again["ok"] and again.get("late")
+    assert _sql(hub, "SELECT evidence, state FROM ledger_rows WHERE row_id = 'r'") == [("newer", "IN FLIGHT")]
+    notes = _sql(hub, "SELECT op_id, note FROM ledger_history WHERE op_id IN ('retry-stale', 'retry-if') "
+                      "ORDER BY id")
+    assert [(o, n.split(";")[0]) for o, n in notes] == [("retry-stale", "arrived late"), ("retry-if", "arrived late")]
+    assert ledger.outbox_status()["pending"] == 0
+
+
+def test_a_statement_timeout_while_probing_the_columns_keeps_the_write_queued(hub, monkeypatch, tmp_path):
+    from khipu import db, ledger
+
+    _snapshot(tmp_path)
+    ok("add", "r", "--title", "Row", "--kind", "slice")
+    monkeypatch.setattr(ledger, "LEDGER_STATEMENT_TIMEOUT_MS", 100)
+    real = db.has_columns
+    slow = [True]
+
+    def probe(cur, table, *names):
+        if table == "ledger_history" and slow[0]:
+            cur.execute("SELECT pg_sleep(0.3)")  # times out
+        return real(cur, table, *names)
+
+    monkeypatch.setattr(db, "has_columns", probe)
+    got = ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "kept"}, op_id="probe-timeout"))
+    assert got["queued"] and ledger.outbox_status()["pending"] == 1
+    assert _sql(hub, "SELECT count(*) FROM ledger_ops WHERE op_id = 'probe-timeout'") == [(0,)]
+    slow[0] = False
+    assert "r · NOT STARTED" in ok("list")  # the next call reaching the hub lands it, once
+    assert ledger.outbox_status()["pending"] == 0
+    assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = 'r'") == [("kept",)]
+
+
+def test_a_write_behind_a_busy_lock_queues_with_an_older_khipus_outcome_still_unmoved(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    legacy = ledger._legacy_outcomes_dir()
+    legacy.mkdir(parents=True)
+    old = ledger.new_op("set", P, "r", fields={"evidence": "old"}, op_id="legacy")
+    (legacy / "legacy.json").write_text(json.dumps({"op_id": "legacy", "digest": ledger.op_digest(old),
+                                                    "status": "landed"}))
+    monkeypatch.setattr(ledger, "LEDGER_LOCK_WAIT_S", 0.1)
+    fd = _hold_ledger_lock(ledger)
+    try:
+        assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "new"}, op_id="busy-legacy"))["queued"]
+        assert ledger.write(dict(old))["ok"]  # the older Khipu's landed write is still answered as landed
+    finally:
+        os.close(fd)
+    assert [q["op_id"] for q in ledger.queued_ops()] == ["busy-legacy"]
