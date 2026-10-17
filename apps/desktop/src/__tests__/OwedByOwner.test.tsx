@@ -121,6 +121,30 @@ describe("Owed by owner", () => {
     expect(reads.every((a) => a.includes(`--limit=${PAGE}`))).toBe(true);
   });
 
+  it("shows the owner's quiet items after his active ones, grouped by weeks, never hidden", async () => {
+    serve(pager([
+      item(5, "user", { text: "Active item of yours" }),
+      item(4, "user", { text: "Quiet three weeks", quiet_weeks: 3 }),
+      item(3, "user", { text: "Quiet seven weeks", quiet_weeks: 7 }),
+      item(2, "user", { text: "Also quiet three weeks", quiet_weeks: 3 }),
+      item(1, "assistant", { text: "The assistant's own" }),
+    ]));
+    await openWork();
+    const needs = await waitFor(() => group(/^Needs you$/));
+    const three = group(/^Quiet for 3 weeks$/);
+    const seven = group(/^Quiet for 7 weeks$/);
+    expect(needs.contains(three) && needs.contains(seven)).toBe(true);
+    expect(within(three).getByText("Quiet three weeks")).toBeInTheDocument();
+    expect(within(three).getByText("Also quiet three weeks")).toBeInTheDocument();
+    expect(within(seven).getByText("Quiet seven weeks")).toBeInTheDocument();
+    expect(within(three).queryByText("Active item of yours")).toBeNull();
+    const order = Array.from(needs.querySelectorAll(".owed-row")).map((r) => r.textContent ?? "");
+    const at = (t: string) => order.findIndex((x) => x.includes(t));
+    expect(at("Active item of yours")).toBeGreaterThanOrEqual(0);
+    expect(at("Active item of yours")).toBeLessThan(at("Quiet three weeks"));
+    expect(at("Quiet three weeks")).toBeLessThan(at("Quiet seven weeks"));
+  });
+
   it("pages through 4,000 items with the cursor, none twice and none missed", async () => {
     serve(pager(flood(4000)));
     await openWork();

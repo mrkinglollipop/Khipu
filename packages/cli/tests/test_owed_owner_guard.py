@@ -26,7 +26,7 @@ WRITERS = {
     ("commitments", "auto_reassign"): "the one automatic owner change, behind the owner guard",
     ("commitments", "set_status"): "the owner's own close, reopen or snooze",
     ("commitments", "reassign"): "the owner's own move",
-    ("commitments", "stale_sql"): "aging after weeks of silence (the scope's rule); stale stays listed and reopens",
+    ("commitments", "stale_sql"): "aging after weeks of silence, only for the rows mark_stale's owner guard lets by",
     ("forget", "forget_episode"): "the owner's own forget",
     ("owed_tidy", "undo"): "the owner's own undo of a batch, behind the owner gate",
     ("hygiene", None): "the restore recipe in a backup's RESTORE.md, text only",
@@ -149,3 +149,59 @@ def test_a_pr_close_reaches_the_owners_item(monkeypatch):
     assert co.close_by_rule(cur, 7, rule="pr", owner=co.OWNER_USER, reason="pull request #3 merged",
                             key="pr:3=merged")
     assert "status = 'closed'" in cur.sql[0]
+
+
+def test_staleness_never_hides_the_owners_item_and_lists_it_as_quiet():
+    """Weeks of silence stale anyone else's item; the owner's stays open and
+    lists after his active ones as "Quiet for N weeks" (the stale rule)."""
+    from tests.test_audit1010_rsna import _RegistryCursor
+    from khipu import db
+
+    cur = _RegistryCursor()
+    try:
+        db._TABLE_COLUMNS_CACHE.clear()
+        mine = cur.commitment("User must approve the release", owner=co.OWNER_USER, kind="blocker", age=50)
+        quiet_followup = cur.commitment("User must reply to the reviewer", owner=co.OWNER_USER, age=22)
+        active = cur.commitment("User must read the plan", owner=co.OWNER_USER, age=2)
+        theirs = cur.commitment("write the release notes", owner=co.OWNER_ASSISTANT, age=50)
+        assert co.mark_stale(cur) == 1
+        assert cur.value("commitments", theirs, "status") == "stale"
+        for cid in (mine, quiet_followup, active):
+            assert cur.value("commitments", cid, "status") == "open"
+
+        rows = co.list_owed(cur, project="p")
+        # His active item, then his quiet ones, then everyone else's.
+        assert [r["id"] for r in rows][:3] == [active, mine, quiet_followup]
+        by_id = {r["id"]: r for r in rows}
+        assert by_id[active]["quiet_weeks"] is None and by_id[active]["group"] is None
+        assert by_id[mine]["group"] == "Quiet for 7 weeks"
+        assert by_id[quiet_followup]["group"] == "Quiet for 3 weeks"
+
+        db._TABLE_COLUMNS_CACHE.clear()
+        cur.execute("SELECT id, text, project, owner, kind, opened_episode, opened_at, due_after, status, "
+                    "closed_episode, closed_at, close_reason, last_seen_at, seen_count FROM commitments "
+                    "WHERE status = 'open'")
+        cols = ["id", "text", "project", "owner", "kind", "opened_episode", "opened_at", "due_after", "status",
+                "closed_episode", "closed_at", "close_reason", "last_seen_at", "seen_count"]
+        raw = [dict(zip(cols, r)) for r in cur.fetchall()]
+        first = co.page_owed([dict(r) for r in raw], owner=co.OWNER_USER, limit=2)
+        assert [r["id"] for r in first["results"]][0] == active
+        rest = co.page_owed([dict(r) for r in raw], owner=co.OWNER_USER, cursor=first["next_cursor"], limit=2)
+        seen = [r["id"] for r in first["results"] + rest["results"]]
+        assert sorted(seen) == sorted([mine, quiet_followup, active]) and len(seen) == 3
+        assert all(r["quiet_weeks"] for r in rest["results"])
+    finally:
+        cur.conn.close()
+
+
+def test_a_snoozed_or_someone_elses_item_is_never_quiet():
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(days=60)).isoformat()
+    row = {"owner": co.OWNER_USER, "kind": "question", "status": "open", "opened_at": old}
+    assert co.quiet_weeks(row, now) == 8
+    assert co.quiet_weeks({**row, "owner": co.OWNER_AGENT}, now) is None
+    assert co.quiet_weeks({**row, "due_after": (now + timedelta(days=1)).isoformat()}, now) is None
+    assert co.quiet_weeks({**row, "last_seen_at": (now - timedelta(days=3)).isoformat()}, now) is None
+    assert co.quiet_weeks({**row, "status": "closed"}, now) is None

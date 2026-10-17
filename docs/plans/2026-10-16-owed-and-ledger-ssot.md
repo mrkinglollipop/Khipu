@@ -395,3 +395,15 @@ Matt approved this scope and answered its questions:
 6. **Bulk closes of the owner's items.** They work by chat on his direction, like every owner action
    (`2026-10-16-owner-direction.md`); nothing is app-only. Until that lands, a bulk change to the owner's
    items passes the existing owner gate, so the new path plugs in there.
+
+## Decisions (orchestrator, 2026-10-17)
+
+7. **Staleness never hides Matt's items.** Recommended by the orchestrator under Matt's no-loss rule, because
+   aging his items into `stale` after weeks of silence broke the invariant that nothing automatic closes,
+   merges, hides or reassigns an item he owns. Staleness is now an automatic rule (`stale` in
+   `commitments.AUTOMATIC_RULES`), so `mark_stale` passes the owner guard and leaves his items open. An item
+   of his unmentioned past the window that would stale anyone else's (14 days for a follow-up or promise, 30
+   for a blocker or question, a live snooze excepted) carries `quiet_weeks` and lists after his active items:
+   in the app's Owed under Needs you as one "Quiet for N weeks" group per week count, and in `khipu_owed` and
+   `khipu owed` at the end of the list with `group` set to the same words. Other owners' items keep the
+   existing staleness. `tests/test_owed_owner_guard.py` covers it with the other automatic rules.

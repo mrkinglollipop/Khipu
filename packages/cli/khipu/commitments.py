@@ -1473,6 +1473,7 @@ AUTOMATIC_RULES: dict[str, str] = {
     "drop": RULE_NEVER,             # the hygiene re-judge: not a commitment
     "owner-rules": RULE_NEVER,      # the owner rules re-run (clean-up, hygiene)
     "model": RULE_NEVER,            # the clean-up's model pass
+    "stale": RULE_NEVER,            # weeks of silence: his items show as quiet instead
 }
 OWNER_GUARD_WORDS = "the owner's own item: an automatic {rule} may propose a change to it, never make it"
 
@@ -1644,28 +1645,94 @@ def stale_sql(*, has_last_seen: bool) -> str:
     "Silence" is measured from ``last_seen_at`` when migration 0012 is in
     (each restatement pushes it forward), else from ``opened_at``.
     """
-    seen = "COALESCE(last_seen_at, opened_at)" if has_last_seen else "opened_at"
-    seen = f"GREATEST({seen}, due_after)"
     return f"""
         UPDATE commitments
         SET status = 'stale'
-        WHERE status = 'open'
+        WHERE {_stale_where(has_last_seen)}
+        """
+
+
+def _stale_where(has_last_seen: bool) -> str:
+    seen = "COALESCE(last_seen_at, opened_at)" if has_last_seen else "opened_at"
+    seen = f"GREATEST({seen}, due_after)"
+    return f"""status = 'open'
           AND (due_after IS NULL OR due_after <= now())
           AND {seen} < now() - (
               CASE WHEN kind IN ('followup', 'promise')
                    THEN interval '{STALE_AFTER_DAYS_SOFT} days'
                    ELSE interval '{STALE_AFTER_DAYS} days'
-              END)
-        """
+              END)"""
 
 
 def mark_stale(cur) -> int:
     """Flip silent open commitments to 'stale' (see :func:`stale_sql`). Never
     silently dropped — stale stays queryable via `khipu owed --status stale`.
+    Staleness is an automatic rule, so :func:`owner_guard` keeps the owner's
+    own items open: they list as quiet (``quiet_weeks``) instead.
     """
-    cur.execute(stale_sql(has_last_seen=_seen_columns_ready(cur))
-                + f" AND {_not_forgotten_clause(cur)}")
-    return cur.rowcount
+    has_seen = _seen_columns_ready(cur)
+    forgotten = _not_forgotten_clause(cur)
+    cols = ["id", "text", "owner", "kind"]
+    if _owner_columns_ready(cur):
+        cols += ["origin", "owner_label"]
+    if _future_trigger_ready(cur):
+        cols.append("future_trigger")
+    if _reassigned_column_ready(cur):
+        cols.append("owner_reassigned_at")
+    cur.execute(f"SELECT {', '.join(cols)} FROM commitments WHERE {_stale_where(has_seen)} AND {forgotten}")
+    ids = []
+    for raw in cur.fetchall():
+        row = dict(zip(cols, raw))
+        trigger = has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
+        if owner_guard(row_owner(row, future_trigger=trigger)[0], "stale") is None:
+            ids.append(int(row["id"]))
+    n = 0
+    for at in range(0, len(ids), 500):
+        chunk = ids[at:at + 500]
+        cur.execute(stale_sql(has_last_seen=has_seen)
+                    + f" AND {forgotten} AND id IN ({', '.join(['%s'] * len(chunk))})", tuple(chunk))
+        n += max(0, cur.rowcount or 0)
+    return n
+
+
+def _as_utc(value: Any) -> datetime | None:
+    from datetime import timezone
+
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(_ISO_Z_RE.sub("+00:00", value.strip().replace(" ", "T", 1)))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def quiet_weeks(row: dict[str, Any], now: datetime | None = None) -> int | None:
+    """Whole weeks an open item of the owner's has gone unmentioned, once
+    that is past the window that would make anyone else's item stale; None
+    otherwise. His items never go stale (:func:`mark_stale`); this is how a
+    list shows the quiet ones, after the active ones, instead of hiding them."""
+    from datetime import timezone
+
+    if row.get("status") not in (None, "open") or row.get("owner") != OWNER_USER:
+        return None
+    now = now or datetime.now(timezone.utc)
+    due = _as_utc(row.get("due_after"))
+    if due and due > now:
+        return None
+    seen = _as_utc(row.get("last_seen_at")) or _as_utc(row.get("opened_at"))
+    if seen is None:
+        return None
+    seen = max(seen, due) if due else seen
+    window = STALE_AFTER_DAYS_SOFT if str(row.get("kind") or "").lower() in ("followup", "promise") \
+        else STALE_AFTER_DAYS
+    days = (now - seen).total_seconds() / 86400
+    return int(days // 7) if days > window else None
+
+
+def quiet_label(weeks: int | None) -> str | None:
+    return f"Quiet for {weeks} weeks" if weeks else None
 
 
 # ---------------------------------------------------------------------------
@@ -1877,7 +1944,10 @@ def finish_owed_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict
     from datetime import datetime, timezone
 
     _max_dt = datetime.max.replace(tzinfo=timezone.utc)
-    rows.sort(key=lambda r: (r["priority"], r.get("opened_at") or _max_dt))
+    # The owner's quiet items follow his active ones (quiet_weeks), still
+    # ahead of everyone else's, so no limit cuts them off.
+    rows.sort(key=lambda r: (r["owner"] != OWNER_USER, bool(r.get("quiet_weeks")), r["priority"],
+                             r.get("opened_at") or _max_dt))
     return rows[:limit]
 
 
@@ -1916,6 +1986,8 @@ def resolve_owed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         clause = trigger_clause(row.get("text") or "") if trigger else None
         row["trigger_text"] = clause
         row["until"] = until_line(clause)
+        row["quiet_weeks"] = quiet_weeks(row)
+        row["group"] = quiet_label(row["quiet_weeks"])
     return rows
 
 
@@ -2006,22 +2078,30 @@ def _opened_key(row: dict[str, Any]) -> tuple[Any, int]:
     return at, int(row.get("id") or 0)
 
 
+def _page_key(row: dict[str, Any]) -> tuple[int, Any, int]:
+    """The keyset, sorted descending: active rows (1) before the owner's quiet
+    ones (0), each newest first."""
+    return (0 if row.get("quiet_weeks") else 1, *_opened_key(row))
+
+
 def encode_cursor(row: dict[str, Any]) -> str:
     import base64
 
-    at, cid = _opened_key(row)
-    return base64.urlsafe_b64encode(json.dumps([at.isoformat(), cid]).encode()).decode().rstrip("=")
+    active, at, cid = _page_key(row)
+    return base64.urlsafe_b64encode(json.dumps([at.isoformat(), cid, active]).encode()).decode().rstrip("=")
 
 
-def decode_cursor(raw: str) -> tuple[Any, int]:
-    """``(opened_at, id)`` of the last row a page gave; ValueError otherwise."""
+def decode_cursor(raw: str) -> tuple[int, Any, int]:
+    """``(active, opened_at, id)`` of the last row a page gave; a cursor from
+    before the quiet group counts as active. ValueError otherwise."""
     import base64
     from datetime import datetime
 
     try:
         text = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
-        at, cid = json.loads(text)
-        return _opened_key({"opened_at": datetime.fromisoformat(at), "id": int(cid)})
+        at, cid, *active = json.loads(text)
+        return _page_key({"opened_at": datetime.fromisoformat(at), "id": int(cid),
+                          "quiet_weeks": None if (active or [1])[0] else 1})
     except (ValueError, TypeError, UnicodeDecodeError):
         raise ValueError("cursor is not one khipu_owed gave; start again without it") from None
 
@@ -2066,11 +2146,11 @@ def page_owed(rows: list[dict[str, Any]], *, owner: str | None = None, kind: str
         if keep(row, skip="kind"):
             k = str(row.get("kind") or "followup")
             counts["kind"][k] = counts["kind"].get(k, 0) + 1
-    matched = sorted((r for r in rows if keep(r)), key=_opened_key, reverse=True)
+    matched = sorted((r for r in rows if keep(r)), key=_page_key, reverse=True)
     after = matched
     if cursor:
         last = decode_cursor(cursor)
-        after = [r for r in matched if _opened_key(r) < last]
+        after = [r for r in matched if _page_key(r) < last]
     page = after[:limit] if limit else after
     more = len(after) > len(page)
     return {"results": page, "total": len(matched), "counts": counts,

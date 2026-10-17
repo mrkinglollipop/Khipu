@@ -546,7 +546,9 @@ TOOLS: list[dict] = [
             "still owe on this project' would change the answer. Pages "
             "newest first: pass the reply's next_cursor as cursor for the "
             "next page; total and counts (by owner and kind) cover every "
-            "matching item, not just this page."
+            "matching item, not just this page. The user's own items never "
+            "go stale: one unmentioned for weeks lists after the active ones "
+            "with quiet_weeks and group 'Quiet for N weeks'."
         ),
         "inputSchema": {
             "type": "object",

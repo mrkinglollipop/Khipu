@@ -177,10 +177,15 @@ class _CommitmentsCursor:
             else:
                 self.rowcount = 0
             return
+        if s.startswith("SELECT id, text, owner, kind") and "SET status" not in s and "due_after <= now()" in s:
+            # mark_stale's candidates; this fake ignores the silence window.
+            cols = s[len("SELECT "):s.index(" FROM commitments")].split(", ")
+            self._result = [tuple(r.get(c) for c in cols) for r in self.rows.values() if r["status"] == "open"]
+            return
         if s.startswith("UPDATE commitments") and "'stale'" in s:
             n = 0
             for r in self.rows.values():
-                if r["status"] == "open":
+                if r["status"] == "open" and (not params or r["id"] in params):
                     r["status"] = "stale"
                     n += 1
             self.rowcount = n

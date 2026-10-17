@@ -435,6 +435,9 @@ type Commitment = {
   origin?: string | null;
   /** A looser decision match, offered and never applied (design (b)). */
   looks_settled?: string | null;
+  /** Whole weeks one of the owner's open items has gone unmentioned. His
+   *  items never go stale; the quiet ones list after his active ones. */
+  quiet_weeks?: number | null;
 };
 
 /** How long ago `opened_at` / `last_seen_at` was, from the hub's age at the
@@ -3711,6 +3714,37 @@ export default function App() {
 
   /** One Owed table. Same columns for every group and every status; only the
    *  actions differ (a closed row reopens, an open one closes or snoozes). */
+  // The owner's items never go stale: the quiet ones show after the active
+  // ones, one group per "Quiet for N weeks", instead of disappearing.
+  const renderNeedsYou = (rows: Commitment[], title: string) => {
+    const active = rows.filter((c) => !c.quiet_weeks);
+    const weeks = [...new Set(rows.map((c) => c.quiet_weeks ?? 0).filter((n) => n > 0))].sort((a, b) => a - b);
+    return (
+      <>
+        {active.length > 0 ? renderOwedTable(active, title) : null}
+        {weeks.map((n) => {
+          const quiet = rows.filter((c) => c.quiet_weeks === n);
+          const label = `Quiet for ${n} weeks`;
+          return (
+            <Disclosure
+              key={`quiet-${n}`}
+              className="group"
+              defaultOpen
+              label={
+                <>
+                  <strong>{label}</strong>
+                  <span className="nav-count quiet">{quiet.length.toLocaleString()}</span>
+                </>
+              }
+            >
+              {renderOwedTable(quiet, label)}
+            </Disclosure>
+          );
+        })}
+      </>
+    );
+  };
+
   const renderOwedTable = (rows: Commitment[], groupTitle?: string) => {
     const selectable = owedStatus === "open";
     const allOn = rows.length > 0 && rows.every((c) => owedSelected.has(c.id));
@@ -5586,7 +5620,7 @@ export default function App() {
                           </>
                         }
                       >
-                        {rows.length > 0 ? renderOwedTable(rows, title) : null}
+                        {id === "needs-you" ? renderNeedsYou(rows, title) : rows.length > 0 ? renderOwedTable(rows, title) : null}
                         {renderOwedMore(key, rows.length)}
                       </Disclosure>
                     );
