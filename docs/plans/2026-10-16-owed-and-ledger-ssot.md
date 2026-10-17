@@ -407,3 +407,32 @@ Matt approved this scope and answered its questions:
    in the app's Owed under Needs you as one "Quiet for N weeks" group per week count, and in `khipu_owed` and
    `khipu owed` at the end of the list with `group` set to the same words. Other owners' items keep the
    existing staleness. `tests/test_owed_owner_guard.py` covers it with the other automatic rules.
+
+## Decision (Matt, 2026-10-17): suggest, don't close
+
+After five review rounds in which every remaining serious bug was one of Matt's items closed or reassigned
+automatically by mistake, Matt decided: **"Suggest, don't close."** This replaces the auto-close rule for his
+items in design (b) and the two exceptions decision 7 left open (a close on the item's own pull requests,
+and his own "done" in a conversation).
+
+- **Items Matt owns never change automatically.** No automatic close (pull request evidence included),
+  merge, hide or reassignment, by any path: the PR rule, the decision rule, a closed loop or `done:` line,
+  the relay close, the session-end rules, the hygiene pass, staleness, and the clean-up's apply.
+- **Looks done.** An item of his that a rule would have closed (every pull request it names merged or
+  closed, a later decision settles it, a later capture says it is done, another item restates it) lists in a
+  **Looks done** group, in the app's Owed and in `khipu_owed` and `khipu owed` (`group` "Looks done",
+  `looks_done` with the rule, the reason and the evidence, and a `looks_done` filter). The suggestion is
+  kept on the item (`settle_suggestion`); a newer state of the same evidence replaces it, and a pull
+  request suggestion is withdrawn when a PR the item names is no longer finished.
+- **Matt closes them, and nothing else does.** By direction ("close those"): the agent lists the Looks done
+  items and closes them with `khipu_owed_update`, through the owner-direction path being built on
+  `docs/owner-direction` (until that merges, through the existing owner gate, `bulk_owner_gate`). Or in the
+  app with one tap: **Close all that look done**, or **Close** on one item. A reopen after such a close
+  withdraws the suggestion and remembers its evidence, so the same evidence never suggests it again.
+- **Job and orchestrator items keep auto-close** by finished-PR evidence and the other rules, as before.
+- **The single write path enforces it.** `commitments.close_by_rule`, `commitments.auto_reassign` and
+  `commitments.mark_stale` read the item's owner under the row lock at the moment of the write, never from
+  the caller's earlier read, and the write itself repeats the check (the stored owner must still be the one
+  read). An automatic writer that finds the owner is Matt is refused; a close becomes a Looks done
+  suggestion, an owner change stays a clean-up proposal. `tests/test_owed_owner_guard.py` enumerates every
+  automatic rule and every writer.
