@@ -183,7 +183,7 @@ describe("App loading and recovery", () => {
   it("keeps Settings and the rail when a hidden Harnesses read returns a malformed envelope", async () => {
     const malformed = deferred();
     let reads = 0;
-    script("ok", { integrations: () => ++reads === 1 ? integrations : malformed.promise });
+    script("ok", { integrations: () => ++reads === 1 ? integrations : reads === 2 ? malformed.promise : integrations });
     render(<App />);
     await select("Harnesses");
     await waitFor(() => expect(within(visiblePanel()).getByRole("button", { name: "Refresh" })).toBeEnabled());
@@ -195,7 +195,16 @@ describe("App loading and recovery", () => {
     const hiddenHarnesses = [...document.querySelectorAll<HTMLElement>("main > section.panel")].find((pane) => pane.querySelector("h1")?.textContent === "Harnesses")!;
     await waitFor(() => expect(hiddenHarnesses).toHaveTextContent("Khipu returned an unreadable harness status."));
     expect(hiddenHarnesses).toHaveClass("is-hidden");
-    expect([...hiddenHarnesses.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Retry")).toBe(true);
+    const retry = [...hiddenHarnesses.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "Retry");
+    expect(retry).toBeDefined();
+    if (!retry) throw new Error("Harnesses retry button was missing");
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+    await waitFor(() => expect(reads).toBe(3));
+    await waitFor(() => expect(hiddenHarnesses).not.toHaveTextContent("Khipu returned an unreadable harness status."));
+    assertPane("Settings");
+    expect(hiddenHarnesses).toHaveClass("is-hidden");
   });
 
   it("provides a working retry for a failed first Work read", async () => {

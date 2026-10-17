@@ -905,6 +905,8 @@ export function IntegrationsPanel({
   }, [focusHome, busy]);
 
   const detected = (rows ?? []).filter((r) => r.detected);
+  const unreadableStatus =
+    loadError?.includes("Khipu returned an unreadable harness status.") ?? false;
 
   return (
     <div className="panel-body wide">
@@ -934,8 +936,9 @@ export function IntegrationsPanel({
             </button>
           }
         >
-          The CLI didn't answer, so this is the last known state. Check that
-          Python 3.11 and the Khipu folder are set under Settings → Advanced.
+          {unreadableStatus
+            ? "Khipu returned an unreadable harness status. The last known state is still shown."
+            : "The CLI didn't answer, so this is the last known state. Check that Python 3.11 and the Khipu folder are set under Settings → Advanced."}
         </Callout>
       ) : null}
 
