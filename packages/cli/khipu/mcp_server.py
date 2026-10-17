@@ -1906,7 +1906,10 @@ def _owed_change_on_hub(args: dict) -> dict:
 
                 batches: list[str] = []
                 live = [cid for cid in ids if cid in rows]
-                if len(ids) > 1 and owed_tidy._ready(cur):
+                batch_ready = len(ids) > 1 and owed_tidy._ready(cur)
+                if len(ids) > 1 and args.get("owner_gate") == "direction" and not batch_ready:
+                    return {"ok": False, "changed": 0, "error": owed_tidy.NOT_READY, **echo}
+                if batch_ready:
                     # Every bulk action is kept with its reason and each
                     # item's state before (owner, status, due date), so
                     # `khipu owed tidy --undo BATCH` restores them exactly.

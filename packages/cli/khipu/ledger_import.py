@@ -565,7 +565,11 @@ def run_import(path: str | os.PathLike, project: str, *, dry_run: bool = False, 
     new, dry run, refused, rolled back."""
     ledger.refuse_secrets(project)
     project = ledger._check_project(project)
-    src = read_tracker(path)
+    from khipu import owner_direction
+
+    src = None if dry_run else owner_direction.import_source(path, project, catch_up=catch_up)
+    if src is None:
+        src = read_tracker(path)
     counts = tracker_counts(src["rows"])
     report: dict[str, Any] = {"ok": True, "project": project, "file": src["name"], "digest": src["digest"],
                               "counts_in_file": counts, "masked": src["masked"], "other_keys": src["other_keys"],

@@ -834,6 +834,11 @@ def run_commitments_hygiene(
             elif v["verdict"] == "duplicate":
                 keeper = dupes[cid]
                 if co.owner_guard(by_id[cid]["owner"], "duplicate"):
+                    co.suggest_looks_done(
+                        cur, cid, rule="duplicate", reason=f"duplicate-of-{keeper}",
+                        key=f"duplicate-of:{keeper}",
+                        evidence={"rule": "duplicate", "keeper": keeper},
+                    )
                     continue
                 if seen_ready:
                     cur.execute(

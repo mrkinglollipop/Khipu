@@ -749,6 +749,37 @@ def pending_direction() -> dict | None:
     return pend["stamp"] if pend and pend["stamp"].get("auth") == "direction" else None
 
 
+def record_owed_batch(batch: str) -> None:
+    """Persist a batch's identity before its transaction can change items."""
+    pend = _PENDING.get()
+    if not pend or pend["intent"]["action"] not in ("owed.change", "owed.tidy"):
+        return
+    line = pend.get("line")
+    if line is None:
+        raise OSError("the owner action must be recorded before its batch can be written")
+    before = dict(pend["before"]) if isinstance(pend.get("before"), dict) else {}
+    if pend["intent"]["action"] == "owed.change":
+        before["batches"] = [*(before.get("batches") or []), batch]
+    else:
+        before["batch"] = batch
+    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
+             "state": "pending", "before": before})
+    pend["before"] = before
+
+
+def import_source(path, project: str, *, catch_up: bool = False) -> dict | None:
+    """The parsed tracker read by this import's gate; never stored in the log."""
+    pend = _PENDING.get()
+    if pend is None:
+        return None
+    want = pend["intent"]
+    facts = want.get("facts") or {}
+    if (want["action"] != "ledger.import" or want["target"] != str(path)
+            or facts.get("project") != project or catch_up):
+        return None
+    return want.get("_import_source")
+
+
 def _ahead_line(want: dict, stamp: dict, before) -> dict:
     """The line written before an owner change (state ``pending``): what it
     is, who asked and how, and ``before``, so Undo works whatever happens to
@@ -1009,13 +1040,15 @@ def _before(want: dict):
         from khipu import ledger_import
 
         try:
-            digest = ledger_import.read_tracker(target)["digest"]
+            source = ledger_import.read_tracker(target)
         except Exception:  # noqa: BLE001 - the import itself says what is wrong with the file
-            return {"project": facts["project"], "digest": None}
+            return _UNREADABLE
+        digest = source["digest"]
         try:
             had = ledger_import.done_imports(facts["project"], digest)
         except Exception:  # noqa: BLE001 - an import needs the database too
             return _UNREADABLE
+        want["_import_source"] = source
         return {"project": facts["project"], "digest": digest, "had": had}
     if action == "ledger.project":
         from khipu import ledger
@@ -1048,8 +1081,7 @@ def _before(want: dict):
             return _UNREADABLE
         return {"fields": {k: row.get(k) for k in ("state", "evidence", "owner", "title", "link")}}
     if action == "owed.change":
-        # Undo undoes the hub's batch for this change, named in its result;
-        # the hub has to answer now, as the change itself needs it to.
+        # The writer records each project's batch before changing its items.
         from khipu import mcp_server
 
         try:
@@ -1058,9 +1090,8 @@ def _before(want: dict):
             return _UNREADABLE
         return _UNREADABLE if mine is None else {"owners_items": mine}
     if action == "owed.tidy":
-        # An apply's Undo undoes the batch its result names; an undo's puts
-        # that batch's changes back (owed_tidy.redo).
-        return {"project": target, "change": (want.get("facts") or {}).get("change")}
+        facts = want.get("facts") or {}
+        return {"project": target, "change": facts.get("change"), "batch": facts.get("batch")}
     if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
     if action == "direction.acknowledge":
@@ -1370,7 +1401,7 @@ def _undo_import(line, via):
 def _undo_owed_change(line, via):
     from khipu import owed_tidy
 
-    batches = (line.get("result") or {}).get("batches") or []
+    batches = _b(line).get("batches") or (line.get("result") or {}).get("batches") or []
     if not batches:
         raise ValueError("Khipu has no record of which batch this change wrote, so it can't undo it")
     restored, left_alone = 0, []
@@ -1386,7 +1417,7 @@ def _undo_owed_change(line, via):
 def _undo_owed_tidy(line, via):
     from khipu import owed_tidy
 
-    batch = (line.get("result") or {}).get("batch")
+    batch = _b(line).get("batch") or (line.get("result") or {}).get("batch")
     if not batch:
         raise ValueError("Khipu has no record of which batch this clean-up wrote, so it can't undo it")
     if _b(line).get("change") == "undo":
