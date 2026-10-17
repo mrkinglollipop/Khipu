@@ -4027,6 +4027,7 @@ export default function App() {
 
       <main className="main" aria-busy={workingLabel != null}>
         <WorkingBanner label={workingLabel} />
+        <div className="main-content">
         <section className={panelClass("first-run")}>
           <PaneBoundary key={paneRetryKeys["first-run"]} title={PANE_TITLES["first-run"]} onRetry={retryActivePane}>
           <div className="panel-body onboard-wrap" data-tauri-drag-region>
@@ -6497,6 +6498,7 @@ export default function App() {
           </div>
           </PaneBoundary>
         </section>
+        </div>
       </main>
 
       <FeedbackForm

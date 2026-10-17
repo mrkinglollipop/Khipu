@@ -1,6 +1,5 @@
-// The working strip and the panel headings both stick to the top of `.main`.
-// The heading must stick below the strip, never under it (the installed app
-// showed "Reading the memory server" covering the Home heading).
+// The working strip lives above the panel scroller. Keeping them in separate
+// layout tracks prevents scrolled panel contents from painting over the strip.
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 import { BANNER_HEIGHT_VAR, WorkingBanner } from "../WorkingBanner";
@@ -9,6 +8,10 @@ import { readFileSync } from "node:fs";
 
 const appCss: string = readFileSync(
   `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/App.css`,
+  "utf8",
+);
+const appSource: string = readFileSync(
+  `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/App.tsx`,
   "utf8",
 );
 const rule = (selector: string) => {
@@ -42,9 +45,27 @@ describe("WorkingBanner", () => {
     }
   });
 
-  it("sticks the panel heading and the sub navigation below the strip", () => {
-    expect(rule(".working-banner")).toMatch(/position: sticky;\s*top: 0;/);
-    expect(rule(".panel-head")).toContain(`top: var(${BANNER_HEIGHT_VAR}, 0px);`);
-    expect(rule(".subnav")).toContain(`var(${BANNER_HEIGHT_VAR}, 0px)`);
+  it("keeps the banner outside the panel scroller", () => {
+    const { container } = render(
+      <main className="main">
+        <WorkingBanner label="Reading the memory server" />
+        <div className="main-content"><section>Scrolled panel</section></div>
+      </main>,
+    );
+    const main = container.querySelector("main")!;
+    const banner = container.querySelector<HTMLElement>(".working-banner")!;
+    const scroller = container.querySelector(".main-content")!;
+    expect(banner.parentElement).toBe(main);
+    expect(scroller.parentElement).toBe(main);
+    expect(banner.nextElementSibling).toBe(scroller);
+    expect(scroller).not.toContainElement(banner);
+    const bannerAt = appSource.indexOf('<WorkingBanner label={workingLabel} />');
+    const scrollerAt = appSource.indexOf('<div className="main-content">');
+    expect(bannerAt).toBeGreaterThanOrEqual(0);
+    expect(scrollerAt).toBeGreaterThan(bannerAt);
+    expect(rule(".main")).toContain("overflow: hidden;");
+    expect(rule(".main-content")).toContain("overflow-y: auto;");
+    expect(rule(".working-banner")).toContain("flex: none;");
+    expect(rule(".panel-head")).toContain("top: 0;");
   });
 });

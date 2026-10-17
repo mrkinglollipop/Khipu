@@ -30,7 +30,7 @@ import {
   windowLabel,
 } from "./PlansCard";
 import type { UsageAccount, UsageAccountEntry } from "./PlansCard";
-import { COMING, cliName, planWord, plural, reasonWords, suggestedName, useAccountsSupport, useDiscovery, versionRefused } from "./accountsApi";
+import { COMING, cliName, offeredSignInServices, planWord, plural, readSignInOffers, reasonWords, serviceName, suggestedName, useAccountsSupport, useDiscovery, versionRefused } from "./accountsApi";
 import type { Candidate } from "./accountsApi";
 import { AddAccountDialog } from "./AddAccountDialog";
 import { AutoTrackSwitch, addQuietLogins } from "./FoundAccounts";
@@ -419,6 +419,15 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
   // error then offers Reload, which reads both again.
   const [moved, setMoved] = useState(false);
   const [reloading, setReloading] = useState(false);
+  const [signInOffers, setSignInOffers] = useState<Awaited<ReturnType<typeof readSignInOffers>> | null>(null);
+  useEffect(() => {
+    if (!active) return;
+    let live = true;
+    void readSignInOffers().then((offers) => {
+      if (live) setSignInOffers(offers);
+    });
+    return () => { live = false; };
+  }, [active]);
   useEffect(() => {
     if (!active) {
       setErr(null);
@@ -789,7 +798,14 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
             <button type="button" className="sm" disabled={saving} onClick={() => setAddOpen((n) => n + 1)}>
               Add another account…
             </button>
-            <span className="t2">Sign in to a second Claude or Codex account, or choose a login kept somewhere else.</span>
+            <span className="t2">
+              {(() => {
+                const offered = offeredSignInServices(signInOffers).map((cli) => serviceName(cli));
+                return offered.length
+                  ? `Sign in to a second ${listOf(offered)} account${offered.length === 1 ? "" : "s"}, or choose a login kept somewhere else.`
+                  : "Choose a login kept somewhere else.";
+              })()}
+            </span>
           </div>
           {listPlan && listWrite ? (
             <p className="set-help" role="status">

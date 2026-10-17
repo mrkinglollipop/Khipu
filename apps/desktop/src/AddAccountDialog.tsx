@@ -24,6 +24,7 @@ import {
   nameProblem,
   plural,
   reasonWords,
+  readSignInOffers,
   saveCliSetting,
   saveNewAccount,
   serviceName,
@@ -31,10 +32,9 @@ import {
   suggestedName,
   tryAccount,
 } from "./accountsApi";
-import type { Candidate, CliId, CliState, DiscoverResult, SaveProblem, Support, TryResult } from "./accountsApi";
+import type { Candidate, CliId, CliState, DiscoverResult, SaveProblem, SignInOffers, Support, TryResult } from "./accountsApi";
 import { fmtPct, meterTone, resetPhrase, signInOutcome, tightestWindow, windowLabel } from "./PlansCard";
 import type { UsageAccount, UsageAccountEntry } from "./PlansCard";
-import { callCli } from "./settingsCli";
 import { SignInNewAccount } from "./SignInNewAccount";
 import "./accounts.css";
 
@@ -201,6 +201,21 @@ function pickable(c: Candidate): boolean {
   return c.state !== "not_checked" && c.state !== "pending";
 }
 
+function candidateCheckSummary(cli: CliId, candidates: Candidate[]): string {
+  const name = serviceName(cli);
+  const count = (state: Candidate["state"]) => candidates.filter((candidate) => candidate.state === state).length;
+  const checked = count("signed_in") + count("not_signed_in");
+  const words = (n: number) => `${n} ${name} ${n === 1 ? "login" : "logins"}`;
+  const parts: string[] = [checked ? `Khipu checked ${words(checked)}.` : `Khipu did not check any ${name} logins.`];
+  const couldntCheck = count("couldnt_check");
+  // A pending probe has not told Khipu whether this login is signed in yet,
+  // so say that it is unchecked rather than quietly counting it as checked.
+  const unchecked = count("not_checked") + count("pending");
+  if (couldntCheck) parts.push(`${words(couldntCheck)} could not be checked.`);
+  if (unchecked) parts.push(`${words(unchecked)} ${unchecked === 1 ? "is" : "are"} unchecked.`);
+  return parts.join(" ");
+}
+
 /** Where each CLI keeps its default login, as the mocks show it. */
 const DEFAULT_HOME: Record<string, string> = { claude: "~/.claude", codex: "~/.codex", grok: "~/.grok" };
 
@@ -284,7 +299,7 @@ export function AddAccountDialog({
   const [checkingFolder, setCheckingFolder] = useState<string | null>(null);
   const [way, setWay] = useState<"have" | "new">("have");
   const [newName, setNewName] = useState("");
-  const [offers, setOffers] = useState<Record<string, { offered?: boolean }> | null>(null);
+  const [offers, setOffers] = useState<SignInOffers | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const headRef = useRef<HTMLHeadingElement>(null);
@@ -317,8 +332,8 @@ export function AddAccountDialog({
   useEffect(() => {
     if (!open || canSignInNew !== undefined || offers) return;
     let live = true;
-    void callCli<Record<string, { offered?: boolean }>>("khipu_account_sign_in_offers").then((res) => {
-      if (live) setOffers(res.ok && res.data && typeof res.data === "object" ? res.data : {});
+    void readSignInOffers().then((next) => {
+      if (live) setOffers(next);
     });
     return () => {
       live = false;
@@ -591,7 +606,7 @@ export function AddAccountDialog({
   if (step === 1) {
     body = (
       <>
-        <h2 id={titleId} ref={headRef} tabIndex={-1}>
+        <h2 className="aa-step-heading" id={titleId} ref={headRef} tabIndex={-1}>
           {stepLabel}Add an account
         </h2>
         <p>Which service is the account with?</p>
@@ -761,7 +776,7 @@ export function AddAccountDialog({
           offered
           canBegin={!!newName.trim() && !newErr}
           heading={(title) => (
-            <h2 id={titleId} ref={headRef} tabIndex={-1}>
+            <h2 className="aa-step-heading" id={titleId} ref={headRef} tabIndex={-1}>
               {stepLabel}
               {title}
             </h2>
@@ -787,7 +802,7 @@ export function AddAccountDialog({
       );
     } else body = (
       <>
-        <h2 id={titleId} ref={headRef} tabIndex={-1}>
+        <h2 className="aa-step-heading" id={titleId} ref={headRef} tabIndex={-1}>
           {stepLabel}
           {svc}: which login?
         </h2>
@@ -872,8 +887,7 @@ export function AddAccountDialog({
         )}
         {candidates.length ? (
           <p className="aa-note">
-            Khipu looked at folder names in your home folder and at the logins your conversations ran under, then asked{" "}
-            {cliName(cli)} whether each one is signed in. It never opened what is inside them.
+            Khipu looked at folder names in your home folder and at the logins your conversations ran under. {candidateCheckSummary(cli, candidates)} It never opened what is inside them.
           </p>
         ) : null}
         <p className="aa-note">
@@ -1000,7 +1014,7 @@ export function AddAccountDialog({
     const otherName = problem?.other ?? null;
     body = (
       <>
-        <h2 id={titleId} ref={headRef} tabIndex={-1}>
+        <h2 className="aa-step-heading" id={titleId} ref={headRef} tabIndex={-1}>
           {stepLabel}Check and save
         </h2>
         <div className="aa-field">
@@ -1097,7 +1111,7 @@ export function AddAccountDialog({
   } else {
     body = (
       <>
-        <h2 id={titleId} ref={headRef} tabIndex={-1}>Add an account</h2>
+        <h2 className="aa-step-heading" id={titleId} ref={headRef} tabIndex={-1}>Add an account</h2>
         <p>Choose a login first.</p>
         <div className="aa-actions">
           <button type="button" className="aa-left" onClick={close}>Cancel</button>

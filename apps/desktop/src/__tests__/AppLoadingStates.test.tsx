@@ -2,9 +2,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "../App";
-import appCss from "../App.css?raw";
+// @ts-expect-error node:fs has no types here
+import { readFileSync } from "node:fs";
 import { WELCOME_DONE_KEY } from "../Welcome";
 import { parseStatusRows } from "../IntegrationsPanel";
+
+const appCss: string = readFileSync(
+  `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/App.css`,
+  "utf8",
+);
 
 const invokeMock = vi.fn();
 const boundaryFault = vi.hoisted(() => ({ enabled: false }));
@@ -112,7 +118,7 @@ afterEach(async () => {
 
 const primaryViews = ["Home", "Work", "Recall", "Activity", "Harnesses", "Settings"] as const;
 function visiblePanel() {
-  const panels = [...document.querySelectorAll<HTMLElement>("main > section.panel")].filter((pane) => !pane.classList.contains("is-hidden"));
+  const panels = [...document.querySelectorAll<HTMLElement>("main section.panel")].filter((pane) => !pane.classList.contains("is-hidden"));
   expect(panels).toHaveLength(1);
   expect(panels[0]).toBeVisible();
   return panels[0];
@@ -192,7 +198,7 @@ describe("App loading and recovery", () => {
     await select("Settings");
     await act(async () => { malformed.resolve('{"ok":false,"error":"unreadable response"}'); });
     assertPane("Settings");
-    const hiddenHarnesses = [...document.querySelectorAll<HTMLElement>("main > section.panel")].find((pane) => pane.querySelector("h1")?.textContent === "Harnesses")!;
+    const hiddenHarnesses = [...document.querySelectorAll<HTMLElement>("main section.panel")].find((pane) => pane.querySelector("h1")?.textContent === "Harnesses")!;
     await waitFor(() => expect(hiddenHarnesses).toHaveTextContent("Khipu returned an unreadable harness status."));
     expect(hiddenHarnesses).toHaveClass("is-hidden");
     const retry = [...hiddenHarnesses.querySelectorAll<HTMLButtonElement>("button")]
@@ -249,4 +255,25 @@ describe("App loading and recovery", () => {
     expect(parseStatusRows("[]")).toEqual([]);
     expect(parseStatusRows(integrations)).toEqual(JSON.parse(integrations));
   });
+});
+
+
+it("keeps Home's loading banner outside the content scroll area", async () => {
+  script("late");
+  render(<App />);
+  const main = screen.getByRole("main");
+  await waitFor(() => expect(main.querySelector(".working-banner")).not.toBeNull());
+  const banner = main.querySelector<HTMLElement>(".working-banner")!;
+  const scroller = main.querySelector(".main-content");
+  expect(scroller).not.toBeNull();
+  expect(banner.parentElement).toBe(main);
+  expect(scroller!.parentElement).toBe(main);
+  expect(banner.nextElementSibling).toBe(scroller);
+  expect(scroller).not.toContainElement(banner);
+  // jsdom does not expand the overflow shorthand, so read the shipped rules themselves.
+  const rule = (selector: string) =>
+    appCss.match(new RegExp(`^\\${selector}\\s*\\{[^}]*\\}`, "m"))?.[0].replace(/\/\*[\s\S]*?\*\//g, "") ?? "";
+  expect(rule(".main")).toMatch(/\boverflow:\s*hidden;/);
+  expect(rule(".main-content")).toMatch(/\boverflow-y:\s*auto;/);
+  expect(scroller!.querySelector("section.panel")).not.toBeNull();
 });

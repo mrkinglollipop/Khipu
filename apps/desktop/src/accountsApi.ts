@@ -345,6 +345,18 @@ export type Support =
   | { state: "here"; status: AccountsStatus9B }
   | { state: "error"; error: string };
 
+export type SignInOffers = Partial<Record<CliId, { offered?: boolean }>>;
+
+/** The desktop bridge is the capability authority for every add-account flow. */
+export async function readSignInOffers(): Promise<SignInOffers> {
+  const res = await callCli<SignInOffers>("khipu_account_sign_in_offers");
+  return res.ok && res.data && typeof res.data === "object" ? res.data : {};
+}
+
+export function offeredSignInServices(offers: SignInOffers | null): CliId[] {
+  return CLI_IDS.filter((cli) => offers?.[cli]?.offered === true);
+}
+
 function shaped9B(d: unknown): d is AccountsStatus9B {
   const s = d as AccountsStatus9B | null;
   return !!s && typeof s === "object" && typeof s.version === "string" && Array.isArray(s.accounts);

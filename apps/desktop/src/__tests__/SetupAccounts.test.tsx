@@ -122,6 +122,8 @@ function fake(o: Opts = {}): World {
       case "khipu_features_show":
         if (o.featuresFail) throw new Error("no");
         return JSON.stringify({ features: { routing_push: { enabled: world.push, source: "default" } } });
+      case "khipu_account_sign_in_offers":
+        return JSON.stringify({ claude: { offered: true }, codex: { offered: false }, grok: { offered: false }, muse: { offered: false } });
       case "khipu_feature_set":
         world.push = args?.enabled === true;
         return JSON.stringify({ ok: true });
@@ -180,6 +182,13 @@ async function ready() {
 }
 
 describe("Setup › Accounts step", () => {
+  it("uses the same offered sign-in capabilities as Add an account", async () => {
+    fake();
+    mount();
+    await ready();
+    expect(await screen.findByText("Sign in to a second Claude account, or choose a login kept somewhere else.")).toBeInTheDocument();
+  });
+
   it("Skip for now writes nothing", async () => {
     fake();
     const { onNext } = mount();
