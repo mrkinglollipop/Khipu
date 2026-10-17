@@ -35,6 +35,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
@@ -287,6 +288,7 @@ def meta() -> dict[str, Any]:
             data = loaded if isinstance(loaded, dict) else {"readable": False}
     except (OSError, ValueError):
         data = {"readable": False}
+    data.pop("ledger_caught_up_at", None)
     # The image is authoritative: a copied/removed sidecar must not make an
     # incremental write look like a fresh full replica, nor strand the
     # dump's hub time that freshness is measured from.
@@ -294,7 +296,7 @@ def meta() -> dict[str, Any]:
         con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
         try:
             if _snapshot_table_columns(con, "snapshot_meta"):
-                for key in ("refreshed_at", "hub_dumped_at"):
+                for key in ("refreshed_at", "hub_dumped_at", "ledger_caught_up_at"):
                     row = con.execute("SELECT value FROM snapshot_meta WHERE key = ?", (key,)).fetchone()
                     if row and _utc(row[0]) is not None:
                         data[key] = row[0]
@@ -311,16 +313,19 @@ def meta() -> dict[str, Any]:
 PULL_CAUGHT_UP_KEY = "pull_caught_up_at"
 
 
-def caught_up_at(m: Mapping[str, Any] | None = None) -> str | None:
+def caught_up_at(m: Mapping[str, Any] | None = None, *, ledger: bool = False) -> str | None:
     """How current the replica is: the later of its last full dump
     (``refreshed_at``) and the start of its last incremental pull that
     finished with every part ok, made against this same dump. A pull that
-    copied nothing counts too: it asked the hub and found nothing new. The
-    one source for the replica's age; tests/test_replica_caught_up.py
+    copied nothing counts too: it asked the hub and found nothing new.
+    Ledger readers use only their own pull stamp, stored in the image.
+    The one source for the replica's age; tests/test_replica_caught_up.py
     enumerates its readers."""
     m = meta() if m is None else m
     stamps = [(_utc(m.get("refreshed_at")), m.get("refreshed_at"))]
-    side = _read_sidecar()
+    if ledger:
+        stamps.append((_utc(m.get("ledger_caught_up_at")), m.get("ledger_caught_up_at")))
+    side = {} if ledger else _read_sidecar()
     # A sidecar left from another dump (copied, or the dump replaced the
     # image but not the sidecar) says nothing about this copy.
     if side.get("pull_dump") is not None and side.get("pull_dump") == m.get("hub_dumped_at"):
@@ -1108,16 +1113,115 @@ def _cursor_after(old: tuple[datetime, int], newest: tuple[datetime, int] | None
     return max(old, new)
 
 
-def _pull_apply(cur, state: Mapping[str, Any], limit: int) -> dict[str, Any]:
+def _read_ledger_pull(cur, limit: int) -> dict[str, Any] | None:
+    """Compare row versions and history tails, never timestamps: a delayed
+    write can carry an old authored time. Projects and vocabulary have no
+    revisions, so each pull compares their complete, small manifests and
+    passes only changed projects to the writer."""
+    if "row_id" not in _pg_columns(cur, "ledger_rows"):
+        return None
+    with closing(sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)) as con:
+        if not _snapshot_table_columns(con, "ledger_rows"):
+            return None
+        if not _snapshot_table_columns(con, "ledger_gone"):
+            return {"ok": False, "needs_refresh": True, "error": "ledger copy has no removal markers; refresh it"}
+        held_projects = {p: (name, hidden, created) for p, name, hidden, created in con.execute(
+            "SELECT project, name, hidden, created_at FROM ledger_projects")}
+        held_vocab: dict[str, dict[str, list]] = {}
+        for p, field, word, meaning in con.execute(
+                "SELECT project, field, word, meaning FROM ledger_vocab ORDER BY project, field, position"):
+            words = held_vocab.setdefault(p, {"state": [], "kind": []})
+            words[field].append([word, meaning] if field == "state" else word)
+        held = {(p, r): (v, h) for p, r, v, h in con.execute(
+            "SELECT r.project, r.row_id, r.version, coalesce(max(h.id), 0) "
+            "FROM ledger_rows r LEFT JOIN ledger_history h "
+            "ON h.project=r.project AND h.row_id=r.row_id GROUP BY r.project, r.row_id, r.version")}
+        marks = {(p, r): v for p, r, v in con.execute("SELECT project, row_id, version FROM ledger_gone")}
+    cur.execute("SELECT r.project, r.row_id, r.version, r.removed_at, coalesce(max(h.id), 0) "
+                "FROM ledger_rows r LEFT JOIN ledger_history h "
+                "ON h.project=r.project AND h.row_id=r.row_id "
+                "GROUP BY r.project, r.row_id, r.version, r.removed_at")
+    changed: dict[str, list[str]] = {}
+    gone: dict[str, dict[str, int]] = {}
+    for project, row_id, version, removed, tail in cur.fetchall():
+        old = held.get((project, row_id))
+        mark = marks.get((project, row_id), 0)
+        if removed is not None:
+            if max(mark, old[0] if old else 0) <= version:
+                if mark < version or old is not None:
+                    gone.setdefault(project, {})[row_id] = version
+        elif mark < version and (old is None or (version, tail) > old):
+            changed.setdefault(project, []).append(row_id)
+    cur.execute("SELECT project, row_id FROM ledger_removed WHERE purged_at IS NOT NULL")
+    for project, row_id in cur.fetchall():
+        if marks.get((project, row_id), 0) < LEDGER_PURGED_VERSION or (project, row_id) in held:
+            gone.setdefault(project, {})[row_id] = LEDGER_PURGED_VERSION
+    if sum(map(len, changed.values())) + sum(map(len, gone.values())) > limit:
+        return {"ok": False, "needs_refresh": True,
+                "error": f"more than {limit} ledger changes; refresh the ledger copy"}
+    cur.execute("SELECT project, name, hidden, created_at FROM ledger_projects")
+    projects = {p: (name, hidden, created) for p, name, hidden, created in cur.fetchall()}
+    vocab: dict[str, dict[str, list]] = {}
+    cur.execute("SELECT project, field, word, meaning, position FROM ledger_vocab ORDER BY project, field, position")
+    for p, field, word, meaning, _position in cur.fetchall():
+        words = vocab.setdefault(p, {"state": [], "kind": []})
+        words[field].append([word, meaning] if field == "state" else word)
+    # Only changed manifests cross into the writer. Row-only changes leave
+    # project metadata and vocabulary untouched.
+    vocab = {p: vocab.get(p, {"state": [], "kind": []}) for p in set(projects) | set(held_vocab)
+             if vocab.get(p, {"state": [], "kind": []}) != held_vocab.get(p, {"state": [], "kind": []})}
+    projects = {p: value for p, value in projects.items()
+                if (value[0], int(bool(value[1])), _ts_text(value[2])) != held_projects.get(p)}
+    rows: dict[str, list] = {}
+    history: dict[str, list] = {}
+    for project, ids in changed.items():
+        cur.execute(f"SELECT {', '.join(_LEDGER_ROW_COLS)} FROM ledger_rows "
+                    "WHERE project = %s AND row_id = ANY(%s) AND removed_at IS NULL", (project, ids))
+        rows[project] = [dict(zip(_LEDGER_ROW_COLS, r, strict=True)) for r in cur.fetchall()]
+        cur.execute(f"SELECT {', '.join(_LEDGER_HIST_COLS)} FROM ledger_history "
+                    "WHERE project = %s AND row_id = ANY(%s) ORDER BY id", (project, ids))
+        history[project] = [dict(zip(_LEDGER_HIST_COLS, r, strict=True)) for r in cur.fetchall()]
+    return {"ok": True, "projects": projects, "vocab": vocab, "rows": rows, "history": history, "gone": gone}
+
+
+def _write_ledger_pull(payload: Mapping[str, Any] | None, *, read_at: float) -> dict[str, Any]:
+    if payload is None:
+        return {"ok": True, "not_applicable": True}
+    return ledger_write_snapshot("", None, {}, [], [], [], _pull=payload, read_at=read_at)
+
+
+def _apply_ledger_pull(con: sqlite3.Connection, payload: Mapping[str, Any], *,
+                       read_at: float) -> dict[str, Any]:
+    """Apply the complete ledger part on the registered replica writer's transaction."""
+    # A dump published since this hub read already contains a newer
+    # ledger. Its data and freshness marker stay together.
+    if _held_read_at(con, "ledger", "*") > read_at:
+        return {"ok": True, "skipped": "the replica holds a newer copy"}
+    projects = payload["projects"]
+    for project in set(projects) | set(payload["vocab"]) | set(payload["gone"]) | set(payload["rows"]):
+        _write_ledger_project(
+            con, project, projects.get(project),
+            payload["vocab"].get(project),
+            payload["rows"].get(project, []), payload["history"].get(project, []),
+            payload["gone"].get(project, {}), read_at=read_at)
+    if _held_read_at(con, "ledger", "*") < read_at:
+        _record_read_at(con, "ledger", "*", read_at)
+        con.execute("INSERT OR REPLACE INTO snapshot_meta(key,value) VALUES ('ledger_caught_up_at', ?)",
+                    (datetime.fromtimestamp(read_at, timezone.utc).isoformat(),))
+    return {"ok": True}
+
+
+def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bool = True) -> dict[str, Any]:
     """The hub half of ``pull_changes``, on its one cursor. Everything the
-    limit can refuse is read before the first write."""
+    memory limit can refuse is read before the first write. Ledger failures
+    are reported separately and never refuse the memory part."""
     from datetime import timedelta
 
+    # Taken before the transaction snapshot, never after its first read.
+    read_at = time.time()
     cur.execute("SELECT now()")
     hub_now = _utc(cur.fetchone()[0]) or datetime.now(timezone.utc)
     cap = hub_now - timedelta(seconds=FRESHNESS_OVERLAP_S)
-    # Every row below is read after this (the freshness rule, _held_read_at).
-    read_at = time.time()
     hub_cols = _pg_columns(cur, "episodes")
     cols = [c for c in _EPISODE_COLS if c in hub_cols]
     sel = ", ".join(cols)
@@ -1171,6 +1275,17 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int) -> dict[str, Any]:
     commitments = _hub_commitments(cur)
     if max(len(fresh), len(gone), len(groups), len(topic_rows or ())) > limit:
         return _pull_needs_dump(limit)
+
+    # Even schema discovery belongs to the savepoint: any failed PostgreSQL
+    # statement would otherwise abort the memory transaction too.
+    cur.execute("SAVEPOINT ledger_pull")
+    try:
+        ledger_payload = _read_ledger_pull(cur, limit) if include_ledger else None
+    except Exception as exc:  # noqa: BLE001 - the ledger is an independent part
+        cur.execute("ROLLBACK TO SAVEPOINT ledger_pull")
+        ledger_payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    finally:
+        cur.execute("RELEASE SAVEPOINT ledger_pull")
 
     changed: dict[int, dict[str, Any]] = {int(r["id"]): r for r in [*fresh, *gone]}
     want = set(state["missed"])
@@ -1271,6 +1386,13 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int) -> dict[str, Any]:
     last_fresh = _utc(fresh_stamps[-1][0]) if fresh_stamps else None
 
     parts = _write_pulled_tables(topic_rows, commitments, read_at=read_at)
+    if ledger_payload is not None and not ledger_payload.get("ok"):
+        parts["ledger"] = ledger_payload
+    else:
+        try:
+            parts["ledger"] = _write_ledger_pull(ledger_payload, read_at=read_at)
+        except Exception as exc:  # noqa: BLE001 - memory writes already succeeded
+            parts["ledger"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     last_group = _utc(groups[-1][3]) if groups else None
     cursors = {
         "episodes": _cursor_after(after, None if last_fresh is None else (last_fresh, int(fresh_stamps[-1][1])),
@@ -1373,7 +1495,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
     return parts
 
 
-def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
+def pull_changes(*, limit: int = PULL_LIMIT, include_ledger: bool = True) -> dict[str, Any]:
     """Bring the replica level with the hub without a full dump: episodes
     changed (by ``changed_at``, or ``ingested_at`` on a hub or row without
     it) or tombstoned since this replica's cursors, the episodes whose
@@ -1382,7 +1504,9 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
     no change stamp) and the decisions changed elsewhere. Every episode goes
     through ``upsert_episode``, so the forgotten-source fence, queued
     erasures, tombstones and the freshness rule apply as for a capture.
-    ``ok`` is the AND of the parts; a failed part is named in ``failed``.
+    ``ok`` covers the memory parts; ledger health is returned separately.
+    A failed part is named in ``failed``. Heal can defer the ledger read with
+    ``include_ledger=False`` while a failed ledger refresh is in backoff.
 
     The cursors live in the sidecar beside ``last_pull_at``; a full dump
     replaces the sidecar and so resets them to its own hub time. Each moves to
@@ -1390,8 +1514,9 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
     ``FRESHNESS_OVERLAP_S``: a stamp is taken inside a transaction, so a long
     one can commit an older stamp after a newer one was read, and the
     overlap re-reads those minutes (the upserts are idempotent). More than
-    ``limit`` changes of a kind writes nothing and asks for a full dump.
-    Never raises."""
+    ``limit`` memory changes of a kind writes nothing and asks for a full dump.
+    Ledger overflow asks for a ledger refresh without stopping memory; only
+    memory parts determine the memory caught-up stamp. Never raises."""
     from datetime import timedelta
 
     path = snapshot_path()
@@ -1429,17 +1554,22 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
     started = time.time()
     try:
         with try_hub_connect(connect_timeout=HUB_CONNECT_TIMEOUT_S) as pg:
+            from psycopg import IsolationLevel
+
+            pg.isolation_level = IsolationLevel.REPEATABLE_READ
             with pg.cursor() as cur:
-                result = _pull_apply(cur, state, limit)
+                result = _pull_apply(cur, state, limit, include_ledger=include_ledger)
     except Exception as exc:  # noqa: BLE001 - reported to the caller, which decides what to do next
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300],
                 "hub_unreachable": hub_connection_failed(exc)}
     if not result.get("ok"):
         return result
     parts = {**result["parts"], "decisions": sync_decision_changes()}
-    # The result is the AND of its parts: one that failed makes it not ok and
-    # is named, so the caller never reports a copy healed that is not.
+    # Ledger repair has its own retry clock; only a memory failure asks the
+    # caller to rebuild the complete copy.
     failed = [name for name, part in parts.items() if not part.get("ok") and not part.get("not_applicable")]
+    if "ledger" in failed:
+        parts["ledger"]["needs_refresh"] = True
     try:
         side = _read_sidecar() or meta()
         for name, (at, at_id) in result["cursors"].items():
@@ -1448,7 +1578,8 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
                 side["pull_episodes_after_id"] = at_id
         side["pull_dump"] = m.get("hub_dumped_at")
         side["last_pull_at"] = _utcnow_iso()
-        if not failed:
+        if not any(name != "ledger" for name in failed):
+            # Ledger freshness lives in SQLite, independently of memory.
             # The start, not the end: a change committed while the pull ran
             # may not have been read.
             side[PULL_CAUGHT_UP_KEY] = datetime.fromtimestamp(started, timezone.utc).isoformat()
@@ -1457,16 +1588,16 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     _clear_missed_patches(result["cleared"], path=path, written_before=started)
     out: dict[str, Any] = {
-        "ok": not failed,
+        "ok": not any(name != "ledger" for name in failed),
         **{k: result[k] for k in ("episodes", "tombstones", "vectors", "missed_retried",
                                   "forgotten_skipped", "kept_newer")},
         "topics": parts["topics"].get("topics", 0), "commitments": parts["commitments"].get("commitments", 0),
-        "decisions": parts["decisions"],
+        "decisions": parts["decisions"], "ledger": parts["ledger"],
     }
     if failed:
         out["failed"] = failed
         out["error"] = "; ".join(f"{name}: {parts[name].get('error') or 'failed'}" for name in failed)[:300]
-        if any(parts[name].get("hub_unreachable") for name in failed):
+        if any(parts[name].get("hub_unreachable") for name in failed if name != "ledger"):
             out["hub_unreachable"] = True
     return out
 
@@ -1737,12 +1868,55 @@ def _ledger_value(col: str, val: Any) -> Any:
     return val
 
 
+def _create_ledger_schema(con: sqlite3.Connection) -> None:
+    # executescript commits an open transaction before running its statements.
+    # Ledger-only rebuilds must keep schema repairs and data in one transaction.
+    for statement in _LEDGER_SCHEMA_SQL.split(";"):
+        if statement.strip():
+            con.execute(statement)
+
+
+def refresh_ledger() -> dict[str, Any]:
+    """Rebuild only the ledger under the replica writer lock. All hub reads
+    share one repeatable-read snapshot; data, removals and freshness publish
+    in one SQLite transaction. Memory tables and their cursors stay untouched."""
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "needs_refresh": True, "error": "hub snapshot refresh in progress"}
+    try:
+        path = snapshot_path()
+        if not path.is_file():
+            return {"ok": False, "needs_refresh": True, "error": "hub snapshot missing"}
+        with try_hub_connect(connect_timeout=REFRESH_CONNECT_TIMEOUT_S) as pg:
+            from psycopg import IsolationLevel
+
+            pg.isolation_level = IsolationLevel.REPEATABLE_READ
+            read_at = time.time()
+            with pg.cursor() as cur:
+                if "row_id" not in _pg_columns(cur, "ledger_rows"):
+                    return {"ok": True, "not_applicable": True}
+                with closing(sqlite3.connect(str(path))) as con, con:
+                    con.execute("BEGIN IMMEDIATE")
+                    _create_ledger_schema(con)
+                    for table in ("ledger_projects", "ledger_vocab", "ledger_rows", "ledger_history", "ledger_gone"):
+                        con.execute(f"DELETE FROM {table}")
+                    count = _insert_ledger(cur, con)
+                    _record_read_at(con, "ledger", "*", read_at)
+                    con.execute("INSERT OR REPLACE INTO snapshot_meta(key,value) VALUES ('ledger_caught_up_at', ?)",
+                                (datetime.fromtimestamp(read_at, timezone.utc).isoformat(),))
+        return {"ok": True, "rows": count}
+    except Exception as exc:  # noqa: BLE001 - reported separately from memory health
+        return {"ok": False, "needs_refresh": True, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    finally:
+        _release_refresh_lock(lock)
+
+
 def _insert_ledger(cur, con: sqlite3.Connection) -> int:
     """The ledger's live rows (never a removed one), their history, and each
     project's words. Empty (0, no error) on a hub without migration 0028."""
     if "row_id" not in _pg_columns(cur, "ledger_rows"):
         return 0
-    con.executescript(_LEDGER_SCHEMA_SQL)
+    _create_ledger_schema(con)
     cur.execute("SELECT project, name, hidden, created_at FROM ledger_projects")
     for project, name, hidden, created in cur.fetchall():
         con.execute("INSERT INTO ledger_projects VALUES (?, ?, ?, ?)", (project, name, int(bool(hidden)),
@@ -1773,9 +1947,93 @@ def _insert_ledger(cur, con: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def _write_ledger_project(con: sqlite3.Connection, project: str, proj: Sequence[Any] | None,
+                          vocab: Mapping[str, list] | None, rows: Sequence[Mapping[str, Any]],
+                          history: Sequence[Mapping[str, Any]], gone: Mapping[str, int], *,
+                          read_at: float) -> dict[str, Any]:
+    """Apply one project on the caller's locked SQLite transaction."""
+    live = {r["row_id"]: r for r in rows}
+
+    def held(row_id: str) -> tuple[int | None, int | None]:
+        got = con.execute("SELECT version FROM ledger_rows WHERE project = ? AND row_id = ?",
+                          (project, row_id)).fetchone()
+        mark = con.execute("SELECT version FROM ledger_gone WHERE project = ? AND row_id = ?",
+                           (project, row_id)).fetchone()
+        return (got[0] if got else None), (mark[0] if mark else None)
+
+    def held_last_entry(row_id: str) -> int:
+        got = con.execute("SELECT MAX(id) FROM ledger_history WHERE project = ? AND row_id = ?",
+                          (project, row_id)).fetchone()
+        return int(got[0] or 0) if got else 0
+
+    last_entry: dict[str, int] = {}
+    for h in history:
+        last_entry[h.get("row_id")] = max(last_entry.get(h.get("row_id"), 0), int(h.get("id") or 0))
+
+    def drop(row_id: str) -> None:
+        con.execute("DELETE FROM ledger_rows WHERE project = ? AND row_id = ?", (project, row_id))
+        con.execute("DELETE FROM ledger_history WHERE project = ? AND row_id = ?", (project, row_id))
+
+    metadata_at = max(_held_read_at(con, "ledger_projects", project), _held_read_at(con, "ledger", "*"))
+    if metadata_at <= read_at and (proj is not None or vocab is not None):
+        if proj is not None:
+            value = (proj[0], int(bool(proj[1])), _ts_text(proj[2]))
+            old = con.execute("SELECT name, hidden, created_at FROM ledger_projects WHERE project = ?",
+                              (project,)).fetchone()
+            if old != value:
+                con.execute("INSERT OR REPLACE INTO ledger_projects VALUES (?, ?, ?, ?)", (project, *value))
+        if vocab is not None:
+            words = [("state", w, m, i) for i, (w, m) in enumerate(vocab.get("state") or [])]
+            words += [("kind", w, "", i) for i, w in enumerate(vocab.get("kind") or [])]
+            old_words = con.execute("SELECT field, word, meaning, position FROM ledger_vocab WHERE project = ? "
+                                    "ORDER BY field, position", (project,)).fetchall()
+            if old_words != sorted(words, key=lambda w: (w[0], w[3])):
+                con.execute("DELETE FROM ledger_vocab WHERE project = ?", (project,))
+                con.executemany("INSERT INTO ledger_vocab VALUES (?, ?, ?, ?, ?)",
+                                [(project, *w) for w in words])
+        if metadata_at < read_at:
+            _record_read_at(con, "ledger_projects", project, read_at)
+    written, stale = [], 0
+    for row_id, row in live.items():
+        have, mark = held(row_id)
+        version = int(row.get("version") or 0)
+        if max(have or 0, mark or 0) > version or (
+                have == version and held_last_entry(row_id) > last_entry.get(row_id, 0)):
+            stale += 1
+            continue
+        drop(row_id)
+        con.execute("DELETE FROM ledger_gone WHERE project = ? AND row_id = ?", (project, row_id))
+        values = {**row, "project": project}
+        con.execute(
+            f"INSERT INTO ledger_rows ({', '.join(_LEDGER_ROW_COLS)}) "
+            f"VALUES ({', '.join('?' * len(_LEDGER_ROW_COLS))})",
+            [_ledger_value(c, values.get(c)) for c in _LEDGER_ROW_COLS],
+        )
+        written.append(row_id)
+    for row_id, version in gone.items():
+        have, mark = held(row_id)
+        if have is not None and have > version:
+            stale += 1
+            continue
+        drop(row_id)
+        con.execute("INSERT OR REPLACE INTO ledger_gone VALUES (?, ?, ?)",
+                    (project, row_id, max(version, mark or 0)))
+    for h in history:
+        if h.get("row_id") not in written:
+            continue
+        values = {**h, "project": project}
+        con.execute(
+            f"INSERT OR REPLACE INTO ledger_history ({', '.join(_LEDGER_HIST_COLS)}) "
+            f"VALUES ({', '.join('?' * len(_LEDGER_HIST_COLS))})",
+            [_ledger_value(c, values.get(c)) for c in _LEDGER_HIST_COLS],
+        )
+    return {"ok": True, "rows": len(written), "stale": stale}
+
+
 def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mapping[str, list],
                           rows: Sequence[Mapping[str, Any]], history: Sequence[Mapping[str, Any]],
-                          row_ids: Sequence[str], gone: Mapping[str, int] | None = None) -> dict[str, Any]:
+                          row_ids: Sequence[str], gone: Mapping[str, int] | None = None, *,
+                          _pull: Mapping[str, Any] | None = None, read_at: float | None = None) -> dict[str, Any]:
     """Write ``row_ids`` of ``project`` through to the replica: each live one
     in ``rows`` (with its whole ``history``), and each removed one in ``gone``
     at the version it was removed at (``LEDGER_PURGED_VERSION`` for a purge
@@ -1786,7 +2044,8 @@ def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mappi
     without a new version). A removed or purged id leaves a marker, so a writer
     that read the hub before a newer change and lands after it changes
     nothing. Under the refresh lock, like every incremental write here.
-    Fail-open."""
+    The incremental pull passes its complete ledger part through this same
+    transaction owner. Fail-open."""
     path = snapshot_path()
     # Missing is judged under the lock: a first refresh still dumping has no
     # file yet, but may have read the hub before this change.
@@ -1797,78 +2056,19 @@ def ledger_write_snapshot(project: str, proj: Sequence[Any] | None, vocab: Mappi
         _release_refresh_lock(lock)
         return {"ok": False, "error": "hub snapshot missing", "missing": True}
     gone = dict(gone or {})
-    live = {r["row_id"]: r for r in rows}
     try:
         con = sqlite3.connect(str(path))
         try:
             con.executescript(_LEDGER_SCHEMA_SQL)
 
-            def held(row_id: str) -> tuple[int | None, int | None]:
-                got = con.execute("SELECT version FROM ledger_rows WHERE project = ? AND row_id = ?",
-                                  (project, row_id)).fetchone()
-                mark = con.execute("SELECT version FROM ledger_gone WHERE project = ? AND row_id = ?",
-                                   (project, row_id)).fetchone()
-                return (got[0] if got else None), (mark[0] if mark else None)
-
-            def held_last_entry(row_id: str) -> int:
-                got = con.execute("SELECT MAX(id) FROM ledger_history WHERE project = ? AND row_id = ?",
-                                  (project, row_id)).fetchone()
-                return int(got[0] or 0) if got else 0
-
-            last_entry: dict[str, int] = {}
-            for h in history:
-                last_entry[h.get("row_id")] = max(last_entry.get(h.get("row_id"), 0), int(h.get("id") or 0))
-
-            def drop(row_id: str) -> None:
-                con.execute("DELETE FROM ledger_rows WHERE project = ? AND row_id = ?", (project, row_id))
-                con.execute("DELETE FROM ledger_history WHERE project = ? AND row_id = ?", (project, row_id))
-
-            if proj is not None:
-                con.execute("INSERT OR REPLACE INTO ledger_projects VALUES (?, ?, ?, ?)",
-                            (project, proj[0], int(bool(proj[1])), _ts_text(proj[2])))
-            con.execute("DELETE FROM ledger_vocab WHERE project = ?", (project,))
-            con.executemany("INSERT INTO ledger_vocab VALUES (?, 'state', ?, ?, ?)",
-                            [(project, w, m, i) for i, (w, m) in enumerate(vocab.get("state") or [])])
-            con.executemany("INSERT INTO ledger_vocab VALUES (?, 'kind', ?, '', ?)",
-                            [(project, w, i) for i, w in enumerate(vocab.get("kind") or [])])
-            written, stale = [], 0
-            for row_id, row in live.items():
-                have, mark = held(row_id)
-                version = int(row.get("version") or 0)
-                if max(have or 0, mark or 0) > version or (
-                        have == version and held_last_entry(row_id) > last_entry.get(row_id, 0)):
-                    stale += 1
-                    continue
-                drop(row_id)
-                con.execute("DELETE FROM ledger_gone WHERE project = ? AND row_id = ?", (project, row_id))
-                values = {**row, "project": project}
-                con.execute(
-                    f"INSERT INTO ledger_rows ({', '.join(_LEDGER_ROW_COLS)}) "
-                    f"VALUES ({', '.join('?' * len(_LEDGER_ROW_COLS))})",
-                    [_ledger_value(c, values.get(c)) for c in _LEDGER_ROW_COLS],
-                )
-                written.append(row_id)
-            for row_id, version in gone.items():
-                have, mark = held(row_id)
-                if have is not None and have > version:
-                    stale += 1
-                    continue
-                drop(row_id)
-                con.execute("INSERT OR REPLACE INTO ledger_gone VALUES (?, ?, ?)",
-                            (project, row_id, max(version, mark or 0)))
-            for h in history:
-                if h.get("row_id") not in written:
-                    continue
-                values = {**h, "project": project}
-                con.execute(
-                    f"INSERT OR REPLACE INTO ledger_history ({', '.join(_LEDGER_HIST_COLS)}) "
-                    f"VALUES ({', '.join('?' * len(_LEDGER_HIST_COLS))})",
-                    [_ledger_value(c, values.get(c)) for c in _LEDGER_HIST_COLS],
-                )
-            con.commit()
+            at = time.time() if read_at is None else read_at
+            result = (_apply_ledger_pull(con, _pull, read_at=at) if _pull is not None else
+                      _write_ledger_project(con, project, proj, vocab, rows, history, gone, read_at=at))
+            if con.in_transaction:
+                con.commit()
         finally:
             con.close()
-        return {"ok": True, "rows": len(written), "stale": stale}
+        return result
     except Exception as exc:  # noqa: BLE001  (the hub write already landed)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     finally:
@@ -1916,6 +2116,7 @@ def ledger_read_snapshot(project: str) -> dict[str, Any] | None:
     except sqlite3.Error:
         return None
     try:
+        con.execute("BEGIN")
         if not _snapshot_table_columns(con, "ledger_rows"):
             return None
         vocab: dict[str, list] = {"state": [], "kind": []}
@@ -1941,11 +2142,16 @@ def ledger_read_snapshot(project: str) -> dict[str, Any] | None:
         gone: dict[str, int] = {}
         if _snapshot_table_columns(con, "ledger_gone"):
             gone = dict(con.execute("SELECT row_id, version FROM ledger_gone WHERE project = ?", (project,)))
+        rows = [r for r in rows if r["row_id"] not in gone or gone[r["row_id"]] < int(r["version"] or 0)]
+        live = {r["row_id"] for r in rows}
+        history = [h for h in history if h["row_id"] in live]
+        image_meta = dict(con.execute("SELECT key, value FROM snapshot_meta")) if (
+            _snapshot_table_columns(con, "snapshot_meta")) else {}
     except (sqlite3.Error, ValueError):
         return None
     finally:
         con.close()
-    return {"vocab": vocab, "rows": rows, "history": history, "gone": gone, "as_of": caught_up_at()}
+    return {"vocab": vocab, "rows": rows, "history": history, "gone": gone, "as_of": caught_up_at(image_meta, ledger=True)}
 
 
 _EPISODE_FTS_COLS = ("summary", "topics", "decisions", "preferences", "people")
@@ -2381,6 +2587,9 @@ def _refresh_locked() -> dict[str, Any]:
             con = sqlite3.connect(str(tmp_path))
             _create_schema(con)
             with try_hub_connect(connect_timeout=REFRESH_CONNECT_TIMEOUT_S) as pg:
+                from psycopg import IsolationLevel
+
+                pg.isolation_level = IsolationLevel.REPEATABLE_READ
                 with pg.cursor() as cur:
                     # The hub's own clock at the start of the dump, before any
                     # table is read: freshness takes every cutoff and floor
