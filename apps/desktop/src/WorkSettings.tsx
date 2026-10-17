@@ -787,11 +787,11 @@ export function WorkSettings({ active, work, importCard }: { active: boolean; wo
     if (p.ok && Array.isArray(p.data.projects)) {
       setProjects(p.data.projects);
       setProjectsError(null);
-    } else if (!p.ok) setProjectsError(p.error);
+    } else setProjectsError(p.ok ? "its answer had no project list." : p.error);
     if (h.ok && Array.isArray(h.data.hidden)) {
       setHidden(h.data.hidden);
       setHiddenError(null);
-    } else if (!h.ok) setHiddenError(h.error);
+    } else setHiddenError(h.ok ? "its answer had no list." : h.error);
     await loadWork(true);
   }, [loadWork]);
   useEffect(() => {
