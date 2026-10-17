@@ -53,6 +53,12 @@ const HARNESS: Record<string, string> = { claude_code: "Claude Code", codex: "Co
 /** The front ends Khipu knows by name (`harness:entrypoint`). */
 const FRONT_ENDS: Record<string, string> = {
   "claude_code:cli": "Claude Code, typed in a terminal or Remote Control",
+  "claude_code:claude-desktop": "Claude Code in the Claude desktop app",
+  "claude_code:claude-desktop-3p": "Claude Code in the Claude desktop app, another provider",
+  "claude_code:claude-vscode": "Claude Code in VS Code",
+  "claude_code:remote": "Claude Code on the web",
+  "claude_code:remote_desktop": "Claude Code in the cloud, from the desktop app",
+  "claude_code:remote_mobile": "Claude Code in the cloud, from the mobile app",
   "claude_code:t3": "Claude Code in T3 Code",
   "claude_code:sdk-cli": "Claude Code jobs (claude -p)",
   "codex:codex_cli_rs": "Codex, typed in a terminal",

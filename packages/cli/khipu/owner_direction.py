@@ -143,8 +143,16 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
 
 def _recent_turn(session: str, conf: dict, now: float) -> dict:
     """The session's latest eligible owner turn, when it is inside the window."""
-    usable = [t for t in owner_turns.turns(session, now) if owner_turns.eligible(t, conf)[0]]
+    recorded = owner_turns.turns(session, now)
+    usable = [t for t in recorded if owner_turns.eligible(t, conf)[0]]
     if not usable:
+        untrusted = owner_turns.untrusted_front_end(recorded, conf)
+        if untrusted:
+            raise DirectionRefused("no_recorded_turn",
+                                   f"The owner typed here, but in {untrusted}, which is not a front end that counts "
+                                   "as the owner. To add it, switch it on in the Khipu app (Settings, Owner actions, "
+                                   "Front ends that count as you), or ask for it in a conversation from a front end "
+                                   "already on that list.")
         raise DirectionRefused("no_recorded_turn",
                                "The owner has not typed in this conversation, so it can't make an owner's change "
                                "(a background or dispatched job never can). Ask the owner to say it in a "

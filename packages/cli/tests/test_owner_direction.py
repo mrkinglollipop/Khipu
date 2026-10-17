@@ -142,6 +142,35 @@ def test_refusal_no_recorded_turn_for_a_dispatched_job(world):
     assert err.value.code == "no_recorded_turn"
 
 
+def test_a_desktop_app_session_passes(world):
+    """The desktop app's Code tab (claude-desktop) is a front end the owner
+    types in (the 2026-10-17 refusal)."""
+    world.say("pause Codex until 5pm", entry="claude-desktop")
+    assert _check()["auth"] == "direction"
+
+
+def test_codex_exec_stays_refused(world, tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(json.dumps({"type": "session_meta", "payload": {"originator": "codex_exec"}}) + "\n")
+    owner_turns.record({"session_id": OWNER, "prompt": "pause Codex until 5pm", "cwd": str(tmp_path),
+                        "transcript_path": str(rollout)}, {"CODEX_THREAD_ID": OWNER}, now=time.time())
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+    assert "front end that counts" not in err.value.message
+
+
+def test_refusal_for_an_untrusted_front_end_names_the_fix(world):
+    owner_turns.write_settings({"trusted": ["claude_code:cli"]})
+    world.say("pause Codex until 5pm", entry="claude-desktop")
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+    message = str(err.value)
+    assert "claude_code:claude-desktop" in message
+    assert "Settings, Owner actions, Front ends that count as you" in message
+
+
 def test_refusal_no_recorded_turn_for_a_delegated_brief(world):
     """A brief the delegation hook noted is a dispatched job's turn even on
     a trusted front end."""
