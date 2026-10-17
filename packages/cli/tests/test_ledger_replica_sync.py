@@ -175,7 +175,7 @@ def test_ledger_pull_limit_only_refuses_the_ledger(world):
     world.ledger.execute(f"INSERT INTO ledger_rows ({', '.join(hs._LEDGER_ROW_COLS)}) VALUES ({','.join('?' for _ in hs._LEDGER_ROW_COLS)})",
                          [hs._ledger_value(c, row[c]) for c in hs._LEDGER_ROW_COLS])
     out = hs.pull_changes(limit=1)
-    assert not out['ok'] and out['failed'] == ['ledger']
+    assert out['ok'] and out['failed'] == ['ledger']
     assert out['ledger']['needs_refresh'] and not out.get('needs_dump')
     with sqlite3.connect(hs.snapshot_path()) as con:
         assert con.execute("SELECT body FROM topics WHERE slug='probe'").fetchone() == ('corrected',)
@@ -197,7 +197,7 @@ def test_failed_ledger_pull_does_not_advance_ledger_freshness(world, monkeypatch
     monkeypatch.setattr(hs, '_acquire_refresh_lock', lambda: None)
     world.ledger.execute("UPDATE ledger_rows SET version=2")
     out = hs.pull_changes()
-    assert not out['ok'] and 'ledger' in out['failed']
+    assert not out['ok'] and {'topics', 'commitments', 'ledger'} <= set(out['failed'])
     assert hs.ledger_read_snapshot('p')['as_of'] == before
 
 
@@ -278,7 +278,7 @@ def test_ledger_failure_does_not_stall_memory_or_its_freshness(world, monkeypatc
         monkeypatch.setattr(hs, '_write_ledger_pull',
                             lambda *_, **__: {'ok': False, 'error': 'hub snapshot refresh in progress'})
     out = hs.pull_changes()
-    assert not out['ok'] and out['failed'] == ['ledger'], out
+    assert out['ok'] and out['failed'] == ['ledger'], out
     with sqlite3.connect(hs.snapshot_path()) as con:
         assert con.execute('SELECT summary FROM episodes WHERE id=2').fetchone() == ('foreign memory',)
         assert con.execute("SELECT body FROM topics WHERE slug='probe'").fetchone() == ('corrected',)
@@ -396,3 +396,58 @@ def test_unchanged_pull_still_fences_older_write_through_metadata(world):
     assert hs.ledger_write_snapshot('p', ('Stale', True, None), {}, [], [], [], read_at=old_read)['ok']
     with sqlite3.connect(hs.snapshot_path()) as con:
         assert con.execute('SELECT name,hidden FROM ledger_projects').fetchall() == [('Old', 0)]
+
+
+def test_ledger_only_refresh_repairs_missing_markers_without_touching_memory(world):
+    before = hs.caught_up_at()
+    world.ledger.execute("UPDATE ledger_rows SET removed_at='removed', version=2")
+    world.ledger.execute("INSERT INTO ledger_removed VALUES ('p','purged','gone')")
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        con.execute('DROP TABLE ledger_gone')
+    out = hs.refresh_ledger()
+    assert out['ok'], out
+    assert world.isolation_level == IsolationLevel.REPEATABLE_READ
+    got = hs.ledger_read_snapshot('p')
+    assert got['rows'] == []
+    assert got['gone'] == {'r': 2, 'purged': hs.LEDGER_PURGED_VERSION}
+    assert hs._utc(got['as_of']) > hs._utc(before)
+    assert hs.caught_up_at() == before
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert con.execute("SELECT body FROM topics WHERE slug='probe'").fetchone() == ('original',)
+
+
+def test_ledger_only_refresh_uses_one_consistent_hub_snapshot(world):
+    world.remove_after_rows = True
+    assert hs.refresh_ledger()['ok']
+    assert world.ledger.execute('SELECT version FROM ledger_rows').fetchone() == (2,)
+    got = hs.ledger_read_snapshot('p')
+    assert [r['version'] for r in got['rows']] == [1]
+    assert got['gone'] == {}
+
+
+def test_ledger_only_refresh_rolls_back_data_markers_and_freshness(world, monkeypatch):
+    before = hs.ledger_read_snapshot('p')
+    world.ledger.execute("UPDATE ledger_projects SET name='Changed'")
+    original = hs._insert_ledger
+
+    def broken(cur, con):
+        original(cur, con)
+        raise sqlite3.OperationalError('synthetic refresh failure')
+
+    monkeypatch.setattr(hs, '_insert_ledger', broken)
+    out = hs.refresh_ledger()
+    assert not out['ok'] and 'synthetic refresh failure' in out['error']
+    assert hs.ledger_read_snapshot('p') == before
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert con.execute('SELECT name FROM ledger_projects').fetchone() == ('Old',)
+
+
+def test_memory_pull_during_backoff_never_reads_or_writes_ledger(world, monkeypatch):
+    before = hs.ledger_read_snapshot('p')
+    monkeypatch.setattr(hs, '_read_ledger_pull', lambda *_: pytest.fail('ledger read during backoff'))
+    monkeypatch.setattr(hs, 'ledger_write_snapshot', lambda *_, **__: pytest.fail('ledger write during backoff'))
+    world.ledger.execute("UPDATE ledger_rows SET title='Foreign', version=2")
+    out = hs.pull_changes(include_ledger=False)
+    assert out['ok'] and hs.ledger_read_snapshot('p') == before
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert con.execute("SELECT body FROM topics WHERE slug='probe'").fetchone() == ('corrected',)

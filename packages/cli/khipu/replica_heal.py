@@ -13,8 +13,8 @@ work, and does it only when the hub answers:
 
 An update is an incremental pull (``hub_snapshot.pull_changes``: what other
 machines and the gateway wrote, missed patches, re-built vectors, decisions);
-a full dump is its fallback, when the pull has too much to catch up or fails
-while the hub answers.
+a full dump is its fallback when memory parts fail while the hub answers.
+Ledger failures rebuild only the ledger, with a separate 15-minute backoff.
 
 Otherwise it does nothing and opens no connection. It never runs from a hook,
 a status read or a tab click. Every dump goes through ``hub_snapshot.refresh``
@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -41,6 +41,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
                           "After a failed connection to the database, skip new attempts for this long (0: never skip)"),
 }
 CHECK_EVERY_MIN_S = 60
+LEDGER_RETRY_AFTER_S = 15 * 60
 STATE_NAME = "replica-heal.json"
 WAKE_NAME = "replica-wake"
 
@@ -284,25 +285,68 @@ def _full_dump() -> dict[str, Any]:
     return {k: v for k, v in out.items() if k != "path"}
 
 
-def _sync() -> dict[str, Any]:
+def _ledger_retry_due(state: Mapping[str, Any], now: datetime) -> bool:
+    age = _age(now, state.get("last_ledger_refresh_at"))
+    return age is None or age >= LEDGER_RETRY_AFTER_S
+
+
+def _refresh_ledger(state: dict[str, Any], now: datetime) -> dict[str, Any]:
     from khipu import hub_snapshot
 
+    if not _ledger_retry_due(state, now):
+        return {**state["last_ledger_error"],
+                "retry_after": (_utc(state["last_ledger_refresh_at"]) +
+                                timedelta(seconds=LEDGER_RETRY_AFTER_S)).isoformat()}
+    state["last_ledger_refresh_at"] = now.isoformat()
     try:
-        pulled = hub_snapshot.pull_changes()
+        result = hub_snapshot.refresh_ledger()
+    except Exception as exc:  # noqa: BLE001 - retained across checks and reported
+        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    if result.get("ok"):
+        state.pop("last_ledger_error", None)
+    else:
+        result = {**result, "needs_refresh": True}
+        state["last_ledger_error"] = result
+    return result
+
+
+def _sync(state: dict[str, Any] | None = None, now: datetime | None = None) -> dict[str, Any]:
+    from khipu import hub_snapshot
+
+    state = {} if state is None else state
+    now = _now() if now is None else now
+    deferred = bool(state.get("last_ledger_error")) and not _ledger_retry_due(state, now)
+    try:
+        pulled = (hub_snapshot.pull_changes(include_ledger=False) if deferred
+                  else hub_snapshot.pull_changes())
     except Exception as exc:  # noqa: BLE001 - a pull that cannot run is a dump's job
         pulled = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     if pulled.get("ok"):
+        ledger = pulled.get("ledger") or {}
+        if deferred or ledger.get("needs_refresh") or not ledger.get("ok", True):
+            if not deferred:
+                state["last_ledger_error"] = {**ledger, "needs_refresh": True}
+            result = {**pulled, "ledger": _refresh_ledger(state, now)}
+            if result["ledger"].get("ok"):
+                result.pop("failed", None)
+                result.pop("error", None)
+            return result
+        if ledger.get("ok"):
+            state.pop("last_ledger_error", None)
         return pulled
-    # Waiting out a dump in progress or an unreachable hub is the caller's job;
-    # anything else means the pull cannot bring the copy level.
+    # Only memory failures fall back to a full dump. An unreachable hub or a
+    # dump already in progress is waited out by the caller.
     if pulled.get("hub_unreachable") or "in progress" in str(pulled.get("error") or ""):
         return pulled
-    return {**_full_dump(), "fallback_from_pull": pulled.get("error")}
+    result = {**_full_dump(), "fallback_from_pull": pulled.get("error")}
+    if result.get("ok"):
+        state.pop("last_ledger_error", None)
+    return result
 
 
 def run() -> dict[str, Any]:
-    """One check. ``ok`` is false only when the hub answered and the work
-    failed; an unreachable hub is waited out, not a failure."""
+    """One check. An unreachable hub is waited out; a retained ledger
+    failure stays visible between retry attempts."""
     from khipu import hub_snapshot
 
     now = _now()
@@ -312,9 +356,14 @@ def run() -> dict[str, Any]:
         now=now, state=state, health=health, sidecar=hub_snapshot._read_sidecar(),
         last_known=hub_snapshot._read_last_known(), refresh_after=float(settings()["replica_refresh_after"]),
     )
+    if action == "none" and state.get("last_ledger_error") and _ledger_retry_due(state, now):
+        action, reason = "ledger", "ledger_needs_refresh"
     state["last_run_at"] = now.isoformat()
     out: dict[str, Any] = {"ok": True, "action": action, "reason": reason}
     if action == "none":
+        if state.get("last_ledger_error"):
+            out.update(ok=False, error=f"ledger: {state['last_ledger_error'].get('error') or 'failed'}",
+                       result={"ledger": _refresh_ledger(state, now)})
         _write_state(state)
         return out
     reachable, error = _hub_reachable()
@@ -325,12 +374,22 @@ def run() -> dict[str, Any]:
         return {**out, "action": "waiting", "planned": action, "reason": "hub_unreachable",
                 "since": state["hub_unreachable_since"], "error": error}
     state.pop("hub_unreachable_since", None)
-    result = _full_dump() if action == "dump" else _sync()
+    if action == "dump":
+        result = _full_dump()
+        if result.get("ok"):
+            state.pop("last_ledger_error", None)
+    elif action == "ledger":
+        result = {"ok": True, "ledger": _refresh_ledger(state, now)}
+    else:
+        result = _sync(state, now)
     out["result"] = result
     if result.get("ok"):
-        state["last_synced_at"] = _now().isoformat()
-        state.pop("last_failed_at", None)
-        state.pop("last_error", None)
+        if action != "ledger":
+            state["last_synced_at"] = _now().isoformat()
+            state.pop("last_failed_at", None)
+            state.pop("last_error", None)
+        elif not state.get("last_failed_at"):
+            state.pop("last_error", None)
     elif "in progress" in str(result.get("error") or ""):
         out["action"] = "skipped"
         out["reason"] = "refresh_in_progress"
@@ -344,5 +403,8 @@ def run() -> dict[str, Any]:
         state["last_failed_at"] = _now().isoformat()
         state["last_error"] = result.get("error")
         out["ok"] = False
+    if result.get("ok") and state.get("last_ledger_error"):
+        out["ok"] = False
+        state["last_error"] = out["error"] = f"ledger: {state['last_ledger_error'].get('error') or 'failed'}"
     _write_state(state)
     return out

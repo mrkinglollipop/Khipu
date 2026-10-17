@@ -1211,7 +1211,7 @@ def _apply_ledger_pull(con: sqlite3.Connection, payload: Mapping[str, Any], *,
     return {"ok": True}
 
 
-def _pull_apply(cur, state: Mapping[str, Any], limit: int) -> dict[str, Any]:
+def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bool = True) -> dict[str, Any]:
     """The hub half of ``pull_changes``, on its one cursor. Everything the
     memory limit can refuse is read before the first write. Ledger failures
     are reported separately and never refuse the memory part."""
@@ -1280,7 +1280,7 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int) -> dict[str, Any]:
     # statement would otherwise abort the memory transaction too.
     cur.execute("SAVEPOINT ledger_pull")
     try:
-        ledger_payload = _read_ledger_pull(cur, limit)
+        ledger_payload = _read_ledger_pull(cur, limit) if include_ledger else None
     except Exception as exc:  # noqa: BLE001 - the ledger is an independent part
         cur.execute("ROLLBACK TO SAVEPOINT ledger_pull")
         ledger_payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
@@ -1495,7 +1495,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
     return parts
 
 
-def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
+def pull_changes(*, limit: int = PULL_LIMIT, include_ledger: bool = True) -> dict[str, Any]:
     """Bring the replica level with the hub without a full dump: episodes
     changed (by ``changed_at``, or ``ingested_at`` on a hub or row without
     it) or tombstoned since this replica's cursors, the episodes whose
@@ -1504,7 +1504,9 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
     no change stamp) and the decisions changed elsewhere. Every episode goes
     through ``upsert_episode``, so the forgotten-source fence, queued
     erasures, tombstones and the freshness rule apply as for a capture.
-    ``ok`` is the AND of the parts; a failed part is named in ``failed``.
+    ``ok`` covers the memory parts; ledger health is returned separately.
+    A failed part is named in ``failed``. Heal can defer the ledger read with
+    ``include_ledger=False`` while a failed ledger refresh is in backoff.
 
     The cursors live in the sidecar beside ``last_pull_at``; a full dump
     replaces the sidecar and so resets them to its own hub time. Each moves to
@@ -1556,16 +1558,18 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
 
             pg.isolation_level = IsolationLevel.REPEATABLE_READ
             with pg.cursor() as cur:
-                result = _pull_apply(cur, state, limit)
+                result = _pull_apply(cur, state, limit, include_ledger=include_ledger)
     except Exception as exc:  # noqa: BLE001 - reported to the caller, which decides what to do next
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300],
                 "hub_unreachable": hub_connection_failed(exc)}
     if not result.get("ok"):
         return result
     parts = {**result["parts"], "decisions": sync_decision_changes()}
-    # The result is the AND of its parts: one that failed makes it not ok and
-    # is named, so the caller never reports a copy healed that is not.
+    # Ledger repair has its own retry clock; only a memory failure asks the
+    # caller to rebuild the complete copy.
     failed = [name for name, part in parts.items() if not part.get("ok") and not part.get("not_applicable")]
+    if "ledger" in failed:
+        parts["ledger"]["needs_refresh"] = True
     try:
         side = _read_sidecar() or meta()
         for name, (at, at_id) in result["cursors"].items():
@@ -1584,7 +1588,7 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     _clear_missed_patches(result["cleared"], path=path, written_before=started)
     out: dict[str, Any] = {
-        "ok": not failed,
+        "ok": not any(name != "ledger" for name in failed),
         **{k: result[k] for k in ("episodes", "tombstones", "vectors", "missed_retried",
                                   "forgotten_skipped", "kept_newer")},
         "topics": parts["topics"].get("topics", 0), "commitments": parts["commitments"].get("commitments", 0),
@@ -1593,7 +1597,7 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
     if failed:
         out["failed"] = failed
         out["error"] = "; ".join(f"{name}: {parts[name].get('error') or 'failed'}" for name in failed)[:300]
-        if any(parts[name].get("hub_unreachable") for name in failed):
+        if any(parts[name].get("hub_unreachable") for name in failed if name != "ledger"):
             out["hub_unreachable"] = True
     return out
 
@@ -1864,12 +1868,55 @@ def _ledger_value(col: str, val: Any) -> Any:
     return val
 
 
+def _create_ledger_schema(con: sqlite3.Connection) -> None:
+    # executescript commits an open transaction before running its statements.
+    # Ledger-only rebuilds must keep schema repairs and data in one transaction.
+    for statement in _LEDGER_SCHEMA_SQL.split(";"):
+        if statement.strip():
+            con.execute(statement)
+
+
+def refresh_ledger() -> dict[str, Any]:
+    """Rebuild only the ledger under the replica writer lock. All hub reads
+    share one repeatable-read snapshot; data, removals and freshness publish
+    in one SQLite transaction. Memory tables and their cursors stay untouched."""
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "needs_refresh": True, "error": "hub snapshot refresh in progress"}
+    try:
+        path = snapshot_path()
+        if not path.is_file():
+            return {"ok": False, "needs_refresh": True, "error": "hub snapshot missing"}
+        with try_hub_connect(connect_timeout=REFRESH_CONNECT_TIMEOUT_S) as pg:
+            from psycopg import IsolationLevel
+
+            pg.isolation_level = IsolationLevel.REPEATABLE_READ
+            read_at = time.time()
+            with pg.cursor() as cur:
+                if "row_id" not in _pg_columns(cur, "ledger_rows"):
+                    return {"ok": True, "not_applicable": True}
+                with closing(sqlite3.connect(str(path))) as con, con:
+                    con.execute("BEGIN IMMEDIATE")
+                    _create_ledger_schema(con)
+                    for table in ("ledger_projects", "ledger_vocab", "ledger_rows", "ledger_history", "ledger_gone"):
+                        con.execute(f"DELETE FROM {table}")
+                    count = _insert_ledger(cur, con)
+                    _record_read_at(con, "ledger", "*", read_at)
+                    con.execute("INSERT OR REPLACE INTO snapshot_meta(key,value) VALUES ('ledger_caught_up_at', ?)",
+                                (datetime.fromtimestamp(read_at, timezone.utc).isoformat(),))
+        return {"ok": True, "rows": count}
+    except Exception as exc:  # noqa: BLE001 - reported separately from memory health
+        return {"ok": False, "needs_refresh": True, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    finally:
+        _release_refresh_lock(lock)
+
+
 def _insert_ledger(cur, con: sqlite3.Connection) -> int:
     """The ledger's live rows (never a removed one), their history, and each
     project's words. Empty (0, no error) on a hub without migration 0028."""
     if "row_id" not in _pg_columns(cur, "ledger_rows"):
         return 0
-    con.executescript(_LEDGER_SCHEMA_SQL)
+    _create_ledger_schema(con)
     cur.execute("SELECT project, name, hidden, created_at FROM ledger_projects")
     for project, name, hidden, created in cur.fetchall():
         con.execute("INSERT INTO ledger_projects VALUES (?, ?, ?, ?)", (project, name, int(bool(hidden)),

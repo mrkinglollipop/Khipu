@@ -261,3 +261,97 @@ def test_a_measurement_older_than_the_last_pull_no_longer_describes_the_copy(tmp
     hub_snapshot._write_meta({"last_pull_at": (checked + timedelta(minutes=1)).isoformat()})
     fresh, why = hub_snapshot.snapshot_is_fresh()
     assert fresh is True and "distrusted_by" not in why
+
+
+@pytest.mark.parametrize('needs_refresh', [True, False])
+def test_persistent_ledger_failure_refreshes_only_ledger_with_backoff(hub, monkeypatch, needs_refresh):
+    hub.up = True
+    hub.age(3600)
+    replica_heal.set_setting('replica_refresh_after', 0)
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(replica_heal, '_now', lambda: now)
+    pulls, refreshes = [], []
+    failure = {'ok': False, 'error': 'synthetic locked ledger', 'needs_refresh': needs_refresh}
+
+    def pull(**kwargs):
+        pulls.append(kwargs)
+        return {'ok': True, 'ledger': failure if kwargs.get('include_ledger', True) else
+                {'ok': True, 'skipped': 'backoff'}}
+
+    monkeypatch.setattr(hub_snapshot, 'pull_changes', pull)
+    monkeypatch.setattr(hub_snapshot, 'refresh_ledger',
+                        lambda: refreshes.append(now) or dict(failure), raising=False)
+    first = replica_heal.run()
+    assert not first['ok'] and 'synthetic locked ledger' in first['result']['ledger']['error']
+    for seconds in (300, 600, 899):
+        now = refreshes[0] + timedelta(seconds=seconds)
+        out = replica_heal.run()
+        assert not out['ok'] and out['result']['ledger']['retry_after']
+    assert len(refreshes) == 1 and hub.dumps == 0
+    assert all(p.get('include_ledger') is False for p in pulls[1:])
+    now = refreshes[0] + timedelta(seconds=900)
+    assert not replica_heal.run()['ok']
+    assert len(refreshes) == 2 and hub.dumps == 0
+
+
+def test_ledger_refresh_retries_when_memory_is_still_fresh(hub, monkeypatch):
+    hub.up = True
+    hub.age(3600)
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(replica_heal, '_now', lambda: now)
+    _pulls(monkeypatch, {'ok': True, 'ledger': {'ok': False, 'needs_refresh': True, 'error': 'broken'}})
+    refreshes = []
+    monkeypatch.setattr(hub_snapshot, 'refresh_ledger',
+                        lambda: refreshes.append(now) or {'ok': False, 'error': 'broken'}, raising=False)
+    assert not replica_heal.run()['ok']
+    now += timedelta(seconds=300)
+    waiting = replica_heal.run()
+    assert not waiting['ok'] and waiting['error'] == 'ledger: broken'
+    assert len(refreshes) == 1
+    replica_heal.set_setting('replica_refresh_after', 3600)
+    now += timedelta(seconds=600)
+    monkeypatch.setattr(hub_snapshot, 'refresh_ledger',
+                        lambda: refreshes.append(now) or {'ok': True})
+    out = replica_heal.run()
+    assert out['ok'] and out['action'] == 'ledger' and len(refreshes) == 2
+    assert 'last_ledger_error' not in replica_heal.read_state()
+    assert hub.dumps == 0
+
+
+def test_successful_ledger_refresh_clears_the_pull_error(hub, monkeypatch):
+    _pulls(monkeypatch, {'ok': True, 'failed': ['ledger'], 'error': 'ledger: missing markers',
+                        'ledger': {'ok': False, 'needs_refresh': True, 'error': 'missing markers'}})
+    monkeypatch.setattr(hub_snapshot, 'refresh_ledger', lambda: {'ok': True})
+    out = replica_heal._sync()
+    assert out == {'ok': True, 'ledger': {'ok': True}}
+    assert hub.dumps == 0
+
+
+def test_memory_failure_during_ledger_backoff_still_dumps(hub, monkeypatch):
+    now = datetime.now(timezone.utc)
+    state = {'last_ledger_error': {'ok': False, 'error': 'ledger broken'},
+             'last_ledger_refresh_at': now.isoformat()}
+    monkeypatch.setattr(hub_snapshot, 'pull_changes',
+                        lambda **_: {'ok': False, 'needs_dump': True, 'error': 'memory overflow'})
+    out = replica_heal._sync(state, now)
+    assert out['ok'] and out['fallback_from_pull'] == 'memory overflow'
+    assert hub.dumps == 1 and 'last_ledger_error' not in state
+
+
+def test_ledger_only_success_preserves_memory_failure_backoff(hub, monkeypatch):
+    hub.up = True
+    hub.age(3600)
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(replica_heal, '_now', lambda: now)
+    state = {'last_failed_at': now.isoformat(), 'last_error': 'memory failure',
+             'last_ledger_refresh_at': (now - timedelta(seconds=900)).isoformat(),
+             'last_ledger_error': {'ok': False, 'error': 'ledger failure'}}
+    replica_heal._write_state(state)
+    monkeypatch.setattr(hub_snapshot, 'refresh_ledger', lambda: {'ok': True})
+    out = replica_heal.run()
+    assert out['ok'] and out['action'] == 'ledger'
+    after = replica_heal.read_state()
+    assert after['last_failed_at'] == state['last_failed_at']
+    assert after['last_error'] == 'memory failure' and 'last_synced_at' not in after
+    assert replica_heal.run()['reason'] == 'recently_failed'
+    assert hub.dumps == 0

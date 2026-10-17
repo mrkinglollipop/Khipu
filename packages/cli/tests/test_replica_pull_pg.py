@@ -188,7 +188,7 @@ def test_ledger_sql_failure_does_not_abort_memory_pull_transaction(pg):
         cur.execute('DROP TABLE ledger_vocab')
     conn.commit()
     out = hs.pull_changes()
-    assert not out['ok'] and out['failed'] == ['ledger'], out
+    assert out['ok'] and out['failed'] == ['ledger'], out
     assert 'ledger_vocab' in out['error']
     assert replica_rows('SELECT summary FROM episodes WHERE id = ?', foreign) == [('scratch ledger-table-missing',)]
     assert hs._utc(hs.caught_up_at()) > hs._utc(before)
