@@ -319,6 +319,35 @@ def project_slice(
     from khipu import decisions as _decisions
     from khipu.embed import _episode_schema_flags
 
+    def mark_same_session_lineage(rows: list[dict[str, Any]]) -> None:
+        """Mark assistant rows from this session or one of its direct children.
+
+        Project Owed deliberately contains every assistant's work.  The
+        session-start rendering only calls a row "(yours)" when the episode
+        that opened it belongs to this session lineage.
+        """
+        if not host_session_id:
+            return
+        assistants = [r for r in rows if r.get("owner") == _commitments.OWNER_ASSISTANT]
+        if not assistants:
+            return
+        missing = [r["id"] for r in assistants if not (r.get("session_id") or r.get("parent_session_id"))]
+        lineage: dict[int, tuple[str | None, str | None]] = {
+            int(r["id"]): (r.get("session_id"), r.get("parent_session_id")) for r in assistants
+        }
+        if missing:
+            flags = _episode_schema_flags(cur)
+            parent = "e.parent_session_id" if flags.get("parent_session_id") else "NULL::text"
+            cur.execute(
+                f"SELECT c.id, e.session_id, {parent} FROM commitments c "
+                "JOIN episodes e ON e.id = c.opened_episode WHERE c.id = ANY(%s)",
+                (missing,),
+            )
+            lineage.update({int(cid): (session_id, parent_id) for cid, session_id, parent_id in cur.fetchall()})
+        for row in assistants:
+            session_id, parent_id = lineage.get(int(row["id"]), (None, None))
+            row["same_session_lineage"] = host_session_id in (session_id, parent_id)
+
     owed: list[dict[str, Any]] = []
     episodes: list[dict[str, Any]] = []
     topics: list[dict[str, Any]] = []
@@ -334,6 +363,7 @@ def project_slice(
                     cur, project=project, status="open", limit=None,
                     hide_snoozed=True,
                 )
+                mark_same_session_lineage(rows)
                 owed = [r for r in rows if r.get("owner") != _commitments.OWNER_AGENT][:commitment_limit]
                 if not job:
                     from khipu.config import count_setting

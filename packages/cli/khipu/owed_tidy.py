@@ -588,6 +588,9 @@ def apply(doc: dict[str, Any], *, owner_gate: str | None = None) -> dict[str, An
             if not gate and any(_is_users(rows[cid]) for cid in live):
                 return {"ok": False, "changed": 0, "error": co.BULK_OWNER_REFUSAL}
             batch = _batch_id("tidy")
+            from khipu import owner_direction
+
+            owner_direction.record_owed_batch(batch)
             counts = {"close": 0, "reassign": 0}
             cur.execute("INSERT INTO commitment_tidy_batches (id, project, plan_version, planned_at, owner_gate) "
                         "VALUES (%s, %s, %s, %s::timestamptz, %s)",
@@ -681,6 +684,9 @@ def bulk_batch(cur, ids: list[int], action: str, change, *, reason: str,
         if not before:
             continue
         batch = _batch_id(action)
+        from khipu import owner_direction
+
+        owner_direction.record_owed_batch(batch)
         cur.execute("INSERT INTO commitment_tidy_batches (id, project, plan_version, planned_at, owner_gate) "
                     "VALUES (%s, %s, %s, NULL, %s)", (batch, project or "", PLAN_VERSION, gate))
         count = 0
