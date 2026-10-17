@@ -433,13 +433,21 @@ def sweep(now: float | None = None) -> dict:
     """The retention, applied on a timer (the replica-refresh job and the
     capture hook's storage sweep), so the owner's words go a day after they
     were typed even when no later prompt or read comes: every turn file and
-    briefs.jsonl line by line, and the widenings waiting for a yes. Local
+    briefs.jsonl line by line (a line a crash cut short goes too), the
+    widenings waiting for a yes, and the rewrite temps a crash left. Local
     files only. Never raises; ``ok`` false names what could not be pruned."""
     now = time.time() if now is None else now
     try:
         out = _sweep(now)
     except Exception as err:  # noqa: BLE001 - a timer sweep reports, never fails its job
         out = {"ok": False, "lines": 0, "errors": [f"{type(err).__name__}: {err}"]}
+    try:
+        from khipu import owner_files
+
+        out["temps"] = owner_files.clean_temps(now=now)["removed"]
+    except Exception as err:  # noqa: BLE001
+        out["ok"] = False
+        out["errors"].append(f"rewrite temps: {type(err).__name__}: {err}")
     try:
         from khipu import owner_direction
 
@@ -452,10 +460,10 @@ def sweep(now: float | None = None) -> dict:
 
 def forget_sessions(sessions) -> dict:
     """Forget's owner words scan on the turn files: delete every recorded
-    turn of these sessions (their files whole, and their lines in any other
-    file), any rewrite temp beside those files, and the briefs they gave or
-    were. Raises OSError when a file can't be read or changed, so the forget
-    stays open."""
+    turn of these sessions (their files whole, whatever a crash left in
+    them, and their lines in any other file) and the briefs they gave or
+    were. Rewrite temps are ``owner_files.clean_temps``'s. Raises OSError
+    when a file can't be read or changed, so the forget stays open."""
     names = {n for n in sessions if n}
     out = {"files": 0, "lines": 0, "briefs": 0}
     d = folder()
@@ -473,7 +481,14 @@ def forget_sessions(sessions) -> dict:
             continue
         path.read_text(encoding="utf-8")  # unreadable raises
         rows = _read_lines(path)
-        mine = [r for r in rows if path.name in files or r.get("session") in names]
+        if path.name in files:
+            # The session's own file goes whole: a line a crash cut short
+            # holds the words too, though it reads as no turn.
+            texts |= {hashlib.sha256(_norm(str(r.get("text") or "")).encode()).hexdigest() for r in rows}
+            path.unlink()
+            out["files"] += 1
+            continue
+        mine = [r for r in rows if r.get("session") in names]
         if not mine:
             continue
         texts |= {hashlib.sha256(_norm(str(r.get("text") or "")).encode()).hexdigest() for r in mine}
@@ -484,9 +499,6 @@ def forget_sessions(sessions) -> dict:
         else:
             path.unlink()
             out["files"] += 1
-    for name in listed:
-        if name.endswith(".tmp") and any(name.startswith(f".{f}.") for f in files):
-            (d / name).unlink(missing_ok=True)
     briefs = d / "briefs.jsonl"
     rows = _read_lines(briefs)
     kept = [b for b in rows if b.get("parent") not in names and b.get("sha") not in texts]

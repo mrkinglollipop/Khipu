@@ -1295,8 +1295,9 @@ def _session_forms(session_id: str) -> set[str]:
 def _owner_words_scan(session_id: str | None, *, gateway: bool) -> dict[str, Any]:
     """The owner's typed words recorded for the episode's session: its turn
     files and briefs (``owner_turns.forget_sessions``), the widenings it asked
-    for and the words in its owner-actions lines (scrubbed, the chain and Undo
-    kept). Local files only: on the gateway there are none, and nothing remote
+    for, the words in its owner-actions lines (scrubbed, the chain and Undo
+    kept), and every rewrite temp a crash left that could hold them
+    (``owner_files.clean_temps``). Local files only: on the gateway there are none, and nothing remote
     is touched. A part that can't be done keeps the forget open."""
     place = "owner words"
     if gateway:
@@ -1304,18 +1305,25 @@ def _owner_words_scan(session_id: str | None, *, gateway: bool) -> dict[str, Any
             "place": place, "path": None, "state": "not applicable", "why": OWNER_WORDS_GATEWAY_WHY}]}
     if not session_id:
         return {"ok": True, "removed": {}, "locations": [{"place": place, "path": None, "state": "clean"}]}
-    from khipu import owner_direction, owner_turns
+    from khipu import owner_direction, owner_files, owner_turns
 
     forms = _session_forms(str(session_id))
     try:
         removed = owner_turns.forget_sessions(forms)
         removed["pending"] = owner_direction.forget_pending(forms)
         removed["log_lines"] = owner_direction.scrub_words(forms)
+        temps = owner_files.clean_temps(forms)
+        removed["temps"] = temps["removed"]
     except Exception as exc:  # noqa: BLE001 - an unfinished scan keeps the forget open
         return {"ok": False, "removed": {}, "locations": [{
             "place": place, "path": None, "state": "not checked",
             "why": (f"the owner's recorded words for this session could not all be removed "
                     f"({type(exc).__name__}), so the forget stays open")}]}
+    if temps["left"]:
+        return {"ok": False, "removed": removed, "locations": [{
+            "place": place, "path": None, "state": "not checked",
+            "why": ("a rewrite of the owner's recorded words was in progress, so its file could still hold "
+                    "this session's words; the forget stays open and the next run removes it")}]}
     state = "removed" if any(removed.values()) else "clean"
     return {"ok": True, "removed": removed, "locations": [{"place": place, "path": None, "state": state}]}
 

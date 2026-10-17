@@ -138,12 +138,12 @@ STORES: tuple[Store, ...] = (
           "none: it never holds summary or transcript text",
           _w("session_capture._log")),
     Store("owner turns", "capture home owner-turns/: <session>.jsonl, briefs.jsonl, settings.json and "
-          "their .tmp rewrites",
+          "their .tmp rewrites (owner_files.PATTERNS)",
           "the typed text of each prompt and the briefs of dispatched jobs, for the owner-direction check",
           "owner words",
           _w("owner_turns._record", "owner_turns._write_private")),
-    Store("owner actions", "data folder owner-actions.jsonl, owner-direction-pending.json and their .tmp "
-          "rewrites",
+    Store("owner actions", "data folder owner-actions.jsonl, its head owner-actions.head.json and lock, "
+          "owner-direction-pending.json and their .tmp rewrites (owner_files.PATTERNS)",
           "each owner action with the owner's quoted words, and widenings waiting for a second turn",
           "owner words",
           _w("owner_direction._append", "owner_direction._log_locked", "owner_direction._write_private")),
