@@ -353,3 +353,23 @@ sys.stdin.readline()
     started = time.monotonic()
     assert usage.probe_grok(str(tmp_path), timeout=4) == {"ok": False, "error": usage.E_CLI}
     assert time.monotonic() - started < 3  # answered at once, not at the timeout
+
+
+def test_a_passed_account_week_is_out_of_date_even_with_a_model_week_ahead():
+    from datetime import datetime, timedelta, timezone
+    from khipu import routing
+    now = datetime(2026, 10, 17, 21, 30, tzinfo=timezone.utc)
+    row = {"ok": True, "windows": [
+        {"name": "weekly", "used_pct": 74, "window_mins": 10080,
+         "resets_at": (now - timedelta(hours=1)).isoformat()},
+        {"name": "weekly_fable", "used_pct": 6, "window_mins": 10080, "model": "Fable",
+         "resets_at": (now + timedelta(days=2)).isoformat()},
+    ]}
+    fact = routing.plan_fact(row, now)
+    assert fact["readable"] is False and fact.get("reset_passed") is True
+
+
+def test_a_role_whose_first_word_is_too_long_is_dropped_not_cut_mid_word():
+    from khipu import routing
+    assert routing._short_words("Supercalifragilisticexpialidocious duties", 20) == ""
+    assert routing._short_words("First for all Claude work: builds", 20) == "First for all…"

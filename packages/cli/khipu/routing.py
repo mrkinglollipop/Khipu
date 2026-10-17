@@ -4797,7 +4797,12 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
         return {"readable": False, "why": "plan figures can't be read just now", "error": error}
     window = _longest_window(row, now)
     longest = _longest_window(row, None)
-    if longest is not None and (window is None or _window_minutes(longest) > _window_minutes(window)):
+    # Compared like _longest_window ranks them: a model's window of the same
+    # length (weekly Fable) never stands in for the account's own.
+    def rank(w: dict) -> tuple:
+        return (_window_minutes(w), not w.get("model"))
+
+    if longest is not None and (window is None or rank(longest) > rank(window)):
         # The longest window's reset has passed since it was read: it has
         # started again, so its figures are known to be wrong (an account
         # can also reset early; only a new read says where it stands).
@@ -4976,8 +4981,10 @@ def _short_words(text: str, width: int) -> str:
     if len(text) <= width:
         return text
     cut = text[:width - 1]
-    if " " in cut:
-        cut = cut[:cut.rindex(" ")]
+    if " " not in cut:
+        # One word longer than the width: never cut a word in half.
+        return ""
+    cut = cut[:cut.rindex(" ")]
     return cut.rstrip(" ,;:.-(") + "…"
 
 
@@ -4994,8 +5001,9 @@ def priority_short_lines(priority: dict, now: datetime, *, relative: bool = True
             items = []
             for i, item in enumerate(entries, 1):
                 text = f"{i}. {item['label']}"
-                if item.get("role"):
-                    text += f": {_short_words(item['role'], width)}"
+                short = _short_words(item["role"], width) if item.get("role") else ""
+                if short:
+                    text += f": {short}"
                 items.append(text)
             line = ("Your priority (your words, shortened; the full words: `khipu_route`; guidance, not a gate"
                     f"{whole}): " + "; ".join(items) + ".")
