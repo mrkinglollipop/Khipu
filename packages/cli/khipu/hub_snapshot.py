@@ -4213,6 +4213,7 @@ def search_snapshot(
     harness: str | None = None,
     t3_thread: str | None = None,
     via: str | None = None,
+    indexed_tokens_only: bool = False,
 ) -> list[dict[str, Any]]:
     """ILIKE-equivalent search over the sqlite replica (W2.3: honours at
     least kind/since/until when the hub is unreachable; fix 7 adds project/
@@ -4256,6 +4257,12 @@ def search_snapshot(
         return True
 
     tokens = search_tokens(query)
+    if indexed_tokens_only and any(len(tok) >= _FTS_MIN_TOKEN for tok in tokens):
+        # A two-digit number (a date or a time) is too short for the trigram
+        # index, and one such token sent the whole search to a LIKE scan of
+        # every row: 100 times slower, past the prompt lane's 1.2 s on a large
+        # replica. The lane matches on the words the index can find.
+        tokens = [tok for tok in tokens if len(tok) >= _FTS_MIN_TOKEN]
     con = open_snapshot()
     # SQLite's LIKE is wildcard/case behaviour, not the callers' exact
     # Python filter semantics. Register deterministic predicates before the
