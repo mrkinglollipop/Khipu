@@ -70,8 +70,10 @@ function view(): RouteView {
       acct("Grok Build", "grok", {
         state: "paused", until: "2026-10-16T13:00:00Z", basis: "owner",
         witness: { source: "owner", written_by: { kind: "owner" }, at: "2026-10-13T22:05:00Z" },
+        reset_check: { status: "error", reason: "Khipu could not read this account's usage" },
       }),
     ],
+    plan_facts: { "grok|": { readable: false, why: "plan figures can't be read just now" } },
     holds: [
       { id: "h1", scope_label: "this Mac", reason: "machine_busy", text: "No new launches while the Mac is busy (load over 75)",
         until: "2026-10-15T13:40:00Z", owner: false, by: "a Claude Code conversation in project-a", at: "2026-10-14T13:40:00Z" },
@@ -340,7 +342,14 @@ describe("Accounts and routing: every problem shows, once", () => {
     const line = (label: string) =>
       within(screen.getByRole("list", { name: "Accounts" })).getAllByRole("listitem").find((li) => li.textContent?.startsWith(label))!;
     expect(line("Claude second").querySelector(".at")).toHaveTextContent("Sources disagree");
-    expect(line("Grok Build").querySelector(".at")).toHaveTextContent("Can't read its plan");
+    expect(line("Grok Build").querySelector(".at")?.textContent).toBe("");
+    fireEvent.click(within(line("Grok Build")).getByRole("button", { name: /^Grok Build/ }));
+    const grokDetails = within(screen.getByRole("region", { name: "Grok Build" }));
+    expect(grokDetails.queryByText("Plan figures can't be read just now")).toBeNull();
+    expect(grokDetails.queryByText("Khipu could not read this account's usage")).toBeNull();
+    const grokFailures = grokDetails.getAllByText(/Can't read its plan: Grok Build didn't answer/);
+    expect(grokFailures).toHaveLength(1);
+    expect(grokFailures[0]).toHaveTextContent("Last checked 2 min ago.");
     expect(line("Codex").querySelector(".at")).toHaveTextContent("Not signed in");
     expect(line("Claude main").querySelector(".at")?.textContent).toBe("");
   });
@@ -457,6 +466,21 @@ describe("Accounts and routing: links open their group", () => {
 });
 
 describe("Accounts and routing: open and closed, remembered on this Mac", () => {
+  it("uses the detail classification for the open count", async () => {
+    const record = calm();
+    record.accounts = [
+      acct("Codex", "codex", { state: "open" }),
+      acct("Muse", "muse", { state: "probably_open", checkable: false, until: "2026-10-14T15:00:00Z" }),
+    ];
+    answers.khipu_route_view = record;
+    render(<RoutingSettings active />);
+    await settled();
+    expect(groupButton("Accounts")).toHaveTextContent("2 accounts: 1 open, 1 probably open");
+    const accounts = within(screen.getByRole("list", { name: "Accounts" }));
+    expect(accounts.getByRole("button", { name: /^Codex/ })).toHaveTextContent("Open");
+    expect(accounts.getByRole("button", { name: /^Muse/ })).toHaveTextContent("this account can't be checked without using a turn");
+  });
+
   it("opens Accounts only at first, opens and closes every group, and remembers it", async () => {
     render(<RoutingSettings active />);
     await settled();

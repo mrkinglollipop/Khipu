@@ -34,6 +34,8 @@ import { COMING, LIST_MOVED, discoverAccounts, lastRunLine, normalDiscover, save
 import type { DiscoverResult, Support } from "../accountsApi";
 import { SetupAccountsStep } from "../SetupAccounts";
 import { POST_UPDATE_NOTICES as NOTICES } from "../postUpdateNotices";
+// @ts-expect-error node:fs has no types here
+import { readFileSync } from "node:fs";
 import {
   CLIENT,
   CLIS_ALL,
@@ -51,6 +53,11 @@ import {
   liveRow,
   status9B,
 } from "./accountsFixtures";
+
+const accountsCss: string = readFileSync(
+  `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/accounts.css`,
+  "utf8",
+);
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -211,6 +218,25 @@ describe("Add an account: step 1, the service", () => {
 });
 
 describe("Add an account: step 2, which login", () => {
+  it("says exactly which Codex logins were checked and which remain unchecked", () => {
+    const checked = { ...CODEX_LAB, id: "codex:checked", state: "signed_in" as const };
+    const pending = { ...CODEX_WORK, id: "codex:pending", state: "pending" as const };
+    render(<Dialog start={{ cli: "codex", step: 2 }} disc={discovery({ candidates: [checked, CODEX_LAB, CODEX_WORK, pending] })} />);
+    expect(screen.getByText(/Khipu checked 1 Codex login\. 1 Codex login could not be checked\. 2 Codex logins are unchecked\./)).toBeInTheDocument();
+  });
+
+  it.each(["claude", "grok"] as const)("keeps %s focus visible and its actions pinned", (cli) => {
+    render(<Dialog start={{ cli, step: 2 }} />);
+    const heading = screen.getByRole("heading", { name: /which login\?/ });
+    expect(heading).toHaveClass("aa-step-heading");
+    heading.focus();
+    expect(document.activeElement).toBe(heading);
+    const actions = screen.getByRole("button", { name: "Cancel" }).closest(".aa-actions")!;
+    expect(actions.closest(".kit-dialog-body")).not.toBeNull();
+    expect(accountsCss).toMatch(/\.aa-actions\s*\{[^}]*position:\s*sticky;[^}]*bottom:\s*0;[^}]*background:\s*var\(--bg\);/s);
+    expect(accountsCss).toMatch(/\.aa-dialog \.aa-step-heading:focus\s*\{[^}]*outline:\s*2px solid var\(--accent\);[^}]*outline-offset:\s*2px;/s);
+  });
+
   it("lists what Khipu found, tracked ones off with their names, and Choose another folder…", () => {
     render(<Dialog start={{ cli: "claude", step: 2 }} />);
     expect(screen.getByRole("heading", { name: /Claude: which login\?/ })).toBeInTheDocument();

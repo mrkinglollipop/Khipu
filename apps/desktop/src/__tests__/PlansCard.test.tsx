@@ -1190,7 +1190,7 @@ describe("one status phrase per account (settings clarity, phase 2)", () => {
     const head = grok.querySelector("h2")!;
     expect(head.textContent).toBe("GrokSuperGrok Heavy plan");
     expect(head.nextElementSibling!.className).toBe("plan-paused");
-    expect(within(grok).getByText("Can't read its plan: Grok Build didn't answer. No figures to show.")).toBeTruthy();
+    expect(within(grok).getByText("Can't read its plan: Grok Build didn't answer. No figures to show. Last checked 3 min ago.")).toBeTruthy();
     expect(grok.className).toBe("plan-block warn");
     const outside = (sel: string) => [...container.querySelectorAll(sel)].filter((n) => !n.closest(".plan-block"));
     for (const sel of ['[role="meter"]', ".plan-fail", ".plan-reads", ".plan-paused", ".plan-empty", ".plan-details"]) {

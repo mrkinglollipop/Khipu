@@ -48,7 +48,7 @@
 .aa-spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--accent); flex: none; animation: spin 1s linear infinite; }
 @media (prefers-reduced-motion: reduce) { .aa-spin { animation: none; } }
 
-.aa-actions { display: flex; gap: 6px; justify-content: flex-end; align-items: center; flex-wrap: wrap; padding-top: var(--s1); }
+.aa-actions { position: sticky; bottom: 0; display: flex; gap: 6px; justify-content: flex-end; align-items: center; flex-wrap: wrap; padding: var(--s2) 0 var(--s1); background: var(--bg); border-top: 1px solid var(--border); }
 .aa-actions .aa-left { margin-right: auto; }
 .aa-note { margin: 0; font-size: var(--t-sm); color: var(--text-2); }
 .aa-dos { margin: 0; padding-left: 1.2em; font-size: var(--t-sm); color: var(--text-2); display: flex; flex-direction: column; gap: 2px; }
@@ -103,7 +103,7 @@ a.btn-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px
 .aa-opt input:focus-visible, .aa-way input:focus-visible { outline: none; }
 .aa-opt:has(input:focus-visible), .aa-way:has(input:focus-visible) { box-shadow: inset 0 0 0 2px var(--accent); }
 .aa-way:has(input:focus-visible) { border-color: var(--accent); }
-.aa-dialog h2[tabindex="-1"]:focus { outline: none; }
+.aa-dialog .aa-step-heading:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 @media (max-width: 760px) {
   .aa-ways { grid-template-columns: minmax(0, 1fr); }

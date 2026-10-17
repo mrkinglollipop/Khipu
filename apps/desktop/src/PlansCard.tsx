@@ -805,9 +805,11 @@ function failureLine(row: UsageAccount, status: PlanStatus, now: Date): string |
   }
   const cause = failureCause(row, code);
   // The figures' age is on the block's read line, so it is said once.
-  if (status.figures !== "none") return `Can't read it now: ${cause}. Showing earlier figures.`;
-  if (onlyResetWindows(row, now)) return `Can't read it now: ${cause}. Every limit has reset since it was read.`;
-  return `Can't read its plan: ${cause}. No figures to show.`;
+  const checked = fmtAgoSince(row.last_attempt_at || row.probed_at);
+  const when = checked ? ` Last checked ${checked}.` : "";
+  if (status.figures !== "none") return `Can't read it now: ${cause}. Showing earlier figures.${when}`;
+  if (onlyResetWindows(row, now)) return `Can't read it now: ${cause}. Every limit has reset since it was read.${when}`;
+  return `Can't read its plan: ${cause}. No figures to show.${when}`;
 }
 
 /** One account in Settings: a bordered block under its name, holding every

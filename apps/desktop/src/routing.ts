@@ -261,6 +261,21 @@ export type RouteView = {
 };
 
 export type Tone = "ok" | "warn" | "err" | null;
+export type AccountClassification = "open" | "probably_open" | "limited" | "down" | "paused" | "unknown";
+
+/** The one owner-facing classification for account details and summaries. */
+export function accountClassification(a: RouteAccount): AccountClassification {
+  switch (a.state) {
+    case "open":
+    case "probably_open":
+    case "limited":
+    case "down":
+    case "paused":
+      return a.state;
+    default:
+      return "unknown";
+  }
+}
 
 const MINUTE_MS = 60_000;
 const DAY_MS = 24 * 60 * MINUTE_MS;
@@ -386,10 +401,11 @@ function stateWord(state: string | undefined): string {
 
 /** The state of one account in the scope's words, and its dot's tone. */
 export function accountState(a: RouteAccount, now: Date): { text: string; tone: Tone } {
+  const classification = accountClassification(a);
   const models = modelLimits(a, now);
   let text: string;
   let tone: Tone = null;
-  switch (a.state) {
+  switch (classification) {
     case "paused":
       text = a.until ? `Paused by you until ${whenLocal(a.until, now)}` : "Paused by you until you clear it";
       break;
@@ -470,23 +486,25 @@ export function accountSource(
   now: Date,
   plan?: PlanFigure | null,
   reportDefault: number = 30 * 60,
+  includeResetReason: boolean = true,
 ): string {
   const parts: string[] = [];
-  const w = a.state === "unknown" ? a.last_seen : a.witness;
+  const classification = accountClassification(a);
+  const w = classification === "unknown" ? a.last_seen : a.witness;
   if (w) {
     const when = saidWhen(w.at, now);
-    let said = `${witnessWords(w, a.harness, a.state)}${when ? ` ${when}` : ""}`;
-    if (a.state === "limited" && w.until_default && w.source !== "runner" && !w.message_time) {
+    let said = `${witnessWords(w, a.harness, classification)}${when ? ` ${when}` : ""}`;
+    if (classification === "limited" && w.until_default && w.source !== "runner" && !w.message_time) {
       said += `; Khipu keeps a report like that for ${spanWords(reportDefault)}`;
     }
     parts.push(said);
   }
   // A probably-open row already says its reset check's reason in its state.
-  if (a.reset_check?.reason) {
-    if (a.state !== "probably_open") parts.push(a.reset_check.reason);
+  if (a.reset_check?.reason && includeResetReason) {
+    if (classification !== "probably_open") parts.push(a.reset_check.reason);
   }
-  else if (a.state === "limited" && a.checkable === false) parts.push("can't be checked without using a turn");
-  if (a.state === "open" && a.witness?.source === "probe" && plan) {
+  else if (classification === "limited" && a.checkable === false) parts.push("can't be checked without using a turn");
+  if (classification === "open" && a.witness?.source === "probe" && plan) {
     parts.push(`${Math.round(plan.pct)}% of its ${plan.window} used`);
   }
   return parts.join(" · ");

@@ -12,6 +12,7 @@ import type { UsageReport } from "./PlansCard";
 import { tightestWindow } from "./PlansCard";
 import {
   accountSource,
+  accountClassification,
   accountState,
   brokenRules,
   disagreementWords,
@@ -69,7 +70,7 @@ function AccountRow({
   checkResult: { account: string; text: string; error: boolean } | null;
 }) {
   const st = accountState(a, now);
-  const src = accountSource(a, now, a.state === "open" ? planFigure(a, plans, now) : null, reportDefault);
+  const src = accountSource(a, now, accountClassification(a) === "open" ? planFigure(a, plans, now) : null, reportDefault);
   // The account's own disagreement and each model's: the attention item
   // "Sources disagree about X (Opus)" points at one of these notes.
   const notes = [disagreementWords(a, now), ...modelDisagreementWords(a, now)].filter((d): d is string => !!d);

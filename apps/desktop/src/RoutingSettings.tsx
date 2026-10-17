@@ -23,7 +23,7 @@ import { ChevronRight, Loader2 } from "lucide-react";
 import { EmptyState, Tag } from "./ui";
 import { callCli, useCliState } from "./settingsCli";
 import type { FeaturesShape } from "./settingsCli";
-import { PlanBlock, RefreshButton, UsageAccountsField, planPauses } from "./PlansCard";
+import { PlanBlock, RefreshButton, UsageAccountsField, planPauses, planStatus } from "./PlansCard";
 import type { PlanUsageState, UsageAccount } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
 import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, routingOverview, staleAfterSeconds } from "./routingOverview";
@@ -534,6 +534,7 @@ function AccountRow({
   now,
   reportDefault,
   fact,
+  suppressResetReadFailure,
   children,
 }: {
   a: RouteAccount;
@@ -541,12 +542,14 @@ function AccountRow({
   now: Date;
   reportDefault?: number;
   fact?: PlanFact;
+  /** PlanBlock owns a failed read's explanation and its checked time. */
+  suppressResetReadFailure?: boolean;
   children?: ReactNode;
 }) {
   const [pausing, setPausing] = useState(false);
   const pauseBtn = useRef<HTMLButtonElement>(null);
   const formId = `pause-${useId().replace(/:/g, "")}`;
-  const src = accountSource(a, now, null, reportDefault);
+  const src = accountSource(a, now, null, reportDefault, !(suppressResetReadFailure && a.reset_check?.status === "error"));
   const close = () => {
     setPausing(false);
     requestAnimationFrame(() => pauseBtn.current?.focus());
@@ -559,7 +562,7 @@ function AccountRow({
       <span className="route-what">
         {src ? <span className="route-src">{src}</span> : null}
         {a.next_check ? <span className="route-src">Khipu checks again at {whenLocal(a.next_check, now)}.</span> : null}
-        {fact && a.configured !== false ? <span className="route-src">{paceWords(fact, now)}</span> : null}
+        {fact && a.configured !== false && (!suppressResetReadFailure || fact.readable) ? <span className="route-src">{paceWords(fact, now)}</span> : null}
       </span>
       <span className="route-acts toolbar">
         {a.checkable !== false && a.configured !== false && ["limited", "probably_open", "unknown"].includes(a.state) ? (
@@ -1030,6 +1033,7 @@ function AccountLine({
   a,
   data,
   plan,
+  suppressResetReadFailure,
   pause,
   onSignedIn,
   tags,
@@ -1042,6 +1046,7 @@ function AccountLine({
   a: RouteAccount;
   data: RouteView;
   plan?: UsageAccount;
+  suppressResetReadFailure?: boolean;
   pause?: string;
   onSignedIn?: () => Promise<unknown> | void;
   tags: GroupTag[];
@@ -1089,7 +1094,8 @@ function AccountLine({
                 void finder.chooseFolderFor({ key: a.key, label: a.label, harness: a.harness, home: homeOfKey(a.key) }, opener)
               } />
           ) : null}
-          <AccountRow a={a} w={w} now={now} reportDefault={data.report_default_limit} fact={fact}>
+          <AccountRow a={a} w={w} now={now} reportDefault={data.report_default_limit} fact={fact}
+            suppressResetReadFailure={suppressResetReadFailure}>
             {plan ? <PlanBlock row={plan} now={now} pause={pause} onSignedIn={onSignedIn} /> : null}
           </AccountRow>
         </div>
@@ -1142,6 +1148,10 @@ function AccountsSection({
   const filterLabel = useId();
   const rows = plans?.accounts ?? [];
   const pauses = planPauses(data, now);
+  const planReadFailure = (row: UsageAccount | undefined) => {
+    const code = row ? planStatus(row, now).code : null;
+    return code != null && !["pending", "not_signed_in", "no_plan_limits"].includes(code);
+  };
   const routed = (row: UsageAccount) => row.key != null && accounts.some((a) => a.key === row.key);
   const loose = rows.filter((row) => !routed(row));
   const [changing, setChanging] = useState(false);
@@ -1193,6 +1203,7 @@ function AccountsSection({
             <div className="route-alist" role="list" aria-label="Accounts">
               {shownAccounts.map((a) => (
                 <AccountLine key={a.key} a={a} data={data} plan={rows.find((r) => r.key != null && r.key === a.key)}
+                  suppressResetReadFailure={planReadFailure(rows.find((r) => r.key != null && r.key === a.key))}
                   pause={pauses.get(a.key)} onSignedIn={plansState?.reread} tags={accountTags(problems, a.key)}
                   folds={folds} staleAfterS={staleAfterS} w={w} now={now} finder={finder} />
               ))}

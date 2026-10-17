@@ -6,7 +6,7 @@
    the closed lines' tags and Home's attention items read the same sources
    (`brokenRules`, `quietRunners` in routing.ts). */
 
-import { brokenRules, quietRunners, rateWords, ruleWords, runnerWords, whenLocal } from "./routing";
+import { accountClassification, brokenRules, quietRunners, rateWords, ruleWords, runnerWords, whenLocal } from "./routing";
 import type { PlanFact, RouteView } from "./routing";
 import { keptWindow, passingGapHeld, planStatus } from "./PlansCard";
 import type { UsageAccount, UsageReport } from "./PlansCard";
@@ -223,14 +223,16 @@ export function groupTags(problems: Problem[], group: GroupKey): GroupTag[] {
 function accountsLine(view: RouteView): string {
   const accounts = view.accounts ?? [];
   if (!accounts.length) return "No accounts yet";
-  const count = (states: string[]) => accounts.filter((a) => states.includes(a.state)).length;
+  const count = (classification: string) => accounts.filter((a) => accountClassification(a) === classification).length;
   const parts: string[] = [];
-  const open = count(["open", "probably_open"]);
-  const limited = count(["limited"]);
-  const paused = count(["paused"]);
-  const down = count(["down"]);
-  const unknown = accounts.length - open - limited - paused - down;
+  const open = count("open");
+  const probablyOpen = count("probably_open");
+  const limited = count("limited");
+  const paused = count("paused");
+  const down = count("down");
+  const unknown = count("unknown");
   if (open) parts.push(`${open} open`);
+  if (probablyOpen) parts.push(`${probablyOpen} probably open`);
   if (limited) parts.push(limited === 1 ? "1 at its limit" : `${limited} at their limit`);
   if (paused) parts.push(`${paused} paused`);
   if (down) parts.push(`${down} down`);
@@ -393,7 +395,6 @@ export function accountWeek(
 
 const ACCOUNT_TAG: Record<string, string> = {
   disagree: "Sources disagree",
-  plan: "Can't read its plan",
   signin: "Not signed in",
 };
 
