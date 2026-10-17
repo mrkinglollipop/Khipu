@@ -3,9 +3,9 @@ slice 1, with Matt's decisions 2 and 3).
 
 A dispatched job's "user" is the orchestrator that wrote its brief, so a
 job's questions and its "Matt to decide X" belong to the orchestrator (owner
-``agent``, label "orchestrator"), not to the user. A named third party ("the
-orchestrator must", "PR #234 author to") is an ``agent`` owner in any
-session. Nothing is dropped: only the owner and where an item shows change.
+``agent``, label "orchestrator"), not to the user. In a job a named third
+party ("the orchestrator must", "PR #234 author to") is an ``agent`` owner;
+in the owner's own conversation the words never move an item away from him. Nothing is dropped: only the owner and where an item shows change.
 
 No live database except the last class, which uses the throwaway PostgreSQL
 of tests/hermetic_pg.py (a hub at migration 0029, so without 0033's columns).
@@ -109,25 +109,38 @@ def _by_text(cur, text):
 
 
 class NamedThirdPartyTest(unittest.TestCase):
+    """A named third party decides the owner only in a job, where the speaker
+    is known to be the orchestrator; in the owner's own conversation the
+    model's declared speaker does."""
+
     def test_the_orchestrator_must_resolve_the_rebase_conflict_is_agent(self):
         text = "The orchestrator must resolve the rebase conflict"
-        self.assertEqual(co.resolve_owner_and_label(text), ("agent", "orchestrator"))
+        self.assertEqual(co.resolve_owner_and_label(text, origin="job"), ("agent", "orchestrator"))
         cur = _OwnerCursor()
-        self.assertEqual(_open(cur, CONVERSATION, text), 1)
+        self.assertEqual(_open(cur, JOB, text), 1)
         row = _by_text(cur, text)
         self.assertEqual((row["owner"], row["owner_label"]), ("agent", "orchestrator"))
 
     def test_pr_author_to_renumber_migration_is_agent(self):
         text = "PR #234 author to renumber migration 115"
-        self.assertEqual(co.resolve_owner_and_label(text), ("agent", "PR author"))
+        self.assertEqual(co.resolve_owner_and_label(text, origin="job"), ("agent", "PR author"))
         cur = _OwnerCursor()
-        self.assertEqual(_open(cur, CONVERSATION, text), 1)
+        self.assertEqual(_open(cur, JOB, text), 1)
         row = _by_text(cur, text)
         self.assertEqual((row["owner"], row["owner_label"]), ("agent", "PR author"))
 
     def test_the_owner_of_a_pr_is_the_pr_author_not_the_user(self):
-        self.assertEqual(co.resolve_owner_and_label("The owner of PR #12 to rebase onto main"),
+        self.assertEqual(co.resolve_owner_and_label("The owner of PR #12 to rebase onto main", origin="job"),
                          ("agent", "PR author"))
+
+    def test_in_a_conversation_the_declared_speaker_decides(self):
+        text = "The orchestrator must resolve the rebase conflict"
+        cur = _OwnerCursor()
+        self.assertEqual(_open(cur, CONVERSATION, {"text": text, "kind": "blocker", "owner": "other",
+                                                   "owner_label": "orchestrator"}), 1)
+        row = _by_text(cur, text)
+        self.assertEqual((row["owner"], row["owner_label"]), ("agent", "orchestrator"))
+        self.assertEqual(co.resolve_owner_and_label(text, declared="user"), ("user", None))
 
 
 class JobRulesTest(unittest.TestCase):
@@ -482,7 +495,7 @@ def test_a_pre_migration_hub_still_answers_reads_and_writes(hub):  # noqa: F811
 def test_supported_reviewer_actor_is_stored_not_dropped_for_agent_work():
     """Slice 1: a supported third-party actor survives agent-word filtering."""
     text = "The reviewer must fix agent attribution before PR #41 merges"
-    owner, label = co.resolve_owner_and_label(text)
+    owner, label = co.resolve_owner_and_label(text, origin="job")
     assert (owner, label) == (co.OWNER_AGENT, "reviewer")
     assert co.rejection_reason(text, owner=owner) is None
 
@@ -495,12 +508,75 @@ def test_the_agent_classifier_reassigns_and_never_discards(monkeypatch):
         assert co.resolve_owner_and_label("Matt to fix agent attribution in the capture hook") == (
             co.OWNER_USER, None)
         assert co.rejection_reason("Matt to fix agent attribution in the capture hook") is None
-        # Waiting on an agent's output is the orchestrator's, not the owner's, and is kept.
+        # Waiting on an agent's output goes by lineage, and is kept.
         text = "Did the phase 2 agent's report land?"
-        assert co.resolve_owner_and_label(text, kind="question") == (co.OWNER_AGENT, co.ORCHESTRATOR)
+        assert co.resolve_owner_and_label(text, kind="question", origin="job") == (
+            co.OWNER_AGENT, co.ORCHESTRATOR)
+        assert co.resolve_owner_and_label(text, kind="question") == (co.OWNER_USER, None)
         assert co.rejection_reason(text, owner=co.OWNER_AGENT, kind="question") is None
         # The word alone moves nothing.
         assert co.resolve_owner_and_label("Should we rename agent attribution?", kind="question") == (
             co.OWNER_USER, None)
     finally:
         co.reset_user_patterns()
+
+
+# ---- owners come from lineage, never from keywords (second cross-family review) ----
+
+_LINEAGE_CASES = [
+    # (text, kind, declared, declared_label, origin, expected)
+    # The review's probes: the owner's own words in his own session.
+    ("I will ask the orchestrator to approve the release", "promise", "user", None, "conversation",
+     ("user", None)),
+    ("Matt, should we enable desktop notifications?", "question", "user", None, "conversation",
+     ("user", None)),
+    ("Matt, what is your verdict on the release?", "question", "user", None, "conversation",
+     ("user", None)),
+    # Their mirrors: the same words in a job, whose "user" is its orchestrator.
+    ("I will ask the orchestrator to approve the release", "promise", "user", None, "job",
+     ("agent", "orchestrator")),
+    ("Matt, should we enable desktop notifications?", "question", "user", None, "job",
+     ("agent", "orchestrator")),
+    ("Matt, what is your verdict on the release?", "question", "user", None, "job",
+     ("agent", "orchestrator")),
+    # Keywords that once moved an item, in a conversation and in a job.
+    ("Did the background agent's report land?", "question", None, None, "conversation", ("user", None)),
+    ("Did the background agent's report land?", "question", None, None, "job", ("agent", "orchestrator")),
+    ("The orchestrator must resolve the rebase conflict", "blocker", "user", None, "conversation",
+     ("user", None)),
+    ("The orchestrator must resolve the rebase conflict", "blocker", None, None, "conversation",
+     ("assistant", None)),
+    ("The orchestrator must resolve the rebase conflict", "blocker", "other", "orchestrator", "conversation",
+     ("agent", "orchestrator")),
+    ("The orchestrator must resolve the rebase conflict", "blocker", "user", None, "job",
+     ("agent", "orchestrator")),
+    ("The reviewer must fix agent attribution before PR #41 merges", "followup", "user", None, "conversation",
+     ("user", None)),
+    ("The reviewer must fix agent attribution before PR #41 merges", "followup", "user", None, "job",
+     ("agent", "reviewer")),
+    ("Matt to fix agent attribution in the capture hook", "followup", None, None, "conversation",
+     ("user", None)),
+    ("Matt to fix agent attribution in the capture hook", "followup", None, None, "job",
+     ("agent", "orchestrator")),
+    ("Receive report from the phase 1-2 agent", "followup", "assistant", None, "conversation",
+     ("assistant", None)),
+    ("Receive report from the phase 1-2 agent", "followup", "assistant", None, "job", ("assistant", None)),
+]
+
+
+@pytest.mark.parametrize("text,kind,declared,label,origin,expected", _LINEAGE_CASES)
+def test_the_owner_comes_from_the_session_not_the_words(text, kind, declared, label, origin, expected):
+    monkey = {"KHIPU_USER_ALIASES": "Matt"}
+    with mock.patch.dict(os.environ, monkey):
+        co.reset_user_patterns()
+        try:
+            assert co.resolve_owner_and_label(text, kind=kind, declared=declared, origin=origin,
+                                              declared_label=label) == expected
+            cur = _OwnerCursor()
+            loop = {"text": text, "kind": kind, **({"owner": declared} if declared else {}),
+                    **({"owner_label": label} if label else {})}
+            assert _open(cur, JOB if origin == "job" else CONVERSATION, loop) == 1
+            row = _by_text(cur, text)
+            assert (row["owner"], row.get("owner_label")) == expected
+        finally:
+            co.reset_user_patterns()

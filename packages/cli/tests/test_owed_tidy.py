@@ -235,9 +235,11 @@ def test_the_plan_sorts_the_flood_by_rule_with_evidence(owed):
             assert items[i]["after"]["owner"] == "agent" and items[i]["rule"], group
             assert items[i]["after"]["origin"] == "job", group
     assert items[f.groups["job_question"][0]]["after"]["owner_label"] == "orchestrator"
-    # Already shown as the orchestrator's (slice 1 reads it so): kept.
+    # The owner's own conversation naming the orchestrator: no keyword moves
+    # it (owners come from lineage); only the model pass may, and here it
+    # says the user's, so it is kept.
     assert actions("agent_named") == {"keep"}
-    assert items[f.groups["agent_named"][0]]["before"]["owner"] == "agent"
+    assert items[f.groups["agent_named"][0]]["before"]["owner"] == "user"
     assert actions("conv_names_user") == {"keep"}
     assert actions("pr_merged") == {"close"}
     assert {items[i]["close"] for i in f.groups["pr_merged"]} == {"pr"}
@@ -271,7 +273,7 @@ def test_the_model_never_sees_items_naming_the_user(owed):
     assert named and not any("matt" in t.lower() for t in model.seen)
     # Only items no rule decided reach it.
     shown = set(model.seen)
-    for group in ("job_question", "pr_merged", "decided", "dup", "agent_named"):
+    for group in ("job_question", "pr_merged", "decided", "dup"):
         assert not any(_rows(owed, [i])[i]["text"] in shown for i in f.groups[group]), group
 
 

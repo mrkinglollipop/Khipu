@@ -166,11 +166,10 @@ def _owner_rule(row: dict[str, Any], origin: str, trigger: bool) -> str:
     from khipu import commitments as co
 
     text = row.get("text") or ""
-    body = co._without_trigger_clause(text) if trigger else text
-    label = co.agent_actor(body)
-    if label:
-        return f"names the {label} as the one to act"
     job = origin == co.ORIGIN_JOB
+    label = co.agent_actor(co._without_trigger_clause(text) if trigger else text) if job else None
+    if label:
+        return f"a job's item naming the {label} as the one to act"
     if co._user_signal(text, kind=row.get("kind"), future_trigger=trigger):
         if job:
             return "a job's question or ask for a decision is the orchestrator's (a job's user is its dispatcher)"

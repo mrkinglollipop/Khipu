@@ -112,10 +112,10 @@ _IN_PROGRESS_RE = re.compile(
 )
 # Waiting on another agent's output: "the agent's verdict", "a report from the
 # phase 2 agent", "poll the drive". The word "agent" alone ("fix agent
-# attribution") is not this shape. It never discards an item: it only moves
-# one the user would otherwise own to the agent that is waited on
-# (:func:`resolve_owner_and_label`), and it marks the assistant's own
-# session-plan rows (:func:`is_session_plan_text`).
+# attribution") is not this shape. It never discards an item and never
+# decides an owner (owners come from lineage, :func:`resolve_owner_and_label`);
+# it only marks the assistant's own session-plan rows
+# (:func:`is_session_plan_text`).
 _AGENT_RE = re.compile(
     r"\b(?:sub-?agents?|agents?)(?:'s|s'|’s)?\s+(?:verdicts?|reports?|results?|outputs?|repl(?:y|ies)|"
     r"answers?|responses?|finish\w*|return\w*|land\w*)\b"
@@ -394,10 +394,11 @@ def reset_user_patterns() -> None:
 # Third-party actors (2026-10-16, owed-and-ledger scope slice 1). In a busy
 # orchestrated project most open items named neither the user nor the
 # assistant but "the orchestrator", "PR #234's author", "the reviewer"; with
-# only two owners they all became the user's. A third-party actor governing a
-# verb makes the item an ``agent`` item with that label. Checked BEFORE the
-# user words, so "the owner of PR #12 to rebase" is the PR author's, not the
-# user's ("owner" is one of the generic user words).
+# only two owners they all became the user's. In a JOB's capture a third-party
+# actor governing a verb makes the item an ``agent`` item with that label,
+# checked before the user words, so "the owner of PR #12 to rebase" is the PR
+# author's ("owner" is one of the generic user words). In the owner's own
+# conversation these words decide nothing (:func:`resolve_owner_and_label`).
 # ---------------------------------------------------------------------------
 
 _ACTOR_VERBS = (
@@ -561,40 +562,42 @@ def resolve_owner_and_label(text: str, *, kind: str | None = None, declared: Any
                             future_trigger: bool | None = None,
                             origin: str | None = None,
                             declared_label: Any = None) -> tuple[str, str | None]:
-    """``(owner, owner_label)`` for one commitment, deterministically, in order:
+    """``(owner, owner_label)`` for one commitment, deterministically.
 
-    1. A third party named as the actor ("the orchestrator must", "PR #234
-       author to") is that party's: ``agent`` with its label.
-    2. From a job (``origin == 'job'``): a user signal (a question, a
-       decision shape, "Matt to decide X") or a model-declared ``"user"``
-       goes to the orchestrator, because a job's user is its dispatcher. The
-       orchestrator asks the user itself if it really needs them.
-    3. Text that waits on another agent's output ("the agent's verdict",
-       "a report from the phase 2 agent") with no user named as its actor
-       goes to the orchestrator, not the user.
-    4. Otherwise today's rule: a user signal is the user's; with no signal
-       and no future trigger, the model's declared owner ("other" with its
-       label becomes ``agent``); else the assistant's.
+    The owner comes from who said it and in which session, never from the
+    words alone. In a job (``origin == 'job'``) the speaker typing as "the
+    user" is known to be the orchestrator that wrote the brief, so:
+
+    1. a third party named as the actor ("the orchestrator must", "PR #234
+       author to") is that party's: ``agent`` with its label;
+    2. a user signal (a question, a decision shape, "Matt to decide X") or a
+       model-declared ``"user"`` goes to the orchestrator; it asks the user
+       itself if it really needs them.
+
+    In the owner's own conversation (any other origin) the words never move
+    an item away from him: his "I will ask the orchestrator to ..." is his,
+    and a question to him stays his whatever it mentions. A user signal is
+    the user's; with no signal and no future trigger the model's declared
+    speaker decides ("other" with its label becomes ``agent``); else the
+    assistant's.
     """
     if future_trigger is None:
         future_trigger = has_future_trigger(text)
     s = (text or "").strip()
-    body = _without_trigger_clause(s) if future_trigger is not False else s
-    label = agent_actor(body)
-    if label:
-        return OWNER_AGENT, label
     job = str(origin or "").strip().lower() == ORIGIN_JOB
-    # Waiting on an agent's output is the orchestrator's, unless the user is
-    # named as the actor; it moves the item, never drops it.
-    waits_on_agent = bool(_AGENT_RE.search(body)) and not _compile_user_patterns().actor_re.search(body)
+    if job:
+        body = _without_trigger_clause(s) if future_trigger is not False else s
+        label = agent_actor(body)
+        if label:
+            return OWNER_AGENT, label
     if _user_signal(text, kind=kind, future_trigger=future_trigger):
-        return (OWNER_AGENT, ORCHESTRATOR) if job or waits_on_agent else (OWNER_USER, None)
+        return (OWNER_AGENT, ORCHESTRATOR) if job else (OWNER_USER, None)
     if not future_trigger:
         norm = _declared(declared)
         if norm == "other":
             return OWNER_AGENT, clean_owner_label(declared_label) or (ORCHESTRATOR if job else "other")
         if norm == OWNER_USER:
-            return (OWNER_AGENT, ORCHESTRATOR) if job or waits_on_agent else (OWNER_USER, None)
+            return (OWNER_AGENT, ORCHESTRATOR) if job else (OWNER_USER, None)
         if norm:
             return norm, None
     return OWNER_ASSISTANT, None
