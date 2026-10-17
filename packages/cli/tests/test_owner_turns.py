@@ -146,7 +146,78 @@ def _rollout(tmp: Path, originator: str) -> Path:
     return path
 
 
-@pytest.mark.parametrize("originator,ok", [("codex_cli_rs", True), ("codex_exec", False), ("codex_desktop", True)])
+@pytest.mark.parametrize("entry,ok", [
+    ("cli", True),                   # a terminal, Remote Control, the JetBrains plugin
+    ("claude-desktop", True),        # the desktop app's Code tab
+    ("claude-desktop-3p", True),     # the desktop app on another provider
+    ("claude-vscode", True),         # the VS Code extension
+    ("remote", True),                # a cloud session typed in on the web
+    ("remote_desktop", True),        # a cloud session from the desktop app
+    ("remote_mobile", True),         # a cloud session from the mobile app
+    ("sdk-cli", False),              # claude -p
+    ("sdk-ts", False),               # the Agent SDK outside T3 Code
+    ("sdk-py", False),
+    ("mcp", False),                  # claude mcp serve
+    ("local-agent", False),
+    ("remote_trigger", False),       # a scheduled cloud job
+    ("claude-code-github-action", False),
+    ("claude-in-slack", False),      # anyone in the channel can type
+])
+def test_claude_code_front_ends_by_entrypoint(home, entry, ok):
+    _record("pause Codex until 5pm", env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": entry})
+    turn = _last()
+    assert (turn["entrypoint"], turn["eligible"]) == (entry, ok)
+
+
+@pytest.mark.parametrize("entry", ["claude-desktop", "claude-vscode", "remote_mobile", "cli"])
+def test_claude_p_inside_a_trusted_session_is_never_the_owner(home, entry):
+    """Claude Code renames only "cli" to "sdk-cli" for ``claude -p``; a job
+    started from a desktop session's shell keeps "claude-desktop". The
+    issuer's command line says print mode, so the turn is ``claude -p``'s."""
+    issuer = {"pid": 4242, "start": T0 - 5, "exe": "claude", "print": True}
+    owner_turns.record(_payload("pause Codex until 5pm"),
+                       env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": entry}, now=T0, issuer=issuer)
+    turn = _last()
+    assert (turn["entrypoint"], turn["eligible"]) == ("sdk-cli", False)
+
+
+def test_a_desktop_session_without_print_mode_stays_the_desktop(home):
+    issuer = {"pid": 4242, "start": T0 - 5, "exe": "claude"}
+    owner_turns.record(_payload("pause Codex until 5pm"),
+                       env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}, now=T0, issuer=issuer)
+    assert (_last()["entrypoint"], _last()["eligible"]) == ("claude-desktop", True)
+
+
+@pytest.mark.parametrize("args,printing", [
+    (["claude", "-p", "do the build"], True),
+    (["claude", "--print", "do the build"], True),
+    (["claude", "--print=text"], True),
+    (["claude", "--output-format", "stream-json", "--input-format", "stream-json", "--resume=x"], False),
+    (["claude", "--", "-p"], False),
+    (["claude"], False),
+    (None, False),
+])
+def test_print_mode_is_read_from_the_command_line(args, printing):
+    assert owner_turns._print_mode(args) is printing
+
+
+def test_an_untrusted_front_end_turn_says_how_to_add_it(home):
+    owner_turns.write_settings({"trusted": ["claude_code:cli"]})
+    _record("pause Codex until 5pm", env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "claude-desktop"})
+    turn = _last()
+    assert turn["eligible"] is False
+    assert "claude_code:claude-desktop" in turn["why"]
+    assert "Front ends that count as you" in turn["why"]
+    assert owner_turns.untrusted_front_end([turn]) == "claude_code:claude-desktop"
+
+
+def test_a_machine_front_end_is_never_offered_as_one_to_add(home):
+    _record("pause Codex until 5pm", env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-cli"})
+    assert owner_turns.untrusted_front_end([_last()]) is None
+
+
+@pytest.mark.parametrize("originator,ok", [("codex_cli_rs", True), ("codex_exec", False), ("codex_desktop", True),
+                                           ("codex_vscode", True), ("codex_sdk_ts", False)])
 def test_codex_counts_by_its_rollouts_originator(home, originator, ok):
     payload = _payload("pause Grok until Monday", transcript_path=str(_rollout(home["tmp"], originator)))
     assert owner_turns.record(payload, env={"CODEX_THREAD_ID": SESSION}, now=T0)

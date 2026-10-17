@@ -40,12 +40,23 @@ from khipu.turn_text import clean_user_text, is_machine, owner_text
 
 RETENTION_S = 24 * 3600
 # Front ends whose typed turns are the owner's. ``harness:entrypoint``, where
-# the entrypoint is Claude Code's CLAUDE_CODE_ENTRYPOINT ("cli" interactive,
-# Remote Control included; "sdk-cli" is ``claude -p``), Codex's originator
-# ("codex_exec" is ``codex exec``), "t3" for a session T3 Code runs, and
-# "aegis" for the Aegis pack (Grok Build included).
-DEFAULT_TRUSTED = ("claude_code:cli", "claude_code:t3", "codex:codex_cli_rs", "codex:codex_desktop",
+# the entrypoint is Claude Code's CLAUDE_CODE_ENTRYPOINT ("cli" a terminal,
+# Remote Control and the JetBrains plugin included; "claude-desktop" and
+# "claude-desktop-3p" the desktop app's Code tab; "claude-vscode" the VS Code
+# extension; "remote", "remote_desktop" and "remote_mobile" a cloud session
+# typed in from the web, desktop or mobile app), Codex's originator
+# ("codex_cli_rs" the terminal, "codex_desktop" the app, "codex_vscode" the
+# extension), "t3" for a session T3 Code runs, and "aegis" for the Aegis pack
+# (Grok Build included). Never trusted: "sdk-cli" (``claude -p``), "sdk-ts"
+# and "sdk-py" (the Agent SDK), "mcp", "local-agent" and the "remote_*"
+# triggers, Slack and Teams, "codex_exec" (``codex exec``) and "codex_sdk_ts".
+DEFAULT_TRUSTED = ("claude_code:cli", "claude_code:claude-desktop", "claude_code:claude-desktop-3p",
+                   "claude_code:claude-vscode", "claude_code:remote", "claude_code:remote_desktop",
+                   "claude_code:remote_mobile", "claude_code:t3", "codex:codex_cli_rs", "codex:codex_desktop",
                    "codex:codex_vscode", "codex:t3", "aegis:aegis")
+# Entrypoints a job runs as, not a person: a refusal never suggests trusting them.
+MACHINE_ENTRYPOINTS = ("sdk-cli", "sdk-ts", "sdk-py", "mcp", "claude-code-github-action", "local-agent",
+                       "remote_trigger", "remote_cowork_trigger", "codex_exec", "codex_sdk_ts", "unknown")
 DEFAULTS = {
     "enabled": True,
     "latest_window_h": 6.0,
@@ -159,11 +170,16 @@ def _codex_originator(transcript: str) -> str | None:
     return originator if isinstance(originator, str) and originator else None
 
 
-def entrypoint_of(harness: str, env: dict, payload: dict, session: str) -> str:
+def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: dict | None = None) -> str:
     if harness == "aegis":
         return "aegis"
     if harness == "claude_code":
         entry = (env.get("CLAUDE_CODE_ENTRYPOINT") or "unknown").strip() or "unknown"
+        # Claude Code turns only "cli" into "sdk-cli" for ``claude -p``: a
+        # job started from a desktop, VS Code or remote session keeps that
+        # session's entrypoint, so the issuer's own command line decides.
+        if (issuer or {}).get("print") and not entry.startswith("sdk-"):
+            return "sdk-cli"
         # T3 Code drives Claude through the Agent SDK; a session it runs has
         # a T3 thread. ``claude -p`` (sdk-cli) never counts as T3.
         if entry.startswith("sdk-") and entry != "sdk-cli" and t3.thread_for_session(session):
@@ -258,6 +274,25 @@ def _read_lines(path: Path) -> list[dict]:
     return out
 
 
+def untrusted_why(key: str) -> str:
+    return (f"{key} is not a front end that counts as the owner. To add it, switch it on in the Khipu app "
+            "(Settings, Owner actions, Front ends that count as you), or ask for it in a conversation "
+            "from a front end already on that list")
+
+
+def untrusted_front_end(turns_: list[dict], conf: dict | None = None) -> str | None:
+    """The front end of the latest turn that would count but for its front
+    end not being trusted, as ``harness:entrypoint``; None when there is none."""
+    conf = conf or settings()
+    for turn in reversed(turns_):
+        key = f"{turn.get('harness')}:{turn.get('entrypoint')}"
+        if key in conf["trusted"] or turn.get("entrypoint") in MACHINE_ENTRYPOINTS:
+            continue
+        if eligible(turn, {**conf, "trusted": [*conf["trusted"], key]})[0]:
+            return key
+    return None
+
+
 def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
     """Whether a recorded turn can carry the owner's words now, and why not."""
     conf = conf or settings()
@@ -273,7 +308,7 @@ def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
         return False, "no typed text"
     key = f"{turn.get('harness')}:{turn.get('entrypoint')}"
     if key not in conf["trusted"]:
-        return False, f"{key} is not a trusted front end"
+        return False, untrusted_why(key)
     if turn.get("harness") in SESSION_ONLY_HARNESSES and not conf["session_binding"]:
         return False, "session-only binding is off"
     return True, ""
@@ -356,6 +391,18 @@ def _only_the_shim(args: list[str] | None) -> bool:
     return bool(words) and os.path.basename(words[0]) == PROMPT_SHIM and all(w.startswith("--") for w in words[1:])
 
 
+def _print_mode(args: list[str] | None) -> bool:
+    """A Claude Code command line run as ``claude -p`` / ``--print``."""
+    if not args:
+        return False
+    for a in args[1:]:
+        if a == "--":
+            return False
+        if a in ("-p", "--print") or a.startswith("--print="):
+            return True
+    return False
+
+
 def hook_issuer() -> dict | None:
     """The process that ran this hook. The recorder's parent must be the
     prompt shim (a shell running ``khipu-prompt-recall``); above it, only a
@@ -390,7 +437,10 @@ def hook_issuer() -> dict | None:
             continue
         if _refused_issuer(name):
             return {"refused": name}
-        return {"pid": pid, "start": started, "exe": name}
+        out = {"pid": pid, "start": started, "exe": name}
+        if _print_mode(_proc_args(pid)):
+            out["print"] = True
+        return out
     return None
 
 
@@ -426,7 +476,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
     turn = {
         "at": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "ts": now, "harness": harness, "session": session,
-        "entrypoint": entrypoint_of(harness, env, payload, session), "cwd": cwd,
+        "entrypoint": entrypoint_of(harness, env, payload, session, issuer), "cwd": cwd,
         "turn": secrets.token_hex(4),
         "typed": bool(text.strip()) and not machine,
         "machine": machine, "wrapped": wrapped, "helper": t3.is_helper_session(cwd), "issuer": issuer,
