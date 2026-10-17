@@ -187,7 +187,12 @@ export function WorkView(props: WorkViewProps) {
         <div className="panel-body wide wk-panel">
           <div className="card">
             {work.error ? (
-              <EmptyState title="Could not read the work view" hint={work.error} />
+              <>
+                <EmptyState title="Could not read the work view" hint={work.error} />
+                <div className="toolbar">
+                  <button type="button" className="sm" onClick={reload}>Retry</button>
+                </div>
+              </>
             ) : (
               <EmptyState title={work.loading ? "Reading the work view" : "Work view not read yet"} hint={WORK_LEDE} />
             )}

@@ -1220,9 +1220,9 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       setClash(null);
       return false;
     }
-    const res = list.length
-      ? await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list), expect })
-      : await callCli("khipu_config_unset", { key: "usage_accounts", expect });
+    const res = next === null
+      ? await callCli("khipu_config_unset", { key: "usage_accounts", expect })
+      : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list), expect });
     if (res.ok) onSaved?.();
     await cfg.reload();
     setSaving(false);

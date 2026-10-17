@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Component, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
@@ -102,6 +102,39 @@ type Tab =
   | "harnesses"
   | "settings"
   | "revisions";
+
+type PaneBoundaryProps = {
+  title: string;
+  onRetry: () => Promise<void>;
+  children: ReactNode;
+};
+
+class PaneBoundary extends Component<PaneBoundaryProps, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() { return { failed: true }; }
+
+  private retry = () => {
+    void this.props.onRetry();
+  };
+
+  render() {
+    if (this.state.failed) {
+      return <div className="panel-body wide" role="alert">
+        <h1>{this.props.title}</h1>
+        <Callout tone="err" stripe title={`Could not render ${this.props.title}`}
+          action={<button type="button" onClick={this.retry}><RefreshCw size={14} strokeWidth={1.75} aria-hidden /> Retry</button>}>
+          This screen could not finish loading. Try again.
+        </Callout>
+      </div>;
+    }
+    return this.props.children;
+  }
+}
+
+const PANE_TITLES: Record<Tab, string> = {
+  "first-run": "Setup", home: "Home", activity: "Activity", recall: "Recall",
+  revisions: "Revisions", work: "Work", harnesses: "Harnesses", settings: "Settings",
+};
 
 type CacheTab = "status" | "activity" | "revisions" | "doctor" | "rightNow";
 
@@ -1246,6 +1279,9 @@ const OwedRow = memo(function OwedRow({
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("home");
+  const [paneRetryKeys, setPaneRetryKeys] = useState<Record<Tab, number>>({
+    "first-run": 0, home: 0, activity: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, settings: 0,
+  });
   // Configuration presence lets setup proceed; it does not prove the database answers.
   const [dsnOk, setDsnOk] = useState<boolean | null>(null);
   const [dbReachable, setDbReachable] = useState<boolean | null>(null);
@@ -3486,6 +3522,23 @@ export default function App() {
   const panelClass = (id: Tab) =>
     tab === id ? "panel" : "panel is-hidden";
 
+  const retryActivePane = async (): Promise<void> => {
+    const activeTab = tab;
+    switch (activeTab) {
+      case "home":
+        await Promise.all([loadStatus(true), loadDoctor(true), loadActivity(true), loadRightNow(true), refreshDsn(true), plans.load(), routing.load()]);
+        break;
+      case "activity": await loadActivity(true); break;
+      case "revisions": await loadRevisions(true); break;
+      case "work": await Promise.all([work.load(true), loadOwed("open", true)]); break;
+      case "harnesses": await loadDoctor(true); break;
+      case "settings": await Promise.all([refreshDsn(true), loadPaths(), loadGraphSources(), loadModels(), loadSecretsPresence()]); break;
+      case "first-run": await refreshDsn(true); break;
+      case "recall": break;
+    }
+    setPaneRetryKeys((keys) => ({ ...keys, [activeTab]: keys[activeTab] + 1 }));
+  };
+
   // Total checks that never ran on this machine — not_configured entries
   // plus graph_backup/graph_offsite when this Mac isn't the graph producer.
   // A skip must never read as a clean pass (audit 2026-08-31).
@@ -3975,6 +4028,7 @@ export default function App() {
       <main className="main" aria-busy={workingLabel != null}>
         <WorkingBanner label={workingLabel} />
         <section className={panelClass("first-run")}>
+          <PaneBoundary key={paneRetryKeys["first-run"]} title={PANE_TITLES["first-run"]} onRetry={retryActivePane}>
           <div className="panel-body onboard-wrap" data-tauri-drag-region>
             <Welcome
               dsnOk={dsnOk}
@@ -3990,9 +4044,11 @@ export default function App() {
               initialStepKey={welcomeInitialStepKey}
             />
           </div>
+          </PaneBoundary>
         </section>
 
         <section className={panelClass("home")}>
+          <PaneBoundary key={paneRetryKeys["home"]} title={PANE_TITLES["home"]} onRetry={retryActivePane}>
           <PanelHeader title="Home" lede="Is memory working right now?">
             {loading.status || loading.doctor ? <Spinner /> : null}
             <button
@@ -4422,9 +4478,11 @@ export default function App() {
               </Disclosure>
             </Disclosure>
           </div>
+          </PaneBoundary>
         </section>
 
         <section className={`${panelClass("activity")} fill`}>
+          <PaneBoundary key={paneRetryKeys["activity"]} title={PANE_TITLES["activity"]} onRetry={retryActivePane}>
           <PanelHeader
             title="Activity"
             lede="Every capture, newest first. Open one to read, correct, or forget it."
@@ -4724,9 +4782,11 @@ export default function App() {
               <RawBlock text={activityText} />
             </Disclosure>
           </div>
+          </PaneBoundary>
         </section>
 
         <section className={`${panelClass("recall")} fill`}>
+          <PaneBoundary key={paneRetryKeys["recall"]} title={PANE_TITLES["recall"]} onRetry={retryActivePane}>
           <PanelHeader
             title="Recall"
             lede="What does the agent remember about this?"
@@ -5380,9 +5440,11 @@ export default function App() {
           </>
             )}
           </div>
+          </PaneBoundary>
         </section>
 
         <section className={panelClass("revisions")}>
+          <PaneBoundary key={paneRetryKeys["revisions"]} title={PANE_TITLES["revisions"]} onRetry={retryActivePane}>
           <PanelHeader
             title="Conflicting edits"
             lede="When the same topic is edited in two places, the newest wins and the older version is kept. Every note file is compared against the database."
@@ -5540,9 +5602,11 @@ export default function App() {
 
             <RawJson text={revisionsText} openKey={revisionsRawKey} />
           </div>
+          </PaneBoundary>
         </section>
 
         <section className={panelClass("work")}>
+          <PaneBoundary key={paneRetryKeys["work"]} title={PANE_TITLES["work"]} onRetry={retryActivePane}>
           <WorkView
             work={work}
             routing={routing}
@@ -5746,9 +5810,11 @@ export default function App() {
               </>
             }
           />
+          </PaneBoundary>
         </section>
 
         <section className={panelClass("harnesses")}>
+          <PaneBoundary key={paneRetryKeys["harnesses"]} title={PANE_TITLES["harnesses"]} onRetry={retryActivePane}>
           <PanelHeader
             title="Harnesses"
             lede="Which agents are wired in, and whether each one is actually recording."
@@ -5767,9 +5833,11 @@ export default function App() {
               setTab("settings");
             }}
           />
+          </PaneBoundary>
         </section>
 
         <section className={panelClass("settings")}>
+          <PaneBoundary key={paneRetryKeys["settings"]} title={PANE_TITLES["settings"]} onRetry={retryActivePane}>
           <PanelHeader
             title="Settings"
             lede="Capture, models, data and this Mac."
@@ -6427,6 +6495,7 @@ export default function App() {
               </div>
             </div>
           </div>
+          </PaneBoundary>
         </section>
       </main>
 

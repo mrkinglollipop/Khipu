@@ -272,8 +272,10 @@ def _render_project_slice(label: str, slice_data: dict) -> str:
         for c in display:
             text = clip_snippet(str(c.get("text") or ""), 160)
             owner = str(c.get("owner") or "").strip()
-            who = {"user": " (needs the user)", "assistant": " (yours)",
+            who = {"user": " (needs the user)",
                    "agent": " (for the orchestrator)"}.get(owner, "")
+            if owner == "assistant" and c.get("same_session_lineage"):
+                who = " (yours)"
             age_days = _commitment_age_days(c)
             age_txt = f" ({age_days}d old)" if age_days is not None and age_days > 7 else ""
             lines.append(f"- [{c.get('kind')}]{who}{age_txt} `{c.get('id')}`: {text}")

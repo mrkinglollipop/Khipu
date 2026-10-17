@@ -320,7 +320,7 @@ def _exit_code(code) -> str:
 
 
 def _converse(argv: list[str], messages: list[dict], is_answer, *, env: dict[str, str],
-              deadline: float, close_stdin: bool) -> list[dict]:
+              deadline: float, close_stdin: bool, keep=None) -> list[dict]:
     """Write ``messages``, read JSON lines until ``is_answer(frame)`` or the
     ``deadline`` (monotonic), then kill the whole process group.
 
@@ -328,7 +328,8 @@ def _converse(argv: list[str], messages: list[dict], is_answer, *, env: dict[str
     stdin right after the requests. Codex and Grok exit on end of input before
     answering, so for them stdin stays open until the answer arrives (the kill
     closes it). Returns the response frames read; notifications are dropped
-    unread (Grok's carry the user's MCP configuration)."""
+    unread (Grok's carry the user's MCP configuration). ``keep`` replaces the
+    test for which frames are response frames."""
     with tempfile.TemporaryDirectory(prefix="khipu-usage-") as cwd, tempfile.TemporaryFile() as errfile:
         try:
             proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errfile,
@@ -373,7 +374,7 @@ def _converse(argv: list[str], messages: list[dict], is_answer, *, env: dict[str
                         continue
                     if not isinstance(frame, dict):
                         continue
-                    if "id" in frame or frame.get("type") == "control_response":
+                    if keep(frame) if keep else ("id" in frame or frame.get("type") == "control_response"):
                         frames.append(frame)
                         if is_answer(frame):
                             return frames
@@ -589,10 +590,112 @@ def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S) -
         {"type": "control_request", "request_id": "usage",
          "request": {"subtype": "get_usage", "skip_behaviors": True}},
     ]
-    frames = _converse([binary, *_CLAUDE_ARGS], messages, _claude_is_answer,
-                       env=probe_environment("claude", config_dir, binary), deadline=time.monotonic() + timeout,
+    deadline = time.monotonic() + timeout
+    env = probe_environment("claude", config_dir, binary)
+    frames = _converse([binary, *_CLAUDE_ARGS], messages, _claude_is_answer, env=env, deadline=deadline,
                        close_stdin=True)
-    return parse_claude(frames)
+    try:
+        return parse_claude(frames)
+    except ProbeError as exc:
+        if exc.code != E_NO_FIGURES or not _turn_due(config_dir):
+            raise
+    # probe_all stops every probe OVERALL_GRACE_S after its timeout; the turn
+    # ends just before that, so a slow turn reads as missing figures.
+    turn = _claude_turn(binary, env, deadline + OVERALL_GRACE_S - 0.25)
+    plan = _text(_dict(_dict(frames[-1], "response"), "response").get("subscription_type"))
+    return dict(turn, plan=plan) if turn else {"ok": False, "error": E_NO_FIGURES}
+
+
+# Claude Code answers get_usage from its own usage endpoint. When that endpoint
+# turns the login away (HTTP 429, seen on a busy account from 2026-10-16), the
+# reply carries no figures, while every model reply still carries them in its
+# rate-limit headers. So Khipu asks for one tiny turn (cheapest model, no tools,
+# a one-line system prompt) at most once per TURN_EVERY_S for each login, and
+# reads the figures from the turn's rate_limit_event.
+TURN_EVERY_S = 1800
+TURN_STAMP_NAME = "usage.turn.json"
+TURN_LOCK_NAME = "usage.turn.lock"
+_CLAUDE_TURN_ARGS = ("-p", "Reply with OK.", "--output-format", "stream-json", "--verbose",
+                     "--setting-sources", "project", "--no-session-persistence", "--strict-mcp-config",
+                     "--model", "haiku", "--max-turns", "1", "--tools", "", "--system-prompt", "Reply with OK.")
+_TURN_WINDOWS = {"five_hour": ("five_hour", 300), "seven_day": ("weekly", 10080)}
+
+
+def _turn_due(config_dir: str | None) -> bool:
+    """True, and the attempt recorded, when this login's last turn was
+    TURN_EVERY_S ago or more (or never). A data dir Khipu can't write means
+    no turn: an unrecorded turn would run on every read."""
+    key = str(_home_path(config_dir) or config_dir) if config_dir else ""
+    fd = _open_lock(TURN_LOCK_NAME)
+    if fd is None:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        path = cache_file().with_name(TURN_STAMP_NAME)
+        try:
+            stamps = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            stamps = {}
+        if not isinstance(stamps, dict):
+            stamps = {}
+        now = time.time()
+        last = stamps.get(key)
+        if isinstance(last, (int, float)) and not isinstance(last, bool) and 0 <= now - last < TURN_EVERY_S:
+            return False
+        stamps[key] = now
+        try:
+            tmp = path.with_name(TURN_STAMP_NAME + ".tmp")
+            tmp.write_text(json.dumps(stamps, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            return False
+        return True
+    finally:
+        _release(fd)
+
+
+def _claude_turn_frame(frame: dict) -> bool:
+    return frame.get("type") in ("rate_limit_event", "result") or (
+        frame.get("type") == "system" and frame.get("subtype") == "init")
+
+
+def parse_claude_turn(frames: list[dict]) -> dict | None:
+    """The figures in a turn's last rate_limit_event, or None without one.
+    ``unifiedWindows`` holds every window; an event without it names only the
+    window it is about (``rateLimitType``). Utilization is a fraction there."""
+    info = None
+    version = None
+    for frame in frames:
+        if frame.get("type") == "rate_limit_event" and isinstance(frame.get("rate_limit_info"), dict):
+            info = frame["rate_limit_info"]
+        elif frame.get("type") == "system":
+            version = _text(frame.get("claude_code_version"))
+    if info is None:
+        return None
+    blocks = _dict(info, "unifiedWindows") or {info.get("rateLimitType"): info}
+    windows = []
+    for key, (name, mins) in _TURN_WINDOWS.items():
+        block = blocks.get(key)
+        if not isinstance(block, dict):
+            continue
+        used = block.get("utilization")
+        used = round(used * 100, 2) if isinstance(used, (int, float)) and not isinstance(used, bool) else used
+        windows.append(_window(name, used, block.get("resetsAt"), mins))
+    windows = [w for w in windows if w]
+    if not windows:
+        return None
+    # Fresh from the server as the turn ran: a live read, unlike Codex's
+    # rollout figures, which may predate a limit.
+    return {"ok": True, "windows": windows, "credits": None, "version": version, "source": "live"}
+
+
+def _claude_turn(binary: str, env: dict[str, str], deadline: float) -> dict | None:
+    try:
+        frames = _converse([binary, *_CLAUDE_TURN_ARGS], [], lambda f: f.get("type") == "result", env=env,
+                           deadline=deadline, close_stdin=True, keep=_claude_turn_frame)
+        return parse_claude_turn(frames)
+    except ProbeError:
+        return None
 
 
 # ---- Codex -------------------------------------------------------------------
@@ -912,7 +1015,7 @@ def configured_accounts() -> list[dict]:
 
     config = load_config()
     raw = config.get("usage_accounts")
-    if not isinstance(raw, list) or not raw:
+    if not isinstance(raw, list):
         if reads_none(config):
             return []
         return [{"label": LABELS[h], "harness": h, "home": None} for h in HARNESSES if _command(h)]
@@ -1118,7 +1221,7 @@ def accounts_status() -> dict:
 
     config = load_config()
     raw = config.get("usage_accounts")
-    stored = raw if isinstance(raw, list) and raw else None
+    stored = raw if isinstance(raw, list) else None
     try:
         user_home = str(Path.home())
     except RuntimeError:
@@ -1129,7 +1232,7 @@ def accounts_status() -> dict:
     # what a write hands back (``--expect``) so it is refused when the list
     # changed after it was read.
     request = config.get("usage_accounts_request")
-    return {"value": stored, "source": "file" if stored is not None else "none" if none else "default",
+    return {"value": stored, "source": "none" if none else "file" if stored is not None else "default",
             "accounts": configured_accounts(), "user_home": user_home, "version": accounts_version(config),
             "none": none, "request": request if isinstance(request, dict) else None}
 

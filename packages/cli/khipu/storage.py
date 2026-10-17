@@ -182,50 +182,72 @@ def log_dirs() -> list[Path]:
 
 
 def log_files() -> list[Path]:
-    """Every ``*.log`` in the log folders, plus the promotion retry's output."""
+    """Every active or rotated daemon log, plus the promotion retry pair."""
     from khipu.promote import config_dir
 
     out = []
     for directory in log_dirs():
         try:
+            out.extend(sorted(p for p in directory.glob("*.log.1") if p.is_file() and not p.is_symlink()))
             out.extend(sorted(p for p in directory.glob("*.log") if p.is_file() and not p.is_symlink()))
         except OSError:
             continue
     retry = config_dir() / "state" / "promote-retry.log"
-    if retry.is_file() and not retry.is_symlink():
-        out.append(retry)
+    for path in (retry.with_name(retry.name + ".1"), retry):
+        if path.is_file() and not path.is_symlink():
+            out.append(path)
     return out
 
 
-def _rotate_log(path: Path, cap_bytes: int, out: dict[str, Any]) -> None:
+def _rotate_log(path: Path, cap_bytes: int, out: dict[str, Any], *, preserve_archive: bool = False) -> None:
     """Move a log over the cap to ``<name>.1`` (replacing an older one) and
     start it afresh.
 
     The lines are copied and the log emptied in place rather than renamed:
-    a running daemon's launchd output stays open, and after a rename it would
-    write into the ``.1`` forever. The log keeps its time, which job status
-    reads as a run's evidence. When the copy cannot be made (the disk is
-    full), the log is renamed, which needs no space."""
+    a running daemon's launchd output stays open. The archive inode is never
+    replaced, so a fallback writer remains discoverable and bounded. The log
+    keeps its time, which job status reads as a run's evidence."""
     try:
         st = path.stat()
     except OSError:
         return
     if st.st_size <= cap_bytes:
         return
-    older = path.with_name(path.name + ".1")
-    tmp = path.with_name(f".{path.name}.1.tmp")
-    out["freed_bytes"] += _size(older)
-    try:
-        older.unlink(missing_ok=True)
+    # A disk-full fallback may have renamed the active path while a daemon
+    # still held its descriptor. It now appends to ``.log.1``. Sweep that
+    # descriptor-backed file in place; making ``.1.1`` would merely move the
+    # unbounded writer one suffix farther away.
+    if path.name.endswith(".log.1"):
         try:
-            shutil.copyfile(path, tmp)
-            os.replace(tmp, older)
             with open(path, "r+b") as fh:
                 fh.truncate(0)
             os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
-        except OSError:
-            tmp.unlink(missing_ok=True)
-            os.replace(path, older)
+        except OSError as exc:
+            out["errors"].append(f"log {path.name}: {describe_os_error(exc)}")
+            return
+        out["rotated"].append(path.name)
+        return
+    older = path.with_name(path.name + ".1")
+    out["freed_bytes"] += _size(older)
+    if preserve_archive:
+        # The archive was already over the cap when this sweep began. It can
+        # still be a daemon descriptor, so leave its inode untouched after
+        # the rotated pass capped it above.
+        pass
+    elif older.is_symlink():
+        out["errors"].append(f"log {path.name}: rotated archive is a symbolic link")
+    else:
+        try:
+            older.touch(exist_ok=True)
+            shutil.copyfile(path, older)
+        except OSError as exc:
+            # Space can be exhausted while making the archive. The active
+            # inode is still the daemon's descriptor, so cap it in place.
+            out["errors"].append(f"log {path.name}: {describe_os_error(exc)}")
+    try:
+        with open(path, "r+b") as fh:
+            fh.truncate(0)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
     except OSError as exc:
         out["errors"].append(f"log {path.name}: {describe_os_error(exc)}")
         return
@@ -289,8 +311,19 @@ def sweep() -> dict[str, Any]:
     _remove(_state_dir() / LEGACY_QUERY_CACHE, out, f"state/{LEGACY_QUERY_CACHE}")
     cap = float(limits["log_max_mb"])
     if cap > 0:
-        for log in log_files():
-            _rotate_log(log, int(cap * 1024 * 1024), out)
+        cap_bytes = int(cap * 1024 * 1024)
+        logs = log_files()
+        over_cap_rotated = set()
+        for log in logs:
+            if not log.name.endswith(".log.1"):
+                continue
+            try:
+                if log.stat().st_size > cap_bytes:
+                    over_cap_rotated.add(log)
+            except OSError:
+                continue
+        for log in logs:
+            _rotate_log(log, cap_bytes, out, preserve_archive=log.with_name(log.name + ".1") in over_cap_rotated)
     try:
         trimmed = trim_synth_usage(int(limits["synth_usage_keep_days"]))
         if trimmed["dropped"]:
@@ -422,7 +455,7 @@ def usage() -> dict[str, Any]:
     logs = 0
     folders = log_dirs()
     for log in log_files():
-        logs += _size(log) + _size(log.with_name(log.name + ".1"))
+        logs += _size(log)
     backups_dir = hygiene.commitments_backup_dir()
     backups = sum(_tree_bytes(p) for p in _children(backups_dir) if hygiene._BACKUP_NAME.fullmatch(p.name))
     temp = sum(_size(p) for p in _children(replica_path.parent) if hub_snapshot.is_replica_temp(p.name))

@@ -1529,9 +1529,10 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
     """Fetch, check the inactive slot out at ``ref``, gate it, and on a pass
     flip ``live`` to it. A failure anywhere leaves the link as it was.
 
-    Every run replaces a queued promotion; a run the gate refused only
-    because the hub was out of reach is queued again (``queue_file``) for
-    ``retry_queued``. ``retry_of`` is the queued entry a retry runs for.
+    A hub-only gate refusal is queued for ``retry_queued``. During a retry,
+    a non-gate local failure stays queued too; only success, cancellation, or
+    a real gate refusal ends that retry. ``retry_of`` is the queued entry a
+    retry runs for.
 
     The queued entry is removed in one place, after the run returned and only
     when the run is not queued again (a re-queue replaces it in one atomic
@@ -1547,10 +1548,19 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
         failed = next((step for step in out.get("gate") or [] if not step["ok"]), None)
         doctor = next((step for step in out.get("gate") or [] if step.get("step") == "doctor"), None)
         override = (doctor or {}).get("override")
-        if not out.get("ok") and failed is not None and failed.get("hub_unreachable"):
+        retryable_hub_refusal = not out.get("ok") and failed is not None and failed.get("hub_unreachable")
+        retryable_local_failure = (
+            retry_of is not None
+            and not out.get("ok")
+            and failed is None
+            and not out.get("cancelled")
+        )
+        if retryable_hub_refusal or retryable_local_failure:
             # Written first (an atomic replace): a crash here keeps the old entry.
-            out["queued"] = _queue((retry_of or {}).get("ref") or ref, out.get("commit"), out.get("error") or "",
-                                   retry_of or previous, (override or {}).get("set_at"))
+            queued_history = retry_of or previous or {}
+            out["queued"] = _queue((retry_of or {}).get("ref") or ref,
+                                   out.get("commit") or (retry_of or {}).get("commit"), out.get("error") or "",
+                                   queued_history, (override or {}).get("set_at"))
         else:
             _clear_queue()
         if override:

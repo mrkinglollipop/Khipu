@@ -78,7 +78,7 @@ def current_list(data: dict, shown_defaults=None) -> tuple[list | None, list]:
     as the caller saw them (``shown_defaults``, or the installed CLIs now),
     labels unchanged and with no ``home``."""
     raw = data.get("usage_accounts")
-    if isinstance(raw, list) and raw:
+    if isinstance(raw, list):
         return raw, [dict(e) if isinstance(e, dict) else e for e in raw]
     if usage.reads_none(data):
         return None, []
@@ -176,14 +176,15 @@ def _lanes_on(lane_map: dict, key: str, known: list[dict]) -> list[tuple[str, st
             for lane, target in lanes.items() if routing._lane_target(target, known) == key]
 
 
-def _store(data: dict, entries: list, *, none: bool = False, request: dict | None = None) -> None:
+def _store(data: dict, entries: list, *, none: bool = False, unset: bool = False,
+           request: dict | None = None) -> None:
     """The list into ``data``, the one place it is written (``_commit``
     calls it): "Read no accounts" only with ``none``; a conversation's
     request kept as ``request`` (with what it replaced), else ended."""
-    if entries:
-        data["usage_accounts"] = entries
-    else:
+    if unset:
         data.pop("usage_accounts", None)
+    else:
+        data["usage_accounts"] = entries
     if none:
         data["usage_accounts_none"] = True
     else:
@@ -384,7 +385,7 @@ def _plan(before: list[dict], after: list[dict], *, moves: bool) -> list[tuple]:
 
 def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: dict | None = None,
             none: bool = False, view: dict | None = None, keep_priority: bool = False, keep_pause: bool = False,
-            keep_lanes: bool = False, end_holds=(), confirmed: list | None = None) -> dict:
+            keep_lanes: bool = False, end_holds=(), confirmed: list | None = None, unset: bool = False) -> dict:
     """The one write of the account list, under ``_locked``: ``base`` (the
     list as it stood) becomes ``parsed`` (checked by
     ``usage.parse_usage_accounts``) through the operations ``_plan`` finds,
@@ -409,7 +410,7 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
     Stop tracking, as above; its other notes are the request's own."""
     owner = request is None
     before = copy.deepcopy(data)
-    after_list = parsed if parsed or none else _installed_defaults()
+    after_list = parsed
     known, after = known_of(base if confirmed is None else confirmed), known_of(after_list)
     ops = _plan(known, after, moves=owner and confirmed is None)
     waiting = data.get("usage_accounts_request")
@@ -477,7 +478,7 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
     held = None
     if not owner:
         held = dict(request, prior=stored, prior_none=data.get("usage_accounts_none"))
-    _store(data, parsed, none=none, request=held)
+    _store(data, parsed, none=none, unset=unset, request=held)
     version = config.accounts_version(data)
     if owner:
         lines = routing.owner_lines(events, via)
@@ -503,7 +504,7 @@ def _request_prior(request: dict) -> list:
     back: the stored list, none after "Read no accounts", else the default
     accounts."""
     prior = request.get("prior")
-    if isinstance(prior, list) and prior:
+    if isinstance(prior, list):
         return prior
     return [] if request.get("prior_none") is True else _installed_defaults()
 
@@ -560,20 +561,21 @@ def save_list(raw, *, expect, via: str = "app", request: dict | None = None) -> 
     """A save of the whole list (``khipu config --set/--unset
     usage_accounts``: the app, a typed yes, or a conversation at the owner's
     ``request``), turned into the operations it implies and committed as
-    they are (``_commit``). None or an empty list goes back to every
-    installed CLI's default login."""
+    they are (``_commit``). None goes back to every installed CLI's default
+    login; an explicit empty list means read no accounts."""
     with _locked(expect) as data:
         if request is not None and isinstance(data.get("usage_accounts_request"), dict):
             raise AccountsError("a conversation's change to the account list is still waiting for the owner; "
                                 "he confirms or undoes it in Settings first", "request_waiting")
         stored, base = current_list(data)
-        parsed = [] if raw is None else usage.parse_usage_accounts(_canonical(raw, stored), previous=stored)
+        parsed = (usage.parse_usage_accounts(_installed_defaults(), previous=stored) if raw is None
+                  else usage.parse_usage_accounts(_canonical(raw, stored), previous=stored))
         # Stop's rule: a list left with only invalid entries reads no account,
         # which only Stop tracking with its confirmation may do.
         if parsed and known_of(base) and not known_of(parsed):
             raise AccountsError("this leaves no account Khipu can read on this Mac; Stop tracking on the last "
                                 "account asks first", "last_account")
-        res = _commit(data, stored, base, parsed, via=via, request=request)
+        res = _commit(data, stored, base, parsed, via=via, request=request, unset=raw is None)
     out = {"ok": True, "version": res["version"], "lane_repairs": res["repairs"]}
     return out
 
