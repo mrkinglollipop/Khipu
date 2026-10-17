@@ -53,9 +53,8 @@ DEFAULTS = {
     "session_binding": True,
 }
 SESSION_ONLY_HARNESSES = ("aegis",)
-# The shells a harness runs a hook command through, and the shim itself:
-# skipped on the way up to the hook's issuer. On macOS /bin/sh runs as
-# /bin/bash (or dash), so the kernel's path never says "sh" alone.
+# The shells the prompt shim runs as. On macOS /bin/sh runs as /bin/bash
+# (or dash), so the kernel's path never says "sh" alone.
 HOOK_SHELLS = ("sh", "bash", "dash")
 # An issuer that is one of these is an agent's own shell or a script, never
 # a harness running its prompt hook: its turn never carries the owner's
@@ -278,21 +277,74 @@ def _proc_info(pid: int) -> tuple[int, str, float] | None:
 
 def _refused_issuer(name: str) -> bool:
     low = name.lower()
-    return low in REFUSED_ISSUERS or low.startswith(REFUSED_ISSUER_PREFIXES)
+    return low in REFUSED_ISSUERS or low.startswith(REFUSED_ISSUER_PREFIXES) or low in HOOK_SHELLS
+
+
+def _proc_args(pid: int) -> list[str] | None:
+    """A process's argv as the kernel has it (``KERN_PROCARGS2``); None when
+    it can't be read."""
+    if sys.platform != "darwin" or pid <= 0:
+        return None
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("/usr/lib/libc.dylib")
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 4:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        raw = buf.raw[:size.value]
+        argc = int.from_bytes(raw[:4], sys.byteorder)
+        # The exec path, its NUL padding, then argc NUL-ended strings.
+        rest = raw[4:].split(b"\0", 1)[1].lstrip(b"\0") if b"\0" in raw[4:] else b""
+        args = rest.split(b"\0")[:argc]
+        return [os.fsdecode(a) for a in args] if len(args) == argc else None
+    except (OSError, AttributeError, ValueError, IndexError):
+        return None
+
+
+PROMPT_SHIM = "khipu-prompt-recall"
+
+
+def _runs_the_shim(args: list[str] | None) -> bool:
+    """A shell running the prompt shim as a script: ``sh <path>/khipu-prompt-recall``."""
+    return bool(args) and len(args) >= 2 and os.path.basename(args[1]) == PROMPT_SHIM
+
+
+def _only_the_shim(args: list[str] | None) -> bool:
+    """A harness's hook shell, ``sh -c '<path>/khipu-prompt-recall [--flag]'``
+    and nothing else. An agent's Bash tool shell runs its own command line,
+    so it never reads as this."""
+    import shlex
+
+    if not args or len(args) != 3 or args[1] != "-c":
+        return False
+    try:
+        words = shlex.split(args[2])
+    except ValueError:
+        return False
+    return bool(words) and os.path.basename(words[0]) == PROMPT_SHIM and all(w.startswith("--") for w in words[1:])
 
 
 def hook_issuer() -> dict | None:
-    """The process that ran this hook: the first one above this process that
-    is not a hook shell (``HOOK_SHELLS``). ``{"pid", "start", "exe"}`` for a
-    harness; ``{"refused": exe}`` when it is an interactive shell or a script
-    interpreter (someone ran the shim by hand); None when the tree can't be
-    read. Same-user processes can't be told apart for certain (scope 2.8):
-    this closes running the shim from an agent's shell, not ``exec`` tricks."""
+    """The process that ran this hook. The recorder's parent must be the
+    prompt shim (a shell running ``khipu-prompt-recall``); above it, only a
+    harness's own hook shell (``sh -c`` with the shim as its whole command)
+    is passed over, and the first process after that is the issuer.
+    ``{"pid", "start", "exe"}`` for a harness; ``{"refused": why}`` when the
+    recorder was not started by the shim, or the shim by a shell, an
+    interpreter or anything that is not a harness's hook (an agent's Bash
+    tool running it); None when the tree can't be read. Same-user processes
+    can't be told apart for certain (scope 2.6): this closes running the
+    recorder or the shim from an agent's shell, not ``exec`` tricks."""
     me = _proc_info(os.getpid())
     if me is None:
         return None
     pid, born = me[0], me[2]
-    for _ in range(_ISSUER_MOST):
+    for step in range(_ISSUER_MOST):
         info = _proc_info(pid)
         if info is None:
             return None
@@ -301,7 +353,12 @@ def hook_issuer() -> dict | None:
             return None  # the parent died and its number went to a newer process
         born = started
         name = os.path.basename(os.path.realpath(exe))
-        if name in HOOK_SHELLS:
+        if step == 0:
+            if name not in HOOK_SHELLS or not _runs_the_shim(_proc_args(pid)):
+                return {"refused": f"{name} (not the prompt hook)"}
+            pid = parent
+            continue
+        if (name in HOOK_SHELLS or name in REFUSED_ISSUERS) and _only_the_shim(_proc_args(pid)):
             pid = parent
             continue
         if _refused_issuer(name):

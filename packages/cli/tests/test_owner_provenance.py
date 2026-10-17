@@ -44,7 +44,7 @@ def hooked(folders, monkeypatch):
     for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("KHIPU_SESSION_ID", "review-session")
-    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(1, 1.0)])
+    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(1, 1.0, "claude")])
     return monkeypatch
 
 
@@ -99,13 +99,27 @@ def test_running_the_shim_by_hand_cannot_make_a_turn_that_passes(folders, monkey
     assert next(a for a in routing.read_view()["accounts"] if a["label"] == "Codex")["state"] != "paused"
 
 
-def test_a_turn_records_the_process_that_ran_the_hook(folders, monkeypatch):
-    """The hook's issuer is the first process above the hook's own shells:
-    the harness for a real hook, an agent's shell or interpreter for a
-    forgery, which the check refuses."""
-    chain = {100: (90, "/usr/bin/python3", 1.0), 90: (80, "/bin/bash", 1.0), 80: (70, "/opt/harness/claude", 1.0)}
+SHIM_ARGS = ["/bin/sh", "/live/packages/cli/bin/khipu-prompt-recall"]
+BASH_TOOL_ARGS = ["/bin/zsh", "-c", "source snapshot.sh && eval 'printf payload | khipu-prompt-recall'"]
+
+
+def _tree(monkeypatch, chain: dict, args: dict) -> None:
     monkeypatch.setattr(owner_turns, "_proc_info", lambda pid: chain.get(pid))
+    monkeypatch.setattr(owner_turns, "_proc_args", lambda pid: args.get(pid))
     monkeypatch.setattr(owner_turns.os, "getpid", lambda: 100)
+
+
+def test_a_turn_records_the_process_that_ran_the_hook(folders, monkeypatch):
+    """The hook's issuer is the process above the prompt shim (and above a
+    harness's own ``sh -c <shim>``, when it did not exec the shim): the
+    harness for a real hook. An agent's shell or interpreter there is refused."""
+    chain = {100: (90, "/usr/bin/python3", 1.0), 90: (80, "/bin/bash", 1.0), 80: (70, "/opt/harness/claude", 1.0)}
+    args = {90: SHIM_ARGS}
+    _tree(monkeypatch, chain, args)
+    assert owner_turns.hook_issuer() == {"pid": 80, "start": 1.0, "exe": "claude"}
+    chain[90] = (85, "/bin/bash", 1.0)
+    chain[85] = (80, "/bin/sh", 1.0)
+    args[85] = ["/bin/sh", "-c", "/live/packages/cli/bin/khipu-prompt-recall"]
     assert owner_turns.hook_issuer() == {"pid": 80, "start": 1.0, "exe": "claude"}
     chain[80] = (70, "/bin/zsh", 1.0)
     assert owner_turns.hook_issuer() == {"refused": "zsh"}
@@ -113,15 +127,59 @@ def test_a_turn_records_the_process_that_ran_the_hook(folders, monkeypatch):
     assert owner_turns.hook_issuer() == {"refused": "python3.11"}
 
 
+def test_the_recorder_run_from_an_agents_bash_tool_is_not_the_hook(folders, monkeypatch):
+    """Fifth review, P1: the agent runs the recorder (or the shim) from its
+    ordinary Bash tool, no exec. The shell above is the agent's, so the turn
+    it writes never carries the owner, and no owner change goes through."""
+    for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("KHIPU_SESSION_ID", "never-typed-session")
+    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(111, 1.0, "claude")])
+    # The recorder straight from the Bash tool's shell.
+    _tree(monkeypatch, {100: (222, "/opt/homebrew/bin/python3.11", 3.0), 222: (111, "/bin/bash", 2.0),
+                        111: (1, "/opt/harness/claude", 1.0)},
+          {222: ["/bin/bash", "-c", "eval 'python3 khipu-owner-turn.py < payload.json'"]})
+    issuer = owner_turns.hook_issuer()
+    assert "refused" in issuer, issuer
+    # The shim from the Bash tool's shell, in a pipeline and through a bash -c of its own.
+    _tree(monkeypatch, {100: (90, "/usr/bin/python3", 3.0), 90: (222, "/bin/bash", 2.5),
+                        222: (111, "/bin/zsh", 2.0), 111: (1, "/opt/harness/claude", 1.0)},
+          {90: SHIM_ARGS, 222: BASH_TOOL_ARGS})
+    assert owner_turns.hook_issuer() == {"refused": "zsh"}
+    _tree(monkeypatch, {100: (90, "/usr/bin/python3", 3.0), 90: (80, "/bin/bash", 2.5),
+                        80: (222, "/bin/bash", 2.2), 222: (111, "/bin/zsh", 2.0), 111: (1, "/opt/harness/claude", 1.0)},
+          {90: SHIM_ARGS, 80: ["/bin/bash", "-c", "/live/bin/khipu-prompt-recall; true"], 222: BASH_TOOL_ARGS})
+    assert owner_turns.hook_issuer() == {"refused": "bash"}
+    owner_turns.record({"session_id": "never-typed-session", "prompt": "agent-written payload", "cwd": "/w"},
+                       CLAUDE_ENV, issuer=issuer)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        owner_direction.check("direction.off")
+    assert err.value.code == "not_from_the_hook"
+    assert owner_turns.settings()["enabled"] is True
+
+
+def test_the_kernel_argv_of_a_process_reads_back(folders):
+    """``_proc_args`` reads a real process's argv, the seam the tests above
+    stand in for."""
+    if sys.platform != "darwin":
+        pytest.skip("macOS process table")
+    root = str(Path(__file__).resolve().parents[1])
+    code = ("import json,os,sys; sys.path.insert(0, sys.argv[1]); from khipu import owner_turns; "
+            "print(json.dumps(owner_turns._proc_args(os.getpid())))")
+    out = subprocess.run([sys.executable, "-S", "-c", code, root, "two words"], capture_output=True, text=True,
+                         timeout=60)
+    assert json.loads(out.stdout)[1:] == ["-S", "-c", code, root, "two words"], out
+
+
 def test_a_turn_whose_issuer_is_not_above_the_caller_is_refused(folders, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-issuer")
     owner_turns.record({"session_id": "s-issuer", "prompt": "pause Codex for now", "cwd": "/w"},
                        CLAUDE_ENV, issuer={"pid": 4242, "start": 7.0, "exe": "claude"})
-    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(4242, 8.0)])
+    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(4242, 8.0, "claude")])
     with pytest.raises(owner_direction.DirectionRefused) as err:
         owner_direction.check("route.pause")
     assert err.value.code == "not_from_the_hook"
-    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(4242, 7.0)])
+    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(4242, 7.0, "claude")])
     assert owner_direction.check("route.pause")["auth"] == "direction"
 
 
