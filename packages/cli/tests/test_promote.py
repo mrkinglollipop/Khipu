@@ -1242,8 +1242,10 @@ def _at(event, args, i, path):
     return path
 
 
-def _audit(event, args):
-    if not _SPY["on"]:
+def _audit(event, args, _spy=_SPY):
+    # An audit hook can't be removed and runs until the interpreter exits,
+    # after module globals are set to None: it holds its own reference.
+    if not _spy["on"]:
         return
     if event == "open":
         path, mode, flags = (list(args) + [None, None, None])[:3]
