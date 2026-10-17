@@ -3392,8 +3392,8 @@ def cmd_config(args: argparse.Namespace) -> int:
     if (args.set and args.set[0] == "usage_accounts") or args.unset == "usage_accounts":
         # The accounts `khipu usage` reads, as JSON (plan usage phase 2):
         # `--set usage_accounts '[{"label": "Claude second", "harness":
-        # "claude", "home": "~/.claude-second"}]'`; `--unset` (or `[]`) goes
-        # back to every installed CLI with its default login.
+        # "claude", "home": "~/.claude-second"}]'`; `--unset` goes back
+        # to every installed CLI with its default login, while `[]` reads none.
         from khipu import accounts, owner_direction, routing, usage
         from khipu.config import config_file
 

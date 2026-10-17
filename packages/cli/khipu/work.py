@@ -21,8 +21,10 @@ every string that is not a time or work.py's own words, saying so).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import difflib
+import fcntl
 import hashlib
 import json
 import os
@@ -45,6 +47,17 @@ NOW_CHARS = 90
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 _LEDGER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$")
 _TOP_LISTS = ("jobs", "prs", "trains")
+
+
+class _View(dict):
+    """A Work document plus the Forget generation observed while it was read."""
+
+    __slots__ = ("_forget_generation",)
+
+    def __init__(self, value: dict, generation: int):
+        super().__init__(value)
+        self._forget_generation = generation
+
 
 # ---- settings -----------------------------------------------------------------
 #
@@ -228,7 +241,41 @@ def _last_file(project: str) -> Path:
     return state_dir() / "last" / (quote(project, safe="") + ".json")
 
 
-def _write_json(path: Path, data: Any) -> None:
+def _view_fence_file() -> Path:
+    return state_dir() / ".view-fence.json"
+
+
+def _view_lock_file() -> Path:
+    return state_dir() / ".view.lock"
+
+
+@contextlib.contextmanager
+def _view_lock():
+    state_dir().mkdir(parents=True, exist_ok=True)
+    fd = os.open(_view_lock_file(), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _view_generation() -> int:
+    with _view_lock():
+        data = _read_json(_view_fence_file())
+        return int(data.get("generation") or 0) if isinstance(data, dict) else 0
+
+
+def invalidate_view() -> None:
+    """Fence every view built before Forget before its saved copy is removed."""
+    with _view_lock():
+        data = _read_json(_view_fence_file())
+        generation = int(data.get("generation") or 0) if isinstance(data, dict) else 0
+        _replace_json(_view_fence_file(), {"generation": generation + 1})
+
+
+def _replace_json(path: Path, data: Any) -> None:
     """Replace ``path`` atomically (a temp file beside it, then rename)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -238,6 +285,21 @@ def _write_json(path: Path, data: Any) -> None:
     finally:
         if tmp.exists():
             tmp.unlink()
+
+
+def _write_json(path: Path, data: Any, view_generation: int | None = None) -> None:
+    """Replace JSON, refusing a Work view that Forget invalidated mid-refresh."""
+    if path != view_file():
+        _replace_json(path, data)
+        return
+    if not isinstance(view_generation, int) or view_generation < 0:
+        return
+    with _view_lock():
+        current = _read_json(_view_fence_file())
+        generation = int(current.get("generation") or 0) if isinstance(current, dict) else 0
+        if view_generation != generation:
+            return
+        _replace_json(path, data)
 
 
 def _read_json(path: Path) -> Any:
@@ -925,7 +987,15 @@ def read_ledger() -> dict[str, Any]:
                 ledger.drain(conn)
             except Exception:  # noqa: BLE001  (waiting writes stay waiting; doctor says so)
                 conn.rollback()
-        for proj in _ledger_projects(conn):
+        projects = {proj["project"]: proj for proj in _ledger_projects(conn)}
+        # A queued add can name a project that has never reached the hub or
+        # its offline snapshot. Work already reads this outbox through each
+        # offline view, so it must also make that project a board.
+        for op in ledger.queued_ops():
+            key = op.get("project")
+            if isinstance(key, str) and key and key not in projects:
+                projects[key] = {"project": key, "name": key, "hidden": False, "created_at": None}
+        for proj in projects.values():
             key = proj["project"]
             history = None
             if conn is not None:
@@ -1301,6 +1371,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
     part, never the view."""
     from khipu import ledger
 
+    fence = _view_generation()
     now = now or _now()
     cfg = cfg or settings()
     ledger_data = ledger_data if ledger_data is not None else read_ledger()
@@ -1309,7 +1380,20 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
 
     registered = {e["project"]: e for e in cfg["work_projects"]}
     ledgers = ledger_data.get("projects") or {}
-    order = list(registered) + [k for k in sorted(ledgers) if k not in registered and not ledgers[k].get("hidden")]
+    hidden_projects = {key for key, data in ledgers.items() if (data or {}).get("hidden")}
+    # The board order below is one visibility boundary; Waiting needs the
+    # same boundary for both its ledger rows and project-scoped commitments.
+    # Copy only the outer documents so caller-owned fake/live reads stay
+    # unchanged while _waiting sees no hidden project source.
+    visible_ledger_data = dict(ledger_data, projects={key: data for key, data in ledgers.items()
+                                                       if key not in hidden_projects})
+    visible_owed = dict(owed, items=[item for item in owed.get("items") or []
+                                     if item.get("project") not in hidden_projects])
+    order = []
+    for key in [*registered, *sorted(ledgers)]:
+        if key in order or (ledgers.get(key) or {}).get("hidden"):
+            continue
+        order.append(key)
     projects, live, times = [], [], []
     for key in order:
         entry, ldata = registered.get(key), ledgers.get(key)
@@ -1390,7 +1474,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                                if p["stage"] == "flagged" or (p.get("verdict") or {}).get("outcome") == "flagged")
         projects.append(board)
 
-    waiting = _waiting(ledger_data, owed, routing_info, now, times)
+    waiting = _waiting(visible_ledger_data, visible_owed, routing_info, now, times)
     try:
         outbox = int(ledger.outbox_status().get("pending") or 0)
     except Exception:  # noqa: BLE001
@@ -1400,7 +1484,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
     times.extend(_parse_time(part.get("valid_until")) for part in (ledger_data, owed, routing_info))
     future = [t for t in times if t is not None and t > now]
     scan = _Scan()
-    view = scan({
+    view = _View(scan({
         "format": VIEW_FORMAT, "version": VIEW_VERSION, "generated_at": _z(now),
         "valid_until": _z_up(min(future)) if future else None,
         "projects": projects, "live": live, "waiting": waiting, "accounts": routing_info.get("accounts") or [],
@@ -1413,7 +1497,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                                        ("routing", routing_info.get("error"))) if v},
         "ledger_offline": bool(ledger_data.get("offline")), "ledger_as_of": ledger_data.get("as_of"),
         "refresh_s": cfg["work_refresh"],
-    })
+    }), fence)
     # A project the scan withheld is still a project: the item says so
     # ("masked"), so the app never reads it as Khipu's own (no project).
     for raw, out in zip(waiting, view["waiting"]):
@@ -1427,8 +1511,14 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
 def write_view(view: dict) -> None:
     from khipu import agent_view
 
+    generation = getattr(view, "_forget_generation", None)
+    # Generation is an in-memory capability granted only by build_view. A
+    # copied/plain document has no proof it was read after Forget, so keeping
+    # it would turn an accidental conversion into a stale-text disclosure.
+    if not isinstance(generation, int) or generation < 0:
+        return
     try:
-        _write_json(view_file(), agent_view.project(view))
+        _write_json(view_file(), agent_view.project(view), generation)
     except OSError:
         pass  # the saved copy is for a later reader; the answer stands without it
 
