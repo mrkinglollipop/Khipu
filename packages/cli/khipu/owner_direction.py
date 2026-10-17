@@ -783,7 +783,8 @@ def _from_the_hook(turn: dict, *, ancestry: bool = True) -> None:
     acting on its parent's turn skips the ancestry test only: a job T3
     started is not a descendant of the parent conversation's harness."""
     issuer = turn.get("issuer")
-    refused = not isinstance(issuer, dict) or "refused" in issuer or not isinstance(issuer.get("pid"), int)
+    refused = not isinstance(issuer, dict) or issuer.get("refused") is not None \
+        or not isinstance(issuer.get("pid"), int)
     if not refused and ancestry:
         refused = (issuer["pid"], issuer.get("start")) not in _caller_chain()
     if refused:

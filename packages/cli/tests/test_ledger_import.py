@@ -284,7 +284,9 @@ def test_a_file_in_a_credential_location_is_refused_before_it_is_opened(hub, tmp
     # Never created: the refusal comes from the path's names alone.
     rc, report = _import(tmp_path / "API Keys" / "tracker.json")
     assert rc == 1 and report["reason"] == "refused" and "private folder" in report["error"]
-    assert opened == [] and _counts(hub) == (0, 0, 0)
+    # The owner-actions log (written ahead of every owner command) is opened;
+    # nothing inside the private folder ever is.
+    assert [p for p in opened if "API Keys" in str(p)] == [] and _counts(hub) == (0, 0, 0)
 
 
 # ---- (i) khipu_ledger --------------------------------------------------------------------
