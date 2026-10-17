@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { HealthChecksCard, windowMinutesError } from "../HealthChecksCard";
 import { buildAttention, promotionAttention } from "../doctorAttention";
+import { healthRows } from "../healthRows";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -120,6 +121,23 @@ describe("buildAttention: rate checks", () => {
     const item = buildAttention({ prompt_recall_snapshot_ok: true, prompt_recall_snapshot: { ok: true, fresh: false } })
       .items.find((i) => i.key === "prompt_recall_snapshot");
     expect(item?.fix?.kind).toBe("refresh-snapshot");
+  });
+
+  it("shows an offline copy built for another version as amber, with the row still green", () => {
+    const message = "This Mac's offline copy was built for an older version of Khipu (layout 5; this version uses 6).";
+    const parsed = {
+      prompt_recall_snapshot_ok: true,
+      prompt_recall_snapshot: { ok: true, fresh: true, level: "amber", message },
+    };
+    const item = buildAttention(parsed).items.find((i) => i.key === "replica_schema");
+    expect(item?.tone).toBe("warn");
+    expect(item?.cause).toBe(message);
+    expect(item?.fix?.kind).toBe("refresh-snapshot");
+    const row = healthRows(parsed).find((r) => r.key === "prompt_recall_snapshot_ok");
+    expect(row?.status).toBe("ok");
+    expect(row?.detail).toBe(message);
+    expect(buildAttention({ prompt_recall_snapshot_ok: true, prompt_recall_snapshot: { ok: true, fresh: true } })
+      .items.find((i) => i.key === "replica_schema")).toBeUndefined();
   });
 
   it("says the search fallback rate judges a window and leaves out offline searches", () => {

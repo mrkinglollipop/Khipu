@@ -858,7 +858,7 @@ def _ledger_projects(conn) -> list[dict]:
     hub, or from the offline copy when it is away."""
     if conn is not None:
         with conn.cursor() as cur:
-            cur.execute("SELECT project, name, hidden FROM ledger_projects ORDER BY project")
+            cur.execute("SELECT project, name, hidden, created_at FROM ledger_projects ORDER BY project")
             got = cur.fetchall()
         conn.rollback()
     else:
@@ -870,12 +870,14 @@ def _ledger_projects(conn) -> list[dict]:
             return []
         con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
         try:
-            got = con.execute("SELECT project, name, hidden FROM ledger_projects ORDER BY project").fetchall()
+            got = con.execute("SELECT project, name, hidden, created_at FROM ledger_projects "
+                              "ORDER BY project").fetchall()
         except sqlite3.Error:
             got = []
         finally:
             con.close()
-    return [{"project": p, "name": n or p, "hidden": bool(h)} for p, n, h in got]
+    return [{"project": p, "name": n or p, "hidden": bool(h),
+             "created_at": _z(c) if isinstance(c, datetime) else c} for p, n, h, c in got]
 
 
 def _entered(conn, project: str, rows: list[dict], history: list[dict] | None) -> dict[str, datetime]:
@@ -935,7 +937,8 @@ def read_ledger() -> dict[str, Any]:
                 history = offline.get("history")
                 out["as_of"] = view.get("as_of")
             needs = [r for r in view["rows"] if ledger._meaning(view["vocab"], r["state"]) == "needs"]
-            out["projects"][key] = {"name": proj["name"], "hidden": proj["hidden"], "vocab": view["vocab"],
+            out["projects"][key] = {"name": proj["name"], "hidden": proj["hidden"],
+                                    "created_at": proj["created_at"], "vocab": view["vocab"],
                                     "rows": view["rows"], "entered": _entered(conn, key, needs, history)}
     except Exception as exc:  # noqa: BLE001
         if not ledger._tables_missing(exc):
@@ -1051,6 +1054,50 @@ def set_hidden(commitment: str, item: dict | None) -> dict[str, str]:
         hidden[str(commitment)] = _hide_mark(item)
     _write_json(_hidden_file(), hidden)
     return hidden
+
+
+def hidden_items() -> dict[str, Any]:
+    """Each Owed item hidden from Waiting on you and still hidden (its words
+    unchanged and still open), for Settings' Unhide."""
+    owed = read_owed()
+    hidden = read_hidden()
+    items = [{"id": str(c.get("id")), "text": c.get("text"), "project": c.get("project"), "kind": c.get("kind")}
+             for c in owed["items"] if hidden.get(str(c.get("id"))) == _hide_mark(c)]
+    return {"ok": True, "hidden": items, "error": owed.get("error")}
+
+
+SUGGESTED_FILE = ("state", "work-summary.json")
+
+
+def suggested_files(config: dict | None = None) -> list[dict]:
+    """Each routing job runner folder holding ``state/work-summary.json``
+    that no project reads yet: Settings offers "Add <name>". Stat only,
+    never opened; a folder under a private one is never suggested."""
+    from khipu import routing_sources
+
+    if config is None:
+        from khipu.config import load_config
+
+        config = load_config()
+    def place(path: str) -> str | None:
+        try:
+            return os.path.join(*safe_read.parse(path, full=True))
+        except (safe_read.Refused, safe_read.NotFullPath):
+            return None
+
+    entries, _refused, _invalid = routing_sources.registered(config)
+    taken = {place(e["file"]) for e in settings(config)["work_projects"]}
+    out = []
+    for entry in entries:
+        path = place(os.path.join(entry["path"].rstrip("/"), *SUGGESTED_FILE))
+        if path is None or path in taken or _private_place(path):
+            continue
+        try:
+            if os.path.isfile(path):
+                out.append({"name": entry["name"], "file": path})
+        except OSError:
+            continue
+    return out
 
 
 def _norm(text: Any) -> str:
@@ -1520,7 +1567,9 @@ def _cmd(args: argparse.Namespace) -> int:
         ok, problems, parsed = check_file(args.file)
         if args.json:
             _emit({"ok": ok, "problems": problems,
-                   "counts": {k: len(parsed[k]) for k in _TOP_LISTS} if parsed else None})
+                   "counts": {k: len(parsed[k]) for k in _TOP_LISTS} if parsed else None,
+                   "project": parsed["project"] if parsed else None,
+                   "written_at": parsed["written_at"] if parsed else None})
         else:
             lines = []
             if parsed:
@@ -1529,6 +1578,9 @@ def _cmd(args: argparse.Namespace) -> int:
             lines.append("OK: Khipu reads this file as it is." if ok else "\n".join(f"- {p}" for p in problems))
             _emit(text="\n".join(lines), as_json=False)
         return 0 if ok else 1
+    if sub == "hidden":
+        _emit(hidden_items())
+        return 0
     if sub in ("hide", "unhide"):
         item = None
         if sub == "hide":
@@ -1563,6 +1615,8 @@ def add_parser(sub) -> None:
     c = verbs.add_parser("check", help="Check a work-summary.json the way Khipu reads it")
     c.add_argument("file")
     c.add_argument("--json", action="store_true")
+    hd = verbs.add_parser("hidden", help="The commitments hidden from Waiting on you")
+    hd.add_argument("--json", action="store_true")
     for name, words in (("hide", "Hide a commitment from Waiting on you until it changes"),
                         ("unhide", "Show a hidden commitment again")):
         h = verbs.add_parser(name, help=words)

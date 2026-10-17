@@ -27,9 +27,10 @@ import {
   unreadAccounts,
 } from "./PlansCard";
 import type { UsageReport } from "./PlansCard";
-import { brokenChecks, lastChangeWords, quietRunners, runnerWords } from "./routing";
+import { brokenChecks, lastChangeWords, quietRunners, runnerWords, whenLocal } from "./routing";
 import type { RouteView } from "./routing";
 import { fmtAge, fmtAgo, fmtAgoSince } from "./time";
+import { plural, shortProject, timeOnly } from "./work";
 
 export type HealthRowStatus = "ok" | "err" | "skipped";
 
@@ -84,6 +85,8 @@ const LABELS: Record<string, string> = {
   plans: "Plans",
   // Not a doctor field: read from `khipu route --json` (routingHealthRow).
   routing: "Routing",
+  // Not a `*_ok` field: doctor's `ledger` and `work` blocks (workHealthRow).
+  work: "Work",
 };
 
 const ORDER = Object.keys(LABELS);
@@ -239,6 +242,10 @@ function detailFor(key: string, parsed: Record<string, unknown>): string | undef
     const ds = parsed.disk_space as { level?: string; message?: string } | undefined;
     return ds?.level === "amber" && ds.message ? ds.message : undefined;
   }
+  if (key === "prompt_recall_snapshot_ok") {
+    const prs = parsed.prompt_recall_snapshot as { level?: string; message?: string } | undefined;
+    return prs?.level === "amber" && prs.message ? prs.message : undefined;
+  }
   return undefined;
 }
 
@@ -311,6 +318,60 @@ export function routingHealthRow(view: RouteView | null | undefined, now: Date =
   };
 }
 
+type WorkSource = { project?: string; state?: string; as_of?: string | null };
+/** Summary states that warn (the scope's source-state table). */
+const WORK_SOURCE_WORDS: Record<string, (s: WorkSource) => string> = {
+  stale: (s) => `not updating since ${timeOnly(s.as_of) || "a while"}`,
+  gone: (s) => `not reporting since ${s.as_of ? whenLocal(s.as_of, new Date()) : "a while"}`,
+  too_big: () => "over its size limit",
+  unreadable: () => "can't be read",
+  refused: () => "not read: inside a private folder",
+  newer_format: () => "in a newer format",
+  wrong_project: () => "for another project",
+  missing: () => "no file yet",
+};
+
+/** The "Work" row (Work view phase 5, mock work-states.html section 6),
+ *  from doctor's `ledger` and `work` blocks: where the ledger is kept, any
+ *  ledger changes waiting for the database, and how each summary stands.
+ *  Red when a summary is not fresh or changes wait; it never gates doctor.
+ *  Grey with no ledger and no summary file; no row until doctor has both. */
+export function workHealthRow(parsed: Record<string, unknown>): HealthRow | null {
+  const ledger = parsed.ledger as
+    | { projects?: Record<string, { rows?: number }>; in_offline_copy?: boolean; outbox?: { pending?: number | null } }
+    | undefined;
+  const work = parsed.work as { sources?: WorkSource[] } | undefined;
+  if (!ledger || !work) return null;
+  const projects = Object.values(ledger.projects ?? {});
+  const sources = Array.isArray(work.sources) ? work.sources : [];
+  if (!projects.length && !sources.length) return { key: "work", status: "skipped", label: LABELS.work };
+  const parts: string[] = [];
+  if (projects.length) {
+    const rows = projects.reduce((n, p) => n + (p.rows ?? 0), 0);
+    const where = ledger.in_offline_copy
+      ? "in the offline copy and the nightly backup"
+      : "in the nightly backup, not in the offline copy yet";
+    parts.push(`Ledger: ${plural(rows, "row")} in ${plural(projects.length, "project")}, ${where}.`);
+  }
+  const pending = ledger.outbox?.pending ?? 0;
+  if (pending) parts.push(`${plural(pending, "ledger change")} ${pending === 1 ? "is" : "are"} waiting for the database.`);
+  const fresh = sources.filter((s) => s.state === "ok").length;
+  const off = sources.filter((s) => s.state === "off").length;
+  const bad = sources.filter((s) => s.state && WORK_SOURCE_WORDS[s.state]);
+  if (sources.length) {
+    const words = [
+      ...(fresh ? [`${fresh} fresh`] : []),
+      ...bad.map((s) => `1 ${WORK_SOURCE_WORDS[s.state!](s)} (${shortProject(s.project ?? "")})`),
+      ...(off ? [`${off} turned off`] : []),
+    ];
+    parts.push(`Summaries: ${words.join(", ")}.`);
+  } else {
+    parts.push("No summary files.");
+  }
+  const red = bad.some((s) => s.state !== "missing") || pending > 0;
+  return { key: "work", status: red ? "err" : "ok", label: LABELS.work, detail: parts.join(" ") };
+}
+
 function sentenceCase(s: string): string {
   const t = s.trim();
   return t ? `${t.charAt(0).toUpperCase()}${t.slice(1)}${/[.!?]$/.test(t) ? "" : "."}` : t;
@@ -348,6 +409,8 @@ export function healthRows(
   if (plansRow) rows.push(plansRow);
   const routingRow = routingHealthRow(routing);
   if (routingRow) rows.push(routingRow);
+  const workRow = workHealthRow(parsed);
+  if (workRow) rows.push(workRow);
 
   const statusRank: Record<HealthRowStatus, number> = {
     err: 0,
