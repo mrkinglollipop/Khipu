@@ -70,8 +70,13 @@ SECRET_REFUSAL = "This looks like a key or password; nothing was saved"
 QUEUED_WORDS = "Saved on this Mac; it reaches the ledger when the database answers"
 HUB_CONNECT_TIMEOUT_S = 5
 # How long a write waits for another write or drain on this Mac to finish before
-# it is told the ledger is busy. Ledger writes are rare; this only bounds a hang.
+# it joins the outbox instead (it is never refused for that). Only bounds a hang.
 LEDGER_LOCK_WAIT_S = 30.0
+# Every ledger transaction waits at most this long for a database lock, and runs
+# a statement at most this long: one stalled statement cannot hold every writer
+# on this Mac behind it. A write that times out waits in the outbox.
+LEDGER_LOCK_TIMEOUT_MS = 10_000
+LEDGER_STATEMENT_TIMEOUT_MS = 30_000
 
 # ---- settings -----------------------------------------------------------------
 
@@ -502,12 +507,13 @@ def _history(cur, op: dict[str, Any], row_id: str, *, from_state: str | None, to
              changes: dict, note: str, at: datetime) -> None:
     from psycopg.types.json import Jsonb
 
-    cur.execute(
-        "INSERT INTO ledger_history (project, row_id, at, at_text, author, from_state, to_state, changes, note, "
-        "op_id, source) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-        (op["project"], row_id, at, _z(at), Jsonb(op["author"]), from_state, to_state, Jsonb(changes), note,
-         op["op_id"], op["source"]),
-    )
+    cols, values = ("project, row_id, at, at_text, author, from_state, to_state, changes, note, op_id, source",
+                    [op["project"], row_id, at, _z(at), Jsonb(op["author"]), from_state, to_state, Jsonb(changes),
+                     note, op["op_id"], op["source"]])
+    if op.get("keep_written_at"):  # migration 0038: the writer's own clock, kept apart from ``at``
+        cols += ", written_at"
+        values.append(_parse_time(op.get("at")))
+    cur.execute(f"INSERT INTO ledger_history ({cols}) VALUES ({', '.join(['%s'] * len(values))})", values)
 
 
 def _last_setter(cur, project: str, row_id: str) -> str:
@@ -518,7 +524,10 @@ def _last_setter(cur, project: str, row_id: str) -> str:
 
 
 def _op_time(op: dict[str, Any]) -> datetime:
-    return _parse_time(op.get("at")) or _now()
+    """When the write landed, by the hub's clock under the project lock
+    (``apply_op``), so a write that waited lands looking newer, not older,
+    than the ones before it. The writer's own time is ``op["at"]``."""
+    return op.get("landed_at") or _parse_time(op.get("at")) or _now()
 
 
 def _add(cur, op: dict[str, Any]) -> dict[str, Any]:
@@ -569,22 +578,26 @@ def _set(cur, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
     wanted = dict(fields)
     if "state" in wanted:
         wanted["state"] = _word(vocab, "state", wanted["state"])
-    if op.get("if_state") is not None:
-        expected = _word(vocab, "state", op["if_state"])
-        if row["state"] != expected:
-            if not late:
-                raise LedgerError(f"row {row_id} is {row['state']} now, set by {_last_setter(cur, project, row_id)}; "
-                                  "nothing was changed", "moved")
-            # A queued write whose condition no longer holds is still kept, as
-            # history; the row is not changed.
-            requested = {k: {"old": row[k], "new": v} for k, v in wanted.items() if v != row[k]}
-            note = f"arrived late; the row had moved to {row['state']}"
-            if op["note"]:
-                note += f". {op['note']}"
-            _history(cur, op, row_id, from_state=row["state"], to_state=row["state"],
-                     changes={"requested": requested}, note=note, at=at)
-            return {"ok": True, "verb": "set", "id": row_id, "late": True, "state": row["state"],
-                    "line": f"set {row_id}: arrived late; the row had moved to {row['state']}", "affected": [row_id]}
+    missed = op.get("if_state") is not None and row["state"] != _word(vocab, "state", op["if_state"])
+    if missed and not late:
+        raise LedgerError(f"row {row_id} is {row['state']} now, set by {_last_setter(cur, project, row_id)}; "
+                          "nothing was changed", "moved")
+    # A queued write also misses when a field it changes no longer holds what
+    # its writer saw (``seen``, from the offline copy and the writes queued
+    # ahead of it): someone changed that field since.
+    if late and not missed:
+        missed = any(k in _SET_FIELDS and row[k] != v for k, v in (op.get("seen") or {}).items())
+    if missed:
+        # A queued write whose condition no longer holds is still kept, as
+        # history; the row is not changed.
+        requested = {k: {"old": row[k], "new": v} for k, v in wanted.items() if v != row[k]}
+        note = f"arrived late; the row had moved to {row['state']}"
+        if op["note"]:
+            note += f". {op['note']}"
+        _history(cur, op, row_id, from_state=row["state"], to_state=row["state"],
+                 changes={"requested": requested}, note=note, at=at)
+        return {"ok": True, "verb": "set", "id": row_id, "late": True, "state": row["state"],
+                "line": f"set {row_id}: arrived late; the row had moved to {row['state']}", "affected": [row_id]}
     changes = {k: {"old": row[k], "new": wanted[k]} for k in _SET_FIELDS if k in wanted and wanted[k] != row[k]}
     if not changes and not op["note"]:
         return {"ok": True, "verb": "set", "id": row_id, "state": row["state"], "line": f"set {row_id}: no change",
@@ -732,6 +745,7 @@ def apply_op(conn, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
     digest = op_digest(op)
     try:
         with conn.cursor() as cur:
+            _bound_waits(cur)
             cur.execute("INSERT INTO ledger_ops (op_id, project, row_id, verb, digest) VALUES (%s, %s, %s, %s, %s) "
                         "ON CONFLICT (op_id) DO NOTHING RETURNING op_id",
                         (op["op_id"], op["project"], op["row_id"], op["verb"], digest))
@@ -743,6 +757,9 @@ def apply_op(conn, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
                 _replica_sync(conn, op["project"], result.get("affected") or [])
                 return {**result, "retried": True}
             lock_project(cur, op["project"])
+            # Taken under the project lock, so landing times follow landing order.
+            cur.execute("SELECT clock_timestamp()")
+            op = {**op, "landed_at": cur.fetchone()[0], "keep_written_at": _written_at_ready(cur)}
             cur.execute("SAVEPOINT ledger_op")
             verb = _VERBS[op["verb"]]
             try:
@@ -768,6 +785,21 @@ def apply_op(conn, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
         raise
     _replica_sync(conn, op["project"], result.get("affected") or [])
     return result
+
+
+def _bound_waits(cur) -> None:
+    """Bound this transaction's lock waits and statements (``SET LOCAL``)."""
+    cur.execute("SELECT set_config('lock_timeout', %s, true), set_config('statement_timeout', %s, true)",
+                (f"{int(LEDGER_LOCK_TIMEOUT_MS)}ms", f"{int(LEDGER_STATEMENT_TIMEOUT_MS)}ms"))
+
+
+def _written_at_ready(cur) -> bool:
+    try:
+        from khipu.db import has_columns
+
+        return has_columns(cur, "ledger_history", "written_at")
+    except Exception:  # noqa: BLE001  (introspection is best-effort; without it the writer's time is not kept)
+        return False
 
 
 def purge(conn, project: str, row_id: str) -> dict[str, Any]:
@@ -879,6 +911,10 @@ def _replica_sync(conn, project: str, row_ids: list[str]) -> None:
         # The row's own marker was written before the commit (the drain), so
         # the offline check still leaves it to the hub.
         _say(f"[khipu-ledger] offline copy not updated: {type(exc).__name__}: {exc}")
+        return
+    later = getattr(_lock_held, "copy_later", None)
+    if later is not None:  # a write: copied once it lets go of the ledger lock (``write``)
+        later.append(project)
         return
     replica_catch_up(conn)
 
@@ -1014,27 +1050,14 @@ _lock_held = threading.local()
 
 
 @contextmanager
-def _ledger_lock(wait_s: float | None = None):
-    """The one lock for writes on this Mac, held from the moment a write starts
-    until its outcome is recorded: what is known of its op id, its place in
-    line, sending it (or queueing it while the hub is away) and recording what
-    became of it happen with no other writer in between, so writes land in the
-    order their writers took the lock. A drain holds it too. Re-entrant within
-    a thread. The system drops the lock when its holder dies, so a writer that
-    crashes frees it at once; one that hangs is waited for ``wait_s`` (default
-    ``LEDGER_LOCK_WAIT_S``), then the caller is told busy and nothing changes."""
-    if getattr(_lock_held, "depth", 0):
-        _lock_held.depth += 1
-        try:
-            yield
-        finally:
-            _lock_held.depth -= 1
-        return
+def _flock(name: str, wait_s: float):
+    """An exclusive lock on ``<outbox>/<name>``, waited for ``wait_s``, then
+    busy. The system drops it when its holder dies."""
     d = outbox_dir()
     d.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(d / ".ledger.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(str(d / name), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        deadline = time.monotonic() + (LEDGER_LOCK_WAIT_S if wait_s is None else wait_s)
+        deadline = time.monotonic() + wait_s
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1044,13 +1067,42 @@ def _ledger_lock(wait_s: float | None = None):
                     raise LedgerError("another ledger write on this Mac is still going; nothing was changed, "
                                       "try again in a moment", "busy") from None
                 time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _ledger_lock(wait_s: float | None = None):
+    """The one lock for writes on this Mac, held from a write's first look at
+    its op id until its outcome is recorded: what is known of its op id, its
+    place in line, sending it (or queueing it while the hub is away) and
+    recording what became of it happen with no other writer in between, so
+    writes land in the order their writers took the lock. Opening the hub
+    connection happens before it and copying to the offline copy after it
+    (``write``). A drain holds it too. Re-entrant within a thread. A writer
+    that crashes frees it at once; one that hangs is waited for ``wait_s``
+    (default ``LEDGER_LOCK_WAIT_S``), then busy: ``write`` queues instead."""
+    if getattr(_lock_held, "depth", 0):
+        _lock_held.depth += 1
+        try:
+            yield
+        finally:
+            _lock_held.depth -= 1
+        return
+    with _flock(".ledger.lock", LEDGER_LOCK_WAIT_S if wait_s is None else wait_s):
         _lock_held.depth = 1
         try:
             yield
         finally:
             _lock_held.depth = 0
-    finally:
-        os.close(fd)
+
+
+def _line_lock():
+    """Guards only the back of the line (naming and writing a job), so a write
+    that finds the ledger lock busy can still join the line in order. Always
+    taken after the ledger lock, never before it."""
+    return _flock(".line.lock", LEDGER_LOCK_WAIT_S)
 
 
 def _record_outcome(op: dict[str, Any], status: str, **detail: Any) -> None:
@@ -1282,23 +1334,29 @@ def enqueue(op: dict[str, Any], reason: str = "") -> Path | None:
     process enqueueing at the same moment cannot put a later write first.
     Returns the job already in line for a retry, and None for a retry of a
     write that landed: it is answered, never queued again."""
-    from khipu.outbox import _atomic_write
-
     with _ledger_lock():
         known = _known(op)
         if known is not None:
             return known[1] if known[0] == "queued" else None
-        last = 0
-        for path in _outbox_jobs(strict=True):
-            head = path.name.split("-", 1)[0]
-            if head.isdigit():
-                last = max(last, int(head))
-        dst = outbox_dir() / f"{max(time.time_ns(), last + 1):020d}-{op['op_id']}.json"
-        try:
-            _atomic_write(dst, {"op": op, "reason": reason[:200], "queued_at": _z(_now())})
-        except OSError as exc:  # nothing was written: the temp file is removed, the line is as it was
-            raise _unreadable_error(op["op_id"], "the line") from exc
-        return dst
+        with _line_lock():
+            return _append_to_line(op, reason)
+
+
+def _append_to_line(op: dict[str, Any], reason: str) -> Path:
+    """With the line lock held."""
+    from khipu.outbox import _atomic_write
+
+    last = 0
+    for path in _outbox_jobs(strict=True):
+        head = path.name.split("-", 1)[0]
+        if head.isdigit():
+            last = max(last, int(head))
+    dst = outbox_dir() / f"{max(time.time_ns(), last + 1):020d}-{op['op_id']}.json"
+    try:
+        _atomic_write(dst, {"op": op, "reason": reason[:200], "queued_at": _z(_now())})
+    except OSError as exc:  # nothing was written: the temp file is removed, the line is as it was
+        raise _unreadable_error(op["op_id"], "the line") from exc
+    return dst
 
 
 def _known(op: dict[str, Any], *, line: bool = True) -> tuple[str, Any] | None:
@@ -1314,6 +1372,14 @@ def _known(op: dict[str, Any], *, line: bool = True) -> tuple[str, Any] | None:
     say, or the offline copy's when the hub is away (``_landed_retry``)."""
     if not getattr(_lock_held, "depth", 0):
         raise RuntimeError("_known needs the ledger lock")
+    return _known_now(op, line=line)
+
+
+def _known_now(op: dict[str, Any], *, line: bool = True) -> tuple[str, Any] | None:
+    """``_known`` without the ledger lock, for a write that found it busy:
+    every record read here is written whole (temp file and rename) and an
+    outcome never changes once kept, so a look without the lock can be late,
+    never wrong; a job leaving the line meanwhile is followed to its outcome."""
     op_id, digest = op["op_id"], op_digest(op)
     if _load_record(_rejected_path(op_id, digest), op_id, "the hub's refusal of it") is not None:
         raise _reused_error(op)
@@ -1343,7 +1409,7 @@ def _known(op: dict[str, Any], *, line: bool = True) -> tuple[str, Any] | None:
             held = json.loads(path.read_text(encoding="utf-8"))["op"]
         except FileNotFoundError:
             # It left the line after the look: what it left behind answers.
-            return _known(op)
+            return _known_now(op)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise _unreadable_error(op_id, "its place in line") from exc
         if not isinstance(held, dict) or op_digest(held) != digest:
@@ -1404,34 +1470,43 @@ def _drain_locked(conn, out: dict[str, Any], waiting: frozenset[str] = frozenset
     owned = conn is None
     try:
         _prune_outcomes()
-        try:
-            jobs = _outbox_jobs(strict=True)
-        except LedgerError as exc:
-            return {**out, "stopped_early": True, "unreadable": str(exc)[:200]}
-        out["jobs"] = len(jobs)
-        if not jobs:
-            return out
-        if owned:
+        seen: set[Path] = set()
+        while True:
+            # Looked at again before letting go: a write that found the lock
+            # busy joined the line meanwhile, and lands now rather than waiting
+            # for the next ledger call.
             try:
-                conn = _connect()
-            except HubAway:
-                return {**out, "stopped_early": True}
-        try:
-            _drain_jobs(conn, jobs, out, waiting)
-        except LedgerError as exc:
-            # What this Mac holds for a job's op id cannot be read or kept: the
-            # job keeps its place, nothing behind it goes first, doctor sees it.
-            if exc.reason != "op_unreadable":
-                raise
-            out["stopped_early"] = True
-            out["unreadable"] = str(exc)[:200]
-        return out
+                jobs = [j for j in _outbox_jobs(strict=True) if j not in seen]
+            except LedgerError as exc:
+                return {**out, "stopped_early": True, "unreadable": str(exc)[:200]}
+            if not jobs:
+                return out
+            out["jobs"] += len(jobs)
+            seen.update(jobs)
+            if owned and conn is None:
+                try:
+                    conn = _connect()
+                except HubAway:
+                    return {**out, "stopped_early": True}
+            finished = False
+            try:
+                finished = _drain_jobs(conn, jobs, out, waiting)
+            except LedgerError as exc:
+                # What this Mac holds for a job's op id cannot be read or kept: the
+                # job keeps its place, nothing behind it goes first, doctor sees it.
+                if exc.reason != "op_unreadable":
+                    raise
+                out["stopped_early"] = True
+                out["unreadable"] = str(exc)[:200]
+            if out["stopped_early"] or not finished:  # nothing newer goes ahead of a job left in place
+                return out
     finally:
         if owned and conn is not None:
             conn.close()
 
 
-def _drain_jobs(conn, jobs: list[Path], out: dict[str, Any], waiting: frozenset[str]) -> None:
+def _drain_jobs(conn, jobs: list[Path], out: dict[str, Any], waiting: frozenset[str]) -> bool:
+    """False when it stopped before the end of ``jobs`` (the rest keep their places)."""
     answers = out.setdefault("answers", {})
     for path in jobs:
         try:
@@ -1509,11 +1584,11 @@ def _drain_jobs(conn, jobs: list[Path], out: dict[str, Any], waiting: frozenset[
             # database fault: the job keeps its place and the line waits.
             if _away(exc) or _tables_missing(exc) or _transient(exc):
                 out["stopped_early"] = True
-                break
+                return False
             if op_id in waiting:
                 _tidy(path.unlink, missing_ok=True)  # nothing landed; its writer is told as it happened
                 answers[op_id] = exc
-                break
+                return False
             # Anything else would fail every time and hold the line for
             # good: it is set aside as refused, kept, and doctor goes red.
             failed = f"this write failed: {type(exc).__name__}"[:200]
@@ -1526,6 +1601,7 @@ def _drain_jobs(conn, jobs: list[Path], out: dict[str, Any], waiting: frozenset[
             out["landed"] += 1
         else:
             out["refused"] += 1
+    return True
 
 
 def _transient(exc: BaseException) -> bool:
@@ -1595,29 +1671,77 @@ def _set_aside(path: Path) -> None:
 
 
 def write(op: dict[str, Any], *, conn=None) -> dict[str, Any]:
-    """Check ``op``, then, with the ledger lock held until its outcome is
-    recorded: answer it from what this Mac already knows of its op id, or put
-    it at the back of the line and send the line, or queue it when the hub is
-    away. Writes land in the order their writers took the lock."""
+    """Check ``op`` and open the hub connection, then, with the ledger lock
+    held until its outcome is recorded: answer it from what this Mac already
+    knows of its op id, or put it at the back of the line and send the line,
+    or queue it when the hub is away. Writes land in the order their writers
+    took the lock. The offline copy is brought up to date after the lock is
+    let go. A lock held past ``LEDGER_LOCK_WAIT_S`` queues the write."""
     _check_op(op, settings())
     op_digest(op)
-    with _ledger_lock():
-        known = _known(op)  # a refusal is raised here
-        if known is not None and known[0] == "landed":
-            return _landed_retry(op, known[1], conn)
-        owned = conn is None
+    owned, away = conn is None, None
+    if owned:
         try:
-            if owned:
-                conn = _connect()
+            conn = _connect()
         except Exception as exc:  # noqa: BLE001
             if not _away(exc):
                 raise
-            return _queue_while_away(op, known, type(exc).__name__)
+            conn, away = None, exc
+    _lock_held.copy_later = []
+    try:
+        locked = False
         try:
-            return _send(conn, op, known)
+            with _ledger_lock():
+                locked = True
+                return _write_locked(op, conn, away)
+        except LedgerError as exc:
+            if locked or exc.reason != "busy":
+                raise
+        return _queue_while_busy(op, conn)
+    finally:
+        later, _lock_held.copy_later = _lock_held.copy_later, None
+        try:
+            if later and conn is not None:
+                replica_catch_up(conn)  # busy when another write holds the lock: it copies these too
         finally:
-            if owned:
+            if owned and conn is not None:
                 conn.close()
+
+
+def _write_locked(op: dict[str, Any], conn, away: BaseException | None) -> dict[str, Any]:
+    known = _known(op)  # a refusal is raised here
+    if known is not None and known[0] == "landed":
+        return _landed_retry(op, known[1], conn)
+    if conn is None:
+        return _queue_while_away(op, known, type(away).__name__)
+    return _send(conn, op, known)
+
+
+def _queue_while_busy(op: dict[str, Any], conn) -> dict[str, Any]:
+    """The ledger lock stayed held past ``LEDGER_LOCK_WAIT_S`` (a hung writer
+    or a long drain): the write joins the back of the line under the line's
+    own lock instead of being refused. The holder looks at the line again
+    before letting go, so it lands then, as a queued write (an --if-state or
+    a field that moved meanwhile is kept as history, never applied); its op
+    id keeps it from landing twice. With the hub away it is checked against
+    the offline copy first, as any write queued while away (a refusal here is
+    answered, not bound to its op id: binding needs the ledger lock)."""
+    with _line_lock():
+        known = _known_now(op)  # a refusal is raised here
+        if known is None:
+            if conn is None:
+                _check_offline(op)
+            _append_to_line(op, "the ledger was busy on this Mac")
+    if known is not None and known[0] == "landed":
+        return _landed_retry(op, known[1], conn)
+    if conn is not None:
+        try:  # the holder may have let go already: then this write sends the line itself
+            with _ledger_lock(wait_s=0):
+                return _write_locked(op, conn, None)
+        except LedgerError as exc:
+            if exc.reason != "busy":
+                raise
+    return _queued_reply(op)
 
 
 def _send(conn, op: dict[str, Any], known: tuple[str, Any] | None) -> dict[str, Any]:
@@ -1797,6 +1921,11 @@ def _check_offline(op: dict[str, Any]) -> None:
         if children:
             raise LedgerError(f"row {row_id} has {len(children)} child row(s); say --children remove to remove "
                               "them too, or --children move-up to move them to its parent", "has_children")
+    if op["verb"] == "set" and row_id in rows:
+        # What this writer saw of each field it changes, the writes queued
+        # ahead of it applied: a field moved since by anyone else makes the
+        # write arrive late when it drains (``_set``), never a silent overwrite.
+        op["seen"] = {k: rows[row_id][k] for k in _SET_FIELDS if k in fields}
 
 
 def _purged_version() -> int:

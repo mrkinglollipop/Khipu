@@ -79,7 +79,8 @@ def pg_dsn():
         started = True
         dsn = f"postgresql://khipu@127.0.0.1:{port}/postgres"
         with _real_connect(dsn) as conn:
-            for name in ("0000_bootstrap.sql", "0028_ledger.sql", "0028_ledger.sql"):  # re-run is safe
+            for name in ("0000_bootstrap.sql", "0028_ledger.sql", "0028_ledger.sql", "0038_ledger_written_at.sql",
+                         "0038_ledger_written_at.sql"):  # re-run is safe
                 conn.execute((MIGRATIONS / name).read_text(encoding="utf-8"))
                 conn.commit()
         yield dsn
@@ -630,7 +631,7 @@ def test_a_key_shaped_argument_is_never_echoed(argv, monkeypatch, tmp_path):
     assert ledger._outbox_jobs() == []
 
 
-def test_a_write_waits_for_a_busy_ledger_and_never_jumps_the_queue(monkeypatch, tmp_path):
+def test_a_write_behind_a_busy_ledger_queues_and_never_jumps_the_queue(monkeypatch, tmp_path):
     ledger = _offline(monkeypatch, tmp_path)
     first = ledger.new_op("set", P, "s-1", fields={"evidence": "first"})
     ledger.enqueue(first)
@@ -640,12 +641,10 @@ def test_a_write_waits_for_a_busy_ledger_and_never_jumps_the_queue(monkeypatch, 
     monkeypatch.setattr(ledger, "LEDGER_LOCK_WAIT_S", 0.2)
     fd = _hold_ledger_lock(ledger)  # another write is going
     try:
-        with pytest.raises(ledger.LedgerError) as err:
-            ledger.write(dict(second), conn=object())
-        assert err.value.reason == "busy"
+        assert ledger.write(dict(second), conn=object())["queued"]
     finally:
         os.close(fd)
-    assert applied == [] and [op["op_id"] for op in ledger.queued_ops()] == [first["op_id"]]
+    assert applied == [] and [op["op_id"] for op in ledger.queued_ops()] == [first["op_id"], second["op_id"]]
     assert ledger.write(dict(second), conn=object())["ok"]
     assert applied == [first["op_id"], second["op_id"]]
 
@@ -660,11 +659,10 @@ def test_a_write_behind_a_busy_ledger_lands_after_the_older_one(hub, monkeypatch
     monkeypatch.setattr(ledger, "LEDGER_LOCK_WAIT_S", 0.2)
     fd = _hold_ledger_lock(ledger)
     try:
-        rc, out, err = run("set", "s-1", "--evidence", "second", "--project", P)
-        assert rc == 1 and "try again" in out + err
+        assert ok("set", "s-1", "--evidence", "second").splitlines()[0] == "set s-1: queued"
     finally:
         os.close(fd)
-    assert ok("set", "s-1", "--evidence", "second").splitlines()[0] == "set s-1: evidence"
+    ok("list")  # the next call that reaches the hub lands both, oldest first
     assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = 's-1'") == [("second",)]
     assert [h[2]["evidence"]["new"] for h in _history(hub, "s-1") if "evidence" in h[2]] == ["first", "second"]
 
@@ -1902,7 +1900,7 @@ def test_migration_never_overwrites_an_outcome_it_cannot_read(monkeypatch, tmp_p
     assert ledger._outcome_path("migrated").read_text() == "{torn" and (legacy / "migrated.json").exists()
 
 
-def test_a_held_lock_answers_busy_and_a_holder_that_dies_frees_it(monkeypatch, tmp_path):
+def test_a_held_lock_queues_the_write_and_a_holder_that_dies_frees_it(monkeypatch, tmp_path):
     import signal
     import time
 
@@ -1910,9 +1908,8 @@ def test_a_held_lock_answers_busy_and_a_holder_that_dies_frees_it(monkeypatch, t
     monkeypatch.setattr(ledger, "LEDGER_LOCK_WAIT_S", 0.3)
     fd = _hold_ledger_lock(ledger)
     try:
-        with pytest.raises(ledger.LedgerError) as err:
-            ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="busy"))
-        assert err.value.reason == "busy" and ledger.queued_ops() == [] and ledger._outcome("busy") is None
+        assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "x"}, op_id="busy"))["queued"]
+        assert [q["op_id"] for q in ledger.queued_ops()] == ["busy"] and ledger._outcome("busy") is None
     finally:
         os.close(fd)
     holder = subprocess.Popen([sys.executable, "-c", (
@@ -2091,6 +2088,8 @@ def test_the_nightly_reports_a_lock_timeout_and_keeps_the_write_queued(monkeypat
             return False
 
         def execute(self, query, params):
+            if query.startswith("SELECT set_config("):  # the transaction's own wait bounds
+                return
             assert query.startswith("INSERT INTO ledger_ops ")
             assert params[0] == "waiting"
             self.inserts += 1
@@ -2256,3 +2255,163 @@ def test_the_nightly_never_purges_a_row_removed_again_after_it_looked(hub, monke
         got = ledger.purge_due(conn)
     assert raced and got["purged"] == 0, got
     assert _sql(hub, "SELECT row_id, removed_at > now() - interval '1 day' FROM ledger_rows") == [("s-1", True)]
+
+
+# ---- the write path under load (Work sync slice 1) ------------------------------
+
+
+def test_a_burst_of_writers_connects_outside_the_ledger_lock_and_none_is_refused(monkeypatch, tmp_path):
+    import time
+
+    ledger = _offline(monkeypatch, tmp_path)
+
+    def slow_away():
+        time.sleep(0.4)  # the hub round trip, then away: each write queues here
+        raise ledger.HubAway("synthetic: slow, then away")
+
+    monkeypatch.setattr(ledger, "_connect", slow_away)
+    monkeypatch.setattr(ledger, "LEDGER_LOCK_WAIT_S", 1.0)
+    answers, refused = [], []
+
+    def writer(i):
+        try:
+            answers.append(ledger.write(ledger.new_op("set", P, "r", fields={"evidence": str(i)}, op_id=f"b{i}")))
+        except ledger.LedgerError as exc:
+            refused.append(exc.reason)
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert refused == [] and len(answers) == 8 and all(a["queued"] for a in answers)
+    assert sorted(q["op_id"] for q in ledger.queued_ops()) == sorted(f"b{i}" for i in range(8))
+
+
+def test_a_write_behind_a_held_lock_is_queued_in_order_not_refused(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    ledger.enqueue(ledger.new_op("set", P, "r", fields={"evidence": "first"}, op_id="first"))
+    applied = []
+    monkeypatch.setattr(ledger, "apply_op", lambda _c, op, **_kw: applied.append(op["op_id"]) or {"ok": True})
+    monkeypatch.setattr(ledger, "LEDGER_LOCK_WAIT_S", 0.2)
+    fd = _hold_ledger_lock(ledger)  # a write on this Mac that hangs
+    try:
+        got = ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "second"}, op_id="second"),
+                           conn=_Conn())
+    finally:
+        os.close(fd)
+    assert got["queued"] and got["words"] == ledger.QUEUED_WORDS and applied == []
+    assert [q["op_id"] for q in ledger.queued_ops()] == ["first", "second"]
+    assert ledger.drain(_Conn())["landed"] == 2 and applied == ["first", "second"]
+
+
+def test_the_lock_holder_lands_writes_queued_behind_it_before_letting_go(monkeypatch, tmp_path):
+    ledger = _offline(monkeypatch, tmp_path)
+    monkeypatch.setattr(ledger, "LEDGER_LOCK_WAIT_S", 0.2)
+    landed, in_holder, behind_queued = [], threading.Event(), threading.Event()
+
+    def apply(_c, op, **_kw):
+        if op["op_id"] == "holder":
+            in_holder.set()
+            behind_queued.wait(5)
+        landed.append(op["op_id"])
+        return {"ok": True}
+
+    monkeypatch.setattr(ledger, "apply_op", apply)
+    holder = threading.Thread(target=lambda: ledger.write(
+        ledger.new_op("set", P, "r", fields={"evidence": "h"}, op_id="holder"), conn=_Conn()))
+    holder.start()
+    assert in_holder.wait(5)
+    got = ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "b"}, op_id="behind"), conn=_Conn())
+    behind_queued.set()
+    holder.join(10)
+    assert got["queued"] and landed == ["holder", "behind"] and ledger.queued_ops() == []
+
+
+@pytest.mark.parametrize("timeouts", [{"LEDGER_LOCK_TIMEOUT_MS": 300}, {"LEDGER_STATEMENT_TIMEOUT_MS": 300}])
+def test_a_write_blocked_on_the_hub_times_out_into_the_outbox_and_lands_once(hub, monkeypatch, timeouts):
+    from khipu import ledger
+
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    monkeypatch.setattr(ledger, "LEDGER_LOCK_TIMEOUT_MS", 60_000, raising=False)
+    monkeypatch.setattr(ledger, "LEDGER_STATEMENT_TIMEOUT_MS", 60_000, raising=False)
+    for name, value in timeouts.items():
+        monkeypatch.setattr(ledger, name, value, raising=False)
+    blocker = _real_connect(hub)  # another writer holds the project's ledger lock and stalls
+    blocker.execute("SELECT pg_advisory_xact_lock(hashtext('khipu-ledger'), hashtext(%s))", (P,))
+    answers = []
+    writer = threading.Thread(target=lambda: answers.append(
+        ledger.write(ledger.new_op("set", P, "s-1", fields={"evidence": "blocked"}, op_id="blocked"))))
+    try:
+        writer.start()
+        writer.join(10)
+        assert not writer.is_alive(), "the write waited on the hub with no timeout"
+    finally:
+        blocker.rollback()
+        blocker.close()
+        writer.join(30)
+    assert answers and answers[0]["queued"] and ledger.outbox_status()["pending"] == 1
+    assert "s-1 · NOT STARTED" in ok("list")  # the next call reaching the hub drains it
+    assert ledger.outbox_status()["pending"] == 0
+    assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = 's-1'") == [("blocked",)]
+    assert _sql(hub, "SELECT count(*) FROM ledger_history WHERE op_id = 'blocked'") == [(1,)]
+
+
+def test_landing_times_come_from_the_hub_and_the_writers_clock_is_kept_apart(hub):
+    from datetime import datetime, timezone
+
+    from khipu import ledger
+
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    op = ledger.new_op("set", P, "s-1", fields={"evidence": "made long ago"}, op_id="old-clock")
+    op["at"] = "2026-01-01T00:00:00Z"  # made earlier, or by a Mac whose clock is behind
+    with _real_connect(hub) as conn:
+        ledger.apply_op(conn, op)
+        now = conn.execute("SELECT now()").fetchone()[0]
+    at, at_text, written = _sql(hub, "SELECT at, at_text, written_at FROM ledger_history WHERE op_id = %s",
+                                ("old-clock",))[0]
+    assert abs((now - at).total_seconds()) < 60 and at_text == ledger._z(at)
+    assert _sql(hub, "SELECT updated_at FROM ledger_rows WHERE row_id = 's-1'") == [(at,)]
+    assert written == datetime(2026, 1, 1, tzinfo=timezone.utc)
+    seeded = _sql(hub, "SELECT at FROM ledger_history WHERE row_id = 's-1' ORDER BY id")
+    assert seeded[0][0] <= at  # landing order and time order agree
+
+
+def test_a_hub_without_migration_0038_still_takes_writes(hub):
+    from khipu import db, ledger
+
+    _sql(hub, "ALTER TABLE ledger_history DROP COLUMN written_at")
+    db._TABLE_COLUMNS_CACHE.pop("ledger_history", None)
+    try:
+        assert ok("add", "s-1", "--title", "A slice", "--kind", "slice").strip() == "added s-1: NOT STARTED"
+        assert ok("set", "s-1", "--state", "IN FLIGHT").strip() == "set s-1: state"
+        assert ledger.outbox_status()["pending"] == 0
+    finally:
+        with _real_connect(hub) as conn:
+            conn.execute((MIGRATIONS / "0038_ledger_written_at.sql").read_text(encoding="utf-8"))
+            conn.commit()
+        db._TABLE_COLUMNS_CACHE.pop("ledger_history", None)
+
+
+def test_a_queued_set_never_silently_overwrites_a_newer_change(hub, monkeypatch, tmp_path):
+    from khipu import ledger
+
+    _snapshot(tmp_path)
+    ok("add", "s-1", "--title", "A slice", "--kind", "slice")
+    ok("add", "s-2", "--title", "Another", "--kind", "slice")
+    _away(monkeypatch)
+    ok("set", "s-1", "--evidence", "offline")  # this Mac saw evidence empty
+    ok("set", "s-2", "--evidence", "step 1")
+    ok("set", "s-2", "--evidence", "step 2")  # its own queued change, seen in order: no false late
+    ok("set", "s-2", "--state", "IN FLIGHT")
+    monkeypatch.setenv("KHIPU_DATABASE_URL", hub)
+    with _real_connect(hub) as conn:  # meanwhile another Mac moved s-1's evidence, and s-2's title only
+        ledger.apply_op(conn, ledger.new_op("set", P, "s-1", fields={"evidence": "online"}))
+        ledger.apply_op(conn, ledger.new_op("set", P, "s-2", fields={"title": "Renamed"}))
+        got = ledger.drain(conn)
+    assert (got["landed"], got["refused"]) == (4, 0)
+    assert _sql(hub, "SELECT row_id, evidence, state, title FROM ledger_rows ORDER BY row_id") == [
+        ("s-1", "online", "NOT STARTED", "A slice"), ("s-2", "step 2", "IN FLIGHT", "Renamed")]
+    last = _history(hub, "s-1")[-1]
+    assert last[3] == "arrived late; the row had moved to NOT STARTED"
+    assert last[2] == {"requested": {"evidence": {"old": "online", "new": "offline"}}}
