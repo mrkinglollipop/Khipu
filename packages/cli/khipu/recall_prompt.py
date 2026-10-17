@@ -489,6 +489,8 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
             # within the read's budget, however long it took to read the pipe.
             answer["done"] = time.monotonic()
             _write_all(write_fd, wire.encode(answer, ensure_ascii=True) + b"\n")
+            os.close(write_fd)  # the hook has its answer; nothing below delays it
+            routing.kick_plan_refresh()
         code = 0
     except BaseException:  # noqa: BLE001 - nothing for routing, never a failed hook
         code = 1

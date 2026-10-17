@@ -4738,8 +4738,12 @@ def note_line(note: dict, now: datetime) -> str:
 # window's own even pace (100% over its whole length); below it, "plenty of time".
 PACE_HURRY = 1.5
 _WINDOW_MINUTES = {"five_hour": 300, "daily": 1440, "weekly": 10080}
-# Figures older than this are shown with their age.
-_FIGURES_AGE_SHOWN = 3600
+# Figures older than this may be out of date (an early reset, a burst of
+# work since): they are shown with their age, and no pace or verdict is drawn
+# from them. The refreshes (``usage.refresh_due``, ``usage.kick_refresh``)
+# keep a working Mac's figures well inside it.
+FIGURES_STALE_S = 15 * 60
+RESET_PASSED_WHY = "its reset time passed; figures out of date"
 
 
 def _window_minutes(window: dict) -> int | None:
@@ -4755,11 +4759,10 @@ def _window_minutes(window: dict) -> int | None:
     return int(match.group(1)) if match and int(match.group(1)) > 0 else None
 
 
-def _longest_window(row: dict, now: datetime) -> dict | None:
-    """The row's longest window still in force (a figure, and a reset time
-    still ahead): a window whose reset has passed has started again, so its
-    figure no longer says anything. The whole account's window before a
-    model's of the same length."""
+def _longest_window(row: dict, now: datetime | None) -> dict | None:
+    """The row's longest window with a figure and a reset time; with
+    ``now``, only one still in force (its reset still ahead). The whole
+    account's window before a model's of the same length."""
     best, best_key = None, None
     for window in row.get("windows") or []:
         if not isinstance(window, dict):
@@ -4769,7 +4772,7 @@ def _longest_window(row: dict, now: datetime) -> dict | None:
         mins = _window_minutes(window)
         if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
             continue
-        if resets is None or resets <= now or mins is None:
+        if resets is None or (now is not None and resets <= now) or mins is None:
             continue
         key = (mins, not window.get("model"))
         if best_key is None or key > best_key:
@@ -4793,6 +4796,17 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
             return {"readable": False, "why": "plan figures can't be read: its CLI is not installed", "error": error}
         return {"readable": False, "why": "plan figures can't be read just now", "error": error}
     window = _longest_window(row, now)
+    longest = _longest_window(row, None)
+    # Compared like _longest_window ranks them: a model's window of the same
+    # length (weekly Fable) never stands in for the account's own.
+    def rank(w: dict) -> tuple:
+        return (_window_minutes(w), not w.get("model"))
+
+    if longest is not None and (window is None or rank(longest) > rank(window)):
+        # The longest window's reset has passed since it was read: it has
+        # started again, so its figures are known to be wrong (an account
+        # can also reset early; only a new read says where it stands).
+        return {"readable": False, "why": RESET_PASSED_WHY, "reset_passed": True}
     if window is None:
         return {"readable": False, "why": "its plan reports no window with a reset time ahead"}
     used = min(100.0, max(0.0, float(window["used_pct"])))
@@ -4810,8 +4824,10 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
             "resets_at": _iso(resets), "seconds": int(seconds), "pace_pct_per_hour": round(pace, 3),
             "hurry": left > 0 and pace >= even * PACE_HURRY, "words": words}
     figures_at = _parse(row.get("observed_at") or row.get("probed_at"))
-    if figures_at is not None and (now - figures_at).total_seconds() > _FIGURES_AGE_SHOWN:
-        fact["figures_at"] = _iso(figures_at)
+    if figures_at is None or (now - figures_at).total_seconds() > FIGURES_STALE_S:
+        # Shown as what was read, with its age; never a pace or a verdict.
+        fact.update(stale=True, figures_at=_iso(figures_at) if figures_at else None, pace_pct_per_hour=None,
+                    hurry=False, words="figures may be out of date")
     return fact
 
 
@@ -4833,6 +4849,13 @@ def plan_facts(view: dict, now: datetime) -> dict[str, dict]:
     return out
 
 
+def _pace_of(fact: dict | None) -> float:
+    """A fact's pace for ordering; one with none (unreadable, or figures
+    that may be out of date) goes last."""
+    pace = (fact or {}).get("pace_pct_per_hour")
+    return pace if isinstance(pace, (int, float)) and not isinstance(pace, bool) else -1.0
+
+
 def _rate_words(pace: float) -> str:
     if pace >= 10:
         return f"{pace:.0f}"
@@ -4841,9 +4864,9 @@ def _rate_words(pace: float) -> str:
     return f"{round(pace, 2):g}" if pace >= 0.01 else "less than 0.01"
 
 
-def _figures_age(fact: dict, now: datetime) -> str:
+def _read_when(fact: dict, now: datetime) -> str:
     at = _parse(fact.get("figures_at"))
-    return f" (figures from {_ago(at, now)})" if at else ""
+    return f"when read {_ago(at, now)}" if at else "when last read"
 
 
 def pace_words(fact: dict, now: datetime) -> str:
@@ -4852,21 +4875,25 @@ def pace_words(fact: dict, now: datetime) -> str:
     if not fact.get("readable"):
         return fact.get("why") or "plan figures can't be read"
     resets = _parse(fact["resets_at"])
+    if fact.get("stale"):
+        return (f"{fact['left_pct']:g}% of its {fact['window']} left {_read_when(fact, now)}, resets "
+                f"{_clock(resets, now)} ({_span(fact['seconds'])}); these figures may be out of date, so no "
+                "pace is given")
     text = (f"{fact['left_pct']:g}% of its {fact['window']} left, resets {_clock(resets, now)} "
             f"({_span(fact['seconds'])})")
     if fact["left_pct"] <= 0:
-        text += ": nothing left to use until then"
-    else:
-        text += f": about {_rate_words(fact['pace_pct_per_hour'])}% an hour to use it all; {fact['words']}"
-    return text + _figures_age(fact, now)
+        return text + ": nothing left to use until then"
+    return text + f": about {_rate_words(fact['pace_pct_per_hour'])}% an hour to use it all; {fact['words']}"
 
 
 def used_words(fact: dict, now: datetime) -> str:
     """'12% of its week used, resets in 2 d 4 h', or why there are no figures."""
     if not fact.get("readable"):
         return fact.get("why") or "plan figures can't be read"
-    return f"{fact['used_pct']:g}% of its {fact['window']} used, resets in {_span(fact['seconds'])}" \
-        + _figures_age(fact, now)
+    if fact.get("stale"):
+        return (f"{fact['used_pct']:g}% of its {fact['window']} used {_read_when(fact, now)}, may be out of "
+                f"date; resets in {_span(fact['seconds'])}")
+    return f"{fact['used_pct']:g}% of its {fact['window']} used, resets in {_span(fact['seconds'])}"
 
 
 def _state_fact(entry: dict, now: datetime, relative: bool) -> str:
@@ -4940,6 +4967,51 @@ def priority_line(priority: dict, now: datetime, *, view: dict | None = None, fa
         else:
             text += " It replaced: no priority."
     return text
+
+
+# Role widths tried, longest first, when the owner's priority is too long
+# for a push: each role cut at a word to at most this many characters.
+_SHORT_ROLE_WIDTHS = (80, 60, 44, 32, 20)
+
+
+def _short_words(text: str, width: int) -> str:
+    """The owner's words cut at a word to at most ``width`` characters, with
+    an ellipsis when cut."""
+    text = " ".join(str(text).split())
+    if len(text) <= width:
+        return text
+    cut = text[:width - 1]
+    if " " not in cut:
+        # One word longer than the width: never cut a word in half.
+        return ""
+    cut = cut[:cut.rindex(" ")]
+    return cut.rstrip(" ,;:.-(") + "…"
+
+
+def priority_short_lines(priority: dict, now: datetime, *, relative: bool = True) -> list[str]:
+    """The owner's priority shortened to fit a push, longest first: his order
+    and each account with its role cut short (``_SHORT_ROLE_WIDTHS``), then
+    the order alone. Each points at ``khipu_route`` for the full words."""
+    until = _parse(priority.get("until"))
+    whole = (f"; until {_clock(until, now)}" + (f", {_remaining(until, now)}" if relative else "")) if until else ""
+    entries = priority["entries"]
+    out: list[str] = []
+    if any(e.get("role") for e in entries):
+        for width in _SHORT_ROLE_WIDTHS:
+            items = []
+            for i, item in enumerate(entries, 1):
+                text = f"{i}. {item['label']}"
+                short = _short_words(item["role"], width) if item.get("role") else ""
+                if short:
+                    text += f": {short}"
+                items.append(text)
+            line = ("Your priority (your words, shortened; the full words: `khipu_route`; guidance, not a gate"
+                    f"{whole}): " + "; ".join(items) + ".")
+            if line not in out:
+                out.append(line)
+    out.append(f"Your priority order (guidance, not a gate{whole}; roles: `khipu_route`): "
+               + "; ".join(f"{i}. {item['label']}" for i, item in enumerate(entries, 1)) + ".")
+    return out
 
 
 def priority_change_line(view: dict, now: datetime, *, facts: dict | None = None, relative: bool = True) -> str:
@@ -5101,13 +5173,13 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         fixed = [line for line in (table_precedence(sources.get("table"), now),) if line]
         accounts_in_order = list(view["accounts"])
         if not view.get("priority") and cfg["routing_pace_order"] and any(
-                f.get("readable") for f in facts.values()):
+                f.get("readable") and not f.get("stale") for f in facts.values()):
             # Arithmetic, not a choice: the account whose allowance would run
             # out unused soonest first; the owner's priority, when he sets
             # one, comes first instead and is never reordered.
             fixed.append("Accounts by how soon their allowance runs out unused (Khipu's arithmetic, not your "
                          "priority):")
-            accounts_in_order.sort(key=lambda e: -(facts.get(e["key"]) or {}).get("pace_pct_per_hour", -1.0))
+            accounts_in_order.sort(key=lambda e: -_pace_of(facts.get(e["key"])))
         lines += fixed
         items: list[tuple[str, str, str]] = []  # (kind, line, at) in display order
         items += [("account", _clip(runner_line(r, now), width), "") for r in sources.get("runners") or []
@@ -5571,7 +5643,7 @@ def _public_account(entry: dict, now: datetime) -> dict:
 
 _PRIORITY_ENTRY_FIELDS = ("label", "role", "until", "in_settings")
 _FACT_FIELDS = ("readable", "why", "window", "used_pct", "left_pct", "resets_at", "seconds", "pace_pct_per_hour",
-                "hurry", "words", "figures_at")
+                "hurry", "words", "figures_at", "stale", "reset_passed")
 
 
 def _public_fact(fact: dict | None) -> dict | None:
@@ -5932,6 +6004,34 @@ def push_off(moment: str, environ=None) -> str | None:
     return None
 
 
+def refresh_plan_figures() -> dict:
+    """The queue-drain job's refresh of the plan figures the routing lines
+    carry (``usage.refresh_due``): only while the routing push is on, so a
+    Mac whose conversations hear no routing lines starts no CLI for them.
+    Never raises."""
+    try:
+        from khipu import features, usage
+
+        if not features.enabled("routing_push"):
+            return {"refreshed": 0, "skipped": "routing push off"}
+        return usage.refresh_due()
+    except Exception:  # noqa: BLE001 - the drain never fails on this
+        return {"refreshed": 0, "skipped": "error"}
+
+
+def kick_plan_refresh() -> bool:
+    """After a routing push has been handed over: start a detached refresh
+    of the plan figures when they are older than
+    ``usage.PROMPT_MAX_AGE_S`` (``usage.kick_refresh``). Never waits, never
+    raises."""
+    try:
+        from khipu import usage
+
+        return usage.kick_refresh()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def start_budget() -> float:
     """Seconds the session-start hook gives routing (``routing_start_budget_ms``,
     at most ``START_BUDGET_MOST_MS``)."""
@@ -6168,8 +6268,9 @@ def _priority_push(view: dict, now: datetime, *, changed: bool = False,
     (line, fallback, whose): in every push while a priority is set (with what
     Khipu read about each account), and its end when it changed to none. A
     conversation's has one pointer; the owner's has the line without the
-    facts, then a pointer. A pointer is fixed words of a bounded size,
-    however many entries ended."""
+    facts, then shortened (``priority_short_lines``: roles cut short, then
+    the order alone), then a pointer. A pointer is fixed words of a bounded
+    size, however many entries ended."""
     ended = len(view.get("priority_ended") or []) if changed else 0
     lead = [_ended_words(ended)] if ended else []
     if view.get("priority"):
@@ -6178,7 +6279,8 @@ def _priority_push(view: dict, now: datetime, *, changed: bool = False,
             priority_line(view["priority"], now, view=view, facts=facts)
         if not view["priority"].get("pending"):
             plain = priority_change_line(view, now) if changed else priority_line(view["priority"], now)
-            return [(line, (plain, " ".join([*lead, OWNER_PRIORITY_POINTER])), PRIORITY)]
+            short = [" ".join([*lead, x]) for x in priority_short_lines(view["priority"], now)]
+            return [(line, (plain, *short, " ".join([*lead, OWNER_PRIORITY_POINTER])), PRIORITY)]
         return [(line, " ".join([*lead, PRIORITY_POINTER]), THEIRS)]
     if changed and changed_lines is not None:
         return [(line, (" ".join([*lead, "No priority set."]),), PRIORITY)
@@ -6214,7 +6316,10 @@ def _fit_push(head: list[tuple[str, str | tuple[str, ...] | None, str]], others:
     for i, (line, fallback, whose) in enumerate(head):
         if whose != PRIORITY:
             continue
-        ladder = [(x, keep) for keep in (first, tail, 0) for x in (line, *fallback)]
+        # Every form that shows the priority (whole, without the facts,
+        # shortened, the order alone) before the pointer that shows none of it.
+        shows, last = (line, *fallback[:-1]), fallback[-1]
+        ladder = [(x, keep) for keep in (first, tail, 0) for x in shows] + [(last, keep) for keep in (first, tail, 0)]
         pick = next((x for x, keep in ladder if fits(len(x) + keep)), "")
         chosen[i] = pick
         used += len(pick) + 1 if pick else 0

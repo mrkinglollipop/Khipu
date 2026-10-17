@@ -632,6 +632,8 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
             data = memoryview(json.dumps({k: out.get(k) for k in ("text", "version", "epoch", "generation")}).encode("utf-8"))
             while data:
                 data = data[os.write(write_fd, data):]
+            os.close(write_fd)  # the hook has its answer; nothing below delays it
+            routing.kick_plan_refresh()
         code = 0
     except BaseException:  # noqa: BLE001 - nothing for routing, never a failed hook
         code = 1

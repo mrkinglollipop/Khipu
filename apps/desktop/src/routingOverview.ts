@@ -6,7 +6,7 @@
    the closed lines' tags and Home's attention items read the same sources
    (`brokenRules`, `quietRunners` in routing.ts). */
 
-import { accountClassification, brokenRules, quietRunners, rateWords, ruleWords, runnerWords, whenLocal } from "./routing";
+import { accountClassification, brokenRules, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
 import type { PlanFact, RouteView } from "./routing";
 import { keptWindow, passingGapHeld, planStatus } from "./PlansCard";
 import type { UsageAccount, UsageReport } from "./PlansCard";
@@ -385,8 +385,15 @@ export function accountWeek(
   if (!fact.readable) {
     const why = fact.why ?? "";
     if (/no window with a reset time/.test(why)) return { week: "Its plan shows no limit that resets", pace: "So there is no pace to work out" };
+    if (fact.reset_passed) return { week: "Its reset time passed; figures out of date", pace: "No pace until Khipu reads its plan again" };
     if (/not read yet/.test(why)) return { week: null, pace: "No pace until Khipu reads its plan" };
     return { week: null, pace: "No pace until Khipu can read its plan" };
+  }
+  if (fact.stale) {
+    return {
+      week: `${fact.left_pct}% of its ${fact.window} left ${readWhen(fact, now)}, resets ${whenLocal(fact.resets_at, now)}`,
+      pace: "These figures may be out of date, so no pace is given",
+    };
   }
   const week = `${fact.left_pct}% of its ${fact.window} left, resets ${whenLocal(fact.resets_at, now)}`;
   if (!fact.left_pct || fact.left_pct <= 0) return { week, pace: "Nothing left to use until then" };
