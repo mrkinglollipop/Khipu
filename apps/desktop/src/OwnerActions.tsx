@@ -179,6 +179,10 @@ export function actionWords(a: OwnerAction): string {
       return "Marked two commitments as different";
     case "direction.off":
       return "Turned owner direction off";
+    case "direction.on":
+      return "Turned owner direction on";
+    case "direction.acknowledge":
+      return "Acknowledged the tamper alarm";
     case "direction.set": {
       if (t.startsWith("trust ")) return `Trusted ${frontEndWords(t.slice(6))}`;
       if (t.startsWith("untrust ")) return `Stopped trusting ${frontEndWords(t.slice(8))}`;
@@ -246,6 +250,8 @@ export type ChainState = {
   lines: number;
   first_bad: { line: number; id?: string | null; kind?: string | null; why: string } | null;
   note?: string;
+  /** A break found earlier, kept until you acknowledge it. */
+  alarm?: { at?: string | null; first_bad: unknown } | null;
 };
 
 type ActionsShape = { ok?: boolean; actions: OwnerAction[]; chain?: ChainState };
@@ -355,6 +361,28 @@ export function OwnerActions({ active }: { active: boolean }) {
             <p className="set-error" role="alert">
               {broken}
             </p>
+          ) : null}
+          {log.data?.chain?.alarm ? (
+            <div className="opt-row">
+              <button
+                type="button"
+                className="sm"
+                disabled={busy !== null}
+                onClick={() => void write("od-ack", "khipu_owner_direction_acknowledge", {})}
+              >
+                {busy === "od-ack" ? <Loader2 size={14} className="spin" aria-hidden /> : null}
+                Acknowledge
+              </button>
+              <p className="opt-what">
+                The warning stays until you acknowledge it, here or by telling a conversation. Acknowledging is
+                listed below with an Undo.
+              </p>
+              {errors["od-ack"] ? (
+                <p className="set-error" role="alert">
+                  {errors["od-ack"]}
+                </p>
+              ) : null}
+            </div>
           ) : null}
           {log.error && !log.data ? (
             <p className="set-error" role="alert">

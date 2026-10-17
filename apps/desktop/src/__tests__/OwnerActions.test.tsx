@@ -69,6 +69,9 @@ beforeEach(() => {
         row.state = row.state === "scheduled" ? "cancelled" : "undone";
         return JSON.stringify({ ok: true, undid: row.id });
       }
+      case "khipu_owner_direction_acknowledge":
+        backend.chain = { ok: true, lines: backend.actions.length, first_bad: null };
+        return JSON.stringify({ ok: true });
       case "khipu_owner_direction_switch":
         backend.settings.enabled = Boolean(args?.on);
         return JSON.stringify({ ok: true });
@@ -182,6 +185,32 @@ describe("Owner actions", () => {
     const alert = await screen.findByText(/changed outside Khipu/);
     expect(alert.getAttribute("role")).toBe("alert");
     expect(alert.textContent).toContain("at line 2 (c3): it was changed after Khipu wrote it.");
+  });
+
+  it("a kept tamper alarm has an Acknowledge button that clears it", async () => {
+    backend.chain = {
+      ok: false,
+      lines: 5,
+      first_bad: { line: 3, id: null, kind: null, why: "1 line Khipu wrote is missing from the end of the log" },
+      alarm: { at: "2026-10-16T14:00:00Z", first_bad: { line: 3 } },
+    };
+    render(<OwnerActions active />);
+    await list();
+    fireEvent.click(await screen.findByRole("button", { name: "Acknowledge" }));
+    await waitFor(() => expect(screen.queryByText(/changed outside Khipu/)).toBeNull());
+    expect(calls).toContainEqual(["khipu_owner_direction_acknowledge", {}]);
+    expect(screen.queryByRole("button", { name: "Acknowledge" })).toBeNull();
+  });
+
+  it("a broken chain with no kept alarm has no Acknowledge button", async () => {
+    backend.chain = {
+      ok: false,
+      lines: 5,
+      first_bad: { line: 2, id: "c3", kind: "action", why: "it was changed after Khipu wrote it" },
+    };
+    render(<OwnerActions active />);
+    await screen.findByText(/changed outside Khipu/);
+    expect(screen.queryByRole("button", { name: "Acknowledge" })).toBeNull();
   });
 
   it("a scheduled purge's button cancels it", async () => {
