@@ -34,6 +34,9 @@ FAKE_CLI = textwrap.dedent("""
     import json, os, subprocess, sys, time
     SENTINEL = "SENTINEL-c0ffee-do-not-leak"
     fixture, mode, out = sys.argv[1], sys.argv[2], sys.argv[3]
+    turn = "--max-turns" in sys.argv  # Claude's one-turn fallback: its own fixture and record
+    if turn:
+        fixture, out = fixture.replace(".jsonl", "-turn.jsonl"), out + ".turn"
     record = {"pid": os.getpid(), "env": sorted(os.environ), "argv": sys.argv[4:], "cwd": os.getcwd(),
               "cwd_entries": os.listdir("."),
               "env_values": {k: os.environ[k] for k in ("CLAUDE_CONFIG_DIR", "GROK_HOME", "CODEX_HOME",
@@ -53,7 +56,11 @@ FAKE_CLI = textwrap.dedent("""
     if mode == "secret_exit":
         sys.stderr.write("fatal: " + SENTINEL + " token=" + SENTINEL + "\\n")
         sys.exit(7)
-    frames = [json.loads(l) for l in open(fixture) if l.strip()]
+    frames = [json.loads(l) for l in open(fixture) if l.strip()] if os.path.exists(fixture) else []
+    if turn:
+        for frame in frames:
+            sys.stdout.write(json.dumps(frame) + "\\n")
+        sys.exit(0)
     for line in sys.stdin:
         msg = json.loads(line)
         rid = msg.get("id", msg.get("request_id"))
@@ -126,14 +133,89 @@ def test_claude_adapter_sets_the_configured_home(fake, tmp_path):
     assert _child(out)["env_values"]["CLAUDE_CONFIG_DIR"] == str(tmp_path / "second")
 
 
-def test_claude_plan_with_limits_but_no_figures_this_time_is_not_a_sign_in_failure(fake):
-    # Signed in, rate_limits_available true, rate_limits null: Claude Code
-    # skipped the figures on this read; signing in again would not help.
-    fake("claude", "claude-null.jsonl")
-    row = usage.probe_account({"label": "Claude", "harness": "claude", "home": None})
-    assert row["ok"] is False
-    assert row["error"] == usage.E_NO_FIGURES == "no_plan_figures"
+def test_claude_adapter_never_spends_a_turn_when_the_reply_has_figures(fake):
+    out = fake("claude", "claude.jsonl")
+    assert usage.probe_claude()["ok"] is True
+    assert not Path(str(out) + ".turn").exists()
+
+
+def test_claude_without_figures_reads_them_from_one_tiny_turn(fake, tmp_path):
+    # The second account's real reply on 2026-10-17: rate_limits null (its
+    # usage endpoint answered 429), while a turn's rate_limit_event carried
+    # the figures (tests/fixtures/usage/claude-null-turn.jsonl).
+    out = fake("claude", "claude-null.jsonl")
+    home = tmp_path / "second"
+    home.mkdir()
+    row = usage.probe_account({"label": "Claude second", "harness": "claude", "home": str(home)})
+    assert row["ok"] is True and row["source"] == "live" and row["plan"] == "max"
+    assert [(w["name"], w["used_pct"], w["resets_at"], w["window_mins"]) for w in row["windows"]] == [
+        ("five_hour", 8, "2026-01-01T12:00:00Z", 300), ("weekly", 96, "2026-01-06T12:00:00Z", 10080)]
+    assert row["version"] == "2.1.296"
+    turn = json.loads(Path(str(out) + ".turn").read_text())
+    argv = turn["argv"]
+    assert "--bare" not in argv
+    assert argv[argv.index("--model") + 1] == "haiku" and argv[argv.index("--tools") + 1] == ""
+    assert argv[argv.index("--max-turns") + 1] == "1" and "--no-session-persistence" in argv
+    assert turn["env_values"]["CLAUDE_CONFIG_DIR"] == str(home)
+
+
+def test_claude_turn_runs_at_most_once_per_interval_for_each_login(fake, tmp_path):
+    out = fake("claude", "claude-null.jsonl")
+    turn = Path(str(out) + ".turn")
+    first, second = tmp_path / "one", tmp_path / "two"
+    first.mkdir(), second.mkdir()
+    assert usage.probe_claude(str(first))["ok"] is True
+    turn.unlink()
+    # Signed in, rate_limits_available true, rate_limits null, and the turn
+    # already spent: a passing gap, not a sign-in failure.
+    row = usage.probe_account({"label": "Claude", "harness": "claude", "home": str(first)})
+    assert row["ok"] is False and row["error"] == usage.E_NO_FIGURES == "no_plan_figures"
     assert "/login" not in row["note"] and "sign in" not in row["note"].lower()
+    assert not turn.exists()
+    assert usage.probe_claude(str(second))["ok"] is True  # another login has its own allowance
+
+
+def test_claude_turn_is_due_again_after_the_interval(fake):
+    fake("claude", "claude-null.jsonl")
+    assert usage.probe_claude()["ok"] is True
+    stamps = usage.cache_file().with_name(usage.TURN_STAMP_NAME)
+    aged = {k: v - usage.TURN_EVERY_S - 1 for k, v in json.loads(stamps.read_text()).items()}
+    stamps.write_text(json.dumps(aged))
+    assert usage.probe_claude()["ok"] is True
+
+
+def test_claude_turn_without_a_rate_limit_event_still_reads_no_figures(fake, tmp_path):
+    lone = tmp_path / "claude-lone.jsonl"  # no claude-lone-turn.jsonl: the turn prints nothing
+    shutil.copy(FIXTURES / "claude-null.jsonl", lone)
+    fake("claude", lone)
+    row = usage.probe_claude()
+    assert row == {"ok": False, "error": usage.E_NO_FIGURES}
+
+
+def _turn_event(info) -> list[dict]:
+    return [{"type": "system", "subtype": "init", "claude_code_version": "2.1.296"},
+            {"type": "rate_limit_event", "rate_limit_info": info}, {"type": "result", "subtype": "success"}]
+
+
+def test_parse_claude_turn_reads_an_event_that_names_one_window():
+    row = usage.parse_claude_turn(_turn_event(
+        {"status": "allowed", "rateLimitType": "seven_day", "utilization": 0.5, "resetsAt": 1767700800}))
+    assert [(w["name"], w["used_pct"]) for w in row["windows"]] == [("weekly", 50)]
+
+
+@pytest.mark.parametrize("frames", [
+    [{"type": "result", "subtype": "success"}],
+    _turn_event({"status": "allowed"}),
+    _turn_event({"unifiedWindows": {"overage": {"utilization": 0.1, "resetsAt": 1767700800}}}),
+])
+def test_parse_claude_turn_without_figures_is_none(frames):
+    assert usage.parse_claude_turn(frames) is None
+
+
+def test_parse_claude_turn_rejects_a_malformed_figure():
+    with pytest.raises(usage.ProbeError) as caught:
+        usage.parse_claude_turn(_turn_event({"unifiedWindows": {"seven_day": {"utilization": "most"}}}))
+    assert caught.value.code == usage.E_BAD
 
 
 def _claude_usage_frames(**body) -> list[dict]:

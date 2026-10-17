@@ -86,7 +86,7 @@ NOT_CAPTURE = {
                      "session_capture._log_subagentstop_shape_once", "session_capture._write_beat",
                      "synth_cli.register", "t3._lookup_health",
                      "t3._thread_linked_capture_evidence", "t3.thread_for_session",
-                     "topic_hits._write_offset", "usage._converse", "usage._save_cache",
+                     "topic_hits._write_offset", "usage._converse", "usage._save_cache", "usage._turn_due",
                      "components_matrix.refresh_matrix_cache"), _COUNTERS),
     **dict.fromkeys(("query_log._rotate_if_needed", "query_log.log_query"),
                     "search queries as typed into search, or their hash; not capture sources"),
