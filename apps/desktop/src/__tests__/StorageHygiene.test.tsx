@@ -101,11 +101,12 @@ describe("Storage settings", () => {
     fireEvent.change(input, { target: { value: "14" } });
     const row = input.closest(".set-field") as HTMLElement;
     fireEvent.click(row.querySelector("button") as HTMLButtonElement);
+    // The field already shows the typed value, so wait for the write itself.
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "commitments_backup_keep_days", value: "14" }]));
     await waitFor(() => expect(input).toHaveValue("14"));
-    expect(calls).toContainEqual(["khipu_config_set", { key: "commitments_backup_keep_days", value: "14" }]);
     fireEvent.click(await screen.findByRole("button", { name: "Use default" }));
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "commitments_backup_keep_days" }]));
     await waitFor(() => expect(input).toHaveValue("30"));
-    expect(calls).toContainEqual(["khipu_config_unset", { key: "commitments_backup_keep_days" }]);
   });
 
   it("refuses bad values before calling Khipu", () => {
