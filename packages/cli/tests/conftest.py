@@ -52,6 +52,17 @@ from pathlib import Path
 
 import pytest
 
+# Every temporary folder the run makes (tempfile.mkdtemp in a test, pytest's
+# tmp_path, a subprocess's own) lands under one root that is removed at exit;
+# without it each run left its folders in the system temp folder for good
+# (about 112,000 were found). The root sits directly in the system temp folder
+# and its name is short: macOS caps a unix socket path at 104 bytes and
+# several tests bind sockets under temporary folders.
+TEMP_ROOT = tempfile.mkdtemp(prefix="kt-")
+atexit.register(shutil.rmtree, TEMP_ROOT, ignore_errors=True)
+os.environ["TMPDIR"] = TEMP_ROOT
+tempfile.tempdir = TEMP_ROOT
+
 if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     _HERMETIC_HOME = tempfile.mkdtemp(prefix="khipu-hermetic-home-")
     atexit.register(shutil.rmtree, _HERMETIC_HOME, ignore_errors=True)

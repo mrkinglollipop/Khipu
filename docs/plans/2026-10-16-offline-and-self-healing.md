@@ -113,6 +113,17 @@ Each slice: read the named code first, keep the hermetic pytest oracle green (fr
 
 Slices 1 and 4 together fix the incident's visible symptoms; slice 2 removes the root cause. Order: 1, 2, 4, 3, 5, 6, 7.
 
+8. **Storage hygiene (added 2026-10-16, after the boot disk filled).** The owner's rule: Khipu never holds junk that wastes storage. The junk found that day was deleted by hand; this slice stops it coming back. Read the storage audit's root causes first.
+   - A refresh or a staged import that dies leaves `.hub_snapshot.<random>.sqlite` and its journal beside the replica. Every failure path removes the temp and its journal; under the refresh lock, a refresh start, the daily storage sweep and forget remove any left behind (forget counts them as copies to remove, because a leftover can still hold a forgotten row).
+   - The old `state/prompt-query-embed-cache.json`, replaced by the sqlite cache, is removed.
+   - Every log and usage file that grows without a cap gets one: logs rotate at a size limit keeping one older copy; `state/synth-usage.jsonl` keeps a number of days.
+   - Commitments backups are kept for 30 days, then removed.
+   - The test suite's temporary folders live inside its own temporary home, which is removed when the run ends.
+   - Doctor checks free space on the volume that holds Khipu's data and on the temporary volume: amber below 10 GB or 5%, red below 3 GB or 2%, with an app button that opens a storage report. A writer that fails because the disk is full says so in plain words.
+   - Doctor's report has a storage line: how much Khipu holds and where (replica, logs, backups, temporary files).
+   - Every retention number and threshold is a setting in the app (Settings, Health checks), liftable on the spot. Nothing here deletes memory content, the current replica, the live slots, the outbox, `refused/` or the pending-erasure folder. Every new writer is in `capture_stores.py`'s inventory.
+   - Oracle: a test per item that fails before the change; the hermetic pytest oracle and ruff count unchanged; vitest, the app build and the Rust tests for the settings and the report button.
+
 ## Decisions (Matt, 2026-10-16)
 
 1. Prompt-time recall answers from the replica even when it is hours behind, marked stale with its age, rather than give no prior work.
@@ -120,3 +131,4 @@ Slices 1 and 4 together fix the incident's visible symptoms; slice 2 removes the
 3. The promotion gate waits and retries by itself after an outage, and Settings also has an owner override for red checks the owner knows are harmless. The override is one-time (owner's reviewer, approved by Matt): the owner chooses "Update anyway" for the red checks that held the last update back; the next promotion skips them once, records that in `promotions.jsonl`, and the override then clears itself (it lapses after 24 hours if no promotion runs; a promotion queued for the hub keeps it for its retry). Only the owner sets or cancels it: the app, or a typed yes on a terminal. There is no standing list.
 4. Owner writes made offline (closing an owed item, superseding a decision) are queued on the Mac, shown as waiting to sync, and replayed when the hub is back, the same way captures already work.
 5. Doctor's rate checks judge the last hour, changeable in Settings.
+6. Storage hygiene (slice 8): keep 30 days of commitments backups; delete leftover replica temp files; keep no eval or replica copies outside the current replica.

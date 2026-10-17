@@ -666,14 +666,61 @@ def backup_commitments(conn, *, dest_root: Path | None = None) -> Path:
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dest = (dest_root or commitments_backup_dir()) / f"commitments-{ts}"
-    dest.mkdir(parents=True, exist_ok=True)
-    data = dest / "commitments.bin"
-    with conn.cursor() as cur, open(data, "wb") as fh:
-        with cur.copy("COPY commitments TO STDOUT (FORMAT BINARY)") as copy:
-            for block in copy:
-                fh.write(bytes(block))
-    (dest / "RESTORE.md").write_text(_RESTORE_MD.format(ts=ts), encoding="utf-8")
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        data = dest / "commitments.bin"
+        with conn.cursor() as cur, open(data, "wb") as fh:
+            with cur.copy("COPY commitments TO STDOUT (FORMAT BINARY)") as copy:
+                for block in copy:
+                    fh.write(bytes(block))
+        (dest / "RESTORE.md").write_text(_RESTORE_MD.format(ts=ts), encoding="utf-8")
+    except OSError as exc:
+        from khipu.storage import describe_os_error, disk_full
+
+        if not disk_full(exc):
+            raise
+        # A half-written backup restores nothing and only holds space.
+        import shutil
+
+        shutil.rmtree(dest, ignore_errors=True)
+        raise OSError(exc.errno, f"the commitments backup could not be written: {describe_os_error(exc)}") from exc
+    try:
+        from khipu import storage
+
+        prune_commitments_backups(dest.parent, storage.settings()["commitments_backup_keep_days"], keep=dest)
+    except Exception:  # noqa: BLE001 — the backup is taken; the daily sweep prunes again
+        pass
     return dest
+
+
+_BACKUP_NAME = re.compile(r"commitments-(\d{8}T\d{6}Z)")
+
+
+def prune_commitments_backups(root: Path | None = None, keep_days: int = 30, *,
+                              keep: Path | None = None, now=None) -> list[str]:
+    """Remove ``commitments-<ts>`` folders older than ``keep_days`` (0 keeps
+    every backup), judged by the time in the name. Only folders named exactly
+    that way, and never ``keep`` (the one just written). Returns the names
+    removed."""
+    import shutil
+    from datetime import datetime, timedelta, timezone
+
+    root = root or commitments_backup_dir()
+    if keep_days <= 0 or not root.is_dir():
+        return []
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=keep_days)
+    removed = []
+    for entry in sorted(root.iterdir()):
+        match = _BACKUP_NAME.fullmatch(entry.name)
+        if not match or entry.is_symlink() or not entry.is_dir():
+            continue
+        if keep is not None and entry.name == keep.name:
+            continue
+        taken = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        if taken < cutoff:
+            shutil.rmtree(entry)
+            removed.append(entry.name)
+    return removed
 
 
 def run_commitments_hygiene(

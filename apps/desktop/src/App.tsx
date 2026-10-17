@@ -52,12 +52,13 @@ import { RoutingCard } from "./RoutingCard";
 import { RoutingSettings } from "./RoutingSettings";
 import { useRouting } from "./routing";
 import { WorkView } from "./WorkView";
-import { WORK_LEDE, badgeLabel, useWork } from "./work";
+import { WORK_LEDE, badgeLabel, shortProject, useWork } from "./work";
 import type { DoctorSynthProvider } from "./SynthProvider";
 import { useModelVerify } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
+import { StorageReportDialog } from "./StorageReportDialog";
 import { OptionalFeatures } from "./OptionalFeatures";
 import { OwnerActions } from "./OwnerActions";
 import { EmbeddingsPanel } from "./EmbeddingsPanel";
@@ -541,21 +542,6 @@ function projectFromScope(scope: string | undefined | null): string | null {
   const codeAt = parts.lastIndexOf("Code");
   if (codeAt >= 0 && parts[codeAt + 1]) return parts[codeAt + 1];
   return parts[parts.length - 1] ?? null;
-}
-
-/** `commitments.project` is an owner/repo slug — or, when the capture could not
- *  resolve one, the raw `harness:uuid` session id it was opened under. The repo
- *  half identifies the first; the harness name identifies the second. The full
- *  value stays as the tooltip either way. */
-function shortProject(project: string): string {
-  if (project.includes(":")) {
-    // A commitment scoped to a session rather than a repo. The pill is
-    // 96px wide; "Claude Code session" overran it, so the label is the short
-    // word and the harness stays in the pill's title (2026-09-05).
-    return "Session";
-  }
-  const parts = project.split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? project;
 }
 
 /** `session_id` is `harness:uuid`, so the harness is the half before the
@@ -2409,6 +2395,7 @@ export default function App() {
   const [noticeDialog, setNoticeDialog] = useState<LaunchPlan["dialog"]>(null);
   const [noticeCard, setNoticeCard] = useState<CardState | null>(null);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [storageReportOpen, setStorageReportOpen] = useState(false);
   const [feedbackSending, setFeedbackSending] = useState(false);
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -3405,18 +3392,20 @@ export default function App() {
                 {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
               </Tag>
             </span>
-            <span className="grow owed-text" title={c.text}>
-              {c.text}
+            <span className="grow owed-main">
+              <span className="owed-text" title={c.text}>
+                {c.text}
+              </span>
+              {seen ? (
+                <span
+                  className="meta owed-seen"
+                  title={`Restated by ${c.seen_count} captures`}
+                >
+                  seen {seen}
+                </span>
+              ) : null}
             </span>
             <WaitingToSync pending={c.pending_sync} />
-            {seen ? (
-              <span
-                className="meta owed-seen"
-                title={`Restated by ${c.seen_count} captures`}
-              >
-                seen {seen}
-              </span>
-            ) : null}
             <span className="w128">
               {c.project ? (
                 <Tag
@@ -3701,6 +3690,8 @@ export default function App() {
                             void applyMigrations();
                           } else if (a.fix?.kind === "refresh-snapshot") {
                             void refreshSnapshot();
+                          } else if (a.fix?.kind === "storage-report") {
+                            setStorageReportOpen(true);
                           }
                         }}
                       >
@@ -4029,9 +4020,14 @@ export default function App() {
                     void applyMigrations();
                   } else if (fix.kind === "refresh-snapshot") {
                     void refreshSnapshot();
+                  } else if (fix.kind === "storage-report") {
+                    setStorageReportOpen(true);
                   }
                 }}
               />
+              {(doctorParsed?.storage as { line?: string } | undefined)?.line ? (
+                <p className="muted">{(doctorParsed?.storage as { line: string }).line}</p>
+              ) : null}
               <Disclosure label="Raw report">
                 <div className="rows-head">Doctor report</div>
                 <RawBlock text={doctorText} />
@@ -6007,6 +6003,12 @@ export default function App() {
         onClose={() => setFeedbackOpen(false)}
         onSendingChange={setFeedbackSending}
         returnFocusRef={feedbackButtonRef}
+      />
+
+      <StorageReportDialog
+        open={storageReportOpen}
+        run={runKhipu}
+        onClose={() => setStorageReportOpen(false)}
       />
 
       <PostUpdateNoticeDialog

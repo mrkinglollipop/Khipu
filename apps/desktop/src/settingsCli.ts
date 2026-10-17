@@ -114,6 +114,11 @@ export type ConfigShape = {
     error?: string;
   };
   config?: Record<string, unknown>;
+  /** The storage settings (slice 8), each with the CLI's own words. */
+  storage?: Record<
+    string,
+    { value: number; default: number; kind: string; source: "file" | "default" | "invalid"; words: string }
+  >;
   /** `offline.settings_status()`: each duration with the CLI's own words. */
   offline?: Record<string, { value: number; default: number; kind: string; source: string; words: string }>;
 };

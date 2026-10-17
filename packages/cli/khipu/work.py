@@ -1367,6 +1367,11 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
         "ledger_offline": bool(ledger_data.get("offline")), "ledger_as_of": ledger_data.get("as_of"),
         "refresh_s": cfg["work_refresh"],
     })
+    # A project the scan withheld is still a project: the item says so
+    # ("masked"), so the app never reads it as Khipu's own (no project).
+    for raw, out in zip(waiting, view["waiting"]):
+        if raw.get("project") is not None and out.get("project") is None:
+            out["masked"] = True
     if scan.degraded:
         view["problems"]["privacy"] = PRIVACY_INCOMPLETE
     return view

@@ -375,7 +375,9 @@ def _refresh_snapshot() -> dict[str, Any]:
         out = refresh()
         return {"ok": bool(out.get("ok")), **{k: v for k, v in out.items() if k != "path"}}
     except Exception as exc:  # noqa: BLE001 — a replica miss cannot fail the night
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        from khipu.storage import describe_os_error
+
+        return {"ok": False, "error": describe_os_error(exc)}
 
 
 def _drain_sessions() -> dict[str, Any]:
@@ -644,8 +646,10 @@ def _hygiene_commitments() -> dict[str, Any]:
             "rejudge": rejudge_report.get("counts"), "backup": str(backup_dir),
         }
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
-        _nightly_log(f"[khipu-hygiene] skipped: {type(exc).__name__}: {exc}")
-        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        from khipu.storage import describe_os_error
+
+        _nightly_log(f"[khipu-hygiene] skipped: {describe_os_error(exc)}")
+        out = {"ok": False, "error": describe_os_error(exc)}
     return out
 
 

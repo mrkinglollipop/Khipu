@@ -22,8 +22,12 @@
 
 /* Waiting on you */
 .wk-filters { display: flex; flex-wrap: wrap; gap: var(--s1); padding: var(--s2) var(--s4); border-bottom: 1px solid var(--border); }
-.wk-filters .seg { flex-wrap: wrap; height: auto; min-height: 30px; }
-.wk-filters .seg button { height: 30px; }
+/* App.css's .seg is `flex: none`, so as a flex item it keeps its one-line width
+   and runs past the card; here it shrinks to the card and wraps, each choice
+   its own bordered chip so a wrapped row still reads as separate buttons. */
+.wk-filters .seg { flex: 1 1 auto; min-width: 0; max-width: 100%; flex-wrap: wrap; gap: var(--s1); height: auto; min-height: 30px; border: 0; overflow: visible; }
+.wk-filters .seg button { height: 30px; border: 1px solid var(--border); border-radius: var(--r-sm); white-space: nowrap; }
+.wk-filters .seg button:last-child { border-right: 1px solid var(--border); }
 .card .row.wk-wait { display: grid; grid-template-columns: minmax(0, 1fr) minmax(7rem, 9rem) auto; column-gap: var(--s3); align-items: center; }
 .wk-wait-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .wk-wait-line { display: flex; align-items: baseline; gap: var(--s2); min-width: 0; }

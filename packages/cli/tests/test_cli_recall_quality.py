@@ -36,6 +36,7 @@ def _green_doctor_patches():
         mock.patch("khipu.session_capture.drain", return_value=None),
         mock.patch("khipu.session_capture.liveness_all", return_value={"ok": True, "red": [], "harnesses": {}}),
         mock.patch("khipu.git_sync_health.status", return_value={"ok": True}),
+        mock.patch("khipu.storage.disk_space", return_value={"ok": True, "level": "ok", "volumes": []}),
         mock.patch("khipu.jobs.job_status", return_value={}),
         mock.patch("khipu.jobs.index_freshness", return_value={"ok": True}),
         mock.patch("khipu.embed.coverage", return_value={

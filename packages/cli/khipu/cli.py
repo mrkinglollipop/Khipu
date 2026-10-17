@@ -210,7 +210,7 @@ LOCAL_GATES = (
     "outbox_ok", "capture_liveness_ok", "git_sync_ok", "dsn_file_ok", "synth_provider_ok",
     "jobs_ok", "index_freshness_ok", "synth_budget_ok", "graph_backup_ok", "bundle_seal_ok",
     "prompt_recall_snapshot_ok", "prompt_recall_outcomes_ok", "recall_daemon_ok",
-    "nightly_steps_ok", "degraded_rate_ok", "launchers_ok", "ledger_outbox_ok",
+    "nightly_steps_ok", "degraded_rate_ok", "launchers_ok", "ledger_outbox_ok", "disk_space_ok",
 )
 
 
@@ -418,6 +418,21 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     except Exception as e:  # noqa: BLE001  (a failed check must not look like a pass)
         ledger_outbox = {"pending": -1, "error": f"{type(e).__name__}: {e}"}
     ledger_outbox_ok = ledger_outbox.get("pending") == 0 and not ledger_outbox.get("refused")
+    # Free space where Khipu writes (slice 8): red holds back an update, which
+    # writes a whole slot copy; amber is a warning and never gates.
+    try:
+        from khipu import storage
+
+        disk_space = storage.disk_space()
+    except Exception as e:  # noqa: BLE001  (a failed check must not look like a pass)
+        disk_space = {"ok": False, "level": "red", "volumes": [], "error": f"{type(e).__name__}: {e}"}
+    # What Khipu holds and where: a line in the report, never a gate.
+    try:
+        from khipu import storage
+
+        storage_block = storage.usage()
+    except Exception as e:  # noqa: BLE001
+        storage_block = {"error": f"{type(e).__name__}: {e}"}
     return {
         "outbox": outbox, "outbox_ok": outbox_ok,
         "ledger_outbox": ledger_outbox, "ledger_outbox_ok": ledger_outbox_ok,
@@ -439,8 +454,16 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         "nightly_steps_ok": all(bool(v.get("ok")) for v in nightly_steps.values()),
         "degraded_rate": degraded_rate, "degraded_rate_ok": bool(degraded_rate.get("ok")),
         "launchers": launchers, "launchers_ok": bool(launchers.get("ok")),
+        "disk_space": disk_space, "disk_space_ok": bool(disk_space.get("ok")),
+        "storage": storage_block,
         "not_configured": not_configured,
     }
+
+
+def _disk_space_warnings(local: dict) -> list[str]:
+    """An amber disk is a warning; red is already its own failed check."""
+    block = local.get("disk_space") or {}
+    return [block["message"]] if block.get("level") == "amber" and block.get("message") else []
 
 
 def _promotion_block() -> dict:
@@ -496,7 +519,7 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
     schema = _schema_check()
     out["schema_migrations"] = schema
     out["schema_migrations_ok"] = not schema.get("pending")
-    out["warnings"] = list(schema.get("warnings") or [])
+    out["warnings"] = list(schema.get("warnings") or []) + _disk_space_warnings(local)
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
                  and all(bool(local[k]) for k in LOCAL_GATES) and out["schema_migrations_ok"])
     print(_strict_json(out, indent=2, default=str))
@@ -917,6 +940,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "graph_drift": graph,
         "outbox": outbox,
         "ledger_outbox": local["ledger_outbox"],
+        "disk_space": local["disk_space"],
+        "storage": local["storage"],
         "capture_liveness": liveness,
         "git_sync": git_sync,
         "backup": backup,
@@ -960,7 +985,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
                      + list(owner_direction_block.get("warnings") or [])
                      + list(owner_actions_log_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
-                     + list(schema.get("warnings") or [])),
+                     + list(schema.get("warnings") or []) + _disk_space_warnings(local)),
         "not_configured": not_configured,
         "ok": (
             hub_ok
@@ -1009,6 +1034,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             # below, and never reaches this aggregate.
             and bool(launchers.get("ok"))
             and local["ledger_outbox_ok"]
+            and local["disk_space_ok"]
             and schema_ok
         ),
         "graph_backup": _graph_backup,
@@ -1042,6 +1068,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "launchers_ok": bool(launchers.get("ok")),
         "nightly_steps_ok": local["nightly_steps_ok"],
         "ledger_outbox_ok": local["ledger_outbox_ok"],
+        "disk_space_ok": local["disk_space_ok"],
         "schema_migrations_ok": schema_ok,
     }
     print(_strict_json(out, indent=2, default=str))
@@ -3309,6 +3336,19 @@ def cmd_config(args: argparse.Namespace) -> int:
             reply["job"] = launchd_gen.rerender_replica_job()
         print(json.dumps(reply))
         return 0
+    from khipu import storage as _storage
+
+    if (args.set and args.set[0] in _storage.SETTINGS) or args.unset in _storage.SETTINGS:
+        # Storage hygiene (slice 8): disk space thresholds and how long logs,
+        # usage lines and commitments backups are kept; 0 keeps everything.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _storage.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _storage.settings_status()[key], "config_file": str(path)}))
+        return 0
     from khipu import ledger as _ledger
 
     if (args.set and args.set[0] in _ledger.SETTINGS) or args.unset in _ledger.SETTINGS:
@@ -3522,6 +3562,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "routing": _routing.settings_status(),
         "ledger": _ledger.settings_status(),
         "replica": replica_heal.settings_status(),
+        "storage": _storage.settings_status(),
         "work": _work.settings_status(),
         "offline": _offline.settings_status(),
         "graph_backup_remote": graph_backup_remote_status(),
@@ -4004,6 +4045,14 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         # The replica-refresh job is Khipu's timer: the owner-turn retention
         # and overdue purges ride on it. Never changes the heal's result.
         out["owner_direction"] = owner_direction.timer()
+        try:
+            from khipu import storage
+
+            swept = storage.sweep_if_due()
+            if swept is not None:
+                out["storage_sweep"] = swept
+        except Exception as e:  # noqa: BLE001 — housekeeping never fails the replica job
+            out["storage_sweep"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         jobs._write_job_state("replica_refresh", rc)
         print(json.dumps(out, indent=2))
         return rc
@@ -4015,7 +4064,9 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     try:
         out = refresh()
     except Exception as exc:
-        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+        from khipu.storage import describe_os_error
+
+        print(json.dumps({"ok": False, "error": describe_os_error(exc)}))
         return 1
     print(json.dumps(out, indent=2))
     return 0 if out.get("ok") else 2
@@ -4381,12 +4432,21 @@ def cmd_paths(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_storage(_args: argparse.Namespace) -> int:
+    """`khipu storage`: free disk space and what Khipu holds, for the app's
+    storage report. Read-only."""
+    from khipu import storage
+
+    print(json.dumps({"disk_space": storage.disk_space(), "storage": storage.usage()}, indent=2))
+    return 0
+
+
 def cmd_backup_local(args: argparse.Namespace) -> int:
     from khipu.paths import backup_local
 
     out = backup_local(dest=Path(args.out))
     print(json.dumps(out, indent=2))
-    return 0
+    return 0 if out.get("ok") else 1
 
 
 def cmd_nightly(_args: argparse.Namespace) -> int:
@@ -4761,6 +4821,9 @@ def build_parser() -> argparse.ArgumentParser:
         "no hub, network or probe checks (the promotion gate's first step)",
     )
     d.set_defaults(func=cmd_doctor)
+
+    storage_p = sub.add_parser("storage", help="Free disk space and what Khipu holds, as JSON (read-only)")
+    storage_p.set_defaults(func=cmd_storage)
 
     rv = sub.add_parser(
         "revisions",

@@ -1866,7 +1866,7 @@ _TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
 # one hook process can ever wait on another's lock; every failure (locked,
 # corrupt, missing directory) degrades to "not cached" below, never raises.
 # Deliberately a NEW filename, not a migration of the old
-# prompt-query-embed-cache.json — that file is left alone, untouched.
+# prompt-query-embed-cache.json; the storage sweep removes that file.
 _QUERY_EMBED_CACHE_CONNECT_TIMEOUT_S = 0.1
 
 

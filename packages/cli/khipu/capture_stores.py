@@ -133,7 +133,7 @@ STORES: tuple[Store, ...] = (
           "it is queued, and a forgotten source is refused when it is",
           _w("session_capture.save_state", "session_capture.request_capture_now",
              "session_capture.sweep_idle", "session_capture._write_at")),
-    Store("capture log", "capture home logs/session-capture.log",
+    Store("capture log", "capture home logs/session-capture.log and its one older copy .log.1",
           "drain and hook events: file names, counts and lengths",
           "none: it never holds summary or transcript text",
           _w("session_capture._log")),
