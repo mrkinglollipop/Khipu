@@ -412,7 +412,8 @@ button.rail-feedback {
 
 .panel-head {
   position: sticky;
-  top: 0;
+  /* Below the working strip while it shows (WorkingBanner sets the height). */
+  top: var(--working-banner-h, 0px);
   z-index: 10;
   display: flex;
   align-items: center;
@@ -2557,7 +2558,7 @@ button.t3-detail {
   width: 180px;
   flex: none;
   position: sticky;
-  top: 76px;
+  top: calc(76px + var(--working-banner-h, 0px));
 }
 
 .subnav button {

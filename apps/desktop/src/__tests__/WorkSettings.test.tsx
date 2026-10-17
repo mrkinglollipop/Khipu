@@ -165,6 +165,28 @@ describe("Settings, Work", () => {
     expect(screen.getByText("Also waiting on you: 1 under Name withheld and 1 under No project.")).toBeInTheDocument();
   });
 
+  it("clears Reading the ledger when the read answers without a project list", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "khipu_ledger_projects" ? JSON.stringify({ ok: true, offline: true }) : base(cmd, args),
+    );
+    render(<WorkSettings active work={work()} />);
+    await screen.findByRole("list", { name: "Projects on the Work tab with no ledger rows" });
+    await waitFor(() => expect(screen.queryByText("Reading the ledger…")).toBeNull());
+    expect(screen.getByText(/Khipu couldn't read the ledger's projects/)).toBeInTheDocument();
+  });
+
+  it("clears Reading the ledger when the read fails", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "khipu_ledger_projects") throw new Error("the hub is away");
+      return base(cmd, args);
+    });
+    render(<WorkSettings active work={work()} />);
+    expect(await screen.findByText(/Khipu couldn't read the ledger's projects/)).toBeInTheDocument();
+    expect(screen.queryByText("Reading the ledger…")).toBeNull();
+  });
+
   it("shows each summary file's state and turns one off, on and removes it", async () => {
     render(<WorkSettings active work={work()} />);
     const list = await screen.findByRole("list", { name: "Summary files" });
