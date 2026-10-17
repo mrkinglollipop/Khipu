@@ -2590,7 +2590,10 @@ def direction_intent(command: str, args: argparse.Namespace, project: str | None
     if action is None:
         return None
     if action == "ledger.import":
-        return owner_direction.intent(action, str(args.file), facts={"project": project} if project else None)
+        facts = {"project": project} if project else {}
+        if getattr(args, "catch_up", False):
+            facts["catch_up"] = True
+        return owner_direction.intent(action, str(args.file), facts=facts or None)
     if action == "ledger.project":
         return owner_direction.intent(action, project) if project else None
     if action.startswith("ledger."):
@@ -2625,8 +2628,6 @@ def _cmd_write(args: argparse.Namespace, verb: str, project: str, *, owner: bool
     op = new_op(verb, project, args.id, fields=fields, note=getattr(args, "note", "") or "",
                 if_state=getattr(args, "if_state", None), children=getattr(args, "children", None),
                 op_id=args.op_id, from_app=args.from_app or owner)
-    if owner:
-        op["source"] = "direction"
     from khipu import owner_direction
 
     result = owner_direction.finish(write(op))

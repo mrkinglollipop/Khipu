@@ -687,6 +687,10 @@ def gate(want: dict | None, *, env=None, now: float | None = None) -> dict:
                                "terminal.")
     stamp = check(want["action"], env=env, now=now)
     before = _before(want)
+    if before is _NO_UNDO and want["action"] == "ledger.import":
+        raise DirectionRefused("not_by_direction",
+                               "A catch-up import can't be undone, so it can't be made by direction; it needs the "
+                               "Khipu app or a yes typed on a terminal.")
     if before is _UNREADABLE:
         raise DirectionRefused("before_unreadable",
                                "Khipu can't read what this would change right now, so it could not be undone; "
@@ -819,7 +823,7 @@ _UNREADABLE = object()  # what it changes can't be read now: a direction is refu
 
 # Why a change has no undo, in words the app shows beside it.
 _NO_UNDO_WHY = {
-    "ledger.import": "An import can't be undone; the rows it brought in can be removed one by one.",
+    "ledger.import": "A catch-up import can't be undone: it changes rows that were already there.",
     "route.rule.confirm": "Confirming a seeded rule can't be undone; the rule can be retired.",
 }
 
@@ -931,6 +935,21 @@ def _before(want: dict):
         from khipu import promote
 
         return {"checks": list(promote.gate_ignore_status().get("value") or [])}
+    if action == "ledger.import":
+        facts = want.get("facts") or {}
+        if facts.get("catch_up") or not facts.get("project"):
+            return _NO_UNDO
+        from khipu import ledger_import
+
+        try:
+            digest = ledger_import.read_tracker(target)["digest"]
+        except Exception:  # noqa: BLE001 - the import itself says what is wrong with the file
+            return {"project": facts["project"], "digest": None}
+        try:
+            had = ledger_import.done_imports(facts["project"], digest)
+        except Exception:  # noqa: BLE001 - an import needs the database too
+            return _UNREADABLE
+        return {"project": facts["project"], "digest": digest, "had": had}
     if action == "ledger.project":
         from khipu import ledger
 
@@ -1013,7 +1032,6 @@ def _ledger_write(verb: str, target: str, fields: dict | None = None) -> dict:
 
     project, _, row_id = target.partition("#")
     op = ledger.new_op(verb, project, row_id, fields=fields or {}, from_app=True)
-    op["source"] = "direction"
     return ledger.write(op)
 
 
@@ -1257,6 +1275,15 @@ def _undo_gate_ignore(line, via):
     return {"ok": True}
 
 
+def _undo_import(line, via):
+    from khipu import ledger_import
+
+    before = _b(line)
+    if not before.get("digest"):
+        raise ValueError("Khipu can't tell which import this was, so it can't undo it")
+    return ledger_import.undo_import(before["project"], before["digest"], before.get("had"))
+
+
 def _ledger_undo(verb: str):
     def run(line, via):
         return _ledger_write(verb, line["target"])
@@ -1297,6 +1324,7 @@ _UNDO = {
     "config.answer_request.undo": _undo_setting,
     "promote.gate_ignore": _undo_gate_ignore,
     "promote.gate_ignore.cancel": _undo_gate_ignore,
+    "ledger.import": _undo_import,
     "ledger.restore": _ledger_undo("remove"),
     "ledger.add": _ledger_undo("remove"),
     "ledger.set": _undo_ledger_set,
