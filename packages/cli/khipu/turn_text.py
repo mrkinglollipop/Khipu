@@ -62,6 +62,64 @@ def clean_user_text(text: str, *, owner: bool = False) -> str:
     return _CURSOR_WRAP.sub("", text)   # no strip: ACP user text arrives in chunks that must re-join exactly
 
 
+# What makes a tag wrapper-like: a name a harness wraps text in, or any
+# name in the snake_case or kebab-case style harnesses use for them. A plain
+# HTML name (<b>, <div>) is something the owner can type.
+_TAG = re.compile(r"</?([A-Za-z][\w-]*)(?:\s[^<>]*)?/?>")
+_HARNESS_STYLE = re.compile(r"[a-z][a-z0-9]*(?:[_-][a-z0-9]+)+")
+_KNOWN_WRAPPERS = frozenset(NOT_TYPED_TAGS) | {"user_query", "timestamp"} | {
+    t.lstrip("<").rstrip(">-") for t in MACHINE_USER_TAGS}
+
+
+def _wrapper_like(name: str) -> bool:
+    name = name.lower()
+    return name in _KNOWN_WRAPPERS or _HARNESS_STYLE.fullmatch(name) is not None
+
+
+def _open_block(text: str, tags: tuple[str, ...]) -> re.Match | None:
+    return re.match(r"<(" + "|".join(re.escape(t) for t in tags) + r")(?:\s[^<>]*)?>", text)
+
+
+def owner_text(text: str) -> str | None:
+    """The words the owner typed in a prompt field, or None when they can't
+    be told apart from text that came from somewhere else.
+
+    Harness wrappers count only at the places a harness puts them: blocks of
+    ``NOT_TYPED_TAGS`` at the start (hook context, a paste or a tool's output
+    the turn opens with), blocks of ``INJECTED_CONTEXT_TAGS`` at the end
+    (hook context appended), and T3's hand-over in front, of which only the
+    text after its last "User message" marker is the current turn (a
+    historical item can hold that marker too, never after T3's own). A
+    block ends at its first closing tag, never at one the reader would pick:
+    any wrapper-like tag left anywhere in the rest, a closing tag inside a
+    block included, means the whole turn does not count."""
+    if not isinstance(text, str):
+        return None
+    rest = text.replace("\r\n", "\n")
+    while True:
+        head = rest.lstrip()
+        m = _open_block(head, NOT_TYPED_TAGS)
+        if m is None:
+            break
+        close = head.find(f"</{m.group(1)}>", m.end())
+        if close < 0:
+            return None
+        rest = head[close + len(m.group(1)) + 3:]
+    while True:
+        tail = rest.rstrip()
+        m = re.search(r"</(" + "|".join(re.escape(t) for t in INJECTED_CONTEXT_TAGS) + r")>$", tail)
+        if m is None:
+            break
+        opened = [o for o in re.finditer(r"<" + re.escape(m.group(1)) + r"(?:\s[^<>]*)?>", tail)]
+        if not opened:
+            return None
+        rest = tail[:opened[-1].start()]
+    rest = strip_handoff(rest.lstrip("\n"), prefer_last=True)
+    if any(_wrapper_like(m.group(1)) for m in _TAG.finditer(rest)):
+        return None
+    return rest.strip()
+
+
 def is_machine(text: str, *, anywhere: bool = False) -> bool:
     """True when a cleaned user turn is a message the harness wrote: it opens
     with one of ``MACHINE_USER_TAGS``. ``anywhere`` (the owner-turn recorder):

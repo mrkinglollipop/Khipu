@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from khipu import t3
-from khipu.turn_text import clean_user_text, is_machine
+from khipu.turn_text import clean_user_text, is_machine, owner_text
 
 RETENTION_S = 24 * 3600
 TEXT_MOST = 8000
@@ -237,6 +237,8 @@ def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
     conf = conf or settings()
     if turn.get("machine"):
         return False, "a message the harness wrote, not a typed turn"
+    if turn.get("wrapped"):
+        return False, "a wrapper away from its harness's place, so the typed words can't be told apart"
     if turn.get("helper"):
         return False, "a T3 helper session"
     if turn.get("delegated"):
@@ -332,8 +334,12 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
         return None
     harness = harness_of(env, payload)
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
-    text = clean_user_text(prompt, owner=True).strip()
-    machine = is_machine(text, anywhere=True)
+    typed = owner_text(prompt)
+    machine = is_machine(clean_user_text(prompt, owner=True), anywhere=True)
+    # A wrapper away from its harness's place: which words are the owner's
+    # can't be told, so none are kept and the turn never counts.
+    wrapped = typed is None and not machine
+    text = "" if typed is None else typed
     if issuer is None:
         issuer = hook_issuer() or {"refused": "unknown"}
     turn = {
@@ -342,7 +348,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
         "entrypoint": entrypoint_of(harness, env, payload, session), "cwd": cwd,
         "turn": secrets.token_hex(4),
         "text": "" if machine else text[:TEXT_MOST],
-        "machine": machine, "helper": t3.is_helper_session(cwd), "issuer": issuer,
+        "machine": machine, "wrapped": wrapped, "helper": t3.is_helper_session(cwd), "issuer": issuer,
     }
     brief = None if machine else brief_for(text, now)
     turn["delegated"] = brief is not None
