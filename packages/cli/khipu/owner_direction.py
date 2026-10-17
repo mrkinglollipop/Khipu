@@ -97,6 +97,11 @@ def session_of(env=None) -> str:
     return ""
 
 
+def _sessions_named(env=None) -> set[str]:
+    env = os.environ if env is None else env
+    return {v for v in ((env.get(name) or "").strip() for name in _SESSION_VARS) if v}
+
+
 def _title(name: str) -> str:
     return name[:1].upper() + name[1:] if name and name.islower() and " " not in name else name
 
@@ -124,6 +129,12 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
     if not session:
         raise DirectionRefused("no_recorded_turn", "Khipu can't tell which conversation this is, so it can't tell "
                                                    "whether the owner is in it.")
+    if len(_sessions_named(env)) > 1:
+        # A job started from a conversation keeps the conversation's id
+        # beside its own: which one is asking can't be told.
+        raise DirectionRefused("no_recorded_turn", "This call names more than one conversation, so Khipu can't tell "
+                                                   "whether the owner is in the one asking. Ask the owner to say it "
+                                                   "in the conversation they are typing in.")
     turn = _recent_turn(session, conf, now)
     _from_the_hook(turn)
     return {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
@@ -148,37 +159,57 @@ def _recent_turn(session: str, conf: dict, now: float) -> dict:
 
 
 _CHAIN_MOST = 16
+# Processes that sit between a harness and the command it runs (its shells,
+# Khipu's own Python, a launcher), passed over to find the harness that
+# runs this call.
+_PASS_THROUGH = ("env", "timeout", "nohup", "uv", "uvx")
 
 
-def _caller_chain() -> list[tuple[int, float]]:
-    """This process's ancestors, parent first, as (pid, start time). Stops
-    where a parent started after its child (its number was reused)."""
+def _caller_chain() -> list[tuple[int, float, str]]:
+    """This process's ancestors, parent first, as (pid, start time, the
+    name of the file it runs). Stops where a parent started after its child
+    (its number was reused)."""
     me = owner_turns._proc_info(os.getpid())
     if me is None:
         return []
     pid, born = me[0], me[2]
-    out: list[tuple[int, float]] = []
+    out: list[tuple[int, float, str]] = []
     for _ in range(_CHAIN_MOST):
         info = owner_turns._proc_info(pid)
         if info is None or info[2] > born:
             break
-        out.append((pid, info[2]))
+        out.append((pid, info[2], os.path.basename(os.path.realpath(info[1]))))
         pid, born = info[0], info[2]
         if pid <= 1:
             break
     return out
 
 
+def _nearest_harness(chain: list[tuple[int, float, str]]) -> tuple[int, float] | None:
+    """The first ancestor that is not a shell, an interpreter or a launcher:
+    the harness whose conversation runs this call. A dispatched job (``claude
+    -p``, ``codex exec``, a T3 delegate) is a harness of its own, so its
+    commands find it, never the conversation that started it."""
+    for pid, start, name in chain:
+        low = name.lower()
+        if low in owner_turns.HOOK_SHELLS or low in owner_turns.REFUSED_ISSUERS \
+                or low.startswith(owner_turns.REFUSED_ISSUER_PREFIXES) or low in _PASS_THROUGH:
+            continue
+        return pid, start
+    return None
+
+
 def _from_the_hook(turn: dict) -> None:
-    """The turn was recorded by a hook its harness ran: its issuer is not an
-    agent's shell or a script, and is above this call, as the harness is
-    above every command its conversation runs. A session id set by hand in
-    another process points at a harness that is not this call's."""
+    """The turn was recorded by a hook its harness ran (its issuer is not an
+    agent's shell or a script), and that harness is the nearest one above
+    this call. A session id set by hand in another process, or inherited by
+    a job started from the conversation, points at a harness that is not
+    the one running this call."""
     issuer = turn.get("issuer")
     refused = not isinstance(issuer, dict) or issuer.get("refused") is not None \
         or not isinstance(issuer.get("pid"), int)
     if not refused:
-        refused = (issuer["pid"], issuer.get("start")) not in _caller_chain()
+        refused = (issuer["pid"], issuer.get("start")) != _nearest_harness(_caller_chain())
     if refused:
         raise DirectionRefused("not_from_the_hook",
                                "The owner's recent turn was not recorded by the prompt hook of the conversation "

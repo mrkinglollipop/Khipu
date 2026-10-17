@@ -267,10 +267,43 @@ def test_a_session_id_from_another_conversation_is_refused(world):
     conversation's session id in its own process does not pass."""
     world.say(session="s-other")
     world.be("s-other")
-    world.mp.setattr(owner_direction, "_caller_chain", lambda: [(4242, 1.0)])
+    world.mp.setattr(owner_direction, "_caller_chain", lambda: [(4242, 1.0, "claude")])
     rc, out = world.run(["route", "pause", "Codex"], True)
     assert rc == 2 and out["code"] == "not_from_the_hook"
     assert not routing.events_file().exists()
+
+
+def test_a_dispatched_job_that_kept_the_conversations_session_id_is_refused(world):
+    """Fifth review, P1: a job started from the owner's conversation (``claude
+    -p``, ``codex exec``, a T3 delegate) runs its own harness process. Even
+    with the parent's session id, the nearest harness above its call is the
+    job's, not the one whose hook recorded the owner's turn."""
+    from tests.conftest import FAKE_HOOK_ISSUER
+
+    world.say()
+    world.be(OWNER, var="KHIPU_SESSION_ID")
+    parent = (FAKE_HOOK_ISSUER["pid"], FAKE_HOOK_ISSUER["start"], "claude")
+    world.mp.setattr(owner_direction, "_caller_chain", lambda: [(5000, 2.0, "zsh"), (5001, 2.0, "claude"), parent])
+    rc, out = world.run(["route", "pause", "Codex"], True)
+    assert rc == 2 and out["code"] == "not_from_the_hook", out
+    assert _state("codex|") != "paused"
+    # The owner's own conversation: only shells and Khipu's Python between.
+    world.mp.setattr(owner_direction, "_caller_chain",
+                     lambda: [(5000, 2.0, "sh"), (5002, 2.0, "python3.11"), (5003, 2.0, "zsh"), parent])
+    rc, out = world.run(["route", "pause", "Codex"], True)
+    assert rc == 0 and _state("codex|") == "paused", out
+
+
+def test_a_call_naming_two_conversations_is_refused(world):
+    """Fifth review, P1: one front end hosts two sessions; a call whose
+    environment names the owner's session and another one can't be told
+    apart, so it is refused."""
+    world.say()
+    world.be(OWNER, var="KHIPU_SESSION_ID")
+    world.mp.setenv("CODEX_THREAD_ID", "another-conversation")
+    rc, out = world.run(["owner-direction", "off"], True)
+    assert rc == 2 and out["code"] == "no_recorded_turn", out
+    assert owner_turns.settings()["enabled"] is True
 
 
 def test_session_only_binding_for_aegis(world):

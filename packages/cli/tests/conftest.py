@@ -191,7 +191,8 @@ FAKE_HOOK_ISSUER = {"pid": 4_000_000, "start": 1.0, "exe": "claude"}
 @pytest.fixture(autouse=True)
 def _owner_turns_from_a_fake_harness(monkeypatch):
     """In-process ``owner_turns.record`` calls get ``FAKE_HOOK_ISSUER``, and
-    the check's caller chain has it above this process. A shim run in a
+    the check's caller chain has it as the nearest harness above this
+    process. A shim run in a
     subprocess still computes its real issuer."""
     from khipu import owner_direction, owner_turns
 
@@ -202,7 +203,8 @@ def _owner_turns_from_a_fake_harness(monkeypatch):
 
     monkeypatch.setattr(owner_turns, "record", record)
     monkeypatch.setattr(owner_direction, "_caller_chain",
-                        lambda: real_chain() + [(FAKE_HOOK_ISSUER["pid"], FAKE_HOOK_ISSUER["start"])])
+                        lambda: [(FAKE_HOOK_ISSUER["pid"], FAKE_HOOK_ISSUER["start"], FAKE_HOOK_ISSUER["exe"])]
+                        + real_chain())
 
 
 class FakeCallers:
