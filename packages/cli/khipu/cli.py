@@ -3519,6 +3519,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "replica": replica_heal.settings_status(),
         "storage": _storage.settings_status(),
         "work": _work.settings_status(),
+        "work_suggested": _work.suggested_files(),
         "offline": _offline.settings_status(),
         "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),

@@ -50,6 +50,7 @@ import { KeysCard } from "./KeysCard";
 import { PlansCard, usePlanAttention, usePlanUsage } from "./PlansCard";
 import { RoutingCard } from "./RoutingCard";
 import { RoutingSettings } from "./RoutingSettings";
+import { WorkSettings } from "./WorkSettings";
 import { useRouting } from "./routing";
 import { WorkView } from "./WorkView";
 import { WORK_LEDE, badgeLabel, shortProject, useWork } from "./work";
@@ -489,6 +490,7 @@ type SettingsSection =
   | "database"
   | "capture"
   | "routing"
+  | "work"
   | "features"
   | "index"
   | "data"
@@ -501,6 +503,7 @@ const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["database", "Database"],
   ["capture", "Capture & models"],
   ["routing", "Accounts and routing"],
+  ["work", "Work"],
   ["features", "Optional features"],
   ["index", "Embeddings"],
   ["data", "Data & backups"],
@@ -3690,6 +3693,9 @@ export default function App() {
                             void refreshSnapshot();
                           } else if (a.fix?.kind === "storage-report") {
                             setStorageReportOpen(true);
+                          } else if (a.fix?.kind === "work-settings") {
+                            setSettingsSection("work");
+                            setTab("settings");
                           }
                         }}
                       >
@@ -4020,6 +4026,9 @@ export default function App() {
                     void refreshSnapshot();
                   } else if (fix.kind === "storage-report") {
                     setStorageReportOpen(true);
+                  } else if (fix.kind === "work-settings") {
+                    setSettingsSection("work");
+                    setTab("settings");
                   }
                 }}
               />
@@ -5168,6 +5177,10 @@ export default function App() {
               setSettingsSection("routing");
               setTab("settings");
             }}
+            onOpenWorkSettings={() => {
+              setSettingsSection("work");
+              setTab("settings");
+            }}
             owedSection={
               <>
                 <div className="inline wk-owed-lede">
@@ -5528,6 +5541,10 @@ export default function App() {
                     plansState={plans}
                     onSetUpAccounts={openAccountsStepInFirstRun}
                   />
+                ) : null}
+
+                {settingsSection === "work" ? (
+                  <WorkSettings active={tab === "settings" && settingsSection === "work"} work={work} />
                 ) : null}
 
                 {settingsSection === "features" ? (
