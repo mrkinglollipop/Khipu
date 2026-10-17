@@ -191,6 +191,14 @@ export function LedgerPage({
   const openRow = useRef(selected);
   openRow.current = selected;
   const [form, setForm] = useState<Form | null>(null);
+  // Bumped on every change typed into the form: a background read that
+  // started before the latest change is dropped instead of resetting it.
+  const editRev = useRef(0);
+  const resetRev = useRef(0);
+  const edit = (next: Form) => {
+    editRev.current += 1;
+    setForm(next);
+  };
   const [saving, setSaving] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [removeOpen, setRemoveOpen] = useState(false);
@@ -212,9 +220,11 @@ export function LedgerPage({
   }, [project]);
 
   const loadDetail = useCallback(
-    async (id: string) => {
+    async (id: string, background = false) => {
+      const rev = editRev.current;
       const res = await callCli<LedgerRow>("khipu_ledger_get", { project, id });
       if (openRow.current !== id) return null;
+      if (background && editRev.current !== rev) return null;
       if (res.ok && res.data && typeof res.data.id === "string") {
         setDetail(res.data);
         setDetailError(null);
@@ -227,10 +237,32 @@ export function LedgerPage({
     [project],
   );
 
+  // One list read at a time, shared by the first read, the poll and the
+  // refreshes after a change. `fresh` waits out a read already under way
+  // and then reads again, so it sees what was just written.
+  const listRead = useRef<Promise<void> | null>(null);
+  const readList = useCallback(
+    (fresh = false): Promise<void> => {
+      const start = () => {
+        const p: Promise<void> = loadList()
+          .catch(() => {})
+          .finally(() => {
+            if (listRead.current === p) listRead.current = null;
+          });
+        listRead.current = p;
+        return p;
+      };
+      const under = listRead.current;
+      if (!under) return start();
+      return fresh ? under.then(() => listRead.current ?? start()) : under;
+    },
+    [loadList],
+  );
+
   useEffect(() => {
-    void loadList();
+    void readList();
     void loadRemoved();
-  }, [loadList, loadRemoved]);
+  }, [readList, loadRemoved]);
 
   const vocab = list?.vocab ?? null;
   // A fresh list hands an equal vocab as a new object: the form resets on
@@ -249,17 +281,21 @@ export function LedgerPage({
   useEffect(() => {
     let stopped = false;
     let timer: number | undefined;
-    const poll = async () => {
-      const id = openRow.current;
-      await Promise.all([loadList(), usableRowId(id) && !editing.current ? loadDetail(id) : null]);
+    const arm = () => {
       if (!stopped) timer = window.setTimeout(() => void poll(), every);
     };
-    timer = window.setTimeout(() => void poll(), every);
+    const poll = async () => {
+      const id = openRow.current;
+      await Promise.all([readList(), usableRowId(id) && !editing.current ? loadDetail(id, true) : null]);
+      arm();
+    };
+    // The first timer starts once the read under way (the page's first) ends.
+    void (listRead.current ?? Promise.resolve()).then(arm);
     return () => {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [every, loadList, loadDetail]);
+  }, [every, readList, loadDetail]);
   const rows = useMemo(() => list?.rows ?? [], [list]);
 
   useEffect(() => {
@@ -272,9 +308,16 @@ export function LedgerPage({
     void loadDetail(selected);
   }, [selected, loadDetail]);
 
+  // The form resets when another row opens or the row itself changed; a new
+  // vocab alone resets it only when nothing has been typed since.
+  const formFor = useRef<string | null>(null);
   useEffect(() => {
-    if (detail) setForm(initialForm(detail, vocab));
-    // The form resets when another row opens or the row itself changed.
+    if (!detail) return;
+    const key = JSON.stringify([detail.id, detail.updated, detail.state]);
+    if (key === formFor.current && editRev.current !== resetRev.current) return;
+    formFor.current = key;
+    resetRev.current = editRev.current;
+    setForm(initialForm(detail, vocab));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail?.id, detail?.updated, detail?.state, vocabKey]);
 
@@ -326,7 +369,7 @@ export function LedgerPage({
   const children = detail ? rows.filter((r) => r.parent === detail.id) : [];
 
   const afterWrite = async (id: string | null) => {
-    await Promise.all([loadList(), id ? loadDetail(id) : Promise.resolve(null), onChanged()]);
+    await Promise.all([readList(true), id ? loadDetail(id) : Promise.resolve(null), onChanged()]);
   };
 
   const save = async () => {
@@ -646,7 +689,7 @@ export function LedgerPage({
                 >
                   <div className="toolbar">
                     <label htmlFor={`${ids}-to`}>New state</label>
-                    <select id={`${ids}-to`} value={form.state} onChange={(e) => setForm({ ...form, state: e.target.value })}>
+                    <select id={`${ids}-to`} value={form.state} onChange={(e) => edit({ ...form, state: e.target.value })}>
                       {(vocab?.state ?? [[detail.state, ""]]).map(([w]) => (
                         <option key={w} value={w}>
                           {stateWords(w)}
@@ -667,7 +710,7 @@ export function LedgerPage({
                       <input
                         id={`${ids}-${field}`}
                         value={form[field]}
-                        onChange={(e) => setForm({ ...form, [field]: e.target.value })}
+                        onChange={(e) => edit({ ...form, [field]: e.target.value })}
                       />
                     </div>
                   ))}
@@ -678,7 +721,7 @@ export function LedgerPage({
                     id={`${ids}-note`}
                     placeholder="Your note"
                     value={form.note}
-                    onChange={(e) => setForm({ ...form, note: e.target.value })}
+                    onChange={(e) => edit({ ...form, note: e.target.value })}
                   />
                   <div className="toolbar">
                     <button type="submit" className="sm primary" disabled={saving}>
@@ -686,6 +729,7 @@ export function LedgerPage({
                     </button>
                     <button type="button" className="sm" disabled={saving}
                       onClick={() => {
+                        resetRev.current = editRev.current;
                         setForm(initialForm(detail, vocab));
                         setRefusal(null);
                       }}>
@@ -730,7 +774,7 @@ export function LedgerPage({
                   onRemoved={async () => {
                     setRemoveOpen(false);
                     setSelected(null);
-                    await Promise.all([loadList(), loadRemoved(), onChanged()]);
+                    await Promise.all([readList(true), loadRemoved(), onChanged()]);
                   }}
                 />
               </>
@@ -744,7 +788,7 @@ export function LedgerPage({
           now={now}
           onClose={() => setRemovedOpen(false)}
           onRestored={async () => {
-            await Promise.all([loadList(), loadRemoved(), onChanged()]);
+            await Promise.all([readList(true), loadRemoved(), onChanged()]);
           }}
         />
       </div>

@@ -94,6 +94,7 @@ NOT_CAPTURE = {
     **dict.fromkeys(("ledger._migrate_outcomes", "ledger._prune_outcomes", "ledger._record_outcome",
                      "ledger._record_rejected", "ledger._refuse_job", "ledger._replica_pending",
                      "ledger._set_aside", "ledger.enqueue"), _LEDGER),
+    "ledger._project_aliases": "the hub's project alias table (alias and project names) kept for offline reads",
     # Owner writes queued while the hub is away: the tool name and its arguments (ids, an action,
     # a decision's text the owner typed), a lock file, and the refused copies.
     "owner_writes._write": "owner writes waiting for the hub: ids, actions, a decision's text; not captures",

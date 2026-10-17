@@ -50,13 +50,15 @@ _TOP_LISTS = ("jobs", "prs", "trains")
 
 
 class _View(dict):
-    """A Work document plus the Forget generation observed while it was read."""
+    """A Work document plus the Forget generation observed while it was read
+    and the refresh number its read was given when it began."""
 
-    __slots__ = ("_forget_generation",)
+    __slots__ = ("_forget_generation", "_refresh_seq")
 
-    def __init__(self, value: dict, generation: int):
+    def __init__(self, value: dict, generation: int, refresh_seq: int | None = None):
         super().__init__(value)
         self._forget_generation = generation
+        self._refresh_seq = refresh_seq
 
 
 # ---- settings -----------------------------------------------------------------
@@ -261,18 +263,43 @@ def _view_lock():
         os.close(fd)
 
 
+def _fence() -> dict[str, int]:
+    """The fence file (under the view lock): the Forget ``generation``, the
+    last refresh number given out (``refresh_seq``) and the one whose view is
+    saved (``published_seq``)."""
+    data = _read_json(_view_fence_file())
+    data = data if isinstance(data, dict) else {}
+    out = {}
+    for key in ("generation", "refresh_seq", "published_seq"):
+        try:
+            out[key] = max(int(data.get(key) or 0), 0)
+        except (TypeError, ValueError):
+            out[key] = 0
+    return out
+
+
 def _view_generation() -> int:
     with _view_lock():
-        data = _read_json(_view_fence_file())
-        return int(data.get("generation") or 0) if isinstance(data, dict) else 0
+        return _fence()["generation"]
+
+
+def _begin_refresh() -> tuple[int, int]:
+    """The Forget generation now and a refresh number larger than any given
+    before: reads are ordered by when they began, never by the clock (which
+    can step back, and whose seconds two reads can share)."""
+    with _view_lock():
+        fence = _fence()
+        fence["refresh_seq"] += 1
+        _replace_json(_view_fence_file(), fence)
+        return fence["generation"], fence["refresh_seq"]
 
 
 def invalidate_view() -> None:
     """Fence every view built before Forget before its saved copy is removed."""
     with _view_lock():
-        data = _read_json(_view_fence_file())
-        generation = int(data.get("generation") or 0) if isinstance(data, dict) else 0
-        _replace_json(_view_fence_file(), {"generation": generation + 1})
+        fence = _fence()
+        fence["generation"] += 1
+        _replace_json(_view_fence_file(), fence)
 
 
 def _replace_json(path: Path, data: Any, text: str | None = None) -> None:
@@ -289,28 +316,27 @@ def _replace_json(path: Path, data: Any, text: str | None = None) -> None:
             tmp.unlink()
 
 
-def _write_json(path: Path, data: Any, view_generation: int | None = None, *, text: str | None = None) -> None:
+def _write_json(path: Path, data: Any, view_generation: int | None = None, *, text: str | None = None,
+                refresh_seq: int | None = None) -> None:
     """Replace JSON, refusing a Work view that Forget invalidated mid-refresh.
-    ``text``: the view already written out (``data`` still gives its time)."""
+    ``text``: the view already written out."""
     if path != view_file():
         _replace_json(path, data)
         return
     if not isinstance(view_generation, int) or view_generation < 0:
         return
     with _view_lock():
-        current = _read_json(_view_fence_file())
-        generation = int(current.get("generation") or 0) if isinstance(current, dict) else 0
-        if view_generation != generation:
+        fence = _fence()
+        if view_generation != fence["generation"]:
             return
-        # Two readers can finish out of order: a view built earlier never
-        # replaces one built later (the fence keeps the newest one's time).
-        built = _parse_time(data.get("generated_at")) if isinstance(data, dict) else None
-        shown = _parse_time(current.get("generated_at")) if isinstance(current, dict) else None
-        if built is not None and shown is not None and built < shown:
-            return
+        # Two readers can finish out of order: a read that began earlier
+        # never replaces one that began later.
+        if isinstance(refresh_seq, int):
+            if refresh_seq < fence["published_seq"]:
+                return
+            fence["published_seq"] = refresh_seq
         _replace_json(path, data, text)
-        if built is not None:
-            _replace_json(_view_fence_file(), {"generation": generation, "generated_at": _z(built)})
+        _replace_json(_view_fence_file(), fence)
 
 
 def _read_json(path: Path) -> Any:
@@ -1484,7 +1510,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
     part, never the view."""
     from khipu import ledger
 
-    fence = _view_generation()
+    fence, refresh_seq = _begin_refresh()
     now = now or _now()
     cfg = cfg or settings()
     # The three sources wait on different things (the hub twice, the
@@ -1632,7 +1658,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                                        ("routing", routing_info.get("error")), ("outbox", line_problem)) if v},
         "ledger_offline": bool(ledger_data.get("offline")), "ledger_as_of": ledger_data.get("as_of"),
         "refresh_s": cfg["work_refresh"],
-    }), fence)
+    }), fence, refresh_seq)
     # A project the scan withheld is still a project: the item says so
     # ("masked"), so the app never reads it as Khipu's own (no project).
     for raw, out in zip(waiting, view["waiting"]):
@@ -1671,7 +1697,8 @@ def _save_emitted(view: dict, text: str) -> None:
         write_view(view)
         return
     try:
-        _write_json(view_file(), {"generated_at": view.get("generated_at")}, generation, text=text)
+        _write_json(view_file(), {"generated_at": view.get("generated_at")}, generation, text=text,
+                    refresh_seq=getattr(view, "_refresh_seq", None))
     except OSError:
         pass  # the saved copy is for a later reader; the answer stands without it
 
@@ -1686,7 +1713,8 @@ def write_view(view: dict) -> None:
     if not isinstance(generation, int) or generation < 0:
         return
     try:
-        _write_json(view_file(), agent_view.project(view), generation)
+        _write_json(view_file(), agent_view.project(view), generation,
+                    refresh_seq=getattr(view, "_refresh_seq", None))
     except OSError:
         pass  # the saved copy is for a later reader; the answer stands without it
 

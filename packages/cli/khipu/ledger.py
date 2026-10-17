@@ -1908,11 +1908,21 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
 
 def _queue_health(drained: dict[str, Any] | None, pending: int) -> dict[str, Any]:
     """What a read says about the line of waiting writes: how many of this
-    project's still wait, and what the drain this read ran answered."""
+    project's still wait, what the drain this read ran answered, and what the
+    line holds on disk whether or not the hub answered: every refusal still
+    kept, and whether each waiting write can be read. A line that cannot be
+    read has no count (``pending: None``), never a healthy zero."""
     drained = drained or {}
-    return {"pending": pending, "busy": bool(drained.get("busy")),
-            "stopped_early": bool(drained.get("stopped_early")), "refused": int(drained.get("refused") or 0),
-            "unreadable": drained.get("unreadable")}
+    status = outbox_status()
+    unreadable = drained.get("unreadable") or status.get("unreadable")
+    if not unreadable:
+        try:
+            queued_ops(strict=True)
+        except LedgerError as exc:
+            unreadable = str(exc)[:200]
+    return {"pending": None if unreadable else pending, "busy": bool(drained.get("busy")),
+            "stopped_early": bool(drained.get("stopped_early")), "refused": status.get("refused"),
+            "unreadable": unreadable or None}
 
 
 def load(project: str, *, conn=None) -> dict[str, Any]:
@@ -1948,19 +1958,41 @@ def load(project: str, *, conn=None) -> dict[str, Any]:
             conn.close()
 
 
+def _queued_row(view: dict[str, Any] | None, row_id: str) -> dict[str, Any] | None:
+    """``row_id`` as the waiting writes leave it, when one of them touches it."""
+    for row in (view or {}).get("rows", []):
+        if row["row_id"] == row_id and row.get("queued"):
+            return row
+    return None
+
+
 def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
+    """One row and its history, as ``load`` would show it: writes still
+    waiting show on it (marked ``queued``), and ``pending``/``queue`` say how
+    the line stands."""
     refuse_secrets(project, row_id)
     owned = conn is None
+    drained = None
     try:
         if owned:
             conn = _connect()
-        drain(conn)
+        drained = drain(conn)
         replica_catch_up(conn)
+        # A drain that was busy or stopped early leaves writes waiting: the
+        # row shows them, as the list does.
+        view = _overlay(_hub_view(conn, project), project) \
+            if any(op.get("project") == project for op in queued_ops()) else None
+        pending = int((view or {}).get("pending") or 0)
+        health = {"offline": False, "pending": pending, "queue": _queue_health(drained, pending)}
+        queued = _queued_row(view, row_id)
         with conn.cursor() as cur:
             cur.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s AND row_id = %s",
                         (project, row_id))
             got = cur.fetchone()
             if got is None:
+                if queued is not None:  # an addition still waiting to be sent
+                    conn.rollback()
+                    return {"row": queued, "history": [], **health}
                 marker = _marker(cur, project, row_id)
                 conn.rollback()
                 if marker:
@@ -1970,11 +2002,14 @@ def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
             if row["removed_at"] is not None:
                 conn.rollback()
                 raise _removed_error(row)
+            if view is not None and row_id in view["queue_removed"]:
+                conn.rollback()
+                raise LedgerError(f"row {row_id} is removed; the removal is waiting to be sent", "removed")
             cur.execute(f"SELECT {', '.join(_HIST_COLS)} FROM ledger_history WHERE project = %s AND row_id = %s "
                         "ORDER BY id", (project, row_id))
             history = [dict(zip(_HIST_COLS, h, strict=True)) for h in cur.fetchall()]
         conn.rollback()
-        return {"row": row, "history": history, "offline": False}
+        return {"row": queued or row, "history": history, **health}
     except LedgerError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -1985,7 +2020,8 @@ def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
         for row in merged["rows"]:
             if row["row_id"] == row_id:
                 history = [h for h in (view or {}).get("history", []) if h["row_id"] == row_id]
-                return {"row": row, "history": history, "offline": True, "as_of": merged.get("as_of")}
+                return {"row": row, "history": history, "offline": True, "as_of": merged.get("as_of"),
+                        "pending": merged["pending"], "queue": _queue_health(drained, merged["pending"])}
         raise LedgerError(f"no such row: {row_id}", "not_found") from exc
     finally:
         if owned and conn is not None:
@@ -2367,12 +2403,64 @@ def nightly() -> dict[str, Any]:
 # ---- the CLI ------------------------------------------------------------------
 
 
+_ALIAS_FRESH_S = 600  # how long the kept alias table is used before the hub is asked again
+
+
+def _aliases_file() -> Path:
+    from khipu.paths import data_dir
+
+    return data_dir() / "ledger-project-aliases.json"
+
+
+def _kept_aliases() -> tuple[dict[str, str] | None, float | None]:
+    """The alias table this Mac last read from the hub, and when."""
+    try:
+        data = json.loads(_aliases_file().read_text(encoding="utf-8"))
+        aliases, at = data["aliases"], float(data["read_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, None
+    if not isinstance(aliases, dict):
+        return None, None
+    return {str(k): str(v) for k, v in aliases.items() if k and v}, at
+
+
+def _project_aliases() -> dict[str, str] | None:
+    """capture's ``project_aliases`` table (alias -> project): from the hub,
+    kept here when it answers; the kept table while it is fresh or while the
+    hub is away. None when no table was ever read on this Mac."""
+    kept, at = _kept_aliases()
+    if kept is not None and at is not None and 0 <= time.time() - at < _ALIAS_FRESH_S:
+        return kept
+    try:
+        conn = _connect()
+    except Exception:  # noqa: BLE001  (away or unset: the table kept here, if any)
+        return kept
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT alias, project FROM project_aliases", ())
+            fresh = {str(a): str(p) for a, p in cur.fetchall() if a and p}
+        conn.rollback()
+    except Exception:  # noqa: BLE001  (a failed read never replaces what is kept)
+        return kept
+    finally:
+        conn.close()
+    from khipu.outbox import _atomic_write
+
+    try:
+        _aliases_file().parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(_aliases_file(), {"aliases": fresh, "read_at": time.time()})
+    except OSError:
+        pass  # kept for the next command only; this one has the table
+    return fresh
+
+
 def _project_for(args: argparse.Namespace, *, canonical: bool = False) -> str:
     """``--project`` as given; else this folder's project. ``canonical``
-    (only after the owner check: it reaches the hub) names it through the
-    project aliases when the hub answers, as capture does, so a renamed
-    repository is one project in the ledger and in Owed. Away, the folder's
-    own name."""
+    (only after the owner check: it can reach the hub) names it through the
+    project aliases, as capture does, so a renamed repository is one project
+    in the ledger and in Owed. The table is kept on this Mac, so the same
+    folder names the same project whether or not the hub answers; with no
+    table ever read here, the folder's own name."""
     if getattr(args, "project", None):
         return _check_project(args.project)
     from khipu.identity import resolve_repo_root
@@ -2384,19 +2472,7 @@ def _project_for(args: argparse.Namespace, *, canonical: bool = False) -> str:
     project = resolve_repo_root(cwd).get("project")
     if not project or not canonical:
         return _check_project(project)
-    try:
-        conn = _connect()
-    except Exception:  # noqa: BLE001  (away or unset: the folder's own name)
-        return _check_project(project)
-    try:
-        from khipu.identity import _resolve_project_alias
-
-        with conn.cursor() as cur:
-            project = _resolve_project_alias(cur, project) or project
-        conn.rollback()
-    finally:
-        conn.close()
-    return _check_project(project)
+    return _check_project((_project_aliases() or {}).get(project) or project)
 
 
 def _emit(args: argparse.Namespace | None, payload: Any = None, text: str | None = None, **kw: Any) -> None:
@@ -2471,6 +2547,8 @@ def cmd(args: argparse.Namespace) -> int:
             got = get(project, args.id)
             payload = row_json(got["row"], got["history"], project)
             payload["offline"], payload["as_of"] = bool(got.get("offline")), got.get("as_of")
+            payload["pending"] = int(got.get("pending") or 0)
+            payload["queue"] = got.get("queue") or _queue_health(None, payload["pending"])
             if got.get("offline"):
                 payload["offline_as_of"] = got.get("as_of")
             _emit(None, payload, as_json=True, sort_keys=True)

@@ -262,6 +262,78 @@ describe("LedgerPage refresh", () => {
   });
 });
 
+describe("LedgerPage edits and single reads", () => {
+  const fake = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+  const title = () => within(screen.getByRole("form", { name: "Change this row" })).getByLabelText("Title");
+
+  it("keeps typing begun after a row read started when that read comes back", async () => {
+    fake();
+    const base = row("s-1", { title: "Original" });
+    let gets = 0;
+    let finish: (v: string) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_ledger_list") return JSON.stringify({ ok: true, offline: false, vocab: VOCAB, rows: [base] });
+      if (cmd === "khipu_ledger_get") {
+        if (++gets === 1) return JSON.stringify(base);
+        return new Promise<string>((resolve) => {
+          finish = resolve;
+        });
+      }
+      return JSON.stringify({ removed: [] });
+    });
+    ledgerPage("s-1");
+    await tick(0);
+    await tick(5_000);
+    expect(gets).toBe(2);
+    fireEvent.change(title(), { target: { value: "My unsaved edit" } });
+    await act(async () => {
+      finish(JSON.stringify({ ...base, title: "Changed elsewhere", updated: ago(0) }));
+    });
+    expect(title()).toHaveValue("My unsaved edit");
+  });
+
+  it("keeps an edit when the list brings a different vocab", async () => {
+    fake();
+    const base = row("s-1", { title: "Original" });
+    let vocab: Vocab = VOCAB;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_ledger_list") return JSON.stringify({ ok: true, offline: false, vocab, rows: [base] });
+      if (cmd === "khipu_ledger_get") return JSON.stringify(base);
+      return JSON.stringify({ removed: [] });
+    });
+    ledgerPage("s-1");
+    await tick(0);
+    fireEvent.change(title(), { target: { value: "My unsaved edit" } });
+    vocab = { ...VOCAB, state: [...VOCAB.state, ["PARKED", "open"]] };
+    await tick(5_100);
+    expect(title()).toHaveValue("My unsaved edit");
+  });
+
+  it("never starts a second list read while the first is still out", async () => {
+    fake();
+    let started = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_ledger_list") {
+        started++;
+        return new Promise<string>((resolve) =>
+          setTimeout(() => resolve(JSON.stringify({ ok: true, offline: false, vocab: VOCAB, rows: [row("s-1")] })), 13_000),
+        );
+      }
+      if (cmd === "khipu_ledger_get") return JSON.stringify(row("s-1"));
+      return JSON.stringify({ removed: [] });
+    });
+    ledgerPage("s-1");
+    await tick(0);
+    expect(started).toBe(1);
+    await tick(5_000);
+    expect(started).toBe(1);
+    await tick(8_000);
+    expect(started).toBe(1);
+    await tick(5_100);
+    expect(started).toBe(2);
+  });
+});
+
 describe("LedgerPage offline and waiting writes", () => {
   it("says it shows the offline copy even when nothing is waiting", async () => {
     serveLedger(() => [row("s-1")], { offline: true, as_of: ago(2 * H), pending: 0 });

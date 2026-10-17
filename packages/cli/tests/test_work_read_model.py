@@ -467,8 +467,8 @@ def test_a_ledger_project_from_the_folder_uses_the_alias(monkeypatch):
         def execute(self, *a):
             pass
 
-        def fetchone(self):
-            return ("neworg/repo",)
+        def fetchall(self):
+            return [("oldorg/repo", "neworg/repo")]
 
     class Conn(_Conn):
         def cursor(self):
@@ -478,14 +478,14 @@ def test_a_ledger_project_from_the_folder_uses_the_alias(monkeypatch):
     assert ledger._project_for(argparse.Namespace(project=None), canonical=True) == "neworg/repo"
     # Before the owner check (no canonical) it never reaches the hub.
     assert ledger._project_for(argparse.Namespace(project=None)) == "oldorg/repo"
-    # A name given outright is used as given, and an away hub keeps the folder's name.
+    # A name given outright is used as given, and an away hub keeps the table read before.
     assert ledger._project_for(argparse.Namespace(project="oldorg/repo"), canonical=True) == "oldorg/repo"
 
     def away():
         raise ledger.HubAway("synthetic")
 
     monkeypatch.setattr(ledger, "_connect", away)
-    assert ledger._project_for(argparse.Namespace(project=None), canonical=True) == "oldorg/repo"
+    assert ledger._project_for(argparse.Namespace(project=None), canonical=True) == "neworg/repo"
 
 
 # ---- summary ids that repeat (V9) ----------------------------------------------------
@@ -513,3 +513,204 @@ def test_check_names_repeated_ids(tmp_path):
     ok, problems, _parsed = work.check_file(str(path))
     assert not ok and any("same id" in p for p in problems)
     assert not any("couldn't be read" in p for p in problems)
+
+
+# ---- round 2 of the review of 5415342 -----------------------------------------------
+
+
+def _built(mark, at):
+    view = work.build_view(at, cfg=cfg(), ledger_data=NO_LEDGER, owed=NO_OWED, routing_info=ROUTING)
+    view["review_marker"] = mark
+    return view
+
+
+def test_a_view_read_earlier_in_the_same_second_never_replaces_a_later_one():
+    old = _built("old", NOW + timedelta(microseconds=100000))
+    new = _built("new", NOW + timedelta(microseconds=900000))
+    work.write_view(new)
+    work.write_view(old)
+    assert json.loads(work.view_file().read_text())["review_marker"] == "new"
+
+
+def test_a_view_read_after_a_clock_rollback_still_publishes():
+    old = _built("old", NOW)
+    new = _built("new", NOW - timedelta(minutes=10))
+    work.write_view(old)
+    work.write_view(new)
+    assert json.loads(work.view_file().read_text())["review_marker"] == "new"
+
+
+def test_forget_keeps_the_refresh_order():
+    a = _built("a", NOW)
+    work.invalidate_view()
+    b = _built("b", NOW)
+    work.write_view(b)
+    work.write_view(a)  # fenced by Forget, and older
+    assert json.loads(work.view_file().read_text())["review_marker"] == "b"
+    c = _built("c", NOW)
+    work.write_view(c)
+    assert json.loads(work.view_file().read_text())["review_marker"] == "c"
+
+
+class _AliasCur:
+    def __init__(self, table):
+        self.table = table
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, *a):
+        self.sql = sql
+
+    def fetchall(self):
+        return list(self.table.items())
+
+    def fetchone(self):
+        return None
+
+
+def _folder(monkeypatch, project="oldorg/repo"):
+    from khipu import identity
+
+    monkeypatch.setattr(identity, "resolve_repo_root", lambda _cwd, **kw: {"project": project})
+
+
+def test_a_renamed_repo_keeps_one_project_key_offline(monkeypatch):
+    _folder(monkeypatch)
+    calls = []
+
+    class Conn(_Conn):
+        def cursor(self):
+            return _AliasCur({"oldorg/repo": "neworg/repo"})
+
+    def connect():
+        calls.append(1)
+        return Conn()
+
+    monkeypatch.setattr(ledger, "_connect", connect)
+    args = argparse.Namespace(project=None)
+    assert ledger._project_for(args, canonical=True) == "neworg/repo"
+    # The table is kept: the next command does not reach the hub again.
+    assert ledger._project_for(args, canonical=True) == "neworg/repo"
+    assert calls == [1]
+
+    def away():
+        raise ledger.HubAway("synthetic")
+
+    monkeypatch.setattr(ledger, "_connect", away)
+    monkeypatch.setattr(ledger, "_ALIAS_FRESH_S", 0)
+    assert ledger._project_for(args, canonical=True) == "neworg/repo"
+
+
+def test_with_no_alias_known_the_folder_name_is_used_both_ways(monkeypatch):
+    _folder(monkeypatch)
+
+    def away():
+        raise ledger.HubAway("synthetic")
+
+    monkeypatch.setattr(ledger, "_connect", away)
+    args = argparse.Namespace(project=None)
+    assert ledger._project_for(args, canonical=True) == "oldorg/repo"
+
+    class Conn(_Conn):
+        def cursor(self):
+            return _AliasCur({})
+
+    monkeypatch.setattr(ledger, "_connect", lambda: Conn())
+    assert ledger._project_for(args, canonical=True) == "oldorg/repo"
+
+
+def _online_get(monkeypatch, *, hub_row, queued, drained=None):
+    import copy
+
+    class Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, *a):
+            self.sql = sql
+
+        def fetchone(self):
+            return ("exists",) if hub_row is not None and "ledger_rows" in self.sql else None
+
+        def fetchall(self):
+            return []
+
+    class Conn(_Conn):
+        def cursor(self):
+            return Cur()
+
+    monkeypatch.setattr(ledger, "_connect", lambda: Conn())
+    monkeypatch.setattr(ledger, "drain", lambda conn: drained or {"busy": True})
+    monkeypatch.setattr(ledger, "replica_catch_up", lambda conn: None)
+    monkeypatch.setattr(ledger, "queued_ops", lambda **kw: list(queued))
+    monkeypatch.setattr(ledger, "_marker", lambda cur, p, r: None)
+    monkeypatch.setattr(ledger, "_hub_view", lambda conn, project: {
+        "vocab": ledger.default_vocab(), "rows": [copy.deepcopy(hub_row)] if hub_row else [], "offline": False,
+        "as_of": None})
+    monkeypatch.setattr(ledger, "_row_dict", lambda got: copy.deepcopy(hub_row))
+
+
+def test_an_online_get_shows_a_write_still_waiting_as_the_list_does(monkeypatch):
+    base = dict(row("one", "Landed", seq=1), created_at=NOW, version=1, removed_at=None)
+    pending = {"verb": "set", "project": "atlas", "row_id": "one", "at": work._z(NOW),
+               "fields": {"title": "Unsaved locally"}}
+    _online_get(monkeypatch, hub_row=base, queued=[pending])
+    listed = ledger.load("atlas")
+    detail = ledger.get("atlas", "one")
+    assert listed["rows"][0]["title"] == detail["row"]["title"] == "Unsaved locally"
+    assert detail["row"]["queued"] is True
+    assert detail["pending"] == 1 and detail["queue"]["busy"] is True
+
+
+def test_an_online_get_finds_a_queued_addition(monkeypatch):
+    _online_get(monkeypatch, hub_row=None, queued=[_queued()])
+    detail = ledger.get("atlas", "q1")
+    assert detail["row"]["title"] == "Queued while busy" and detail["row"]["queued"] is True
+    assert detail["offline"] is False and detail["pending"] == 1
+
+
+def test_ledger_get_json_says_how_the_line_stands(monkeypatch):
+    from khipu import cli, owner_direction
+
+    monkeypatch.setattr(ledger, "require", lambda *a, **kw: None)
+    monkeypatch.setattr(owner_direction, "run_due", lambda: None)
+    one = row("one", "Synthetic")
+    monkeypatch.setattr(ledger, "get", lambda p, i: {"row": one, "history": [], "offline": False, "pending": 1,
+                                                     "queue": {"pending": 1, "busy": True}})
+    args = cli.build_parser().parse_args(["ledger", "get", "one", "--project", "atlas", "--json"])
+    out = io.StringIO()
+    with redirect_stdout(out):
+        ledger.cmd(args)
+    got = json.loads(out.getvalue())
+    assert got["pending"] == 1 and got["queue"]["busy"] is True
+
+
+def test_an_offline_read_with_an_unreadable_waiting_write_is_not_a_healthy_zero(monkeypatch):
+    def away():
+        raise ledger.HubAway("synthetic")
+
+    monkeypatch.setattr(ledger, "_connect", away)
+    monkeypatch.setattr(ledger, "_offline_view", lambda p: None)
+    ledger.outbox_dir().mkdir(parents=True)
+    (ledger.outbox_dir() / "broken.json").write_text("{")
+    got = ledger.load("atlas")
+    assert got["queue"]["unreadable"]
+    assert got["queue"]["pending"] is None
+
+
+def test_earlier_refusals_stay_in_the_next_reads_health(monkeypatch):
+    monkeypatch.setattr(ledger, "_connect", lambda: _Conn())
+    monkeypatch.setattr(ledger, "replica_catch_up", lambda c: None)
+    monkeypatch.setattr(ledger, "_hub_view", lambda c, p: {"rows": [], "vocab": ledger.default_vocab(),
+                                                          "offline": False})
+    ledger._refused_dir().mkdir(parents=True)
+    (ledger._refused_dir() / "refused.json").write_text("{}")
+    got = ledger.load("atlas")
+    assert got["queue"]["refused"] == 1 and got["queue"]["unreadable"] is None
