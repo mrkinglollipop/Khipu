@@ -72,6 +72,8 @@ export type WorkViewProps = {
   onOpenRouting: () => void;
   /** Opens Settings -> Work -> Ledger -> Import a tracker... */
   onImportTracker?: () => void;
+  /** Opens Settings, Work (a board's Raise the limit and Open Settings). */
+  onOpenWorkSettings?: () => void;
 };
 
 type LedgerTarget = { project: string; name: string; row?: string };
@@ -276,7 +278,8 @@ export function WorkView(props: WorkViewProps) {
               <div className="wk-boards">
                 {view.projects.map((b, i) => (
                   <Board key={b.project ?? `withheld-${i}`} board={b} waiting={b.project ? (waitingBy.get(b.project) ?? 0) : 0}
-                    now={now} onOpenLedger={b.project ? () => openLedger(b.project!) : null} />
+                    now={now} onOpenLedger={b.project ? () => openLedger(b.project!) : null}
+                    onOpenSettings={props.onOpenWorkSettings} />
                 ))}
               </div>
             ) : null}
@@ -771,17 +774,29 @@ function sentence(text: string): string {
   return /[.!?]$/.test(text) ? text : `${text}.`;
 }
 
+/** The board's way to Settings, Work (mock work-states.html, section 3):
+ *  a file over its limit or a list capped can have its limit raised; a file
+ *  missing, for another project or refused needs another place set. */
+function settingsAsk(board: WorkBoard): "Raise the limit" | "Open Settings" | null {
+  const s = board.source;
+  if (s.state === "too_big" || ((s.state === "ok" || s.state === "stale") && Object.keys(s.capped ?? {}).length)) return "Raise the limit";
+  if (s.state === "missing" || s.state === "wrong_project" || s.state === "refused") return "Open Settings";
+  return null;
+}
+
 function Board({
   board,
   waiting,
   now,
   onOpenLedger,
+  onOpenSettings,
 }: {
   board: WorkBoard;
   waiting: number;
   now: Date;
   /** Null when the board's project key was withheld: its ledger can't be named. */
   onOpenLedger: (() => void) | null;
+  onOpenSettings?: () => void;
 }) {
   const folds = boardFolds(board, waiting);
   const [unfolded, setUnfolded] = useState(false);
@@ -825,6 +840,11 @@ function Board({
           <div className={line.tone && line.tone !== "ok" ? `wk-src ${line.tone}` : "wk-src"}>
             <span className={line.tone ? `hdot ${line.tone}` : "hdot"} aria-hidden />
             <span>{line.text}</span>
+            {onOpenSettings && settingsAsk(board) ? (
+              <button type="button" className={settingsAsk(board) === "Open Settings" ? "sm link" : "sm"} onClick={onOpenSettings}>
+                {settingsAsk(board)}
+              </button>
+            ) : null}
           </div>
           {board.source.state === "stale" ? (
             <div className="row">

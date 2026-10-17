@@ -1487,9 +1487,12 @@ def _before_flip() -> dict[str, Any] | None:
 
 
 def _after_flip() -> dict[str, Any]:
-    """Re-render any plist the new live code renders differently, then
-    restart the two long-running jobs that hold the old modules."""
-    from khipu.jobs import PLIST_QUEUE_DRAIN, PLIST_RECALL_DAEMON, _plist_path
+    """Re-render any plist the new live code renders differently, restart
+    the two long-running jobs that hold the old modules, then wake the
+    replica job so the new code rebuilds a replica at another schema now,
+    not at its next interval."""
+    from khipu import replica_heal
+    from khipu.jobs import PLIST_QUEUE_DRAIN, PLIST_RECALL_DAEMON, PLIST_REPLICA_REFRESH, _plist_path
 
     live = live_root()
     out: dict[str, Any] = {"kicked": [], "kick_failed": []}
@@ -1512,6 +1515,9 @@ def _after_flip() -> dict[str, Any]:
             continue
         r = _run(["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"], timeout=30)
         (out["kicked"] if r.returncode == 0 else out["kick_failed"]).append(label)
+    if _plist_path(PLIST_REPLICA_REFRESH).is_file():
+        replica_heal.wake()
+        out["replica_woken"] = True
     out["note"] = MCP_NOTE
     return out
 

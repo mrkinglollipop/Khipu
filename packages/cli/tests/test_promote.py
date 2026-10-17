@@ -1671,3 +1671,24 @@ def test_the_recall_client_logs_inside_the_isolated_dir(home, monkeypatch, tmp_p
     client.log_failure('{"session_id": "khipu-gate-c"}', "timeout", 0.0)
     assert "session=khipu-gate-c" in (iso / "capture" / "logs" / "prompt-recall.log").read_text()
     assert not (home / "live-capture").exists()
+
+
+def test_after_a_flip_the_replica_job_is_woken_to_heal_at_once(home, monkeypatch):
+    """A promote that changes the replica schema must not leave the old copy
+    in place until the job's next interval: the watched wake file is touched."""
+    from khipu import replica_heal
+    from khipu.jobs import PLIST_REPLICA_REFRESH, _plist_path
+
+    monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
+    monkeypatch.setattr(pm, "_run", lambda argv, **_kw: subprocess.CompletedProcess(argv, 0, "{}", ""))
+    out = pm._after_flip()
+    assert "replica_woken" not in out and not replica_heal.wake_path().exists()
+
+    plist = _plist_path(PLIST_REPLICA_REFRESH)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text("<plist/>")
+    wake = replica_heal.ensure_wake_file()
+    os.utime(wake, (1, 1))
+    out = pm._after_flip()
+    assert out["replica_woken"] is True
+    assert wake.stat().st_mtime > 1

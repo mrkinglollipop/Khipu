@@ -234,3 +234,24 @@ button.wk-job-title {
 .wk-count th, .wk-count td { padding: 4px var(--s2); text-align: right; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
 .wk-count th:first-child, .wk-count td:first-child { text-align: left; overflow-wrap: anywhere; }
 .wk-count th { color: var(--text-2); font-weight: 600; }
+/* Settings, Work (phase 5; mock settings-work.html). */
+.row-item.wk-proj-row { display: grid; grid-template-columns: 8.5rem minmax(0, 1fr) auto; column-gap: var(--s3); align-items: start; }
+.wk-proj-row .wk-proj-name { font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+.wk-proj-what { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.wk-path { font-family: var(--mono); font-size: var(--t-sm); color: var(--text-2); overflow-wrap: anywhere; }
+.wk-proj-acts { display: inline-flex; gap: var(--s2); flex-wrap: wrap; justify-content: flex-end; }
+.wk-span { grid-column: 1 / -1; min-width: 0; }
+.wk-span:empty { display: none; }
+.wk-add { display: flex; flex-direction: column; gap: var(--s2); padding: var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); margin-top: var(--s2); }
+.wk-add .toolbar label { font-size: var(--t-sm); color: var(--text-2); min-width: 7rem; }
+.wk-add .toolbar input { flex: 1; min-width: 12rem; }
+.wk-found { font-size: var(--t-sm); color: var(--text); background: var(--ok-soft); border-radius: var(--r-sm); padding: var(--s2) var(--s3); }
+.row-item.wk-limit { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; column-gap: var(--s3); align-items: center; }
+.wk-limit-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.wk-limit-name { color: var(--text); font-weight: 500; }
+.wk-val { font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; }
+.row-item.wk-hidden { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: var(--s3); align-items: center; }
+@media (max-width: 1180px) {
+  .row-item.wk-proj-row { grid-template-columns: 8.5rem minmax(0, 1fr); }
+  .wk-proj-acts { grid-column: 2 / -1; justify-content: flex-start; margin-top: var(--s1); }
+}

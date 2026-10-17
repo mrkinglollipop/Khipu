@@ -2033,7 +2033,7 @@ def _stale_marker(health: dict[str, Any], *, why: str | None = None) -> dict[str
     one line ``_stale_line`` words; every such answer path builds it here
     (tests/test_replica_pull_integrity.py enumerates them)."""
     return {
-        "age_seconds": health.get("age_seconds"), "refreshed_at": health.get("refreshed_at"),
+        "age_seconds": health.get("age_seconds"), "refreshed_at": health.get("caught_up_at") or health.get("refreshed_at"),
         "why": why or health.get("distrusted_by") or "overdue",
     }
 
@@ -2129,7 +2129,7 @@ def _snapshot_search_hits(
 
     # Keyword leg runs on the calling thread while the embedding request (if
     # any) is in flight on its own daemon thread above.
-    lexical_rows = hub_snapshot.search_snapshot(prompt, _SEARCH_LIMIT, kind=None)
+    lexical_rows = hub_snapshot.search_snapshot(prompt, _SEARCH_LIMIT, kind=None, indexed_tokens_only=True)
     for r in lexical_rows:
         r["rank_text"] = f"{r.get('label') or ''} {r.get('snippet') or ''}"
     if tokens:
