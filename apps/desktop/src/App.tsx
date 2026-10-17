@@ -2616,6 +2616,7 @@ export default function App() {
   const [hubSnapBusy, setHubSnapBusy] = useState(false);
   const [hubSnapshotHealth, setHubSnapshotHealth] = useState<{
     refreshed_at?: string;
+    caught_up_at?: string | null;
     size_bytes?: number;
     bytes?: number;
     ok?: boolean;
@@ -5781,10 +5782,10 @@ export default function App() {
                           {advertiseInfo.ipv4 ? ` · LAN ${advertiseInfo.ipv4}` : null}
                         </p>
                       ) : null}
-                      {hubSnapshotHealth?.refreshed_at ? (
+                      {hubSnapshotHealth?.caught_up_at || hubSnapshotHealth?.refreshed_at ? (
                         <p className="muted">
-                          Offline copy refreshed{" "}
-                          <code>{hubSnapshotHealth.refreshed_at}</code>
+                          Offline copy up to date as of{" "}
+                          <code>{hubSnapshotHealth.caught_up_at || hubSnapshotHealth.refreshed_at}</code>
                           {typeof (hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes) === "number"
                             ? ` (${formatBytes(hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes ?? 0)})`
                             : null}

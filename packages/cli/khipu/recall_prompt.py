@@ -2033,7 +2033,7 @@ def _stale_marker(health: dict[str, Any], *, why: str | None = None) -> dict[str
     one line ``_stale_line`` words; every such answer path builds it here
     (tests/test_replica_pull_integrity.py enumerates them)."""
     return {
-        "age_seconds": health.get("age_seconds"), "refreshed_at": health.get("refreshed_at"),
+        "age_seconds": health.get("age_seconds"), "refreshed_at": health.get("caught_up_at") or health.get("refreshed_at"),
         "why": why or health.get("distrusted_by") or "overdue",
     }
 

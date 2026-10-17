@@ -279,6 +279,28 @@ def meta() -> dict[str, Any]:
     return data
 
 
+# The sidecar key a pull writes when it finished with every part ok.
+PULL_CAUGHT_UP_KEY = "pull_caught_up_at"
+
+
+def caught_up_at(m: Mapping[str, Any] | None = None) -> str | None:
+    """How current the replica is: the later of its last full dump
+    (``refreshed_at``) and the start of its last incremental pull that
+    finished with every part ok, made against this same dump. A pull that
+    copied nothing counts too: it asked the hub and found nothing new. The
+    one source for the replica's age; tests/test_replica_caught_up.py
+    enumerates its readers."""
+    m = meta() if m is None else m
+    stamps = [(_utc(m.get("refreshed_at")), m.get("refreshed_at"))]
+    side = _read_sidecar()
+    # A sidecar left from another dump (copied, or the dump replaced the
+    # image but not the sidecar) says nothing about this copy.
+    if side.get("pull_dump") is not None and side.get("pull_dump") == m.get("hub_dumped_at"):
+        stamps.append((_utc(side.get(PULL_CAUGHT_UP_KEY)), side.get(PULL_CAUGHT_UP_KEY)))
+    known = [(at, raw) for at, raw in stamps if at is not None]
+    return max(known, key=lambda t: t[0])[1] if known else None
+
+
 _SYNC_CURSOR_KEYS = ("last_decision_sync_at", "last_decision_sync_id")
 
 
@@ -1387,6 +1409,9 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
     if not result.get("ok"):
         return result
     parts = {**result["parts"], "decisions": sync_decision_changes()}
+    # The result is the AND of its parts: one that failed makes it not ok and
+    # is named, so the caller never reports a copy healed that is not.
+    failed = [name for name, part in parts.items() if not part.get("ok") and not part.get("not_applicable")]
     try:
         side = _read_sidecar() or meta()
         for name, (at, at_id) in result["cursors"].items():
@@ -1395,13 +1420,14 @@ def pull_changes(*, limit: int = PULL_LIMIT) -> dict[str, Any]:
                 side["pull_episodes_after_id"] = at_id
         side["pull_dump"] = m.get("hub_dumped_at")
         side["last_pull_at"] = _utcnow_iso()
+        if not failed:
+            # The start, not the end: a change committed while the pull ran
+            # may not have been read.
+            side[PULL_CAUGHT_UP_KEY] = datetime.fromtimestamp(started, timezone.utc).isoformat()
         _write_meta(side)
     except OSError as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     _clear_missed_patches(result["cleared"], path=path, written_before=started)
-    # The result is the AND of its parts: one that failed makes it not ok and
-    # is named, so the caller never reports a copy healed that is not.
-    failed = [name for name, part in parts.items() if not part.get("ok") and not part.get("not_applicable")]
     out: dict[str, Any] = {
         "ok": not failed,
         **{k: result[k] for k in ("episodes", "tombstones", "vectors", "missed_retried",
@@ -1889,7 +1915,7 @@ def ledger_read_snapshot(project: str) -> dict[str, Any] | None:
         return None
     finally:
         con.close()
-    return {"vocab": vocab, "rows": rows, "history": history, "gone": gone, "as_of": meta().get("refreshed_at")}
+    return {"vocab": vocab, "rows": rows, "history": history, "gone": gone, "as_of": caught_up_at()}
 
 
 _EPISODE_FTS_COLS = ("summary", "topics", "decisions", "preferences", "people")
@@ -3176,7 +3202,10 @@ def maybe_refresh(
 
 
 def snapshot_health() -> dict[str, Any]:
-    """Age and size for doctor/status — separate from hub liveness."""
+    """Age and size for doctor/status — separate from hub liveness.
+    ``age_seconds`` is the time since the copy last caught up with the hub
+    (``caught_up_at``); ``refreshed_at`` and ``dump_age_seconds`` are the
+    last full dump's, which names the dump and schedules the next one."""
     path = snapshot_path()
     m = meta()
     if not path.is_file():
@@ -3185,25 +3214,30 @@ def snapshot_health() -> dict[str, Any]:
             "exists": False,
             "path": str(path),
             "refreshed_at": m.get("refreshed_at"),
+            "caught_up_at": None,
             "size_bytes": None,
             "age_seconds": None,
+            "dump_age_seconds": None,
         }
     st = path.stat()
     refreshed_at = m.get("refreshed_at")
-    age_s: int | None = None
-    if refreshed_at:
-        try:
-            ref = datetime.fromisoformat(str(refreshed_at).replace("Z", "+00:00"))
-            age_s = int((datetime.now(timezone.utc) - ref).total_seconds())
-        except (TypeError, ValueError):
-            age_s = None
+    current_at = caught_up_at(m)
+    now = datetime.now(timezone.utc)
+
+    def age_of(val: Any) -> int | None:
+        at = _utc(val)
+        return None if at is None else int((now - at).total_seconds())
+
+    age_s = age_of(current_at)
     return {
         "ok": age_s is not None,
         "exists": True,
         "path": str(path),
         "refreshed_at": refreshed_at,
+        "caught_up_at": current_at,
         "size_bytes": st.st_size,
         "age_seconds": age_s,
+        "dump_age_seconds": age_of(refreshed_at),
         "counts": m.get("counts"),
         "schema_version": m.get("schema_version"),
         **({"reason": "refresh_evidence_unknown"} if age_s is None else {}),
@@ -4054,7 +4088,8 @@ def stale_fields() -> dict[str, Any]:
     m = meta()
     return {
         "stale": True,
-        "snapshot_refreshed_at": m.get("refreshed_at"),
+        # When the copy last caught up with the hub, not the dump alone.
+        "snapshot_refreshed_at": caught_up_at(m),
     }
 
 

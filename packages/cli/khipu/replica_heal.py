@@ -200,9 +200,10 @@ def _age(now: datetime, when: Any) -> float | None:
 
 
 def last_update_at(state: Mapping[str, Any], health: Mapping[str, Any]) -> datetime | None:
-    """The newest of this job's last good update and the last full dump (the
-    nightly's or a manual one): either brings the copy level with the hub."""
-    stamps = [_utc(state.get("last_synced_at")), _utc(health.get("refreshed_at"))]
+    """The newest of this job's last good update and the copy's own last
+    catch-up (``hub_snapshot.caught_up_at``: a full dump, the nightly's or a
+    manual one, or a pull from anywhere): either brings it level with the hub."""
+    stamps = [_utc(state.get("last_synced_at")), _utc(health.get("caught_up_at") or health.get("refreshed_at"))]
     stamps = [s for s in stamps if s is not None]
     return max(stamps) if stamps else None
 
@@ -230,14 +231,17 @@ def plan(
         action, reason = "dump", "missing"
     elif wrong_schema:
         action, reason = "dump", "schema"
-    elif health["age_seconds"] > SNAPSHOT_MAX_AGE_S:
+    elif (health.get("dump_age_seconds") if health.get("dump_age_seconds") is not None
+          else health["age_seconds"]) > SNAPSHOT_MAX_AGE_S:
+        # By the dump, not the catch-up: a pull leaves the graph tables as the
+        # dump wrote them, so a day without one still asks for a dump.
         action, reason = "dump", "overdue"
     elif isinstance(sidecar.get("refresh_error"), dict) and _ts_not_before(
             sidecar["refresh_error"].get("at"), health.get("refreshed_at")):
         action, reason = "dump", "refresh_failed"
     elif (last_known and last_known.get("state") == "behind"
           and last_known.get("refreshed_at") == health.get("refreshed_at")
-          and _ts_not_before(last_known.get("checked_at"), state.get("last_synced_at") or health.get("refreshed_at"))):
+          and _ts_not_before(last_known.get("checked_at"), last_update_at(state, health))):
         action, reason = "dump", "behind"
     else:
         since = last_update_at(state, health)
