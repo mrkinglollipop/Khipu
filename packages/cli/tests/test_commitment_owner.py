@@ -705,9 +705,10 @@ class _RelayCursor(_OwnerCursor):
             super().execute(sql.replace(", prs)", ")"), params[:-1])
             return
         if s.startswith("UPDATE commitments SET status = 'closed'") and "reopened_rule_keys" in s:
-            episode, reason, by, key, evidence, cid, checked_key = params
+            episode, reason, by, key, evidence, cid, checked_key, *same = params
             row = self.rows[cid]
-            self.rowcount = int(row["status"] == "open" and checked_key not in row.get("reopened_rule_keys", []))
+            self.rowcount = int(row["status"] == "open" and checked_key not in row.get("reopened_rule_keys", [])
+                                and (not same or same[0] == row["owner"]))
             if self.rowcount:
                 row.update(status="closed", closed_episode=episode, close_reason=reason, closed_by=by,
                            close_rule_key=key)
@@ -716,6 +717,10 @@ class _RelayCursor(_OwnerCursor):
             status, reason, by, cid = params
             self.rows[cid].update(status=status, close_reason=reason, closed_by=by, close_rule_key=None)
             self.rowcount = 1
+            return
+        if "settle_suggestion = NULL" in s:
+            # A reopen withdraws a "Looks done" suggestion; this fake keeps none.
+            self.rowcount = 0
             return
         if s.startswith("UPDATE commitments SET status = 'open'"):
             cid, = params

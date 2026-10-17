@@ -1,16 +1,20 @@
 """The owner's own items are changed only by the owner (fourth cross-family
 review of docs/plans/2026-10-16-owed-and-ledger-ssot.md).
 
-The invariant: an item the user owns is never closed, merged, hidden or
-reassigned by anything automatic. Every automatic rule is named in
-``commitments.AUTOMATIC_RULES`` and every automatic write passes
-``commitments.owner_guard`` in ``close_by_rule`` or ``auto_reassign``. These
-tests enumerate both sides: each rule against each owner, and every place in
-the package that writes a commitment's status or owner.
+The invariant (Matt, 2026-10-17: "Suggest, don't close"): an item the user
+owns is never closed, merged, hidden or reassigned by anything automatic,
+by any rule. Every automatic rule is named in ``commitments.AUTOMATIC_RULES``
+and every automatic write reads the owner under the row lock and passes
+``commitments.owner_guard`` in ``close_by_rule``, ``auto_reassign`` or
+``mark_stale``; a refused close lands in "Looks done". These tests enumerate
+both sides: each rule against each owner, every place in the package that
+writes a commitment's status or owner, and every automatic path run against
+the owner's own item on a real hub.
 """
 from __future__ import annotations
 
 import ast
+import json
 import re
 from pathlib import Path
 
@@ -82,7 +86,9 @@ def test_the_known_writers_are_all_still_there():
     assert not missing, missing
 
 
-def test_every_automatic_close_and_move_names_its_rule_and_owner():
+def test_every_automatic_close_and_move_names_its_rule_and_never_an_earlier_owner():
+    """The owner is read under the row lock at the write, so no caller may
+    hand the write an owner it read earlier (a stale snapshot)."""
     calls = []
     for path in sorted(PACKAGE.glob("*.py")):
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
@@ -93,20 +99,18 @@ def test_every_automatic_close_and_move_names_its_rule_and_owner():
                     calls.append((path.stem, node.lineno, name, kw))
     assert calls
     for module, line, name, kw in calls:
-        need = {"rule", "owner"} if name == "close_by_rule" else {"rule", "owner_before"}
-        assert need <= kw, f"{module}.py:{line} calls {name} without {sorted(need - kw)}"
+        assert "rule" in kw, f"{module}.py:{line} calls {name} without its rule"
+        assert not kw & {"owner", "owner_before", "origin"}, f"{module}.py:{line} hands {name} an owner it read earlier"
 
 
 @pytest.mark.parametrize("rule", sorted(co.AUTOMATIC_RULES))
-def test_no_automatic_rule_changes_the_owners_item_except_his_own(rule):
-    for origin in (None, co.ORIGIN_JOB, co.ORIGIN_CONVERSATION):
-        why = co.owner_guard(co.OWNER_USER, rule, origin=origin)
-        if rule == "pr":
-            assert why is None, "a close on the item's own pull requests is allowed"
-        elif rule == "loop" and origin == co.ORIGIN_CONVERSATION:
-            assert why is None, "the owner's own done in his own conversation is allowed"
-        else:
-            assert why and "propose" in why, (rule, origin)
+def test_no_automatic_rule_changes_the_owners_item(rule):
+    """Suggest, don't close (Matt, 2026-10-17): every automatic rule, a close
+    on the item's own pull requests and his "done" in a conversation
+    included, is refused for the owner's item and only suggests."""
+    assert co.AUTOMATIC_RULES[rule] in (co.PROPOSE_LOOKS_DONE, co.PROPOSE_TIDY, co.PROPOSE_QUIET)
+    why = co.owner_guard(co.OWNER_USER, rule)
+    assert why and "suggest" in why, rule
     for owner in (co.OWNER_ASSISTANT, co.OWNER_AGENT, None):
         assert co.owner_guard(owner, rule) is None
 
@@ -116,39 +120,113 @@ def test_an_unknown_rule_is_refused():
         co.owner_guard(co.OWNER_USER, "something-new")
 
 
-class _Cur:
+# ---- the write itself: the owner as it is at the write ------------------------
+
+
+class _RacingCursor:
+    """The registry SQL in SQLite (tests/test_audit1010_rsna.py) with the
+    close columns. ``move`` commits an owner-directed move of one item to
+    the owner just before the automatic write's locked read (``"read"``) or
+    just before its UPDATE (``"write"``: a writer outside a transaction holds
+    no lock, so only the UPDATE's own check stands)."""
+
     def __init__(self):
-        self.sql = []
-        self.rowcount = 1
+        from tests.test_audit1010_rsna import _RegistryCursor
+
+        self.inner = _RegistryCursor()
+        for column in ("owner_reassigned_at TEXT", "closed_by TEXT", "close_rule_key TEXT",
+                       "close_evidence TEXT", "reopened_rule_keys TEXT DEFAULT '[]'", "prs TEXT",
+                       "settle_suggestion TEXT", "pr_check TEXT"):
+            self.inner.conn.execute(f"ALTER TABLE commitments ADD COLUMN {column}")
+        self.move: tuple[str, int] | None = None
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
 
     def execute(self, sql, params=()):
-        self.sql.append(sql)
+        if self.move:
+            when, cid = self.move
+            if (when == "read" and re.search(r"FOR UPDATE", sql)) or \
+                    (when == "write" and re.search(r"UPDATE\s+commitments\s+SET\s+(status|owner|settle)", sql)):
+                self.move = None
+                self.inner.conn.execute("UPDATE commitments SET owner = 'user', "
+                                        "owner_reassigned_at = CURRENT_TIMESTAMP WHERE id = ?", (cid,))
+        sql = sql.replace("NOT (%s = ANY(reopened_rule_keys))",
+                          "NOT EXISTS (SELECT 1 FROM json_each(reopened_rule_keys) AS k WHERE k.value = %s)")
+        self.inner.execute(sql, params)
+
+    def suggestion(self, cid):
+        raw = self.inner.value("commitments", cid, "settle_suggestion")
+        return json.loads(raw) if raw else None
 
 
-@pytest.mark.parametrize("rule", sorted(r for r in co.AUTOMATIC_RULES if r != "pr"))
-def test_the_one_close_and_the_one_move_write_nothing_for_the_owners_item(monkeypatch, rule):
-    monkeypatch.setattr(co, "_close_columns_ready", lambda cur: True)
-    monkeypatch.setattr(co, "_not_forgotten_clause", lambda cur: "true")
-    cur = _Cur()
-    assert co.close_by_rule(cur, 7, rule=rule, owner=co.OWNER_USER, origin=co.ORIGIN_JOB, reason="r", key="k") \
-        is False
-    assert co.auto_reassign(cur, 7, rule=rule, owner_before=co.OWNER_USER, sets=["owner = %s"],
-                            params=("agent",)) is False
-    assert cur.sql == []
-    # The same rule on someone else's item writes.
-    assert co.close_by_rule(cur, 7, rule=rule, owner=co.OWNER_ASSISTANT, reason="r", key="k") is True
-    assert co.auto_reassign(cur, 7, rule=rule, owner_before=co.OWNER_ASSISTANT, sets=["owner = %s"],
-                            params=("agent",)) is True
-    assert len(cur.sql) == 2
+@pytest.fixture
+def racing(monkeypatch):
+    from khipu import db
+
+    db._TABLE_COLUMNS_CACHE.clear()
+    cur = _RacingCursor()
+    yield cur
+    cur.inner.conn.close()
+    db._TABLE_COLUMNS_CACHE.clear()
 
 
-def test_a_pr_close_reaches_the_owners_item(monkeypatch):
-    monkeypatch.setattr(co, "_close_columns_ready", lambda cur: True)
-    monkeypatch.setattr(co, "_not_forgotten_clause", lambda cur: "true")
-    cur = _Cur()
-    assert co.close_by_rule(cur, 7, rule="pr", owner=co.OWNER_USER, reason="pull request #3 merged",
-                            key="pr:3=merged")
-    assert "status = 'closed'" in cur.sql[0]
+@pytest.mark.parametrize("when", ["read", "write"])
+@pytest.mark.parametrize("rule", sorted(r for r in co.AUTOMATIC_RULES if r != "stale"))
+def test_an_automatic_close_reads_the_owner_at_the_write(racing, rule, when):
+    """A close the rule chose while the item was the assistant's finds the
+    owner took it (round 5: a stale owner snapshot closed his item)."""
+    cid = racing.commitment("Rebuild the deployment index")
+    racing.move = (when, cid)
+    assert not co.close_by_rule(racing, cid, rule=rule, reason="synthetic automatic rule", key=f"{rule}:1")
+    assert racing.value("commitments", cid, "status") == "open"
+    assert racing.value("commitments", cid, "owner") == "user"
+    if when == "read":
+        # Refused at the read: a close of his item becomes a suggestion.
+        got = racing.suggestion(cid)
+        if co.AUTOMATIC_RULES[rule] == co.PROPOSE_LOOKS_DONE:
+            assert got["looks_done"] and got["rule"] == rule and got["reason"] == "synthetic automatic rule"
+        else:
+            assert got is None
+
+
+@pytest.mark.parametrize("when", ["read", "write"])
+@pytest.mark.parametrize("rule", ["owner-rules", "model"])
+def test_an_automatic_reassign_reads_the_owner_at_the_write(racing, rule, when):
+    cid = racing.commitment("Rebuild the deployment index")
+    racing.move = (when, cid)
+    assert not co.auto_reassign(racing, cid, rule=rule, sets=["owner = %s"], params=("agent",))
+    assert racing.value("commitments", cid, "owner") == "user"
+
+
+@pytest.mark.parametrize("when", ["read", "write"])
+def test_staleness_reads_the_owner_at_the_write(racing, when):
+    cid = racing.commitment("Rebuild the deployment index", age=60)
+    racing.move = (when, cid)
+    assert co.mark_stale(racing) == 0
+    assert racing.value("commitments", cid, "owner") == "user"
+    assert racing.value("commitments", cid, "status") == "open"
+
+
+@pytest.mark.parametrize("rule", sorted(r for r in co.AUTOMATIC_RULES if r != "stale"))
+def test_someone_elses_item_still_closes_and_moves(racing, rule):
+    cid = racing.commitment("Rebuild the deployment index")
+    assert co.close_by_rule(racing, cid, rule=rule, reason="r", key="k")
+    assert racing.value("commitments", cid, "status") == "closed"
+    other = racing.commitment("Rebuild the search index")
+    assert co.auto_reassign(racing, other, rule=rule, sets=["owner = %s"], params=("agent",))
+    assert racing.value("commitments", other, "owner") == "agent"
+
+
+def test_a_suggestion_is_not_rewritten_for_the_same_evidence_nor_after_a_reopen(racing):
+    cid = racing.commitment("Rebuild the deployment index", owner=co.OWNER_USER)
+    assert not co.close_by_rule(racing, cid, rule="pr", reason="pull request #3 merged", key="pr:3=merged")
+    assert racing.suggestion(cid)["key"] == "pr:3=merged"
+    assert not co.suggest_looks_done(racing, cid, rule="pr", reason="again", key="pr:3=merged")
+    racing.inner.conn.execute("UPDATE commitments SET settle_suggestion = NULL, reopened_rule_keys = ? "
+                              "WHERE id = ?", (json.dumps(["pr:3=merged"]), cid))
+    assert not co.close_by_rule(racing, cid, rule="pr", reason="pull request #3 merged", key="pr:3=merged")
+    assert racing.suggestion(cid) is None
 
 
 def test_staleness_never_hides_the_owners_item_and_lists_it_as_quiet():

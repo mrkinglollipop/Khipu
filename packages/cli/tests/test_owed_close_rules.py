@@ -371,8 +371,8 @@ def test_a_decision_strict_match_closes_with_the_decision_id_in_the_reason(hub):
 
 
 def test_a_strict_decision_only_suggests_on_the_owners_own_question(hub):  # noqa: F811
-    """The owner guard: a decision never closes the owner's own item; it is
-    offered as "Looks settled by decision N" for him to close."""
+    """Suggest, don't close: a decision never closes the owner's own item; it
+    lands in "Looks done" with the decision as its evidence, for him to close."""
     conn = _migrated(hub)
     with conn.cursor() as cur:
         named = _open(cur, "Should the nightly keep the hourly backup window?", "question")
@@ -380,10 +380,15 @@ def test_a_strict_decision_only_suggests_on_the_owners_own_question(hub):  # noq
         by_id = _decide(cur, f"Settles commitment {named}: keep the hourly window")
         by_text = _decide(cur, "Decide whether the gateway keeps the legacy route")
         report = close_rules.run(cur)
-        assert report["closed_decision"] == 0 and report["suggested"] == 2
+        assert report["closed_decision"] == 0
         assert _row(cur, named)["status"] == _row(cur, same)["status"] == "open"
-        assert _row(cur, named)["settle_suggestion"]["decision_id"] == by_id
-        assert _row(cur, same)["settle_suggestion"]["decision_id"] == by_text
+        for cid, did in ((named, by_id), (same, by_text)):
+            suggestion = _row(cur, cid)["settle_suggestion"]
+            assert suggestion["looks_done"] and suggestion["rule"] == "decision"
+            assert suggestion["evidence"]["decision_id"] == did and f"decision {did}" in suggestion["reason"]
+        listed = {r["id"]: r for r in co.list_owed(cur, project=PROJECT, limit=None)}
+        assert listed[named]["group"] == "Looks done" and listed[named]["looks_settled"] is None
+        assert f"decision {by_id}" in listed[named]["looks_done"]["reason"]
 
 
 def test_a_loose_decision_match_only_suggests(hub):  # noqa: F811

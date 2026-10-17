@@ -245,10 +245,11 @@ def test_the_plan_sorts_the_flood_by_rule_with_evidence(owed):
     assert (items[f.groups["agent_named"][0]]["before"]["owner"],
             items[f.groups["agent_named"][0]]["before"]["owner_label"]) == ("agent", "orchestrator")
     assert actions("conv_names_user") == {"keep"}
-    assert actions("pr_merged") == {"close"}
-    assert {items[i]["close"] for i in f.groups["pr_merged"]} == {"pr"}
-    assert "#801" in items[f.groups["pr_merged"][1]]["reason"]
-    assert items[f.groups["pr_merged"][0]]["evidence"]["rule"] == "pr"
+    # The owner's own items whose pull requests all merged: suggested, never
+    # closed (Matt, 2026-10-17: "Suggest, don't close").
+    assert actions("pr_merged") == {"keep"}
+    assert {items[i]["proposed"]["close"] for i in f.groups["pr_merged"]} == {"pr"}
+    assert "#801" in items[f.groups["pr_merged"][1]]["proposed"]["reason"]
     assert actions("pr_open") == actions("pr_half") == {"keep"}
     # The owner's own questions: a decision that settles them is a proposal.
     assert actions("decided") == {"keep"}
@@ -343,7 +344,7 @@ def test_an_item_changed_after_apply_is_left_alone_by_undo_and_listed(owed, monk
     _app(monkeypatch)
     res = owed_tidy.apply(plan)
     moved = f.groups["job_question"][0]
-    closed = f.groups["pr_merged"][0]
+    closed = f.groups["dup"][0]
     with owed.cursor() as cur:
         assert co.reassign(cur, moved, "assistant")
         assert co.set_status(cur, closed, "open")
@@ -358,7 +359,7 @@ def test_a_plan_whose_items_changed_skips_them_and_lists_them(owed, monkeypatch)
     f = _flood(owed)
     plan = _plan(owed, judge=FakeModel())
     changed = f.groups["job_followup"][0]
-    gone = f.groups["pr_merged"][0]
+    gone = f.groups["dup"][0]
     with owed.cursor() as cur:
         cur.execute("UPDATE commitments SET text = text || ' today' WHERE id = %s", (changed,))
         assert co.set_status(cur, gone, "closed", reason="done", by=co.BY_APP)
@@ -643,5 +644,5 @@ def test_apply_never_changes_the_owners_item_even_from_an_edited_plan(owed, monk
     refused = {s["id"] for s in out["skipped"] if "owner's own item" in s["why"]}
     assert refused == {decided, named}
     assert _rows(owed, [decided, named]) == before
-    # A close on the owner's item's own pull requests is made.
-    assert all(_rows(owed, [i])[i]["status"] == "closed" for i in f.groups["pr_merged"])
+    # Not even a close on the owner's item's own pull requests is made.
+    assert all(_rows(owed, [i])[i]["status"] == "open" for i in f.groups["pr_merged"])

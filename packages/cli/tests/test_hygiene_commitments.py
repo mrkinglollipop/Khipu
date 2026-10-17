@@ -70,12 +70,19 @@ class _Cursor:
                 for r in out
             ]
             return
+        if s.startswith("SELECT id, text, owner, kind, status") and "FOR UPDATE" in s:
+            # commitments.row_at_write: one item, as it is now.
+            cols = s[len("SELECT "):s.index(" FROM commitments")].split(", ")
+            r = self.rows.get(params[0])
+            self._result = [tuple(r.get(c) for c in cols)] if r else []
+            return
         if s.startswith("UPDATE commitments SET status = 'dropped'"):
-            # commitments.close_by_rule(status="dropped") before 0034: (episode, reason, id).
-            reason, cid = params[1], params[-1]
+            # commitments.close_by_rule(status="dropped") before 0034:
+            # (episode, reason, id, the stored owner it read).
+            reason, cid, same = params[1], params[2], params[3]
             r = self.rows.get(cid)
             self.rowcount = 0
-            if r and r["status"] == "open":
+            if r and r["status"] == "open" and r["owner"] == same:
                 r["status"] = "dropped"
                 r["close_reason"] = reason
                 self.rowcount = 1
@@ -86,11 +93,12 @@ class _Cursor:
             self.rowcount = 1
             return
         if s.startswith("UPDATE commitments SET status = 'closed'"):
-            # commitments.close_by_rule on a hub before 0034: (episode, reason, id).
-            reason, cid = params[1], params[-1]
+            # commitments.close_by_rule on a hub before 0034:
+            # (episode, reason, id, the stored owner it read).
+            reason, cid, same = params[1], params[2], params[3]
             r = self.rows.get(cid)
             self.rowcount = 0
-            if r and r["status"] == "open":
+            if r and r["status"] == "open" and r["owner"] == same:
                 r["status"] = "closed"
                 r["close_reason"] = reason
                 self.rowcount = 1
@@ -375,26 +383,37 @@ class _SessionCursor:
             self.rowcount = 1
             return
         if s.startswith("UPDATE commitments SET owner = %s WHERE"):
-            owner, cid = params
+            owner, cid, same = params
+            if self.rows[cid]["owner"] != same:
+                self.rowcount = 0
+                return
             self.rows[cid]["owner"] = owner
             self.rowcount = 1
             return
         if s.startswith("UPDATE commitments SET status = 'closed'"):
-            # commitments.close_by_rule on a hub before 0034: (episode, reason, id).
-            reason, cid = params[1], params[-1]
+            # commitments.close_by_rule on a hub before 0034:
+            # (episode, reason, id, the stored owner it read).
+            reason, cid, same = params[1], params[2], params[3]
             r = self.rows.get(cid)
             self.rowcount = 0
-            if r and r["status"] == "open":
+            if r and r["status"] == "open" and r["owner"] == same:
                 r["status"] = "closed"
                 r["close_reason"] = reason
                 self.rowcount = 1
             return
+        if s.startswith("SELECT id, text, owner, kind, status") and "FOR UPDATE" in s:
+            # commitments.row_at_write: one item, as it is now.
+            cols = s[len("SELECT "):s.index(" FROM commitments")].split(", ")
+            r = self.rows.get(params[0])
+            self._result = [tuple(r.get(c) for c in cols)] if r else []
+            return
         if s.startswith("UPDATE commitments SET status = 'dropped'"):
-            # commitments.close_by_rule(status="dropped") before 0034: (episode, reason, id).
-            reason, cid = params[1], params[-1]
+            # commitments.close_by_rule(status="dropped") before 0034:
+            # (episode, reason, id, the stored owner it read).
+            reason, cid, same = params[1], params[2], params[3]
             r = self.rows.get(cid)
             self.rowcount = 0
-            if r and r["status"] == "open":
+            if r and r["status"] == "open" and r["owner"] == same:
                 r["status"] = "dropped"
                 r["close_reason"] = reason
                 self.rowcount = 1
@@ -469,7 +488,9 @@ class SessionEndedPassTest(unittest.TestCase):
         report = hygiene.run_session_ended_pass(cur, apply=True)
         self.assertEqual(report["applied"], 2)
         self.assertEqual(cur.rows[1]["status"], "open")
-        self.assertEqual(cur.rows[1]["owner"], "user")
+        # The owner's own item (as read) is never rewritten by a rule, not
+        # even to store the owner it already shows.
+        self.assertIsNone(cur.rows[1]["owner"])
         self.assertEqual(cur.rows[2]["status"], "closed")
         self.assertEqual(cur.rows[2]["close_reason"], "session-ended")
         self.assertTrue(cur.rows[3]["future_trigger"])

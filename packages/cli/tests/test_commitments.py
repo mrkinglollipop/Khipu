@@ -166,10 +166,17 @@ class _CommitmentsCursor:
             else:
                 self.rowcount = 0
             return
+        if s.startswith("SELECT id, text, owner, kind, status") and "WHERE id = %s" in s and "FOR UPDATE" in s:
+            # commitments.row_at_write: one item, as it is now.
+            cols = s[len("SELECT "):s.index(" FROM commitments")].split(", ")
+            r = self.rows.get(params[0])
+            self._result = [tuple(r.get(c) for c in cols)] if r else []
+            return
         if s.startswith("UPDATE commitments") and "SET status = 'closed'" in s:
-            episode_id, close_reason, cid = params
+            # The stored owner the write read must still be the stored one.
+            episode_id, close_reason, cid, *same = params
             r = self.rows.get(cid)
-            if r and r["status"] == "open":
+            if r and r["status"] == "open" and (not same or same[0] == r["owner"]):
                 r["status"] = "closed"
                 r["closed_episode"] = episode_id
                 r["close_reason"] = close_reason
@@ -177,18 +184,17 @@ class _CommitmentsCursor:
             else:
                 self.rowcount = 0
             return
-        if s.startswith("SELECT id, text, owner, kind") and "SET status" not in s and "due_after <= now()" in s:
+        if s.startswith("SELECT id FROM commitments WHERE") and "due_after <= now()" in s:
             # mark_stale's candidates; this fake ignores the silence window.
-            cols = s[len("SELECT "):s.index(" FROM commitments")].split(", ")
-            self._result = [tuple(r.get(c) for c in cols) for r in self.rows.values() if r["status"] == "open"]
+            self._result = [(r["id"],) for r in self.rows.values() if r["status"] == "open"]
             return
         if s.startswith("UPDATE commitments") and "'stale'" in s:
-            n = 0
-            for r in self.rows.values():
-                if r["status"] == "open" and (not params or r["id"] in params):
-                    r["status"] = "stale"
-                    n += 1
-            self.rowcount = n
+            cid, *same = params
+            r = self.rows.get(cid)
+            self.rowcount = 0
+            if r and r["status"] == "open" and (not same or same[0] == r["owner"]):
+                r["status"] = "stale"
+                self.rowcount = 1
             return
         if s.startswith("SELECT id, text, project, owner, kind"):
             status = params[0]

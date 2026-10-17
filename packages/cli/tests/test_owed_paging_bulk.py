@@ -507,7 +507,8 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
     # The same page the tool gives.
     tool = srv._tool_owed({"project": "acme/widget", "limit": 500})
     assert [r["id"] for r in tool["results"]] == [r["id"] for r in results]
-    assert tool["next_cursor"] == result["next_cursor"]
+    # The same place in the list; each read stamps its own clock for the quiet group.
+    assert co.decode_cursor(tool["next_cursor"]) == co.decode_cursor(result["next_cursor"])
 
 
 # ---- the third cross-family review's bulk probes (fakes, no hub) ----------

@@ -2445,7 +2445,8 @@ def _owed_page_cli(args: argparse.Namespace, project: str | None, status: str) -
     try:
         out = mcp_server.owed_listing({
             "project": project, "status": status, "limit": getattr(args, "limit", None),
-            **{k: getattr(args, k, None) for k in ("cursor", "owner", "kind", "origin", "query", "pr")}},
+            **{k: getattr(args, k, None) for k in ("cursor", "owner", "kind", "origin", "query", "pr",
+                                                   "looks_done")}},
             hub_ages=True)
     except ValueError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}))
@@ -5354,6 +5355,8 @@ def build_parser() -> argparse.ArgumentParser:
     owed.add_argument("--origin", default=None, choices=("conversation", "job"))
     owed.add_argument("--query", default=None, help="Only items whose text holds all these words")
     owed.add_argument("--pr", type=int, default=None, help="Only items naming this pull request number")
+    owed.add_argument("--looks-done", dest="looks_done", action="store_true",
+                      help="Only the owner's items a rule found done, for him to close")
     owed.add_argument("--cursor", default=None, help="next_cursor from the previous page")
     owed.add_argument("--close", metavar="ID[,ID...]", default=None, help="Close commitment ID, or several")
     owed.add_argument("--reopen", metavar="ID[,ID...]", default=None, help="Reopen commitment ID, or several")

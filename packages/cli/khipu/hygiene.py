@@ -828,7 +828,7 @@ def run_commitments_hygiene(
         for cid, v in verdicts.items():
             if v["verdict"] == "drop":
                 applied += int(co.close_by_rule(
-                    cur, cid, rule="drop", owner=by_id[cid]["owner"], status="dropped",
+                    cur, cid, rule="drop", status="dropped",
                     reason=f"hygiene-{stamp}: {v['reason']}", key=f"hygiene-drop:{v['reason']}"[:200],
                     evidence={"rule": "hygiene-drop", "reason": v["reason"]}))
             elif v["verdict"] == "duplicate":
@@ -843,7 +843,7 @@ def run_commitments_hygiene(
                         (cid, keeper),
                     )
                 applied += int(co.close_by_rule(
-                    cur, cid, rule="duplicate", owner=by_id[cid]["owner"],
+                    cur, cid, rule="duplicate",
                     reason=f"duplicate-of-{keeper}", key=f"duplicate-of:{keeper}",
                     evidence={"rule": "duplicate", "keeper": keeper}))
 
@@ -1015,19 +1015,19 @@ def run_session_ended_pass(
             cid = item["id"]
             if item["owner"] != item["stored_owner"]:
                 # An owner the rules now read differently: never the owner's
-                # own item moved away (the owner guard reads the stored one).
-                co.auto_reassign(cur, cid, rule="owner-rules", owner_before=item["stored_owner"],
-                                 sets=["owner = %s"], params=(item["owner"],))
+                # own item moved away (auto_reassign reads both owners under
+                # the row lock).
+                co.auto_reassign(cur, cid, rule="owner-rules", sets=["owner = %s"], params=(item["owner"],))
             if trigger_col:
                 cur.execute("UPDATE commitments SET future_trigger = %s WHERE id = %s",
                             (item["future_trigger"], cid))
             if item["verdict"] == "close":
                 applied += int(co.close_by_rule(
-                    cur, cid, rule="session-ended", owner=item["owner"], reason="session-ended",
+                    cur, cid, rule="session-ended", reason="session-ended",
                     key="hygiene:session-ended", evidence={"rule": "hygiene-session-ended"}))
             elif item["verdict"] == "drop":
                 applied += int(co.close_by_rule(
-                    cur, cid, rule="drop", owner=item["owner"], status="dropped",
+                    cur, cid, rule="drop", status="dropped",
                     reason=f"hygiene-{stamp}: {item['reason']}", key=f"hygiene-drop:{item['reason']}"[:200],
                     evidence={"rule": "hygiene-session-ended", "reason": item["reason"]}))
 

@@ -33,6 +33,10 @@ mention is the project's), with the state that source read and when. The
 newest record for a PR wins, so a PR that was reopened revokes an earlier
 "merged". Two repositories' PR #41 are two PRs.
 
+The owner's own items are never closed by these rules (Matt, 2026-10-17:
+"Suggest, don't close"): ``commitments.close_by_rule`` reads the owner under
+the row lock and turns the close into a "Looks done" suggestion for him.
+
 Every close goes through ``commitments.close_by_rule`` and records
 ``close_reason``, ``closed_by`` (``BY_RULE``), ``close_rule_key`` and
 ``close_evidence``. A reopened item keeps its rule key in
@@ -58,7 +62,6 @@ from khipu.commitments import (
     _not_forgotten_clause,
     close_by_rule,
     completion_match,
-    owner_guard,
 )
 
 GH_TIMEOUT_S = 10
@@ -151,15 +154,31 @@ def pr_refs(text: str, project_repo: str | None) -> list[tuple[str | None, int]]
 
 def item_refs(item: dict[str, Any], project_repo: str | None) -> list[tuple[str | None, int]]:
     """Every pull request an item was ever said to need: those its text and
-    its latest restatement name, and every number in its stored ``prs`` (a
-    restatement adds to that list, never replaces it). All are required."""
+    its latest restatement name, every number in its stored ``prs`` and every
+    other repository's PR an earlier restatement named (``pr_check["refs"]``;
+    a restatement adds to both lists, never replaces them). All are
+    required."""
     refs = pr_refs(item.get("text") or "", project_repo)
-    for ref in pr_refs(item.get("latest_text") or "", project_repo):
+    check = item.get("pr_check") if isinstance(item.get("pr_check"), dict) else {}
+    kept = [(m.group(1), int(m.group(2))) for m in (_QUALIFIED_RE.match(str(r)) for r in check.get("refs") or [])
+            if m]
+    for ref in pr_refs(item.get("latest_text") or "", project_repo) + kept:
         if ref not in refs:
             refs.append(ref)
     named = {n for _, n in refs}
     refs += [(_repo(project_repo), int(n)) for n in (item.get("prs") or []) if int(n) not in named]
     return refs
+
+
+_QUALIFIED_RE = re.compile(r"^([A-Za-z0-9][\w.-]*/[\w.-]+)#(\d{1,7})$")
+
+
+def other_repo_labels(text: str, project: str | None) -> list[str]:
+    """``owner/repo#N`` for each PR ``text`` names in a repository other
+    than ``project``'s: what a restatement keeps in ``pr_check["refs"]``,
+    since ``prs`` holds only numbers."""
+    repo = _project_repo(project)
+    return [f"{r}#{n}" for r, n in pr_refs(text, repo) if r and r != _repo(repo)]
 
 
 def ref_label(ref: tuple[str | None, int], project_repo: str | None) -> str:
@@ -423,7 +442,8 @@ _QUESTION_START_RE = re.compile(r"^\s*(?:was|were|is|are|did|does|do|has|have|ha
                                 r"would|why|how|what|when|whether)\b", re.I)
 
 
-def evidence_problem(text: str, item_text: str = "", project: str | None = None) -> str | None:
+def evidence_problem(text: str, item_text: str = "", project: str | None = None, *,
+                     item: dict[str, Any] | None = None) -> str | None:
     """Why ``text`` (a closed loop, a ``done:`` line, a decision or a session
     mention) is not evidence that closes an item reading ``item_text`` in
     ``project``, or None when it is. The same check for every close path
@@ -436,12 +456,14 @@ def evidence_problem(text: str, item_text: str = "", project: str | None = None)
       line about it in this evidence, and only a line git or gh printed
       (:func:`capture_pr_records`) counts. A reopened PR, or any named PR the
       evidence does not show finished, keeps the item open; the PR rule asks
-      the PR's own sources, GitHub included, and closes it when they are."""
+      the PR's own sources, GitHub included, and closes it when they are.
+      With ``item`` (its row), the PRs are every one it was ever said to
+      need (:func:`item_refs`), not only those ``item_text`` names."""
     s = str(text or "").strip()
     if s.endswith("?") or _QUESTION_START_RE.match(s):
         return "a question is not evidence"
     repo = _project_repo(project)
-    refs = pr_refs(item_text, repo)
+    refs = item_refs(item, repo) if item is not None else pr_refs(item_text, repo)
     if refs:
         states = {_key(key, repo): state for key, state in capture_pr_records([s]).items()}
         unfinished = [ref_label(ref, repo) for ref in refs if states.get(_key(ref, repo)) not in DONE_STATES]
@@ -480,7 +502,7 @@ def _pr_reason(found: dict[str, tuple[str, str]]) -> str:
     return reason
 
 
-def _close(cur, cid: int, *, rule: str, owner: str | None, reason: str, key: str, evidence: dict,
+def _close(cur, cid: int, *, rule: str, reason: str, key: str, evidence: dict,
            episode: int | None, sink: dict | None = None) -> bool:
     """Close one item by rule (``commitments.close_by_rule``: the reopen
     guard every automatic close shares), or, with ``sink`` (the clean-up
@@ -488,8 +510,7 @@ def _close(cur, cid: int, *, rule: str, owner: str | None, reason: str, key: str
     if sink is not None:
         sink[cid] = {"reason": reason[:300], "key": key, "evidence": evidence, "episode": episode}
         return True
-    return close_by_rule(cur, cid, rule=rule, owner=owner, reason=reason, key=key, evidence=evidence,
-                         episode=episode)
+    return close_by_rule(cur, cid, rule=rule, reason=reason, key=key, evidence=evidence, episode=episode)
 
 
 def _open_items(cur, project: str | None) -> list[dict[str, Any]]:
@@ -554,7 +575,7 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
              github: GitHub, sink: dict | None = None) -> None:
     by_project: dict[str, list[dict]] = {}
     for item in items:
-        if item["prs"] or parse_prs(item.get("latest_text") or ""):
+        if item["prs"] or parse_prs(item.get("latest_text") or "") or (item.get("pr_check") or {}).get("refs"):
             by_project.setdefault(item["project"], []).append(item)
     asked_for: set[int] | None = None
     capture: dict[EvidenceKey, dict[str, Any]] = {}
@@ -612,7 +633,7 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
                     report["kept_open_reopened"] += 1
                     continue
                 evidence = {"rule": "pr", "prs": records}
-                if _close(cur, item["id"], rule="pr", owner=item.get("owner"), reason=_pr_reason(found),
+                if _close(cur, item["id"], rule="pr", reason=_pr_reason(found),
                           key=key, evidence=evidence,
                           episode=max(capture_episodes) if capture_episodes else None, sink=sink):
                     report["closed_pr"] += 1
@@ -622,9 +643,17 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
                 continue
             check = {"states": {label: f"{s} ({SOURCE_WORDS[src]})" for label, (s, src) in found.items()},
                      "waiting": waiting}
+            if (item["pr_check"] or {}).get("refs"):
+                check["refs"] = item["pr_check"]["refs"]
             if sink is None and check != item["pr_check"]:
                 cur.execute("UPDATE commitments SET pr_check = %s::jsonb WHERE id = %s",
                             (json.dumps(check), item["id"]))
+            suggestion = item.get("suggestion") if isinstance(item.get("suggestion"), dict) else {}
+            if sink is None and suggestion.get("looks_done") and suggestion.get("rule") == "pr":
+                # A PR the owner's item names is not finished any more (reopened,
+                # or added by a restatement): it no longer looks done.
+                cur.execute("UPDATE commitments SET settle_suggestion = NULL WHERE id = %s AND status = 'open'",
+                            (item["id"],))
 
 
 def _is_decide_item(item: dict) -> bool:
@@ -704,22 +733,19 @@ def _decision_rule(cur, items: list[dict], report: dict, *, episode_id: int | No
                 if key in (item["reopened"] or []):
                     report["kept_open_reopened"] += 1
                     continue
-                if sink is None and owner_guard(item.get("owner"), "decision"):
-                    # The owner's own item: a decision only suggests it is
-                    # settled ("Looks settled by decision N"); he closes it.
-                    hit = ("loose", did, text, score)
-                else:
-                    if _close(cur, item["id"], rule="decision", owner=item.get("owner"),
-                              reason=f"settled by decision {did}: {text[:150]!r}", key=key,
-                              evidence={"rule": "decision", "decision_id": did, "match": how,
-                                        "score": round(score, 3)}, episode=dep, sink=sink):
-                        report["closed_decision"] += 1
-                    continue
+                # The owner's own item is refused under the row lock and kept as
+                # "Looks done" for him to close (commitments.close_by_rule).
+                if _close(cur, item["id"], rule="decision",
+                          reason=f"settled by decision {did}: {text[:150]!r}", key=key,
+                          evidence={"rule": "decision", "decision_id": did, "match": how,
+                                    "score": round(score, 3)}, episode=dep, sink=sink):
+                    report["closed_decision"] += 1
+                continue
             _, did, text, near = hit
             if sink is not None:
                 continue
             old = item["suggestion"] if isinstance(item["suggestion"], dict) else {}
-            if old.get("decision_id") == did or float(old.get("score") or 0) > near:
+            if old.get("looks_done") or old.get("decision_id") == did or float(old.get("score") or 0) > near:
                 continue
             cur.execute("UPDATE commitments SET settle_suggestion = %s::jsonb WHERE id = %s",
                         (json.dumps({"decision_id": did, "text": text[:200], "score": round(near, 3)}),

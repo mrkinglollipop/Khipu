@@ -30,9 +30,10 @@ its text and its reason.
 proposes a change to an item the user owns, by the owner rules read with the
 item's lineage (a job's item shown as the user's is the orchestrator's, as
 the rules of step 3 say, so it moves). Its action stays ``keep`` and the
-change the rules would make is kept under ``proposed``; Apply never makes it.
-The one exception is a close because every pull request the item itself
-names is merged or closed.
+change the rules would make is kept under ``proposed``; Apply never makes it,
+a close on the item's own pull requests included (Matt, 2026-10-17: "Suggest,
+don't close"). Apply also reads each owner again under the row lock
+(``commitments.close_by_rule``, ``auto_reassign``).
 
 **Applying** a plan (``apply``) writes every change in one transaction, under
 one ``tidy_batch`` id, with each item's reason and its state before
@@ -106,7 +107,10 @@ _UNDECIDED_RULES = ("the owner the capture gave it", "no one named: the assistan
 # undo since applying, and the part of it an undo restores.
 FINGERPRINT_FIELDS = ("status", "owner", "owner_label", "origin", "owner_reassigned_at", "closed_at",
                       "closed_episode", "close_reason", "closed_by", "close_rule_key", "close_evidence",
-                      "tidy_batch", "text", "kind", "due_after")
+                      "tidy_batch", "text", "kind", "due_after",
+                      # A restatement's newer wording and the PRs it added: a
+                      # plan made before one must not close the item after it.
+                      "prs", "latest_text", "pr_check")
 # Who set the owner by hand, why, and the owner before (migration 0037):
 # kept with each change and restored by an undo, never part of the fingerprint.
 LINEAGE_FIELDS = ("owner_reassigned_by", "owner_reassign_reason", "owner_prior", "owner_prior_label")
@@ -160,6 +164,9 @@ def _plain(value: Any) -> Any:
 def fingerprint(row: dict[str, Any]) -> str:
     """A hash of the item's state (``FINGERPRINT_FIELDS``)."""
     state = {f: _plain(row.get(f)) for f in FINGERPRINT_FIELDS}
+    # Of pr_check only the PRs it keeps count; its nightly status words do not.
+    check = row.get("pr_check")
+    state["pr_check"] = check.get("refs") if isinstance(check, dict) else None
     return hashlib.sha256(json.dumps(state, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -408,8 +415,8 @@ def _plan(cur, project: str, *, judge, use_model: bool) -> dict[str, Any]:
                           rule=f"model: {(ans.get('reason') or 'not the user').strip()}",
                           reason=f"to the {_owner_words(after)}: the model's reading, no rule decided it")
 
-    # 5. The owner's own items: every change but a close on its own pull
-    # requests is a proposal, never applied (commitments.owner_guard).
+    # 5. The owner's own items: every change is a proposal, never applied
+    # (commitments.owner_guard).
     for it in items.values():
         if it["action"] == "keep" or not co.owner_guard(it.pop("_owner"), _rule_of(it)):
             it.pop("_owner", None)
@@ -571,16 +578,23 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
                 it = planned[cid]
                 prior = {f: _plain(rows[cid].get(f)) for f in PRIOR_FIELDS}
                 now_owner = _owners(rows[cid])[1]["owner"]
+
+                def owner_of(locked: dict, lineage=rows[cid]["lineage"]) -> str:
+                    # The owner as the plan reads it, from the row as it is at
+                    # the write: the lineage of the opening capture never changes.
+                    return _owners({**locked, "owner": locked["stored_owner"], "lineage": lineage})[1]["owner"]
+
                 if co.owner_guard(now_owner, _rule_of(it)):
                     skipped.append({"id": cid, "why": "the owner's own item: the clean-up only suggests a change"})
                     continue
                 if it["action"] == "close":
-                    if not co.close_by_rule(cur, cid, rule=_rule_of(it), owner=now_owner,
+                    if not co.close_by_rule(cur, cid, rule=_rule_of(it),
                                             reason=it.get("reason") or "closed by the clean-up",
                                             key=it.get("key") or f"tidy:{cid}", evidence=it.get("evidence") or {},
                                             episode=it.get("episode"), set_extra=", tidy_batch = %s",
-                                            extra_params=(batch,)):
-                        skipped.append({"id": cid, "why": "the owner reopened it after the same evidence closed it"})
+                                            extra_params=(batch,), owner_of=owner_of):
+                        skipped.append({"id": cid, "why": "the owner reopened it after the same evidence closed it, "
+                                                          "or it is now the owner's own item"})
                         continue
                 else:
                     after = it.get("after") or {}
@@ -599,11 +613,14 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
                                    "owner_reassigned_by = %s, owner_reassign_reason = %s, ")
                         lineage_params = (f"khipu owed tidy ({batch})",
                                           (it.get("reason") or it.get("rule") or "")[:400] or None)
-                    co.auto_reassign(
-                        cur, cid, rule=_rule_of(it), owner_before=now_owner,
+                    if not co.auto_reassign(
+                        cur, cid, rule=_rule_of(it),
                         sets=[f"{lineage}owner = %s", "owner_label = %s", "origin = %s", "owner_reassigned_at = now()",
                               "tidy_batch = %s"],
-                        params=(*lineage_params, owner, label, origin, batch))
+                        params=(*lineage_params, owner, label, origin, batch), owner_of=owner_of):
+                        skipped.append({"id": cid, "why": "the owner's own item now: the clean-up only suggests "
+                                                          "a change"})
+                        continue
                 counts[it["action"]] += 1
                 done = _select(cur, project, ids=[cid])[cid]
                 cur.execute(

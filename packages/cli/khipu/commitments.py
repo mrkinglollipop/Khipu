@@ -1170,7 +1170,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
                 # A restatement in other words keeps the newer wording.
                 cur.execute("UPDATE commitments SET latest_text = %s WHERE id = %s", (norm["text"], existing))
             if close_ready:
-                from khipu.close_rules import parse_prs
+                from khipu.close_rules import other_repo_labels, parse_prs
 
                 added = parse_prs(norm["text"])
                 if added:
@@ -1180,16 +1180,21 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
                         "UPDATE commitments SET prs = ARRAY(SELECT DISTINCT n FROM "
                         "unnest(COALESCE(prs, '{}'::int[]) || %s::int[]) AS n ORDER BY n) WHERE id = %s",
                         (added, existing))
+                elsewhere = other_repo_labels(norm["text"], payload.get("project"))
+                if elsewhere:
+                    # prs keeps numbers only, and latest_text only the newest
+                    # wording: another repository's PR an in-between wording
+                    # named is kept here, or a later wording would lose it.
+                    _keep_other_repo_refs(cur, existing, elsewhere)
             continue
         linked = [r["id"] for r in others
                   if r["id"] == exact or _match_score(norm["text"], r["text"]) >= NEAR_DUP_MIN_SCORE]
-        relay_owner = {r["id"]: r.get("owner") for r in job_rows}
         closed_relays: list[int] = []
         for rid in relay_ids:
             # Closed before the insert: an identical text shares the open
             # (project, content_hash) slot the unique index guards. The
             # reason names the new row once it exists (below).
-            if close_by_rule(cur, rid, rule="relay", owner=relay_owner.get(rid),
+            if close_by_rule(cur, rid, rule="relay",
                              reason="relayed-by a conversation item",
                              key=evidence_key("relayed-by", norm["text"]), episode=episode_id,
                              evidence={"rule": "relayed-by", "text": norm["text"][:300]}):
@@ -1263,6 +1268,19 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     return inserted
 
 
+def _keep_other_repo_refs(cur, commitment_id: int, labels: list[str]) -> None:
+    """Add ``owner/repo#N`` labels to the item's ``pr_check["refs"]``, the
+    other repositories' PRs ``khipu.close_rules.item_refs`` requires."""
+    cur.execute("SELECT pr_check FROM commitments WHERE id = %s FOR UPDATE", (commitment_id,))
+    got = cur.fetchone()
+    check = got[0] if got and isinstance(got[0], dict) else {}
+    refs = list(check.get("refs") or [])
+    new = [label for label in labels if label not in refs]
+    if new:
+        cur.execute("UPDATE commitments SET pr_check = %s::jsonb WHERE id = %s",
+                    (json.dumps({**check, "refs": refs + new}), commitment_id))
+
+
 def _relay_matches(cur, text: str, exact: int | None, scope: str | None,
                    job_rows: list[dict[str, Any]]) -> list[int]:
     """Open job items this conversation item restates: the exact text, or
@@ -1292,6 +1310,10 @@ def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None 
             cols += [c for c in ("origin", "owner_label") if c not in cols]
         if _reassigned_column_ready(cur):
             cols.append("owner_reassigned_at")
+        if _close_columns_ready(cur):
+            cols += ["prs", "pr_check"]
+        if _lineage_columns_ready(cur):
+            cols.append("latest_text")
     cur.execute(
         f"SELECT {', '.join(cols)} FROM commitments WHERE status = 'open' AND project IS NOT DISTINCT FROM %s "
         f"AND {lineage} AND {_not_forgotten_clause(cur)}",
@@ -1438,112 +1460,195 @@ def evidence_key(rule: str, text: str) -> str:
     return f"{rule}:{hashlib.sha256(norm.encode('utf-8')).hexdigest()[:16]}"
 
 
-def evidence_problem(text: str, item_text: str = "", project: str | None = None) -> str | None:
+def evidence_problem(text: str, item_text: str = "", project: str | None = None, *,
+                     item: dict[str, Any] | None = None) -> str | None:
     """Why ``text`` is not evidence that closes an item reading
     ``item_text`` in ``project`` (``khipu.close_rules.evidence_problem``, the
-    one check every close path shares), or None."""
+    one check every close path shares), or None. With ``item`` (its row),
+    every pull request it was ever said to need is required."""
     from khipu.close_rules import evidence_problem as check
 
-    return check(text, item_text, project)
+    return check(text, item_text, project, item=item)
 
 
 # ---- the owner's own items --------------------------------------------------
 #
-# The invariant: an item the owner owes (``row_owner`` gives ``user``) is never
-# closed, merged, hidden or reassigned by anything automatic. Every automatic
-# change to a commitment names its rule here and passes :func:`owner_guard`,
-# in the one write each kind of change has: :func:`close_by_rule` for a close,
-# a drop or a merge, :func:`auto_reassign` for an owner change. Only two rules
-# may change the owner's item: a pull request rule on the item's own PR list,
-# and the owner's own "done" in his own conversation. Everything else may
-# propose a change (the clean-up's preview, a "Looks settled" suggestion),
-# never make it. The owner's own changes are :func:`set_status` and
-# :func:`reassign`; a forgotten episode's items are closed by ``khipu.forget``.
-RULE_OWN_PRS = "own-prs"
-RULE_OWN_SESSION = "own-session"
-RULE_NEVER = "never"
+# The invariant (Matt, 2026-10-17: "Suggest, don't close"): an item the owner
+# owes (``row_owner`` gives ``user``) is never closed, merged, hidden or
+# reassigned by anything automatic, by any rule. Every automatic rule is named
+# here with what it becomes for his item, and every automatic change goes
+# through the one write each kind of change has: :func:`close_by_rule` for a
+# close, a drop or a merge, :func:`auto_reassign` for an owner change and
+# :func:`mark_stale` for staleness. Each reads the owner under the row lock at
+# the moment of the write (never the caller's earlier read) and the write
+# itself repeats the check. A close refused for his item becomes a "Looks
+# done" suggestion on it (``settle_suggestion``) for him to close; an owner
+# change stays a proposal in the clean-up's preview; staleness lists it as
+# quiet. The owner's own changes are :func:`set_status` and :func:`reassign`;
+# a forgotten episode's items are closed by ``khipu.forget``.
+PROPOSE_LOOKS_DONE = "looks-done"
+PROPOSE_TIDY = "tidy"
+PROPOSE_QUIET = "quiet"
 AUTOMATIC_RULES: dict[str, str] = {
-    "pr": RULE_OWN_PRS,             # every PR the item itself names is merged or closed
-    "loop": RULE_OWN_SESSION,       # a closed loop or "done:" from the owner's conversation
-    "decision": RULE_NEVER,         # a later decision settles it: a suggestion for his items
-    "relay": RULE_NEVER,            # another item restates it
-    "session-ended": RULE_NEVER,    # its session ended
-    "session-plan": RULE_NEVER,     # a plan-shaped row the session mentioned as finished
-    "duplicate": RULE_NEVER,        # dedup, in the hygiene pass or the clean-up
-    "drop": RULE_NEVER,             # the hygiene re-judge: not a commitment
-    "owner-rules": RULE_NEVER,      # the owner rules re-run (clean-up, hygiene)
-    "model": RULE_NEVER,            # the clean-up's model pass
-    "stale": RULE_NEVER,            # weeks of silence: his items show as quiet instead
+    "pr": PROPOSE_LOOKS_DONE,        # every PR the item names is merged or closed
+    "loop": PROPOSE_LOOKS_DONE,      # a closed loop or "done:" line of a later capture
+    "decision": PROPOSE_LOOKS_DONE,  # a later decision settles it
+    "relay": PROPOSE_LOOKS_DONE,     # a conversation item restates a job's item
+    "duplicate": PROPOSE_LOOKS_DONE,  # dedup, in the hygiene pass or the clean-up
+    "session-ended": PROPOSE_TIDY,   # its session ended
+    "session-plan": PROPOSE_TIDY,    # a plan-shaped row the session mentioned as finished
+    "drop": PROPOSE_TIDY,            # the hygiene re-judge: not a commitment
+    "owner-rules": PROPOSE_TIDY,     # the owner rules re-run (clean-up, hygiene)
+    "model": PROPOSE_TIDY,           # the clean-up's model pass
+    "stale": PROPOSE_QUIET,          # weeks of silence: his items show as quiet instead
 }
-OWNER_GUARD_WORDS = "the owner's own item: an automatic {rule} may propose a change to it, never make it"
+OWNER_GUARD_WORDS = "the owner's own item: an automatic {rule} may suggest a change to it, never make it"
+LOOKS_DONE = "Looks done"
 
 
-def owner_guard(owner: str | None, rule: str, *, origin: str | None = None) -> str | None:
+def owner_guard(owner: str | None, rule: str) -> str | None:
     """Why the automatic ``rule`` may not change an item owned by ``owner``
-    (the owner as :func:`row_owner` reads it), or None when it may.
-    ``origin`` is the session the evidence came from, for ``loop``."""
-    allowed = AUTOMATIC_RULES.get(rule)
-    if allowed is None:
+    (the owner as :func:`row_owner` reads it), or None when it may: every
+    rule is refused for the owner's own item, none for anyone else's."""
+    if rule not in AUTOMATIC_RULES:
         raise ValueError(f"not an automatic rule Khipu knows: {rule!r}")
     if str(owner or "").strip().lower() != OWNER_USER:
-        return None
-    if allowed == RULE_OWN_PRS:
-        return None
-    if allowed == RULE_OWN_SESSION and str(origin or "").strip().lower() == ORIGIN_CONVERSATION:
         return None
     return OWNER_GUARD_WORDS.format(rule=rule)
 
 
-def close_by_rule(cur, commitment_id: int, *, rule: str, owner: str | None, reason: str, key: str,
-                  evidence: dict | None = None, episode: int | None = None, origin: str | None = None,
-                  status: str = "closed", set_extra: str = "", extra_params: tuple = ()) -> bool:
+def _owner_cols(cur) -> list[str]:
+    cols = ["id", "text", "owner", "kind", "status"]
+    if _owner_columns_ready(cur):
+        cols += ["origin", "owner_label"]
+    if _future_trigger_ready(cur):
+        cols.append("future_trigger")
+    if _reassigned_column_ready(cur):
+        cols.append("owner_reassigned_at")
+    return cols
+
+
+def _resolved(row: dict[str, Any]) -> dict[str, Any]:
+    """``row`` with its stored owner kept as ``stored_owner`` and ``owner``,
+    ``owner_label`` resolved by :func:`row_owner`."""
+    row["stored_owner"] = row.get("owner")
+    trigger = has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
+    row["owner"], row["owner_label"] = row_owner(row, future_trigger=trigger)
+    return row
+
+
+def row_at_write(cur, commitment_id: int) -> dict[str, Any] | None:
+    """The item as it is now, its row locked for this transaction (``FOR
+    UPDATE``), with the owner resolved; None when it is missing or forgotten.
+    Every automatic write decides on this read, never on an earlier one."""
+    cols = _owner_cols(cur)
+    cur.execute(f"SELECT {', '.join(cols)} FROM commitments WHERE id = %s "
+                f"AND {_not_forgotten_clause(cur)} FOR UPDATE", (commitment_id,))
+    got = cur.fetchone()
+    return _resolved(dict(zip(cols, got))) if got else None
+
+
+def _owner_unchanged(cur, row: dict[str, Any]) -> tuple[str, tuple]:
+    """A WHERE clause the automatic write adds so it changes nothing when the
+    stored owner moved after :func:`row_at_write` read it (a writer outside a
+    transaction holds no lock)."""
+    sql, params = " AND owner IS NOT DISTINCT FROM %s", [row.get("stored_owner")]
+    if "owner_reassigned_at" in row:
+        sql += " AND owner_reassigned_at IS NOT DISTINCT FROM %s"
+        params.append(row["owner_reassigned_at"])
+    return sql, tuple(params)
+
+
+def suggest_looks_done(cur, commitment_id: int, *, rule: str, reason: str, key: str,
+                       evidence: dict | None = None, episode: int | None = None) -> bool:
+    """Keep a refused close on the owner's item as a "Looks done" suggestion
+    (``settle_suggestion``) with its rule, reason and evidence, for him to
+    close. Evidence he already reopened against (``reopened_rule_keys``) is
+    never suggested again, and the same key is not rewritten."""
+    if not _close_columns_ready(cur):
+        return False
+    doc = {"looks_done": True, "rule": rule, "reason": str(reason or "")[:300], "key": key,
+           "evidence": evidence or {}, "episode": episode}
+    cur.execute(
+        "UPDATE commitments SET settle_suggestion = %s::jsonb WHERE id = %s AND status = 'open' "
+        "AND NOT (%s = ANY(reopened_rule_keys)) "
+        "AND (settle_suggestion IS NULL OR settle_suggestion->>'key' IS DISTINCT FROM %s)",
+        (json.dumps(doc, default=str), commitment_id, key, key),
+    )
+    return cur.rowcount > 0
+
+
+def close_by_rule(cur, commitment_id: int, *, rule: str, reason: str, key: str,
+                  evidence: dict | None = None, episode: int | None = None,
+                  status: str = "closed", set_extra: str = "", extra_params: tuple = (),
+                  owner_of: Any = None) -> bool:
     """The one write every automatic close goes through (the PR and decision
     rules, the closed-loop match, the session-end close, the relay close, the
-    hygiene re-judge and dedup, and the clean-up's apply). ``owner`` is the
-    item's owner as the caller read it; :func:`owner_guard` refuses the
-    owner's own item for every ``rule`` but his own. It records the reason,
-    who closed it (:data:`BY_RULE`), the rule ``key`` and the ``evidence``,
-    and it refuses an item the owner reopened after that same key closed it
+    hygiene re-judge and dedup, and the clean-up's apply). It reads the item
+    under the row lock (:func:`row_at_write`); :func:`owner_guard` refuses
+    the owner's own item for every rule, and a refused close of the
+    :data:`PROPOSE_LOOKS_DONE` rules becomes a "Looks done" suggestion
+    (:func:`suggest_looks_done`). Otherwise it records the reason, who
+    closed it (:data:`BY_RULE`), the rule ``key`` and the ``evidence``, and
+    it refuses an item the owner reopened after that same key closed it
     (``reopened_rule_keys``). ``status`` is ``closed``, or ``dropped`` for the
     hygiene re-judge. On a hub before migration 0034 there is no key to
-    remember, so only the reason is written."""
-    why = owner_guard(owner, rule, origin=origin)
-    if why:
-        _log(f"kept commitment {commitment_id} as it is: {why}")
-        return False
+    remember, so only the reason is written. ``owner_of(row)`` reads the
+    owner from the locked row when a caller knows more than the row holds
+    (the clean-up: the lineage of the capture that opened it)."""
     if status not in ("closed", "dropped"):
         raise ValueError(f"an automatic close sets closed or dropped, not {status!r}")
+    row = row_at_write(cur, commitment_id)
+    if row is None or row.get("status") != "open":
+        return False
+    why = owner_guard(owner_of(row) if owner_of else row["owner"], rule)
+    if why:
+        _log(f"kept commitment {commitment_id} as it is: {why}")
+        if AUTOMATIC_RULES[rule] == PROPOSE_LOOKS_DONE:
+            suggest_looks_done(cur, commitment_id, rule=rule, reason=reason, key=key, evidence=evidence,
+                               episode=episode)
+        return False
     reason = str(reason or "")[:300]
+    same, same_params = _owner_unchanged(cur, row)
     if _close_columns_ready(cur):
         cur.execute(
             f"UPDATE commitments SET status = '{status}', closed_at = now(), closed_episode = %s, "
             f"close_reason = %s, closed_by = %s, close_rule_key = %s, close_evidence = %s::jsonb{set_extra} "
             "WHERE id = %s AND status = 'open' AND NOT (%s = ANY(reopened_rule_keys)) "
-            f"AND {_not_forgotten_clause(cur)}",
-            (episode, reason, BY_RULE, key, json.dumps(evidence or {}), *extra_params, commitment_id, key),
+            f"AND {_not_forgotten_clause(cur)}{same}",
+            (episode, reason, BY_RULE, key, json.dumps(evidence or {}), *extra_params, commitment_id, key,
+             *same_params),
         )
     else:
         cur.execute(
             f"UPDATE commitments SET status = '{status}', closed_at = now(), closed_episode = %s, "
             f"close_reason = %s{set_extra} WHERE id = %s AND status = 'open' "
-            f"AND {_not_forgotten_clause(cur)}",
-            (episode, reason, *extra_params, commitment_id),
+            f"AND {_not_forgotten_clause(cur)}{same}",
+            (episode, reason, *extra_params, commitment_id, *same_params),
         )
     return cur.rowcount > 0
 
 
-def auto_reassign(cur, commitment_id: int, *, rule: str, owner_before: str | None, sets: list[str],
-                  params: tuple) -> bool:
+def auto_reassign(cur, commitment_id: int, *, rule: str, sets: list[str], params: tuple,
+                  owner_of: Any = None) -> bool:
     """The one write every automatic owner change goes through (the hygiene
     pass's owner refresh and the clean-up's apply): ``UPDATE commitments SET
-    <sets>`` for one item, refused by :func:`owner_guard` when the item is
-    the owner's own (``owner_before``). The owner's own move is
-    :func:`reassign`."""
-    why = owner_guard(owner_before, rule)
+    <sets>`` for one item, read under the row lock (:func:`row_at_write`) and
+    refused by :func:`owner_guard` when the item is the owner's own, as it
+    reads now or as it is stored; with ``owner_of`` (see
+    :func:`close_by_rule`), as that reads the locked row. The owner's own
+    move is :func:`reassign`."""
+    row = row_at_write(cur, commitment_id)
+    if row is None:
+        return False
+    why = (owner_guard(owner_of(row), rule) if owner_of
+           else owner_guard(row["owner"], rule) or owner_guard(row["stored_owner"], rule))
     if why:
         _log(f"kept commitment {commitment_id}'s owner as it is: {why}")
         return False
-    cur.execute(f"UPDATE commitments SET {', '.join(sets)} WHERE id = %s", (*params, commitment_id))
+    same, same_params = _owner_unchanged(cur, row)
+    cur.execute(f"UPDATE commitments SET {', '.join(sets)} WHERE id = %s{same}",
+                (*params, commitment_id, *same_params))
     return cur.rowcount > 0
 
 
@@ -1614,13 +1719,14 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
                 best_id, tied = own[0], False
         if best_id is None or tied or (best_via == "cosine" and semantic_matches > 1):
             continue
-        best_text = next(r["text"] for r in open_rows if r["id"] == best_id)
-        why_not = evidence_problem(text, best_text, payload.get("project"))
+        best = next(r for r in open_rows if r["id"] == best_id)
+        # Every pull request the item was ever said to need counts, not only
+        # those of its first wording.
+        why_not = evidence_problem(text, best["text"], payload.get("project"), item=best)
         if why_not:
             _log(f"kept commitment {best_id} open: {why_not}")
             continue
-        best_owner = next(r.get("owner") for r in open_rows if r["id"] == best_id)
-        if close_by_rule(cur, best_id, rule="loop", owner=best_owner, origin=origin,
+        if close_by_rule(cur, best_id, rule="loop",
                          reason=f"{best_via} match ({best_score:.2f}): {text[:200]!r}",
                          key=evidence_key("loop", text), episode=episode_id,
                          evidence={"rule": "loop", "text": text[:300], "match": best_via,
@@ -1667,30 +1773,21 @@ def _stale_where(has_last_seen: bool) -> str:
 def mark_stale(cur) -> int:
     """Flip silent open commitments to 'stale' (see :func:`stale_sql`). Never
     silently dropped — stale stays queryable via `khipu owed --status stale`.
-    Staleness is an automatic rule, so :func:`owner_guard` keeps the owner's
-    own items open: they list as quiet (``quiet_weeks``) instead.
+    Staleness is an automatic rule: each item is read again under its row
+    lock (:func:`row_at_write`) and :func:`owner_guard` keeps the owner's
+    own items open; they list as quiet (``quiet_weeks``) instead.
     """
     has_seen = _seen_columns_ready(cur)
     forgotten = _not_forgotten_clause(cur)
-    cols = ["id", "text", "owner", "kind"]
-    if _owner_columns_ready(cur):
-        cols += ["origin", "owner_label"]
-    if _future_trigger_ready(cur):
-        cols.append("future_trigger")
-    if _reassigned_column_ready(cur):
-        cols.append("owner_reassigned_at")
-    cur.execute(f"SELECT {', '.join(cols)} FROM commitments WHERE {_stale_where(has_seen)} AND {forgotten}")
-    ids = []
-    for raw in cur.fetchall():
-        row = dict(zip(cols, raw))
-        trigger = has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
-        if owner_guard(row_owner(row, future_trigger=trigger)[0], "stale") is None:
-            ids.append(int(row["id"]))
+    cur.execute(f"SELECT id FROM commitments WHERE {_stale_where(has_seen)} AND {forgotten} ORDER BY id")
     n = 0
-    for at in range(0, len(ids), 500):
-        chunk = ids[at:at + 500]
-        cur.execute(stale_sql(has_last_seen=has_seen)
-                    + f" AND {forgotten} AND id IN ({', '.join(['%s'] * len(chunk))})", tuple(chunk))
+    for (cid,) in cur.fetchall():
+        row = row_at_write(cur, int(cid))
+        if row is None or owner_guard(row["owner"], "stale"):
+            continue
+        same, same_params = _owner_unchanged(cur, row)
+        cur.execute(stale_sql(has_last_seen=has_seen) + f" AND {forgotten} AND id = %s{same}",
+                    (int(cid), *same_params))
         n += max(0, cur.rowcount or 0)
     return n
 
@@ -1841,7 +1938,8 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
             # closed by the sessionend itself.
             hit = next(
                 (m for m in mentions if _match_score(m, row["text"]) >= DONE_MATCH_MIN_SCORE
-                 and not evidence_problem(m, row["text"], row.get("project") or payload.get("project"))),
+                 and not evidence_problem(m, row["text"], row.get("project") or payload.get("project"),
+                                          item=row)),
                 None,
             )
             if hit is None:
@@ -1853,7 +1951,7 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
         rule = "session-ended" if reason == "session-ended" else "session-plan"
         if reason == "session-ended":
             key, evidence = f"session-ended:{session_id}", {"rule": "session-ended", "session_id": session_id}
-        if close_by_rule(cur, row["id"], rule=rule, owner=owner, reason=reason, key=key, evidence=evidence,
+        if close_by_rule(cur, row["id"], rule=rule, reason=reason, key=key, evidence=evidence,
                          episode=episode_id):
             closed += 1
     if closed:
@@ -1971,8 +2069,13 @@ def resolve_owed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for key in ("prs", "closed_by", "close_rule_key", "settle_suggestion", "pr_check"):
             row.setdefault(key, None)
         suggestion = row["settle_suggestion"] if isinstance(row["settle_suggestion"], dict) else None
+        # A close a rule would have made to the owner's item is kept as a
+        # "Looks done" suggestion for him to close (suggest_looks_done).
+        done = suggestion if suggestion and suggestion.get("looks_done") else None
+        row["looks_done"] = ({k: done.get(k) for k in ("rule", "reason", "evidence")}
+                             if done and row.get("status") in (None, "open") else None)
         row["looks_settled"] = (f"Looks settled by decision {suggestion['decision_id']}"
-                                if suggestion and suggestion.get("decision_id") else None)
+                                if suggestion and not done and suggestion.get("decision_id") else None)
         # Sort rank for the Owed surface: user-owed first (blocker → question →
         # everything else the user owes), then assistant promises with an
         # explicit future trigger, then the rest by kind. Computed here so the
@@ -1986,9 +2089,15 @@ def resolve_owed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         clause = trigger_clause(row.get("text") or "") if trigger else None
         row["trigger_text"] = clause
         row["until"] = until_line(clause)
-        row["quiet_weeks"] = quiet_weeks(row)
-        row["group"] = quiet_label(row["quiet_weeks"])
+        set_quiet(row)
     return rows
+
+
+def set_quiet(row: dict[str, Any], now: datetime | None = None) -> None:
+    """``quiet_weeks`` and the list ``group`` ("Looks done" first, else "Quiet
+    for N weeks") of one resolved row, as of ``now``."""
+    row["quiet_weeks"] = quiet_weeks(row, now)
+    row["group"] = LOOKS_DONE if row.get("looks_done") else quiet_label(row["quiet_weeks"])
 
 
 def add_hub_ages(rows: list[dict[str, Any]], hub_now: Any) -> list[dict[str, Any]]:
@@ -2034,6 +2143,19 @@ def set_status(cur, commitment_id: int, status: str, *, reason: str | None = Non
             "AND other.content_hash = commitments.content_hash)",
             (commitment_id,),
         )
+        reopened = cur.rowcount > 0
+        if close_ready and reopened:
+            # Reopened after a close from "Looks done": that evidence was wrong,
+            # so it is withdrawn and never suggested again (suggest_looks_done).
+            cur.execute(
+                "UPDATE commitments SET reopened_rule_keys = CASE "
+                "WHEN settle_suggestion->>'key' IS NULL "
+                "OR settle_suggestion->>'key' = ANY(reopened_rule_keys) THEN reopened_rule_keys "
+                "ELSE array_append(reopened_rule_keys, settle_suggestion->>'key') END, "
+                "settle_suggestion = NULL WHERE id = %s AND settle_suggestion IS NOT NULL",
+                (commitment_id,),
+            )
+        return reopened
     else:
         extra = ", closed_at = now()" if status == "closed" else ""
         params: list[Any] = [status]
@@ -2084,11 +2206,28 @@ def _page_key(row: dict[str, Any]) -> tuple[int, Any, int]:
     return (0 if row.get("quiet_weeks") else 1, *_opened_key(row))
 
 
-def encode_cursor(row: dict[str, Any]) -> str:
+def encode_cursor(row: dict[str, Any], as_of: datetime | None = None) -> str:
+    """The cursor after ``row``. ``as_of`` is the clock the first page read
+    quiet items by; later pages read them by the same clock, so an item that
+    turns quiet between pages neither repeats nor goes missing."""
     import base64
 
     active, at, cid = _page_key(row)
-    return base64.urlsafe_b64encode(json.dumps([at.isoformat(), cid, active]).encode()).decode().rstrip("=")
+    parts = [at.isoformat(), cid, active] + ([as_of.isoformat()] if as_of else [])
+    return base64.urlsafe_b64encode(json.dumps(parts).encode()).decode().rstrip("=")
+
+
+def cursor_as_of(raw: str | None) -> datetime | None:
+    """The clock a cursor's first page read quiet items by, or None."""
+    import base64
+
+    if not raw:
+        return None
+    try:
+        parts = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode())
+        return _as_utc(parts[3]) if len(parts) > 3 else None
+    except (ValueError, TypeError, UnicodeDecodeError, IndexError):
+        return None
 
 
 def decode_cursor(raw: str) -> tuple[int, Any, int]:
@@ -2116,7 +2255,8 @@ def _row_prs(row: dict[str, Any]) -> list[int]:
 
 def page_owed(rows: list[dict[str, Any]], *, owner: str | None = None, kind: str | None = None,
               origin: str | None = None, query: str | None = None, pr: int | None = None,
-              cursor: str | None = None, limit: int | None = 50) -> dict[str, Any]:
+              cursor: str | None = None, limit: int | None = 50,
+              looks_done: bool | None = None) -> dict[str, Any]:
     """One page of raw owed rows (``fetch_owed_rows`` or the replica's), newest
     first on the keyset (``opened_at``, ``id``), so a page never skips or
     repeats a row while new ones arrive (they sort ahead of every cursor).
@@ -2124,8 +2264,16 @@ def page_owed(rows: list[dict[str, Any]], *, owner: str | None = None, kind: str
     ``total`` counts every row that matches; ``counts`` holds how many each
     owner and kind has among the rows the other filters match (the owner
     counts ignore the owner filter, the kind counts the kind filter), so a
-    caller sees what the other headings hold. ``limit`` None or 0: no limit."""
+    caller sees what the other headings hold, and ``counts["looks_done"]``
+    how many of them look done. ``looks_done`` True keeps only those. The
+    quiet group is read by the first page's clock throughout (``as_of`` in
+    the cursor). ``limit`` None or 0: no limit."""
+    from datetime import timezone
+
     resolve_owed_rows(rows)
+    as_of = cursor_as_of(cursor) or datetime.now(timezone.utc)
+    for row in rows:
+        set_quiet(row, as_of)
     words = [w for w in (query or "").lower().split() if w]
 
     def keep(row: dict[str, Any], *, skip: str = "") -> bool:
@@ -2137,15 +2285,19 @@ def page_owed(rows: list[dict[str, Any]], *, owner: str | None = None, kind: str
             return False
         if words and not all(w in (row.get("text") or "").lower() for w in words):
             return False
+        if looks_done and not row.get("looks_done"):
+            return False
         return not (pr is not None and pr not in _row_prs(row))
 
-    counts: dict[str, dict[str, int]] = {"owner": {}, "kind": {}}
+    counts: dict[str, Any] = {"owner": {}, "kind": {}, "looks_done": 0}
     for row in rows:
         if keep(row, skip="owner"):
             counts["owner"][row["owner"]] = counts["owner"].get(row["owner"], 0) + 1
         if keep(row, skip="kind"):
             k = str(row.get("kind") or "followup")
             counts["kind"][k] = counts["kind"].get(k, 0) + 1
+        if keep(row) and row.get("looks_done"):
+            counts["looks_done"] += 1
     matched = sorted((r for r in rows if keep(r)), key=_page_key, reverse=True)
     after = matched
     if cursor:
@@ -2154,28 +2306,16 @@ def page_owed(rows: list[dict[str, Any]], *, owner: str | None = None, kind: str
     page = after[:limit] if limit else after
     more = len(after) > len(page)
     return {"results": page, "total": len(matched), "counts": counts,
-            "next_cursor": encode_cursor(page[-1]) if more and page else None}
+            "next_cursor": encode_cursor(page[-1], as_of) if more and page else None}
 
 
 def owners_of(cur, ids: list[int], *, lock: bool = False) -> dict[int, dict[str, Any]]:
     """``{id: row}`` with the resolved owner for the given ids (forgotten
     and missing ids left out); ``lock`` holds the rows for this transaction."""
-    cols = ["id", "text", "owner", "kind", "status"]
-    if _owner_columns_ready(cur):
-        cols += ["origin", "owner_label"]
-    if _future_trigger_ready(cur):
-        cols.append("future_trigger")
-    if _reassigned_column_ready(cur):
-        cols.append("owner_reassigned_at")
+    cols = _owner_cols(cur)
     cur.execute(f"SELECT {', '.join(cols)} FROM commitments WHERE id = ANY(%s) "
                 f"AND {_not_forgotten_clause(cur)}{' FOR UPDATE' if lock else ''}", (list(ids),))
-    out = {}
-    for raw in cur.fetchall():
-        row = dict(zip(cols, raw))
-        trigger = has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
-        row["owner"], row["owner_label"] = row_owner(row, future_trigger=trigger)
-        out[int(row["id"])] = row
-    return out
+    return {int(raw[0]): _resolved(dict(zip(cols, raw))) for raw in cur.fetchall()}
 
 
 def reassign(cur, commitment_id: int, owner: str, label: str | None = None, *,

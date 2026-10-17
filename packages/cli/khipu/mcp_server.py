@@ -548,7 +548,13 @@ TOOLS: list[dict] = [
             "next page; total and counts (by owner and kind) cover every "
             "matching item, not just this page. The user's own items never "
             "go stale: one unmentioned for weeks lists after the active ones "
-            "with quiet_weeks and group 'Quiet for N weeks'."
+            "with quiet_weeks and group 'Quiet for N weeks'. Nothing "
+            "automatic ever closes the user's own items: one a rule would have "
+            "closed (its pull requests merged, a decision settled it) has "
+            "group 'Looks done' and looks_done (rule, reason, evidence); "
+            "looks_done=true lists only those and counts.looks_done counts "
+            "them. When the user says to close them, close them with "
+            "khipu_owed_update."
         ),
         "inputSchema": {
             "type": "object",
@@ -563,6 +569,8 @@ TOOLS: list[dict] = [
                 "origin": {"type": "string", "description": "conversation | job"},
                 "query": {"type": "string", "description": "Words that must all be in the text"},
                 "pr": {"type": "integer", "description": "Only items naming this pull request number"},
+                "looks_done": {"type": "boolean",
+                               "description": "Only the user's items a rule found done, for the user to close"},
                 "cursor": {"type": "string", "description": "next_cursor from the previous page"},
                 "limit": {"type": "integer",
                           "description": "Default 50; at most the owed_page_max setting (200, 0 for no limit)"},
@@ -1597,7 +1605,8 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
 
 
 def owed_filters(args: dict) -> dict:
-    """The owed list's filters, checked: owner, kind, origin, query, pr, cursor."""
+    """The owed list's filters, checked: owner, kind, origin, query, pr,
+    looks_done, cursor."""
     from khipu import commitments
 
     owner = (args.get("owner") or "all").strip().lower()
@@ -1617,8 +1626,12 @@ def owed_filters(args: dict) -> dict:
     cursor = str(args.get("cursor") or "").strip() or None
     if cursor:
         commitments.decode_cursor(cursor)
+    looks_done = args.get("looks_done")
+    if isinstance(looks_done, str):
+        looks_done = looks_done.strip().lower() in ("1", "true", "yes")
     return {"owner": None if owner == "all" else owner, "kind": kind, "origin": origin,
-            "query": str(args.get("query") or "").strip() or None, "pr": pr, "cursor": cursor}
+            "query": str(args.get("query") or "").strip() or None, "pr": pr, "cursor": cursor,
+            "looks_done": bool(looks_done) or None}
 
 
 def owed_page_limit(raw) -> tuple[int | None, str | None]:
