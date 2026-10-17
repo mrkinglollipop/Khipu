@@ -340,7 +340,11 @@ export function LedgerPage({
   }, [every, readList, loadDetail]);
   const rows = useMemo(() => list?.rows ?? [], [list]);
 
+  // Bumped whenever the open row changes: a save that finishes after it
+  // belongs to an edit session that has ended, and touches nothing on screen.
+  const session = useRef(0);
   useEffect(() => {
+    session.current += 1;
     setRefusal(null);
     setNotice(null);
     setEdits({});
@@ -415,27 +419,33 @@ export function LedgerPage({
     }
     change.if_state = detail.state;
     const sent = form;
+    const mine = session.current;
     setSaving(true);
     setRefusal(null);
     setNotice(null);
     try {
       const out = await callCli<LedgerSetReply>("khipu_ledger_set", { project, id: detail.id, change });
+      // The commitment closed is the saved row's own; what shows (a refusal,
+      // a notice, the edits cleared) changes only while that row's edit
+      // session is still the one open.
       if (!out.ok) {
         // Refused: everything typed stays, unsaved.
-        setRefusal(out.error);
+        if (session.current === mine) setRefusal(out.error);
       } else {
         const reply = out.data;
         const commitment = detail.refs?.commitment;
         const owed = !!change.state && commitment != null && commitment !== "" && finished(vocab, change.state);
         if (owed && appliedFinished(reply, vocab)) await onOwedClose(Number(commitment));
-        setNotice(unappliedWords(reply, owed));
-        // Arrived late: nothing was applied, so what was typed stays. Otherwise
-        // what was sent is saved (or waiting to be sent) and only typing done
-        // during the save stays.
-        if (!reply?.late) {
-          setEdits((cur) =>
-            Object.fromEntries(Object.entries(cur).filter(([k, v]) => v !== sent[k as keyof Form])) as Edits,
-          );
+        if (session.current === mine) {
+          setNotice(unappliedWords(reply, owed));
+          // Arrived late: nothing was applied, so what was typed stays. Otherwise
+          // what was sent is saved (or waiting to be sent) and only typing done
+          // during the save stays.
+          if (!reply?.late) {
+            setEdits((cur) =>
+              Object.fromEntries(Object.entries(cur).filter(([k, v]) => v !== sent[k as keyof Form])) as Edits,
+            );
+          }
         }
       }
       await afterWrite(detail.id);

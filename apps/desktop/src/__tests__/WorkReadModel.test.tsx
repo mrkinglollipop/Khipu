@@ -696,3 +696,29 @@ describe("LedgerPage queue health and a missing offline copy", () => {
     expect(screen.queryByText(/showing its offline copy/i)).toBeNull();
   });
 });
+
+describe("LedgerPage save completion belongs to the row it was made on", () => {
+  it("a save finishing after a switch leaves the other row's edits, marker and notices alone", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const first = row("s-1", { version: 1, evidence: "" });
+    const second = row("s-2", { version: 1, evidence: "" });
+    let finish: (value: string) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string, args: Record<string, unknown>) => {
+      if (cmd === "khipu_ledger_list") return JSON.stringify({ ok: true, offline: false, vocab: VOCAB, rows: [first, second] });
+      if (cmd === "khipu_ledger_get") return JSON.stringify(args.id === "s-1" ? first : second);
+      if (cmd === "khipu_ledger_set") return new Promise<string>((resolve) => { finish = resolve; });
+      return JSON.stringify({ removed: [] });
+    });
+    ledgerPage("s-1"); await tick(0);
+    const form = () => screen.getByRole("form", { name: "Change this row" });
+    const evidence = () => within(form()).getByLabelText("Evidence");
+    fireEvent.change(evidence(), { target: { value: "Shared proof" } });
+    fireEvent.submit(form()); await tick(0);
+    fireEvent.click(screen.getByText("Row s-2")); await tick(0);
+    fireEvent.change(evidence(), { target: { value: "Shared proof" } });
+    await act(async () => { finish(JSON.stringify({ ok: true, queued: true })); });
+    expect(evidence()).toHaveValue("Shared proof");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(screen.queryByText(/waiting to be sent to the database/i)).toBeNull();
+  });
+});

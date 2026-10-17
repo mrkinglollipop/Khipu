@@ -897,6 +897,8 @@ def test_offline_checks_do_not_refuse_a_row_the_copy_has_not_caught_up_with(hub,
 class _ReplicaHub:
     """A hub that holds one row at one version, for the offline-copy catch-up."""
 
+    isolation_level = None
+
     def __init__(self, version, removed=False):
         self.version, self.removed = version, removed
 

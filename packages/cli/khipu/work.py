@@ -1026,14 +1026,13 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
 # ---- the ledger, commitments and routing (each fail-open) ---------------------------
 
 
-def _ledger_projects(conn) -> list[dict]:
+def _ledger_projects(cur) -> list[dict]:
     """Every ledger project with its display name and hidden mark: from the
-    hub, or from the offline copy when it is away."""
-    if conn is not None:
-        with conn.cursor() as cur:
-            cur.execute("SELECT project, name, hidden, created_at FROM ledger_projects ORDER BY project")
-            got = cur.fetchall()
-        conn.rollback()
+    hub (``cur``, read in ``read_ledger``'s snapshot), or from the offline
+    copy when it is away (None)."""
+    if cur is not None:
+        cur.execute("SELECT project, name, hidden, created_at FROM ledger_projects ORDER BY project")
+        got = cur.fetchall()
     else:
         import sqlite3
 
@@ -1053,20 +1052,20 @@ def _ledger_projects(conn) -> list[dict]:
              "created_at": _z(c) if isinstance(c, datetime) else c} for p, n, h, c in got]
 
 
-def _entered(conn, project: str, rows: list[dict], history: list[dict] | None) -> dict[str, datetime]:
-    """When each of ``rows`` last entered its current state, from its history.
-    An entry that keeps the state (a note or an edit) is not an entering."""
+def _entered(cur, project: str, rows: list[dict], history: list[dict] | None) -> dict[str, datetime]:
+    """When each of ``rows`` last entered its current state, from its history
+    (``cur``, read in ``read_ledger``'s snapshot; None: ``history``, the
+    offline copy's). An entry that keeps the state (a note or an edit) is not
+    an entering."""
     if not rows:
         return {}
     states = {r["row_id"]: r["state"] for r in rows}
     out: dict[str, datetime] = {}
-    if conn is not None:
-        with conn.cursor() as cur:
-            cur.execute("SELECT row_id, to_state, max(at) FROM ledger_history WHERE project = %s "
-                        "AND row_id = ANY(%s) AND from_state IS DISTINCT FROM to_state "
-                        "GROUP BY row_id, to_state", (project, list(states)))
-            found = cur.fetchall()
-        conn.rollback()
+    if cur is not None:
+        cur.execute("SELECT row_id, to_state, max(at) FROM ledger_history WHERE project = %s "
+                    "AND row_id = ANY(%s) AND from_state IS DISTINCT FROM to_state "
+                    "GROUP BY row_id, to_state", (project, list(states)))
+        found = cur.fetchall()
     else:
         found = [(h.get("row_id"), h.get("to_state"), h.get("at")) for h in history or []
                  if h.get("from_state") != h.get("to_state")]
@@ -1076,6 +1075,59 @@ def _entered(conn, project: str, rows: list[dict], history: list[dict] | None) -
                 and (row_id not in out or at > out[row_id]):
             out[row_id] = at
     return out
+
+
+@contextlib.contextmanager
+def _hub_read(conn):
+    """``read_ledger``'s one hub snapshot (``ledger._one_snapshot``), in
+    pipeline mode: reads that do not wait on one another go to the hub
+    together, so the boards cost a few round trips, not one per statement.
+    ``read_ledger`` closes the connection after it. None when the hub is
+    away."""
+    from khipu import ledger
+
+    if conn is None:
+        yield None
+        return
+    with ledger._one_snapshot(conn, closing=True, pipeline=True) as cur:
+        yield cur
+
+
+def _read_boards(conn, cur, out: dict[str, Any]) -> None:
+    """``read_ledger``'s boards into ``out["projects"]``: online from ``cur``
+    (the snapshot of ``conn``), offline (None) from the offline copy."""
+    from khipu import ledger
+
+    projects = {proj["project"]: proj for proj in _ledger_projects(cur)}
+    # A queued add can name a project that has never reached the hub or
+    # its offline snapshot. Work already reads this outbox through each
+    # offline view, so it must also make that project a board.
+    queued = set()
+    for op in ledger.queued_ops():
+        key = op.get("project")
+        if isinstance(key, str) and key:
+            queued.add(key)
+        if isinstance(key, str) and key and key not in projects:
+            projects[key] = {"project": key, "name": key, "hidden": False, "created_at": None}
+    for proj in projects.values():
+        key = proj["project"]
+        history = None
+        if cur is not None:
+            view = ledger._hub_rows(conn, key)
+            # Writes the drain left waiting (another writer held the
+            # line, or it stopped early) still show, marked queued, so
+            # "What you see includes them" stays true online too.
+            if key in queued:
+                view = ledger._hub_overlay(conn, view, key)
+        else:
+            offline = ledger._offline_view(key) or ledger._no_copy_view()
+            view = ledger._overlay(offline, key)
+            history = offline.get("history")
+            out["as_of"] = view.get("as_of")
+        needs = [r for r in view["rows"] if ledger._meaning(view["vocab"], r["state"]) == "needs"]
+        out["projects"][key] = {"name": proj["name"], "hidden": proj["hidden"],
+                                "created_at": proj["created_at"], "vocab": view["vocab"],
+                                "rows": view["rows"], "entered": _entered(cur, key, needs, history)}
 
 
 def read_ledger() -> dict[str, Any]:
@@ -1107,36 +1159,8 @@ def read_ledger() -> dict[str, Any]:
 
             if not hub_snapshot.ledger_in_snapshot():
                 out["error"], out["copy_unavailable"] = LEDGER_NO_COPY, True
-        projects = {proj["project"]: proj for proj in _ledger_projects(conn)}
-        # A queued add can name a project that has never reached the hub or
-        # its offline snapshot. Work already reads this outbox through each
-        # offline view, so it must also make that project a board.
-        queued = set()
-        for op in ledger.queued_ops():
-            key = op.get("project")
-            if isinstance(key, str) and key:
-                queued.add(key)
-            if isinstance(key, str) and key and key not in projects:
-                projects[key] = {"project": key, "name": key, "hidden": False, "created_at": None}
-        for proj in projects.values():
-            key = proj["project"]
-            history = None
-            if conn is not None:
-                view = ledger._hub_view(conn, key)
-                # Writes the drain left waiting (another writer held the
-                # line, or it stopped early) still show, marked queued, so
-                # "What you see includes them" stays true online too.
-                if key in queued:
-                    view = ledger._hub_overlay(conn, view, key)
-            else:
-                offline = ledger._offline_view(key) or ledger._no_copy_view()
-                view = ledger._overlay(offline, key)
-                history = offline.get("history")
-                out["as_of"] = view.get("as_of")
-            needs = [r for r in view["rows"] if ledger._meaning(view["vocab"], r["state"]) == "needs"]
-            out["projects"][key] = {"name": proj["name"], "hidden": proj["hidden"],
-                                    "created_at": proj["created_at"], "vocab": view["vocab"],
-                                    "rows": view["rows"], "entered": _entered(conn, key, needs, history)}
+        with _hub_read(conn) as cur:
+            _read_boards(conn, cur, out)
     except Exception as exc:  # noqa: BLE001
         if not ledger._tables_missing(exc):
             out["error"] = type(exc).__name__
@@ -1158,6 +1182,13 @@ def read_owed(now: datetime | None = None) -> dict[str, Any]:
         return {"items": [], "error": type(exc).__name__}
     try:
         from khipu.commitments import list_owed
+
+        # One read, so no transaction: a BEGIN would cost its own round trip.
+        conn.autocommit = True
+        from khipu.db import prime_table_columns
+
+        # The read asks which columns both tables have: one round trip.
+        prime_table_columns(conn, "episodes", "commitments")
 
         with conn.cursor() as cur:
             # No limit: the list is every open commitment, the user's picked

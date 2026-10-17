@@ -232,3 +232,87 @@ def test_a_copy_without_receipts_still_reads(hub, tmp_path, monkeypatch):
         con.execute("DROP TABLE IF EXISTS ledger_receipts")
     _hub_away(monkeypatch)
     assert [r["row_id"] for r in ledger.load(P)["rows"]] == ["r"]
+
+
+# ---- receipts never outrun their rows (round 2) ----------------------------
+
+
+def _remote_apply(hub, op, monkeypatch):
+    """Another Mac lands ``op``: only the hub is shared with this reader."""
+    with monkeypatch.context() as m:
+        m.setattr(ledger, "_mark_lag", lambda *a: None)
+        m.setattr(ledger, "_replica_sync", lambda *a: None)
+        with _real_connect(hub) as c:
+            return ledger.apply_op(c, op, late=True)
+
+
+def _waiting_done(tmp_path):
+    _snapshot(tmp_path)
+    ok("add", "r", "--title", "Row", "--kind", "slice")
+    op = ledger.new_op("set", P, "r", fields={"state": "DONE"}, op_id="receipt-race")
+    op["seen"] = {"state": "NOT STARTED"}
+    ledger.enqueue(op)
+    return op
+
+
+def _land_during_receipt_read(hub, op, monkeypatch):
+    real, calls = hs._read_ledger_receipts, []
+
+    def racing(cur, ids):
+        if ids and not calls:
+            calls.append(_remote_apply(hub, op, monkeypatch))
+        return real(cur, ids)
+
+    monkeypatch.setattr(hs, "_read_ledger_receipts", racing)
+    return calls
+
+
+def test_catch_up_never_copies_a_receipt_newer_than_its_row(hub, tmp_path, monkeypatch):
+    op = _waiting_done(tmp_path)
+    ledger._mark_lag(P, ["r"])
+    calls = _land_during_receipt_read(hub, op, monkeypatch)
+    with _real_connect(hub) as c:
+        assert ledger.replica_catch_up(c)["copied"] == 1
+    assert calls and calls[0]["ok"]
+    copy = hs.ledger_read_snapshot(P)
+    assert copy["rows"][0]["state"] == "NOT STARTED"
+    assert op["op_id"] not in (copy["receipts"] or {})
+    shown = ledger._overlay(ledger._offline_view(P), P)["rows"][0]
+    assert shown["state"] == "DONE" and shown["queued"]
+
+
+def test_an_online_read_never_takes_a_receipt_newer_than_its_rows(hub, tmp_path, monkeypatch):
+    op = _waiting_done(tmp_path)
+    calls = _land_during_receipt_read(hub, op, monkeypatch)
+    with _real_connect(hub) as c:
+        shown = ledger._hub_overlay(c, ledger._hub_view(c, P), P)["rows"][0]
+    assert calls and calls[0]["ok"]
+    assert shown["state"] == "DONE" and shown["queued"]
+
+
+def test_an_online_read_and_its_overlay_share_one_snapshot(hub, tmp_path, monkeypatch):
+    op = _waiting_done(tmp_path)
+    with _real_connect(hub) as c:
+        view = ledger._hub_view(c, P)
+        _remote_apply(hub, op, monkeypatch)
+        shown = ledger._hub_overlay(c, view, P)["rows"][0]
+    assert shown["state"] == "DONE" and shown["queued"]
+
+
+def test_one_row_read_never_takes_a_receipt_newer_than_its_row(hub, tmp_path, monkeypatch):
+    op = _waiting_done(tmp_path)
+    monkeypatch.setattr(ledger, "drain", lambda *a, **k: ledger._drain_result())
+    calls = _land_during_receipt_read(hub, op, monkeypatch)
+    with _real_connect(hub) as c:
+        got = ledger.get(P, "r", conn=c)
+    assert calls and calls[0]["ok"]
+    assert got["row"]["state"] == "DONE" and got["row"]["queued"]
+    assert all(h["to_state"] != "DONE" for h in got["history"])
+
+
+def test_a_snapshot_read_leaves_the_connection_as_it_found_it(hub):
+    with _real_connect(hub) as c:
+        before = c.isolation_level
+        ledger._hub_view(c, P)
+        assert c.isolation_level == before
+        assert c.info.transaction_status == c.info.transaction_status.IDLE

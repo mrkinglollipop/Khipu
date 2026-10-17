@@ -16,7 +16,7 @@ import os
 import random
 import threading
 import time
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from datetime import timedelta
 
 import pytest
@@ -413,11 +413,16 @@ def test_ledger_get_says_offline_or_live(monkeypatch):
 
 
 class _Conn:
+    isolation_level = None
+
     def close(self):
         pass
 
     def rollback(self):
         pass
+
+    def pipeline(self):
+        return nullcontext()
 
 
 def _queued(project="atlas", row_id="q1"):
@@ -485,7 +490,7 @@ def test_work_shows_writes_still_waiting_on_an_online_read(monkeypatch):
 
     monkeypatch.setattr(ledger, "_connect", lambda: Conn())
     monkeypatch.setattr(ledger, "drain", lambda conn: {"busy": True})
-    monkeypatch.setattr(ledger, "_hub_view", lambda conn, project: {
+    monkeypatch.setattr(ledger, "_hub_rows", lambda conn, project: {
         "rows": [], "vocab": ledger.default_vocab(), "offline": False, "as_of": None})
     monkeypatch.setattr(ledger, "queued_ops", lambda **kw: [_queued()])
     got = work.read_ledger()
@@ -601,9 +606,12 @@ def _online_get(monkeypatch, *, hub_row, queued, drained=None):
     monkeypatch.setattr(ledger, "replica_catch_up", lambda conn: None)
     monkeypatch.setattr(ledger, "queued_ops", lambda **kw: list(queued))
     monkeypatch.setattr(ledger, "_marker", lambda cur, p, r: None)
-    monkeypatch.setattr(ledger, "_hub_view", lambda conn, project: {
-        "vocab": ledger.default_vocab(), "rows": [copy.deepcopy(hub_row)] if hub_row else [], "offline": False,
-        "as_of": None})
+    def hub_rows(conn, project):
+        return {"vocab": ledger.default_vocab(), "rows": [copy.deepcopy(hub_row)] if hub_row else [],
+                "offline": False, "as_of": None}
+
+    monkeypatch.setattr(ledger, "_hub_rows", hub_rows)
+    monkeypatch.setattr(ledger, "_hub_view", hub_rows)
     monkeypatch.setattr(ledger, "_row_dict", lambda got: copy.deepcopy(hub_row))
 
 
