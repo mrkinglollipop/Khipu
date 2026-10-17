@@ -1579,7 +1579,16 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
             c["turn_ts"] = None
         issuer = turn.get("issuer")
         issuers.append((c, issuer if isinstance(issuer, dict) else {}))
-    env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    # A Codex or Grok job started from a Claude session's shell inherits that
+    # session's CLAUDE_CODE_SESSION_ID; its own markers say it is not Claude.
+    codex_tid = os.environ.get("CODEX_THREAD_ID")
+    if codex_tid:
+        own = [c for c, _ in issuers if c["harness"] == "codex"
+               and (c["state"].get("session_id") or c["sid"]) == codex_tid]
+        if len(own) == 1:
+            return own[0]["harness"], own[0]["sid"], "session_env"
+    foreign = codex_tid or any(k.startswith("GROK_HOOK_") for k in os.environ)
+    env_sid = None if foreign else os.environ.get("CLAUDE_CODE_SESSION_ID")
     if env_sid:
         for candidate, issuer in issuers:
             if (candidate["harness"] != "claude_code"
