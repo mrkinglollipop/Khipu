@@ -1594,7 +1594,7 @@ _AUTH_OF_VIA = {"app": "app", "cli": "terminal", "direction": "direction"}
 _OWNERS_OWN = ("app", "direction")
 # Lines only the owner writes; the fold counts one with no author as his.
 _OWNER_ONLY = frozenset({"pause", "lift", "clear", "clear_undo", "dismiss", "undismiss", "note_set", "note_end", "rule_confirm", "rule_retire",
-                         "rule_restore", "rule_undo", "rule_dismiss", "priority_confirm", "priority_undo",
+                         "rule_restore", "rule_undo", "rule_unconfirm", "rule_dismiss", "priority_confirm", "priority_undo",
                          "priority_clear", "priority_drop", "account_move", "account_note"})
 
 
@@ -2518,7 +2518,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                  "pending_by": author_words(info["written_by"], push=True) if pending else None,
                                  "pending_author": info["written_by"] if pending else None,
                                  "written_by": info["written_by"], "via": info["via"], "at": info["at"]}
-        elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_dismiss") and event.get("n") in rules:
+        elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_unconfirm",
+                      "rule_dismiss") and event.get("n") in rules:
             rule = rules[event["n"]]
             if kind == "rule_edit" and isinstance(event.get("text"), str):
                 was_pending = bool(rule.get("pending"))
@@ -2548,6 +2549,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 rule.update(text=rule["prior_text"], pending=False, pending_kind=None, prior_text=None,
                             prior_confirmed=None, pending_by=None, pending_author=None,
                             confirmed=bool(rule.get("prior_confirmed")))
+            elif kind == "rule_unconfirm" and rule["seeded"]:
+                rule["confirmed"] = False
             elif kind == "rule_dismiss":
                 rule["retired"] = True
             rule.update(written_by=info["written_by"], via=info["via"], at=info["at"])
@@ -3319,7 +3322,8 @@ def _touched(kind: str | None, event: dict, info: dict) -> str | None:
         return f"hold:{event['id']}"
     if kind == "hold_end" and info["target"]:
         return f"hold:{info['target']}"
-    if kind in ("rule_add", "rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_dismiss") \
+    if kind in ("rule_add", "rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_unconfirm",
+                "rule_dismiss") \
             and isinstance(event.get("n"), int):
         return f"rule:{event['n']}"
     if kind in ("note_set", "note_end"):
@@ -3956,7 +3960,7 @@ _REASON_ARGS = {"machine-busy": "machine_busy", "disk-low": "disk_low", "keep": 
 
 def add_hold(text: str, *, reason: str, scope: str, account: str | None = None, until: str | None = None,
              owner: bool = False, author: dict | None = None, via: str = "cli",
-             now: datetime | None = None) -> dict:
+             now: datetime | None = None, hold_id: str | None = None) -> dict:
     """A short note about one account, the Mac or all work. A conversation's
     hold lasts 24 hours by default and at most 7 days (settings); the owner's
     lasts until he chooses, "until I clear it" included. Its words are at
@@ -3990,7 +3994,7 @@ def add_hold(text: str, *, reason: str, scope: str, account: str | None = None, 
         longest = cfg["routing_conversation_hold_max"]
         if longest:
             stop = min(stop, _after(now, longest))
-    event = {"type": "hold", "id": _new_id("h"), "scope": hold_scope, "reason": code,
+    event = {"type": "hold", "id": hold_id or _new_id("h"), "scope": hold_scope, "reason": code,
              "text": words if owner else _clean(words, most), "until": _iso(stop), "owner": owner,
              "written_by": OWNER if owner else (author or conversation_author()), "via": via}
     written, view = _write(_owner_stamp(event) if owner else event)
@@ -4184,7 +4188,10 @@ def _rule(n, now) -> dict:
     return rule
 
 
-def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | None = None) -> dict:
+def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | None = None,
+             event_id: str | None = None) -> dict:
+    """``event_id``: the id an owner action chose for this line before it
+    was written, so its Undo finds this rule and no other."""
     now = now or _now()
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
@@ -4193,7 +4200,7 @@ def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | 
         n = _next_rules(events, 1)
         out = _owner_write({"type": "rule_add", "n": n, "text": text.strip(),
                             "source": _one_line(source) or "added by you", "date": now.date().isoformat(),
-                            "seeded": False}, via)
+                            "seeded": False, **({"id": event_id} if event_id else {})}, via)
     return dict(out, n=n)
 
 
@@ -4276,6 +4283,15 @@ def restore_rule(n, *, via: str, now: datetime | None = None) -> dict:
 def confirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
     return dict(_owner_write({"type": "rule_confirm", "n": rule["n"]}, via), n=rule["n"])
+
+
+def unconfirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
+    """Undo of confirming a seeded rule: it reads as seeded and unconfirmed
+    again."""
+    rule = _rule(n, now)
+    if not rule["seeded"]:
+        raise RouteError(f"standing rule {rule['n']} is not a seeded rule")
+    return dict(_owner_write({"type": "rule_unconfirm", "n": rule["n"]}, via), n=rule["n"])
 
 
 def undo_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
@@ -4990,6 +5006,7 @@ _DIRECTION_VERBS = {"pause": "Paused {a}", "lift": "Lifted the pause on {a}", "c
                     "rule_edit": "Changed standing rule {n}", "rule_retire": "Retired standing rule {n}",
                     "rule_restore": "Restored standing rule {n}", "rule_confirm": "Confirmed standing rule {n}",
                     "rule_undo": "Undid the change to standing rule {n}",
+                    "rule_unconfirm": "Set standing rule {n} back to unconfirmed",
                     "rule_dismiss": "Dismissed standing rule {n}", "priority_set": "Set the priority",
                     "priority_confirm": "Confirmed the priority", "priority_undo": "Undid the priority change",
                     "priority_clear": "Cleared the priority", "priority_drop": "Cleared the priority"}
@@ -6796,6 +6813,12 @@ def _hold_intent(args, words: list[str]) -> dict | None:
     return owner_direction.intent("route.hold.add", target)
 
 
+def _planned_id(action: str) -> str | None:
+    from khipu import owner_direction
+
+    return owner_direction.planned_id(action)
+
+
 def run_cli(args) -> int:
     """``khipu route``: read the record, or write one change to it. An
     owner's change is timed after its typed confirmation, not before."""
@@ -6880,7 +6903,8 @@ def run_cli(args) -> int:
                 raise RouteError("--reason is needed: machine-busy, disk-low, keep, outage or other")
             scope = "account" if args.account else "machine" if args.machine else "all" if args.all else ""
             out = add_hold(" ".join(words), reason=args.reason, scope=scope, account=args.account,
-                           until=args.until, owner=owner_flag, via=via, now=now)
+                           until=args.until, owner=owner_flag, via=via, now=now,
+                           hold_id=_planned_id("route.hold.add") if owner_flag else None)
             _print_json(_finish_owner(out) if owner_flag else out)
             return 0
         if cmd == "priority":
@@ -6920,7 +6944,8 @@ def run_cli(args) -> int:
         elif cmd == "rule":
             params = list(args.params)
             if args.action == "add":
-                out = add_rule(" ".join(params), source=args.source, via=via, now=now)
+                out = add_rule(" ".join(params), source=args.source, via=via, now=now,
+                               event_id=_planned_id("route.rule.add"))
             elif args.action == "edit":
                 if len(params) < 2:
                     raise RouteError('rule edit takes the rule number and its new words: rule edit 3 "<words>"')

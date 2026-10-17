@@ -203,9 +203,11 @@ def test_refusal_before_unreadable(world, monkeypatch):
     assert _log() == []
 
 
-def test_a_change_with_no_undo_is_applied_by_direction_and_logged_as_such(world):
-    # A clear has an Undo now (tests/test_owner_undo.py); confirming a seeded
-    # rule still has none.
+def test_every_change_by_direction_is_logged_with_an_undo(world):
+    # Confirming a seeded rule was the last change without one (the sixth
+    # review); the only change with no Undo, a catch-up import, is refused by
+    # direction (test_refusal_not_by_direction).
+    assert set(owner_direction._NO_UNDO_WHY) == {"ledger.import"}
     routing._write({"type": "rule_add", "n": 1, "text": "never run the fast tier", "seeded": True,
                     "written_by": {"kind": "seed", "file": "rules.json"}, "via": "seed"})
     world.say()
@@ -213,9 +215,7 @@ def test_a_change_with_no_undo_is_applied_by_direction_and_logged_as_such(world)
     assert rc == 0 and out["ok"] is True, out
     (line,) = _log()
     assert line["action"] == "route.rule.confirm" and line["auth"] == "direction"
-    assert line["undo"] is None and "can't be undone" in line["no_undo"]
-    rc, out = world.run(["owner-direction", "undo", line["id"]], True)
-    assert rc == 2 and "can't be undone" in out["error"]
+    assert not line.get("no_undo") and line["before"] == {"seeded": True}
 
 
 def test_widening_the_check_and_turning_it_on_are_ordinary_changes(world):

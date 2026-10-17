@@ -10,6 +10,8 @@ Hermetic: the ``world`` fixture from tests/test_owner_direction.py (temp data an
 folders, turns recorded the way the prompt hook records them)."""
 from __future__ import annotations
 
+import pytest
+
 from khipu import owner_direction, routing
 from tests import test_owner_direction as base
 
@@ -347,3 +349,92 @@ def test_a_lost_finish_purge_runs_on_its_day_and_then_says_it_ran(world, monkeyp
     assert owner_direction.run_due(line["runs_at_ts"] + 1) == [line["id"]] and purged == [("atlas", "R1")]
     rc, undone = world.run(["owner-direction", "undo", line["id"]], True)
     assert rc == 2 and "already ran" in undone["error"], undone
+
+
+# ---- the sixth review's probes: a lost finish, another writer, a seeded rule ------------------
+
+
+def test_a_lost_finish_rule_undo_retires_its_own_rule_not_one_added_meanwhile(world, monkeypatch):
+    real_add = routing.add_rule
+
+    def interleaved(*args, **kwargs):
+        real_add("Independent concurrent rule", via="app")
+        return real_add(*args, **kwargs)
+
+    monkeypatch.setattr(routing, "add_rule", interleaved)
+    world.say()
+    restore = _no_finish(monkeypatch)
+    rc, out = world.run(["route", "rule", "add", "Rule requested by this action"], True)
+    assert rc == 0 and out.get("record_incomplete"), out
+    restore()
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
+    assert rc == 0, undone
+    assert [r["text"] for r in routing.read_view()["rules"]] == ["Independent concurrent rule"]
+
+
+def test_a_lost_finish_hold_undo_ends_its_own_hold_not_one_added_meanwhile(world, monkeypatch):
+    real_add = routing.add_hold
+
+    def interleaved(*args, **kwargs):
+        real_add("another owner hold", reason="keep", scope="machine", owner=True, via="app")
+        return real_add(*args, **kwargs)
+
+    monkeypatch.setattr(routing, "add_hold", interleaved)
+    world.say()
+    restore = _no_finish(monkeypatch)
+    rc, out = world.run(["route", "hold", "while the Mac updates", "--account", "Codex", "--reason", "keep"], True)
+    assert rc == 0 and out.get("record_incomplete"), out
+    restore()
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
+    assert rc == 0, undone
+    assert [h["text"] for h in routing.read_view()["holds"] if h["owner"]] == ["another owner hold"]
+
+
+def test_an_undo_whose_rule_was_never_written_refuses_instead_of_guessing(world, monkeypatch):
+    real_add = routing.add_rule
+
+    def lost(*args, **kwargs):
+        real_add("Independent concurrent rule", via="app")
+        raise routing.RouteError("the rule's own line was never written")
+
+    world.say()
+    monkeypatch.setattr(routing, "add_rule", lost)
+    world.run(["route", "rule", "add", "Rule requested by this action"], True)
+    (line,) = [x for x in owner_direction.read_log() if x.get("kind") == "action"]
+    with pytest.raises(ValueError):
+        owner_direction._added_rule(line)
+    assert [r["text"] for r in routing.read_view()["rules"]] == ["Independent concurrent rule"]
+
+
+def _seed_rule() -> None:
+    routing._write({"type": "rule_add", "n": 1, "text": "Fake seeded rule", "seeded": True,
+                    "written_by": {"kind": "seed", "file": "rules.json"}, "via": "seed"})
+
+
+def test_confirming_a_seeded_rule_by_direction_can_be_undone(world):
+    _seed_rule()
+    (rule,) = routing.read_view()["rules"]
+    assert rule["seeded"] and not rule["confirmed"]
+    world.say()
+    rc, out = world.run(["route", "rule", "confirm", "1"], True)
+    assert rc == 0 and routing.read_view()["rules"][0]["confirmed"], out
+    (line,) = owner_direction.actions()
+    assert not line.get("no_undo") and line["before"] == {"seeded": True}
+    rc, undone = world.run(["owner-direction", "undo", line["id"]], True)
+    assert rc == 0, undone
+    (rule,) = routing.read_view()["rules"]
+    assert (rule["text"], rule["seeded"], rule["confirmed"]) == ("Fake seeded rule", True, False)
+    # Confirming it again works as it did the first time.
+    rc, out = world.run(["route", "rule", "confirm", "1"], True)
+    assert rc == 0 and routing.read_view()["rules"][0]["confirmed"], out
+
+
+def test_confirming_a_seeded_rule_in_the_app_can_be_undone(world, khipu_app):
+    _seed_rule()
+    khipu_app.as_app()
+    rc, out = world.run(["route", "rule", "confirm", "1", "--from-app"])
+    assert rc == 0, out
+    (line,) = owner_direction.actions()
+    rc, undone = world.run(["owner-direction", "undo", "--from-app", line["id"]])
+    assert rc == 0, undone
+    assert routing.read_view()["rules"][0]["confirmed"] is False

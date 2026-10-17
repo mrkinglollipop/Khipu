@@ -103,7 +103,8 @@ Only what the check needs: one line per turn with its time, harness, entrypoint,
 - **Owner-actions log**: every owner change, by direction, in the app or on a terminal, is a line in `<data dir>/owner-actions.jsonl` with `before` (enough to undo), `auth`, and for direction the harness, session, turn id and binding. The log is hash-chained and append-only; a break (a changed line, lines cut from its end) raises a persistent tamper alarm kept in its own file until the owner acknowledges it (an owner action, logged, with an Undo that brings the alarm back). A direction is applied only when its line, with its Undo, could be written first.
 - **The app**: Settings, Owner actions lists every change with how it was made, when, and Undo per line.
 - **The next routing block** names every owner change once, however it was made. A change the routing record holds is named from its own line; any other (an owner-direction setting such as the window, a ledger or Work view change, Update anyway, an Undo) writes one `owner_change` line to the routing record with fixed words, never its target.
-- **Undo survives a lost finish**: everything Undo needs is on the line written before the change. A rule or an owner hold whose number or id was never recorded is found as the one that was not there before; a purge by direction carries its day on that line, so it stays cancellable until then and runs on its day.
+- **Undo survives a lost finish**: everything Undo needs is on the line written before the change. A new rule or owner hold gets its record line's id chosen on that line before it is written, so an Undo whose finish was lost finds exactly that rule or hold, never one another writer added meanwhile, and refuses if it was never written; a purge by direction carries its day on that line, so it stays cancellable until then and runs on its day.
+- **Confirming a seeded rule** has an Undo: it sets the rule back to seeded and unconfirmed.
 - **An import** by direction has an Undo: it removes (restorably, children first) the rows that import added and marks the import undone. A catch-up import changes rows already there, so it has no Undo and is refused by direction (`not_by_direction`).
 - **Purge** (row 15) keeps its 24-hour delay: by direction it is scheduled a day out and Undo cancels it until then; from the deadline on, Undo refuses.
 - **Undo by chat** is the action `direction.undo` with the line's id, through the same check.
@@ -119,6 +120,15 @@ Khipu and the agents run as one Mac user. A program running as that user can wri
 ### 2.7 Removed
 
 The word parser and the per-action verb and name tables, argument coverage as an authoriser, the turn token, the earlier-turn window, the two-turn rule and bare-yes widening, the waiting-widenings file (an old one is deleted by the timer and by forget), the parent-session link for dispatched jobs (`--owner-session`), and the code reply. Sections 3 to 5 below are the history of the earlier design, kept for the record; where they differ, this section wins.
+
+### 2.8 Accepted limit: a same-user process that forges a harness
+
+The check exists to stop ordinary dispatched jobs and unattended sessions, which run their own harness, from making owner changes by accident. It does not try to stop a same-user program built to forge one, and no more ancestry heuristics are added for it (Matt, 2026-10-16). The sixth review's two P1 probes are named examples of this accepted limit:
+
+- **A Node process as the harness.** A same-user Node (or other background) process runs the stock prompt shim with invented words, then the CLI. The shim records Node as the hook's issuer, and Node is the nearest harness above the call, so the change passes.
+- **Borrowed ancestry.** A background job that kept the foreground session's environment, with only shells, interpreters or `nohup` between it and the foreground harness, or a lone borrowed session id beneath a shared front end, is read as that conversation and uses its turn.
+
+What keeps this acceptable: every owner change, forged or not, is a line in the owner-actions log with its Undo, a row in the app's Settings, Owner actions with Undo, and a line in the next routing block. The ordinary cases stay refused and are pinned in `tests/test_owner_accepted_limit.py`: a `claude -p` job, a `codex exec` job, a T3 delegate and a launchd job, each under its own harness, with its own session id or with the owner's.
 
 ## 3. Slices
 

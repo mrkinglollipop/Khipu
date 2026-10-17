@@ -673,6 +673,15 @@ def _find(line_id: str) -> dict | None:
 _PENDING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_owner_action", default=None)
 
 
+def planned_id(action: str) -> str | None:
+    """The id the owner action being written chose for the line it adds
+    (a rule or a hold), so the writer uses it; None for any other write."""
+    pend = _PENDING.get()
+    if not pend or pend["intent"]["action"] != action or not isinstance(pend.get("before"), dict):
+        return None
+    return pend["before"].get({"route.rule.add": "event", "route.hold.add": "hold"}.get(action, ""))
+
+
 def intent(action: str, target: str, *, facts: dict | None = None) -> dict:
     """What an owner command is about to do, for the check and the log."""
     return {"action": action, "target": str(target), "facts": dict(facts or {})}
@@ -873,7 +882,6 @@ _UNREADABLE = object()  # what it changes can't be read now: a direction is refu
 # Why a change has no undo, in words the app shows beside it.
 _NO_UNDO_WHY = {
     "ledger.import": "A catch-up import can't be undone: it changes rows that were already there.",
-    "route.rule.confirm": "Confirming a seeded rule can't be undone; the rule can be retired.",
 }
 
 
@@ -925,15 +933,16 @@ def _before(want: dict):
     if action in ("route.rule.edit", "route.rule.undo"):
         return {"text": _rule_now(target).get("text")}
     if action == "route.rule.add":
-        # The new rule's number is known only after; it is the first above
-        # every rule now, so Undo finds it if the finish was never written.
-        return {"rules": [r["n"] for r in routing.read_view()["rules"]]}
+        # The new rule's number is known only after, so its line's id is
+        # chosen now: Undo finds that line even if the finish was never
+        # written, whatever else was added meanwhile.
+        return {"event": routing._new_id("o")}
     if action == "route.hold.add":
-        return {"holds": [h["id"] for h in routing.read_view()["holds"]]}
+        return {"hold": routing._new_id("h")}
     if action == "route.rule.confirm":
         rule = _rule_now(target)
         if not rule.get("pending"):
-            return _NO_UNDO
+            return {"seeded": True}
         return {"pending_kind": rule.get("pending_kind"), "prior_text": rule.get("prior_text")}
     if action == "route.hold.end":
         hold = next((h for h in routing.read_view()["holds"] if h["id"] == target), None)
@@ -1173,6 +1182,8 @@ def _undo_rule_confirm(line, via):
     from khipu import routing
 
     before = line.get("before") or {}
+    if before.get("seeded"):
+        return routing.unconfirm_rule(line["target"], via=via)
     if before.get("pending_kind") == "changed" and isinstance(before.get("prior_text"), str):
         return routing.edit_rule(line["target"], before["prior_text"], via=via)
     return routing.retire_rule(line["target"], via=via)
@@ -1265,10 +1276,11 @@ def _undo_hold_add(line, via):
 
     hold_id = (line.get("after") or {}).get("id")
     if hold_id is None:
-        # Unconfirmed: the owner's hold that was not there before.
-        had = set(_b(line).get("holds") or [])
-        new = [h["id"] for h in routing.read_view()["holds"] if h.get("owner") and h["id"] not in had]
-        hold_id = new[0] if len(new) == 1 else None
+        # Unconfirmed: the id this action gave its hold before writing it.
+        planned = _b(line).get("hold")
+        events, _bad = routing.read_events()
+        if planned and any(e.get("type") == "hold" and e.get("id") == planned for e in events):
+            hold_id = planned
     if hold_id is None:
         raise ValueError("Khipu can't tell which hold this was, so it can't undo it")
     return routing.end_hold(hold_id, owner=True, via=via)
@@ -1279,12 +1291,11 @@ def _added_rule(line) -> int:
 
     n = (line.get("after") or {}).get("n")
     if n is None:
-        # Unconfirmed: the first rule numbered above every rule there before.
-        had = _b(line).get("rules")
-        if isinstance(had, list):
-            top = max([x for x in had if isinstance(x, int)] or [0])
-            new = sorted(r["n"] for r in routing.read_view()["rules"] if isinstance(r["n"], int) and r["n"] > top)
-            n = new[0] if new else None
+        # Unconfirmed: the rule written under the id this action chose.
+        planned = _b(line).get("event")
+        events, _bad = routing.read_events()
+        n = next((e["n"] for e in events if planned and e.get("type") == "rule_add" and e.get("id") == planned
+                  and isinstance(e.get("n"), int)), None)
     if n is None:
         raise ValueError("Khipu can't tell which rule this added, so it can't undo it")
     return n
