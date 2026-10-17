@@ -2022,7 +2022,10 @@ def set_project(project: str, *, name: str | None = None, hidden: bool | None = 
         if not found:
             conn.rollback()
             raise LedgerError(f"no ledger project {project}", "no_project")
+        # The empty row id marks project metadata, including projects with no rows.
+        _mark_lag(project, [""])
         conn.commit()
+        _replica_sync(conn, project, [""])
     finally:
         conn.close()
     words = [f"named {name or project}"] if name is not None else []
