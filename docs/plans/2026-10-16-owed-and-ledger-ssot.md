@@ -436,3 +436,13 @@ and his own "done" in a conversation).
   read). An automatic writer that finds the owner is Matt is refused; a close becomes a Looks done
   suggestion, an owner change stays a clean-up proposal. `tests/test_owed_owner_guard.py` enumerates every
   automatic rule and every writer.
+- **The stored owner decides** (third confirmation review). The owner rules infer an owner only when an
+  item is first captured. After that its owner changes only by Matt's direction, or by an explicit
+  reassignment of someone else's item (the clean-up's apply); the nightly hygiene pass no longer rewrites
+  owners. The guard (`commitments.row_guard`) reads the stored owner, so a legacy item stored as Matt's
+  is his however its text reads today, and the clean-up keeps any change to it as a proposal, whatever
+  owner it would propose.
+- **Every close waits on every pull request.** `close_by_rule` refuses to close any item while a pull
+  request it was ever said to need (its text, latest wording, stored `prs` and other repositories' refs)
+  is not shown merged or closed, by the PR rule's records or by git or gh lines in the evidence. A rule
+  with no such evidence (an ended session, a duplicate, a relay, a re-judge) leaves it for the PR rule.

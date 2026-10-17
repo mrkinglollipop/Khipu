@@ -283,3 +283,117 @@ def test_a_snoozed_or_someone_elses_item_is_never_quiet():
     assert co.quiet_weeks({**row, "due_after": (now + timedelta(days=1)).isoformat()}, now) is None
     assert co.quiet_weeks({**row, "last_seen_at": (now - timedelta(days=3)).isoformat()}, now) is None
     assert co.quiet_weeks({**row, "status": "closed"}, now) is None
+
+
+# ---- the stored owner decides, never an owner inferred again --------------------
+# Third confirmation review: a legacy item stored as the user's whose text the
+# owner rules now read as the assistant's ("Test the installation after the
+# reviewer finishes", a deferred promise) was closed, staled and reassigned by
+# the automatic rules, because the guard read the inferred owner. Inference is
+# for an item's first capture; once stored, the owner moves only by the owner.
+
+_LEGACY = "Test the installation after the reviewer finishes"
+
+
+def _legacy_users_item(cur, **kw) -> int:
+    cid = cur.commitment(_LEGACY, owner=co.OWNER_USER, kind="promise", **kw)
+    cur.inner.conn.execute("UPDATE commitments SET future_trigger = 1 WHERE id = ?", (cid,))
+    return cid
+
+
+def test_the_legacy_item_reads_as_someone_elses_but_is_stored_as_the_users(racing):
+    # The premise of the tests below: without the stored owner, the guard would let it by.
+    cid = _legacy_users_item(racing)
+    row = co.row_at_write(racing, cid)
+    assert row["stored_owner"] == co.OWNER_USER and row["owner"] != co.OWNER_USER
+
+
+@pytest.mark.parametrize("rule", sorted(co.AUTOMATIC_RULES))
+def test_every_automatic_path_keys_on_the_stored_owner(racing, rule):
+    cid = _legacy_users_item(racing, age=60)
+    if rule == "stale":
+        assert co.mark_stale(racing) == 0
+    else:
+        assert not co.close_by_rule(racing, cid, rule=rule, reason="done: " + _LEGACY, key=f"{rule}:done")
+        assert not co.auto_reassign(racing, cid, rule=rule, sets=["owner = %s"], params=(co.OWNER_AGENT,))
+    assert racing.value("commitments", cid, "status") == "open"
+    assert racing.value("commitments", cid, "owner") == co.OWNER_USER
+    got = racing.suggestion(cid)
+    if co.AUTOMATIC_RULES[rule] == co.PROPOSE_LOOKS_DONE:
+        assert got["looks_done"] and got["rule"] == rule
+    else:
+        assert got is None
+
+
+def test_no_automatic_write_is_handed_an_owner_reader():
+    """The guard reads the stored owner itself; no caller may substitute an
+    owner it works out (the clean-up once passed the owner its rules would
+    give, which let it move the user's item)."""
+    for path in sorted(PACKAGE.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and (getattr(node.func, "attr", None) or getattr(node.func, "id", None)) \
+                    in ("close_by_rule", "auto_reassign"):
+                assert "owner_of" not in {k.arg for k in node.keywords}, f"{path.name}:{node.lineno}"
+
+
+def test_a_capture_done_line_does_not_close_the_users_legacy_item(racing):
+    cid = _legacy_users_item(racing)
+    result = co.auto_close(racing, {"project": "p", "session_id": "codex:owner-conversation",
+                                    "closed_loops": [{"text": "done: " + _LEGACY, "commitment_id": cid}]},
+                           episode_id=2)
+    assert racing.value("commitments", cid, "status") == "open", result
+    assert racing.value("commitments", cid, "owner") == co.OWNER_USER
+
+
+def test_only_the_clean_up_moves_an_existing_item():
+    """The owner rules re-read on a nightly do not move an existing item, the
+    user's or anyone else's: only the owner, or the clean-up he applies, does."""
+    callers = set()
+    for path in sorted(PACKAGE.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and (getattr(node.func, "attr", None) or getattr(node.func, "id", None)) \
+                    == "auto_reassign":
+                callers.add(path.stem)
+    assert callers == {"owed_tidy"}
+
+
+# ---- every close of someone else's item waits on every pull request -----------
+
+
+@pytest.mark.parametrize("history", ["prs", "cross_repo"])
+def test_a_decision_close_waits_on_every_pull_request_the_item_ever_named(racing, history):
+    from datetime import datetime, timezone
+
+    from khipu import close_rules as cr
+
+    text = "The reviewer will decide the rollout after PR #12 merges"
+    cid = racing.commitment(text, owner=co.OWNER_AGENT, kind="question")
+    row = dict(id=cid, text=text, owner=co.OWNER_AGENT, project="acme/widget", kind="question", opened_episode=1,
+               opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc), prs=[12, 13] if history == "prs" else [12],
+               latest_text="The reviewer will decide the rollout after PR #12 and PR #13 merge"
+               if history == "prs" else None,
+               pr_check={"refs": ["other/repo#12"]} if history == "cross_repo" else {},
+               reopened=[], suggestion=None)
+    decision = f"Settles commitment {cid}: enable the rollout.\nMerge pull request #12 from acme/feature"
+    racing.inner.conn.execute("INSERT INTO decisions (project, text, episode_id, decided_at) VALUES (?, ?, ?, ?)",
+                              ("acme/widget", decision, 2, "2026-10-17 12:00:00"))
+    report = dict(closed_decision=0, kept_open_reopened=0, suggested=0)
+    cr._decision_rule(racing, [row], report, episode_id=None)
+    assert racing.value("commitments", cid, "status") == "open", report
+
+
+@pytest.mark.parametrize("rule", sorted(r for r in co.AUTOMATIC_RULES if r != "stale"))
+def test_no_close_of_someone_elses_item_skips_an_unfinished_pull_request(racing, rule):
+    """The write itself checks the union: a rule with no evidence that every
+    pull request the item names is finished (an ended session, a duplicate,
+    a relay, a re-judge) leaves it for the PR rule."""
+    cid = racing.commitment("Rebuild the deployment index after PR #12 and PR #13 merge")
+    racing.inner.conn.execute("UPDATE commitments SET prs = ? WHERE id = ?", ("[12, 13]", cid))
+    evidence = {"rule": rule, "text": "Merge pull request #12 from acme/feature",
+                "prs": {"12": {"state": "merged", "source": "github"}}}
+    assert not co.close_by_rule(racing, cid, rule=rule, reason="synthetic", key=f"{rule}:12",
+                                evidence=evidence)
+    assert racing.value("commitments", cid, "status") == "open"
+    evidence["prs"]["13"] = {"state": "closed", "source": "github"}
+    evidence["text"] += "\nMerge pull request #13 from acme/other"
+    assert co.close_by_rule(racing, cid, rule=rule, reason="synthetic", key=f"{rule}:12,13", evidence=evidence)

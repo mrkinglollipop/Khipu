@@ -1013,11 +1013,9 @@ def run_session_ended_pass(
         stamp = _today()
         for item in listing:
             cid = item["id"]
-            if item["owner"] != item["stored_owner"]:
-                # An owner the rules now read differently: never the owner's
-                # own item moved away (auto_reassign reads both owners under
-                # the row lock).
-                co.auto_reassign(cur, cid, rule="owner-rules", sets=["owner = %s"], params=(item["owner"],))
+            # The owner the rules read today is listed, never written: a
+            # stored owner moves only by the owner or by an explicit
+            # reassignment (commitments.row_guard).
             if trigger_col:
                 cur.execute("UPDATE commitments SET future_trigger = %s WHERE id = %s",
                             (item["future_trigger"], cid))

@@ -1507,14 +1507,24 @@ LOOKS_DONE = "Looks done"
 
 
 def owner_guard(owner: str | None, rule: str) -> str | None:
-    """Why the automatic ``rule`` may not change an item owned by ``owner``
-    (the owner as :func:`row_owner` reads it), or None when it may: every
-    rule is refused for the owner's own item, none for anyone else's."""
+    """Why the automatic ``rule`` may not change an item owned by ``owner``,
+    or None when it may: every rule is refused for the owner's own item, none
+    for anyone else's. The writes pass the stored owner (:func:`row_guard`)."""
     if rule not in AUTOMATIC_RULES:
         raise ValueError(f"not an automatic rule Khipu knows: {rule!r}")
     if str(owner or "").strip().lower() != OWNER_USER:
         return None
     return OWNER_GUARD_WORDS.format(rule=rule)
+
+
+def row_guard(row: dict[str, Any], rule: str) -> str | None:
+    """:func:`owner_guard` for a row :func:`row_at_write` read. The stored
+    owner decides: the owner rules infer an owner only when an item is first
+    captured, and a stored owner moves only by the owner or by an explicit
+    reassignment of someone else's item, so an item stored as the user's is
+    his however its text reads now. An item that reads as his today is kept
+    too, as it is shown to him."""
+    return owner_guard(row.get("stored_owner"), rule) or owner_guard(row.get("owner"), rule)
 
 
 def _owner_cols(cur) -> list[str]:
@@ -1525,6 +1535,11 @@ def _owner_cols(cur) -> list[str]:
         cols.append("future_trigger")
     if _reassigned_column_ready(cur):
         cols.append("owner_reassigned_at")
+    if _close_columns_ready(cur):
+        # What close_by_rule's pull request check reads (migration 0034).
+        cols += ["project", "prs", "pr_check"]
+        if _lineage_columns_ready(cur):
+            cols.append("latest_text")
     return cols
 
 
@@ -1532,6 +1547,12 @@ def _resolved(row: dict[str, Any]) -> dict[str, Any]:
     """``row`` with its stored owner kept as ``stored_owner`` and ``owner``,
     ``owner_label`` resolved by :func:`row_owner`."""
     row["stored_owner"] = row.get("owner")
+    for field in ("prs", "pr_check"):
+        if isinstance(row.get(field), str):
+            try:
+                row[field] = json.loads(row[field])
+            except ValueError:
+                row[field] = None
     trigger = has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
     row["owner"], row["owner_label"] = row_owner(row, future_trigger=trigger)
     return row
@@ -1581,32 +1602,44 @@ def suggest_looks_done(cur, commitment_id: int, *, rule: str, reason: str, key: 
 def close_by_rule(cur, commitment_id: int, *, rule: str, reason: str, key: str,
                   evidence: dict | None = None, episode: int | None = None,
                   status: str = "closed", set_extra: str = "", extra_params: tuple = (),
-                  owner_of: Any = None) -> bool:
+                  proof: str | None = None) -> bool:
     """The one write every automatic close goes through (the PR and decision
     rules, the closed-loop match, the session-end close, the relay close, the
     hygiene re-judge and dedup, and the clean-up's apply). It reads the item
-    under the row lock (:func:`row_at_write`); :func:`owner_guard` refuses
-    the owner's own item for every rule, and a refused close of the
+    under the row lock (:func:`row_at_write`); :func:`row_guard` refuses
+    the owner's own item, by its stored owner, for every rule, and a refused
+    close of the
     :data:`PROPOSE_LOOKS_DONE` rules becomes a "Looks done" suggestion
     (:func:`suggest_looks_done`). Otherwise it records the reason, who
     closed it (:data:`BY_RULE`), the rule ``key`` and the ``evidence``, and
     it refuses an item the owner reopened after that same key closed it
     (``reopened_rule_keys``). ``status`` is ``closed``, or ``dropped`` for the
     hygiene re-judge. On a hub before migration 0034 there is no key to
-    remember, so only the reason is written. ``owner_of(row)`` reads the
-    owner from the locked row when a caller knows more than the row holds
-    (the clean-up: the lineage of the capture that opened it)."""
+    remember, so only the reason is written. From 0034 on, any other item
+    closes only when every pull request it was ever said to need is merged
+    or closed, as the PR rule's ``evidence["prs"]`` or the git or gh lines of
+    ``proof`` (the evidence text; ``evidence["text"]`` without it) show;
+    until then the PR rule closes it."""
     if status not in ("closed", "dropped"):
         raise ValueError(f"an automatic close sets closed or dropped, not {status!r}")
     row = row_at_write(cur, commitment_id)
     if row is None or row.get("status") != "open":
         return False
-    why = owner_guard(owner_of(row) if owner_of else row["owner"], rule)
+    why = row_guard(row, rule)
     if why:
         _log(f"kept commitment {commitment_id} as it is: {why}")
         if AUTOMATIC_RULES[rule] == PROPOSE_LOOKS_DONE:
             suggest_looks_done(cur, commitment_id, rule=rule, reason=reason, key=key, evidence=evidence,
                                episode=episode)
+        return False
+    from khipu.close_rules import unfinished_problem
+
+    evidence = evidence or {}
+    why = "pr_check" in row and unfinished_problem(
+        row, row.get("project"), text=str(proof if proof is not None else evidence.get("text") or ""),
+        records=evidence.get("prs") if rule == "pr" else None)
+    if why:
+        _log(f"kept commitment {commitment_id} open: {why}")
         return False
     reason = str(reason or "")[:300]
     same, same_params = _owner_unchanged(cur, row)
@@ -1629,20 +1662,17 @@ def close_by_rule(cur, commitment_id: int, *, rule: str, reason: str, key: str,
     return cur.rowcount > 0
 
 
-def auto_reassign(cur, commitment_id: int, *, rule: str, sets: list[str], params: tuple,
-                  owner_of: Any = None) -> bool:
-    """The one write every automatic owner change goes through (the hygiene
-    pass's owner refresh and the clean-up's apply): ``UPDATE commitments SET
-    <sets>`` for one item, read under the row lock (:func:`row_at_write`) and
-    refused by :func:`owner_guard` when the item is the owner's own, as it
-    reads now or as it is stored; with ``owner_of`` (see
-    :func:`close_by_rule`), as that reads the locked row. The owner's own
-    move is :func:`reassign`."""
+def auto_reassign(cur, commitment_id: int, *, rule: str, sets: list[str], params: tuple) -> bool:
+    """The one write every owner change the owner did not make himself goes
+    through (the clean-up's apply, an explicit reassignment of someone
+    else's item): ``UPDATE commitments SET <sets>`` for one item, read under
+    the row lock (:func:`row_at_write`) and refused by :func:`row_guard`
+    when the item is stored as the owner's own. The owner's own move is
+    :func:`reassign`."""
     row = row_at_write(cur, commitment_id)
     if row is None:
         return False
-    why = (owner_guard(owner_of(row), rule) if owner_of
-           else owner_guard(row["owner"], rule) or owner_guard(row["stored_owner"], rule))
+    why = row_guard(row, rule)
     if why:
         _log(f"kept commitment {commitment_id}'s owner as it is: {why}")
         return False
@@ -1728,7 +1758,7 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
             continue
         if close_by_rule(cur, best_id, rule="loop",
                          reason=f"{best_via} match ({best_score:.2f}): {text[:200]!r}",
-                         key=evidence_key("loop", text), episode=episode_id,
+                         key=evidence_key("loop", text), episode=episode_id, proof=text,
                          evidence={"rule": "loop", "text": text[:300], "match": best_via,
                                    "score": round(best_score, 3)}):
             already_closed.add(best_id)
@@ -1774,8 +1804,8 @@ def mark_stale(cur) -> int:
     """Flip silent open commitments to 'stale' (see :func:`stale_sql`). Never
     silently dropped — stale stays queryable via `khipu owed --status stale`.
     Staleness is an automatic rule: each item is read again under its row
-    lock (:func:`row_at_write`) and :func:`owner_guard` keeps the owner's
-    own items open; they list as quiet (``quiet_weeks``) instead.
+    lock (:func:`row_at_write`) and :func:`row_guard` keeps the items stored
+    as the owner's open; they list as quiet (``quiet_weeks``) instead.
     """
     has_seen = _seen_columns_ready(cur)
     forgotten = _not_forgotten_clause(cur)
@@ -1783,7 +1813,7 @@ def mark_stale(cur) -> int:
     n = 0
     for (cid,) in cur.fetchall():
         row = row_at_write(cur, int(cid))
-        if row is None or owner_guard(row["owner"], "stale"):
+        if row is None or row_guard(row, "stale"):
             continue
         same, same_params = _owner_unchanged(cur, row)
         cur.execute(stale_sql(has_last_seen=has_seen) + f" AND {forgotten} AND id = %s{same}",
@@ -1952,7 +1982,7 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
         if reason == "session-ended":
             key, evidence = f"session-ended:{session_id}", {"rule": "session-ended", "session_id": session_id}
         if close_by_rule(cur, row["id"], rule=rule, reason=reason, key=key, evidence=evidence,
-                         episode=episode_id):
+                         episode=episode_id, proof=hit if rule == "session-plan" else None):
             closed += 1
     if closed:
         _log(f"closed {closed} session-end commitment(s) for {session_id}")

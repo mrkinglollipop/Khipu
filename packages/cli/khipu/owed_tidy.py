@@ -26,10 +26,10 @@ its work:
 Everything else is **keep**. Nothing is ever deleted: a close keeps the row,
 its text and its reason.
 
-**The owner's own items** (``commitments.owner_guard``): the clean-up only
-proposes a change to an item the user owns, by the owner rules read with the
-item's lineage (a job's item shown as the user's is the orchestrator's, as
-the rules of step 3 say, so it moves). Its action stays ``keep`` and the
+**The owner's own items** (``commitments.row_guard``): the clean-up only
+proposes a change to an item stored as the user's or shown as his today,
+whatever owner the rules of step 3 would give it (a job's item stored as his
+included: the move stays a proposal). Its action stays ``keep`` and the
 change the rules would make is kept under ``proposed``; Apply never makes it,
 a close on the item's own pull requests included (Matt, 2026-10-17: "Suggest,
 don't close"). Apply also reads each owner again under the row lock
@@ -323,7 +323,7 @@ def _plan(cur, project: str, *, judge, use_model: bool) -> dict[str, Any]:
         before, after, rule = _owners(row)
         items[cid] = {"id": cid, "kind": row.get("kind"), "text": row.get("text"), "action": "keep",
                       "reason": "", "rule": rule, "before": before, "fingerprint": fingerprint(row),
-                      "_after": after, "_owner": after["owner"]}
+                      "_after": after, "_owner": _guarded_owner(row)}
 
     # 1. The PR and decision rules, read-only.
     if close_rules.ready(cur):
@@ -514,10 +514,20 @@ def _owner_now(row: dict) -> str:
     return co.row_owner(row, future_trigger=trigger)[0]
 
 
+def _guarded_owner(row: dict) -> str:
+    """The owner the guard reads for a row ``_select`` gave: the user when it
+    is stored as his or shows as his today (``commitments.row_guard``), never
+    the owner the plan would give it."""
+    from khipu import commitments as co
+
+    return co.OWNER_USER if co.OWNER_USER in (str(row.get("owner") or "").lower(), _owner_now(row)) \
+        else _owner_now(row)
+
+
 def _is_users(row: dict) -> bool:
     from khipu import commitments as co
 
-    return _owner_now(row) == co.OWNER_USER
+    return _guarded_owner(row) == co.OWNER_USER
 
 
 def _gate(cur, rows: dict[int, dict], ids: list[int], extra_users: set[int] | None = None):
@@ -577,14 +587,7 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
             for cid in live:
                 it = planned[cid]
                 prior = {f: _plain(rows[cid].get(f)) for f in PRIOR_FIELDS}
-                now_owner = _owners(rows[cid])[1]["owner"]
-
-                def owner_of(locked: dict, lineage=rows[cid]["lineage"]) -> str:
-                    # The owner as the plan reads it, from the row as it is at
-                    # the write: the lineage of the opening capture never changes.
-                    return _owners({**locked, "owner": locked["stored_owner"], "lineage": lineage})[1]["owner"]
-
-                if co.owner_guard(now_owner, _rule_of(it)):
+                if co.owner_guard(_guarded_owner(rows[cid]), _rule_of(it)):
                     skipped.append({"id": cid, "why": "the owner's own item: the clean-up only suggests a change"})
                     continue
                 if it["action"] == "close":
@@ -592,7 +595,7 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
                                             reason=it.get("reason") or "closed by the clean-up",
                                             key=it.get("key") or f"tidy:{cid}", evidence=it.get("evidence") or {},
                                             episode=it.get("episode"), set_extra=", tidy_batch = %s",
-                                            extra_params=(batch,), owner_of=owner_of):
+                                            extra_params=(batch,)):
                         skipped.append({"id": cid, "why": "the owner reopened it after the same evidence closed it, "
                                                           "or it is now the owner's own item"})
                         continue
@@ -617,7 +620,7 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
                         cur, cid, rule=_rule_of(it),
                         sets=[f"{lineage}owner = %s", "owner_label = %s", "origin = %s", "owner_reassigned_at = now()",
                               "tidy_batch = %s"],
-                        params=(*lineage_params, owner, label, origin, batch), owner_of=owner_of):
+                        params=(*lineage_params, owner, label, origin, batch)):
                         skipped.append({"id": cid, "why": "the owner's own item now: the clean-up only suggests "
                                                           "a change"})
                         continue

@@ -462,16 +462,32 @@ def evidence_problem(text: str, item_text: str = "", project: str | None = None,
     s = str(text or "").strip()
     if s.endswith("?") or _QUESTION_START_RE.match(s):
         return "a question is not evidence"
+    return unfinished_problem(item if item is not None else {"text": item_text}, project, text=s)
+
+
+def unfinished_problem(item: dict[str, Any], project: str | None, *, text: str = "",
+                       records: dict[str, dict[str, Any]] | None = None) -> str | None:
+    """Why closing ``item`` would skip a pull request it was ever said to need
+    (:func:`item_refs`), or None when every one is merged or closed in the
+    git or gh lines of ``text`` or in ``records`` (the PR rule's
+    ``evidence["prs"]``, by :func:`ref_label`). ``commitments.close_by_rule``
+    asks this of every close, so no rule closes an item a PR still holds."""
     repo = _project_repo(project)
-    refs = item_refs(item, repo) if item is not None else pr_refs(item_text, repo)
-    if refs:
-        states = {_key(key, repo): state for key, state in capture_pr_records([s]).items()}
-        unfinished = [ref_label(ref, repo) for ref in refs if states.get(_key(ref, repo)) not in DONE_STATES]
-        if unfinished:
-            named = ", ".join(n if "#" in n else f"#{n}" for n in unfinished)
-            return (f"the item waits on every pull request it names, and {named} is not shown merged or "
-                    "closed by a git or gh line here")
-    return None
+    refs = item_refs(item, repo)
+    if not refs:
+        return None
+    states = {_key(key, repo): state for key, state in capture_pr_records([text]).items()} if text else {}
+    for label, rec in (records or {}).items():
+        m = _QUALIFIED_RE.match(str(label))
+        ref = (m.group(1), int(m.group(2))) if m else (None, int(label)) if str(label).isdigit() else None
+        if ref is not None and isinstance(rec, dict):
+            states[_key(ref, repo)] = rec.get("state")
+    unfinished = [ref_label(ref, repo) for ref in refs if states.get(_key(ref, repo)) not in DONE_STATES]
+    if not unfinished:
+        return None
+    named = ", ".join(n if "#" in n else f"#{n}" for n in unfinished)
+    return (f"the item waits on every pull request it names, and {named} is not shown merged or "
+            "closed by a git or gh line here")
 
 
 def _project_repo(project: str | None) -> str | None:
@@ -679,7 +695,7 @@ def _settles(item: dict, decisions: list[tuple], threshold: float):
         if not _later(item, dep, decided_at):
             continue
         text = text or ""
-        if evidence_problem(text, item["text"], item.get("project")):
+        if evidence_problem(text, item["text"], item.get("project"), item=item):
             continue
         if any(int(m.group(1)) == item["id"] for m in _NAMES_ITEM_RE.finditer(text)):
             return ("strict", did, text, "names the item", 1.0, dep)
@@ -738,7 +754,7 @@ def _decision_rule(cur, items: list[dict], report: dict, *, episode_id: int | No
                 if _close(cur, item["id"], rule="decision",
                           reason=f"settled by decision {did}: {text[:150]!r}", key=key,
                           evidence={"rule": "decision", "decision_id": did, "match": how,
-                                    "score": round(score, 3)}, episode=dep, sink=sink):
+                                    "score": round(score, 3), "text": text[:2000]}, episode=dep, sink=sink):
                     report["closed_decision"] += 1
                 continue
             _, did, text, near = hit

@@ -230,15 +230,17 @@ def test_the_plan_sorts_the_flood_by_rule_with_evidence(owed):
     def actions(group):
         return {items[i]["action"] for i in f.groups[group]}
 
-    # A job's asks move to the orchestrator: the lineage of the capture that
-    # opened them says they came from a job, though the row says conversation.
+    # A job's asks stored as the owner's: the lineage of the capture that
+    # opened them says they are the orchestrator's, but a stored owner moves
+    # only by the owner, so the move is proposed, never made.
     for group in ("job_question", "job_followup", "job_names_user"):
-        assert actions(group) == {"reassign"}, group
+        assert actions(group) == {"keep"}, group
         for i in f.groups[group]:
             assert items[i]["before"]["owner"] == "user", group
-            assert items[i]["after"]["owner"] == "agent" and items[i]["rule"], group
-            assert items[i]["after"]["origin"] == "job", group
-    assert items[f.groups["job_question"][0]]["after"]["owner_label"] == "orchestrator"
+            proposed = items[i]["proposed"]
+            assert proposed["action"] == "reassign" and proposed["rule"], group
+            assert proposed["after"]["owner"] == "agent" and proposed["after"]["origin"] == "job", group
+    assert items[f.groups["job_question"][0]]["proposed"]["after"]["owner_label"] == "orchestrator"
     # The owner's own conversation naming the orchestrator as the subject:
     # the orchestrator's whoever said it, already shown so, so it is kept.
     assert actions("agent_named") == {"keep"}
@@ -322,7 +324,8 @@ def test_apply_then_undo_returns_every_row_to_its_prior_state(owed, monkeypatch)
     _app(monkeypatch)
     res = owed_tidy.apply(plan)
     assert res["ok"] and res["changed"] == plan["totals"]["move"]["total"] + plan["totals"]["close"]["total"]
-    assert res["skipped"] == [] and res["owner_gate"] == "app"
+    # Only other owners' items change, so the owner gate is not asked.
+    assert res["changed"] and res["skipped"] == [] and res["owner_gate"] is None
     after = _rows(owed)
     assert after != before
     changed = [i for i, it in _by_id(plan).items() if it["action"] != "keep"]
@@ -343,7 +346,7 @@ def test_an_item_changed_after_apply_is_left_alone_by_undo_and_listed(owed, monk
     plan = _plan(owed, judge=FakeModel())
     _app(monkeypatch)
     res = owed_tidy.apply(plan)
-    moved = f.groups["job_question"][0]
+    moved = f.groups["conv_cache"][0]
     closed = f.groups["dup"][0]
     with owed.cursor() as cur:
         assert co.reassign(cur, moved, "assistant")
@@ -358,7 +361,7 @@ def test_an_item_changed_after_apply_is_left_alone_by_undo_and_listed(owed, monk
 def test_a_plan_whose_items_changed_skips_them_and_lists_them(owed, monkeypatch):
     f = _flood(owed)
     plan = _plan(owed, judge=FakeModel())
-    changed = f.groups["job_followup"][0]
+    changed = f.groups["conv_cache"][0]
     gone = f.groups["dup"][0]
     with owed.cursor() as cur:
         cur.execute("UPDATE commitments SET text = text || ' today' WHERE id = %s", (changed,))
@@ -367,13 +370,23 @@ def test_a_plan_whose_items_changed_skips_them_and_lists_them(owed, monkeypatch)
     res = owed_tidy.apply(plan)
     assert {x["id"] for x in res["skipped"]} == {changed, gone}
     rows = _rows(owed, [changed, gone])
-    assert rows[changed]["tidy_batch"] is None and rows[changed]["owner"] == "user"
+    assert rows[changed]["tidy_batch"] is None and rows[changed]["owner"] == "assistant"
     assert rows[gone]["close_reason"] == "done"
 
 
+def _edited_to_move_the_owners_item(f, plan) -> int:
+    """A plan edited by hand to apply the move proposed for one of the owner's
+    items: the plan itself never makes it actionable."""
+    mine = f.groups["job_question"][0]
+    it = _by_id(plan)[mine]
+    it.update(action="reassign", after=it["proposed"]["after"])
+    return mine
+
+
 def test_apply_is_refused_without_the_gate_for_user_items(owed, monkeypatch):
-    _flood(owed)
+    f = _flood(owed)
     plan = _plan(owed, judge=FakeModel())
+    _edited_to_move_the_owners_item(f, plan)
     before = _snapshot(owed)
     res = owed_tidy.apply(plan)
     assert res["ok"] is False and res["changed"] == 0 and res["needs_owner"]
@@ -381,16 +394,16 @@ def test_apply_is_refused_without_the_gate_for_user_items(owed, monkeypatch):
     assert _snapshot(owed) == before
 
 
-def test_apply_passes_the_gate_with_a_typed_yes_and_undo_asks_again(owed, monkeypatch):
-    _flood(owed)
+def test_apply_passes_the_gate_with_a_typed_yes_and_still_never_moves_the_owners_item(owed, monkeypatch):
+    f = _flood(owed)
     plan = _plan(owed, judge=FakeModel())
+    mine = _edited_to_move_the_owners_item(f, plan)
     asked: list[str] = []
     monkeypatch.setattr(co, "bulk_owner_gate", lambda n: asked.append(n) or "terminal")
     res = owed_tidy.apply(plan)
     assert res["ok"] and res["owner_gate"] == "terminal" and asked
-    monkeypatch.setattr(co, "bulk_owner_gate", lambda n: None)
-    refused = owed_tidy.undo(res["batch"])
-    assert refused["ok"] is False and refused["restored"] == 0
+    assert mine in {s["id"] for s in res["skipped"]}
+    assert _rows(owed, [mine])[mine]["owner"] == "user" and _rows(owed, [mine])[mine]["tidy_batch"] is None
 
 
 def test_a_batch_of_only_assistant_and_agent_items_needs_no_gate(owed, monkeypatch):
@@ -430,9 +443,7 @@ def test_cli_plan_out_apply_and_undo(owed, monkeypatch, tmp_path, capsys):
     assert summary["plan_out"] == str(out) and summary["totals"] == doc["totals"]
     assert cli.main(["owed", "tidy", "--project", PROJECT, "--no-model"]) == 0
     assert json.loads(capsys.readouterr().out)["model"]["calls"] == 0
-    assert cli.main(["owed", "tidy", "--project", PROJECT, "--apply", str(out)]) == 1
-    assert json.loads(capsys.readouterr().out)["ok"] is False  # not the app, no typed yes
-    _app(monkeypatch)
+    # The plan changes only other owners' items: no gate, from a terminal too.
     assert cli.main(["owed", "tidy", "--project", PROJECT, "--apply", str(out)]) == 0
     batch = json.loads(capsys.readouterr().out)["batch"]
     assert cli.main(["owed", "tidy", "--project", PROJECT, "--undo", batch]) == 0
@@ -646,3 +657,78 @@ def test_apply_never_changes_the_owners_item_even_from_an_edited_plan(owed, monk
     assert _rows(owed, [decided, named]) == before
     # Not even a close on the owner's item's own pull requests is made.
     assert all(_rows(owed, [i])[i]["status"] == "open" for i in f.groups["pr_merged"])
+
+
+def test_tidy_never_moves_an_item_stored_as_the_users(monkeypatch):
+    """Third confirmation review: a legacy question stored as the user's, whose
+    capture had a parent session, was planned as the orchestrator's and Apply
+    moved it. The guard reads the stored owner, never the owner the plan
+    proposes; the move stays a proposal."""
+    import json as _json
+
+    from khipu import close_rules, db, hygiene
+    from khipu import commitments as co
+    from khipu import owed_tidy as tidy
+    from tests.test_owed_owner_guard import _RacingCursor
+
+    class LocalCursor(_RacingCursor):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    db._TABLE_COLUMNS_CACHE.clear()
+    cur = LocalCursor()
+    try:
+        for spec in ("origin TEXT", "owner_label TEXT", "tidy_batch TEXT"):
+            cur.inner.conn.execute("ALTER TABLE commitments ADD COLUMN " + spec)
+        cur.inner.conn.executescript("""
+            CREATE TABLE commitment_tidy_batches(id TEXT, project TEXT, plan_version INT, planned_at TEXT,
+                                                 owner_gate TEXT, counts TEXT, skipped TEXT);
+            CREATE TABLE commitment_tidy_items(batch_id TEXT, commitment_id INT, action TEXT, reason TEXT,
+                                               prior TEXT, after_fingerprint TEXT);
+        """)
+        cur.episode(1, parent="orchestrator")
+        cid = cur.commitment("Should the migration be renumbered after the rebase?", project="acme/widget",
+                             owner=co.OWNER_USER, kind="question")
+        cur.inner.conn.execute("UPDATE commitments SET origin = 'conversation' WHERE id = ?", (cid,))
+
+        def select(cur_, project, **kwargs):
+            c = cur.inner.conn.execute("SELECT * FROM commitments WHERE id = ?", (cid,))
+            row = dict(zip([d[0] for d in c.description], c.fetchone()))
+            for field in ("prs", "pr_check", "close_evidence"):
+                if isinstance(row.get(field), str):
+                    row[field] = _json.loads(row[field])
+            row["lineage"] = "orchestrator"
+            return {cid: row}
+
+        monkeypatch.setattr(tidy, "_select", select)
+        monkeypatch.setattr(close_rules, "ready", lambda cur: False)
+        monkeypatch.setattr(hygiene, "_duplicate_groups", lambda *a, **k: {})
+        doc = tidy._plan(cur, "acme/widget", judge=None, use_model=False)
+        item = doc["items"][0]
+        assert item["before"]["owner"] == co.OWNER_USER
+        assert item["action"] == "keep" and item["proposed"]["action"] == "reassign", item
+
+        class Conn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def cursor(self):
+                return cur
+
+        monkeypatch.setattr(db, "connect", lambda **k: Conn())
+        monkeypatch.setattr(tidy, "_ready", lambda cur: True)
+        monkeypatch.setattr(co, "bulk_owner_gate", lambda count: "app")
+        # Even a plan edited to apply the move is refused at the write.
+        item.update(action="reassign", after=item["proposed"]["after"])
+        result = tidy.apply(doc)
+        assert cur.value("commitments", cid, "owner") == co.OWNER_USER, result
+        assert result["changed"] == 0
+    finally:
+        cur.inner.conn.close()
+        db._TABLE_COLUMNS_CACHE.clear()
