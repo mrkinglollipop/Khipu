@@ -66,6 +66,9 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "work.not_same": (("row", "commitment"), ()),
     # ``why`` is the change's reason (``reason`` is a hold's, from a fixed list).
     "owed.change": (("ids", "change", "why"), ("to", "label")),
+    # The clean-up: ``plan`` (a file from ``khipu owed tidy --plan-out``, shown
+    # to the owner first) to apply, or ``batch`` to undo; one, not both.
+    "owed.tidy": (("project",), ("plan", "batch")),
     "direction.off": ((), ()),
     "direction.on": ((), ()),
     "direction.acknowledge": ((), ()),
@@ -251,6 +254,11 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
             raise _bad("a reassign names the new owner (to); close and reopen take none")
         return ["owed", f"--{v['change']}={','.join(str(c) for c in v['ids'])}", f"--reason={v['why']}",
                 *_opts(v, "to", "label")], []
+    if action == "owed.tidy":
+        if ("plan" in v) == ("batch" in v):
+            raise _bad("owed.tidy names the plan to apply or the batch to undo, one of the two")
+        return ["owed", "tidy", *_opts(v, "project"), f"--apply={v['plan']}" if "plan" in v
+                else f"--undo={v['batch']}"], []
     if action in ("work.same", "work.not_same"):
         return ["work", verb.replace("_", "-")], [v["row"], v["commitment"]]
     if action in ("direction.off", "direction.on", "direction.acknowledge"):

@@ -732,3 +732,130 @@ def test_tidy_never_moves_an_item_stored_as_the_users(monkeypatch):
     finally:
         cur.inner.conn.close()
         db._TABLE_COLUMNS_CACHE.clear()
+
+
+# ---- apply and undo on the owner's direction -------------------------------
+
+
+def _direction(tmp_path, monkeypatch, session="s-tidy-apply"):
+    from khipu import owner_turns
+
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", session)
+    owner_turns.record({"session_id": session, "prompt": "apply that clean-up", "cwd": str(tmp_path)},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"})
+
+
+def _plan_file(tmp_path, plan) -> str:
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan, default=str), encoding="utf-8")
+    return str(path)
+
+
+def _owner_undo(line_id: str) -> tuple[int, dict]:
+    from contextlib import redirect_stdout
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = cli.main(["owner-direction", "undo", line_id, "--owner-direction"])
+    return rc, json.loads(out.getvalue())
+
+
+def _no_gate_but_direction(monkeypatch):
+    monkeypatch.setattr(routing, "typed_yes", lambda prompt: pytest.fail("the terminal was asked"))
+    monkeypatch.setattr(co, "bulk_owner_gate", lambda n: pytest.fail("the app or terminal gate was asked"))
+
+
+def test_apply_by_direction_passes_the_gate_is_logged_and_its_undo_restores(owed, monkeypatch, tmp_path):
+    from khipu import owner_act, owner_direction
+
+    f = _flood(owed)
+    plan = _plan(owed, judge=FakeModel())
+    mine = _edited_to_move_the_owners_item(f, plan)
+    before = _rows(owed)
+    _no_gate_but_direction(monkeypatch)
+    _direction(tmp_path, monkeypatch)
+    ok_, out = owner_act.act("owed.tidy", {"project": PROJECT, "plan": _plan_file(tmp_path, plan)})
+    assert ok_ and out["owner_gate"] == "direction" and out["changed"] > 0 and out["owner_action"], out
+    assert _rows(owed, [mine])[mine]["owner"] == "user"
+    line = next(x for x in owner_direction.actions() if x["id"] == out["owner_action"])
+    assert line["action"] == "owed.tidy" and line["auth"] == "direction" and "no_undo" not in line
+    rc, undone = _owner_undo(out["owner_action"])
+    assert rc == 0 and undone["restored"] == out["changed"], undone
+    assert _rows(owed) == before
+
+
+def test_apply_by_direction_is_refused_without_a_recent_owner_turn(owed, monkeypatch, tmp_path):
+    from khipu import owner_act
+
+    _flood(owed)
+    plan = _plan(owed, judge=FakeModel())
+    before = _snapshot(owed)
+    _no_gate_but_direction(monkeypatch)
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-nobody-typed")
+    ok_, out = owner_act.act("owed.tidy", {"project": PROJECT, "plan": _plan_file(tmp_path, plan)})
+    assert not ok_ and out["code"] == "no_recorded_turn" and "Nothing was changed" in out["error"], out
+    assert _snapshot(owed) == before
+
+
+def test_undo_by_direction_restores_the_batch_and_its_undo_puts_the_changes_back(owed, monkeypatch, tmp_path):
+    from khipu import owner_act, owner_direction
+
+    f = _flood(owed)
+    plan = _plan(owed, judge=FakeModel())
+    _edited_to_move_the_owners_item(f, plan)
+    before = _rows(owed)
+    _app(monkeypatch)
+    applied = owed_tidy.apply(plan)
+    assert applied["ok"] and applied["changed"] > 0
+    after_apply = _rows(owed)
+    monkeypatch.setattr(routing, "_caller", lambda: {"app": False, "chain": ["claude"]})
+    _no_gate_but_direction(monkeypatch)
+    _direction(tmp_path, monkeypatch)
+    ok_, out = owner_act.act("owed.tidy", {"project": PROJECT, "batch": applied["batch"]})
+    assert ok_ and out["restored"] == applied["changed"] and out["owner_action"], out
+    assert _rows(owed) == before
+    line = next(x for x in owner_direction.actions() if x["id"] == out["owner_action"])
+    assert line["action"] == "owed.tidy" and "no_undo" not in line
+    rc, redone = _owner_undo(out["owner_action"])
+    assert rc == 0 and redone["reapplied"] == applied["changed"], redone
+    assert _rows(owed) == after_apply
+    # The batch is applied again, so its own undo works once more.
+    assert owed_tidy.undo(applied["batch"])["restored"] == applied["changed"]
+    assert _rows(owed) == before
+
+
+def test_redo_leaves_alone_an_item_changed_since_the_undo(owed, monkeypatch):
+    _flood(owed)
+    plan = _plan(owed, judge=FakeModel())
+    _app(monkeypatch)
+    applied = owed_tidy.apply(plan)
+    owed_tidy.undo(applied["batch"])
+    changed = _batch_ids(owed, applied["batch"])[0]
+    with owed.cursor() as cur:
+        cur.execute("UPDATE commitments SET close_reason = 'touched by hand' WHERE id = %s", (changed,))
+    out = owed_tidy.redo(applied["batch"], project=PROJECT)
+    assert out["ok"] and out["reapplied"] == applied["changed"] - 1
+    assert [x["id"] for x in out["left_alone"]] == [changed]
+
+
+def _batch_ids(conn, batch) -> list[int]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT commitment_id FROM commitment_tidy_items WHERE batch_id = %s ORDER BY 1", (batch,))
+        return [int(r[0]) for r in cur.fetchall()]
+
+
+def test_tidy_by_direction_takes_a_plan_or_a_batch_and_nothing_else(owed, tmp_path):
+    from khipu import owner_act
+
+    for args in ({"project": PROJECT}, {"project": PROJECT, "plan": "p.json", "batch": "tidy-1"},
+                 {"plan": "p.json"}, {"project": PROJECT, "plan": "p.json", "ids": [1]}):
+        ok_, out = owner_act.act("owed.tidy", args)
+        assert not ok_ and out["code"] == "bad_args", (args, out)
+    head, pos = owner_act.argv("owed.tidy", owner_act._values("owed.tidy", {"project": PROJECT, "plan": "-x.json"}))
+    ns = cli.build_parser().parse_args(owner_act.full_argv(head, pos, ["--owner-direction"]))
+    assert (ns.apply, ns.project, ns.by_direction) == ("-x.json", PROJECT, True)
+    head, pos = owner_act.argv("owed.tidy", owner_act._values("owed.tidy", {"project": PROJECT, "batch": "tidy-1"}))
+    ns = cli.build_parser().parse_args(owner_act.full_argv(head, pos, ["--owner-direction"]))
+    assert (ns.undo, ns.by_direction) == ("tidy-1", True)

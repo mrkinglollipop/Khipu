@@ -47,7 +47,9 @@ fields of every item in the batch that has not changed since the apply; an
 item changed since is left alone and listed. A close by a PR or decision
 rule that is undone is remembered in ``reopened_rule_keys``, so the nightly
 never closes it again by the same evidence. Undo passes the gate too when it
-touches the user's items.
+touches the user's items. **Redo** (``redo``) puts an undone batch's changes
+back on the items unchanged since the undo (the Undo of an undo made by the
+owner's direction).
 
 **The plan document** (what the app's preview reads, slice 5)::
 
@@ -546,8 +548,10 @@ def _gate(cur, rows: dict[int, dict], ids: list[int], extra_users: set[int] | No
     return gate is not None, gate, mine
 
 
-def apply(doc: dict[str, Any]) -> dict[str, Any]:
-    """Apply a plan: one transaction, one batch (see the module docstring)."""
+def apply(doc: dict[str, Any], *, owner_gate: str | None = None) -> dict[str, Any]:
+    """Apply a plan: one transaction, one batch (see the module docstring).
+    ``owner_gate`` is how the owner gate already passed for this apply (the
+    owner's direction, ``khipu owed tidy --apply --owner-direction``)."""
     from khipu import commitments as co, offline
     from khipu.db import connect
 
@@ -577,7 +581,7 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
                 return rows, skipped, live
 
             rows, skipped, live = current(lock=False)
-            passed, gate, mine = _gate(cur, rows, live)
+            passed, gate, mine = _gate(cur, rows, live, passed=owner_gate)
             if not passed:
                 return {"ok": False, "changed": 0, "needs_owner": mine, "error": co.BULK_OWNER_REFUSAL}
             rows, skipped, live = current(lock=True)
@@ -757,39 +761,125 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                         "error": co.BULK_OWNER_REFUSAL}
             restored = 0
             lineage_ready = co._lineage_columns_ready(cur)
+            redo_from = _redo_states(cur, batch)
             for cid, action, prior in todo:
-                cur.execute("SAVEPOINT owed_tidy_undo")
-                try:
-                    cur.execute(
-                        "UPDATE commitments SET status = %s, owner = %s, owner_label = %s, origin = %s, "
-                        "owner_reassigned_at = %s::timestamptz, closed_at = %s::timestamptz, closed_episode = %s, "
-                        "close_reason = %s, closed_by = %s, close_rule_key = %s, close_evidence = %s::jsonb, "
-                        "tidy_batch = %s, reopened_rule_keys = CASE WHEN %s AND close_rule_key IS NOT NULL "
-                        "AND NOT (close_rule_key = ANY(reopened_rule_keys)) "
-                        "THEN array_append(reopened_rule_keys, close_rule_key) ELSE reopened_rule_keys END, "
-                        # A clean-up batch kept no due date and never moved one.
-                        "due_after = CASE WHEN %s THEN %s::timestamptz ELSE due_after END"
-                        + (", owner_reassigned_by = %s, owner_reassign_reason = %s, owner_prior = %s, "
-                           "owner_prior_label = %s" if lineage_ready else "")
-                        + " WHERE id = %s",
-                        (prior["status"], prior["owner"], prior["owner_label"], prior["origin"],
-                         prior["owner_reassigned_at"], prior["closed_at"], prior["closed_episode"],
-                         prior["close_reason"], prior["closed_by"], prior["close_rule_key"],
-                         None if prior["close_evidence"] is None else json.dumps(prior["close_evidence"]),
-                         prior["tidy_batch"], action == "close", "due_after" in prior, prior.get("due_after"),
-                         *([prior.get(f) for f in LINEAGE_FIELDS] if lineage_ready else []),
-                         cid))
-                    cur.execute("RELEASE SAVEPOINT owed_tidy_undo")
-                except Exception as exc:  # noqa: BLE001 — e.g. the same text is open again
-                    cur.execute("ROLLBACK TO SAVEPOINT owed_tidy_undo")
-                    left_alone.append({"id": cid, "why": f"could not be restored ({type(exc).__name__}); "
-                                                         "an open item with the same text may exist"})
+                undone_from = {f: _plain(rows[cid].get(f)) for f in BULK_PRIOR_FIELDS}
+                if not _put(cur, cid, prior, lineage_ready, reopen_rule=action == "close"):
+                    left_alone.append({"id": cid, "why": "could not be restored; an open item with the same "
+                                                         "text may exist"})
                     continue
                 cur.execute("UPDATE commitment_tidy_items SET undone_at = now() WHERE batch_id = %s "
                             "AND commitment_id = %s", (batch, cid))
+                redo_from[str(cid)] = {"state": undone_from,
+                                       "fingerprint": fingerprint(_select(cur, project, ids=[cid])[cid])}
                 restored += 1
             report = {"restored": restored, "left_alone": left_alone, "owner_gate": gate}
             cur.execute("UPDATE commitment_tidy_batches SET undone_at = now(), undo_report = %s::jsonb "
-                        "WHERE id = %s", (json.dumps(report), batch))
+                        "WHERE id = %s", (json.dumps(dict(report, redo=redo_from), default=str), batch))
     _log(f"{batch}: undo restored {restored}, left alone {len(left_alone)}")
     return {"ok": True, "batch": batch, "project": project or "", **report}
+
+
+def _put(cur, cid: int, state: dict, lineage_ready: bool, *, reopen_rule: bool) -> bool:
+    """Write ``state`` (``BULK_PRIOR_FIELDS``) back onto item ``cid``; False,
+    with nothing written, when the hub refuses it (the same text open again).
+    ``reopen_rule`` remembers an undone rule close in ``reopened_rule_keys``."""
+    cur.execute("SAVEPOINT owed_tidy_put")
+    try:
+        cur.execute(
+            "UPDATE commitments SET status = %s, owner = %s, owner_label = %s, origin = %s, "
+            "owner_reassigned_at = %s::timestamptz, closed_at = %s::timestamptz, closed_episode = %s, "
+            "close_reason = %s, closed_by = %s, close_rule_key = %s, close_evidence = %s::jsonb, "
+            "tidy_batch = %s, reopened_rule_keys = CASE WHEN %s AND close_rule_key IS NOT NULL "
+            "AND NOT (close_rule_key = ANY(reopened_rule_keys)) "
+            "THEN array_append(reopened_rule_keys, close_rule_key) ELSE reopened_rule_keys END, "
+            # A clean-up batch kept no due date and never moved one.
+            "due_after = CASE WHEN %s THEN %s::timestamptz ELSE due_after END"
+            + (", owner_reassigned_by = %s, owner_reassign_reason = %s, owner_prior = %s, "
+               "owner_prior_label = %s" if lineage_ready else "")
+            + " WHERE id = %s",
+            (state["status"], state["owner"], state["owner_label"], state["origin"],
+             state["owner_reassigned_at"], state["closed_at"], state["closed_episode"],
+             state["close_reason"], state["closed_by"], state["close_rule_key"],
+             None if state["close_evidence"] is None else json.dumps(state["close_evidence"]),
+             state["tidy_batch"], reopen_rule, "due_after" in state, state.get("due_after"),
+             *([state.get(f) for f in LINEAGE_FIELDS] if lineage_ready else []),
+             cid))
+    except Exception:  # noqa: BLE001 — e.g. the same text is open again
+        cur.execute("ROLLBACK TO SAVEPOINT owed_tidy_put")
+        return False
+    cur.execute("RELEASE SAVEPOINT owed_tidy_put")
+    return True
+
+
+def _redo_states(cur, batch: str) -> dict:
+    """``{id: {state, fingerprint}}``: each undone item's state before its
+    undo and its fingerprint just after, kept on the batch for ``redo``."""
+    cur.execute("SELECT undo_report FROM commitment_tidy_batches WHERE id = %s", (batch,))
+    found = cur.fetchone()
+    report = found[0] if found else None
+    if isinstance(report, str):
+        report = json.loads(report)
+    redo_from = (report or {}).get("redo") if isinstance(report, dict) else None
+    return dict(redo_from) if isinstance(redo_from, dict) else {}
+
+
+def redo(batch: str, *, project: str | None = None, owner_gate: str | None = None) -> dict[str, Any]:
+    """Put an undone batch's changes back: each item ``undo`` restored and
+    that has not changed since gets the state it had before that undo; an
+    item changed since is left alone and listed. The owner-actions log's
+    Undo of an undo made by direction; passes the owner gate like ``undo``."""
+    from khipu import commitments as co, offline
+    from khipu.db import connect
+
+    batch = str(batch or "").strip()
+    with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+        with conn.cursor() as cur:
+            if not _ready(cur):
+                return {"ok": False, "reapplied": 0, "error": NOT_READY}
+            cur.execute("SELECT project FROM commitment_tidy_batches WHERE id = %s FOR UPDATE", (batch,))
+            found = cur.fetchone()
+            if found is None:
+                return {"ok": False, "reapplied": 0, "error": f"no clean-up batch {batch!r}; nothing was changed"}
+            if project is not None and found[0] != project:
+                return {"ok": False, "reapplied": 0, "batch": batch, "project": found[0],
+                        "error": f"batch {batch!r} is for project {found[0]!r}, not {project!r}; "
+                                 "nothing was changed"}
+            project = found[0] or None
+            redo_from = _redo_states(cur, batch)
+            cur.execute("SELECT commitment_id FROM commitment_tidy_items WHERE batch_id = %s "
+                        "AND undone_at IS NOT NULL ORDER BY commitment_id", (batch,))
+            ids = [int(r[0]) for r in cur.fetchall() if str(r[0]) in redo_from]
+            rows = _select(cur, project, ids=ids, lock=True)
+            left_alone, todo = [], []
+            for cid in ids:
+                row = rows.get(cid)
+                if row is None:
+                    left_alone.append({"id": cid, "why": "no longer on the hub, or forgotten"})
+                elif fingerprint(row) != redo_from[str(cid)].get("fingerprint"):
+                    left_alone.append({"id": cid, "why": "changed after the undo"})
+                else:
+                    todo.append(cid)
+            then_users = {cid for cid in todo if redo_from[str(cid)]["state"].get("owner") == co.OWNER_USER}
+            passed, gate, mine = _gate(cur, rows, todo, then_users, owner_gate)
+            if not passed:
+                return {"ok": False, "reapplied": 0, "batch": batch, "needs_owner": mine,
+                        "error": co.BULK_OWNER_REFUSAL}
+            reapplied = 0
+            lineage_ready = co._lineage_columns_ready(cur)
+            for cid in todo:
+                if not _put(cur, cid, redo_from[str(cid)]["state"], lineage_ready, reopen_rule=False):
+                    left_alone.append({"id": cid, "why": "could not be put back; an open item with the same "
+                                                         "text may exist"})
+                    continue
+                done = _select(cur, project, ids=[cid])[cid]
+                cur.execute("UPDATE commitment_tidy_items SET undone_at = NULL, after_fingerprint = %s "
+                            "WHERE batch_id = %s AND commitment_id = %s", (fingerprint(done), batch, cid))
+                redo_from.pop(str(cid))
+                reapplied += 1
+            cur.execute("UPDATE commitment_tidy_batches SET undone_at = NULL, "
+                        "undo_report = jsonb_set(COALESCE(undo_report, '{}'::jsonb), '{redo}', %s::jsonb) "
+                        "WHERE id = %s", (json.dumps(redo_from, default=str), batch))
+    _log(f"{batch}: redo put back {reapplied}, left alone {len(left_alone)}")
+    return {"ok": True, "batch": batch, "project": project or "", "reapplied": reapplied,
+            "left_alone": left_alone, "owner_gate": gate}

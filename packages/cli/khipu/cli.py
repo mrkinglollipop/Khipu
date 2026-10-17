@@ -2360,7 +2360,10 @@ def cmd_owed(args: argparse.Namespace) -> int:
 def cmd_owed_tidy(args: argparse.Namespace) -> int:
     """`khipu owed tidy --project P`: plan the clean-up (writes nothing),
     `--apply PLAN` apply a plan in one batch, `--undo BATCH` undo one. Plain
-    JSON out, like the other owed commands (khipu.owed_tidy)."""
+    JSON out, like the other owed commands (khipu.owed_tidy). With
+    ``--owner-direction`` an apply or undo passes the owner gate on the
+    owner's direction in this conversation, logged with an Undo, or is
+    refused with nothing changed."""
     from khipu import offline, owed_tidy
     from khipu.db import connect
 
@@ -2368,6 +2371,12 @@ def cmd_owed_tidy(args: argparse.Namespace) -> int:
     if args.apply and args.undo:
         print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
         return 2
+    if getattr(args, "by_direction", False):
+        if not (args.apply or args.undo):
+            print(json.dumps({"ok": False, "error": "--owner-direction applies or undoes a clean-up; "
+                                                    "planning one needs no direction"}))
+            return 2
+        return _owed_tidy_by_direction(args, project)
     if args.apply:
         try:
             doc = json.loads(Path(args.apply).read_text(encoding="utf-8"))
@@ -2409,6 +2418,41 @@ def cmd_owed_tidy(args: argparse.Namespace) -> int:
     else:
         print(json.dumps(doc, indent=2, default=str))
     return 0
+
+
+def _owed_tidy_by_direction(args: argparse.Namespace, project: str) -> int:
+    """``owed tidy --apply/--undo --owner-direction``: the owner-direction
+    check (action ``owed.tidy``) before anything is read or changed, then the
+    same apply or undo with the gate passed as ``direction``."""
+    from khipu import owed_tidy, owner_direction
+
+    change = "apply" if args.apply else "undo"
+    facts = {"change": change, **({"plan": args.apply} if args.apply else {"batch": args.undo})}
+    want = owner_direction.intent("owed.tidy", project, facts=facts)
+    try:
+        owner_direction.gate(want)
+    except owner_direction.DirectionRefused as err:
+        print(json.dumps({**err.refusal(), "error": err.message + " Nothing was changed."}))
+        return 2
+    try:
+        if args.apply:
+            try:
+                doc = json.loads(Path(args.apply).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                res = {"ok": False, "error": f"could not read the plan: {type(exc).__name__}"}
+            else:
+                res = ({"ok": False, "error": f"this plan is for project {doc.get('project')!r}, not "
+                                              f"{project!r}; nothing was changed"}
+                       if isinstance(doc, dict) and doc.get("project") != project
+                       else owed_tidy.apply(doc, owner_gate="direction"))
+        else:
+            res = owed_tidy.undo(args.undo, project=project, owner_gate="direction")
+    except BaseException:
+        owner_direction._abandon()
+        raise
+    res = owner_direction.finish(res) or res
+    print(json.dumps(res, indent=2, default=str))
+    return 0 if res.get("ok") else 1
 
 
 def _owed_ids_arg(raw: str) -> list[int]:
@@ -5457,6 +5501,7 @@ def build_parser() -> argparse.ArgumentParser:
     tidy.add_argument("--undo", metavar="BATCH", default=None, help="Undo the applied batch BATCH")
     tidy.add_argument("--no-model", action="store_true",
                       help="Rules only: no model pass for the items the rules cannot sort")
+    _owed_owner_flags(tidy)
     tidy.set_defaults(func=cmd_owed_tidy)
     owed.set_defaults(func=cmd_owed)
 
