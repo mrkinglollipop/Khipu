@@ -19,7 +19,6 @@ import { SettingField } from "./SettingsControls";
 export type OwnerDirectionSettings = {
   enabled: boolean;
   latest_window_h: number;
-  earlier_window_min: number;
   trusted: string[];
   session_binding: boolean;
 };
@@ -40,7 +39,7 @@ export type OwnerAction = {
   auth?: string;
   words?: string;
   harness?: string;
-  binding?: "token" | "session";
+  binding?: "hook" | "token" | "session";
   via_session?: string;
   state?: string | null;
   runs_at?: string;
@@ -80,8 +79,7 @@ function accountWords(key: string): string {
 }
 
 const SETTING_WORDS: Record<string, string> = {
-  latest_window_h: "the latest-turn window",
-  earlier_window_min: "the earlier-turn window",
+  latest_window_h: "the window after your last message",
   session_binding: "session-only binding",
 };
 
@@ -260,7 +258,7 @@ type ActionsShape = { ok?: boolean; actions: OwnerAction[]; chain?: ChainState }
 function sourceWords(a: OwnerAction): string {
   switch (a.auth) {
     case "direction":
-      return `You said this in ${conversationWords(a)}${a.binding === "session" ? "; checked by conversation only" : ""}.`;
+      return `You asked for this in ${conversationWords(a)}${a.binding === "session" ? "; checked by conversation only" : ""}.`;
     case "app":
       return "Done in the Khipu app.";
     case "terminal":
@@ -345,8 +343,9 @@ export function OwnerActions({ active }: { active: boolean }) {
   return (
     <>
       <p className="set-help set-intro">
-        A conversation can make an owner's change when you asked for it in your own typed words. Every owner change,
-        made that way, in the app or on a terminal, is listed here, and you can undo it.
+        A conversation you are typing in can make an owner's change when you ask for it; background and dispatched
+        jobs can't. Every owner change, made that way, in the app or on a terminal, is listed here, and you can undo
+        it.
       </p>
       {show.error && !show.data ? (
         <p className="set-error" role="alert">
@@ -444,14 +443,14 @@ export function OwnerActions({ active }: { active: boolean }) {
           {sw(
             "od-enabled",
             "Owner direction",
-            "Conversations may make an owner's change when your own typed words in that conversation ask for it. Off: only this app, or a yes typed in a terminal, can.",
+            "A conversation you have typed in recently may make an owner's change you ask for. Off: only this app, or a yes typed in a terminal, can.",
             conf?.enabled === true,
             (next) => void write("od-enabled", "khipu_owner_direction_switch", { on: next }),
           )}
           {sw(
             "od-session",
-            "Check by conversation only where there is no turn token",
-            "Aegis and Grok Build can't carry a turn token, so their words are matched by conversation alone. Off: those conversations can't make owner's changes.",
+            "Allow Aegis and Grok Build, checked by conversation only",
+            "Aegis and Grok Build don't show Khipu's hook output, so their requests are checked by conversation alone. Off: those conversations can't make owner's changes.",
             conf?.session_binding === true,
             (next) =>
               void write("od-session", "khipu_owner_direction_set", {
@@ -462,22 +461,12 @@ export function OwnerActions({ active }: { active: boolean }) {
           <div className="opt-row">
             <div className="opt-text">
               <SettingField
-                label="Your latest message counts for (hours)"
+                label="After your last message, a conversation counts for (hours)"
                 narrow
                 inputMode="decimal"
                 value={conf ? String(conf.latest_window_h) : ""}
-                help="How long your newest message in a conversation can still be acted on. The default is 6."
+                help="How long after your last message in a conversation it can still make owner's changes. The default is 6."
                 onSave={(v) => write("od-latest", "khipu_owner_direction_set", { key: "latest_window_h", value: v.trim() })}
-              />
-              <SettingField
-                label="An earlier message counts for (minutes)"
-                narrow
-                inputMode="decimal"
-                value={conf ? String(conf.earlier_window_min) : ""}
-                help="How long a message you have since followed with another can still be acted on. The default is 30."
-                onSave={(v) =>
-                  write("od-earlier", "khipu_owner_direction_set", { key: "earlier_window_min", value: v.trim() })
-                }
               />
             </div>
           </div>
@@ -488,7 +477,7 @@ export function OwnerActions({ active }: { active: boolean }) {
         <div className="section-head">Front ends that count as you</div>
         <div className="section-body">
           <p className="set-help">
-            Words typed in these count as yours. Jobs a conversation starts never count.
+            Conversations typed in these count as yours. Jobs a conversation starts never count.
           </p>
           {conf ? (
             <div className="rows" role="list" aria-label="Front ends that count as you">

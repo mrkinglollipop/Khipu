@@ -20,7 +20,6 @@ function fresh(): Backend {
     settings: {
       enabled: true,
       latest_window_h: 6,
-      earlier_window_min: 30,
       trusted: ["claude_code:cli", "codex:codex_cli_rs"],
       session_binding: true,
     },
@@ -32,9 +31,10 @@ function fresh(): Backend {
       },
       {
         id: "c3", at: "2026-10-16T14:03:00Z", action: "route.rule.confirm", target: "2", auth: "direction",
-        words: "keep rule 2 please", harness: "claude_code", binding: "token", state: "applied",
+        harness: "claude_code", binding: "hook", state: "applied",
         no_undo: "Confirming a seeded rule can't be undone; the rule can be retired.",
       },
+      // A line written under the earlier design keeps the words it was asked with.
       {
         id: "a1", at: "2026-10-16T14:02:00Z", action: "route.pause", target: "codex|", auth: "direction",
         words: "pause Codex until tonight", harness: "claude_code", binding: "token", state: "applied",
@@ -80,7 +80,6 @@ beforeEach(() => {
         const s = backend.settings;
         if (key === "session_binding") s.session_binding = value === "on";
         else if (key === "latest_window_h") s.latest_window_h = Number(value);
-        else if (key === "earlier_window_min") s.earlier_window_min = Number(value);
         else if (key === "trust") s.trusted = [...s.trusted, value];
         else if (key === "untrust") s.trusted = s.trusted.filter((t) => t !== value);
         return JSON.stringify({ ok: true, settings: s });
@@ -98,20 +97,20 @@ async function list() {
 }
 
 describe("Owner actions", () => {
-  it("lists every owner action, newest first, with the words, the conversation and the state", async () => {
+  it("lists every owner action, newest first, with the conversation and the state", async () => {
     render(<OwnerActions active />);
     const items = within(await list()).getAllByRole("listitem");
     expect(items).toHaveLength(5);
     expect(items[0].textContent).toContain("Removed T-12 from the ledger for good");
     expect(items[0].textContent).toContain("Purge scheduled for");
-    expect(items[0].textContent).toContain("You said this in an Aegis conversation; checked by conversation only.");
+    expect(items[0].textContent).toContain("You asked for this in an Aegis conversation; checked by conversation only.");
     expect(items[0].textContent).toContain("checked by conversation only");
     expect(items[1].textContent).toContain("No undo");
     expect(items[1].textContent).toContain("can't be undone");
     expect(within(items[1]).queryByRole("button")).toBeNull();
     expect(items[2].textContent).toContain("Paused Codex");
     expect(items[2].textContent).toContain("“pause Codex until tonight”");
-    expect(items[2].textContent).toContain("You said this in a Claude Code conversation.");
+    expect(items[2].textContent).toContain("You asked for this in a Claude Code conversation.");
     expect(items[2].textContent).not.toContain("checked by conversation only");
   });
 
@@ -243,7 +242,8 @@ describe("Owner actions", () => {
     await waitFor(() => expect(session.checked).toBe(false));
     expect(calls).toContainEqual(["khipu_owner_direction_set", { key: "session_binding", value: "off" }]);
 
-    const latest = screen.getByLabelText(/latest message counts for/) as HTMLInputElement;
+    expect(screen.queryByLabelText(/earlier message/)).toBeNull();
+    const latest = screen.getByLabelText(/After your last message/) as HTMLInputElement;
     fireEvent.change(latest, { target: { value: "2" } });
     fireEvent.submit(latest.closest("form")!);
     await waitFor(() =>

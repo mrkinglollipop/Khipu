@@ -2278,7 +2278,7 @@ async fn khipu_route_check(account: String) -> Result<String, String> {
 }
 
 // --- Settings -> Owner actions (owner direction, scope 2.5 and section 4).
-// The list of what conversations did on the owner's words, one Undo per line,
+// The list of every owner change, one Undo per line,
 // and the check's own settings. The app is the owner, so every write carries
 // `--from-app` and applies at once; each value is checked here and travels
 // after `--`, so nothing the webview sends can become a flag.
@@ -2287,7 +2287,7 @@ const OWNER_DIRECTION_SHOW_ARGV: &[&str] = &["owner-direction", "show"];
 const OWNER_DIRECTION_ACTIONS_ARGV: &[&str] = &["owner-direction", "actions", "--json"];
 const OWNER_DIRECTION_ACKNOWLEDGE_ARGV: &[&str] = &["owner-direction", "acknowledge", "--from-app"];
 /// The keys `khipu owner-direction set` takes.
-const OWNER_DIRECTION_KEYS: &[&str] = &["latest_window_h", "earlier_window_min", "session_binding", "trust", "untrust"];
+const OWNER_DIRECTION_KEYS: &[&str] = &["latest_window_h", "session_binding", "trust", "untrust"];
 
 /// An owner-actions log line's id: 8 lowercase hex characters.
 fn owner_direction_undo_argv(id: &str) -> Result<Vec<String>, String> {
@@ -2308,7 +2308,7 @@ fn owner_direction_set_argv(key: &str, value: &str) -> Result<Vec<String>, Strin
     }
     let value = value.trim();
     let ok = match key {
-        "latest_window_h" | "earlier_window_min" => {
+        "latest_window_h" => {
             value.len() <= 12
                 && value.chars().all(|c| c.is_ascii_digit() || c == '.')
                 && value.parse::<f64>().is_ok_and(|n| n > 0.0)
@@ -5244,7 +5244,8 @@ mod settings_command_tests {
             ("latest_window_h", "-1"),
             ("latest_window_h", "0"),
             ("latest_window_h", "six"),
-            ("earlier_window_min", "1e3"),
+            ("latest_window_h", "1e3"),
+            ("earlier_window_min", "30"),
             ("session_binding", "yes"),
             ("trust", "--from-app"),
             ("trust", "claude_code"),
