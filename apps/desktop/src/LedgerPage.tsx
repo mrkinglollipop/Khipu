@@ -199,6 +199,9 @@ export function LedgerPage({
     editRev.current += 1;
     setForm(next);
   };
+  // The form as it was sent, when typing went on during the save: the saved
+  // row's refresh then keeps every field changed since instead of resetting.
+  const rebase = useRef<Form | null>(null);
   const [saving, setSaving] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [removeOpen, setRemoveOpen] = useState(false);
@@ -220,12 +223,13 @@ export function LedgerPage({
   }, [project]);
 
   const loadDetail = useCallback(
-    async (id: string, background = false) => {
+    async (id: string, background = false, sent?: { rev: number; form: Form }) => {
       const rev = editRev.current;
       const res = await callCli<LedgerRow>("khipu_ledger_get", { project, id });
       if (openRow.current !== id) return null;
       if (background && editRev.current !== rev) return null;
       if (res.ok && res.data && typeof res.data.id === "string") {
+        rebase.current = sent && editRev.current !== sent.rev ? sent.form : null;
         setDetail(res.data);
         setDetailError(null);
         return res.data;
@@ -314,10 +318,21 @@ export function LedgerPage({
   useEffect(() => {
     if (!detail) return;
     const key = JSON.stringify([detail.id, detail.updated, detail.state]);
+    const sent = rebase.current;
+    rebase.current = null;
     if (key === formFor.current && editRev.current !== resetRev.current) return;
+    const fresh = initialForm(detail, vocab);
+    if (sent && key !== formFor.current) {
+      formFor.current = key;
+      // Fields typed after Save keep their newer text and stay unsaved.
+      setForm((now) =>
+        now ? (Object.fromEntries((Object.keys(fresh) as Array<keyof Form>).map((k) => [k, now[k] !== sent[k] ? now[k] : fresh[k]])) as Form) : fresh,
+      );
+      return;
+    }
     formFor.current = key;
     resetRev.current = editRev.current;
-    setForm(initialForm(detail, vocab));
+    setForm(fresh);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail?.id, detail?.updated, detail?.state, vocabKey]);
 
@@ -368,8 +383,8 @@ export function LedgerPage({
   const visible = filtered.slice(0, limit);
   const children = detail ? rows.filter((r) => r.parent === detail.id) : [];
 
-  const afterWrite = async (id: string | null) => {
-    await Promise.all([readList(true), id ? loadDetail(id) : Promise.resolve(null), onChanged()]);
+  const afterWrite = async (id: string | null, sent?: { rev: number; form: Form }) => {
+    await Promise.all([readList(true), id ? loadDetail(id, false, sent) : Promise.resolve(null), onChanged()]);
   };
 
   const save = async () => {
@@ -386,6 +401,7 @@ export function LedgerPage({
       return;
     }
     change.if_state = detail.state;
+    const sent = { rev: editRev.current, form };
     setSaving(true);
     setRefusal(null);
     try {
@@ -398,7 +414,7 @@ export function LedgerPage({
           await onOwedClose(Number(commitment));
         }
       }
-      await afterWrite(detail.id);
+      await afterWrite(detail.id, sent);
     } finally {
       setSaving(false);
     }
@@ -735,6 +751,9 @@ export function LedgerPage({
                       }}>
                       Cancel
                     </button>
+                    {!saving && !sameForm(form, initialForm(detail, vocab)) ? (
+                      <span className="lg-unsaved">Unsaved changes</span>
+                    ) : null}
                     <span className="meta">
                       Saved as “you, in the app”.
                       {commitment != null && commitment !== "" && (formMeaning === "done" || formMeaning === "dropped")

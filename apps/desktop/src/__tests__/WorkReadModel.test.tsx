@@ -3,6 +3,8 @@
 // without wiping an edit, and offline and waiting-write state that always shows.
 (globalThis as unknown as { process: { env: Record<string, string> } }).process.env.TZ = "America/New_York";
 
+// @ts-expect-error node:fs has no types here
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, renderHook, screen, within } from "@testing-library/react";
 import { LedgerPage } from "../LedgerPage";
@@ -307,6 +309,64 @@ describe("LedgerPage edits and single reads", () => {
     vocab = { ...VOCAB, state: [...VOCAB.state, ["PARKED", "open"]] };
     await tick(5_100);
     expect(title()).toHaveValue("My unsaved edit");
+  });
+
+  it("keeps typing done while a save is in flight and says it is unsaved", async () => {
+    fake();
+    let current = row("s-1", { title: "Original" });
+    let finishSave: () => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_ledger_list") return JSON.stringify({ ok: true, offline: false, vocab: VOCAB, rows: [current] });
+      if (cmd === "khipu_ledger_get") return JSON.stringify(current);
+      if (cmd === "khipu_ledger_set") {
+        return new Promise<string>((resolve) => {
+          finishSave = () => {
+            current = { ...current, title: "Saved edit", updated: ago(0) };
+            resolve(JSON.stringify({ ok: true }));
+          };
+        });
+      }
+      return JSON.stringify({ removed: [] });
+    });
+    ledgerPage("s-1");
+    await tick(0);
+    fireEvent.change(title(), { target: { value: "Saved edit" } });
+    fireEvent.submit(screen.getByRole("form", { name: "Change this row" }));
+    await tick(0);
+    fireEvent.change(title(), { target: { value: "Typed during save" } });
+    await act(async () => {
+      finishSave();
+    });
+    await tick(0);
+    expect(title()).toHaveValue("Typed during save");
+    const form = screen.getByRole("form", { name: "Change this row" });
+    expect(within(form).getByText("Unsaved changes")).toHaveClass("lg-unsaved");
+    // The open row itself shows the save that went through.
+    await tick(5_100);
+    expect(title()).toHaveValue("Typed during save");
+    const css = readFileSync(`${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/Work.css`, "utf8");
+    expect(css).toMatch(/\.lg-unsaved \{[^}]*color:\s*var\(--warn\)/);
+  });
+
+  it("a save with nothing typed after it resets the form to the saved row", async () => {
+    fake();
+    let current = row("s-1", { title: "Original" });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_ledger_list") return JSON.stringify({ ok: true, offline: false, vocab: VOCAB, rows: [current] });
+      if (cmd === "khipu_ledger_get") return JSON.stringify(current);
+      if (cmd === "khipu_ledger_set") {
+        current = { ...current, title: "Saved edit", updated: ago(0) };
+        return JSON.stringify({ ok: true });
+      }
+      return JSON.stringify({ removed: [] });
+    });
+    ledgerPage("s-1");
+    await tick(0);
+    fireEvent.change(title(), { target: { value: "Saved edit" } });
+    fireEvent.submit(screen.getByRole("form", { name: "Change this row" }));
+    await tick(0);
+    expect(title()).toHaveValue("Saved edit");
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
   });
 
   it("never starts a second list read while the first is still out", async () => {

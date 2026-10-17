@@ -2,7 +2,7 @@
 "Looks like" without comparing every pair in full, one owed read, the three
 sources read at once, one projection per answer, caches that never go back
 in time, a file read that never mixes two versions, offline and queue state on
-every ledger read, project aliases, and summary ids that repeat.
+every ledger read, and summary ids that repeat.
 
 Hermetic: no hub, no database; every input is synthetic.
 """
@@ -443,49 +443,21 @@ def test_work_shows_writes_still_waiting_on_an_online_read(monkeypatch):
     assert [r["row_id"] for r in got["projects"]["atlas"]["rows"]] == ["q1"]
 
 
-# ---- one project name for the ledger and capture (V8) --------------------------------
+# ---- the ledger keys by the folder's own project, online and offline -----------------
 
 
-def test_a_ledger_project_from_the_folder_uses_the_alias(monkeypatch):
+def test_a_ledger_project_from_the_folder_never_asks_the_hub(monkeypatch):
     from khipu import identity
 
-    monkeypatch.setattr(os, "getcwd", lambda: "/synthetic/repo")
+    monkeypatch.setattr(identity, "resolve_repo_root", lambda _cwd, **kw: {"project": "oldorg/repo"})
 
-    def git(cwd, args):
-        return {"rev-parse --show-toplevel": "/synthetic/repo", "rev-parse --git-common-dir": ".git",
-                "remote get-url origin": "https://github.com/oldorg/repo.git"}[" ".join(args)]
+    def connect():
+        raise AssertionError("naming the project must not reach the hub")
 
-    monkeypatch.setattr(identity, "_git", git)
-
-    class Cur:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def execute(self, *a):
-            pass
-
-        def fetchall(self):
-            return [("oldorg/repo", "neworg/repo")]
-
-    class Conn(_Conn):
-        def cursor(self):
-            return Cur()
-
-    monkeypatch.setattr(ledger, "_connect", lambda: Conn())
-    assert ledger._project_for(argparse.Namespace(project=None), canonical=True) == "neworg/repo"
-    # Before the owner check (no canonical) it never reaches the hub.
+    monkeypatch.setattr(ledger, "_connect", connect)
     assert ledger._project_for(argparse.Namespace(project=None)) == "oldorg/repo"
-    # A name given outright is used as given, and an away hub keeps the table read before.
-    assert ledger._project_for(argparse.Namespace(project="oldorg/repo"), canonical=True) == "oldorg/repo"
-
-    def away():
-        raise ledger.HubAway("synthetic")
-
-    monkeypatch.setattr(ledger, "_connect", away)
-    assert ledger._project_for(argparse.Namespace(project=None), canonical=True) == "neworg/repo"
+    assert ledger._project_for(argparse.Namespace(project="neworg/repo")) == "neworg/repo"
+    assert not hasattr(ledger, "_project_aliases")
 
 
 # ---- summary ids that repeat (V9) ----------------------------------------------------
@@ -550,77 +522,6 @@ def test_forget_keeps_the_refresh_order():
     c = _built("c", NOW)
     work.write_view(c)
     assert json.loads(work.view_file().read_text())["review_marker"] == "c"
-
-
-class _AliasCur:
-    def __init__(self, table):
-        self.table = table
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def execute(self, sql, *a):
-        self.sql = sql
-
-    def fetchall(self):
-        return list(self.table.items())
-
-    def fetchone(self):
-        return None
-
-
-def _folder(monkeypatch, project="oldorg/repo"):
-    from khipu import identity
-
-    monkeypatch.setattr(identity, "resolve_repo_root", lambda _cwd, **kw: {"project": project})
-
-
-def test_a_renamed_repo_keeps_one_project_key_offline(monkeypatch):
-    _folder(monkeypatch)
-    calls = []
-
-    class Conn(_Conn):
-        def cursor(self):
-            return _AliasCur({"oldorg/repo": "neworg/repo"})
-
-    def connect():
-        calls.append(1)
-        return Conn()
-
-    monkeypatch.setattr(ledger, "_connect", connect)
-    args = argparse.Namespace(project=None)
-    assert ledger._project_for(args, canonical=True) == "neworg/repo"
-    # The table is kept: the next command does not reach the hub again.
-    assert ledger._project_for(args, canonical=True) == "neworg/repo"
-    assert calls == [1]
-
-    def away():
-        raise ledger.HubAway("synthetic")
-
-    monkeypatch.setattr(ledger, "_connect", away)
-    monkeypatch.setattr(ledger, "_ALIAS_FRESH_S", 0)
-    assert ledger._project_for(args, canonical=True) == "neworg/repo"
-
-
-def test_with_no_alias_known_the_folder_name_is_used_both_ways(monkeypatch):
-    _folder(monkeypatch)
-
-    def away():
-        raise ledger.HubAway("synthetic")
-
-    monkeypatch.setattr(ledger, "_connect", away)
-    args = argparse.Namespace(project=None)
-    assert ledger._project_for(args, canonical=True) == "oldorg/repo"
-
-    class Conn(_Conn):
-        def cursor(self):
-            return _AliasCur({})
-
-    monkeypatch.setattr(ledger, "_connect", lambda: Conn())
-    assert ledger._project_for(args, canonical=True) == "oldorg/repo"
 
 
 def _online_get(monkeypatch, *, hub_row, queued, drained=None):

@@ -2403,64 +2403,7 @@ def nightly() -> dict[str, Any]:
 # ---- the CLI ------------------------------------------------------------------
 
 
-_ALIAS_FRESH_S = 600  # how long the kept alias table is used before the hub is asked again
-
-
-def _aliases_file() -> Path:
-    from khipu.paths import data_dir
-
-    return data_dir() / "ledger-project-aliases.json"
-
-
-def _kept_aliases() -> tuple[dict[str, str] | None, float | None]:
-    """The alias table this Mac last read from the hub, and when."""
-    try:
-        data = json.loads(_aliases_file().read_text(encoding="utf-8"))
-        aliases, at = data["aliases"], float(data["read_at"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return None, None
-    if not isinstance(aliases, dict):
-        return None, None
-    return {str(k): str(v) for k, v in aliases.items() if k and v}, at
-
-
-def _project_aliases() -> dict[str, str] | None:
-    """capture's ``project_aliases`` table (alias -> project): from the hub,
-    kept here when it answers; the kept table while it is fresh or while the
-    hub is away. None when no table was ever read on this Mac."""
-    kept, at = _kept_aliases()
-    if kept is not None and at is not None and 0 <= time.time() - at < _ALIAS_FRESH_S:
-        return kept
-    try:
-        conn = _connect()
-    except Exception:  # noqa: BLE001  (away or unset: the table kept here, if any)
-        return kept
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT alias, project FROM project_aliases", ())
-            fresh = {str(a): str(p) for a, p in cur.fetchall() if a and p}
-        conn.rollback()
-    except Exception:  # noqa: BLE001  (a failed read never replaces what is kept)
-        return kept
-    finally:
-        conn.close()
-    from khipu.outbox import _atomic_write
-
-    try:
-        _aliases_file().parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write(_aliases_file(), {"aliases": fresh, "read_at": time.time()})
-    except OSError:
-        pass  # kept for the next command only; this one has the table
-    return fresh
-
-
-def _project_for(args: argparse.Namespace, *, canonical: bool = False) -> str:
-    """``--project`` as given; else this folder's project. ``canonical``
-    (only after the owner check: it can reach the hub) names it through the
-    project aliases, as capture does, so a renamed repository is one project
-    in the ledger and in Owed. The table is kept on this Mac, so the same
-    folder names the same project whether or not the hub answers; with no
-    table ever read here, the folder's own name."""
+def _project_for(args: argparse.Namespace) -> str:
     if getattr(args, "project", None):
         return _check_project(args.project)
     from khipu.identity import resolve_repo_root
@@ -2469,10 +2412,7 @@ def _project_for(args: argparse.Namespace, *, canonical: bool = False) -> str:
         cwd = os.getcwd()
     except OSError:
         cwd = ""
-    project = resolve_repo_root(cwd).get("project")
-    if not project or not canonical:
-        return _check_project(project)
-    return _check_project((_project_aliases() or {}).get(project) or project)
+    return _check_project(resolve_repo_root(cwd).get("project"))
 
 
 def _emit(args: argparse.Namespace | None, payload: Any = None, text: str | None = None, **kw: Any) -> None:
@@ -2518,7 +2458,7 @@ def cmd(args: argparse.Namespace) -> int:
                               f"{r['needs_owner']} need you{' · hidden' if r['hidden'] else ''}"
                               for r in listed["projects"]] + ["", f"{len(listed['projects'])} project(s)"]))
             return 0
-        project = _project_for(args, canonical=True)
+        project = _project_for(args)
         if verb == "project":
             result = set_project(project, name=args.rename,
                                  hidden=True if args.hide else False if args.show else None)
