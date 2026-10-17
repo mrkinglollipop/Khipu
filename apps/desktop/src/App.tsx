@@ -50,6 +50,7 @@ import { KeysCard } from "./KeysCard";
 import { PlansCard, usePlanAttention, usePlanUsage } from "./PlansCard";
 import { RoutingCard } from "./RoutingCard";
 import { RoutingSettings } from "./RoutingSettings";
+import { WorkSettings } from "./WorkSettings";
 import { useRouting } from "./routing";
 import { WorkView } from "./WorkView";
 import { WORK_LEDE, badgeLabel, shortProject, useWork } from "./work";
@@ -491,6 +492,7 @@ type SettingsSection =
   | "capture"
   | "routing"
   | "owner"
+  | "work"
   | "features"
   | "index"
   | "data"
@@ -504,6 +506,7 @@ const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["capture", "Capture & models"],
   ["routing", "Accounts and routing"],
   ["owner", "Owner actions"],
+  ["work", "Work"],
   ["features", "Optional features"],
   ["index", "Embeddings"],
   ["data", "Data & backups"],
@@ -2619,6 +2622,7 @@ export default function App() {
   const [hubSnapBusy, setHubSnapBusy] = useState(false);
   const [hubSnapshotHealth, setHubSnapshotHealth] = useState<{
     refreshed_at?: string;
+    caught_up_at?: string | null;
     size_bytes?: number;
     bytes?: number;
     ok?: boolean;
@@ -3692,6 +3696,9 @@ export default function App() {
                             void refreshSnapshot();
                           } else if (a.fix?.kind === "storage-report") {
                             setStorageReportOpen(true);
+                          } else if (a.fix?.kind === "work-settings") {
+                            setSettingsSection("work");
+                            setTab("settings");
                           }
                         }}
                       >
@@ -4022,6 +4029,9 @@ export default function App() {
                     void refreshSnapshot();
                   } else if (fix.kind === "storage-report") {
                     setStorageReportOpen(true);
+                  } else if (fix.kind === "work-settings") {
+                    setSettingsSection("work");
+                    setTab("settings");
                   }
                 }}
               />
@@ -5170,6 +5180,10 @@ export default function App() {
               setSettingsSection("routing");
               setTab("settings");
             }}
+            onOpenWorkSettings={() => {
+              setSettingsSection("work");
+              setTab("settings");
+            }}
             owedSection={
               <>
                 <div className="inline wk-owed-lede">
@@ -5536,6 +5550,10 @@ export default function App() {
                   <OwnerActions active={tab === "settings" && settingsSection === "owner"} />
                 ) : null}
 
+                {settingsSection === "work" ? (
+                  <WorkSettings active={tab === "settings" && settingsSection === "work"} work={work} />
+                ) : null}
+
                 {settingsSection === "features" ? (
                   <OptionalFeatures active={tab === "settings" && settingsSection === "features"} />
                 ) : null}
@@ -5788,10 +5806,10 @@ export default function App() {
                           {advertiseInfo.ipv4 ? ` · LAN ${advertiseInfo.ipv4}` : null}
                         </p>
                       ) : null}
-                      {hubSnapshotHealth?.refreshed_at ? (
+                      {hubSnapshotHealth?.caught_up_at || hubSnapshotHealth?.refreshed_at ? (
                         <p className="muted">
-                          Offline copy refreshed{" "}
-                          <code>{hubSnapshotHealth.refreshed_at}</code>
+                          Offline copy up to date as of{" "}
+                          <code>{hubSnapshotHealth.caught_up_at || hubSnapshotHealth.refreshed_at}</code>
                           {typeof (hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes) === "number"
                             ? ` (${formatBytes(hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes ?? 0)})`
                             : null}

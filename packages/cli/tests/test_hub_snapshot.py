@@ -959,6 +959,30 @@ class PromptRecallSnapshotStatusTest(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["age_seconds"], hs.SNAPSHOT_MAX_AGE_S + 100)
 
+    def test_a_replica_at_an_older_schema_is_amber_in_plain_words(self) -> None:
+        old = hs.SNAPSHOT_SCHEMA_VERSION - 1
+        with mock.patch.object(hs, "snapshot_is_fresh",
+                               return_value=(True, {"exists": True, "schema_version": old})):
+            out = hs.prompt_recall_snapshot_status()
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["level"], "amber")
+        self.assertEqual((out["schema_on_disk"], out["schema_expected"]), (old, hs.SNAPSHOT_SCHEMA_VERSION))
+        self.assertIn("built for an older version of Khipu", out["message"])
+        self.assertIn("rebuilt at the next check", out["message"])
+        self.assertNotIn("\u2014", out["message"])
+        from khipu.cli import _replica_schema_warnings
+
+        self.assertEqual(_replica_schema_warnings({"prompt_recall_snapshot": out}), [out["message"]])
+
+    def test_a_replica_at_this_schema_carries_no_warning(self) -> None:
+        with mock.patch.object(hs, "snapshot_is_fresh", return_value=(
+                True, {"exists": True, "schema_version": hs.SNAPSHOT_SCHEMA_VERSION})):
+            out = hs.prompt_recall_snapshot_status()
+        self.assertEqual(out, {"ok": True, "fresh": True})
+        from khipu.cli import _replica_schema_warnings
+
+        self.assertEqual(_replica_schema_warnings({"prompt_recall_snapshot": out}), [])
+
 
 def _make_decisions_snapshot(data: Path) -> Path:
     """A version-2 replica with two decisions on episode 1 (one current, one

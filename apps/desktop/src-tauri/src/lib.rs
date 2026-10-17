@@ -788,6 +788,103 @@ fn storage_setting_value(key: &str, raw: &str) -> Result<String, String> {
     }
     Ok(v.to_string())
 }
+/// Settings -> Work (Work view phase 5): every cap and time of the live view
+/// and the ledger, each `config --set KEY N` or `config --unset=KEY`; 0 lifts
+/// a cap. Whole numbers of 0 or more.
+const WORK_COUNT_KEYS: &[&str] = &[
+    "work_file_max_bytes",
+    "work_max_jobs",
+    "work_max_prs",
+    "work_max_trains",
+    "work_max_runs",
+    "work_line_chars",
+    "ledger_id_chars",
+    "ledger_title_chars",
+    "ledger_evidence_chars",
+];
+/// Lengths of time, in whole seconds.
+const WORK_DURATION_KEYS: &[&str] = &[
+    "work_job_quiet_after",
+    "work_gone_after",
+    "work_finished_for",
+    "work_merged_for",
+    "work_clock_slack",
+    "work_refresh",
+    "ledger_stale_after",
+    "ledger_purge_after",
+];
+/// Seconds, or `auto` (five of the runner's own intervals).
+const WORK_STALE_KEY: &str = "work_stale_after";
+const WORK_PROJECTS_KEY: &str = "work_projects";
+const WORK_PROJECTS_MAX: usize = 64;
+const LEDGER_PROJECT_NAME_CHARS: usize = 80;
+
+fn work_key(key: &str) -> bool {
+    WORK_COUNT_KEYS.contains(&key) || WORK_DURATION_KEYS.contains(&key) || key == WORK_STALE_KEY || key == WORK_PROJECTS_KEY
+}
+
+fn work_setting_value(key: &str, raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if key == WORK_PROJECTS_KEY {
+        return checked_work_projects(v);
+    }
+    if key == WORK_STALE_KEY && v == "auto" {
+        return Ok("auto".to_string());
+    }
+    let n: u64 = if !v.is_empty() && v.len() <= 12 && v.bytes().all(|b| b.is_ascii_digit()) {
+        v.parse().map_err(|_| format!("{key} is too large"))?
+    } else {
+        return Err(format!("{key} must be a whole number of 0 or more, got {raw:?}"));
+    };
+    let most: u64 = if WORK_COUNT_KEYS.contains(&key) { 10_000_000_000 } else { 10 * 366 * 86_400 };
+    if n > most {
+        return Err(format!("{key} is too large"));
+    }
+    Ok(n.to_string())
+}
+
+/// The summary files, parsed and re-serialised: only `{project, name?, file,
+/// on, show_now}` with a full path reaches argv. The CLI refuses a file inside
+/// a private folder and a project key it can't take.
+fn checked_work_projects(raw: &str) -> Result<String, String> {
+    let bad = || "summary files must be a JSON list of {project, name, file, on, show_now}".to_string();
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| bad())?;
+    let entries = value.as_array().ok_or_else(bad)?;
+    if entries.len() > WORK_PROJECTS_MAX {
+        return Err(format!("at most {WORK_PROJECTS_MAX} summary files"));
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let n = i + 1;
+        let obj = entry.as_object().ok_or_else(bad)?;
+        if obj.keys().any(|k| !matches!(k.as_str(), "project" | "name" | "file" | "on" | "show_now")) {
+            return Err(format!("summary file {n} has a field Khipu doesn't keep"));
+        }
+        let project = checked_ledger_project(obj.get("project").and_then(|p| p.as_str()).unwrap_or(""))?;
+        let file = checked_routing_path(
+            &format!("summary file {n}"),
+            obj.get("file").and_then(|f| f.as_str()).ok_or_else(|| format!("summary file {n} needs its full path"))?,
+        )?;
+        let switch = |k: &str| -> Result<bool, String> {
+            match obj.get(k) {
+                None => Ok(true),
+                Some(serde_json::Value::Bool(b)) => Ok(*b),
+                Some(_) => Err(format!("summary file {n}: {k} must be true or false")),
+            }
+        };
+        let mut clean = serde_json::Map::new();
+        clean.insert("project".into(), project.into());
+        if let Some(name) = obj.get("name").filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
+            clean.insert("name".into(), routing_json_text(&format!("summary file {n}'s name"), name, LEDGER_PROJECT_NAME_CHARS)?.into());
+        }
+        clean.insert("file".into(), file.into());
+        clean.insert("on".into(), switch("on")?.into());
+        clean.insert("show_now".into(), switch("show_now")?.into());
+        out.push(serde_json::Value::Object(clean));
+    }
+    serde_json::to_string(&out).map_err(|e| e.to_string())
+}
+
 const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse"];
 const USAGE_ACCOUNTS_MAX: usize = 32;
 /// Settings -> Routing (routing truth phase 4): the sizes, times and switches
@@ -1310,6 +1407,7 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
         k if REPLICA_DURATION_KEYS.contains(&k) => Ok(set(k, replica_setting_value(k, value)?)),
         k if OFFLINE_DURATION_KEYS.contains(&k) => Ok(set(k, routing_setting_value(k, value)?)),
         k if storage_key(k) => Ok(set(k, storage_setting_value(k, value)?)),
+        k if work_key(k) => Ok(set(k, work_setting_value(k, value)?)),
         _ => Err(format!("not a settable key: {key:?}")),
     }
 }
@@ -1342,6 +1440,7 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
         && !REPLICA_DURATION_KEYS.contains(&key)
         && !OFFLINE_DURATION_KEYS.contains(&key)
         && !storage_key(key)
+        && !work_key(key)
         && !by_profile
     {
         return Err(format!("not a resettable key: {key:?}"));
@@ -2482,6 +2581,63 @@ fn work_same_argv(project: &str, row: &str, commitment: &str, same: bool) -> Res
         format!("{}#{}", checked_ledger_project(project)?, checked_ledger_id(row)?),
         checked_commitment_id(commitment)?,
     ])
+}
+
+fn ledger_projects_argv() -> Vec<String> {
+    vec!["ledger".to_string(), "projects".to_string(), "--json".to_string()]
+}
+
+/// `ledger project`: the owner's rename (empty: the key again) or hide or
+/// show of one project, from the app (`--from-app`, the owner gate).
+fn ledger_project_argv(project: &str, name: Option<&str>, hidden: Option<bool>) -> Result<Vec<String>, String> {
+    if name.is_none() && hidden.is_none() {
+        return Err("say what to change about the project".to_string());
+    }
+    let mut argv = ledger_base("project", project, true)?;
+    if let Some(n) = name {
+        let n = n.trim();
+        if n.chars().count() > LEDGER_PROJECT_NAME_CHARS || has_control(n) {
+            return Err(format!("a project's name is one line of at most {LEDGER_PROJECT_NAME_CHARS} characters"));
+        }
+        argv.push(format!("--rename={n}"));
+    }
+    match hidden {
+        Some(true) => argv.push("--hide".to_string()),
+        Some(false) => argv.push("--show".to_string()),
+        None => {}
+    }
+    Ok(argv)
+}
+
+fn work_hidden_argv() -> Vec<String> {
+    vec!["work".to_string(), "hidden".to_string(), "--json".to_string()]
+}
+
+/// `work check --json -- FILE`: a summary file's first read before it is
+/// added. Read-only; the CLI refuses a file inside a private folder.
+fn work_check_argv(path: &str) -> Result<Vec<String>, String> {
+    let file = checked_routing_path("the summary file", path)?;
+    Ok(vec!["work".to_string(), "check".to_string(), "--json".to_string(), "--".to_string(), file])
+}
+
+#[tauri::command]
+async fn khipu_ledger_projects() -> Result<String, String> {
+    run_khipu_cli_async(ledger_projects_argv()).await
+}
+
+#[tauri::command]
+async fn khipu_ledger_project_set(project: String, name: Option<String>, hidden: Option<bool>) -> Result<String, String> {
+    run_khipu_cli_async(ledger_project_argv(&project, name.as_deref(), hidden)?).await
+}
+
+#[tauri::command]
+async fn khipu_work_hidden() -> Result<String, String> {
+    run_khipu_cli_async(work_hidden_argv()).await
+}
+
+#[tauri::command]
+async fn khipu_work_check(path: String) -> Result<String, String> {
+    run_khipu_cli_async(work_check_argv(&path)?).await
 }
 
 #[tauri::command]
@@ -4499,6 +4655,10 @@ pub fn run() {
             khipu_ledger_restore,
             khipu_work_hide,
             khipu_work_same,
+            khipu_ledger_projects,
+            khipu_ledger_project_set,
+            khipu_work_hidden,
+            khipu_work_check,
             khipu_account_sign_in,
             khipu_account_sign_in_offers,
             khipu_account_new_folder,
@@ -7059,5 +7219,86 @@ mod work_command_tests {
         );
         assert_eq!(work_same_argv("atlas", "n-7", "42", false).unwrap()[1], "not-same");
         assert!(work_same_argv("atlas", "n-7", "4 2", true).is_err());
+    }
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn settings_work_reads_are_fixed() {
+        assert_eq!(ledger_projects_argv(), v(&["ledger", "projects", "--json"]));
+        assert_eq!(work_hidden_argv(), v(&["work", "hidden", "--json"]));
+        assert_eq!(
+            work_check_argv("/runners/atlas/state/work-summary.json").unwrap(),
+            v(&["work", "check", "--json", "--", "/runners/atlas/state/work-summary.json"])
+        );
+        assert_eq!(work_check_argv(" ~/r/w.json ").unwrap()[4], "~/r/w.json");
+        for bad in ["", "relative/w.json", "--json", "/a\nb.json"] {
+            assert!(work_check_argv(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_project_change_is_the_owners_and_names_one_change() {
+        assert_eq!(
+            ledger_project_argv("owner/atlas", Some(" Atlas "), None).unwrap(),
+            v(&["ledger", "project", "--json", "--from-app", "--project=owner/atlas", "--rename=Atlas"])
+        );
+        assert_eq!(
+            ledger_project_argv("atlas", None, Some(true)).unwrap(),
+            v(&["ledger", "project", "--json", "--from-app", "--project=atlas", "--hide"])
+        );
+        assert_eq!(ledger_project_argv("atlas", Some(""), Some(false)).unwrap()[5..], v(&["--rename=", "--show"]));
+        assert!(ledger_project_argv("atlas", None, None).is_err());
+        assert!(ledger_project_argv("atlas", Some(&"x".repeat(81)), None).is_err());
+        assert!(ledger_project_argv("atlas", Some("two\nlines"), None).is_err());
+        assert!(ledger_project_argv("a#b", None, Some(true)).is_err());
+    }
+
+    #[test]
+    fn every_work_and_ledger_limit_is_settable_and_resettable() {
+        for key in WORK_COUNT_KEYS.iter().chain(WORK_DURATION_KEYS) {
+            assert_eq!(config_set_argv(key, " 0 ").unwrap(), v(&["config", "--set", key, "0"]));
+            assert_eq!(config_set_argv(key, "300").unwrap()[3], "300");
+            for bad in ["", "-1", "1.5", "abc", "--unset", "auto", "99999999999"] {
+                assert!(config_set_argv(key, bad).is_err(), "{key} accepted {bad:?}");
+            }
+            assert_eq!(config_unset_argv(key).unwrap(), v(&["config", &format!("--unset={key}")]));
+        }
+        assert_eq!(config_set_argv("work_stale_after", "auto").unwrap()[3], "auto");
+        assert_eq!(config_set_argv("work_stale_after", "600").unwrap()[3], "600");
+        assert!(config_set_argv("work_stale_after", "automatic").is_err());
+        assert!(config_unset_argv("work_stale_after").is_ok());
+        // Not offered by the app: the owner word is set where it is used.
+        assert!(config_set_argv("ledger_owner_word", "NEEDS MATT").is_err());
+    }
+
+    #[test]
+    fn the_summary_files_are_checked_and_re_serialised() {
+        let raw = r#"[{"project":"owner/atlas","name":" Atlas ","file":"/r/atlas/state/work-summary.json","on":false},
+                     {"project":"lumen","file":"~/r/lumen/w.json","show_now":false}]"#;
+        let got: serde_json::Value = serde_json::from_str(&config_set_argv("work_projects", raw).unwrap()[3]).unwrap();
+        assert_eq!(
+            got,
+            serde_json::json!([
+                {"project": "owner/atlas", "name": "Atlas", "file": "/r/atlas/state/work-summary.json", "on": false, "show_now": true},
+                {"project": "lumen", "file": "~/r/lumen/w.json", "on": true, "show_now": false}
+            ])
+        );
+        assert_eq!(config_set_argv("work_projects", "[]").unwrap()[3], "[]");
+        for bad in [
+            "{}",
+            r#"[{"project":"a","file":"relative.json"}]"#,
+            r#"[{"project":"a#b","file":"/w.json"}]"#,
+            r#"[{"project":"a","file":"/w.json","extra":1}]"#,
+            r#"[{"project":"a","file":"/w.json","on":"yes"}]"#,
+            r#"[{"project":"a"}]"#,
+        ] {
+            assert!(config_set_argv("work_projects", bad).is_err(), "accepted {bad}");
+        }
+        let many: Vec<String> = (0..65).map(|i| format!(r#"{{"project":"p{i}","file":"/w{i}.json"}}"#)).collect();
+        assert!(config_set_argv("work_projects", &format!("[{}]", many.join(","))).is_err());
+        assert!(config_unset_argv("work_projects").is_ok());
     }
 }

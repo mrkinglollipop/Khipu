@@ -16,7 +16,7 @@ import { changeDays, chosenEnd, durationWords, endChoices, isoLocal, limitWords,
 // @ts-expect-error node:fs has no types here
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 // @ts-expect-error node:child_process has no types here
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 // @ts-expect-error node:os has no types here
 import { tmpdir } from "node:os";
 
@@ -1300,7 +1300,12 @@ const GAPS = `(function () {
 describe.skipIf(!CHROME)("Settings -> Routing laid out (fix round 1)", () => {
   it("keeps the pane's space between the intro and every card, as the mock does (F2)", async () => {
     const { container } = render(<RoutingSettings active />);
+    // Snapshot the page only once every read has landed: the accounts come
+    // from the routing record, Needs you and the retry fields from the
+    // settings, so an early snapshot on a busy machine had fewer cards.
     await screen.findByRole("list", { name: "Accounts" });
+    await screen.findByRole("region", { name: "Needs you" });
+    await waitFor(() => expect(screen.getByLabelText("First retry in seconds")).toHaveValue("600"));
     const css: string = readFileSync(`${CWD.cwd()}/src/App.css`, "utf8");
     const dir = mkdtempSync(`${tmpdir()}/khipu-routing-settings-`);
     try {
@@ -1308,19 +1313,27 @@ describe.skipIf(!CHROME)("Settings -> Routing laid out (fix round 1)", () => {
       writeFileSync(file, `<!doctype html><html lang="en"><head><meta charset="utf-8"><style>${css}</style></head>` +
         `<body><div id="root"><div class="settings-pane">${container.innerHTML}</div></div>` +
         `<script>${GAPS}</script></body></html>`);
-      const dom: string = execFileSync(CHROME, [
+      // The page measures itself in an inline script after the stylesheet in
+      // its head (App.css loads no fonts or images), so no wait inside Chrome
+      // decides the numbers. Chrome's exit code is not the verdict: on a busy
+      // machine it can exit non-zero while shutting down after dumping the
+      // page. The time limit is how long a stuck Chrome lasts, not a budget.
+      const run = spawnSync(CHROME, [
         "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", `--user-data-dir=${dir}/profile`,
-        "--window-size=1280,1600", "--virtual-time-budget=2000", "--dump-dom", `file://${file}`,
-      ], { encoding: "utf8", timeout: 60000, stdio: ["ignore", "pipe", "ignore"] });
-      const m = dom.match(/data-out="([^"]*)"/);
-      if (!m) throw new Error("the page did not report its layout");
+        "--window-size=1280,1600", "--dump-dom", `file://${file}`,
+      ], { encoding: "utf8", timeout: 240000, maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+      const m = (run.stdout ?? "").match(/data-out="([^"]*)"/);
+      if (!m) {
+        throw new Error(`the page did not report its layout (status ${run.status}, signal ${run.signal}, ` +
+          `${run.error?.message ?? "no error"}): ${(run.stderr ?? "").slice(-2000)}`);
+      }
       const out = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&")) as { gaps: number[]; n: number };
       expect(out.n).toBeGreaterThanOrEqual(5);
       for (const g of out.gaps) expect(g).toBeGreaterThanOrEqual(12);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 90000);
+  }, 300000);
 });
 
 // ---- Final fix round --------------------------------------------------------------------------

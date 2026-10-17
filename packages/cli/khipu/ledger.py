@@ -1973,6 +1973,63 @@ def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
             conn.close()
 
 
+PROJECT_NAME_CHARS = 80
+
+
+def project_list() -> dict[str, Any]:
+    """Every ledger project, hidden ones too, with its name and counts (the
+    app's Settings, Work). Read from the hub, or the offline copy when away."""
+    from khipu import work
+
+    data = work.read_ledger()
+    if data.get("error"):
+        raise LedgerError("the ledger can't be read just now", "failed")
+    out = []
+    for key, proj in sorted((data.get("projects") or {}).items()):
+        meanings = [_meaning(proj["vocab"], r["state"]) for r in proj["rows"]]
+        out.append({"project": key, "name": proj["name"], "hidden": proj["hidden"],
+                    "created_at": proj.get("created_at"), "rows": len(meanings),
+                    "open": sum(m not in ("done", "dropped") for m in meanings),
+                    "needs_owner": sum(m == "needs" for m in meanings)})
+    return {"projects": out, "offline": bool(data.get("offline")), "as_of": data.get("as_of")}
+
+
+def set_project(project: str, *, name: str | None = None, hidden: bool | None = None) -> dict[str, Any]:
+    """The owner's rename (an empty name shows the key again) or hide of one
+    ledger project. Hide only takes it off the Work tab; no row changes."""
+    if name is None and hidden is None:
+        raise LedgerError("say what to change: --rename, --hide or --show", "nothing_to_change")
+    if name is not None:
+        name = name.strip()
+        if len(name) > PROJECT_NAME_CHARS or any(ord(c) < 32 or ord(c) == 127 for c in name):
+            raise LedgerError(f"a project's name is one line of at most {PROJECT_NAME_CHARS} characters",
+                              "bad_name")
+    sets, params = [], []
+    if name is not None:
+        sets.append("name = %s")
+        params.append(name)
+    if hidden is not None:
+        sets.append("hidden = %s")
+        params.append(hidden)
+    try:
+        conn = _connect()
+    except HubAway as exc:
+        raise LedgerError("the database is away; changing a project needs it", "away") from exc
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE ledger_projects SET {', '.join(sets)} WHERE project = %s", (*params, project))
+            found = cur.rowcount
+        if not found:
+            conn.rollback()
+            raise LedgerError(f"no ledger project {project}", "no_project")
+        conn.commit()
+    finally:
+        conn.close()
+    words = [f"named {name or project}"] if name is not None else []
+    words += [] if hidden is None else ["hidden" if hidden else "shown"]
+    return {"ok": True, "verb": "project", "project": project, "line": f"{project}: {', '.join(words)}"}
+
+
 def removed_rows(project: str | None, *, conn=None) -> list[dict[str, Any]]:
     """Rows removed and not yet purged, with the days left to restore them."""
     after = settings()["ledger_purge_after"]
@@ -2329,7 +2386,7 @@ def cmd(args: argparse.Namespace) -> int:
         refuse_secrets([v for k, v in vars(args).items() if k != "func"])
         command = f"ledger {verb}"
         intent = None
-        if command in WRITE_POLICY:
+        if command in WRITE_POLICY and verb != "projects":
             try:
                 intent = direction_intent(command, args, _project_for(args))
             except Exception:  # noqa: BLE001 - no intent: a direction is refused, the command says why
@@ -2340,7 +2397,19 @@ def cmd(args: argparse.Namespace) -> int:
         from khipu import owner_direction
 
         owner_direction.run_due()
+        if verb == "projects":
+            listed = project_list()
+            _emit(args, {"ok": True, **listed},
+                  "\n".join([f"{r['project']} · {r['name']} · {r['rows']} rows · {r['open']} open · "
+                              f"{r['needs_owner']} need you{' · hidden' if r['hidden'] else ''}"
+                              for r in listed["projects"]] + ["", f"{len(listed['projects'])} project(s)"]))
+            return 0
         project = _project_for(args)
+        if verb == "project":
+            result = set_project(project, name=args.rename,
+                                 hidden=True if args.hide else False if args.show else None)
+            _emit(args, result, result["line"])
+            return 0
         if verb in ("add", "set", "remove", "restore"):
             return _cmd_write(args, verb, project, owner=stamp is not None)
         if verb == "purge":
@@ -2432,11 +2501,12 @@ def cmd(args: argparse.Namespace) -> int:
 # ``require`` before it does anything.
 WRITE_POLICY: dict[str, str] = {
     "ledger add": "writer", "ledger set": "writer", "ledger remove": "writer",
-    "ledger restore": "app", "ledger purge": "app", "ledger import": "owner",
+    "ledger restore": "app", "ledger purge": "app", "ledger import": "owner", "ledger project": "owner",
     "work hide": "owner", "work unhide": "owner", "work same": "owner", "work not-same": "owner",
 }
 READ_VERBS = frozenset({"ledger get", "ledger list", "ledger loose-ends", "ledger needs-owner", "ledger needs-matt",
-                        "ledger render", "ledger check", "ledger removed", "ledger export", "work", "work check"})
+                        "ledger render", "ledger check", "ledger removed", "ledger export", "ledger projects",
+                        "work", "work check", "work hidden"})
 _APP_ONLY = {
     "ledger restore": "a removed row is restored in the Khipu app (Settings, Work, Removed rows)",
     "ledger purge": "removing a row for good is done in the Khipu app (Settings, Work, Removed rows)",
@@ -2752,6 +2822,15 @@ def add_parser(sub) -> None:
     pg = verbs.add_parser("purge", help="Remove a removed row for good (the app's Remove for good)")
     pg.add_argument("id")
     common(pg, write=True)
+
+    common(verbs.add_parser("projects", help="Every ledger project with its name and counts"))
+
+    pj = verbs.add_parser("project", help="Rename, hide or show a ledger project (the app's Settings, Work)")
+    pj.add_argument("--rename", default=None, help="The name shown for it (empty: its key again)")
+    shown = pj.add_mutually_exclusive_group()
+    shown.add_argument("--hide", action="store_true", help="Take it off the Work tab; its rows stay")
+    shown.add_argument("--show", action="store_true")
+    common(pj, write=True)
 
     im = verbs.add_parser("import", help="Import an old tracker file (the app's Import a tracker)")
     im.add_argument("file")

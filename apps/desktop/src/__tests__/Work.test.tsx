@@ -145,10 +145,12 @@ function Harness({
   onOwedClose = async () => {},
   onSnooze = () => {},
   routing = stubRouting(),
+  onOpenWorkSettings = () => {},
 }: {
   onOwedClose?: (id: number) => Promise<void>;
   onSnooze?: (id: string, title: string) => void;
   routing?: RoutingState;
+  onOpenWorkSettings?: () => void;
 }) {
   const work = useWork(true);
   return (
@@ -161,6 +163,7 @@ function Harness({
       onOwedClose={onOwedClose}
       onSnooze={onSnooze}
       onOpenRouting={() => {}}
+      onOpenWorkSettings={onOpenWorkSettings}
     />
   );
 }
@@ -305,6 +308,28 @@ describe("Work tab boards", () => {
       const card = head.closest(".card") as HTMLElement;
       expect(within(card).getByText(words)).toBeInTheDocument();
     }
+  });
+
+  it("offers Raise the limit and Open Settings where the file needs a setting changed", async () => {
+    const states: Array<[string, WorkBoard["source"], string | null]> = [
+      ["Big", { state: "too_big", problem: "The summary file is 412 KB, over the 256 KB limit.", as_of: ago(40 * MIN) }, "Raise the limit"],
+      ["Capped", { state: "ok", as_of: ago(9 * S), capped: { jobs: { shown: 50, of: 64 } } }, "Raise the limit"],
+      ["Missing", { state: "missing" }, "Open Settings"],
+      ["Delta", { state: "wrong_project", problem: "This file says it is for harbor, not delta." }, "Open Settings"],
+      ["Ember", { state: "refused" }, "Open Settings"],
+      ["Fine", { state: "ok", as_of: ago(9 * S) }, null],
+    ];
+    serve(view({ projects: states.map(([name, source]) => board(name.toLowerCase(), name, source, { flagged: 1 })) }));
+    const open = vi.fn();
+    render(<Harness onOpenWorkSettings={open} />);
+    for (const [name, , label] of states) {
+      const card = (await screen.findByRole("heading", { name })).closest(".card") as HTMLElement;
+      for (const other of ["Raise the limit", "Open Settings"]) {
+        if (other !== label) expect(within(card).queryByRole("button", { name: other })).toBeNull();
+      }
+      if (label) fireEvent.click(within(card).getByRole("button", { name: label }));
+    }
+    expect(open).toHaveBeenCalledTimes(5);
   });
 
   it("a board that stopped reporting folds and unfolds with Show", async () => {
