@@ -177,3 +177,19 @@ def test_no_full_dump_on_record_needs_a_dump_without_connecting(monkeypatch):
     monkeypatch.setattr(hs, "try_hub_connect", lambda **_k: pytest.fail("connected"))
     out = hs.pull_changes()
     assert out["ok"] is False and out["needs_dump"] is True
+
+
+def test_ledger_sql_failure_does_not_abort_memory_pull_transaction(pg):
+    conn, profile = pg
+    assert hs.refresh()['ok']
+    before = hs.ledger_read_snapshot('synthetic')['as_of']
+    foreign = add_episode(conn, profile, 'ledger-table-missing')
+    with conn.cursor() as cur:
+        cur.execute('DROP TABLE ledger_vocab')
+    conn.commit()
+    out = hs.pull_changes()
+    assert not out['ok'] and out['failed'] == ['ledger'], out
+    assert 'ledger_vocab' in out['error']
+    assert replica_rows('SELECT summary FROM episodes WHERE id = ?', foreign) == [('scratch ledger-table-missing',)]
+    assert hs._utc(hs.caught_up_at()) > hs._utc(before)
+    assert hs.ledger_read_snapshot('synthetic')['as_of'] == before

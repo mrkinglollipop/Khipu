@@ -169,15 +169,17 @@ def test_project_change_retries_after_refresh_lock_is_released(world):
         assert con.execute('SELECT name, hidden FROM ledger_projects').fetchall() == [('Renamed', 1)]
 
 
-def test_ledger_pull_limit_refuses_before_any_replica_write(world):
+def test_ledger_pull_limit_only_refuses_the_ledger(world):
     world.ledger.execute("UPDATE ledger_rows SET title='Foreign', version=2")
     row = {**_replica_row('second', 1), 'project': 'p'}
     world.ledger.execute(f"INSERT INTO ledger_rows ({', '.join(hs._LEDGER_ROW_COLS)}) VALUES ({','.join('?' for _ in hs._LEDGER_ROW_COLS)})",
                          [hs._ledger_value(c, row[c]) for c in hs._LEDGER_ROW_COLS])
     out = hs.pull_changes(limit=1)
-    assert not out['ok'] and out['needs_dump']
+    assert not out['ok'] and out['failed'] == ['ledger']
+    assert out['ledger']['needs_refresh'] and not out.get('needs_dump')
     with sqlite3.connect(hs.snapshot_path()) as con:
-        assert con.execute("SELECT body FROM topics WHERE slug='probe'").fetchone() == ('original',)
+        assert con.execute("SELECT body FROM topics WHERE slug='probe'").fetchone() == ('corrected',)
+    assert hs._utc(hs.caught_up_at()) > hs._utc(hs.ledger_read_snapshot('p')['as_of'])
     assert hs.ledger_read_snapshot('p')['rows'][0]['version'] == 1
 
 
@@ -254,3 +256,143 @@ def test_precommit_project_marker_consumed_by_older_catchup_is_requeued(world, m
     assert ledger.set_project('p', name='Committed', hidden=True)['ok']
     with sqlite3.connect(hs.snapshot_path()) as con:
         assert con.execute('SELECT name,hidden FROM ledger_projects').fetchall() == [('Committed', 1)]
+
+
+@pytest.mark.parametrize('failure', ['missing_gone', 'locked_read', 'write_error', 'busy_write'])
+def test_ledger_failure_does_not_stall_memory_or_its_freshness(world, monkeypatch, failure):
+    before = hs.ledger_read_snapshot('p')['as_of']
+    world.episodes.append({'id': 2, 'summary': 'foreign memory',
+                           'ingested_at': datetime.now(timezone.utc), 'deleted_at': None})
+    if failure == 'missing_gone':
+        with sqlite3.connect(hs.snapshot_path()) as con:
+            con.execute('DROP TABLE ledger_gone')
+    elif failure == 'locked_read':
+        def locked(*_):
+            raise sqlite3.OperationalError('database is locked')
+        monkeypatch.setattr(hs, '_read_ledger_pull', locked)
+    elif failure == 'write_error':
+        def broken(*_, **__):
+            raise sqlite3.OperationalError('synthetic ledger write failed')
+        monkeypatch.setattr(hs, '_write_ledger_pull', broken)
+    else:
+        monkeypatch.setattr(hs, '_write_ledger_pull',
+                            lambda *_, **__: {'ok': False, 'error': 'hub snapshot refresh in progress'})
+    out = hs.pull_changes()
+    assert not out['ok'] and out['failed'] == ['ledger'], out
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert con.execute('SELECT summary FROM episodes WHERE id=2').fetchone() == ('foreign memory',)
+        assert con.execute("SELECT body FROM topics WHERE slug='probe'").fetchone() == ('corrected',)
+        assert con.execute('SELECT status FROM commitments WHERE id=1').fetchone() == ('closed',)
+    assert hs.ledger_read_snapshot('p')['as_of'] == before
+    assert hs._utc(hs.caught_up_at()) > hs._utc(before)
+    assert hs._read_sidecar()['pull_episodes_after']
+    if failure == 'missing_gone':
+        assert out['ledger']['needs_refresh']
+
+
+def test_old_write_through_uses_hub_read_time_and_cannot_rewind_a_newer_pull(world, monkeypatch):
+    with ledger._replica_pending() as pending:
+        pending['p#'] = 'synthetic pending rename'
+    original = hs.ledger_write_snapshot
+    newer_read = []
+
+    def delayed_write(*args, **kwargs):
+        world.ledger.execute("UPDATE ledger_projects SET name='Newer', hidden=1")
+        assert hs.pull_changes()['ok']
+        with sqlite3.connect(hs.snapshot_path()) as con:
+            newer_read.append(hs._held_read_at(con, 'ledger', '*'))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hs, 'ledger_write_snapshot', delayed_write)
+    # Pull writes use the original writer, avoiding recursion through the delayed catch-up.
+    monkeypatch.setattr(hs, '_write_ledger_pull',
+                        lambda payload, *, read_at: original('', None, {}, [], [], [],
+                                                             _pull=payload, read_at=read_at))
+    assert ledger.replica_catch_up(world)['left'] == 0
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert con.execute('SELECT name,hidden FROM ledger_projects').fetchall() == [('Newer', 1)]
+        assert hs._held_read_at(con, 'ledger_projects', 'p') <= newer_read[0]
+
+
+def test_unchanged_pull_has_no_project_payload_or_ledger_data_writes(world, monkeypatch):
+    # Seed nonempty vocabulary so deleting/reinserting equal words is observable.
+    world.ledger.execute("INSERT INTO ledger_vocab VALUES ('p','kind','task','',0)")
+    assert hs.pull_changes()['ok']
+    with world.cursor() as cur:
+        payload = hs._read_ledger_pull(cur, hs.PULL_LIMIT)
+    assert payload['projects'] == {} and payload['vocab'] == {}
+    assert payload['rows'] == {} and payload['history'] == {} and payload['gone'] == {}
+    events = []
+    connect = sqlite3.connect
+
+    def traced(*args, **kwargs):
+        con = connect(*args, **kwargs)
+        con.set_trace_callback(events.append)
+        return con
+
+    monkeypatch.setattr(hs.sqlite3, 'connect', traced)
+    assert hs.pull_changes()['ok']
+    writes = [q for q in events if q.lstrip().upper().startswith(('INSERT', 'UPDATE', 'DELETE'))]
+    assert not any(re.search(r'\bledger_(projects|vocab|rows|history|gone)\b', q) for q in writes), writes
+    assert any('ledger_caught_up_at' in q for q in writes)
+
+
+def test_identical_ledger_snapshot_does_not_commit(world, monkeypatch):
+    payload = {'projects': {}, 'vocab': {}, 'rows': {}, 'history': {}, 'gone': {}}
+    at = datetime.now(timezone.utc).timestamp()
+    assert hs._write_ledger_pull(payload, read_at=at)['ok']
+    commits = []
+    connect = sqlite3.connect
+
+    class CountCommits(sqlite3.Connection):
+        def commit(self):
+            commits.append(True)
+            return super().commit()
+
+    monkeypatch.setattr(hs.sqlite3, 'connect', lambda *a, **kw: connect(*a, factory=CountCommits, **kw))
+    assert hs._write_ledger_pull(payload, read_at=at)['ok']
+    assert commits == []
+
+
+def test_delayed_write_through_cannot_make_a_newer_rename_pull_look_stale(world, monkeypatch):
+    with ledger._replica_pending() as pending:
+        pending['p#'] = 'synthetic pending rename'
+    original = hs.ledger_write_snapshot
+
+    def publish_old_then_finish_newer_pull(*args, **kwargs):
+        world.ledger.execute("UPDATE ledger_projects SET name='Newer', hidden=1")
+        read_at = datetime.now(timezone.utc).timestamp()
+        with world.cursor() as cur:
+            payload = hs._read_ledger_pull(cur, hs.PULL_LIMIT)
+        result = original(*args, **kwargs)
+        assert original('', None, {}, [], [], [], _pull=payload, read_at=read_at)['ok']
+        assert hs._utc(hs.ledger_read_snapshot('p')['as_of']).timestamp() == read_at
+        return result
+
+    monkeypatch.setattr(hs, 'ledger_write_snapshot', publish_old_then_finish_newer_pull)
+    assert ledger.replica_catch_up(world)['left'] == 0
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert con.execute('SELECT name,hidden FROM ledger_projects').fetchall() == [('Newer', 1)]
+
+
+def test_row_only_pull_preserves_unchanged_vocabulary_and_metadata(world):
+    world.ledger.execute("INSERT INTO ledger_vocab VALUES ('p','state','GO','active',0)")
+    assert hs.pull_changes()['ok']
+    world.ledger.execute("UPDATE ledger_rows SET version=2, title='Changed row'")
+    assert hs.pull_changes()['ok']
+    got = hs.ledger_read_snapshot('p')
+    assert got['vocab']['state'] == [['GO', 'active']]
+    assert got['rows'][0]['title'] == 'Changed row'
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert con.execute('SELECT name FROM ledger_projects').fetchone() == ('Old',)
+    world.ledger.execute('DELETE FROM ledger_vocab')
+    assert hs.pull_changes()['ok']
+    assert hs.ledger_read_snapshot('p')['vocab'] == {'state': [], 'kind': []}
+
+
+def test_unchanged_pull_still_fences_older_write_through_metadata(world):
+    old_read = datetime.now(timezone.utc).timestamp()
+    assert hs.pull_changes()['ok']
+    assert hs.ledger_write_snapshot('p', ('Stale', True, None), {}, [], [], [], read_at=old_read)['ok']
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert con.execute('SELECT name,hidden FROM ledger_projects').fetchall() == [('Old', 0)]

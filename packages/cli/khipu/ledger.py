@@ -924,6 +924,7 @@ def _replica_catch_up_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
             by_project.setdefault(project, []).append(row_id)
         done: list[str] = []
         for project, ids in by_project.items():
+            read_at = time.time()
             with conn.cursor() as cur:
                 vocab = _vocab(cur, project)
                 cur.execute("SELECT name, hidden, created_at FROM ledger_projects WHERE project = %s", (project,))
@@ -944,7 +945,8 @@ def _replica_catch_up_locked(conn, out: dict[str, Any]) -> dict[str, Any]:
                             "AND row_id = ANY(%s) ORDER BY id", (project, [r["row_id"] for r in rows]))
                 history = [dict(zip(_HIST_COLS, h, strict=True)) for h in cur.fetchall()]
             conn.rollback()
-            got = hub_snapshot.ledger_write_snapshot(project, proj, vocab, rows, history, ids, gone=gone)
+            got = hub_snapshot.ledger_write_snapshot(project, proj, vocab, rows, history, ids,
+                                                    gone=gone, read_at=read_at)
             # No offline copy and no refresh dumping one: the next refresh
             # starts after this change and copies everything.
             if got.get("ok") or got.get("missing"):

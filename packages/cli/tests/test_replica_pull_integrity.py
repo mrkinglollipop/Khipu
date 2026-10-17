@@ -38,6 +38,9 @@ class PullCursor(FakeCursor):
 
     def execute(self, sql, params=()):
         self.hub.queries.append(sql)
+        if sql in ("SAVEPOINT ledger_pull", "ROLLBACK TO SAVEPOINT ledger_pull", "RELEASE SAVEPOINT ledger_pull"):
+            self._rows = []
+            return
         if sql == "SELECT now()":
             self._rows = [(datetime.now(timezone.utc),)]
             return
