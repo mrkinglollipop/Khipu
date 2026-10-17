@@ -110,8 +110,11 @@ def test_ledger_json_outputs_leave_through_the_projection(private, monkeypatch):
 
 def test_work_json_and_the_saved_view_leave_through_the_projection(private, monkeypatch):
     text, forbidden = private
-    view = {"version": 1, "counts": {"waiting": 1, "blocking": 0, "running": 0}, "waiting": [{"title": text}],
-            "live": [], "projects": [{"name": text, "source": {"problem": text}}], text: [text]}
+    view = work._View(
+        {"version": 1, "counts": {"waiting": 1, "blocking": 0, "running": 0}, "waiting": [{"title": text}],
+         "live": [], "projects": [{"name": text, "source": {"problem": text}}], text: [text]},
+        work._view_generation(),
+    )
     monkeypatch.setattr(work, "build_view", lambda *a, **k: view)
     rc, out, err = _cli("work", "--json")
     assert rc == 0, err

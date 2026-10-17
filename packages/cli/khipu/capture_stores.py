@@ -121,7 +121,7 @@ STORES: tuple[Store, ...] = (
           "the same writer saves state/work/last/*.json, links.json and hidden.json there, which "
           "hold job summaries, ids and hashes only",
           "the Work view's read model, which lists open commitments' text", "work view",
-          _w("work._write_json")),
+          _w("work._replace_json")),
     Store("recall eval record", "a file the owner names with khipu recall eval --record",
           "the golden queries, quoted text included, and the ids each one returned",
           "kept: an owner-chosen file outside the data folder that forget cannot find; a known "
