@@ -58,6 +58,7 @@ from khipu.commitments import (
     _not_forgotten_clause,
     close_by_rule,
     completion_match,
+    owner_guard,
 )
 
 GH_TIMEOUT_S = 10
@@ -146,6 +147,19 @@ def pr_refs(text: str, project_repo: str | None) -> list[tuple[str | None, int]]
         if n > 0 and (repo, n) not in out:
             out.append((repo, n))
     return out
+
+
+def item_refs(item: dict[str, Any], project_repo: str | None) -> list[tuple[str | None, int]]:
+    """Every pull request an item was ever said to need: those its text and
+    its latest restatement name, and every number in its stored ``prs`` (a
+    restatement adds to that list, never replaces it). All are required."""
+    refs = pr_refs(item.get("text") or "", project_repo)
+    for ref in pr_refs(item.get("latest_text") or "", project_repo):
+        if ref not in refs:
+            refs.append(ref)
+    named = {n for _, n in refs}
+    refs += [(_repo(project_repo), int(n)) for n in (item.get("prs") or []) if int(n) not in named]
+    return refs
 
 
 def ref_label(ref: tuple[str | None, int], project_repo: str | None) -> str:
@@ -466,31 +480,53 @@ def _pr_reason(found: dict[str, tuple[str, str]]) -> str:
     return reason
 
 
-def _close(cur, cid: int, *, reason: str, key: str, evidence: dict, episode: int | None,
-           sink: dict | None = None) -> bool:
+def _close(cur, cid: int, *, rule: str, owner: str | None, reason: str, key: str, evidence: dict,
+           episode: int | None, sink: dict | None = None) -> bool:
     """Close one item by rule (``commitments.close_by_rule``: the reopen
     guard every automatic close shares), or, with ``sink`` (the clean-up
     planner), only record what would close it and write nothing."""
     if sink is not None:
         sink[cid] = {"reason": reason[:300], "key": key, "evidence": evidence, "episode": episode}
         return True
-    return close_by_rule(cur, cid, reason=reason, key=key, evidence=evidence, episode=episode)
+    return close_by_rule(cur, cid, rule=rule, owner=owner, reason=reason, key=key, evidence=evidence,
+                         episode=episode)
 
 
 def _open_items(cur, project: str | None) -> list[dict[str, Any]]:
+    """The open items the rules read, each with its ``owner`` as
+    ``commitments.row_owner`` reads it (the owner guard's input)."""
+    from khipu.commitments import (
+        _future_trigger_ready, _lineage_columns_ready, _reassigned_column_ready, has_future_trigger, row_owner,
+    )
+
     where = "status = 'open' AND project IS NOT NULL"
     params: tuple = ()
     if project is not None:
         where += " AND project = %s"
         params = (project,)
+    # The owner columns (migration 0033) come before the close columns (0034).
+    extra = ["owner", "origin", "owner_label"]
+    if _future_trigger_ready(cur):
+        extra.append("future_trigger")
+    if _reassigned_column_ready(cur):
+        extra.append("owner_reassigned_at")
+    if _lineage_columns_ready(cur):
+        extra.append("latest_text")
     cur.execute(
         "SELECT id, text, project, kind, opened_episode, opened_at, prs, reopened_rule_keys, pr_check, "
-        f"settle_suggestion FROM commitments WHERE {where} AND {_not_forgotten_clause(cur)} ORDER BY id",
+        f"settle_suggestion, {', '.join(extra)} FROM commitments WHERE {where} AND {_not_forgotten_clause(cur)} "
+        "ORDER BY id",
         params,
     )
     cols = ("id", "text", "project", "kind", "opened_episode", "opened_at", "prs", "reopened",
-            "pr_check", "suggestion")
-    return [dict(zip(cols, r)) for r in cur.fetchall()]
+            "pr_check", "suggestion", *extra)
+    out = []
+    for r in cur.fetchall():
+        item = dict(zip(cols, r))
+        trigger = has_future_trigger(item.get("text") or "") or bool(item.get("future_trigger"))
+        item["owner"], item["owner_label"] = row_owner(item, future_trigger=trigger)
+        out.append(item)
+    return out
 
 
 def _key(ref: tuple[str | None, int], project_repo: str | None) -> EvidenceKey:
@@ -518,7 +554,7 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
              github: GitHub, sink: dict | None = None) -> None:
     by_project: dict[str, list[dict]] = {}
     for item in items:
-        if item["prs"]:
+        if item["prs"] or parse_prs(item.get("latest_text") or ""):
             by_project.setdefault(item["project"], []).append(item)
     asked_for: set[int] | None = None
     capture: dict[EvidenceKey, dict[str, Any]] = {}
@@ -549,7 +585,7 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
             records: dict[str, dict[str, Any]] = {}
             waiting: dict[str, str] = {}
             capture_episodes: list[int] = []
-            for ref in pr_refs(item["text"], repo) or [(_repo(repo), n) for n in item["prs"]]:
+            for ref in item_refs(item, repo):
                 label = ref_label(ref, repo)
                 rec = _newest_for(ref, repo, opened, [runner, ledger, capture, later])
                 if rec is None or rec["state"] not in DONE_STATES:
@@ -576,7 +612,8 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
                     report["kept_open_reopened"] += 1
                     continue
                 evidence = {"rule": "pr", "prs": records}
-                if _close(cur, item["id"], reason=_pr_reason(found), key=key, evidence=evidence,
+                if _close(cur, item["id"], rule="pr", owner=item.get("owner"), reason=_pr_reason(found),
+                          key=key, evidence=evidence,
                           episode=max(capture_episodes) if capture_episodes else None, sink=sink):
                     report["closed_pr"] += 1
                     item["closed"] = True
@@ -667,11 +704,17 @@ def _decision_rule(cur, items: list[dict], report: dict, *, episode_id: int | No
                 if key in (item["reopened"] or []):
                     report["kept_open_reopened"] += 1
                     continue
-                if _close(cur, item["id"], reason=f"settled by decision {did}: {text[:150]!r}", key=key,
-                          evidence={"rule": "decision", "decision_id": did, "match": how,
-                                    "score": round(score, 3)}, episode=dep, sink=sink):
-                    report["closed_decision"] += 1
-                continue
+                if sink is None and owner_guard(item.get("owner"), "decision"):
+                    # The owner's own item: a decision only suggests it is
+                    # settled ("Looks settled by decision N"); he closes it.
+                    hit = ("loose", did, text, score)
+                else:
+                    if _close(cur, item["id"], rule="decision", owner=item.get("owner"),
+                              reason=f"settled by decision {did}: {text[:150]!r}", key=key,
+                              evidence={"rule": "decision", "decision_id": did, "match": how,
+                                        "score": round(score, 3)}, episode=dep, sink=sink):
+                        report["closed_decision"] += 1
+                    continue
             _, did, text, near = hit
             if sink is not None:
                 continue

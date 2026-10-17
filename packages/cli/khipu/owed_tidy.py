@@ -15,8 +15,9 @@ its work:
    re-run on the stored text and the origin, give another owner than the one
    shown today. The origin is the row's, or ``job`` when the capture that
    opened it has a parent session (the lineage a pre-0033 row never stored);
-4. a **model pass** over what the rules leave as the user's: only items that
-   do not name the user by any alias, in batches of ``JUDGE_BATCH``, at most
+4. a **model pass** over the items no owner rule decided (the capture's
+   declared owner, or no one named), never the user's own and never an item
+   that names the user by any alias, in batches of ``JUDGE_BATCH``, at most
    ``owed_tidy_calls`` calls (a count setting, 0 for no limit). Past the cap
    an item is kept as it is and marked ``unjudged``. The model only moves an
    item to another owner; it never closes one. A failed or unreadable answer
@@ -24,6 +25,14 @@ its work:
 
 Everything else is **keep**. Nothing is ever deleted: a close keeps the row,
 its text and its reason.
+
+**The owner's own items** (``commitments.owner_guard``): the clean-up only
+proposes a change to an item the user owns, by the owner rules read with the
+item's lineage (a job's item shown as the user's is the orchestrator's, as
+the rules of step 3 say, so it moves). Its action stays ``keep`` and the
+change the rules would make is kept under ``proposed``; Apply never makes it.
+The one exception is a close because every pull request the item itself
+names is merged or closed.
 
 **Applying** a plan (``apply``) writes every change in one transaction, under
 one ``tidy_batch`` id, with each item's reason and its state before
@@ -65,6 +74,7 @@ touches the user's items.
         "before": {"owner", "owner_label", "origin"}, # as shown today
         "after": {"owner", "owner_label", "origin"},  # with action reassign
         "unjudged": true,                             # past the model call cap
+        "proposed": {"action", "close", "after", "reason", "rule"},  # the user's item: never applied
         "fingerprint": "sha256 of the item's state when planned"
       }, ...]
     }
@@ -88,7 +98,9 @@ CALLS_SETTING = "owed_tidy_calls"
 DEFAULT_CALLS = 25
 JUDGE_BATCH = 40
 SAMPLES = 20
-GROUPS = ("stay_user", "keep_other", "move", "close_pr", "close_decision", "close_duplicate")
+GROUPS = ("stay_user", "keep_other", "move", "close_pr", "close_decision", "close_duplicate", "proposed")
+# The rules the model pass may stand in for: no owner rule decided the item.
+_UNDECIDED_RULES = ("the owner the capture gave it", "no one named: the assistant's")
 
 # The item's state that an apply checks has not changed since planning and an
 # undo since applying, and the part of it an undo restores.
@@ -304,7 +316,7 @@ def _plan(cur, project: str, *, judge, use_model: bool) -> dict[str, Any]:
         before, after, rule = _owners(row)
         items[cid] = {"id": cid, "kind": row.get("kind"), "text": row.get("text"), "action": "keep",
                       "reason": "", "rule": rule, "before": before, "fingerprint": fingerprint(row),
-                      "_after": after}
+                      "_after": after, "_owner": after["owner"]}
 
     # 1. The PR and decision rules, read-only.
     if close_rules.ready(cur):
@@ -325,7 +337,8 @@ def _plan(cur, project: str, *, judge, use_model: bool) -> dict[str, Any]:
         notes.append("the pull request and decision rules need migration 0034; none ran")
 
     # 2. Duplicates of an older item that stays open.
-    remaining = [{"id": cid, "project": project, "text": it["text"] or ""}
+    remaining = [{"id": cid, "project": project, "text": it["text"] or "",
+                  "owner": it["_after"]["owner"], "owner_label": it["_after"]["owner_label"]}
                  for cid, it in items.items() if it["action"] == "keep"]
     by_text = {r["id"]: r["text"] for r in remaining}
 
@@ -363,10 +376,11 @@ def _plan(cur, project: str, *, judge, use_model: bool) -> dict[str, Any]:
         if (after["owner"], after["owner_label"]) != (it["before"]["owner"], it["before"]["owner_label"]):
             it.update(action="reassign", after=after, reason=f"to the {_owner_words(after)}: {it['rule']}")
 
-    # 4. The model, for what the rules leave as the user's, never naming them.
+    # 4. The model, for what no owner rule decided: never the user's own item
+    # (it never overrides the deterministic owner) and never one naming him.
     candidates = [it for it in items.values()
-                  if it["action"] == "keep" and it["before"]["owner"] == co.OWNER_USER
-                  and it["rule"] != "set by hand" and not _names_user(it["text"] or "")]
+                  if it["action"] == "keep" and co.OWNER_USER not in (it["before"]["owner"], it["_owner"])
+                  and it["rule"] in _UNDECIDED_RULES and not _names_user(it["text"] or "")]
     unjudged = 0
     if use_model:
         for start in range(0, len(candidates), JUDGE_BATCH):
@@ -383,17 +397,38 @@ def _plan(cur, project: str, *, judge, use_model: bool) -> dict[str, Any]:
             answers += [{"owner": "user"}] * (len(batch) - len(answers))
             for it, ans in zip(batch, answers):
                 owner = str((ans or {}).get("owner") or "user").lower()
-                if owner not in (co.OWNER_ASSISTANT, co.OWNER_AGENT):
+                if owner not in (co.OWNER_ASSISTANT, co.OWNER_AGENT) or co.owner_guard(it["_owner"], "model"):
                     continue
                 label = (co.clean_owner_label(ans.get("label")) or co.ORCHESTRATOR) if owner == co.OWNER_AGENT \
                     else None
                 after = {"owner": owner, "owner_label": label, "origin": it["before"]["origin"]}
+                if (after["owner"], after["owner_label"]) == (it["before"]["owner"], it["before"]["owner_label"]):
+                    continue
                 it.update(action="reassign", after=after,
                           rule=f"model: {(ans.get('reason') or 'not the user').strip()}",
                           reason=f"to the {_owner_words(after)}: the model's reading, no rule decided it")
 
+    # 5. The owner's own items: every change but a close on its own pull
+    # requests is a proposal, never applied (commitments.owner_guard).
+    for it in items.values():
+        if it["action"] == "keep" or not co.owner_guard(it.pop("_owner"), _rule_of(it)):
+            it.pop("_owner", None)
+            continue
+        it["proposed"] = {k: it[k] for k in ("action", "close", "after", "reason", "rule") if k in it}
+        for k in ("close", "after", "evidence", "key", "episode"):
+            it.pop(k, None)
+        it.update(action="keep", reason=f"suggested, yours to decide: {it['proposed']['reason']}")
+
     return _document(project, planned_at, items, calls=calls, used=use_model,
                      candidates=len(candidates), unjudged=unjudged, notes=notes)
+
+
+def _rule_of(it: dict) -> str:
+    """The automatic rule (``commitments.AUTOMATIC_RULES``) behind a planned
+    change."""
+    if it["action"] == "close":
+        return it.get("close") or "duplicate"
+    return "model" if str(it.get("rule") or "").startswith("model:") else "owner-rules"
 
 
 def _owner_words(owner: dict) -> str:
@@ -407,6 +442,8 @@ def _group(it: dict) -> str:
         return f"close_{it['close']}"
     if it["action"] == "reassign":
         return "move"
+    if it.get("proposed"):
+        return "proposed"
     return "stay_user" if it["before"]["owner"] == "user" else "keep_other"
 
 
@@ -414,7 +451,9 @@ def _document(project, planned_at, items, *, calls, used, candidates, unjudged, 
     ordered = [items[k] for k in sorted(items)]
     totals: dict[str, Any] = {"open": len(ordered), "stay_user": 0, "keep_other": 0,
                               "move": {"total": 0, "agent": 0, "assistant": 0, "user": 0},
-                              "close": {"total": 0, "pr": 0, "decision": 0, "duplicate": 0}}
+                              "close": {"total": 0, "pr": 0, "decision": 0, "duplicate": 0},
+                              # A part of stay_user: changes only suggested for the user's own items.
+                              "proposed": {"total": 0, "move": 0, "close": 0}}
     samples: dict[str, list] = {g: [] for g in GROUPS}
     for it in ordered:
         group = _group(it)
@@ -424,6 +463,10 @@ def _document(project, planned_at, items, *, calls, used, candidates, unjudged, 
         elif group.startswith("close_"):
             totals["close"]["total"] += 1
             totals["close"][it["close"]] += 1
+        elif group == "proposed":
+            totals["stay_user"] += 1
+            totals["proposed"]["total"] += 1
+            totals["proposed"]["move" if it["proposed"]["action"] == "reassign" else "close"] += 1
         else:
             totals[group] += 1
         if len(samples[group]) < SAMPLES:
@@ -457,11 +500,17 @@ def _check_plan(doc: Any) -> str | None:
     return None
 
 
-def _is_users(row: dict) -> bool:
+def _owner_now(row: dict) -> str:
     from khipu import commitments as co
 
     trigger = co.has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
-    return co.row_owner(row, future_trigger=trigger)[0] == co.OWNER_USER
+    return co.row_owner(row, future_trigger=trigger)[0]
+
+
+def _is_users(row: dict) -> bool:
+    from khipu import commitments as co
+
+    return _owner_now(row) == co.OWNER_USER
 
 
 def _gate(cur, rows: dict[int, dict], ids: list[int], extra_users: set[int] | None = None):
@@ -521,8 +570,13 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
             for cid in live:
                 it = planned[cid]
                 prior = {f: _plain(rows[cid].get(f)) for f in PRIOR_FIELDS}
+                now_owner = _owners(rows[cid])[1]["owner"]
+                if co.owner_guard(now_owner, _rule_of(it)):
+                    skipped.append({"id": cid, "why": "the owner's own item: the clean-up only suggests a change"})
+                    continue
                 if it["action"] == "close":
-                    if not co.close_by_rule(cur, cid, reason=it.get("reason") or "closed by the clean-up",
+                    if not co.close_by_rule(cur, cid, rule=_rule_of(it), owner=now_owner,
+                                            reason=it.get("reason") or "closed by the clean-up",
                                             key=it.get("key") or f"tidy:{cid}", evidence=it.get("evidence") or {},
                                             episode=it.get("episode"), set_extra=", tidy_batch = %s",
                                             extra_params=(batch,)):
@@ -545,10 +599,11 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
                                    "owner_reassigned_by = %s, owner_reassign_reason = %s, ")
                         lineage_params = (f"khipu owed tidy ({batch})",
                                           (it.get("reason") or it.get("rule") or "")[:400] or None)
-                    cur.execute(
-                        f"UPDATE commitments SET {lineage}owner = %s, owner_label = %s, origin = %s, "
-                        "owner_reassigned_at = now(), tidy_batch = %s WHERE id = %s",
-                        (*lineage_params, owner, label, origin, batch, cid))
+                    co.auto_reassign(
+                        cur, cid, rule=_rule_of(it), owner_before=now_owner,
+                        sets=[f"{lineage}owner = %s", "owner_label = %s", "origin = %s", "owner_reassigned_at = now()",
+                              "tidy_batch = %s"],
+                        params=(*lineage_params, owner, label, origin, batch))
                 counts[it["action"]] += 1
                 done = _select(cur, project, ids=[cid])[cid]
                 cur.execute(

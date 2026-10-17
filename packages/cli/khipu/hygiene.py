@@ -463,6 +463,11 @@ def _duplicate_groups(
     """
     from khipu.commitments import _match_score
 
+    def _group(row: dict[str, Any]) -> tuple:
+        # Two items are duplicates only within one project AND one owner:
+        # dedup never merges what two different owners owe.
+        return (row["project"], row.get("owner"), row.get("owner_label"))
+
     ordered = sorted(rows, key=lambda r: r["id"])
     keepers: list[dict[str, Any]] = []
     dupes: dict[int, int] = {}
@@ -471,7 +476,7 @@ def _duplicate_groups(
         hit = next(
             (
                 k for k in keepers
-                if k["project"] == row["project"]
+                if _group(k) == _group(row)
                 and _match_score(row["text"], k["text"]) >= DUP_MIN_SCORE
             ),
             None,
@@ -513,7 +518,7 @@ def _duplicate_groups(
         scored = []
         for k_id in ids_in_order[:i]:
             k = by_id[k_id]
-            if k["project"] != row["project"]:
+            if _group(k) != _group(row):
                 continue
             s = _score(row["id"], k_id)
             if s is not None and s >= DUP_COSINE_ASK:
@@ -755,6 +760,8 @@ def run_commitments_hygiene(
     judged: list[dict[str, Any]] = []
     for row in rows:
         owner = resolve_owner(row["text"], kind=row.get("kind"), declared=row.get("owner"))
+        # Dedup groups by the owner Owed shows, and the owner guard reads it.
+        row["owner"], row["owner_label"] = co.row_owner(row)
         reason = rejection_reason(row["text"], owner=owner, kind=row.get("kind"))
         if reason is not None:
             verdicts[row["id"]] = {"verdict": "drop", "reason": f"filter:{reason}"}
@@ -820,14 +827,14 @@ def run_commitments_hygiene(
         stamp = _today()
         for cid, v in verdicts.items():
             if v["verdict"] == "drop":
-                cur.execute(
-                    "UPDATE commitments SET status = 'dropped', closed_at = now(), "
-                    "close_reason = %s WHERE id = %s AND status = 'open'",
-                    (f"hygiene-{stamp}: {v['reason']}"[:400], cid),
-                )
-                applied += cur.rowcount
+                applied += int(co.close_by_rule(
+                    cur, cid, rule="drop", owner=by_id[cid]["owner"], status="dropped",
+                    reason=f"hygiene-{stamp}: {v['reason']}", key=f"hygiene-drop:{v['reason']}"[:200],
+                    evidence={"rule": "hygiene-drop", "reason": v["reason"]}))
             elif v["verdict"] == "duplicate":
                 keeper = dupes[cid]
+                if co.owner_guard(by_id[cid]["owner"], "duplicate"):
+                    continue
                 if seen_ready:
                     cur.execute(
                         "UPDATE commitments SET seen_count = seen_count + "
@@ -836,7 +843,8 @@ def run_commitments_hygiene(
                         (cid, keeper),
                     )
                 applied += int(co.close_by_rule(
-                    cur, cid, reason=f"duplicate-of-{keeper}", key=f"duplicate-of:{keeper}",
+                    cur, cid, rule="duplicate", owner=by_id[cid]["owner"],
+                    reason=f"duplicate-of-{keeper}", key=f"duplicate-of:{keeper}",
                     evidence={"rule": "duplicate", "keeper": keeper}))
 
     report: dict[str, Any] = {
@@ -990,6 +998,7 @@ def run_session_ended_pass(
         listing.append({
             "id": row["id"],
             "owner": owner,
+            "stored_owner": row.get("owner"),
             "future_trigger": trigger,
             "session_ended": ended,
             "verdict": verdict,
@@ -1004,27 +1013,23 @@ def run_session_ended_pass(
         stamp = _today()
         for item in listing:
             cid = item["id"]
+            if item["owner"] != item["stored_owner"]:
+                # An owner the rules now read differently: never the owner's
+                # own item moved away (the owner guard reads the stored one).
+                co.auto_reassign(cur, cid, rule="owner-rules", owner_before=item["stored_owner"],
+                                 sets=["owner = %s"], params=(item["owner"],))
             if trigger_col:
-                cur.execute(
-                    "UPDATE commitments SET owner = %s, future_trigger = %s WHERE id = %s",
-                    (item["owner"], item["future_trigger"], cid),
-                )
-            else:
-                cur.execute(
-                    "UPDATE commitments SET owner = %s WHERE id = %s",
-                    (item["owner"], cid),
-                )
+                cur.execute("UPDATE commitments SET future_trigger = %s WHERE id = %s",
+                            (item["future_trigger"], cid))
             if item["verdict"] == "close":
                 applied += int(co.close_by_rule(
-                    cur, cid, reason="session-ended", key="hygiene:session-ended",
-                    evidence={"rule": "hygiene-session-ended"}))
+                    cur, cid, rule="session-ended", owner=item["owner"], reason="session-ended",
+                    key="hygiene:session-ended", evidence={"rule": "hygiene-session-ended"}))
             elif item["verdict"] == "drop":
-                cur.execute(
-                    "UPDATE commitments SET status = 'dropped', closed_at = now(), "
-                    "close_reason = %s WHERE id = %s AND status = 'open'",
-                    (f"hygiene-{stamp}: {item['reason']}"[:400], cid),
-                )
-                applied += cur.rowcount
+                applied += int(co.close_by_rule(
+                    cur, cid, rule="drop", owner=item["owner"], status="dropped",
+                    reason=f"hygiene-{stamp}: {item['reason']}", key=f"hygiene-drop:{item['reason']}"[:200],
+                    evidence={"rule": "hygiene-session-ended", "reason": item["reason"]}))
 
     return {
         "ok": True,

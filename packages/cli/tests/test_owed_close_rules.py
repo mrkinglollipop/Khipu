@@ -351,11 +351,15 @@ def _decide(cur, text) -> int:
     return int(cur.fetchone()[0])
 
 
+JOB = dict(BASE, session_id="job-1", parent_session_id="conv-1")
+
+
 def test_a_decision_strict_match_closes_with_the_decision_id_in_the_reason(hub):  # noqa: F811
     conn = _migrated(hub)
     with conn.cursor() as cur:
-        named = _open(cur, "Should the nightly keep the hourly backup window?", "question")
-        same = _open(cur, "Decide whether the gateway keeps the legacy route", "question")
+        # A job's questions: the orchestrator's, so a decision closes them.
+        named = _open(cur, "Should the nightly keep the hourly backup window?", "question", JOB)
+        same = _open(cur, "Decide whether the gateway keeps the legacy route", "question", JOB)
         by_id = _decide(cur, f"Settles commitment {named}: keep the hourly window")
         by_text = _decide(cur, "Decide whether the gateway keeps the legacy route")
         report = close_rules.run(cur)
@@ -364,6 +368,22 @@ def test_a_decision_strict_match_closes_with_the_decision_id_in_the_reason(hub):
         assert row["status"] == "closed" and f"decision {by_id}" in row["close_reason"]
         assert row["close_rule_key"] == f"decision:{by_id}" and row["closed_by"] == "Khipu, by rule"
         assert f"decision {by_text}" in _row(cur, same)["close_reason"]
+
+
+def test_a_strict_decision_only_suggests_on_the_owners_own_question(hub):  # noqa: F811
+    """The owner guard: a decision never closes the owner's own item; it is
+    offered as "Looks settled by decision N" for him to close."""
+    conn = _migrated(hub)
+    with conn.cursor() as cur:
+        named = _open(cur, "Should the nightly keep the hourly backup window?", "question")
+        same = _open(cur, "Decide whether the gateway keeps the legacy route", "question")
+        by_id = _decide(cur, f"Settles commitment {named}: keep the hourly window")
+        by_text = _decide(cur, "Decide whether the gateway keeps the legacy route")
+        report = close_rules.run(cur)
+        assert report["closed_decision"] == 0 and report["suggested"] == 2
+        assert _row(cur, named)["status"] == _row(cur, same)["status"] == "open"
+        assert _row(cur, named)["settle_suggestion"]["decision_id"] == by_id
+        assert _row(cur, same)["settle_suggestion"]["decision_id"] == by_text
 
 
 def test_a_loose_decision_match_only_suggests(hub):  # noqa: F811
@@ -624,7 +644,9 @@ def test_every_close_path_goes_through_the_one_guarded_close():
     and the rule's author), a hand close (``set_status``), or the forget of an
     episode. A new close path fails here until it uses ``close_by_rule``."""
     writes = _functions_that(r"SET\s+status\s*=\s*'closed'")
-    assert writes == {("commitments", "close_by_rule"), ("forget", "forget_episode")}, writes
+    # close_by_rule writes the status it is given (closed, or dropped for
+    # the hygiene re-judge); tests/test_owed_owner_guard.py lists every writer.
+    assert writes == {("forget", "forget_episode")}, writes
     callers = _functions_that(None, calls="close_by_rule")
     assert {("close_rules", "_close"), ("commitments", "auto_close"), ("commitments", "close_session_plan"),
             ("commitments", "open_from_episode"), ("owed_tidy", "apply")} <= callers, callers
@@ -729,3 +751,75 @@ def test_long_pr_list_does_not_close_when_its_unparsed_tail_is_open(monkeypatch)
 
     assert planned == {}, f"An unfinished #30 was omitted and the item was planned closed: {planned}"
     assert asked == numbers
+
+
+# ---- the fourth review: a restatement adds PRs, never replaces them ---------
+
+class _RestateCursor:
+    """Records the restatement's writes: the newer wording and the PR list."""
+
+    def __init__(self, prs):
+        self.latest_text = None
+        self.prs = list(prs)
+
+    def execute(self, sql, params=()):
+        if "SET latest_text" in sql:
+            self.latest_text = params[0]
+        if "SET prs = ARRAY" in sql:
+            self.prs = sorted(set(self.prs) | set(params[0]))
+
+
+def test_restatement_that_adds_a_pr_cannot_close_on_the_original_pr_only(monkeypatch):
+    cur = _RestateCursor([12])
+    original = "Land PR #12 before release"
+    expanded = "Land PR #12 and PR #13 before release"
+    row = {"id": 1, "text": original, "owner": "assistant", "owner_label": None}
+    for ready in ("_seen_columns_ready", "_owner_columns_ready", "_close_columns_ready", "_lineage_columns_ready"):
+        monkeypatch.setattr(co, ready, lambda cur: True)
+    for ready in ("_future_trigger_ready", "_trigger_text_ready"):
+        monkeypatch.setattr(co, ready, lambda cur: False)
+    monkeypatch.setattr(co, "_open_commitments", lambda *a, **k: [row])
+    monkeypatch.setattr(co, "_open_id_for_hash", lambda *a, **k: None)
+    monkeypatch.setattr(co, "_touch_seen", lambda *a, **k: None)
+    assert co.open_from_episode(
+        cur, {"project": PROJECT, "session_id": "s", "open_loops": [{"text": expanded, "kind": "blocker"}]}, 2
+    ) == 0
+    assert cur.latest_text == expanded
+    assert cur.prs == [12, 13]
+
+    # The item as the rule reads it after the restatement: its first words,
+    # its newer wording and its stored list.
+    merged_12 = {(None, 12): {"state": "merged", "read_at": "2026-10-16T00:00:00+00:00", "source": "runner"}}
+    item = {"id": 1, "text": original, "latest_text": cur.latest_text, "project": PROJECT, "kind": "blocker",
+            "opened_episode": 1, "prs": cur.prs, "reopened": [], "pr_check": {}}
+    planned, report = {}, {"closed_pr": 0, "kept_open_reopened": 0}
+    monkeypatch.setattr(close_rules, "_runner_states", lambda _: merged_12)
+    monkeypatch.setattr(close_rules, "_ledger_states", lambda *_: {})
+    monkeypatch.setattr(close_rules, "_episode_states", lambda *_: {})
+    close_rules._pr_rule(cur, [item], report, payload=None, episode_id=None, github=mock.Mock(
+        state=lambda repo, n: (None, "not asked")), sink=planned)
+    assert planned == {}, "must remain open until added PR #13 is done"
+    # Its stored list alone is enough: the newer wording is not needed.
+    item.pop("latest_text")
+    close_rules._pr_rule(cur, [item], report, payload=None, episode_id=None, github=mock.Mock(
+        state=lambda repo, n: (None, "not asked")), sink=planned)
+    assert planned == {}
+
+
+def test_a_restated_hub_item_waits_for_every_pr_ever_named(hub, monkeypatch, tmp_path):  # noqa: F811
+    conn = _migrated(hub)
+    _runner(monkeypatch, tmp_path, [(12, "merged"), (13, "fixing")])
+    with conn.cursor() as cur:
+        cid = _open(cur, "Land PR #12 before the release ships", "blocker")
+        with mock.patch.object(co, "_cosine_scores", _no_cosine), \
+             mock.patch.object(co, "_has_commitment_embeddings", lambda cur, ids: False):
+            restated = dict(BASE, open_loops=[{"text": "Land PR #12 and PR #13 before the release ships",
+                                               "kind": "blocker"}])
+            assert co.open_from_episode(cur, restated, _episode(cur)) == 0
+        assert _row(cur, cid)["prs"] == [12, 13]
+        assert close_rules.run(cur)["closed_pr"] == 0
+        assert _row(cur, cid)["status"] == "open"
+    _runner(monkeypatch, tmp_path, [(12, "merged"), (13, "merged")])
+    with conn.cursor() as cur:
+        assert close_rules.run(cur)["closed_pr"] == 1
+        assert _row(cur, cid)["close_rule_key"] == "pr:12=merged,13=merged"

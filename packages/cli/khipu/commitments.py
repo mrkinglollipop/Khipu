@@ -775,7 +775,7 @@ def rejection_reason(text: str, *, owner: str | None = None,
             return reason
     if owner is None:
         owner = resolve_owner(s, kind=kind)
-    if owner != OWNER_USER and is_reporting_text(s):
+    if owner != OWNER_USER and is_reporting_text(s) and not _third_party_subject(s, owner):
         return "reporting"
     if len(re.findall(r"[A-Za-z0-9][A-Za-z0-9'./-]*", s)) < MIN_COMMITMENT_WORDS:
         return "too-short"
@@ -784,6 +784,16 @@ def rejection_reason(text: str, *, owner: str | None = None,
         # renumber migration 115") names its action by construction.
         return "no-action"
     return None
+
+
+def _third_party_subject(text: str, owner: str | None) -> bool:
+    """True when a third party is the sentence's subject ("The reviewer will
+    provide the evidence"): that party's commitment, never the speaker's
+    within-session reporting duty."""
+    if owner != OWNER_AGENT:
+        return False
+    subject = commit_subject(_without_trigger_clause(text) if has_future_trigger(text) else text)
+    return subject is not None and subject[0] == OWNER_AGENT
 
 
 def is_commitment_worthy(text: str, *, owner: str | None = None,
@@ -1159,21 +1169,39 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             if row is not None and lineage_ready and norm["text"] != row["text"]:
                 # A restatement in other words keeps the newer wording.
                 cur.execute("UPDATE commitments SET latest_text = %s WHERE id = %s", (norm["text"], existing))
+            if close_ready:
+                from khipu.close_rules import parse_prs
+
+                added = parse_prs(norm["text"])
+                if added:
+                    # The PR list auto-close reads is everything the item was
+                    # ever said to need, never the older list alone.
+                    cur.execute(
+                        "UPDATE commitments SET prs = ARRAY(SELECT DISTINCT n FROM "
+                        "unnest(COALESCE(prs, '{}'::int[]) || %s::int[]) AS n ORDER BY n) WHERE id = %s",
+                        (added, existing))
             continue
         linked = [r["id"] for r in others
                   if r["id"] == exact or _match_score(norm["text"], r["text"]) >= NEAR_DUP_MIN_SCORE]
-        if exact is not None and any(r["id"] == exact for r in others) and exact not in relay_ids:
-            # The same words, owed by someone else: the open (project,
-            # content_hash) slot is theirs, so this owner's item takes a hash
-            # of its own and both stay.
-            h = content_hash(lifecycle_scope, f"{norm['text']}\x00owner:{owner}:{owner_label or ''}")
+        relay_owner = {r["id"]: r.get("owner") for r in job_rows}
+        closed_relays: list[int] = []
         for rid in relay_ids:
             # Closed before the insert: an identical text shares the open
             # (project, content_hash) slot the unique index guards. The
             # reason names the new row once it exists (below).
-            close_by_rule(cur, rid, reason="relayed-by a conversation item",
-                          key=evidence_key("relayed-by", norm["text"]), episode=episode_id,
-                          evidence={"rule": "relayed-by", "text": norm["text"][:300]})
+            if close_by_rule(cur, rid, rule="relay", owner=relay_owner.get(rid),
+                             reason="relayed-by a conversation item",
+                             key=evidence_key("relayed-by", norm["text"]), episode=episode_id,
+                             evidence={"rule": "relayed-by", "text": norm["text"][:300]}):
+                closed_relays.append(rid)
+        relay_ids = closed_relays
+        if exact is not None and exact not in relay_ids:
+            # The same words are still open in another item this one does not
+            # fold into: another owner's, or a relayed job item the owner
+            # reopened (the same evidence never closes it again). That item
+            # keeps the open (project, content_hash) slot, so this one takes a
+            # hash of its own and both stay.
+            h = content_hash(lifecycle_scope, f"{norm['text']}\x00owner:{owner}:{owner_label or ''}")
         due_sql, due_param = _parse_due_after(norm["due_after"])
         stored_text = norm["text"]
         due_phrase = str(norm["due_after"] or "").strip()
@@ -1419,20 +1447,75 @@ def evidence_problem(text: str, item_text: str = "", project: str | None = None)
     return check(text, item_text, project)
 
 
-def close_by_rule(cur, commitment_id: int, *, reason: str, key: str, evidence: dict | None = None,
-                  episode: int | None = None, set_extra: str = "", extra_params: tuple = ()) -> bool:
+# ---- the owner's own items --------------------------------------------------
+#
+# The invariant: an item the owner owes (``row_owner`` gives ``user``) is never
+# closed, merged, hidden or reassigned by anything automatic. Every automatic
+# change to a commitment names its rule here and passes :func:`owner_guard`,
+# in the one write each kind of change has: :func:`close_by_rule` for a close,
+# a drop or a merge, :func:`auto_reassign` for an owner change. Only two rules
+# may change the owner's item: a pull request rule on the item's own PR list,
+# and the owner's own "done" in his own conversation. Everything else may
+# propose a change (the clean-up's preview, a "Looks settled" suggestion),
+# never make it. The owner's own changes are :func:`set_status` and
+# :func:`reassign`; a forgotten episode's items are closed by ``khipu.forget``.
+RULE_OWN_PRS = "own-prs"
+RULE_OWN_SESSION = "own-session"
+RULE_NEVER = "never"
+AUTOMATIC_RULES: dict[str, str] = {
+    "pr": RULE_OWN_PRS,             # every PR the item itself names is merged or closed
+    "loop": RULE_OWN_SESSION,       # a closed loop or "done:" from the owner's conversation
+    "decision": RULE_NEVER,         # a later decision settles it: a suggestion for his items
+    "relay": RULE_NEVER,            # another item restates it
+    "session-ended": RULE_NEVER,    # its session ended
+    "session-plan": RULE_NEVER,     # a plan-shaped row the session mentioned as finished
+    "duplicate": RULE_NEVER,        # dedup, in the hygiene pass or the clean-up
+    "drop": RULE_NEVER,             # the hygiene re-judge: not a commitment
+    "owner-rules": RULE_NEVER,      # the owner rules re-run (clean-up, hygiene)
+    "model": RULE_NEVER,            # the clean-up's model pass
+}
+OWNER_GUARD_WORDS = "the owner's own item: an automatic {rule} may propose a change to it, never make it"
+
+
+def owner_guard(owner: str | None, rule: str, *, origin: str | None = None) -> str | None:
+    """Why the automatic ``rule`` may not change an item owned by ``owner``
+    (the owner as :func:`row_owner` reads it), or None when it may.
+    ``origin`` is the session the evidence came from, for ``loop``."""
+    allowed = AUTOMATIC_RULES.get(rule)
+    if allowed is None:
+        raise ValueError(f"not an automatic rule Khipu knows: {rule!r}")
+    if str(owner or "").strip().lower() != OWNER_USER:
+        return None
+    if allowed == RULE_OWN_PRS:
+        return None
+    if allowed == RULE_OWN_SESSION and str(origin or "").strip().lower() == ORIGIN_CONVERSATION:
+        return None
+    return OWNER_GUARD_WORDS.format(rule=rule)
+
+
+def close_by_rule(cur, commitment_id: int, *, rule: str, owner: str | None, reason: str, key: str,
+                  evidence: dict | None = None, episode: int | None = None, origin: str | None = None,
+                  status: str = "closed", set_extra: str = "", extra_params: tuple = ()) -> bool:
     """The one write every automatic close goes through (the PR and decision
     rules, the closed-loop match, the session-end close, the relay close, the
-    hygiene re-judge and the clean-up's apply). It records the reason, who
-    closed it (:data:`BY_RULE`), the rule ``key`` and the ``evidence``, and it
-    refuses an item the owner reopened after that same key closed it
-    (``reopened_rule_keys``). Hand closes are :func:`set_status`; a forgotten
-    episode's items are closed by ``khipu.forget``. On a hub before migration
-    0034 there is no key to remember, so only the reason is written."""
+    hygiene re-judge and dedup, and the clean-up's apply). ``owner`` is the
+    item's owner as the caller read it; :func:`owner_guard` refuses the
+    owner's own item for every ``rule`` but his own. It records the reason,
+    who closed it (:data:`BY_RULE`), the rule ``key`` and the ``evidence``,
+    and it refuses an item the owner reopened after that same key closed it
+    (``reopened_rule_keys``). ``status`` is ``closed``, or ``dropped`` for the
+    hygiene re-judge. On a hub before migration 0034 there is no key to
+    remember, so only the reason is written."""
+    why = owner_guard(owner, rule, origin=origin)
+    if why:
+        _log(f"kept commitment {commitment_id} as it is: {why}")
+        return False
+    if status not in ("closed", "dropped"):
+        raise ValueError(f"an automatic close sets closed or dropped, not {status!r}")
     reason = str(reason or "")[:300]
     if _close_columns_ready(cur):
         cur.execute(
-            "UPDATE commitments SET status = 'closed', closed_at = now(), closed_episode = %s, "
+            f"UPDATE commitments SET status = '{status}', closed_at = now(), closed_episode = %s, "
             f"close_reason = %s, closed_by = %s, close_rule_key = %s, close_evidence = %s::jsonb{set_extra} "
             "WHERE id = %s AND status = 'open' AND NOT (%s = ANY(reopened_rule_keys)) "
             f"AND {_not_forgotten_clause(cur)}",
@@ -1440,11 +1523,26 @@ def close_by_rule(cur, commitment_id: int, *, reason: str, key: str, evidence: d
         )
     else:
         cur.execute(
-            "UPDATE commitments SET status = 'closed', closed_at = now(), closed_episode = %s, "
+            f"UPDATE commitments SET status = '{status}', closed_at = now(), closed_episode = %s, "
             f"close_reason = %s{set_extra} WHERE id = %s AND status = 'open' "
             f"AND {_not_forgotten_clause(cur)}",
             (episode, reason, *extra_params, commitment_id),
         )
+    return cur.rowcount > 0
+
+
+def auto_reassign(cur, commitment_id: int, *, rule: str, owner_before: str | None, sets: list[str],
+                  params: tuple) -> bool:
+    """The one write every automatic owner change goes through (the hygiene
+    pass's owner refresh and the clean-up's apply): ``UPDATE commitments SET
+    <sets>`` for one item, refused by :func:`owner_guard` when the item is
+    the owner's own (``owner_before``). The owner's own move is
+    :func:`reassign`."""
+    why = owner_guard(owner_before, rule)
+    if why:
+        _log(f"kept commitment {commitment_id}'s owner as it is: {why}")
+        return False
+    cur.execute(f"UPDATE commitments SET {', '.join(sets)} WHERE id = %s", (*params, commitment_id))
     return cur.rowcount > 0
 
 
@@ -1520,7 +1618,9 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
         if why_not:
             _log(f"kept commitment {best_id} open: {why_not}")
             continue
-        if close_by_rule(cur, best_id, reason=f"{best_via} match ({best_score:.2f}): {text[:200]!r}",
+        best_owner = next(r.get("owner") for r in open_rows if r["id"] == best_id)
+        if close_by_rule(cur, best_id, rule="loop", owner=best_owner, origin=origin,
+                         reason=f"{best_via} match ({best_score:.2f}): {text[:200]!r}",
                          key=evidence_key("loop", text), episode=episode_id,
                          evidence={"rule": "loop", "text": text[:300], "match": best_via,
                                    "score": round(best_score, 3)}):
@@ -1683,9 +1783,11 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
             key, evidence = evidence_key("session-plan", hit), {"rule": "session-plan", "text": hit[:300]}
         else:
             continue
+        rule = "session-ended" if reason == "session-ended" else "session-plan"
         if reason == "session-ended":
             key, evidence = f"session-ended:{session_id}", {"rule": "session-ended", "session_id": session_id}
-        if close_by_rule(cur, row["id"], reason=reason, key=key, evidence=evidence, episode=episode_id):
+        if close_by_rule(cur, row["id"], rule=rule, owner=owner, reason=reason, key=key, evidence=evidence,
+                         episode=episode_id):
             closed += 1
     if closed:
         _log(f"closed {closed} session-end commitment(s) for {session_id}")

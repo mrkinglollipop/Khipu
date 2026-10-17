@@ -680,3 +680,101 @@ def test_similar_items_of_different_owners_both_stay_and_same_owner_restatements
     assert _open(cur, CONVERSATION, {"text": "Review the deployment checklist before the release",
                                      "kind": "followup", "owner": "assistant"}, episode=3) == 0
     assert len(cur.rows) == 2
+
+
+# ---- the fourth review ------------------------------------------------------
+
+def test_capture_does_not_reject_a_third_partys_reporting_shaped_commitment():
+    text = "The reviewer will provide the evidence for the release decision"
+    owner, label = co.resolve_owner_and_label(text, origin="conversation")
+    assert (owner, label) == ("agent", "reviewer")
+    assert co.rejection_reason(text, owner=owner, kind="followup") is None
+    # The speaker's own reporting duty is still not a commitment.
+    assert co.rejection_reason("Provide the evidence for the release decision", owner=co.OWNER_ASSISTANT) \
+        == "reporting"
+
+
+class _RelayCursor(_OwnerCursor):
+    """The migrated close rule and the partial unique index on (project,
+    content_hash) for open rows, with the real SQL's parameters."""
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        params = tuple(params or ())
+        if s.startswith("INSERT INTO commitments") and ", prs)" in s:
+            super().execute(sql.replace(", prs)", ")"), params[:-1])
+            return
+        if s.startswith("UPDATE commitments SET status = 'closed'") and "reopened_rule_keys" in s:
+            episode, reason, by, key, evidence, cid, checked_key = params
+            row = self.rows[cid]
+            self.rowcount = int(row["status"] == "open" and checked_key not in row.get("reopened_rule_keys", []))
+            if self.rowcount:
+                row.update(status="closed", closed_episode=episode, close_reason=reason, closed_by=by,
+                           close_rule_key=key)
+            return
+        if s.startswith("UPDATE commitments SET status = %s"):
+            status, reason, by, cid = params
+            self.rows[cid].update(status=status, close_reason=reason, closed_by=by, close_rule_key=None)
+            self.rowcount = 1
+            return
+        if s.startswith("UPDATE commitments SET status = 'open'"):
+            cid, = params
+            row = self.rows[cid]
+            blocked = any(other["id"] != cid and other["status"] == "open" and other["project"] == row["project"]
+                          and other["content_hash"] == row["content_hash"] for other in self.rows.values())
+            self.rowcount = int(not blocked)
+            if not blocked:
+                if row.get("close_rule_key"):
+                    row.setdefault("reopened_rule_keys", []).append(row["close_rule_key"])
+                row.update(status="open", close_rule_key=None, close_reason=None)
+            return
+        super().execute(sql, params)
+
+
+def test_reopened_job_relay_does_not_swallow_a_renewed_owner_question(monkeypatch):
+    monkeypatch.setattr(co, "_close_columns_ready", lambda cur: True)
+    monkeypatch.setattr(co, "_lineage_columns_ready", lambda cur: False)
+    monkeypatch.setattr(co, "_reassigned_column_ready", lambda cur: False)
+    cur = _RelayCursor()
+    text = "Matt to decide whether the export includes archived rows"
+    assert _open(cur, JOB, dict(text=text, kind="question", owner="user")) == 1
+    assert _open(cur, CONVERSATION, dict(text=text, kind="question", owner="user"), episode=2) == 1
+    assert cur.rows[1]["status"] == "closed"
+    assert co.set_status(cur, 2, "closed", reason="Owner closed the relayed item", by=co.BY_APP)
+    assert co.set_status(cur, 1, "open", by=co.BY_APP)
+    assert cur.rows[1]["reopened_rule_keys"] == [co.evidence_key("relayed-by", text)]
+    inserted = _open(cur, CONVERSATION, dict(text=text, kind="question", owner="user"), episode=4)
+    own = [r for r in cur.rows.values() if r["owner"] == "user" and r["status"] == "open"]
+    assert inserted == 1 and own, f"the owner question was swallowed: inserted={inserted}, rows={cur.rows}"
+    # The reopened job item stays open beside it.
+    assert cur.rows[1]["status"] == "open"
+
+
+def test_a_renewed_owner_question_after_a_reopened_relay_is_visible_on_the_hub(hub):  # noqa: F811
+    from khipu import db
+
+    conn = hub.connect()
+    hub.migrate(conn=conn)
+    db._TABLE_COLUMNS_CACHE.clear()
+    text = "Matt to decide whether the export includes archived rows"
+
+    def _ep(cur, n):
+        cur.execute("INSERT INTO episodes (ts, summary, raw) VALUES (now(), %s, '{}'::jsonb) RETURNING id",
+                    (f"episode {n}",))
+        return int(cur.fetchone()[0])
+
+    with conn.cursor() as cur:
+        assert _pg_open(cur, JOB, text, "question", _ep(cur, 1)) == 1
+        assert _pg_open(cur, CONVERSATION, text, "question", _ep(cur, 2)) == 1
+        cur.execute("SELECT id, origin, status FROM commitments ORDER BY id")
+        (job_id, _, job_status), (conv_id, _, _) = cur.fetchall()
+        assert job_status == "closed"
+        assert co.set_status(cur, conv_id, "closed", reason="answered", by=co.BY_APP)
+        assert co.set_status(cur, job_id, "open", by=co.BY_APP)
+        assert _pg_open(cur, CONVERSATION, text, "question", _ep(cur, 3)) == 1
+    conn.commit()
+    with conn.cursor() as cur:
+        rows = co.list_owed(cur, project="acme/widget", limit=None)
+        mine = [r for r in rows if r["owner"] == co.OWNER_USER and r["text"] == text]
+        assert len(mine) == 1, rows
+        assert any(r["id"] == job_id for r in rows), "the reopened job item stays open too"

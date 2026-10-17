@@ -125,9 +125,13 @@ def _flood(conn, *, model_questions: int = 6) -> Flood:
         f.item("agent_named", f"The orchestrator must resolve the {_words(i + 400)} conflict", episode=conv)
     for i in range(4):
         f.item("conv_names_user", f"Matt to approve the {_words(i + 500)} release notes", episode=conv)
-    for i in range(model_questions):
+    for i in range(6):
         f.item("conv_question", f"Should the {_words(i + 600)} cache use a shorter window?",
                kind="question", episode=conv)
+    # No owner rule decides these: the capture's own owner, the assistant.
+    for i in range(model_questions):
+        f.item("conv_cache", f"Tune the {_words(i + 650)} cache window after the load test", episode=conv,
+               owner="assistant")
     for i in range(3):
         f.item("conv_assistant", f"Write the {_words(i + 700)} changelog entry", episode=conv,
                owner="assistant")
@@ -246,14 +250,18 @@ def test_the_plan_sorts_the_flood_by_rule_with_evidence(owed):
     assert "#801" in items[f.groups["pr_merged"][1]]["reason"]
     assert items[f.groups["pr_merged"][0]]["evidence"]["rule"] == "pr"
     assert actions("pr_open") == actions("pr_half") == {"keep"}
-    assert {items[i]["close"] for i in f.groups["decided"]} == {"decision"}
+    # The owner's own questions: a decision that settles them is a proposal.
+    assert actions("decided") == {"keep"}
+    assert {items[i]["proposed"]["close"] for i in f.groups["decided"]} == {"decision"}
     assert {items[i]["close"] for i in f.groups["dup"]} == {"duplicate"}
     assert actions("dup_keeper") == {"keep"}
     keeper = f.groups["dup_keeper"][0]
     assert items[f.groups["dup"][0]]["evidence"]["duplicate_of"] == keeper
-    # The model sorted what the rules left as the user's, unnamed.
-    assert actions("conv_question") == {"reassign"}
-    assert items[f.groups["conv_question"][0]]["rule"].startswith("model")
+    # The model sorted what no owner rule decided, never the owner's own.
+    assert actions("conv_cache") == {"reassign"}
+    assert items[f.groups["conv_cache"][0]]["rule"].startswith("model")
+    assert actions("conv_question") == {"keep"}
+    assert not any("proposed" in items[i] for i in f.groups["conv_question"])
 
 
 def test_the_plan_writes_nothing(owed):
@@ -273,7 +281,7 @@ def test_the_model_never_sees_items_naming_the_user(owed):
     assert named and not any("matt" in t.lower() for t in model.seen)
     # Only items no rule decided reach it.
     shown = set(model.seen)
-    for group in ("job_question", "pr_merged", "decided", "dup"):
+    for group in ("job_question", "pr_merged", "decided", "dup", "conv_question"):
         assert not any(_rows(owed, [i])[i]["text"] in shown for i in f.groups[group]), group
 
 
@@ -282,7 +290,7 @@ def test_no_model_flag_skips_the_pass(owed):
     model = FakeModel()
     plan = _plan(owed, judge=model, use_model=False)
     assert model.calls == 0 and plan["model"]["calls"] == 0
-    assert {_by_id(plan)[i]["action"] for i in f.groups["conv_question"]} == {"keep"}
+    assert {_by_id(plan)[i]["action"] for i in f.groups["conv_cache"]} == {"keep"}
 
 
 def test_the_cap_stops_the_model_pass_and_0_lifts_it(owed):
@@ -549,3 +557,91 @@ def test_undo_with_another_project_changes_nothing_on_the_hub(owed, monkeypatch)
     assert _rows(owed) == before
     assert owed_tidy.batch_project(res["batch"]) == PROJECT
     assert owed_tidy.undo(res["batch"], project=PROJECT)["ok"] is True
+
+
+# ---- the fourth review: the owner's own items only get proposals ------------
+
+def _probe_row(cid, owner, label, origin, text="Rebase the release branch"):
+    out = {key: None for key in (*owed_tidy.FINGERPRINT_FIELDS, *owed_tidy.LINEAGE_FIELDS)}
+    out.update(id=cid, project="p", opened_episode=None, opened_at=None, text=text, kind="followup",
+               owner=owner, owner_label=label, origin=origin, status="open", future_trigger=False,
+               owner_reassigned_at=None, lineage=None)
+    return out
+
+
+class _NowCursor:
+    def execute(self, sql, params=()):
+        assert sql == "SELECT now()"
+
+    def fetchone(self):
+        return (datetime(2026, 10, 16, tzinfo=timezone.utc),)
+
+
+def test_hygiene_dedup_does_not_merge_identical_commitments_of_different_owners():
+    from khipu import hygiene
+
+    rows = [
+        {"id": 1, "project": "p", "text": "Rebase the release branch", "owner": "agent",
+         "owner_label": "orchestrator", "origin": "job"},
+        {"id": 2, "project": "p", "text": "Rebase the release branch", "owner": "user",
+         "owner_label": None, "origin": "conversation"},
+    ]
+    assert hygiene._duplicate_groups(rows) == {}
+
+
+def test_tidy_plan_does_not_close_a_cross_owner_duplicate(monkeypatch):
+    from khipu import close_rules
+
+    rows = {1: _probe_row(1, "agent", "orchestrator", "job"), 2: _probe_row(2, "user", None, "conversation")}
+    monkeypatch.setattr(owed_tidy, "_select", lambda cur, project: rows)
+    monkeypatch.setattr(close_rules, "ready", lambda cur: False)
+    plan = owed_tidy._plan(_NowCursor(), "p", judge=None, use_model=False)
+    assert {item["id"]: item["action"] for item in plan["items"]} == {1: "keep", 2: "keep"}
+
+
+def test_tidy_model_does_not_override_the_deterministic_speakers_i_will(monkeypatch):
+    from khipu import close_rules
+
+    row = _probe_row(1, "user", None, "conversation", text="I will rebase the release branch")
+    monkeypatch.setattr(owed_tidy, "_select", lambda cur, project: {1: row})
+    monkeypatch.setattr(close_rules, "ready", lambda cur: False)
+    monkeypatch.setattr(config, "count_setting", lambda name: 1)
+    plan = owed_tidy._plan(_NowCursor(), "p", use_model=True,
+                           judge=lambda texts: [{"owner": "agent", "label": "orchestrator", "reason": "bad"}])
+    assert plan["items"][0]["action"] == "keep"
+    assert "proposed" not in plan["items"][0], "a model proposal that moves the owner's item is dropped"
+
+
+def test_a_duplicate_of_the_owners_item_is_only_proposed(monkeypatch):
+    from khipu import close_rules
+
+    rows = {1: _probe_row(1, "user", None, "conversation"), 2: _probe_row(2, "user", None, "conversation")}
+    monkeypatch.setattr(owed_tidy, "_select", lambda cur, project: rows)
+    monkeypatch.setattr(close_rules, "ready", lambda cur: False)
+    plan = owed_tidy._plan(_NowCursor(), "p", judge=None, use_model=False)
+    second = _by_id(plan)[2]
+    assert second["action"] == "keep"
+    assert second["proposed"]["action"] == "close" and second["proposed"]["close"] == "duplicate"
+    assert plan["totals"]["proposed"] == {"total": 1, "move": 0, "close": 1}
+    assert plan["totals"]["stay_user"] == 2 and plan["samples"]["proposed"][0]["id"] == 2
+
+
+def test_apply_never_changes_the_owners_item_even_from_an_edited_plan(owed, monkeypatch):
+    f = _flood(owed)
+    plan = _plan(owed, judge=FakeModel())
+    items = _by_id(plan)
+    decided, named = f.groups["decided"][0], f.groups["conv_names_user"][0]
+    assert items[decided]["action"] == items[named]["action"] == "keep"
+    # A plan edited by hand to close or move them is refused at the write.
+    items[decided].update(action="close", close="decision", key="decision:1", reason="settled")
+    items[named].update(action="reassign", after={"owner": "agent", "owner_label": "orchestrator",
+                                                  "origin": "conversation"}, rule="owner rules")
+    before = _rows(owed, [decided, named])
+    _app(monkeypatch)
+    out = owed_tidy.apply(plan)
+    assert out["ok"] is True
+    refused = {s["id"] for s in out["skipped"] if "owner's own item" in s["why"]}
+    assert refused == {decided, named}
+    assert _rows(owed, [decided, named]) == before
+    # A close on the owner's item's own pull requests is made.
+    assert all(_rows(owed, [i])[i]["status"] == "closed" for i in f.groups["pr_merged"])

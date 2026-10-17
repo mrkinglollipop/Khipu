@@ -71,7 +71,8 @@ class _Cursor:
             ]
             return
         if s.startswith("UPDATE commitments SET status = 'dropped'"):
-            reason, cid = params
+            # commitments.close_by_rule(status="dropped") before 0034: (episode, reason, id).
+            reason, cid = params[1], params[-1]
             r = self.rows.get(cid)
             self.rowcount = 0
             if r and r["status"] == "open":
@@ -214,9 +215,23 @@ class ApplyTest(unittest.TestCase):
     def _cur(self):
         return _Cursor(_rows(
             "Drive 46 is still running",
+            "Write the 0.3.17 release notes for the seal fix",
+            "Write the 0.3.17 release notes for the seal fix tonight",
+        ))
+
+    def test_the_owners_own_duplicate_and_drop_are_never_applied(self):
+        # The owner guard (fourth review): the owner's items are reported
+        # duplicate or droppable, and left exactly as they are.
+        cur = _Cursor(_rows(
             "Matt to decide whether 0.3.17 ships with the seal fix",
             "Matt to decide whether 0.3.17 ships with the seal fix or waits",
         ))
+        cur.rows[2]["seen_count"] = 5
+        report = hygiene.run_commitments_hygiene(cur, judge=_Judge(), apply=True)
+        self.assertEqual(report["counts"]["duplicate"], 1)
+        self.assertEqual(report["applied"], 0)
+        self.assertTrue(all(r["status"] == "open" for r in cur.rows.values()))
+        self.assertEqual(cur.rows[1]["seen_count"], 1)
 
     def test_dry_run_writes_nothing_and_lists_every_verdict(self):
         cur = self._cur()
@@ -354,6 +369,11 @@ class _SessionCursor:
             self.rows[cid]["future_trigger"] = trigger
             self.rowcount = 1
             return
+        if s.startswith("UPDATE commitments SET future_trigger = %s WHERE"):
+            trigger, cid = params
+            self.rows[cid]["future_trigger"] = trigger
+            self.rowcount = 1
+            return
         if s.startswith("UPDATE commitments SET owner = %s WHERE"):
             owner, cid = params
             self.rows[cid]["owner"] = owner
@@ -370,7 +390,8 @@ class _SessionCursor:
                 self.rowcount = 1
             return
         if s.startswith("UPDATE commitments SET status = 'dropped'"):
-            reason, cid = params
+            # commitments.close_by_rule(status="dropped") before 0034: (episode, reason, id).
+            reason, cid = params[1], params[-1]
             r = self.rows.get(cid)
             self.rowcount = 0
             if r and r["status"] == "open":
