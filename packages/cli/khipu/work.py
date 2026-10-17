@@ -1562,15 +1562,11 @@ def _cmd(args: argparse.Namespace) -> int:
     sub = getattr(args, "work_cmd", None)
     command = f"work {sub}" if sub else "work"
     try:
-        ledger.require(command, owner_words=getattr(args, "owner_words", None),
-                       owner_turn=getattr(args, "owner_turn", None), owner_session=getattr(args, "owner_session", None),
+        ledger.require(command, by_direction=getattr(args, "by_direction", False),
                        intent=ledger.direction_intent(command, args, None))
     except ledger.LedgerError as exc:
         _emit({"ok": False, "error": str(exc), "reason": exc.reason}, indent=None)
         return 1
-    except owner_direction.AlreadyDone as done:
-        _emit(done.answer(), indent=None)
-        return 0
     owner_direction.run_due()
     if sub == "check":
         ok, problems, parsed = check_file(args.file)

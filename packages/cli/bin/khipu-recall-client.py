@@ -70,29 +70,6 @@ def hook_stdout(out):
     return json.dumps(out)
 
 
-TURN_LINE = "Owner turn: "
-TOKEN_CHARS = frozenset("0123456789abcdef")
-
-
-def with_turn_line(out, token):
-    """``khipu.owner_turns.with_turn_line``, copied (this client imports no
-    khipu module; a test pins the two equal): the owner-turn token the
-    launcher recorded, added as one line to what the conversation sees."""
-    if not isinstance(token, str) or len(token) != 8 or not set(token) <= TOKEN_CHARS:
-        return out
-    line = TURN_LINE + token
-    out = dict(out) if isinstance(out, dict) else {}
-    hso = out.get("hookSpecificOutput")
-    if isinstance(hso, dict):
-        hso = dict(hso)
-        ctx = hso.get("additionalContext")
-        hso["additionalContext"] = ctx + "\n\n" + line if isinstance(ctx, str) and ctx else line
-        out["hookSpecificOutput"] = hso
-    else:
-        out["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit", "additionalContext": line}
-    return out
-
-
 def socket_path():
     isolated = os.environ.get("KHIPU_ISOLATED_DIR")
     if isolated:
@@ -161,7 +138,6 @@ def log_failure(raw, reason, started):
 
 def main(argv):
     shape = "cursor" if any(a in ("cursor", "--cursor") for a in argv[1:]) else "claude"
-    token = os.environ.get("KHIPU_OWNER_TURN")
     raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
     started = time.monotonic()
     deadline = started + ANSWER_TIMEOUT_S
@@ -181,8 +157,6 @@ def main(argv):
         sock.sendall(request.encode("utf-8"))
         line = read_answer(sock, deadline)
         out = as_hook_output(line)
-        if out is not None and shape == "claude":
-            out = with_turn_line(out, token)
         text = hook_stdout(out) if out is not None else None
         if text is not None and time.monotonic() < deadline:
             sys.stdout.write(text + "\n")
@@ -204,8 +178,7 @@ def main(argv):
     if remaining >= 1.4:
         sys.stdout.write(str(deadline))
         return NO_CONNECTION
-    empty = with_turn_line({}, token) if shape == "claude" else {}
-    sys.stdout.write((hook_stdout(empty) or "{}") + "\n")
+    sys.stdout.write((hook_stdout({}) or "{}") + "\n")
     return NO_BUDGET
 
 

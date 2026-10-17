@@ -3302,13 +3302,6 @@ def prompt_recall_main(*, shape: str | None = None) -> None:
         finish_delivery(delivery, delivered=False, reason="error: hook_main crashed")
         log_terminal_outcome(raw, f"error: hook_main crashed: {type(exc).__name__}: {exc}")
         out = {}
-    if want == "claude":
-        try:
-            from khipu.owner_turns import with_turn_line
-
-            out = with_turn_line(out, os.environ.get("KHIPU_OWNER_TURN"))
-        except Exception:  # noqa: BLE001 - the turn line never costs the answer
-            pass
     try:
         print(wire.dumps(out, ensure_ascii=True), flush=True)
     except OSError:

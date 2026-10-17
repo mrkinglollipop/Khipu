@@ -1294,8 +1294,8 @@ def _session_forms(session_id: str) -> set[str]:
 
 def _owner_words_scan(session_id: str | None, *, gateway: bool) -> dict[str, Any]:
     """The owner's typed words recorded for the episode's session: its turn
-    files and briefs (``owner_turns.forget_sessions``), the widenings it asked
-    for, the words in its owner-actions lines (scrubbed, the chain and Undo
+    files and briefs (``owner_turns.forget_sessions``), the old widenings
+    file, the words in its owner-actions lines (scrubbed, the chain and Undo
     kept), and every rewrite temp a crash left that could hold them
     (``owner_files.clean_temps``). Local files only: on the gateway there are none, and nothing remote
     is touched. A part that can't be done keeps the forget open."""
@@ -1310,7 +1310,7 @@ def _owner_words_scan(session_id: str | None, *, gateway: bool) -> dict[str, Any
     forms = _session_forms(str(session_id))
     try:
         removed = owner_turns.forget_sessions(forms)
-        removed["pending"] = owner_direction.forget_pending(forms)
+        removed["pending"] = owner_direction.remove_old_widenings()
         removed["log_lines"] = owner_direction.scrub_words(forms)
         temps = owner_files.clean_temps(forms)
         removed["temps"] = temps["removed"]

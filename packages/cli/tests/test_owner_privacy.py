@@ -1,10 +1,11 @@
 """Owner direction: privacy and the purge timer (docs/plans/2026-10-16-owner-direction.md).
 
-The owner's typed words are kept for a day and no longer: a read past the retention
-removes them, and the replica-refresh timer removes them when no further prompt comes.
-Forgetting an episode removes its session's recorded owner words (turn files, briefs,
-widenings waiting for a yes) and scrubs the words from its owner-actions lines, which
-keep their hash so the log's chain still holds. On the gateway the scan does not apply
+The owner's typed text is never kept: a turn record holds only when it was typed, whether
+it was a machine message, and so on. The records themselves go after a day: a read past the
+retention removes them, and the replica-refresh timer removes them when no further prompt
+comes. Forgetting an episode removes its session's turn files and briefs, deletes an old
+widenings file, and scrubs words from owner-actions lines written under the old design,
+which keep their hash so the log's chain still holds. On the gateway the scan does not apply
 and touches nothing. A purge runs on its own once its day has passed, from the same
 timer, and from its deadline on it can no longer be cancelled.
 
@@ -35,14 +36,25 @@ def folders(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _say(session: str, text: str, at: float, cwd) -> None:
-    owner_turns.record({"session_id": session, "prompt": text, "cwd": str(cwd)}, CLAUDE_HOOK, now=at)
+def _say(session: str, text: str, at: float, cwd) -> str | None:
+    return owner_turns.record({"session_id": session, "prompt": text, "cwd": str(cwd)}, CLAUDE_HOOK, now=at)
+
+
+def _old_widenings() -> "os.PathLike":
+    """An old waiting-widenings file, as the earlier design left it."""
+    from khipu.paths import data_dir
+
+    path = data_dir() / owner_direction.OLD_PENDING_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps([{"action": "direction.set", "session": "s-old", "words": "old words"}]),
+                    encoding="utf-8")
+    return path
 
 
 # ---- the original probes ----------------------------------------------------------------------
 
 
-def test_owner_turn_plaintext_is_not_left_past_retention_without_another_prompt(tmp_path, monkeypatch):
+def test_owner_turn_records_are_not_left_past_retention_without_another_prompt(tmp_path, monkeypatch):
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
     monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
     session = "review-retention"
@@ -53,11 +65,14 @@ def test_owner_turn_plaintext_is_not_left_past_retention_without_another_prompt(
         now=at,
     )
     path = owner_turns.session_file(session)
-    assert "pause Codex until five" in path.read_text(encoding="utf-8")
+    # The record is there, and the typed words never were.
+    (row,) = owner_turns.turns(session, now=at + 1)
+    assert row["typed"] is True and "text" not in row
+    assert "pause Codex until five" not in path.read_text(encoding="utf-8")
 
     # Retention is a privacy deadline, not merely a filtered read result.
     assert owner_turns.turns(session, now=at + owner_turns.RETENTION_S + 1) == []
-    assert not path.exists(), "expired owner words remain plaintext until a future prompt is recorded"
+    assert not path.exists(), "an expired turn record remains until a future prompt is recorded"
 
 
 def test_undo_refuses_a_scheduled_purge_once_its_deadline_has_passed(tmp_path, monkeypatch):
@@ -76,8 +91,8 @@ def test_undo_refuses_a_scheduled_purge_once_its_deadline_has_passed(tmp_path, m
         owner_direction._clock = original_clock
 
 
-def test_completed_local_forget_does_not_leave_raw_owner_turn_words(tmp_path, monkeypatch):
-    """A fake local forget may complete only if its matching owner words are gone too."""
+def test_completed_local_forget_does_not_leave_the_sessions_turn_records(tmp_path, monkeypatch):
+    """A fake local forget may complete only if the session's turn records are gone too."""
     from tests import test_forget_ownership as fo
 
     data = tmp_path / "data"
@@ -101,7 +116,7 @@ def test_completed_local_forget_does_not_leave_raw_owner_turn_words(tmp_path, mo
     )
     raw_turn = owner_turns.session_file("codex:forget-review")
     assert fo.run_forget(world, 1, root)["complete"] is True
-    assert not raw_turn.exists(), "forget completed while matching raw owner words remained"
+    assert not raw_turn.exists(), "forget completed while the session's turn records remained"
 
 
 # ---- retention --------------------------------------------------------------------------------
@@ -109,40 +124,38 @@ def test_completed_local_forget_does_not_leave_raw_owner_turn_words(tmp_path, mo
 
 def test_a_read_keeps_the_fresh_lines_and_drops_only_the_expired_ones(folders):
     at = 1_700_000_000.0
-    _say("s-mixed", "first words long ago", at, folders)
-    _say("s-mixed", "fresh words", at + owner_turns.RETENTION_S - 10, folders)
+    old = _say("s-mixed", "first words long ago", at, folders)
+    fresh = _say("s-mixed", "fresh words", at + owner_turns.RETENTION_S - 10, folders)
     later = at + owner_turns.RETENTION_S + 1
-    assert [t["text"] for t in owner_turns.turns("s-mixed", now=later)] == ["fresh words"]
+    assert [t["turn"] for t in owner_turns.turns("s-mixed", now=later)] == [fresh]
     raw = owner_turns.session_file("s-mixed").read_text(encoding="utf-8")
-    assert "first words long ago" not in raw and "fresh words" in raw
+    assert old not in raw and fresh in raw
+    assert "first words long ago" not in raw and "fresh words" not in raw
 
 
-def test_the_sweep_prunes_every_file_line_by_line_and_expires_waiting_widenings(folders):
+def test_the_sweep_prunes_every_file_line_by_line_and_deletes_an_old_widenings_file(folders):
     at = 1_700_000_000.0
     day = owner_turns.RETENTION_S
     _say("s-old", "all of this is old", at, folders)
-    _say("s-both", "old line in a fresh file", at, folders)
-    _say("s-both", "new line in that file", at + day - 5, folders)
+    old_line = _say("s-both", "old line in a fresh file", at, folders)
+    new_line = _say("s-both", "new line in that file", at + day - 5, folders)
     # A fresh mtime must not keep old lines: expiry is by each line's time.
     os.utime(owner_turns.session_file("s-old"), None)
     owner_turns.note_brief("a dispatched brief from long ago, long enough", parent="s-old", harness="claude_code",
                            now=at)
     owner_turns.note_brief("a dispatched brief from just now, long enough", parent="s-both",
                            harness="claude_code", now=at + day - 5)
-    owner_direction._save_pending([
-        {"action": "direction.set", "target": "latest_window_h", "session": "s-old", "ts": at, "words": "old"},
-        {"action": "direction.set", "target": "earlier_window_min", "session": "s-both", "ts": at + day - 5,
-         "words": "new"}])
+    widenings = _old_widenings()
 
     out = owner_turns.sweep(now=at + day + 1)
 
     assert out["ok"] is True, out
     assert not owner_turns.session_file("s-old").exists()
     both = owner_turns.session_file("s-both").read_text(encoding="utf-8")
-    assert "old line in a fresh file" not in both and "new line in that file" in both
+    assert old_line not in both and new_line in both
     briefs = (owner_turns.folder() / "briefs.jsonl").read_text(encoding="utf-8")
     assert "long ago" not in briefs and "just now" in briefs
-    assert [p["words"] for p in owner_direction._pending()] == ["new"]
+    assert out["pending"] == 1 and not widenings.exists()
 
 
 def test_the_replica_refresh_job_runs_the_sweep_and_due_purges(folders, monkeypatch):
@@ -173,21 +186,25 @@ def test_the_replica_refresh_job_still_heals_when_the_sweep_fails(folders, monke
 # ---- forget: the owner words scan -------------------------------------------------------------
 
 
-def _direction_with_words(world, session: str, words: str, verb: str) -> dict:
+def _direction_with_old_words(world, session: str, words: str, verb: str) -> dict:
+    """A direction in ``session``, then a line the earlier design wrote for it
+    (its words in the log), so the scrub has something to find."""
     world.be(session)
-    token = world.say(words, session=session)
-    rc, out = world.run(["route", verb, "Codex"], words, token)
+    world.say(session=session)
+    rc, out = world.run(["route", verb, "Codex"], True)
     assert rc == 0 and out["ok"], out
+    assert not any(x.get("words") for x in owner_direction.read_log() if x.get("session") == session)
+    owner_direction._append({"kind": "action", "id": f"old-{session}", "session": session,
+                             "action": f"route.{verb}", "target": "codex|", "words": words})
     return next(x for x in owner_direction.read_log() if x.get("session") == session and x.get("words"))
 
 
-def test_forget_scrubs_the_sessions_words_and_the_chain_still_holds(world):
-    _direction_with_words(world, "s-forgotten", "pause Codex for now", "pause")
-    _direction_with_words(world, "s-kept", "lift Codex please", "lift")
+def test_forget_scrubs_old_words_and_deletes_the_turns_and_the_chain_still_holds(world):
+    _direction_with_old_words(world, "s-forgotten", "pause Codex for now", "pause")
+    _direction_with_old_words(world, "s-kept", "lift Codex please", "lift")
     owner_turns.note_brief("a dispatched brief from the forgotten session", parent="s-forgotten",
                            harness="claude_code")
-    owner_direction._save_pending([{"action": "direction.set", "target": "latest_window_h",
-                                    "session": "s-forgotten", "ts": time.time(), "words": "pending words"}])
+    widenings = _old_widenings()
 
     out = forget._owner_words_scan("claude_code:s-forgotten", gateway=False)
 
@@ -195,7 +212,7 @@ def test_forget_scrubs_the_sessions_words_and_the_chain_still_holds(world):
     assert not owner_turns.session_file("s-forgotten").exists()
     assert owner_turns.session_file("s-kept").exists()
     assert "forgotten session" not in (owner_turns.folder() / "briefs.jsonl").read_text(encoding="utf-8")
-    assert owner_direction._pending() == []
+    assert out["removed"]["pending"] == 1 and not widenings.exists()
     raw = owner_direction.log_path().read_text(encoding="utf-8")
     assert "pause Codex for now" not in raw and "lift Codex please" in raw
     scrubbed = [x for x in owner_direction.read_log() if x.get("session") == "s-forgotten" and x.get("scrubbed")]
@@ -274,8 +291,8 @@ def _scheduled_purge(world, monkeypatch, row: str = "T-12") -> tuple[dict, list]
     purged: list = []
     monkeypatch.setattr(ledger, "_connect", lambda: type("C", (), {"close": lambda self: None})())
     monkeypatch.setattr(ledger, "purge", lambda conn, project, r: purged.append((project, r)) or {"ok": True})
-    words = f"purge {row} from the atlas ledger"
-    rc, out = world.run(["ledger", "purge", row, "--project", "atlas", "--json"], words, world.say(words))
+    world.say(f"purge {row} from the atlas ledger")
+    rc, out = world.run(["ledger", "purge", row, "--project", "atlas", "--json"], True)
     assert rc == 0 and out["state"] == "scheduled", out
     return owner_direction.actions()[-1], purged
 
@@ -299,8 +316,8 @@ def test_undo_says_a_purge_already_ran_once_it_ran(world, monkeypatch):
 def test_an_undo_command_for_a_due_purge_is_refused_with_the_deadline(world, monkeypatch):
     line, _purged = _scheduled_purge(world, monkeypatch)
     monkeypatch.setattr(owner_direction, "_clock", lambda: time.time() + owner_direction.PURGE_DELAY_S + 60)
-    words = f"undo the purge {line['id']}"
-    rc, out = world.run(["owner-direction", "undo", line["id"]], words, world.say(words))
+    world.say("undo that purge please")
+    rc, out = world.run(["owner-direction", "undo", line["id"]], True)
     assert rc == 2 and out["code"] == "refused" and "deadline" in out["error"], out
 
 
@@ -338,7 +355,7 @@ def _crash_temps(words: str, session: str) -> list:
     brief_tmp.write_text(json.dumps({"parent": session, "head": words, "sha": "digest"}) + "\n", encoding="utf-8")
     turn_tmp = owner_turns.folder() / ".other-session.jsonl.77.tmp"
     turn_tmp.write_text('{"session": "other-session", "text": "' + words[:12], encoding="utf-8")
-    pending_tmp = owner_direction._pending_path().with_name(".owner-direction-pending.json.123.tmp")
+    pending_tmp = owner_direction.log_path().with_name(".owner-direction-pending.json.123.tmp")
     pending_tmp.parent.mkdir(parents=True, exist_ok=True)
     pending_tmp.write_text(json.dumps([{"session": session, "words": words}]) + "\n", encoding="utf-8")
     action_tmp = owner_direction.log_path().with_name(".owner-actions.jsonl.123.tmp")
@@ -352,7 +369,7 @@ def _age(paths, seconds: float) -> None:
         os.utime(path, (then, then))
 
 
-def test_forget_removes_crash_temps_for_briefs_pending_and_action_words(folders):
+def test_forget_removes_crash_temps_for_briefs_old_widenings_and_action_words(folders):
     session = "forgotten-session"
     words = "raw owner words from an interrupted private rewrite"
     temps = _crash_temps(words, session)
@@ -393,7 +410,7 @@ def test_every_file_owner_direction_writes_is_in_the_inventory(folders, monkeypa
     owner_turns.record({"session_id": session, "prompt": "pause Codex for review", "cwd": "/w"}, HOOK)
     owner_turns.note_brief("a delegated brief with the owner's words in it", parent=session, harness="claude_code")
     owner_turns.write_settings({"enabled": True})
-    owner_direction._save_pending([{"session": session, "words": "x y z", "ts": time.time()}])
+    _old_widenings()
     owner_direction._append({"kind": "action", "id": "inv-1", "session": session, "action": "route.pause",
                              "target": "codex|", "words": "pause Codex for review"})
     owner_direction.scrub_words({session})
@@ -407,19 +424,19 @@ def test_every_file_owner_direction_writes_is_in_the_inventory(folders, monkeypa
     assert {"turns", "briefs", "settings", "pending", "log", "head", "lock", "temp"} <= kinds, kinds
 
 
-def test_normal_forget_scrubs_words_and_keeps_the_action_log_chain_and_undo_state(folders):
+def test_normal_forget_scrubs_old_words_and_keeps_the_action_log_chain_and_undo_state(folders):
     session = "normal-forget"
     words = "pause Codex for review"
     owner_turns.record({"session_id": session, "prompt": words, "cwd": str(folders)}, HOOK, now=1700000000)
     owner_turns.note_brief("a delegated brief containing the owner words", parent=session, harness="claude_code",
                            now=1700000000)
-    owner_direction._save_pending([{"session": session, "words": words, "ts": 1700000000}])
+    widenings = _old_widenings()
     owner_direction._append({"kind": "action", "id": "forget-log", "session": session,
                              "action": "route.pause", "target": "codex|", "state": "done", "words": words})
     owner_turns.forget_sessions({session})
-    owner_direction.forget_pending({session})
+    assert owner_direction.remove_old_widenings() == 1
     owner_direction.scrub_words({session})
-    assert not owner_turns.session_file(session).exists()
+    assert not owner_turns.session_file(session).exists() and not widenings.exists()
     assert words not in (owner_turns.folder() / "briefs.jsonl").read_text(encoding="utf-8")
     assert words not in owner_direction.log_path().read_text(encoding="utf-8")
     assert owner_direction.verify_log()["first_bad"] is None
@@ -427,16 +444,18 @@ def test_normal_forget_scrubs_words_and_keeps_the_action_log_chain_and_undo_stat
     assert line["words"] is None and line["words_sha"]
 
 
-def test_retention_read_prunes_expired_words_but_keeps_fresh_words(folders):
+def test_retention_read_prunes_expired_records_but_keeps_fresh_ones_and_never_the_words(folders):
     at = 1700000000
     session = "mixed-retention"
-    owner_turns.record({"session_id": session, "prompt": "expired owner words", "cwd": str(folders)}, HOOK, now=at)
-    owner_turns.record({"session_id": session, "prompt": "fresh owner words", "cwd": str(folders)}, HOOK,
-                       now=at + owner_turns.RETENTION_S - 1)
+    expired = owner_turns.record({"session_id": session, "prompt": "expired owner words", "cwd": str(folders)},
+                                 HOOK, now=at)
+    fresh = owner_turns.record({"session_id": session, "prompt": "fresh owner words", "cwd": str(folders)}, HOOK,
+                               now=at + owner_turns.RETENTION_S - 1)
     got = owner_turns.turns(session, now=at + owner_turns.RETENTION_S + 1)
     raw = owner_turns.session_file(session).read_text(encoding="utf-8")
-    assert [turn["text"] for turn in got] == ["fresh owner words"]
-    assert "expired owner words" not in raw and "fresh owner words" in raw
+    assert [turn["turn"] for turn in got] == [fresh]
+    assert expired not in raw and fresh in raw
+    assert "expired owner words" not in raw and "fresh owner words" not in raw
 
 
 def test_purge_cannot_run_early_or_be_cancelled_after_deadline(folders, monkeypatch):

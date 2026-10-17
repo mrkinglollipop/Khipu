@@ -20,8 +20,8 @@ REPORTER = {"kind": "conversation", "harness": "codex", "project": "p", "session
 
 
 def _pause_by_direction(world, words: str = "pause Codex for now") -> tuple[int, dict]:
-    token = world.say(words)
-    return world.run(["route", "pause", "Codex"], words, token)
+    world.say(words)
+    return world.run(["route", "pause", "Codex"], True)
 
 
 def _chain_ok() -> None:
@@ -48,12 +48,12 @@ def test_direction_never_reports_success_when_its_undo_log_cannot_be_written(wor
 def test_clear_can_restore_the_report_it_replaced(world):
     routing.report(state="limited", account="Codex", until="2h", author=dict(REPORTER))
     words = "clear Codex report please"
-    token = world.say(words)
-    rc, out = world.run(["route", "clear", "Codex"], words, token)
+    world.say(words)
+    rc, out = world.run(["route", "clear", "Codex"], True)
     assert rc == 0 and _state("codex|") == "open", out
     words = "undo that clear please"
-    token = world.say(words)
-    rc, out = world.run(["owner-direction", "undo", out["owner_action"]], words, token)
+    world.say(words)
+    rc, out = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 0 and _state("codex|") == "limited", out
     _chain_ok()
 
@@ -111,7 +111,8 @@ def test_a_completion_that_cannot_be_written_leaves_an_unconfirmed_line_that_und
     assert owner_direction.line_state(out["owner_action"]) == "unconfirmed"
     monkeypatch.setattr(owner_direction, "_append", real)
     words = "undo that pause on Codex"
-    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], words, world.say(words))
+    world.say(words)
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 0 and _state("codex|") != "paused", undone
     assert owner_direction.line_state(out["owner_action"]) == "undone"
     _chain_ok()
@@ -159,7 +160,8 @@ def test_undo_is_written_before_the_inverse_and_completed_after(world, monkeypat
 
     monkeypatch.setattr(routing, "lift", watched)
     words = "undo that pause on Codex"
-    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], words, world.say(words))
+    world.say(words)
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 0 and _state("codex|") != "paused", undone
     pending = seen[0][-1]
     assert (pending["kind"], pending["undoes"], pending["state"]) == ("undo", out["owner_action"], "pending")
@@ -178,7 +180,8 @@ def test_an_undo_that_fails_leaves_the_action_standing(world, monkeypatch):
 
     monkeypatch.setattr(routing, "lift", broken)
     words = "undo that pause on Codex"
-    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], words, world.say(words))
+    world.say(words)
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 2 and _state("codex|") == "paused", undone
     assert owner_direction.line_state(out["owner_action"]) == "applied"
     undo_line = next(x for x in owner_direction.read_log() if x.get("kind") == "undo")
@@ -195,7 +198,8 @@ def test_an_undo_whose_log_cannot_be_written_changes_nothing(world, monkeypatch)
 
     monkeypatch.setattr(owner_direction, "_append", full)
     words = "undo that pause on Codex"
-    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], words, world.say(words))
+    world.say(words)
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 2 and undone["code"] == "log_unwritable" and _state("codex|") == "paused", undone
 
 
@@ -232,8 +236,8 @@ def test_undoing_an_older_clear_keeps_the_newer_one(world, khipu_app):
 def test_a_dismissed_report_comes_back_on_undo(world, khipu_app):
     report = routing.report(state="limited", account="Codex", until="2h", author=dict(REPORTER))
     words = "dismiss that Codex report please"
-    token = world.say(words)
-    rc, out = world.run(["route", "clear", "Codex", "--report", report["id"]], words, token)
+    world.say(words)
+    rc, out = world.run(["route", "clear", "Codex", "--report", report["id"]], True)
     assert rc == 0 and _state("codex|") != "limited", out
     khipu_app.as_app()
     rc, undone = world.run(["owner-direction", "undo", out["owner_action"], "--from-app"])
@@ -267,7 +271,8 @@ def test_an_undo_left_unconfirmed_shows_its_action_as_unconfirmed(world, monkeyp
 
     monkeypatch.setattr(owner_direction, "_append", no_completion)
     words = "undo that pause on Codex"
-    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], words, world.say(words))
+    world.say(words)
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 0 and _state("codex|") != "paused", undone
     undo_line = next(x for x in owner_direction.read_log() if x.get("kind") == "undo")
     assert owner_direction.line_state(undo_line["id"]) == "unconfirmed"

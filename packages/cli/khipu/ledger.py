@@ -2392,8 +2392,7 @@ def cmd(args: argparse.Namespace) -> int:
             except Exception:  # noqa: BLE001 - no intent: a direction is refused, the command says why
                 intent = None
         stamp = require(command, from_app=getattr(args, "from_app", False), dry_run=getattr(args, "dry_run", False),
-                        owner_words=getattr(args, "owner_words", None), owner_turn=getattr(args, "owner_turn", None),
-                        owner_session=getattr(args, "owner_session", None), intent=intent)
+                        by_direction=getattr(args, "by_direction", False), intent=intent)
         from khipu import owner_direction
 
         owner_direction.run_due()
@@ -2408,6 +2407,7 @@ def cmd(args: argparse.Namespace) -> int:
         if verb == "project":
             result = set_project(project, name=args.rename,
                                  hidden=True if args.hide else False if args.show else None)
+            result = owner_direction.finish(result) or result
             _emit(args, result, result["line"])
             return 0
         if verb in ("add", "set", "remove", "restore"):
@@ -2478,9 +2478,6 @@ def cmd(args: argparse.Namespace) -> int:
         else:
             _say(f"error: {exc}")
         return 1
-    except _already_done() as done:
-        _emit(args, done.answer(), "already done")
-        return 0
     except Exception as exc:  # noqa: BLE001  (an unexpected error answers through the same emit)
         from khipu import agent_view
 
@@ -2515,32 +2512,31 @@ _APP_ONLY = {
 
 # The owner-direction action each owner verb is (``owner_direction.ACTIONS``);
 # a writer verb is the owner's only when it is written as him (row 16 of the
-# owner-direction scope: --from-app, or his words).
+# owner-direction scope: --from-app, or his direction).
 DIRECTION_ACTIONS = {
     "ledger import": "ledger.import", "ledger restore": "ledger.restore", "ledger purge": "ledger.purge",
+    "ledger project": "ledger.project",
     "ledger add": "ledger.add", "ledger set": "ledger.set", "ledger remove": "ledger.remove",
     "work hide": "work.hide", "work unhide": "work.unhide", "work same": "work.same", "work not-same": "work.not_same",
 }
 
 
-def require(command: str, *, from_app: bool = False, dry_run: bool = False, owner_words: str | None = None,
-            owner_turn: str | None = None, intent: dict | None = None, owner_session: str | None = None) -> dict | None:
+def require(command: str, *, from_app: bool = False, dry_run: bool = False, by_direction: bool = False,
+            intent: dict | None = None) -> dict | None:
     """The one owner check for every verb that changes anything (see
     ``WRITE_POLICY``); raises ``LedgerError`` when this caller may not run
     ``command``. ``dry_run`` (an import that writes nothing) only reads. A
     verb in neither table is refused: a new verb must be classified.
 
-    ``owner_words`` (with ``owner_turn``, and ``owner_session`` for a
-    dispatched job) asks for the owner-direction check
-    on ``intent`` in place of the app or a typed yes: the owner's verbs, the
-    app's (restore, purge) and a write as the owner. Returns the direction's
-    auth stamp then (``owner_direction.AlreadyDone`` when this turn already
-    did it), else None."""
+    ``by_direction`` asks for the owner-direction check on ``intent`` in
+    place of the app or a typed yes: the owner's verbs, the app's (restore,
+    purge) and a write as the owner. Returns the direction's auth stamp
+    then, else None."""
     policy = WRITE_POLICY.get(command)
     if policy is None and command not in READ_VERBS:
         raise LedgerError(f"{command} is not a known verb; nothing was changed", "unknown_verb")
-    if owner_words is not None and not from_app and not dry_run and policy is not None:
-        return _direction(command, owner_words, owner_turn, intent, owner_session)
+    if by_direction and not from_app and not dry_run and policy is not None:
+        return _direction(command, intent)
     if policy is None or dry_run or policy == "writer":
         if from_app:
             _check_from_app()
@@ -2564,19 +2560,17 @@ def require(command: str, *, from_app: bool = False, dry_run: bool = False, owne
     if routing.typed_yes(f"This is the owner's change ({command}). Type yes to confirm: "):
         _noted(intent, "terminal")
         return None
-    raise LedgerError("only the Khipu app, the owner's yes typed on a terminal, or the owner's own words by owner "
-                      "direction can make this change; nothing was changed", "not_app")
+    raise LedgerError("only the Khipu app, the owner's yes typed on a terminal, or a conversation the owner is "
+                      "typing in (owner direction) can make this change; nothing was changed", "not_app")
 
 
-def _direction(command: str, words: str, turn: str | None, intent: dict | None, session: str | None = None) -> dict:
-    from types import SimpleNamespace
-
+def _direction(command: str, intent: dict | None) -> dict:
     from khipu import owner_direction
 
     if intent is not None and intent.get("action") != DIRECTION_ACTIONS.get(command):
         intent = None
     try:
-        return owner_direction.gate(SimpleNamespace(owner_words=words, owner_turn=turn, owner_session=session), intent)
+        return owner_direction.gate(intent)
     except owner_direction.DirectionRefused as err:
         raise LedgerError(err.message, err.code) from None
 
@@ -2596,21 +2590,13 @@ def direction_intent(command: str, args: argparse.Namespace, project: str | None
     if action is None:
         return None
     if action == "ledger.import":
-        return owner_direction.intent(action, str(args.file), project=project)
+        return owner_direction.intent(action, str(args.file), facts={"project": project} if project else None)
+    if action == "ledger.project":
+        return owner_direction.intent(action, project) if project else None
     if action.startswith("ledger."):
         if not project or not getattr(args, "id", None):
             return None
-        stored, fields = None, None
-        if action == "ledger.add":
-            stored = [args.title]
-        elif action == "ledger.set":
-            # Each field it sets and the value it gives are arguments the
-            # owner's words must state ("set T-12 title to done" never sets
-            # the state).
-            fields = {k: v for k in ("state", "evidence", "owner", "title", "link")
-                      if isinstance(v := getattr(args, k, None), str) and v.strip()} or None
-            stored = list(fields.values()) if fields else None
-        return owner_direction.intent(action, f"{project}#{args.id}", stored=stored, fields=fields)
+        return owner_direction.intent(action, f"{project}#{args.id}")
     if action in ("work.hide", "work.unhide"):
         return owner_direction.intent(action, str(args.id))
     return owner_direction.intent(action, f"{args.row}|{args.commitment}")
@@ -2626,12 +2612,6 @@ def _check_from_app() -> None:
     if not routing._caller()["app"]:
         raise LedgerError("only the Khipu app can make this change as you; it was not the app that asked, "
                           "so nothing was changed", "not_app")
-
-
-def _already_done() -> type:
-    from khipu.owner_direction import AlreadyDone
-
-    return AlreadyDone
 
 
 def _cmd_write(args: argparse.Namespace, verb: str, project: str, *, owner: bool = False) -> int:

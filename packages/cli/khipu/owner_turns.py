@@ -1,25 +1,27 @@
-"""Owner turns: what the owner typed, recorded by Khipu's own prompt hook.
+"""Owner turns: when the owner last typed in each conversation, recorded by
+Khipu's own prompt hook.
 
 The owner-direction check (``owner_direction``) accepts an owner action from
-a conversation only when the owner's words are in a turn recorded here. An
-agent cannot write here: the only writer is the UserPromptSubmit hook, which
-the harness runs with the turn the person sent. Text that reached the agent
-any other way (a page, a file, a tool's output, another session's message)
-never passes through this hook as this session's typed turn.
+a conversation only when an owner turn of that conversation is recorded here
+within the window. An agent cannot write here: the only writer is the
+UserPromptSubmit hook, which the harness runs with the turn the person sent.
+A background job, a dispatched job's brief or another session's message is
+never recorded as this conversation's typed turn.
 
 One file per session, ``<capture home>/owner-turns/<session>.jsonl``, mode
-0600 in a 0700 folder: never synced, captured, searched or backed up. Lines
-older than ``RETENTION_S`` go on the next write or read of the file, and on
-the timer's ``sweep`` (the replica-refresh job) when neither comes. Standard
-library plus ``khipu.t3`` and ``khipu.turn_text``, so the hook's recorder
-starts in a few milliseconds without the rest of the package.
+0600 in a 0700 folder: never synced, captured, searched or backed up. Each
+line is a time and facts about the turn, never its text. Lines older than
+``RETENTION_S`` go on the next write or read of the file, and on the timer's
+``sweep`` (the replica-refresh job) when neither comes. Standard library plus
+``khipu.t3`` and ``khipu.turn_text``, so the hook's recorder starts in a few
+milliseconds without the rest of the package.
 
 Which turns count (``eligible``) is decided at check time against the
 current settings, so turning the check off or tightening it applies to turns
-already recorded. The recorder stores the facts: harness, entrypoint, and
-whether the turn was a machine message, a T3 helper or a dispatched brief,
-and which process ran the hook (``hook_issuer``), which the check needs to
-be above the call that acts on the turn.
+already recorded. The recorder stores the facts: harness, entrypoint,
+whether the turn held typed words, whether it was a machine message, a T3
+helper or a dispatched brief, and which process ran the hook
+(``hook_issuer``), which the check needs to be above the call that acts.
 """
 from __future__ import annotations
 
@@ -37,9 +39,6 @@ from khipu import t3
 from khipu.turn_text import clean_user_text, is_machine, owner_text
 
 RETENTION_S = 24 * 3600
-TEXT_MOST = 8000
-TURN_LINE = "Owner turn: "
-TOKEN_RE = re.compile(r"[0-9a-f]{8}")
 # Front ends whose typed turns are the owner's. ``harness:entrypoint``, where
 # the entrypoint is Claude Code's CLAUDE_CODE_ENTRYPOINT ("cli" interactive,
 # Remote Control included; "sdk-cli" is ``claude -p``), Codex's originator
@@ -50,7 +49,6 @@ DEFAULT_TRUSTED = ("claude_code:cli", "claude_code:t3", "codex:codex_cli_rs", "c
 DEFAULTS = {
     "enabled": True,
     "latest_window_h": 6.0,
-    "earlier_window_min": 30.0,
     "trusted": list(DEFAULT_TRUSTED),
     "session_binding": True,
 }
@@ -180,27 +178,6 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str) -> str:
     return "unknown"
 
 
-_DIRECTION_WORD = re.compile(r"(?<!\w)direction(?!\w)")
-_SHORT_CONFIRM = re.compile(r"(?<!\w)(?:yes|confirm|confirmed|do it|go ahead|approve|approved)(?!\w)")
-_CONFIRM_MOST_WORDS = 8
-_CONFIRM_WITHIN_S = 3600
-
-
-def _may_turn_on(session: str, typed: str | None, now: float) -> bool:
-    """While owner direction is off, only the turns that could turn it back
-    on by chat are kept (decision 1's two turns): one that names owner
-    direction, and a short yes soon after a kept turn of the same session.
-    Everything else the owner types is not recorded."""
-    norm = _norm(typed or "")
-    if not norm:
-        return False
-    if _DIRECTION_WORD.search(norm):
-        return True
-    if len(norm.split()) > _CONFIRM_MOST_WORDS or not _SHORT_CONFIRM.search(norm):
-        return False
-    return any(now - float(t.get("ts") or 0) <= _CONFIRM_WITHIN_S for t in turns(session, now))
-
-
 def _norm(text: str) -> str:
     return " ".join(text.lower().split())
 
@@ -266,7 +243,7 @@ def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
         return False, "a T3 helper session"
     if turn.get("delegated"):
         return False, "a dispatched job's brief"
-    if not (turn.get("text") or "").strip():
+    if not turn.get("typed", bool((turn.get("text") or "").strip())):
         return False, "no typed text"
     key = f"{turn.get('harness')}:{turn.get('entrypoint')}"
     if key not in conf["trusted"]:
@@ -335,10 +312,9 @@ def hook_issuer() -> dict | None:
 
 def record(payload: dict, env: dict | None = None, now: float | None = None,
            issuer: dict | None = None) -> str | None:
-    """Record one prompt-submit turn. Returns the turn token to push into the
-    conversation when the turn is eligible and the harness shows hook output
-    (Claude Code, Codex), else None. ``issuer`` None means this process's
-    (``hook_issuer``). Never raises."""
+    """Record one prompt-submit turn. Returns its id, or None when nothing
+    was recorded. ``issuer`` None means this process's (``hook_issuer``).
+    Never raises."""
     try:
         return _record(payload, os.environ if env is None else env, time.time() if now is None else now, issuer)
     except Exception:  # noqa: BLE001 - the recorder must never fail a prompt
@@ -357,8 +333,6 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
     typed = owner_text(prompt)
     machine = is_machine(clean_user_text(prompt, owner=True), anywhere=True)
-    if not conf["enabled"] and (machine or not _may_turn_on(session, typed, now)):
-        return None
     # A wrapper away from its harness's place: which words are the owner's
     # can't be told, so none are kept and the turn never counts.
     wrapped = typed is None and not machine
@@ -370,7 +344,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
         "ts": now, "harness": harness, "session": session,
         "entrypoint": entrypoint_of(harness, env, payload, session), "cwd": cwd,
         "turn": secrets.token_hex(4),
-        "text": "" if machine else text[:TEXT_MOST],
+        "typed": bool(text.strip()) and not machine,
         "machine": machine, "wrapped": wrapped, "helper": t3.is_helper_session(cwd), "issuer": issuer,
     }
     brief = None if machine else brief_for(text, now)
@@ -396,7 +370,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
             fh.write(line)
     if oldest is None or now - oldest >= RETENTION_S:
         _sweep(now)
-    return turn["turn"] if ok and harness not in SESSION_ONLY_HARNESSES else None
+    return turn["turn"]
 
 
 def _first_ts(path: Path) -> float | None:
@@ -454,10 +428,10 @@ def _sweep(now: float) -> dict:
 
 def sweep(now: float | None = None) -> dict:
     """The retention, applied on a timer (the replica-refresh job and the
-    capture hook's storage sweep), so the owner's words go a day after they
-    were typed even when no later prompt or read comes: every turn file and
+    capture hook's storage sweep), so a turn's record goes a day after it
+    was typed even when no later prompt or read comes: every turn file and
     briefs.jsonl line by line (a line a crash cut short goes too), the
-    widenings waiting for a yes, and the rewrite temps a crash left. Local
+    rewrite temps a crash left, and the old widenings file. Local
     files only. Never raises; ``ok`` false names what could not be pruned."""
     now = time.time() if now is None else now
     try:
@@ -474,10 +448,10 @@ def sweep(now: float | None = None) -> dict:
     try:
         from khipu import owner_direction
 
-        out["pending"] = owner_direction.expire_pending(now)
+        out["pending"] = owner_direction.remove_old_widenings()
     except Exception as err:  # noqa: BLE001
         out["ok"] = False
-        out["errors"].append(f"pending widenings: {type(err).__name__}: {err}")
+        out["errors"].append(f"old widenings: {type(err).__name__}: {err}")
     return out
 
 
@@ -597,36 +571,14 @@ def doctor_block(now: float | None = None, installed: list[str] | None = None) -
             "summary": "Turns recorded in the last day: " + (", ".join(parts) if parts else "none") + "."}
 
 
-def with_turn_line(out: dict, token: str | None) -> dict:
-    """The hook's output with the turn token added to what the conversation
-    sees. ``{}`` (nothing recalled) becomes a context of just that line.
-    Anything but a token the recorder makes is left out. The recall client
-    (``bin/khipu-recall-client.py``) carries a copy, pinned equal by test."""
-    if not isinstance(token, str) or not TOKEN_RE.fullmatch(token):
-        return out
-    line = f"{TURN_LINE}{token}"
-    out = dict(out) if isinstance(out, dict) else {}
-    hso = out.get("hookSpecificOutput")
-    if isinstance(hso, dict):
-        hso = dict(hso)
-        ctx = hso.get("additionalContext")
-        hso["additionalContext"] = f"{ctx}\n\n{line}" if isinstance(ctx, str) and ctx else line
-        out["hookSpecificOutput"] = hso
-    else:
-        out["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit", "additionalContext": line}
-    return out
-
-
 def main(argv: list[str]) -> int:
-    """The prompt hook's recorder: the payload on stdin, prints the token
-    (or nothing). Always exits 0."""
+    """The prompt hook's recorder: the payload on stdin, prints nothing.
+    Always exits 0."""
     import sys
 
     try:
         payload = json.loads(sys.stdin.buffer.read().decode("utf-8", errors="replace"))
     except ValueError:
         return 0
-    token = record(payload)
-    if token:
-        sys.stdout.write(token)
+    record(payload)
     return 0

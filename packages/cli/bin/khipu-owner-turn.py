@@ -1,7 +1,7 @@
 """khipu-owner-turn: record one prompt-submit turn for owner direction
 (``khipu.owner_turns``). Run by ``khipu-prompt-recall`` as ``python3 -S -E
--B`` before it answers, with the hook payload on stdin; prints the turn
-token, or nothing. Standard library plus the three small stdlib-only khipu
+-B`` before it answers, with the hook payload on stdin; prints nothing.
+Standard library plus the three small stdlib-only khipu
 modules it needs, loaded from beside this script: ``..`` in the repo,
 ``../packages/cli`` in the app bundle's ``bin``. Any failure prints nothing
 and exits 0, so a prompt is never failed or held by the recorder.

@@ -1,14 +1,13 @@
 """Owner direction, slice 5 of docs/plans/2026-10-16-owner-direction.md: the
 feature is on by default. The real prompt-hook shim records the owner's turn
-and pushes its token; the agent's ``khipu_owner_act`` call acts on it; the
-routing record, the owner-actions log and the next routing block show it; an
+(no text kept, no token pushed); the agent's ``khipu_owner_act`` call with
+only an action and its arguments acts on it; the routing record, the owner-actions log and the next routing block show it; an
 undo by the app (and a second direction) puts it back. The setting is never
 written: this runs on the shipped default. Hermetic: temp HOME, capture home
 and data dir; the hook runs with no warm service."""
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -49,15 +48,15 @@ def world(tmp_path, monkeypatch, khipu_app):
 
 
 def _hook(prompt: str) -> str:
-    """The real shim, as the harness runs it; the token it pushed."""
+    """The real shim, as the harness runs it; the turn id it recorded."""
     import os
 
     env = {**os.environ, "KHIPU_RECALL_DAEMON": "0", "KHIPU_PYTHON": sys.executable}
     payload = {"session_id": SESSION, "prompt": prompt, "cwd": os.environ["HOME"], "hook_event_name": "UserPromptSubmit"}
     done = subprocess.run(["/bin/sh", str(SHIM)], input=json.dumps(payload), capture_output=True, text=True,
                           env=env, timeout=60)
-    found = re.search(r"Owner turn: ([0-9a-f]{8})", done.stdout)
-    assert found, (done.stdout, done.stderr)
+    # Nothing about the turn reaches the model: no token, no "Owner turn" line.
+    assert "Owner turn" not in done.stdout and "KHIPU_OWNER_TURN" not in done.stdout, (done.stdout, done.stderr)
     # Run from here, the hook's issuer is this test's Python, which the check
     # refuses (a shim run by hand). Stand the harness in for it: the turn's
     # issuer becomes the one conftest puts above this process.
@@ -65,16 +64,17 @@ def _hook(prompt: str) -> str:
 
     path = owner_turns.session_file(SESSION)
     rows = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()]
-    assert rows[-1]["turn"] == found.group(1) and "refused" in rows[-1]["issuer"], rows[-1]
+    assert rows and "refused" in rows[-1]["issuer"], rows
+    assert "text" not in rows[-1] and rows[-1]["typed"] is True, rows[-1]
+    assert prompt not in path.read_text(encoding="utf-8")
     rows[-1]["issuer"] = dict(FAKE_HOOK_ISSUER)
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-    return found.group(1)
+    return rows[-1]["turn"]
 
 
-def _act(action: str, args: dict, words: str, turn: str) -> tuple[bool, dict]:
+def _act(action: str, args: dict) -> tuple[bool, dict]:
     out = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                          "params": {"name": "khipu_owner_act",
-                                     "arguments": {"action": action, "args": args, "words": words, "turn": turn}}})
+                          "params": {"name": "khipu_owner_act", "arguments": {"action": action, "args": args}}})
     result = out["result"]
     return result["isError"], json.loads(result["content"][0]["text"])
 
@@ -98,24 +98,26 @@ def test_it_is_on_by_default(world):
     assert owner_turns.settings()["enabled"] is True
 
 
-def test_a_direction_goes_from_the_hook_to_the_record_and_back(world, khipu_app):
+def test_a_direction_goes_from_the_hook_to_the_record_and_back(world, khipu_app, monkeypatch):
     routing.report(account="Claude", state="open",
                    author={"kind": "conversation", "harness": "codex", "project": "p", "session": "s-other"})
     marker = routing.prompt_push(None, budget=5.0)
     seen = {"version": marker["version"], "epoch": marker["epoch"], "full_at": routing._iso(routing._now())}
-    token = _hook("pause Codex until 5pm")
+    turn = _hook("pause Codex until 5pm")
 
-    is_error, out = _act("route.pause", {"account": "Codex", "until": _five_pm()}, "pause Codex until 5pm", token)
+    is_error, out = _act("route.pause", {"account": "Codex", "until": _five_pm()})
     assert not is_error and out["ok"] is True, out
     assert _state("Codex") == "paused"
     (line,) = [x for x in _log() if x.get("kind") == "action"]
     assert (line["action"], line["auth"], line["binding"], line["turn"], line["session"]) == \
-        ("route.pause", "direction", "token", token, SESSION)
+        ("route.pause", "direction", "hook", turn, SESSION)
     assert "by your direction" in routing.prompt_push(seen, budget=5.0)["text"]
 
-    # A call whose words the hook never recorded is refused, and changes nothing.
-    is_error, bad = _act("route.lift", {"account": "Codex"}, "lift Codex right now", token)
-    assert is_error and bad["ok"] is False and _state("Codex") == "paused"
+    # A conversation with no recent owner turn is refused, and changes nothing.
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "e2e-session-never-typed")
+    is_error, bad = _act("route.lift", {"account": "Codex"})
+    assert is_error and bad["code"] == "no_recorded_turn" and _state("Codex") == "paused"
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION)
 
     # Undo from the app.
     khipu_app.as_app()
@@ -125,10 +127,10 @@ def test_a_direction_goes_from_the_hook_to_the_record_and_back(world, khipu_app)
 
 
 def test_a_second_direction_lifts_it(world):
-    token = _hook("pause Codex until 5pm")
-    assert not _act("route.pause", {"account": "Codex", "until": _five_pm()}, "pause Codex until 5pm", token)[0]
-    token = _hook("lift Codex now")
-    is_error, out = _act("route.lift", {"account": "Codex"}, "lift Codex now", token)
+    _hook("pause Codex until 5pm")
+    assert not _act("route.pause", {"account": "Codex", "until": _five_pm()})[0]
+    _hook("lift Codex now")
+    is_error, out = _act("route.lift", {"account": "Codex"})
     assert not is_error and out["ok"] is True, out
     assert _state("Codex") != "paused"
     assert [x["action"] for x in _log() if x.get("kind") == "action"] == ["route.pause", "route.lift"]

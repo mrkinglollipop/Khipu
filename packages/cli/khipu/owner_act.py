@@ -1,8 +1,7 @@
 """``khipu_owner_act``: an owner action by direction, asked for over MCP.
 
-The tool runs the owner command the CLI runs, with ``--owner-words``,
-``--owner-turn`` and ``--owner-session`` (``owner_direction.gate``), so
-there is one check, not two. The arguments become that command's argv from
+The tool runs the owner command the CLI runs, with ``--owner-direction``
+(``owner_direction.gate``), so there is one check, not two. The arguments become that command's argv from
 a fixed table per action: each action takes only its own keys, every value
 is typed, options are passed as ``--name=value`` and positionals follow the
 command words with none starting with ``-`` (no ``--``: Python 3.11's argparse
@@ -57,6 +56,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "ledger.import": (("file",), ("project", "catch_up")),
     "ledger.restore": (("id",), ("project",)),
     "ledger.purge": (("id",), ("project",)),
+    "ledger.project": (("project",), ("rename", "hide", "show")),
     "ledger.add": (("id", "title", "kind"), ("project", "parent", "state", "evidence", "owner", "note", "link")),
     "ledger.set": (("id",), ("project", "state", "evidence", "owner", "note", "title", "link", "if_state")),
     "ledger.remove": (("id",), ("project", "note", "children")),
@@ -72,10 +72,10 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 }
 _LISTS = {"entries", "list", "checks"}
 _INTS = {"rule"}
-_FLAGS = {"catch_up"}
+_FLAGS = {"catch_up", "hide", "show"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
-_DIRECTION_KEYS = ("latest_window_h", "earlier_window_min", "session_binding", "trust", "untrust")
+_DIRECTION_KEYS = ("latest_window_h", "session_binding", "trust", "untrust")
 
 
 class Refused(ValueError):
@@ -231,6 +231,10 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["config", "--set", "promote_gate_ignore", _bare(",".join(v["checks"]), "checks")], []
     if action == "promote.gate_ignore.cancel":
         return ["config", "--unset=promote_gate_ignore"], []
+    if action == "ledger.project":
+        if v.get("hide") and v.get("show"):
+            raise _bad("a project is hidden or shown, not both")
+        return ["ledger", "project", "--json", *_opts(v, "project", "rename", "hide", "show")], []
     if action.startswith("ledger."):
         keys = ("project", "catch_up", "title", "kind", "parent", "state", "evidence", "owner", "note", "link",
                 "if_state", "children")
@@ -275,30 +279,19 @@ def _parsed(text: str) -> dict:
     return {"text": text}
 
 
-def act(action, args, words, turn=None, owner_session=None) -> tuple[bool, dict]:
+def act(action, args) -> tuple[bool, dict]:
     """Run one owner action by direction. (ok, the command's JSON answer),
     or (False, ``{ok: false, code, error}``) when refused."""
     from khipu import cli, owner_direction
 
     if not isinstance(action, str) or action not in owner_direction.ACTIONS or action not in SPECS:
         return False, {"ok": False, "code": "not_by_direction", "error": "That change can't be made by direction."}
-    if not isinstance(words, str) or not words.strip():
-        return False, {"ok": False, "code": "not_the_owners_words",
-                       "error": "words is needed: the owner's words, quoted exactly from their message."}
-    for name, value in (("turn", turn), ("owner_session", owner_session)):
-        if value is not None and (not isinstance(value, str) or not value.strip() or "\x00" in value):
-            return False, {"ok": False, "code": "bad_args", "error": f"{name} must be text"}
     try:
         head, positionals = argv(action, _values(action, args))
     except Refused as err:
         return False, err.refusal()
-    owner = [f"--owner-words={words}"]
-    if turn is not None:
-        owner.append(f"--owner-turn={turn.strip()}")
-    if owner_session is not None:
-        owner.append(f"--owner-session={owner_session.strip()}")
     try:
-        full = full_argv(head, positionals, owner)
+        full = full_argv(head, positionals, ["--owner-direction"])
     except Refused as err:
         return False, err.refusal()
     out, err = io.StringIO(), io.StringIO()
@@ -309,7 +302,7 @@ def act(action, args, words, turn=None, owner_session=None) -> tuple[bool, dict]
             return False, {"ok": False, "code": "bad_args", "error": f"Those arguments don't fit {action}."}
         # The command reaches its owner gate only through the direction branch.
         if (getattr(ns, "from_app", False) or getattr(ns, "at_owner_request", None) is not None
-                or getattr(ns, "owner", None) is True or getattr(ns, "dry_run", False) or ns.owner_words != words):
+                or getattr(ns, "owner", None) is True or getattr(ns, "dry_run", False) or ns.by_direction is not True):
             return False, {"ok": False, "code": "bad_args", "error": f"Those arguments don't fit {action}."}
         rc = int(ns.func(ns) or 0)
     result = _parsed(out.getvalue())

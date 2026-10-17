@@ -306,7 +306,7 @@ def test_every_verb_is_classified():
 def test_every_owner_verb_is_reachable_by_direction():
     """Owner direction (scope row 11 to 16): every verb that is not open to
     any writer, and every write a writer can make as the owner, is an
-    owner-direction action, and its parser takes the owner's words."""
+    owner-direction action, and its parser takes --owner-direction."""
     from khipu import owner_direction
 
     for name, policy in ledger.WRITE_POLICY.items():
@@ -314,10 +314,10 @@ def test_every_owner_verb_is_reachable_by_direction():
         assert action in owner_direction.ACTIONS, f"{name}: name its owner-direction action"
         command, verb = name.split(" ", 1)
         flags = {o for a in _subcommands(command)[verb]._actions for o in a.option_strings}
-        assert {"--owner-words", "--owner-turn"} <= flags, name
+        assert "--owner-direction" in flags, name
 
 
-def test_owner_words_the_owner_never_typed_are_refused_and_change_nothing(monkeypatch, tmp_path):
+def test_a_direction_from_a_session_with_no_owner_turn_is_refused_and_changes_nothing(monkeypatch, tmp_path):
     from khipu import owner_direction, owner_turns
 
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
@@ -326,16 +326,16 @@ def test_owner_words_the_owner_never_typed_are_refused_and_change_nothing(monkey
     monkeypatch.setattr(routing, "_caller", lambda: {"app": False, "chain": ["zsh"]})
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     monkeypatch.setattr(work, "read_owed", lambda: {"items": [{"id": "42"}], "error": None})
-    out, _err = _run(["work", "same", "atlas#one", "42", "--owner-words", "one and 42 are the same"])
+    out, _err = _run(["work", "same", "atlas#one", "42", "--owner-direction"])
     assert json.loads(out)["reason"] == "no_recorded_turn"
-    for name in ("ledger restore", "ledger purge", "work hide"):
+    for name, policy in ledger.WRITE_POLICY.items():
         with pytest.raises(ledger.LedgerError) as err:
-            ledger.require(name, owner_words="restore one in the ledger", owner_turn="0badc0de")
-        assert err.value.reason == "not_by_direction"  # no intent: nothing to check the words against
+            ledger.require(name, by_direction=True)
+        assert err.value.reason == "not_by_direction", name  # no intent: nothing named to change
         want = owner_direction.intent(ledger.DIRECTION_ACTIONS[name], "atlas#one")
         with pytest.raises(ledger.LedgerError) as err:
-            ledger.require(name, owner_words="restore one in the ledger", owner_turn="0badc0de", intent=want)
-        assert err.value.reason == "no_recorded_turn"
+            ledger.require(name, by_direction=True, intent=want)
+        assert err.value.reason == "no_recorded_turn", name
     assert work.read_links() == {"same": [], "not_same": []} and work.read_hidden() == {}
 
 

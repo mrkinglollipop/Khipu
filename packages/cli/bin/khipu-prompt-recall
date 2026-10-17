@@ -40,16 +40,11 @@ for a in "$@"; do
 done
 # stdin can be read once, and every path below needs the payload.
 PAYLOAD=$(cat)
-# Owner direction: record the turn first, on every path (khipu.owner_turns).
-# The recorder is stdlib-only, prints the turn token or nothing, and never
-# fails; only a token it printed reaches the answer, never one inherited.
-unset KHIPU_OWNER_TURN
+# Owner direction: record that the owner typed, first, on every path
+# (khipu.owner_turns). The recorder is stdlib-only, prints nothing and never
+# fails.
 if [ -f "$SELF_DIR/khipu-owner-turn.py" ]; then
-  TURN=$(printf '%s' "$PAYLOAD" | "$PY" -S -E -B "$SELF_DIR/khipu-owner-turn.py" 2>/dev/null)
-  case "$TURN" in
-    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
-      [ "$SHAPE" = "claude" ] && KHIPU_OWNER_TURN="$TURN" && export KHIPU_OWNER_TURN ;;
-  esac
+  printf '%s' "$PAYLOAD" | "$PY" -S -E -B "$SELF_DIR/khipu-owner-turn.py" >/dev/null 2>&1
 fi
 if [ "${KHIPU_HARNESS:-}" = "aegis" ]; then
   echo '{}'

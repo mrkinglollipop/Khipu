@@ -617,8 +617,6 @@ def note_brief(payload: dict, env) -> None:
             return
         from khipu import owner_turns
 
-        if not owner_turns.settings()["enabled"]:
-            return
         parent = str(payload.get("session_id") or payload.get("sessionId") or "")
         harness = owner_turns.harness_of(env, payload)
         for brief in briefs_of(payload):

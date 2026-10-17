@@ -31,7 +31,8 @@ def folders(tmp_path, monkeypatch):
 
 def test_log_rewrite_downgrade_is_detected(world):
     words = "pause Codex for now"
-    rc, out = world.run(["route", "pause", "Codex"], words, world.say(words))
+    world.say(words)
+    rc, out = world.run(["route", "pause", "Codex"], True)
     assert rc == 0, out
     path = owner_direction.log_path()
     rows = [json.loads(s) for s in path.read_text().splitlines()]
@@ -59,10 +60,12 @@ def test_a_chained_line_without_its_hash_is_a_break_not_an_old_line(folders, str
 
 def test_tail_deletion_is_detected(world):
     words = "pause Codex for now"
-    rc, out = world.run(["route", "pause", "Codex"], words, world.say(words))
+    world.say(words)
+    rc, out = world.run(["route", "pause", "Codex"], True)
     assert rc == 0, out
     words = "lift Codex pause please"
-    rc, out = world.run(["route", "lift", "Codex"], words, world.say(words))
+    world.say(words)
+    rc, out = world.run(["route", "lift", "Codex"], True)
     assert rc == 0, out
     path = owner_direction.log_path()
     lines = path.read_text().splitlines()
@@ -111,7 +114,8 @@ def test_an_append_that_crashed_before_its_head_was_written_still_verifies(folde
 @pytest.mark.parametrize("tamper", ["rewrite", "append"])
 def test_ordinary_log_tamper_is_detected(world, tamper):
     words = "pause Codex for now"
-    rc, out = world.run(["route", "pause", "Codex"], words, world.say(words))
+    world.say(words)
+    rc, out = world.run(["route", "pause", "Codex"], True)
     assert rc == 0, out
     path = owner_direction.log_path()
     rows = [json.loads(s) for s in path.read_text().splitlines()]

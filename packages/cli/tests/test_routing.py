@@ -990,10 +990,10 @@ def test_owner_commands_refuse_without_a_typed_confirmation(home, capsys, monkey
         in block["warnings"]
 
 
-def test_every_owner_command_takes_the_owners_words(home):
+def test_every_owner_command_takes_owner_direction(home):
     """Owner direction (scope rows 1 to 10): each owner command of the
     routing record, the account list, the routing settings and Update
-    anyway takes --owner-words and --owner-turn beside --from-app."""
+    anyway takes --owner-direction beside --from-app."""
     import argparse
 
     from khipu import cli
@@ -1007,13 +1007,14 @@ def test_every_owner_command_takes_the_owners_words(home):
     commands = [("route", c) for c in ("pause", "lift", "clear", "note", "priority", "rule", "hold")]
     commands += [("accounts", c) for c in ("track", "rename", "stop", "move", "decline", "offer-again",
                                             "auto-track", "request")]
-    commands += [("config",), ("owner-direction", "off"), ("owner-direction", "set"), ("owner-direction", "undo")]
+    commands += [("config",), ("owner-direction", "off"), ("owner-direction", "on"), ("owner-direction", "set"),
+                 ("owner-direction", "undo"), ("owner-direction", "acknowledge")]
     for path in commands:
         flags = {o for a in sub(parser, *path)._actions for o in a.option_strings}
-        assert {"--from-app", "--owner-words", "--owner-turn"} <= flags, path
+        assert {"--from-app", "--owner-direction"} <= flags, path
 
 
-def test_owner_words_never_typed_are_refused_like_a_piped_yes(home, capsys, monkeypatch, tmp_path):
+def test_a_direction_from_a_session_with_no_owner_turn_is_refused(home, capsys, monkeypatch, tmp_path):
     from khipu import owner_turns
 
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
@@ -1022,11 +1023,13 @@ def test_owner_words_never_typed_are_refused_like_a_piped_yes(home, capsys, monk
     owner_turns.write_settings({"enabled": False})
     for argv in (["route", "pause", "Codex"], ["route", "note", "set", "Codex first"],
                  ["route", "rule", "add", "Never a -fast tier."], ["route", "rule", "confirm", "1"]):
-        rc, out = _cli(argv + ["--owner-words", "pause Codex for now"], capsys)
+        rc, out = _cli(argv + ["--owner-direction"], capsys)
         assert rc == 2 and json.loads(out)["code"] == "direction_off", argv
     owner_turns.write_settings({"enabled": True})
-    rc, out = _cli(["route", "pause", "Codex", "--owner-words", "pause Codex for now"], capsys)
-    assert rc == 2 and json.loads(out)["code"] == "no_recorded_turn"
+    for argv in (["route", "pause", "Codex"], ["route", "note", "set", "Codex first"],
+                 ["route", "rule", "add", "Never a -fast tier."], ["route", "rule", "confirm", "1"]):
+        rc, out = _cli(argv + ["--owner-direction"], capsys)
+        assert rc == 2 and json.loads(out)["code"] == "no_recorded_turn", argv
     assert not routing.events_file().exists()
 
 

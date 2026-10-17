@@ -6484,7 +6484,7 @@ def _caller() -> dict:
 
 def _owner_via(args, intent: dict | None = None) -> str | None:
     """'app' when the app itself started this ``--from-app`` call
-    (``_caller``), 'direction' when ``--owner-words`` passed the owner
+    (``_caller``), 'direction' when ``--owner-direction`` passed the owner
     direction check for ``intent`` (``owner_direction.gate``, which raises
     its refusal), 'cli' after a typed confirmation on a terminal, else None
     (refused). Either way how it was authorised is set for the write
@@ -6504,9 +6504,8 @@ def _owner_via(args, intent: dict | None = None) -> str | None:
         _OWNER_AUTH.set({"auth": "app", "auth_chain": " < ".join(caller["chain"] + [caller["where"]])})
         owner_direction.noted(intent, _OWNER_AUTH.get())
         return "app"
-    if getattr(args, "owner_words", None) is not None:
-        stamp = owner_direction.gate(args, intent)
-        _OWNER_AUTH.set({k: v for k, v in stamp.items() if k != "confirms"})
+    if getattr(args, "by_direction", False):
+        _OWNER_AUTH.set(owner_direction.gate(intent))
         return "direction"
     if not typed_yes("This is an owner's change to the routing record. Type yes to confirm: "):
         return None
@@ -6710,25 +6709,18 @@ def _intent_or_none(build, *args) -> dict | None:
 
 def _priority_intent(args, action: str) -> dict | None:
     """The owner's priority change, for owner direction and the log: a set
-    names each account it orders, and keeps each role's words."""
+    names each account it orders."""
     from khipu import owner_direction
 
     if action != "set":
-        # A pending priority is the only one an answer can mean, so "confirm
-        # it" names it (rows 17 to 20 of the owner-direction scope).
-        answer = action in ("confirm", "undo") and bool((read_view().get("priority") or {}).get("pending"))
-        return owner_direction.intent(f"route.priority.{action}", "priority",
-                                      names=[["priority", "order"] + (["that", "it"] if answer else [])])
+        return owner_direction.intent(f"route.priority.{action}", "priority")
     entries = _priority_entries_arg(args)
-    keys, roles = [], []
+    keys = []
     for item in entries if isinstance(entries, list) else []:
         item = {"account": item} if isinstance(item, str) else item
         if isinstance(item, dict) and isinstance(item.get("account"), str):
             keys.append(resolve_account(item["account"]))
-            if isinstance(item.get("role"), str) and item["role"].strip():
-                roles.append(item["role"])
-    return owner_direction.intent("route.priority.set", ",".join(keys), stored=roles or None, timed=True,
-                                  until=getattr(args, "until", None))
+    return owner_direction.intent("route.priority.set", ",".join(keys))
 
 
 def _route_intent(cmd: str, args) -> dict | None:
@@ -6738,28 +6730,18 @@ def _route_intent(cmd: str, args) -> dict | None:
 
     if cmd in ("pause", "lift", "clear"):
         facts = {"report": args.report} if cmd == "clear" and getattr(args, "report", None) else None
-        return owner_direction.intent(f"route.{cmd}", resolve_account(args.account), facts=facts,
-                                      timed=cmd == "pause", until=getattr(args, "until", None))
+        return owner_direction.intent(f"route.{cmd}", resolve_account(args.account), facts=facts)
     if cmd == "note":
-        if args.action == "set":
-            return owner_direction.intent("route.note.set", "note", stored=[args.text or ""])
-        return owner_direction.intent("route.note.end", "note")
+        return owner_direction.intent(f"route.note.{'set' if args.action == 'set' else 'end'}", "note")
     if cmd == "rule":
         params = [str(p) for p in args.params]
         if args.action == "add":
-            return owner_direction.intent("route.rule.add", "new", stored=[" ".join(params)])
+            return owner_direction.intent("route.rule.add", "new")
         if args.action == "edit":
-            return owner_direction.intent("route.rule.edit", params[0], stored=[" ".join(params[1:])]) \
-                if len(params) >= 2 else None
+            return owner_direction.intent("route.rule.edit", params[0]) if len(params) >= 2 else None
         if len(params) != 1:
             return None
-        if args.action in ("confirm", "undo", "dismiss"):
-            # "Keep that rule" names it when it is the one rule waiting.
-            n = params[0].strip()
-            waiting = [str(r["n"]) for r in read_view()["rules"] if r.get("pending")]
-            names = [f"rule {n}", f"rule number {n}", f"rule #{n}"] + (["that", "it"] if waiting == [n] else [])
-            return owner_direction.intent(f"route.rule.{args.action}", n, names=[names])
-        return owner_direction.intent(f"route.rule.{args.action}", params[0])
+        return owner_direction.intent(f"route.rule.{args.action}", params[0].strip())
     return None
 
 
@@ -6767,20 +6749,7 @@ def _hold_intent(args, words: list[str]) -> dict | None:
     from khipu import owner_direction
 
     if len(words) == 2 and words[0] == "end":
-        holds = read_view().get("holds") or []
-        hold = next((h for h in holds if h["id"] == words[1]), None)
-        names = [words[1]]
-        if hold is not None:
-            scope = hold.get("scope") or {}
-            alike = [h for h in holds if h.get("owner") and h.get("scope") == scope]
-            if len(alike) == 1:
-                if scope.get("kind") == "account":
-                    names += owner_direction.account_names(scope["account"])[0]
-                elif scope.get("kind") == "machine":
-                    names += ["machine", "mac", "this mac"]
-                else:
-                    names += ["all", "everything", "all work"]
-        return owner_direction.intent("route.hold.end", words[1], names=[names])
+        return owner_direction.intent("route.hold.end", words[1])
     if args.account:
         target = f"account:{resolve_account(args.account)}"
     elif args.machine:
@@ -6789,8 +6758,7 @@ def _hold_intent(args, words: list[str]) -> dict | None:
         target = "all"
     else:
         return None
-    return owner_direction.intent("route.hold.add", target, stored=[" ".join(words)], timed=True,
-                                  until=getattr(args, "until", None))
+    return owner_direction.intent("route.hold.add", target)
 
 
 def run_cli(args) -> int:
@@ -6861,7 +6829,7 @@ def run_cli(args) -> int:
             return 0
         if cmd == "hold":
             words = list(args.words)
-            owner_flag = bool(args.owner or args.from_app or getattr(args, "owner_words", None) is not None)
+            owner_flag = bool(args.owner or args.from_app or getattr(args, "by_direction", False))
             via = "cli"
             if owner_flag:
                 via = _owner_via(args, _intent_or_none(_hold_intent, args, words))
@@ -6947,9 +6915,6 @@ def run_cli(args) -> int:
     except owner_direction.DirectionRefused as err:
         _print_json(err.refusal())
         return 2
-    except owner_direction.AlreadyDone as done:
-        _print_json(done.answer())
-        return 0
     finally:
         owner_direction.noted(None, {})
         _OWNER_AUTH.reset(auth)

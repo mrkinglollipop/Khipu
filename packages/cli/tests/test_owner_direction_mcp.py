@@ -1,6 +1,6 @@
 """Owner direction, slice 3 of docs/plans/2026-10-16-owner-direction.md: the
-``khipu_owner_act`` MCP tool, a dispatched job acting on its parent's words
-(``owner_session``), and pending requests confirmed by direction.
+``khipu_owner_act`` MCP tool, a dispatched job refused, and pending requests
+confirmed by direction.
 
 Every call goes through ``mcp_server.handle_message`` as a client sends it.
 The server's process environment is faked per harness (Claude Code, Codex,
@@ -34,9 +34,10 @@ class World:
         self.tmp = tmp_path
         self.mp = monkeypatch
 
-    def say(self, text: str, *, session: str, harness: str = "claude_code", entry: str = "cli") -> str | None:
-        """A turn the prompt hook records for ``session``; the token it
-        pushes (None for Aegis and for an ineligible turn)."""
+    def say(self, text: str = "please go ahead with that", *, session: str, harness: str = "claude_code",
+            entry: str = "cli", ago: float = 0.0) -> str | None:
+        """A turn the prompt hook records for ``session``; its turn id
+        (None when nothing was recorded)."""
         payload = {"session_id": session, "prompt": text, "cwd": str(self.tmp)}
         if harness == "claude_code":
             env = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": entry}
@@ -47,7 +48,7 @@ class World:
             payload["transcript_path"] = str(rollout)
         else:
             env = {"GROK_HOOK_NAME": "UserPromptSubmit"}
-        return owner_turns.record(payload, env, now=time.time())
+        return owner_turns.record(payload, env, now=time.time() - ago)
 
     def server(self, session: str | None, harness: str = "claude_code") -> None:
         """The MCP server's process environment, as the harness started it."""
@@ -73,13 +74,8 @@ def world(tmp_path, monkeypatch, khipu_app):
     return w
 
 
-def _act(action: str, args: dict | None = None, words: str | None = None, turn: str | None = None,
-         **extra) -> tuple[bool, dict]:
+def _act(action: str, args: dict | None = None, **extra) -> tuple[bool, dict]:
     arguments = {"action": action, "args": args or {}, **extra}
-    if words is not None:
-        arguments["words"] = words
-    if turn is not None:
-        arguments["turn"] = turn
     out = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                           "params": {"name": "khipu_owner_act", "arguments": arguments}})
     result = out["result"]
@@ -99,85 +95,91 @@ def _log() -> list[dict]:
 
 @pytest.mark.parametrize("harness,entry", [("claude_code", "cli"), ("codex", "codex_cli_rs"), ("aegis", "aegis")])
 def test_a_pause_passes_from_each_harness(world, harness, entry):
-    token = world.say("pause Codex until tonight please", session="s-1", harness=harness, entry=entry)
+    world.say("pause Codex until tonight please", session="s-1", harness=harness, entry=entry)
     world.server("s-1", harness)
-    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token)
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"})
     assert not is_error and out["ok"] is True, out
     assert _state("Codex") == "paused"
     (line,) = _log()
     assert (line["action"], line["auth"], line["session"], line["harness"]) == ("route.pause", "direction", "s-1",
                                                                               harness)
-    assert line["binding"] == ("session" if harness == "aegis" else "token")
+    assert line["binding"] == ("session" if harness == "aegis" else "hook")
 
 
 def test_no_session_in_the_servers_environment_is_refused(world):
-    token = world.say("pause Codex until tonight please", session="s-1")
+    world.say(session="s-1")
     world.server(None)
-    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token)
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"})
     assert is_error and out["ok"] is False and out["code"] == "no_recorded_turn"
     assert _state("Codex") != "paused"
 
 
-def test_a_paraphrase_is_refused(world):
-    token = world.say("please stop using Codex for a bit", session="s-1")
-    world.server("s-1")
-    is_error, out = _act("route.pause", {"account": "Codex"}, "pause Codex for a bit", token)
-    assert is_error and out["code"] == "not_the_owners_words" and "error" in out
-    assert _state("Codex") != "paused"
-
-
 def test_a_forged_session_id_is_refused(world):
-    token = world.say("pause Codex until tonight please", session="s-a")
-    world.say("hello there my friend", session="s-b")
+    world.say(session="s-a")
     world.server("s-b")
-    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token)
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"})
     assert is_error and out["code"] == "no_recorded_turn"
     assert _state("Codex") != "paused"
 
 
 def test_the_session_is_never_taken_from_the_arguments(world):
-    token = world.say("pause Codex until tonight please", session="s-a")
+    world.say(session="s-a")
     world.server("s-b")
     for key in ("session", "session_id"):
-        is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token,
-                             **{key: "s-a"})
-        assert is_error and _state("Codex") != "paused"
+        is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, **{key: "s-a"})
+        assert is_error and out["code"] == "bad_args" and _state("Codex") != "paused"
+
+
+@pytest.mark.parametrize("extra", [{"words": "pause Codex"}, {"turn": "abcd1234"}, {"owner_session": "s-1"}])
+def test_the_old_word_and_token_keys_are_refused(world, extra):
+    world.say(session="s-1")
+    world.server("s-1")
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, **extra)
+    assert is_error and out["code"] == "bad_args"
+    assert _state("Codex") != "paused" and _log() == []
 
 
 @pytest.mark.parametrize("args", [{"account": "Codex", "from_app": True}, {"account": "Codex", "owner_words": "x"},
                                   {"account": "--from-app"}, {"account": 3}, {}])
 def test_arguments_are_checked_strictly(world, args):
-    token = world.say("pause Codex until tonight please", session="s-1")
+    world.say(session="s-1")
     world.server("s-1")
-    is_error, out = _act("route.pause", args, "pause Codex until tonight", token)
+    is_error, out = _act("route.pause", args)
     assert is_error and out["ok"] is False
     assert _state("Codex") != "paused" and _log() == []
 
 
-def test_an_unknown_action_or_a_missing_quote_is_refused(world):
-    token = world.say("pause Codex until tonight please", session="s-1")
+def test_an_unknown_action_is_refused(world):
+    world.say(session="s-1")
     world.server("s-1")
-    is_error, out = _act("route.report", {"account": "Codex"}, "pause Codex until tonight", token)
+    is_error, out = _act("route.report", {"account": "Codex"})
     assert is_error and out["code"] == "not_by_direction"
-    is_error, out = _act("route.pause", {"account": "Codex"}, None, token)
-    assert is_error and out["ok"] is False
+    assert _state("Codex") != "paused"
+
+
+def test_a_stale_turn_is_refused(world):
+    world.say(session="s-1", ago=7 * 3600)
+    world.server("s-1")
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"})
+    assert is_error and out["code"] == "stale"
     assert _state("Codex") != "paused"
 
 
 def test_a_routing_setting_outside_the_routing_settings_is_refused(world):
-    token = world.say("set the cli path for codex to the new one", session="s-1")
+    world.say(session="s-1")
     world.server("s-1")
-    is_error, out = _act("config.routing_setting", {"key": "cli_path.codex", "value": "/bin/codex"},
-                         "set the cli path for codex", token)
+    is_error, out = _act("config.routing_setting", {"key": "cli_path.codex", "value": "/bin/codex"})
     assert is_error and out["ok"] is False
 
 
-def test_the_tool_tells_agents_to_quote_and_never_retry(world):
+def test_the_tool_takes_only_an_action_and_its_arguments(world):
     tool = next(t for t in ms.TOOLS if t["name"] == "khipu_owner_act")
     text = tool["description"].lower()
-    for phrase in ("exactly", "paraphrase", "owner turn", "never retry", "page", "another conversation"):
+    for phrase in ("page", "another conversation", "dispatched"):
         assert phrase in text, phrase
-    assert set(tool["inputSchema"]["properties"]) == {"action", "args", "words", "turn", "owner_session"}
+    for gone in ("quote", "paraphrase", "owner turn", "words"):
+        assert gone not in text, gone
+    assert set(tool["inputSchema"]["properties"]) == {"action", "args"}
     assert tool["annotations"]["readOnlyHint"] is False
     assert " he " not in f" {text} " and " his " not in f" {text} " and " him " not in f" {text} "
 
@@ -188,102 +190,41 @@ def test_the_tool_tells_agents_to_quote_and_never_retry(world):
 def test_the_gateway_does_not_list_or_run_it(world):
     from khipu.request_context import gateway_request
 
-    token = world.say("pause Codex until tonight please", session="s-1")
+    world.say(session="s-1")
     world.server("s-1")
     with gateway_request("bot"):
         listed = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         names = {t["name"] for t in listed["result"]["tools"]}
         assert "khipu_owner_act" not in names and "khipu_route" in names
-        is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token)
+        is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"})
     assert is_error and _state("Codex") != "paused"
     local = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert "khipu_owner_act" in {t["name"] for t in local["result"]["tools"]}
 
 
-# ---- dispatched jobs: owner_session -----------------------------------------------------------
+# ---- dispatched jobs are refused -------------------------------------------------------------
 
 
-def _dispatch(world, parent: str, job: str = "s-job") -> None:
+def test_a_job_acting_on_its_delegated_brief_is_refused(world):
     """The delegation hook notes the brief; the job's first turn is it."""
-    owner_turns.note_brief(BRIEF, parent=parent, harness="claude_code")
-    world.say(BRIEF, session=job, entry="sdk-cli")
-    (turn,) = owner_turns.turns(job)
-    assert turn["delegated"] is True and turn["parent"] == parent
-
-
-def test_a_job_with_its_parent_link_and_the_parents_token_passes(world):
-    token = world.say("pause Codex until tonight please", session="s-parent")
-    _dispatch(world, "s-parent")
+    world.say(session="s-parent")
+    owner_turns.note_brief(BRIEF, parent="s-parent", harness="claude_code")
+    world.say(BRIEF, session="s-job", entry="sdk-cli")
+    (turn,) = owner_turns.turns("s-job")
+    assert turn["delegated"] is True and turn["parent"] == "s-parent"
     world.server("s-job")
-    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token,
-                         owner_session="s-parent")
-    assert not is_error and out["ok"] is True, out
-    assert _state("Codex") == "paused"
-    (line,) = _log()
-    assert (line["session"], line["via_session"], line["turn"]) == ("s-parent", "s-job", token)
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"})
+    assert is_error and out["code"] == "no_recorded_turn"
+    assert _state("Codex") != "paused" and _log() == []
 
 
-def test_a_job_acting_on_its_own_brief_is_refused(world):
+def test_a_session_started_by_an_sdk_cli_turn_is_refused_even_with_a_typed_parent(world):
     world.say("pause Codex until tonight please", session="s-parent")
-    _dispatch(world, "s-parent")
+    world.say("pause Codex until tonight please", session="s-job", entry="sdk-cli")
     world.server("s-job")
-    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight")
+    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"})
     assert is_error and out["code"] == "no_recorded_turn"
     assert _state("Codex") != "paused"
-
-
-def test_a_job_naming_a_parent_that_never_typed_the_words_is_refused(world):
-    token = world.say("build the docs page for routing", session="s-parent")
-    _dispatch(world, "s-parent")
-    world.server("s-job")
-    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token,
-                         owner_session="s-parent")
-    assert is_error and out["code"] == "not_the_owners_words"
-    assert _state("Codex") != "paused"
-
-
-def test_a_job_naming_a_session_it_was_not_started_from_is_refused(world):
-    world.say("hello from the real parent", session="s-parent")
-    token = world.say("pause Codex until tonight please", session="s-other")
-    _dispatch(world, "s-parent")
-    world.server("s-job")
-    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token,
-                         owner_session="s-other")
-    assert is_error and out["code"] == "no_recorded_turn" and "not started from" in out["error"]
-    assert _state("Codex") != "paused"
-
-
-def test_a_session_with_no_brief_cannot_name_another(world):
-    token = world.say("pause Codex until tonight please", session="s-parent")
-    world.say("just a normal turn here", session="s-other")
-    world.server("s-other")
-    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight", token,
-                         owner_session="s-parent")
-    assert is_error and out["code"] == "no_recorded_turn"
-    assert _state("Codex") != "paused"
-
-
-def test_a_claude_code_parent_still_needs_its_token(world):
-    world.say("pause Codex until tonight please", session="s-parent")
-    _dispatch(world, "s-parent")
-    world.server("s-job")
-    is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"}, "pause Codex until tonight",
-                         owner_session="s-parent")
-    assert is_error and out["code"] == "no_recorded_turn"
-    assert _state("Codex") != "paused"
-
-
-def test_the_cli_takes_owner_session_too(world, capsys):
-    from khipu import cli
-
-    token = world.say("pause Codex until tonight please", session="s-parent")
-    _dispatch(world, "s-parent")
-    world.server("s-job")
-    rc = cli.main(["route", "pause", "Codex", "--until", "6h", "--owner-words", "pause Codex until tonight",
-                   "--owner-turn", token, "--owner-session", "s-parent"])
-    assert rc == 0, capsys.readouterr().out
-    assert _state("Codex") == "paused"
-    assert _log()[0]["via_session"] == "s-job"
 
 
 # ---- pending requests confirmed by direction (rows 17 to 20) ----------------------------------
@@ -297,31 +238,20 @@ def _pending_rule() -> int:
 
 def test_a_pending_rule_confirmed_by_direction(world):
     n = _pending_rule()
-    token = world.say("yes, keep that rule", session="s-1")
+    world.say("yes, keep that rule", session="s-1")
     world.server("s-1")
-    is_error, out = _act("route.rule.confirm", {"rule": n}, "yes, keep that rule", token)
+    is_error, out = _act("route.rule.confirm", {"rule": n})
     assert not is_error and out["ok"] is True, out
     (rule,) = routing.read_view()["rules"]
     assert rule["pending"] is False
 
 
-def test_a_pending_rule_is_not_confirmed_by_words_about_something_else(world):
+def test_a_pending_rule_is_not_confirmed_with_no_owner_turn(world):
     n = _pending_rule()
-    token = world.say("yes, keep the note as it is", session="s-1")
     world.server("s-1")
-    is_error, out = _act("route.rule.confirm", {"rule": n}, "yes, keep the note", token)
-    assert is_error and out["code"] == "words_do_not_ask_for_this"
+    is_error, out = _act("route.rule.confirm", {"rule": n})
+    assert is_error and out["code"] == "no_recorded_turn"
     assert routing.read_view()["rules"][0]["pending"] is True
-
-
-def test_that_rule_needs_exactly_one_pending(world):
-    n = _pending_rule()
-    routing.request_rule("Never run the fast tier.", owner_request="the owner asked",
-                         author={"harness": "grok_bot", "session": "bot-1"}, via="mcp")
-    token = world.say("yes, keep that rule", session="s-1")
-    world.server("s-1")
-    is_error, out = _act("route.rule.confirm", {"rule": n}, "yes, keep that rule", token)
-    assert is_error and out["code"] == "words_do_not_ask_for_this"
 
 
 def _pending_priority() -> str:
@@ -334,20 +264,11 @@ def _pending_priority() -> str:
 
 def test_a_pending_priority_confirmed_by_direction(world):
     version = _pending_priority()
-    token = world.say("yes confirm it", session="s-1")
+    world.say("yes confirm it", session="s-1")
     world.server("s-1")
-    is_error, out = _act("route.priority.confirm", {"expect": version}, "yes confirm it", token)
+    is_error, out = _act("route.priority.confirm", {"expect": version})
     assert not is_error and out["ok"] is True, out
     assert routing.read_view()["priority"]["pending"] is False
-
-
-def test_a_pending_priority_is_not_confirmed_by_other_words(world):
-    version = _pending_priority()
-    token = world.say("yes confirm the rule", session="s-1")
-    world.server("s-1")
-    is_error, out = _act("route.priority.confirm", {"expect": version}, "yes confirm the rule", token)
-    assert is_error and out["code"] == "words_do_not_ask_for_this"
-    assert routing.read_view()["priority"]["pending"] is True
 
 
 def _pending_setting(world) -> None:
@@ -360,22 +281,11 @@ def _pending_setting(world) -> None:
 def test_a_pending_routing_setting_confirmed_by_direction(world, capsys):
     _pending_setting(world)
     capsys.readouterr()
-    token = world.say("yes, confirm that change", session="s-1")
+    world.say("yes, confirm that change", session="s-1")
     world.server("s-1")
-    is_error, out = _act("config.answer_request.confirm", {"key": "routing_stale_after"}, "yes, confirm that change",
-                         token)
+    is_error, out = _act("config.answer_request.confirm", {"key": "routing_stale_after"})
     assert not is_error and out["ok"] is True, out
     assert routing._setting_requests(json.loads((world.tmp / "data" / "config.json").read_text())) == {}
-
-
-def test_a_pending_routing_setting_is_not_confirmed_by_an_undo(world, capsys):
-    _pending_setting(world)
-    capsys.readouterr()
-    token = world.say("undo that change please", session="s-1")
-    world.server("s-1")
-    is_error, out = _act("config.answer_request.confirm", {"key": "routing_stale_after"}, "undo that change please",
-                         token)
-    assert is_error and out["code"] == "words_do_not_ask_for_this"
 
 
 def _pending_accounts(world) -> None:
@@ -392,22 +302,8 @@ def test_a_pending_account_list_change_confirmed_by_direction(world, capsys):
 
     _pending_accounts(world)
     capsys.readouterr()
-    token = world.say("yes, confirm that account list change", session="s-1")
+    world.say("yes, confirm that account list change", session="s-1")
     world.server("s-1")
-    is_error, out = _act("accounts.request.confirm", {"expect": config.accounts_version()},
-                         "yes, confirm that account list change", token)
+    is_error, out = _act("accounts.request.confirm", {"expect": config.accounts_version()})
     assert not is_error and out["ok"] is True, out
     assert not config.load_config().get("usage_accounts_request")
-
-
-def test_a_pending_account_list_change_is_not_confirmed_by_other_words(world, capsys):
-    from khipu import config
-
-    _pending_accounts(world)
-    capsys.readouterr()
-    token = world.say("yes, confirm the new rule", session="s-1")
-    world.server("s-1")
-    is_error, out = _act("accounts.request.confirm", {"expect": config.accounts_version()},
-                         "yes, confirm the new rule", token)
-    assert is_error and out["code"] == "words_do_not_ask_for_this"
-    assert config.load_config().get("usage_accounts_request")

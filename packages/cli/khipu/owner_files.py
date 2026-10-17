@@ -10,7 +10,7 @@ still found: a file in the owner-turns folder that no pattern names is
 listed as ``unknown`` and cleaned like a temp.
 
 Not here: the log's own lines (``owner_direction.scrub_words``), the
-widenings (``owner_direction.forget_pending``) and the turn files' lines
+widenings (``owner_direction.remove_old_widenings``) and the turn files' lines
 (``owner_turns.forget_sessions``), which forget rewrites in place.
 """
 from __future__ import annotations

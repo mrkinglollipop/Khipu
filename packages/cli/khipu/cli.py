@@ -3156,9 +3156,6 @@ def _owner_only(args: argparse.Namespace, intent: "dict | None" = None) -> "str 
     except owner_direction.DirectionRefused as err:
         print(json.dumps(err.refusal()))
         return 2
-    except owner_direction.AlreadyDone as done:
-        print(json.dumps(done.answer()))
-        return 0
     finally:
         routing._OWNER_AUTH.reset(auth)
     if via is None:
@@ -3288,9 +3285,6 @@ def cmd_config(args: argparse.Namespace) -> int:
         except owner_direction.DirectionRefused as err:
             print(json.dumps(err.refusal()))
             return 2
-        except owner_direction.AlreadyDone as done:
-            print(json.dumps(done.answer()))
-            return 0
         finally:
             routing._OWNER_AUTH.reset(auth)
         out = {"ok": True, "version": saved["version"], "usage_accounts": usage.accounts_status(),
@@ -3406,9 +3400,7 @@ def cmd_config(args: argparse.Namespace) -> int:
 
         intent = None
         if action in ("confirm", "undo"):
-            waiting = _routing._setting_requests(load_config())
-            names = owner_direction._setting_names(key) + (["that", "it"] if list(waiting) == [key] else [])
-            intent = owner_direction.intent(f"config.answer_request.{action}", key, names=[names])
+            intent = owner_direction.intent(f"config.answer_request.{action}", key)
         via = _owner_only(args, intent)
         if isinstance(via, int):
             return via if via == 0 else 2
@@ -3431,8 +3423,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         # decides whose limits a report counts against.
         from khipu import owner_direction
 
-        intent = owner_direction.intent("config.routing_setting", key,
-                                        stored=[args.set[1]] if args.set else None)
+        intent = owner_direction.intent("config.routing_setting", key)
         request = _owner_or_request(args, intent)
         if isinstance(request, int):
             return request
@@ -3593,8 +3584,7 @@ def _config_gate_override(args: argparse.Namespace) -> int:
 
     checks = [c.strip() for c in (args.set[1] if args.set else "").split(",") if c.strip()]
     intent = (owner_direction.intent("promote.gate_ignore", ",".join(checks)) if checks else
-              owner_direction.intent("promote.gate_ignore.cancel", "update anyway",
-                                     names=[["update anyway", "the override", "skipping the checks"]]))
+              owner_direction.intent("promote.gate_ignore.cancel", "update anyway"))
     via = _owner_only(args, intent)
     if isinstance(via, int):
         return via
@@ -3610,27 +3600,10 @@ def _config_gate_override(args: argparse.Namespace) -> int:
 
 
 def _accounts_list_intent(args: argparse.Namespace) -> "dict | None":
-    """A save of the whole account list, for owner direction and the log:
-    the words must name each account it adds, drops or renames."""
-    from khipu import owner_direction, usage
-    from khipu.config import load_config
+    """A save of the whole account list, for owner direction and the log."""
+    from khipu import owner_direction
 
-    def labels(raw) -> dict:
-        out = {}
-        for entry in raw if isinstance(raw, list) else []:
-            if isinstance(entry, dict) and isinstance(entry.get("harness"), str):
-                label = entry.get("label") or usage.LABELS.get(entry["harness"], entry["harness"])
-                out[(entry["harness"], entry.get("home") or None)] = str(label)
-        return out
-
-    try:
-        new = json.loads(args.set[1]) if args.set else []
-    except ValueError:
-        return None
-    before, after = labels(load_config().get("usage_accounts")), labels(new)
-    changed = {after[k] for k in after if before.get(k) != after[k]} | {before[k] for k in before if k not in after}
-    names = [[label] for label in sorted(changed)] or [["account list", "accounts"]]
-    return owner_direction.intent("config.usage_accounts", "list", names=names)
+    return owner_direction.intent("config.usage_accounts", "list")
 
 
 def _promote_gate_ignore_status() -> dict:

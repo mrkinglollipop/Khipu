@@ -28,14 +28,15 @@ def test_built_argv_never_contains_double_dash(monkeypatch):
                          ("route.hold.end", {"hold": "h1"}),
                          ("work.same", {"row": "a", "commitment": "b"})):
         with pytest.raises(Stop):
-            owner_act.act(action, args, "pause it")
+            owner_act.act(action, args)
     assert len(seen) == 4
     assert all("--" not in full for full in seen)
     assert seen[0][:3] == ["route", "pause", "codex"]
+    assert all(full[-1] == "--owner-direction" for full in seen)
 
 
 def test_a_positional_starting_with_a_dash_is_refused():
-    ok, out = owner_act.act("route.note.set", {"text": "--from-app"}, "set a note")
+    ok, out = owner_act.act("route.note.set", {"text": "--from-app"})
     assert not ok and out["code"] == "bad_args"
 
 
@@ -48,9 +49,9 @@ def test_real_parser_reads_the_argv_under_python311():
         "         ('work.same', {'row': 'a', 'commitment': 'b'}), ('direction.undo', {'id': 'x'})]\n"
         "for action, args in cases:\n"
         "    h, p = owner_act.argv(action, owner_act._values(action, args))\n"
-        "    f = owner_act.full_argv(h, p, ['--owner-words=confirm it'])\n"
+        "    f = owner_act.full_argv(h, p, ['--owner-direction'])\n"
         "    ns = cli.build_parser().parse_args(f)\n"
-        "    assert ns.owner_words == 'confirm it', action\n"
+        "    assert ns.by_direction is True, action\n"
         "print('ok')\n"
     )
     pkg = os.path.dirname(os.path.dirname(owner_act.__file__))
