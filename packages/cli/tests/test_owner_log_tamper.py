@@ -14,9 +14,16 @@ import pytest
 
 from khipu import owner_direction
 from tests import test_owner_direction as _base
-from tests.test_owner_provenance import folders  # noqa: F401 - the fixture, shared
 
 world = _base.world  # the fixture, shared
+
+
+@pytest.fixture
+def folders(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
+    return tmp_path
 
 
 
