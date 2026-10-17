@@ -1022,3 +1022,24 @@ def test_inbox_copy_refuses_catch_up_before_any_catch_up_work(monkeypatch):
 
     assert result["result"] == "refused"
     assert called == []
+
+
+def test_an_unchanged_inbox_copy_still_refuses_catch_up(monkeypatch):
+    """The fourth review: a copy already imported, brought again unchanged
+    with catch-up, is refused like a changed one (the hard cut), never
+    answered "nothing new"."""
+    from khipu import ledger, ledger_import
+
+    class Cursor:
+        def execute(self, _sql, _params=()):
+            pass
+
+        def fetchall(self):
+            return [("already-imported-digest", "done")]
+
+    monkeypatch.setattr(ledger_import, "_existing", lambda *_args: ({}, {}))
+    monkeypatch.setattr(ledger, "_vocab", lambda *_args: {"state": [], "kind": []})
+    result = ledger_import._import_in(Cursor(), "project", {"rows": {}, "digest": "already-imported-digest"},
+                                      {"in_inbox": True}, dry_run=False, catch_up=True)
+    assert result["result"] == "refused"
+    assert result["reason"] == "inbox_copy"

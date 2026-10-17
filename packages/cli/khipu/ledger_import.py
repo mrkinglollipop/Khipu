@@ -629,14 +629,15 @@ def _import_in(cur, project: str, src: dict[str, Any], report: dict[str, Any], *
     landed = cur.fetchall()
     here, purged = _existing(cur, project, ids)
     existing = ledger._vocab(cur, project)
-    if src["digest"] in {d for d, _r in landed}:
-        return {**report, "result": "nothing new", "words": "Nothing new: every row and history entry is already here."}
     if catch_up and report.get("in_inbox"):
         # Scope (e)(3): a copy in the inbox never changes, so the switch from
-        # a login folder is a hard cut and a copy has no catch-up.
+        # a login folder is a hard cut and a copy has no catch-up, changed or
+        # not.
         return {**report, "ok": False, "result": "refused", "reason": "inbox_copy",
                 "words": "This is a copy in the ledger inbox, and a copy is never caught up: the switch from a "
                          "login folder is a hard cut. Keep working in the ledger itself."}
+    if src["digest"] in {d for d, _r in landed}:
+        return {**report, "result": "nothing new", "words": "Nothing new: every row and history entry is already here."}
     if catch_up and not landed:
         return {**report, "ok": False, "result": "refused", "reason": "no_import",
                 "words": f"Nothing was imported into {project} yet, so there is nothing to catch up."}
