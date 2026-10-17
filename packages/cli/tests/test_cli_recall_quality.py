@@ -152,6 +152,15 @@ class DoctorAggregateOkTest(_Patched):
         self.assertFalse(out["ok"])
         self.assertFalse(out["hub_snapshot"]["ok"])
 
+    def test_a_failing_ledger_copy_fails_doctor(self):
+        with mock.patch("khipu.replica_heal.ledger_copy_status",
+                        return_value={"ok": False, "state": "failing"}):
+            rc, out = self._run(recall_probe_ok=True, hub_snapshot_ok=True)
+        self.assertEqual(rc, 2)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["ledger_copy_ok"])
+        self.assertEqual(out["ledger_copy"]["state"], "failing")
+
     def test_ratio_metrics_alone_never_fail_doctor(self):
         """recall_quality ratios are warn-only (scope §W6.2) — a red ratio
         inside the block must not flip doctor's overall ok."""

@@ -355,3 +355,73 @@ def test_ledger_only_success_preserves_memory_failure_backoff(hub, monkeypatch):
     assert after['last_error'] == 'memory failure' and 'last_synced_at' not in after
     assert replica_heal.run()['reason'] == 'recently_failed'
     assert hub.dumps == 0
+
+
+# ---- doctor's ledger_copy field ------------------------------------------------
+
+
+def _ledger_image(stamp: datetime | None) -> None:
+    import sqlite3
+
+    con = sqlite3.connect(str(hub_snapshot.snapshot_path()))
+    with con:
+        con.execute("CREATE TABLE snapshot_meta (key TEXT PRIMARY KEY, value TEXT)")
+        con.execute("CREATE TABLE ledger_rows (row_id TEXT PRIMARY KEY)")
+        if stamp is not None:
+            con.execute("INSERT INTO snapshot_meta VALUES ('ledger_caught_up_at', ?)", (stamp.isoformat(),))
+    con.close()
+
+
+def test_ledger_copy_is_not_applicable_without_ledger_tables(hub):
+    out = replica_heal.ledger_copy_status(hub_ok=True)
+    assert out["ok"] and out["state"] == "not_applicable"
+
+
+def test_a_fresh_ledger_copy_is_ok_and_says_its_age(hub):
+    now = datetime.now(timezone.utc)
+    _ledger_image(now - timedelta(minutes=10))
+    out = replica_heal.ledger_copy_status(hub_ok=True, now=now)
+    assert out["ok"] and out["state"] == "fresh"
+    assert 590 <= out["age_seconds"] <= 610 and out["ledger_caught_up_at"]
+
+
+def test_a_ledger_copy_older_than_two_hours_is_red_only_while_the_hub_answers(hub):
+    now = datetime.now(timezone.utc)
+    _ledger_image(now - timedelta(hours=3))
+    out = replica_heal.ledger_copy_status(hub_ok=True, now=now)
+    assert not out["ok"] and out["state"] == "old"
+    assert replica_heal.ledger_copy_status(hub_ok=False, now=now)["ok"]
+
+
+def test_a_ledger_failure_turns_red_after_two_retry_intervals(hub, monkeypatch):
+    hub.up = True
+    hub.age(3600)
+    now = datetime.now(timezone.utc)
+    _ledger_image(now - timedelta(minutes=5))
+    monkeypatch.setattr(replica_heal, '_now', lambda: now)
+    monkeypatch.setattr(hub_snapshot, 'pull_changes',
+                        lambda **_k: {'ok': True, 'ledger': {'ok': False, 'needs_refresh': True, 'error': 'locked'}})
+    monkeypatch.setattr(hub_snapshot, 'refresh_ledger',
+                        lambda: {'ok': False, 'needs_refresh': True, 'error': 'locked'}, raising=False)
+    started = now
+    replica_heal.run()
+    early = replica_heal.ledger_copy_status(hub_ok=True, now=now)
+    assert early["ok"] and early["state"] == "retrying"
+    assert early["last_error"]["error"] == "locked" and early["last_error"]["since"] == started.isoformat()
+    assert early["last_error"]["next_retry_at"] == (started + timedelta(minutes=15)).isoformat()
+    for minutes in (15, 30):
+        now = started + timedelta(minutes=minutes)
+        replica_heal.run()
+    late = replica_heal.ledger_copy_status(hub_ok=True, now=now + timedelta(seconds=1))
+    assert not late["ok"] and late["state"] == "failing"
+    assert late["last_error"]["since"] == started.isoformat()
+
+
+def test_a_ledger_error_older_than_a_later_full_dump_no_longer_counts(hub):
+    now = datetime.now(timezone.utc)
+    _ledger_image(now - timedelta(minutes=1))
+    replica_heal._write_state({
+        "last_ledger_refresh_at": (now - timedelta(hours=1)).isoformat(),
+        "last_ledger_error": {"error": "locked", "since": (now - timedelta(hours=2)).isoformat()}})
+    out = replica_heal.ledger_copy_status(hub_ok=True, now=now)
+    assert out["ok"] and out["state"] == "fresh" and "last_error" not in out
