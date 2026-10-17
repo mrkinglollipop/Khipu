@@ -1,5 +1,5 @@
 """Which session a capture-now request lands on. The caller (MCP server, CLI)
-has no session id of its own, so it is matched against what each capture hook
+inherits Claude's session id or is matched against what each capture hook
 recorded about itself: process ancestry and working directory. The old answer,
 "the newest file in the state directory", picked the per-prompt recall dedup
 file as a session and, with several sessions live, whichever was last active.
@@ -54,6 +54,94 @@ def _owner_turn(sid: str, pid: int, start: float | None, *, harness: str = "clau
 
 
 class ResolverTest(unittest.TestCase):
+    def test_claude_session_env_beats_a_later_prompt_before_any_process_lookup(self):
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "mine"}):
+            now = sc.time.time()
+            _state("claude_code", "mine", cwd=td, age_s=3 * 86400)
+            _state("claude_code", "other", cwd=td)
+            _owner_turn("mine", 20, 100.25, ts=now - 20 * 60)
+            _owner_turn("other", 30, 101.5, ts=now)
+            with mock.patch.object(sc, "ancestor_pids") as ancestry, \
+                    mock.patch.object(ot, "_proc_info") as proc_info:
+                self.assertEqual(sc.resolve_session_ref(cwd=td),
+                                 ("claude_code", "mine", "session_env"))
+                ancestry.assert_not_called()
+                proc_info.assert_not_called()
+
+    def test_claude_session_env_works_without_owner_turn_records(self):
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "mine"}):
+            _state("claude_code", "mine", cwd=td)
+            _state("claude_code", "other", cwd=td)
+            self.assertEqual(sc.resolve_session_ref(host_pids=[], cwd=td),
+                             ("claude_code", "mine", "session_env"))
+
+    def test_unknown_claude_session_env_falls_through_to_issuer_matching(self):
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "unknown"}):
+            now = sc.time.time()
+            _state("claude_code", "mine", cwd=td)
+            _state("claude_code", "other", cwd=td)
+            _owner_turn("mine", 20, 100.25, ts=now - 20 * 60)
+            _owner_turn("other", 30, 101.5, ts=now)
+            with mock.patch.object(ot, "_proc_info", return_value=(99, "/bin/claude", 100.25)):
+                self.assertEqual(sc.resolve_session_ref(host_pids=[20], cwd=td),
+                                 ("claude_code", "mine", "process"))
+
+    def test_claude_session_env_cannot_select_a_non_claude_candidate(self):
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "codex-thread"}):
+            now = sc.time.time()
+            _state("codex", "codex-thread", cwd=td)
+            _state("claude_code", "mine", cwd=td)
+            _owner_turn("codex-thread", 30, 101.5, harness="codex", ts=now)
+            _owner_turn("mine", 20, 100.25, ts=now - 1)
+            with mock.patch.object(ot, "_proc_info", return_value=(99, "/bin/claude", 100.25)):
+                self.assertEqual(sc.resolve_session_ref(host_pids=[20], cwd=td),
+                                 ("claude_code", "mine", "process"))
+
+    def test_claude_env_successor_requires_the_full_latest_issuer_identity(self):
+        for pid, start in ((30, 100.25), (20, 101.5), (20, None), (None, 100.25)):
+            with self.subTest(pid=pid, start=start), tempfile.TemporaryDirectory() as td, _home(td), \
+                    mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "mine"}):
+                now = sc.time.time()
+                _state("claude_code", "mine", cwd=td)
+                _state("claude_code", "other", cwd=td)
+                _owner_turn("mine", 20, 100.25, ts=now - 2)
+                _owner_turn("mine", pid, start, ts=now - 1)
+                _owner_turn("other", 20, 100.25, ts=now)
+                self.assertEqual(sc.resolve_session_ref(host_pids=[], cwd=td),
+                                 ("claude_code", "mine", "session_env"))
+
+    def test_claude_env_successor_cannot_be_a_different_harness(self):
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "mine"}):
+            now = sc.time.time()
+            _state("claude_code", "mine", cwd=td)
+            _state("codex", "other", cwd=td)
+            _owner_turn("mine", 20, 100.25, ts=now - 1)
+            _owner_turn("other", 20, 100.25, harness="codex", ts=now)
+            self.assertEqual(sc.resolve_session_ref(host_pids=[], cwd=td),
+                             ("claude_code", "mine", "session_env"))
+
+    def test_tied_successors_of_a_stale_claude_env_refuse(self):
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "before-clear"}):
+            now = sc.time.time()
+            for sid, ts in (("before-clear", now - 1), ("after-a", now), ("after-b", now)):
+                _state("claude_code", sid, cwd=td)
+                _owner_turn(sid, 20, 100.25, ts=ts)
+            with self.assertRaisesRegex(ValueError, "cannot tell which session is yours"):
+                sc.resolve_session_ref(host_pids=[], cwd=td)
+
+    def test_explicit_session_still_overrides_the_claude_env(self):
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "mine"}):
+            _state("claude_code", "mine", cwd=td)
+            self.assertEqual(sc.resolve_session_ref("codex", "chosen", host_pids=[], cwd=td),
+                             ("codex", "chosen", "explicit"))
+
     def test_owner_turn_issuer_resolves_a_session_with_stale_capture_state(self):
         with tempfile.TemporaryDirectory() as td, _home(td):
             _state("claude_code", "older", cwd=td, host_pids=[20, 99], age_s=3 * 86400)
@@ -71,10 +159,24 @@ class ResolverTest(unittest.TestCase):
             self.assertEqual(sc.resolve_session_ref(host_pids=[], cwd=td),
                              ("claude_code", "newer", "cwd"))
 
-    def test_shared_codex_issuer_uses_latest_prompt_in_callers_folder(self):
+    def test_shared_codex_issuer_refuses_two_recent_prompts_in_callers_folder(self):
         with tempfile.TemporaryDirectory() as td, _home(td):
             now = sc.time.time()
-            for sid, folder, ts in (("old", td, now - 1), ("new", td, now),
+            for sid, folder, ts in (("old", td, now - 20 * 60), ("new", td, now),
+                                    ("elsewhere", str(Path(td) / "other"), now + 1)):
+                _state("codex", sid, cwd=folder, age_s=3 * 86400)
+                _owner_turn(sid, 20, 100.25, harness="codex", ts=ts)
+            with mock.patch.object(ot, "_proc_info", return_value=(99, "/bin/codex", 100.25)):
+                with self.assertRaises(ValueError) as cm:
+                    sc.resolve_session_ref(host_pids=[20], cwd=td)
+                self.assertIn("codex:old", str(cm.exception))
+                self.assertIn("codex:new", str(cm.exception))
+                self.assertIn("session_id='<harness>:<id>'", str(cm.exception))
+
+    def test_shared_codex_issuer_uses_latest_prompt_when_other_is_idle(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            now = sc.time.time()
+            for sid, folder, ts in (("old", td, now - 2 * 3600), ("new", td, now),
                                     ("elsewhere", str(Path(td) / "other"), now + 1)):
                 _state("codex", sid, cwd=folder, age_s=3 * 86400)
                 _owner_turn(sid, 20, 100.25, harness="codex", ts=ts)
@@ -83,7 +185,8 @@ class ResolverTest(unittest.TestCase):
                                  ("codex", "new", "process"))
 
     def test_clear_reuses_process_but_latest_session_prompt_wins(self):
-        with tempfile.TemporaryDirectory() as td, _home(td):
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "before-clear"}):
             now = sc.time.time()
             _state("claude_code", "before-clear", cwd=td)
             _state("claude_code", "after-clear", cwd=td, age_s=3 * 86400)
@@ -91,7 +194,7 @@ class ResolverTest(unittest.TestCase):
             _owner_turn("after-clear", 20, 100.25, ts=now)
             with mock.patch.object(ot, "_proc_info", return_value=(99, "/bin/claude", 100.25)):
                 self.assertEqual(sc.resolve_session_ref(host_pids=[20], cwd=td),
-                                 ("claude_code", "after-clear", "process"))
+                                 ("claude_code", "after-clear", "session_env"))
 
     def test_shared_issuer_exact_prompt_tie_refuses_despite_different_state_times(self):
         with tempfile.TemporaryDirectory() as td, _home(td):
@@ -145,6 +248,34 @@ class ResolverTest(unittest.TestCase):
             for sid, ts in (("a", now - 1), ("b", now)):
                 _state("claude_code", sid, cwd=td, age_s=3 * 86400)
                 _owner_turn(sid, 20, 100.25, ts=ts)
+            with self.assertRaisesRegex(ValueError, "cannot tell which session is yours"):
+                sc.resolve_session_ref(host_pids=[], cwd=td)
+
+    def test_a_long_running_turn_and_a_new_prompt_in_the_same_folder_refuse(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            now = sc.time.time()
+            for sid, ts in (("long-turn", now - 20 * 60), ("new-prompt", now)):
+                _state("claude_code", sid, cwd=td, age_s=3 * 86400)
+                _owner_turn(sid, 20, 100.25, ts=ts)
+            with self.assertRaisesRegex(ValueError, "cannot tell which session is yours"):
+                sc.resolve_session_ref(host_pids=[], cwd=td)
+
+    def test_fresh_state_beats_a_day_old_prompt_in_a_mixed_folder(self):
+        for harness in ("aegis", "cursor"):
+            with self.subTest(harness=harness), tempfile.TemporaryDirectory() as td, _home(td):
+                now = sc.time.time()
+                _state("claude_code", "idle", cwd=td, age_s=86400)
+                _owner_turn("idle", 20, 100.25, ts=now - 86400)
+                _state(harness, "live", cwd=td)
+                self.assertEqual(sc.resolve_session_ref(host_pids=[], cwd=td),
+                                 (harness, "live", "cwd"))
+
+    def test_recent_state_and_recent_prompt_in_a_mixed_folder_refuse(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            now = sc.time.time()
+            _state("claude_code", "long-turn", cwd=td, age_s=86400)
+            _owner_turn("long-turn", 20, 100.25, ts=now - 20 * 60)
+            _state("aegis", "live", cwd=td)
             with self.assertRaisesRegex(ValueError, "cannot tell which session is yours"):
                 sc.resolve_session_ref(host_pids=[], cwd=td)
 

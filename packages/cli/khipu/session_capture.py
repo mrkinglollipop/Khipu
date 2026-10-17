@@ -1384,14 +1384,13 @@ def _ack_capture_now(harness: str, sid: str, expected: dict) -> None:
 
 
 # A capture-now request has to name a session that is actually being captured,
-# and its caller (the MCP server, the CLI) is not the hook, so it has no session
-# id of its own. Each hook run therefore records two facts about itself in the
-# session's state file (its working directory and its process ancestry), and
-# resolve_session_ref matches the caller against them.
+# and its caller (the MCP server, the CLI) is not the hook. Claude supplies an
+# inherited session id; otherwise each hook's recorded working directory and
+# process ancestry let resolve_session_ref match the caller to a session.
 ANCESTOR_LOOKUP_TIMEOUT_S = 1
 ONLY_ACTIVE_WINDOW_S = 30 * 60
 PROCESS_MATCH_MAX_AGE_S = 12 * 60 * 60
-CAPTURE_AMBIGUITY_WINDOW_S = 5 * 60
+CAPTURE_AMBIGUITY_WINDOW_S = 30 * 60
 
 
 def ancestor_pids(pid: int | None = None) -> list[int]:
@@ -1500,14 +1499,16 @@ def _newest_capture_candidate(candidates: list[dict], now: float, *, process: bo
         return None
     if len(candidates) == 1:
         return candidates[0]
-    # Prompt times outrank capture progress. Harnesses without prompt records
-    # retain the state-time fallback, including pre-prompt-hook sessions.
+    # A session's prompt time outranks its capture progress. In the folder
+    # fallback, state times put harnesses without prompts on the same clock.
     has_turns = any(c.get("turn_ts") is not None for c in candidates)
     if process and not has_turns:
         return None
-    ranked = sorted(candidates, key=lambda c: (c.get("turn_ts") or 0) if has_turns else c["mtime"],
-                    reverse=True)
-    first, second = [((c.get("turn_ts") or 0) if has_turns else c["mtime"]) for c in ranked[:2]]
+    def activity(candidate: dict) -> float:
+        return candidate.get("turn_ts") or (0 if process else candidate["mtime"])
+
+    ranked = sorted(candidates, key=activity, reverse=True)
+    first, second = [activity(c) for c in ranked[:2]]
     if first == second:
         return None
     if (not process and now - second <= CAPTURE_AMBIGUITY_WINDOW_S
@@ -1516,20 +1517,30 @@ def _newest_capture_candidate(candidates: list[dict], now: float, *, process: bo
     return ranked[0]
 
 
+def _capture_ambiguity_error(candidates: list[dict]) -> ValueError:
+    names = ", ".join(f"{c['harness']}:{c['sid'][:8]}"
+                      for c in sorted(candidates, key=lambda c: -c["mtime"]))
+    return ValueError(
+        f"cannot tell which session is yours among {names}; "
+        "pass session_id='<harness>:<id>' (the full session id)."
+    )
+
+
 def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
                         host_pids: list[int] | None = None,
                         cwd: str | None = None) -> tuple[str, str, str]:
     """(harness, session id, how) for a capture-now request; ``how`` is
-    "explicit" | "process" | "cwd" | "only_active". Raises ValueError rather
-    than guess between two live sessions.
+    "explicit" | "session_env" | "process" | "cwd" | "only_active". Raises
+    ValueError rather than guess between two live sessions.
 
     An explicit harness and session id are taken as given, the harness having
     to be a real one. Otherwise the caller is matched to what the hooks
-    recorded: a matching issuer (pid and start time), then legacy ancestry,
-    then the working directory and prompt times, then the only session active
-    in the last half hour. Shared issuers are narrowed by directory and latest
-    prompt; without process evidence, near-simultaneous recent activity refuses.
-    The caller's ancestry and directory default to this process's."""
+    recorded: Claude's inherited session id, a matching issuer (pid and start
+    time), legacy ancestry, the working directory and prompt times, then the
+    only session active in the last half hour. Shared issuers are narrowed by
+    directory; two recently prompted holders refuse. Folder fallback also
+    refuses between sessions active in the last half hour. The caller's
+    ancestry and directory default to this process's."""
     if harness and harness not in HARNESSES:
         raise ValueError(f"unknown capture harness {harness!r}; expected one of {', '.join(HARNESSES)}")
     if harness and sid:
@@ -1558,7 +1569,6 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
         _same_dir(c["state"].get("cwd"), cwd)
         or (not c["state"].get("cwd")
             and _transcript_project_matches(c["harness"], c["state"].get("transcript_path"), cwd)))]
-    pids = ancestor_pids() if host_pids is None else host_pids
     issuers = []
     for c in cands:
         turn = _latest_capture_turn(c)
@@ -1569,6 +1579,28 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
             c["turn_ts"] = None
         issuer = turn.get("issuer")
         issuers.append((c, issuer if isinstance(issuer, dict) else {}))
+    env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if env_sid:
+        for candidate, issuer in issuers:
+            if (candidate["harness"] != "claude_code"
+                    or (candidate["state"].get("session_id") or candidate["sid"]) != env_sid):
+                continue
+            # /clear and resume retain the MCP server's launch environment.
+            # Only a newer prompt from that same process can supersede it.
+            if (candidate["turn_ts"] is not None and issuer.get("pid") is not None
+                    and issuer.get("start") is not None):
+                successors = [other for other, other_issuer in issuers
+                              if other["harness"] == "claude_code"
+                              and other_issuer.get("pid") == issuer["pid"]
+                              and other_issuer.get("start") == issuer["start"]
+                              and (other.get("turn_ts") or 0) > candidate["turn_ts"]]
+                if successors:
+                    best = _newest_capture_candidate(successors, now, process=True)
+                    if best is None:
+                        raise _capture_ambiguity_error(cands)
+                    candidate = best
+            return candidate["harness"], candidate["sid"], "session_env"
+    pids = ancestor_pids() if host_pids is None else host_pids
     mismatched = set()
     ambiguous_process = False
     # Prompt records stay current even when the capture state has been idle.
@@ -1585,9 +1617,13 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
         if len(holders) == 1:
             return holders[0]["harness"], holders[0]["sid"], "process"
         if holders:
-            best = _newest_capture_candidate([c for c in holders if c in same], now, process=True)
-            if best is not None:
-                return best["harness"], best["sid"], "process"
+            folder_holders = [c for c in holders if c in same]
+            recent_holders = [c for c in folder_holders if c.get("turn_ts") is not None
+                              and now - c["turn_ts"] <= CAPTURE_AMBIGUITY_WINDOW_S]
+            if len(recent_holders) < 2:
+                best = _newest_capture_candidate(folder_holders, now, process=True)
+                if best is not None:
+                    return best["harness"], best["sid"], "process"
             ambiguous_process = True
             break
     # A process id is reused once its owner is gone, so a session that has
@@ -1608,11 +1644,7 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
     recent = [c for c in cands if now - (c.get("turn_ts") or c["mtime"]) <= ONLY_ACTIVE_WINDOW_S]
     if len(recent) == 1 and not ambiguous_process:
         return recent[0]["harness"], recent[0]["sid"], "only_active"
-    names = ", ".join(f"{c['harness']}:{c['sid'][:8]}" for c in sorted(cands, key=lambda c: -c["mtime"]))
-    raise ValueError(
-        f"cannot tell which session is yours among {names}; "
-        "pass session_id='<harness>:<id>' (the full session id)."
-    )
+    raise _capture_ambiguity_error(cands)
 
 
 # ---- high-value turn trigger (K1) ------------------------------------------------
