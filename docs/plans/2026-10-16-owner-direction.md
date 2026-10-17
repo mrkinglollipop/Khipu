@@ -1,6 +1,6 @@
 # Owner direction through the agent (scope, 2026-10-16)
 
-Status: built. Section 2 was rewritten on 2026-10-17 (section 6). Owner requirement (Matt, 2026-10-16):
+Status: scope for review. No code changed. Owner requirement (Matt, 2026-10-16):
 
 > "I need to be able to do any changes in Khipu through you with my direction. I can't play games trying to manually confirm something when I'm not in front of my computer."
 
@@ -73,48 +73,105 @@ Work-view settings (`work.set_setting`, `cli.py:3286`), ledger settings (`cli.py
 
 **Count: 16 owner actions behind mechanisms A and B (rows 1 to 16), plus 4 pending-request paths (rows 17 to 20) that exist only because A and B cannot be reached from a conversation. 3 gate functions (`_owner_via`, `typed_yes`, `require`) cover all of them.**
 
-## 2. Design: a code the owner replies with (Matt, 2026-10-17)
+## 2. Design
 
-This section replaces the first design, which read the action out of the owner's own words. Four cross-family review rounds kept finding ways to fool free-text reading (section 6 records the decision). Khipu no longer infers anything from what the owner wrote. The agent says exactly what it will do, Khipu shows it in plain English with a short code, and the owner's reply with that code is the confirmation.
+### The idea in one paragraph
 
-### 2.1 The protocol: one path for every owner action
+A third way to satisfy the owner check, beside the app and the typed yes: **the owner's own words, recorded by Khipu's own prompt hook from a real user turn**. The agent submits the action together with the owner's words quoted verbatim and its session. Khipu looks those words up in what its UserPromptSubmit hook recorded for that session, from turns the person typed (never from wrapped material), within a recent window, and checks that the words actually ask for this action on this target. If they do, the action is applied at once, stamped `auth: "direction"`, written to an owner-actions log, shown in the app with one-tap Undo, and named in the next routing block. If they do not, nothing changes and the refusal says why in a way the agent can relay ("say it again in your own words").
 
-1. **Propose.** The agent submits the structured action, its kind and every argument, through `khipu_owner_act` (no `code`) or the owner command on the CLI with `--owner-propose`. Khipu validates the arguments the way the command always does, and returns a plain-English summary of exactly what will change (the action, what it acts on, and every argument as given) plus a short single-use code: 4 characters from an alphabet with no look-alikes (no 0, O, 1, I, L, 2, Z, 5, S, 8 or B), always holding at least one letter and one digit so it is never an ordinary word. The code is bound to the action's hash (the kind and every argument), the session, and an expiry (30 minutes; the setting `code_expiry_min`). Nothing changes yet. The proposal is a line in the owner-actions log.
-2. **Show.** The agent shows the owner the summary and the code. The owner replies with the code, for example "yes 4F2K", from any front end.
-3. **Confirm.** The agent submits the same action with the code (`khipu_owner_act` with `code`, or `--owner-code`). Khipu applies it only when all of these hold:
-   - the code appears as a standalone token (case does not matter) in an owner turn that Khipu's own prompt hook recorded for that session, after the proposal, outside every wrapper (the existing cleaner: `<system-reminder>`, `<pasted_content>`, tool results, T3 hand-overs; a machine turn never counts);
-   - that turn is eligible: a trusted front end, not a T3 helper, not a dispatched job's brief, and recorded by a hook whose issuer is an ancestor of the confirming call (2.4);
-   - the code is unexpired and unused;
-   - the action's hash matches the proposal's: any argument changed since the proposal is refused (`code_mismatch`).
-   A reply that also says "no", "not", "don't", "never", "stop", "wait" or "cancel" in the same sentence as the code refuses (`code_refused`) and spends the code. Then the change applies through the same function the app calls, is logged in the hash-chained log with its Undo, and is named in the next routing block.
+The protection holds because an agent cannot write into the hook's record. Injected text from a page, a file, a tool or another session never passes through UserPromptSubmit for this session as a typed turn, so it can never supply the words.
 
-Submitting a spent code again for the same action answers with the first result and changes nothing (`already_done`); for any other action it is refused (`code_used`).
+### 2.1 What the prompt hook records (new)
 
-### 2.2 What stays from the first design
+Today the hook (`bin/khipu-prompt-recall`, `recall_prompt.prompt_recall_main` `recall_prompt.py:3285`) receives the harness payload (`prompt`, `session_id`, `cwd`, `transcript_path`) and keeps only per-session recall state (`recall--<session>.json`: recent result batches and the routing marker, `recall_prompt.py:151-313`). It keeps no prompt text. The warm path (`bin/khipu-recall-client.py`) answers without ever starting the cold Python path, so recording must happen before the shim branches.
 
-- **Turn recording** (`owner_turns`): the prompt hook records each typed turn, cleaned of wrappers, per session, with its privacy rules: file mode 0600, never synced, captured, searched or sent to the gateway, dropped after 24 hours by the expiry sweep, and deleted by forget (with the waiting proposals). While owner direction is off, the hook keeps only the turns that hold a code-shaped token, so an "on" proposal can still be confirmed.
-- **Harness provenance checks**: the issuer test (an agent's shell or a script that runs the shim never carries the owner's word), the ancestry test, the trusted front-end list, T3 helper and dispatched-brief exclusion.
-- **Dispatched jobs**: a job may propose with `--owner-session` naming the session it was started from, accepted only when the delegation hook recorded that link. The code must then be in that parent session's turns.
-- **The tamper-evident log and its persistent alarm** (section 5, rule 2), **Undo on everything reversible**, and **purge** scheduled 24 hours out and undoable until then (decision 3).
+New: a small stdlib-only recorder runs first in the shim (both paths) and appends one line per turn to `<data dir>/owner-turns/<session>.jsonl` (file mode 0600, folder 0700, never synced to the hub, never captured, never searchable):
 
-### 2.3 What is gone
+- `at` (the hook's own clock), `harness`, `session`, `entrypoint` (from the hook process's environment, for example `CLAUDE_CODE_ENTRYPOINT`), `cwd`, a per-turn `turn` id, and `text`.
+- `text` is the person's part only, cleaned by the same rules capture already uses: drop `<system-reminder>` and the other `INJECTED_CONTEXT_TAGS` (`session_capture.py:312`), the T3 hand-over (`t3.strip_handoff`, `t3.py:276`), and add `<pasted_content>` and tool-result wrappers to that list. A turn that is a machine message (`MACHINE_USER_TAGS`, `session_capture.py:347`: task notifications, cross-session messages and deliveries, local-command and slash-command wrappers) is recorded as `machine: true` with no text and is never eligible.
+- `eligible: false` for a T3 helper session (`t3.is_helper_session`) and for any entrypoint not on the trusted list (2.4).
+- Retention: lines older than 24 hours are dropped on the next write or read of the file, and by a sweep on the replica-refresh job's timer (and the capture hook's daily storage sweep) when neither comes; the sweep goes line by line through every session file and the briefs, and drops widenings that waited as long. Forgetting an episode deletes its session's turn files, briefs and waiting widenings and scrubs the words from its owner-actions lines (each keeps its words hash, so the log's chain and Undo hold). On the gateway there are no such files and the scan does not apply.
 
-The free-text authoriser is removed: the word parser (verbs, targets, clauses, negation, time words) and argument-coverage matching (section 5, rule 1) no longer exist, and `--owner-words` and `--owner-turn` are gone. Nothing reads meaning from the owner's words except the code test and the refusal words beside it. The two-turn rule for widenings (decision 1, section 5 rules 3 and 4) is gone too: widening the check (trusting a new front end, lengthening the code expiry, turning session-only binding on) and turning owner direction on need the code like every other action; the code is the second confirmation. The 6-hour and 30-minute turn windows (decision 4) are replaced by the code's expiry.
+The recorder must never fail or slow a prompt: any error writes nothing and the hook carries on. Budget: under 5 ms, measured in the slice oracle.
 
-Every owner gate's enumerating test lists the code path as the only chat path: the app, a yes typed on a terminal, or a confirmed code.
+**Turn token.** Where the harness lets the hook add context (Claude Code, Codex), the hook adds one short line to its output: `Owner turn: <token>` (random, 8 characters, recorded with the turn). The agent passes the token back with the action. This binds the action to a turn of *this* conversation without trusting the session id (2.6). Where the hook's output is discarded (Aegis, Grok Build), there is no token and the session id alone is the lookup key, with the weaker binding said plainly in the record.
+
+### 2.2 How an agent submits
+
+One new MCP tool, `khipu_owner_act`, and the same thing on the CLI as a flag every owner command accepts: `--owner-words "<verbatim quote>" [--owner-turn <token>]`. The MCP tool takes `{action, args, words, turn}` where `action` is one of the inventory's owner actions (rows 1 to 16) or a confirmation of a pending request (rows 17 to 20).
+
+The session is never taken from the tool's arguments. It is read the way `routing.conversation_author` (`routing.py:1066`) already does, from the calling process's environment (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, `KHIPU_SESSION_ID`), and for MCP from the server process's environment, which the harness sets when it starts the server. (Slice 1 confirms each harness really passes it to the MCP server; where one does not, the token carries the binding.)
+
+`_owner_via` gains a third branch: no `--from-app`, no TTY, but `--owner-words` present, so the direction check runs. It returns `"direction"` on success and stamps `{"auth": "direction", "harness", "session", "turn", "words"}` through the existing `_OWNER_AUTH`. `ledger.require` gets the same branch for its "owner" verbs. Nothing else in the callers changes: they already pass `via` through to the record.
+
+### 2.3 The check, in order
+
+1. **A recorded turn exists.** The session (and token, when given) names a recorded, eligible turn. Else refuse: `no_recorded_turn`.
+2. **Fresh.** The turn is the session's latest eligible turn (any age up to 6 hours, since a long task may act on the turn it is answering), or an earlier eligible turn of the same session no more than 30 minutes old. Else refuse: `stale`. Both numbers are owner settings, liftable in the app and by direction.
+3. **Verbatim.** The submitted words, after normalising case, whitespace, straight and curly quotes and trailing punctuation, are a contiguous part of that turn's recorded text, at least 3 words long. No fuzzy matching: a paraphrase is refused with `not_the_owners_words`, and the refusal tells the agent to quote him exactly or ask him to say it again.
+4. **The words ask for this action.** A fixed, deterministic table per action (in code, unit-tested), never a model call:
+   - a verb word for the action ("pause", "stop using", "hold off" for pause; "lift", "unpause", "resume", "back on" for lift; "rule" plus "add", "new", "make it a rule" for a rule; "priority", "first", "before" for priority; "track", "rename", "stop tracking"; "update anyway", "skip the check"; "hide", "same", "merge", "not the same"; "import"; "restore"; "purge", "delete for good"; "confirm", "yes", "approve" for a pending request), and
+   - the target named in the words: the account's label or one of its known aliases, the rule's number, the row id or title words, the check's name, "all" or "everything" when the target is all.
+   - For words the action stores (a rule's text, the note, a hold's text), the stored words must be the quoted words or a contiguous part of them. The owner's rule is his sentence, not the agent's rewrite.
+   Else refuse: `words_do_not_ask_for_this` with the missing part named ("the words do not name Codex").
+5. **Not already used.** Each `(turn, action, target)` is used once. A repeat is answered with the first result, not applied again (`already_done`).
+6. **Irreversible actions need two turns.** Only `ledger purge` (row 15) cannot be undone. It needs the words from one turn and an eligible later turn of the same session whose words confirm it ("yes, purge it"). The agent asks; he answers from the phone. No app step.
+
+Jev or any model may never take part in steps 1 to 6: this is a permission decision (the user's standing rule).
 
 ### 2.4 Which turns count, per harness
 
-| Harness | Turns recorded | Check |
-|---|---|---|
-| Claude Code (CLI, Remote Control, T3 Code) and Codex | yes | the full check in 2.1 |
-| Aegis and Grok Build | recorder-only hook; hook output discarded | Matt allowed every owner action on the weaker session check: when no recorded turn holds the code, it is accepted when the agent submits it, provided the session has a turn its Aegis hook recorded above this call, and the log records `check: "session"` |
-| Grok Bot (cloud, gateway only) | none | no owner direction; its owner actions stay pending requests (rows 17 to 20) |
-| A dispatched job (`claude -p`, `codex exec`, a subagent) | its brief is noted and never eligible | only through its parent's session (2.2) |
+| Harness | Prompt hook today | Can inject the token | Plan |
+|---|---|---|---|
+| Claude Code (CLI, Remote Control from the phone) | yes, UserPromptSubmit (`integrations.py:724`) | yes | full design |
+| Claude Code driven by T3 Code | yes (same hooks, second account included) | yes | full design; T3's hand-over stripped; helper sessions ineligible; threads T3 started by `delegate_task` ineligible (slice 1 finds how T3 marks them) |
+| Codex | yes, `hooks.json` UserPromptSubmit (`integrations.py:1637`) | yes, the recall push already rides it | full design; Codex's own prepended context (AGENTS.md, environment) stripped as capture does |
+| Aegis | UserPromptSubmit is an observe gate: output discarded (`recall_rule.py`), the shim exits at once for Aegis | no | a recorder-only Aegis hook entry (no output); session id binding only; marked "weaker binding" in the log |
+| Grok Build | same as Aegis; Grok is paused | no | same as Aegis, built but not turned on while Grok is paused |
+| Grok Bot (cloud, gateway only) | none | no | no direction: its owner actions stay pending requests (rows 17 to 20) |
+| A dispatched job (`claude -p`, `codex exec`, a subagent, a workflow agent) | the hook fires, but the "user" turn is another agent's brief | n/a | ineligible: trusted entrypoints are an allow-list (`cli`, the desktop app, Remote Control and the T3 front end); `sdk-cli` and `exec` are not on it |
 
-### 2.5 Known boundary: the same Mac user
+The last row matters most. A dispatched job's first prompt is written by an orchestrator, often quoting the owner (this very scope's brief does). An orchestrator that wants a dispatched job to take an owner action passes the owner's words, and the check runs against the **orchestrator's** session, where the owner typed them: the job submits `--owner-words` plus `--owner-session` naming its parent, and the parent's record must hold the words. That keeps "the owner said it" true without trusting any brief.
 
-Khipu and the agents run as one Mac user. A program running as that user can read the proposal file, write the owner-turn files, write the log, or run the hook's shim with `exec` from a bash shell. Matt accepted this limit on 2026-10-16: the issuer and ancestry tests close running the shim from an agent's shell or a script, and every owner action is a line in the hash-chained log, listed on Owner actions with Undo and named in the next routing block, so anything done another way is visible.
+### 2.5 After the check: apply, log, show, undo, report
+
+- **Apply at once**, through the same function the app calls. No pending state.
+- **Owner-actions log**: `<data dir>/owner-actions.jsonl`, one line per action: `at`, `action`, `target`, `before` and `after` (enough to undo), `auth` (`app`, `terminal`, `direction`), and for direction the `words`, `harness`, `session`, `turn`, the binding strength (token or session only). Routing changes are also lines in the routing record, as now, stamped `auth: direction`.
+- **The app**: an "Every owner action" list (Settings, Owner actions) with how each change was made (by direction, with the words and which conversation; in the app; on a terminal), when, and one-tap **Undo** per line. Undo applies the inverse from `before`. An undo is itself logged. A banner names the first bad entry when the log's hash chain is broken (2.8).
+- **Undo by chat**: "undo that" or "put Codex back" is an owner direction like any other (the inverse action with its own words check).
+- **The next routing block** names every owner change once, however it was made: "Paused Codex by your direction in a Claude Code conversation, 14:02Z (undo in Settings)", "Set the note in the app, ...", "Paused Codex on a terminal, ...". `author_words` (`routing.py:1100`) keeps the push free of the session id and project, as now.
+- **Pending requests (rows 17 to 20)** stay for conversations that cannot pass the check (Grok Bot, a session with no hook). A direction can confirm one ("yes, keep that rule").
+
+### 2.6 Failure modes
+
+- **A forged session id.** The session comes from the process environment, not the arguments, but a shell call can set `KHIPU_SESSION_ID` itself. With a token, a forged id fails step 1 (the token belongs to another session's turn, and the token is only ever in that session's context). Without a token (Aegis), a forged id can only point at another session's real turn, so the action still needs words the owner really typed there, it is used once (step 5), and the log names both sessions. The residual case: the owner asked for X in session B, and an agent in session A, steered by injected text, applies X first. X is what he asked for; B's agent is told it is done. Acceptable, and stated.
+- **A stale prompt.** Step 2. An hour-old "pause Codex" cannot be replayed after he said "lift it" later, because the later turn is the latest and the older one is past 30 minutes.
+- **The agent paraphrasing.** Step 3 refuses; the agent quotes him exactly or asks him to repeat. No fuzzy match, so injected text cannot be "close enough".
+- **"Do X and Y".** One turn, two actions: the agent submits each with the part of the quote that asks for it (or the whole sentence); step 4 runs per action and step 5 keys on the action and target, so both go through once each. "Pause Codex and Grok" names both targets; "pause everything" needs "all" or "everything".
+- **A prompt in another session.** Without `--owner-session`, words from another session's turn fail step 1. With it (2.4, dispatched jobs), the named session must be the caller's recorded parent; slice 3 records the parent link at dispatch time (the delegation hook already sees every delegation call).
+- **Pasted text that is not wrapped.** A plain paste into Claude Code reaches the hook as part of the typed prompt, with no wrapper. If the owner pastes a page that contains "pause Codex", the words are in his turn. Steps 3 and 4 still need the action and target, Undo is one tap, and the routing block says what happened. This is the one injection path the hook cannot see; it is named here, not hidden.
+- **The hook did not run** (budget, crash, harness update). No record, so refusal `no_recorded_turn`, and doctor gets a row: "owner direction: N turns recorded in the last day per harness", red when a harness with the hook installed recorded none.
+- **Prompt text on disk.** The owner-turns files hold what he typed for 24 hours. They are local, 0600, excluded from capture, sync, search, backups and every agent surface (`agent_view`), and named in the storage report.
+
+### 2.7 What stays app-only
+
+Argued, since the owner's default is nothing:
+
+- **Nothing an owner does stays app-only.** Restore (row 14) becomes undoable by direction. Purge (row 15) becomes a two-turn direction (2.3 step 6), still no app step.
+- **One exception, recommended: weakening this check.** The trusted-entrypoint list, the wrapper list and the "session-only binding" switch for Aegis decide what counts as his words for every other action. If a direction could widen them, one unwrapped paste could open the door for everything after it. Recommendation: by direction he can turn owner direction **off** or **tighten** it at once; widening it (adding an entrypoint, turning on session-only binding, lengthening the windows past their defaults) is done in the app. This is a recommendation, his call (question 1).
+
+### 2.8 Known boundary: the same Mac user
+
+Khipu and the agents run as one Mac user. A program running as that user can write the owner-turn files, write the owner-actions log, or run the prompt hook's shim with `exec` from a bash shell so that the shim's parent looks like a harness. File modes and process checks cannot separate two programs of the same user, so none of this can be made impossible. Matt accepted this limit on 2026-10-16: every owner action is made tamper-evident and visible instead.
+
+What is closed:
+
+- **Running the shim by hand.** Each recorded turn names the process that ran the hook (its issuer: the first process above the hook's own `sh`, `bash` or `dash` shells). An issuer that is an interactive shell (zsh, fish, tcsh, csh, ksh) or a script interpreter (Python, Perl, Ruby, osascript) is refused, so a shim run from an agent's zsh shell or from a script never carries the owner's word. Otherwise the issuer must be an ancestor of the call that acts on the turn, as the harness is above every command its conversation runs (refusal `not_from_the_hook`). A dispatched job acting on its parent's turn skips only the ancestor test.
+- **Wrappers anywhere.** A turn that holds a machine wrapper (a task notification, a message from another session, a slash command's output) anywhere, not only at the start, never counts.
+
+What remains: `exec` tricks from a bash shell, direct writes to the turn files, and log lines written through Khipu's own append code.
+
+Why that is acceptable: every owner action is a line in a hash-chained, append-only log. Each line carries the hash of the line before it and its own hash (the words enter it as their hash, so forgetting can scrub the words without breaking the chain). Any line written another way, changed later or deleted breaks the chain at a named entry: doctor turns red and names it, and the app shows a banner on Owner actions naming it. Every owner action, by direction, in the app or on a terminal, is listed on Owner actions and named in the next routing block, with Undo.
 
 ## 3. Slices
 
@@ -128,7 +185,7 @@ Each slice is one session. The oracle for every slice is the hermetic pytest run
 
 ## 4. Decisions (Matt, 2026-10-16)
 
-Matt approved the first design and answered the questions. Decisions 1 and 4 are superseded by section 6; 2, 3 and 5 stand.
+Matt approved the design and answered the questions. These replace section 2.7's recommendation and step 6 of 2.3 where they differ.
 
 1. **Changing the check itself works by chat; nothing needs the app.** Turning owner direction off, or tightening it (shorter windows, removing an entrypoint, turning off session-only binding), works by direction in one message. Widening it (for example trusting a new front end as the owner, lengthening a window, turning session-only binding on) also works by direction, but needs a second turn of the same session whose words confirm it ("yes"), the same two-turn rule as step 6.
 2. **Front ends that count as the owner**: Remote Control and T3 Code, as the doc assumed, alongside an ordinary Claude Code or Codex session the owner types in. Dispatched jobs stay ineligible.
@@ -138,18 +195,10 @@ Matt approved the first design and answered the questions. Decisions 1 and 4 are
 
 ## 5. Rules added after the third review (2026-10-17)
 
-Rules 1, 3 (the two turns) and 4 are superseded by section 6; rule 2 and the logging half of rule 3 stand.
-
 The third cross-family review found seven gaps of one shape: words that named part of an action were taken to authorise all of it. These rules close the class.
 
 1. **Argument coverage.** An owner direction authorises a structured action only when every argument of that action is stated in the owner's own words, in the clause that asks for it: the action (its verb), what it acts on (an account, a rule, a setting, a file, a row and the row's project, a front end as its harness and its entry point), the field it changes, the value it gives, the end a timed change carries, the order of a list and the side a switch is turned to. Each is matched exactly or by the synonyms documented in `owner_direction.py` (the verbs in `ACTIONS`, the names in `_names`, `FIELD_NAMES`, `_FRONT_END_NAMES`). An argument the words do not state is refused with a plain message naming it ("the owner's words do not say which project (atlas)"). One function lists the arguments of every owner action (`arguments`) and one checks them (`_read`); a test drops each argument from every action's passing words and expects a refusal. A verbless clause carries arguments for the verb before it when arguments are all it holds ("make the latest window 12 hours and the earlier window 60 minutes"); a value belongs to the clause that names what it changes.
 2. **The tamper alarm stays until the owner acknowledges it.** A break found in the owner-actions log (a changed line, lines cut from its end) is kept in a file of its own beside the log. A later append, which rewrites the head, never clears it. The owner acknowledges it in the app (Settings, Owner actions, Acknowledge) or by chat ("acknowledge the tamper alarm"); acknowledging is an owner action, logged, with an Undo that brings the alarm back.
 3. **Turning owner direction on is an owner action.** It is logged with its Undo however it is made. By chat it is a widening, so it takes decision 1's two turns. While owner direction is off, the prompt hook records only the turns that could turn it back on (one that names owner direction, then a short yes soon after); everything else the owner types is not recorded, and no other action goes by direction. Delegation briefs are noted while it is off too, so a brief never passes for the owner's turn.
 4. **Naming one of several waiting widenings.** With more than one widening waiting from the same turn, a confirmation that names one ("yes to trusting T3", "yes, make the earlier window 60 minutes") selects it; a bare "yes" is refused and asks which. Any number the confirmation gives must be the waiting widening's.
-
-## 6. Decision: a code reply replaces reading the owner's words (Matt, 2026-10-17)
-
-After four cross-family review rounds each found new ways to fool free-text reading of his words (a negation the parser missed, an argument the words did not state, a clause read with the wrong verb, a time read loosely), Matt decided to stop inferring the action from his words. The agent proposes the exact action, Khipu shows it with a code, and his reply with the code confirms it (section 2). What this keeps and removes is in 2.2 and 2.3.
-
-The earlier review probes that describe an attack on the new protocol are regression tests in `packages/cli/tests/test_owner_code.py` (an injected code, a code inside a wrapper, a code from another session, a stale or reused code, a negated reply, a changed action). The probes that only tested reading free text were dropped with the parser.
 
