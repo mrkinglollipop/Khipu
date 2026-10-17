@@ -1391,6 +1391,7 @@ def _ack_capture_now(harness: str, sid: str, expected: dict) -> None:
 ANCESTOR_LOOKUP_TIMEOUT_S = 1
 ONLY_ACTIVE_WINDOW_S = 30 * 60
 PROCESS_MATCH_MAX_AGE_S = 12 * 60 * 60
+CAPTURE_AMBIGUITY_WINDOW_S = 5 * 60
 
 
 def ancestor_pids(pid: int | None = None) -> list[int]:
@@ -1481,7 +1482,7 @@ def _capture_candidates() -> list[dict]:
     return out
 
 
-def _latest_capture_issuer(candidate: dict) -> dict:
+def _latest_capture_turn(candidate: dict) -> dict:
     from khipu import owner_turns
 
     sid = candidate["state"].get("session_id") or candidate["sid"]
@@ -1489,10 +1490,30 @@ def _latest_capture_issuer(candidate: dict) -> dict:
         rows = owner_turns._read_lines(owner_turns.session_file(sid))
         latest = next((r for r in reversed(rows)
                        if r.get("session") == sid and r.get("harness") == candidate["harness"]), {})
-        issuer = latest.get("issuer")
-        return issuer if isinstance(issuer, dict) else {}
+        return latest
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def _newest_capture_candidate(candidates: list[dict], now: float, *, process: bool = False) -> dict | None:
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    # Prompt times outrank capture progress. Harnesses without prompt records
+    # retain the state-time fallback, including pre-prompt-hook sessions.
+    has_turns = any(c.get("turn_ts") is not None for c in candidates)
+    if process and not has_turns:
+        return None
+    ranked = sorted(candidates, key=lambda c: (c.get("turn_ts") or 0) if has_turns else c["mtime"],
+                    reverse=True)
+    first, second = [((c.get("turn_ts") or 0) if has_turns else c["mtime"]) for c in ranked[:2]]
+    if first == second:
+        return None
+    if (not process and now - second <= CAPTURE_AMBIGUITY_WINDOW_S
+            and first - second <= CAPTURE_AMBIGUITY_WINDOW_S):
+        return None
+    return ranked[0]
 
 
 def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
@@ -1504,10 +1525,11 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
 
     An explicit harness and session id are taken as given, the harness having
     to be a real one. Otherwise the caller is matched to what the hooks
-    recorded: the nearest process ancestor it shares with exactly one session
-    (an ancestor every session shares says nothing), then the working
-    directory (only when unique), then the only session touched in the last
-    half hour. The caller's own ancestry and directory default to this process's."""
+    recorded: a matching issuer (pid and start time), then legacy ancestry,
+    then the working directory and prompt times, then the only session active
+    in the last half hour. Shared issuers are narrowed by directory and latest
+    prompt; without process evidence, near-simultaneous recent activity refuses.
+    The caller's ancestry and directory default to this process's."""
     if harness and harness not in HARNESSES:
         raise ValueError(f"unknown capture harness {harness!r}; expected one of {', '.join(HARNESSES)}")
     if harness and sid:
@@ -1526,9 +1548,29 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
         )
     from khipu import owner_turns
 
+    now = time.time()
+    if cwd is None:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = ""
+    same = [c for c in cands if cwd and (
+        _same_dir(c["state"].get("cwd"), cwd)
+        or (not c["state"].get("cwd")
+            and _transcript_project_matches(c["harness"], c["state"].get("transcript_path"), cwd)))]
     pids = ancestor_pids() if host_pids is None else host_pids
-    issuers = [(c, _latest_capture_issuer(c)) for c in cands]
+    issuers = []
+    for c in cands:
+        turn = _latest_capture_turn(c)
+        try:
+            ts = float(turn.get("ts"))
+            c["turn_ts"] = ts if math.isfinite(ts) and ts > 0 else None
+        except (TypeError, ValueError):
+            c["turn_ts"] = None
+        issuer = turn.get("issuer")
+        issuers.append((c, issuer if isinstance(issuer, dict) else {}))
     mismatched = set()
+    ambiguous_process = False
     # Prompt records stay current even when the capture state has been idle.
     # The kernel start time binds an issuer to its process, not a reused pid.
     for pid in pids:
@@ -1536,18 +1578,22 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
         if not recorded:
             continue
         info = owner_turns._proc_info(pid)
-        holders = [c for c, issuer in recorded if info is not None and issuer.get("start") == info[2]]
+        holders = [c for c, issuer in recorded if info is not None
+                   and issuer.get("start") is not None and issuer["start"] == info[2]]
         mismatched.update((c["harness"], c["sid"], pid) for c, issuer in recorded
-                          if info is not None and issuer.get("start") is not None and issuer["start"] != info[2])
+                          if c not in holders)
         if len(holders) == 1:
             return holders[0]["harness"], holders[0]["sid"], "process"
-        if holders and len(holders) < len(cands):
+        if holders:
+            best = _newest_capture_candidate([c for c in holders if c in same], now, process=True)
+            if best is not None:
+                return best["harness"], best["sid"], "process"
+            ambiguous_process = True
             break
     # A process id is reused once its owner is gone, so a session that has
     # been quiet for half a day no longer vouches for the ids it recorded.
-    now = time.time()
     live = [c for c in cands if now - c["mtime"] <= PROCESS_MATCH_MAX_AGE_S]
-    for pid in pids:
+    for pid in ([] if ambiguous_process else pids):
         # A known issuer mismatch cannot become a match through pid-only state.
         holders = [c for c in live if pid in (c["state"].get("host_pids") or [])
                    and (c["harness"], c["sid"], pid) not in mismatched]
@@ -1555,22 +1601,12 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
             if len(holders) == 1:
                 return holders[0]["harness"], holders[0]["sid"], "process"
             break
-    if cwd is None:
-        try:
-            cwd = os.getcwd()
-        except OSError:
-            cwd = ""
-    same = []
-    if cwd:
-        same = [c for c in cands
-                if _same_dir(c["state"].get("cwd"), cwd)
-                or (not c["state"].get("cwd")
-                    and _transcript_project_matches(c["harness"], c["state"].get("transcript_path"), cwd))]
-        if len(same) == 1:
-            best = same[0]
+    if not ambiguous_process:
+        best = _newest_capture_candidate(same, now)
+        if best is not None:
             return best["harness"], best["sid"], "cwd"
-    recent = [c for c in cands if now - c["mtime"] <= ONLY_ACTIVE_WINDOW_S] if len(same) < 2 else []
-    if len(recent) == 1:
+    recent = [c for c in cands if now - (c.get("turn_ts") or c["mtime"]) <= ONLY_ACTIVE_WINDOW_S]
+    if len(recent) == 1 and not ambiguous_process:
         return recent[0]["harness"], recent[0]["sid"], "only_active"
     names = ", ".join(f"{c['harness']}:{c['sid'][:8]}" for c in sorted(cands, key=lambda c: -c["mtime"]))
     raise ValueError(
