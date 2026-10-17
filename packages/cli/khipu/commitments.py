@@ -558,48 +558,124 @@ def _declared(raw: Any) -> str | None:
     return normalize_owner(raw)
 
 
+# The grammatical subject who commits (third cross-family review). An item's
+# owner is whoever the sentence says will do it, as stated by its speaker,
+# read with the session's lineage: the speaker's own "I will" (conditional or
+# not) is the speaker's; "Bob will review" or "the reviewer will" names a
+# third party, whoever says it and in any session; and in a job the "I" of
+# the job's user is the orchestrator that wrote its brief.
+_LEAD_IN = r"^\s*(?:(?:then|next|also|and|so|ok(?:ay)?|finally|first|later)\b[,]?\s+)*"
+_FIRST_PERSON_RE = re.compile(
+    _LEAD_IN + r"I(?:['’]ll\b|['’]m\s+going\s+to\b|\s+(?:will|shall|must|should|can|need\s+to|"
+    r"have\s+to|am\s+going\s+to|want\s+to|plan\s+to|promise\s+to|intend\s+to|owe|still\s+owe|"
+    r"still\s+need\s+to|will\s+also|also\s+need\s+to)\b)",
+    re.I,
+)
+_NAMED_SUBJECT_RE = re.compile(
+    _LEAD_IN + r"([A-Z][a-z]{1,30})\s+(?:will|must|should|needs?\s+to|has\s+to|is\s+going\s+to|"
+    r"promised\s+to|owes|to)\s+(?!be\b)[a-z]+")
+_NOT_NAMES = frozenset("""
+    i we you he she it they this that these those there here the a an someone somebody anyone
+    everyone everybody nobody nothing something then next also and so finally first later now
+    please when if once after before until while who what which why how each every all both
+    tests test docs doc ci it's let make run build check
+""".split())
+
+
+def commit_subject(text: str) -> tuple[str, str | None] | None:
+    """Who the sentence says commits, as its grammatical subject, or None
+    when it names nobody (an imperative, a passive, a question):
+
+    * ``("self", None)``: the speaker ("I will ...", "I'll ...");
+    * ``("user", None)``: the user by name or alias ("Matt will ...");
+    * ``("agent", label)``: a third party ("the reviewer must ...",
+      "PR #12's author to ...", "Bob will ...").
+
+    Only the subject counts: "I will ask the orchestrator to merge" is the
+    speaker's, and "Merge once the reviewer approves" names nobody."""
+    s = (text or "").strip()
+    if _FIRST_PERSON_RE.match(s):
+        return "self", None
+    lead = re.match(_LEAD_IN, s)
+    rest = s[lead.end():] if lead else s
+    for label, pattern in _agent_actor_res():
+        m = pattern.match(rest)
+        if m:
+            return OWNER_AGENT, label
+    patterns = _compile_user_patterns()
+    m = patterns.actor_re.match(rest)
+    if m:
+        return OWNER_USER, None
+    m = _NAMED_SUBJECT_RE.match(s)
+    if m:
+        name = m.group(1)
+        if name.lower() in patterns.owners:
+            return OWNER_USER, None
+        if name.lower() not in _NOT_NAMES:
+            return OWNER_AGENT, name
+    return None
+
+
 def resolve_owner_and_label(text: str, *, kind: str | None = None, declared: Any = None,
                             future_trigger: bool | None = None,
                             origin: str | None = None,
                             declared_label: Any = None) -> tuple[str, str | None]:
-    """``(owner, owner_label)`` for one commitment, deterministically.
+    """``(owner, owner_label)`` for one commitment, deterministically. The one
+    owner function: capture, the clean-up and reassignment defaults all call
+    it, and ``tests/test_commitment_owner.py`` holds its table of cases.
 
-    The owner comes from who said it and in which session, never from the
-    words alone. In a job (``origin == 'job'``) the speaker typing as "the
-    user" is known to be the orchestrator that wrote the brief, so:
+    ``declared`` is the speaker the extractor names (``user``, ``assistant``
+    or ``other`` with ``declared_label``); ``origin`` is the session's
+    lineage (``job`` for a dispatched job, else the owner's conversation).
+    The subject (:func:`commit_subject`) of the body, read without any
+    trigger clause ("When the reviewer finishes, I will test it" is the
+    speaker's), decides first:
 
-    1. a third party named as the actor ("the orchestrator must", "PR #234
-       author to") is that party's: ``agent`` with its label;
-    2. a user signal (a question, a decision shape, "Matt to decide X") or a
-       model-declared ``"user"`` goes to the orchestrator; it asks the user
-       itself if it really needs them.
+    1. the speaker's own "I will": the user's, or in a job the orchestrator's
+       (a job's user is the orchestrator that wrote its brief); the
+       assistant's; or the declared third party's;
+    2. a named third party, in any session: ``agent`` with its label;
+    3. the user named as the subject: the user's, in a job the orchestrator's.
 
-    In the owner's own conversation (any other origin) the words never move
-    an item away from him: his "I will ask the orchestrator to ..." is his,
-    and a question to him stays his whatever it mentions. A user signal is
-    the user's; with no signal and no future trigger the model's declared
-    speaker decides ("other" with its label becomes ``agent``); else the
-    assistant's.
+    With no subject, a job's third party named anywhere is that party's; a
+    question or decision owed (a user signal) is the user's, in a job the
+    orchestrator's; with no future trigger the declared speaker decides; and
+    anything else is the assistant's.
     """
     if future_trigger is None:
         future_trigger = has_future_trigger(text)
     s = (text or "").strip()
     job = str(origin or "").strip().lower() == ORIGIN_JOB
+    body = _without_trigger_clause(s) if future_trigger is not False else s
+    speaker = _declared(declared)
+    users = (OWNER_AGENT, ORCHESTRATOR) if job else (OWNER_USER, None)
+    subject = commit_subject(body)
+    if subject is not None:
+        who, label = subject
+        if who == "self":
+            if speaker == OWNER_USER:
+                return users
+            if speaker == OWNER_ASSISTANT:
+                return OWNER_ASSISTANT, None
+            if speaker == "other":
+                return OWNER_AGENT, clean_owner_label(declared_label) or (ORCHESTRATOR if job else "other")
+        elif who == OWNER_AGENT:
+            return OWNER_AGENT, label
+        elif who == OWNER_USER:
+            return users
     if job:
-        body = _without_trigger_clause(s) if future_trigger is not False else s
         label = agent_actor(body)
         if label:
             return OWNER_AGENT, label
     if _user_signal(text, kind=kind, future_trigger=future_trigger):
-        return (OWNER_AGENT, ORCHESTRATOR) if job else (OWNER_USER, None)
+        return users
     if not future_trigger:
-        norm = _declared(declared)
-        if norm == "other":
+        if speaker == "other":
             return OWNER_AGENT, clean_owner_label(declared_label) or (ORCHESTRATOR if job else "other")
-        if norm == OWNER_USER:
-            return (OWNER_AGENT, ORCHESTRATOR) if job else (OWNER_USER, None)
-        if norm:
-            return norm, None
+        if speaker == OWNER_USER:
+            return users
+        if speaker:
+            return speaker, None
     return OWNER_ASSISTANT, None
 
 
@@ -914,6 +990,19 @@ def _reassigned_column_ready(cur) -> bool:
         return False
 
 
+def _lineage_columns_ready(cur) -> bool:
+    """True when migration 0037 (reassignment metadata, ``linked_ids`` and
+    ``latest_text``) has been applied. Without it a reassign keeps only its
+    time, and similar items of different owners stay apart unlinked."""
+    try:
+        from khipu.db import has_columns
+
+        return has_columns(cur, "commitments", "owner_reassigned_by", "owner_reassign_reason", "owner_prior",
+                           "owner_prior_label", "linked_ids", "latest_text")
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
 def _close_columns_ready(cur) -> bool:
     """True when migration 0034 (prs, closed_by, close_rule_key and the rule
     notes) has been applied. Fail-closed like the others: a pre-migration hub
@@ -1006,6 +1095,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     trigger_text_ready = _trigger_text_ready(cur)
     owner_ready = _owner_columns_ready(cur)
     close_ready = _close_columns_ready(cur)
+    lineage_ready = _lineage_columns_ready(cur)
     origin = capture_origin(payload)
     inserted = 0
     rejected = 0
@@ -1041,27 +1131,42 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
         # therefore looks at conversation rows only. Never the other way: a
         # job item that matches a conversation item is folded into it, as
         # before.
+        #
+        # Dedup never merges two items with different owners: a near
+        # duplicate is looked for among the open items the SAME owner owes
+        # only. A similar item another owner owes stays, and the two are
+        # linked (migration 0037).
         relay_ids: list[int] = []
-        if owner_ready and scope is not None and origin == ORIGIN_CONVERSATION:
-            rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id,
-                                     with_origin=True)
-            job_rows = [r for r in rows if r.get("origin") == ORIGIN_JOB]
-            own_rows = [r for r in rows if r.get("origin") != ORIGIN_JOB]
-            exact = _open_id_for_hash(cur, scope, h)
-            existing = exact if any(r["id"] == exact for r in own_rows) else None
-            if existing is None:
-                existing = _near_duplicate_open(cur, scope, norm["text"], rows=own_rows)
-            if existing is None and job_rows:
-                relay_ids = _relay_matches(cur, norm["text"], exact, scope, job_rows)
-        else:
-            existing = _open_id_for_hash(cur, scope, h)
-            if existing is None:
-                existing = _near_duplicate_open(cur, scope, norm["text"],
-                                                payload=payload, episode_id=episode_id)
+        relay = owner_ready and scope is not None and origin == ORIGIN_CONVERSATION
+        rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id,
+                                 with_origin=owner_ready, with_owner=True)
+        job_rows = [r for r in rows if r.get("origin") == ORIGIN_JOB] if relay else []
+        pool = [r for r in rows if r.get("origin") != ORIGIN_JOB] if relay else rows
+        same = [r for r in pool if (r["owner"], r.get("owner_label")) == (owner, owner_label)]
+        others = [r for r in pool if (r["owner"], r.get("owner_label")) != (owner, owner_label)]
+        exact = _open_id_for_hash(cur, scope, h)
+        existing = exact if any(r["id"] == exact for r in same) else None
+        if exact is not None and not any(r["id"] == exact for r in rows):
+            existing = exact  # open but outside what this capture reads: as before, never a second row
+        if existing is None:
+            existing = _near_duplicate_open(cur, scope, norm["text"], rows=same)
+        if existing is None and job_rows:
+            relay_ids = _relay_matches(cur, norm["text"], exact, scope, job_rows)
         if existing is not None:
             if seen_ready:
                 _touch_seen(cur, existing)
+            row = next((r for r in same if r["id"] == existing), None)
+            if row is not None and lineage_ready and norm["text"] != row["text"]:
+                # A restatement in other words keeps the newer wording.
+                cur.execute("UPDATE commitments SET latest_text = %s WHERE id = %s", (norm["text"], existing))
             continue
+        linked = [r["id"] for r in others
+                  if r["id"] == exact or _match_score(norm["text"], r["text"]) >= NEAR_DUP_MIN_SCORE]
+        if exact is not None and any(r["id"] == exact for r in others) and exact not in relay_ids:
+            # The same words, owed by someone else: the open (project,
+            # content_hash) slot is theirs, so this owner's item takes a hash
+            # of its own and both stay.
+            h = content_hash(lifecycle_scope, f"{norm['text']}\x00owner:{owner}:{owner_label or ''}")
         for rid in relay_ids:
             # Closed before the insert: an identical text shares the open
             # (project, content_hash) slot the unique index guards. The
@@ -1111,12 +1216,17 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
         )
         if cur.rowcount > 0:
             inserted += 1
+            row = cur.fetchone() if (relay_ids or (linked and lineage_ready)) and owner_ready else None
             if relay_ids:
-                row = cur.fetchone()
                 if row:
                     cur.execute("UPDATE commitments SET close_reason = %s WHERE id = ANY(%s)",
                                 (f"relayed-by {int(row[0])}", relay_ids))
                 relayed += len(relay_ids)
+            if row and linked and lineage_ready:
+                new_id = int(row[0])
+                cur.execute("UPDATE commitments SET linked_ids = %s WHERE id = %s", (linked, new_id))
+                cur.execute("UPDATE commitments SET linked_ids = array_append(linked_ids, %s) "
+                            "WHERE id = ANY(%s) AND NOT (%s = ANY(linked_ids))", (new_id, linked, new_id))
     if inserted or rejected:
         _log(
             f"opened {inserted} commitment(s), rejected {rejected}, relayed {relayed}, for "
@@ -1142,17 +1252,28 @@ def _relay_matches(cur, text: str, exact: int | None, scope: str | None,
 
 def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None = None,
                       episode_id: int | None = None,
-                      with_origin: bool = False) -> list[dict[str, Any]]:
+                      with_origin: bool = False, with_owner: bool = False) -> list[dict[str, Any]]:
+    """The open items in ``scope``'s lineage: ``id`` and ``text``, with
+    ``origin`` and, for ``with_owner``, the columns :func:`row_owner` reads
+    (its resolved ``owner`` and ``owner_label`` replace the stored ones)."""
     lineage, params = _lineage_clause(cur, payload or {"project": scope}, episode_id)
-    cols = "id, text, origin" if with_origin else "id, text"
+    cols = ["id", "text"] + (["origin"] if with_origin else [])
+    if with_owner:
+        cols += ["owner", "kind"]
+        if _owner_columns_ready(cur):
+            cols += [c for c in ("origin", "owner_label") if c not in cols]
+        if _reassigned_column_ready(cur):
+            cols.append("owner_reassigned_at")
     cur.execute(
-        f"SELECT {cols} FROM commitments WHERE status = 'open' AND project IS NOT DISTINCT FROM %s "
+        f"SELECT {', '.join(cols)} FROM commitments WHERE status = 'open' AND project IS NOT DISTINCT FROM %s "
         f"AND {lineage} AND {_not_forgotten_clause(cur)}",
         (scope, *params),
     )
-    if with_origin:
-        return [{"id": r[0], "text": r[1], "origin": r[2]} for r in cur.fetchall()]
-    return [{"id": r[0], "text": r[1]} for r in cur.fetchall()]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    if with_owner:
+        for row in rows:
+            row["owner"], row["owner_label"] = row_owner(row)
+    return rows
 
 
 def _candidate_close_texts(payload: dict[str, Any]) -> list[tuple[str, str, int | None]]:
@@ -1339,12 +1460,13 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
     candidates = _candidate_close_texts(payload)
     if not candidates:
         return 0
-    open_rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id)
+    open_rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id, with_owner=True)
     if not open_rows:
         return 0
     from khipu.config import float_setting
 
     threshold = float_setting("commitment_close_similarity")
+    origin = capture_origin(payload)
     ids = [r["id"] for r in open_rows]
     already_closed: set[int] = set()
     closed = 0
@@ -1362,6 +1484,7 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
         best_score = 0.0
         best_via = ""
         tied = False
+        tied_ids: list[int] = []
         semantic_matches = 0
         for row in open_rows:
             cid = row["id"]
@@ -1377,9 +1500,19 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
                 semantic_matches += 1
             if via and score > best_score:
                 best_id, best_score, best_via = cid, score, via
-                tied = False
+                tied, tied_ids = False, [cid]
             elif via and abs(score - best_score) < 1e-9:
                 tied = True
+                tied_ids.append(cid)
+        if tied and best_via != "cosine":
+            # Items of different owners that say the same thing both stay
+            # open (dedup never merges them), so they tie. The evidence
+            # closes the one whose owner its own session would give it.
+            mine = resolve_owner_and_label(text, origin=origin)
+            own = [r["id"] for r in open_rows
+                   if r["id"] in tied_ids and (r.get("owner"), r.get("owner_label")) == mine]
+            if len(own) == 1:
+                best_id, tied = own[0], False
         if best_id is None or tied or (best_via == "cosine" and semantic_matches > 1):
             continue
         best_text = next(r["text"] for r in open_rows if r["id"] == best_id)
@@ -1615,6 +1748,9 @@ def fetch_owed_rows(cur, *, project: str | None = None, parent_session_id: str |
         select_cols += ["prs", "closed_by", "close_rule_key", "settle_suggestion", "pr_check"]
     if _reassigned_column_ready(cur):
         select_cols.append("owner_reassigned_at")
+    if _lineage_columns_ready(cur):
+        select_cols += ["owner_reassigned_by", "owner_reassign_reason", "owner_prior", "owner_prior_label",
+                        "linked_ids", "latest_text"]
     cur.execute(
         f"""
         SELECT {', '.join(select_cols)}
@@ -1860,21 +1996,46 @@ def owners_of(cur, ids: list[int], *, lock: bool = False) -> dict[int, dict[str,
     return out
 
 
-def reassign(cur, commitment_id: int, owner: str, label: str | None = None) -> bool:
-    """Set one item's owner by hand: ``agent`` keeps ``label`` (default the
-    orchestrator), the user and the assistant none. Once migration 0035 is in,
-    a read keeps the owner as written instead of resolving it from the text."""
+def reassign(cur, commitment_id: int, owner: str, label: str | None = None, *,
+             by: str | None = None, reason: str | None = None) -> bool:
+    """Set one item's owner by hand. ``agent`` keeps ``label``; with none,
+    the owner function's own label for the item's words (the third party it
+    names as its subject), else the orchestrator. The user and the assistant
+    take no label. Once migration 0035 is in, a read keeps the owner as
+    written; with 0037 the change also keeps who made it (``by``), its
+    ``reason`` and the owner before it, so a Mac's copy shows the same."""
     if owner not in OWNERS:
         raise ValueError(f"owner must be one of {', '.join(OWNERS)}, got {owner!r}")
+    if owner == OWNER_AGENT and not clean_owner_label(label):
+        label = _default_agent_label(cur, commitment_id)
     sets, params = ["owner = %s"], [owner]
     if _owner_columns_ready(cur):
         sets.append("owner_label = %s")
         params.append((clean_owner_label(label) or ORCHESTRATOR) if owner == OWNER_AGENT else None)
+    if _lineage_columns_ready(cur):
+        # The right-hand sides read the row as it was before this UPDATE.
+        sets[:0] = ["owner_prior = owner", "owner_prior_label = owner_label",
+                    "owner_reassigned_by = %s", "owner_reassign_reason = %s"]
+        params[:0] = [str(by or BY_CONVERSATION)[:80], (str(reason)[:400] if reason else None)]
     if _reassigned_column_ready(cur):
         sets.append("owner_reassigned_at = now()")
     cur.execute(f"UPDATE commitments SET {', '.join(sets)} WHERE id = %s AND {_not_forgotten_clause(cur)}",
                 (*params, commitment_id))
     return cur.rowcount > 0
+
+
+def _default_agent_label(cur, commitment_id: int) -> str:
+    """The label a reassign to ``agent`` takes when none is given: the third
+    party the item's words name as their subject, else the orchestrator."""
+    try:
+        cur.execute("SELECT text, kind FROM commitments WHERE id = %s", (commitment_id,))
+        got = cur.fetchone()
+    except Exception:  # noqa: BLE001 — a default label is never worth failing the change
+        return ORCHESTRATOR
+    if not got:
+        return ORCHESTRATOR
+    owner, label = resolve_owner_and_label(got[0] or "", kind=got[1])
+    return label if owner == OWNER_AGENT and label and label != "other" else ORCHESTRATOR
 
 
 def bulk_owner_gate(count: int) -> str | None:

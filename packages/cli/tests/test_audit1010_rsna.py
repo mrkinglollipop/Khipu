@@ -290,7 +290,10 @@ class CommitmentClosureTest(RegistryTest):
         self.cur.episode(2, "child", "root")
         self.cur.episode(3, "unrelated")
         self.cur.commitment(text, project=None, episode=1)
-        self.assertEqual(co.open_from_episode(self.cur, {"session_id": "child", "parent_session_id": "root", "open_loops": [text]}, 2), 0)
+        # The child is a job, so its restatement is the orchestrator's: a
+        # different owner from the root's item, kept beside it and never
+        # folded into it (third cross-family review).
+        self.assertEqual(co.open_from_episode(self.cur, {"session_id": "child", "parent_session_id": "root", "open_loops": [text]}, 2), 1)
         self.assertEqual(co.open_from_episode(self.cur, {"session_id": "unrelated", "open_loops": [text]}, 3), 1)
         self.assertEqual(co.auto_close(self.cur, {"session_id": "child", "parent_session_id": "root", "closed_loops": [text]}, 2), 1)
 

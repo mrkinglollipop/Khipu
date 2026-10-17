@@ -593,7 +593,8 @@ TOOLS: list[dict] = [
                 "until": {"type": "string", "description": "snooze only: 2026-09-30, 7d, 2w, 1m"},
                 "owner": {"type": "string", "description": "reassign only: user | assistant | agent"},
                 "owner_label": {"type": "string",
-                                "description": "reassign to agent only: who (orchestrator, builder, reviewer)"},
+                                "description": "reassign to agent only: who (orchestrator, builder, reviewer); "
+                                               "default: the third party the item names, else the orchestrator"},
                 "reason": {"type": "string",
                            "description": "why (kept on a closed item); required with more than one id"},
             },
@@ -1823,7 +1824,8 @@ def _owed_change_on_hub(args: dict) -> dict:
                         return cur.rowcount > 0
                     if action == "reassign":
                         return commitments.reassign(cur, cid, str(args.get("owner") or ""),
-                                                    str(args.get("owner_label") or "") or None)
+                                                    str(args.get("owner_label") or "") or None,
+                                                    by=by, reason=reason)
                     return commitments.set_status(cur, cid, "closed" if action == "close" else "open",
                                                   reason=reason, by=by)
 

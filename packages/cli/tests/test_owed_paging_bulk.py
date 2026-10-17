@@ -508,3 +508,199 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
     tool = srv._tool_owed({"project": "acme/widget", "limit": 500})
     assert [r["id"] for r in tool["results"]] == [r["id"] for r in results]
     assert tool["next_cursor"] == result["next_cursor"]
+
+
+# ---- the third cross-family review's bulk probes (fakes, no hub) ----------
+# The round-2 snooze probe with its response-shape fake updated for the new
+# batches key; its assertions are the reviewer's.
+
+import copy  # noqa: E402
+
+
+
+def test_bulk_snooze_keeps_audit_with_new_batch_response(monkeypatch):
+    from khipu import commitments, config, db, mcp_server, offline, owed_tidy
+
+    reason = "Matt asked to defer these until the vendor replies"
+    original_due_after = "2026-10-18"
+    state = {
+        "commitments": {1: {"due_after": original_due_after}, 2: {"due_after": None}},
+        "owner_writes_applied": [],
+        "sql": [], "batches": {}, "items": [],
+    }
+
+    class Cursor:
+        rowcount = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=()):
+            compact = " ".join(sql.split())
+            params = tuple(params)
+            state["sql"].append((compact, params))
+            if compact.startswith("INSERT INTO owner_writes_applied"):
+                state["owner_writes_applied"].append({"write_id": params[0], "tool": params[1]})
+                self.rowcount = 1
+            elif compact.startswith("UPDATE commitments SET due_after"):
+                commitment_id = params[-1]
+                state["commitments"][commitment_id]["due_after"] = (params[0] if len(params) > 1 else "2026-10-23")
+                self.rowcount = 1
+            elif compact.startswith("SELECT id, project FROM commitments"):
+                self.result = [(cid, "acme/widget") for cid in params[0]]
+            elif compact.startswith("INSERT INTO commitment_tidy_batches"):
+                state["batches"][params[0]] = {"project": params[1]}
+            elif compact.startswith("UPDATE commitments SET tidy_batch"):
+                state["commitments"][params[1]]["tidy_batch"] = params[0]
+            elif compact.startswith("INSERT INTO commitment_tidy_items"):
+                state["items"].append({"batch": params[0], "id": params[1], "action": params[2],
+                                       "reason": params[3], "prior": json.loads(params[4])})
+            elif compact.startswith("UPDATE commitment_tidy_batches SET counts"):
+                state["batches"][params[1]]["counts"] = json.loads(params[0])
+            else:
+                raise AssertionError(f"unexpected SQL: {compact}")
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return self.result
+
+    class Connection:
+        def __init__(self):
+            self.commits = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            return None
+
+    conn = Connection()
+    monkeypatch.setattr(db, "connect", lambda **kwargs: conn)
+    monkeypatch.setattr(owed_tidy, "_ready", lambda cur: True)
+    monkeypatch.setattr(owed_tidy, "_select", lambda cur, project, ids=None, **kwargs: {
+        cid: copy.deepcopy(row) for cid, row in state["commitments"].items()
+        if ids is None or cid in ids
+    })
+    monkeypatch.setattr(config, "count_setting", lambda key: 0 if key == "owed_bulk_max" else 200)
+    monkeypatch.setattr(offline, "setting", lambda key: 10)
+    monkeypatch.setattr(mcp_server, "_ensure_path", lambda: None)
+    monkeypatch.setattr(mcp_server, "_owed_owners_items", lambda ids: [])
+    monkeypatch.setattr(commitments, "owners_of", lambda cur, ids, **kwargs: {
+        commitment_id: {"owner": commitments.OWNER_ASSISTANT} for commitment_id in ids
+    })
+
+    result = mcp_server.owed_change(
+        [1, 2], "snooze", by=commitments.BY_CONVERSATION,
+        until="7d", reason=reason, queue_ok=False,
+    )
+
+    assert result['ok'] is True
+    assert result['changed'] == 2
+    assert result['results'] == [{'id':1,'ok':True},{'id':2,'ok':True}]
+    assert result['batches']
+    assert len(state['items']) == 2
+    assert state['items'][0]['prior']['due_after'] == original_due_after
+    assert state['items'][0]['reason'] == reason
+    assert conn.commits == 1
+    assert state["commitments"][1]["due_after"] != original_due_after
+    assert reason in json.dumps(state)
+    assert original_due_after in json.dumps(state)
+
+
+def test_bulk_owner_gate_refuses_and_never_dispatches(monkeypatch):
+    from khipu import mcp_server as srv, commitments as co, config, owner_writes
+    monkeypatch.setattr(config,'count_setting',lambda name:500)
+    monkeypatch.setattr(srv,'_owed_owners_items',lambda ids:[1])
+    monkeypatch.setattr(co,'bulk_owner_gate',lambda count:None)
+    def forbidden(*a,**kw): raise AssertionError('owner write dispatched without owner gate')
+    monkeypatch.setattr(owner_writes,'run',forbidden)
+    result=srv.owed_change([1,2],'close',by=co.BY_CONVERSATION,reason='fake requested close')
+    assert not result['ok'] and result['changed']==0
+    assert result['needs_owner']==[1]
+
+
+def test_bulk_limit_is_enforced_and_zero_lifts_it(monkeypatch):
+    import pytest
+    from khipu import mcp_server as srv, commitments as co, config, owner_writes
+    monkeypatch.setattr(config,'count_setting',lambda name:1)
+    with pytest.raises(ValueError,match='at most 1'):
+        srv.owed_change([1,2],'close',by=co.BY_CONVERSATION,reason='fake close')
+    monkeypatch.setattr(config,'count_setting',lambda name:0)
+    monkeypatch.setattr(srv,'_owed_owners_items',lambda ids:[])
+    called=[]
+    monkeypatch.setattr(owner_writes,'run',lambda tool,args,**kw:called.append(args) or {'ok':True})
+    assert srv.owed_change([1,2],'close',by=co.BY_CONVERSATION,reason='fake close')['ok']
+    assert called[0]['ids']==[1,2]
+
+
+def test_four_thousand_rows_page_stably_while_fifty_arrive():
+    from datetime import datetime,timezone,timedelta
+    from khipu import commitments as co
+    at=datetime(2026,10,1,tzinfo=timezone.utc)
+    rows=[dict(id=i,text=f'Rebuild deployment index {i}',owner='assistant',kind='followup',opened_at=at+timedelta(seconds=i//3)) for i in range(1,4001)]
+    result=co.page_owed(rows,limit=113)
+    seen=[r['id'] for r in result['results']]
+    rows.extend(dict(id=i,text=f'Rebuild deployment index {i}',owner='assistant',kind='followup',opened_at=at+timedelta(days=1)) for i in range(4001,4051))
+    while result['next_cursor']:
+        result=co.page_owed(rows,cursor=result['next_cursor'],limit=113)
+        seen.extend(r['id'] for r in result['results'])
+    assert seen == list(range(4000,0,-1))
+
+
+# ---- reassignment metadata and linked items on the hub (migration 0037) -----
+
+def test_a_reassign_keeps_who_why_and_the_prior_owner(owed):
+    ids = _seed(owed, 1, start=700, text="The reviewer must rebase the release branch {i}", owner="user")
+    out = srv._tool_owed_update({"id": ids[0], "action": "reassign", "owner": "agent",
+                                 "reason": "the reviewer owns rebases"})
+    assert out["ok"] is True
+    with owed.cursor() as cur:
+        cur.execute("SELECT owner, owner_label, owner_prior, owner_prior_label, owner_reassigned_by, "
+                    "owner_reassign_reason, owner_reassigned_at IS NOT NULL FROM commitments WHERE id = %s",
+                    (ids[0],))
+        owner, label, prior, prior_label, by, reason, stamped = cur.fetchone()
+    # No label given: the owner function's own, the subject the words name.
+    assert (owner, label, prior, prior_label, reason, stamped) == (
+        "agent", "reviewer", "user", None, "the reviewer owns rebases", True)
+    assert by
+    row = next(r for r in srv._tool_owed({"project": PROJECT})["results"] if r["id"] == ids[0])
+    assert (row["owner_prior"], row["owner_reassign_reason"]) == ("user", "the reviewer owns rebases")
+
+
+def test_similar_items_of_two_owners_both_stay_linked_on_the_hub(owed):
+    from unittest import mock
+
+    with owed.cursor() as cur:
+        cur.execute("INSERT INTO episodes (ts, summary, raw) VALUES (now(), 's', '{}'::jsonb) RETURNING id")
+        ep = int(cur.fetchone()[0])
+        base = {"project": PROJECT, "session_id": "claude_code:host-1"}
+        with mock.patch.object(co, "_has_commitment_embeddings", lambda cur, ids: False):
+            assert co.open_from_episode(cur, dict(base, open_loops=[
+                {"text": "Review the deployment checklist before release", "kind": "followup",
+                 "owner": "assistant"}]), ep) == 1
+            assert co.open_from_episode(cur, dict(base, open_loops=[
+                {"text": "I will review the deployment checklist before release", "kind": "promise",
+                 "owner": "user"}]), ep) == 1
+            assert co.open_from_episode(cur, dict(base, open_loops=[
+                {"text": "Review the deployment checklist before the release", "kind": "followup",
+                 "owner": "assistant"}]), ep) == 0
+        cur.execute("SELECT id, owner, linked_ids, latest_text FROM commitments WHERE project = %s "
+                    "AND status = 'open' ORDER BY id", (PROJECT,))
+        (a, a_owner, a_links, a_latest), (u, u_owner, u_links, _u_latest) = cur.fetchall()
+    assert (a_owner, u_owner) == ("assistant", "user")
+    assert (a_links, u_links) == ([u], [a])
+    assert a_latest == "Review the deployment checklist before the release"

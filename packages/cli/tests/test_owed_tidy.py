@@ -235,11 +235,11 @@ def test_the_plan_sorts_the_flood_by_rule_with_evidence(owed):
             assert items[i]["after"]["owner"] == "agent" and items[i]["rule"], group
             assert items[i]["after"]["origin"] == "job", group
     assert items[f.groups["job_question"][0]]["after"]["owner_label"] == "orchestrator"
-    # The owner's own conversation naming the orchestrator: no keyword moves
-    # it (owners come from lineage); only the model pass may, and here it
-    # says the user's, so it is kept.
+    # The owner's own conversation naming the orchestrator as the subject:
+    # the orchestrator's whoever said it, already shown so, so it is kept.
     assert actions("agent_named") == {"keep"}
-    assert items[f.groups["agent_named"][0]]["before"]["owner"] == "user"
+    assert (items[f.groups["agent_named"][0]]["before"]["owner"],
+            items[f.groups["agent_named"][0]]["before"]["owner_label"]) == ("agent", "orchestrator")
     assert actions("conv_names_user") == {"keep"}
     assert actions("pr_merged") == {"close"}
     assert {items[i]["close"] for i in f.groups["pr_merged"]} == {"pr"}

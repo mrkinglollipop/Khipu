@@ -136,10 +136,14 @@ class _CommitmentsCursor:
             ]
             self._result = [(hit[0],)] if hit else []
             return
-        if s.startswith("SELECT id, text FROM commitments WHERE status = 'open'"):
+        if s.startswith("SELECT id, text") and " FROM commitments WHERE status = 'open' AND project" in s:
+            # The open items of a scope, with whatever columns were asked for.
             project = params[0]
+            cols = s[len("SELECT "):s.index(" FROM commitments")].split(", ")
+            defaults = {"origin": "conversation"}
             self._result = [
-                (r["id"], r["text"]) for r in self.rows.values()
+                tuple(r.get(c) if r.get(c) is not None else defaults.get(c) for c in cols)
+                for r in self.rows.values()
                 if r["status"] == "open" and r["project"] == project
             ]
             return
@@ -1189,9 +1193,11 @@ class ConfigurableUserAliasesTest(unittest.TestCase):
     def test_matt_is_not_recognised_when_the_only_configured_alias_is_priya(self):
         with mock.patch.dict(os.environ, {"KHIPU_USER_ALIASES": "priya"}):
             co.reset_user_patterns()
+            # Not the user: with the alias priya, "Matt" is a third party named
+            # as the subject, so the item is his as an agent, never the user's.
             self.assertEqual(
-                co.resolve_owner("Matt to decide whether the release ships"),
-                co.OWNER_ASSISTANT,
+                co.resolve_owner_and_label("Matt to decide whether the release ships"),
+                (co.OWNER_AGENT, "Matt"),
             )
 
 

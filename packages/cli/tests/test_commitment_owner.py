@@ -1,11 +1,14 @@
 """Owner and origin at capture (scope docs/plans/2026-10-16-owed-and-ledger-ssot.md,
 slice 1, with Matt's decisions 2 and 3).
 
-A dispatched job's "user" is the orchestrator that wrote its brief, so a
-job's questions and its "Matt to decide X" belong to the orchestrator (owner
-``agent``, label "orchestrator"), not to the user. In a job a named third
-party ("the orchestrator must", "PR #234 author to") is an ``agent`` owner;
-in the owner's own conversation the words never move an item away from him. Nothing is dropped: only the owner and where an item shows change.
+An item's owner is the grammatical subject who commits, as its speaker
+states it, read with the session's lineage (third cross-family review): the
+speaker's own "I will" (conditional or not) is the speaker's; "Bob will
+review" or "the reviewer must" names a third party (owner ``agent`` with that
+label), whoever says it and in any session; and a dispatched job's "user" is
+the orchestrator that wrote its brief, so a job's questions, its "Matt to
+decide X" and its user's "I will" belong to the orchestrator. Nothing is
+dropped: only the owner and where an item shows change.
 
 No live database except the last class, which uses the throwaway PostgreSQL
 of tests/hermetic_pg.py (a hub at migration 0029, so without 0033's columns).
@@ -68,14 +71,6 @@ class _OwnerCursor(_CommitmentsCursor):
                 self.rows[cid].update(origin=origin, owner_label=label)
             self._result = [(cid,) for cid in new]
             return
-        if s.startswith("SELECT id, text, origin FROM commitments WHERE status = 'open'"):
-            project = params[0]
-            self._result = [
-                (r["id"], r["text"], r.get("origin") or "conversation")
-                for r in self.rows.values()
-                if r["status"] == "open" and r["project"] == project
-            ]
-            return
         if s.startswith("UPDATE commitments SET close_reason = %s WHERE id = ANY(%s)"):
             reason, ids = params
             for cid in ids:
@@ -109,9 +104,8 @@ def _by_text(cur, text):
 
 
 class NamedThirdPartyTest(unittest.TestCase):
-    """A named third party decides the owner only in a job, where the speaker
-    is known to be the orchestrator; in the owner's own conversation the
-    model's declared speaker does."""
+    """A named third party as the subject owns the item, whoever says it, in
+    a job and in the owner's own conversation alike."""
 
     def test_the_orchestrator_must_resolve_the_rebase_conflict_is_agent(self):
         text = "The orchestrator must resolve the rebase conflict"
@@ -133,14 +127,14 @@ class NamedThirdPartyTest(unittest.TestCase):
         self.assertEqual(co.resolve_owner_and_label("The owner of PR #12 to rebase onto main", origin="job"),
                          ("agent", "PR author"))
 
-    def test_in_a_conversation_the_declared_speaker_decides(self):
+    def test_in_a_conversation_the_named_third_party_decides(self):
         text = "The orchestrator must resolve the rebase conflict"
         cur = _OwnerCursor()
         self.assertEqual(_open(cur, CONVERSATION, {"text": text, "kind": "blocker", "owner": "other",
                                                    "owner_label": "orchestrator"}), 1)
         row = _by_text(cur, text)
         self.assertEqual((row["owner"], row["owner_label"]), ("agent", "orchestrator"))
-        self.assertEqual(co.resolve_owner_and_label(text, declared="user"), ("user", None))
+        self.assertEqual(co.resolve_owner_and_label(text, declared="user"), ("agent", "orchestrator"))
 
 
 class JobRulesTest(unittest.TestCase):
@@ -539,19 +533,20 @@ _LINEAGE_CASES = [
      ("agent", "orchestrator")),
     ("Matt, what is your verdict on the release?", "question", "user", None, "job",
      ("agent", "orchestrator")),
-    # Keywords that once moved an item, in a conversation and in a job.
+    # Keywords that once moved an item, in a conversation and in a job. A
+    # third party as the subject owns it, whoever says it.
     ("Did the background agent's report land?", "question", None, None, "conversation", ("user", None)),
     ("Did the background agent's report land?", "question", None, None, "job", ("agent", "orchestrator")),
     ("The orchestrator must resolve the rebase conflict", "blocker", "user", None, "conversation",
-     ("user", None)),
+     ("agent", "orchestrator")),
     ("The orchestrator must resolve the rebase conflict", "blocker", None, None, "conversation",
-     ("assistant", None)),
+     ("agent", "orchestrator")),
     ("The orchestrator must resolve the rebase conflict", "blocker", "other", "orchestrator", "conversation",
      ("agent", "orchestrator")),
     ("The orchestrator must resolve the rebase conflict", "blocker", "user", None, "job",
      ("agent", "orchestrator")),
     ("The reviewer must fix agent attribution before PR #41 merges", "followup", "user", None, "conversation",
-     ("user", None)),
+     ("agent", "reviewer")),
     ("The reviewer must fix agent attribution before PR #41 merges", "followup", "user", None, "job",
      ("agent", "reviewer")),
     ("Matt to fix agent attribution in the capture hook", "followup", None, None, "conversation",
@@ -561,6 +556,38 @@ _LINEAGE_CASES = [
     ("Receive report from the phase 1-2 agent", "followup", "assistant", None, "conversation",
      ("assistant", None)),
     ("Receive report from the phase 1-2 agent", "followup", "assistant", None, "job", ("assistant", None)),
+    # The third review's probes and their mirrors: the subject who commits,
+    # as the speaker states it, with the session's lineage.
+    ("When the reviewer finishes, I will test the installation on my phone", "promise", "user", None,
+     "conversation", ("user", None)),
+    ("When the reviewer finishes, I will test the installation on my phone", "promise", "user", None,
+     "job", ("agent", "orchestrator")),
+    ("When the reviewer finishes, I will test the installation on my phone", "promise", "assistant", None,
+     "conversation", ("assistant", None)),
+    ("I will review the deployment checklist before release", "promise", "user", None, "conversation",
+     ("user", None)),
+    ("I will review the deployment checklist before release", "promise", "user", None, "job",
+     ("agent", "orchestrator")),
+    ("I will review the deployment checklist before release", "promise", "assistant", None, "conversation",
+     ("assistant", None)),
+    ("I will review the deployment checklist before release", "promise", "assistant", None, "job",
+     ("assistant", None)),
+    ("The reviewer must rebase the release branch", "followup", None, None, "conversation",
+     ("agent", "reviewer")),
+    ("The reviewer must rebase the release branch", "followup", "user", None, "conversation",
+     ("agent", "reviewer")),
+    ("The reviewer must rebase the release branch", "followup", "assistant", None, "job",
+     ("agent", "reviewer")),
+    ("Bob will review the migration plan", "followup", "user", None, "conversation", ("agent", "Bob")),
+    ("Bob will review the migration plan", "followup", "assistant", None, "conversation", ("agent", "Bob")),
+    ("Bob will review the migration plan", "followup", "user", None, "job", ("agent", "Bob")),
+    ("Matt will review the migration plan", "followup", "assistant", None, "conversation", ("user", None)),
+    ("Matt will review the migration plan", "followup", "assistant", None, "job", ("agent", "orchestrator")),
+    # No subject: an imperative or a passive names nobody, so the speaker's.
+    ("Merge the release branch once the reviewer approves", "followup", "assistant", None, "conversation",
+     ("assistant", None)),
+    ("I'll rerun the oracle after the reviewer approves the fix", "promise", "assistant", None,
+     "conversation", ("assistant", None)),
 ]
 
 
@@ -580,3 +607,76 @@ def test_the_owner_comes_from_the_session_not_the_words(text, kind, declared, la
             assert (row["owner"], row.get("owner_label")) == expected
         finally:
             co.reset_user_patterns()
+
+
+# ---- the third cross-family review's probes ---------------------------------
+
+def test_real_owner_conditional_i_will_remains_the_owner():
+    text = "When the reviewer finishes, I will test the installation on my phone"
+    with mock.patch.dict(os.environ, {"KHIPU_USER_ALIASES": "Matt"}):
+        co.reset_user_patterns()
+        assert co.has_future_trigger(text)
+        assert co.rejection_reason(text, owner="user", kind="promise") is None
+        assert co.resolve_owner_and_label(text, kind="promise", declared="user", origin="conversation") == (
+            "user", None)
+
+
+def test_an_assistant_duplicate_cannot_swallow_the_owners_new_promise():
+    with mock.patch.dict(os.environ, {"KHIPU_USER_ALIASES": "Matt"}):
+        co.reset_user_patterns()
+        cur = _OwnerCursor()
+        _open(cur, CONVERSATION, {"text": "Review the deployment checklist before release", "kind": "followup",
+                                  "owner": "assistant"})
+        _open(cur, CONVERSATION, {"text": "I will review the deployment checklist before release",
+                                  "kind": "promise", "owner": "user"}, episode=2)
+        user_rows = [r for r in co.list_owed(cur, project="acme/widget", limit=None) if r["owner"] == "user"]
+        assert user_rows, "The owner made a real promise, but dedup kept only an assistant-owned row"
+        assert any("I will" in r["text"] for r in user_rows), "His promise text must survive"
+
+
+def test_reviewer_work_in_a_conversation_must_not_die_with_the_session(monkeypatch):
+    monkeypatch.setenv("KHIPU_USER_ALIASES", "Matt")
+    co.reset_user_patterns()
+    text = "The reviewer must rebase the release branch"
+    cur = _OwnerCursor()
+    _open(cur, CONVERSATION, {"text": text, "kind": "followup"})
+    monkeypatch.setattr(co, "_session_open_commitments", lambda cur, sid: list(cur.rows.values()))
+    closed = co.close_session_plan(cur, dict(CONVERSATION, event="sessionend"), episode_id=2)
+    assert closed == 0, "A third party still owes this work after the conversation ends"
+    assert next(iter(cur.rows.values()))["status"] == "open"
+
+
+def test_owner_conversation_job_and_orchestrator_attribution(monkeypatch):
+    monkeypatch.setenv("KHIPU_USER_ALIASES", "Matt")
+    co.reset_user_patterns()
+    assert co.resolve_owner_and_label("I will accept the developer agreement", declared="user",
+                                      origin="conversation")[0] == "user"
+    assert co.resolve_owner_and_label("Matt, should we ship the next version?", kind="question",
+                                      declared="assistant", origin="conversation")[0] == "user"
+    assert co.resolve_owner_and_label("Matt to decide whether to ship the next version", kind="question",
+                                      declared="user", origin="job") == ("agent", "orchestrator")
+    assert co.resolve_owner_and_label("The reviewer must rebase the release branch",
+                                      origin="conversation") == ("agent", "reviewer")
+
+
+def test_supported_reviewer_actor_is_stored_in_any_session():
+    """The round-1 probe as written: no lineage given, the reviewer still owns it."""
+    text = "The reviewer must fix agent attribution before PR #41 merges"
+    owner, label = co.resolve_owner_and_label(text)
+    assert (owner, label) == (co.OWNER_AGENT, "reviewer")
+    assert co.rejection_reason(text, owner=owner) is None
+
+
+def test_similar_items_of_different_owners_both_stay_and_same_owner_restatements_fold():
+    cur = _OwnerCursor()
+    _open(cur, CONVERSATION, {"text": "Review the deployment checklist before release", "kind": "followup",
+                              "owner": "assistant"})
+    # The same words, the owner's own: a second row, not a fold.
+    assert _open(cur, CONVERSATION, {"text": "Review the deployment checklist before release",
+                                     "kind": "followup", "owner": "user"}, episode=2) == 1
+    owners = sorted(r["owner"] for r in cur.rows.values())
+    assert owners == ["assistant", "user"]
+    # The assistant restating its own item folds into it.
+    assert _open(cur, CONVERSATION, {"text": "Review the deployment checklist before the release",
+                                     "kind": "followup", "owner": "assistant"}, episode=3) == 0
+    assert len(cur.rows) == 2

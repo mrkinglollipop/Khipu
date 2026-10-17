@@ -162,6 +162,16 @@ by the time this was built):
 4. The extractor prompt asks for `owner` as one of `user`, `assistant` or `other`, plus `owner_label`, and
    is told whether the transcript is a job's. The deterministic result still wins on conflict.
 
+**Ownership model (after the third cross-family review).** The owner is the grammatical subject who
+commits, as its speaker states it, read with the session's lineage: the speaker's own "I will" (conditional
+or not) is the speaker's; "Bob will review" or "the reviewer will" names a third party, whoever says it, in
+any session; in a job the "I" of the job's user is the orchestrator's. One function decides it
+(`commitments.resolve_owner_and_label`, its cases in `tests/test_commitment_owner.py`), used by capture, the
+clean-up and a reassign's default label. Dedup never merges items of different owners and keeps the newer
+wording of a restatement (`latest_text`); similar items of different owners both stay, linked (`linked_ids`,
+migration `0037_commitment_owner_lineage.sql`, which also keeps who reassigned an item, why, and its owner
+before, all carried in the replica).
+
 **Nothing is dropped.** An item that is not Matt's is still stored, searchable through `khipu_search` and
 `khipu owed --owner agent`, shown in Owed under its own heading, and closed by the same rules. What changes is
 where it shows:

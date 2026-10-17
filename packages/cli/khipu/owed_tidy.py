@@ -95,7 +95,10 @@ GROUPS = ("stay_user", "keep_other", "move", "close_pr", "close_decision", "clos
 FINGERPRINT_FIELDS = ("status", "owner", "owner_label", "origin", "owner_reassigned_at", "closed_at",
                       "closed_episode", "close_reason", "closed_by", "close_rule_key", "close_evidence",
                       "tidy_batch", "text", "kind", "due_after")
-PRIOR_FIELDS = FINGERPRINT_FIELDS[:12]
+# Who set the owner by hand, why, and the owner before (migration 0037):
+# kept with each change and restored by an undo, never part of the fingerprint.
+LINEAGE_FIELDS = ("owner_reassigned_by", "owner_reassign_reason", "owner_prior", "owner_prior_label")
+PRIOR_FIELDS = (*FINGERPRINT_FIELDS[:12], *LINEAGE_FIELDS)
 _TIMESTAMPS = ("owner_reassigned_at", "closed_at")
 NOT_READY = ("This hub has no clean-up tables yet (migrations 0033 to 0036). Planning works; applying and "
              "undoing need the migrations. Nothing was changed.")
@@ -116,7 +119,8 @@ def _select(cur, project: str, *, ids: list[int] | None = None, lock: bool = Fal
     from khipu.db import has_columns, table_columns
 
     have = table_columns(cur, "commitments")
-    wanted = ("id", "project", "opened_episode", "opened_at", "future_trigger", *FINGERPRINT_FIELDS)
+    wanted = ("id", "project", "opened_episode", "opened_at", "future_trigger", *FINGERPRINT_FIELDS,
+              *LINEAGE_FIELDS)
     cols = [c for c in wanted if c in have]
     lineage = "NULL"
     if has_columns(cur, "episodes", "parent_session_id"):
@@ -533,10 +537,18 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
                     label = (co.clean_owner_label(after.get("owner_label")) or co.ORCHESTRATOR) \
                         if owner == co.OWNER_AGENT else None
                     origin = after.get("origin") if after.get("origin") in co.ORIGINS else prior["origin"]
+                    lineage = ""
+                    lineage_params: tuple = ()
+                    if co._lineage_columns_ready(cur):
+                        # The right-hand sides read the row before this UPDATE.
+                        lineage = ("owner_prior = owner, owner_prior_label = owner_label, "
+                                   "owner_reassigned_by = %s, owner_reassign_reason = %s, ")
+                        lineage_params = (f"khipu owed tidy ({batch})",
+                                          (it.get("reason") or it.get("rule") or "")[:400] or None)
                     cur.execute(
-                        "UPDATE commitments SET owner = %s, owner_label = %s, origin = %s, "
+                        f"UPDATE commitments SET {lineage}owner = %s, owner_label = %s, origin = %s, "
                         "owner_reassigned_at = now(), tidy_batch = %s WHERE id = %s",
-                        (owner, label, origin, batch, cid))
+                        (*lineage_params, owner, label, origin, batch, cid))
                 counts[it["action"]] += 1
                 done = _select(cur, project, ids=[cid])[cid]
                 cur.execute(
@@ -663,6 +675,7 @@ def undo(batch: str, *, project: str | None = None) -> dict[str, Any]:
                 return {"ok": False, "restored": 0, "batch": batch, "needs_owner": mine,
                         "error": co.BULK_OWNER_REFUSAL}
             restored = 0
+            lineage_ready = co._lineage_columns_ready(cur)
             for cid, action, prior in todo:
                 cur.execute("SAVEPOINT owed_tidy_undo")
                 try:
@@ -674,13 +687,16 @@ def undo(batch: str, *, project: str | None = None) -> dict[str, Any]:
                         "AND NOT (close_rule_key = ANY(reopened_rule_keys)) "
                         "THEN array_append(reopened_rule_keys, close_rule_key) ELSE reopened_rule_keys END, "
                         # A clean-up batch kept no due date and never moved one.
-                        "due_after = CASE WHEN %s THEN %s::timestamptz ELSE due_after END "
-                        "WHERE id = %s",
+                        "due_after = CASE WHEN %s THEN %s::timestamptz ELSE due_after END"
+                        + (", owner_reassigned_by = %s, owner_reassign_reason = %s, owner_prior = %s, "
+                           "owner_prior_label = %s" if lineage_ready else "")
+                        + " WHERE id = %s",
                         (prior["status"], prior["owner"], prior["owner_label"], prior["origin"],
                          prior["owner_reassigned_at"], prior["closed_at"], prior["closed_episode"],
                          prior["close_reason"], prior["closed_by"], prior["close_rule_key"],
                          None if prior["close_evidence"] is None else json.dumps(prior["close_evidence"]),
                          prior["tidy_batch"], action == "close", "due_after" in prior, prior.get("due_after"),
+                         *([prior.get(f) for f in LINEAGE_FIELDS] if lineage_ready else []),
                          cid))
                     cur.execute("RELEASE SAVEPOINT owed_tidy_undo")
                 except Exception as exc:  # noqa: BLE001 — e.g. the same text is open again
