@@ -607,16 +607,17 @@ def _adjudicate_pairs_prompt(pairs: list[tuple[str, str]]) -> str:
     )
 
 
-def _model_adjudicate_pairs(pairs: list[tuple[str, str]]) -> list[bool]:
-    """One batched model call deciding same-obligation for every pair.
-    Fail-open: any transport/parse problem, or a short/malformed answer,
-    returns all False (never merges on an unreadable response)."""
+def _model_adjudicate_pairs(pairs: list[tuple[str, str]], *, retries: int = 1) -> list[bool]:
+    """One batched model call deciding same-obligation for every pair, with
+    ``retries`` further provider attempts. Fail-open: any transport/parse
+    problem, or a short/malformed answer, returns all False (never merges on
+    an unreadable response)."""
     if not pairs:
         return []
     from khipu.extract import _generate, parse_model_json
 
     try:
-        raw = _generate(_adjudicate_pairs_prompt(pairs), timeout=60, retries=1, caller="hygiene")
+        raw = _generate(_adjudicate_pairs_prompt(pairs), timeout=60, retries=retries, caller="hygiene")
     except Exception:  # noqa: BLE001
         return [False] * len(pairs)
     parsed = parse_model_json(raw) or {}

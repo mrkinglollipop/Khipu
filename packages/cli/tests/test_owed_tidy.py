@@ -453,3 +453,61 @@ def test_the_migration_is_safe_to_run_twice(owed):
         cur.execute(migration_sql("0036_commitment_tidy.sql"))
         cur.execute("SELECT count(*) FROM schema_migrations WHERE version = '0036_commitment_tidy'")
         assert cur.fetchone()[0] == 1
+
+
+# ---- the review's probes: the model budget and undo's project ----------------
+
+def test_tidy_model_cap_does_not_allow_a_retry_per_budgeted_call(monkeypatch):
+    """One budgeted tidy batch must produce at most one provider attempt."""
+    from khipu import extract
+
+    attempts = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"candidates":[{"content":{"parts":[{"text":"{\\"owners\\":[]}"}]}}]}'
+
+    def fake_urlopen(*args, **kwargs):
+        attempts.append((args, kwargs))
+        if len(attempts) == 1:
+            raise OSError("synthetic transient failure")
+        return Response()
+
+    def real_adapter(prompt, **kwargs):
+        return extract._generate_gemini(prompt, model_id="synthetic", **kwargs)
+
+    monkeypatch.setattr(extract, "_generate", real_adapter)
+    monkeypatch.setattr(extract, "_key", lambda: "synthetic")
+    monkeypatch.setattr(extract, "_synth_budget_take", lambda: None)
+    monkeypatch.setattr(extract.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(extract.time, "sleep", lambda _seconds: None)
+    owed_tidy._model_owner_judge(["Route the cache repair to the orchestrator"])
+
+    assert len(attempts) <= 1
+
+
+def test_a_retry_of_a_failed_batch_takes_another_unit(owed):
+    _flood(owed)
+    config.set_count_setting("owed_tidy_calls", 1)
+
+    class Failing:
+        calls = 0
+
+        def __call__(self, texts):
+            self.calls += 1
+            return [{"owner": "user", "reason": "model unavailable: OSError", "failed": True} for _ in texts]
+
+    once = Failing()
+    plan = _plan(owed, judge=once)
+    assert once.calls == 1 and plan["model"]["calls"] == 1
+    config.set_count_setting("owed_tidy_calls", 2)
+    twice = Failing()
+    plan = _plan(owed, judge=twice)
+    assert twice.calls == 2 and plan["model"]["calls"] == 2
+    config.set_count_setting("owed_tidy_calls", 0)

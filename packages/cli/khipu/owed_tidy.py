@@ -228,16 +228,18 @@ def _owner_judge_prompt(texts: list[str]) -> str:
 
 def _model_owner_judge(texts: list[str]) -> list[dict[str, Any]]:
     """One batch through the summariser model (``khipu.extract._generate``,
-    the routing, retries and fallback ``hygiene._model_judge`` uses).
-    Fail-open: a failed call or an unreadable answer keeps every item as the
-    user's."""
+    the routing ``hygiene._model_judge`` uses), as exactly one provider
+    attempt: one unit of ``owed_tidy_calls``. A retry is the plan's, and
+    costs another unit. Fail-open: a failed call (marked ``failed``) or an
+    unreadable answer keeps every item as the user's."""
     from khipu.extract import _generate, parse_model_json
 
     out: list[dict[str, Any]] = [{"owner": "user", "reason": "model returned no answer"} for _ in texts]
     try:
-        raw = _generate(_owner_judge_prompt(texts), timeout=90, retries=1, caller="hygiene")
+        raw = _generate(_owner_judge_prompt(texts), timeout=90, retries=0, caller="hygiene")
     except Exception as exc:  # noqa: BLE001 — keep everything on a failed call
-        return [{"owner": "user", "reason": f"model unavailable: {type(exc).__name__}"} for _ in texts]
+        return [{"owner": "user", "reason": f"model unavailable: {type(exc).__name__}", "failed": True}
+                for _ in texts]
     parsed = parse_model_json(raw) or {}
     for item in parsed.get("owners") or []:
         if not isinstance(item, dict):
@@ -254,7 +256,9 @@ def _model_owner_judge(texts: list[str]) -> list[dict[str, Any]]:
 
 
 class _Calls:
-    """The model call budget for one plan (``owed_tidy_calls``, 0 = none)."""
+    """The model budget for one plan (``owed_tidy_calls``, 0 = no limit), in
+    provider attempts: every model call here makes one attempt, and a retry
+    takes another unit."""
 
     def __init__(self, cap: int) -> None:
         self.cap, self.used = cap, 0
@@ -335,7 +339,7 @@ def _plan(cur, project: str, *, judge, use_model: bool) -> dict[str, Any]:
         allowed = [i for i, (a, b) in enumerate(pairs) if not (_names_user(a) or _names_user(b))]
         answers = [False] * len(pairs)
         if allowed and calls.take():
-            got = hygiene._model_adjudicate_pairs([pairs[i] for i in allowed])
+            got = hygiene._model_adjudicate_pairs([pairs[i] for i in allowed], retries=0)
             for i, same in zip(allowed, got):
                 answers[i] = bool(same)
         return answers
@@ -369,7 +373,10 @@ def _plan(cur, project: str, *, judge, use_model: bool) -> dict[str, Any]:
                     it["unjudged"] = True
                 unjudged += len(batch)
                 continue
-            answers = list(judge([it["text"] or "" for it in batch]))
+            texts = [it["text"] or "" for it in batch]
+            answers = list(judge(texts))
+            if answers and all((a or {}).get("failed") for a in answers) and calls.take():
+                answers = list(judge(texts))
             answers += [{"owner": "user"}] * (len(batch) - len(answers))
             for it, ans in zip(batch, answers):
                 owner = str((ans or {}).get("owner") or "user").lower()
