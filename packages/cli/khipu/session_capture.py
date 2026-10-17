@@ -1384,13 +1384,13 @@ def _ack_capture_now(harness: str, sid: str, expected: dict) -> None:
 
 
 # A capture-now request has to name a session that is actually being captured,
-# and its caller (the MCP server, the CLI) is not the hook, so it has no session
-# id of its own. Each hook run therefore records two facts about itself in the
-# session's state file (its working directory and its process ancestry), and
-# resolve_session_ref matches the caller against them.
+# and its caller (the MCP server, the CLI) is not the hook. Claude supplies an
+# inherited session id; otherwise each hook's recorded working directory and
+# process ancestry let resolve_session_ref match the caller to a session.
 ANCESTOR_LOOKUP_TIMEOUT_S = 1
 ONLY_ACTIVE_WINDOW_S = 30 * 60
 PROCESS_MATCH_MAX_AGE_S = 12 * 60 * 60
+CAPTURE_AMBIGUITY_WINDOW_S = 30 * 60
 
 
 def ancestor_pids(pid: int | None = None) -> list[int]:
@@ -1481,19 +1481,66 @@ def _capture_candidates() -> list[dict]:
     return out
 
 
+def _latest_capture_turn(candidate: dict) -> dict:
+    from khipu import owner_turns
+
+    sid = candidate["state"].get("session_id") or candidate["sid"]
+    try:
+        rows = owner_turns._read_lines(owner_turns.session_file(sid))
+        latest = next((r for r in reversed(rows)
+                       if r.get("session") == sid and r.get("harness") == candidate["harness"]), {})
+        return latest
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _newest_capture_candidate(candidates: list[dict], now: float, *, process: bool = False) -> dict | None:
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    # A session's prompt time outranks its capture progress. In the folder
+    # fallback, state times put harnesses without prompts on the same clock.
+    has_turns = any(c.get("turn_ts") is not None for c in candidates)
+    if process and not has_turns:
+        return None
+    def activity(candidate: dict) -> float:
+        return candidate.get("turn_ts") or (0 if process else candidate["mtime"])
+
+    ranked = sorted(candidates, key=activity, reverse=True)
+    first, second = [activity(c) for c in ranked[:2]]
+    if first == second:
+        return None
+    if (not process and now - second <= CAPTURE_AMBIGUITY_WINDOW_S
+            and first - second <= CAPTURE_AMBIGUITY_WINDOW_S):
+        return None
+    return ranked[0]
+
+
+def _capture_ambiguity_error(candidates: list[dict]) -> ValueError:
+    names = ", ".join(f"{c['harness']}:{c['sid'][:8]}"
+                      for c in sorted(candidates, key=lambda c: -c["mtime"]))
+    return ValueError(
+        f"cannot tell which session is yours among {names}; "
+        "pass session_id='<harness>:<id>' (the full session id)."
+    )
+
+
 def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
                         host_pids: list[int] | None = None,
                         cwd: str | None = None) -> tuple[str, str, str]:
     """(harness, session id, how) for a capture-now request; ``how`` is
-    "explicit" | "process" | "cwd" | "only_active". Raises ValueError rather
-    than guess between two live sessions.
+    "explicit" | "session_env" | "process" | "cwd" | "only_active". Raises
+    ValueError rather than guess between two live sessions.
 
     An explicit harness and session id are taken as given, the harness having
     to be a real one. Otherwise the caller is matched to what the hooks
-    recorded: the nearest process ancestor it shares with exactly one session
-    (an ancestor every session shares says nothing), then the working
-    directory (newest wins), then the only session touched in the last half
-    hour. The caller's own ancestry and directory default to this process's."""
+    recorded: Claude's inherited session id, a matching issuer (pid and start
+    time), legacy ancestry, the working directory and prompt times, then the
+    only session active in the last half hour. Shared issuers are narrowed by
+    directory; two recently prompted holders refuse. Folder fallback also
+    refuses between sessions active in the last half hour. The caller's
+    ancestry and directory default to this process's."""
     if harness and harness not in HARNESSES:
         raise ValueError(f"unknown capture harness {harness!r}; expected one of {', '.join(HARNESSES)}")
     if harness and sid:
@@ -1510,37 +1557,103 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
             "hook has not run once in this session). Pass session_id='<harness>:<id>' "
             "explicitly, or wait for the hook's first run and retry."
         )
-    # A process id is reused once its owner is gone, so a session that has
-    # been quiet for half a day no longer vouches for the ids it recorded.
+    from khipu import owner_turns
+
     now = time.time()
-    live = [c for c in cands if now - c["mtime"] <= PROCESS_MATCH_MAX_AGE_S]
-    for pid in (ancestor_pids() if host_pids is None else host_pids):
-        holders = [c for c in live if pid in (c["state"].get("host_pids") or [])]
-        if holders and len(holders) < len(live):
-            if len(holders) == 1:
-                return holders[0]["harness"], holders[0]["sid"], "process"
-            break
     if cwd is None:
         try:
             cwd = os.getcwd()
         except OSError:
             cwd = ""
-    if cwd:
-        same = [c for c in cands
-                if _same_dir(c["state"].get("cwd"), cwd)
-                or (not c["state"].get("cwd")
-                    and _transcript_project_matches(c["harness"], c["state"].get("transcript_path"), cwd))]
-        if same:
-            best = max(same, key=lambda c: c["mtime"])
+    same = [c for c in cands if cwd and (
+        _same_dir(c["state"].get("cwd"), cwd)
+        or (not c["state"].get("cwd")
+            and _transcript_project_matches(c["harness"], c["state"].get("transcript_path"), cwd)))]
+    issuers = []
+    for c in cands:
+        turn = _latest_capture_turn(c)
+        try:
+            ts = float(turn.get("ts"))
+            c["turn_ts"] = ts if math.isfinite(ts) and ts > 0 else None
+        except (TypeError, ValueError):
+            c["turn_ts"] = None
+        issuer = turn.get("issuer")
+        issuers.append((c, issuer if isinstance(issuer, dict) else {}))
+    # A Codex or Grok job started from a Claude session's shell inherits that
+    # session's CLAUDE_CODE_SESSION_ID; its own markers say it is not Claude.
+    codex_tid = os.environ.get("CODEX_THREAD_ID")
+    if codex_tid:
+        own = [c for c, _ in issuers if c["harness"] == "codex"
+               and (c["state"].get("session_id") or c["sid"]) == codex_tid]
+        if len(own) == 1:
+            return own[0]["harness"], own[0]["sid"], "session_env"
+    foreign = codex_tid or any(k.startswith("GROK_HOOK_") for k in os.environ)
+    env_sid = None if foreign else os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if env_sid:
+        for candidate, issuer in issuers:
+            if (candidate["harness"] != "claude_code"
+                    or (candidate["state"].get("session_id") or candidate["sid"]) != env_sid):
+                continue
+            # /clear and resume retain the MCP server's launch environment.
+            # Only a newer prompt from that same process can supersede it.
+            if (candidate["turn_ts"] is not None and issuer.get("pid") is not None
+                    and issuer.get("start") is not None):
+                successors = [other for other, other_issuer in issuers
+                              if other["harness"] == "claude_code"
+                              and other_issuer.get("pid") == issuer["pid"]
+                              and other_issuer.get("start") == issuer["start"]
+                              and (other.get("turn_ts") or 0) > candidate["turn_ts"]]
+                if successors:
+                    best = _newest_capture_candidate(successors, now, process=True)
+                    if best is None:
+                        raise _capture_ambiguity_error(cands)
+                    candidate = best
+            return candidate["harness"], candidate["sid"], "session_env"
+    pids = ancestor_pids() if host_pids is None else host_pids
+    mismatched = set()
+    ambiguous_process = False
+    # Prompt records stay current even when the capture state has been idle.
+    # The kernel start time binds an issuer to its process, not a reused pid.
+    for pid in pids:
+        recorded = [(c, issuer) for c, issuer in issuers if issuer.get("pid") == pid]
+        if not recorded:
+            continue
+        info = owner_turns._proc_info(pid)
+        holders = [c for c, issuer in recorded if info is not None
+                   and issuer.get("start") is not None and issuer["start"] == info[2]]
+        mismatched.update((c["harness"], c["sid"], pid) for c, issuer in recorded
+                          if c not in holders)
+        if len(holders) == 1:
+            return holders[0]["harness"], holders[0]["sid"], "process"
+        if holders:
+            folder_holders = [c for c in holders if c in same]
+            recent_holders = [c for c in folder_holders if c.get("turn_ts") is not None
+                              and now - c["turn_ts"] <= CAPTURE_AMBIGUITY_WINDOW_S]
+            if len(recent_holders) < 2:
+                best = _newest_capture_candidate(folder_holders, now, process=True)
+                if best is not None:
+                    return best["harness"], best["sid"], "process"
+            ambiguous_process = True
+            break
+    # A process id is reused once its owner is gone, so a session that has
+    # been quiet for half a day no longer vouches for the ids it recorded.
+    live = [c for c in cands if now - c["mtime"] <= PROCESS_MATCH_MAX_AGE_S]
+    for pid in ([] if ambiguous_process else pids):
+        # A known issuer mismatch cannot become a match through pid-only state.
+        holders = [c for c in live if pid in (c["state"].get("host_pids") or [])
+                   and (c["harness"], c["sid"], pid) not in mismatched]
+        if holders and len(holders) < len(live):
+            if len(holders) == 1:
+                return holders[0]["harness"], holders[0]["sid"], "process"
+            break
+    if not ambiguous_process:
+        best = _newest_capture_candidate(same, now)
+        if best is not None:
             return best["harness"], best["sid"], "cwd"
-    recent = [c for c in cands if now - c["mtime"] <= ONLY_ACTIVE_WINDOW_S]
-    if len(recent) == 1:
+    recent = [c for c in cands if now - (c.get("turn_ts") or c["mtime"]) <= ONLY_ACTIVE_WINDOW_S]
+    if len(recent) == 1 and not ambiguous_process:
         return recent[0]["harness"], recent[0]["sid"], "only_active"
-    names = ", ".join(f"{c['harness']}:{c['sid'][:8]}" for c in sorted(cands, key=lambda c: -c["mtime"]))
-    raise ValueError(
-        f"cannot tell which session is yours among {names}; "
-        "pass session_id='<harness>:<id>' (the full session id)."
-    )
+    raise _capture_ambiguity_error(cands)
 
 
 # ---- high-value turn trigger (K1) ------------------------------------------------

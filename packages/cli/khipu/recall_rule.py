@@ -757,36 +757,60 @@ def session_start_main(*, shape: str | None = None) -> None:
     With routing's push on, the full routing summary follows the memory part,
     and the whole stays within the harness's limit (``fit_start_context``).
     """
-    payload = _session_start_payload()
-    cwd = _session_start_cwd(payload)
-    if is_helper_session(cwd):
-        print("{}")  # T3's thread-title helper: no recall
-        return
-    routing = _RoutingAtStart().begin()
-    token = _START_IS_JOB.set(_session_is_job(payload))
+    started = time.monotonic()
+    payload = {}
+    injected, pushed = 0, False
+    reason, want = "ok", "claude"
     try:
-        memory = session_start_context(cwd)
-    finally:
-        _START_IS_JOB.reset(token)
-    ctx, pushed = fit_start_context(memory, routing.text())
-    if shape is None:
-        shape = "cursor" if "--cursor" in sys.argv[1:] else "claude"
-    want = shape.strip().lower()
-    if want == "cursor":
-        out = {"additional_context": ctx}
-    else:
-        out = {
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": ctx,
-            }
-        }
-    from khipu import wire
-
-    print(wire.dumps(out, ensure_ascii=True))
-    if pushed:
-        try:
-            sys.stdout.flush()
-        except Exception:
+        payload = _session_start_payload()
+        if shape is None:
+            shape = "cursor" if "--cursor" in sys.argv[1:] else "claude"
+        want = shape.strip().lower()
+        cwd = _session_start_cwd(payload)
+        if is_helper_session(cwd):
+            print("{}")  # T3's thread-title helper: no recall
             return
-        routing.delivered(payload.get("session_id") or payload.get("sessionId"))
+        routing = _RoutingAtStart().begin()
+        token = _START_IS_JOB.set(_session_is_job(payload))
+        try:
+            memory = session_start_context(cwd)
+        finally:
+            _START_IS_JOB.reset(token)
+        ctx, pushed = fit_start_context(memory, routing.text())
+        if want == "cursor":
+            out = {"additional_context": ctx}
+        else:
+            out = {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": ctx,
+                }
+            }
+        from khipu import wire
+
+        print(wire.dumps(out, ensure_ascii=True))
+        injected = len(ctx)
+        if pushed:
+            try:
+                sys.stdout.flush()
+            except Exception as exc:
+                reason = f"error: {type(exc).__name__}: {exc}"
+                return
+            routing.delivered(payload.get("session_id") or payload.get("sessionId"))
+    except Exception as exc:
+        reason = f"error: {type(exc).__name__}: {exc}"
+        raise
+    finally:
+        try:
+            from khipu import owner_turns, recall_prompt
+
+            harness = "cursor" if want == "cursor" else owner_turns.harness_of(os.environ, payload)
+            if harness == "unknown":
+                harness = "claude_code"
+            session = payload.get("session_id") or payload.get("sessionId") or payload.get("conversation_id") or "unknown"
+            msg = (f"session={session} harness={harness} source={payload.get('source') or 'startup'} "
+                   f"reason={reason} bytes={injected} routing={'yes' if pushed and injected else 'no'} "
+                   f"ms={(time.monotonic() - started) * 1000:.1f}")
+            recall_prompt._log(" ".join(msg.split()), tag="khipu-session-start")
+        except Exception:
+            pass
