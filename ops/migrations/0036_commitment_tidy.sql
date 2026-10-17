@@ -16,10 +16,11 @@
 --                               the counts, the items skipped because they
 --                               changed after planning, and when (and what)
 --                               an undo restored or left alone.
---   commitment_tidy_items       one row per changed item: the action (close
---                               or reassign), the reason, the item's state
---                               before (owner, label, origin, status and the
---                               close fields), and a fingerprint of its
+--   commitment_tidy_items       one row per changed item: the action (close,
+--                               reassign, or a bulk change's reopen or
+--                               snooze), the reason, the item's state before
+--                               (owner, label, origin, status, the close
+--                               fields and the due date), and a fingerprint of its
 --                               state after, so an undo leaves alone any
 --                               item changed since.
 --
@@ -53,7 +54,7 @@ CREATE TABLE IF NOT EXISTS commitment_tidy_batches (
 CREATE TABLE IF NOT EXISTS commitment_tidy_items (
     batch_id           TEXT NOT NULL REFERENCES commitment_tidy_batches (id),
     commitment_id      BIGINT NOT NULL REFERENCES commitments (id),
-    action             TEXT NOT NULL CHECK (action IN ('close', 'reassign')),
+    action             TEXT NOT NULL CHECK (action IN ('close', 'reassign', 'reopen', 'snooze')),
     reason             TEXT NOT NULL,
     prior              JSONB NOT NULL,
     after_fingerprint  TEXT NOT NULL,

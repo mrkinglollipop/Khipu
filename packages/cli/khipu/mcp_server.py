@@ -1621,10 +1621,12 @@ def _tool_owed_update(args: dict) -> dict:
     sync; the gateway never queues. ``ids``, or ``reassign``, go through
     ``owed_change``: one transaction, one result per id."""
     action = (args.get("action") or "").strip().lower()
-    if action not in ("close", "reopen", "snooze", "reassign"):
-        raise ValueError("action must be 'close', 'reopen', 'snooze' or 'reassign'")
     _ensure_path()
     from khipu import commitments, owner_writes
+    from khipu.owed_tidy import BULK_ACTIONS
+
+    if action not in BULK_ACTIONS:
+        raise ValueError("action must be 'close', 'reopen', 'snooze' or 'reassign'")
 
     if args.get("ids") is not None or action == "reassign":
         # Who closed it, and whether the owner gate passed, are set here and
@@ -1795,33 +1797,34 @@ def _owed_change_on_hub(args: dict) -> dict:
                     snooze = _snooze_until_sql(str(args.get("until") or ""))
                     if snooze is None:
                         raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
-                results = []
-                batches: list[str] = []
-                moved: dict[int, bool] | None = None
-                if action == "reassign" and len(ids) > 1 and owed_tidy._ready(cur):
-                    # Kept with its reason and each item's owner before, so
-                    # `khipu owed tidy --undo BATCH` restores them exactly.
-                    moved, batches = owed_tidy.reassign_batch(
-                        cur, [cid for cid in ids if cid in rows], str(args.get("owner") or ""),
-                        str(args.get("owner_label") or "") or None, reason=reason or "",
-                        gate=args.get("owner_gate"))
-                for cid in ids:
-                    if cid not in rows:
-                        results.append({"id": cid, "ok": False, "error": f"no such commitment: {cid}"})
-                        continue
+                def change(cid: int) -> bool:
                     if action == "snooze":
                         expr, param = snooze
                         cur.execute(f"UPDATE commitments SET due_after = {expr} WHERE id = %s",
                                     (*([param] if param is not None else []), cid))
-                        ok = cur.rowcount > 0
-                    elif moved is not None:
-                        ok = moved.get(cid, False)
-                    elif action == "reassign":
-                        ok = commitments.reassign(cur, cid, str(args.get("owner") or ""),
-                                                  str(args.get("owner_label") or "") or None)
-                    else:
-                        ok = commitments.set_status(cur, cid, "closed" if action == "close" else "open",
-                                                    reason=reason, by=by)
+                        return cur.rowcount > 0
+                    if action == "reassign":
+                        return commitments.reassign(cur, cid, str(args.get("owner") or ""),
+                                                    str(args.get("owner_label") or "") or None)
+                    return commitments.set_status(cur, cid, "closed" if action == "close" else "open",
+                                                  reason=reason, by=by)
+
+                batches: list[str] = []
+                live = [cid for cid in ids if cid in rows]
+                if len(ids) > 1 and owed_tidy._ready(cur):
+                    # Every bulk action is kept with its reason and each
+                    # item's state before (owner, status, due date), so
+                    # `khipu owed tidy --undo BATCH` restores them exactly.
+                    done, batches = owed_tidy.bulk_batch(cur, live, action, change, reason=reason or "",
+                                                         gate=args.get("owner_gate"))
+                else:
+                    done = {cid: change(cid) for cid in live}
+                results = []
+                for cid in ids:
+                    if cid not in rows:
+                        results.append({"id": cid, "ok": False, "error": f"no such commitment: {cid}"})
+                        continue
+                    ok = done.get(cid, False)
                     results.append({"id": cid, "ok": True} if ok else {
                         "id": cid, "ok": False,
                         "error": ("an open item already says the same" if action == "reopen"

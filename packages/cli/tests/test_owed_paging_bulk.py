@@ -393,3 +393,73 @@ def test_cli_reassign_and_reopen_take_lists(owed, capsys):
 def test_the_two_caps_are_count_settings():
     assert config.COUNT_SETTINGS["owed_page_max"] == 200
     assert config.COUNT_SETTINGS["owed_bulk_max"] == 500
+
+
+# ---- the second cross-family review: every bulk action keeps the same audit ----
+
+
+def _state(conn, ids):
+    from khipu import owed_tidy
+
+    cols = ", ".join(owed_tidy.BULK_PRIOR_FIELDS)
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT id, {cols} FROM commitments WHERE id = ANY(%s) ORDER BY id", (list(ids),))
+        return {int(r[0]): r[1:] for r in cur.fetchall()}
+
+
+def _audit(conn, batches):
+    with conn.cursor() as cur:
+        cur.execute("SELECT commitment_id, action, reason, prior FROM commitment_tidy_items "
+                    "WHERE batch_id = ANY(%s) ORDER BY commitment_id", (list(batches),))
+        return {int(c): {"action": a, "reason": r, "prior": p} for c, a, r, p in cur.fetchall()}
+
+
+def test_bulk_snooze_preserves_reason_and_prior_due_after(owed):
+    """The review's probe on the hermetic hub: a successful bulk snooze keeps
+    its reason and each item's previous due date, and undo restores both."""
+    from khipu import owed_tidy
+
+    reason = "Matt asked to defer these until the vendor replies"
+    original_due_after = "2026-10-18"
+    ids = _seed(owed, 2, owner="assistant")
+    with owed.cursor() as cur:
+        cur.execute("UPDATE commitments SET due_after = %s::timestamptz WHERE id = %s", (original_due_after, ids[0]))
+    before = _state(owed, ids)
+    result = srv.owed_change(ids, "snooze", by=co.BY_CONVERSATION, until="7d", reason=reason, queue_ok=False)
+    assert result["ok"] and result["changed"] == 2 and result["action"] == "snooze"
+    assert result["results"] == [{"id": ids[0], "ok": True}, {"id": ids[1], "ok": True}]
+    assert _state(owed, ids)[ids[0]] != before[ids[0]]
+    state = _audit(owed, result["batches"])
+    assert reason in json.dumps(state)
+    assert original_due_after in json.dumps(state)
+    assert state[ids[1]]["prior"]["due_after"] is None
+    undone = owed_tidy.undo(result["batches"][0], project=PROJECT)
+    assert undone["ok"] and undone["restored"] == 2
+    assert _state(owed, ids) == before
+
+
+@pytest.mark.parametrize("action", ["close", "reopen", "snooze", "reassign"])
+def test_every_bulk_action_keeps_the_same_audit_record_and_undoes_exactly(owed, action):
+    from khipu import owed_tidy
+
+    assert set(owed_tidy.BULK_ACTIONS) == {"close", "reopen", "snooze", "reassign"}
+    ids = _seed(owed, 2, text=f"{action} widget {{i}} in the staging area", owner="assistant")
+    if action == "reopen":
+        with owed.cursor() as cur:
+            cur.execute("UPDATE commitments SET status = 'closed', closed_at = now(), close_reason = 'done', "
+                        "closed_by = 'a conversation' WHERE id = ANY(%s)", (ids,))
+    before = _state(owed, ids)
+    reason = f"bulk {action} for the audit test"
+    extra = {"until": "2w"} if action == "snooze" else {"owner": "agent", "owner_label": "reviewer"} \
+        if action == "reassign" else {}
+    result = srv.owed_change(ids, action, by=co.BY_CONVERSATION, reason=reason, queue_ok=False, **extra)
+    assert result["ok"] and result["changed"] == 2, result
+    audit = _audit(owed, result["batches"])
+    assert sorted(audit) == ids
+    for cid in ids:
+        assert audit[cid]["action"] == action and audit[cid]["reason"] == reason
+        assert set(audit[cid]["prior"]) == set(owed_tidy.BULK_PRIOR_FIELDS)
+    assert _state(owed, ids) != before
+    undone = owed_tidy.undo(result["batches"][0], project=PROJECT)
+    assert undone["ok"] and undone["restored"] == 2, undone
+    assert _state(owed, ids) == before

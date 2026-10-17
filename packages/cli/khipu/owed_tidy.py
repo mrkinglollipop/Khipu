@@ -556,15 +556,25 @@ def _batch_id(prefix: str) -> str:
     return f"{prefix}-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
 
 
-def reassign_batch(cur, ids: list[int], owner: str, label: str | None, *, reason: str,
-                   gate: str | None) -> tuple[dict[int, bool], list[str]]:
-    """Reassign ``ids`` as undoable batches, one per project, in the
-    caller's transaction: each item's state before and the reason are kept in
-    ``commitment_tidy_items`` exactly as a clean-up's are, so ``undo`` (and
-    ``khipu owed tidy --undo``) restores every item's prior owner and label.
-    Returns ``({id: changed}, [batch ids])``."""
-    from khipu import commitments as co
+# Every action a bulk owed change can take; each one is kept as an undoable
+# batch with the same record shape (``bulk_batch``).
+BULK_ACTIONS = ("close", "reopen", "snooze", "reassign")
+# The state an undo of a bulk change restores: the clean-up's, plus the due
+# date a snooze moves.
+BULK_PRIOR_FIELDS = (*PRIOR_FIELDS, "due_after")
 
+
+def bulk_batch(cur, ids: list[int], action: str, change, *, reason: str,
+               gate: str | None) -> tuple[dict[int, bool], list[str]]:
+    """Apply ``change(cid) -> bool`` (a close, reopen, snooze or reassign) to
+    ``ids`` as undoable batches, one per project, in the caller's
+    transaction. Every bulk action keeps the same record: the batch, and per
+    changed item in ``commitment_tidy_items`` its action, the reason and its
+    state before (``BULK_PRIOR_FIELDS``, the due date included), so ``undo``
+    (and ``khipu owed tidy --undo``) restores each item exactly. Returns
+    ``({id: changed}, [batch ids])``."""
+    if action not in BULK_ACTIONS:
+        raise ValueError(f"action must be one of {', '.join(BULK_ACTIONS)}")
     cur.execute("SELECT id, project FROM commitments WHERE id = ANY(%s) ORDER BY id", (list(ids),))
     by_project: dict[str | None, list[int]] = {}
     for cid, project in cur.fetchall():
@@ -575,26 +585,26 @@ def reassign_batch(cur, ids: list[int], owner: str, label: str | None, *, reason
         before = _select(cur, project, ids=pids, lock=True)
         if not before:
             continue
-        batch = _batch_id("reassign")
+        batch = _batch_id(action)
         cur.execute("INSERT INTO commitment_tidy_batches (id, project, plan_version, planned_at, owner_gate) "
                     "VALUES (%s, %s, %s, NULL, %s)", (batch, project or "", PLAN_VERSION, gate))
         count = 0
         for cid in pids:
             row = before.get(cid)
-            if row is None or not co.reassign(cur, cid, owner, label):
+            if row is None or not change(cid):
                 changed[cid] = False
                 continue
             cur.execute("UPDATE commitments SET tidy_batch = %s WHERE id = %s", (batch, cid))
             after = _select(cur, project, ids=[cid])[cid]
             cur.execute(
                 "INSERT INTO commitment_tidy_items (batch_id, commitment_id, action, reason, prior, "
-                "after_fingerprint) VALUES (%s, %s, 'reassign', %s, %s::jsonb, %s)",
-                (batch, cid, reason[:400], json.dumps({f: _plain(row.get(f)) for f in PRIOR_FIELDS}, default=str),
-                 fingerprint(after)))
+                "after_fingerprint) VALUES (%s, %s, %s, %s, %s::jsonb, %s)",
+                (batch, cid, action, reason[:400],
+                 json.dumps({f: _plain(row.get(f)) for f in BULK_PRIOR_FIELDS}, default=str), fingerprint(after)))
             changed[cid] = True
             count += 1
         cur.execute("UPDATE commitment_tidy_batches SET counts = %s::jsonb WHERE id = %s",
-                    (json.dumps({"close": 0, "reassign": count}), batch))
+                    (json.dumps({action: count}), batch))
         batches.append(batch)
     return changed, batches
 
@@ -662,13 +672,16 @@ def undo(batch: str, *, project: str | None = None) -> dict[str, Any]:
                         "close_reason = %s, closed_by = %s, close_rule_key = %s, close_evidence = %s::jsonb, "
                         "tidy_batch = %s, reopened_rule_keys = CASE WHEN %s AND close_rule_key IS NOT NULL "
                         "AND NOT (close_rule_key = ANY(reopened_rule_keys)) "
-                        "THEN array_append(reopened_rule_keys, close_rule_key) ELSE reopened_rule_keys END "
+                        "THEN array_append(reopened_rule_keys, close_rule_key) ELSE reopened_rule_keys END, "
+                        # A clean-up batch kept no due date and never moved one.
+                        "due_after = CASE WHEN %s THEN %s::timestamptz ELSE due_after END "
                         "WHERE id = %s",
                         (prior["status"], prior["owner"], prior["owner_label"], prior["origin"],
                          prior["owner_reassigned_at"], prior["closed_at"], prior["closed_episode"],
                          prior["close_reason"], prior["closed_by"], prior["close_rule_key"],
                          None if prior["close_evidence"] is None else json.dumps(prior["close_evidence"]),
-                         prior["tidy_batch"], action == "close", cid))
+                         prior["tidy_batch"], action == "close", "due_after" in prior, prior.get("due_after"),
+                         cid))
                     cur.execute("RELEASE SAVEPOINT owed_tidy_undo")
                 except Exception as exc:  # noqa: BLE001 — e.g. the same text is open again
                     cur.execute("ROLLBACK TO SAVEPOINT owed_tidy_undo")
