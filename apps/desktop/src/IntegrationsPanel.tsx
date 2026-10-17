@@ -68,6 +68,49 @@ export type ClaudeHomeRow = {
   error?: string;
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isHarnessId(value: unknown): value is HarnessId {
+  return typeof value === "string" && ALL_HARNESSES.includes(value as HarnessId);
+}
+
+function isClaudeHomeRow(value: unknown): value is ClaudeHomeRow {
+  if (!isRecord(value)) return false;
+  return typeof value.path === "string"
+    && typeof value.label === "string"
+    && typeof value.source === "string"
+    && typeof value.is_default === "boolean"
+    && typeof value.exists === "boolean"
+    && typeof value.memory_tools_ok === "boolean"
+    && typeof value.hooks_ok === "boolean"
+    && typeof value.installed === "boolean";
+}
+
+/** Only accept the status shape this pane reads. An unexpected JSON payload
+ * is not an integrations status list and must stay a recoverable read error. */
+export function parseStatusRows(raw: string): StatusRow[] | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(value)) return null;
+  const valid = value.every((row): row is StatusRow => {
+    if (!isRecord(row)) return false;
+    return isHarnessId(row.harness)
+      && typeof row.detected === "boolean"
+      && typeof row.mcp === "boolean"
+      && typeof row.hook_stop === "boolean"
+      && typeof row.hook_precompact === "boolean"
+      && typeof row.recall_rule === "string"
+      && (row.homes === undefined || (Array.isArray(row.homes) && row.homes.every(isClaudeHomeRow)));
+  });
+  return valid ? value : null;
+}
+
 export type StatusRow = {
   harness: HarnessId;
   detected: boolean;
@@ -673,7 +716,9 @@ export function IntegrationsPanel({
     try {
       const raw = await runKhipu(["integrations", "status"]);
       if (latestLoad.current !== request) return;
-      setRows(JSON.parse(raw) as StatusRow[]);
+      const nextRows = parseStatusRows(raw);
+      if (nextRows == null) throw new Error("Khipu returned an unreadable harness status.");
+      setRows(nextRows);
     } catch (e) {
       // A failed status read is NOT "nothing installed" — keep the last rows
       // and surface the failure as its own state.
@@ -860,6 +905,8 @@ export function IntegrationsPanel({
   }, [focusHome, busy]);
 
   const detected = (rows ?? []).filter((r) => r.detected);
+  const unreadableStatus =
+    loadError?.includes("Khipu returned an unreadable harness status.") ?? false;
 
   return (
     <div className="panel-body wide">
@@ -889,8 +936,9 @@ export function IntegrationsPanel({
             </button>
           }
         >
-          The CLI didn't answer, so this is the last known state. Check that
-          Python 3.11 and the Khipu folder are set under Settings → Advanced.
+          {unreadableStatus
+            ? "Khipu returned an unreadable harness status. The last known state is still shown."
+            : "The CLI didn't answer, so this is the last known state. Check that Python 3.11 and the Khipu folder are set under Settings → Advanced."}
         </Callout>
       ) : null}
 
