@@ -553,8 +553,24 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
             "skipped": skipped, "owner_gate": gate}
 
 
-def undo(batch: str) -> dict[str, Any]:
-    """Undo one applied batch (see the module docstring)."""
+def batch_project(batch: str) -> str | None:
+    """The project a batch belongs to ("" for items with none), or None when
+    there is no such batch. Read only."""
+    from khipu import offline
+    from khipu.db import connect
+
+    with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+        with conn.cursor() as cur:
+            if not _ready(cur):
+                return None
+            cur.execute("SELECT project FROM commitment_tidy_batches WHERE id = %s", (str(batch or "").strip(),))
+            found = cur.fetchone()
+    return None if found is None else str(found[0])
+
+
+def undo(batch: str, *, project: str | None = None) -> dict[str, Any]:
+    """Undo one applied batch (see the module docstring). With ``project``,
+    a batch of another project is refused before anything changes."""
     from khipu import commitments as co, offline
     from khipu.db import connect
 
@@ -567,7 +583,11 @@ def undo(batch: str) -> dict[str, Any]:
             found = cur.fetchone()
             if found is None:
                 return {"ok": False, "restored": 0, "error": f"no clean-up batch {batch!r}; nothing was changed"}
-            project = found[0]
+            if project is not None and found[0] != project:
+                return {"ok": False, "restored": 0, "batch": batch, "project": found[0],
+                        "error": f"batch {batch!r} is for project {found[0]!r}, not {project!r}; "
+                                 "nothing was changed"}
+            project = found[0] or None
             cur.execute("SELECT commitment_id, action, prior, after_fingerprint FROM commitment_tidy_items "
                         "WHERE batch_id = %s AND undone_at IS NULL ORDER BY commitment_id", (batch,))
             entries = [(int(c), a, p if isinstance(p, dict) else json.loads(p), fp) for c, a, p, fp in cur.fetchall()]
@@ -616,4 +636,4 @@ def undo(batch: str) -> dict[str, Any]:
             cur.execute("UPDATE commitment_tidy_batches SET undone_at = now(), undo_report = %s::jsonb "
                         "WHERE id = %s", (json.dumps(report), batch))
     _log(f"{batch}: undo restored {restored}, left alone {len(left_alone)}")
-    return {"ok": True, "batch": batch, "project": project, **report}
+    return {"ok": True, "batch": batch, "project": project or "", **report}

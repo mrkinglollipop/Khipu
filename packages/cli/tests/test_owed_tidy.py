@@ -511,3 +511,39 @@ def test_a_retry_of_a_failed_batch_takes_another_unit(owed):
     plan = _plan(owed, judge=twice)
     assert twice.calls == 2 and plan["model"]["calls"] == 2
     config.set_count_setting("owed_tidy_calls", 0)
+
+
+def test_tidy_undo_cannot_change_a_batch_for_another_project(monkeypatch):
+    """The required --project must constrain undo as it already constrains apply."""
+    import argparse
+
+    from khipu import cli
+
+    state = {"undo_calls": 0, "mutated": False}
+
+    def fake_undo(batch):
+        state["undo_calls"] += 1
+        state["mutated"] = True
+        return {"ok": True, "batch": batch, "project": "other/project", "restored": 1,
+                "left_alone": [], "owner_gate": "app"}
+
+    monkeypatch.setattr(owed_tidy, "undo", fake_undo)
+    monkeypatch.setattr(owed_tidy, "batch_project", lambda batch: "other/project")
+    args = argparse.Namespace(project="expected/project", apply=None, undo="tidy-other",
+                              plan_out=None, no_model=False)
+
+    assert cli.cmd_owed_tidy(args) == 2
+    assert state == {"undo_calls": 0, "mutated": False}
+
+
+def test_undo_with_another_project_changes_nothing_on_the_hub(owed, monkeypatch):
+    _flood(owed)
+    plan = _plan(owed, judge=FakeModel())
+    _app(monkeypatch)
+    res = owed_tidy.apply(plan)
+    before = _rows(owed)
+    refused = owed_tidy.undo(res["batch"], project="other/project")
+    assert refused["ok"] is False and refused["restored"] == 0
+    assert _rows(owed) == before
+    assert owed_tidy.batch_project(res["batch"]) == PROJECT
+    assert owed_tidy.undo(res["batch"], project=PROJECT)["ok"] is True

@@ -2386,9 +2386,20 @@ def cmd_owed_tidy(args: argparse.Namespace) -> int:
         print(json.dumps(res, indent=2, default=str))
         return 0 if res.get("ok") else 1
     if args.undo:
-        res = owed_tidy.undo(args.undo)
-        if res.get("ok") and res.get("project") != project:
-            res = dict(res, note=f"the batch was for project {res.get('project')!r}")
+        # The batch's project is checked before anything changes, as --apply
+        # checks the plan's; undo checks it again under its lock.
+        try:
+            owner_project = owed_tidy.batch_project(args.undo)
+        except Exception as exc:  # noqa: BLE001 — not checked means not undone
+            print(json.dumps({"ok": False, "error": f"could not read the batch ({type(exc).__name__}); "
+                                                    "nothing was changed"}))
+            return 2
+        if owner_project != project:
+            why = (f"no clean-up batch {args.undo!r}" if owner_project is None
+                   else f"batch {args.undo!r} is for project {owner_project!r}, not {project!r}")
+            print(json.dumps({"ok": False, "error": why + "; nothing was changed"}))
+            return 2
+        res = owed_tidy.undo(args.undo, project=project)
         print(json.dumps(res, indent=2, default=str))
         return 0 if res.get("ok") else 1
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
