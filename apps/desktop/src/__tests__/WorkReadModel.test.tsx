@@ -369,6 +369,100 @@ describe("LedgerPage edits and single reads", () => {
     expect(screen.queryByText("Unsaved changes")).toBeNull();
   });
 
+  // A save that is held until the test answers it; `elsewhere` is what
+  // another writer changes on the row meanwhile, whether or not it saves.
+  function heldSave() {
+    let current = row("s-1", { title: "Original" });
+    let answer: (ok: boolean, elsewhere?: Partial<LedgerRow>) => void = () => {};
+    let held = true;
+    invokeMock.mockImplementation(async (cmd: string, args: Record<string, unknown>) => {
+      if (cmd === "khipu_ledger_list") return JSON.stringify({ ok: true, offline: false, vocab: VOCAB, rows: [current] });
+      if (cmd === "khipu_ledger_get") return JSON.stringify(current);
+      if (cmd === "khipu_ledger_set") {
+        const change = args.change as Record<string, string>;
+        const apply = (ok: boolean, elsewhere?: Partial<LedgerRow>) => {
+          if (!ok && !elsewhere) return JSON.stringify({ ok: false, error: "the row changed elsewhere" });
+          const saved = ok ? Object.fromEntries(Object.entries(change).filter(([k]) => k !== "if_state" && k !== "note")) : {};
+          current = { ...current, ...saved, ...elsewhere, updated: ago(0) };
+          return JSON.stringify(ok ? { ok: true } : { ok: false, error: "the row changed elsewhere" });
+        };
+        if (!held) return apply(true);
+        return new Promise<string>((resolve) => {
+          answer = (ok, elsewhere) => resolve(apply(ok, elsewhere));
+        });
+      }
+      return JSON.stringify({ removed: [] });
+    });
+    return {
+      answer: (ok: boolean, elsewhere?: Partial<LedgerRow>) => answer(ok, elsewhere),
+      release: () => {
+        held = false;
+      },
+    };
+  }
+  const field = (label: string) => within(screen.getByRole("form", { name: "Change this row" })).getByLabelText(label);
+  const save = () => fireEvent.submit(screen.getByRole("form", { name: "Change this row" }));
+
+  it("a refused save keeps what was sent and typed since, and takes only untouched fields from the row", async () => {
+    fake();
+    const s = heldSave();
+    ledgerPage("s-1");
+    await tick(0);
+    fireEvent.change(field("Evidence"), { target: { value: "Evidence to save" } });
+    save();
+    await tick(0);
+    fireEvent.change(title(), { target: { value: "Later title" } });
+    await act(async () => {
+      s.answer(false, { link: "https://elsewhere.example" });
+    });
+    await tick(0);
+    expect(field("Evidence")).toHaveValue("Evidence to save");
+    expect(title()).toHaveValue("Later title");
+    expect(field("Link")).toHaveValue("https://elsewhere.example");
+    expect(screen.getByRole("alert")).toHaveTextContent("the row changed elsewhere");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+  });
+
+  it("a refused save with nothing changed elsewhere keeps the form as it is", async () => {
+    fake();
+    const s = heldSave();
+    ledgerPage("s-1");
+    await tick(0);
+    fireEvent.change(field("Evidence"), { target: { value: "Evidence to save" } });
+    save();
+    await tick(0);
+    await act(async () => {
+      s.answer(false);
+    });
+    await tick(5_100);
+    expect(field("Evidence")).toHaveValue("Evidence to save");
+    expect(title()).toHaveValue("Original");
+    expect(screen.getByRole("alert")).toHaveTextContent("the row changed elsewhere");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+  });
+
+  it("a refused save with another writer's change, then a retry that saves, clears Unsaved changes", async () => {
+    fake();
+    const s = heldSave();
+    ledgerPage("s-1");
+    await tick(0);
+    fireEvent.change(field("Evidence"), { target: { value: "Evidence to save" } });
+    save();
+    await tick(0);
+    await act(async () => {
+      s.answer(false, { link: "https://elsewhere.example" });
+    });
+    await tick(0);
+    expect(field("Evidence")).toHaveValue("Evidence to save");
+    s.release();
+    save();
+    await tick(0);
+    expect(field("Evidence")).toHaveValue("Evidence to save");
+    expect(field("Link")).toHaveValue("https://elsewhere.example");
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+  });
+
   it("never starts a second list read while the first is still out", async () => {
     fake();
     let started = 0;

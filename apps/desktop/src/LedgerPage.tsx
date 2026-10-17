@@ -142,6 +142,8 @@ function HistoryItem({ h, now }: { h: HistoryEntry; now: Date }) {
 
 type Form = { state: string; title: string; evidence: string; owner: string; link: string; note: string };
 
+type Sent = { rev: number; form: Form; refused?: boolean };
+
 function initialForm(row: LedgerRow, vocab: Vocab | null): Form {
   const needs = meaningOf(vocab, row.state) === "needs";
   return {
@@ -199,8 +201,11 @@ export function LedgerPage({
     editRev.current += 1;
     setForm(next);
   };
-  // The form as it was sent, when typing went on during the save: the saved
-  // row's refresh then keeps every field changed since instead of resetting.
+  // The refresh after a write takes the row's value only for fields still
+  // equal to this form and keeps the rest as typed. After a save that went
+  // through it is the form as sent (set only when typing went on during the
+  // save); after a refused one it is the form as last loaded, so nothing the
+  // user wrote is lost.
   const rebase = useRef<Form | null>(null);
   const [saving, setSaving] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
@@ -223,13 +228,13 @@ export function LedgerPage({
   }, [project]);
 
   const loadDetail = useCallback(
-    async (id: string, background = false, sent?: { rev: number; form: Form }) => {
+    async (id: string, background = false, sent?: Sent) => {
       const rev = editRev.current;
       const res = await callCli<LedgerRow>("khipu_ledger_get", { project, id });
       if (openRow.current !== id) return null;
       if (background && editRev.current !== rev) return null;
       if (res.ok && res.data && typeof res.data.id === "string") {
-        rebase.current = sent && editRev.current !== sent.rev ? sent.form : null;
+        rebase.current = sent && (sent.refused || editRev.current !== sent.rev) ? sent.form : null;
         setDetail(res.data);
         setDetailError(null);
         return res.data;
@@ -324,7 +329,7 @@ export function LedgerPage({
     const fresh = initialForm(detail, vocab);
     if (sent && key !== formFor.current) {
       formFor.current = key;
-      // Fields typed after Save keep their newer text and stay unsaved.
+      // Fields the user changed keep their text and stay unsaved.
       setForm((now) =>
         now ? (Object.fromEntries((Object.keys(fresh) as Array<keyof Form>).map((k) => [k, now[k] !== sent[k] ? now[k] : fresh[k]])) as Form) : fresh,
       );
@@ -383,7 +388,7 @@ export function LedgerPage({
   const visible = filtered.slice(0, limit);
   const children = detail ? rows.filter((r) => r.parent === detail.id) : [];
 
-  const afterWrite = async (id: string | null, sent?: { rev: number; form: Form }) => {
+  const afterWrite = async (id: string | null, sent?: Sent) => {
     await Promise.all([readList(true), id ? loadDetail(id, false, sent) : Promise.resolve(null), onChanged()]);
   };
 
@@ -401,13 +406,14 @@ export function LedgerPage({
       return;
     }
     change.if_state = detail.state;
-    const sent = { rev: editRev.current, form };
+    let sent: Sent = { rev: editRev.current, form };
     setSaving(true);
     setRefusal(null);
     try {
       const out = await callCli("khipu_ledger_set", { project, id: detail.id, change });
       if (!out.ok) {
         setRefusal(out.error);
+        sent = { rev: sent.rev, form: initialForm(detail, vocab), refused: true };
       } else {
         const commitment = detail.refs?.commitment;
         if (change.state && commitment != null && commitment !== "" && finished(vocab, change.state)) {
