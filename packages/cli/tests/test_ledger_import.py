@@ -284,7 +284,9 @@ def test_a_file_in_a_credential_location_is_refused_before_it_is_opened(hub, tmp
     # Never created: the refusal comes from the path's names alone.
     rc, report = _import(tmp_path / "API Keys" / "tracker.json")
     assert rc == 1 and report["reason"] == "refused" and "private folder" in report["error"]
-    assert opened == [] and _counts(hub) == (0, 0, 0)
+    # The owner-actions log (written ahead of every owner command) is opened;
+    # nothing inside the private folder ever is.
+    assert [p for p in opened if "API Keys" in str(p)] == [] and _counts(hub) == (0, 0, 0)
 
 
 # ---- (i) khipu_ledger --------------------------------------------------------------------
@@ -1043,3 +1045,55 @@ def test_an_unchanged_inbox_copy_still_refuses_catch_up(monkeypatch):
                                       {"in_inbox": True}, dry_run=False, catch_up=True)
     assert result["result"] == "refused"
     assert result["reason"] == "inbox_copy"
+
+
+# ---- owner direction: an import has an Undo ----------------------------------------------------
+
+
+def _direction(tmp_path, monkeypatch, session="s-import"):
+    from khipu import owner_turns
+
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", session)
+    owner_turns.record({"session_id": session, "prompt": "import the old tracker", "cwd": str(tmp_path)},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"})
+
+
+def _owner_undo(line_id: str) -> tuple[int, dict]:
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    from khipu import cli
+
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = cli.main(["owner-direction", "undo", line_id, "--owner-direction"])
+    assert out.getvalue().strip(), err.getvalue()
+    return rc, json.loads(out.getvalue())
+
+
+def test_an_import_by_direction_is_undone_by_removing_what_it_added(hub, tmp_path, monkeypatch):
+    """Fifth review, P2: an import made by direction has an Undo. It removes
+    (restorably) the rows that import added, children first, and marks the
+    import undone; a row the ledger had before stays."""
+    ok("add", "kept-row", "--title", "Here before the import", "--kind", "slice")
+    _direction(tmp_path, monkeypatch)
+    doc = _tracker(30)
+    rc, report = _import(_write(tmp_path, doc), "--owner-direction")
+    assert rc == 0 and report["result"] == "done", report
+    live = "SELECT count(*) FROM ledger_rows WHERE project = %s AND removed_at IS NULL"
+    assert _sql(hub, live, (P,))[0][0] == 31
+    rc, out = _owner_undo(report["owner_action"])
+    assert rc == 0 and len(out["removed"]) == 30, out
+    assert _sql(hub, "SELECT row_id FROM ledger_rows WHERE project = %s AND removed_at IS NULL", (P,)) == [
+        ("kept-row",)]
+    assert _sql(hub, "SELECT result FROM ledger_imports")[0][0] == "undone"
+    rc, again = _owner_undo(report["owner_action"])
+    assert rc == 2 and "already undone" in again["error"], again
+
+
+def test_a_catch_up_import_is_not_made_by_direction(hub, tmp_path, monkeypatch):
+    """A catch-up changes rows already there, so it has no Undo and needs the app."""
+    _direction(tmp_path, monkeypatch)
+    rc, report = _import(_write(tmp_path, _tracker(10)), "--catch-up", "--owner-direction")
+    assert rc != 0 and report.get("reason") == "not_by_direction", report

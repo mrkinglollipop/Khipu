@@ -2207,11 +2207,14 @@ def set_status(cur, commitment_id: int, status: str, *, reason: str | None = Non
 
 OWNERS = (OWNER_USER, OWNER_ASSISTANT, OWNER_AGENT)
 ORIGINS = (ORIGIN_CONVERSATION, ORIGIN_JOB)
-# What ``bulk_owner_gate`` returns when it passes; the hub accepts a bulk
-# change to the owner's items only with one of these on the write.
-OWNER_GATE_PASSES = ("app", "terminal")
+# How the owner gate passed for a bulk change to the owner's items: the app
+# or a typed yes (``bulk_owner_gate``), or the owner's direction in a
+# conversation (``mcp_server.owed_change``, ``owner_direction.gate``). The hub
+# accepts such a change only with one of these on the write.
+OWNER_GATE_PASSES = ("app", "terminal", "direction")
 BULK_OWNER_REFUSAL = ("Changing more than one of the owner's own items at once needs the owner: "
-                      "do it in the Khipu app, or type yes on a terminal. Nothing was changed.")
+                      "do it in the Khipu app, type yes on a terminal, or ask in a conversation the owner is "
+                      "typing in (khipu_owner_act with owed.change). Nothing was changed.")
 
 
 def _opened_key(row: dict[str, Any]) -> tuple[Any, int]:
@@ -2395,9 +2398,9 @@ def bulk_owner_gate(count: int) -> str | None:
     (decision 6): ``"app"`` when the Khipu app itself started this process,
     ``"terminal"`` after the owner's yes typed on a terminal, else None. The
     same two checks as the ledger's owner verbs (``ledger.require``), made
-    through routing's own functions, never reimplemented here. This is the
-    one place the owner's direction through the agent
-    (docs/plans/2026-10-16-owner-direction.md) plugs in when it lands."""
+    through routing's own functions, never reimplemented here. The owner's
+    direction through the agent is the third way past it, asked for
+    explicitly (``mcp_server.owed_change(by_direction=True)``)."""
     from khipu import routing
 
     if routing._caller()["app"]:

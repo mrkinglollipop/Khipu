@@ -178,7 +178,7 @@ def main(argv):
     if remaining >= 1.4:
         sys.stdout.write(str(deadline))
         return NO_CONNECTION
-    sys.stdout.write("{}\n")
+    sys.stdout.write((hook_stdout({}) or "{}") + "\n")
     return NO_BUDGET
 
 

@@ -1155,12 +1155,12 @@ _TOML_HEADER_RE = re.compile(
 )
 _AEGIS_NATIVE_HOOK_HEADER_RE = re.compile(
     r"^[ \t]*\[\[[ \t]*hooks[ \t]*\.[ \t]*"
-    r"(?P<event>Stop|PreCompact|SessionEnd)[ \t]*\.[ \t]*hooks[ \t]*\]\]"
+    r"(?P<event>Stop|PreCompact|SessionEnd|UserPromptSubmit)[ \t]*\.[ \t]*hooks[ \t]*\]\]"
     r"[ \t]*(?:#.*)?$"
 )
 _AEGIS_NATIVE_GROUP_HEADER_RE = re.compile(
     r"^[ \t]*\[\[[ \t]*hooks[ \t]*\.[ \t]*"
-    r"(?P<event>Stop|PreCompact|SessionEnd)[ \t]*\]\][ \t]*(?:#.*)?$"
+    r"(?P<event>Stop|PreCompact|SessionEnd|UserPromptSubmit)[ \t]*\]\][ \t]*(?:#.*)?$"
 )
 
 
@@ -1262,10 +1262,11 @@ def _native_aegis_hook_is_ours(block: str) -> bool:
         data = tomllib.loads(block)
     except tomllib.TOMLDecodeError:
         return False
-    for event in ("Stop", "PreCompact", "SessionEnd"):
+    for event in ("Stop", "PreCompact", "SessionEnd", "UserPromptSubmit"):
+        ours = _is_our_prompt_recall if event == "UserPromptSubmit" else _is_our_capture
         group = (data.get("hooks") or {}).get(event) or {}
         for hook in (group.get("hooks") or []) if isinstance(group, dict) else []:
-            if (isinstance(hook, dict) and _is_our_capture(hook.get("command"))
+            if (isinstance(hook, dict) and ours(hook.get("command"))
                     and isinstance(hook.get("env"), dict)
                     and hook["env"].get("KHIPU_HARNESS") == "aegis"):
                 return True
@@ -1350,6 +1351,10 @@ def _aegis_detected() -> bool:
     return (HOME / ".grok").is_dir()
 
 
+# The Aegis recorder-only prompt entry: it starts one small stdlib process.
+AEGIS_PROMPT_TIMEOUT = 2
+
+
 def _aegis_blocks() -> tuple[str, str]:
     mcp = (
         "[mcp_servers.khipu]\n"
@@ -1378,6 +1383,17 @@ def _aegis_blocks() -> tuple[str, str]:
             "  timeout = 15\n"
             '  env = { KHIPU_HARNESS = "aegis" }\n'
         )
+    # Owner direction: Aegis discards UserPromptSubmit output, so this entry
+    # only records the owner's turn (khipu-prompt-recall prints {} under the
+    # pack's mark, after recording).
+    hooks += (
+        "[[hooks.UserPromptSubmit]]\n"
+        "  [[hooks.UserPromptSubmit.hooks]]\n"
+        '  type = "command"\n'
+        f'  command = {json.dumps(prompt_recall_hook(), ensure_ascii=False)}\n'
+        f"  timeout = {AEGIS_PROMPT_TIMEOUT}\n"
+        '  env = { KHIPU_HARNESS = "aegis" }\n'
+    )
     hooks += "# khipu-pack: end\n"
     return mcp, hooks
 
@@ -1519,6 +1535,23 @@ def _aegis_capture_events(text: str) -> set[str]:
     return found
 
 
+def _aegis_prompt_recorder(text: str) -> bool:
+    """Whether Aegis runs khipu-prompt-recall at UserPromptSubmit under the
+    pack's mark (the owner-direction recorder), in either form Aegis keeps."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return False
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    groups = hooks.get("UserPromptSubmit") if isinstance(hooks, dict) else None
+    for group in groups if isinstance(groups, list) else []:
+        for h in (group.get("hooks") or []) if isinstance(group, dict) else []:
+            env = h.get("env") if isinstance(h, dict) and isinstance(h.get("env"), dict) else {}
+            if isinstance(h, dict) and _is_our_prompt_recall(h.get("command")) and env.get("KHIPU_HARNESS") == "aegis":
+                return True
+    return False
+
+
 def _aegis_capture_command(text: str) -> str | None:
     """The ``command`` aegis's own capture hook block currently holds, or
     None — mirrors ``_aegis_capture_events``'s parse but returns the command
@@ -1549,6 +1582,7 @@ def _aegis_status() -> dict:
             "mcp": bool(m and mcp_launcher() in m[2]),
             "hook_stop": "Stop" in events, "hook_precompact": "PreCompact" in events,
             "recall_rule": "n/a",
+            "prompt_recall": "installed" if _aegis_prompt_recorder(text) else "missing",
             "extract": "installed" if ours else "missing"}
     out.update(_pack_launchers("aegis", {
         "khipu-mcp": _toml_mcp_command(text),

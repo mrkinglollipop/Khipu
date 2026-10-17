@@ -82,7 +82,8 @@ if not hasattr(_t3, 'cache_thread'):
     import importlib
     importlib.reload(_t3)
 from khipu.lines import split_lines
-from khipu.t3 import cache_thread, is_helper_session, strip_handoff
+from khipu.t3 import cache_thread, is_helper_session
+from khipu.turn_text import INJECTED_CONTEXT_TAGS, MACHINE_USER_TAGS, clean_user_text, is_machine  # noqa: F401
 
 HARNESSES = ("claude_code", "cursor", "codex", "aegis")
 
@@ -325,35 +326,9 @@ def transcript_path(env: dict, harness: str = "", *, synth_sessions: set[str] | 
 
 # ---- transcript readers ---------------------------------------------------------
 
-# Blocks a harness writes into a user turn to carry hook output and other
-# context the person never typed. One entry per harness tag, so a new harness's
-# wrapper is one more name here, not a second stripping path:
-#   system-reminder  Claude Code (hook context, reminders)
-#   hooks_context    Cursor (sessionStart additional_context, recorded in the
-#                    agent transcript with a description="..." attribute)
-INJECTED_CONTEXT_TAGS = ("system-reminder", "hooks_context")
-_INJECTED_CONTEXT = re.compile(
-    r"<(" + "|".join(re.escape(t) for t in INJECTED_CONTEXT_TAGS) + r")(?:\s[^>]*)?>.*?</\1>", re.S)
-_CURSOR_WRAP = re.compile(r"</?(?:user_query|timestamp)>")
-
-
 def _clean_user_text(text: str) -> str:
-    """Strip harness-injected scaffolding from a user turn: the injected
-    context blocks in ``INJECTED_CONTEXT_TAGS`` (Claude Code's <system-reminder>,
-    Cursor's <hooks_context>; thousands of chars of hook context, none of it the
-    user), Cursor's <user_query>/<timestamp> wrappers, and the hand-over T3 Code
-    glues in front of the first message after a provider switch."""
-    cleaned = _INJECTED_CONTEXT.sub("", text)
-    # A Claude system-reminder can leave its separator newline before a real
-    # T3 header. The public stripper stays strict; this harness cleanup owns
-    # that injected prefix.
-    if cleaned != text and cleaned.startswith("\n"):
-        candidate = cleaned.lstrip("\n")
-        stripped = strip_handoff(candidate)
-        text = stripped if stripped != candidate else cleaned
-    else:
-        text = strip_handoff(cleaned)
-    return _CURSOR_WRAP.sub("", text)   # no strip: ACP user text arrives in chunks that must re-join exactly
+    """The typed part of a user turn (``turn_text.clean_user_text``)."""
+    return clean_user_text(text)
 
 
 # "User" messages the harness writes, not the person: background-task
@@ -365,14 +340,6 @@ def _clean_user_text(text: str) -> str:
 # whole body stays (outer tag stripped); a task notification keeps its
 # <summary> text; the rest stay as one line so the summariser knows they
 # happened.
-MACHINE_USER_TAGS = (
-    "<task-notification",
-    "<cross-session-message",
-    "<cross-session-idle",
-    "<cross-session-delivery",
-    "<local-command-",
-    "<command-name>",
-)
 _TAG_NAME = re.compile(r"<([A-Za-z][\w-]*)")
 _OUTER_TAG = re.compile(r"^<[^>]*>|</[^>]*>\s*$")
 _SUMMARY = re.compile(r"<summary>(.*?)</summary>", re.S)
@@ -382,7 +349,7 @@ def _machine_user_message(text: str) -> str | None:
     """What the window keeps for a machine-generated user message, or None
     when ``text`` (already cleaned) is something the person wrote."""
     head = text.lstrip()
-    if not head.startswith(MACHINE_USER_TAGS):
+    if not is_machine(head):
         return None
     m = _TAG_NAME.match(head)
     tag = m.group(1) if m else "notification"
@@ -1235,6 +1202,10 @@ def sweep_login_homes(*, now: float | None = None, force: bool = False) -> int:
                         return cleared
             older = now - LOGIN_HOME_KEEP_S
             cleared += sum(_clear_at(dfd, n, older_than=older) == "cleared" for n in _state_names(dfd))
+            # The owner-turn retention, as a backstop to the replica-refresh timer.
+            from khipu import owner_turns
+
+            owner_turns.sweep(now)
             with contextlib.suppress(OSError):
                 _write_at(dfd, _LOGIN_SWEEP_STAMP, "", times_ns=(int(now * 1e9), int(now * 1e9)))
             return cleared

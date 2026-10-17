@@ -25,7 +25,8 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from khipu import capture_stores, db, forget, hub_snapshot, outbox, paths, recall_eval, tombstones, work
+from khipu import (capture_stores, db, forget, hub_snapshot, outbox, owner_turns, paths, recall_eval, tombstones,
+                   work)
 from khipu import session_capture as sc
 from khipu import writer_groups as wg
 from tests import test_forget_ownership as fo
@@ -315,6 +316,7 @@ INJECT = {
     # A folder where the recall test file should be cannot be read as one.
     "recall golden": lambda mp, tmp: recall_eval.default_golden_path().mkdir(parents=True),
     "work view": lambda mp, tmp: _deny_listing(mp, lambda: work.view_file().parent),
+    "owner words": lambda mp, tmp: (owner_turns._ensure_folder(), _deny_listing(mp, owner_turns.folder)),
 }
 
 

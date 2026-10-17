@@ -530,14 +530,18 @@ def _is_users(row: dict) -> bool:
     return _guarded_owner(row) == co.OWNER_USER
 
 
-def _gate(cur, rows: dict[int, dict], ids: list[int], extra_users: set[int] | None = None):
+def _gate(cur, rows: dict[int, dict], ids: list[int], extra_users: set[int] | None = None,
+          passed: str | None = None):
     """``(passed, gate, mine)``: the owner gate when any of ``ids`` is the
-    user's item now (or in ``extra_users``)."""
+    user's item now (or in ``extra_users``). ``passed`` is a gate the caller
+    already passed (an Undo from the owner-actions log)."""
     from khipu import commitments as co
 
     mine = [cid for cid in ids if _is_users(rows[cid]) or cid in (extra_users or set())]
     if not mine:
         return True, None, mine
+    if passed in co.OWNER_GATE_PASSES:
+        return True, passed, mine
     gate = co.bulk_owner_gate(len(ids))
     return gate is not None, gate, mine
 
@@ -711,9 +715,11 @@ def batch_project(batch: str) -> str | None:
     return None if found is None else str(found[0])
 
 
-def undo(batch: str, *, project: str | None = None) -> dict[str, Any]:
+def undo(batch: str, *, project: str | None = None, owner_gate: str | None = None) -> dict[str, Any]:
     """Undo one applied batch (see the module docstring). With ``project``,
-    a batch of another project is refused before anything changes."""
+    a batch of another project is refused before anything changes.
+    ``owner_gate`` is how the owner gate already passed for this Undo (the
+    owner-actions log's Undo of a bulk change made by direction)."""
     from khipu import commitments as co, offline
     from khipu.db import connect
 
@@ -745,7 +751,7 @@ def undo(batch: str, *, project: str | None = None) -> dict[str, Any]:
                 else:
                     todo.append((cid, action, prior))
             prior_users = {cid for cid, _, prior in todo if prior.get("owner") == co.OWNER_USER}
-            passed, gate, mine = _gate(cur, rows, [t[0] for t in todo], prior_users)
+            passed, gate, mine = _gate(cur, rows, [t[0] for t in todo], prior_users, owner_gate)
             if not passed:
                 return {"ok": False, "restored": 0, "batch": batch, "needs_owner": mine,
                         "error": co.BULK_OWNER_REFUSAL}

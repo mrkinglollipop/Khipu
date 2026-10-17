@@ -705,3 +705,85 @@ def test_similar_items_of_two_owners_both_stay_linked_on_the_hub(owed):
     assert (a_owner, u_owner) == ("assistant", "user")
     assert (a_links, u_links) == ([u], [a])
     assert a_latest == "Review the deployment checklist before the release"
+
+
+# ---- "close those": a bulk change to the owner's items on his direction ---------------------
+
+
+def _direction(tmp_path, monkeypatch, session="s-close-those"):
+    from khipu import owner_turns
+
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", session)
+    owner_turns.record({"session_id": session, "prompt": "close those", "cwd": str(tmp_path)},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"})
+
+
+def _owner_undo(line_id: str) -> tuple[int, dict]:
+    from contextlib import redirect_stderr, redirect_stdout
+
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = cli.main(["owner-direction", "undo", line_id, "--owner-direction"])
+    assert out.getvalue().strip(), err.getvalue()
+    return rc, json.loads(out.getvalue())
+
+
+def test_close_those_by_direction_closes_the_owners_items_and_undo_reopens_them(owed, tmp_path, monkeypatch):
+    from khipu import owner_act
+
+    mine = _seed(owed, 3, text="should we ship widget {i}?", kind="question")
+    monkeypatch.setattr(routing, "typed_yes", lambda prompt: pytest.fail("the terminal was asked"))
+    _direction(tmp_path, monkeypatch)
+    ok_, out = owner_act.act("owed.change", {"ids": mine, "change": "close", "why": "Matt said close those"})
+    assert ok_ and out["changed"] == 3 and out["owner_action"], out
+    assert set(_status(owed, mine).values()) == {"closed"}
+    rc, undone = _owner_undo(out["owner_action"])
+    assert rc == 0 and undone["restored"] == 3, undone
+    assert set(_status(owed, mine).values()) == {"open"}
+    rc, again = _owner_undo(out["owner_action"])
+    assert rc == 2 and "already undone" in again["error"], again
+
+
+def test_close_those_is_refused_without_a_recent_owner_turn(owed, tmp_path, monkeypatch):
+    from khipu import owner_act
+
+    mine = _seed(owed, 2, text="should we ship widget {i}?", kind="question")
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-nobody-typed")
+    ok_, out = owner_act.act("owed.change", {"ids": mine, "change": "close", "why": "a job thinks so"})
+    assert not ok_ and out["code"] == "no_recorded_turn", out
+    assert "Nothing was changed" in out["error"]
+    assert set(_status(owed, mine).values()) == {"open"}
+
+
+def test_a_direction_reassign_is_undone_back_to_the_owner(owed, tmp_path, monkeypatch):
+    from khipu import owner_act
+
+    mine = _seed(owed, 2, text="should we ship widget {i}?", kind="question")
+    before = _state(owed, mine)
+    _direction(tmp_path, monkeypatch)
+    ok_, out = owner_act.act("owed.change", {"ids": mine, "change": "reassign", "why": "the builder has these",
+                                             "to": "agent", "label": "builder"})
+    assert ok_ and out["changed"] == 2, out
+    assert _state(owed, mine) != before
+    rc, undone = _owner_undo(out["owner_action"])
+    assert rc == 0 and undone["restored"] == 2, undone
+    assert _state(owed, mine) == before
+
+
+def test_owed_change_by_direction_takes_only_its_own_arguments():
+    from khipu import owner_act
+
+    for args in ({"ids": [1, 2], "change": "reassign", "why": "x"},
+                 {"ids": [1, 2], "change": "close", "why": "x", "to": "user"},
+                 {"ids": ["1", "-2"], "change": "close", "why": "x"},
+                 {"ids": [1, True], "change": "close", "why": "x"},
+                 {"ids": [1, 2], "change": "snooze", "why": "x"},
+                 {"ids": [1, 2], "change": "close"}):
+        ok_, out = owner_act.act("owed.change", args)
+        assert not ok_ and out["code"] == "bad_args", (args, out)
+    head, pos = owner_act.argv("owed.change", owner_act._values(
+        "owed.change", {"ids": [4, 5], "change": "close", "why": "done"}))
+    ns = cli.build_parser().parse_args(owner_act.full_argv(head, pos, ["--owner-direction"]))
+    assert ns.close == "4,5" and ns.reason == "done" and ns.by_direction is True

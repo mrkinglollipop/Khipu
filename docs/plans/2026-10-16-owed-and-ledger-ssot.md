@@ -234,7 +234,8 @@ conversation", "Khipu, by rule"), so no close is silent again.
   id, through `owner_writes` so a queued write replays whole. The most ids per call is the setting
   `owed_bulk_max` (default 500, 0 for no limit). A conversation may close or reassign items it or its jobs
   own in bulk; **a bulk change to items owned by the user passes the owner gate** (decision 6): the app, or
-  the owner's direction through the agent once `2026-10-16-owner-direction.md` lands; single closes by id
+  a yes typed on a terminal, or the owner's direction through the agent (`khipu_owner_act` with
+  `owed.change`, or `khipu owed --close ID,ID --owner-direction`), logged with an Undo; single closes by id
   stay as today for "the user says it is done".
 - `khipu owed`: the same filters, `--cursor`, `--close ID[,ID...]`, `--reassign`, `--reason`, and `--json`
   accepted as a no-op so callers that pass it keep working.
@@ -394,7 +395,8 @@ Matt approved this scope and answered its questions:
 5. **The tracker's move.** The ledger inbox is the right place, and the orchestrator does the copy.
 6. **Bulk closes of the owner's items.** They work by chat on his direction, like every owner action
    (`2026-10-16-owner-direction.md`); nothing is app-only. Until that lands, a bulk change to the owner's
-   items passes the existing owner gate, so the new path plugs in there.
+   items passes the existing owner gate, so the new path plugs in there. (Landed with the owner-direction
+   merge: the direction is the owner action `owed.change`, and its Undo undoes the change's batch.)
 
 ## Decisions (orchestrator, 2026-10-17)
 
@@ -425,8 +427,8 @@ and his own "done" in a conversation).
   kept on the item (`settle_suggestion`); a newer state of the same evidence replaces it, and a pull
   request suggestion is withdrawn when a PR the item names is no longer finished.
 - **Matt closes them, and nothing else does.** By direction ("close those"): the agent lists the Looks done
-  items and closes them with `khipu_owed_update`, through the owner-direction path being built on
-  `docs/owner-direction` (until that merges, through the existing owner gate, `bulk_owner_gate`). Or in the
+  items and closes them through the owner-direction path (`khipu_owner_act` with `owed.change`, which
+  Settings, Owner actions can undo). Or in the
   app with one tap: **Close all that look done**, or **Close** on one item. A reopen after such a close
   withdraws the suggestion and remembers its evidence, so the same evidence never suggests it again.
 - **Job and orchestrator items keep auto-close** by finished-PR evidence and the other rules, as before.

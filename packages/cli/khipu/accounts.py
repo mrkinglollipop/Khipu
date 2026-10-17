@@ -1059,17 +1059,46 @@ def _print(data: dict) -> None:
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
+def _intent(cmd: str, args) -> dict | None:
+    """An owner's ``khipu accounts`` change, for owner direction and the
+    owner-actions log (``owner_direction.ACTIONS``); None when its
+    arguments name nothing Khipu knows."""
+    from khipu import owner_direction
+
+    try:
+        if cmd == "track":
+            raw = json.loads(args.entries) if isinstance(args.entries, str) else args.entries
+            return owner_direction.intent("accounts.track", json.dumps(raw, sort_keys=True)) \
+                if isinstance(raw, list) and raw else None
+        if cmd in ("rename", "stop"):
+            return owner_direction.intent(f"accounts.{cmd}", normal_key(args.account))
+        if cmd == "move":
+            return owner_direction.intent("accounts.move", normal_key(args.account), facts={"folder": args.folder})
+        if cmd in ("decline", "offer-again"):
+            return owner_direction.intent(f"accounts.{cmd.replace('-', '_')}", _harness(args.harness),
+                                          facts={"folder": args.folder})
+        if cmd == "auto-track":
+            return owner_direction.intent("accounts.auto_track", args.state)
+        if cmd == "request":
+            return owner_direction.intent(f"accounts.request.{args.action}", "request")
+    except (AccountsError, ValueError, TypeError, AttributeError):
+        return None
+    return None
+
+
 def run_cli(args) -> int:
     """``khipu accounts``: one JSON object; a refusal is ``{"ok": false,
     "error", "code"}`` with exit 2. Every write is the owner's
     (``routing._owner_via``: the app, or a typed yes on a terminal)."""
+    from khipu import owner_direction
+
     cmd = getattr(args, "accounts_cmd", None) or "status"
     auth = routing._OWNER_AUTH.set(None)
     try:
         if cmd == "status":
             _print(status())
             return 0
-        via = routing._owner_via(args)
+        via = routing._owner_via(args, _intent(cmd, args))
         if via is None:
             _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
             return 2
@@ -1095,8 +1124,11 @@ def run_cli(args) -> int:
             out = answer_request(args.action, expect=expect, via=via)
         else:
             raise AccountsError(f"unknown accounts command {cmd!r}", "bad_command")
-        _print(out)
+        _print(owner_direction.finish(out) or out)
         return 0
+    except owner_direction.DirectionRefused as err:
+        _print(err.refusal())
+        return 2
     except AccountsError as err:
         _print(err.refusal())
         return 2
@@ -1108,4 +1140,5 @@ def run_cli(args) -> int:
                 "code": "config_unreadable"})
         return 2
     finally:
+        owner_direction.noted(None, {})
         routing._OWNER_AUTH.reset(auth)
