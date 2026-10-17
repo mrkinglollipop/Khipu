@@ -1775,6 +1775,8 @@ def _owed_change_on_hub(args: dict) -> dict:
     from khipu import commitments, offline, owner_writes
     from khipu.db import connect
 
+    from khipu import owed_tidy
+
     echo = {"ids": ids, "action": action}
     reason = str(args.get("reason") or "") or None
     by = str(args.get("by") or "") or None
@@ -1794,6 +1796,15 @@ def _owed_change_on_hub(args: dict) -> dict:
                     if snooze is None:
                         raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
                 results = []
+                batches: list[str] = []
+                moved: dict[int, bool] | None = None
+                if action == "reassign" and len(ids) > 1 and owed_tidy._ready(cur):
+                    # Kept with its reason and each item's owner before, so
+                    # `khipu owed tidy --undo BATCH` restores them exactly.
+                    moved, batches = owed_tidy.reassign_batch(
+                        cur, [cid for cid in ids if cid in rows], str(args.get("owner") or ""),
+                        str(args.get("owner_label") or "") or None, reason=reason or "",
+                        gate=args.get("owner_gate"))
                 for cid in ids:
                     if cid not in rows:
                         results.append({"id": cid, "ok": False, "error": f"no such commitment: {cid}"})
@@ -1803,6 +1814,8 @@ def _owed_change_on_hub(args: dict) -> dict:
                         cur.execute(f"UPDATE commitments SET due_after = {expr} WHERE id = %s",
                                     (*([param] if param is not None else []), cid))
                         ok = cur.rowcount > 0
+                    elif moved is not None:
+                        ok = moved.get(cid, False)
                     elif action == "reassign":
                         ok = commitments.reassign(cur, cid, str(args.get("owner") or ""),
                                                   str(args.get("owner_label") or "") or None)
@@ -1813,7 +1826,8 @@ def _owed_change_on_hub(args: dict) -> dict:
                         "id": cid, "ok": False,
                         "error": ("an open item already says the same" if action == "reopen"
                                   else f"no such commitment: {cid}")})
-                return {"ok": True, "changed": sum(1 for r in results if r["ok"]), "results": results, **echo}
+                return {"ok": True, "changed": sum(1 for r in results if r["ok"]), "results": results,
+                        **({"batches": batches} if batches else {}), **echo}
 
             return owner_writes.apply_on_hub(conn, cur, "owed_update", args, write, echo)
 

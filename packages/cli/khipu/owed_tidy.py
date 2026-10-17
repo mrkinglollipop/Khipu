@@ -122,7 +122,7 @@ def _select(cur, project: str, *, ids: list[int] | None = None, lock: bool = Fal
     if has_columns(cur, "episodes", "parent_session_id"):
         lineage = ("(SELECT NULLIF(e.parent_session_id, '') FROM episodes e "
                    "WHERE e.id = commitments.opened_episode)")
-    where = "project = %s AND " + ("id = ANY(%s)" if ids is not None else "status = 'open'")
+    where = "project IS NOT DISTINCT FROM %s AND " + ("id = ANY(%s)" if ids is not None else "status = 'open'")
     params: tuple = (project, list(ids)) if ids is not None else (project,)
     cur.execute(f"SELECT {', '.join(cols)}, {lineage} FROM commitments WHERE {where} "
                 f"AND {_not_forgotten_clause(cur)} ORDER BY id{' FOR UPDATE' if lock else ''}", params)
@@ -510,7 +510,7 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
             rows, skipped, live = current(lock=True)
             if not gate and any(_is_users(rows[cid]) for cid in live):
                 return {"ok": False, "changed": 0, "error": co.BULK_OWNER_REFUSAL}
-            batch = "tidy-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
+            batch = _batch_id("tidy")
             counts = {"close": 0, "reassign": 0}
             cur.execute("INSERT INTO commitment_tidy_batches (id, project, plan_version, planned_at, owner_gate) "
                         "VALUES (%s, %s, %s, %s::timestamptz, %s)",
@@ -551,6 +551,53 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
     _log(f"{batch}: closed {counts['close']}, reassigned {counts['reassign']}, skipped {len(skipped)}")
     return {"ok": True, "batch": batch, "project": project, "changed": changed, "counts": counts,
             "skipped": skipped, "owner_gate": gate}
+
+
+def _batch_id(prefix: str) -> str:
+    return f"{prefix}-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
+
+
+def reassign_batch(cur, ids: list[int], owner: str, label: str | None, *, reason: str,
+                   gate: str | None) -> tuple[dict[int, bool], list[str]]:
+    """Reassign ``ids`` as undoable batches, one per project, in the
+    caller's transaction: each item's state before and the reason are kept in
+    ``commitment_tidy_items`` exactly as a clean-up's are, so ``undo`` (and
+    ``khipu owed tidy --undo``) restores every item's prior owner and label.
+    Returns ``({id: changed}, [batch ids])``."""
+    from khipu import commitments as co
+
+    cur.execute("SELECT id, project FROM commitments WHERE id = ANY(%s) ORDER BY id", (list(ids),))
+    by_project: dict[str | None, list[int]] = {}
+    for cid, project in cur.fetchall():
+        by_project.setdefault(project, []).append(int(cid))
+    changed: dict[int, bool] = {}
+    batches: list[str] = []
+    for project, pids in by_project.items():
+        before = _select(cur, project, ids=pids, lock=True)
+        if not before:
+            continue
+        batch = _batch_id("reassign")
+        cur.execute("INSERT INTO commitment_tidy_batches (id, project, plan_version, planned_at, owner_gate) "
+                    "VALUES (%s, %s, %s, NULL, %s)", (batch, project or "", PLAN_VERSION, gate))
+        count = 0
+        for cid in pids:
+            row = before.get(cid)
+            if row is None or not co.reassign(cur, cid, owner, label):
+                changed[cid] = False
+                continue
+            cur.execute("UPDATE commitments SET tidy_batch = %s WHERE id = %s", (batch, cid))
+            after = _select(cur, project, ids=[cid])[cid]
+            cur.execute(
+                "INSERT INTO commitment_tidy_items (batch_id, commitment_id, action, reason, prior, "
+                "after_fingerprint) VALUES (%s, %s, 'reassign', %s, %s::jsonb, %s)",
+                (batch, cid, reason[:400], json.dumps({f: _plain(row.get(f)) for f in PRIOR_FIELDS}, default=str),
+                 fingerprint(after)))
+            changed[cid] = True
+            count += 1
+        cur.execute("UPDATE commitment_tidy_batches SET counts = %s::jsonb WHERE id = %s",
+                    (json.dumps({"close": 0, "reassign": count}), batch))
+        batches.append(batch)
+    return changed, batches
 
 
 def batch_project(batch: str) -> str | None:

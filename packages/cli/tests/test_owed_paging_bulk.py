@@ -314,6 +314,36 @@ def test_reassign_moves_owner_and_label_and_it_sticks(owed):
         srv._tool_owed_update({"id": q[0], "action": "reassign", "owner": "someone"})
 
 
+def _owners(conn, ids):
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, owner, owner_label, owner_reassigned_at, tidy_batch FROM commitments "
+                    "WHERE id = ANY(%s) ORDER BY id", (list(ids),))
+        return {int(r[0]): r[1:] for r in cur.fetchall()}
+
+
+def test_bulk_reassignment_keeps_its_reason_and_prior_owner(owed, monkeypatch):
+    """A successful owner-approved bulk move must leave a durable undo/audit record."""
+    from khipu import owed_tidy
+
+    reason = "Owner-approved move after a specific review"
+    ids = _seed(owed, 1, text="ship widget {i} to staging", owner="user") + _seed(
+        owed, 1, start=10, text="reviewer to rebase widget {i}", owner="agent", origin="job", label="reviewer")
+    before = _owners(owed, ids)
+    monkeypatch.setattr(routing, "_caller", lambda: {"app": True, "chain": ["khipu"]})
+    result = srv.owed_change(ids, "reassign", by=co.BY_APP, reason=reason, owner="assistant", queue_ok=False)
+    assert result["changed"] == 2
+    assert {row[0] for row in _owners(owed, ids).values()} == {"assistant"}
+    with owed.cursor() as cur:
+        cur.execute("SELECT commitment_id, reason, prior FROM commitment_tidy_items WHERE batch_id = ANY(%s)",
+                    (result["batches"],))
+        state = {int(c): {"reason": r, "prior": p} for c, r, p in cur.fetchall()}
+    assert reason in json.dumps(state), "Successful bulk reassignment discarded its required reason and prior owners"
+    assert (state[ids[0]]["prior"]["owner"], state[ids[1]]["prior"]["owner_label"]) == ("user", "reviewer")
+    undone = owed_tidy.undo(result["batches"][0], project=PROJECT)
+    assert undone["ok"] and undone["restored"] == 2
+    assert _owners(owed, ids) == before
+
+
 # ---- the CLI ----------------------------------------------------------------
 
 
