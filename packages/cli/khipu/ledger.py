@@ -523,15 +523,17 @@ def _last_setter(cur, project: str, row_id: str) -> str:
     return f"{author_words(got[0])} at {_z(got[1])}" if got else "an unknown writer"
 
 
-def _last_change_ours(cur, project: str, row_id: str, field: str) -> bool:
-    """Whether ``field`` was last changed by a write this Mac landed (or never
-    changed): no one else's value would be overwritten. An outcome that cannot
-    be read counts as someone else's."""
+def _last_change_ours(cur, project: str, row_id: str, field: str, current: Any) -> bool:
+    """Whether a write that never saw ``field`` may change it: its last change
+    was a write this Mac landed, or it was never changed and holds nothing
+    (``current`` is empty). A value with no change history (an imported row,
+    an older Khipu's) is someone's work, not a free field. An outcome that
+    cannot be read counts as someone else's."""
     cur.execute("SELECT op_id FROM ledger_history WHERE project = %s AND row_id = %s AND changes ? %s "
                 "ORDER BY id DESC LIMIT 1", (project, row_id, field))
     got = cur.fetchone()
     if got is None:
-        return True
+        return current == ""
     if not got[0]:
         return False
     try:
@@ -601,15 +603,17 @@ def _set(cur, op: dict[str, Any], *, late: bool = False) -> dict[str, Any]:
         raise LedgerError(f"row {row_id} is {row['state']} now, set by {_last_setter(cur, project, row_id)}; "
                           "nothing was changed", "moved")
     # A queued write also misses when a field it changes no longer holds what
-    # its writer saw (``seen``, from the offline copy and the writes queued
-    # ahead of it): someone changed that field since. A field its writer could
-    # not see (no offline copy of the row, or a job an older Khipu queued)
-    # misses unless its last change was this Mac's own write, or the row
-    # already holds the value.
+    # its writer saw (``seen``: the hub's row, or the offline copy when the hub
+    # was away, with the writes queued ahead of it applied): someone changed
+    # that field since. A field its writer could not see (no copy of the row,
+    # or a job an older Khipu queued) misses unless its last change was this
+    # Mac's own write, it was never changed and is empty, or the row already
+    # holds the value.
     if late and not missed:
         seen = op.get("seen") or {}
         missed = any(k in _SET_FIELDS and row[k] != v for k, v in seen.items()) or any(
-            k in _SET_FIELDS and k not in seen and row[k] != v and not _last_change_ours(cur, project, row_id, k)
+            k in _SET_FIELDS and k not in seen and row[k] != v
+            and not _last_change_ours(cur, project, row_id, k, row[k])
             for k, v in wanted.items())
     if missed:
         # A queued write whose condition no longer holds is still kept, as
@@ -1732,6 +1736,7 @@ def write(op: dict[str, Any], *, conn=None) -> dict[str, Any]:
                 raise
             conn, away = None, exc
     _lock_held.copy_later = []
+    _lock_held.hub_seen = _hub_observation(conn, op) if conn is not None else None
     try:
         locked = False
         try:
@@ -1744,6 +1749,7 @@ def write(op: dict[str, Any], *, conn=None) -> dict[str, Any]:
         return _queue_while_busy(op, conn)
     finally:
         later, _lock_held.copy_later = _lock_held.copy_later, None
+        _lock_held.hub_seen = None
         try:
             if later and conn is not None:
                 replica_catch_up(conn)  # busy when another write holds the lock: it copies these too
@@ -1965,7 +1971,7 @@ def _check_offline(op: dict[str, Any]) -> None:
             raise LedgerError(f"row {row_id} has {len(children)} child row(s); say --children remove to remove "
                               "them too, or --children move-up to move them to its parent", "has_children")
     if op["verb"] == "set":
-        op["seen"] = _seen(rows.get(row_id), fields)
+        op["seen"], op["seen_from"] = _seen(rows.get(row_id), fields), "offline copy"
 
 
 def _copy_rows(merged: dict[str, Any], project: str) -> tuple[dict[str, dict[str, Any]], set[str]]:
@@ -1989,9 +1995,55 @@ def _seen(row: dict[str, Any] | None, fields: dict[str, Any]) -> dict[str, Any]:
     return {k: row[k] for k in _SET_FIELDS if k in fields} if row is not None else {}
 
 
+def _line_ids(project: str, row_id: str) -> set[str]:
+    return {q.get("op_id") for q in queued_ops() if q.get("project") == project and q.get("row_id") == row_id}
+
+
+def _hub_observation(conn, op: dict[str, Any]) -> dict[str, Any] | None:
+    """For a set made with the hub up: the row and words as the hub holds them
+    now, read before the Mac lock (a plain read, waiting on no writer), and
+    which of this Mac's waiting writes to the row were in line then. None when
+    the hub cannot answer: the offline copy stands in (``_observe``)."""
+    if op["verb"] != "set" or "seen" in op:
+        return None
+    project, row_id = op["project"], op["row_id"]
+    try:
+        line = _line_ids(project, row_id)
+        with conn.cursor() as cur:
+            _bound_waits(cur)
+            vocab = _vocab(cur, project)
+            cur.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s AND row_id = %s "
+                        "AND removed_at IS NULL", (project, row_id))
+            got = cur.fetchone()
+        conn.rollback()
+    except Exception:  # noqa: BLE001  (the write itself finds out what is wrong with the hub)
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    return {"op_id": op["op_id"], "line": line, "vocab": vocab, "rows": [_row_dict(got)] if got else []}
+
+
 def _observe(op: dict[str, Any]) -> None:
-    """``seen`` for a set joining the line without the offline check (the
-    hub was up). A copy that cannot be read saw nothing."""
+    """``seen`` for a set joining the line without the offline check (the hub
+    was up): the hub's row as its writer read it, the writes waiting ahead of
+    it applied. When that read failed, or a write to the row left the line
+    since (landed or not, which the read cannot say), the offline copy's row
+    instead; ``seen_from`` says which. A copy that cannot be read saw nothing."""
+    project, row_id = op["project"], op["row_id"]
+    hub = getattr(_lock_held, "hub_seen", None)
+    if hub is not None and hub["op_id"] == op["op_id"]:
+        try:
+            if not hub["line"] - _line_ids(project, row_id):
+                merged = _overlay({"vocab": hub["vocab"], "rows": [dict(r) for r in hub["rows"]], "as_of": None,
+                                   "offline": False}, project)
+                rows = {r["row_id"]: r for r in merged["rows"]}
+                op["seen"], op["seen_from"] = _seen(rows.get(row_id), op["fields"]), "hub"
+                return
+        except Exception:  # noqa: BLE001  (the offline copy answers instead)
+            pass
+    op["seen_from"] = "offline copy"
     try:
         view = _offline_view(op["project"])
         merged = _overlay(view or {"vocab": {"state": [], "kind": []}, "rows": [], "as_of": None, "offline": True},

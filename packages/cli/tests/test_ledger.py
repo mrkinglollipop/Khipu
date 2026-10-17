@@ -1406,7 +1406,9 @@ def test_a_later_writer_cannot_take_a_place_ahead_of_the_lock_holders_decision(m
     at_check, later_queued, first_look, landed = threading.Event(), threading.Event(), [True], []
 
     def jobs(**kw):
-        if threading.current_thread().name == "older" and first_look[0]:
+        # The older writer's first look at the line under the lock (its look
+        # before the lock, for what it saw of the row, decides no place).
+        if threading.current_thread().name == "older" and first_look[0] and getattr(ledger._lock_held, "depth", 0):
             first_look[0] = False
             at_check.set()
             later_queued.wait(1)  # a later write that can queue now would go first
@@ -2473,6 +2475,62 @@ def test_a_queued_set_with_nothing_seen_lands_only_over_this_macs_own_change(hub
     assert _sql(hub, "SELECT row_id, evidence FROM ledger_rows ORDER BY row_id") == [
         ("mine", "step 2"), ("theirs", "their work")]
     assert _history(hub, "theirs")[-1][3].startswith("arrived late")
+
+
+def test_a_queued_set_with_nothing_seen_lands_over_an_empty_never_set_field_only(hub, monkeypatch):
+    from khipu import ledger
+
+    # No offline copy, and no history for the field: only an empty value is
+    # known to hold nobody's work; a cleared field has a history, so is not.
+    ok("add", "empty", "--title", "Empty", "--kind", "slice")
+    with _real_connect(hub) as conn:
+        ledger.apply_op(conn, ledger.new_op("add", P, "cleared", fields={"title": "Cleared", "kind": "slice",
+                                                                         "evidence": "theirs"}))
+        ledger.apply_op(conn, ledger.new_op("set", P, "cleared", fields={"evidence": ""}))
+    ledger.enqueue(ledger.new_op("set", P, "empty", fields={"evidence": "first"}, op_id="q-empty"))
+    ledger.enqueue(ledger.new_op("set", P, "cleared", fields={"evidence": "over a clear"}, op_id="q-cleared"))
+    with _real_connect(hub) as conn:
+        assert ledger.drain(conn)["landed"] == 2
+    assert _sql(hub, "SELECT row_id, evidence FROM ledger_rows ORDER BY row_id") == [
+        ("cleared", ""), ("empty", "first")]
+    assert _history(hub, "cleared")[-1][3].startswith("arrived late")
+
+
+def test_a_set_queued_after_a_timeout_is_judged_by_the_hubs_row_not_a_stale_copy(hub, monkeypatch, tmp_path):
+    """Codex round-2 P2: with a live hub connection the write's ``seen`` is the
+    hub's current row (read before the Mac lock), not an older offline copy."""
+    from khipu import ledger
+
+    _snapshot(tmp_path)
+    ok("add", "r", "--title", "Row", "--kind", "slice")
+    with monkeypatch.context() as other_mac:
+        other_mac.setenv("KHIPU_DATA_DIR", str(tmp_path / "mac-b"))
+        with _real_connect(hub) as c:
+            ledger.apply_op(c, ledger.new_op("set", P, "r", fields={"evidence": "remote current"}))
+    assert ledger.get(P, "r")["row"]["evidence"] == "remote current"
+    monkeypatch.setattr(ledger, "LEDGER_LOCK_TIMEOUT_MS", 100)
+    with _real_connect(hub) as blocker:
+        ledger.lock_project(blocker.cursor(), P)
+        assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "legitimate next"},
+                                          op_id="fresh-read"))["queued"]
+        blocker.rollback()
+    queued = ledger.queued_ops()[0]
+    assert (queued["seen"], queued["seen_from"]) == ({"evidence": "remote current"}, "hub")
+    with _real_connect(hub) as c:
+        ledger.drain(c)
+    assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = 'r'") == [("legitimate next",)]
+    assert not _sql(hub, "SELECT note FROM ledger_history WHERE note LIKE 'arrived late%%'")
+
+
+def test_a_set_queued_away_says_its_seen_came_from_the_offline_copy(hub, monkeypatch, tmp_path):
+    from khipu import ledger
+
+    _snapshot(tmp_path)
+    ok("add", "r", "--title", "Row", "--kind", "slice")
+    _away(monkeypatch)
+    assert ledger.write(ledger.new_op("set", P, "r", fields={"evidence": "away"}, op_id="away-seen"))["queued"]
+    queued = ledger.queued_ops()[0]
+    assert (queued["seen"], queued["seen_from"]) == ({"evidence": ""}, "offline copy")
 
 
 def test_a_retry_of_a_queued_set_lands_as_the_queued_write_it_is(hub, monkeypatch, tmp_path):
