@@ -262,6 +262,50 @@ describe("Accounts: Sort by and Show accounts", () => {
     expect(screen.queryByText(/hidden by this filter/)).toBeNull();
   });
 
+  it("keeps every account chip and its rows aligned with the Accounts classification", async () => {
+    const record = view();
+    record.accounts = [
+      acct("Open one", "open-one", { state: "open" }),
+      acct("Open two", "open-two", { state: "open" }),
+      acct("Open three", "open-three", { state: "open" }),
+      // Its limit is past, but Khipu cannot spend a turn to verify it.
+      acct("Muse", "muse", { state: "probably_open", checkable: false, until: "2026-10-14T15:00:00Z" }),
+      acct("Probably checked", "probably", { state: "probably_open", until: "2026-10-14T15:00:00Z" }),
+      acct("Limited", "limited", { state: "limited", until: "2026-10-14T17:00:00Z" }),
+      acct("Unknown", "unknown", { state: "unknown" }),
+      acct("Paused", "paused", { state: "paused", until: "2026-10-16T13:00:00Z" }),
+      acct("Down", "down", { state: "down", reason: "an outage" }),
+    ];
+    record.holds = [{ id: "active-hold", scope_label: "this Mac", reason: "machine_busy", until: "2026-10-14T17:00:00Z" }];
+    answers.khipu_route_view = record;
+    render(<RoutingSettings active plansState={plansOf([
+      planRow({ key: "unknown|", harness: "grok", account: "Unknown", ok: false, error: "not_signed_in", windows: [] }),
+    ])} />);
+    await screen.findByRole("combobox", { name: "Sort by" });
+
+    expect(document.querySelector('[data-settings-group="accounts"]')).toHaveTextContent(
+      "9 accounts: 3 open, 2 probably open, 1 at its limit, 1 paused, 1 down, 1 unknown",
+    );
+    const rows = () => [...document.querySelectorAll<HTMLElement>('button[data-route-item^="account:"]')].map((b) => b.textContent ?? "");
+    const expectRows = (label: string, expected: string[]) => {
+      fireEvent.click(chip(label));
+      expect(rows()).toHaveLength(expected.length);
+      for (const name of expected) expect(rows().join(" ")).toContain(name);
+    };
+
+    expectRows("All, 9 accounts", ["Open one", "Open two", "Open three", "Muse", "Probably checked", "Limited", "Unknown", "Paused", "Down"]);
+    expect(rows().join(" ")).toContain("this account can't be checked without using a turn");
+    expect(rows().join(" ")).toContain("Limit reached");
+    expect(rows().join(" ")).toContain("Unknown: no report yet");
+    expect(rows().join(" ")).toContain("Paused by you until");
+    expect(rows().join(" ")).toContain("Down: an outage");
+    expect(document.querySelector('[data-settings-group="holds"]')).toHaveTextContent("1 hold");
+    expectRows("Needs a look, 3 accounts", ["Limited", "Unknown", "Down"]);
+    expectRows("Open, 3 accounts", ["Open one", "Open two", "Open three"]);
+    expectRows("At the limit, 1 account", ["Limited"]);
+    expectRows("Paused, 1 account", ["Paused"]);
+  });
+
   it("says so when a filter leaves no accounts, with a way back", async () => {
     answers.khipu_route_view = { ...view(), accounts: view().accounts!.filter((a) => a.state !== "paused") };
     await page();

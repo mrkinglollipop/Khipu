@@ -4,6 +4,7 @@
 // priority order is changed only by the Priority controls.
 
 import { useState } from "react";
+import { accountClassification } from "./routing";
 import type { RouteAccount, RouteView } from "./routing";
 import type { Problem } from "./routingOverview";
 import type { ChangeAbout, ChangeBy } from "./routingWords";
@@ -61,15 +62,16 @@ export function accountHasProblem(problems: Problem[], key: string): boolean {
 }
 
 export function accountInFilter(a: RouteAccount, f: AccountFilter, problems: Problem[]): boolean {
+  const classification = accountClassification(a);
   switch (f) {
     case "needs":
       return accountHasProblem(problems, a.key);
     case "open":
-      return a.state === "open" || a.state === "probably_open";
+      return classification === "open";
     case "limit":
-      return a.state === "limited";
+      return classification === "limited";
     case "paused":
-      return a.state === "paused";
+      return classification === "paused";
     default:
       return true;
   }
