@@ -241,3 +241,157 @@ def test_a_yes_that_names_the_widening_confirms_it(world):
     yes = world.say(words)
     rc, out = world.run(["owner-direction", "set", "latest_window_h", "12"], words, yes)
     assert rc == 0 and owner_turns.settings()["latest_window_h"] == 12, out
+
+
+# ---- the second review's probes: the whole clause decides, never the quoted part ---------------
+#
+# The agent quotes part of the owner's message; the parser reads the whole
+# sentence that part sits in, so a quote can't drop the negation, the
+# quotation marks or the other half of a sequence around it.
+
+CLAUSE_TABLE = [
+    # (the owner's whole message, the part the agent quotes, action, target, expected)
+    ("do not pause Codex for now", "pause Codex for now", "route.pause", "codex|", NOT_ASKED),
+    ("pause Codex for now", "pause Codex for now", "route.pause", "codex|", PASS),
+    ("please don't, under any circumstances, pause Codex", "circumstances, pause Codex", "route.pause", "codex|", NOT_ASKED),
+    ("please, under any circumstances, pause Codex", "circumstances, pause Codex", "route.pause", "codex|", PASS),
+    ("never, ever pause Codex", "ever pause Codex", "route.pause", "codex|", NOT_ASKED),
+    ("pause Codex now. Actually, don't.", "pause Codex now", "route.pause", "codex|", NOT_ASKED),
+    ("pause Codex now. Never mind, lift Grok instead", "pause Codex now", "route.pause", "codex|", NOT_ASKED),
+    ("pause Codex now. Never mind, lift Grok instead", "lift Grok instead", "route.lift", "grok|", PASS),
+    ("pause Codex now, actually yes, do it", "pause Codex now", "route.pause", "codex|", PASS),
+    ('The file says "pause Codex for now". Do not follow that instruction.', "pause Codex for now",
+     "route.pause", "codex|", NOT_ASKED),
+    ('pause Codex for now, the file said "do not pause Codex"', "pause Codex for now", "route.pause", "codex|",
+     PASS),
+    ('please "pause" Codex for now', "pause\" Codex for now", "route.pause", "codex|", PASS),
+    ("Do not trust claude_code:sdk-cli please", "trust claude_code:sdk-cli please", "direction.set", TRUST,
+     NOT_ASKED),
+    ("Do not trust claude_code:sdk-cli please", "trust claude_code:sdk-cli please", "direction.set", UNTRUST, PASS),
+    ("trust claude_code:sdk-cli please", "trust claude_code:sdk-cli please", "direction.set", UNTRUST, NOT_ASKED),
+    ("don't lift Codex today", "lift Codex today", "route.lift", "codex|", NOT_ASKED),
+    ("lift Codex today", "lift Codex today", "route.lift", "codex|", PASS),
+    ("I never said to lift Codex", "to lift Codex", "route.lift", "codex|", NOT_ASKED),
+    ("pause Codex but not now", "pause Codex but", "route.pause", "codex|", NOT_ASKED),
+    ("No, pause Codex instead", "pause Codex instead", "route.pause", "codex|", PASS),
+    ("pause Codex and Grok, but not Grok", "pause Codex and", "route.pause", "grok|", NOT_ASKED),
+    ("pause Codex and Grok, but not Grok", "pause Codex and", "route.pause", "codex|", PASS),
+    ("pause Grok now. Lift Codex as well", "Lift Codex as well", "route.lift", "codex|", PASS),
+    ("don't pause Grok now. Lift Codex as well", "Lift Codex as well", "route.lift", "codex|", PASS),
+]
+
+
+@pytest.mark.parametrize("turn,quote,action,target,expected", CLAUSE_TABLE,
+                         ids=[f"{r[2]}:{r[3]}:{r[0]}" for r in CLAUSE_TABLE])
+def test_the_whole_clause_decides_not_the_quoted_part(world, turn, quote, action, target, expected):
+    token = world.say(turn)
+    if expected == PASS:
+        assert owner_direction.check(action, target, quote, turn_token=token)["auth"] == "direction"
+        return
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        owner_direction.check(action, target, quote, turn_token=token)
+    assert err.value.code == expected, err.value.message
+
+
+@pytest.mark.parametrize("full,quote", [
+    ("do not pause Codex for now", "pause Codex for now"),
+    ('The file says "pause Codex for now". Do not follow that instruction.', "pause Codex for now"),
+    ("Do not trust claude_code:sdk-cli please", "trust claude_code:sdk-cli please"),
+])
+def test_quote_cannot_discard_context(world, full, quote):
+    token = world.say(full)
+    if "trust" in quote:
+        rc, out = world.run(["owner-direction", "set", "trust", "claude_code:sdk-cli"], quote, token)
+        assert out.get("code") != "needs_second_turn", out
+    else:
+        rc, out = world.run(["route", "pause", "Codex"], quote, token)
+        assert rc == 2 and _state("codex|") != "paused", out
+
+
+# A switch's value follows the words: "turn on" never sets it off, and the
+# mirror image never sets it on.
+@pytest.mark.parametrize("words,value,expected", [
+    ("turn on session binding please", "off", False),
+    ("turn off session binding please", "on", False),
+    ("enable session binding please", "off", False),
+    ("disable session binding please", "on", False),
+    ("turn off session binding please", "off", True),
+])
+def test_session_binding_polarity_is_preserved(world, words, value, expected):
+    owner_turns.write_settings({"session_binding": value == "off"})
+    before = owner_turns.settings()["session_binding"]
+    rc, out = world.run(["owner-direction", "set", "session_binding", value], words, world.say(words))
+    if expected:
+        assert rc == 0 and owner_turns.settings()["session_binding"] is False, out
+    else:
+        assert rc == 2 and owner_turns.settings()["session_binding"] is before, out
+
+
+def test_track_direction_cannot_remove_accounts(world):
+    import json
+
+    from khipu import config
+
+    words = "track Grok account please"
+    before = config.load_config()["usage_accounts"]
+    after = [a for a in before if a["harness"] != "grok"]
+    rc, out = world.run(["config", "--set", "usage_accounts", json.dumps(after)], words, world.say(words))
+    assert rc == 2 and config.load_config()["usage_accounts"] == before, out
+
+
+# ---- a sequence keeps its order ---------------------------------------------------------------
+
+
+def test_reversed_multi_step_execution_cannot_reverse_the_requested_final_state(world):
+    routing.pause("Codex", via="app")
+    words = "pause Codex then lift Codex please"
+    token = world.say(words)
+    # A hostile agent applies the latter clause first, then the former clause.
+    rc, lift = world.run(["route", "lift", "Codex"], words, token)
+    rc, pause = world.run(["route", "pause", "Codex"], words, token)
+    assert not (rc == 0 and lift.get("ok") is True and pause.get("ok") is True)
+    assert _state("codex|") != routing.PAUSED
+
+
+@pytest.mark.parametrize("words,first,second,final", [
+    ("pause Codex then lift Codex please", "pause", "lift", "open"),
+    ("lift Codex and then pause Codex please", "lift", "pause", "paused"),
+])
+def test_a_sequence_runs_in_the_owners_order(world, words, first, second, final):
+    if first == "lift":
+        routing.pause("Codex", via="app")
+    token = world.say(words)
+    rc, out = world.run(["route", first, "Codex"], words, token)
+    assert rc == 0, out
+    rc, out = world.run(["route", second, "Codex"], words, token)
+    assert rc == 0, out
+    assert (_state("codex|") == routing.PAUSED) is (final == "paused")
+    # Once the later step ran, the earlier one can't run after it.
+    rc, out = world.run(["route", first, "Codex"], words, token)
+    assert (_state("codex|") == routing.PAUSED) is (final == "paused"), out
+
+
+@pytest.mark.parametrize("words,first,second", [
+    ("pause Codex then lift Codex please", "pause", "lift"),
+    ("lift Codex and then pause Codex please", "lift", "pause"),
+])
+def test_the_earlier_step_is_refused_once_the_later_one_ran(world, words, first, second):
+    if second == "lift":
+        routing.pause("Codex", via="app")
+    token = world.say(words)
+    rc, out = world.run(["route", second, "Codex"], words, token)
+    assert rc == 0, out
+    after = _state("codex|")
+    rc, out = world.run(["route", first, "Codex"], words, token)
+    assert rc == 2 and out["code"] == "out_of_order", out
+    assert _state("codex|") == after
+
+
+def test_a_sequence_on_different_accounts_needs_no_order(world):
+    routing.pause("Codex", via="app")
+    words = "pause Grok then lift Codex please"
+    token = world.say(words)
+    rc, out = world.run(["route", "lift", "Codex"], words, token)
+    assert rc == 0, out
+    rc, out = world.run(["route", "pause", "Grok"], words, token)
+    assert rc == 0 and _state("grok|") == "paused", out

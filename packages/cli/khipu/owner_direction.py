@@ -302,21 +302,61 @@ def _without(words: str, phrases: list[str]) -> str:
     return words
 
 
+def _mask(words: str, phrases, fill: str = "|") -> str:
+    """``_without`` that keeps every other character where it was: each
+    phrase becomes ``fill`` padded to its length, so positions found in the
+    masked words are positions in the words."""
+    for phrase in sorted((p for p in phrases if p), key=len, reverse=True):
+        words = re.sub(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)",
+                       lambda m: (fill + " " * len(m.group(0)))[:len(m.group(0))], words)
+    return words
+
+
 # ---- the parser: which action, on what, asked for or against -------------------------------
+#
+# The parser reads the owner's whole message, never only the part an agent
+# quotes: the quote picks which of the message's requests the agent means,
+# and everything around it (a negation, quotation marks, a "never mind", the
+# rest of a sequence) still applies to it.
 #
 # The words are cut into statements at these separators; a statement with no
 # verb inherits the verb of the one before it ("pause Codex and Grok"). Verb
 # phrases are found over one lexicon of every action's phrases, longest first
 # and never overlapping, so "stop trusting" is never "trust" and "unpause"
-# never "pause". A verb after a negator in its statement asks for nothing.
+# never "pause". What negates a verb:
+#   - a negator before it in its statement ("do not pause Codex");
+#   - a statement that is only a negator, leading it in its sentence ("never,
+#     ever pause Codex");
+#   - a retraction anywhere after it in the message ("pause Codex. Actually,
+#     don't.", "never mind", "scratch that"), which takes back every request
+#     before it;
+#   - quotation marks: a verb inside a quoted phrase of two or more words is
+#     a mention, not a request ('the file says "pause Codex"').
 
-_SEPARATORS = re.compile(r"\s*(?:[,;]|\.(?=\s|$)|(?<!\w)(?:and then|then|and|but|also)(?!\w))\s*")
+_SEPARATORS = re.compile(r"\s*(?:[,;!?]|\.(?=\s|$)|(?<!\w)(?:and then|then|and|but|also)(?!\w))\s*")
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
 _NEGATOR = re.compile(r"(?<!\w)(?:no need to|do not|don't|dont|won't|wont|shouldn't|never|not|no|without)(?!\w)")
+_RETRACTION = re.compile(r"(?<!\w)(?:never mind|nevermind|scratch that|forget that|forget it|on second thoughts?"
+                         r"|ignore that|belay that|actually no|wait no)(?!\w)")
+_RETRACTED = "~"  # what a retraction is masked with: its statement takes back what came before
+# Words that leave a statement with a negator a bare "don't" ("actually,
+# don't", "but not now"): it then takes back what came before.
+_FILLER = frozenset(("actually", "now", "yet", "please", "ok", "okay", "wait", "just", "so", "that", "this", "it",
+                     "do", "sorry", "thanks", "right", "really", "again", "after", "all", "oh", "well", "today",
+                     "for", "anymore", "any", "more", "go", "ahead", "with", "on", "second", "thought", "thoughts",
+                     "i", "we", "you", "should", "want", "to", "|"))
+# A message that opens with only one of these answers the agent ("No, pause
+# Codex"): it negates nothing after it.
+_ANSWERS = frozenset(("no", "nope", "nah", "no thanks"))
+_QUOTED = re.compile(r'"([^"]+)"')
 # "lift the pause on Codex": after one of these a verb of an account action
 # is a noun, and asks for nothing.
 _DETERMINERS = frozenset(("the", "a", "an", "that", "this", "my", "your", "its", "their", "any", "each"))
 _PART = "+part"  # the first word of a two-word verb ("rule+add"): starts a statement, credits nothing alone
 _ORDER_REVERSED = re.compile(r"(?<!\w)(?:after|behind|below|under)(?!\w)")
+# What a switch's words say: one of these, and none of the other.
+_SWITCH_ON = re.compile(r"(?<!\w)(?:turn on|switch on|enable|on|true)(?!\w)")
+_SWITCH_OFF = re.compile(r"(?<!\w)(?:turn off|switch off|disable|off|false)(?!\w)")
 
 
 def _verbs(action: str, target: str) -> tuple[str, ...]:
@@ -365,15 +405,58 @@ def _kinds(actions) -> set[str]:
     return {ACTIONS[a]["target"] for a in actions if a in ACTIONS}
 
 
+def _unquoted(words: str) -> str:
+    """The words with every quoted phrase of two or more words that holds a
+    verb blanked (its quotation marks kept): what the owner quotes is not
+    what the owner asks for, and its negators negate nothing."""
+    def blank(m: re.Match) -> str:
+        inner = m.group(1)
+        if len(inner.split()) >= 2 and _occurrences(inner):
+            return '"' + " " * len(inner) + '"'
+        return m.group(0)
+
+    return _QUOTED.sub(blank, words)
+
+
+def _statements(words: str) -> list[tuple[int, int]]:
+    """The spans between separators, each stripped of its spaces."""
+    spans, at = [], 0
+    for m in list(_SEPARATORS.finditer(words)) + [None]:
+        end = m.start() if m else len(words)
+        a, b = at, end
+        while a < b and words[a] == " ":
+            a += 1
+        while b > a and words[b - 1] == " ":
+            b -= 1
+        if a < b:
+            spans.append((a, b))
+        if m:
+            at = m.end()
+    return spans
+
+
+def _bare_negation(text: str) -> bool:
+    """A statement that is a negator and nothing the owner names ("don't",
+    "but not now"): a "no" to what came before."""
+    rest = _NEGATOR.sub(" ", text).split()
+    return _NEGATOR.search(text) is not None and all(w.strip(_EDGE) in _FILLER or not w.strip(_EDGE)
+                                                     for w in rest)
+
+
+def _asking(occ: dict) -> bool:
+    """A verb occurrence that can ask for something: not a noun."""
+    return bool(occ["acts"]) and not occ["noun"]
+
+
 def _clauses(words: str) -> list[dict]:
-    """The words as clauses: each with its verb occurrences, whether each is
-    a noun here, and whether a negator stands before it."""
+    """The words as clauses: each with its span, its sentence, its verb
+    occurrences, whether each is a noun or a mention here, and whether a
+    negator stands before it."""
     lex = _lexicon()
+    ends = [m.start() for m in _SENTENCE_END.finditer(words)]
     out = []
-    for statement in _SEPARATORS.split(words):
-        statement = statement.strip()
-        if not statement:
-            continue
+    for s_start, s_end in _statements(words):
+        statement = words[s_start:s_end]
         occs = []
         prev_end = 0
         for start, end, phrase in _occurrences(statement):
@@ -398,35 +481,74 @@ def _clauses(words: str) -> list[dict]:
         cuts.append(len(statement))
         for a, b in zip(cuts, cuts[1:]):
             mine = [dict(o, start=o["start"] - a) for o in occs if a <= o["start"] < b]
-            text = statement[a:b].strip()
-            if text:
-                out.append({"text": statement[a:b], "occs": mine,
-                            "verbal": any(o["acts"] and not o["noun"] for o in mine)})
+            text = statement[a:b]
+            if text.strip():
+                out.append({"text": text, "occs": mine, "start": s_start + a, "end": s_start + b,
+                            "sentence": sum(1 for e in ends if e < s_start + a),
+                            "verbal": any(_asking(o) for o in mine),
+                            "retracts": _RETRACTED in text or (not any(_asking(o) for o in mine)
+                                                               and _bare_negation(text))})
     return out
 
 
 def _chains(words: str) -> list[dict]:
-    """Clauses grouped by the verb they share: a verb clause, then the
-    verbless clauses after it. A verbless clause with a negator ("but not
-    Grok") inherits the verb as a refusal; verbless clauses before any verb
-    lead the first verb clause."""
+    """Clauses grouped by the verb they share, within a sentence: a verb
+    clause, then the verbless clauses after it in its sentence. Verbless
+    clauses before a verb clause of their sentence lead it; a sentence with
+    no verb clause is a chain of its own (two-word verbs alone, "T-12 and 42
+    are the same"). A verbless clause with a negator after a verb ("but not
+    Grok") is a refusal of its own. A bare negator ("don't", "no") leads the
+    next verb clause of its sentence as its negation; with none after it in
+    its sentence, it takes back every request before it, as a retraction
+    does. A message that opens with a bare answer ("No, pause Codex")
+    negates nothing."""
+    clauses = _clauses(words)
     chains: list[dict] = []
     lead: list[dict] = []
-    for clause in _clauses(words):
+    lead_neg = False
+
+    def new(members: list[dict], *, neg: bool = False, led: bool = False) -> None:
+        chains.append({"clauses": members, "neg": neg, "retracted": False, "lead_neg": led})
+
+    def flush() -> None:
+        nonlocal lead, lead_neg
+        if lead:
+            negates = any(_NEGATOR.search(c["text"]) for c in lead)
+            new(lead, neg=negates and bool(chains), led=lead_neg)
+        lead, lead_neg = [], False
+
+    for i, clause in enumerate(clauses):
+        if i and clause["sentence"] != clauses[i - 1]["sentence"]:
+            flush()
+        same = [c for c in clauses[i + 1:] if c["sentence"] == clause["sentence"]]
+        if clause["retracts"]:
+            if i == 0 and _quote(clause["text"]) in _ANSWERS:
+                continue
+            if _RETRACTED in clause["text"] or not any(c["verbal"] for c in same):
+                flush()
+                for chain in chains:
+                    chain["retracted"] = True
+            else:
+                lead_neg = True
+            continue
         if clause["verbal"]:
-            chains.append({"clauses": lead + [clause], "neg": False})
-            lead = []
-        elif _NEGATOR.search(clause["text"]):
-            if chains:
-                chains.append({"clauses": [clause], "neg": True})
-        elif chains:
+            new(lead + [clause], led=lead_neg)
+            lead, lead_neg = [], False
+        elif _NEGATOR.search(clause["text"]) and chains and not lead \
+                and chains[-1]["clauses"][-1]["sentence"] == clause["sentence"]:
+            new([clause], neg=True)
+        elif chains and not lead and chains[-1]["clauses"][-1]["sentence"] == clause["sentence"] \
+                and not chains[-1]["neg"]:
             chains[-1]["clauses"].append(clause)
         else:
+            if _NEGATOR.search(clause["text"]) and any(c["verbal"] for c in same):
+                lead_neg = True
             lead.append(clause)
-    if not chains and lead:  # no verb anywhere: two-word verbs alone
-        chains.append({"clauses": lead, "neg": False})
+    flush()
     for chain in chains:
         chain["text"] = " | ".join(c["text"] for c in chain["clauses"])
+        chain["start"] = min(c["start"] for c in chain["clauses"])
+        chain["end"] = max(c["end"] for c in chain["clauses"])
     return chains
 
 
@@ -440,16 +562,21 @@ def _verdict(chain: dict, action: str, target: str) -> str | None:
             return f"not:{phrase}"
     plain = {_quote(v) for v in verbs if "+" not in v}
     noun_ok = spec["target"] != "account"
-    hits = [o for c in chain["clauses"] for o in c["occs"] if o["phrase"] in plain and (noun_ok or not o["noun"])]
-    if chain["neg"] and (hits or any(_verb_in(text, v) for v in verbs if "+" in v)):
+    hits = [o for c in chain["clauses"] for o in c["occs"] if o["phrase"] in plain
+            and (noun_ok or not o["noun"])]
+    if (chain["neg"] or chain.get("lead_neg")) and (hits or any(_verb_in(text, v) for v in verbs if "+" in v)):
         return "neg"
     if hits:
-        return "neg" if any(o["neg"] for o in hits) else "ok"
+        if any(o["neg"] for o in hits):
+            return "neg"
+        return "retracted" if chain.get("retracted") else "ok"
     for verb in [v for v in verbs if "+" in v]:
         if _verb_in(text, verb):
             first = min(re.search(r"(?<!\w)" + re.escape(_quote(p)) + r"(?!\w)", text).start()
                         for p in verb.split("+"))
-            return "neg" if _NEGATOR.search(text, 0, first) else "ok"
+            if _NEGATOR.search(text, 0, first):
+                return "neg"
+            return "retracted" if chain.get("retracted") else "ok"
     return None
 
 
@@ -481,20 +608,74 @@ def _order_ok(plain: str, groups: list[list[str]]) -> bool:
     return fits == [tuple(range(len(groups)))]
 
 
-def _asks_for(action: str, target: str, quote: str, *, stored, names, exclude) -> str:
-    """Step 4: the words ask for this action on this target, and any words
-    the action stores are the owner's own. The words that asked for it."""
+_LIST_WORDS = frozenset(("as", "well", "too", "both", "also", "the", "account", "accounts", "lane", "lanes", "login",
+                         "logins", "one", "ones", "either", "each", "every", "of", "them"))
+
+
+def _names_only(text: str, names: list[str]) -> bool:
+    """The clause is names, a time and list words, nothing else."""
+    rest = _without(_quote(text), [_quote(n) for n in names])
+    for pattern in (_FOR, _UNTIL, _VAGUE):
+        rest = pattern.sub(" ", rest)
+    words = [w.strip(_EDGE) for w in rest.split()]
+    return all(not w or w in _FILLER or w in _LIST_WORDS for w in words)
+
+
+def _quote_spans(words: str, quote: str) -> list[tuple[int, int]]:
+    q = _quote(quote)
+    if not q:
+        return []
+    return [(m.start(), m.end()) for m in re.finditer(r"(?<!\w)" + re.escape(q) + r"(?!\w)", words)]
+
+
+def _names_target(chain: dict, groups: list[list[str]], others: list[str]) -> list[str] | None:
+    """The first group ``chain`` does not name, or None when it names all."""
+    plain = _without(chain["text"], others)
+    return next((g for g in groups if not any(_has(plain, n) for n in g if n)), None)
+
+
+def _read(action: str, target: str, quote: str, *, stored, names, exclude, turn_text: str | None = None,
+          switch: bool | None = None) -> dict:
+    """Step 4: the owner's whole message asks for this action on this
+    target, in the part the agent quoted, and any words the action stores
+    are the owner's own. The chain that asked, with every chain of the
+    message (for the sequence check)."""
     spec = ACTIONS[action]
-    words = _quote(quote)
+    quoted = _quote(quote)
+    message = normalise(turn_text) if turn_text is not None else quoted
+    spans = _quote_spans(message, quote) or [(0, len(message))]
+    if turn_text is not None and not _quote_spans(message, quote):
+        message, spans = quoted, [(0, len(quoted))]
     kept = [_quote(t) for t in (stored or []) if isinstance(t, str) and t.strip()]
     # The words an action stores are not the owner asking ("add a rule: never
     # run the fast tier" does not negate "add"), nor do they name its target
     # ("rename Grok to Codex main" does not name Codex); nor do other
-    # accounts' longer names.
-    chains = _chains(_without(words, kept))
+    # accounts' longer names. A retraction is masked so its own "never" is
+    # not a negator of what follows ("never mind, lift Grok").
+    work = _mask(_mask(_unquoted(message), kept), [m.group(0) for m in _RETRACTION.finditer(message)], _RETRACTED)
+    chains = _chains(work)
     groups, auto_exclude = _names(action, target, names)
     others = [_quote(e) for e in list(exclude or []) + auto_exclude]
-    verdicts = [(c, _verdict(c, action, target)) for c in chains]
+    names_all = [n for g in groups for n in g if n] + others
+
+    def counts(chain: dict, clause: dict) -> bool:
+        # A clause without a verb of its own names a target for the verb
+        # before it only when names are all it holds ("pause Codex, then
+        # Grok as well"), never "pause Grok, and look at Codex".
+        return (any(o["acts"] for o in clause["occs"]) or clause is chain["clauses"][0]
+                or _names_only(clause["text"], names_all))
+
+    def quoted_parts(chain: dict) -> list[str]:
+        # The parts of the chain's clauses that the agent quoted.
+        out = []
+        for clause in chain["clauses"]:
+            if counts(chain, clause):
+                out += [work[max(a, clause["start"]):min(b, clause["end"])] for a, b in spans
+                        if clause["start"] < b and a < clause["end"]]
+        return out
+
+    inside = [c for c in chains if quoted_parts(c)]
+    verdicts = [(c, _verdict(c, action, target)) for c in inside]
     asked = [c for c, v in verdicts if v == "ok"]
     first = _verbs(action, target)[0].replace("+", " ")
     if not asked:
@@ -503,6 +684,10 @@ def _asks_for(action: str, target: str, quote: str, *, stored, names, exclude) -
             raise DirectionRefused("words_do_not_ask_for_this",
                                    f"The owner's words say \"{blocked}\", which does not ask for this. Ask the owner "
                                    "to say what they want in their own words.")
+        if any(v == "retracted" for _c, v in verdicts):
+            raise DirectionRefused("words_do_not_ask_for_this",
+                                   f"The owner asked to {first}, then took it back later in the same message. Ask "
+                                   "the owner to say what they want in their own words.")
         if any(v == "neg" for _c, v in verdicts):
             raise DirectionRefused("words_do_not_ask_for_this",
                                    f"The owner's words say not to {first}. Ask the owner to say what they want in "
@@ -512,10 +697,12 @@ def _asks_for(action: str, target: str, quote: str, *, stored, names, exclude) -
                                "it, or ask the owner to say it again.")
     missing = None
     for chain in asked:
-        plain = _without(chain["text"], others)
-        gap = next((g for g in groups if not any(_has(plain, n) for n in g if n)), None)
+        # The target is named in the part the agent quoted: the rest of the
+        # message decides whether it was asked for, never what it is about.
+        quoted_part = dict(chain, text=" | ".join(quoted_parts(chain)))
+        gap = _names_target(quoted_part, groups, others)
         if gap is None:
-            if spec["target"] == "accounts" and not _order_ok(plain, groups):
+            if spec["target"] == "accounts" and not _order_ok(_without(quoted_part["text"], others), groups):
                 raise DirectionRefused("words_do_not_ask_for_this",
                                        "The owner's words give a different order. Pass the accounts in the order "
                                        "the owner said them, or ask the owner to say the order again.")
@@ -528,12 +715,68 @@ def _asks_for(action: str, target: str, quote: str, *, stored, names, exclude) -
         raise DirectionRefused("words_do_not_ask_for_this",
                                f"The words do not name {_title(shown)}. Quote the part where the owner "
                                "names it, or ask the owner to say it again.")
+    at = chains.index(chain)
+    # "pause Codex and Grok, but not Grok": a refusal after it that names
+    # this target takes it out.
+    for later in chains[at + 1:]:
+        if later["neg"] and groups and _names_target(later, groups, others) is None:
+            raise DirectionRefused("words_do_not_ask_for_this",
+                                   f"The owner's words leave {_title(groups[0][0])} out. Ask the owner to say "
+                                   "what they want in their own words.")
+    if switch is not None:
+        on, off = _SWITCH_ON.search(chain["text"]), _SWITCH_OFF.search(chain["text"])
+        if (on is None) == (off is None) or bool(on) != bool(switch):
+            raise DirectionRefused("words_do_not_ask_for_this",
+                                   f"The owner's words do not say to turn it {'on' if switch else 'off'}. Pass the "
+                                   "setting the owner asked for, or ask the owner to say it again.")
     for text in [s for s in (stored or []) if isinstance(s, str) and s.strip()]:
-        if not _has(words, text):
+        if not _has(quoted, text):
             raise DirectionRefused("words_do_not_ask_for_this",
                                    f"\"{text.strip()}\" is not in the owner's words. What Khipu keeps must be the owner's "
                                    "own words: use them exactly, or ask the owner to say it again.")
-    return " | ".join([chain["text"]] + kept)
+    return {"asked": " | ".join([chain["text"]] + kept), "chain": at, "chains": chains, "groups": groups,
+            "others": others}
+
+
+def _asks_for(action: str, target: str, quote: str, *, stored, names, exclude, turn_text: str | None = None,
+              switch: bool | None = None) -> str:
+    """Step 4 (``_read``): the words that asked for it."""
+    return _read(action, target, quote, stored=stored, names=names, exclude=exclude, turn_text=turn_text,
+                 switch=switch)["asked"]
+
+
+# Kinds of target whose actions undo or redo one another on one target, so
+# a message that asks for two of them on it asks for them in its order.
+_SEQUENCED = ("account", "accounts", "hold_scope", "rule", "note", "priority", "setting", "row", "commitment",
+              "pair", "harness", "switch", "direction", "direction_setting", "checks", "file")
+
+
+def _in_order(action: str, target: str, read: dict, session: str, turn: dict) -> None:
+    """A message that asks for two changes to one target ("pause Codex then
+    lift Codex") asks for them in its order: once a later one has run, an
+    earlier one can't run after it, so whatever an agent does of the
+    sequence, what it leaves is in the owner's order and never the opposite
+    of where the owner said to end."""
+    kind = ACTIONS[action]["target"]
+    if kind not in _SEQUENCED or not read["groups"]:
+        return
+    mine = read["chain"]
+    for j, chain in enumerate(read["chains"]):
+        if j == mine or chain["neg"] or _names_target(chain, read["groups"], read["others"]) is not None:
+            continue
+        others = {a for c in chain["clauses"] for o in c["occs"] if _asking(o) for a in o["acts"]
+                  if a in ACTIONS and a != action and ACTIONS[a]["target"] == kind}
+        for other in sorted(others):
+            if _verdict(chain, other, target) != "ok":
+                continue
+            if j > mine and find_done(session, turn["turn"], other, target) is not None:
+                raise DirectionRefused("out_of_order",
+                                       f"The owner asked for this before {_ACTION_WORDS.get(other, other)}, which "
+                                       "is already done, so doing this now would undo it. Ask the owner what they "
+                                       "want now.")
+
+
+_ACTION_WORDS = {"route.pause": "the pause", "route.lift": "the lift", "route.clear": "the clear"}
 
 
 # ---- times: a timed change keeps the owner's time ------------------------------------------
@@ -636,7 +879,7 @@ def _title(name: str) -> str:
 
 def check(action: str, target: str, words: str, *, turn_token: str | None = None, stored=None, names=None,
           exclude=None, env=None, now: float | None = None, widening: bool = False, value=None,
-          owner_session: str | None = None, timed: bool = False, until=None) -> dict:
+          owner_session: str | None = None, timed: bool = False, until=None, switch: bool | None = None) -> dict:
     """The owner-direction check (scope 2.3 with decision 1). The auth stamp
     for the record, or ``DirectionRefused``; ``AlreadyDone`` with the first
     result when this turn already took this action on this target.
@@ -646,7 +889,10 @@ def check(action: str, target: str, words: str, *, turn_token: str | None = None
     a turn of the caller's own session is that session's recorded brief.
 
     ``timed`` (a pause, a hold, a priority): the change can carry an end,
-    ``until`` (its ``--until``), which must keep the owner's time."""
+    ``until`` (its ``--until``), which must keep the owner's time.
+
+    ``switch`` (a setting turned on or off): the value it is set to, which
+    the owner's words must say."""
     if action not in ACTIONS:
         raise DirectionRefused("not_by_direction", "That change can't be made by direction.")
     now = _clock() if now is None else now
@@ -666,16 +912,19 @@ def check(action: str, target: str, words: str, *, turn_token: str | None = None
     _from_the_hook(turn, ancestry=via_session is None)
     if widening:  # step 6 (decision 1): a later turn confirms it
         if _confirms_pending(action, target, value, session, turn, quote, conf, now,
-                             asks={"stored": stored, "names": names, "exclude": exclude}):
+                             asks={"stored": stored, "names": names, "exclude": exclude, "switch": switch,
+                                   "turn_text": turn.get("text") or ""}):
             return _stamp(turn, session, quote, turn_token, confirms=True, via_session=via_session)
         if len(_quote(quote).split()) < MIN_WORDS:
             _verbatim(quote, {"text": ""})
-    asked = _asks_for(action, target, quote, stored=stored, names=names, exclude=exclude)  # step 4
+    read = _read(action, target, quote, stored=stored, names=names, exclude=exclude,  # step 4
+                 turn_text=turn.get("text") or "", switch=switch)
     if timed:
-        _same_time(asked, until, now)
+        _same_time(read["asked"], until, now)
     done = find_done(session, turn["turn"], action, target)  # step 5
     if done is not None:
         raise AlreadyDone(done.get("result") or {})
+    _in_order(action, target, read, session, turn)
     if widening:
         _note_pending(action, target, value, session, turn, quote, now)
         raise DirectionRefused("needs_second_turn",
@@ -1243,11 +1492,14 @@ _PENDING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_ow
 
 
 def intent(action: str, target: str, *, stored=None, names=None, exclude=None, widening: bool = False,
-           value=None, facts: dict | None = None, timed: bool = False, until=None) -> dict:
+           value=None, facts: dict | None = None, timed: bool = False, until=None,
+           switch: bool | None = None) -> dict:
     """What an owner command is about to do, for the check and the log.
-    ``timed``: the command can carry an end, ``until`` as it was given."""
+    ``timed``: the command can carry an end, ``until`` as it was given.
+    ``switch``: the on or off it sets, which the words must say."""
     return {"action": action, "target": str(target), "stored": stored, "names": names, "exclude": exclude,
-            "widening": widening, "value": value, "facts": dict(facts or {}), "timed": timed, "until": until}
+            "widening": widening, "value": value, "facts": dict(facts or {}), "timed": timed, "until": until,
+            "switch": switch}
 
 
 def gate(args, want: dict | None, *, env=None, now: float | None = None) -> dict:
@@ -1262,7 +1514,7 @@ def gate(args, want: dict | None, *, env=None, now: float | None = None) -> dict
                   turn_token=getattr(args, "owner_turn", None), stored=want.get("stored"), names=want.get("names"),
                   exclude=want.get("exclude"), env=env, now=now, widening=bool(want.get("widening")),
                   value=want.get("value"), owner_session=getattr(args, "owner_session", None),
-                  timed=bool(want.get("timed")), until=want.get("until"))
+                  timed=bool(want.get("timed")), until=want.get("until"), switch=want.get("switch"))
     before = _before(want)
     if before is _UNREADABLE:
         raise DirectionRefused("before_unreadable",
@@ -2065,7 +2317,8 @@ def run_cli(args) -> int:
             target = args.key if args.key not in ("trust", "untrust") else f"{args.key} {args.value}"
             stored = [args.value] if args.key in ("latest_window_h", "earlier_window_min") else None
             want = intent("direction.set", target, stored=stored, widening=_widens(None, values),
-                          value=json.dumps(values, sort_keys=True))
+                          value=json.dumps(values, sort_keys=True),
+                          switch=values[args.key] if args.key == "session_binding" else None)
             via = routing._owner_via(args, want)
             if via is None:
                 _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})

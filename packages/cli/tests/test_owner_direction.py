@@ -409,12 +409,14 @@ def test_paraphrase_is_refused(world):
 
 def test_pause_codex_and_grok_applies_both_once(world):
     token = world.say("pause Codex and Grok until tonight")
+    # The quote leaves "until tonight" out, but the owner's whole sentence
+    # keeps it, so each pause carries an end.
     for name in ("Codex", "Grok"):
-        rc, out = world.run(["route", "pause", name], "pause Codex and Grok", token)
+        rc, out = world.run(["route", "pause", name, "--until", "6h"], "pause Codex and Grok", token)
         assert rc == 0 and out["ok"] is True, out
     assert _state("codex|") == "paused" and _state("grok|") == "paused"
     for name in ("Codex", "Grok"):
-        rc, out = world.run(["route", "pause", name], "pause Codex and Grok", token)
+        rc, out = world.run(["route", "pause", name, "--until", "6h"], "pause Codex and Grok", token)
         assert out.get("already_done") is True
     rc, out = world.run(["route", "pause", "Claude"], "pause Codex and Grok", token)
     assert rc == 2 and out["code"] == "words_do_not_ask_for_this"

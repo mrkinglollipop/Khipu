@@ -1085,7 +1085,8 @@ def _intent(cmd: str, args) -> dict | None:
             return owner_direction.intent(f"accounts.{cmd.replace('-', '_')}", _harness(args.harness),
                                           facts={"folder": args.folder})
         if cmd == "auto-track":
-            return owner_direction.intent("accounts.auto_track", args.state)
+            return owner_direction.intent("accounts.auto_track", args.state,
+                                          switch={"on": True, "off": False}.get(args.state))
         if cmd == "request":
             return owner_direction.intent(f"accounts.request.{args.action}", "request",
                                           names=[["account list", "accounts", "that", "it"]])
