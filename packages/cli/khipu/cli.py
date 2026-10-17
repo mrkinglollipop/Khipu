@@ -2277,9 +2277,7 @@ def cmd_owed(args: argparse.Namespace) -> int:
     """W3.4: `khipu owed` — list, close, reopen, or snooze commitments. With
     the hub away a close, reopen or snooze waits on this Mac and replays when
     it answers (`waiting_to_sync`), and the list comes from this Mac's copy."""
-    from khipu import commitments, offline, offline_reads, owner_writes
-    from khipu.db import connect
-    from khipu.hub_snapshot import hub_connection_failed
+    from khipu import commitments, owner_writes
 
     snooze_id = getattr(args, "snooze", None)
     if snooze_id:
@@ -2326,39 +2324,7 @@ def cmd_owed(args: argparse.Namespace) -> int:
                           **({"waiting_to_sync": True} if res.get("waiting_to_sync") else {})}))
         return 0
 
-    project = getattr(args, "project", None)
-    status = getattr(args, "status", None) or "open"
-    if any(getattr(args, k, None) not in (None, "") for k in ("cursor", "owner", "kind", "origin", "query", "pr")):
-        return _owed_page_cli(args, project, status)
-    limit = int(getattr(args, "limit", None) or 50)
-    stale: dict = {}
-    try:
-        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
-            with conn.cursor() as cur:
-                rows = commitments.list_owed(cur, project=project, status=status, limit=limit)
-                # Ages counted on the hub's own clock, so a Mac clock that runs
-                # ahead of or behind the hub can't make an age negative.
-                cur.execute("SELECT now()")
-                hub_now = (cur.fetchone() or [None])[0]
-    except Exception as exc:  # noqa: BLE001
-        if not hub_connection_failed(exc):
-            raise
-        copy = offline_reads.owed(project, status, limit)
-        if copy is None:
-            raise
-        rows = copy["results"]
-        stale = {"stale": True, "snapshot_refreshed_at": copy.get("snapshot_refreshed_at")}
-        from datetime import datetime, timezone
-
-        hub_now = datetime.now(timezone.utc)
-    commitments.add_hub_ages(rows, hub_now)
-    owner_writes.annotate(rows, "owed_update")
-    if getattr(args, "envelope", False):
-        print(json.dumps({"results": rows, "stale": bool(stale), "snapshot_refreshed_at": stale.get("snapshot_refreshed_at"),
-                          "waiting_to_sync": owner_writes.status()}, indent=2, default=str))
-    else:
-        print(json.dumps(rows, indent=2, default=str))
-    return 0
+    return _owed_page_cli(args, getattr(args, "project", None), getattr(args, "status", None) or "open")
 
 
 def cmd_owed_tidy(args: argparse.Namespace) -> int:
@@ -2461,19 +2427,23 @@ def _owed_change_cli(args: argparse.Namespace) -> int:
 
 
 def _owed_page_cli(args: argparse.Namespace, project: str | None, status: str) -> int:
-    """`khipu owed` with a filter or --cursor: one page, as khipu_owed gives it."""
-    from datetime import datetime, timezone
-
-    from khipu import commitments, mcp_server
+    """`khipu owed`'s list: one page, the same listing khipu_owed gives
+    (``mcp_server.owed_listing``), at most ``owed_page_max`` rows with a
+    next_cursor for the rest. ``--envelope`` always says whether the list is
+    the stale copy and what waits to sync."""
+    from khipu import mcp_server, owner_writes
 
     try:
-        out = mcp_server._tool_owed({
+        out = mcp_server.owed_listing({
             "project": project, "status": status, "limit": getattr(args, "limit", None),
-            **{k: getattr(args, k, None) for k in ("cursor", "owner", "kind", "origin", "query", "pr")}})
+            **{k: getattr(args, k, None) for k in ("cursor", "owner", "kind", "origin", "query", "pr")}},
+            hub_ages=True)
     except ValueError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}))
         return 2
-    commitments.add_hub_ages(out["results"], datetime.now(timezone.utc))
+    if getattr(args, "envelope", False):
+        out = {**out, "stale": bool(out.get("stale")), "snapshot_refreshed_at": out.get("snapshot_refreshed_at"),
+               "waiting_to_sync": owner_writes.status()}
     print(json.dumps(out, indent=2, default=str))
     return 0
 
@@ -5395,7 +5365,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     owed.add_argument(
         "--envelope", action="store_true",
-        help="Print {results, stale, snapshot_refreshed_at, waiting_to_sync} instead of the bare list",
+        help="Always include stale, snapshot_refreshed_at and waiting_to_sync with the page",
     )
     owed_sub = owed.add_subparsers(dest="owed_cmd")
     tidy = owed_sub.add_parser(

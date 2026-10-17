@@ -1541,10 +1541,19 @@ def _captured_episode_id(written: dict) -> int | None:
 
 
 def _tool_owed(args: dict) -> dict:
-    """W3.4: list commitments, one keyset page at a time (``commitments.page_owed``).
-    Read-only. When the hub is away it answers from this Mac's replica, marked
-    stale (``offline_reads``); with no replica to read the hub's own error
-    stands. Rows with a write still waiting to sync say so (``pending_sync``)."""
+    """W3.4: list commitments, one keyset page at a time (``owed_listing``)."""
+    return owed_listing(args)
+
+
+def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
+    """One page of the owed list, the one listing ``khipu_owed`` and every
+    ``khipu owed`` read go through (``commitments.page_owed``): the filters,
+    at most ``owed_page_max`` rows and a ``next_cursor`` for the rest.
+    Read-only. When the hub is away it answers from this Mac's replica,
+    marked stale (``offline_reads``); with no replica to read the hub's own
+    error stands. Rows with a write still waiting to sync say so
+    (``pending_sync``). With ``hub_ages`` each row carries its age counted on
+    the hub's own clock (this Mac's when the hub is away)."""
     status = (args.get("status") or "open").strip().lower()
     if status not in ("open", "closed", "stale"):
         raise ValueError("status must be 'open', 'closed', or 'stale'")
@@ -1556,10 +1565,15 @@ def _tool_owed(args: dict) -> dict:
     filters = owed_filters(args)
     limit, note = owed_page_limit(args.get("limit"))
     project = args.get("project") or None
+    hub_now = None
     try:
         with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
             with conn.cursor() as cur:
                 rows = commitments.fetch_owed_rows(cur, project=project, status=status)
+                if hub_ages:
+                    # A Mac clock ahead of or behind the hub can't make an age negative.
+                    cur.execute("SELECT now()")
+                    hub_now = (cur.fetchone() or [None])[0]
         stale: dict = {}
     except Exception as exc:  # noqa: BLE001
         if not hub_connection_failed(exc):
@@ -1569,6 +1583,10 @@ def _tool_owed(args: dict) -> dict:
             raise
         stale = stale_fields()
     page = commitments.page_owed(rows, **filters, limit=limit)
+    if hub_ages:
+        from datetime import datetime, timezone
+
+        commitments.add_hub_ages(page["results"], hub_now or datetime.now(timezone.utc))
     out = {"status": status, "project": project, **page, "limit": limit,
            **({"limit_note": note} if note else {}), **stale}
     out.update(owner_writes.annotate(out["results"], "owed_update"))

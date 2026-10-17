@@ -105,8 +105,8 @@ class OwedCommandTest(unittest.TestCase):
         ]})])
         rc, out = _run(["owed"], cur)
         self.assertEqual(rc, 0)
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out[0]["text"], "follow up")
+        self.assertEqual(len(out["results"]), 1)
+        self.assertEqual(out["results"][0]["text"], "follow up")
         sql, params = next(c for c in cur.calls if c[0].startswith("SELECT id, text"))
         self.assertIn("status = %s", sql)
         self.assertEqual(params[0], "open")
@@ -130,7 +130,7 @@ class OwedCommandTest(unittest.TestCase):
         ])
         rc, out = _run(["owed"], cur)
         self.assertEqual(rc, 0)
-        by_id = {r["id"]: r for r in out}
+        by_id = {r["id"]: r for r in out["results"]}
         self.assertEqual(by_id[1]["opened_age_s"], 40.0)
         self.assertEqual(by_id[2]["opened_age_s"], 0.0)
         self.assertIsNone(by_id[1]["last_seen_age_s"])

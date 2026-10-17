@@ -463,3 +463,48 @@ def test_every_bulk_action_keeps_the_same_audit_record_and_undoes_exactly(owed, 
     undone = owed_tidy.undo(result["batches"][0], project=PROJECT)
     assert undone["ok"] and undone["restored"] == 2, undone
     assert _state(owed, ids) == before
+
+
+def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
+    """The review's probe: `khipu owed --limit 500` with owed_page_max 200
+    gives one page of 200 and a cursor, through the same listing as the tool."""
+    at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    rows = [dict(id=i, text=f"Rebuild deployment index {i}", owner="assistant", kind="followup", opened_at=at)
+            for i in range(1, 501)]
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def execute(self, *args, **kwargs):
+            pass
+
+        def fetchone(self):
+            return (at,)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setattr(db, "connect", lambda **kwargs: Connection())
+    monkeypatch.setattr(co, "fetch_owed_rows", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(config, "count_setting", lambda key: 200)
+    args = cli.build_parser().parse_args(["owed", "--project", "acme/widget", "--limit", "500"])
+    assert args.func(args) == 0
+    result = json.loads(capsys.readouterr().out)
+    results = result["results"] if isinstance(result, dict) else result
+    assert len(results) <= 200, f"owed_page_max=200 returned {len(results)} rows"
+    assert result["next_cursor"]
+    # The same page the tool gives.
+    tool = srv._tool_owed({"project": "acme/widget", "limit": 500})
+    assert [r["id"] for r in tool["results"]] == [r["id"] for r in results]
+    assert tool["next_cursor"] == result["next_cursor"]
