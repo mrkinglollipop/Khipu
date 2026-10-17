@@ -101,8 +101,8 @@ def _lookup_health(path: Path) -> tuple[bool, str | None]:
     """Can this build still read T3's provider-thread projection?
 
     This intentionally validates the exact three columns ``thread_for_session``
-    reads.  It never guesses from a database mtime or a capture: those only say
-    T3 was used, not that Khipu can link a native session to its T3 thread.
+    reads. It only verifies the provider-thread lookup; it does not establish
+    whether T3 has recent conversation activity.
     """
     if not path.is_file():
         return False, "T3's thread database was not found"
@@ -130,6 +130,37 @@ def _lookup_health(path: Path) -> tuple[bool, str | None]:
         return False, "T3's thread lookup is unavailable"
     except (OSError, ValueError, sqlite3.Error):
         return False, "T3's thread lookup is unavailable"
+    finally:
+        if con is not None:
+            con.close()
+
+
+def _recent_conversation_use(path: Path) -> tuple[bool | None, str | None]:
+    """Whether user or assistant conversation messages are newer than one day.
+
+    ``None`` is deliberately distinct from an empty table: unreadable or
+    changed message records cannot safely prove that T3 was unused.
+    """
+    if not path.is_file():
+        return None, "T3 recent conversation use is unavailable"
+    con = None
+    try:
+        con = sqlite3.connect(_readonly_uri(path), uri=True, timeout=0.5)
+        con.execute("PRAGMA busy_timeout = 50")
+        deadline = time.monotonic() + 0.5
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        row = con.execute(
+            "SELECT created_at FROM orchestration_v2_projection_messages "
+            "WHERE role IN ('user', 'assistant') ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return False, None
+        age = _age_seconds(str(row[0]) if row[0] is not None else None)
+        if age is None:
+            return None, "T3 recent conversation use is unavailable"
+        return age < 86400, None
+    except (OSError, ValueError, sqlite3.Error):
+        return None, "T3 recent conversation use is unavailable"
     finally:
         if con is not None:
             con.close()
@@ -206,19 +237,12 @@ def health(home: Path | None = None) -> dict[str, Any] | None:
         return None
     path = _thread_db_path(home)
     lookup_ok, lookup_error = _lookup_health(path)
-    activity_mtime = None
-    try:
-        mtimes = [p.stat().st_mtime for p in (path, Path(f"{path}-wal")) if p.is_file()]
-        activity_mtime = max(mtimes) if mtimes else None
-    except OSError:
-        activity_mtime = None
-    activity_age = max(0.0, time.time() - activity_mtime) if activity_mtime is not None else None
+    used_recently, recent_use_error = _recent_conversation_use(path)
     last_capture_at, last_capture_harness, captures_today, evidence_ok = _thread_linked_capture_evidence()
     last_capture_age = _age_seconds(last_capture_at)
     recent_without_capture = bool(
         evidence_ok
-        and activity_age is not None
-        and activity_age <= 86400
+        and used_recently is True
         and (last_capture_age is None or last_capture_age > 86400)
     )
     warnings: list[str] = []
@@ -229,7 +253,8 @@ def health(home: Path | None = None) -> dict[str, Any] | None:
     return {
         "detected": True,
         "lookup": {"ok": lookup_ok, "error": lookup_error},
-        "used_recently": activity_age is not None and activity_age <= 86400,
+        "used_recently": used_recently,
+        "recent_use_error": recent_use_error,
         "last_thread_linked_capture_at": last_capture_at,
         "last_thread_linked_capture_age_s": last_capture_age,
         "last_thread_linked_capture_harness": last_capture_harness,
