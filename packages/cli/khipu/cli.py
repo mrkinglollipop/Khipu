@@ -4182,22 +4182,36 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     from khipu.hub_snapshot import refresh, snapshot_freshness
 
     if args.snapshot_cmd == "heal":
-        from khipu import jobs, owner_direction, replica_heal
+        from khipu import jobs, owner_direction, replica_heal, storage
 
-        out = replica_heal.run()
+        def timer_error(exc: Exception) -> dict[str, object]:
+            return {"ok": False, "error": storage.describe_os_error(exc)}
+
+        # Reclaim local space before any timer stage needs to make more of it.
+        # Each stage is independent: an ENOSPC (or other local fault) in one
+        # must never prevent the remaining recovery work from running.
+        try:
+            out: dict[str, object] = {"storage_sweep": storage.sweep_if_due()}
+        except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
+            out = {"storage_sweep": timer_error(exc)}
+        try:
+            heal = replica_heal.run()
+        except Exception as exc:  # noqa: BLE001 — report and continue timer stages
+            heal = timer_error(exc)
+        out.update(heal)
+        out["replica_heal"] = heal
         rc = 0 if out.get("ok") else 1
         # The replica-refresh job is Khipu's timer: the owner-turn retention
         # and overdue purges ride on it. Never changes the heal's result.
-        out["owner_direction"] = owner_direction.timer()
         try:
-            from khipu import storage
-
-            swept = storage.sweep_if_due()
-            if swept is not None:
-                out["storage_sweep"] = swept
-        except Exception as e:  # noqa: BLE001 — housekeeping never fails the replica job
-            out["storage_sweep"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        jobs._write_job_state("replica_refresh", rc)
+            out["owner_direction"] = owner_direction.timer()
+        except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
+            out["owner_direction"] = timer_error(exc)
+        try:
+            jobs._write_job_state("replica_refresh", rc)
+            out["job_state"] = {"ok": True}
+        except Exception as exc:  # noqa: BLE001 — no timer stage starves the next
+            out["job_state"] = timer_error(exc)
         print(json.dumps(out, indent=2))
         return rc
     if args.snapshot_cmd == "status":

@@ -152,7 +152,7 @@ def waiting() -> bool:
 def _read(path: Path) -> dict[str, Any] | None:
     try:
         job = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except ValueError:
         return None
     if isinstance(job, dict) and job.get("tool") in TOOLS and isinstance(job.get("args"), dict):
         return job
@@ -294,11 +294,21 @@ def run(tool: str, args: dict[str, Any], *, queue_ok: bool = True) -> dict[str, 
         _release(path, held)
 
 
-def _refuse(path: Path, job: dict[str, Any], error: str) -> None:
-    _refused_dir().mkdir(parents=True, exist_ok=True)
-    _write(_refused_dir() / path.name, {
-        **job, "error": error[:300], "refused_at": datetime.now(timezone.utc).isoformat()})
-    _remove(path)
+def _refuse(path: Path, job: dict[str, Any], error: str) -> bool:
+    """Archive a terminal hub or legacy-format refusal.
+
+    A local disk error cannot turn a retryable queued write into a permanent
+    refusal. Return false when the archive or acknowledgement cannot land so
+    the original queue entry stays available for a later landed check.
+    """
+    try:
+        _refused_dir().mkdir(parents=True, exist_ok=True)
+        _write(_refused_dir() / path.name, {
+            **job, "error": error[:300], "refused_at": datetime.now(timezone.utc).isoformat()})
+        _remove(path)
+    except OSError:
+        return False
+    return True
 
 
 def _replay(path: Path) -> str | None:
@@ -310,35 +320,53 @@ def _replay(path: Path) -> str | None:
     if not path.exists():
         _held_path(path).unlink(missing_ok=True)
         return None
-    job = _read(path)
+    try:
+        job = _read(path)
+    except OSError:
+        return "local_error"
     if job is None:  # never left to block the line behind it
-        _refuse(path, {}, "ValueError: this waiting write could not be read")
-        return "refused"
+        return "refused" if _refuse(path, {}, "ValueError: this waiting write could not be read") else "local_error"
     if not job["args"].get("write_id"):
         # It may have landed already, and no record can say: never sent.
-        _refuse(path, job, _NO_ID)
-        return "refused"
+        return "refused" if _refuse(path, job, _NO_ID) else "local_error"
     try:
         landed = _landed(job["tool"], job["args"])
-        if landed is not None:
-            if landed[0] == "refused":
-                _refuse(path, job, landed[1] or "the hub refused this write")
-                return "refused"
-            _remove(path)
-            return "replayed"
-        _write(path, {**job, "state": "sending", "sent_at": datetime.now(timezone.utc).isoformat()})
-        result = _apply(job["tool"], job["args"])
     except HubRecordMissing:
         return "unrecorded"
     except Exception as exc:  # noqa: BLE001
         if hub_connection_failed(exc):
             return "away"
-        _refuse(path, job, f"{type(exc).__name__}: {str(exc)[:200]}")
-        return "refused"
+        return "local_error"
+    if landed is not None:
+        if landed[0] == "refused":
+            return "refused" if _refuse(path, job, landed[1] or "the hub refused this write") else "local_error"
+        try:
+            _remove(path)
+        except OSError:
+            return "local_error"
+        return "replayed"
+    try:
+        _write(path, {**job, "state": "sending", "sent_at": datetime.now(timezone.utc).isoformat()})
+    except OSError:
+        return "local_error"
+    try:
+        result = _apply(job["tool"], job["args"])
+    except HubRecordMissing:
+        return "unrecorded"
+    except ValueError as exc:
+        # The hub's owner-write transaction uses ValueError for a semantic
+        # refusal and records that outcome before returning it.
+        return "refused" if _refuse(path, job, f"{type(exc).__name__}: {exc}") else "local_error"
+    except Exception as exc:  # noqa: BLE001
+        if hub_connection_failed(exc):
+            return "away"
+        return "local_error"
     if isinstance(result, dict) and result.get("ok") is False:
-        _refuse(path, job, _refusal(result))
-        return "refused"
-    _remove(path)
+        return "refused" if _refuse(path, job, _refusal(result)) else "local_error"
+    try:
+        _remove(path)
+    except OSError:
+        return "local_error"
     return "replayed"
 
 
@@ -366,10 +394,12 @@ def drain() -> dict[str, Any]:
                 step = _replay(path)
             finally:
                 os.close(claim)
-            if step in ("away", "unrecorded"):
+            if step in ("away", "unrecorded", "local_error"):
                 out["stopped_early"] = True
                 if step == "unrecorded":
                     out["hub_needs_migrate"] = True
+                if step == "local_error":
+                    out["local_error"] = True
                 break
             if step:
                 out[step] += 1
@@ -380,13 +410,21 @@ def drain() -> dict[str, Any]:
 
 
 def status() -> dict[str, Any]:
-    jobs = [j for j in (_read(p) for p in _jobs()) if j is not None]
+    paths = _jobs()
+    jobs = []
+    for path in paths:
+        try:
+            job = _read(path)
+        except OSError:
+            continue
+        if job is not None:
+            jobs.append(job)
     try:
         refused = len(list(_refused_dir().glob("*.json")))
     except OSError:
         refused = 0
     queued = sorted(str(j.get("queued_at") or j.get("made_at") or "") for j in jobs)
-    return {"pending": len(jobs), "refused": refused, "oldest_queued_at": queued[0] if queued else None}
+    return {"pending": len(paths), "refused": refused, "oldest_queued_at": queued[0] if queued else None}
 
 
 def pending_marks(tool: str) -> dict[int, str]:
@@ -394,7 +432,10 @@ def pending_marks(tool: str) -> dict[int, str]:
     write for an id winning."""
     marks: dict[int, str] = {}
     for path in _jobs():
-        job = _read(path)
+        try:
+            job = _read(path)
+        except OSError:
+            continue
         if job is None or job["tool"] != tool:
             continue
         ids = job["args"].get("ids")
