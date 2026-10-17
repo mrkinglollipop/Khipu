@@ -10,6 +10,7 @@ The payload carries the stale marker MCP search uses
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any
 
@@ -61,6 +62,13 @@ def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
     for row in rows:
         for col in ("opened_at", "due_after", "closed_at", "last_seen_at"):
             row[col] = hub_snapshot._utc(row.get(col))
+        if row.get("owner_reassigned_at"):
+            row["owner_reassigned_at"] = hub_snapshot._utc(row["owner_reassigned_at"])
+        if "linked_ids" in row:
+            try:
+                row["linked_ids"] = [int(v) for v in json.loads(row["linked_ids"] or "[]")]
+            except (TypeError, ValueError):
+                row["linked_ids"] = []
         row["future_trigger"] = bool(row.get("future_trigger"))
         row["stale"] = True
     return rows

@@ -97,7 +97,11 @@ _TABLES = (
 # Version 6 adds `commitments`, so `khipu_owed` answers while the hub is away
 # (offline and self-healing scope, slice 5). Rows of a forgotten episode are
 # never in it.
-SNAPSHOT_SCHEMA_VERSION = 6
+# Version 7 adds the commitment owner's lineage (origin, label, and who
+# reassigned it, why, and from whom), the links between similar items of
+# different owners and the newest wording, so an offline read shows the same
+# owner as the hub. A replica of version 6 gains them on its next pull.
+SNAPSHOT_SCHEMA_VERSION = 7
 
 _COMMITMENT_COLS = (
     "id",
@@ -116,6 +120,30 @@ _COMMITMENT_COLS = (
     "last_seen_at",
     "seen_count",
     "future_trigger",
+    # 0033 / 0035 / 0037 columns: what row_owner reads, so the replica's
+    # owner is the hub's.
+    "origin",
+    "owner_label",
+    "owner_reassigned_at",
+    "owner_reassigned_by",
+    "owner_reassign_reason",
+    "owner_prior",
+    "owner_prior_label",
+    "linked_ids",
+    "latest_text",
+)
+# The version 7 columns, added to an older replica's table before a pull
+# writes rows into it.
+_COMMITMENT_LINEAGE_COLS = (
+    ("origin", "TEXT"),
+    ("owner_label", "TEXT"),
+    ("owner_reassigned_at", "TEXT"),
+    ("owner_reassigned_by", "TEXT"),
+    ("owner_reassign_reason", "TEXT"),
+    ("owner_prior", "TEXT"),
+    ("owner_prior_label", "TEXT"),
+    ("linked_ids", "TEXT"),
+    ("latest_text", "TEXT"),
 )
 
 _DELIVERABLE_COLS = (
@@ -1631,6 +1659,8 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
             CREATE INDEX idx_snapshot_commitments_project_status ON commitments (project, status);
             """
         )
+    if version >= 7:
+        _add_commitment_lineage_cols(con)
     if version >= 4:
         try:
             con.executescript(_FTS_SCHEMA_SQL)
@@ -2243,17 +2273,33 @@ def _hub_commitments(cur) -> tuple[list[str], list[Any]] | None:
     return cols, list(cur.fetchall())
 
 
+def _add_commitment_lineage_cols(con: sqlite3.Connection) -> None:
+    """Give a replica's ``commitments`` table the version 7 columns it lacks."""
+    have = _snapshot_table_columns(con, "commitments")
+    if not have:
+        return
+    for col, kind in _COMMITMENT_LINEAGE_COLS:
+        if col not in have:
+            con.execute(f"ALTER TABLE commitments ADD COLUMN {col} {kind}")
+
+
 def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: Sequence[Any]) -> int:
-    """Insert hub commitment rows (``cols`` order) into ``con``; columns this
-    replica lacks are left out. Caller clears the table first and commits."""
+    """Insert hub commitment rows (``cols`` order) into ``con``. A replica of
+    an older version first gains the owner's lineage columns, so its owners
+    match the hub's; other columns it lacks are left out. Caller clears the
+    table first and commits."""
+    _add_commitment_lineage_cols(con)
     have = _snapshot_table_columns(con, "commitments")
     keep = [i for i, c in enumerate(cols) if c in have]
     sel = ", ".join(cols[i] for i in keep)
-    ts_cols = {"opened_at", "due_after", "closed_at", "last_seen_at"}
+    ts_cols = {"opened_at", "due_after", "closed_at", "last_seen_at", "owner_reassigned_at"}
     for row in rows:
         vals = []
         for i in keep:
             col, val = cols[i], row[i]
+            if col == "linked_ids":
+                vals.append(json.dumps([int(v) for v in (val or [])]))
+                continue
             vals.append(_ts_text(val) if col in ts_cols else (int(bool(val)) if col == "future_trigger" else val))
         con.execute(
             f"INSERT INTO commitments ({sel}) VALUES ({', '.join('?' * len(keep))})",
