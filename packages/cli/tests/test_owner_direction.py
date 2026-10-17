@@ -237,9 +237,9 @@ def test_refusal_before_unreadable(world, monkeypatch):
 
     monkeypatch.setattr(ledger, "get", away)
     monkeypatch.setattr(ledger, "write", lambda op: pytest.fail("written without its before-state"))
-    token = world.say("mark T-12 as done in the ledger")
+    token = world.say("mark T-12 as done in the atlas ledger")
     rc, out = world.run(["ledger", "set", "T-12", "--state", "done", "--project", "atlas", "--json"],
-                        "mark T-12 as done in the ledger", token)
+                        "mark T-12 as done in the atlas ledger", token)
     assert rc == 1 and out["reason"] == "before_unreadable"
     assert _log() == []
 
@@ -330,17 +330,18 @@ CASES: dict[str, tuple] = {
     "promote.gate_ignore.cancel": ("update anyway", "cancel the update anyway", "cancel the note for now", {}),
     "ledger.import": ("/trackers/tracker.json", "import the tracker.json file now", "import the board file now",
                       {}),
-    "ledger.restore": ("atlas#T-12", "restore T-12 in the ledger", "restore T-13 in the ledger", {}),
-    "ledger.purge": ("atlas#T-12", "purge T-12 from the ledger", "purge T-13 from the ledger", {}),
-    "ledger.add": ("atlas#T-14", "add T-14 to the ledger as ship the docs", "add T-15 to the ledger as ship the docs",
-                   {"stored": ["ship the docs"]}),
-    "ledger.set": ("atlas#T-12", "mark T-12 as done in the ledger", "mark T-12 as blocked in the ledger",
-                   {"stored": ["done"]}),
-    "ledger.remove": ("atlas#T-12", "remove T-12 from the ledger", "remove T-13 from the ledger", {}),
+    "ledger.restore": ("atlas#T-12", "restore T-12 in the atlas ledger", "restore T-13 in the atlas ledger", {}),
+    "ledger.purge": ("atlas#T-12", "purge T-12 from the atlas ledger", "purge T-13 from the atlas ledger", {}),
+    "ledger.add": ("atlas#T-14", "add T-14 to the atlas ledger as ship the docs",
+                   "add T-15 to the atlas ledger as ship the docs", {"stored": ["ship the docs"]}),
+    "ledger.set": ("atlas#T-12", "mark T-12 as done in the atlas ledger", "mark T-12 as blocked in the atlas ledger",
+                   {"stored": ["done"], "fields": {"state": "done"}}),
+    "ledger.remove": ("atlas#T-12", "remove T-12 from the atlas ledger", "remove T-13 from the atlas ledger", {}),
     "work.hide": ("42", "hide commitment 42 for now", "hide commitment 43 for now", {}),
     "work.unhide": ("42", "unhide commitment 42 please", "unhide commitment 43 please", {}),
-    "work.same": ("atlas#T-12|42", "T-12 and 42 are the same", "T-12 and 42 are not the same", {}),
-    "work.not_same": ("atlas#T-12|42", "T-12 and 42 are not the same", "T-12 and 43 are not the same", {}),
+    "work.same": ("atlas#T-12|42", "atlas T-12 and 42 are the same", "atlas T-12 and 42 are not the same", {}),
+    "work.not_same": ("atlas#T-12|42", "atlas T-12 and 42 are not the same", "atlas T-12 and 43 are not the same",
+                      {}),
     "direction.off": ("direction", "turn owner direction off", "turn the note off", {}),
     "direction.set": ("latest_window_h", "make the latest window 2 hours", "make the earlier window 2 hours",
                       {"stored": ["2"]}),
@@ -539,8 +540,8 @@ def test_purge_by_direction_is_scheduled_runs_a_day_later_and_undo_cancels_it(wo
     purged: list = []
     monkeypatch.setattr(ledger, "_connect", lambda: type("C", (), {"close": lambda self: None})())
     monkeypatch.setattr(ledger, "purge", lambda conn, project, row: purged.append((project, row)) or {"ok": True})
-    token = world.say("purge T-12 from the ledger")
-    rc, out = world.run(["ledger", "purge", "T-12", "--project", "atlas", "--json"], "purge T-12 from the ledger",
+    token = world.say("purge T-12 from the atlas ledger")
+    rc, out = world.run(["ledger", "purge", "T-12", "--project", "atlas", "--json"], "purge T-12 from the atlas ledger",
                         token)
     assert rc == 0 and out["state"] == "scheduled" and purged == []
     (line,) = _log()
@@ -552,8 +553,8 @@ def test_purge_by_direction_is_scheduled_runs_a_day_later_and_undo_cancels_it(wo
     owner_direction.run_due(now=time.time() + 26 * 3600)
     assert purged == [("atlas", "T-12")]
 
-    token = world.say("purge T-13 from the ledger")
-    rc, out = world.run(["ledger", "purge", "T-13", "--project", "atlas", "--json"], "purge T-13 from the ledger",
+    token = world.say("purge T-13 from the atlas ledger")
+    rc, out = world.run(["ledger", "purge", "T-13", "--project", "atlas", "--json"], "purge T-13 from the atlas ledger",
                         token)
     second = _log()[-1]
     undo = world.say("undo the purge of T-13")

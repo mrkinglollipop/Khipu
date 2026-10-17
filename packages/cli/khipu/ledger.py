@@ -2526,17 +2526,21 @@ def direction_intent(command: str, args: argparse.Namespace, project: str | None
     if action is None:
         return None
     if action == "ledger.import":
-        return owner_direction.intent(action, str(args.file))
+        return owner_direction.intent(action, str(args.file), project=project)
     if action.startswith("ledger."):
         if not project or not getattr(args, "id", None):
             return None
-        stored = None
+        stored, fields = None, None
         if action == "ledger.add":
             stored = [args.title]
         elif action == "ledger.set":
-            stored = [v for v in (args.state, args.evidence, args.owner, args.title, args.link)
-                      if isinstance(v, str) and v.strip()] or None
-        return owner_direction.intent(action, f"{project}#{args.id}", stored=stored)
+            # Each field it sets and the value it gives are arguments the
+            # owner's words must state ("set T-12 title to done" never sets
+            # the state).
+            fields = {k: v for k in ("state", "evidence", "owner", "title", "link")
+                      if isinstance(v := getattr(args, k, None), str) and v.strip()} or None
+            stored = list(fields.values()) if fields else None
+        return owner_direction.intent(action, f"{project}#{args.id}", stored=stored, fields=fields)
     if action in ("work.hide", "work.unhide"):
         return owner_direction.intent(action, str(args.id))
     return owner_direction.intent(action, f"{args.row}|{args.commitment}")

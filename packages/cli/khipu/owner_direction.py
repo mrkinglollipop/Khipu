@@ -156,9 +156,12 @@ ACTIONS: dict[str, dict[str, Any]] = {
 
 # direction.set's verbs follow its key: "trust X" widens what counts as the
 # owner's word and "untrust X" narrows it, so neither may read as the other.
-TRUST_VERBS = ("trust", "start trusting", "count", "allow", "accept")
+TRUST_VERBS = ("trust", "trusting", "start trusting", "count", "allow", "accept")
 UNTRUST_VERBS = ("untrust", "stop trusting", "don't trust", "do not trust", "dont trust", "no longer trust",
                  "distrust", "remove")
+
+_FRONT_END_NAMES = {"claude_code": ["claude_code", "claude code"], "codex": ["codex"],
+                    "aegis": ["aegis", "grok build"], "t3": ["t3", "t3 code"]}
 
 _DIRECTION_NAMES = {
     "latest_window_h": ["latest window", "latest turn window", "latest owner turn window"],
@@ -291,11 +294,20 @@ def _names(action: str, target: str, given) -> tuple[list[list[str]], list[str]]
         return [[target]], []
     if kind == "direction":
         return [["owner direction", "direction"]], []
+    if kind == "alarm":
+        return [["alarm", "tamper alarm", "log alarm", "warning", "banner"]], []
     if kind == "direction_setting":
         if target in _DIRECTION_NAMES:
             return [_DIRECTION_NAMES[target]], []
         entry = target.partition(" ")[2] or target
-        return [[entry, entry.replace(":", " ").replace("_", " ")]], []
+        harness, _, point = entry.partition(":")
+        if not point:
+            return [[entry, entry.replace("_", " ")]], []
+        # A front end is two arguments: its harness and its entry point,
+        # each named in full or by a synonym in _FRONT_END_NAMES.
+        full = [entry, entry.replace(":", " ").replace("_", " ")]
+        return [full + _FRONT_END_NAMES.get(harness, [harness, harness.replace("_", " ")]),
+                full + _FRONT_END_NAMES.get(point, [point, point.replace("_", " ").replace("-", " ")])], []
     if kind == "none":
         return [], []
     return [[target]], []
@@ -614,7 +626,8 @@ def _order_ok(plain: str, groups: list[list[str]]) -> bool:
 
 
 _LIST_WORDS = frozenset(("as", "well", "too", "both", "also", "the", "account", "accounts", "lane", "lanes", "login",
-                         "logins", "one", "ones", "either", "each", "every", "of", "them"))
+                         "logins", "one", "ones", "either", "each", "every", "of", "them", "minute", "minutes", "min",
+                         "mins", "hour", "hours", "hr", "hrs", "h", "day", "days", "week", "weeks", "its"))
 
 
 def _names_only(text: str, names: list[str]) -> bool:
@@ -639,19 +652,118 @@ def _names_target(chain: dict, groups: list[list[str]], others: list[str]) -> li
     return next((g for g in groups if not any(_has(plain, n) for n in g if n)), None)
 
 
+# ---- argument coverage: every argument stated in the owner's words ----------------------------
+#
+# An owner direction authorises a structured action only when EVERY argument
+# of that action is stated in the owner's own words, in the clause that asks
+# for it: the action (its verb), what it acts on (an account, a row and its
+# project, a rule, a setting, a front end, a file, ...), the field it changes
+# and the value it gives, the end a timed change carries, the order of a list
+# and the side a switch is turned to. Each is matched exactly or by the
+# synonyms documented in this file (the verbs in ACTIONS, the names in
+# ``_names``, FIELD_NAMES, _FRONT_END_NAMES). An argument the words do not
+# state is refused with a message naming it, so the agent asks the owner to
+# say it. ``arguments`` lists them and ``_read`` checks every one; every
+# owner action goes through both.
+
+# The fields a ledger row's owner change sets, and the words that name each.
+FIELD_NAMES = {
+    "state": ("state", "status", "mark", "marked"),
+    "title": ("title", "retitle", "call it", "name it"),
+    "owner": ("owner", "assign", "assigned", "give it to"),
+    "evidence": ("evidence", "proof"),
+    "link": ("link", "url"),
+}
+
+# The kinds of argument, as ``arguments`` returns them.
+ARGUMENT_KINDS = ("action", "target", "project", "order", "field", "value", "duration", "switch")
+
+
+def _project_names(project: str) -> list[str]:
+    last = project.rstrip("/").rsplit("/", 1)[-1]
+    names = [project, last]
+    names += [n.replace("-", " ").replace("_", " ") for n in names]
+    return list(dict.fromkeys(_quote(n) for n in names if n))
+
+
+def _project_of(action: str, target: str, project: str | None) -> str | None:
+    if project:
+        return project
+    kind = ACTIONS[action]["target"]
+    row = target.partition("|")[0] if kind == "pair" else target if kind == "row" else ""
+    return row.partition("#")[0] if "#" in row else None
+
+
+def arguments(action: str, target: str, *, names=None, stored=None, fields=None, project: str | None = None,
+              timed: bool = False, switch: bool | None = None) -> tuple[list[dict], list[str]]:
+    """Every argument of this owner action, as what the owner's words must
+    state, and the other names to take out of the words first (another
+    account whose name contains this one's). Each argument is a dict with
+    ``kind`` (one of ARGUMENT_KINDS) and what states it: ``names`` (any one
+    of them), ``value`` or ``field``."""
+    out: list[dict] = [{"kind": "action", "names": list(_verbs(action, target))}]
+    groups, exclude = _names(action, target, names)
+    out += [{"kind": "target", "names": g} for g in groups]
+    proj = _project_of(action, target, project) if names is None else None
+    if proj:
+        out.append({"kind": "project", "names": _project_names(proj), "value": proj})
+    if ACTIONS[action]["target"] == "accounts" and len(groups) > 1:
+        out.append({"kind": "order"})
+    for field in (fields or {}):
+        out.append({"kind": "field", "field": field, "names": list(FIELD_NAMES.get(field, (field,)))})
+    for text in stored or []:
+        if isinstance(text, str) and text.strip():
+            out.append({"kind": "value", "value": text})
+    if timed:
+        out.append({"kind": "duration"})
+    if switch is not None:
+        out.append({"kind": "switch", "value": bool(switch)})
+    return out, exclude
+
+
+def _starts_in(message: str, text: str, spans: list[tuple[int, int]]) -> bool:
+    """``text`` stands in ``message`` starting inside one of ``spans`` (a
+    clause ends where its masked value's padding starts, so the value is
+    found by where it starts)."""
+    return any(a <= m.start() < b for m in re.finditer(r"(?<!\w)" + re.escape(_quote(text)) + r"(?!\w)", message)
+               for a, b in spans)
+
+
+def _not_stated(arg: dict, target: str) -> DirectionRefused:
+    """The refusal for one argument the words do not state."""
+    kind = arg["kind"]
+    if kind == "project":
+        what = f"which project ({arg['value']})"
+    elif kind == "field":
+        what = f"which field to change ({arg['field']})"
+    elif kind == "value":
+        what = f"the value \"{str(arg['value']).strip()}\" in the part that names what it changes"
+    else:
+        group = arg.get("names") or [target]
+        shown = next((n for n in group if n and not re.fullmatch(r"[0-9a-f]{12,}", n)), group[0] if group
+                     else target)
+        return DirectionRefused("words_do_not_ask_for_this",
+                                f"The words do not name {_title(shown)}. Quote the part where the owner "
+                                "names it, or ask the owner to say it again.")
+    return DirectionRefused("words_do_not_ask_for_this",
+                            f"The owner's words do not say {what}. Ask the owner to say it in their own words.")
+
+
 def _read(action: str, target: str, quote: str, *, stored, names, exclude, turn_text: str | None = None,
-          switch: bool | None = None) -> dict:
-    """Step 4: the owner's whole message asks for this action on this
-    target, in the part the agent quoted, and any words the action stores
-    are the owner's own. The chain that asked, with every chain of the
-    message (for the sequence check)."""
-    spec = ACTIONS[action]
+          switch: bool | None = None, fields=None, project: str | None = None, timed: bool = False,
+          until=None, now: float | None = None) -> dict:
+    """Step 4: the owner's whole message asks for this action, in the part
+    the agent quoted, and states every one of its ``arguments`` there. The
+    chain that asked, with every chain of the message (for the sequence
+    check)."""
     quoted = _quote(quote)
     message = normalise(turn_text) if turn_text is not None else quoted
     spans = _quote_spans(message, quote) or [(0, len(message))]
     if turn_text is not None and not _quote_spans(message, quote):
         message, spans = quoted, [(0, len(quoted))]
-    kept = [_quote(t) for t in (stored or []) if isinstance(t, str) and t.strip()]
+    args, auto_exclude = arguments(action, target, names=names, stored=stored, fields=fields, project=project,
+                                   timed=timed, switch=switch)
+    kept = [_quote(a["value"]) for a in args if a["kind"] == "value"]
     # The words an action stores are not the owner asking ("add a rule: never
     # run the fast tier" does not negate "add"), nor do they name its target
     # ("rename Grok to Codex main" does not name Codex); nor do other
@@ -659,31 +771,34 @@ def _read(action: str, target: str, quote: str, *, stored, names, exclude, turn_
     # not a negator of what follows ("never mind, lift Grok").
     work = _mask(_mask(_unquoted(message), kept), [m.group(0) for m in _RETRACTION.finditer(message)], _RETRACTED)
     chains = _chains(work)
-    groups, auto_exclude = _names(action, target, names)
+    targets = [a["names"] for a in args if a["kind"] == "target"]
+    named = [a for a in args if a["kind"] in ("target", "project")]
+    groups = [a["names"] for a in named]
     others = [_quote(e) for e in list(exclude or []) + auto_exclude]
-    names_all = [n for g in groups for n in g if n] + others
+    fields_said = [n for a in args if a["kind"] == "field" for n in a["names"]]
+    names_all = [n for g in groups for n in g if n] + others + fields_said
 
     def counts(chain: dict, clause: dict) -> bool:
-        # A clause without a verb of its own names a target for the verb
-        # before it only when names are all it holds ("pause Codex, then
-        # Grok as well"), never "pause Grok, and look at Codex".
+        # A clause without a verb of its own carries arguments for the verb
+        # before it only when arguments are all it holds ("pause Codex, then
+        # Grok as well", "make the latest window 12 hours and the earlier
+        # window 60 minutes"), never "pause Grok, and look at Codex".
         return (any(o["acts"] for o in clause["occs"]) or clause is chain["clauses"][0]
                 or _names_only(clause["text"], names_all))
 
+    def clause_spans(clause: dict) -> list[tuple[int, int]]:
+        return [(max(a, clause["start"]), min(b, clause["end"])) for a, b in spans
+                if clause["start"] < b and a < clause["end"]]
+
     def quoted_parts(chain: dict) -> list[str]:
         # The parts of the chain's clauses that the agent quoted.
-        out = []
-        for clause in chain["clauses"]:
-            if counts(chain, clause):
-                out += [work[max(a, clause["start"]):min(b, clause["end"])] for a, b in spans
-                        if clause["start"] < b and a < clause["end"]]
-        return out
+        return [work[a:b] for clause in chain["clauses"] if counts(chain, clause) for a, b in clause_spans(clause)]
 
     inside = [c for c in chains if quoted_parts(c)]
     verdicts = [(c, _verdict(c, action, target)) for c in inside]
     asked = [c for c, v in verdicts if v == "ok"]
     first = _verbs(action, target)[0].replace("+", " ")
-    if not asked:
+    if not asked:  # the action argument
         blocked = next((v[4:] for _c, v in verdicts if v and v.startswith("not:")), None)
         if blocked:
             raise DirectionRefused("words_do_not_ask_for_this",
@@ -702,52 +817,60 @@ def _read(action: str, target: str, quote: str, *, stored, names, exclude, turn_
                                "it, or ask the owner to say it again.")
     missing = None
     for chain in asked:
-        # The target is named in the part the agent quoted: the rest of the
-        # message decides whether it was asked for, never what it is about.
+        # What it acts on is named in the part the agent quoted: the rest of
+        # the message decides whether it was asked for, never what it is
+        # about.
         quoted_part = dict(chain, text=" | ".join(quoted_parts(chain)))
-        gap = _names_target(quoted_part, groups, others)
+        gap = next((a for a in named if _names_target(quoted_part, [a["names"]], others) is not None), None)
         if gap is None:
-            if spec["target"] == "accounts" and not _order_ok(_without(quoted_part["text"], others), groups):
+            if any(a["kind"] == "order" for a in args) and not _order_ok(_without(quoted_part["text"], others),
+                                                                        targets):
                 raise DirectionRefused("words_do_not_ask_for_this",
                                        "The owner's words give a different order. Pass the accounts in the order "
                                        "the owner said them, or ask the owner to say the order again.")
             break
         missing = missing or gap
     else:
-        group = missing or [target]
-        shown = next((n for n in group if n and not re.fullmatch(r"[0-9a-f]{12,}", n)), group[0] if group
-                     else target)
-        raise DirectionRefused("words_do_not_ask_for_this",
-                               f"The words do not name {_title(shown)}. Quote the part where the owner "
-                               "names it, or ask the owner to say it again.")
+        raise _not_stated(missing or {"kind": "target", "names": [target]}, target)
     at = chains.index(chain)
     # "pause Codex and Grok, but not Grok": a refusal after it that names
     # this target takes it out.
     for later in chains[at + 1:]:
-        if later["neg"] and groups and _names_target(later, groups, others) is None:
+        if later["neg"] and targets and _names_target(later, targets, others) is None:
             raise DirectionRefused("words_do_not_ask_for_this",
-                                   f"The owner's words leave {_title(groups[0][0])} out. Ask the owner to say "
+                                   f"The owner's words leave {_title(targets[0][0])} out. Ask the owner to say "
                                    "what they want in their own words.")
-    if switch is not None:
-        on, off = _SWITCH_ON.search(chain["text"]), _SWITCH_OFF.search(chain["text"])
-        if (on is None) == (off is None) or bool(on) != bool(switch):
-            raise DirectionRefused("words_do_not_ask_for_this",
-                                   f"The owner's words do not say to turn it {'on' if switch else 'off'}. Pass the "
-                                   "setting the owner asked for, or ask the owner to say it again.")
-    for text in [s for s in (stored or []) if isinstance(s, str) and s.strip()]:
-        if not _has(quoted, text):
-            raise DirectionRefused("words_do_not_ask_for_this",
-                                   f"\"{text.strip()}\" is not in the owner's words. What Khipu keeps must be the owner's "
-                                   "own words: use them exactly, or ask the owner to say it again.")
-    return {"asked": " | ".join([chain["text"]] + kept), "chain": at, "chains": chains, "groups": groups,
-            "others": others}
-
-
-def _asks_for(action: str, target: str, quote: str, *, stored, names, exclude, turn_text: str | None = None,
-              switch: bool | None = None) -> str:
-    """Step 4 (``_read``): the words that asked for it."""
-    return _read(action, target, quote, stored=stored, names=names, exclude=exclude, turn_text=turn_text,
-                 switch=switch)["asked"]
+    # A field and a value are stated in the clause that names what they
+    # change ("make the latest window 12 hours and the earlier window 60
+    # minutes": 60 is the earlier window's), and within the quoted part.
+    counted = [c for c in chain["clauses"] if counts(chain, c)]
+    primary = targets[0] if targets else None
+    bound = [c for c in counted if primary is None
+             or any(_has(_without(c["text"], others), n) for n in primary if n)] or counted
+    bound_spans = [s for c in bound for s in clause_spans(c)]
+    for arg in args:
+        if arg["kind"] == "field":
+            if not any(_has(work[a:b], n) for a, b in bound_spans for n in arg["names"]):
+                raise _not_stated(arg, target)
+        elif arg["kind"] == "value":
+            if not _has(quoted, arg["value"]):
+                raise DirectionRefused("words_do_not_ask_for_this",
+                                       f"\"{arg['value'].strip()}\" is not in the owner's words. What Khipu keeps "
+                                       "must be the owner's own words: use them exactly, or ask the owner to say "
+                                       "it again.")
+            if not _starts_in(message, arg["value"], bound_spans):
+                raise _not_stated(arg, target)
+        elif arg["kind"] == "switch":
+            on, off = _SWITCH_ON.search(chain["text"]), _SWITCH_OFF.search(chain["text"])
+            if (on is None) == (off is None) or bool(on) != arg["value"]:
+                raise DirectionRefused("words_do_not_ask_for_this",
+                                       f"The owner's words do not say to turn it {'on' if arg['value'] else 'off'}. "
+                                       "Pass the setting the owner asked for, or ask the owner to say it again.")
+    asked_words = " | ".join([chain["text"]] + kept)
+    if any(a["kind"] == "duration" for a in args):
+        _same_time(asked_words, until, _clock() if now is None else now)
+    return {"asked": asked_words, "chain": at, "chains": chains, "groups": targets, "others": others,
+            "arguments": args}
 
 
 # Kinds of target whose actions undo or redo one another on one target, so
@@ -884,7 +1007,8 @@ def _title(name: str) -> str:
 
 def check(action: str, target: str, words: str, *, turn_token: str | None = None, stored=None, names=None,
           exclude=None, env=None, now: float | None = None, widening: bool = False, value=None,
-          owner_session: str | None = None, timed: bool = False, until=None, switch: bool | None = None) -> dict:
+          owner_session: str | None = None, timed: bool = False, until=None, switch: bool | None = None,
+          fields=None, project: str | None = None) -> dict:
     """The owner-direction check (scope 2.3 with decision 1). The auth stamp
     for the record, or ``DirectionRefused``; ``AlreadyDone`` with the first
     result when this turn already took this action on this target.
@@ -897,12 +1021,17 @@ def check(action: str, target: str, words: str, *, turn_token: str | None = None
     ``until`` (its ``--until``), which must keep the owner's time.
 
     ``switch`` (a setting turned on or off): the value it is set to, which
-    the owner's words must say."""
+    the owner's words must say. ``fields`` (a ledger row's change): the
+    fields it sets, each of which the words must name. ``project``: the
+    project an action names outside its target (an import).
+
+    Every argument of the action must be stated in the owner's words
+    (``arguments``, checked by ``_read``)."""
     if action not in ACTIONS:
         raise DirectionRefused("not_by_direction", "That change can't be made by direction.")
     now = _clock() if now is None else now
     conf = owner_turns.settings()
-    if not conf["enabled"]:  # step 0
+    if not conf["enabled"] and action != "direction.on":  # step 0: off stops all but turning it back on
         raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes typed on a "
                                                 "terminal can make this change.")
     session = session_of(env)
@@ -916,22 +1045,19 @@ def check(action: str, target: str, words: str, *, turn_token: str | None = None
     turn = _the_turn(session, turn_token, quote, conf, now, short_ok=widening)  # steps 1 to 3
     _from_the_hook(turn, ancestry=via_session is None)
     if widening:  # step 6 (decision 1): a later turn confirms it
-        if _confirms_pending(action, target, value, session, turn, quote, conf, now,
-                             asks={"stored": stored, "names": names, "exclude": exclude, "switch": switch,
-                                   "turn_text": turn.get("text") or ""}):
+        if _confirms_pending(action, target, value, session, turn, quote, conf, now):
             return _stamp(turn, session, quote, turn_token, confirms=True, via_session=via_session)
         if len(_quote(quote).split()) < MIN_WORDS:
             _verbatim(quote, {"text": ""})
     read = _read(action, target, quote, stored=stored, names=names, exclude=exclude,  # step 4
-                 turn_text=turn.get("text") or "", switch=switch)
-    if timed:
-        _same_time(read["asked"], until, now)
+                 turn_text=turn.get("text") or "", switch=switch, fields=fields, project=project, timed=timed,
+                 until=until, now=now)
     done = find_done(session, turn["turn"], action, target)  # step 5
     if done is not None:
         raise AlreadyDone(done.get("result") or {})
     _in_order(action, target, read, session, turn)
     if widening:
-        _note_pending(action, target, value, session, turn, quote, now)
+        _note_pending(action, target, value, session, turn, quote, now, stored=stored, names=names)
         raise DirectionRefused("needs_second_turn",
                                "This widens what counts as the owner's word, so it needs the owner's confirmation in a "
                                "later message of this conversation. Ask the owner to confirm (for example \"yes, do "
@@ -1129,11 +1255,13 @@ def _float(value) -> float:
         return 0.0
 
 
-def _note_pending(action, target, value, session, turn, quote, now) -> None:
+def _note_pending(action, target, value, session, turn, quote, now, *, stored=None, names=None) -> None:
     rows = [p for p in _pending() if now - float(p.get("ts") or 0) < owner_turns.RETENTION_S
             and not (p.get("session") == session and p.get("action") == action and p.get("target") == target)]
     rows.append({"action": action, "target": target, "value": value, "session": session, "turn": turn["turn"],
-                 "turn_ts": turn.get("ts"), "ts": now, "words": quote.strip()})
+                 "turn_ts": turn.get("ts"), "ts": now, "words": quote.strip(),
+                 "stored": [t for t in (stored or []) if isinstance(t, str)] or None,
+                 "names": [list(g) for g in names] if names else None})
     _save_pending(rows)
 
 
@@ -1147,13 +1275,37 @@ def _whole_turn_confirm(quote: str, turn: dict) -> bool:
     return q == _quote(turn.get("text") or "") and _POLITE.sub("", q).strip(_EDGE) in WHOLE_TURN_CONFIRMS
 
 
-def _confirms_pending(action, target, value, session, turn, quote, conf, now, *, asks: dict) -> bool:
+def _confirm_names(p: dict, words: str) -> bool:
+    """Whether a confirmation's words name the waiting widening ``p`` ("yes
+    to trusting T3", "yes, make the earlier window 60 minutes"): its verb,
+    asked for and not negated, and a name of what it changes. Its arguments
+    were all stated when it was asked for; the confirmation only has to say
+    which one, and any number it gives must be that widening's."""
+    action, target = p.get("action"), str(p.get("target") or "")
+    if action not in ACTIONS:
+        return False
+    try:
+        groups, others = _names(action, target, p.get("names"))
+    except Exception:  # noqa: BLE001 - a widening Khipu can't name is never selected by name
+        return False
+    plain = _without(words, [_quote(o) for o in others])
+    if not any(_has(plain, n) for g in groups for n in g if n):
+        return False
+    if not any(_verdict(c, action, target) == "ok" for c in _chains(_unquoted(words))):
+        return False
+    if re.search(r"\d", words):
+        return all(_has(words, t) for t in (p.get("stored") or []))
+    return True
+
+
+def _confirms_pending(action, target, value, session, turn, quote, conf, now) -> bool:
     """Whether this turn confirms the widening it was asked about: the very
-    next owner turn after the one that asked for it, with that widening the
-    only one noted between the two turns, and words that are a whole-turn
-    confirmation or a confirmation that itself asks for this change."""
+    next owner turn after the one that asked for it, with words that are a
+    whole-turn confirmation or a confirmation that names it. With several
+    widenings waiting from that turn, the words must name one (a bare yes is
+    refused, asking which)."""
     words = _quote(quote)
-    if not any(_has(words, w) for w in CONFIRM_WORDS):
+    if not any(_has(words, w) for w in CONFIRM_WORDS) or _NEGATOR.search(words):
         return False
     usable = [t for t in owner_turns.turns(session, now) if owner_turns.eligible(t, conf)[0]]
     at = next((i for i, t in enumerate(usable) if t.get("turn") == turn["turn"]), None)
@@ -1163,23 +1315,26 @@ def _confirms_pending(action, target, value, session, turn, quote, conf, now, *,
     since, until = float(asked_in.get("ts") or 0), float(turn.get("ts") or 0)
     rows = _pending()
     waiting = [p for p in rows if p.get("session") == session and since <= float(p.get("ts") or 0) <= until]
-    if len(waiting) > 1:
-        raise DirectionRefused("needs_second_turn",
-                               "More than one change is waiting for the owner's yes, so a yes can't say which. Ask "
-                               "the owner to confirm in words that name the change.")
     if not waiting:
         return False
-    p = waiting[0]
+    whole = _whole_turn_confirm(quote, turn)
+    if len(waiting) > 1:
+        chosen = [] if whole else [p for p in waiting if _confirm_names(p, words)]
+        if len(chosen) != 1:
+            raise DirectionRefused("needs_second_turn",
+                                   "More than one change is waiting for the owner's yes, so a yes can't say which. "
+                                   "Ask the owner which one to confirm, in words that name it (for example \"yes "
+                                   "to the earlier window\").")
+        p = chosen[0]
+    else:
+        p = waiting[0]
+        if not whole and not _confirm_names(p, words):
+            return False
     if p.get("turn") != asked_in.get("turn") or (p.get("action"), p.get("target"), p.get("value")) != (
             action, target, value):
         return False
     if now - since > conf["earlier_window_min"] * 60:
         return False
-    if not _whole_turn_confirm(quote, turn):
-        try:
-            _asks_for(action, target, quote, **asks)
-        except DirectionRefused:
-            return False
     _save_pending([r for r in rows if r is not p])
     return True
 
@@ -1561,13 +1716,15 @@ _PENDING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_ow
 
 def intent(action: str, target: str, *, stored=None, names=None, exclude=None, widening: bool = False,
            value=None, facts: dict | None = None, timed: bool = False, until=None,
-           switch: bool | None = None) -> dict:
+           switch: bool | None = None, fields: dict | None = None, project: str | None = None) -> dict:
     """What an owner command is about to do, for the check and the log.
     ``timed``: the command can carry an end, ``until`` as it was given.
-    ``switch``: the on or off it sets, which the words must say."""
+    ``switch``: the on or off it sets, which the words must say.
+    ``fields``: the fields a row's change sets ({field: value}).
+    ``project``: the project, when the target does not carry it."""
     return {"action": action, "target": str(target), "stored": stored, "names": names, "exclude": exclude,
             "widening": widening, "value": value, "facts": dict(facts or {}), "timed": timed, "until": until,
-            "switch": switch}
+            "switch": switch, "fields": fields, "project": project}
 
 
 def gate(args, want: dict | None, *, env=None, now: float | None = None) -> dict:
@@ -1582,7 +1739,8 @@ def gate(args, want: dict | None, *, env=None, now: float | None = None) -> dict
                   turn_token=getattr(args, "owner_turn", None), stored=want.get("stored"), names=want.get("names"),
                   exclude=want.get("exclude"), env=env, now=now, widening=bool(want.get("widening")),
                   value=want.get("value"), owner_session=getattr(args, "owner_session", None),
-                  timed=bool(want.get("timed")), until=want.get("until"), switch=want.get("switch"))
+                  timed=bool(want.get("timed")), until=want.get("until"), switch=want.get("switch"),
+                  fields=want.get("fields"), project=want.get("project"))
     before = _before(want)
     if before is _UNREADABLE:
         raise DirectionRefused("before_unreadable",
