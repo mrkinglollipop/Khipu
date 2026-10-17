@@ -85,7 +85,8 @@ class _Cursor:
             self.rowcount = 1
             return
         if s.startswith("UPDATE commitments SET status = 'closed'"):
-            reason, cid = params
+            # commitments.close_by_rule on a hub before 0034: (episode, reason, id).
+            reason, cid = params[1], params[-1]
             r = self.rows.get(cid)
             self.rowcount = 0
             if r and r["status"] == "open":
@@ -359,12 +360,13 @@ class _SessionCursor:
             self.rowcount = 1
             return
         if s.startswith("UPDATE commitments SET status = 'closed'"):
-            (cid,) = params
+            # commitments.close_by_rule on a hub before 0034: (episode, reason, id).
+            reason, cid = params[1], params[-1]
             r = self.rows.get(cid)
             self.rowcount = 0
             if r and r["status"] == "open":
                 r["status"] = "closed"
-                r["close_reason"] = "session-ended"
+                r["close_reason"] = reason
                 self.rowcount = 1
             return
         if s.startswith("UPDATE commitments SET status = 'dropped'"):

@@ -131,7 +131,7 @@ def _flood(conn, *, model_questions: int = 6) -> Flood:
     for i in range(3):
         f.item("conv_assistant", f"Write the {_words(i + 700)} changelog entry", episode=conv,
                owner="assistant")
-    # PRs: 801 and 802 merged (a later capture says so), 900 still open.
+    # PRs: 801 and 802 merged (a later capture carries git's and gh's lines), 900 still open.
     for i, prs in enumerate(("PR #801", "PR #801 and PR #802", "PR #802")):
         f.item("pr_merged", f"Land the {_words(i + 800)} fix in {prs} before the release", episode=conv)
     f.item("pr_open", f"Review the {_words(850)} change in PR #900 once checks pass", episode=conv)
@@ -145,7 +145,8 @@ def _flood(conn, *, model_questions: int = 6) -> Flood:
         keeper = f"Add the {_words(i + 1000)} retry to the importer"
         f.item("dup_keeper", keeper, episode=conv, owner="assistant")
         f.item("dup", keeper + " soon", episode=conv, owner="assistant", at=BASE_AT + timedelta(hours=1))
-    later = f.episode(summary="PR #801 merged and PR #802 merged", at=BASE_AT + timedelta(days=1))
+    later = f.episode(summary="Merge pull request #801 from acme/fix\n✓ Merged pull request acme/widget#802 (Fix)",
+                      at=BASE_AT + timedelta(days=1))
     with conn.cursor() as cur:
         for i in range(3):
             cur.execute("INSERT INTO decisions (project, text, episode_id, decided_at) VALUES (%s, %s, %s, %s)",

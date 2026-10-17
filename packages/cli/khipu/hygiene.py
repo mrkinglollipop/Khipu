@@ -743,6 +743,7 @@ def run_commitments_hygiene(
     (token containment, then cosine) among whatever survived. Anything past
     the call cap is reported ``unjudged`` and left strictly alone.
     """
+    from khipu import commitments as co
     from khipu.commitments import OWNER_USER, rejection_reason, resolve_owner
     from khipu.db import has_columns
 
@@ -833,12 +834,9 @@ def run_commitments_hygiene(
                         "last_seen_at = now() WHERE id = %s",
                         (cid, keeper),
                     )
-                cur.execute(
-                    "UPDATE commitments SET status = 'closed', closed_at = now(), "
-                    "close_reason = %s WHERE id = %s AND status = 'open'",
-                    (f"duplicate-of-{keeper}", cid),
-                )
-                applied += cur.rowcount
+                applied += int(co.close_by_rule(
+                    cur, cid, reason=f"duplicate-of-{keeper}", key=f"duplicate-of:{keeper}",
+                    evidence={"rule": "duplicate", "keeper": keeper}))
 
     report: dict[str, Any] = {
         "ok": True,
@@ -955,6 +953,7 @@ def run_session_ended_pass(
     with or without migration 0013: the two fields are computed in memory and
     only written back when the column is there.
     """
+    from khipu import commitments as co
     from khipu.commitments import has_future_trigger, is_reporting_text, row_owner
     from khipu.db import has_columns
 
@@ -1015,12 +1014,9 @@ def run_session_ended_pass(
                     (item["owner"], cid),
                 )
             if item["verdict"] == "close":
-                cur.execute(
-                    "UPDATE commitments SET status = 'closed', closed_at = now(), "
-                    "close_reason = 'session-ended' WHERE id = %s AND status = 'open'",
-                    (cid,),
-                )
-                applied += cur.rowcount
+                applied += int(co.close_by_rule(
+                    cur, cid, reason="session-ended", key="hygiene:session-ended",
+                    evidence={"rule": "hygiene-session-ended"}))
             elif item["verdict"] == "drop":
                 cur.execute(
                     "UPDATE commitments SET status = 'dropped', closed_at = now(), "

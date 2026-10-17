@@ -512,12 +512,12 @@ def apply(doc: dict[str, Any]) -> dict[str, Any]:
                 it = planned[cid]
                 prior = {f: _plain(rows[cid].get(f)) for f in PRIOR_FIELDS}
                 if it["action"] == "close":
-                    cur.execute(
-                        "UPDATE commitments SET status = 'closed', closed_at = now(), closed_episode = %s, "
-                        "close_reason = %s, closed_by = %s, close_rule_key = %s, close_evidence = %s::jsonb, "
-                        "tidy_batch = %s WHERE id = %s AND status = 'open'",
-                        (it.get("episode"), (it.get("reason") or "closed by the clean-up")[:300], co.BY_RULE,
-                         it.get("key"), json.dumps(it.get("evidence") or {}), batch, cid))
+                    if not co.close_by_rule(cur, cid, reason=it.get("reason") or "closed by the clean-up",
+                                            key=it.get("key") or f"tidy:{cid}", evidence=it.get("evidence") or {},
+                                            episode=it.get("episode"), set_extra=", tidy_batch = %s",
+                                            extra_params=(batch,)):
+                        skipped.append({"id": cid, "why": "the owner reopened it after the same evidence closed it"})
+                        continue
                 else:
                     after = it.get("after") or {}
                     owner = after.get("owner")

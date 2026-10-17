@@ -11,8 +11,9 @@ closed. A PR's fate comes from, in order, all read-only:
 2. the ledger: a row whose ``refs.pr`` names the PR in a state that means
    done (merged, verified, done);
 3. a later capture in the same project whose decisions, closed loops or
-   summary say "PR #N merged" or "closed #N" (:func:`capture_pr_states`; "will
-   merge" and "before #N merges" do not count);
+   summary carry a line git or gh printed ("Merge pull request #N from ...",
+   "✓ Merged pull request owner/repo#N"; :func:`capture_pr_records`). A
+   model's sentence or a question ("Was PR #366 merged?") never counts;
 4. GitHub, through ``gh pr view N --repo OWNER/REPO --json state,mergedAt``
    (fixed argv, no shell, a short timeout), on by default and switched off
    with the ``owed_pr_check_github`` setting. Each PR is asked once a run.
@@ -26,9 +27,16 @@ it matches the item by ``commitments.completion_match`` at
 ``commitment_close_similarity``. A looser match is kept in
 ``settle_suggestion`` ("Looks settled by decision N") and never closes it.
 
-Every close records ``close_reason``, ``closed_by`` (``BY_RULE``),
-``close_rule_key`` and ``close_evidence``. A reopened item keeps its rule key
-in ``reopened_rule_keys``; the same rule and evidence never close it again.
+**Evidence.** Each source gives one record per pull request, keyed by its
+repository and number (a pull link names its own repository; any other
+mention is the project's), with the state that source read and when. The
+newest record for a PR wins, so a PR that was reopened revokes an earlier
+"merged". Two repositories' PR #41 are two PRs.
+
+Every close goes through ``commitments.close_by_rule`` and records
+``close_reason``, ``closed_by`` (``BY_RULE``), ``close_rule_key`` and
+``close_evidence``. A reopened item keeps its rule key in
+``reopened_rule_keys``; the same rule and evidence never close it again.
 The nightly runs both rules over every open item (``jobs``); each capture
 runs them for its own project (``capture``), asking GitHub only about the
 PRs that capture names. Nothing here writes outside the commitments table.
@@ -44,11 +52,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from khipu.commitments import (
-    BY_RULE,
     _close_columns_ready,
     _jaccard,
     _match_score,
     _not_forgotten_clause,
+    close_by_rule,
     completion_match,
 )
 
@@ -69,14 +77,16 @@ _PR_LIST_RE = re.compile(rf"\b{_PR_WORD}\b([^.;:\n]{{0,60}})", re.I)
 _HASH_RE = re.compile(r"(?<![\w&])#(\d{1,7})\b")
 _PULL_LINK_RE = re.compile(r"github\.com/([A-Za-z0-9][\w.-]*/[\w.-]+?)/pull/(\d{1,7})\b", re.I)
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
-# The narrow "it happened" pattern of a later capture: past tense only, and
-# nothing in the words just before it that makes it a plan or a negation.
-_PR_REF = rf"(?:{_PR_WORD}\s*#?\s*|#)(\d{{1,7}})"
-_DONE_AFTER_RE = re.compile(rf"{_PR_REF}\s+(?:(?:was|is|got|has\s+been|have\s+been)\s+)?(merged|closed)\b",
-                            re.I)
-_DONE_BEFORE_RE = re.compile(rf"\b(merged|closed)\s+{_PR_REF}", re.I)
-_NOT_YET_RE = re.compile(r"\b(?:not|never|will|would|should|could|can|to|before|until|once|after|if|when|"
-                         r"unless|yet|planned|plan|going)\b|n't\b", re.I)
+# A capture's words are evidence of a PR's fate only as a line git or gh
+# itself prints: git's merge commit subject, or gh's own merge, close and
+# reopen lines. A model's sentence ("PR #366 merged") or a question ("Was PR
+# #366 merged?") is never one; GitHub is asked instead.
+_GIT_MERGE_LINE_RE = re.compile(r"^\s*(?:[0-9a-f]{7,40}\s+)?Merge\s+pull\s+request\s+#(\d{1,7})\s+from\s+\S+",
+                                re.I)
+_GH_LINE_RE = re.compile(
+    r"^\s*[✓✔]?\s*(Merged|Squashed\s+and\s+merged|Rebased\s+and\s+merged|Closed|Reopened)\s+pull\s+request\s+"
+    r"(?:([A-Za-z0-9][\w.-]*/[\w.-]+))?#(\d{1,7})\b")
+_GH_WORD_STATE = {"closed": "closed", "reopened": "open"}
 _DECIDE_RE = re.compile(r"\bdecid(?:e|es|ing|ed)\b|\bdecision\b", re.I)
 _NAMES_ITEM_RE = re.compile(r"\b(?:commitment|owed\s+item|item|question)\s*#?\s*(\d{1,12})\b", re.I)
 
@@ -109,9 +119,32 @@ def parse_prs(text: str) -> list[int]:
     return out
 
 
-def _link_repos(text: str) -> dict[int, str]:
-    """``{pr: "owner/repo"}`` for each GitHub pull link in ``text``."""
-    return {int(m.group(2)): m.group(1) for m in _PULL_LINK_RE.finditer(str(text or ""))}
+def _repo(value: str | None) -> str | None:
+    return str(value).lower() if value else None
+
+
+def pr_refs(text: str, project_repo: str | None) -> list[tuple[str | None, int]]:
+    """The ``(repository, number)`` of each pull request ``text`` names, in
+    :func:`parse_prs` order. A GitHub pull link names its own repository (two
+    links with the same number in two repositories are two refs); any other
+    mention is the project's repository, None when that is not known."""
+    text = str(text or "")
+    links: dict[int, list[str]] = {}
+    for m in _PULL_LINK_RE.finditer(text):
+        repos = links.setdefault(int(m.group(2)), [])
+        if _repo(m.group(1)) not in repos:
+            repos.append(_repo(m.group(1)))
+    out: list[tuple[str | None, int]] = []
+    for n in parse_prs(text):
+        for repo in links.get(n) or [_repo(project_repo)]:
+            out.append((repo, n))
+    return out
+
+
+def ref_label(ref: tuple[str | None, int], project_repo: str | None) -> str:
+    """``"41"`` for the project's own repository, else ``"owner/repo#41"``."""
+    repo, n = ref
+    return str(n) if repo == _repo(project_repo) else f"{repo}#{n}"
 
 
 def ready(cur) -> bool:
@@ -135,22 +168,66 @@ def backfill_prs(cur, *, batch: int = BACKFILL_BATCH) -> int:
 
 
 # ---- where a PR's fate comes from ---------------------------------------------
+#
+# Every source gives evidence records keyed by ``(repository, number)``, the
+# repository lower-cased and None when the source does not name one (it is
+# then the project's own). A record carries the PR's state as that source last
+# read it (``merged``, ``closed`` or ``open``), when it was read, and the
+# source. For one PR the newest record wins, so a later "open" (a reopened PR)
+# revokes an earlier "merged".
+
+EvidenceKey = tuple  # (repository or None, number)
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _record(state: str, read_at: Any, source: str, **extra: Any) -> dict[str, Any]:
+    return {"state": state, "read_at": _iso(read_at), "source": source, **extra}
+
+
+def _iso(value: Any) -> str | None:
+    at = _at(value)
+    return at.isoformat() if at else None
+
+
+def _at(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not value:
+        return None
+    try:
+        at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+
+
+def capture_pr_records(texts) -> dict[EvidenceKey, str]:
+    """``{(repository, pr): state}`` from the lines git or gh print among a
+    capture's texts: "Merge pull request #366 from owner/branch" (merged),
+    "✓ Merged pull request owner/repo#366" (merged), "✓ Closed pull request
+    #367" (closed), "✓ Reopened pull request #367" (open). The last line about
+    a PR wins. Nothing else counts: not a model's sentence, and never a
+    question."""
+    out: dict[EvidenceKey, str] = {}
+    for raw in texts or []:
+        for line in str(raw or "").splitlines():
+            if line.rstrip().endswith("?"):
+                continue
+            m = _GIT_MERGE_LINE_RE.match(line)
+            if m:
+                out[(None, int(m.group(1)))] = "merged"
+                continue
+            m = _GH_LINE_RE.match(line)
+            if m:
+                word = m.group(1).split()[-1].lower()
+                out[(_repo(m.group(2)), int(m.group(3)))] = _GH_WORD_STATE.get(word, "merged")
+    return out
 
 
 def capture_pr_states(texts) -> dict[int, str]:
-    """``{pr: "merged" | "closed"}`` from a capture's own lines: "PR #366
-    merged", "PR #366 was merged", "closed #367", "merged PR #368". A line
-    that says it will happen, should happen, or has not ("will merge #366",
-    "before #366 merges", "not merged PR #366") does not count."""
-    out: dict[int, str] = {}
-    for raw in texts or []:
-        text = str(raw or "")
-        hits = [(m.start(), int(m.group(1)), m.group(2)) for m in _DONE_AFTER_RE.finditer(text)]
-        hits += [(m.start(), int(m.group(2)), m.group(1)) for m in _DONE_BEFORE_RE.finditer(text)]
-        for start, number, state in sorted(hits):
-            if not _NOT_YET_RE.search(text[max(0, start - 30):start]):
-                out.setdefault(number, state.lower())
-    return out
+    """``{pr: state}`` of :func:`capture_pr_records`, for callers that only
+    want the numbers."""
+    return {n: state for (_, n), state in capture_pr_records(texts).items()}
 
 
 def _loop_texts(items) -> list[str]:
@@ -172,31 +249,42 @@ def _pr_id(item: dict) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _runner_states(project: str) -> dict[int, str]:
-    """``{pr: "merged" | "closed"}`` from the project's registered runner
-    summary, read through ``khipu.work`` (the same checks as the Work view)."""
+def _runner_states(project: str) -> dict[EvidenceKey, dict[str, Any]]:
+    """Evidence from the project's registered runner summary, read through
+    ``khipu.work`` (the same checks as the Work view). Only a current summary
+    counts: a stale, gone or failed one (whose contents are the last good
+    read) is no evidence at all. Every listed PR is a record, the ones not
+    merged or closed as ``open``, read when the summary was written."""
     from khipu import work
 
     cfg = work.settings()
     entry = next((e for e in cfg["work_projects"] if e["project"] == project), None)
     if entry is None:
         return {}
-    contents = work.read_source(entry, cfg, datetime.now(timezone.utc)).get("contents") or {}
-    out: dict[int, str] = {}
+    source = work.read_source(entry, cfg, datetime.now(timezone.utc))
+    if source.get("state") != "ok":
+        return {}
+    contents = source.get("contents") or {}
+    out: dict[EvidenceKey, dict[str, Any]] = {}
     for pr in contents.get("prs") or []:
         n = _pr_id(pr)
-        if n is not None and pr.get("stage") in DONE_STATES:
-            out[n] = pr["stage"]
+        if n is None:
+            continue
+        link = _PULL_LINK_RE.search(str(pr.get("link") or ""))
+        stage = pr.get("stage")
+        out[(_repo(link.group(1)) if link else None, n)] = _record(
+            stage if stage in DONE_STATES else "open", contents.get("written_at"), "runner")
     return out
 
 
-def _ledger_states(cur, project: str) -> dict[int, str]:
-    """``{pr: "merged"}`` from ledger rows whose ``refs.pr`` names a PR in a
-    state that means done (the vocab's ``done``, or a merged word)."""
+def _ledger_states(cur, project: str) -> dict[EvidenceKey, dict[str, Any]]:
+    """Evidence from ledger rows whose ``refs.pr`` names a PR: ``merged``
+    when the row's state means done (the vocab's ``done``, or a merged word),
+    else ``open``, read when the row last changed."""
     cur.execute("SAVEPOINT close_rules_ledger")
     try:
         cur.execute(
-            "SELECT r.refs->>'pr', r.state, v.meaning FROM ledger_rows r "
+            "SELECT r.refs->>'pr', r.state, v.meaning, r.updated_at FROM ledger_rows r "
             "LEFT JOIN ledger_vocab v ON v.project = r.project AND v.field = 'state' AND v.word = r.state "
             "WHERE r.project = %s AND r.removed_at IS NULL AND r.refs ? 'pr'",
             (project,),
@@ -207,35 +295,50 @@ def _ledger_states(cur, project: str) -> dict[int, str]:
         cur.execute("ROLLBACK TO SAVEPOINT close_rules_ledger")
         _log(f"ledger read skipped ({type(exc).__name__})")
         return {}
-    out: dict[int, str] = {}
-    for ref, state, meaning in rows:
+    out: dict[EvidenceKey, dict[str, Any]] = {}
+    for ref, state, meaning, updated_at in rows:
         m = re.fullmatch(r"\s*(?:pr[-_ ]?|#)?(\d{1,7})\s*", str(ref or ""), re.I)
+        if not m:
+            continue
         word = str(state or "").upper()
         merged = "MERGED" in word and "UNMERGED" not in word
-        if m and (meaning == "done" or merged):
-            out[int(m.group(1))] = "merged"
+        rec = _record("merged" if (meaning == "done" or merged) else "open", updated_at, "ledger")
+        key = (None, int(m.group(1)))
+        if _newer(rec, out.get(key)):
+            out[key] = rec
     return out
 
 
-def _episode_states(cur, project: str, after_episode: int) -> dict[int, tuple[str, int]]:
-    """``{pr: (state, episode_id)}`` from the project's captures after
-    ``after_episode`` (the nightly's view of source 3), earliest first."""
+def _episode_states(cur, project: str, after_episode: int) -> dict[EvidenceKey, dict[str, Any]]:
+    """Evidence from the git and gh lines in the project's captures after
+    ``after_episode`` (the nightly's view of source 3): the newest capture's
+    line about each PR, with that capture's id as ``episode``."""
     cur.execute(
-        "SELECT e.id, e.summary, e.raw->'decisions', e.raw->'closed_loops' FROM episodes e "
+        "SELECT e.id, e.ts, e.summary, e.raw->'decisions', e.raw->'closed_loops' FROM episodes e "
         "WHERE e.project = %s AND e.id > %s "
-        "AND (e.summary ~* '(merged|closed)' OR (e.raw->'decisions')::text ~* '(merged|closed)' "
-        "OR (e.raw->'closed_loops')::text ~* '(merged|closed)') ORDER BY e.id",
+        "AND (e.summary ~* 'pull request' OR (e.raw->'decisions')::text ~* 'pull request' "
+        "OR (e.raw->'closed_loops')::text ~* 'pull request') ORDER BY e.id",
         (project, after_episode),
     )
-    out: dict[int, tuple[str, int]] = {}
-    for eid, summary, decisions, loops in cur.fetchall():
+    out: dict[EvidenceKey, dict[str, Any]] = {}
+    for eid, ts, summary, decisions, loops in cur.fetchall():
         texts = [summary or ""]
         for blob in (decisions, loops):
             items = json.loads(blob) if isinstance(blob, str) else blob
             texts += _loop_texts(items if isinstance(items, list) else [])
-        for n, state in capture_pr_states(texts).items():
-            out.setdefault(n, (state, int(eid)))
+        for key, state in capture_pr_records(texts).items():
+            out[key] = _record(state, ts, "capture", episode=int(eid))
     return out
+
+
+def _newer(rec: dict[str, Any], than: dict[str, Any] | None) -> bool:
+    """True when ``rec`` should replace ``than``: it was read later, or at
+    the same time and says the PR is still open (the cautious reading). A
+    record with no read time is the oldest."""
+    if than is None:
+        return True
+    a, b = _at(rec.get("read_at")) or _EPOCH, _at(than.get("read_at")) or _EPOCH
+    return a > b or (a == b and rec["state"] == "open" and than["state"] != "open")
 
 
 class GitHub:
@@ -293,18 +396,48 @@ class GitHub:
         return state, None
 
 
+# ---- the evidence check every close path shares --------------------------------
+
+_QUESTION_START_RE = re.compile(r"^\s*(?:was|were|is|are|did|does|do|has|have|had|can|could|should|will|"
+                                r"would|why|how|what|when|whether)\b", re.I)
+_PR_STATE_WORD_RE = re.compile(r"\b(?:merg\w*|clos\w*|reopen\w*)\b", re.I)
+
+
+def evidence_problem(text: str, item_text: str = "") -> str | None:
+    """Why ``text`` (a closed loop, a ``done:`` line, a decision or a session
+    mention) is not evidence that closes an item reading ``item_text``, or
+    None when it is. The same check for every close path
+    (``commitments.auto_close``, ``commitments.close_session_plan`` and the
+    decision rule here):
+
+    * a question is never evidence ("Was PR #366 merged?");
+    * a claim about the state of a PR the item names is evidence only as a
+      line git or gh printed (:func:`capture_pr_records`); otherwise the PR
+      rule asks the PR's own sources, GitHub included."""
+    s = str(text or "").strip()
+    if s.endswith("?") or _QUESTION_START_RE.match(s):
+        return "a question is not evidence"
+    named = set(parse_prs(item_text))
+    if named and _PR_STATE_WORD_RE.search(s):
+        claimed = named & set(parse_prs(s))
+        trusted = {n for (_, n) in capture_pr_records([s])}
+        if claimed - trusted:
+            return "a pull request's state comes from GitHub or a git or gh line, not a sentence"
+    return None
+
+
 # ---- the rules --------------------------------------------------------------
 
 
-def _pr_reason(found: dict[int, tuple[str, str]]) -> str:
+def _pr_reason(found: dict[str, tuple[str, str]]) -> str:
     """'pull request #366 merged (from the runner's summary)', grouped by
     state and source in the item's PR order."""
-    groups: dict[tuple[str, str], list[int]] = {}
-    for n, (state, source) in found.items():
-        groups.setdefault((state, source), []).append(n)
+    groups: dict[tuple[str, str], list[str]] = {}
+    for label, (state, source) in found.items():
+        groups.setdefault((state, source), []).append(label)
     parts = []
-    for (state, source), numbers in groups.items():
-        refs = [f"#{n}" for n in numbers]
+    for (state, source), labels in groups.items():
+        refs = [label if "#" in label else f"#{label}" for label in labels]
         named = refs[0] if len(refs) == 1 else ", ".join(refs[:-1]) + f" and {refs[-1]}"
         noun = "pull request" if len(refs) == 1 else "pull requests"
         parts.append(f"{noun} {named} {state} ({SOURCE_WORDS[source]})")
@@ -313,19 +446,13 @@ def _pr_reason(found: dict[int, tuple[str, str]]) -> str:
 
 def _close(cur, cid: int, *, reason: str, key: str, evidence: dict, episode: int | None,
            sink: dict | None = None) -> bool:
-    """Close one item by rule, or, with ``sink`` (the clean-up planner), only
-    record what would close it and write nothing."""
+    """Close one item by rule (``commitments.close_by_rule``: the reopen
+    guard every automatic close shares), or, with ``sink`` (the clean-up
+    planner), only record what would close it and write nothing."""
     if sink is not None:
         sink[cid] = {"reason": reason[:300], "key": key, "evidence": evidence, "episode": episode}
         return True
-    cur.execute(
-        "UPDATE commitments SET status = 'closed', closed_at = now(), closed_episode = %s, "
-        "close_reason = %s, closed_by = %s, close_rule_key = %s, close_evidence = %s::jsonb "
-        "WHERE id = %s AND status = 'open' AND NOT (%s = ANY(reopened_rule_keys)) "
-        f"AND {_not_forgotten_clause(cur)}",
-        (episode, reason[:300], BY_RULE, key, json.dumps(evidence), cid, key),
-    )
-    return cur.rowcount > 0
+    return close_by_rule(cur, cid, reason=reason, key=key, evidence=evidence, episode=episode)
 
 
 def _open_items(cur, project: str | None) -> list[dict[str, Any]]:
@@ -344,6 +471,27 @@ def _open_items(cur, project: str | None) -> list[dict[str, Any]]:
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def _key(ref: tuple[str | None, int], project_repo: str | None) -> EvidenceKey:
+    return (ref[0] or _repo(project_repo), ref[1])
+
+
+def _newest_for(ref: tuple[str | None, int], project_repo: str | None, opened: int,
+                sources: list[dict[EvidenceKey, dict[str, Any]]]) -> dict[str, Any] | None:
+    """The newest record any source holds for one PR. A capture's record
+    counts only when that capture came after the one that opened the item."""
+    want = _key(ref, project_repo)
+    best = None
+    for source in sources:
+        for key, rec in source.items():
+            if _key(key, project_repo) != want:
+                continue
+            if rec.get("episode") is not None and int(rec["episode"]) <= opened:
+                continue
+            if _newer(rec, best):
+                best = rec
+    return best
+
+
 def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, episode_id: int | None,
              github: GitHub, sink: dict | None = None) -> None:
     by_project: dict[str, list[dict]] = {}
@@ -351,10 +499,13 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
         if item["prs"]:
             by_project.setdefault(item["project"], []).append(item)
     asked_for: set[int] | None = None
-    capture: dict[int, str] = {}
+    capture: dict[EvidenceKey, dict[str, Any]] = {}
     if payload is not None:
         texts = _payload_texts(payload)
-        capture = capture_pr_states(texts)
+        now = datetime.now(timezone.utc)
+        if episode_id is not None:
+            capture = {key: _record(state, now, "capture", episode=int(episode_id))
+                       for key, state in capture_pr_records(texts).items()}
         # A capture asks GitHub only about the PRs it names; the nightly asks
         # about every open item's.
         asked_for = set(parse_prs("\n".join(texts + _loop_texts(payload.get("open_loops")))))
@@ -365,49 +516,52 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
             _log(f"runner summary skipped ({type(exc).__name__})")
             runner = {}
         ledger = _ledger_states(cur, project)
-        later: dict[int, tuple[str, int]] = {}
+        later: dict[EvidenceKey, dict[str, Any]] = {}
         if payload is None:
             later = _episode_states(cur, project, min(int(r["opened_episode"] or 0) for r in rows))
         repo = project if _REPO_RE.match(project) else None
         for item in rows:
             opened = int(item["opened_episode"] or 0)
             before = (item["pr_check"] or {}).get("waiting") or {}
-            found: dict[int, tuple[str, str]] = {}
+            found: dict[str, tuple[str, str]] = {}
+            records: dict[str, dict[str, Any]] = {}
             waiting: dict[str, str] = {}
             capture_episodes: list[int] = []
-            links = _link_repos(item["text"])
-            for n in item["prs"]:
-                if n in runner:
-                    found[n] = (runner[n], "runner")
-                elif n in ledger:
-                    found[n] = (ledger[n], "ledger")
-                elif n in capture and episode_id is not None and episode_id > opened:
-                    found[n] = (capture[n], "capture")
-                    capture_episodes.append(episode_id)
-                elif n in later and later[n][1] > opened:
-                    found[n] = (later[n][0], "capture")
-                    capture_episodes.append(later[n][1])
-                elif asked_for is not None and n not in asked_for:
-                    waiting[str(n)] = before.get(str(n)) or NOT_ASKED
-                else:
-                    state, why = github.state(links.get(n) or repo, n)
-                    if state in DONE_STATES:
-                        found[n] = (state, "github")
-                    else:
-                        waiting[str(n)] = why or "still open on GitHub"
-            if not waiting:
-                key = "pr:" + ",".join(f"{n}={found[n][0]}" for n in item["prs"])
+            for ref in pr_refs(item["text"], repo) or [(_repo(repo), n) for n in item["prs"]]:
+                label = ref_label(ref, repo)
+                rec = _newest_for(ref, repo, opened, [runner, ledger, capture, later])
+                if rec is None or rec["state"] not in DONE_STATES:
+                    if asked_for is not None and ref[1] not in asked_for:
+                        waiting[label] = before.get(label) or (
+                            f"still open ({SOURCE_WORDS[rec['source']]})" if rec else NOT_ASKED)
+                        continue
+                    state, why = github.state(ref[0] or _repo(repo), ref[1])
+                    if state is None:
+                        waiting[label] = (f"still open ({SOURCE_WORDS[rec['source']]}); {why}" if rec
+                                          else why or "GitHub could not say")
+                        continue
+                    rec = _record(state, datetime.now(timezone.utc), "github")
+                    if state not in DONE_STATES:
+                        waiting[label] = "still open on GitHub"
+                        continue
+                found[label] = (rec["state"], rec["source"])
+                records[label] = {k: v for k, v in rec.items() if k != "episode"}
+                if rec.get("episode") is not None:
+                    capture_episodes.append(int(rec["episode"]))
+            if not waiting and found:
+                key = "pr:" + ",".join(f"{label}={state}" for label, (state, _) in found.items())
                 if key in (item["reopened"] or []):
                     report["kept_open_reopened"] += 1
                     continue
-                evidence = {"rule": "pr", "prs": {str(n): {"state": s, "source": src}
-                                                  for n, (s, src) in found.items()}}
+                evidence = {"rule": "pr", "prs": records}
                 if _close(cur, item["id"], reason=_pr_reason(found), key=key, evidence=evidence,
                           episode=max(capture_episodes) if capture_episodes else None, sink=sink):
                     report["closed_pr"] += 1
                     item["closed"] = True
+                elif sink is None:
+                    report["kept_open_reopened"] += 1
                 continue
-            check = {"states": {str(n): f"{s} ({SOURCE_WORDS[src]})" for n, (s, src) in found.items()},
+            check = {"states": {label: f"{s} ({SOURCE_WORDS[src]})" for label, (s, src) in found.items()},
                      "waiting": waiting}
             if sink is None and check != item["pr_check"]:
                 cur.execute("UPDATE commitments SET pr_check = %s::jsonb WHERE id = %s",
@@ -437,6 +591,8 @@ def _settles(item: dict, decisions: list[tuple], threshold: float):
         if not _later(item, dep, decided_at):
             continue
         text = text or ""
+        if evidence_problem(text, item["text"]):
+            continue
         if any(int(m.group(1)) == item["id"] for m in _NAMES_ITEM_RE.finditer(text)):
             return ("strict", did, text, "names the item", 1.0, dep)
         score, via, _ = completion_match(text, item["text"], kind="loop", threshold=threshold)

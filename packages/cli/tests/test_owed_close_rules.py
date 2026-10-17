@@ -184,14 +184,19 @@ def test_both_merged_closes_with_the_reason(hub, monkeypatch, tmp_path):  # noqa
         assert row["close_reason"] == "pull requests #12 and #13 merged (from the runner's summary)"
         assert row["closed_by"] == "Khipu, by rule"
         assert row["close_rule_key"] == "pr:12=merged,13=merged"
-        assert row["close_evidence"]["prs"]["13"] == {"state": "merged", "source": "runner"}
+        evidence = row["close_evidence"]["prs"]["13"]
+        assert (evidence["state"], evidence["source"]) == ("merged", "runner") and evidence["read_at"]
 
 
 def test_before_pr_merges_closes_on_the_merge_a_later_capture_reports(hub):  # noqa: F811
     conn = _migrated(hub)
     with conn.cursor() as cur:
         cid = _open(cur, "Implement the two fixes before PR #366 can merge", "blocker")
-        later = dict(BASE, decisions=["PR #366 merged after the second review"])
+        # A model's sentence is not evidence; GitHub is asked instead (the
+        # test shim fails), so the item stays open.
+        said = dict(BASE, decisions=["PR #366 merged after the second review"])
+        assert close_rules.run(cur, payload=said, episode_id=_episode(cur, raw=said))["closed_pr"] == 0
+        later = dict(BASE, closed_loops=["Merge pull request #366 from acme/fix-copy"])
         ep = _episode(cur, raw=later)
         assert close_rules.run(cur, payload=later, episode_id=ep)["closed_pr"] == 1
         row = _row(cur, cid)
@@ -210,10 +215,13 @@ def test_will_merge_in_a_later_capture_does_not_count(hub):  # noqa: F811
         # The nightly reads the same capture from the episodes table.
         close_rules.run(cur)
         assert _row(cur, cid)["status"] == "open"
-    assert close_rules.capture_pr_states(["PR #366 merged", "closed #367", "merged PR #368"]) == {
-        366: "merged", 367: "closed", 368: "merged"}
-    assert close_rules.capture_pr_states(["will merge #366", "before #366 merges",
-                                          "we have not merged PR #366", "PR #366 will be merged"]) == {}
+    assert close_rules.capture_pr_states([
+        "Merge pull request #366 from acme/fix-copy", "✓ Closed pull request acme/widget#367",
+        "a1b2c3d Merge pull request #368 from acme/docs\n✓ Squashed and merged pull request #369 (Docs)",
+    ]) == {366: "merged", 367: "closed", 368: "merged", 369: "merged"}
+    assert close_rules.capture_pr_states(["will merge #366", "before #366 merges", "PR #366 merged",
+                                          "we have not merged PR #366", "PR #366 will be merged",
+                                          "closed #367", "merged PR #368"]) == {}
 
 
 def test_a_ledger_row_naming_the_pr_as_verified_closes_it(hub):  # noqa: F811
@@ -456,3 +464,168 @@ def test_gh_is_found_in_the_install_folders_when_not_on_path(hub, monkeypatch, t
         assert close_rules.run(cur)["closed_pr"] == 1
         assert _row(cur, cid)["status"] == "closed"
     assert _calls(log) == ["pr view 41 --repo acme/widget --json state,mergedAt"]
+
+
+# ---- the review's probes: one evidence record per repository and number ----
+
+def test_stale_runner_summary_is_not_close_evidence(monkeypatch):
+    """A Work source marked stale must not auto-close from cached contents."""
+    monkeypatch.setattr(work, "settings", lambda: {"work_projects": [{"project": "acme/widget"}]})
+    monkeypatch.setattr(
+        work,
+        "read_source",
+        lambda entry, cfg, now: {"state": "stale", "contents": {"prs": [{"id": "41", "stage": "closed"}]}},
+    )
+    assert close_rules._runner_states("acme/widget") == {}
+
+
+def test_two_linked_repositories_with_same_pr_number_do_not_collapse(monkeypatch):
+    """Every named PR must be independently evidenced, even when numbers collide."""
+    class Github:
+        def state(self, repo, number):
+            # Only the second repository's PR is done.
+            return ("merged", None) if repo == "second/repo" and number == 41 else ("open", None)
+
+    monkeypatch.setattr(close_rules, "_runner_states", lambda project: {})
+    monkeypatch.setattr(close_rules, "_ledger_states", lambda cur, project: {})
+    monkeypatch.setattr(close_rules, "_episode_states", lambda cur, project, after: {})
+    text = (
+        "Follow https://github.com/first/repo/pull/41 and "
+        "https://github.com/second/repo/pull/41 before release"
+    )
+    item = {
+        "id": 1, "text": text, "project": "not-a-repository", "kind": "blocker",
+        "opened_episode": 1, "prs": close_rules.parse_prs(text), "reopened": [], "pr_check": {},
+    }
+    report = {"closed_pr": 0, "kept_open_reopened": 0}
+    planned = {}
+    close_rules._pr_rule(None, [item], report, payload=None, episode_id=None, github=Github(), sink=planned)
+    assert planned == {}
+    assert report["closed_pr"] == 0
+
+
+def test_question_about_merge_is_not_capture_close_evidence():
+    """Unanswered status questions must not be read as a past-tense fact."""
+    assert close_rules.capture_pr_states(["Was PR #366 merged?"]) == {}
+
+
+def test_a_question_is_never_evidence_on_any_close_path():
+    assert close_rules.evidence_problem("Was PR #366 merged?", "Land PR #366") == "a question is not evidence"
+    assert close_rules.evidence_problem("Did we rebuild the deployment index", "Rebuild the deployment index")
+    assert close_rules.evidence_problem("PR #366 merged", "Land PR #366")
+    assert close_rules.evidence_problem("Merge pull request #366 from acme/x", "Land PR #366") is None
+    assert close_rules.evidence_problem("Rebuilt the deployment index", "Rebuild the deployment index") is None
+
+
+def test_a_reopened_pr_revokes_the_earlier_merge_line(hub):  # noqa: F811
+    conn = _migrated(hub)
+    with conn.cursor() as cur:
+        cid = _open(cur, "Implement the two fixes before PR #366 can merge", "blocker")
+        _episode(cur, raw=dict(BASE, closed_loops=["Merge pull request #366 from acme/fix-copy"]))
+        _episode(cur, raw=dict(BASE, closed_loops=["✓ Reopened pull request acme/widget#366"]))
+        assert close_rules.run(cur)["closed_pr"] == 0
+        row = _row(cur, cid)
+        assert row["status"] == "open"
+        assert row["pr_check"]["waiting"]["366"].startswith("still open (from a later conversation)")
+
+
+def test_a_runner_reading_newer_than_a_merge_line_wins(hub, monkeypatch, tmp_path):  # noqa: F811
+    conn = _migrated(hub)
+    with conn.cursor() as cur:
+        cid = _open(cur, "Follow up on PR #12 with the docs change")
+        cur.execute("INSERT INTO episodes (ts, summary, raw, project) VALUES (now() - interval '1 day', "
+                    "'Merge pull request #12 from acme/docs', '{}'::jsonb, %s)", (PROJECT,))
+        _runner(monkeypatch, tmp_path, [(12, "fixing")])
+        assert close_rules.run(cur)["closed_pr"] == 0
+        assert _row(cur, cid)["status"] == "open"
+
+
+# ---- every close path: one guarded write, one evidence check ----------------
+
+def _episode_in(cur, session_id) -> int:
+    cur.execute("INSERT INTO episodes (ts, summary, raw, project, session_id) VALUES (now(), %s, '{}'::jsonb, "
+                "%s, %s) RETURNING id", (f"episode {next(_EPISODES)}", PROJECT, session_id))
+    return int(cur.fetchone()[0])
+
+
+def test_reopened_legacy_auto_close_does_not_reclose_on_same_evidence(hub):  # noqa: F811
+    """The plan's reopen guarantee applies to existing closed-loop matching."""
+    conn = _migrated(hub)
+    with conn.cursor() as cur:
+        cid = _open(cur, "Rebuild the deployment index")
+        payload = dict(BASE, closed_loops=[{"text": "done: Rebuild the deployment index", "commitment_id": cid}])
+        with mock.patch.object(co, "_has_commitment_embeddings", return_value=False):
+            assert co.auto_close(cur, payload, episode_id=_episode(cur)) == 1
+            assert co.set_status(cur, cid, "open")
+            assert co.auto_close(cur, payload, episode_id=_episode(cur)) == 0
+        assert _row(cur, cid)["status"] == "open"
+
+
+def test_a_question_closed_loop_does_not_close_by_text(hub):  # noqa: F811
+    conn = _migrated(hub)
+    with conn.cursor() as cur:
+        cid = _open(cur, "Land PR #366 after the second review")
+        payload = dict(BASE, closed_loops=["done: Land PR #366 after the second review?",
+                                           "done: PR #366 merged after the second review"])
+        with mock.patch.object(co, "_has_commitment_embeddings", return_value=False):
+            assert co.auto_close(cur, payload, episode_id=_episode(cur)) == 0
+        assert _row(cur, cid)["status"] == "open"
+
+
+def test_session_end_close_records_rule_author_after_0034(hub):  # noqa: F811
+    """The older session-end automatic close must remain auditable too, and
+    is not repeated on an item the owner reopened."""
+    conn = _migrated(hub)
+    with conn.cursor() as cur:
+        ep = _episode_in(cur, "codex:s")
+        cur.execute("INSERT INTO commitments (text, project, owner, kind, opened_episode, status, content_hash) "
+                    "VALUES ('Rebuild the deployment index', %s, 'assistant', 'followup', %s, 'open', 'h-s') "
+                    "RETURNING id", (PROJECT, ep))
+        cid = int(cur.fetchone()[0])
+        end = {"session_id": "codex:s", "event": "sessionend", "project": PROJECT}
+        assert co.close_session_plan(cur, end, episode_id=_episode_in(cur, "codex:s")) == 1
+        row = _row(cur, cid)
+        assert row["closed_by"] == co.BY_RULE and row["close_rule_key"] == "session-ended:codex:s"
+        assert co.set_status(cur, cid, "open")
+        assert co.close_session_plan(cur, end, episode_id=_episode_in(cur, "codex:s")) == 0
+
+
+def _functions_that(pattern, *, calls=None):
+    """``{(module, function)}`` in the khipu package whose own body writes
+    ``pattern`` (or, with ``calls``, calls that name)."""
+    import ast
+    import re as _re
+    from pathlib import Path
+
+    found = set()
+    for path in sorted((Path(co.__file__).parent).glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            inner = {id(n) for sub in ast.walk(fn) if sub is not fn
+                     and isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) for n in ast.walk(sub)}
+            for node in ast.walk(fn):
+                if id(node) in inner:
+                    continue
+                if calls is not None and isinstance(node, ast.Call):
+                    f = node.func
+                    name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
+                    if name == calls:
+                        found.add((path.stem, fn.name))
+                if calls is None and isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                        and _re.search(pattern, node.value):
+                    found.add((path.stem, fn.name))
+    return found
+
+
+def test_every_close_path_goes_through_the_one_guarded_close():
+    """Every write that closes an item is ``close_by_rule`` (the reopen guard
+    and the rule's author), a hand close (``set_status``), or the forget of an
+    episode. A new close path fails here until it uses ``close_by_rule``."""
+    writes = _functions_that(r"SET\s+status\s*=\s*'closed'")
+    assert writes == {("commitments", "close_by_rule"), ("forget", "forget_episode")}, writes
+    callers = _functions_that(None, calls="close_by_rule")
+    assert {("close_rules", "_close"), ("commitments", "auto_close"), ("commitments", "close_session_plan"),
+            ("commitments", "open_from_episode"), ("owed_tidy", "apply")} <= callers, callers
+    assert {m for m, _ in callers} >= {"hygiene"}, callers

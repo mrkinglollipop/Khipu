@@ -1049,16 +1049,9 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             # Closed before the insert: an identical text shares the open
             # (project, content_hash) slot the unique index guards. The
             # reason names the new row once it exists (below).
-            cur.execute(
-                f"""
-                UPDATE commitments
-                SET status = 'closed', closed_episode = %s, closed_at = now(),
-                    close_reason = %s
-                WHERE id = %s AND status = 'open'
-                  AND {_not_forgotten_clause(cur)}
-                """,
-                (episode_id, "relayed-by a conversation item", rid),
-            )
+            close_by_rule(cur, rid, reason="relayed-by a conversation item",
+                          key=evidence_key("relayed-by", norm["text"]), episode=episode_id,
+                          evidence={"rule": "relayed-by", "text": norm["text"][:300]})
         due_sql, due_param = _parse_due_after(norm["due_after"])
         stored_text = norm["text"]
         due_phrase = str(norm["due_after"] or "").strip()
@@ -1272,6 +1265,51 @@ def completion_match(text: str, row_text: str, *, kind: str, threshold: float,
     return score, via, False
 
 
+def evidence_key(rule: str, text: str) -> str:
+    """A close rule key for evidence that is a piece of text: the same words
+    give the same key, so a reopened item is not closed again by them."""
+    norm = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    return f"{rule}:{hashlib.sha256(norm.encode('utf-8')).hexdigest()[:16]}"
+
+
+def evidence_problem(text: str, item_text: str = "") -> str | None:
+    """Why ``text`` is not evidence that closes an item reading
+    ``item_text`` (``khipu.close_rules.evidence_problem``, the one check every
+    close path shares), or None."""
+    from khipu.close_rules import evidence_problem as check
+
+    return check(text, item_text)
+
+
+def close_by_rule(cur, commitment_id: int, *, reason: str, key: str, evidence: dict | None = None,
+                  episode: int | None = None, set_extra: str = "", extra_params: tuple = ()) -> bool:
+    """The one write every automatic close goes through (the PR and decision
+    rules, the closed-loop match, the session-end close, the relay close, the
+    hygiene re-judge and the clean-up's apply). It records the reason, who
+    closed it (:data:`BY_RULE`), the rule ``key`` and the ``evidence``, and it
+    refuses an item the owner reopened after that same key closed it
+    (``reopened_rule_keys``). Hand closes are :func:`set_status`; a forgotten
+    episode's items are closed by ``khipu.forget``. On a hub before migration
+    0034 there is no key to remember, so only the reason is written."""
+    reason = str(reason or "")[:300]
+    if _close_columns_ready(cur):
+        cur.execute(
+            "UPDATE commitments SET status = 'closed', closed_at = now(), closed_episode = %s, "
+            f"close_reason = %s, closed_by = %s, close_rule_key = %s, close_evidence = %s::jsonb{set_extra} "
+            "WHERE id = %s AND status = 'open' AND NOT (%s = ANY(reopened_rule_keys)) "
+            f"AND {_not_forgotten_clause(cur)}",
+            (episode, reason, BY_RULE, key, json.dumps(evidence or {}), *extra_params, commitment_id, key),
+        )
+    else:
+        cur.execute(
+            "UPDATE commitments SET status = 'closed', closed_at = now(), closed_episode = %s, "
+            f"close_reason = %s{set_extra} WHERE id = %s AND status = 'open' "
+            f"AND {_not_forgotten_clause(cur)}",
+            (episode, reason, *extra_params, commitment_id),
+        )
+    return cur.rowcount > 0
+
+
 def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
     """Match every closed_loop / done-decision against this scope's open
     commitments (``scope``: project, else parent_session_id/session_id — fix
@@ -1327,17 +1365,15 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
                 tied = True
         if best_id is None or tied or (best_via == "cosine" and semantic_matches > 1):
             continue
-        cur.execute(
-            f"""
-            UPDATE commitments
-            SET status = 'closed', closed_episode = %s, closed_at = now(),
-                close_reason = %s
-            WHERE id = %s AND status = 'open'
-              AND {_not_forgotten_clause(cur)}
-            """,
-            (episode_id, f"{best_via} match ({best_score:.2f}): {text[:200]!r}", best_id),
-        )
-        if cur.rowcount > 0:
+        best_text = next(r["text"] for r in open_rows if r["id"] == best_id)
+        why_not = evidence_problem(text, best_text)
+        if why_not:
+            _log(f"kept commitment {best_id} open: {why_not}")
+            continue
+        if close_by_rule(cur, best_id, reason=f"{best_via} match ({best_score:.2f}): {text[:200]!r}",
+                         key=evidence_key("loop", text), episode=episode_id,
+                         evidence={"rule": "loop", "text": text[:300], "match": best_via,
+                                   "score": round(best_score, 3)}):
             already_closed.add(best_id)
             closed += 1
             _log(f"closed commitment {best_id} via {best_via} ({best_score:.2f}) at episode {episode_id}")
@@ -1487,25 +1523,19 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
             # mentions as finished is retired. A future-trigger row is never
             # closed by the sessionend itself.
             hit = next(
-                (m for m in mentions if _match_score(m, row["text"]) >= DONE_MATCH_MIN_SCORE),
+                (m for m in mentions if _match_score(m, row["text"]) >= DONE_MATCH_MIN_SCORE
+                 and not evidence_problem(m, row["text"])),
                 None,
             )
             if hit is None:
                 continue
             reason = f"session-plan (mentioned): {hit[:150]!r}"
+            key, evidence = evidence_key("session-plan", hit), {"rule": "session-plan", "text": hit[:300]}
         else:
             continue
-        cur.execute(
-            f"""
-            UPDATE commitments
-            SET status = 'closed', closed_episode = %s, closed_at = now(),
-                close_reason = %s
-            WHERE id = %s AND status = 'open'
-              AND {_not_forgotten_clause(cur)}
-            """,
-            (episode_id, reason, row["id"]),
-        )
-        if cur.rowcount > 0:
+        if reason == "session-ended":
+            key, evidence = f"session-ended:{session_id}", {"rule": "session-ended", "session_id": session_id}
+        if close_by_rule(cur, row["id"], reason=reason, key=key, evidence=evidence, episode=episode_id):
             closed += 1
     if closed:
         _log(f"closed {closed} session-end commitment(s) for {session_id}")
