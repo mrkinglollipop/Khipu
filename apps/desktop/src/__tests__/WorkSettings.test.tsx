@@ -136,6 +136,25 @@ describe("Settings, Work", () => {
     await waitFor(() => expect(setCalls("khipu_ledger_project_set")).toContainEqual({ project: "acme/atlas", name: "Atlas app", hidden: null }));
   });
 
+  it("lists the Work tab's projects even when the ledger has none (the installed app said No projects yet)", async () => {
+    projects = [];
+    const state = work();
+    (state.data as unknown as { waiting: unknown[] }).waiting = [
+      { source: "commitment", key: "c1", project: "acme/church", id: "1", title: "a", kind: "blocker", since: ago(60), blocking: true, actions: [], masked: false },
+      { source: "commitment", key: "c2", project: "acme/church", id: "2", title: "b", kind: "followup", since: ago(60), blocking: false, actions: [], masked: false },
+      { source: "commitment", key: "c3", project: null, id: "3", title: "c", kind: "followup", since: ago(60), blocking: false, actions: [], masked: false },
+      { source: "commitment", key: "c4", project: null, id: "4", title: null, kind: "blocker", since: ago(60), blocking: true, actions: [], masked: true },
+    ];
+    render(<WorkSettings active work={state} />);
+    const list = await screen.findByRole("list", { name: "Projects on the Work tab with no ledger rows" });
+    expect(screen.queryByText("No projects yet.")).toBeNull();
+    expect(within(list).getByText("church")).toBeInTheDocument();
+    expect(within(list).getByText("2 waiting on you")).toBeInTheDocument();
+    expect(within(list).getByText("acme/atlas")).toBeInTheDocument();
+    expect(within(list).getByText("acme/quarry")).toBeInTheDocument();
+    expect(screen.getByText("Also waiting on you: 1 under Name withheld and 1 under No project.")).toBeInTheDocument();
+  });
+
   it("shows each summary file's state and turns one off, on and removes it", async () => {
     render(<WorkSettings active work={work()} />);
     const list = await screen.findByRole("list", { name: "Summary files" });

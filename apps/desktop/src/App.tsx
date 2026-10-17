@@ -71,7 +71,7 @@ import {
   GraphBackupRemoteCard,
   HubAwayCard,
 } from "./SettingsControls";
-import { HealthChecksCard } from "./HealthChecksCard";
+import { type DiskSpace, HealthChecksCard } from "./HealthChecksCard";
 import {
   launchWhatsNew,
   recordVersionOnSetupFinish,
@@ -5993,7 +5993,11 @@ export default function App() {
 
                     <JobsCard active={tab === "settings" && settingsSection === "advanced"} />
 
-                    <HealthChecksCard active={tab === "settings" && settingsSection === "advanced"} />
+                    <HealthChecksCard
+                      active={tab === "settings" && settingsSection === "advanced"}
+                      diskSpace={doctorParsed?.disk_space as DiskSpace}
+                      onOpenStorageReport={() => setStorageReportOpen(true)}
+                    />
 
                     <RawJson
                       text={settingsRawText}

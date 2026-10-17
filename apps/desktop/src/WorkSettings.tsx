@@ -10,7 +10,7 @@ import { type FormEvent, useCallback, useEffect, useId, useRef, useState } from 
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { type ConfigShape, callCli } from "./settingsCli";
 import { type LimitUnit, limitWords } from "./routingWords";
-import { type WorkBoard, type WorkState, plural, shortProject, sourceLine } from "./work";
+import { type WorkBoard, type WorkState, type WorkView, NO_PROJECT, WITHHELD, plural, shortProject, sourceLine } from "./work";
 import "./Work.css";
 
 type Setting = { value: unknown; default: unknown; source?: string };
@@ -184,10 +184,52 @@ function ProjectRow({ p, w }: { p: LedgerProject; w: Writes }) {
   );
 }
 
-function ProjectsSection({ projects, error, w }: { projects: LedgerProject[] | null; error: string | null; w: Writes }) {
+/** A project the Work tab shows (a board, or the project of an item waiting
+ *  on you) that has no ledger row yet: Owed alone can name one. */
+export type WorkOnlyProject = { project: string; name: string; waiting: number };
+
+/** The Work tab's projects that the ledger doesn't list, named as the Work
+ *  tab names them, and how many waiting items have no project or a withheld
+ *  one (the tab's "No project" and "Name withheld" chips). */
+export function workOnlyProjects(view: WorkView | null | undefined, ledger: LedgerProject[]): {
+  projects: WorkOnlyProject[];
+  unnamed: { withheld: number; none: number };
+} {
+  const known = new Set(ledger.map((p) => p.project));
+  const found = new Map<string, WorkOnlyProject>();
+  const unnamed = { withheld: 0, none: 0 };
+  const nameOf = (project: string) => {
+    const board = view?.projects.find((b) => b.project === project);
+    return board?.name ?? shortProject(project);
+  };
+  for (const b of view?.projects ?? []) {
+    if (b.project && !known.has(b.project) && !found.has(b.project)) found.set(b.project, { project: b.project, name: nameOf(b.project), waiting: 0 });
+  }
+  for (const item of view?.waiting ?? []) {
+    if (!item.project) {
+      if (item.source === "ledger" || item.masked) unnamed.withheld += 1;
+      else if (item.source !== "routing") unnamed.none += 1;
+      continue;
+    }
+    if (known.has(item.project)) continue;
+    const got = found.get(item.project) ?? { project: item.project, name: nameOf(item.project), waiting: 0 };
+    got.waiting += 1;
+    found.set(item.project, got);
+  }
+  const projects = [...found.values()].sort((a, b) => b.waiting - a.waiting || a.name.localeCompare(b.name));
+  return { projects, unnamed };
+}
+
+function ProjectsSection({ projects, error, view, w }: { projects: LedgerProject[] | null; error: string | null; view: WorkView | null; w: Writes }) {
+  const others = workOnlyProjects(view, projects ?? []);
+  const unnamedWords = [
+    others.unnamed.withheld ? `${others.unnamed.withheld.toLocaleString()} under ${WITHHELD.name}` : "",
+    others.unnamed.none ? `${others.unnamed.none.toLocaleString()} under ${NO_PROJECT}` : "",
+  ].filter(Boolean);
+  const empty = projects !== null && projects.length === 0 && others.projects.length === 0;
   return (
     <div className="section-card">
-      <div className="section-head">Projects in the ledger</div>
+      <div className="section-head">Projects</div>
       <div className="section-body">
         {error ? (
           <p className="set-error" role="alert">
@@ -195,16 +237,36 @@ function ProjectsSection({ projects, error, w }: { projects: LedgerProject[] | n
           </p>
         ) : projects === null ? (
           <p className="set-help">Reading the ledger…</p>
-        ) : projects.length === 0 ? (
+        ) : empty ? (
           <p className="set-help">No projects yet.</p>
-        ) : (
+        ) : null}
+        {projects?.length ? (
           <div className="rows" role="list" aria-label="Ledger projects">
             {projects.map((p) => (
               <ProjectRow key={p.project} p={p} w={w} />
             ))}
           </div>
-        )}
-        <p className="set-help">A project appears when its first row is added. Hide only takes a project off the Work tab; its rows stay.</p>
+        ) : null}
+        {others.projects.length ? (
+          <div className="rows" role="list" aria-label="Projects on the Work tab with no ledger rows">
+            {others.projects.map((p) => (
+              <div key={p.project} className="row-item wk-proj-row" role="listitem">
+                <span className="wk-proj-name">{p.name}</span>
+                <span className="wk-proj-what">
+                  <span>{p.waiting ? `${p.waiting.toLocaleString()} waiting on you` : "Reported by its job runner"}</span>
+                  <span className="set-help">No ledger rows yet. Rename and Hide come with its first row.</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {unnamedWords.length ? (
+          <p className="set-help">Also waiting on you: {unnamedWords.join(" and ")}.</p>
+        ) : null}
+        <p className="set-help">
+          These are the projects the Work tab shows. A project joins the ledger when its first row is added. Hide only takes a project off the Work
+          tab; its rows stay.
+        </p>
       </div>
     </div>
   );
@@ -761,7 +823,7 @@ export function WorkSettings({ active, work }: { active: boolean; work: WorkStat
           Khipu couldn't read its settings: {cfgError}
         </p>
       ) : null}
-      <ProjectsSection projects={projects} error={projectsError} w={w} />
+      <ProjectsSection projects={projects} error={projectsError} view={work.data ?? null} w={w} />
       {/* Import a tracker…, Last import and Old tracker files sit here (the
           mock's second card). They are built on the docs/owed-and-ledger-ssot
           branch with the ledger inbox; this page leaves their place. */}

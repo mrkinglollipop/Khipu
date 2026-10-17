@@ -203,3 +203,26 @@ describe("promotionAttention", () => {
     expect(promotionAttention(null)).toEqual([]);
   });
 });
+
+describe("HealthChecksCard: the Storage section's disk row (slice 8)", () => {
+  it("always shows the disk row with an Open storage report button, not only when the disk is low", async () => {
+    const open = vi.fn();
+    render(
+      <HealthChecksCard
+        active
+        diskSpace={{ level: "ok", message: "303.0 GB is free on the disk that holds Khipu's data." }}
+        onOpenStorageReport={open}
+      />,
+    );
+    expect(await screen.findByText("Disk space")).toBeInTheDocument();
+    expect(screen.getByText("Plenty of room. 303.0 GB is free on the disk that holds Khipu's data.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open storage report" }));
+    expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  it("says when doctor hasn't checked the disk and still offers the report", async () => {
+    render(<HealthChecksCard active diskSpace={null} onOpenStorageReport={() => {}} />);
+    expect(await screen.findByText("Doctor hasn't checked the disk yet. The storage report checks it now.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open storage report" })).toBeInTheDocument();
+  });
+});
