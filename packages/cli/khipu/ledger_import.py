@@ -631,6 +631,12 @@ def _import_in(cur, project: str, src: dict[str, Any], report: dict[str, Any], *
     existing = ledger._vocab(cur, project)
     if src["digest"] in {d for d, _r in landed}:
         return {**report, "result": "nothing new", "words": "Nothing new: every row and history entry is already here."}
+    if catch_up and report.get("in_inbox"):
+        # Scope (e)(3): a copy in the inbox never changes, so the switch from
+        # a login folder is a hard cut and a copy has no catch-up.
+        return {**report, "ok": False, "result": "refused", "reason": "inbox_copy",
+                "words": "This is a copy in the ledger inbox, and a copy is never caught up: the switch from a "
+                         "login folder is a hard cut. Keep working in the ledger itself."}
     if catch_up and not landed:
         return {**report, "ok": False, "result": "refused", "reason": "no_import",
                 "words": f"Nothing was imported into {project} yet, so there is nothing to catch up."}
@@ -643,10 +649,12 @@ def _import_in(cur, project: str, src: dict[str, Any], report: dict[str, Any], *
         if plan["result"] == "nothing new":
             return plan
         taken = sorted(here)
+        hint = ("A copy in the ledger inbox is never caught up; keep working in the ledger itself."
+                if report.get("in_inbox") else
+                "If this tracker was imported before and changed since, bring the changes in with --catch-up; "
+                "otherwise choose a different project or a new one.")
         return {**report, "ok": False, "result": "refused", "reason": "exists", "existing_ids": taken,
-                "words": f"Nothing was imported: these ids already exist in {project}: {_listed(taken)}. If this "
-                         "tracker was imported before and changed since, bring the changes in with --catch-up; "
-                         "otherwise choose a different project or a new one."}
+                "words": f"Nothing was imported: these ids already exist in {project}: {_listed(taken)}. {hint}"}
     if purged:
         gone = sorted(purged)
         return {**report, "ok": False, "result": "refused", "reason": "purged", "purged_ids": gone,

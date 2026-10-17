@@ -992,3 +992,33 @@ def test_the_app_import_of_a_file_in_a_fake_login_folder_shows_the_plain_refusal
     for dry_run in (True, False):
         rc, report = _app_import(path, dry_run=dry_run)
         assert rc == 1 and report == {"ok": False, "error": APP_REFUSAL, "reason": "refused"}, report
+
+
+# ---- the third cross-family review's probe: an inbox copy has no catch-up ----
+
+def test_inbox_copy_refuses_catch_up_before_any_catch_up_work(monkeypatch):
+    """Scope (e)(3): copied inbox trackers have no catch-up path."""
+    from khipu import ledger, ledger_import
+
+    class Cursor:
+        def execute(self, _sql, _params=()):
+            pass
+
+        def fetchall(self):
+            return [("already-imported", "done")]
+
+    called = []
+    monkeypatch.setattr(ledger_import, "_existing", lambda *_args: ({}, {}))
+    monkeypatch.setattr(ledger, "_vocab", lambda *_args: {"state": [], "kind": []})
+    monkeypatch.setattr(
+        ledger_import,
+        "_catch_up",
+        lambda *_args, **_kw: called.append(True) or {"result": "caught up"},
+    )
+    src = {"rows": {}, "digest": "changed-copy"}
+    report = {"in_inbox": True}
+
+    result = ledger_import._import_in(Cursor(), "project", src, report, dry_run=False, catch_up=True)
+
+    assert result["result"] == "refused"
+    assert called == []
