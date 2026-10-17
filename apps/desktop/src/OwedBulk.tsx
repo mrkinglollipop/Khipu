@@ -209,6 +209,8 @@ export type TidyPlan = {
     keep_other: number;
     move: { total: number; agent: number; assistant: number; user: number };
     close: { total: number; pr: number; decision: number; duplicate: number };
+    /** A part of stay_user: changes only suggested for your own items, never applied. */
+    proposed?: { total: number; move: number; close: number };
   };
   model?: { used?: boolean; calls?: number; cap?: number; candidates?: number; unjudged?: number };
   samples?: Partial<Record<string, Sample[]>>;
@@ -220,6 +222,7 @@ type UndoAnswer = { ok?: boolean; restored?: number; left_alone?: unknown[] };
 
 const SAMPLE_GROUPS: ReadonlyArray<readonly [string, string]> = [
   ["stay_user", "Examples that stay yours"],
+  ["proposed", "Suggested changes to your own items"],
   ["move", "Examples that move"],
   ["close_pr", "Examples closed because their pull requests merged"],
   ["close_decision", "Examples a decision settled"],
@@ -413,6 +416,19 @@ export function OwedTidyDialog({
                 </span>
                 <span className="mono">{n(t.close.total)}</span>
               </div>
+              {t.proposed?.total ? (
+                <div className="row">
+                  <span className="grow">
+                    Of yours, with a suggested change
+                    <span className="meta">
+                      {" "}
+                      {n(t.proposed.move)} to move, {n(t.proposed.close)} to close. Applying changes none of them; you
+                      decide each one in Owed.
+                    </span>
+                  </span>
+                  <span className="mono">{n(t.proposed.total)}</span>
+                </div>
+              ) : null}
               <div className="row">
                 <span className="grow">Kept for others as they are</span>
                 <span className="mono">{n(t.keep_other)}</span>
