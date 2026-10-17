@@ -263,6 +263,58 @@ describe("Owed, many at once", () => {
   });
 });
 
+describe("Owed, looks done", () => {
+  const done = (id: number, reason: string) =>
+    item(id, "user", { text: `Done-looking ${id}`, looks_done: { rule: "pr", reason, evidence: null }, group: "Looks done" });
+  const rows = () => [
+    done(9, "pull request #41 merged (from the runner's summary)"),
+    done(8, "pull request #40 merged"),
+    item(7, "user", { text: "Still active" }),
+    item(6, "user", { text: "Quiet one", quiet_weeks: 3 }),
+  ];
+
+  it("lists a Looks done group with its count, ahead of the rest, without duplicates", async () => {
+    serve(pager(rows()));
+    await openWork();
+    const looks = await waitFor(() => group(/^Looks done$/));
+    expect(within(looks).getByText("2")).toBeInTheDocument();
+    expect(within(looks).getByText("Done-looking 9")).toBeInTheDocument();
+    expect(within(looks).getByText("Looks done: pull request #41 merged (from the runner's summary)")).toBeInTheDocument();
+    const needsAll = group(/^Needs you$/);
+    expect(within(needsAll).getAllByText("Done-looking 9")).toHaveLength(1);
+    expect(within(needsAll).getAllByText("Done-looking 8")).toHaveLength(1);
+    expect(within(looks).queryByText("Still active")).toBeNull();
+    const needs = group(/^Needs you$/);
+    const order = Array.from(needs.querySelectorAll(".owed-row")).map((r) => r.textContent ?? "");
+    const at = (t: string) => order.findIndex((x) => x.includes(t));
+    expect(at("Done-looking 9")).toBeLessThan(at("Still active"));
+    expect(at("Still active")).toBeLessThan(at("Quiet one"));
+  });
+
+  it("Close on one row closes just that id with its reason", async () => {
+    serve(pager(rows()), { khipu_owed_change: () => ({ ok: true, results: [] }) });
+    await openWork();
+    const looks = await waitFor(() => group(/^Looks done$/));
+    const row = within(looks).getByText("Done-looking 8").closest(".owed-row") as HTMLElement;
+    fireEvent.click(within(row).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(callsOf("khipu_owed_change")).toHaveLength(1));
+    expect(callsOf("khipu_owed_change")[0]).toEqual({
+      action: "close", ids: ["8"], reason: "Looked done: pull request #40 merged", to: null, label: null,
+    });
+  });
+
+  it("Close all that look done closes every row in the group in one change", async () => {
+    serve(pager(rows()), { khipu_owed_change: () => ({ ok: true, results: [] }) });
+    await openWork();
+    await waitFor(() => group(/^Looks done$/));
+    fireEvent.click(screen.getByRole("button", { name: "Close all that look done" }));
+    await waitFor(() => expect(callsOf("khipu_owed_change")).toHaveLength(1));
+    expect(callsOf("khipu_owed_change")[0]).toEqual({
+      action: "close", ids: ["9", "8"], reason: "Looked done: closed by you in the app", to: null, label: null,
+    });
+  });
+});
+
 describe("Tidy this list", () => {
   const plan = {
     format: "khipu-owed-tidy-plan", version: 1, project: "acme/atlas", planned_at: "2026-10-16T12:00:00Z",

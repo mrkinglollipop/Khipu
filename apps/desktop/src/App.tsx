@@ -395,6 +395,8 @@ const NAV_ICONS: Record<Exclude<Tab, "first-run" | "revisions">, ReactNode> = {
   ),
 };
 
+const LOOKED_DONE_REASON = "Looked done: closed by you in the app";
+
 /** One row of `khipu owed --json` (khipu.commitments.list_owed). */
 type Commitment = {
   id: number;
@@ -435,6 +437,10 @@ type Commitment = {
   origin?: string | null;
   /** A looser decision match, offered and never applied (design (b)). */
   looks_settled?: string | null;
+  /** An item of the owner's that a rule would have closed: listed as "Looks
+   *  done" and closed only by him (suggest, don't close). */
+  looks_done?: { rule?: string | null; reason?: string | null; evidence?: unknown } | null;
+  group?: string | null;
   /** Whole weeks one of the owner's open items has gone unmentioned. His
    *  items never go stale; the quiet ones list after his active ones. */
   quiet_weeks?: number | null;
@@ -1081,7 +1087,7 @@ function renderHealthRow(
   );
 }
 
-type OwedRowAction = "select" | "unselect" | "settle" | "activity" | "reopen" | "done" | "snooze";
+type OwedRowAction = "select" | "unselect" | "settle" | "closedone" | "activity" | "reopen" | "done" | "snooze";
 
 /** One Owed row. Memoised: a list of thousands re-renders only the rows
  *  whose item, tick or busy state changed. `onAct` is stable. */
@@ -1141,6 +1147,21 @@ const OwedRow = memo(function OwedRow({
               onClick={() => onAct("settle", c)}
             >
               Close as settled
+            </button>
+          </span>
+        ) : null}
+        {c.status !== "closed" && c.looks_done ? (
+          <span className="inline owed-settled">
+            <span className="meta">
+              Looks done{c.looks_done.reason ? `: ${c.looks_done.reason}` : ""}
+            </span>
+            <button
+              type="button"
+              className="sm link"
+              disabled={busy}
+              onClick={() => onAct("closedone", c)}
+            >
+              Close
             </button>
           </span>
         ) : null}
@@ -2711,6 +2732,20 @@ export default function App() {
     [loadOwed, work.load],
   );
 
+  // "Close all that look done" is one bulk change; its button waits for it.
+  const [owedClosingDone, setOwedClosingDone] = useState(false);
+  const closeAllLookingDone = useCallback(
+    async (ids: number[]) => {
+      setOwedClosingDone(true);
+      try {
+        await owedChangeMany("close", ids, LOOKED_DONE_REASON, null, null);
+      } finally {
+        setOwedClosingDone(false);
+      }
+    },
+    [owedChangeMany],
+  );
+
   const [owedFocusKey, setOwedFocusKey] = useState(0);
   const openOwedInWork = useCallback(() => {
     setTab("work");
@@ -3705,6 +3740,7 @@ export default function App() {
   owedActRef.current = (action, c) => {
     if (action === "select" || action === "unselect") toggleOwed([c.id], action === "select");
     else if (action === "settle") void owedChangeMany("close", [c.id], c.looks_settled ?? "", null, null);
+    else if (action === "closedone") void owedChangeMany("close", [c.id], c.looks_done?.reason ? `Looked done: ${c.looks_done.reason}` : LOOKED_DONE_REASON, null, null);
     else if (action === "activity") openInActivity(c.opened_episode ?? 0);
     else if (action === "reopen") void owedWrite(c.id, [`--reopen=${c.id}`]);
     else if (action === "done") void owedWrite(c.id, [`--close=${c.id}`]);
@@ -3716,11 +3752,39 @@ export default function App() {
    *  actions differ (a closed row reopens, an open one closes or snoozes). */
   // The owner's items never go stale: the quiet ones show after the active
   // ones, one group per "Quiet for N weeks", instead of disappearing.
-  const renderNeedsYou = (rows: Commitment[], title: string) => {
+  const renderNeedsYou = (allRows: Commitment[], title: string) => {
+    // Rows that look done list first, in their own group, and nowhere else.
+    const done = allRows.filter((c) => c.looks_done);
+    const rows = allRows.filter((c) => !c.looks_done);
     const active = rows.filter((c) => !c.quiet_weeks);
     const weeks = [...new Set(rows.map((c) => c.quiet_weeks ?? 0).filter((n) => n > 0))].sort((a, b) => a - b);
     return (
       <>
+        {done.length > 0 ? (
+          <Disclosure
+            key="looks-done"
+            className="group"
+            defaultOpen
+            label={
+              <>
+                <strong>Looks done</strong>
+                <span className="nav-count quiet">{done.length.toLocaleString()}</span>
+              </>
+            }
+          >
+            <div className="inline">
+              <button
+                type="button"
+                className="sm"
+                disabled={owedBusyId != null || owedClosingDone}
+                onClick={() => void closeAllLookingDone(done.map((c) => c.id))}
+              >
+                Close all that look done
+              </button>
+            </div>
+            {renderOwedTable(done, "Looks done")}
+          </Disclosure>
+        ) : null}
         {active.length > 0 ? renderOwedTable(active, title) : null}
         {weeks.map((n) => {
           const quiet = rows.filter((c) => c.quiet_weeks === n);
