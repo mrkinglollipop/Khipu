@@ -1481,6 +1481,20 @@ def _capture_candidates() -> list[dict]:
     return out
 
 
+def _latest_capture_issuer(candidate: dict) -> dict:
+    from khipu import owner_turns
+
+    sid = candidate["state"].get("session_id") or candidate["sid"]
+    try:
+        rows = owner_turns._read_lines(owner_turns.session_file(sid))
+        latest = next((r for r in reversed(rows)
+                       if r.get("session") == sid and r.get("harness") == candidate["harness"]), {})
+        issuer = latest.get("issuer")
+        return issuer if isinstance(issuer, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
 def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
                         host_pids: list[int] | None = None,
                         cwd: str | None = None) -> tuple[str, str, str]:
@@ -1492,8 +1506,8 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
     to be a real one. Otherwise the caller is matched to what the hooks
     recorded: the nearest process ancestor it shares with exactly one session
     (an ancestor every session shares says nothing), then the working
-    directory (newest wins), then the only session touched in the last half
-    hour. The caller's own ancestry and directory default to this process's."""
+    directory (only when unique), then the only session touched in the last
+    half hour. The caller's own ancestry and directory default to this process's."""
     if harness and harness not in HARNESSES:
         raise ValueError(f"unknown capture harness {harness!r}; expected one of {', '.join(HARNESSES)}")
     if harness and sid:
@@ -1510,12 +1524,33 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
             "hook has not run once in this session). Pass session_id='<harness>:<id>' "
             "explicitly, or wait for the hook's first run and retry."
         )
+    from khipu import owner_turns
+
+    pids = ancestor_pids() if host_pids is None else host_pids
+    issuers = [(c, _latest_capture_issuer(c)) for c in cands]
+    mismatched = set()
+    # Prompt records stay current even when the capture state has been idle.
+    # The kernel start time binds an issuer to its process, not a reused pid.
+    for pid in pids:
+        recorded = [(c, issuer) for c, issuer in issuers if issuer.get("pid") == pid]
+        if not recorded:
+            continue
+        info = owner_turns._proc_info(pid)
+        holders = [c for c, issuer in recorded if info is not None and issuer.get("start") == info[2]]
+        mismatched.update((c["harness"], c["sid"], pid) for c, issuer in recorded
+                          if info is not None and issuer.get("start") is not None and issuer["start"] != info[2])
+        if len(holders) == 1:
+            return holders[0]["harness"], holders[0]["sid"], "process"
+        if holders and len(holders) < len(cands):
+            break
     # A process id is reused once its owner is gone, so a session that has
     # been quiet for half a day no longer vouches for the ids it recorded.
     now = time.time()
     live = [c for c in cands if now - c["mtime"] <= PROCESS_MATCH_MAX_AGE_S]
-    for pid in (ancestor_pids() if host_pids is None else host_pids):
-        holders = [c for c in live if pid in (c["state"].get("host_pids") or [])]
+    for pid in pids:
+        # A known issuer mismatch cannot become a match through pid-only state.
+        holders = [c for c in live if pid in (c["state"].get("host_pids") or [])
+                   and (c["harness"], c["sid"], pid) not in mismatched]
         if holders and len(holders) < len(live):
             if len(holders) == 1:
                 return holders[0]["harness"], holders[0]["sid"], "process"
@@ -1525,15 +1560,16 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
             cwd = os.getcwd()
         except OSError:
             cwd = ""
+    same = []
     if cwd:
         same = [c for c in cands
                 if _same_dir(c["state"].get("cwd"), cwd)
                 or (not c["state"].get("cwd")
                     and _transcript_project_matches(c["harness"], c["state"].get("transcript_path"), cwd))]
-        if same:
-            best = max(same, key=lambda c: c["mtime"])
+        if len(same) == 1:
+            best = same[0]
             return best["harness"], best["sid"], "cwd"
-    recent = [c for c in cands if now - c["mtime"] <= ONLY_ACTIVE_WINDOW_S]
+    recent = [c for c in cands if now - c["mtime"] <= ONLY_ACTIVE_WINDOW_S] if len(same) < 2 else []
     if len(recent) == 1:
         return recent[0]["harness"], recent[0]["sid"], "only_active"
     names = ", ".join(f"{c['harness']}:{c['sid'][:8]}" for c in sorted(cands, key=lambda c: -c["mtime"]))

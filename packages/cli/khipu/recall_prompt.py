@@ -132,7 +132,7 @@ def _log_path() -> Path:
     return khipu_home() / "logs" / "prompt-recall.log"
 
 
-def _log(msg: str) -> None:
+def _log(msg: str, *, tag: str = "khipu-prompt-recall") -> None:
     """Same stamped-line style as session_capture._log, its own file so a
     per-prompt hook's chatter never interleaves with per-turn capture logs."""
     try:
@@ -140,7 +140,7 @@ def _log(msg: str) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            f.write(f"{stamp} [khipu-prompt-recall] {msg}\n")
+            f.write(f"{stamp} [{tag}] {msg}\n")
     except Exception:  # noqa: BLE001 — logging must never break the hook
         pass
 

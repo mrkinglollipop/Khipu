@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 from khipu import mcp_server as ms
+from khipu import owner_turns as ot
 from khipu import session_capture as sc
 
 
@@ -43,7 +44,66 @@ def _transcript(td: str, name: str) -> Path:
     return p
 
 
+def _owner_turn(sid: str, pid: int, start: float, *, harness: str = "claude_code") -> None:
+    path = ot.session_file(sid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"session": sid, "harness": harness,
+                             "issuer": {"pid": pid, "start": start, "exe": "claude"}}) + "\n")
+
+
 class ResolverTest(unittest.TestCase):
+    def test_owner_turn_issuer_resolves_a_session_with_stale_capture_state(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            _state("claude_code", "older", cwd=td, host_pids=[20, 99], age_s=3 * 86400)
+            _state("claude_code", "newer", cwd=td, host_pids=[10, 99], age_s=2 * 86400)
+            _owner_turn("older", 20, 100.25)
+            _owner_turn("newer", 10, 101.5)
+            with mock.patch.object(ot, "_proc_info", return_value=(99, "/bin/claude", 100.25)):
+                self.assertEqual(sc.resolve_session_ref(host_pids=[20, 99], cwd=td),
+                                 ("claude_code", "older", "process"))
+
+    def test_shared_cwd_without_process_evidence_refuses_even_when_only_one_is_recent(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            _state("claude_code", "older", cwd=td, age_s=3 * 86400)
+            _state("claude_code", "newer", cwd=td)
+            with self.assertRaisesRegex(ValueError, "cannot tell which session is yours"):
+                sc.resolve_session_ref(host_pids=[], cwd=td)
+
+    def test_a_single_session_in_the_cwd_still_resolves_with_stale_state(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            _state("claude_code", "only", cwd=td, age_s=3 * 86400)
+            self.assertEqual(sc.resolve_session_ref(host_pids=[], cwd=td),
+                             ("claude_code", "only", "cwd"))
+
+    def test_a_reused_pid_does_not_match_even_with_recent_host_pids(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            _state("claude_code", "older", cwd=td, host_pids=[20])
+            _state("claude_code", "newer", cwd=td)
+            _owner_turn("older", 20, 100.25)
+            with mock.patch.object(ot, "_proc_info", return_value=(99, "/bin/claude", 101.5)):
+                with self.assertRaisesRegex(ValueError, "cannot tell which session is yours"):
+                    sc.resolve_session_ref(host_pids=[20], cwd=td)
+
+    def test_a_historical_issuer_is_not_used_instead_of_the_latest(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            _state("claude_code", "older", cwd=td, age_s=3 * 86400)
+            _state("claude_code", "newer", cwd=td)
+            _owner_turn("older", 20, 100.25)
+            _owner_turn("older", 30, 101.5)
+            with mock.patch.object(ot, "_proc_info", return_value=(99, "/bin/claude", 100.25)):
+                with self.assertRaisesRegex(ValueError, "cannot tell which session is yours"):
+                    sc.resolve_session_ref(host_pids=[20], cwd=td)
+
+    def test_an_issuer_of_another_harness_is_not_process_evidence(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            _state("claude_code", "older", cwd=td, age_s=3 * 86400)
+            _state("claude_code", "newer", cwd=td)
+            _owner_turn("older", 20, 100.25, harness="codex")
+            with mock.patch.object(ot, "_proc_info", return_value=(99, "/bin/claude", 100.25)):
+                with self.assertRaisesRegex(ValueError, "cannot tell which session is yours"):
+                    sc.resolve_session_ref(host_pids=[20], cwd=td)
+
     def test_the_recall_dedup_file_is_never_a_session_even_when_newest(self):
         with tempfile.TemporaryDirectory() as td, _home(td):
             _state("claude_code", "aaaaaaaa1111", age_s=60)

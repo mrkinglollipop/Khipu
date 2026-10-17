@@ -11,10 +11,13 @@ from __future__ import annotations
 import io
 import json
 import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest import mock
 
+from khipu import recall_prompt as rp
 from khipu import recall_rule as rr
 
 
@@ -72,6 +75,67 @@ class RuleTextTest(unittest.TestCase):
         for f in ("kind", "project", "since", "session_id", "harness"):
             with self.subTest(filter=f):
                 self.assertIn(f, rr.RULE_MD)
+
+
+class SessionStartLogTest(unittest.TestCase):
+    def setUp(self):
+        td = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": td, "KHIPU_CAPTURE_HOME": str(Path(td) / "kh"),
+                                                     "KHIPU_HARNESS": "claude_code"}))
+        self.path = Path(td) / "prompt-recall.log"
+        self.enterContext(mock.patch.object(rp, "_log_path", return_value=self.path))
+        self.payload = {"session_id": "session-a", "cwd": td, "source": "startup"}
+        self.enterContext(mock.patch.object(rr, "_session_start_payload", return_value=self.payload))
+        self.context = self.enterContext(mock.patch.object(rr, "session_start_context", return_value="memory \u2603"))
+        self.routing = self.enterContext(mock.patch.object(rr, "_RoutingAtStart")).return_value.begin.return_value
+        self.routing.text.return_value = None
+
+    def run_hook(self, shape="claude"):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rr.session_start_main(shape=shape)
+        return json.loads(buf.getvalue())
+
+    def test_each_start_source_writes_exactly_one_summary_with_the_injected_size(self):
+        for source in ("startup", "resume", "compact", "clear"):
+            for shape, routed in (("claude", False), ("cursor", True)):
+                with self.subTest(source=source, shape=shape):
+                    before = self.path.read_text().splitlines() if self.path.exists() else []
+                    self.payload["source"] = source
+                    self.routing.text.return_value = "routing" if routed else None
+                    out = self.run_hook(shape)
+                    ctx = out["additional_context"] if shape == "cursor" else out["hookSpecificOutput"]["additionalContext"]
+                    lines = self.path.read_text().splitlines()
+                    self.assertEqual(len(lines), len(before) + 1)
+                    harness = "cursor" if shape == "cursor" else "claude_code"
+                    self.assertRegex(lines[-1],
+                                     rf"^\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}Z \[khipu-session-start\] "
+                                     rf"session=session-a harness={harness} source={source} reason=ok "
+                                     rf"bytes={len(ctx)} routing={'yes' if routed else 'no'} ms=\d+\.\d$")
+
+    def test_logging_failure_does_not_change_the_normal_output(self):
+        expected = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "memory \u2603"}}
+        with mock.patch.object(rp, "_log", side_effect=OSError("log unavailable")) as log:
+            self.assertEqual(self.run_hook(), expected)
+        log.assert_called_once()
+        with mock.patch.object(rp, "_log_path", side_effect=OSError("log unavailable")):
+            self.assertEqual(self.run_hook(), expected)
+
+    def test_helper_exit_is_logged_once_without_injected_context(self):
+        self.payload["cwd"] = "/var/folders/ab/cd/T/t3code-claude-title-q7w8e9"
+        self.assertEqual(self.run_hook(), {})
+        self.context.assert_not_called()
+        lines = self.path.read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("reason=ok bytes=0 routing=no", lines[0])
+
+    def test_context_error_is_logged_once_without_hiding_the_error(self):
+        self.context.side_effect = RuntimeError("context\nunavailable")
+        with self.assertRaisesRegex(RuntimeError, "context"):
+            self.run_hook()
+        lines = self.path.read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("reason=error: RuntimeError: context unavailable bytes=0 routing=no", lines[0])
 
 
 class ClaudeShapeTest(unittest.TestCase):
