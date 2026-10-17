@@ -1906,16 +1906,34 @@ def _overlay(view: dict[str, Any], project: str) -> dict[str, Any]:
             "queue_added": added - set(removed)}
 
 
+def _queue_health(drained: dict[str, Any] | None, pending: int) -> dict[str, Any]:
+    """What a read says about the line of waiting writes: how many of this
+    project's still wait, and what the drain this read ran answered."""
+    drained = drained or {}
+    return {"pending": pending, "busy": bool(drained.get("busy")),
+            "stopped_early": bool(drained.get("stopped_early")), "refused": int(drained.get("refused") or 0),
+            "unreadable": drained.get("unreadable")}
+
+
 def load(project: str, *, conn=None) -> dict[str, Any]:
     """A project's live rows and words: from the hub (after draining waiting
-    writes), or from the offline copy plus the waiting writes when it is away."""
+    writes), or from the offline copy plus the waiting writes when it is away.
+    Either way, writes still waiting show on top, marked ``queued``, and
+    ``pending``/``queue`` say how the line stands."""
     owned = conn is None
+    drained = None
     try:
         if owned:
             conn = _connect()
-        drain(conn)
+        drained = drain(conn)
         replica_catch_up(conn)
-        return _hub_view(conn, project)
+        view = _hub_view(conn, project)
+        # A drain that was busy (another writer holds the line) or stopped
+        # early leaves writes waiting: they show on top, as they do offline.
+        if any(op.get("project") == project for op in queued_ops()):
+            view = _overlay(view, project)
+        pending = int(view.get("pending") or 0)
+        return {**view, "pending": pending, "queue": _queue_health(drained, pending)}
     except Exception as exc:  # noqa: BLE001
         if _tables_missing(exc):
             raise LedgerError("the ledger tables are not in the database yet; run khipu migrate", "no_tables") from exc
@@ -1923,7 +1941,8 @@ def load(project: str, *, conn=None) -> dict[str, Any]:
             raise
         view = _offline_view(project) or {"vocab": {"state": [], "kind": []}, "rows": [], "as_of": None,
                                           "offline": True}
-        return _overlay(view, project)
+        view = _overlay(view, project)
+        return {**view, "queue": _queue_health(drained, view["pending"])}
     finally:
         if owned and conn is not None:
             conn.close()
@@ -2348,7 +2367,12 @@ def nightly() -> dict[str, Any]:
 # ---- the CLI ------------------------------------------------------------------
 
 
-def _project_for(args: argparse.Namespace) -> str:
+def _project_for(args: argparse.Namespace, *, canonical: bool = False) -> str:
+    """``--project`` as given; else this folder's project. ``canonical``
+    (only after the owner check: it reaches the hub) names it through the
+    project aliases when the hub answers, as capture does, so a renamed
+    repository is one project in the ledger and in Owed. Away, the folder's
+    own name."""
     if getattr(args, "project", None):
         return _check_project(args.project)
     from khipu.identity import resolve_repo_root
@@ -2357,7 +2381,22 @@ def _project_for(args: argparse.Namespace) -> str:
         cwd = os.getcwd()
     except OSError:
         cwd = ""
-    return _check_project(resolve_repo_root(cwd).get("project"))
+    project = resolve_repo_root(cwd).get("project")
+    if not project or not canonical:
+        return _check_project(project)
+    try:
+        conn = _connect()
+    except Exception:  # noqa: BLE001  (away or unset: the folder's own name)
+        return _check_project(project)
+    try:
+        from khipu.identity import _resolve_project_alias
+
+        with conn.cursor() as cur:
+            project = _resolve_project_alias(cur, project) or project
+        conn.rollback()
+    finally:
+        conn.close()
+    return _check_project(project)
 
 
 def _emit(args: argparse.Namespace | None, payload: Any = None, text: str | None = None, **kw: Any) -> None:
@@ -2403,7 +2442,7 @@ def cmd(args: argparse.Namespace) -> int:
                               f"{r['needs_owner']} need you{' · hidden' if r['hidden'] else ''}"
                               for r in listed["projects"]] + ["", f"{len(listed['projects'])} project(s)"]))
             return 0
-        project = _project_for(args)
+        project = _project_for(args, canonical=True)
         if verb == "project":
             result = set_project(project, name=args.rename,
                                  hidden=True if args.hide else False if args.show else None)
@@ -2431,32 +2470,40 @@ def cmd(args: argparse.Namespace) -> int:
         if verb == "get":
             got = get(project, args.id)
             payload = row_json(got["row"], got["history"], project)
+            payload["offline"], payload["as_of"] = bool(got.get("offline")), got.get("as_of")
             if got.get("offline"):
                 payload["offline_as_of"] = got.get("as_of")
             _emit(None, payload, as_json=True, sort_keys=True)
             return 0
         view = load(project)
         note = _offline_note(view)
+        # Every read says where it came from and how the line of waiting
+        # writes stands, whether or not any are waiting.
+        fresh = {"offline": bool(view.get("offline")), "as_of": view.get("as_of"),
+                 "pending": int(view.get("pending") or 0),
+                 "queue": view.get("queue") or _queue_health(None, int(view.get("pending") or 0))}
         rc = 0
         if verb == "list":
             rows, text = render_list(view, state=args.state, kind=args.kind, owner=args.owner,
                                      stale_hours=args.stale_hours)
-            _emit(args, {"ok": True, "project": project, "offline": view["offline"], "as_of": view.get("as_of"),
+            _emit(args, {"ok": True, "project": project, **fresh,
                          "vocab": view["vocab"], "rows": [row_json(r, [], project) for r in rows]}, text)
         elif verb == "loose-ends":
             rows, text = render_loose_ends(view, summary=args.summary)
-            _emit(args, {"ok": True, "project": project, "rows": [row_json(r, [], project) for r in rows]}, text)
+            _emit(args, {"ok": True, "project": project, **fresh,
+                         "rows": [row_json(r, [], project) for r in rows]}, text)
         elif verb in ("needs-owner", "needs-matt"):
             rows, text = render_needs(view)
-            _emit(args, {"ok": True, "project": project, "rows": [row_json(r, [], project) for r in rows]}, text)
+            _emit(args, {"ok": True, "project": project, **fresh,
+                         "rows": [row_json(r, [], project) for r in rows]}, text)
         elif verb == "render":
             board = render_board(view)
             if args.out:
                 _emit(None, text=board, to_file=args.out)
-                _emit(args, {"ok": True, "rows": len(view["rows"]), "out": args.out},
+                _emit(args, {"ok": True, "rows": len(view["rows"]), "out": args.out, **fresh},
                       f"rendered {len(view['rows'])} rows -> {args.out}")
             else:
-                _emit(args, {"ok": True, "board": board}, board)
+                _emit(args, {"ok": True, "board": board, **fresh}, board)
         elif verb == "check":
             result = check(view)
             if result["ok"]:
@@ -2467,7 +2514,7 @@ def cmd(args: argparse.Namespace) -> int:
             if result["warnings"]:
                 text += "\n" + "\n".join([f"{len(result['warnings'])} warning(s):"]
                                          + [f"  - {w}" for w in result["warnings"]])
-            _emit(args, {**result, "project": project, "vocab": view["vocab"]}, text)
+            _emit(args, {**result, "project": project, "vocab": view["vocab"], **fresh}, text)
             rc = 0 if result["ok"] else 1
         if note and not args.json:
             _emit(args, text=note)

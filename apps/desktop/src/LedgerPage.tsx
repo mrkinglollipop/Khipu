@@ -45,6 +45,18 @@ export function OutboxNotice({ view, now }: { view: WorkView | null; now: Date }
   );
 }
 
+/** The ledger read from the offline copy: said whenever it is, waiting
+ *  writes or not, with the time the copy was made. */
+export function LedgerOfflineNotice({ asOf, now }: { asOf?: string | null; now: Date }) {
+  const at = asOf ? changedWords(asOf, now) : "";
+  return (
+    <Callout tone="warn" stripe title="The ledger is showing its offline copy">
+      The database didn't answer, so this is what the ledger held {at ? `at ${at}` : "when it was last copied"}. Changes
+      you make are saved on this Mac and sent when it answers.
+    </Callout>
+  );
+}
+
 const PAGE = 100;
 const STALE_DAYS = 7;
 const NO_OWNER = ["", "none", "unassigned", "unowned", "-", "n/a"];
@@ -66,6 +78,10 @@ function isNoOwner(owner: string): boolean {
 function finished(vocab: Vocab | null, state: string): boolean {
   const m = meaningOf(vocab, state);
   return m === "done" || m === "dropped";
+}
+
+function sameForm(a: Form, b: Form): boolean {
+  return (Object.keys(a) as Array<keyof Form>).every((k) => a[k] === b[k]);
 }
 
 function fieldValue(v: unknown): string {
@@ -217,6 +233,33 @@ export function LedgerPage({
   }, [loadList, loadRemoved]);
 
   const vocab = list?.vocab ?? null;
+  // A fresh list hands an equal vocab as a new object: the form resets on
+  // its words, never on its identity.
+  const vocabKey = JSON.stringify(vocab);
+
+  // What the poll may touch: an edit under way or a save keeps the open
+  // row's detail (and so the form) as it is.
+  const editing = useRef(false);
+  editing.current = saving || (!!form && !!detail && !sameForm(form, initialForm(detail, vocab)));
+
+  // The list (and the open row, when it is not being edited) is read again
+  // refresh_s after the previous read ends, so an open page follows changes
+  // made elsewhere and a slow read never has another start behind it.
+  const every = Math.max(1, view?.refresh_s ?? 5) * 1000;
+  useEffect(() => {
+    let stopped = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      const id = openRow.current;
+      await Promise.all([loadList(), usableRowId(id) && !editing.current ? loadDetail(id) : null]);
+      if (!stopped) timer = window.setTimeout(() => void poll(), every);
+    };
+    timer = window.setTimeout(() => void poll(), every);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [every, loadList, loadDetail]);
   const rows = useMemo(() => list?.rows ?? [], [list]);
 
   useEffect(() => {
@@ -233,7 +276,7 @@ export function LedgerPage({
     if (detail) setForm(initialForm(detail, vocab));
     // The form resets when another row opens or the row itself changed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detail?.id, detail?.updated, detail?.state, vocab]);
+  }, [detail?.id, detail?.updated, detail?.state, vocabKey]);
 
   const byId = useMemo(() => new Map(rows.map((r) => [r.id, r])), [rows]);
   const owners = useMemo(
@@ -377,7 +420,11 @@ export function LedgerPage({
             <span className={stateTone(r.state, m)} aria-hidden />
             {stateWords(r.state)}
           </span>
-          <span className={old ? "lg-when old" : "lg-when"}>{when}</span>
+          {r.queued ? (
+            <span className="lg-when" title="Saved on this Mac; the database hasn't taken it yet">Not sent yet</span>
+          ) : (
+            <span className={old ? "lg-when old" : "lg-when"}>{when}</span>
+          )}
         </button>
       </div>,
     );
@@ -406,9 +453,18 @@ export function LedgerPage({
         </div>
       </header>
       <div className="panel-body wide lg-page">
-        {view && view.counts.ledger_outbox > 0 ? (
+        {(view && view.counts.ledger_outbox > 0) || list?.offline || (list?.pending ?? 0) > 0 ? (
           <div className="wk-notices">
             <OutboxNotice view={view} now={now} />
+            {list?.offline && !(view && view.counts.ledger_outbox > 0 && view.ledger_offline) ? (
+              <LedgerOfflineNotice asOf={list.as_of} now={now} />
+            ) : null}
+            {list && !list.offline && (list.pending ?? 0) > 0 ? (
+              <Callout tone="warn" stripe title={plural(list.pending ?? 0, "change is waiting to be sent", "changes are waiting to be sent")}>
+                Saved on this Mac and marked Not sent yet below until the database takes{" "}
+                {(list.pending ?? 0) === 1 ? "it" : "them"}.
+              </Callout>
+            ) : null}
           </div>
         ) : null}
         {listError ? (

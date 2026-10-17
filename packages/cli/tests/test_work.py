@@ -1167,11 +1167,12 @@ def test_a_snooze_ending_is_a_deadline_of_the_view(monkeypatch):
             pass
 
     monkeypatch.setattr(hub_snapshot, "try_hub_connect", lambda **kw: Conn())
-    monkeypatch.setattr(commitments, "list_owed",
-                        lambda cur, **kw: [] if kw.get("hide_snoozed") and clock[0] < deadline else [parked])
+    # One read of every open commitment; the snooze is decided against the
+    # view's own time.
+    monkeypatch.setattr(commitments, "list_owed", lambda cur, **kw: [dict(parked)])
 
     def view():
-        return work.build_view(clock[0], cfg=cfg(), ledger_data=NO_LEDGER, owed=work.read_owed(),
+        return work.build_view(clock[0], cfg=cfg(), ledger_data=NO_LEDGER, owed=work.read_owed(clock[0]),
                                routing_info=ROUTING)
 
     before = view()

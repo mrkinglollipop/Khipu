@@ -239,16 +239,26 @@ def open_file(path: str | os.PathLike, limit: int = 0) -> Opened:
     return opened
 
 
+READ_TRIES = 3
+
+
+def _version(st: os.stat_result) -> tuple[int, int, int]:
+    return st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
 def read_file(path: str | os.PathLike, limit: int = 0) -> tuple[bytes, os.stat_result]:
     """The whole file and its ``fstat``, re-checked after reading. A file
-    that grew past ``limit`` while it was read raises ``TooBig``, and one
-    whose size changed since it was opened raises ``Refused``: never a part
-    of it, and never more than the ``fstat`` returned describes."""
-    with open_file(path, limit) as opened:
-        data = opened.read(limit + 1 if limit else 0)
-        if limit and len(data) > limit:
-            raise TooBig(len(data), limit)
-        opened.recheck()
-        if os.fstat(opened.fd).st_size != len(data) or opened.st.st_size != len(data):
-            raise Refused
-        return data, opened.st
+    that grew past ``limit`` while it was read raises ``TooBig``. One that
+    changed while it was read (its size, or its change times, even at the
+    same size) is read again, up to ``READ_TRIES`` times, then raises
+    ``Refused``: never a part of it, never two versions stitched together,
+    and never more than the ``fstat`` returned describes."""
+    for _ in range(READ_TRIES):
+        with open_file(path, limit) as opened:
+            data = opened.read(limit + 1 if limit else 0)
+            if limit and len(data) > limit:
+                raise TooBig(len(data), limit)
+            opened.recheck()
+            if opened.st.st_size == len(data) and _version(os.fstat(opened.fd)) == _version(opened.st):
+                return data, opened.st
+    raise Refused

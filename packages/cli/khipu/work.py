@@ -275,20 +275,23 @@ def invalidate_view() -> None:
         _replace_json(_view_fence_file(), {"generation": generation + 1})
 
 
-def _replace_json(path: Path, data: Any) -> None:
-    """Replace ``path`` atomically (a temp file beside it, then rename)."""
+def _replace_json(path: Path, data: Any, text: str | None = None) -> None:
+    """Replace ``path`` atomically (a temp file beside it, then rename).
+    ``text`` is ``data`` already written out as JSON."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True, default=str) if text is None else text,
+                       encoding="utf-8")
         os.replace(tmp, path)
     finally:
         if tmp.exists():
             tmp.unlink()
 
 
-def _write_json(path: Path, data: Any, view_generation: int | None = None) -> None:
-    """Replace JSON, refusing a Work view that Forget invalidated mid-refresh."""
+def _write_json(path: Path, data: Any, view_generation: int | None = None, *, text: str | None = None) -> None:
+    """Replace JSON, refusing a Work view that Forget invalidated mid-refresh.
+    ``text``: the view already written out (``data`` still gives its time)."""
     if path != view_file():
         _replace_json(path, data)
         return
@@ -299,7 +302,15 @@ def _write_json(path: Path, data: Any, view_generation: int | None = None) -> No
         generation = int(current.get("generation") or 0) if isinstance(current, dict) else 0
         if view_generation != generation:
             return
-        _replace_json(path, data)
+        # Two readers can finish out of order: a view built earlier never
+        # replaces one built later (the fence keeps the newest one's time).
+        built = _parse_time(data.get("generated_at")) if isinstance(data, dict) else None
+        shown = _parse_time(current.get("generated_at")) if isinstance(current, dict) else None
+        if built is not None and shown is not None and built < shown:
+            return
+        _replace_json(path, data, text)
+        if built is not None:
+            _replace_json(_view_fence_file(), {"generation": generation, "generated_at": _z(built)})
 
 
 def _read_json(path: Path) -> Any:
@@ -458,7 +469,8 @@ def _fixed_words() -> frozenset[str]:
              "ok", "stale", "gone", "missing", "refused", "off", "none", "unreadable", "too_big", "wrong_project",
              "newer_format", "open", "needs", "done", "dropped", "ledger", "commitment", "routing", "rule", "hold",
              "seeded", "same", "not_same", "snooze", "hide", "drop", "answered", "open_ledger", "open_link",
-             "open_owed", "open_routing", "Confirm a standing rule a conversation changed"}
+             "open_owed", "open_routing", "Confirm a standing rule a conversation changed",
+             OUTBOX_UNREADABLE, OUTBOX_REFUSED}
     for table in (JOB_STATES, PR_STAGES, TRAIN_STATES):
         words.update(table)
         words.update(table.values())
@@ -483,6 +495,7 @@ class _Scan:
         except Exception:  # noqa: BLE001  (fail closed: see __call__)
             self.table = None
         self.degraded = self.table is None
+        self._kept: dict[tuple[str, bool], bool] = {}
         if self.degraded:
             self.fixed = _fixed_words()
             from khipu import agent_view
@@ -492,6 +505,14 @@ class _Scan:
             self.view_fields = agent_view.VIEW_FIELDS
 
     def _keep(self, text: str, key: bool) -> bool:
+        # One scan has one table, so a string's answer never changes within
+        # it; a view repeats its keys and words thousands of times.
+        got = self._kept.get((text, key))
+        if got is None:
+            got = self._kept[(text, key)] = self._keep_once(text, key)
+        return got
+
+    def _keep_once(self, text: str, key: bool) -> bool:
         if self.degraded:
             if key:
                 return (text in self.view_fields or text in self.fixed) and text.casefold() not in self.names
@@ -563,6 +584,7 @@ class _Reading:
         self.dropped = 0  # every left-out item, another project's included
         self.other_project = 0  # how many of those named another project
         self.clamped = 0
+        self.duplicates = 0  # items left out because a newer one has the same id
         self.capped: dict[str, dict[str, int]] = {}
 
     def time(self, value: Any, *, required: bool = True) -> str | None:
@@ -683,6 +705,22 @@ def _train(item: dict, r: _Reading) -> dict:
             "summary": r.text(item.get("summary"), r.cfg["work_line_chars"])}
 
 
+def _one_per_id(items: list[dict], key: str, r: _Reading) -> list[dict]:
+    """One item per id: the newest by ``key``, the later one in the file on
+    a tie, in its own place. Each one left out counts as dropped."""
+    best: dict[str, int] = {}
+    for n, item in enumerate(items):
+        held = best.get(item["id"])
+        if held is None or (item.get(key) or "") >= (items[held].get(key) or ""):
+            best[item["id"]] = n
+    if len(best) == len(items):
+        return items
+    r.duplicates += len(items) - len(best)
+    r.dropped += len(items) - len(best)
+    keep = set(best.values())
+    return [item for n, item in enumerate(items) if n in keep]
+
+
 def _newest(items: list[dict], key: str, cap: int, r: _Reading, what: str) -> list[dict]:
     """The newest ``cap`` items (0: all), in the order the file gave them."""
     if not cap or len(items) <= cap:
@@ -792,11 +830,13 @@ def parse_summary(data: bytes, project: str | None, cfg: dict, now: datetime) ->
                 items.append(reader(item, r))
             except (_Drop, TypeError, ValueError, OverflowError):
                 r.dropped += 1
+        items = _one_per_id(items, newest, r)
         out[key] = _newest(items, newest, cfg[cap_key], r, key)
     _cap_runs(out["trains"], cfg, r)
     waiting = doc.get("waiting_on_owner")
     out["waiting_list_ignored"] = 0 if waiting is None else (len(waiting) if isinstance(waiting, list) else 1)
-    out.update(dropped=r.dropped, other_project=r.other_project, clamped=r.clamped, capped=r.capped)
+    out.update(dropped=r.dropped, other_project=r.other_project, clamped=r.clamped, capped=r.capped,
+               duplicates=r.duplicates)
     return out
 
 
@@ -849,6 +889,11 @@ def _read_checked(path: str, limit: int) -> tuple[bytes, os.stat_result]:
                          size=exc.size, limit=limit) from None
 
 
+def _same_file_last(last: Any, project: str, name: str) -> dict | None:
+    return last if isinstance(last, dict) and last.get("project_key") == project \
+        and isinstance(last.get("stamp"), list) and last["stamp"][:1] == [name] else None
+
+
 def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
     """One project's summary source: its state, the contents to show (this
     read, or the last good read when this one failed) and the counts. A file
@@ -864,9 +909,7 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
     # The last good read stands in only for the same file (its name as set,
     # kept as a hash): a source set to another file never shows this one's.
     name = hashlib.sha256(os.fsencode(path)).hexdigest()[:16]
-    last = _read_json(_last_file(project))
-    last = last if isinstance(last, dict) and last.get("project_key") == project \
-        and isinstance(last.get("stamp"), list) and last["stamp"][:1] == [name] else None
+    last = _same_file_last(_read_json(_last_file(project)), project, name)
     limit = cfg["work_file_max_bytes"]
     try:
         data, st = _read_checked(path, limit)
@@ -896,7 +939,14 @@ def read_source(entry: dict | None, cfg: dict, now: datetime) -> dict:
         if before is not None and _parse_time(parsed["written_at"]) < before:
             return _failed("unreadable", SOURCE_PROBLEMS["older"], last, cfg)
         try:
-            _write_json(_last_file(project), {"project_key": project, "stamp": stamp, "contents": parsed})
+            # Compared again under the lock: another reader may have kept a
+            # newer read of this file since this one started.
+            with _view_lock():
+                held = _same_file_last(_read_json(_last_file(project)), project, name)
+                newer = _parse_time(((held or {}).get("contents") or {}).get("written_at"))
+                if newer is not None and _parse_time(parsed["written_at"]) < newer:
+                    return _failed("unreadable", SOURCE_PROBLEMS["older"], held, cfg)
+                _write_json(_last_file(project), {"project_key": project, "stamp": stamp, "contents": parsed})
         except OSError:
             pass  # the last good read is a convenience; this read still shows
     age = (now - _parse_time(parsed["written_at"])).total_seconds()
@@ -991,8 +1041,11 @@ def read_ledger() -> dict[str, Any]:
         # A queued add can name a project that has never reached the hub or
         # its offline snapshot. Work already reads this outbox through each
         # offline view, so it must also make that project a board.
+        queued = set()
         for op in ledger.queued_ops():
             key = op.get("project")
+            if isinstance(key, str) and key:
+                queued.add(key)
             if isinstance(key, str) and key and key not in projects:
                 projects[key] = {"project": key, "name": key, "hidden": False, "created_at": None}
         for proj in projects.values():
@@ -1000,6 +1053,11 @@ def read_ledger() -> dict[str, Any]:
             history = None
             if conn is not None:
                 view = ledger._hub_view(conn, key)
+                # Writes the drain left waiting (another writer held the
+                # line, or it stopped early) still show, marked queued, so
+                # "What you see includes them" stays true online too.
+                if key in queued:
+                    view = ledger._overlay(view, key)
             else:
                 offline = ledger._offline_view(key) or {"vocab": {"state": [], "kind": []}, "rows": [],
                                                         "as_of": None}
@@ -1019,9 +1077,10 @@ def read_ledger() -> dict[str, Any]:
     return out
 
 
-def read_owed() -> dict[str, Any]:
+def read_owed(now: datetime | None = None) -> dict[str, Any]:
     """Khipu's open commitments marked "needs the user", across every
-    project, snoozed ones left out."""
+    project, snoozed ones (due_after still ahead of ``now``) left out."""
+    now = now or _now()
     try:
         from khipu.hub_snapshot import try_hub_connect
 
@@ -1032,16 +1091,19 @@ def read_owed() -> dict[str, Any]:
         from khipu.commitments import list_owed
 
         with conn.cursor() as cur:
-            # No limit: the list is every open commitment, the user's picked after.
-            rows = list_owed(cur, status="open", limit=None, hide_snoozed=True)
-            # A snoozed one enters Waiting when its snooze ends: that end is
-            # a deadline of the view (valid_until).
-            shown = {r.get("id") for r in rows}
-            ends = [_parse_time(r.get("due_after")) for r in list_owed(cur, status="open", limit=None)
-                    if r.get("owner") == "user" and r.get("id") not in shown]
-            ends = [t for t in ends if t is not None]
-        return {"items": [r for r in rows if r.get("owner") == "user"], "error": None,
-                "valid_until": min(ends) if ends else None}
+            # No limit: the list is every open commitment, the user's picked
+            # after (an owner is resolved in Python, so SQL can't pick it).
+            rows = [r for r in list_owed(cur, status="open", limit=None) if r.get("owner") == "user"]
+        items, ends = [], []
+        for r in rows:
+            due = _parse_time(r.get("due_after"))
+            if due is not None and due > now:
+                # A snoozed one enters Waiting when its snooze ends: that end
+                # is a deadline of the view (valid_until).
+                ends.append(due)
+            else:
+                items.append(r)
+        return {"items": items, "error": None, "valid_until": min(ends) if ends else None}
     except Exception as exc:  # noqa: BLE001
         return {"items": [], "error": type(exc).__name__}
     finally:
@@ -1174,8 +1236,48 @@ def _norm(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip().lower())
 
 
+ALIKE = 0.75
+
+
 def _alike(a: str, b: str) -> bool:
-    return bool(a and b) and difflib.SequenceMatcher(None, a, b).ratio() >= 0.75
+    return bool(a and b) and difflib.SequenceMatcher(None, a, b).ratio() >= ALIKE
+
+
+def _ratio_bound(a: str, b: str) -> float:
+    """2 * LCS / (len a + len b): never below difflib's ratio for the same
+    pair (its matching blocks are one common subsequence), so a pair under
+    ALIKE here is under it there. Bit-parallel LCS (Allison-Dix)."""
+    if not a and not b:
+        return 0.0
+    masks: dict[str, int] = {}
+    for i, ch in enumerate(a):
+        masks[ch] = masks.get(ch, 0) | (1 << i)
+    full = (1 << len(a)) - 1
+    v = full
+    for ch in b:
+        u = v & masks.get(ch, 0)
+        v = ((v + u) | (v - u)) & full
+    return 2.0 * (len(a) - bin(v).count("1")) / (len(a) + len(b))
+
+
+class _Alike:
+    """``_alike(row title, text)`` for one commitment's text against many
+    rows, with the same answers: two exact upper bounds rule most pairs out
+    before the full comparison runs."""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.matcher = difflib.SequenceMatcher(None)
+        self.matcher.set_seq2(text)
+
+    def __call__(self, title: str) -> bool:
+        if not (title and self.text):
+            return False
+        m = self.matcher
+        m.set_seq1(title)
+        if m.real_quick_ratio() < ALIKE or _ratio_bound(title, self.text) < ALIKE:
+            return False
+        return m.ratio() >= ALIKE
 
 
 # ---- the read model -----------------------------------------------------------------
@@ -1309,29 +1411,36 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime,
     explicit = {id(item): {x for x in (str((row.get("refs") or {}).get("commitment") or ""),
                                        same.get((p, row["row_id"])) or "") if x}
                 for p, row, item in needs}
+    # Each project's needs-you rows in order, with their words' hash and
+    # normal form worked out once, not once per commitment.
+    by_project: dict[Any, list[tuple[dict, dict, str, str]]] = {}
+    for p, row, item in needs:
+        by_project.setdefault(p, []).append((row, item, content_hash(p, row["title"]), _norm(row["title"])))
     for c in owed.get("items") or []:
         cid, project, text = str(c.get("id")), c.get("project") or None, c.get("text") or ""
         if hidden.get(cid) == _hide_mark(c):
             continue
+        rows_here = by_project.get(project) or []
         # An explicit link (the row's reference or a remembered "Same") wins;
         # equal words link only a row with no explicit link, never a pair
         # remembered as "Not the same".
         # A row shows one commitment: a second one linked to it shows on its own.
-        linked = next((item for p, row, item in needs if p == project and cid in explicit[id(item)]
+        linked = next((item for row, item, _h, _n in rows_here if cid in explicit[id(item)]
                        and item["also_owed"] in (None, cid)), None)
-        if linked is None:
-            linked = next((item for p, row, item in needs if p == project and not explicit[id(item)]
-                           and item["also_owed"] is None and (p, row["row_id"], cid) not in not_same
-                           and content_hash(project, row["title"]) == content_hash(project, text)), None)
+        if linked is None and rows_here:
+            words = content_hash(project, text)
+            linked = next((item for row, item, h, _n in rows_here if not explicit[id(item)]
+                           and item["also_owed"] is None and (project, row["row_id"], cid) not in not_same
+                           and h == words), None)
         if linked is not None:
             linked["also_owed"] = cid
             linked["blocking"] = linked["blocking"] or c.get("kind") == "blocker"
             linked["actions"] = list(dict.fromkeys([*linked["actions"], "open_owed"]))
             continue
+        alike = _Alike(_norm(text)) if rows_here else None
         looks_like = next(({"id": row["row_id"], "title": clean_text(row["title"], TITLE_CHARS)}
-                           for p, row, _item in needs
-                           if p == project and (p, row["row_id"], cid) not in not_same
-                           and _alike(_norm(row["title"]), _norm(text))), None)
+                           for row, _item, _h, title in rows_here
+                           if (project, row["row_id"], cid) not in not_same and alike(title)), None)
         opened = _parse_time(c.get("opened_at"))
         items.append({"source": "commitment", "key": f"commitment:{cid}", "project": project, "id": cid,
                       "title": clean_text(text, TITLE_CHARS), "kind": c.get("kind"), "since": _z(opened),
@@ -1364,6 +1473,10 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime,
     return items
 
 
+OUTBOX_UNREADABLE = "Khipu couldn't read the ledger changes waiting to be sent; doctor names the file."
+OUTBOX_REFUSED = "The ledger refused waiting changes; doctor lists them."
+
+
 def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_data: dict | None = None,
                owed: dict | None = None, routing_info: dict | None = None) -> dict:
     """The ``khipu-work-view`` document. Each input can be given (tests);
@@ -1374,9 +1487,22 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
     fence = _view_generation()
     now = now or _now()
     cfg = cfg or settings()
-    ledger_data = ledger_data if ledger_data is not None else read_ledger()
-    owed = owed if owed is not None else read_owed()
-    routing_info = routing_info if routing_info is not None else read_routing(now)
+    # The three sources wait on different things (the hub twice, the
+    # routing lock): read together, the view waits for the slowest only.
+    readers = {k: f for k, given, f in (("ledger", ledger_data, read_ledger),
+                                         ("owed", owed, read_owed),
+                                         ("routing", routing_info, lambda: read_routing(now))) if given is None}
+    if len(readers) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(readers)) as pool:
+            futures = {k: pool.submit(f) for k, f in readers.items()}
+            got = {k: fut.result() for k, fut in futures.items()}
+    else:
+        got = {k: f() for k, f in readers.items()}
+    ledger_data = ledger_data if ledger_data is not None else got["ledger"]
+    owed = owed if owed is not None else got["owed"]
+    routing_info = routing_info if routing_info is not None else got["routing"]
 
     registered = {e["project"]: e for e in cfg["work_projects"]}
     ledgers = ledger_data.get("projects") or {}
@@ -1475,10 +1601,19 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
         projects.append(board)
 
     waiting = _waiting(visible_ledger_data, visible_owed, routing_info, now, times)
+    # The line of waiting ledger writes: a line that can't be read, or writes
+    # the ledger refused, are problems of their own, never a quiet zero.
+    line_problem = None
     try:
-        outbox = int(ledger.outbox_status().get("pending") or 0)
-    except Exception:  # noqa: BLE001
-        outbox = 0
+        line = ledger.outbox_status()
+    except Exception as exc:  # noqa: BLE001
+        line = {"unreadable": type(exc).__name__}
+    outbox = int(line.get("pending") or 0)
+    refused = int(line.get("refused") or 0)
+    if line.get("unreadable"):
+        line_problem = OUTBOX_UNREADABLE
+    elif refused:
+        line_problem = OUTBOX_REFUSED
     # The earliest deadline of every input: the routing record's (a hold
     # reminder entering Waiting on you) and any the ledger or commitments give.
     times.extend(_parse_time(part.get("valid_until")) for part in (ledger_data, owed, routing_info))
@@ -1492,9 +1627,9 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                    "running": sum(1 for j in live if j["state"] == "running"),
                    "flagged": sum(p["flagged"] for p in projects),
                    "stale_sources": sum(1 for p in projects if p["source"]["state"] not in ("ok", "none", "off")),
-                   "ledger_outbox": outbox},
+                   "ledger_outbox": outbox, "ledger_refused": refused},
         "problems": {k: v for k, v in (("ledger", ledger_data.get("error")), ("owed", owed.get("error")),
-                                       ("routing", routing_info.get("error"))) if v},
+                                       ("routing", routing_info.get("error")), ("outbox", line_problem)) if v},
         "ledger_offline": bool(ledger_data.get("offline")), "ledger_as_of": ledger_data.get("as_of"),
         "refresh_s": cfg["work_refresh"],
     }), fence)
@@ -1506,6 +1641,39 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
     if scan.degraded:
         view["problems"]["privacy"] = PRIVACY_INCOMPLETE
     return view
+
+
+class _Tee:
+    """stdout that also keeps what was written."""
+
+    def __init__(self) -> None:
+        import sys
+
+        self.out, self.kept = sys.stdout, []
+
+    def write(self, text: str) -> int:
+        self.kept.append(text)
+        return self.out.write(text)
+
+    def flush(self) -> None:
+        self.out.flush()
+
+
+def _save_emitted(view: dict, text: str) -> None:
+    """Save the answer ``khipu work --json`` printed (``view`` projected) as
+    view.json, fenced like ``write_view``; without it, ``write_view``."""
+    generation = getattr(view, "_forget_generation", None)
+    if not isinstance(generation, int) or generation < 0:
+        return
+    try:
+        json.loads(text)
+    except ValueError:
+        write_view(view)
+        return
+    try:
+        _write_json(view_file(), {"generated_at": view.get("generated_at")}, generation, text=text)
+    except OSError:
+        pass  # the saved copy is for a later reader; the answer stands without it
 
 
 def write_view(view: dict) -> None:
@@ -1584,9 +1752,13 @@ def check_file(path: str) -> tuple[bool, list[str], dict | None]:
     except Unreadable as exc:
         return False, [exc.problem], None
     problems = []
-    if parsed["dropped"] or parsed["other_project"]:
-        problems.append(f"{parsed['dropped']} item(s) couldn't be read and would be left out "
+    unread = parsed["dropped"] - parsed["duplicates"]
+    if unread > 0 or parsed["other_project"]:
+        problems.append(f"{unread} item(s) couldn't be read and would be left out "
                         "(a missing required field, a bad id or time, or another project's item).")
+    if parsed["duplicates"]:
+        problems.append(f"{parsed['duplicates']} item(s) repeat the same id; only the newest of each would be "
+                        "shown.")
     for what, cap in parsed["capped"].items():
         problems.append(f"Only the newest {cap['shown']} of {cap['of']} {what} would be shown.")
     if parsed["clamped"]:
@@ -1626,11 +1798,12 @@ def render_text(view: dict) -> str:
     return "\n".join(lines)
 
 
-def _emit(payload: Any = None, text: str | None = None, *, as_json: bool = True, indent: int | None = 2) -> None:
+def _emit(payload: Any = None, text: str | None = None, *, as_json: bool = True, indent: int | None = 2,
+          stream: Any = None) -> None:
     """Every answer of ``khipu work`` (``agent_view.emit``: projected first)."""
     from khipu import agent_view
 
-    agent_view.emit(payload, text, as_json=as_json, indent=indent)
+    agent_view.emit(payload, text, as_json=as_json, indent=indent, stream=stream)
 
 
 def cmd(args: argparse.Namespace) -> int:
@@ -1696,8 +1869,17 @@ def _cmd(args: argparse.Namespace) -> int:
         _emit(owner_direction.finish({"ok": True}), indent=None)
         return 0
     view = build_view()
-    write_view(view)
-    _emit(view, None if args.json else render_text(view), as_json=bool(args.json))
+    if not args.json:
+        write_view(view)
+        _emit(view, render_text(view), as_json=False)
+        return 0
+    # One projection for the answer and the saved copy: the answer leaves
+    # through agent_view.emit as always, and its text is kept on the way out.
+    tee = _Tee()
+    try:
+        _emit(view, stream=tee)
+    finally:
+        _save_emitted(view, "".join(tee.kept))
     return 0
 
 
