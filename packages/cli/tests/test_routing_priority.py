@@ -342,10 +342,11 @@ def test_the_longest_window_in_force_and_a_window_that_resets_before_the_next_on
     fact = routing.plan_fact(FIGURES["claude|"], T0)
     assert fact["window"] == "week" and fact["left_pct"] == 60
     # A week whose reset has passed has started again: its old figure says
-    # nothing, so the window still in force is used.
+    # nothing, and a shorter window is no stand-in for it (routing freshness,
+    # 2026-10-17): the figures are out of date until the next read.
     row = _row("Claude", "claude", None, _five(30, T0 + timedelta(hours=1)), _week(95, T0 - timedelta(minutes=5)))
     fact = routing.plan_fact(row, T0)
-    assert (fact["window"], fact["left_pct"], fact["seconds"]) == ("five-hour", 70, 3600)
+    assert fact == {"readable": False, "why": routing.RESET_PASSED_WHY, "reset_passed": True}
     # A week that resets before the five-hour window still gives the week's pace.
     row = _row("Claude", "claude", None, _five(10, T0 + timedelta(hours=4)), _week(50, T0 + timedelta(hours=1)))
     fact = routing.plan_fact(row, T0)

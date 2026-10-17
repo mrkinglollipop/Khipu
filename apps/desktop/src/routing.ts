@@ -223,6 +223,11 @@ export type PlanFact = {
   pace_pct_per_hour?: number;
   hurry?: boolean;
   words?: string;
+  /** Read more than 15 minutes ago: shown with its age, never a pace. */
+  stale?: boolean;
+  figures_at?: string | null;
+  /** Its longest window's reset time passed since it was read. */
+  reset_passed?: boolean;
 };
 
 export type RouteView = {
@@ -954,6 +959,12 @@ export function priorityPendingWords(p: RoutePriority): string {
   return `Set by ${p.pending_by || "a conversation"} at your request; you haven't confirmed it yet.`;
 }
 
+/** "when read 1 h ago" for figures that may be out of date. */
+export function readWhen(fact: PlanFact, now: Date): string {
+  const ago = fmtAgoSince(fact.figures_at, now.getTime());
+  return ago ? `when read ${ago}` : "when last read";
+}
+
 /** A pace in words: "1.7", "12" or "less than 0.01". */
 export function rateWords(pace: number): string {
   if (pace >= 10) return pace.toFixed(0);
@@ -966,6 +977,10 @@ export function rateWords(pace: number): string {
 export function paceWords(fact: PlanFact | null | undefined, now: Date): string | null {
   if (!fact) return null;
   if (!fact.readable) return capitalise(fact.why || "plan figures can't be read");
+  if (fact.stale) {
+    return `${fact.left_pct}% of its ${fact.window} left ${readWhen(fact, now)}, resets ${whenLocal(fact.resets_at, now)}: ` +
+      "these figures may be out of date, so no pace is given";
+  }
   const head = `${fact.left_pct}% of its ${fact.window} left, resets ${whenLocal(fact.resets_at, now)}`;
   if (!fact.left_pct || fact.left_pct <= 0) return `${head}: nothing left to use until then`;
   return `${head}: about ${rateWords(fact.pace_pct_per_hour ?? 0)}% an hour to use it all (${fact.words})`;

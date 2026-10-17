@@ -10,6 +10,7 @@ import type { PlanUsageState, UsageAccount } from "../PlansCard";
 import { RoutingCard } from "../RoutingCard";
 import { RoutingSettings } from "../RoutingSettings";
 import { paceWords, priorityHeadline } from "../routing";
+import { accountWeek } from "../routingOverview";
 import type { RoutePriority, RouteView, RoutingState } from "../routing";
 
 const invokeMock = vi.fn();
@@ -303,5 +304,19 @@ describe("the words", () => {
       .toBe("0% of its week left, resets Sat 2:00 PM: nothing left to use until then");
     expect(priorityHeadline({ ...PRIORITY, until: "2026-10-20T13:00:00Z" }, NOW))
       .toBe("Priority: Claude second until Sat 3:00 PM, then Codex, then Claude (all of it until Tue 9:00 AM)");
+  });
+  it("give figures that may be out of date no pace, and say when a reset passed", () => {
+    const stale = { readable: true, window: "week", left_pct: 26, used_pct: 74, resets_at: "2026-10-19T02:00:00Z",
+      stale: true, figures_at: "2026-10-15T12:38:00Z", pace_pct_per_hour: undefined, words: "figures may be out of date" };
+    const text = paceWords(stale, NOW) ?? "";
+    expect(text).toContain("26% of its week left when read 82 min ago");
+    expect(text).toContain("may be out of date, so no pace is given");
+    expect(text).not.toMatch(/an hour|plenty of time|little time/);
+    const overview = accountWeek(stale, NOW);
+    expect(overview.week).toContain("when read 82 min ago");
+    expect(overview.pace).toBe("These figures may be out of date, so no pace is given");
+    const passed = { readable: false, why: "its reset time passed; figures out of date", reset_passed: true };
+    expect(paceWords(passed, NOW)).toBe("Its reset time passed; figures out of date");
+    expect(accountWeek(passed, NOW).week).toBe("Its reset time passed; figures out of date");
   });
 });
