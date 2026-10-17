@@ -118,6 +118,16 @@ afterEach(() => {
 
 const setCalls = (cmd: string) => calls.filter(([c]) => c === cmd).map(([, a]) => a);
 
+// Every button stays disabled while a write and the read after it run, and a
+// limit's Change button until the first read lands; a click on a disabled
+// button does nothing, so each click waits for its button to be enabled.
+const enabled = (name: string, role = "button", root: HTMLElement = document.body) =>
+  waitFor(() => {
+    const el = within(root).getByRole(role, { name });
+    expect(el).toBeEnabled();
+    return el;
+  });
+
 describe("Settings, Work", () => {
   it("lists the ledger's projects with their counts and renames and hides as the owner", async () => {
     render(<WorkSettings active work={work()} />);
@@ -125,11 +135,11 @@ describe("Settings, Work", () => {
     expect(within(list).getByText("1,120 rows · 19 open · 9 need you")).toBeInTheDocument();
     expect(within(list).getByText("48 rows · 3 open · 1 needs you")).toBeInTheDocument();
     expect(within(list).getByText("Hidden from the Work tab")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Hide Atlas" }));
+    fireEvent.click(await enabled("Hide Atlas"));
     await waitFor(() => expect(setCalls("khipu_ledger_project_set")).toContainEqual({ project: "acme/atlas", name: null, hidden: true }));
-    fireEvent.click(await screen.findByRole("button", { name: "Show Lumen" }));
+    fireEvent.click(await enabled("Show Lumen"));
     await waitFor(() => expect(setCalls("khipu_ledger_project_set")).toContainEqual({ project: "acme/lumen", name: null, hidden: false }));
-    fireEvent.click(screen.getByRole("button", { name: "Rename Atlas" }));
+    fireEvent.click(await enabled("Rename Atlas"));
     const field = screen.getByLabelText("Name");
     fireEvent.change(field, { target: { value: "Atlas app" } });
     fireEvent.submit(field.closest("form")!);
@@ -161,18 +171,17 @@ describe("Settings, Work", () => {
     expect(within(list).getByText(/Updated 12 s ago · 3 jobs, 12 pull requests, 1 release train/)).toBeInTheDocument();
     expect(within(list).getByText(/over the 256 KB limit/)).toBeInTheDocument();
     expect(within(list).getByText("Turned off")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Turn off the summary file for Atlas" }));
+    fireEvent.click(await enabled("Turn off the summary file for Atlas"));
     await waitFor(() => expect(entries.find((e) => e.project === "acme/atlas")?.on).toBe(false));
-    fireEvent.click(screen.getByRole("button", { name: "Turn on the summary file for harbor" }));
+    fireEvent.click(await enabled("Turn on the summary file for harbor"));
     await waitFor(() => expect(entries.find((e) => e.project === "acme/harbor")?.on).toBe(true));
-    fireEvent.click(screen.getByRole("button", { name: "Remove the summary file for quarry" }));
+    fireEvent.click(await enabled("Remove the summary file for quarry"));
     await waitFor(() => expect(entries.map((e) => e.project)).toEqual(["acme/atlas", "acme/harbor"]));
   });
 
   it("switches off what a project's jobs say they are doing", async () => {
     render(<WorkSettings active work={work()} />);
-    const sw = await screen.findByRole("switch", { name: "Show what Atlas jobs say they are doing" });
-    fireEvent.click(sw);
+    fireEvent.click(await enabled("Show what Atlas jobs say they are doing", "switch"));
     await waitFor(() => expect(entries.find((e) => e.project === "acme/atlas")?.show_now).toBe(false));
   });
 
@@ -184,7 +193,8 @@ describe("Settings, Work", () => {
     fireEvent.change(within(form).getByLabelText("Project"), { target: { value: "\u0000new" } });
     fireEvent.click(within(form).getByRole("button", { name: "Choose file…" }));
     expect(await within(form).findByText("Found 1 job, 4 pull requests and no release trains, updated 6 s ago.")).toBeInTheDocument();
-    expect(within(form).getByLabelText("The new project's key")).toHaveValue("lumen");
+    // The key is filled in by an effect that runs after the read's words render.
+    await waitFor(() => expect(within(form).getByLabelText("The new project's key")).toHaveValue("lumen"));
     fireEvent.submit(form);
     await waitFor(() =>
       expect(entries[entries.length - 1]).toEqual({ project: "lumen", file: "/runners/lumen/state/work-summary.json", on: true, show_now: true }),
@@ -202,14 +212,14 @@ describe("Settings, Work", () => {
 
   it("changes a limit to No limit and the out-of-date time to a fixed time", async () => {
     render(<WorkSettings active work={work()} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Change: Largest summary file Khipu reads" }));
+    fireEvent.click(await enabled("Change: Largest summary file Khipu reads"));
     const form = screen.getByRole("form", { name: "Change: Largest summary file Khipu reads" });
     const select = within(form).getByLabelText("Largest file");
     expect(within(select).getByRole("option", { name: "256 KB (the default)" })).toBeInTheDocument();
     fireEvent.change(select, { target: { value: "0" } });
     fireEvent.submit(form);
     await waitFor(() => expect(setCalls("khipu_config_set")).toContainEqual({ key: "work_file_max_bytes", value: "0" }));
-    const stale = screen.getByRole("button", { name: "Change: A summary is out of date after" });
+    const stale = await enabled("Change: A summary is out of date after");
     expect(stale.parentElement).toHaveTextContent("Automatic");
     fireEvent.click(stale);
     const sform = screen.getByRole("form", { name: "Change: A summary is out of date after" });
@@ -239,7 +249,7 @@ describe("Settings, Work", () => {
     render(<WorkSettings active work={work()} />);
     const list = await screen.findByRole("list", { name: "Hidden items" });
     expect(within(list).getByText("Owed · harbor")).toBeInTheDocument();
-    fireEvent.click(within(list).getByRole("button", { name: "Unhide Look at the nightly report size again" }));
+    fireEvent.click(await enabled("Unhide Look at the nightly report size again", "button", list));
     await waitFor(() => expect(setCalls("khipu_work_hide")).toContainEqual({ id: "42", hide: false }));
     expect(await screen.findByText("Nothing is hidden.")).toBeInTheDocument();
   });

@@ -72,11 +72,12 @@ describe("HealthChecksCard", () => {
     await waitFor(() => expect(input).toHaveValue("60"));
     fireEvent.change(input, { target: { value: "90" } });
     fireEvent.click(screen.getAllByRole("button", { name: "Save" })[0]);
+    // The field already shows the typed value, so wait for the write itself.
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "doctor_rate_window_minutes", value: "90" }]));
     await waitFor(() => expect(input).toHaveValue("90"));
-    expect(calls).toContainEqual(["khipu_config_set", { key: "doctor_rate_window_minutes", value: "90" }]);
     fireEvent.click(screen.getByRole("button", { name: "Use default" }));
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "doctor_rate_window_minutes" }]));
     await waitFor(() => expect(input).toHaveValue("60"));
-    expect(calls).toContainEqual(["khipu_config_unset", { key: "doctor_rate_window_minutes" }]);
   });
 
   it("refuses a value out of range before calling Khipu", async () => {
