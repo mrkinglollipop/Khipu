@@ -352,7 +352,10 @@ describe("IntegrationsPanel — T3 health card", () => {
     expect(within(card).getByText("Linking threads")).toBeInTheDocument();
     expect(within(card).getByText(/Thread lookup · reads T3's thread records, read-only/)).toBeInTheDocument();
     expect(within(card).getByText(/Last capture linked to a thread 12 min ago · Codex/)).toBeInTheDocument();
-    fireEvent.click(within(card).getByRole("button", { name: "Recheck" }));
+    // Recheck stays disabled until the panel's first read finishes.
+    const recheck = within(card).getByRole("button", { name: "Recheck" });
+    await waitFor(() => expect(recheck).toBeEnabled());
+    fireEvent.click(recheck);
     fireEvent.click(within(card).getByRole("button", { name: "Search T3 captures" }));
     expect(refresh).toHaveBeenCalledOnce();
     expect(search).toHaveBeenCalledOnce();
