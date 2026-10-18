@@ -826,7 +826,7 @@ def _signed_in(cli: str, path: Path | None, check) -> str:
     elif cli == "grok":
         state = discover._from_probe(usage.probe_grok(home))[0]
     else:
-        state = discover._from_probe(usage.probe_muse())[0]
+        state = discover._from_probe(usage.probe_muse(turn=False))[0]
     return {discover.SIGNED_IN: SIGNED_IN, discover.NOT_SIGNED_IN: NOT_SIGNED_IN}.get(state, COULDNT_CHECK)
 
 

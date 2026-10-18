@@ -2141,7 +2141,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         return {"id": e["id"], "source": e["source"], "written_by": e["written_by"], "at": _iso(e["at"]),
                 "evidence": e.get("evidence"), "message_time": e.get("message_time", False),
                 "cleared": bool(e.get("cleared")), "observed": bool(e.get("observed")),
-                "until_default": bool(e.get("until_default"))}
+                "turn": bool(e.get("turn")), "until_default": bool(e.get("until_default"))}
 
     underlying = {"state": state, "until": _iso(behind["until"]) if behind and state in (LIMITED, PROBABLY_OPEN)
                   else None, "basis": behind["basis"] if behind and state in (LIMITED, PROBABLY_OPEN) else None}
@@ -4492,6 +4492,8 @@ def _witness_words(entry: dict, push: bool) -> str:
     source, by = w.get("source"), w.get("written_by")
     cli_name = _harness_label(entry)
     if source == "probe":
+        if w.get("turn"):
+            return f"read from a {cli_name} turn Khipu ran"
         return f"read from {cli_name}'s last turn" if w.get("observed") else f"read from {cli_name}"
     if source == "check":
         return "checked by Khipu"
@@ -5560,7 +5562,8 @@ _VIEW_FIELDS = ("schema", "epoch", "version", "folded_at", "checked_at", "record
 _AUTHOR_PUBLIC = ("kind", "harness", "project", "session", "name")
 _ACCOUNT_FIELDS = ("label", "harness", "state", "until", "basis", "scope", "reason", "checkable", "confirmed_at",
                    "since", "silent", "configured")
-_WITNESS_FIELDS = ("id", "source", "at", "evidence", "message_time", "cleared", "observed", "until_default")
+_WITNESS_FIELDS = ("id", "source", "at", "evidence", "message_time", "cleared", "observed", "turn",
+                   "until_default")
 _REPORT_FIELDS = ("id", "state", "source", "at", "since", "until")
 _LAST_SEEN_FIELDS = (*_REPORT_FIELDS, "cleared")
 _MODEL_FIELDS = ("model", "until", "basis", "source", "at", "id")

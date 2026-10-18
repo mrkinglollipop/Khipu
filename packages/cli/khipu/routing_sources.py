@@ -948,7 +948,7 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
                 continue
             base = {"account": key, "runner": None, "lane": None, "scope": scope, "source": "probe",
                     "written_by": by, "via": "probe", "at": at, "reason": None, "message_time": False,
-                    "observed": observed}
+                    "observed": observed, "turn": row.get("source") == "turn"}
             if full:
                 reset, w = max(full, key=lambda item: item[0])
                 name = safe_name(w.get("name")) or ""

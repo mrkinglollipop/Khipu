@@ -142,6 +142,36 @@ def test_a_probe_at_100_percent_replaces_a_runners_guess(home):
     assert "read from Muse's last turn" in routing.account_line(muse, T0)
 
 
+def test_muse_figures_from_a_turn_khipu_ran_say_so(home):
+    _register(home)
+    seen = T0 - timedelta(minutes=3)
+    five, week = T0 + timedelta(hours=3), T0 + timedelta(days=4)
+    _usage(home, {"muse|": _row(seen, [
+        {"name": "five_hour", "used_pct": 39, "resets_at": routing._iso(five), "window_mins": 300},
+        {"name": "weekly", "used_pct": 13, "resets_at": routing._iso(week), "window_mins": 10080}],
+        source="turn", observed_at=routing._iso(seen))})
+    muse = _account(routing.read_view(), "muse|")
+    assert muse["state"] == "open" and muse["witness"]["turn"] is True
+    line = routing.account_line(muse, T0)
+    assert "read from a Muse turn Khipu ran" in line and "last turn" not in line
+    rows = {"muse|": json.loads((home["data"] / "state" / "usage.json").read_text())["rows"]["muse|"]}
+    fact = routing.plan_fact(rows["muse|"], T0)
+    assert fact["readable"] is True and fact["window"] == "week" and fact["used_pct"] == 13
+    assert fact["resets_at"] == routing._iso(week)
+    # Once the week's reset passes, the same figures read as out of date.
+    assert routing.plan_fact(rows["muse|"], week + timedelta(minutes=1))["why"] == routing.RESET_PASSED_WHY
+
+
+def test_muse_refusal_from_its_logs_reads_as_a_limit(home):
+    _register(home)
+    seen, resets = T0 - timedelta(minutes=10), T0 + timedelta(hours=2)
+    _usage(home, {"muse|": _row(seen, [{"name": "refused", "used_pct": 100, "resets_at": routing._iso(resets)}],
+                                 source="last_observed", observed_at=routing._iso(seen),
+                                 limited_until=routing._iso(resets))})
+    muse = _account(routing.read_view(), "muse|")
+    assert (muse["state"], muse["until"]) == ("limited", routing._iso(resets))
+
+
 def test_a_later_probe_with_headroom_reopens(home):
     _register(home)
     windows = [{"name": "five_hour", "used_pct": 40.0, "resets_at": routing._iso(T0 + timedelta(hours=2))}]
