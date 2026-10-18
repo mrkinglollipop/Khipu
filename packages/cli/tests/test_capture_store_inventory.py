@@ -36,7 +36,7 @@ _REPLICA_META = "replica bookkeeping: meta, freshness, erasure and purge markers
 _REGISTRY = "the forgotten-source registry: identities and ids, never text"
 
 NOT_CAPTURE = {
-    **dict.fromkeys(("hub_snapshot._acquire_refresh_lock", "ledger._ledger_lock",
+    **dict.fromkeys(("hub_snapshot._acquire_refresh_lock", "ledger._flock",
                      "memory_lock._take", "outbox._locked_outbox", "promote._lock",
                      "recall_prompt._session_lock", "routing._lock", "session_capture._beat_lock",
                      "session_capture._capture_now_lock", "session_capture._claim_lock",
@@ -93,7 +93,7 @@ NOT_CAPTURE = {
                     "search queries as typed into search, or their hash; not capture sources"),
     **dict.fromkeys(("ledger._migrate_outcomes", "ledger._prune_outcomes", "ledger._record_outcome",
                      "ledger._record_rejected", "ledger._refuse_job", "ledger._replica_pending",
-                     "ledger._set_aside", "ledger.enqueue"), _LEDGER),
+                     "ledger._set_aside", "ledger._append_to_line"), _LEDGER),
     # Owner writes queued while the hub is away: the tool name and its arguments (ids, an action,
     # a decision's text the owner typed), a lock file, and the refused copies.
     "owner_writes._write": "owner writes waiting for the hub: ids, actions, a decision's text; not captures",

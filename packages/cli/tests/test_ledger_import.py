@@ -1097,3 +1097,26 @@ def test_a_catch_up_import_is_not_made_by_direction(hub, tmp_path, monkeypatch):
     _direction(tmp_path, monkeypatch)
     rc, report = _import(_write(tmp_path, _tracker(10)), "--catch-up", "--owner-direction")
     assert rc != 0 and report.get("reason") == "not_by_direction", report
+
+
+def test_a_set_queued_unseen_never_overwrites_a_value_another_mac_imported(hub, tmp_path, monkeypatch):
+    """Codex round-2 P1: an imported row has values but no per-field history;
+    a set this Mac queued without seeing the row arrives late over them."""
+    from khipu import ledger
+
+    _tl._away(monkeypatch)
+    op = ledger.new_op("set", P, "1000", fields={"evidence": "stale queued"}, op_id="unknown-before-import")
+    assert ledger.write(op)["queued"]
+    assert ledger.queued_ops()[0]["seen"] == {}
+    monkeypatch.setenv("KHIPU_DATABASE_URL", hub)
+    with monkeypatch.context() as other_mac:
+        other_mac.setenv("KHIPU_DATA_DIR", str(tmp_path / "mac-b"))
+        rc, report = _import(_write(tmp_path, {"rows": {"1000": _tracker(8)["rows"]["1000"]}}))
+    assert rc == 0, report
+    before = _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = '1000'")
+    assert before[0][0]
+    with _real_connect(hub) as conn:
+        assert ledger.drain(conn)["landed"] == 1
+    assert _sql(hub, "SELECT evidence FROM ledger_rows WHERE row_id = '1000'") == before
+    assert _sql(hub, "SELECT note FROM ledger_history WHERE op_id = 'unknown-before-import'")[0][0].startswith(
+        "arrived late")

@@ -335,3 +335,53 @@ describe("offline copy row (hub_snapshot_ok)", () => {
     expect(item?.cause).toContain("The nightly job rebuilds it in full and last did so 30 h ago.");
   });
 });
+
+describe("ledger copy row", () => {
+  it("sits next to the offline copy row and says the ledger's age", () => {
+    const rows = healthRows({
+      hub_snapshot_ok: true,
+      ledger_copy_ok: true,
+      hub_ok: true,
+      ledger_copy: { ok: true, state: "fresh", age_seconds: 600 },
+    });
+    const keys = rows.map((r) => r.key);
+    expect(keys.indexOf("ledger_copy_ok")).toBe(keys.indexOf("hub_snapshot_ok") + 1);
+    const row = rows.find((r) => r.key === "ledger_copy_ok")!;
+    expect(row.label).toBe("Offline copy of the ledger");
+    expect(row.status).toBe("ok");
+    expect(row.detail).toBe("in step · last caught up 10 min ago");
+  });
+
+  it("goes red with the failure, when it started and the next retry", () => {
+    const now = Date.now();
+    const parsed = {
+      ledger_copy_ok: false,
+      ledger_copy: {
+        ok: false,
+        state: "failing",
+        age_seconds: 3 * 3600,
+        last_error: {
+          error: "database is locked",
+          since: new Date(now - 45 * 60_000).toISOString(),
+          next_retry_at: new Date(now + 5 * 60_000).toISOString(),
+        },
+      },
+    };
+    const row = healthRows(parsed).find((r) => r.key === "ledger_copy_ok")!;
+    expect(row.status).toBe("err");
+    expect(row.detail).toContain("updates keep failing");
+    expect(row.detail).toContain("last caught up 3 h ago");
+    expect(row.detail).toContain("the last update failed: database is locked");
+    expect(row.detail).toContain("failing since 45 min ago");
+    expect(row.detail).toMatch(/next try at /);
+    const item = buildAttention(parsed).items.find((i) => i.key === "ledger_copy");
+    expect(item?.cause).toContain("database is locked");
+  });
+
+  it("says nothing to fix on a fresh install with no ledger yet", () => {
+    const row = healthRows({ ledger_copy_ok: true, ledger_copy: { ok: true, state: "not_applicable" } })
+      .find((r) => r.key === "ledger_copy_ok")!;
+    expect(row.status).toBe("ok");
+    expect(row.detail).toBe("no ledger in the offline copy yet");
+  });
+});

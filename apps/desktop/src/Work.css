@@ -195,6 +195,7 @@ button.wk-job-title {
 .lg-change { display: flex; flex-direction: column; gap: var(--s2); padding: var(--s3) var(--s4); border-bottom: 1px solid var(--border); background: var(--surface); }
 .lg-change .toolbar label { font-size: var(--t-sm); color: var(--text-2); min-width: 4.5rem; }
 .lg-change .toolbar input { flex: 1; min-width: 0; }
+.lg-unsaved { font-size: var(--t-sm); color: var(--warn); font-weight: 600; white-space: nowrap; }
 .lg-hist { list-style: none; margin: 0; padding: var(--s2) var(--s4) var(--s3); display: flex; flex-direction: column; gap: var(--s2); }
 .lg-hist li { display: flex; flex-direction: column; gap: 2px; font-size: var(--t-sm); color: var(--text-2); line-height: 1.45; padding-left: var(--s3); border-left: 2px solid var(--border); overflow-wrap: anywhere; }
 .lg-hist li.new { border-left-color: var(--accent); }

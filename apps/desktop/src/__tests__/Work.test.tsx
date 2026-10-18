@@ -462,7 +462,7 @@ describe("Waiting on you", () => {
   it("Done on an item also in Owed closes the commitment too", async () => {
     const onOwedClose = vi.fn(async () => {});
     serve(view({ projects: [atlas], waiting: [wait("atlas", "n-1", { also_owed: "42", actions: ["done", "open_owed"] })] }), {
-      khipu_ledger_set: () => ({ ok: true }),
+      khipu_ledger_set: () => ({ ok: true, state: "complete" }),
     });
     render(<Harness onOwedClose={onOwedClose} />);
     const list = await screen.findByRole("list", { name: "Waiting on you" });

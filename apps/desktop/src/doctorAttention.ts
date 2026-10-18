@@ -458,6 +458,27 @@ export function buildAttention(parsed: Record<string, unknown>): {
     });
   }
 
+  const ledgerCopy = (parsed as {
+    ledger_copy?: { ok?: boolean; state?: string; age_seconds?: number | null; error?: string;
+      last_error?: { error?: string } | null };
+  }).ledger_copy;
+  if (ledgerCopy && ledgerCopy.ok === false) {
+    issues.push(`Offline copy of the ledger is out of date${ledgerCopy.state ? `: ${ledgerCopy.state}` : ""}`);
+    const why =
+      ledgerCopy.state === "failing"
+        ? `Its updates have failed for over 30 minutes${ledgerCopy.last_error?.error ? `: ${ledgerCopy.last_error.error}` : ""}.`
+        : ledgerCopy.state === "old"
+          ? `It last caught up ${fmtAgo(ledgerCopy.age_seconds)} while the database answers.`
+          : `Khipu could not check it${ledgerCopy.error ? `: ${ledgerCopy.error}` : ""}.`;
+    items.push({
+      key: "ledger_copy",
+      tone: "warn",
+      title: "The offline copy of your ledger is out of date",
+      cause: `${why} The background job retries every 15 minutes; until one succeeds, the ledger read offline is older than the database's.`,
+      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
+    });
+  }
+
   // Disk space: amber warns while doctor's flag is still true, red is an error.
   const ds = (parsed as { disk_space?: { level?: string; message?: string } }).disk_space;
   if (ds && (ds.level === "amber" || ds.level === "red")) {
