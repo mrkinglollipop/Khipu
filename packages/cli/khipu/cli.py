@@ -2180,6 +2180,10 @@ def cmd_usage(args: argparse.Namespace) -> int:
     the orchestrator."""
     from khipu import usage
 
+    if getattr(args, "refresh_due", None) is not None:
+        # The per-prompt routing read's detached refresh (usage.kick_refresh).
+        print(json.dumps(usage.refresh_due(max_age=max(0.0, args.refresh_due))))
+        return 0
     if getattr(args, "forget_login_paths", False):
         from khipu import session_capture
 
@@ -4446,8 +4450,15 @@ def cmd_sessions(args: argparse.Namespace) -> int:
     if args.aegis_cmd == "sweep":
         print(json.dumps(sc.sweep_idle(limit=args.limit, dry_run=args.dry_run), indent=2))
         return 0
+    if not args.dry_run:
+        # Plan figures stay fresh for every conversation's routing lines
+        # without anyone asking: this job runs every five minutes.
+        from khipu.routing import refresh_plan_figures
+
+        refreshed = refresh_plan_figures()
     out = sc.drain(limit=args.limit, dry_run=args.dry_run, sweep=True)
     if not args.dry_run:
+        out["plan_usage"] = refreshed
         # A promotion queued while the hub was out of reach is retried from
         # here, in its own process (khipu.promote.kick_queued_retry).
         from khipu.promote import kick_queued_retry
@@ -5540,6 +5551,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-age", type=float, default=None, metavar="S",
         help="Reuse a cached probe younger than S seconds (default 120); older figures are marked stale",
     )
+    us.add_argument("--refresh-due", type=float, default=None, metavar="S",
+                    help="Read only the accounts whose figures are older than S seconds, unless another read "
+                         "is running (JSON)")
     us.add_argument("--account", default=None, metavar="LABEL",
                     help="Only this configured account (its label, as Settings shows it)")
     us.add_argument("--account-key", default=None, metavar="KEY",

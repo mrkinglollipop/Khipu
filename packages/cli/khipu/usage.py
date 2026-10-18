@@ -41,6 +41,7 @@ import select
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -161,7 +162,8 @@ def _rollout_note(code: str, home: str | None) -> str:
                 f"Open Codex{folder} and sign in again")
     return ROLLOUT_NOTE
 _SIGNIN = re.compile(r"not (signed|logged) in|(log|sign) ?in (is )?required|please (log|sign) ?in|"
-                     r"unauthori[sz]ed|unauthenticated|authentication (failed|required)|\b401\b", re.I)
+                     r"unauthori[sz]ed|unauthenticated|authentication (failed|required)|\b401\b|"
+                     r"(invalid|expired)( or expired)? credentials|no auth context", re.I)
 
 
 class ProbeError(Exception):
@@ -320,7 +322,7 @@ def _exit_code(code) -> str:
 
 
 def _converse(argv: list[str], messages: list[dict], is_answer, *, env: dict[str, str],
-              deadline: float, close_stdin: bool, keep=None) -> list[dict]:
+              deadline: float, close_stdin: bool, keep=None, follow=None) -> list[dict]:
     """Write ``messages``, read JSON lines until ``is_answer(frame)`` or the
     ``deadline`` (monotonic), then kill the whole process group.
 
@@ -329,7 +331,8 @@ def _converse(argv: list[str], messages: list[dict], is_answer, *, env: dict[str
     answering, so for them stdin stays open until the answer arrives (the kill
     closes it). Returns the response frames read; notifications are dropped
     unread (Grok's carry the user's MCP configuration). ``keep`` replaces the
-    test for which frames are response frames."""
+    test for which frames are response frames. ``follow(frame)`` returns the
+    requests to write once that response frame has arrived (None: none)."""
     with tempfile.TemporaryDirectory(prefix="khipu-usage-") as cwd, tempfile.TemporaryFile() as errfile:
         try:
             proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errfile,
@@ -378,6 +381,13 @@ def _converse(argv: list[str], messages: list[dict], is_answer, *, env: dict[str
                         frames.append(frame)
                         if is_answer(frame):
                             return frames
+                        more = follow(frame) if follow else None
+                        if more:
+                            try:
+                                proc.stdin.write("".join(json.dumps(m) + "\n" for m in more).encode())
+                                proc.stdin.flush()
+                            except (BrokenPipeError, OSError, ValueError):
+                                pass
         finally:
             _kill(proc)
             if run is not None:
@@ -475,7 +485,10 @@ def _answer(frames: list[dict], rid) -> dict:
         if frame.get("id") == rid:
             if frame.get("error") is not None:
                 err = frame["error"]
-                raise ProbeError(_classify(err.get("message") if isinstance(err, dict) else err, E_CLI))
+                # Grok puts the reason in ``data`` under a bare "Internal error".
+                text = " ".join(str(err.get(k)) for k in ("message", "data") if isinstance(err.get(k), str)) \
+                    if isinstance(err, dict) else err
+                raise ProbeError(_classify(text, E_CLI))
             result = frame.get("result")
             if not isinstance(result, dict):
                 raise ProbeError(E_BAD)
@@ -852,6 +865,8 @@ def probe_codex(home: str | None = None, *, timeout: float = TIMEOUT_S, rollout:
 
 
 def parse_grok(frames: list[dict]) -> dict:
+    if not any(frame.get("id") == 2 for frame in frames):
+        _answer(frames, 1)  # a failed initialize is the probe's error
     version = None
     for frame in frames:
         if frame.get("id") == 1 and isinstance(frame.get("result"), dict):
@@ -875,18 +890,22 @@ def parse_grok(frames: list[dict]) -> dict:
 def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
     """Grok Build's ``_x.ai/billing`` (ACP, undocumented) for the login in
     ``grok_home`` (``GROK_HOME``; None = the default ``~/.grok``). See
-    ``_GROK_ENV``: Grok cannot be started with no MCP servers at all."""
+    ``_GROK_ENV``: Grok cannot be started with no MCP servers at all.
+
+    The billing request goes only after ``initialize`` has answered: sent
+    together, Grok Build 1.0.52 can run it before the session has its
+    sign-in and answers "Invalid or expired credentials ... no auth
+    context", which read as ``cli_error`` from 2026-10-14 on."""
     binary = _command("grok")
     if not binary:
         return _not_installed("grok")
-    messages = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-         "params": {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": _CLIENT_INFO}},
-        {"jsonrpc": "2.0", "id": 2, "method": "_x.ai/billing", "params": {}},
-    ]
-    frames = _converse([binary, "agent", "--no-leader", "stdio"], messages, lambda f: f.get("id") == 2,
+    initialize = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                  "params": {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": _CLIENT_INFO}}
+    billing = {"jsonrpc": "2.0", "id": 2, "method": "_x.ai/billing", "params": {}}
+    frames = _converse([binary, "agent", "--no-leader", "stdio"], [initialize],
+                       lambda f: f.get("id") == 2 or (f.get("id") == 1 and f.get("error") is not None),
                        env=probe_environment("grok", grok_home, binary), deadline=time.monotonic() + timeout,
-                       close_stdin=False)
+                       close_stdin=False, follow=lambda f: [billing] if f.get("id") == 1 else None)
     return parse_grok(frames)
 
 
@@ -1485,6 +1504,89 @@ def wait_for_refresh(timeout: float | None = None) -> bool:
         return True
     thread.join(timeout)
     return not thread.is_alive()
+
+
+# Keeping the cache fresh without a reader asking (routing freshness,
+# 2026-10-17): the five-minute queue-drain job refreshes what is older than
+# ``PERIODIC_MAX_AGE_S``, and the per-prompt routing read starts one detached
+# refresh when the cache is older than ``PROMPT_MAX_AGE_S``, at most once per
+# ``KICK_EVERY_S``. Both go through the shared refresh lock, so one refresh
+# runs at a time on this Mac.
+PERIODIC_MAX_AGE_S = 300
+PROMPT_MAX_AGE_S = 600
+KICK_EVERY_S = 60
+KICK_STAMP_NAME = "usage.kick"
+
+
+def _due(accounts: list[dict], cache: dict[str, dict], now: datetime, max_age: float) -> list[dict]:
+    """The valid accounts whose last attempt is older than ``max_age`` (or
+    that were never read)."""
+    out = []
+    for account in accounts:
+        if account.get("invalid"):
+            continue
+        cached = cache.get(_key(account)) or {}
+        attempted = _parse_time(cached.get("last_attempt_at") or cached.get("probed_at"))
+        if attempted is None or (now - attempted).total_seconds() > max_age:
+            out.append(account)
+    return out
+
+
+def refresh_due(*, max_age: float = PERIODIC_MAX_AGE_S, timeout: float = TIMEOUT_S,
+                accounts: list[dict] | None = None) -> dict:
+    """Read every account whose figures are older than ``max_age``, under
+    the shared refresh lock taken without waiting: when another refresh
+    holds it, that refresh is this one. What is due is judged again once the
+    lock is held, so callers that race refresh once. Never raises:
+    ``{"refreshed": n, "skipped": None | "fresh" | "busy" | "error"}``."""
+    try:
+        accounts = configured_accounts() if accounts is None else accounts
+        if not _due(accounts, _load_cache(), _now(), max_age):
+            return {"refreshed": 0, "skipped": "fresh"}
+        fd = _try_refresh_lock()
+        if fd is None:
+            return {"refreshed": 0, "skipped": "busy"}
+        try:
+            due = _due(accounts, _load_cache(), _now(), max_age)
+            if not due:
+                return {"refreshed": 0, "skipped": "fresh"}
+            _store(due, probe_all(due, timeout=timeout))
+            return {"refreshed": len(due), "skipped": None}
+        finally:
+            _release(fd)
+    except Exception:  # noqa: BLE001 - a periodic refresh never fails its caller
+        return {"refreshed": 0, "skipped": "error"}
+
+
+def kick_refresh(*, max_age: float = PROMPT_MAX_AGE_S, spawn=None) -> bool:
+    """For a caller that must not wait (the per-prompt routing read): when
+    some account's figures are older than ``max_age``, no refresh holds the
+    lock and none was started in the last ``KICK_EVERY_S``, start
+    ``khipu usage --refresh-due`` as its own detached process and return at
+    once. True when one was started. Never raises."""
+    try:
+        stamp = cache_file().with_name(KICK_STAMP_NAME)
+        with contextlib.suppress(OSError):
+            if 0 <= time.time() - stamp.stat().st_mtime < KICK_EVERY_S:
+                return False
+        if not _due(configured_accounts(), _load_cache(), _now(), max_age):
+            return False
+        fd = _try_refresh_lock()
+        if fd is None:
+            return False
+        _release(fd)  # only a look: the child takes it for its own read
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+        os.utime(stamp)
+        argv = [sys.executable, "-m", "khipu", "usage", "--refresh-due", str(int(max_age)), "--json"]
+        if spawn is not None:
+            spawn(argv)
+        else:
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             cwd=str(Path.home()), start_new_session=True, close_fds=True)
+        return True
+    except Exception:  # noqa: BLE001 - the prompt never pays for a refresh
+        return False
 
 
 def _age_s(row: dict, now: datetime) -> float | None:

@@ -169,4 +169,12 @@ built in round 2 and are unchanged.
 - Cache with a short max age rather than a daemon: a daemon would poll accounts nobody is using; a
   cached probe costs a second only when someone asks.
 - Routing truth phase 5 is the narrow exception: its resident helper checks an account only after a known limited reset time, never an open account; see `2026-10-14-routing-truth.md` phase 5 and decision 7.
+- Routing freshness (2026-10-17): with the routing push on, the figures conversations hear are kept fresh
+  without anyone asking. The five-minute queue-drain job reads every account older than 5 minutes
+  (`usage.refresh_due`), and the per-prompt and session-start routing reads start one detached `khipu usage
+  --refresh-due 600` when the cache is older than 10 minutes (`usage.kick_refresh`, at most once a minute, never
+  waited on); both single-flight on the refresh lock. Figures older than 15 minutes are shown with their age and
+  no pace; a longest window whose reset passed reads "its reset time passed; figures out of date". The Grok
+  probe sends `_x.ai/billing` only after `initialize` answers (sent together, Grok Build 1.0.52 answered "no
+  auth context", read as `cli_error` from 2026-10-14 19:16Z).
 - Khipu reports; it does not route. The routing table and the orchestrator read `khipu_usage` and decide.
