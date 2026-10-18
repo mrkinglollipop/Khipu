@@ -423,3 +423,38 @@ def test_a_snapshot_left_idle_is_ended_by_the_hub(hub, monkeypatch):
                 cur.execute("SELECT 1")
     finally:
         c.close()
+
+
+@pytest.mark.parametrize("reader", ["get", "work"])
+def test_a_new_projects_words_are_read_before_the_snapshot_opens(hub, tmp_path, monkeypatch, reader):
+    # A waiting add to a project the hub has no words for falls back to the
+    # default words, which read the config file: that read happens before the
+    # hub snapshot opens, never with a hub transaction held open.
+    from khipu import config
+
+    _snapshot(tmp_path)
+    ledger.enqueue(ledger.new_op("add", "new/project", "new-row", fields={"title": "New", "kind": "slice"}))
+    monkeypatch.setattr(ledger, "drain", lambda *a, **k: {**ledger._drain_result(), "busy": True})
+    monkeypatch.setattr(ledger, "replica_catch_up", lambda *a: None)
+    config.config_file().write_text("{}")
+    c = _real_connect(hub)
+    observer = _real_connect(hub)
+    observer.autocommit = True
+    real, states = config.load_config, []
+
+    def watched(*a, **k):
+        states.append(observer.execute("SELECT state FROM pg_stat_activity WHERE pid = %s",
+                                       (c.info.backend_pid,)).fetchone()[0])
+        return real(*a, **k)
+
+    monkeypatch.setattr(config, "load_config", watched)
+    try:
+        if reader == "get":
+            assert ledger.get("new/project", "new-row", conn=c)["row"]["queued"]
+        else:
+            monkeypatch.setattr(ledger, "_connect", lambda: c)
+            assert work.read_ledger()["projects"]["new/project"]["rows"][0]["queued"]
+    finally:
+        c.close()
+        observer.close()
+    assert states and all(state == "idle" for state in states), states

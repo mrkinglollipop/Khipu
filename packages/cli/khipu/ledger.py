@@ -2226,10 +2226,11 @@ def _no_copy_view() -> dict[str, Any]:
 
 
 def _hub_overlay(conn, view: dict[str, Any], project: str,
-                 line: list[tuple[dict[str, Any], bool]]) -> dict[str, Any]:
+                 line: list[tuple[dict[str, Any], bool]], *,
+                 words: dict[str, list] | None = None) -> dict[str, Any]:
     """The hub's view with the writes of ``line`` (the one its receipts were
     read for) the hub did not hold yet on top."""
-    return _overlay(view, project, line=line)
+    return _overlay(view, project, line=line, words=words)
 
 
 def _answered_here(op_id: Any) -> bool:
@@ -2264,19 +2265,23 @@ def _arrives_late(op: dict[str, Any], row: dict[str, Any], wanted: dict[str, Any
 
 
 def _overlay(view: dict[str, Any], project: str, *, receipts: set[str] | None = None,
-             line: list[tuple[dict[str, Any], bool]] | None = None) -> dict[str, Any]:
+             line: list[tuple[dict[str, Any], bool]] | None = None,
+             words: dict[str, list] | None = None) -> dict[str, Any]:
     """Apply the waiting writes (``line``, read now when not given) to a view,
     in the order they were made, by the rules the hub applies them by. A
     write the hub already holds (its receipt is in the view or ``receipts``,
     or this Mac recorded its outcome) is in the view already and is never
-    applied again; it still counts as waiting until its job leaves the line."""
+    applied again; it still counts as waiting until its job leaves the line.
+    ``words`` stands in for a project with no words yet; a caller inside a
+    hub snapshot passes ``default_vocab()`` read before it opened, since
+    reading it here reads the config file."""
     rows = {r["row_id"]: r for r in view["rows"]}
     gone = view.get("gone") or {}
     held = set(view.get("receipts") or ()) | set(receipts or ())
     removed: dict[str, dict[str, Any]] = {}
     restored: set[str] = set()
     added: set[str] = set()
-    vocab = view["vocab"] if view["vocab"]["state"] else default_vocab()
+    vocab = view["vocab"] if view["vocab"]["state"] else (words or default_vocab())
     pending = 0
     for op, answered in _line_now(project) if line is None else line:
         if op.get("project") != project:
@@ -2409,9 +2414,10 @@ def get(project: str, row_id: str, *, conn=None) -> dict[str, Any]:
         # receipts the waiting writes are judged by are one snapshot; the
         # line is read before it and the line's health after it.
         line = _line_now(project)
+        words = default_vocab() if line else None
         history: list[dict[str, Any]] = []
         with _one_snapshot(conn) as cur:
-            view = _overlay(_hub_rows(conn, project, line), project, line=line) if line else None
+            view = _overlay(_hub_rows(conn, project, line), project, line=line, words=words) if line else None
             queued = _queued_row(view, row_id)
             cur.execute(f"SELECT {', '.join(_ROW_COLS)} FROM ledger_rows WHERE project = %s AND row_id = %s",
                         (project, row_id))

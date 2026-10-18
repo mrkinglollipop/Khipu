@@ -1093,11 +1093,13 @@ def _hub_read(conn):
         yield cur
 
 
-def _read_boards(conn, cur, out: dict[str, Any], line: list[tuple[dict[str, Any], bool]]) -> None:
+def _read_boards(conn, cur, out: dict[str, Any], line: list[tuple[dict[str, Any], bool]],
+                 words: dict[str, list] | None = None) -> None:
     """``read_ledger``'s boards into ``out["projects"]``: online from ``cur``
     (the snapshot of ``conn``), offline (None) from the offline copy, with
     the waiting writes of ``line`` (``ledger._line_now``, read before the
-    snapshot opened) on top."""
+    snapshot opened) on top; ``words`` (``ledger.default_vocab``, read
+    before the snapshot too) stands in for a project with no words yet."""
     from khipu import ledger
 
     projects = {proj["project"]: proj for proj in _ledger_projects(cur)}
@@ -1120,7 +1122,7 @@ def _read_boards(conn, cur, out: dict[str, Any], line: list[tuple[dict[str, Any]
             # line, or it stopped early) still show, marked queued, so
             # "What you see includes them" stays true online too.
             if key in queued:
-                view = ledger._hub_overlay(conn, view, key, line)
+                view = ledger._hub_overlay(conn, view, key, line, words=words)
         else:
             offline = ledger._offline_view(key) or ledger._no_copy_view()
             view = ledger._overlay(offline, key, line=line)
@@ -1162,8 +1164,9 @@ def read_ledger() -> dict[str, Any]:
             if not hub_snapshot.ledger_in_snapshot():
                 out["error"], out["copy_unavailable"] = LEDGER_NO_COPY, True
         line = ledger._line_now()
+        words = ledger.default_vocab() if line else None
         with _hub_read(conn) as cur:
-            _read_boards(conn, cur, out, line)
+            _read_boards(conn, cur, out, line, words)
     except Exception as exc:  # noqa: BLE001
         if not ledger._tables_missing(exc):
             out["error"] = type(exc).__name__
