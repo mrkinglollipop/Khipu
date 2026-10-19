@@ -1,0 +1,51 @@
+/* Settings -> Projects (docs/mockups/2026-10-19-repo-renames/mock.css, approved
+   2026-10-19). Tokens and components come from App.css. */
+
+.proj { border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden; }
+.proj + .proj { margin-top: var(--s3); }
+.proj-head { display: flex; align-items: baseline; gap: var(--s2); flex-wrap: wrap; padding: var(--s2) var(--s3); background: var(--surface-2); border-bottom: 1px solid var(--border); }
+.proj-name { font-family: var(--mono); font-size: var(--t-md); font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+.proj-head .meta { margin-left: auto; }
+.oldname { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: var(--s4); padding: var(--s2) var(--s3); border-bottom: 1px solid var(--border); }
+.oldname:last-child { border-bottom: 0; }
+.oldname-id { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.oldname-line { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.oldname-name { font-family: var(--mono); font-size: var(--t-sm); color: var(--text); overflow-wrap: anywhere; }
+.oldname-why { font-size: var(--t-sm); color: var(--text-2); }
+.oldname-acts { display: flex; align-items: center; gap: var(--s2); white-space: nowrap; }
+.oldname-acts .meta { min-width: 92px; text-align: right; }
+.label-sm { font-size: var(--t-xs); color: var(--muted); }
+.kept-list > .oldname { border: 1px solid var(--border); border-radius: var(--r-sm); }
+.kept-list > .oldname + .oldname { margin-top: var(--s2); }
+.proj-row-error { grid-column: 1 / -1; margin: var(--s1) 0 0; }
+
+.proj-add { display: flex; align-items: flex-end; flex-wrap: wrap; gap: var(--s2); }
+.proj-add label { display: flex; flex-direction: column; gap: 3px; }
+.proj-add input { min-width: 220px; }
+
+/* The "same project?" question. */
+.ask { border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); border-radius: var(--r-md); background: var(--surface); box-shadow: var(--shadow-sm); overflow: hidden; }
+.ask + .ask { margin-top: var(--s3); }
+.ask-head { display: flex; align-items: center; gap: var(--s2); padding: var(--s3) var(--s4); background: var(--warn-soft); border-bottom: 1px solid color-mix(in srgb, var(--warn) 30%, transparent); }
+.ask-head svg { color: var(--warn); flex: none; }
+.ask-head b { font-size: 14px; color: var(--text); }
+.ask-head .meta { margin-left: auto; }
+.ask-body { display: flex; flex-direction: column; gap: var(--s3); padding: var(--s3) var(--s4) var(--s4); }
+.ask-body p { margin: 0; font-size: var(--t-md); color: var(--text-2); line-height: 1.5; }
+.pair, .choices { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s3); }
+.pair-side { border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s2) var(--s3); display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pair-side span:not(.proj-name) { font-size: var(--t-sm); color: var(--text-2); }
+.choice { display: flex; flex-direction: column; gap: var(--s2); align-items: flex-start; border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s3); }
+.ask-body .choice p { font-size: var(--t-sm); }
+.choice select { height: 26px; font: inherit; font-size: var(--t-sm); font-family: var(--mono); color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 0 var(--s2); max-width: 100%; }
+.pick { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.pick label { white-space: nowrap; }
+
+.chat-hint { display: flex; gap: var(--s2); align-items: flex-start; font-size: var(--t-sm); color: var(--text-2); line-height: 1.5; }
+.chat-hint svg { flex: none; margin-top: 2px; color: var(--muted); }
+.chat-hint q { color: var(--text); }
+.projects-stack { display: flex; flex-direction: column; gap: var(--s4); }
+
+@media (max-width: 1040px) {
+  .pair, .choices { grid-template-columns: 1fr; }
+}

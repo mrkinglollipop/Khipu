@@ -106,6 +106,25 @@ def test_show_counts_per_name_and_in_total_and_lists_pairs_asked_first(pg):
     assert [(p["a"], p["b"], p["state"]) for p in out["pairs"]] == [(A, B, "asked"), (A, OTHER, "kept_separate")]
 
 
+def test_list_gives_groups_pairs_and_counts_for_the_settings_page(pg, monkeypatch, capsys):
+    from khipu import project_renames
+
+    _seed(pg)
+    pg.execute("INSERT INTO project_aliases (alias, project, source) VALUES (%s, %s, 'github')", (C, OTHER))
+    pg.connection.commit()
+    monkeypatch.setattr(project_renames, "_read_last",
+                        lambda: {"at": "2026-10-19T02:05:00+00:00", "result": "skipped", "reason": "gh is not signed in"})
+    out = project_group.list_all(pg)
+    assert [g["canonical"] for g in out["groups"]] == [OTHER]
+    assert {n["name"]: n.get("source") for n in out["groups"][0]["names"]} == {OTHER: None, C: "github"}
+    assert [(p["a"], p["b"], p["state"]) for p in out["pairs"]] == [(A, B, "asked"), (A, OTHER, "kept_separate")]
+    assert out["pair_counts"][A]["open_commitments"] == 2 and out["pair_counts"][B]["episodes"] == 1
+    assert out["pair_counts"][A]["last_used"] and out["pair_counts"][B]["last_used"]
+    assert out["sweep"] == {"at": "2026-10-19T02:05:00+00:00", "result": "skipped", "reason": "gh is not signed in"}
+    assert project_group.cmd_list(None) == 0
+    assert json.loads(capsys.readouterr().out)["groups"][0]["canonical"] == OTHER
+
+
 def test_an_unrelated_name_is_its_own_group(pg):
     _seed(pg)
     out = project_group.show(pg, OTHER)

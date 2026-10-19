@@ -2862,6 +2862,10 @@ def cmd_project(args: argparse.Namespace) -> int:
         from khipu import project_group
 
         return project_group.cmd_show(args)
+    if getattr(args, "project_cmd", None) == "list":
+        from khipu import project_group
+
+        return project_group.cmd_list(args)
     if getattr(args, "project_cmd", None) in ("merge", "keep-separate") or (
             getattr(args, "project_cmd", None) == "alias" and getattr(args, "alias_cmd", None) in ("add", "remove")):
         from khipu import project_group
@@ -5885,6 +5889,8 @@ def build_parser() -> argparse.ArgumentParser:
     proj_show = proj_sub.add_parser("show", help="Is NAME one project? Its names, evidence, counts and pairs")
     proj_show.add_argument("name")
     proj_show.add_argument("--json", action="store_true")
+    proj_list = proj_sub.add_parser("list", help="Every project with more than one name, every pair, the last GitHub check")
+    proj_list.add_argument("--json", action="store_true", help="(always JSON)")
     proj_merge = proj_sub.add_parser("merge", help="Merge an asked pair: both read as one project (owner)")
     proj_merge.add_argument("a")
     proj_merge.add_argument("b")

@@ -2383,6 +2383,59 @@ async fn khipu_owner_direction_set(key: String, value: String) -> Result<String,
     run_khipu_cli_async(owner_direction_set_argv(&key, &value)?).await
 }
 
+/// A project name as the app sends it: one line, no control characters, and
+/// not so long it is not a name. The CLI checks the rest (an alias of itself,
+/// an unknown pair).
+fn checked_project_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 300 || has_control(name) {
+        return Err("that is not a project name".to_string());
+    }
+    Ok(name.to_string())
+}
+
+const PROJECTS_LIST_ARGV: &[&str] = &["project", "list", "--json"];
+
+fn project_owner_argv(verb: &[&str], flags: &[(&str, &str)], names: &[&str]) -> Result<Vec<String>, String> {
+    let mut argv: Vec<String> = vec!["project".to_string()];
+    argv.extend(verb.iter().map(|s| s.to_string()));
+    argv.push("--from-app".to_string());
+    for (flag, value) in flags {
+        argv.push(flag.to_string());
+        argv.push(checked_project_name(value)?);
+    }
+    argv.push("--".to_string());
+    for n in names {
+        argv.push(checked_project_name(n)?);
+    }
+    Ok(argv)
+}
+
+#[tauri::command]
+async fn khipu_projects_list() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(PROJECTS_LIST_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_project_name_add(older: String, current: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["alias", "add"], &[], &[&older, &current])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_name_remove(older: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["alias", "remove"], &[], &[&older])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_merge(a: String, b: String, show_as: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["merge"], &[("--show-as", &show_as)], &[&a, &b])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_keep_separate(a: String, b: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["keep-separate"], &[], &[&a, &b])?).await
+}
+
 #[tauri::command]
 async fn khipu_route_clear(account: String, report: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(route_clear_argv(&account, report.as_deref())?).await
@@ -4900,6 +4953,11 @@ pub fn run() {
             khipu_owner_direction_acknowledge,
             khipu_owner_direction_switch,
             khipu_owner_direction_set,
+            khipu_projects_list,
+            khipu_project_name_add,
+            khipu_project_name_remove,
+            khipu_project_merge,
+            khipu_project_keep_separate,
             khipu_route_clear,
             khipu_route_note_set,
             khipu_route_note_end,
@@ -5477,6 +5535,25 @@ mod settings_command_tests {
             assert!(!argv.iter().any(|a| a.starts_with("--max-age")));
         }
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"usage"));
+    }
+
+    #[test]
+    fn project_commands_are_fixed_verbs_marked_from_the_app() {
+        assert_eq!(fixed_argv(PROJECTS_LIST_ARGV), v(&["project", "list", "--json"]));
+        assert_eq!(
+            project_owner_argv(&["alias", "add"], &[], &["o/old", "o/new"]).unwrap(),
+            v(&["project", "alias", "add", "--from-app", "--", "o/old", "o/new"])
+        );
+        assert_eq!(
+            project_owner_argv(&["merge"], &[("--show-as", "o/b")], &["o/a", "o/b"]).unwrap(),
+            v(&["project", "merge", "--from-app", "--show-as", "o/b", "--", "o/a", "o/b"])
+        );
+        assert_eq!(
+            project_owner_argv(&["keep-separate"], &[], &["--x", "o/b"]).unwrap(),
+            v(&["project", "keep-separate", "--from-app", "--", "--x", "o/b"])
+        );
+        assert!(project_owner_argv(&["alias", "remove"], &[], &[""]).is_err());
+        assert!(project_owner_argv(&["alias", "remove"], &[], &["a\nb"]).is_err());
     }
 
     #[test]

@@ -157,6 +157,38 @@ def show(cur, name: str) -> dict:
             "names": names, "totals": totals, "pairs": pair_rows(cur, group)}
 
 
+def list_all(cur) -> dict:
+    """What Settings > Projects shows, in one read: every project that has more
+    than one name (as ``show`` gives it, newest name canonical), every pair
+    with its state (asked, merged, kept_separate) and the counts of the names in
+    an asked pair, and the last GitHub sweep's outcome as the sweep file has
+    it. Read-only: it never runs the sweep."""
+    from khipu import project_renames
+
+    canonicals = [r[0] for r in _savepoint(
+        cur, "project_group_list", "SELECT DISTINCT project FROM project_aliases ORDER BY project", ())]
+    groups = [show(cur, c) for c in canonicals]
+    pairs = [_pair_dict(r) for r in _savepoint(
+        cur, "project_group_list_pairs",
+        f"SELECT {_PAIR_COLS} FROM project_pairs ORDER BY (state = 'asked') DESC, state, created_at, a, b", ())]
+    asked_names = sorted({n for p in pairs if p["state"] == ASKED for n in (p["a"], p["b"])})
+    counts = _counts(cur, asked_names) if asked_names else {}
+    if asked_names:
+        from khipu.embed import _episode_schema_flags
+
+        flags = _episode_schema_flags(cur)
+        expr = "COALESCE(project, scope)" if flags["project"] else "scope"
+        deleted = " AND deleted_at IS NULL" if flags["deleted_at"] else ""
+        for name, ts in _savepoint(
+                cur, "project_group_last_used",
+                f"SELECT {expr}, max(ts) FROM episodes WHERE {expr} = ANY(%s){deleted} GROUP BY {expr}",
+                (asked_names,)):
+            counts[name]["last_used"] = _iso(ts)
+    last = project_renames._read_last() or {}
+    sweep = {"at": last.get("at"), "result": last.get("result"), "reason": last.get("reason") or last.get("error")}
+    return {"ok": True, "groups": groups, "pairs": pairs, "pair_counts": counts, "sweep": sweep}
+
+
 def asked_pairs(cur, project: str | None) -> list[dict]:
     """The pairs still waiting on the owner that involve ``project``'s group."""
     if not project:
@@ -368,6 +400,16 @@ def cmd_show(args) -> int:
         print(out["error"], file=sys.stderr)
         return 2
     print(json.dumps(out, indent=2, default=str) if getattr(args, "json", False) else render_text(out))
+    return 0
+
+
+def cmd_list(args) -> int:
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            out = list_all(cur)
+    print(json.dumps(out, indent=2, default=str))
     return 0
 
 
