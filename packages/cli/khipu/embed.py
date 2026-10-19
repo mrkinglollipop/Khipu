@@ -2146,6 +2146,7 @@ def _cosine_candidates(
                 "OR m.kind NOT IN ('episode', 'topic'))\n"
             )
             if filters is not None and filters.active:
+                filters.expand_project(cur)
                 filter_params = filters.params
                 ep = (
                     "(m.kind = 'episode' AND EXISTS (SELECT 1 FROM episodes e"
@@ -2332,6 +2333,9 @@ class _SearchFilters:
         from khipu.search_text import parse_time_filter
 
         self.project = (project or "").strip() or None
+        # The project filter matches every key of the project's alias group;
+        # ``expand_project`` fills this in once a cursor is open.
+        self.projects: list[str] = [self.project] if self.project else []
         self.session_id = (session_id or "").strip() or None
         self.harness = (harness or "").strip() or None
         self.t3_thread = (t3_thread or "").strip() or None
@@ -2345,13 +2349,21 @@ class _SearchFilters:
         # bound excludes them — exactly what the post-fusion pass does.
         self.media_allowed = not self.active
 
+    def expand_project(self, cur) -> None:
+        """Widen the project filter to the project's alias group (best-effort)."""
+        if self.project:
+            from khipu.identity import project_group
+
+            self.projects = project_group(cur, self.project) or [self.project]
+
     @property
     def params(self) -> dict[str, Any]:
         from khipu.cli import _escape_like
 
         out: dict[str, Any] = {}
         if self.project:
-            out["kf_project"] = f"%{_escape_like(self.project)}%"
+            patterns = [f"%{_escape_like(p)}%" for p in self.projects]
+            out["kf_project"] = patterns[0] if len(patterns) == 1 else patterns
         if self.session_id:
             out["kf_session"] = f"{_escape_like(self.session_id)}%"
         if self.harness:
@@ -2372,7 +2384,11 @@ class _SearchFilters:
         parts: list[str] = []
         if self.project:
             proj = f"COALESCE({a}project, {a}scope)" if flags["project"] else f"{a}scope"
-            parts.append(proj + " ILIKE %(kf_project)s ESCAPE '" + chr(92) + "'")
+            if len(self.projects) == 1:
+                parts.append(proj + " ILIKE %(kf_project)s ESCAPE '" + chr(92) + "'")
+            else:
+                # ESCAPE cannot follow ANY(...); backslash is the default escape.
+                parts.append(proj + " ILIKE ANY(%(kf_project)s)")
         if self.session_id:
             parts.append(f"{a}session_id LIKE %(kf_session)s ESCAPE '" + chr(92) + "'")
         if self.harness:
@@ -2424,6 +2440,7 @@ def _apply_search_filters(
     harness: str | None = None,
     t3_thread: str | None = None,
     via: str | None = None,
+    projects: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Post-fusion metadata filter + recency tiebreak, in one place for every
     mode (W2.3). project/session_id/harness only exist on episodes — a topic
@@ -2520,8 +2537,10 @@ def _apply_search_filters(
         if want_episode_only:
             if k != "episode":
                 continue
-            if project and project.strip().lower() not in (m.get("project") or "").lower():
-                continue
+            if project:
+                row_project = (m.get("project") or "").lower()
+                if not any(p.strip().lower() in row_project for p in (projects or [project])):
+                    continue
             if session_id and not (m.get("session_id") or "").startswith(session_id):
                 continue
             if harness:
@@ -2984,6 +3003,7 @@ def hybrid_search(
             fused = _apply_search_filters(
                 cur, fused, project=project, since=since, until=until,
                 session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
+                projects=filters.projects,
             )
 
             # Absolute relevance gate: the list unchanged when any row is

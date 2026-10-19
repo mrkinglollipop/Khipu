@@ -1434,6 +1434,7 @@ def _literal_candidates(
     ep_filter = tp_filter = nd_filter = "TRUE"
     filter_params: dict = {}
     if filters is not None and filters.active:
+        filters.expand_project(cur)
         filter_params = filters.params
         ep_filter = filters.episode_sql(cur)
         tp_filter = filters.topic_sql()
@@ -2844,8 +2845,10 @@ def cmd_project(args: argparse.Namespace) -> int:
     """K6: `khipu project backfill [--dry-run|--apply] [--limit N]` — resolve
     a project for episodes that have none, from the session's other episodes
     or a known repo_root. Never from a session id or free-text scope."""
+    if getattr(args, "project_cmd", None) == "alias":
+        return cmd_project_alias(args)
     if getattr(args, "project_cmd", None) != "backfill":
-        print(json.dumps({"ok": False, "error": "usage: khipu project backfill [--dry-run|--apply]"}))
+        print(json.dumps({"ok": False, "error": "usage: khipu project backfill [--dry-run|--apply] | alias add|list|remove"}))
         return 2
     from khipu.db import connect
     from khipu import hygiene
@@ -2863,6 +2866,40 @@ def cmd_project(args: argparse.Namespace) -> int:
     report["dry_run"] = not apply
     print(json.dumps(report, indent=2, default=str))
     return 0
+
+
+def cmd_project_alias(args: argparse.Namespace) -> int:
+    """`khipu project alias add <alias> <canonical> | list [--json] | remove <alias>`:
+    manage the keys that read as one project (migration 0021)."""
+    from khipu import identity
+    from khipu.db import connect
+
+    sub = getattr(args, "alias_cmd", None)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if sub == "list":
+                rows = identity.list_project_aliases(cur)
+                if getattr(args, "json", False):
+                    print(json.dumps(rows, indent=2, default=str))
+                else:
+                    for r in rows:
+                        print(f"{r['alias']} -> {r['canonical']}")
+                    if not rows:
+                        print("no project aliases")
+                return 0
+            if sub == "add":
+                out = identity.add_project_alias(cur, args.alias, args.canonical)
+            elif sub == "remove":
+                out = identity.remove_project_alias(cur, args.alias)
+            else:
+                out = {"ok": False, "error": "usage: khipu project alias add|list|remove"}
+        if out.get("ok"):
+            conn.commit()
+    if out.get("ok"):
+        print(json.dumps(out))
+        return 0
+    print(out["error"], file=sys.stderr)
+    return 2
 
 
 def cmd_hygiene_commitments(args: argparse.Namespace) -> int:
@@ -5788,6 +5825,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Actually write the backfill (destructive; needs an explicit go — never run against the live shared hub without it)",
     )
     proj_bf.add_argument("--limit", type=int, default=None)
+    proj_alias = proj_sub.add_parser("alias", help="Manage project aliases: keys that read as one project")
+    alias_sub = proj_alias.add_subparsers(dest="alias_cmd", required=True)
+    al_add = alias_sub.add_parser("add", help="Make ALIAS another key for CANONICAL")
+    al_add.add_argument("alias")
+    al_add.add_argument("canonical")
+    al_list = alias_sub.add_parser("list", help="List the aliases")
+    al_list.add_argument("--json", action="store_true")
+    al_rm = alias_sub.add_parser("remove", help="Remove an alias")
+    al_rm.add_argument("alias")
     proj.set_defaults(func=cmd_project)
 
     hy = sub.add_parser("hygiene", help="Graph hygiene jobs (memory reliability W5.2)")

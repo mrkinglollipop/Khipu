@@ -69,6 +69,11 @@ class FakeCursor:
         if "information_schema.columns" in sql and tuple(params or ()) == ("decisions",):
             self._current = [(c,) for c in self.decisions_columns]
             return
+        if "project_alias_group" in sql or "FROM project_aliases" in sql:
+            # The alias-group lookup (khipu.identity.project_canonical_group)
+            # is out of band too: no aliases on this fake hub, nothing consumed.
+            self._current = []
+            return
         self.statements.append(" ".join(sql.split()))
         self.params.append(params)
         self._current = self._results.pop(0) if self._results else []

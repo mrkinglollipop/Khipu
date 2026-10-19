@@ -507,9 +507,13 @@ def list_decisions(cur, *, project: str | None = None, since: Any = None,
     evidence_ready = _evidence_ready(cur)
     clauses: list[str] = []
     params: list[Any] = []
+    canonical = None
     if project:
-        clauses.append("project = %s")
-        params.append(project)
+        from khipu.identity import project_canonical_group
+
+        canonical, group = project_canonical_group(cur, project)
+        clauses.append("project = %s" if len(group) == 1 else "project = ANY(%s)")
+        params.append(group[0] if len(group) == 1 else group)
     if since is not None:
         clauses.append("decided_at >= %s")
         params.append(since)
@@ -547,6 +551,8 @@ def list_decisions(cur, *, project: str | None = None, since: Any = None,
     rows = [dict(zip(cols, row)) for row in cur.fetchall()]
     for row in rows:
         row["state"] = state_of(row)
+        if canonical and row.get("project"):
+            row["project"] = canonical
     return rows
 
 
@@ -761,8 +767,15 @@ def list_links(cur, *, state: str | None = None, project: str | None = None,
         clauses.append("l.state = %s")
         params.append(state)
     if project:
-        clauses.append("(o.project = %s OR n.project = %s)")
-        params.extend([project, project])
+        from khipu.identity import project_group
+
+        group = project_group(cur, project)
+        if len(group) == 1:
+            clauses.append("(o.project = %s OR n.project = %s)")
+            params.extend([group[0], group[0]])
+        else:
+            clauses.append("(o.project = ANY(%s) OR n.project = ANY(%s))")
+            params.extend([group, group])
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params.append(limit)
     cur.execute(

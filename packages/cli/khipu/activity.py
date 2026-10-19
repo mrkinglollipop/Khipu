@@ -383,9 +383,12 @@ def project_slice(
             project_expr = "COALESCE(project, scope)" if flags["project"] else "scope"
             clauses: list[str] = []
             params: list[Any] = []
+            from khipu.identity import project_group
+
+            group = project_group(cur, project) if project else []
             if project:
-                clauses.append(f"{project_expr} = %s")
-                params.append(project)
+                clauses.append(f"{project_expr} = %s" if len(group) == 1 else f"{project_expr} = ANY(%s)")
+                params.append(group[0] if len(group) == 1 else group)
             if host_session_id and flags.get("parent_session_id"):
                 clauses.append("parent_session_id = %s")
                 params.append(host_session_id)
@@ -453,16 +456,17 @@ def project_slice(
                 seen_slugs = {t["slug"] for t in topics}
                 remaining = topic_limit - len(topics)
                 now = datetime.now(timezone.utc)
+                note_match = "%s" if len(group) == 1 else "ANY(%s)"
                 cur.execute(
-                    """
+                    f"""
                     SELECT slug, title, COALESCE(event_at, updated_at, created_at), status
                     FROM topics
                     WHERE deleted_at IS NULL AND slug LIKE 'note:%%'
-                      AND frontmatter->>'project' = %s
+                      AND frontmatter->>'project' = {note_match}
                     ORDER BY COALESCE(event_at, updated_at, created_at) DESC NULLS LAST
                     LIMIT %s
                     """,
-                    (project, remaining + len(seen_slugs)),
+                    (group[0] if len(group) == 1 else group, remaining + len(seen_slugs)),
                 )
                 for slug, title, when, status in cur.fetchall():
                     if slug in seen_slugs:
