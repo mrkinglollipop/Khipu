@@ -66,8 +66,28 @@ def _git(cwd: str, args: list[str], timeout: float = GIT_TIMEOUT_S) -> str | Non
     return out or None
 
 
+# A project name is untrusted data that reaches model context (the pushed
+# slice), so only these shapes are ever produced or rendered: a remote's
+# ``owner/repo`` (GitHub's own rules are narrower) or a folder name.
+REMOTE_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,100}")
+FOLDER_NAME_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._ -]{0,99}")
+
+
+def safe_project_name(name: Any) -> bool:
+    """True when ``name`` is a remote slug or folder name of the safe shape."""
+    return isinstance(name, str) and bool(REMOTE_SLUG_RE.fullmatch(name) or FOLDER_NAME_RE.fullmatch(name))
+
+
+def _folder_project(name: str) -> str | None:
+    """A repo folder's name as a project: anything outside the safe set
+    (newlines, backticks, slashes, other punctuation) becomes ``-``."""
+    out = re.sub(r"[^A-Za-z0-9._ -]", "-", name or "").strip(" -")[:100].strip(" -")
+    return out if out and FOLDER_NAME_RE.fullmatch(out) else None
+
+
 def _slug_from_remote_url(url: str) -> str | None:
-    """``owner/repo`` from an https/ssh/scp-style git remote URL, or None."""
+    """``owner/repo`` from an https/ssh/scp-style git remote URL, or None for
+    anything that is not exactly that safe shape (the folder name applies)."""
     url = (url or "").strip()
     if not url:
         return None
@@ -77,7 +97,7 @@ def _slug_from_remote_url(url: str) -> str | None:
     if not m:
         return None
     slug = m.group(1).strip("/")
-    return slug or None
+    return slug if REMOTE_SLUG_RE.fullmatch(slug) else None
 
 
 def _remote_slug(repo_root: Path) -> str | None:
@@ -397,6 +417,8 @@ def observation_fields(obs: Any) -> tuple[str, str, str, str, float] | None:
         return None
     if kind not in ("remote", "folder", "unknown") or not (key and root and project):
         return None
+    if not safe_project_name(project):
+        return None
     return key, root, project, kind, at
 
 
@@ -546,7 +568,9 @@ def resolve_repo_root(cwd: str, *, cur: Any = None) -> dict[str, Any]:
     out["repo_root"] = str(main_root)
     out["is_worktree"] = is_worktree
     slug = _remote_slug(main_root)
-    project = slug or main_root.name
+    project = slug or _folder_project(main_root.name)
+    if not project:
+        return out
     if cur is not None:
         project = _resolve_project_alias(cur, project) or project
     out["project"] = project
