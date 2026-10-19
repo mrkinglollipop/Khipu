@@ -35,10 +35,21 @@ build is the foundation for this scope. It does not detect anything by itself.
 
 Three ways a rename shows up, each handled where the evidence already is.
 
-1. **The same checkout reports a new name.** Khipu keeps a small local record, per checkout (real
-   path plus root commit), of the last project name it reported. When the name changes on the same
-   checkout, that is a rename: certain, local, no network. The capture that sees it records the
-   alias with the new name as canonical.
+1. **The same checkout reports a new name.** A checkout's identity is the (device, inode) of its git
+   common dir, not its path: a moved folder keeps it, a deleted-and-recloned folder gets a new one, so
+   a reused path never inherits the old repo's evidence. The hook only observes: each capture job
+   carries `{checkout_key, root_commit, project, project_kind}` (`remote`, `folder` when git says
+   there is no origin, or `unknown` on any git error) and the hook keeps no "last project" state; its
+   only cache is the root commit, one small file per checkout key. The hub decides, in the capture
+   write, from its `project_checkouts` table (the observation is recorded for every job, including
+   ones whose extraction is empty; an observation older than the row is ignored; `unknown` only
+   refreshes `last_seen_at`). A transition is the same checkout and root commit with a changed project:
+   - folder to folder (a remoteless folder renamed or moved) and folder to remote (a local project
+     pushed to a remote) are certain: applied, remote name canonical;
+   - remote to folder (origin removed) is ignored;
+   - remote to remote may be a fork switch: applied only if `gh api repos/<old>` confirms it,
+     otherwise a `project_pairs` "asked" row is kept for the owner and nothing is merged;
+   - a different root commit is never a rename. Empty repos have no root commit and never produce one.
 2. **GitHub says the old name is now another name.** A daily check (in the existing nightly, off
    the hook path) asks `gh api repos/<slug>` for each GitHub project seen in the last 30 days. When
    the answer's `full_name` differs, Khipu records the alias before anyone re-points a remote. This
@@ -72,8 +83,18 @@ Rules for every alias Khipu records:
   newest one.
 - `project_aliases` is replicated to the local snapshot, so replica readers and the session-start
   slice group the same way the hub does.
-- Folder-keyed projects (no remote) get case 1 too, since a folder rename on the same checkout
-  keeps the root commit.
+- Folder-keyed projects (no remote) get case 1 too, since a moved or renamed folder keeps its
+  git common dir identity and root commit.
+- Grouping never splits. Observation times are compared only within one checkout (one Mac's clock,
+  `project_checkouts`), never across checkouts. A rename whose two names are already one group only
+  relabels it (every member re-pointed at the new name); otherwise the two groups merge under the new
+  name. So a late, stale event from another Mac can at worst relabel a group, never drop a member.
+- Each checkout's observations are evaluated under a per-checkout lock, and each group change under a
+  lock on the group's canonical name; there is no global lock.
+- An observation the hub cannot record (unreachable, failed write) waits in a small local spool per
+  checkout key in the capture state dir (at most 20, consecutive repeats kept once) and lands, oldest
+  first, before the next observation for that checkout. A rolled-back capture is retried from the
+  outbox with its observation.
 
 Out of scope: rewriting old rows to the new name; per-project files outside Khipu (Claude's own
 `~/.claude/projects/<path>` folders, Cursor rule files) beyond what Khipu itself writes; GitLab and
@@ -83,8 +104,8 @@ other hosts for case 2 (cases 1 and 3 still work there).
 
 - **A. Foundation (in flight):** `feat/project-alias-readers`: alias-aware readers and
   `khipu project alias add|list|remove`. Gate it, then add the olivewood alias by hand.
-- **B. Replica and same-checkout detection:** replicate `project_aliases` to the snapshot; the
-  per-checkout name record; the capture write records the alias; re-pointing so there are no chains;
+- **B. Replica and same-checkout detection:** replicate `project_aliases` to the snapshot (whole table on every pull); the
+  checkout observation in the hook and the hub's `project_checkouts` decision; the capture write records the alias; re-pointing so there are no chains;
   the evidence log. Hermetic tests: rename on one checkout, rename twice, folder rename.
 - **C. GitHub check and doctor:** the nightly `gh` lookup; doctor lines for aliases found, check
   skipped (no `gh`), and lookup failures.

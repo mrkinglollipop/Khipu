@@ -181,6 +181,182 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
     return int(row[0]) if row else None
 
 
+# A checkout observation that fails to reach the hub waits here, one small
+# JSON list per checkout key, oldest first, and is landed in order before the
+# next observation for that key (record_checkout_observation, _observe_checkout).
+# Consecutive observations of the same state keep only the oldest (its time is
+# the one a transition needs); past the cap the newest are dropped, since the
+# next live observation re-reports the current state anyway.
+CHECKOUT_SPOOL_CAP = 20
+
+
+def _spool_path(key: str) -> Path:
+    from khipu.session_capture import state_dir
+
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
+    return state_dir() / "checkout_spool" / f"{safe}.json"
+
+
+def _spool_key(obs: Any) -> str | None:
+    key = obs.get("checkout_key") if isinstance(obs, dict) else None
+    return str(key) if key else None
+
+
+def _spool_read(key: str) -> list[dict[str, Any]]:
+    try:
+        items = json.loads(_spool_path(key).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [o for o in items if isinstance(o, dict)] if isinstance(items, list) else []
+
+
+def _spool_edit(key: str, change) -> None:
+    """Read-modify-write one key's spool under an exclusive file lock, written
+    atomically (temp file, then rename). Best-effort: never raises."""
+    import fcntl
+    import tempfile
+
+    path = _spool_path(key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path.with_suffix(".lock"), "a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            items = change(_spool_read(key))
+            if not items:
+                path.unlink(missing_ok=True)
+                return
+            fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".spool.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(items, fh)
+            os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"checkout spool for {key} not written ({type(exc).__name__}: {exc})")
+
+
+def _spool_append(obs: dict[str, Any]) -> None:
+    key = _spool_key(obs)
+    if not key:
+        return
+
+    def add(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Concurrent drains spool in completion order, not observation order:
+        # sort by observed_at so the flush never lands a newer state first and
+        # then drops an older one as stale. Coalesce only after sorting.
+        same = ("root_commit", "project", "project_kind")
+        merged = sorted([*items, obs], key=lambda o: float(o.get("observed_at") or 0))
+        out: list[dict[str, Any]] = []
+        for item in merged:
+            if out and all(out[-1].get(k) == item.get(k) for k in same):
+                continue
+            out.append(item)
+        return out[:CHECKOUT_SPOOL_CAP]
+
+    _spool_edit(key, add)
+
+
+def _observation_failed(res: Any) -> bool:
+    return not (isinstance(res, dict) and res.get("ok"))
+
+
+def _land_observations(observations: list[dict[str, Any]]) -> bool:
+    """Record observations in order in one transaction of their own; all or none."""
+    try:
+        from khipu.db import connect
+        from khipu.identity import record_checkout_observation as decide
+
+        with connect() as conn, conn.cursor() as cur:
+            for obs in observations:
+                if _observation_failed(decide(cur, obs)):
+                    conn.rollback()
+                    return False
+            conn.commit()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def flush_checkout_spool(key: str | None) -> bool:
+    """Land this checkout's spooled observations, oldest first. True when none
+    are left waiting (an empty spool needs no hub)."""
+    if not key:
+        return True
+    pending = _spool_read(key)
+    if not pending:
+        return True
+    if not _land_observations(pending):
+        return False
+    _spool_edit(key, lambda items: items[len(pending):] if items[:len(pending)] == pending else items)
+    return not _spool_read(key)
+
+
+def _observe_checkout(cur, payload: dict[str, Any]) -> None:
+    """The hook's checkout observation (``payload["checkout"]``) goes to the hub's
+    rename decision (identity.record_checkout_observation). Runs before the alias
+    lookup so this very capture lands under the new name. It is popped so the
+    episode never stores it; ``capture`` keeps its own copy for the outbox, so a
+    rolled-back write is retried with it. Older spooled observations for the
+    same checkout land first; when they cannot, or this one fails, it joins the
+    spool instead, so observations always land in order. Never raises."""
+    from khipu.identity import observation_fields
+
+    obs = payload.pop("checkout", None)
+    if not isinstance(obs, dict):
+        return
+    payload["root_commit"] = obs.get("root_commit")
+    if observation_fields(obs) is None:
+        return
+    if not flush_checkout_spool(_spool_key(obs)):
+        _spool_append(obs)
+        return
+    try:
+        from khipu.identity import record_checkout_observation
+
+        res = record_checkout_observation(cur, obs)
+    except Exception as exc:  # noqa: BLE001
+        res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if _observation_failed(res):
+        _spool_append(obs)
+
+
+def record_checkout_observation(obs: dict[str, Any]) -> None:
+    """Record one observation on its own, for a job whose extraction came back
+    empty and so never reaches ``write_pg``: after any spooled ones for its
+    checkout, in one transaction. When the hub cannot take it (unreachable, no
+    table, any failure) it is spooled locally and lands with a later one."""
+    from khipu.identity import observation_fields
+
+    key = _spool_key(obs)
+    if not key or observation_fields(obs) is None:
+        return
+    pending = _spool_read(key)
+    if _land_observations([*pending, obs]):
+        if pending:
+            _spool_edit(key, lambda items: items[len(pending):] if items[:len(pending)] == pending else items)
+        return
+    _spool_append(obs)
+
+
+def _note_project_root(cur, payload: dict[str, Any]) -> None:
+    """Remember the root commit this (resolved) project name was seen with.
+    Best-effort: a hub before migration 0039 has no table, and never fails a capture."""
+    root = payload.get("root_commit")
+    if not (root and payload.get("project")):
+        return
+    try:
+        cur.execute("SAVEPOINT project_roots_note", ())
+        try:
+            cur.execute(
+                "INSERT INTO project_roots (project, root_commit) VALUES (%s, %s) "
+                "ON CONFLICT (project, root_commit) DO UPDATE SET last_seen = now()",
+                (payload["project"], str(root)))
+            cur.execute("RELEASE SAVEPOINT project_roots_note", ())
+        except Exception:  # noqa: BLE001
+            cur.execute("ROLLBACK TO SAVEPOINT project_roots_note", ())
+            cur.execute("RELEASE SAVEPOINT project_roots_note", ())
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _inherit_project(cur, payload: dict[str, Any]) -> None:
     """W1.2b: identity.resolve_repo_root cannot resolve a scratchpad/`/tmp`
     cwd — repo_root and project both come back None, which is exactly the
@@ -835,10 +1011,12 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             if hub_source_forgotten(cur, payload, source):
                 return _forgotten_result(cur, payload, source)
             _inherit_project(cur, payload)
+            _observe_checkout(cur, payload)
             if payload.get("project"):
                 from khipu.identity import _resolve_project_alias
 
                 payload["project"] = _resolve_project_alias(cur, payload["project"]) or payload["project"]
+            _note_project_root(cur, payload)
             dedup = dedup_before_insert(cur, payload, source=source)
             if dedup["action"] in ("skip", "merge"):
                 # ``episode_sources`` deliberately retains the source key on
@@ -1315,6 +1493,9 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
     # outbox (replayed by the next Stop hook / nightly / `khipu outbox drain`)
     # and the file line is still written, so nothing is ever lost and nothing
     # is ever double-written (the replay is the same identity upsert).
+    # write_pg pops the checkout observation off the payload; a rolled-back
+    # write must still carry it into the outbox, so the retry gets a copy.
+    checkout = payload.get("checkout")
     try:
         stats = write_pg(payload)
         if result is not None:
@@ -1329,8 +1510,9 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
         from khipu.outbox import enqueue
 
         _log(f"PG write FAILED ({type(exc).__name__}: {exc}) → outbox")
+        retry = payload if checkout is None else {**payload, "checkout": checkout}
         try:
-            enqueue(payload, reason=f"{type(exc).__name__}")
+            enqueue(retry, reason=f"{type(exc).__name__}")
             queued = True
         except Exception as qexc:  # noqa: BLE001 — outbox itself unwritable
             _log(f"outbox enqueue FAILED ({type(qexc).__name__}: {qexc})")

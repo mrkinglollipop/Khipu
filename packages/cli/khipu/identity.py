@@ -17,8 +17,12 @@ stay cheap, dependency-free, and safe to run inside Aegis's sandbox: only
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -186,6 +190,301 @@ def remove_project_alias(cur, alias: str) -> dict[str, Any]:
     if not cur.rowcount:
         return {"ok": False, "error": f"{alias!r} is not an alias"}
     return {"ok": True, "alias": alias, "changed": True}
+
+
+# Advisory lock classes (the first key of the two-key form), so a project
+# name and a checkout key never share a lock by hash coincidence.
+PROJECT_LOCK_CLASS = 0x4B485052  # one project group, by its canonical name
+CHECKOUT_LOCK_CLASS = 0x4B48434B  # one checkout, by its key
+
+
+def _xact_lock(cur, cls: int, name: str) -> None:
+    cur.execute("SELECT pg_advisory_xact_lock(%s::int4, hashtext(%s))", (cls, name))
+
+
+def _canonical_of(cur, name: str) -> str:
+    cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (name,))
+    row = cur.fetchone()
+    return str(row[0]) if row and row[0] else name
+
+
+def record_rename(cur, old: str, new: str, *, source: str, evidence: dict | None = None,
+                  observed_at: float | None = None) -> dict[str, Any]:
+    """``old`` is now called ``new``: the newest name becomes canonical for the
+    whole group, with no alias chains (A to B to C leaves A->C and B->C).
+
+    Grouping never splits. When ``old`` and ``new`` are already one group the
+    only change is relabelling: every member is re-pointed at ``new``. Otherwise
+    ``old``'s group and ``new``'s group (each a canonical plus its aliases) merge
+    under ``new``. ``new``'s own alias row, if any, is dropped so it can be
+    canonical; no member ever leaves. Observation times from different checkouts
+    come from different Macs' clocks, so they are never compared: a late, stale
+    event can relabel a group but never take a name out of it. ``observed_at``
+    is only kept in the evidence of the rows this call creates.
+
+    Every group change takes one transaction-level advisory lock before it
+    reads, so two renames never interleave into a chain. One savepoint; best-effort like the readers: never
+    raises, any failure rolls back and returns ``ok`` false."""
+    old, new = (old or "").strip(), (new or "").strip()
+    if not old or not new:
+        return {"ok": False, "error": "old and new must both be non-empty"}
+    if old == new:
+        return {"ok": True, "changed": False, "old": old, "new": new, "canonical": new}
+    ev_dict = dict(evidence) if evidence else {}
+    if observed_at is not None:
+        ev_dict["observed_at"] = float(observed_at)
+    ev = json.dumps(ev_dict) if ev_dict else None
+    try:
+        cur.execute("SAVEPOINT project_record_rename", ())
+        # One lock for every group change. Per-group locks had to be rediscovered
+        # as canonicals moved, which could take them out of order and deadlock;
+        # renames are rare, so serialising them all costs nothing.
+        _xact_lock(cur, PROJECT_LOCK_CLASS, "*project-groups*")
+        tops = {_canonical_of(cur, old), _canonical_of(cur, new)}
+        group = {old, new, *tops}
+        cur.execute("SELECT alias FROM project_aliases WHERE project = ANY(%s)", (sorted(tops),))
+        group.update(str(r[0]) for r in cur.fetchall())
+        removed: list[str] = []
+        cur.execute("DELETE FROM project_aliases WHERE alias = %s", (new,))
+        if cur.rowcount:
+            removed.append(new)
+        added: list[str] = []
+        repointed: list[str] = []
+        for member in sorted(group - {new}):
+            cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (member,))
+            have = cur.fetchone()
+            if have is None:
+                cur.execute(
+                    "INSERT INTO project_aliases (alias, project, source, evidence) "
+                    "VALUES (%s, %s, %s, %s::jsonb)", (member, new, source, ev))
+                added.append(member)
+            elif str(have[0]) != new:
+                cur.execute("UPDATE project_aliases SET project = %s WHERE alias = %s", (new, member))
+                repointed.append(member)
+        cur.execute("RELEASE SAVEPOINT project_record_rename", ())
+        return {"ok": True, "changed": bool(added or repointed or removed), "old": old, "new": new,
+                "canonical": new, "added": added, "repointed": repointed, "removed": removed}
+    except Exception as exc:  # noqa: BLE001 — recording a rename is best-effort, never fatal
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT project_record_rename", ())
+            cur.execute("RELEASE SAVEPOINT project_record_rename", ())
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def github_confirms_rename(old: str, new: str) -> bool | None:
+    """Whether GitHub says ``old`` is now ``new``: ``gh api repos/<old> --jq
+    .full_name`` (GitHub follows its own redirect after a rename), 3 s, no shell.
+    True only when the answer equals ``new`` case-insensitively; False when it
+    names something else; None when ``gh`` is missing, unauthenticated, slow or
+    errors in any way. ``gh`` is found by ``synth_cli.binary`` (PATH, then the
+    usual install folders), since the drain runs under launchd's bare PATH."""
+    try:
+        from khipu.synth_cli import binary
+
+        gh = binary("gh")
+    except Exception:  # noqa: BLE001
+        gh = None
+    if not gh:
+        return None
+    try:
+        proc = subprocess.run([gh, "api", f"repos/{old}", "--jq", ".full_name"], capture_output=True,
+                              text=True, timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    answer = (proc.stdout or "").strip()
+    if not answer:
+        return None
+    return answer.lower() == (new or "").strip().lower()
+
+
+def _root_commit(repo_root: str) -> str | None:
+    """A root commit of the checkout (``git rev-list --max-parents=0 HEAD``, the
+    smallest hash when there are several); every checkout, clone and rename of
+    one repo shares it. None for a repo with no commits."""
+    out = _git(repo_root, ["rev-list", "--max-parents=0", "HEAD"])
+    return min(out.split()) if out else None
+
+
+def _origin_kind(repo_root: str) -> tuple[str, str | None]:
+    """``('remote', slug)`` when origin resolves, ``('folder', None)`` when git
+    reports there is genuinely no such remote, ``('unknown', None)`` for anything
+    else (timeout, other git error, a URL that carries no owner/repo)."""
+    try:
+        proc = subprocess.run(["git", "-C", repo_root, "remote", "get-url", "origin"], capture_output=True,
+                              text=True, timeout=GIT_TIMEOUT_S, check=False, env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return "unknown", None
+    if proc.returncode == 0:
+        slug = _slug_from_remote_url((proc.stdout or "").strip())
+        return ("remote", slug) if slug else ("unknown", None)
+    if proc.returncode == 2 and "no such remote" in (proc.stderr or "").lower():
+        return "folder", None
+    return "unknown", None
+
+
+def _checkout_key(cwd: str) -> str | None:
+    """``device:inode`` of the repo's git common dir, so a moved folder keeps
+    its key and a deleted-and-recloned one gets a new key."""
+    common = _git(cwd, ["rev-parse", "--git-common-dir"])
+    if not common:
+        return None
+    path = Path(common)
+    if not path.is_absolute():
+        path = Path(cwd) / path
+    try:
+        st = os.stat(path.resolve())
+    except OSError:
+        return None
+    return f"{st.st_dev}:{st.st_ino}"
+
+
+def observe_checkout(cwd: str, repo_root: str | None, project: str | None, cache_dir: Path) -> dict[str, Any] | None:
+    """Hook-side observation of one checkout. It only reports what it sees
+    (``{checkout_key, root_commit, project, project_kind, observed_at}``), never
+    remembers a last project and never decides a rename; the hub does that from
+    its ``project_checkouts`` row. No database. The root commit is cached in one
+    small file per checkout key (written atomically, so concurrent hooks never
+    clobber each other); a new key always recomputes it. None when there is no
+    repo, no commit yet, or anything fails."""
+    if not (cwd and repo_root and project):
+        return None
+    try:
+        key = _checkout_key(cwd)
+        if not key:
+            return None
+        cache = cache_dir / f"{key.replace(':', '_')}.json"
+        root = None
+        try:
+            rec = json.loads(cache.read_text(encoding="utf-8"))
+            root = rec.get("root_commit") if isinstance(rec, dict) and rec.get("checkout_key") == key else None
+        except (OSError, ValueError):
+            pass
+        if not root:
+            root = _root_commit(repo_root)
+            if root:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(dir=cache.parent, prefix=".checkout.", suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"checkout_key": key, "root_commit": root}, fh)
+                os.replace(tmp, cache)
+        if not root:
+            return None
+        kind, slug = _origin_kind(repo_root)
+        if kind == "remote":
+            project = slug or project
+        return {"checkout_key": key, "root_commit": root, "project": project, "project_kind": kind,
+                "observed_at": time.time()}
+    except Exception:  # noqa: BLE001 — identity is best-effort on the hook path
+        return None
+
+
+def _pair(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a < b else (b, a)
+
+
+def observation_fields(obs: Any) -> tuple[str, str, str, str, float] | None:
+    """``(checkout_key, root_commit, project, project_kind, observed_at)`` of a
+    well-formed observation, else None."""
+    try:
+        key, root = str(obs["checkout_key"]), str(obs["root_commit"])
+        project, kind = str(obs["project"]), str(obs["project_kind"])
+        at = float(obs["observed_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if kind not in ("remote", "folder", "unknown") or not (key and root and project):
+        return None
+    return key, root, project, kind, at
+
+
+def record_checkout_observation(cur, obs: dict[str, Any]) -> dict[str, Any]:
+    """The hub's side: compare one observation with the checkout's stored row
+    and record a rename when the rules say it is certain.
+
+    A transition is the same ``checkout_key``, the same ``root_commit``, a
+    changed project and an observation not older than the row (both times come
+    from the one Mac that owns the checkout, so comparing them is safe; times
+    from different checkouts are never compared). folder to folder
+    and folder to remote are certain; remote to folder is ignored; remote to
+    remote is a rename only if GitHub confirms it, otherwise a ``project_pairs``
+    'asked' row is kept for the owner and nothing is merged. A different root
+    commit is never a rename. An 'unknown' observation only moves
+    ``last_seen_at``. One savepoint, never raises: when anything fails (e.g.
+    migration 0039 not applied) nothing is recorded and ``ok`` is false, so the
+    caller can keep the observation (capture's local spool) and land it later."""
+    fields = observation_fields(obs)
+    if fields is None:
+        return {"ok": False, "error": "malformed observation"}
+    key, root, project, kind, at = fields
+    try:
+        cur.execute("SAVEPOINT project_checkout_observation", ())
+        # Read-evaluate-write under a per-checkout lock: two first sightings of
+        # one checkout in concurrent transactions are evaluated one after the
+        # other, so the second sees the first's row and its transition counts.
+        _xact_lock(cur, CHECKOUT_LOCK_CLASS, key)
+        cur.execute("SELECT root_commit, project, project_kind, extract(epoch FROM last_seen_at) "
+                    "FROM project_checkouts WHERE checkout_key = %s FOR UPDATE", (key,))
+        row = cur.fetchone()
+        out: dict[str, Any] = {"ok": True, "action": "recorded"}
+        if row is None:
+            if kind != "unknown":
+                cur.execute("INSERT INTO project_checkouts (checkout_key, root_commit, project, project_kind, "
+                            "last_seen_at) VALUES (%s, %s, %s, %s, to_timestamp(%s)) "
+                            "ON CONFLICT (checkout_key) DO NOTHING", (key, root, project, kind, at))
+            out["action"] = "first" if kind != "unknown" else "ignored"
+        else:
+            old_root, old_project, old_kind, seen = str(row[0]), str(row[1]), str(row[2]), float(row[3])
+            if at < seen:
+                out["action"] = "stale"
+            elif kind == "unknown":
+                cur.execute("UPDATE project_checkouts SET last_seen_at = to_timestamp(%s) WHERE checkout_key = %s",
+                            (at, key))
+                out["action"] = "seen"
+            elif old_root != root:
+                cur.execute("UPDATE project_checkouts SET root_commit = %s, project = %s, project_kind = %s, "
+                            "last_seen_at = to_timestamp(%s) WHERE checkout_key = %s", (root, project, kind, at, key))
+                out["action"] = "new_root"
+            elif old_project == project:
+                cur.execute("UPDATE project_checkouts SET project_kind = %s, last_seen_at = to_timestamp(%s) "
+                            "WHERE checkout_key = %s", (kind, at, key))
+            elif old_kind == "remote" and kind == "folder":
+                # Origin removed: not a rename, and the remote name stays the
+                # last known one so re-adding it later is not a transition.
+                cur.execute("UPDATE project_checkouts SET last_seen_at = to_timestamp(%s) WHERE checkout_key = %s",
+                            (at, key))
+                out["action"] = "ignored_remote_to_folder"
+            else:
+                evidence = {"old": old_project, "new": project, "root_commit": root, "checkout_key": key}
+                source = "checkout"
+                if old_kind == "remote" and kind == "remote":
+                    if github_confirms_rename(old_project, project):
+                        source = "github"
+                    else:
+                        a, b = _pair(old_project, project)
+                        cur.execute("INSERT INTO project_pairs (a, b, root_commit, state) VALUES (%s, %s, %s, 'asked') "
+                                    "ON CONFLICT (a, b) DO NOTHING", (a, b, root))
+                        source = ""
+                if source:
+                    res = record_rename(cur, old_project, project, source=source, evidence=evidence, observed_at=at)
+                    if not res.get("ok"):
+                        raise RuntimeError(str(res.get("error")))
+                    out.update(action="renamed", rename=res)
+                else:
+                    out["action"] = "asked"
+                cur.execute("UPDATE project_checkouts SET project = %s, project_kind = %s, "
+                            "last_seen_at = to_timestamp(%s) WHERE checkout_key = %s", (project, kind, at, key))
+        cur.execute("RELEASE SAVEPOINT project_checkout_observation", ())
+        return out
+    except Exception as exc:  # noqa: BLE001 — best-effort; the next capture re-derives it
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT project_checkout_observation", ())
+            cur.execute("RELEASE SAVEPOINT project_checkout_observation", ())
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def resolve_repo_root(cwd: str, *, cur: Any = None) -> dict[str, Any]:
