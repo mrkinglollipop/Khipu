@@ -1,4 +1,4 @@
-# Settings → Projects: renamed repos (mock, 2026-10-19, for approval)
+# Settings → Projects: renamed repos (mock, 2026-10-19, for approval) (approved by Matt 2026-10-19)
 
 Static mock for the app part of slice D in `docs/plans/2026-10-19-repo-renames.md`. Open either `.html` in a
 browser; it follows the system appearance. `App.css` is a copy of the app stylesheet on main today (v0.4.15);
