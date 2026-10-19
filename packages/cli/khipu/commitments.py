@@ -2016,9 +2016,15 @@ def fetch_owed_rows(cur, *, project: str | None = None, parent_session_id: str |
     """
     clauses = ["status = %s"]
     params: list[Any] = [status]
+    canonical = None
     if project:
-        clauses.append("project = %s")
-        params.append(project)
+        # An aliased key reads as its canonical project: every member of the
+        # alias group matches, whichever key the caller passed.
+        from khipu.identity import project_canonical_group
+
+        canonical, group = project_canonical_group(cur, project)
+        clauses.append("project = %s" if len(group) == 1 else "project = ANY(%s)")
+        params.append(group[0] if len(group) == 1 else group)
     elif parent_session_id or session_id:
         lineage, lineage_params = _lineage_clause(
             cur, {"parent_session_id": parent_session_id, "session_id": session_id}, None)
@@ -2058,7 +2064,12 @@ def fetch_owed_rows(cur, *, project: str | None = None, parent_session_id: str |
         """,
         params,
     )
-    return [dict(zip(select_cols, row)) for row in cur.fetchall()]
+    out = [dict(zip(select_cols, row)) for row in cur.fetchall()]
+    if canonical:
+        for row in out:
+            if row.get("project"):
+                row["project"] = canonical
+    return out
 
 
 def finish_owed_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:

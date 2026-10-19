@@ -106,6 +106,88 @@ def _resolve_project_alias(cur, project: str) -> str | None:
         return None
 
 
+def project_canonical_group(cur, project: str | None) -> tuple[str | None, list[str]]:
+    """``(canonical, group)`` for ``project`` through ``project_aliases``: the
+    canonical project is the alias's target (or ``project`` itself), and the
+    group is the canonical plus every alias that points at it, canonical first.
+    One round trip. Best-effort exactly like :func:`_resolve_project_alias`:
+    never raises, and any failure (no table on a pre-0021 hub, a dead cursor)
+    yields ``(project, [project])``."""
+    if not project:
+        return project, [project] if project else []
+    try:
+        cur.execute("SAVEPOINT project_alias_group", ())
+        cur.execute(
+            "WITH c AS (SELECT COALESCE((SELECT project FROM project_aliases WHERE alias = %s), %s) AS p) "
+            "SELECT c.p, a.alias FROM c LEFT JOIN project_aliases a ON a.project = c.p ORDER BY a.alias",
+            (project, project),
+        )
+        rows = cur.fetchall()
+        cur.execute("RELEASE SAVEPOINT project_alias_group", ())
+        if not rows:
+            return project, [project]
+        canonical = str(rows[0][0])
+        group = [canonical] + [str(r[1]) for r in rows if r[1] and str(r[1]) != canonical]
+        return canonical, group
+    except Exception:  # noqa: BLE001 — alias expansion is best-effort only
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT project_alias_group", ())
+            cur.execute("RELEASE SAVEPOINT project_alias_group", ())
+        except Exception:  # noqa: BLE001
+            pass
+        return project, [project]
+
+
+def project_group(cur, project: str | None) -> list[str]:
+    """Every key that reads as the same project as ``project`` (the canonical
+    plus its aliases); ``[project]`` when it has none or the lookup fails."""
+    return project_canonical_group(cur, project)[1]
+
+
+def list_project_aliases(cur) -> list[dict[str, Any]]:
+    cur.execute("SELECT alias, project, created_at FROM project_aliases ORDER BY project, alias", ())
+    return [{"alias": r[0], "canonical": r[1], "created_at": r[2]} for r in cur.fetchall()]
+
+
+def add_project_alias(cur, alias: str, canonical: str) -> dict[str, Any]:
+    """Record ``alias`` as another key for ``canonical``. Refuses (``ok`` false,
+    ``error`` says why) an alias equal to its canonical, a canonical that is
+    itself an alias (no chains), and an alias that already has aliases of its
+    own. Re-adding the same pair is a no-op success; an alias that already
+    points elsewhere is refused rather than silently re-pointed."""
+    alias, canonical = (alias or "").strip(), (canonical or "").strip()
+    if not alias or not canonical:
+        return {"ok": False, "error": "alias and canonical must both be non-empty"}
+    if alias == canonical:
+        return {"ok": False, "error": f"{alias!r} cannot be an alias of itself"}
+    cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (canonical,))
+    row = cur.fetchone()
+    if row:
+        return {"ok": False, "error": f"{canonical!r} is itself an alias of {row[0]!r}; "
+                                      f"use {row[0]!r} as the canonical (no alias chains)"}
+    cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (alias,))
+    row = cur.fetchone()
+    if row:
+        if row[0] == canonical:
+            return {"ok": True, "alias": alias, "canonical": canonical, "changed": False}
+        return {"ok": False, "error": f"{alias!r} is already an alias of {row[0]!r}; "
+                                      f"remove it first to point it at {canonical!r}"}
+    cur.execute("SELECT count(*) FROM project_aliases WHERE project = %s", (alias,))
+    if int(cur.fetchone()[0]):
+        return {"ok": False, "error": f"{alias!r} is the canonical of other aliases; "
+                                      "move or remove those first (no alias chains)"}
+    cur.execute("INSERT INTO project_aliases (alias, project) VALUES (%s, %s)", (alias, canonical))
+    return {"ok": True, "alias": alias, "canonical": canonical, "changed": True}
+
+
+def remove_project_alias(cur, alias: str) -> dict[str, Any]:
+    alias = (alias or "").strip()
+    cur.execute("DELETE FROM project_aliases WHERE alias = %s", (alias,))
+    if not cur.rowcount:
+        return {"ok": False, "error": f"{alias!r} is not an alias"}
+    return {"ok": True, "alias": alias, "changed": True}
+
+
 def resolve_repo_root(cwd: str, *, cur: Any = None) -> dict[str, Any]:
     """{repo_root, project, is_worktree} for a hook's cwd.
 
