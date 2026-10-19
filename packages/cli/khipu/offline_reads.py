@@ -50,11 +50,18 @@ def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
             return None
         sql = "SELECT * FROM commitments WHERE status = ?"
         params: list[Any] = [status]
+        canonical = None
         if project:
-            sql += " AND project = ?"
-            params.append(project)
+            # An aliased key reads as its canonical project, as on the hub.
+            canonical, group = hub_snapshot.snapshot_project_group(con, project)
+            sql += f" AND project IN ({', '.join('?' * len(group))})"
+            params.extend(group)
         sql += hub_snapshot.forget_fence_sql(con, "commitments", "opened_episode")
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
+        if canonical:
+            for row in rows:
+                if row.get("project"):
+                    row["project"] = canonical
     except sqlite3.Error:
         return None
     finally:
@@ -90,11 +97,17 @@ def decisions(project: str | None, since: Any, status: str, limit: int) -> dict[
             return None
         sql = "SELECT * FROM decisions WHERE 1 = 1"
         params: list[Any] = []
+        canonical = None
         if project:
-            sql += " AND project = ?"
-            params.append(project)
+            canonical, group = hub_snapshot.snapshot_project_group(con, project)
+            sql += f" AND project IN ({', '.join('?' * len(group))})"
+            params.extend(group)
         sql += hub_snapshot.forget_fence_sql(con, "decisions", "episode_id")
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
+        if canonical:
+            for row in rows:
+                if row.get("project"):
+                    row["project"] = canonical
     except sqlite3.Error:
         return None
     finally:

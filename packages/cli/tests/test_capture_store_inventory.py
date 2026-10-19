@@ -44,6 +44,8 @@ NOT_CAPTURE = {
                      "accounts._declined_lock", "signin._lock", "work._view_lock"), _LOCKS),
     # Account discovery (9A): which login folders exist and when they were checked,
     # and a throwaway folder a status check runs in. Folder names and counts only.
+    "identity.checkout_identity": "per checkout: the project name last reported, its root commit and "
+                                  "when; names, paths and hashes, no capture text",
     "discover._save_store": "account discovery results: folder names, CLI kinds and check times",
     "discover.run_once": "a temporary empty folder a CLI status check runs in, removed after",
     "accounts._save_declined": "the logins the owner chose not to be offered again: folder names and CLI kinds",

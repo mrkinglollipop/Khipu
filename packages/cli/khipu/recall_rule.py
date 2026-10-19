@@ -366,7 +366,9 @@ def _stale_project_slice(project: str | None, host: str | None) -> str:
                 "SELECT id, summary, raw FROM episodes "
                 "ORDER BY COALESCE(ingested_at, ts) DESC LIMIT 200"
             )
-        for eid, summary, raw in cur.fetchall():
+        rows = cur.fetchall()
+        group = hub_snapshot.snapshot_project_group(con, project)[1] if project else []
+        for eid, summary, raw in rows:
             proj = parent = None
             if raw:
                 try:
@@ -375,7 +377,7 @@ def _stale_project_slice(project: str | None, host: str | None) -> str:
                     parent = payload.get("parent_session_id")
                 except (ValueError, TypeError):
                     pass
-            if (project and proj == project) or (host and parent == host):
+            if (project and proj in group) or (host and parent == host):
                 hits.append((str(eid), summary or ""))
             if len(hits) >= 5:
                 break

@@ -2165,6 +2165,15 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
         ident = resolve_repo_root(cwd)
     except Exception:  # noqa: BLE001 — identity is best-effort, never fatal
         ident = {"repo_root": None, "project": None, "is_worktree": False}
+    # Same checkout, new project name = a rename. Local file only: the hook
+    # path never opens a database. The capture write records the alias.
+    try:
+        from khipu.identity import checkout_identity
+
+        checkout = checkout_identity(ident.get("repo_root"), ident.get("project"),
+                                     khipu_home() / "checkouts.json")
+    except Exception:  # noqa: BLE001
+        checkout = {"root_commit": None, "rename": None}
     # K3: split on message boundaries instead of tail-clipping — every
     # part is queued and extracted into its own episode.
     parts = _window_parts(msgs, MAX_TRANSCRIPT)
@@ -2193,6 +2202,10 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
         if st.get("origin") == "job" and not job_parent:
             # KHIPU_JOB=1 with no lineage; lineage alone already marks a job.
             job["origin"] = "job"
+        if checkout.get("root_commit"):
+            job["root_commit"] = checkout["root_commit"]
+        if checkout.get("rename"):
+            job["rename"] = checkout["rename"]
         if window_id:
             job["window_id"] = window_id
             job["part"] = f"{i}/{len(parts)}"
@@ -2778,6 +2791,9 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         payload["harness"] = harness
         payload["repo_root"] = job.get("repo_root")
         payload["project"] = job.get("project")
+        payload["root_commit"] = job.get("root_commit")
+        if job.get("rename"):
+            payload["rename"] = job["rename"]
         payload["parent_session_id"] = job.get("parent_session_id")
         if _job_origin(job) == "job" and not job.get("parent_session_id"):
             # Not `origin`: that key is the episode's server-stamped owner and

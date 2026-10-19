@@ -181,6 +181,42 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
     return int(row[0]) if row else None
 
 
+def _record_checkout_rename(cur, payload: dict[str, Any]) -> None:
+    """A rename seen on this checkout (``payload["rename"]``, set by the hook)
+    becomes an alias with the new name canonical. Runs before the alias lookup
+    so this very capture lands under the new name. Best-effort: never raises."""
+    rename = payload.pop("rename", None)
+    try:
+        if isinstance(rename, dict) and rename.get("old") and rename.get("new"):
+            from khipu.identity import record_rename
+
+            record_rename(cur, str(rename["old"]), str(rename["new"]), source="checkout",
+                          evidence={k: rename.get(k) for k in ("old", "new", "root_commit", "repo_root")})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _note_project_root(cur, payload: dict[str, Any]) -> None:
+    """Remember the root commit this (resolved) project name was seen with.
+    Best-effort: a hub before migration 0039 has no table, and never fails a capture."""
+    root = payload.get("root_commit")
+    if not (root and payload.get("project")):
+        return
+    try:
+        cur.execute("SAVEPOINT project_roots_note", ())
+        try:
+            cur.execute(
+                "INSERT INTO project_roots (project, root_commit) VALUES (%s, %s) "
+                "ON CONFLICT (project, root_commit) DO UPDATE SET last_seen = now()",
+                (payload["project"], str(root)))
+            cur.execute("RELEASE SAVEPOINT project_roots_note", ())
+        except Exception:  # noqa: BLE001
+            cur.execute("ROLLBACK TO SAVEPOINT project_roots_note", ())
+            cur.execute("RELEASE SAVEPOINT project_roots_note", ())
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _inherit_project(cur, payload: dict[str, Any]) -> None:
     """W1.2b: identity.resolve_repo_root cannot resolve a scratchpad/`/tmp`
     cwd — repo_root and project both come back None, which is exactly the
@@ -835,10 +871,12 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             if hub_source_forgotten(cur, payload, source):
                 return _forgotten_result(cur, payload, source)
             _inherit_project(cur, payload)
+            _record_checkout_rename(cur, payload)
             if payload.get("project"):
                 from khipu.identity import _resolve_project_alias
 
                 payload["project"] = _resolve_project_alias(cur, payload["project"]) or payload["project"]
+            _note_project_root(cur, payload)
             dedup = dedup_before_insert(cur, payload, source=source)
             if dedup["action"] in ("skip", "merge"):
                 # ``episode_sources`` deliberately retains the source key on

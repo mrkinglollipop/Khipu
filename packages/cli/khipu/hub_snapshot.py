@@ -102,7 +102,10 @@ _TABLES = (
 # reassigned it, why, and from whom), the links between similar items of
 # different owners and the newest wording, so an offline read shows the same
 # owner as the hub. A replica of version 6 gains them on its next pull.
-SNAPSHOT_SCHEMA_VERSION = 7
+# Version 8 adds `project_aliases`, so an offline read groups a renamed
+# project's keys the way the hub does. A replica of version 7 gets them on
+# its next full refresh; a reader on a file without the table sees no groups.
+SNAPSHOT_SCHEMA_VERSION = 8
 
 _COMMITMENT_COLS = (
     "id",
@@ -1827,6 +1830,19 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
         )
     if version >= 7:
         _add_commitment_lineage_cols(con)
+    if version >= 8:
+        con.executescript(
+            """
+            CREATE TABLE project_aliases (
+                alias TEXT PRIMARY KEY,
+                project TEXT NOT NULL,
+                created_at TEXT,
+                source TEXT,
+                evidence TEXT
+            );
+            CREATE INDEX idx_snapshot_project_aliases_project ON project_aliases (project);
+            """
+        )
     if version >= 4:
         try:
             con.executescript(_FTS_SCHEMA_SQL)
@@ -2523,6 +2539,38 @@ def _insert_deliverables(cur, con: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def _insert_project_aliases(cur, con: sqlite3.Connection) -> int:
+    """Empty (returns 0, no error) on a hub with no ``project_aliases`` table;
+    ``source``/``evidence`` come only from a hub at migration 0039."""
+    hub_cols = _pg_columns(cur, "project_aliases")
+    if not {"alias", "project"} <= hub_cols:
+        return 0
+    cols = [c for c in ("alias", "project", "created_at", "source", "evidence") if c in hub_cols]
+    cur.execute(f"SELECT {', '.join(cols)} FROM project_aliases ORDER BY alias")
+    rows = cur.fetchall()
+    for row in rows:
+        vals = [_json_text(v) if c == "evidence" else _ts_text(v) if c == "created_at" else v
+                for c, v in zip(cols, row, strict=True)]
+        con.execute(f"INSERT INTO project_aliases ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})", vals)
+    return len(rows)
+
+
+def snapshot_project_group(con: sqlite3.Connection, project: str | None) -> tuple[str | None, list[str]]:
+    """The replica's ``identity.project_canonical_group``: ``(canonical, group)``
+    with the canonical first, ``(project, [project])`` when it has no aliases,
+    the table is missing (a replica older than version 8) or the read fails."""
+    if not project:
+        return project, [project] if project else []
+    try:
+        row = con.execute("SELECT project FROM project_aliases WHERE alias = ?", (project,)).fetchone()
+        canonical = str(row[0]) if row and row[0] else project
+        rest = [str(r[0]) for r in con.execute(
+            "SELECT alias FROM project_aliases WHERE project = ? ORDER BY alias", (canonical,)).fetchall()]
+        return canonical, [canonical] + [a for a in rest if a != canonical]
+    except Exception:  # noqa: BLE001 — grouping is best-effort, like the hub's
+        return project, [project]
+
+
 def _insert_commitments(cur, con: sqlite3.Connection) -> int:
     """Empty (returns 0, no error) on a hub with no ``commitments`` table.
     Rows opened by a forgotten episode are never exported, the same
@@ -2657,6 +2705,7 @@ def _refresh_locked() -> dict[str, Any]:
                     counts["decisions"] = _insert_decisions(cur, con)
                     counts["deliverables"] = _insert_deliverables(cur, con)
                     counts["commitments"] = _insert_commitments(cur, con)
+                    counts["project_aliases"] = _insert_project_aliases(cur, con)
                     counts["ledger_rows"] = _insert_ledger(cur, con)
             refreshed_at = _utcnow_iso()
             if _snapshot_table_columns(con, "snapshot_meta"):
@@ -4608,10 +4657,11 @@ def search_snapshot(
         # replica. The lane matches on the words the index can find.
         tokens = [tok for tok in tokens if len(tok) >= _FTS_MIN_TOKEN]
     con = open_snapshot()
+    proj_keys = snapshot_project_group(con, project.strip())[1] if project else []
     # SQLite's LIKE is wildcard/case behaviour, not the callers' exact
     # Python filter semantics. Register deterministic predicates before the
     # LIMIT so a rejected row cannot consume the result budget.
-    con.create_function("khipu_project_match", 2, lambda value, wanted: str(wanted or "").lower() in str(value or "").lower())
+    con.create_function("khipu_project_match", 2, lambda value, wanted: any(w.lower() in str(value or "").lower() for w in str(wanted or "").split("\x1f")))
     con.create_function("khipu_prefix", 2, lambda value, prefix: str(value or "").startswith(str(prefix or "")))
     def _sql_in_range(value, lo, hi):
         parsed = _parse_snapshot_ts(value)
@@ -4745,7 +4795,7 @@ def search_snapshot(
         identity_params: list[Any] = []
         if project:
             identity_clause += f" AND khipu_project_match({project_expr}, ?)"
-            identity_params.append(project.strip())
+            identity_params.append("\x1f".join(snapshot_project_group(con, project.strip())[1]))
         if session_id:
             identity_clause += f" AND khipu_prefix({session_expr}, ?)"
             identity_params.append(session_id)
@@ -4791,7 +4841,7 @@ def search_snapshot(
             if not _in_range(r[4]):
                 continue
             row_sid = r[5] or ""
-            if project and project.strip().lower() not in (r[6] or "").lower():
+            if project and not any(k.lower() in (r[6] or "").lower() for k in proj_keys):
                 continue
             if session_id and not row_sid.startswith(session_id):
                 continue
@@ -5320,6 +5370,7 @@ def semantic_search_snapshot(
             f"profile {spec.id!r} dimension {spec.dim}"
         )
     con = open_snapshot()
+    proj_keys = snapshot_project_group(con, project.strip())[1] if project else []
     profile = spec.id
     params: list[Any] = [profile]
     kind_clause = ""
@@ -5379,7 +5430,7 @@ def semantic_search_snapshot(
                 if row_deleted is not None:
                     continue
                 row_sid = row_sid or ""
-                if project and project.strip().lower() not in (row_proj or "").lower():
+                if project and not any(k.lower() in (row_proj or "").lower() for k in proj_keys):
                     continue
                 if session_id and not row_sid.startswith(session_id):
                     continue

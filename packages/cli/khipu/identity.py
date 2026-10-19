@@ -17,8 +17,12 @@ stay cheap, dependency-free, and safe to run inside Aegis's sandbox: only
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -186,6 +190,104 @@ def remove_project_alias(cur, alias: str) -> dict[str, Any]:
     if not cur.rowcount:
         return {"ok": False, "error": f"{alias!r} is not an alias"}
     return {"ok": True, "alias": alias, "changed": True}
+
+
+def record_rename(cur, old: str, new: str, *, source: str, evidence: dict | None = None) -> dict[str, Any]:
+    """``old`` is now called ``new``: the newest name becomes canonical for the
+    whole group, with no alias chains (A to B to C leaves A->C and B->C). The
+    group is ``old``'s canonical plus every alias of it; each member is
+    re-pointed at ``new``. If ``new`` was itself an alias (a rename back,
+    A->B->A) its row is dropped first so it can be canonical again. One
+    savepoint; best-effort exactly like the readers: never raises, any failure
+    rolls back and returns ``ok`` false. ``source`` and ``evidence`` are kept on
+    the rows this call creates, so an automatic alias can be shown and undone."""
+    old, new = (old or "").strip(), (new or "").strip()
+    if not old or not new:
+        return {"ok": False, "error": "old and new must both be non-empty"}
+    if old == new:
+        return {"ok": True, "changed": False, "old": old, "new": new, "canonical": new}
+    ev = json.dumps(evidence) if evidence is not None else None
+    try:
+        cur.execute("SAVEPOINT project_record_rename", ())
+        cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (old,))
+        row = cur.fetchone()
+        top = str(row[0]) if row and row[0] else old
+        cur.execute("SELECT alias FROM project_aliases WHERE project = %s", (top,))
+        members = {top, *(str(r[0]) for r in cur.fetchall())}
+        removed: list[str] = []
+        cur.execute("DELETE FROM project_aliases WHERE alias = %s", (new,))
+        if cur.rowcount:
+            removed.append(new)
+        members.discard(new)
+        added: list[str] = []
+        repointed: list[str] = []
+        for member in sorted(members):
+            cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (member,))
+            have = cur.fetchone()
+            if have is None:
+                cur.execute(
+                    "INSERT INTO project_aliases (alias, project, source, evidence) "
+                    "VALUES (%s, %s, %s, %s::jsonb)", (member, new, source, ev))
+                added.append(member)
+            elif str(have[0]) != new:
+                cur.execute("UPDATE project_aliases SET project = %s WHERE alias = %s", (new, member))
+                repointed.append(member)
+        cur.execute("RELEASE SAVEPOINT project_record_rename", ())
+        return {"ok": True, "changed": bool(added or repointed or removed), "old": old, "new": new,
+                "canonical": new, "added": added, "repointed": repointed, "removed": removed}
+    except Exception as exc:  # noqa: BLE001 — recording a rename is best-effort, never fatal
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT project_record_rename", ())
+            cur.execute("RELEASE SAVEPOINT project_record_rename", ())
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _root_commit(repo_root: str) -> str | None:
+    """First root commit of the checkout (``git rev-list --max-parents=0 HEAD``);
+    every checkout, clone and rename of one repo shares it."""
+    out = _git(repo_root, ["rev-list", "--max-parents=0", "HEAD"])
+    return out.splitlines()[0].strip() or None if out else None
+
+
+def checkout_identity(repo_root: str | None, project: str | None, state_path: Path) -> dict[str, Any]:
+    """Hook-side rename detection for one checkout, with no database: ``state_path``
+    is a small JSON file keyed by the checkout's real main repo root holding
+    ``{project, root_commit, seen_at}``. The root commit is computed once per
+    checkout and never again once cached. When the same checkout (same root
+    commit) now resolves to a different project than the one recorded, that is
+    a rename: ``rename`` is ``{old, new, root_commit, repo_root}`` and the file
+    is updated. Returns ``{root_commit, rename}``; never raises."""
+    out: dict[str, Any] = {"root_commit": None, "rename": None}
+    if not repo_root or not project:
+        return out
+    try:
+        key = str(Path(repo_root).resolve())
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                state = {}
+        except (OSError, ValueError):
+            state = {}
+        rec = state.get(key) if isinstance(state.get(key), dict) else {}
+        root = rec.get("root_commit") or _root_commit(key)
+        out["root_commit"] = root
+        if not root:
+            return out
+        old = rec.get("project")
+        if old and old != project:
+            out["rename"] = {"old": old, "new": project, "root_commit": root, "repo_root": key}
+        if old != project or rec.get("root_commit") != root:
+            state[key] = {"project": project, "root_commit": root, "seen_at": time.time()}
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=state_path.parent, prefix=".checkouts.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+            os.replace(tmp, state_path)
+    except Exception:  # noqa: BLE001 — identity is best-effort on the hook path
+        pass
+    return out
 
 
 def resolve_repo_root(cwd: str, *, cur: Any = None) -> dict[str, Any]:
