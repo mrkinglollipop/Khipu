@@ -128,11 +128,13 @@ def sweep(conn: Any = None, lookup: Callable[[str], tuple[str | None, str | None
             return name
 
         def rename(cur, old: str, new: str, full: str, *, pair: tuple[str, str] | None) -> None:
-            if identity.pair_kept_separate(cur, old, new):
-                out["skipped_by_owner"].append({"old": old, "new": new})
-                return
+            # Whether the owner keeps the two groups apart is decided by
+            # record_rename under the group lock, never here before it.
             res = identity.record_rename(cur, old, new, source="github", evidence={
                 "full_name": full, "checked_at": datetime.now(timezone.utc).isoformat()})
+            if res.get("code") == identity.KEPT_SEPARATE:
+                out["skipped_by_owner"].append({"old": old, "new": new})
+                return
             if not res.get("ok"):
                 raise RuntimeError(str(res.get("error")))
             if pair:

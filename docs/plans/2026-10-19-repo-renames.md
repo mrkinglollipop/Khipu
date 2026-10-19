@@ -78,6 +78,10 @@ Rules for every alias Khipu records:
   re-pointed at it, so there are no chains (A to B to C becomes A to C and B to C).
 - Stored rows keep the project name they were written with. Readers group by alias; nothing is
   rewritten, so removing an alias undoes the grouping exactly.
+- The two names of a kept-separate pair are never in one group: every write to `project_aliases`
+  (`record_rename`, alias add, the owner actions and their Undo) checks the two complete groups it
+  would join under the one group lock and refuses when that pair would straddle them (automatic
+  sources skip with a reason, owner actions say which pair and to undo it in Kept separate first).
 - Every automatic alias is logged with its evidence (same checkout, GitHub, or owner), shown by
   `khipu_project` and in Settings, and undoable from either. Doctor reports the count and the
   newest one.

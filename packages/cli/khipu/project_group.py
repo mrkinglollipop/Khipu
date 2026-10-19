@@ -223,7 +223,9 @@ def _asked(cur, a: str, b: str) -> tuple[dict | None, str | None]:
 
 def merge(cur, a: str, b: str, show_as: str) -> dict:
     """Merge an asked pair under the name ``show_as`` (one of the two):
-    ``record_rename`` with source 'owner', and the pair becomes 'merged'."""
+    ``record_rename`` with source 'owner', and the pair becomes 'merged'.
+    Refused, with nothing changed, when the two groups hold a pair the owner
+    keeps separate (``record_rename`` decides that under the group lock)."""
     a, b, show_as = (a or "").strip(), (b or "").strip(), (show_as or "").strip()
     if show_as not in (a, b):
         return {"ok": False, "error": f"show_as must be one of the pair: {a} or {b}"}
@@ -279,7 +281,7 @@ def separate(cur, name: str) -> dict:
 
 
 def _lock(cur) -> None:
-    identity._xact_lock(cur, identity.PROJECT_LOCK_CLASS, "*project-groups*")
+    identity.group_lock(cur)
 
 
 def _members(cur, names: list[str]) -> list[str]:
@@ -463,6 +465,16 @@ def undo(cur, action: str, target: str, result: dict | None) -> dict:
         alias, mid, top = chain
         raise ValueError(f"{mid} was renamed since (it is now an alias of {top}), so {alias} can't point at it "
                          f"again; add {alias} as an alias of {top} instead")
+    # A row put back must not join a pair the owner has kept separate since.
+    members = sorted(set().union(*(identity.group_members(cur, n) for n in touched))) if touched else []
+    cur.execute("SELECT p.a, p.b FROM project_pairs p WHERE p.state = 'kept_separate' AND p.a = ANY(%s) AND "
+                "COALESCE((SELECT project FROM project_aliases WHERE alias = p.a), p.a) = "
+                "COALESCE((SELECT project FROM project_aliases WHERE alias = p.b), p.b) ORDER BY p.a, p.b LIMIT 1",
+                (members,))
+    kept = cur.fetchone()
+    if kept:
+        raise ValueError(f"You said {kept[0]} and {kept[1]} are separate projects since, so this was not undone; "
+                         "undo that in Kept separate first")
     return {"ok": True, "changed": True, **({"pair_state": pair["old"]["state"]} if pair and pair.get("old") else {})}
 
 

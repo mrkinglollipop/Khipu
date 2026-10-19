@@ -472,3 +472,46 @@ def test_unsafe_names_are_refused_before_the_gate_and_any_write(pg, capsys, bad)
         is_error, out = _act(action, args)
         assert is_error and out["code"] == "bad_args", out
     assert (_aliases(pg), _pairs(pg), list(owner_direction.actions())) == before
+
+
+# ---- the invariant: a kept-separate pair is never in one group --------------------------------
+
+
+def test_merge_is_refused_when_the_other_group_holds_a_name_kept_separate(pg):
+    _seed(pg)  # (A, B) asked, (A, OTHER) kept separate
+    pg.execute("INSERT INTO project_aliases (alias, project, source) VALUES (%s, %s, 'github')", (OTHER, B))
+    pg.connection.commit()
+    aliases, pairs = _aliases(pg), _pairs(pg)
+    is_error, out = _act("project.merge", {"a": A, "b": B, "show_as": B})
+    assert is_error, out
+    assert (f"You said {A} and {OTHER} are separate projects. Undo that in Kept separate first, then merge."
+            in json.dumps(out)), out
+    assert _aliases(pg) == aliases and _pairs(pg) == pairs
+    assert _line("project.merge")["state"] == "failed"
+
+
+def test_owner_alias_add_across_a_kept_separate_pair_is_refused(pg):
+    _seed(pg)  # (A, OTHER) kept separate
+    aliases = _aliases(pg)
+    is_error, out = _act("project.alias_add", {"alias": A, "canonical": OTHER})
+    assert is_error and f"You said {A} and {OTHER} are separate projects" in json.dumps(out), out
+    # nor into a group that only holds OTHER as an older name
+    pg.execute("INSERT INTO project_aliases (alias, project, source) VALUES (%s, %s, 'github')", (OTHER, C))
+    pg.connection.commit()
+    aliases = _aliases(pg)
+    is_error, out = _act("project.alias_add", {"alias": A, "canonical": C})
+    assert is_error and f"You said {A} and {OTHER} are separate projects" in json.dumps(out), out
+    assert _aliases(pg) == aliases
+
+
+def test_undo_never_rejoins_a_pair_kept_separate_since(pg):
+    pg.execute("INSERT INTO project_aliases (alias, project, source) VALUES (%s, %s, 'github')", (A, B))
+    pg.connection.commit()
+    is_error, removed = _act("project.alias_remove", {"alias": A})
+    assert not is_error, removed
+    pg.execute("INSERT INTO project_pairs (a, b, root_commit, state) VALUES (%s, %s, 'r', 'asked')", (A, B))
+    pg.connection.commit()
+    assert not _act("project.keep_separate", {"a": A, "b": B})[0]
+    is_error, err = _act("direction.undo", {"id": removed["owner_action"]})
+    assert is_error and f"You said {A} and {B} are separate projects since" in json.dumps(err), err
+    assert _aliases(pg) == [] and _pairs(pg) == {(A, B): "kept_separate"}

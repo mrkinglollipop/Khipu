@@ -178,12 +178,15 @@ def add_project_alias(cur, alias: str, canonical: str) -> dict[str, Any]:
     ``error`` says why) an alias equal to its canonical, a canonical that is
     itself an alias (no chains), and an alias that already has aliases of its
     own. Re-adding the same pair is a no-op success; an alias that already
-    points elsewhere is refused rather than silently re-pointed."""
+    points elsewhere is refused rather than silently re-pointed. Joining
+    ``alias`` to a group holding a name the owner keeps separate from it is
+    refused (``code`` kept_separate), decided under the group lock."""
     alias, canonical = (alias or "").strip(), (canonical or "").strip()
     if not alias or not canonical:
         return {"ok": False, "error": "alias and canonical must both be non-empty"}
     if alias == canonical:
         return {"ok": False, "error": f"{alias!r} cannot be an alias of itself"}
+    group_lock(cur)
     cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (canonical,))
     row = cur.fetchone()
     if row:
@@ -200,6 +203,9 @@ def add_project_alias(cur, alias: str, canonical: str) -> dict[str, Any]:
     if int(cur.fetchone()[0]):
         return {"ok": False, "error": f"{alias!r} is the canonical of other aliases; "
                                       "move or remove those first (no alias chains)"}
+    pair = kept_separate_between(cur, {alias}, group_members(cur, canonical))
+    if pair:
+        return _kept_refusal(pair, "add this name")
     cur.execute("INSERT INTO project_aliases (alias, project) VALUES (%s, %s)", (alias, canonical))
     return {"ok": True, "alias": alias, "canonical": canonical, "changed": True}
 
@@ -222,10 +228,54 @@ def _xact_lock(cur, cls: int, name: str) -> None:
     cur.execute("SELECT pg_advisory_xact_lock(%s::int4, hashtext(%s))", (cls, name))
 
 
+def group_lock(cur) -> None:
+    """The one lock every write to ``project_aliases`` takes before it reads.
+    Per-group locks had to be rediscovered as canonicals moved, which could
+    take them out of order and deadlock; renames are rare, so serialising
+    them all costs nothing. Transaction-level, so taking it twice is fine."""
+    _xact_lock(cur, PROJECT_LOCK_CLASS, "*project-groups*")
+
+
 def _canonical_of(cur, name: str) -> str:
     cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (name,))
     row = cur.fetchone()
     return str(row[0]) if row and row[0] else name
+
+
+def group_members(cur, name: str) -> set[str]:
+    """``name``'s whole group: its canonical and every alias of that canonical."""
+    top = _canonical_of(cur, name)
+    cur.execute("SELECT alias FROM project_aliases WHERE project = %s", (top,))
+    return {name, top, *(str(r[0]) for r in cur.fetchall())}
+
+
+# The invariant: no two names of a 'kept_separate' pair are ever in one group.
+# Every write that joins two groups checks it here, under ``group_lock`` and
+# against the two complete groups, never the two names it was handed alone.
+KEPT_SEPARATE = "kept_separate"
+
+
+def kept_separate_between(cur, left: set[str], right: set[str]) -> tuple[str, str] | None:
+    """A pair the owner keeps separate with one name in ``left`` and the
+    other in ``right``, else None. A hub without ``project_pairs`` has none."""
+    cur.execute("SELECT to_regclass('project_pairs') IS NOT NULL", ())
+    if not cur.fetchone()[0]:
+        return None
+    lft, rgt = sorted(left), sorted(right)
+    cur.execute("SELECT a, b FROM project_pairs WHERE state = 'kept_separate' AND "
+                "((a = ANY(%s) AND b = ANY(%s)) OR (a = ANY(%s) AND b = ANY(%s))) ORDER BY a, b LIMIT 1",
+                (lft, rgt, rgt, lft))
+    row = cur.fetchone()
+    return (str(row[0]), str(row[1])) if row else None
+
+
+def kept_separate_message(pair: tuple[str, str] | list[str], then: str) -> str:
+    return (f"You said {pair[0]} and {pair[1]} are separate projects. Undo that in Kept separate first, "
+            f"then {then}.")
+
+
+def _kept_refusal(pair: tuple[str, str], then: str) -> dict[str, Any]:
+    return {"ok": False, "code": KEPT_SEPARATE, "pair": list(pair), "error": kept_separate_message(pair, then)}
 
 
 def record_rename(cur, old: str, new: str, *, source: str, evidence: dict | None = None,
@@ -243,8 +293,11 @@ def record_rename(cur, old: str, new: str, *, source: str, evidence: dict | None
     is only kept in the evidence of the rows this call creates.
 
     Every group change takes one transaction-level advisory lock before it
-    reads, so two renames never interleave into a chain. One savepoint; best-effort like the readers: never
-    raises, any failure rolls back and returns ``ok`` false."""
+    reads, so two renames never interleave into a chain. Under it, when the
+    two groups differ and a pair the owner keeps separate has a name in each,
+    nothing is written and ``ok`` is false with ``code`` kept_separate and the
+    ``pair``. One savepoint; best-effort like the readers: never raises, any
+    failure rolls back and returns ``ok`` false."""
     old, new = (old or "").strip(), (new or "").strip()
     if not old or not new:
         return {"ok": False, "error": "old and new must both be non-empty"}
@@ -256,14 +309,14 @@ def record_rename(cur, old: str, new: str, *, source: str, evidence: dict | None
     ev = json.dumps(ev_dict) if ev_dict else None
     try:
         cur.execute("SAVEPOINT project_record_rename", ())
-        # One lock for every group change. Per-group locks had to be rediscovered
-        # as canonicals moved, which could take them out of order and deadlock;
-        # renames are rare, so serialising them all costs nothing.
-        _xact_lock(cur, PROJECT_LOCK_CLASS, "*project-groups*")
-        tops = {_canonical_of(cur, old), _canonical_of(cur, new)}
-        group = {old, new, *tops}
-        cur.execute("SELECT alias FROM project_aliases WHERE project = ANY(%s)", (sorted(tops),))
-        group.update(str(r[0]) for r in cur.fetchall())
+        group_lock(cur)
+        old_group, new_group = group_members(cur, old), group_members(cur, new)
+        if new not in old_group:
+            pair = kept_separate_between(cur, old_group, new_group)
+            if pair:
+                cur.execute("RELEASE SAVEPOINT project_record_rename", ())
+                return {**_kept_refusal(pair, "merge"), "old": old, "new": new}
+        group = old_group | new_group
         removed: list[str] = []
         cur.execute("DELETE FROM project_aliases WHERE alias = %s", (new,))
         if cur.rowcount:
@@ -406,15 +459,6 @@ def _pair(a: str, b: str) -> tuple[str, str]:
     return (a, b) if a < b else (b, a)
 
 
-def pair_kept_separate(cur, a: str, b: str) -> bool:
-    """The owner said ``a`` and ``b`` are different projects: no automatic
-    linker (the GitHub sweep, the same-checkout path) may link them. A hub
-    without ``project_pairs`` reads as False."""
-    a, b = _pair(a, b)
-    cur.execute("SELECT 1 FROM project_pairs WHERE a = %s AND b = %s AND state = 'kept_separate'", (a, b))
-    return cur.fetchone() is not None
-
-
 def observation_fields(obs: Any) -> tuple[str, str, str, str, float] | None:
     """``(checkout_key, root_commit, project, project_kind, observed_at)`` of a
     well-formed observation, else None."""
@@ -481,13 +525,6 @@ def record_checkout_observation(cur, obs: dict[str, Any]) -> dict[str, Any]:
             elif old_project == project:
                 cur.execute("UPDATE project_checkouts SET project_kind = %s, last_seen_at = to_timestamp(%s) "
                             "WHERE checkout_key = %s", (kind, at, key))
-            elif pair_kept_separate(cur, old_project, project):
-                # The owner said these two are different projects: record
-                # nothing, but follow the checkout's name so this is not
-                # re-evaluated on every capture.
-                cur.execute("UPDATE project_checkouts SET project = %s, project_kind = %s, "
-                            "last_seen_at = to_timestamp(%s) WHERE checkout_key = %s", (project, kind, at, key))
-                out["action"] = "kept_separate"
             elif old_kind == "remote" and kind == "folder":
                 # Origin removed: not a rename, and the remote name stays the
                 # last known one so re-adding it later is not a transition.
@@ -506,10 +543,17 @@ def record_checkout_observation(cur, obs: dict[str, Any]) -> dict[str, Any]:
                                     "ON CONFLICT (a, b) DO NOTHING", (a, b, root))
                         source = ""
                 if source:
+                    # The GitHub lookup above ran before the group lock; whether
+                    # the owner keeps these apart is decided by record_rename
+                    # under it. Refused: no rename, but the checkout's name is
+                    # followed so this is not re-evaluated on every capture.
                     res = record_rename(cur, old_project, project, source=source, evidence=evidence, observed_at=at)
-                    if not res.get("ok"):
+                    if res.get("code") == KEPT_SEPARATE:
+                        out.update(action="kept_separate", pair=res["pair"])
+                    elif not res.get("ok"):
                         raise RuntimeError(str(res.get("error")))
-                    out.update(action="renamed", rename=res)
+                    else:
+                        out.update(action="renamed", rename=res)
                 else:
                     out["action"] = "asked"
                 cur.execute("UPDATE project_checkouts SET project = %s, project_kind = %s, "

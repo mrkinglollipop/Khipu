@@ -117,13 +117,27 @@ function newest(g: ProjectGroup): string {
 }
 
 /** The owner-actions line that put `p` in Kept separate: the keep-separate
- * answer (both names) or the separation of one of them. Names come from the
- * line's own `facts.names`, never parsed out of its target. */
+ * answer or a separation, matched on both names of the pair the line itself
+ * recorded (its `result.delta.pair`, order-insensitive) and only while the
+ * pair still holds exactly what that line left. Never one endpoint, never
+ * parsed out of its target. */
+type RecordedPair = { a?: unknown; b?: unknown; new?: { state?: unknown; decided_at?: unknown } | null };
+
+function sameInstant(x: unknown, y: unknown): boolean {
+  if (typeof x !== "string" || typeof y !== "string") return x == null && y == null;
+  const tx = Date.parse(x);
+  const ty = Date.parse(y);
+  return Number.isNaN(tx) || Number.isNaN(ty) ? x === y : tx === ty;
+}
+
 function recordedPair(a: OwnerAction, p: ProjectPair): boolean {
-  const names = Array.isArray(a.facts?.names) ? (a.facts?.names as unknown[]) : [];
-  if (a.action === "project.keep_separate") return names.length === 2 && names.includes(p.a) && names.includes(p.b);
-  if (a.action === "project.separate") return names.length === 1 && (names[0] === p.a || names[0] === p.b);
-  return false;
+  if (a.action !== "project.keep_separate" && a.action !== "project.separate") return false;
+  const delta = (a.result as { delta?: { pair?: RecordedPair } } | null | undefined)?.delta;
+  const pair = delta?.pair;
+  if (!pair || typeof pair.a !== "string" || typeof pair.b !== "string") return false;
+  const bothNames = (pair.a === p.a && pair.b === p.b) || (pair.a === p.b && pair.b === p.a);
+  const left = pair.new;
+  return bothNames && left?.state === p.state && sameInstant(left?.decided_at, p.decided_at);
 }
 
 export function ProjectsSettings({ active, state }: { active: boolean; state: ProjectsState }) {

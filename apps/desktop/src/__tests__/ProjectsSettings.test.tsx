@@ -64,6 +64,12 @@ function bridge(list: ProjectsList | Error, extra: Record<string, (a?: unknown) 
   });
 }
 
+const KEPT_AT = "2020-10-03T12:00:00Z";
+/** The `result` an owner-actions line keeps: the pair it changed and what it left. */
+const left = (a: string, b: string, decided_at = KEPT_AT) => ({
+  delta: { names: [], aliases: [], pair: { a, b, old: null, new: { state: "kept_separate", decided_at } } },
+});
+
 const calls = (cmd: string) => invokeMock.mock.calls.filter(([c]) => c === cmd).map(([, a]) => a);
 
 it("lists each project with its older names, how Khipu knew, and no word 'alias'", async () => {
@@ -137,8 +143,8 @@ it("Undo on a kept-separate pair undoes the owner-action line that recorded it",
   bridge(LIST, {
     khipu_owner_direction_actions: () => ({
       actions: [
-        { id: "aaaaaaaa", at: "x", action: "project.keep_separate", target: "x", facts: { names: [SITE_OLD, SITE] }, state: "undone" },
-        { id: "bbbbbbbb", at: "x", action: "project.keep_separate", target: "x", facts: { names: [SITE_OLD, SITE] }, state: "applied" },
+        { id: "aaaaaaaa", at: "x", action: "project.keep_separate", target: "x", facts: { names: [SITE_OLD, SITE] }, result: left(SITE, SITE_OLD), state: "undone" },
+        { id: "bbbbbbbb", at: "x", action: "project.keep_separate", target: "x", facts: { names: [SITE_OLD, SITE] }, result: left(SITE_OLD, SITE), state: "applied" },
       ],
     }),
   });
@@ -152,7 +158,7 @@ it("Undo on a kept-separate pair undoes the owner-action line that recorded it",
 it("Undo on a pair that was separated undoes the separation line", async () => {
   bridge(LIST, {
     khipu_owner_direction_actions: () => ({
-      actions: [{ id: "cccccccc", at: "x", action: "project.separate", target: SITE_OLD, facts: { names: [SITE_OLD] }, state: "applied" }],
+      actions: [{ id: "cccccccc", at: "x", action: "project.separate", target: SITE_OLD, facts: { names: [SITE_OLD] }, result: left(SITE, SITE_OLD), state: "applied" }],
     }),
   });
   render(<Harness />);
@@ -160,6 +166,42 @@ it("Undo on a pair that was separated undoes the separation line", async () => {
   const row = screen.getByText(SITE).closest(".oldname") as HTMLElement;
   fireEvent.click(within(row).getByRole("button", { name: /Undo/ }));
   await waitFor(() => expect(calls("khipu_owner_direction_undo")).toEqual([{ id: "cccccccc" }]));
+});
+
+it("Undo beside one kept pair never undoes the separation of another pair sharing a name", async () => {
+  const OTHER = "mrkinglollipop/khipu-docs";
+  const list = {
+    ...LIST,
+    pairs: [...LIST.pairs, { a: SITE_OLD, b: OTHER, state: "kept_separate", decided_at: "2020-10-05T09:00:00Z" }],
+  };
+  bridge(list, {
+    khipu_owner_direction_actions: () => ({
+      actions: [
+        // newest first: the separation of SITE_OLD from OTHER, then the SITE / SITE_OLD answer
+        { id: "dddddddd", at: "x", action: "project.separate", target: SITE_OLD, facts: { names: [SITE_OLD] }, result: left(OTHER, SITE_OLD, "2020-10-05T09:00:00Z"), state: "applied" },
+        { id: "eeeeeeee", at: "x", action: "project.keep_separate", target: "x", facts: { names: [SITE_OLD, SITE] }, result: left(SITE_OLD, SITE), state: "applied" },
+      ],
+    }),
+  });
+  render(<Harness />);
+  await screen.findByText("Kept separate");
+  const row = screen.getByText(SITE).closest(".oldname") as HTMLElement;
+  fireEvent.click(within(row).getByRole("button", { name: /Undo/ }));
+  await waitFor(() => expect(calls("khipu_owner_direction_undo")).toEqual([{ id: "eeeeeeee" }]));
+});
+
+it("Undo refuses a line whose pair was decided again since, and changes nothing", async () => {
+  bridge(LIST, {
+    khipu_owner_direction_actions: () => ({
+      actions: [{ id: "ffffffff", at: "x", action: "project.keep_separate", target: "x", facts: { names: [SITE, SITE_OLD] }, result: left(SITE, SITE_OLD, "2020-09-01T00:00:00Z"), state: "applied" }],
+    }),
+  });
+  render(<Harness />);
+  await screen.findByText("Kept separate");
+  const row = screen.getByText(SITE).closest(".oldname") as HTMLElement;
+  fireEvent.click(within(row).getByRole("button", { name: /Undo/ }));
+  expect((await within(row).findByRole("alert")).textContent).toContain("no undoable record");
+  expect(calls("khipu_owner_direction_undo")).toEqual([]);
 });
 
 it("Undo on a kept-separate pair with no undoable record says so and changes nothing", async () => {

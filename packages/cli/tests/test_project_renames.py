@@ -716,7 +716,8 @@ def test_an_older_pull_never_replaces_newer_aliases(replica):
 def test_a_kept_separate_pair_is_not_linked_by_the_checkout_path(cur):
     cur.execute("INSERT INTO project_pairs (a, b, state, decided_at) VALUES (%s, %s, 'kept_separate', now())", (A, B))
     cur.execute("INSERT INTO project_pairs (a, b, state, decided_at) VALUES ('newdir', 'olddir', 'kept_separate', now())")
-    with mock.patch.object(identity, "github_confirms_rename", side_effect=AssertionError("asked GitHub")):
+    # GitHub may be asked before the lock; even its yes is refused under it.
+    with mock.patch.object(identity, "github_confirms_rename", return_value=True):
         out = _observe(cur, _obs("1:10", B, "remote", 1), _obs("1:10", A, "remote", 2),
                        _obs("2:20", "olddir", "folder", 1), _obs("2:20", "newdir", "folder", 2))
     assert [o["action"] for o in out] == ["first", "kept_separate", "first", "kept_separate"]
@@ -725,3 +726,29 @@ def test_a_kept_separate_pair_is_not_linked_by_the_checkout_path(cur):
     assert {r[0] for r in cur.fetchall()} == {"kept_separate"}
     cur.execute("SELECT project FROM project_checkouts WHERE checkout_key = '1:10'")
     assert cur.fetchone()[0] == A
+
+
+def test_an_observation_past_its_lookup_is_refused_when_the_owner_separates_first(hub, cur):  # noqa: F811
+    """The GitHub lookup runs before the group lock. The owner's separation,
+    on another connection, takes the lock and commits while it runs; the
+    observation's write then decides under the lock, and is refused."""
+    from khipu import project_group
+
+    cur.execute("INSERT INTO project_aliases (alias, project, source) VALUES (%s, %s, 'github')", (A, B))
+    _observe(cur, _obs("1:10", A, "remote", 1))
+    cur.connection.commit()
+    owner = hub.connect()
+
+    def lookup(old, new):
+        with owner.cursor() as ocur:
+            assert project_group.apply(ocur, project_group.ACTION_SEPARATE, [A])["ok"]
+        owner.commit()
+        return True
+
+    with mock.patch.object(identity, "github_confirms_rename", side_effect=lookup):
+        [out] = _observe(cur, _obs("1:10", B, "remote", 2))
+    cur.connection.commit()
+    owner.close()
+    assert out["ok"] and out["action"] == "kept_separate" and out["pair"] == [A, B], out
+    assert _aliases(cur) == {}
+    assert _pairs(cur) == [(A, B, "kept_separate")]
