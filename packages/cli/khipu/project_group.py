@@ -245,6 +245,12 @@ def keep_separate(cur, a: str, b: str) -> dict:
     row, why = _asked(cur, (a or "").strip(), (b or "").strip())
     if row is None:
         return {"ok": False, "error": why}
+    # The pair may have become one project since it was asked (a GitHub-confirmed
+    # rename, an owner link): recording it as kept separate would break the rule
+    # that kept-separate names are never in one group.
+    if row["b"] in identity.group_members(cur, row["a"]):
+        return {"ok": False, "error": f"{row['a']} and {row['b']} are already one project; to split them, "
+                                      f"separate the older name instead; nothing was changed"}
     _set_pair(cur, a, b, KEPT)
     return {"ok": True, "pair": [row["a"], row["b"]], "pair_state": KEPT}
 

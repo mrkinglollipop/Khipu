@@ -214,6 +214,17 @@ def test_keep_separate_applies_and_undo_sets_the_pair_asked_again(pg):
     assert pg.fetchone()[0] is None
 
 
+def test_keep_separate_refuses_a_pair_already_linked_since_it_was_asked(pg):
+    _seed(pg)
+    # A GitHub-confirmed rename (or an owner link) joined the pair after it was asked.
+    pg.execute("INSERT INTO project_aliases (alias, project, source) VALUES (%s, %s, 'github')", (A, B))
+    pg.connection.commit()
+    is_error, out = _act("project.keep_separate", {"a": A, "b": B})
+    assert is_error and out["ok"] is False and "already one project" in out["error"], out
+    assert _pairs(pg)[(A, B)] == "asked"
+    assert [r[0] for r in _aliases(pg)] == [A]
+
+
 @pytest.mark.parametrize("job", sorted(limit.JOBS))
 @pytest.mark.parametrize("action,args", [
     ("project.alias_add", {"alias": A, "canonical": B}),
