@@ -85,8 +85,16 @@ Rules for every alias Khipu records:
   slice group the same way the hub does.
 - Folder-keyed projects (no remote) get case 1 too, since a moved or renamed folder keeps its
   git common dir identity and root commit.
-- Renames are serialised on one lock and ordered by observation time: an event older than one already
-  recorded for the group is refused, so a delayed capture never undoes a newer rename.
+- Grouping never splits. Observation times are compared only within one checkout (one Mac's clock,
+  `project_checkouts`), never across checkouts. A rename whose two names are already one group only
+  relabels it (every member re-pointed at the new name); otherwise the two groups merge under the new
+  name. So a late, stale event from another Mac can at worst relabel a group, never drop a member.
+- Each checkout's observations are evaluated under a per-checkout lock, and each group change under a
+  lock on the group's canonical name; there is no global lock.
+- An observation the hub cannot record (unreachable, failed write) waits in a small local spool per
+  checkout key in the capture state dir (at most 20, consecutive repeats kept once) and lands, oldest
+  first, before the next observation for that checkout. A rolled-back capture is retried from the
+  outbox with its observation.
 
 Out of scope: rewriting old rows to the new name; per-project files outside Khipu (Claude's own
 `~/.claude/projects/<path>` folders, Cursor rule files) beyond what Khipu itself writes; GitLab and

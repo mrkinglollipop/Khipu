@@ -22,6 +22,12 @@ from tests.hermetic_pg import MIGRATIONS, hub, pg_cluster  # noqa: F401
 A, B, C = "o/alpha", "o/beta", "o/gamma"
 
 
+@pytest.fixture(autouse=True)
+def _own_capture_home(tmp_path, monkeypatch):
+    """The checkout spool lives in the capture state dir: one per test."""
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture-home"))
+
+
 def _migrate_0039(hub):  # noqa: F811
     """The shared template stops at 0029; this slice's migration goes on top."""
     conn = hub.connect()
@@ -154,10 +160,11 @@ def test_github_confirms_rename_runs_gh_without_a_shell():
     def fake(answer, rc=0):
         return mock.Mock(returncode=rc, stdout=answer + "\n", stderr="")
 
-    with mock.patch("subprocess.run", return_value=fake("O/Beta")) as run:
+    with (mock.patch("khipu.synth_cli.binary", return_value="/opt/gh"),
+          mock.patch("subprocess.run", return_value=fake("O/Beta")) as run):
         assert identity.github_confirms_rename(A, B) is True
     argv = run.call_args.args[0]
-    assert argv == ["gh", "api", f"repos/{A}", "--jq", ".full_name"]
+    assert argv == ["/opt/gh", "api", f"repos/{A}", "--jq", ".full_name"]
     assert run.call_args.kwargs["timeout"] == 3 and not run.call_args.kwargs.get("shell")
     with mock.patch("subprocess.run", return_value=fake("o/other")):
         assert identity.github_confirms_rename(A, B) is False
@@ -167,6 +174,24 @@ def test_github_confirms_rename_runs_gh_without_a_shell():
         assert identity.github_confirms_rename(A, B) is None
     with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("gh", 3)):
         assert identity.github_confirms_rename(A, B) is None
+    with (mock.patch("khipu.synth_cli.binary", return_value=None),
+          mock.patch("subprocess.run", side_effect=AssertionError("ran without a gh"))):
+        assert identity.github_confirms_rename(A, B) is None
+
+
+def test_gh_is_found_by_the_resolver_under_a_bare_launchd_path(tmp_path, monkeypatch):
+    from khipu import synth_cli
+
+    fake = tmp_path / "brew" / "gh"
+    fake.parent.mkdir()
+    fake.write_text(f"#!/bin/sh\necho {B}\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.delenv("KHIPU_GH_CLI", raising=False)
+    monkeypatch.setattr(synth_cli, "_chosen", lambda name: None)
+    monkeypatch.setitem(synth_cli._CANDIDATES, "gh", (str(fake),))
+    assert shutil.which("gh") is None
+    assert identity.github_confirms_rename(A, B) is True
 
 
 def test_folder_to_folder_is_certain(cur):
@@ -204,12 +229,25 @@ def test_a_delayed_older_observation_does_not_undo_a_newer_rename(cur):
     _observe(cur, _obs("1:10", "olddir", "folder", 1), _obs("1:10", "newdir", "folder", 3))
     out = identity.record_checkout_observation(cur, _obs("1:10", "olddir", "folder", 2))
     assert out["action"] == "stale" and _aliases(cur) == {"olddir": "newdir"}
-    # The rename itself refuses an event older than the evidence already in its group,
-    # even when it arrives by another checkout.
-    res = identity.record_rename(cur, "newdir", "olddir", source="checkout", observed_at=2.0)
-    assert res["ok"] and not res["changed"] and "older" in res["refused"]
-    assert _aliases(cur) == {"olddir": "newdir"}
-    assert identity.record_rename(cur, "newdir", "olddir", source="checkout", observed_at=4.0)["changed"]
+
+
+def test_a_late_stale_transition_from_another_mac_keeps_the_group_whole(cur):
+    # Mac 2 sees B -> C at its 100; Mac 1's A -> B arrives later stamped with its own
+    # (behind) clock. Times from two Macs are never compared: nothing is refused and
+    # nothing leaves the group, the late event can only relabel it.
+    _observe(cur, _obs("2:20", B, "folder", 99), _obs("2:20", C, "folder", 100))
+    assert _aliases(cur) == {B: C}
+    out = _observe(cur, _obs("1:10", A, "folder", 49), _obs("1:10", B, "folder", 50))
+    assert out[1]["action"] == "renamed"
+    for name in (A, B, C):
+        assert sorted(identity.project_group(cur, name)) == [A, B, C]
+    assert set(_aliases(cur).values()) == {B}  # flat, no chain
+
+
+def test_rename_of_two_separate_groups_merges_them_under_the_new_name(cur):
+    cur.execute("INSERT INTO project_aliases (alias, project) VALUES (%s, %s), (%s, %s)", (A, B, "o/x", C))
+    identity.record_rename(cur, B, "o/x", source="checkout", evidence=None)
+    assert _aliases(cur) == {A: "o/x", B: "o/x", C: "o/x"}
 
 
 def test_recording_failure_is_rolled_back_so_the_next_observation_rederives_it(cur):
@@ -222,6 +260,41 @@ def test_recording_failure_is_rolled_back_so_the_next_observation_rederives_it(c
     assert cur.fetchone()[0] == "olddir"  # not advanced
     assert identity.record_checkout_observation(cur, _obs("1:10", "newdir", "folder", 3))["action"] == "renamed"
     assert _aliases(cur) == {"olddir": "newdir"}
+
+
+def test_concurrent_first_observations_of_one_checkout_both_count(cur, hub):  # noqa: F811
+    import threading
+    import time
+
+    first, second, watch = hub.connect(), hub.connect(), hub.connect()
+    watch.autocommit = True
+    try:
+        assert identity.record_checkout_observation(first.cursor(), _obs("1:10", "olddir", "folder", 1))["ok"]
+        got: dict = {}
+
+        def other():
+            got["out"] = identity.record_checkout_observation(second.cursor(), _obs("1:10", "newdir", "folder", 2))
+            second.commit()
+
+        t = threading.Thread(target=other)
+        t.start()
+        deadline = time.time() + 10
+        while time.time() < deadline:  # the second waits on the first, then evaluates
+            row = watch.execute("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                                "AND pid <> pg_backend_pid()").fetchone()
+            if row[0]:
+                break
+            time.sleep(0.05)
+        first.commit()
+        t.join(10)
+        assert got["out"]["action"] == "renamed"
+        third = first.cursor()
+        assert identity.record_checkout_observation(third, _obs("1:10", "lastdir", "folder", 3))["action"] == "renamed"
+        first.commit()
+        assert _aliases(cur) == {"olddir": "lastdir", "newdir": "lastdir"}
+    finally:
+        for conn in (first, second, watch):
+            conn.close()
 
 
 # ---- capture write -------------------------------------------------------------
@@ -287,6 +360,8 @@ def test_capture_still_succeeds_when_the_0039_tables_are_missing(hub, monkeypatc
     assert out["episode_inserted"]
     out = capture.write_pg(_payload(B, 2, checkout=_obs("1:10", B, "folder", 2)))
     assert out["episode_inserted"]
+    # Neither observation could be recorded: both wait in the spool, in order.
+    assert [o["project"] for o in capture._spool_read("1:10")] == [A, B]
     cur = hub.connect().cursor()
     cur.execute("SELECT count(*) FROM episodes")
     assert cur.fetchone()[0] == 2
@@ -299,6 +374,42 @@ def test_an_empty_extraction_job_still_records_its_observation(writer):
     capture.record_checkout_observation(_obs("1:10", "newdir", "folder", 2))
     cur = writer.connect().cursor()
     assert _aliases(cur) == {"olddir": "newdir"}
+
+
+def test_a_rolled_back_capture_is_retried_with_its_observation(writer, monkeypatch):
+    from khipu import capture
+
+    queued: list[dict] = []
+    monkeypatch.setattr("khipu.outbox.enqueue", lambda payload, **k: queued.append(payload))
+    monkeypatch.setattr(capture, "run_capture_v2", lambda *a, **k: 0)
+    monkeypatch.setattr(capture, "dedup_before_insert", mock.Mock(side_effect=RuntimeError("hub went away")))
+    obs = _obs("1:10", A, "folder", 1)
+    capture.capture(_payload(A, 1, checkout=dict(obs)), mode="hub")
+    assert len(queued) == 1 and queued[0]["checkout"] == obs
+
+
+def test_failed_empty_job_observations_are_spooled_and_landed_in_order(writer, monkeypatch):
+    from khipu import capture
+    from khipu import session_capture as sc
+
+    capture.record_checkout_observation(_obs("1:10", "olddir", "folder", 1))
+    with monkeypatch.context() as down:
+        down.setattr("khipu.db.connect", mock.Mock(side_effect=OSError("hub unreachable")))
+        capture.record_checkout_observation(_obs("1:10", "newdir", "folder", 2))
+        capture.record_checkout_observation(_obs("1:10", "newdir", "folder", 3))  # same state: kept once
+        capture.record_checkout_observation(_obs("1:10", "lastdir", "folder", 4))
+    spooled = capture._spool_read("1:10")
+    assert [(o["project"], o["observed_at"]) for o in spooled] == [("newdir", 2.0), ("lastdir", 4.0)]
+    # The next drain lands the spool oldest first, then the new job's observation.
+    monkeypatch.setattr("khipu.config.capture_mode", lambda: "hub")
+    monkeypatch.setattr("khipu.extract.extract_memory", lambda *a, **k: None)
+    sc.enqueue({"harness": "claude_code", "session_id": "s", "cwd": "/x", "event": "stop",
+                "ts": "2026-10-19T12:00:00Z", "turns": 1, "transcript": "hello",
+                "checkout": _obs("1:10", "lastdir", "folder", 5)})
+    assert sc.drain()["empty"] == 1
+    assert capture._spool_read("1:10") == []
+    cur = writer.connect().cursor()
+    assert _aliases(cur) == {"olddir": "lastdir", "newdir": "lastdir"}
 
 
 def test_drain_records_the_observation_before_archiving_an_empty_job(tmp_path, monkeypatch):
@@ -573,4 +684,17 @@ def test_incremental_pull_carries_an_alias_add_and_an_alias_delete(replica):
     sync([])
     con = sqlite3.connect(str(replica))
     assert con.execute("SELECT count(*) FROM project_aliases").fetchone()[0] == 0
+    con.close()
+
+
+def test_an_older_pull_never_replaces_newer_aliases(replica):
+    import time
+
+    now = time.time()
+    newer = hs._write_pulled_tables(None, None, (["alias", "project"], [("o/x", B)]), read_at=now)
+    assert newer["project_aliases"] == {"ok": True, "project_aliases": 1}
+    older = hs._write_pulled_tables(None, None, (["alias", "project"], []), read_at=now - 60)
+    assert older["project_aliases"]["skipped"]
+    con = sqlite3.connect(str(replica))
+    assert con.execute("SELECT alias, project FROM project_aliases").fetchall() == [("o/x", B)]
     con.close()

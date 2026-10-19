@@ -1441,7 +1441,8 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
     whole table, as a dump would, unless the table held was read after
     ``read_at`` (a dump or pull that finished meanwhile): then it stays.
     ``project_aliases`` (tiny) is copied whole on every pull, replacing the
-    replica's rows in the same transaction, so a deleted alias arrives too."""
+    replica's rows in the same transaction, so a deleted alias arrives too;
+    like commitments, a copy read after ``read_at`` stays."""
     parts: dict[str, dict[str, Any]] = {}
     path = snapshot_path()
     con = sqlite3.connect(str(path))
@@ -1502,9 +1503,14 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     _record_read_at(con, "commitments", "*", read_at)
             if "project_aliases" in wanted:
                 cols, rows = aliases  # type: ignore[misc]
-                con.execute("DELETE FROM project_aliases")
-                _write_project_alias_rows(con, cols, rows)
-                parts["project_aliases"] = {"ok": True, "project_aliases": len(rows)}
+                if _held_read_at(con, "project_aliases", "*") > read_at:
+                    parts["project_aliases"] = {"ok": True, "project_aliases": 0,
+                                                "skipped": "the replica holds a newer copy"}
+                else:
+                    con.execute("DELETE FROM project_aliases")
+                    _write_project_alias_rows(con, cols, rows)
+                    parts["project_aliases"] = {"ok": True, "project_aliases": len(rows)}
+                    _record_read_at(con, "project_aliases", "*", read_at)
             con.commit()
         finally:
             con.close()

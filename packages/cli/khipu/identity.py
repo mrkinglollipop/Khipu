@@ -192,41 +192,40 @@ def remove_project_alias(cur, alias: str) -> dict[str, Any]:
     return {"ok": True, "alias": alias, "changed": True}
 
 
-RENAME_LOCK_KEY = 0x4B48495055524E4D  # fixed: renames are rare, one at a time is fine
+# Advisory lock classes (the first key of the two-key form), so a project
+# name and a checkout key never share a lock by hash coincidence.
+PROJECT_LOCK_CLASS = 0x4B485052  # one project group, by its canonical name
+CHECKOUT_LOCK_CLASS = 0x4B48434B  # one checkout, by its key
 
 
-def _evidence_times(rows) -> list[float]:
-    out: list[float] = []
-    for (ev,) in rows:
-        if isinstance(ev, str):
-            try:
-                ev = json.loads(ev)
-            except ValueError:
-                continue
-        if isinstance(ev, dict) and ev.get("observed_at") is not None:
-            try:
-                out.append(float(ev["observed_at"]))
-            except (TypeError, ValueError):
-                continue
-    return out
+def _xact_lock(cur, cls: int, name: str) -> None:
+    cur.execute("SELECT pg_advisory_xact_lock(%s::int4, hashtext(%s))", (cls, name))
+
+
+def _canonical_of(cur, name: str) -> str:
+    cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (name,))
+    row = cur.fetchone()
+    return str(row[0]) if row and row[0] else name
 
 
 def record_rename(cur, old: str, new: str, *, source: str, evidence: dict | None = None,
                   observed_at: float | None = None) -> dict[str, Any]:
     """``old`` is now called ``new``: the newest name becomes canonical for the
-    whole group, with no alias chains (A to B to C leaves A->C and B->C). The
-    group is ``old``'s canonical plus every alias of it; each member is
-    re-pointed at ``new``. If ``new`` was itself an alias (a rename back,
-    A->B->A) its row is dropped first so it can be canonical again. One
-    savepoint; best-effort exactly like the readers: never raises, any failure
-    rolls back and returns ``ok`` false. ``source`` and ``evidence`` are kept on
-    the rows this call creates, so an automatic alias can be shown and undone.
+    whole group, with no alias chains (A to B to C leaves A->C and B->C).
 
-    Renames serialise on a transaction-level advisory lock. ``observed_at``
-    (epoch seconds, kept in the evidence) orders them: an event older than the
-    newest ``observed_at`` already recorded for any alias in the affected group
-    is refused (``ok`` true, ``changed`` false, ``refused`` says why), so a
-    delayed observation never undoes a newer rename."""
+    Grouping never splits. When ``old`` and ``new`` are already one group the
+    only change is relabelling: every member is re-pointed at ``new``. Otherwise
+    ``old``'s group and ``new``'s group (each a canonical plus its aliases) merge
+    under ``new``. ``new``'s own alias row, if any, is dropped so it can be
+    canonical; no member ever leaves. Observation times from different checkouts
+    come from different Macs' clocks, so they are never compared: a late, stale
+    event can relabel a group but never take a name out of it. ``observed_at``
+    is only kept in the evidence of the rows this call creates.
+
+    Each affected group is locked (transaction-level advisory lock on its
+    canonical name) before it is read, so two renames touching one group never
+    interleave into a chain. One savepoint; best-effort like the readers: never
+    raises, any failure rolls back and returns ``ok`` false."""
     old, new = (old or "").strip(), (new or "").strip()
     if not old or not new:
         return {"ok": False, "error": "old and new must both be non-empty"}
@@ -238,28 +237,26 @@ def record_rename(cur, old: str, new: str, *, source: str, evidence: dict | None
     ev = json.dumps(ev_dict) if ev_dict else None
     try:
         cur.execute("SAVEPOINT project_record_rename", ())
-        cur.execute("SELECT pg_advisory_xact_lock(%s)", (RENAME_LOCK_KEY,))
-        cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (old,))
-        row = cur.fetchone()
-        top = str(row[0]) if row and row[0] else old
-        cur.execute("SELECT alias FROM project_aliases WHERE project = %s", (top,))
-        group = {top, new, *(str(r[0]) for r in cur.fetchall())}
-        if observed_at is not None:
-            cur.execute("SELECT evidence FROM project_aliases WHERE alias = ANY(%s) OR project = ANY(%s)",
-                        (sorted(group), sorted(group)))
-            newest = max(_evidence_times(cur.fetchall()), default=None)
-            if newest is not None and float(observed_at) < newest:
-                cur.execute("RELEASE SAVEPOINT project_record_rename", ())
-                return {"ok": True, "changed": False, "old": old, "new": new, "refused":
-                        f"older than a rename already recorded for this group ({observed_at} < {newest})"}
-        members = group - {new}
+        locked: set[str] = set()
+        for _ in range(5):
+            tops = {_canonical_of(cur, old), _canonical_of(cur, new)}
+            if tops <= locked:
+                break
+            for top in sorted(tops - locked):
+                _xact_lock(cur, PROJECT_LOCK_CLASS, top)
+                locked.add(top)
+        else:
+            raise RuntimeError("project groups kept changing while being locked")
+        group = {old, new, *tops}
+        cur.execute("SELECT alias FROM project_aliases WHERE project = ANY(%s)", (sorted(tops),))
+        group.update(str(r[0]) for r in cur.fetchall())
         removed: list[str] = []
         cur.execute("DELETE FROM project_aliases WHERE alias = %s", (new,))
         if cur.rowcount:
             removed.append(new)
         added: list[str] = []
         repointed: list[str] = []
-        for member in sorted(members):
+        for member in sorted(group - {new}):
             cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (member,))
             have = cur.fetchone()
             if have is None:
@@ -268,11 +265,7 @@ def record_rename(cur, old: str, new: str, *, source: str, evidence: dict | None
                     "VALUES (%s, %s, %s, %s::jsonb)", (member, new, source, ev))
                 added.append(member)
             elif str(have[0]) != new:
-                cur.execute(
-                    "UPDATE project_aliases SET project = %s, evidence = "
-                    "CASE WHEN %s::float8 IS NULL THEN evidence ELSE COALESCE(evidence, '{}'::jsonb) "
-                    "|| jsonb_build_object('observed_at', %s::float8) END WHERE alias = %s",
-                    (new, observed_at, observed_at, member))
+                cur.execute("UPDATE project_aliases SET project = %s WHERE alias = %s", (new, member))
                 repointed.append(member)
         cur.execute("RELEASE SAVEPOINT project_record_rename", ())
         return {"ok": True, "changed": bool(added or repointed or removed), "old": old, "new": new,
@@ -291,9 +284,18 @@ def github_confirms_rename(old: str, new: str) -> bool | None:
     .full_name`` (GitHub follows its own redirect after a rename), 3 s, no shell.
     True only when the answer equals ``new`` case-insensitively; False when it
     names something else; None when ``gh`` is missing, unauthenticated, slow or
-    errors in any way."""
+    errors in any way. ``gh`` is found by ``synth_cli.binary`` (PATH, then the
+    usual install folders), since the drain runs under launchd's bare PATH."""
     try:
-        proc = subprocess.run(["gh", "api", f"repos/{old}", "--jq", ".full_name"], capture_output=True,
+        from khipu.synth_cli import binary
+
+        gh = binary("gh")
+    except Exception:  # noqa: BLE001
+        gh = None
+    if not gh:
+        return None
+    try:
+        proc = subprocess.run([gh, "api", f"repos/{old}", "--jq", ".full_name"], capture_output=True,
                               text=True, timeout=3, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -390,29 +392,45 @@ def _pair(a: str, b: str) -> tuple[str, str]:
     return (a, b) if a < b else (b, a)
 
 
-def record_checkout_observation(cur, obs: dict[str, Any]) -> dict[str, Any]:
-    """The hub's side: compare one observation with the checkout's stored row
-    and record a rename when the rules say it is certain.
-
-    A transition is the same ``checkout_key``, the same ``root_commit``, a
-    changed project and an observation not older than the row. folder to folder
-    and folder to remote are certain; remote to folder is ignored; remote to
-    remote is a rename only if GitHub confirms it, otherwise a ``project_pairs``
-    'asked' row is kept for the owner and nothing is merged. A different root
-    commit is never a rename. An 'unknown' observation only moves
-    ``last_seen_at``. One savepoint, never raises: when anything fails (e.g.
-    migration 0039 not applied) nothing is recorded and the next capture's
-    observation re-derives it."""
+def observation_fields(obs: Any) -> tuple[str, str, str, str, float] | None:
+    """``(checkout_key, root_commit, project, project_kind, observed_at)`` of a
+    well-formed observation, else None."""
     try:
         key, root = str(obs["checkout_key"]), str(obs["root_commit"])
         project, kind = str(obs["project"]), str(obs["project_kind"])
         at = float(obs["observed_at"])
     except (KeyError, TypeError, ValueError):
-        return {"ok": False, "error": "malformed observation"}
+        return None
     if kind not in ("remote", "folder", "unknown") or not (key and root and project):
+        return None
+    return key, root, project, kind, at
+
+
+def record_checkout_observation(cur, obs: dict[str, Any]) -> dict[str, Any]:
+    """The hub's side: compare one observation with the checkout's stored row
+    and record a rename when the rules say it is certain.
+
+    A transition is the same ``checkout_key``, the same ``root_commit``, a
+    changed project and an observation not older than the row (both times come
+    from the one Mac that owns the checkout, so comparing them is safe; times
+    from different checkouts are never compared). folder to folder
+    and folder to remote are certain; remote to folder is ignored; remote to
+    remote is a rename only if GitHub confirms it, otherwise a ``project_pairs``
+    'asked' row is kept for the owner and nothing is merged. A different root
+    commit is never a rename. An 'unknown' observation only moves
+    ``last_seen_at``. One savepoint, never raises: when anything fails (e.g.
+    migration 0039 not applied) nothing is recorded and ``ok`` is false, so the
+    caller can keep the observation (capture's local spool) and land it later."""
+    fields = observation_fields(obs)
+    if fields is None:
         return {"ok": False, "error": "malformed observation"}
+    key, root, project, kind, at = fields
     try:
         cur.execute("SAVEPOINT project_checkout_observation", ())
+        # Read-evaluate-write under a per-checkout lock: two first sightings of
+        # one checkout in concurrent transactions are evaluated one after the
+        # other, so the second sees the first's row and its transition counts.
+        _xact_lock(cur, CHECKOUT_LOCK_CLASS, key)
         cur.execute("SELECT root_commit, project, project_kind, extract(epoch FROM last_seen_at) "
                     "FROM project_checkouts WHERE checkout_key = %s FOR UPDATE", (key,))
         row = cur.fetchone()
