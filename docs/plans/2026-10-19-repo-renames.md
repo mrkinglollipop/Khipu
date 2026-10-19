@@ -107,8 +107,12 @@ other hosts for case 2 (cases 1 and 3 still work there).
 - **B. Replica and same-checkout detection:** replicate `project_aliases` to the snapshot (whole table on every pull); the
   checkout observation in the hook and the hub's `project_checkouts` decision; the capture write records the alias; re-pointing so there are no chains;
   the evidence log. Hermetic tests: rename on one checkout, rename twice, folder rename.
-- **C. GitHub check and doctor:** the nightly `gh` lookup; doctor lines for aliases found, check
-  skipped (no `gh`), and lookup failures.
+- **C. GitHub check and doctor (built):** `khipu/project_renames.py`: the nightly `project_renames` step (before
+  the replica refresh) and `khipu project renames check [--json]` ask `gh api repos/<slug>` for each GitHub project
+  active in 30 days (at most 50 lookups, 3 s each) and for 'asked' pairs; a confirmed pair gets state
+  `merged_github` (slice D adds the owner states `merged` / `kept_separate`). No `gh` or no login is `skipped`,
+  never a failure. Doctor's `project_renames` block: aliases by source, newest alias, pairs waiting, last sweep;
+  yellow only after 3 days of failed or skipped sweeps.
 - **D. Conversation and app:** the `khipu_project` read tool; the owner actions (merge, keep
   separate, add, remove, undo) through `khipu_owner_act`; the "same project?" question in the
   session-start slice; then the Settings list with evidence and Undo and the in-app prompt. Mock of
