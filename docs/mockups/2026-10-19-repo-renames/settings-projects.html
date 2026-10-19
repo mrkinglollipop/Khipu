@@ -1,0 +1,79 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Khipu Settings mock: Projects</title><link rel="stylesheet" href="App.css"><link rel="stylesheet" href="mock.css"></head>
+<body><div id="root"><div class="shell">
+<nav class="rail" aria-label="Primary"><div class="rail-drag"></div>
+<div class="brand"><img class="brand-icon" src="../../../apps/desktop/src/assets/khipu-icon.png" width="26" height="26" alt=""><span class="brand-name">Khipu</span></div>
+<div class="rail-nav"><div class="nav-group">
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 8 4l5 4.5V13H3z"/></svg><span class="nav-label">Home</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M6 3v10M10 3v10"/></svg><span class="nav-label">Work</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4"/><path d="m10 10 3.5 3.5"/></svg><span class="nav-label">Recall</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg><span class="nav-label">Activity</span></button>
+<button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z"/><path d="M8 11v3"/></svg><span class="nav-label">Harnesses</span></button>
+<button type="button" class="nav active" aria-current="page"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 11h10"/><circle cx="6" cy="5" r="1.5"/><circle cx="10" cy="11" r="1.5"/></svg><span class="nav-label">Settings</span></button>
+</div></div>
+<div class="rail-foot"><div class="rail-health"><span class="hdot ok" aria-hidden="true"></span><span>Memory is working</span></div>
+<div class="rail-meta"><button type="button" class="rail-feedback">Feedback</button><span class="version-chip">v0.4.15</span></div></div></nav>
+<main class="main"><section class="panel"><header class="panel-head"><div class="panel-head-text"><h1>Settings</h1><p class="lede">Capture, models, data and this Mac.</p></div></header>
+<div class="panel-body wide settings-body"><div class="settings-split">
+<div class="subnav" role="tablist" aria-label="Settings sections">
+<button type="button" role="tab" aria-selected="false">Database</button>
+<button type="button" role="tab" aria-selected="false">Capture &amp; models</button>
+<button type="button" role="tab" aria-selected="false">Accounts and routing</button>
+<button type="button" role="tab" aria-selected="false">Owner actions</button>
+<button type="button" role="tab" aria-selected="false">Work</button>
+<button type="button" role="tab" aria-selected="true" class="on">Projects</button>
+<button type="button" role="tab" aria-selected="false">Optional features</button>
+<button type="button" role="tab" aria-selected="false">Embeddings</button>
+<button type="button" role="tab" aria-selected="false">Data &amp; backups</button>
+<button type="button" role="tab" aria-selected="false">Another Mac</button>
+<button type="button" role="tab" aria-selected="false">Components</button>
+<button type="button" role="tab" aria-selected="false">Updates</button>
+<button type="button" role="tab" aria-selected="false">Advanced</button>
+</div>
+<div class="settings-pane">
+<div class="section-card" aria-labelledby="names-head">
+<div class="section-head" id="names-head">Projects with more than one name</div>
+<div class="section-body">
+<p class="muted">When a repo or folder is renamed, Khipu keeps its old and new conversations together as one project under the newest name. Each conversation keeps the name it was saved with; nothing is rewritten, so Undo puts everything back exactly as it was.</p>
+
+<div class="proj" role="group" aria-label="mrkinglollipop/olivewood">
+<div class="proj-head"><span class="proj-name">mrkinglollipop/olivewood</span><span class="tag ok">Current name</span><span class="meta">412 conversations · 9 open commitments · 31 decisions, both names together</span></div>
+<div class="oldname">
+<div class="oldname-id">
+<div class="oldname-line"><span class="label-sm">Older name</span><span class="oldname-name">mrkinglollipop/church-harness</span><span class="tag">GitHub</span></div>
+<span class="oldname-why">GitHub says this repo is now mrkinglollipop/olivewood. 398 conversations were saved under the old name.</span>
+</div>
+<div class="oldname-acts"><span class="meta">Today, 1:40 PM</span><button type="button" class="sm">Undo</button></div>
+</div>
+</div>
+
+<div class="proj" role="group" aria-label="field-notes">
+<div class="proj-head"><span class="proj-name">field-notes</span><span class="tag ok">Current name</span><span class="meta">57 conversations · 2 open commitments · folder, no GitHub</span></div>
+<div class="oldname">
+<div class="oldname-id">
+<div class="oldname-line"><span class="label-sm">Older name</span><span class="oldname-name">notes-scratch</span><span class="tag">Same checkout</span></div>
+<span class="oldname-why">The folder ~/Code/notes-scratch was renamed to ~/Code/field-notes on this Mac. Same files, same history.</span>
+</div>
+<div class="oldname-acts"><span class="meta">Oct 12</span><button type="button" class="sm">Undo</button></div>
+</div>
+</div>
+
+<div class="inline"><button type="button" class="sm">Add another name…</button><span class="meta push">GitHub checked today at 2:05 AM, signed in as mrkinglollipop</span></div>
+</div></div>
+
+<div class="section-card" aria-labelledby="kept-head">
+<div class="section-head" id="kept-head">Kept separate</div>
+<div class="section-body">
+<div class="rows">
+<div class="oldname">
+<div class="oldname-id">
+<div class="oldname-line"><span class="oldname-name">mrkinglollipop/khipu-site</span><span class="label-sm">and</span><span class="oldname-name">mrkinglollipop/site-2025</span></div>
+<span class="oldname-why"><span class="tag">You</span> They start from the same first commit, and you said they are different projects. Khipu won't ask about this pair again.</span>
+</div>
+<div class="oldname-acts"><span class="meta">Oct 3</span><button type="button" class="sm">Undo</button></div>
+</div>
+</div>
+</div></div>
+
+<div class="chat-hint"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z"/></svg><span>You don't need this page to check or change any of this. In any conversation, ask <q>is olivewood one project now?</q> and your agent shows the same list. Say <q>undo the church-harness rename</q> and it is undone; Owner actions keeps a record of it.</span></div>
+</div></div></div></section></main></div></div></body></html>
