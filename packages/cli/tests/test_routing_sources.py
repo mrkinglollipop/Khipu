@@ -172,6 +172,47 @@ def test_muse_refusal_from_its_logs_reads_as_a_limit(home):
     assert (muse["state"], muse["until"]) == ("limited", routing._iso(resets))
 
 
+def _muse_carried_log_refusal(home):
+    from khipu import usage
+
+    seen = T0 - timedelta(hours=1)  # 14:00
+    refused = T0 - timedelta(minutes=1)  # 14:59
+    resets = T0 + timedelta(hours=2)  # 17:00
+    figures = _row(seen, [
+        {"name": "weekly", "used_pct": 13, "resets_at": routing._iso(T0 + timedelta(days=3))}],
+        source="turn", observed_at=routing._iso(seen))
+    row = usage._muse_carry({"ok": True, "windows": [], "source": "last_observed"}, figures,
+                            (routing._iso(resets), routing._iso(refused)), T0)
+    _usage(home, {"muse|": row})
+    return seen, refused, resets
+
+
+def test_muse_log_refusal_after_owner_clear_uses_its_own_observation_time(home):
+    home["clock"].now = T0 - timedelta(minutes=30)  # 14:30
+    routing.clear("Muse", via="app")
+    home["clock"].now = T0
+    seen, refused, resets = _muse_carried_log_refusal(home)
+
+    muse = _account(routing.read_view(), "muse|")
+    assert (muse["state"], muse["until"]) == ("limited", routing._iso(resets))
+    assert muse["witness"]["at"] == routing._iso(refused)
+    assert "cleared by you" not in routing.account_line(muse, T0)
+    row = json.loads((home["data"] / "state" / "usage.json").read_text())["rows"]["muse|"]
+    assert row["observed_at"] == routing._iso(seen)
+    evidence, status = routing_sources.usage_evidence({"muse|"})
+    assert evidence[0]["at"] == refused
+    assert status["newest"] == routing._iso(refused)
+
+
+def test_muse_log_refusal_provenance_names_session_logs_instead_of_a_khipu_turn(home):
+    _muse_carried_log_refusal(home)
+    muse = _account(routing.read_view(), "muse|")
+    line = routing.account_line(muse, T0)
+    assert "(read from Muse's session logs)" in line
+    assert "a Muse turn Khipu ran" not in line
+    assert "last turn" not in line
+
+
 def test_a_later_probe_with_headroom_reopens(home):
     _register(home)
     windows = [{"name": "five_hour", "used_pct": 40.0, "resets_at": routing._iso(T0 + timedelta(hours=2))}]

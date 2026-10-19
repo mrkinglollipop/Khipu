@@ -1195,7 +1195,8 @@ def _muse_carry(row: dict, prev: dict | None, refusal: tuple[str, str] | None, n
     reset = _parse_iso(refusal[0]) if refusal else None
     if reset and reset > now:
         out["windows"] = [w for w in out.get("windows") or [] if w.get("name") != MUSE_REFUSED_WINDOW]
-        out["windows"].append({"name": MUSE_REFUSED_WINDOW, "used_pct": 100, "resets_at": refusal[0]})
+        out["windows"].append({"name": MUSE_REFUSED_WINDOW, "used_pct": 100, "resets_at": refusal[0],
+                               "observed_at": refusal[1], "source": "session_logs"})
         out["limited_until"] = refusal[0]
         out["refusal_observed_at"] = refusal[1]
         if not out.get("observed_at"):

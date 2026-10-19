@@ -417,6 +417,9 @@ def test_muse_refusal_keeps_carried_figures_stale(fake):
     assert not Path(str(out) + ".turn").exists()
     assert row["observed_at"] == usage._iso(seen.timestamp())
     assert row["refusal_observed_at"] == usage._iso(refused.timestamp())
+    window = next(w for w in row["windows"] if w["name"] == "refused")
+    assert window["observed_at"] == usage._iso(refused.timestamp())
+    assert window["source"] == "session_logs"
     fact = routing.plan_fact(row, now)
     assert fact["used_pct"] == 13 and fact["stale"] is True
     assert fact["pace_pct_per_hour"] is None
@@ -507,7 +510,8 @@ def test_muse_refusal_in_its_session_logs_marks_it_limited_without_a_turn(fake):
     row = usage.probe_account(_MUSE_ACCOUNT)
     assert not Path(str(out) + ".turn").exists()
     assert row["ok"] is True and row["limited_until"] == resets
-    assert row["windows"] == [{"name": usage.MUSE_REFUSED_WINDOW, "used_pct": 100, "resets_at": resets}]
+    assert row["windows"] == [{"name": usage.MUSE_REFUSED_WINDOW, "used_pct": 100, "resets_at": resets,
+                               "observed_at": usage._iso(refused_at.timestamp()), "source": "session_logs"}]
     assert row["observed_at"] == usage._iso(refused_at.timestamp()) and row["source"] == "last_observed"
     # Only the fixed words are read: no other text from the log reaches the row.
     assert "request_id" not in json.dumps(row) and "fixture]" not in json.dumps(row)

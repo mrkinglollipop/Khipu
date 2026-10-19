@@ -2141,7 +2141,8 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         return {"id": e["id"], "source": e["source"], "written_by": e["written_by"], "at": _iso(e["at"]),
                 "evidence": e.get("evidence"), "message_time": e.get("message_time", False),
                 "cleared": bool(e.get("cleared")), "observed": bool(e.get("observed")),
-                "turn": bool(e.get("turn")), "until_default": bool(e.get("until_default"))}
+                "turn": bool(e.get("turn")), "session_logs": bool(e.get("session_logs")),
+                "until_default": bool(e.get("until_default"))}
 
     underlying = {"state": state, "until": _iso(behind["until"]) if behind and state in (LIMITED, PROBABLY_OPEN)
                   else None, "basis": behind["basis"] if behind and state in (LIMITED, PROBABLY_OPEN) else None}
@@ -4492,6 +4493,8 @@ def _witness_words(entry: dict, push: bool) -> str:
     source, by = w.get("source"), w.get("written_by")
     cli_name = _harness_label(entry)
     if source == "probe":
+        if w.get("session_logs"):
+            return f"read from {cli_name}'s session logs"
         if w.get("turn"):
             return f"read from a {cli_name} turn Khipu ran"
         return f"read from {cli_name}'s last turn" if w.get("observed") else f"read from {cli_name}"

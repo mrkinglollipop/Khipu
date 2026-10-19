@@ -940,7 +940,8 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
                     continue
                 top = used if top is None else max(top, used)
                 reset = _parse(w.get("resets_at"))
-                if used >= 100 and reset is not None and reset > at:
+                window_at = _parse(w.get("observed_at")) or at
+                if used >= 100 and reset is not None and reset > window_at:
                     full.append((reset, w))
             # A window at its limit is never headroom: with no reset time
             # still ahead of the probe, the scope gives no evidence at all.
@@ -951,9 +952,16 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
                     "observed": observed, "turn": row.get("source") == "turn"}
             if full:
                 reset, w = max(full, key=lambda item: item[0])
+                # A refusal can be newer than the percentage figures carried beside it.
+                window_at = _parse(w.get("observed_at")) or at
+                session_logs = key.partition("|")[0] == "muse" and w.get("source") == "session_logs"
+                if session_logs:
+                    base.update(observed=True, turn=False, session_logs=True)
+                base["at"] = window_at
+                newest = max(newest, window_at)
                 name = safe_name(w.get("name")) or ""
                 window = "weekly" if name.startswith("weekly") else name or None
-                out.append(dict(base, id="p" + _sid(key, scope, "limited", _iso(at), _iso(reset)), state="limited",
+                out.append(dict(base, id="p" + _sid(key, scope, "limited", _iso(window_at), _iso(reset)), state="limited",
                                 until=reset, basis="cli", window=window, used_pct=_number(w.get("used_pct")),
                                 evidence=_redacted(f"usage probe: {name or 'window'} at {_number(w.get('used_pct'))}%")))
             else:
