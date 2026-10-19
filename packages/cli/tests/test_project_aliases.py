@@ -118,16 +118,20 @@ def test_hybrid_search_literal_by_alias_returns_both(seeded):
 
 
 def _alias_cmd(pg, monkeypatch, capsys, *argv):
-    from khipu import cli, db
+    from khipu import cli, db, routing
 
     monkeypatch.setattr(db, "connect", lambda **_kw: pg.connect())
+    if argv[0] in ("add", "remove"):
+        # The owner's change: a yes typed on a terminal, logged in a temp data dir.
+        monkeypatch.setattr(routing, "typed_yes", lambda _prompt: True)
     args = cli.build_parser().parse_args(["project", "alias", *argv])
     code = args.func(args)
     cap = capsys.readouterr()
     return code, cap.out, cap.err
 
 
-def test_cli_alias_add_list_remove_and_refusals(hub, monkeypatch, capsys):  # noqa: F811
+def test_cli_alias_add_list_remove_and_refusals(hub, monkeypatch, capsys, tmp_path):  # noqa: F811
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
     code, out, _ = _alias_cmd(hub, monkeypatch, capsys, "add", ALIAS, CANON)
     assert code == 0 and json.loads(out)["changed"] is True
     code, out, _ = _alias_cmd(hub, monkeypatch, capsys, "add", ALIAS, CANON)

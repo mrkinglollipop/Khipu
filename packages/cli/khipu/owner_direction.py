@@ -81,7 +81,7 @@ ACTIONS: frozenset[str] = frozenset({
     "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel", "ledger.import",
     "ledger.restore", "ledger.purge", "ledger.project", "ledger.add", "ledger.set", "ledger.remove", "work.hide", "work.unhide",
     "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
-    "direction.undo",
+    "direction.undo", "project.alias_add", "project.alias_remove", "project.merge", "project.keep_separate",
 })
 
 
@@ -1099,6 +1099,11 @@ def _before(want: dict):
     if action == "direction.set":
         return {"settings": {k: owner_turns.settings()[k] for k in ("latest_window_h",
                                                                    "trusted", "session_binding")}}
+    if action.startswith("project."):
+        from khipu import project_group
+
+        read = project_group.read_before(action, target)
+        return _UNREADABLE if read is None else read
     if action in _UNDO or action in ("ledger.purge", "direction.undo"):
         return None
     return _NO_UNDO
@@ -1389,6 +1394,12 @@ def _undo_gate_ignore(line, via):
     return {"ok": True}
 
 
+def _undo_project_group(line, via):
+    from khipu import project_group
+
+    return project_group.run_undo(line["action"], line["target"], line.get("before") or {})
+
+
 def _undo_import(line, via):
     from khipu import ledger_import
 
@@ -1481,6 +1492,10 @@ _UNDO = {
     "work.unhide": _undo_hidden,
     "work.same": _undo_link,
     "work.not_same": _undo_link,
+    "project.alias_add": _undo_project_group,
+    "project.alias_remove": _undo_project_group,
+    "project.merge": _undo_project_group,
+    "project.keep_separate": _undo_project_group,
     "owed.change": _undo_owed_change,
     "owed.tidy": _undo_owed_tidy,
     "direction.off": _undo_direction,

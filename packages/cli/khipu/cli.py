@@ -2845,6 +2845,15 @@ def cmd_project(args: argparse.Namespace) -> int:
     """K6: `khipu project backfill [--dry-run|--apply] [--limit N]` — resolve
     a project for episodes that have none, from the session's other episodes
     or a known repo_root. Never from a session id or free-text scope."""
+    if getattr(args, "project_cmd", None) == "show":
+        from khipu import project_group
+
+        return project_group.cmd_show(args)
+    if getattr(args, "project_cmd", None) in ("merge", "keep-separate") or (
+            getattr(args, "project_cmd", None) == "alias" and getattr(args, "alias_cmd", None) in ("add", "remove")):
+        from khipu import project_group
+
+        return project_group.cmd_owner(args)
     if getattr(args, "project_cmd", None) == "alias":
         return cmd_project_alias(args)
     if getattr(args, "project_cmd", None) != "backfill":
@@ -5813,6 +5822,8 @@ def build_parser() -> argparse.ArgumentParser:
     bf_identity.add_argument("--limit", type=int, default=None)
     bf.set_defaults(func=cmd_backfill)
 
+    from khipu import owner_direction
+
     proj = sub.add_parser("project", help="Project identity maintenance (K6)")
     proj_sub = proj.add_subparsers(dest="project_cmd", required=True)
     proj_bf = proj_sub.add_parser(
@@ -5830,10 +5841,27 @@ def build_parser() -> argparse.ArgumentParser:
     al_add = alias_sub.add_parser("add", help="Make ALIAS another key for CANONICAL")
     al_add.add_argument("alias")
     al_add.add_argument("canonical")
+    owner_direction.add_owner_flags(al_add)
+    al_add.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     al_list = alias_sub.add_parser("list", help="List the aliases")
     al_list.add_argument("--json", action="store_true")
     al_rm = alias_sub.add_parser("remove", help="Remove an alias")
     al_rm.add_argument("alias")
+    owner_direction.add_owner_flags(al_rm)
+    al_rm.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
+    proj_show = proj_sub.add_parser("show", help="Is NAME one project? Its names, evidence, counts and pairs")
+    proj_show.add_argument("name")
+    proj_show.add_argument("--json", action="store_true")
+    proj_merge = proj_sub.add_parser("merge", help="Merge an asked pair: both read as one project (owner)")
+    proj_merge.add_argument("a")
+    proj_merge.add_argument("b")
+    proj_merge.add_argument("--show-as", dest="show_as", required=True, help="The name to keep (A or B)")
+    proj_keep = proj_sub.add_parser("keep-separate", help="Keep an asked pair as two projects (owner)")
+    proj_keep.add_argument("a")
+    proj_keep.add_argument("b")
+    for _p in (proj_merge, proj_keep):
+        owner_direction.add_owner_flags(_p)
+        _p.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     proj.set_defaults(func=cmd_project)
 
     hy = sub.add_parser("hygiene", help="Graph hygiene jobs (memory reliability W5.2)")
