@@ -1100,10 +1100,9 @@ def _before(want: dict):
         return {"settings": {k: owner_turns.settings()[k] for k in ("latest_window_h",
                                                                    "trusted", "session_binding")}}
     if action.startswith("project."):
-        from khipu import project_group
-
-        read = project_group.read_before(action, target)
-        return _UNREADABLE if read is None else read
+        # Read, changed and diffed under the group lock in the change's own
+        # transaction: its result's ``delta`` (on the finish line) is the Undo.
+        return {}
     if action in _UNDO or action in ("ledger.purge", "direction.undo"):
         return None
     return _NO_UNDO
@@ -1397,7 +1396,7 @@ def _undo_gate_ignore(line, via):
 def _undo_project_group(line, via):
     from khipu import project_group
 
-    return project_group.run_undo(line["action"], line["target"], line.get("before") or {})
+    return project_group.run_undo(line["action"], line["target"], line.get("result"))
 
 
 def _undo_import(line, via):
