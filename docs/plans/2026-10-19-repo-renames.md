@@ -1,6 +1,6 @@
 # Repos that get renamed (scope, 2026-10-19)
 
-Status: draft, waiting for Matt's approval.
+Status: approved by Matt 2026-10-19 (all three recommendations, plus the conversation rule below).
 
 ## The incident
 
@@ -45,8 +45,21 @@ Three ways a rename shows up, each handled where the evidence already is.
    is the case that would have caught olivewood the same day. Without a `gh` login the check is
    skipped and doctor says so; it never guesses.
 3. **Two names share a root commit but nothing confirms a rename.** That is a fork or a rename on a
-   Mac without `gh`. Khipu never merges these by itself. The app shows "These look like the same
-   project" with Merge and Keep separate, so the owner decides in the app (or tells an agent).
+   Mac without `gh`. Khipu never merges these by itself. It raises "These look like the same
+   project" with Merge and Keep separate, both in the app and in conversation (below).
+
+**Everything works from a conversation (Matt, 2026-10-19).** The owner must never have to open the
+app to check a fix or make a choice. So:
+
+- A read tool (`khipu_project`, MCP and `khipu project show`) answers "is this one project now?":
+  the canonical name, every alias with its evidence and date, and what each name holds (open
+  commitments, standing decisions, episodes), grouped the way readers see them. Any agent can run
+  it and paste the answer as proof.
+- Pending "same project?" questions are pushed in the session-start slice for that project, so the
+  agent sees them and asks the owner in chat.
+- Merge, Keep separate, add, remove and Undo are owner actions through `khipu_owner_act`
+  (`owner_direction`, scope 2026-10-16-owner-direction.md): the owner says it in chat, the agent
+  applies it, and the action log keeps the undo.
 
 Rules for every alias Khipu records:
 
@@ -54,8 +67,9 @@ Rules for every alias Khipu records:
   re-pointed at it, so there are no chains (A to B to C becomes A to C and B to C).
 - Stored rows keep the project name they were written with. Readers group by alias; nothing is
   rewritten, so removing an alias undoes the grouping exactly.
-- Every automatic alias is logged with its evidence (same checkout, GitHub, or owner) and shown in
-  Settings with Undo. Doctor reports the count and the newest one.
+- Every automatic alias is logged with its evidence (same checkout, GitHub, or owner), shown by
+  `khipu_project` and in Settings, and undoable from either. Doctor reports the count and the
+  newest one.
 - `project_aliases` is replicated to the local snapshot, so replica readers and the session-start
   slice group the same way the hub does.
 - Folder-keyed projects (no remote) get case 1 too, since a folder rename on the same checkout
@@ -74,12 +88,15 @@ other hosts for case 2 (cases 1 and 3 still work there).
   the evidence log. Hermetic tests: rename on one checkout, rename twice, folder rename.
 - **C. GitHub check and doctor:** the nightly `gh` lookup; doctor lines for aliases found, check
   skipped (no `gh`), and lookup failures.
-- **D. App:** Settings list of aliases with their evidence and Undo; the "same project?" prompt for
-  case 3, with Merge and Keep separate. Mock first, approved before build.
+- **D. Conversation and app:** the `khipu_project` read tool; the owner actions (merge, keep
+  separate, add, remove, undo) through `khipu_owner_act`; the "same project?" question in the
+  session-start slice; then the Settings list with evidence and Undo and the in-app prompt. Mock of
+  the app part first, approved before that part is built. The conversation part needs no mock.
 
-## Decisions for Matt
+## Decisions (Matt, 2026-10-19)
 
-1. The newest name is canonical (labels follow the rename). Recommended.
+1. The newest name is canonical (labels follow the rename).
 2. Same-checkout and GitHub-confirmed renames are applied automatically and can be undone. Only the
-   unconfirmed shared-root case asks. Recommended.
-3. Old rows are never rewritten. Recommended.
+   unconfirmed shared-root case asks.
+3. Old rows are never rewritten.
+4. Every check and every choice in this scope works from a conversation; the app is never required.
