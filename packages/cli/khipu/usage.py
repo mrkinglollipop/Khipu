@@ -644,19 +644,21 @@ _CLAUDE_TURN_ARGS = ("-p", "Reply with OK.", "--output-format", "stream-json", "
 _TURN_WINDOWS = {"five_hour": ("five_hour", 300), "seven_day": ("weekly", 10080)}
 
 
-def _turn_due(config_dir: str | None, *, key: str | None = None, every: float = TURN_EVERY_S) -> bool:
+def _turn_due(config_dir: str | None, *, key: str | None = None, every: float = TURN_EVERY_S,
+              directory: Path | None = None) -> bool:
     """True, and the attempt recorded, when this login's last turn was
     ``every`` seconds ago or more (or never). A data dir Khipu can't write
     means no turn: an unrecorded turn would run on every read. ``key`` names
-    a login that has no folder (Muse)."""
+    a login that has no folder (Muse); ``directory`` keeps its allowance
+    beside that login rather than in a movable Khipu data directory."""
     if key is None:
         key = str(_home_path(config_dir) or config_dir) if config_dir else ""
-    fd = _open_lock(TURN_LOCK_NAME)
+    path = (directory / TURN_STAMP_NAME) if directory is not None else cache_file().with_name(TURN_STAMP_NAME)
+    fd = _open_lock(TURN_LOCK_NAME, directory=path.parent)
     if fd is None:
         return False
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        path = cache_file().with_name(TURN_STAMP_NAME)
         try:
             stamps = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -961,6 +963,8 @@ MUSE_TURN_EVERY_S = 1800
 MUSE_REFRESH_S = 15 * 60  # routing.FIGURES_STALE_S: older figures read "may be out of date"
 MUSE_TURN_S = 20.0
 MUSE_TURN_KEY = "muse|"
+# Muse has one login per user, independent of Khipu's configured data directory.
+MUSE_TURN_STATE = (".local", "state", "khipu", "muse")
 MUSE_TURN_MODEL = "muse-spark-1.3"
 MUSE_TURN_PROMPT = "Reply with OK."
 _MUSE_TURN_ARGS = ("serve", "--no-session-log", "--model", MUSE_TURN_MODEL, "--disable-shell", "--disable-write")
@@ -1177,12 +1181,15 @@ def _muse_carry(row: dict, prev: dict | None, refusal: tuple[str, str] | None, n
     their own ``observed_at``) and a refusal from the session logs whose
     reset is still ahead."""
     out = dict(row)
-    if prev and prev.get("ok") and (prev.get("windows") or []) and prev.get("observed_at"):
+    if prev and (prev.get("ok") or prev.get("last_good_at")) and (prev.get("windows") or []) \
+            and prev.get("observed_at"):
         out.update(plan=prev.get("plan"), source=prev.get("source") or "last_observed",
                    observed_at=prev["observed_at"], note=None)
         out["windows"] = [w for w in prev["windows"] if isinstance(w, dict)
                           and not (w.get("name") == MUSE_REFUSED_WINDOW
                                    and (_parse_iso(w.get("resets_at")) or now) <= now)]
+        if prev.get("refusal_observed_at"):
+            out["refusal_observed_at"] = prev["refusal_observed_at"]
         if prev.get("limited_until") and (_parse_iso(prev["limited_until"]) or now) > now:
             out["limited_until"] = prev["limited_until"]
     reset = _parse_iso(refusal[0]) if refusal else None
@@ -1190,7 +1197,8 @@ def _muse_carry(row: dict, prev: dict | None, refusal: tuple[str, str] | None, n
         out["windows"] = [w for w in out.get("windows") or [] if w.get("name") != MUSE_REFUSED_WINDOW]
         out["windows"].append({"name": MUSE_REFUSED_WINDOW, "used_pct": 100, "resets_at": refusal[0]})
         out["limited_until"] = refusal[0]
-        if not out.get("observed_at") or (_parse_iso(out["observed_at"]) or now) < _parse_iso(refusal[1]):
+        out["refusal_observed_at"] = refusal[1]
+        if not out.get("observed_at"):
             out.update(observed_at=refusal[1], source="last_observed", note=None)
     return out
 
@@ -1219,8 +1227,10 @@ def probe_muse(*, timeout: float = TIMEOUT_S, turn: bool = True) -> dict:
     now = _now()
     prev = _load_cache().get(MUSE_TURN_KEY)
     refusal = _muse_log_refusal()
-    if turn and _muse_limit(prev, refusal, now) is None and _muse_stale(prev, now) \
-            and _turn_due(None, key=MUSE_TURN_KEY, every=MUSE_TURN_EVERY_S):
+    if turn and "KHIPU_ISOLATED_DIR" not in os.environ \
+            and _muse_limit(prev, refusal, now) is None and _muse_stale(prev, now) \
+            and _turn_due(None, key=MUSE_TURN_KEY, every=MUSE_TURN_EVERY_S,
+                          directory=Path.home().joinpath(*MUSE_TURN_STATE)):
         try:
             turn = _muse_turn(binary, env, time.monotonic() + MUSE_TURN_S)
             return dict(turn, version=turn.get("version") or row.get("version"))
@@ -1672,8 +1682,8 @@ def _save_cache(rows: dict[str, dict], *, strict: bool = False) -> None:
             raise
 
 
-def _open_lock(name: str) -> int | None:
-    path = cache_file().with_name(name)
+def _open_lock(name: str, *, directory: Path | None = None) -> int | None:
+    path = directory / name if directory is not None else cache_file().with_name(name)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
