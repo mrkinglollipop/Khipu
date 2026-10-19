@@ -222,9 +222,8 @@ def record_rename(cur, old: str, new: str, *, source: str, evidence: dict | None
     event can relabel a group but never take a name out of it. ``observed_at``
     is only kept in the evidence of the rows this call creates.
 
-    Each affected group is locked (transaction-level advisory lock on its
-    canonical name) before it is read, so two renames touching one group never
-    interleave into a chain. One savepoint; best-effort like the readers: never
+    Every group change takes one transaction-level advisory lock before it
+    reads, so two renames never interleave into a chain. One savepoint; best-effort like the readers: never
     raises, any failure rolls back and returns ``ok`` false."""
     old, new = (old or "").strip(), (new or "").strip()
     if not old or not new:
@@ -237,16 +236,11 @@ def record_rename(cur, old: str, new: str, *, source: str, evidence: dict | None
     ev = json.dumps(ev_dict) if ev_dict else None
     try:
         cur.execute("SAVEPOINT project_record_rename", ())
-        locked: set[str] = set()
-        for _ in range(5):
-            tops = {_canonical_of(cur, old), _canonical_of(cur, new)}
-            if tops <= locked:
-                break
-            for top in sorted(tops - locked):
-                _xact_lock(cur, PROJECT_LOCK_CLASS, top)
-                locked.add(top)
-        else:
-            raise RuntimeError("project groups kept changing while being locked")
+        # One lock for every group change. Per-group locks had to be rediscovered
+        # as canonicals moved, which could take them out of order and deadlock;
+        # renames are rare, so serialising them all costs nothing.
+        _xact_lock(cur, PROJECT_LOCK_CLASS, "*project-groups*")
+        tops = {_canonical_of(cur, old), _canonical_of(cur, new)}
         group = {old, new, *tops}
         cur.execute("SELECT alias FROM project_aliases WHERE project = ANY(%s)", (sorted(tops),))
         group.update(str(r[0]) for r in cur.fetchall())

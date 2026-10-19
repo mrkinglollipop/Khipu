@@ -367,6 +367,19 @@ def test_capture_still_succeeds_when_the_0039_tables_are_missing(hub, monkeypatc
     assert cur.fetchone()[0] == 2
 
 
+def test_the_spool_keeps_observation_order_when_drains_finish_out_of_order(tmp_path, monkeypatch):
+    from khipu import capture
+
+    from khipu import session_capture
+
+    monkeypatch.setattr(session_capture, "state_dir", lambda: tmp_path)
+    # B@2 finishes before A@1 during an outage; the flush must see A first.
+    capture._spool_append(_obs("1:10", B, "folder", 2))
+    capture._spool_append(_obs("1:10", A, "folder", 1))
+    capture._spool_append(_obs("1:10", B, "folder", 3))
+    assert [(o["project"], o["observed_at"]) for o in capture._spool_read("1:10")] == [(A, 1), (B, 2)]
+
+
 def test_an_empty_extraction_job_still_records_its_observation(writer):
     from khipu import capture
 

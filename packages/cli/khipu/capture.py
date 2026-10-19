@@ -239,10 +239,17 @@ def _spool_append(obs: dict[str, Any]) -> None:
         return
 
     def add(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Concurrent drains spool in completion order, not observation order:
+        # sort by observed_at so the flush never lands a newer state first and
+        # then drops an older one as stale. Coalesce only after sorting.
         same = ("root_commit", "project", "project_kind")
-        if items and all(items[-1].get(k) == obs.get(k) for k in same):
-            return items
-        return items if len(items) >= CHECKOUT_SPOOL_CAP else [*items, obs]
+        merged = sorted([*items, obs], key=lambda o: float(o.get("observed_at") or 0))
+        out: list[dict[str, Any]] = []
+        for item in merged:
+            if out and all(out[-1].get(k) == item.get(k) for k in same):
+                continue
+            out.append(item)
+        return out[:CHECKOUT_SPOOL_CAP]
 
     _spool_edit(key, add)
 
