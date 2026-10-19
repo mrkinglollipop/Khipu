@@ -181,17 +181,33 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
     return int(row[0]) if row else None
 
 
-def _record_checkout_rename(cur, payload: dict[str, Any]) -> None:
-    """A rename seen on this checkout (``payload["rename"]``, set by the hook)
-    becomes an alias with the new name canonical. Runs before the alias lookup
-    so this very capture lands under the new name. Best-effort: never raises."""
-    rename = payload.pop("rename", None)
+def _observe_checkout(cur, payload: dict[str, Any]) -> None:
+    """The hook's checkout observation (``payload["checkout"]``) goes to the hub's
+    rename decision (identity.record_checkout_observation). Runs before the alias
+    lookup so this very capture lands under the new name. Best-effort: never raises."""
+    obs = payload.pop("checkout", None)
+    if not isinstance(obs, dict):
+        return
+    payload["root_commit"] = obs.get("root_commit")
     try:
-        if isinstance(rename, dict) and rename.get("old") and rename.get("new"):
-            from khipu.identity import record_rename
+        from khipu.identity import record_checkout_observation
 
-            record_rename(cur, str(rename["old"]), str(rename["new"]), source="checkout",
-                          evidence={k: rename.get(k) for k in ("old", "new", "root_commit", "repo_root")})
+        record_checkout_observation(cur, obs)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def record_checkout_observation(obs: dict[str, Any]) -> None:
+    """Record one observation on its own, for a job whose extraction came back
+    empty and so never reaches ``write_pg``. Best-effort: no hub, no table or any
+    failure just drops it; the next capture's observation re-derives it."""
+    try:
+        from khipu.db import connect
+        from khipu.identity import record_checkout_observation as decide
+
+        with connect() as conn, conn.cursor() as cur:
+            decide(cur, obs)
+            conn.commit()
     except Exception:  # noqa: BLE001
         pass
 
@@ -871,7 +887,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             if hub_source_forgotten(cur, payload, source):
                 return _forgotten_result(cur, payload, source)
             _inherit_project(cur, payload)
-            _record_checkout_rename(cur, payload)
+            _observe_checkout(cur, payload)
             if payload.get("project"):
                 from khipu.identity import _resolve_project_alias
 

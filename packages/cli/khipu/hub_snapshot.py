@@ -1285,6 +1285,7 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
                     (*params, limit + 1))
         topic_rows = [dict(zip(tcols, r)) for r in cur.fetchall()]
     commitments = _hub_commitments(cur)
+    aliases = _hub_project_aliases(cur)
     if max(len(fresh), len(gone), len(groups), len(topic_rows or ())) > limit:
         return _pull_needs_dump(limit)
 
@@ -1397,7 +1398,7 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
 
     last_fresh = _utc(fresh_stamps[-1][0]) if fresh_stamps else None
 
-    parts = _write_pulled_tables(topic_rows, commitments, read_at=read_at)
+    parts = _write_pulled_tables(topic_rows, commitments, aliases, read_at=read_at)
     if ledger_payload is not None and not ledger_payload.get("ok"):
         parts["ledger"] = ledger_payload
     else:
@@ -1429,7 +1430,8 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
 
 
 def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
-                         commitments: tuple[list[str], list[Any]] | None, *,
+                         commitments: tuple[list[str], list[Any]] | None,
+                         aliases: tuple[list[str], list[Any]] | None, *,
                          read_at: float) -> dict[str, dict[str, Any]]:
     """The pull's topic bodies and commitments, under the refresh lock, in one
     transaction. Each part's result by name; a part the hub or this replica
@@ -1437,7 +1439,9 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
     held (by ``updated_at``) never replaces it, a tombstone held stays, and a
     purged topic is never written back. Commitments replace the replica's
     whole table, as a dump would, unless the table held was read after
-    ``read_at`` (a dump or pull that finished meanwhile): then it stays."""
+    ``read_at`` (a dump or pull that finished meanwhile): then it stays.
+    ``project_aliases`` (tiny) is copied whole on every pull, replacing the
+    replica's rows in the same transaction, so a deleted alias arrives too."""
     parts: dict[str, dict[str, Any]] = {}
     path = snapshot_path()
     con = sqlite3.connect(str(path))
@@ -1446,9 +1450,11 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
             parts["topics"] = {"ok": True, "not_applicable": True}
         if commitments is None or not _snapshot_table_columns(con, "commitments"):
             parts["commitments"] = {"ok": True, "not_applicable": True}
+        if aliases is None or not _snapshot_table_columns(con, "project_aliases"):
+            parts["project_aliases"] = {"ok": True, "not_applicable": True}
     finally:
         con.close()
-    wanted = [name for name in ("topics", "commitments") if name not in parts]
+    wanted = [name for name in ("topics", "commitments", "project_aliases") if name not in parts]
     if not wanted:
         return parts
     lock = _acquire_refresh_lock()
@@ -1494,6 +1500,11 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     con.execute("DELETE FROM commitments")
                     parts["commitments"] = {"ok": True, "commitments": _write_commitment_rows(con, cols, rows)}
                     _record_read_at(con, "commitments", "*", read_at)
+            if "project_aliases" in wanted:
+                cols, rows = aliases  # type: ignore[misc]
+                con.execute("DELETE FROM project_aliases")
+                _write_project_alias_rows(con, cols, rows)
+                parts["project_aliases"] = {"ok": True, "project_aliases": len(rows)}
             con.commit()
         finally:
             con.close()
@@ -1604,6 +1615,7 @@ def pull_changes(*, limit: int = PULL_LIMIT, include_ledger: bool = True) -> dic
         **{k: result[k] for k in ("episodes", "tombstones", "vectors", "missed_retried",
                                   "forgotten_skipped", "kept_newer")},
         "topics": parts["topics"].get("topics", 0), "commitments": parts["commitments"].get("commitments", 0),
+        "project_aliases": parts["project_aliases"].get("project_aliases", 0),
         "decisions": parts["decisions"], "ledger": parts["ledger"],
     }
     if failed:
@@ -2539,20 +2551,29 @@ def _insert_deliverables(cur, con: sqlite3.Connection) -> int:
     return len(rows)
 
 
-def _insert_project_aliases(cur, con: sqlite3.Connection) -> int:
-    """Empty (returns 0, no error) on a hub with no ``project_aliases`` table;
+def _hub_project_aliases(cur) -> tuple[list[str], list[Any]] | None:
+    """The hub's whole ``project_aliases`` table, or ``None`` on a hub with none;
     ``source``/``evidence`` come only from a hub at migration 0039."""
     hub_cols = _pg_columns(cur, "project_aliases")
     if not {"alias", "project"} <= hub_cols:
-        return 0
+        return None
     cols = [c for c in ("alias", "project", "created_at", "source", "evidence") if c in hub_cols]
     cur.execute(f"SELECT {', '.join(cols)} FROM project_aliases ORDER BY alias")
-    rows = cur.fetchall()
+    return cols, cur.fetchall()
+
+
+def _write_project_alias_rows(con: sqlite3.Connection, cols: list[str], rows: list[Any]) -> int:
     for row in rows:
         vals = [_json_text(v) if c == "evidence" else _ts_text(v) if c == "created_at" else v
                 for c, v in zip(cols, row, strict=True)]
         con.execute(f"INSERT INTO project_aliases ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})", vals)
     return len(rows)
+
+
+def _insert_project_aliases(cur, con: sqlite3.Connection) -> int:
+    """Empty (returns 0, no error) on a hub with no ``project_aliases`` table."""
+    got = _hub_project_aliases(cur)
+    return _write_project_alias_rows(con, *got) if got else 0
 
 
 def snapshot_project_group(con: sqlite3.Connection, project: str | None) -> tuple[str | None, list[str]]:

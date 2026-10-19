@@ -1,10 +1,13 @@
 """Repo renames, slice B (docs/plans/2026-10-19-repo-renames.md): the newest
-name becomes canonical without alias chains, the same checkout reporting a new
-name is detected from a local file with no database, the capture write records
-it, and the local replica groups aliases the way the hub does."""
+name becomes canonical without alias chains, the hook only observes a checkout
+(device and inode of its git common dir) with no database, the hub decides a
+rename from successive observations, and the local replica groups aliases the
+way the hub does."""
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -100,14 +103,135 @@ def test_migration_creates_roots_and_pairs(cur):
         cur.execute("INSERT INTO project_pairs (a, b, state) VALUES ('b', 'a', 'asked')")
 
 
+# ---- the hub decides from checkout observations -----------------------------------
+
+
+def _obs(key, project, kind, at, root="r1"):
+    return {"checkout_key": key, "root_commit": root, "project": project, "project_kind": kind,
+            "observed_at": float(at)}
+
+
+def _observe(cur, *observations):
+    return [identity.record_checkout_observation(cur, o) for o in observations]
+
+
+def _pairs(cur):
+    cur.execute("SELECT a, b, state FROM project_pairs ORDER BY a, b")
+    return cur.fetchall()
+
+
+def test_reused_path_with_a_fresh_clone_is_not_a_rename(cur):
+    # The path is the same, the checkout (device and inode of its git common dir) is not.
+    _observe(cur, _obs("1:10", A, "remote", 1), _obs("1:99", B, "remote", 2, root="r2"))
+    assert _aliases(cur) == {} and _pairs(cur) == []
+    # Even a key that survives, with a different root commit, is never a rename.
+    out = identity.record_checkout_observation(cur, _obs("1:10", B, "remote", 3, root="r2"))
+    assert out["action"] == "new_root" and _aliases(cur) == {}
+
+
+def test_fork_switch_without_github_confirmation_asks_and_never_merges(cur):
+    with mock.patch.object(identity, "github_confirms_rename", return_value=None) as gh:
+        _observe(cur, _obs("1:10", B, "remote", 1), _obs("1:10", A, "remote", 2))
+    gh.assert_called_once_with(B, A)
+    assert _aliases(cur) == {}
+    cur.execute("SELECT a, b, root_commit, state FROM project_pairs")
+    assert cur.fetchall() == [(A, B, "r1", "asked")]
+    # A third observation of the same state asks nothing new.
+    with mock.patch.object(identity, "github_confirms_rename", side_effect=AssertionError("asked again")):
+        _observe(cur, _obs("1:10", A, "remote", 3))
+    assert len(_pairs(cur)) == 1
+
+
+def test_github_confirming_a_remote_switch_records_the_alias(cur):
+    with mock.patch.object(identity, "github_confirms_rename", return_value=True):
+        out = _observe(cur, _obs("1:10", A, "remote", 1), _obs("1:10", B, "remote", 2))
+    assert out[1]["action"] == "renamed" and _aliases(cur) == {A: B} and _pairs(cur) == []
+    cur.execute("SELECT source, evidence->>'checkout_key' FROM project_aliases")
+    assert cur.fetchone() == ("github", "1:10")
+
+
+def test_github_confirms_rename_runs_gh_without_a_shell():
+    def fake(answer, rc=0):
+        return mock.Mock(returncode=rc, stdout=answer + "\n", stderr="")
+
+    with mock.patch("subprocess.run", return_value=fake("O/Beta")) as run:
+        assert identity.github_confirms_rename(A, B) is True
+    argv = run.call_args.args[0]
+    assert argv == ["gh", "api", f"repos/{A}", "--jq", ".full_name"]
+    assert run.call_args.kwargs["timeout"] == 3 and not run.call_args.kwargs.get("shell")
+    with mock.patch("subprocess.run", return_value=fake("o/other")):
+        assert identity.github_confirms_rename(A, B) is False
+    with mock.patch("subprocess.run", return_value=fake("", rc=1)):
+        assert identity.github_confirms_rename(A, B) is None
+    with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+        assert identity.github_confirms_rename(A, B) is None
+    with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("gh", 3)):
+        assert identity.github_confirms_rename(A, B) is None
+
+
+def test_folder_to_folder_is_certain(cur):
+    _observe(cur, _obs("1:10", "olddir", "folder", 1), _obs("1:10", "newdir", "folder", 2))
+    assert _aliases(cur) == {"olddir": "newdir"}
+    cur.execute("SELECT source FROM project_aliases")
+    assert cur.fetchone()[0] == "checkout"
+
+
+def test_folder_to_remote_is_certain_and_the_remote_name_is_canonical(cur):
+    _observe(cur, _obs("1:10", "olddir", "folder", 1), _obs("1:10", A, "remote", 2))
+    assert _aliases(cur) == {"olddir": A}
+
+
+def test_remote_to_folder_is_ignored_and_does_not_re_arm_a_later_transition(cur):
+    _observe(cur, _obs("1:10", A, "remote", 1), _obs("1:10", "work", "folder", 2))
+    assert _aliases(cur) == {}
+    with mock.patch.object(identity, "github_confirms_rename", side_effect=AssertionError("asked")):
+        _observe(cur, _obs("1:10", A, "remote", 3))  # origin put back: still the same project
+    assert _aliases(cur) == {} and _pairs(cur) == []
+
+
+def test_unknown_observations_only_move_last_seen(cur):
+    _observe(cur, _obs("1:10", A, "remote", 1), _obs("1:10", "work", "unknown", 5))
+    cur.execute("SELECT project, project_kind, extract(epoch FROM last_seen_at) FROM project_checkouts")
+    assert cur.fetchall() == [(A, "remote", 5.0)]
+    assert _aliases(cur) == {}
+    # And an unknown first sighting stores nothing.
+    assert identity.record_checkout_observation(cur, _obs("2:20", "x", "unknown", 1))["action"] == "ignored"
+    cur.execute("SELECT count(*) FROM project_checkouts")
+    assert cur.fetchone()[0] == 1
+
+
+def test_a_delayed_older_observation_does_not_undo_a_newer_rename(cur):
+    _observe(cur, _obs("1:10", "olddir", "folder", 1), _obs("1:10", "newdir", "folder", 3))
+    out = identity.record_checkout_observation(cur, _obs("1:10", "olddir", "folder", 2))
+    assert out["action"] == "stale" and _aliases(cur) == {"olddir": "newdir"}
+    # The rename itself refuses an event older than the evidence already in its group,
+    # even when it arrives by another checkout.
+    res = identity.record_rename(cur, "newdir", "olddir", source="checkout", observed_at=2.0)
+    assert res["ok"] and not res["changed"] and "older" in res["refused"]
+    assert _aliases(cur) == {"olddir": "newdir"}
+    assert identity.record_rename(cur, "newdir", "olddir", source="checkout", observed_at=4.0)["changed"]
+
+
+def test_recording_failure_is_rolled_back_so_the_next_observation_rederives_it(cur):
+    _observe(cur, _obs("1:10", "olddir", "folder", 1))
+    cur.execute("ALTER TABLE project_aliases RENAME TO project_aliases_gone")
+    out = identity.record_checkout_observation(cur, _obs("1:10", "newdir", "folder", 2))
+    assert out["ok"] is False
+    cur.execute("ALTER TABLE project_aliases_gone RENAME TO project_aliases")
+    cur.execute("SELECT project FROM project_checkouts")
+    assert cur.fetchone()[0] == "olddir"  # not advanced
+    assert identity.record_checkout_observation(cur, _obs("1:10", "newdir", "folder", 3))["action"] == "renamed"
+    assert _aliases(cur) == {"olddir": "newdir"}
+
+
 # ---- capture write -------------------------------------------------------------
 
 
-@pytest.fixture
-def writer(hub, monkeypatch):  # noqa: F811
+def _writer(hub, monkeypatch, migrate=True):  # noqa: F811
     import psycopg
 
-    _migrate_0039(hub)
+    if migrate:
+        _migrate_0039(hub)
     monkeypatch.setenv("KHIPU_DATABASE_URL", hub.dsn)
     monkeypatch.setattr(psycopg, "connect", psycopg.Connection.connect)
     monkeypatch.setattr("khipu.db.connect", lambda *a, **k: hub.connect())
@@ -115,6 +239,11 @@ def writer(hub, monkeypatch):  # noqa: F811
     monkeypatch.setattr("khipu.config.path_setting", lambda *a, **k: None)
     monkeypatch.setattr("khipu.embed.embed_one", mock.Mock(side_effect=RuntimeError("no key")))
     return hub
+
+
+@pytest.fixture
+def writer(hub, monkeypatch):  # noqa: F811
+    return _writer(hub, monkeypatch)
 
 
 def _payload(project, n, **extra):
@@ -125,23 +254,23 @@ def _payload(project, n, **extra):
 def test_capture_with_a_rename_lands_under_the_new_name(writer):
     from khipu import capture
 
-    rename = {"old": A, "new": B, "root_commit": "r1", "repo_root": "/x"}
-    out = capture.write_pg(_payload(B, 1, root_commit="r1", rename=rename))
+    capture.write_pg(_payload(A, 1, checkout=_obs("1:10", A, "folder", 1)))
+    out = capture.write_pg(_payload(B, 2, checkout=_obs("1:10", B, "folder", 2)))
     assert out["episode_inserted"]
-    # A later capture from a checkout still on the old remote lands under the new name too.
-    capture.write_pg(_payload(A, 2, root_commit="r1"))
+    # A later capture from a checkout still reporting the old name lands under the new name too.
+    capture.write_pg(_payload(A, 3, checkout=_obs("2:20", A, "folder", 3)))
     conn = writer.connect()
     cur = conn.cursor()
     cur.execute("SELECT project FROM episodes ORDER BY id")
-    assert [r[0] for r in cur.fetchall()] == [B, B]
+    assert [r[0] for r in cur.fetchall()] == [A, B, B]
     assert identity.project_group(cur, A) == [B, A]
     cur.execute("SELECT source, evidence->>'root_commit' FROM project_aliases WHERE alias = %s", (A,))
     assert cur.fetchone() == ("checkout", "r1")
     cur.execute("SELECT project, root_commit FROM project_roots ORDER BY project")
-    assert cur.fetchall() == [(B, "r1")]
+    assert cur.fetchall() == [(A, "r1"), (B, "r1")]
 
 
-def test_capture_without_root_commit_writes_no_root_row(writer):
+def test_capture_without_an_observation_writes_no_root_row(writer):
     from khipu import capture
 
     capture.write_pg(_payload(A, 1))
@@ -150,7 +279,45 @@ def test_capture_without_root_commit_writes_no_root_row(writer):
     assert cur.fetchone()[0] == 0
 
 
-# ---- hook-side detection (no database) ------------------------------------------
+def test_capture_still_succeeds_when_the_0039_tables_are_missing(hub, monkeypatch):  # noqa: F811
+    from khipu import capture
+
+    _writer(hub, monkeypatch, migrate=False)
+    out = capture.write_pg(_payload(A, 1, checkout=_obs("1:10", A, "folder", 1)))
+    assert out["episode_inserted"]
+    out = capture.write_pg(_payload(B, 2, checkout=_obs("1:10", B, "folder", 2)))
+    assert out["episode_inserted"]
+    cur = hub.connect().cursor()
+    cur.execute("SELECT count(*) FROM episodes")
+    assert cur.fetchone()[0] == 2
+
+
+def test_an_empty_extraction_job_still_records_its_observation(writer):
+    from khipu import capture
+
+    capture.record_checkout_observation(_obs("1:10", "olddir", "folder", 1))
+    capture.record_checkout_observation(_obs("1:10", "newdir", "folder", 2))
+    cur = writer.connect().cursor()
+    assert _aliases(cur) == {"olddir": "newdir"}
+
+
+def test_drain_records_the_observation_before_archiving_an_empty_job(tmp_path, monkeypatch):
+    from khipu import capture
+    from khipu import session_capture as sc
+
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "home"))
+    seen: list[dict] = []
+    monkeypatch.setattr(capture, "record_checkout_observation", lambda o: seen.append(o))
+    monkeypatch.setattr("khipu.config.capture_mode", lambda: "hub")
+    monkeypatch.setattr("khipu.extract.extract_memory", lambda *a, **k: None)
+    obs = _obs("1:10", A, "remote", 1)
+    sc.enqueue({"harness": "claude_code", "session_id": "s", "cwd": "/x", "event": "stop", "ts": "2026-10-19T12:00:00Z",
+                "turns": 1, "transcript": "hello", "checkout": obs})
+    out = sc.drain()
+    assert out["empty"] == 1 and seen == [obs]
+
+
+# ---- hook-side observation (no database) -----------------------------------------
 
 
 def _git(cwd, *args):
@@ -158,10 +325,10 @@ def _git(cwd, *args):
                    capture_output=True)
 
 
-def _repo(path: Path, remote: str | None) -> Path:
+def _repo(path: Path, remote: str | None, commit: str = "root") -> Path:
     path.mkdir(parents=True)
     _git(path, "init", "-q")
-    _git(path, "commit", "-q", "--allow-empty", "-m", "root")
+    _git(path, "commit", "-q", "--allow-empty", "-m", commit)
     if remote:
         _git(path, "remote", "add", "origin", remote)
     return path
@@ -177,47 +344,93 @@ def no_database(monkeypatch):
     return boom
 
 
-def _seen(repo: Path, state: Path) -> dict:
+def _seen(repo: Path, cache: Path) -> dict | None:
     ident = identity.resolve_repo_root(str(repo))
-    return {"project": ident["project"], **identity.checkout_identity(ident["repo_root"], ident["project"], state)}
+    return identity.observe_checkout(str(repo), ident["repo_root"], ident["project"], cache)
 
 
-def test_remote_change_on_the_same_checkout_is_a_rename(tmp_path, no_database):
+def test_observation_reports_key_root_project_and_kind_without_a_database(tmp_path, no_database):
+    cache = tmp_path / "cache"
+    remote = _seen(_repo(tmp_path / "work", "git@github.com:o/alpha.git"), cache)
+    assert remote["project"] == A and remote["project_kind"] == "remote" and remote["root_commit"]
+    assert remote["checkout_key"].count(":") == 1
+    folder = _seen(_repo(tmp_path / "plain", None), cache)
+    assert folder["project"] == "plain" and folder["project_kind"] == "folder"
+    no_database.assert_not_called()
+
+
+def test_the_hook_keeps_no_last_project_state(tmp_path):
     repo = _repo(tmp_path / "work", "git@github.com:o/alpha.git")
-    state = tmp_path / "state" / "checkouts.json"
-    first = _seen(repo, state)
-    assert first["project"] == A and first["rename"] is None and first["root_commit"]
-    assert _seen(repo, state)["rename"] is None
+    cache = tmp_path / "cache"
+    first = _seen(repo, cache)
     _git(repo, "remote", "set-url", "origin", "git@github.com:o/beta.git")
-    second = _seen(repo, state)
-    assert second["rename"] == {"old": A, "new": B, "root_commit": first["root_commit"],
-                                "repo_root": str(repo.resolve())}
-    assert _seen(repo, state)["rename"] is None  # reported once, then recorded
-    assert json.loads(state.read_text())[str(repo.resolve())]["project"] == B
-    no_database.assert_not_called()
+    second = _seen(repo, cache)
+    assert first["project"] == A and second["project"] == B
+    assert first["checkout_key"] == second["checkout_key"] and "rename" not in second
+    for f in cache.iterdir():
+        assert set(json.loads(f.read_text())) == {"checkout_key", "root_commit"}
 
 
-def test_folder_rename_of_a_remoteless_checkout_is_a_rename(tmp_path, no_database):
-    repo = _repo(tmp_path / "olddir", None)
-    state = tmp_path / "checkouts.json"
-    first = _seen(repo, state)
-    assert first["project"] == "olddir"
-    # git's own worktree/common-dir layout is keyed by real path, so a moved folder is a new key;
-    # the same checkout is recognised by its root commit through the recorded project name only
-    # when the key is unchanged, so rename the project by changing the folder's basename in place.
-    moved = tmp_path / "newdir"
-    repo.rename(moved)
-    rec = json.loads(state.read_text())
-    rec[str(moved.resolve())] = rec.pop(str(repo.resolve()))
-    state.write_text(json.dumps(rec))
-    second = _seen(moved, state)
-    assert second["rename"]["old"] == "olddir" and second["rename"]["new"] == "newdir"
-    no_database.assert_not_called()
-
-
-def test_root_commit_is_computed_once_per_checkout(tmp_path):
+def test_any_git_error_is_unknown_not_folder(tmp_path):
     repo = _repo(tmp_path / "work", "git@github.com:o/alpha.git")
-    state = tmp_path / "checkouts.json"
+    real = subprocess.run
+
+    def failing(argv, *a, **k):
+        if "get-url" in argv:
+            return mock.Mock(returncode=128, stdout="", stderr="fatal: not something we can parse")
+        return real(argv, *a, **k)
+
+    with mock.patch("subprocess.run", failing):
+        assert _seen(repo, tmp_path / "cache")["project_kind"] == "unknown"
+    with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 3)):
+        assert identity._origin_kind(str(repo)) == ("unknown", None)
+
+
+def test_folder_move_of_a_remoteless_repo_keeps_the_key_and_is_detected(tmp_path, cur):
+    cache = tmp_path / "cache"
+    repo = _repo(tmp_path / "olddir", None)
+    first = _seen(repo, cache)
+    moved = tmp_path / "newdir"
+    os.rename(repo, moved)
+    second = _seen(moved, cache)
+    assert first["checkout_key"] == second["checkout_key"] and first["root_commit"] == second["root_commit"]
+    assert (first["project"], second["project"]) == ("olddir", "newdir")
+    _observe(cur, first, second)
+    assert _aliases(cur) == {"olddir": "newdir"}
+
+
+def test_folder_then_remote_is_detected_end_to_end(tmp_path, cur):
+    cache = tmp_path / "cache"
+    repo = _repo(tmp_path / "work", None)
+    first = _seen(repo, cache)
+    _git(repo, "remote", "add", "origin", "git@github.com:o/alpha.git")
+    second = _seen(repo, cache)
+    assert (first["project_kind"], second["project_kind"]) == ("folder", "remote")
+    _observe(cur, first, second)
+    assert _aliases(cur) == {"work": A}
+
+
+def test_a_fresh_clone_at_a_reused_path_is_a_different_checkout(tmp_path, cur):
+    cache = tmp_path / "cache"
+    path = tmp_path / "work"
+    first = _seen(_repo(path, "git@github.com:o/alpha.git", "one"), cache)
+    shutil.rmtree(path)
+    second = _seen(_repo(path, "git@github.com:o/beta.git", "two"), cache)
+    assert second["root_commit"] != first["root_commit"]  # the cache is per checkout key, never per path
+    _observe(cur, first, second)
+    assert _aliases(cur) == {} and _pairs(cur) == []
+
+
+def test_empty_repo_carries_no_observation(tmp_path):
+    repo = tmp_path / "empty"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    assert identity.observe_checkout(str(repo), str(repo), "empty", tmp_path / "cache") is None
+
+
+def test_root_commit_is_computed_once_per_checkout_key(tmp_path):
+    repo = _repo(tmp_path / "work", "git@github.com:o/alpha.git")
+    cache = tmp_path / "cache"
     calls: list[list[str]] = []
     real = identity._git
 
@@ -227,11 +440,38 @@ def test_root_commit_is_computed_once_per_checkout(tmp_path):
 
     with mock.patch.object(identity, "_git", counting):
         for _ in range(3):
-            identity.checkout_identity(str(repo), A, state)
-    assert sum(1 for a in calls if a[:1] == ["rev-list"]) == 1
+            identity.observe_checkout(str(repo), str(repo), A, cache)
+        assert sum(1 for a in calls if a[:1] == ["rev-list"]) == 1
+        other = _repo(tmp_path / "other", "git@github.com:o/alpha.git")  # a new key always recomputes
+        identity.observe_checkout(str(other), str(other), A, cache)
+        assert sum(1 for a in calls if a[:1] == ["rev-list"]) == 2
 
 
-def test_enqueued_job_carries_root_commit_and_rename(tmp_path, monkeypatch, no_database):
+def test_concurrent_hooks_for_different_checkouts_both_persist(tmp_path):
+    import threading
+
+    cache = tmp_path / "cache"
+    repos = [_repo(tmp_path / f"r{i}", None, f"c{i}") for i in range(6)]
+    results: dict[int, dict | None] = {}
+    barrier = threading.Barrier(len(repos))
+
+    def hook(i):
+        barrier.wait()
+        results[i] = _seen(repos[i], cache)
+
+    threads = [threading.Thread(target=hook, args=(i,)) for i in range(len(repos))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(results[i] for i in range(len(repos)))
+    files = sorted(f for f in cache.iterdir() if f.suffix == ".json")
+    assert len(files) == len(repos)
+    assert {json.loads(f.read_text())["root_commit"] for f in files} == {results[i]["root_commit"] for i in range(6)}
+    assert not [f for f in cache.iterdir() if f.name.endswith(".tmp")]
+
+
+def test_enqueued_job_carries_the_observation(tmp_path, monkeypatch, no_database):
     from khipu import session_capture as sc
 
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "home"))
@@ -239,18 +479,12 @@ def test_enqueued_job_carries_root_commit_and_rename(tmp_path, monkeypatch, no_d
     captured: list[dict] = []
     monkeypatch.setattr(sc, "enqueue", lambda job: captured.append(job) or tmp_path / "job.json")
     monkeypatch.setattr(sc, "save_state", lambda *a, **k: None)
-
-    def window(i):
-        sc._enqueue_window(harness="claude_code", sid="s", track_sid="s", cwd=str(repo), event="stop",
-                           path=tmp_path / "t.jsonl", st={}, msgs=[("user", f"hello {i}"), ("assistant", "hi")],
-                           new_off=10, turns=1)
-
-    window(1)
-    _git(repo, "remote", "set-url", "origin", "git@github.com:o/beta.git")
-    window(2)
-    assert captured[0]["root_commit"] and "rename" not in captured[0]
-    assert captured[1]["rename"]["old"] == A and captured[1]["rename"]["new"] == B
-    assert captured[1]["root_commit"] == captured[0]["root_commit"]
+    sc._enqueue_window(harness="claude_code", sid="s", track_sid="s", cwd=str(repo), event="stop",
+                       path=tmp_path / "t.jsonl", st={}, msgs=[("user", "hello"), ("assistant", "hi")],
+                       new_off=10, turns=1)
+    obs = captured[0]["checkout"]
+    assert obs["project"] == A and obs["project_kind"] == "remote" and obs["root_commit"]
+    assert "rename" not in captured[0] and "root_commit" not in captured[0]
 
 
 # ---- the local replica -----------------------------------------------------------
@@ -319,3 +553,24 @@ def test_dump_copies_project_aliases_from_the_hub(cur, tmp_path):
     assert hs._insert_project_aliases(cur, con) == 1
     assert hs.snapshot_project_group(con, A) == (B, [B, A])
     assert con.execute("SELECT source, evidence FROM project_aliases").fetchone() == ("checkout", '{"root_commit": "r1"}')
+
+
+def test_incremental_pull_carries_an_alias_add_and_an_alias_delete(replica):
+    import time
+
+    def sync(rows):
+        parts = hs._write_pulled_tables(None, None, (["alias", "project", "source", "evidence"], rows),
+                                        read_at=time.time())
+        assert parts["project_aliases"] == {"ok": True, "project_aliases": len(rows)}
+
+    con = sqlite3.connect(str(replica))
+    sync([("o/x", B, "checkout", None), (A, B, "owner", '{"k": 1}')])
+    assert hs.snapshot_project_group(con, "o/x") == (B, [B, A, "o/x"])
+    sync([("o/x", B, "checkout", None)])  # the owner removed A's alias on the hub
+    assert hs.snapshot_project_group(con, A) == (A, [A])
+    assert hs.snapshot_project_group(con, "o/x") == (B, [B, "o/x"])
+    con.close()
+    sync([])
+    con = sqlite3.connect(str(replica))
+    assert con.execute("SELECT count(*) FROM project_aliases").fetchone()[0] == 0
+    con.close()

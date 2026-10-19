@@ -300,7 +300,7 @@ def test_stale_pull_vector_cannot_replace_new_capture_vector(replica, monkeypatc
 def test_pulled_commitments_cannot_overwrite_newer_dump(replica, monkeypatch):
     real_write = hs._write_pulled_tables
 
-    def interleave(topics, commitments, **kw):
+    def interleave(topics, commitments, aliases, **kw):
         # A nightly dump finishes after the pull read the hub, before it writes.
         def dump_commitments(cur, con):
             con.execute("INSERT INTO commitments(id,text,status,opened_episode) "
@@ -318,7 +318,7 @@ def test_pulled_commitments_cannot_overwrite_newer_dump(replica, monkeypatch):
                      "_insert_deliverables", "_insert_ledger"):
             monkeypatch.setattr(hs, name, lambda *a: 0)
         assert hs.refresh()["ok"]
-        return real_write(topics, commitments, **kw)
+        return real_write(topics, commitments, aliases, **kw)
 
     monkeypatch.setattr(hs, "_write_pulled_tables", interleave)
     assert hs.pull_changes()["ok"]
