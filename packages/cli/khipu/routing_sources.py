@@ -932,7 +932,7 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
         for w in windows:
             groups.setdefault(safe_name(w.get("model")) or "all", []).append(w)
         for scope, group in sorted(groups.items()):
-            full: list[tuple[datetime, dict]] = []
+            full: list[tuple[datetime, datetime, dict]] = []
             top = None
             for w in group:
                 used = _number(w.get("used_pct"))
@@ -942,7 +942,7 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
                 reset = _parse(w.get("resets_at"))
                 window_at = _parse(w.get("observed_at")) or at
                 if used >= 100 and reset is not None and reset > window_at:
-                    full.append((reset, w))
+                    full.append((window_at, reset, w))
             # A window at its limit is never headroom: with no reset time
             # still ahead of the probe, the scope gives no evidence at all.
             if top is None or (top >= 100 and not full):
@@ -951,9 +951,10 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
                     "written_by": by, "via": "probe", "at": at, "reason": None, "message_time": False,
                     "observed": observed, "turn": row.get("source") == "turn"}
             if full:
-                reset, w = max(full, key=lambda item: item[0])
-                # A refusal can be newer than the percentage figures carried beside it.
-                window_at = _parse(w.get("observed_at")) or at
+                # The newest full window wins, then the latest reset: a fresh refusal must
+                # not hide behind an older full window carried beside it (which an owner
+                # clear may have overruled). Windows without their own time all share ``at``.
+                window_at, reset, w = max(full, key=lambda item: item[:2])
                 session_logs = key.partition("|")[0] == "muse" and w.get("source") == "session_logs"
                 if session_logs:
                     base.update(observed=True, turn=False, session_logs=True)

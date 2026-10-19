@@ -204,6 +204,26 @@ def test_muse_log_refusal_after_owner_clear_uses_its_own_observation_time(home):
     assert status["newest"] == routing._iso(refused)
 
 
+@pytest.mark.parametrize("old_reset_hours", [2, 3])
+def test_a_fresh_muse_refusal_is_not_hidden_by_an_older_full_window(home, old_reset_hours):
+    from khipu import usage
+
+    home["clock"].now = T0 - timedelta(minutes=30)  # 14:30
+    routing.clear("Muse", via="app")
+    home["clock"].now = T0
+    seen, refused, resets = T0 - timedelta(hours=1), T0 - timedelta(minutes=1), T0 + timedelta(hours=2)
+    figures = _row(seen, [{"name": "five_hour", "used_pct": 100,
+                           "resets_at": routing._iso(T0 + timedelta(hours=old_reset_hours))}],
+                   source="turn", observed_at=routing._iso(seen))
+    row = usage._muse_carry({"ok": True, "windows": [], "source": "last_observed"}, figures,
+                            (routing._iso(resets), routing._iso(refused)), T0)
+    _usage(home, {"muse|": row})
+
+    muse = _account(routing.read_view(), "muse|")
+    assert (muse["state"], muse["until"]) == ("limited", routing._iso(resets))
+    assert muse["witness"]["at"] == routing._iso(refused)
+
+
 def test_muse_log_refusal_provenance_names_session_logs_instead_of_a_khipu_turn(home):
     _muse_carried_log_refusal(home)
     muse = _account(routing.read_view(), "muse|")
