@@ -16,7 +16,10 @@ One adapter per CLI, each a short child process:
   grok    ``grok agent stdio`` (ACP) with ``GROK_HOME``: ``initialize``, then
           ``_x.ai/billing``
   muse    ``muse serve --no-session-log`` (MSP): ``initialize``, ``initialized``,
-          ``usage/read`` (last observed figures, never refreshed by a turn)
+          ``usage/read``; a fresh host has observed nothing, so the figures
+          come from one tiny turn at most every MUSE_TURN_EVERY_S (never
+          while Muse is limited) and are carried as last observed between
+          turns; refusals in Muse's own session logs mark it limited
 
 Each child gets an allowlisted environment (``probe_environment``: no value is
 read for any other name), a fresh empty temp directory as its cwd, its stdin
@@ -275,6 +278,7 @@ class _Run:
         self._lock = threading.Lock()
         self._procs: set[subprocess.Popen] = set()
         self._closed = False
+        self.until = 0.0
 
     def add(self, proc: subprocess.Popen) -> None:
         with self._lock:
@@ -286,6 +290,12 @@ class _Run:
     def discard(self, proc: subprocess.Popen) -> None:
         with self._lock:
             self._procs.discard(proc)
+
+    def extend(self, deadline: float) -> None:
+        """A probe that may run past the overall deadline by design (Muse's
+        turn) names its own; the overall wait stretches to it."""
+        with self._lock:
+            self.until = max(self.until, deadline)
 
     def kill_all(self) -> None:
         with self._lock:
@@ -634,17 +644,21 @@ _CLAUDE_TURN_ARGS = ("-p", "Reply with OK.", "--output-format", "stream-json", "
 _TURN_WINDOWS = {"five_hour": ("five_hour", 300), "seven_day": ("weekly", 10080)}
 
 
-def _turn_due(config_dir: str | None) -> bool:
+def _turn_due(config_dir: str | None, *, key: str | None = None, every: float = TURN_EVERY_S,
+              directory: Path | None = None) -> bool:
     """True, and the attempt recorded, when this login's last turn was
-    TURN_EVERY_S ago or more (or never). A data dir Khipu can't write means
-    no turn: an unrecorded turn would run on every read."""
-    key = str(_home_path(config_dir) or config_dir) if config_dir else ""
-    fd = _open_lock(TURN_LOCK_NAME)
+    ``every`` seconds ago or more (or never). A data dir Khipu can't write
+    means no turn: an unrecorded turn would run on every read. ``key`` names
+    a login that has no folder (Muse); ``directory`` keeps its allowance
+    beside that login rather than in a movable Khipu data directory."""
+    if key is None:
+        key = str(_home_path(config_dir) or config_dir) if config_dir else ""
+    path = (directory / TURN_STAMP_NAME) if directory is not None else cache_file().with_name(TURN_STAMP_NAME)
+    fd = _open_lock(TURN_LOCK_NAME, directory=path.parent)
     if fd is None:
         return False
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        path = cache_file().with_name(TURN_STAMP_NAME)
         try:
             stamps = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -653,7 +667,7 @@ def _turn_due(config_dir: str | None) -> bool:
             stamps = {}
         now = time.time()
         last = stamps.get(key)
-        if isinstance(last, (int, float)) and not isinstance(last, bool) and 0 <= now - last < TURN_EVERY_S:
+        if isinstance(last, (int, float)) and not isinstance(last, bool) and 0 <= now - last < every:
             return False
         stamps[key] = now
         try:
@@ -935,10 +949,267 @@ def parse_muse(frames: list[dict]) -> dict:
             "version": version, "source": "last_observed", "observed_at": _iso(usage.get("observedAtMs"))}
 
 
+# A fresh ``muse serve`` host answers ``usage/read`` with {} until one of its
+# own turns has run: the figures arrive in the provider's reply to a model
+# call, and Muse keeps no copy across processes or in its session logs
+# (checked on 1.4.6, 2026-10-18). So, like Claude's fallback, Khipu runs one
+# tiny turn (the cheapest model, reasoning off, shell and writes off, every
+# tool call denied) at most once per MUSE_TURN_EVERY_S, and only when the
+# figures it holds are older than MUSE_REFRESH_S or a reset time in them has
+# passed, and never while Muse is known to be limited. Measured 2026-10-18:
+# about 29,200 input tokens a turn (Muse's own system prompt), and two turns
+# moved neither the five-hour nor the weekly figure by a whole point.
+MUSE_TURN_EVERY_S = 1800
+MUSE_REFRESH_S = 15 * 60  # routing.FIGURES_STALE_S: older figures read "may be out of date"
+MUSE_TURN_S = 20.0
+MUSE_TURN_KEY = "muse|"
+# Muse has one login per user, independent of Khipu's configured data directory.
+MUSE_TURN_STATE = (".local", "state", "khipu", "muse")
+MUSE_TURN_MODEL = "muse-spark-1.3"
+MUSE_TURN_PROMPT = "Reply with OK."
+_MUSE_TURN_ARGS = ("serve", "--no-session-log", "--model", MUSE_TURN_MODEL, "--disable-shell", "--disable-write")
+# Muse's session logs (any process that ran Muse without --no-session-log):
+# the newest few days, the newest files, the tail of each.
+MUSE_SESSIONS = (".local", "share", "muse", "sessions")
+MUSE_LOG_DAYS = 3
+MUSE_LOG_FILES = 24
+_MUSE_REFUSAL = re.compile(rb"Subscription quota exhausted\. Your usage window resets at "
+                           rb"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)")
+_MUSE_RECORDED = re.compile(rb'"recorded_at"\s*:\s*(\d{10,17})')
+# A refusal holds no figure: it stands in the row as one window at 100% that
+# ends at the refusal's reset time, so routing reads Muse as limited until then.
+MUSE_REFUSED_WINDOW = "refused"
+
+
+def _muse_usage(usage: dict, source: str) -> dict:
+    window, weekly = _dict(usage, "window"), _dict(usage, "weekly")
+    mins = _mins(window.get("windowDurationMins"))
+    windows = [
+        _window(_window_name(mins), window.get("usedPercent"), window.get("resetsAtMs"), mins),
+        _window("weekly", weekly.get("usedPercent"), weekly.get("resetsAtMs"), 10080),
+    ]
+    return {"ok": True, "plan": _text(usage.get("tier")), "windows": [w for w in windows if w],
+            "source": source, "observed_at": _iso(usage.get("observedAtMs"))}
+
+
+def _muse_version(frames: list[dict]) -> str | None:
+    for frame in frames:
+        if frame.get("id") == 1 and isinstance(frame.get("result"), dict):
+            info = frame["result"].get("serverInfo")
+            return _text(info.get("version")) if isinstance(info, dict) else None
+    return None
+
+
+def parse_muse(frames: list[dict]) -> dict:
+    version = _muse_version(frames)
+    usage = _answer(frames, 2).get("usage")
+    if usage is None or usage == {}:
+        # A fresh host answers {} until a Muse turn has run: truthful absence.
+        return {"ok": True, "plan": None, "windows": [], "version": version, "source": "last_observed",
+                "note": "no turn observed yet"}
+    if not isinstance(usage, dict):
+        raise ProbeError(E_BAD)
+    return dict(_muse_usage(usage, "last_observed"), version=version)
+
+
+def parse_muse_turn(frames: list[dict]) -> dict:
+    """The figures ``usage/read`` gave after Khipu's own turn (``source``
+    ``turn``), and the reset time when the turn was refused for quota
+    (``limited_until``). Neither: no figures."""
+    version = _muse_version(frames)
+    for rid in (1, 2, 3):
+        if any(f.get("id") == rid for f in frames):
+            _answer(frames, rid)  # a refused request raises its own code
+    refused = None
+    for frame in frames:
+        if frame.get("method") == "turn/completed":
+            quota = _dict(_dict(_dict(frame, "params"), "error"), "quota")
+            refused = _iso(quota.get("resetsAtMs")) if quota else None
+    usage = _answer(frames, 4).get("usage") if any(f.get("id") == 4 for f in frames) else None
+    if usage is not None and not isinstance(usage, dict):
+        raise ProbeError(E_BAD)
+    if usage:
+        row = _muse_usage(usage, "turn")
+    elif refused:
+        row = {"ok": True, "plan": None, "windows": [], "source": "turn", "observed_at": _iso(_now().timestamp())}
+    else:
+        raise ProbeError(E_NO_FIGURES)
+    if refused:
+        row["limited_until"] = refused
+        row["windows"] = [*row["windows"], {"name": MUSE_REFUSED_WINDOW, "used_pct": 100, "resets_at": refused}]
+    return dict(row, version=version)
+
+
+def _uuid7() -> str:
+    """MSP command ids are UUIDv7 (Python 3.11 has no ``uuid.uuid7``)."""
+    import uuid
+
+    ms = int(time.time() * 1000) & ((1 << 48) - 1)
+    rand = int.from_bytes(os.urandom(10), "big")
+    value = (ms << 80) | (0x7 << 76) | (((rand >> 62) & 0xFFF) << 64) | (0b10 << 62) | (rand & ((1 << 62) - 1))
+    return str(uuid.UUID(int=value))
+
+
+def _muse_turn_frame(frame: dict) -> bool:
+    return "id" in frame or frame.get("method") == "turn/completed"
+
+
+def _muse_turn(binary: str, env: dict[str, str], deadline: float) -> dict:
+    """One tiny Muse turn in its own memory-only host, then ``usage/read``."""
+    def follow(frame: dict) -> list[dict] | None:
+        rid = frame.get("id")
+        if frame.get("error") is not None:
+            return None
+        if rid == 1:
+            return [{"jsonrpc": "2.0", "id": 2, "method": "session/start",
+                     "params": {"commandId": _uuid7(), "approvalMode": "denyUnmatched"}}]
+        if rid == 2:
+            session = _dict(_dict(frame, "result"), "session").get("sessionId")
+            if not isinstance(session, str):
+                raise ProbeError(E_BAD)
+            return [{"jsonrpc": "2.0", "id": 3, "method": "turn/start",
+                     "params": {"commandId": _uuid7(), "sessionId": session, "reasoningEffort": "none",
+                                "input": [{"type": "text", "text": MUSE_TURN_PROMPT}]}}]
+        if frame.get("method") == "turn/completed":
+            return [{"jsonrpc": "2.0", "id": 4, "method": "usage/read", "params": {}}]
+        return None
+
+    run = getattr(_local, "run", None)
+    if run is not None:
+        run.extend(deadline)
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"clientInfo": _CLIENT_INFO, "capabilities": {"experimentalApi": True}}},
+        {"jsonrpc": "2.0", "method": "initialized"},
+    ]
+    frames = _converse([binary, *_MUSE_TURN_ARGS], messages,
+                       lambda f: f.get("id") == 4 or (f.get("id") in (1, 2, 3) and f.get("error") is not None),
+                       env=env, deadline=deadline, close_stdin=False, keep=_muse_turn_frame, follow=follow)
+    return parse_muse_turn(frames)
+
+
+def _muse_log_refusal() -> tuple[str, str] | None:
+    """(reset time, refused at) of the newest quota refusal in Muse's own
+    session logs, or None. Only the refusal's fixed words and the record's
+    ``recorded_at`` are read from a line; nothing else in a log is kept."""
+    root = Path.home().joinpath(*MUSE_SESSIONS)
+    try:
+        days = sorted(p for p in root.glob("[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9]") if p.is_dir())
+        files = []
+        for day in days[-MUSE_LOG_DAYS:]:
+            for path in day.glob("*/session.jsonl"):
+                with contextlib.suppress(OSError):
+                    files.append((path.stat().st_mtime, path))
+    except OSError:
+        return None
+    best = None
+    for mtime, path in sorted(files, reverse=True)[:MUSE_LOG_FILES]:
+        try:
+            with open(path, "rb") as fh:
+                size = os.fstat(fh.fileno()).st_size
+                fh.seek(max(0, size - ROLLOUT_TAIL_BYTES))
+                data = fh.read(ROLLOUT_TAIL_BYTES)
+        except OSError:
+            continue
+        for line in data.split(b"\n"):
+            match = _MUSE_REFUSAL.search(line)
+            if not match:
+                continue
+            stamp = _MUSE_RECORDED.search(line)
+            value = int(stamp.group(1)) if stamp else None
+            # recorded_at is epoch microseconds; a line without one dates from the file.
+            at = _iso(value / 1_000_000 if value and value > 100_000_000_000_000 else value) if value \
+                else _iso(mtime)
+            reset = _iso(match.group(1).decode())
+            if reset and at and (best is None or at > best[1]):
+                best = (reset, at)
+    return best
+
+
+def _muse_routing_limit(now: datetime) -> bool:
+    """Whether Khipu's routing record holds Muse limited or paused now."""
+    try:
+        from khipu import routing
+
+        view = routing._load_view() or {}
+        for entry in view.get("accounts") or []:
+            if not isinstance(entry, dict) or entry.get("harness") != "muse":
+                continue
+            until = entry.get("until")
+            ends = datetime.fromisoformat(until.replace("Z", "+00:00")) if isinstance(until, str) else None
+            if entry.get("state") == routing.PAUSED and (ends is None or ends > now):
+                return True
+            if entry.get("state") == routing.LIMITED and ends is not None and ends > now:
+                return True
+    except Exception:  # noqa: BLE001 - an unreadable record leaves the other guards
+        return False
+    return False
+
+
+def _muse_limit(prev: dict | None, refusal: tuple[str, str] | None, now: datetime) -> str | None:
+    """The time Muse is known to be limited until (or "now" for an open-ended
+    hold), from the figures Khipu holds, its session logs or the routing record."""
+    ahead = []
+    for window in (prev or {}).get("windows") or []:
+        used = window.get("used_pct") if isinstance(window, dict) else None
+        reset = _parse_iso(window.get("resets_at")) if isinstance(window, dict) else None
+        if isinstance(used, (int, float)) and not isinstance(used, bool) and used >= 100 and reset and reset > now:
+            ahead.append(reset)
+    if refusal and _parse_iso(refusal[0]) and _parse_iso(refusal[0]) > now:
+        ahead.append(_parse_iso(refusal[0]))
+    if ahead:
+        return _iso(max(ahead).timestamp())
+    return _iso(now.timestamp()) if _muse_routing_limit(now) else None
+
+
+def _parse_iso(value) -> datetime | None:
+    iso = _iso(value) if isinstance(value, str) else None
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")) if iso else None
+
+
+def _muse_stale(prev: dict | None, now: datetime) -> bool:
+    windows = [w for w in (prev or {}).get("windows") or [] if isinstance(w, dict)
+               and w.get("name") != MUSE_REFUSED_WINDOW]
+    at = _parse_iso((prev or {}).get("observed_at"))
+    if not windows or at is None or (now - at).total_seconds() >= MUSE_REFRESH_S:
+        return True
+    return any((_parse_iso(w.get("resets_at")) or now) <= now for w in windows)
+
+
+def _muse_carry(row: dict, prev: dict | None, refusal: tuple[str, str] | None, now: datetime) -> dict:
+    """The free read's row, holding the last figures Khipu observed (with
+    their own ``observed_at``) and a refusal from the session logs whose
+    reset is still ahead."""
+    out = dict(row)
+    if prev and (prev.get("ok") or prev.get("last_good_at")) and (prev.get("windows") or []) \
+            and prev.get("observed_at"):
+        out.update(plan=prev.get("plan"), source=prev.get("source") or "last_observed",
+                   observed_at=prev["observed_at"], note=None)
+        out["windows"] = [w for w in prev["windows"] if isinstance(w, dict)
+                          and not (w.get("name") == MUSE_REFUSED_WINDOW
+                                   and (_parse_iso(w.get("resets_at")) or now) <= now)]
+        if prev.get("refusal_observed_at"):
+            out["refusal_observed_at"] = prev["refusal_observed_at"]
+        if prev.get("limited_until") and (_parse_iso(prev["limited_until"]) or now) > now:
+            out["limited_until"] = prev["limited_until"]
+    reset = _parse_iso(refusal[0]) if refusal else None
+    if reset and reset > now:
+        out["windows"] = [w for w in out.get("windows") or [] if w.get("name") != MUSE_REFUSED_WINDOW]
+        out["windows"].append({"name": MUSE_REFUSED_WINDOW, "used_pct": 100, "resets_at": refusal[0],
+                               "observed_at": refusal[1], "source": "session_logs"})
+        out["limited_until"] = refusal[0]
+        out["refusal_observed_at"] = refusal[1]
+        if not out.get("observed_at"):
+            out.update(observed_at=refusal[1], source="last_observed", note=None)
+    return out
+
+
 @_guard
-def probe_muse(*, timeout: float = TIMEOUT_S) -> dict:
-    """Muse's ``usage/read``: the figures as of the last Muse turn (marked
-    ``observed_at``); never refreshed by spending a turn."""
+def probe_muse(*, timeout: float = TIMEOUT_S, turn: bool = True) -> dict:
+    """Muse's ``usage/read``, then (a fresh host having observed nothing)
+    the figures from one tiny turn when one is due (``_muse_turn``), else
+    the last ones Khipu observed, marked ``observed_at``. ``turn=False``
+    (a sign-in check) never spends one."""
     binary = _command("muse")
     if not binary:
         return _not_installed("muse")
@@ -948,9 +1219,26 @@ def probe_muse(*, timeout: float = TIMEOUT_S) -> dict:
         {"jsonrpc": "2.0", "method": "initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "usage/read", "params": {}},
     ]
+    env = probe_environment("muse", None, binary)
     frames = _converse([binary, "serve", "--no-session-log"], messages, lambda f: f.get("id") == 2,
-                       env=probe_environment("muse", None, binary), deadline=time.monotonic() + timeout, close_stdin=True)
-    return parse_muse(frames)
+                       env=env, deadline=time.monotonic() + timeout, close_stdin=True)
+    row = parse_muse(frames)
+    if row["windows"]:
+        return row
+    now = _now()
+    prev = _load_cache().get(MUSE_TURN_KEY)
+    refusal = _muse_log_refusal()
+    if turn and "KHIPU_ISOLATED_DIR" not in os.environ \
+            and _muse_limit(prev, refusal, now) is None and _muse_stale(prev, now) \
+            and _turn_due(None, key=MUSE_TURN_KEY, every=MUSE_TURN_EVERY_S,
+                          directory=Path.home().joinpath(*MUSE_TURN_STATE)):
+        try:
+            turn = _muse_turn(binary, env, time.monotonic() + MUSE_TURN_S)
+            return dict(turn, version=turn.get("version") or row.get("version"))
+        except ProbeError as exc:
+            if exc.code == E_SIGNIN:
+                raise
+    return _muse_carry(row, prev, refusal, now)
 
 
 # ---- accounts ----------------------------------------------------------------
@@ -1272,7 +1560,7 @@ def _blank_row(account: dict) -> dict:
             "observed_at": None, "error": None, "note": None}
 
 
-def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = True) -> dict:
+def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = True, turn: bool = True) -> dict:
     # probe_all supplies one shared run for its worker threads. A standalone
     # reset check owns one too, so a helper alarm or stop can unwind this call
     # and kill every vendor process group before the child exits.
@@ -1298,7 +1586,7 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
         elif harness == "grok":
             data = probe_grok(home, timeout=timeout)
         elif harness == "muse":
-            data = probe_muse(timeout=timeout)
+            data = probe_muse(timeout=timeout, turn=turn)
         else:
             data = {"ok": False, "error": E_INVALID}
         row = _blank_row(account)
@@ -1346,6 +1634,10 @@ def probe_all(accounts: list[dict], *, timeout: float = TIMEOUT_S) -> list[dict]
     end = time.monotonic() + timeout + OVERALL_GRACE_S
     for thread in threads:
         thread.join(max(0.0, end - time.monotonic()))
+    later = run.until + 0.25
+    if later > end:
+        for thread in threads:
+            thread.join(max(0.0, later - time.monotonic()))
     run.kill_all()
     return [results[i] if results[i] is not None else _failed_row(a, E_TIMEOUT)
             for i, a in enumerate(accounts)]
@@ -1391,8 +1683,8 @@ def _save_cache(rows: dict[str, dict], *, strict: bool = False) -> None:
             raise
 
 
-def _open_lock(name: str) -> int | None:
-    path = cache_file().with_name(name)
+def _open_lock(name: str, *, directory: Path | None = None) -> int | None:
+    path = directory / name if directory is not None else cache_file().with_name(name)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)

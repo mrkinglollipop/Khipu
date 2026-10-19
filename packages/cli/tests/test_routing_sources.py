@@ -142,6 +142,97 @@ def test_a_probe_at_100_percent_replaces_a_runners_guess(home):
     assert "read from Muse's last turn" in routing.account_line(muse, T0)
 
 
+def test_muse_figures_from_a_turn_khipu_ran_say_so(home):
+    _register(home)
+    seen = T0 - timedelta(minutes=3)
+    five, week = T0 + timedelta(hours=3), T0 + timedelta(days=4)
+    _usage(home, {"muse|": _row(seen, [
+        {"name": "five_hour", "used_pct": 39, "resets_at": routing._iso(five), "window_mins": 300},
+        {"name": "weekly", "used_pct": 13, "resets_at": routing._iso(week), "window_mins": 10080}],
+        source="turn", observed_at=routing._iso(seen))})
+    muse = _account(routing.read_view(), "muse|")
+    assert muse["state"] == "open" and muse["witness"]["turn"] is True
+    line = routing.account_line(muse, T0)
+    assert "read from a Muse turn Khipu ran" in line and "last turn" not in line
+    rows = {"muse|": json.loads((home["data"] / "state" / "usage.json").read_text())["rows"]["muse|"]}
+    fact = routing.plan_fact(rows["muse|"], T0)
+    assert fact["readable"] is True and fact["window"] == "week" and fact["used_pct"] == 13
+    assert fact["resets_at"] == routing._iso(week)
+    # Once the week's reset passes, the same figures read as out of date.
+    assert routing.plan_fact(rows["muse|"], week + timedelta(minutes=1))["why"] == routing.RESET_PASSED_WHY
+
+
+def test_muse_refusal_from_its_logs_reads_as_a_limit(home):
+    _register(home)
+    seen, resets = T0 - timedelta(minutes=10), T0 + timedelta(hours=2)
+    _usage(home, {"muse|": _row(seen, [{"name": "refused", "used_pct": 100, "resets_at": routing._iso(resets)}],
+                                 source="last_observed", observed_at=routing._iso(seen),
+                                 limited_until=routing._iso(resets))})
+    muse = _account(routing.read_view(), "muse|")
+    assert (muse["state"], muse["until"]) == ("limited", routing._iso(resets))
+
+
+def _muse_carried_log_refusal(home):
+    from khipu import usage
+
+    seen = T0 - timedelta(hours=1)  # 14:00
+    refused = T0 - timedelta(minutes=1)  # 14:59
+    resets = T0 + timedelta(hours=2)  # 17:00
+    figures = _row(seen, [
+        {"name": "weekly", "used_pct": 13, "resets_at": routing._iso(T0 + timedelta(days=3))}],
+        source="turn", observed_at=routing._iso(seen))
+    row = usage._muse_carry({"ok": True, "windows": [], "source": "last_observed"}, figures,
+                            (routing._iso(resets), routing._iso(refused)), T0)
+    _usage(home, {"muse|": row})
+    return seen, refused, resets
+
+
+def test_muse_log_refusal_after_owner_clear_uses_its_own_observation_time(home):
+    home["clock"].now = T0 - timedelta(minutes=30)  # 14:30
+    routing.clear("Muse", via="app")
+    home["clock"].now = T0
+    seen, refused, resets = _muse_carried_log_refusal(home)
+
+    muse = _account(routing.read_view(), "muse|")
+    assert (muse["state"], muse["until"]) == ("limited", routing._iso(resets))
+    assert muse["witness"]["at"] == routing._iso(refused)
+    assert "cleared by you" not in routing.account_line(muse, T0)
+    row = json.loads((home["data"] / "state" / "usage.json").read_text())["rows"]["muse|"]
+    assert row["observed_at"] == routing._iso(seen)
+    evidence, status = routing_sources.usage_evidence({"muse|"})
+    assert evidence[0]["at"] == refused
+    assert status["newest"] == routing._iso(refused)
+
+
+@pytest.mark.parametrize("old_reset_hours", [2, 3])
+def test_a_fresh_muse_refusal_is_not_hidden_by_an_older_full_window(home, old_reset_hours):
+    from khipu import usage
+
+    home["clock"].now = T0 - timedelta(minutes=30)  # 14:30
+    routing.clear("Muse", via="app")
+    home["clock"].now = T0
+    seen, refused, resets = T0 - timedelta(hours=1), T0 - timedelta(minutes=1), T0 + timedelta(hours=2)
+    figures = _row(seen, [{"name": "five_hour", "used_pct": 100,
+                           "resets_at": routing._iso(T0 + timedelta(hours=old_reset_hours))}],
+                   source="turn", observed_at=routing._iso(seen))
+    row = usage._muse_carry({"ok": True, "windows": [], "source": "last_observed"}, figures,
+                            (routing._iso(resets), routing._iso(refused)), T0)
+    _usage(home, {"muse|": row})
+
+    muse = _account(routing.read_view(), "muse|")
+    assert (muse["state"], muse["until"]) == ("limited", routing._iso(resets))
+    assert muse["witness"]["at"] == routing._iso(refused)
+
+
+def test_muse_log_refusal_provenance_names_session_logs_instead_of_a_khipu_turn(home):
+    _muse_carried_log_refusal(home)
+    muse = _account(routing.read_view(), "muse|")
+    line = routing.account_line(muse, T0)
+    assert "(read from Muse's session logs)" in line
+    assert "a Muse turn Khipu ran" not in line
+    assert "last turn" not in line
+
+
 def test_a_later_probe_with_headroom_reopens(home):
     _register(home)
     windows = [{"name": "five_hour", "used_pct": 40.0, "resets_at": routing._iso(T0 + timedelta(hours=2))}]

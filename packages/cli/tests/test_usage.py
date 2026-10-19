@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import textwrap
 import threading
@@ -35,7 +36,8 @@ FAKE_CLI = textwrap.dedent("""
     SENTINEL = "SENTINEL-c0ffee-do-not-leak"
     fixture, mode, out = sys.argv[1], sys.argv[2], sys.argv[3]
     turn = "--max-turns" in sys.argv  # Claude's one-turn fallback: its own fixture and record
-    if turn:
+    muse_turn = "--disable-shell" in sys.argv  # Muse's one-turn host: the same, answered over stdin
+    if turn or muse_turn:
         fixture, out = fixture.replace(".jsonl", "-turn.jsonl"), out + ".turn"
     record = {"pid": os.getpid(), "env": sorted(os.environ), "argv": sys.argv[4:], "cwd": os.getcwd(),
               "cwd_entries": os.listdir("."),
@@ -61,8 +63,15 @@ FAKE_CLI = textwrap.dedent("""
         for frame in frames:
             sys.stdout.write(json.dumps(frame) + "\\n")
         sys.exit(0)
+    if muse_turn and not frames:
+        sys.exit(0)
+    if muse_turn and mode == "slow_turn":
+        time.sleep(3)
     for line in sys.stdin:
         msg = json.loads(line)
+        if muse_turn:
+            with open(out + ".in", "a") as fh:
+                fh.write(json.dumps(msg) + "\\n")
         rid = msg.get("id", msg.get("request_id"))
         if rid is None:
             continue
@@ -72,6 +81,9 @@ FAKE_CLI = textwrap.dedent("""
             sys.stdout.flush()
             if frame.get("id") == rid or (frame.get("response") or {}).get("request_id") == rid:
                 break
+        while muse_turn and frames and "id" not in frames[0]:
+            sys.stdout.write(json.dumps(frames.pop(0)) + "\\n")  # the turn's notifications follow its ack
+            sys.stdout.flush()
 """)
 
 
@@ -284,6 +296,277 @@ def test_muse_observed_usage_carries_observed_at(fake):
     assert row["observed_at"] == "2026-01-01T00:00:00Z"
     assert [(w["name"], w["used_pct"], w.get("window_mins")) for w in row["windows"]] == [
         ("five_hour", 61, 300), ("weekly", 62, 10080)]
+
+
+_MUSE_ACCOUNT = {"label": "Muse", "harness": "muse", "home": None}
+_MUSE_FIGURES = [("five_hour", 39, "2026-10-18T04:38:37Z", 300), ("weekly", 13, "2026-10-19T00:00:00Z", 10080)]
+
+
+def _figures(row: dict) -> list[tuple]:
+    return [(w["name"], w["used_pct"], w["resets_at"], w.get("window_mins")) for w in row["windows"]]
+
+
+def _muse_sent(out: Path) -> list[dict]:
+    path = Path(str(out) + ".turn.in")
+    return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+
+def _hold_muse(rows: dict) -> None:
+    path = usage.cache_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": usage.CACHE_VERSION, "rows": rows}))
+
+
+def _muse_row(observed: datetime, windows: list[dict], **extra) -> dict:
+    return dict({"ok": True, "harness": "muse", "account": "Muse", "home": None, "plan": "fixture_tier",
+                 "windows": windows, "source": "turn", "observed_at": usage._iso(observed.timestamp()),
+                 "probed_at": usage._iso(observed.timestamp()), "last_good_at": usage._iso(observed.timestamp())},
+                **extra)
+
+
+def _ahead(**kw) -> str:
+    return usage._iso((datetime.now(timezone.utc) + timedelta(**kw)).timestamp())
+
+
+def test_muse_without_figures_reads_them_from_one_tiny_turn(fake, monkeypatch):
+    # The figures and times of the real turn on 2026-10-18 01:43Z (Muse Code
+    # 1.4.6): a fresh host answers usage/read with {}; after one turn of its
+    # own the same read carries both windows.
+    monkeypatch.setenv("META_API_KEY", "fixture-not-a-key")
+    out = fake("muse", "muse-fresh.jsonl")
+    row = usage.probe_account(_MUSE_ACCOUNT)
+    assert row["ok"] is True and row["source"] == "turn" and row["plan"] == "fixture_tier"
+    assert _figures(row) == _MUSE_FIGURES
+    assert row["observed_at"] == "2026-10-18T01:43:37Z" and row["version"] == "1.4.6"
+    turn = json.loads(Path(str(out) + ".turn").read_text())
+    argv = turn["argv"]
+    assert argv[:2] == ["serve", "--no-session-log"] and "--disable-shell" in argv and "--disable-write" in argv
+    assert argv[argv.index("--model") + 1] == usage.MUSE_TURN_MODEL == "muse-spark-1.3"
+    assert "META_API_KEY" not in turn["env"]
+    sent = {m.get("method"): m.get("params") for m in _muse_sent(out)}
+    assert sent["session/start"]["approvalMode"] == "denyUnmatched"
+    assert sent["turn/start"]["reasoningEffort"] == "none"
+    assert sent["turn/start"]["input"] == [{"type": "text", "text": "Reply with OK."}]
+    assert re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                        sent["turn/start"]["commandId"])
+    assert list(sent) == ["initialize", "initialized", "session/start", "turn/start", "usage/read"]
+
+
+def test_a_sign_in_check_never_spends_a_muse_turn(fake):
+    out = fake("muse", "muse-fresh.jsonl")
+    assert usage.probe_muse(turn=False)["windows"] == []
+    assert usage.probe_account(_MUSE_ACCOUNT, turn=False)["windows"] == []
+    assert not Path(str(out) + ".turn").exists()
+    assert not usage.cache_file().with_name(usage.TURN_STAMP_NAME).exists()  # the allowance is left whole
+
+
+def test_muse_turn_runs_at_most_once_per_interval(fake):
+    out = fake("muse", "muse-fresh.jsonl")
+    turn = Path(str(out) + ".turn")
+    assert usage.probe_muse()["source"] == "turn"
+    turn.unlink()
+    # Nothing held (probe_muse stores nothing) and the turn already spent.
+    row = usage.probe_muse()
+    assert row == {"ok": True, "plan": None, "windows": [], "version": "1.4.6", "source": "last_observed",
+                   "note": "no turn observed yet"}
+    assert not turn.exists()
+    stamps = Path.home().joinpath(*usage.MUSE_TURN_STATE, usage.TURN_STAMP_NAME)
+    aged = {k: v - usage.MUSE_TURN_EVERY_S - 1 for k, v in json.loads(stamps.read_text()).items()}
+    stamps.write_text(json.dumps(aged))
+    assert usage.probe_muse()["source"] == "turn"
+
+
+
+def test_muse_turn_allowance_is_shared_across_data_dirs_and_processes(fake, tmp_path):
+    out = fake("muse", "muse-fresh.jsonl")
+    binary = usage._command("muse")
+    script = ("from khipu import usage; "
+              f"usage._command = lambda _: {binary!r}; "
+              "usage.probe_muse()")
+    for index in range(2):
+        env = dict(os.environ, KHIPU_DATA_DIR=str(tmp_path / f"data-{index}"))
+        subprocess.run([sys.executable, "-c", script], env=env, check=True, timeout=10)
+        turn = Path(str(out) + ".turn")
+        if index == 0:
+            assert turn.exists()
+            turn.unlink()
+        else:
+            assert not turn.exists()
+
+
+def test_isolated_muse_reads_never_spend_or_record_a_turn(fake, monkeypatch, tmp_path):
+    out = fake("muse", "muse-fresh.jsonl")
+    for index in range(2):
+        monkeypatch.setenv("KHIPU_ISOLATED_DIR", str(tmp_path / f"isolated-{index}"))
+        assert usage.probe_muse()["ok"] is True
+        assert not Path(str(out) + ".turn").exists()
+    monkeypatch.delenv("KHIPU_ISOLATED_DIR")
+    assert usage.probe_muse()["source"] == "turn"
+
+
+def test_muse_refusal_keeps_carried_figures_stale(fake):
+    from khipu import routing
+
+    out = fake("muse", "muse-fresh.jsonl")
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    seen, refused = now - timedelta(hours=1), now - timedelta(minutes=1)
+    held = [{"name": "weekly", "used_pct": 13, "resets_at": _ahead(days=3), "window_mins": 10080}]
+    _hold_muse({"muse|": _muse_row(seen, held)})
+    _muse_log("2026/10/17", refused, _ahead(hours=2))
+    row = usage.probe_account(_MUSE_ACCOUNT)
+    assert not Path(str(out) + ".turn").exists()
+    assert row["observed_at"] == usage._iso(seen.timestamp())
+    assert row["refusal_observed_at"] == usage._iso(refused.timestamp())
+    window = next(w for w in row["windows"] if w["name"] == "refused")
+    assert window["observed_at"] == usage._iso(refused.timestamp())
+    assert window["source"] == "session_logs"
+    fact = routing.plan_fact(row, now)
+    assert fact["used_pct"] == 13 and fact["stale"] is True
+    assert fact["pace_pct_per_hour"] is None
+
+
+def test_muse_recovery_carries_last_good_figures_after_free_read_timeout(fake):
+    out = fake("muse", "muse-fresh.jsonl")
+    seen = datetime.now(timezone.utc) - timedelta(minutes=5)
+    held = [{"name": "five_hour", "used_pct": 39, "resets_at": _ahead(hours=2), "window_mins": 300},
+            {"name": "weekly", "used_pct": 13, "resets_at": _ahead(days=3), "window_mins": 10080}]
+    previous = _muse_row(seen, held)
+    fake("muse", "muse-fresh.jsonl", mode="hang")
+    failed = usage.probe_account(_MUSE_ACCOUNT, timeout=0.05)
+    assert failed["ok"] is False and failed["error"] == usage.E_TIMEOUT
+    retained = usage._merge(previous, failed)
+    assert retained["ok"] is False and retained["last_good_at"] == previous["last_good_at"]
+    _hold_muse({"muse|": retained})
+    fake("muse", "muse-fresh.jsonl")
+    recovered = usage._merge(retained, usage.probe_account(_MUSE_ACCOUNT))
+    assert recovered["ok"] is True and recovered["windows"] == held
+    assert recovered["observed_at"] == previous["observed_at"]
+    assert not Path(str(out) + ".turn").exists()
+
+
+def test_muse_turn_has_its_own_allowance_beside_claudes(fake, tmp_path):
+    fake("claude", "claude-null.jsonl")
+    fake("muse", "muse-fresh.jsonl")
+    assert usage.probe_claude()["ok"] is True
+    assert usage.probe_muse()["source"] == "turn"
+
+
+def test_muse_fresh_figures_are_carried_without_a_turn(fake):
+    out = fake("muse", "muse-fresh.jsonl")
+    seen = datetime.now(timezone.utc) - timedelta(minutes=5)
+    held = [{"name": "five_hour", "used_pct": 20, "resets_at": _ahead(hours=2), "window_mins": 300},
+            {"name": "weekly", "used_pct": 10, "resets_at": _ahead(days=3), "window_mins": 10080}]
+    _hold_muse({"muse|": _muse_row(seen, held)})
+    row = usage.probe_account(_MUSE_ACCOUNT)
+    assert not Path(str(out) + ".turn").exists()
+    assert row["ok"] is True and row["windows"] == held and row["source"] == "turn"
+    assert row["observed_at"] == usage._iso(seen.timestamp()) and row["note"] is None
+    # Stored again, they keep the time they were observed, never the probe's.
+    usage._store([_MUSE_ACCOUNT], [row])
+    assert usage._load_cache()["muse|"]["observed_at"] == usage._iso(seen.timestamp())
+
+
+@pytest.mark.parametrize("age_min, reset", [(usage.MUSE_REFRESH_S // 60 + 1, {"hours": 2}), (5, {"minutes": -1})])
+def test_muse_turn_when_held_figures_are_old_or_a_reset_passed(fake, age_min, reset):
+    out = fake("muse", "muse-fresh.jsonl")
+    seen = datetime.now(timezone.utc) - timedelta(minutes=age_min)
+    _hold_muse({"muse|": _muse_row(seen, [
+        {"name": "five_hour", "used_pct": 20, "resets_at": _ahead(**reset), "window_mins": 300},
+        {"name": "weekly", "used_pct": 10, "resets_at": _ahead(days=3), "window_mins": 10080}])})
+    row = usage.probe_muse()
+    assert Path(str(out) + ".turn").exists()
+    assert row["source"] == "turn" and _figures(row) == _MUSE_FIGURES
+
+
+def test_muse_spends_no_turn_while_a_held_window_is_at_its_limit(fake):
+    out = fake("muse", "muse-fresh.jsonl")
+    seen = datetime.now(timezone.utc) - timedelta(hours=2)
+    held = [{"name": "five_hour", "used_pct": 100, "resets_at": _ahead(hours=1), "window_mins": 300}]
+    _hold_muse({"muse|": _muse_row(seen, held)})
+    row = usage.probe_muse()
+    assert not Path(str(out) + ".turn").exists()
+    assert row["windows"] == held and row["observed_at"] == usage._iso(seen.timestamp())
+
+
+def _muse_log(day: str, refused_at: datetime, resets: str) -> Path:
+    folder = Path.home() / ".local/share/muse/sessions" / day / "01a13ac4-0000-7000-8000-00000000000a"
+    folder.mkdir(parents=True, exist_ok=True)
+    reason = ("model failed: API error 429 [request_id=fixture]: Subscription quota exhausted. "
+              f"Your usage window resets at {resets}. (rate_limit_error)")
+    lines = [{"schema_version": 1, "id": "a", "recorded_at": int(refused_at.timestamp() * 1_000_000) - 5_000_000,
+              "payload": {"kind": "run", "event": {"kind": "started"}}},
+             {"schema_version": 1, "id": "b", "recorded_at": int(refused_at.timestamp() * 1_000_000),
+              "payload": {"kind": "run", "event": {"kind": "failed", "reason": reason}}}]
+    path = folder / "session.jsonl"
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    return path
+
+
+def test_muse_refusal_in_its_session_logs_marks_it_limited_without_a_turn(fake):
+    out = fake("muse", "muse-fresh.jsonl")
+    refused_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=10)
+    resets = _ahead(hours=3)
+    _muse_log("2026/10/17", refused_at, resets)
+    row = usage.probe_account(_MUSE_ACCOUNT)
+    assert not Path(str(out) + ".turn").exists()
+    assert row["ok"] is True and row["limited_until"] == resets
+    assert row["windows"] == [{"name": usage.MUSE_REFUSED_WINDOW, "used_pct": 100, "resets_at": resets,
+                               "observed_at": usage._iso(refused_at.timestamp()), "source": "session_logs"}]
+    assert row["observed_at"] == usage._iso(refused_at.timestamp()) and row["source"] == "last_observed"
+    # Only the fixed words are read: no other text from the log reaches the row.
+    assert "request_id" not in json.dumps(row) and "fixture]" not in json.dumps(row)
+
+
+def test_muse_refusal_whose_reset_passed_leaves_the_turn(fake):
+    out = fake("muse", "muse-fresh.jsonl")
+    _muse_log("2026/10/14", datetime.now(timezone.utc) - timedelta(hours=8), _ahead(hours=-1))
+    assert usage.probe_muse()["source"] == "turn"
+    assert Path(str(out) + ".turn").exists()
+
+
+def test_muse_limited_or_paused_in_the_routing_record_spends_no_turn(fake, monkeypatch):
+    from khipu import routing
+
+    out = fake("muse", "muse-fresh.jsonl")
+    for entry in ({"harness": "muse", "state": routing.LIMITED, "until": _ahead(hours=1)},
+                  {"harness": "muse", "state": routing.PAUSED, "until": None}):
+        monkeypatch.setattr(routing, "_load_view", lambda entry=entry: {"accounts": [entry]})
+        assert usage.probe_muse()["windows"] == []
+        assert not Path(str(out) + ".turn").exists()
+    # A limit whose time has passed is no longer one.
+    monkeypatch.setattr(routing, "_load_view", lambda: {"accounts": [
+        {"harness": "muse", "state": routing.LIMITED, "until": _ahead(minutes=-1)}]})
+    assert usage.probe_muse()["source"] == "turn"
+
+
+def test_muse_turn_refused_for_quota_records_the_limit(fake):
+    fake("muse", "muse-quota.jsonl")
+    row = usage.probe_muse()
+    assert row["ok"] is True and row["source"] == "turn" and row["limited_until"] == "2026-10-18T04:38:37Z"
+    assert row["windows"] == [{"name": usage.MUSE_REFUSED_WINDOW, "used_pct": 100,
+                               "resets_at": "2026-10-18T04:38:37Z"}]
+
+
+def test_muse_turn_that_answers_nothing_leaves_the_free_read(fake):
+    fake("muse", "muse-empty.jsonl")  # no muse-empty-turn.jsonl: the turn host exits at once
+    row = usage.probe_muse()
+    assert row["windows"] == [] and row["note"] == "no turn observed yet"
+
+
+def test_probe_all_waits_for_a_muse_turn_past_its_overall_deadline(fake):
+    fake("muse", "muse-fresh.jsonl", mode="slow_turn")
+    started = time.monotonic()
+    rows = usage.probe_all([_MUSE_ACCOUNT], timeout=1.0)
+    assert time.monotonic() - started > 1.0 + usage.OVERALL_GRACE_S
+    assert rows[0]["ok"] is True and rows[0]["source"] == "turn"
+
+
+def test_parse_muse_turn_without_figures_or_refusal_is_no_figures():
+    frames = [_MUSE_INIT, {"jsonrpc": "2.0", "id": 2, "result": {"session": {"sessionId": "s"}}},
+              {"jsonrpc": "2.0", "id": 3, "result": {}}, {"jsonrpc": "2.0", "id": 4, "result": {}}]
+    with pytest.raises(usage.ProbeError) as exc:
+        usage.parse_muse_turn(frames)
+    assert exc.value.code == usage.E_NO_FIGURES
 
 
 def test_probe_environment_carries_no_key_and_no_claudecode(fake, monkeypatch):

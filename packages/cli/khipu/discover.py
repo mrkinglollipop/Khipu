@@ -685,13 +685,13 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
         plan = None
         if state == SIGNED_IN and end - time.monotonic() > 0.5:
             row = usage.probe_account({"label": usage.LABELS[cli], "harness": cli, "home": home},
-                                      timeout=left(), rollout=False)
+                                      timeout=left(), rollout=False, turn=False)
             plan = row.get("plan") if row.get("ok") else None
         return state, reason, plan
     if cli == "grok":
         return settle(*_from_probe(usage.probe_grok(home, timeout=left())))
     if cli == "muse":
-        return settle(*_from_probe(usage.probe_muse(timeout=left())))
+        return settle(*_from_probe(usage.probe_muse(timeout=left(), turn=False)))
     return COULDNT_CHECK, R_BAD, None
 
 
