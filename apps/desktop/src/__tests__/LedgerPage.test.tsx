@@ -184,7 +184,7 @@ describe("LedgerPage", () => {
     serve(() => [current], {
       khipu_ledger_set: () => {
         current = { ...current, state: "DONE" };
-        return { ok: true };
+        return { ok: true, state: "DONE" };
       },
     });
     const { onOwedClose } = page();

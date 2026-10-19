@@ -93,7 +93,7 @@ def private_backends(monkeypatch, tmp_path):
         def close(self): pass
 
     monkeypatch.setattr(ledger, "require", lambda *a, **k: None)
-    monkeypatch.setattr(ledger, "_project_for", lambda args: "atlas")
+    monkeypatch.setattr(ledger, "_project_for", lambda args, **kw: "atlas")
     monkeypatch.setattr(ledger, "load", lambda project, **k: copy.deepcopy(view))
     monkeypatch.setattr(ledger, "get", lambda project, row_id, **k: {"row": _private_row(), "history": history,
                                                                      "offline": True, "as_of": SAY})
@@ -166,7 +166,7 @@ def test_a_refusal_answers_through_the_projection(monkeypatch):
     def refuse(*a, **k):
         raise ledger.LedgerError(f"refused: {SAY}", "refused")
 
-    monkeypatch.setattr(ledger, "_project_for", lambda args: "atlas")
+    monkeypatch.setattr(ledger, "_project_for", lambda args, **kw: "atlas")
     monkeypatch.setattr(ledger, "load", refuse)
     for argv in (["ledger", "list"], ["ledger", "list", "--json"]):
         out, err = _run(argv)

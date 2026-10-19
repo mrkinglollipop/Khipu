@@ -29,7 +29,7 @@ import {
 import type { UsageReport } from "./PlansCard";
 import { brokenChecks, lastChangeWords, quietRunners, runnerWords, whenLocal } from "./routing";
 import type { RouteView } from "./routing";
-import { fmtAge, fmtAgo, fmtAgoSince } from "./time";
+import { fmtAge, fmtAgo, fmtAgoSince, fmtClock } from "./time";
 import { plural, shortProject, timeOnly } from "./work";
 
 export type HealthRowStatus = "ok" | "err" | "skipped";
@@ -54,6 +54,7 @@ const LABELS: Record<string, string> = {
   hub_ok: "Database reachable",
   disk_space_ok: "Enough free disk space",
   hub_snapshot_ok: "Offline copy of memory",
+  ledger_copy_ok: "Offline copy of the ledger",
   dsn_file_ok: "Connection stored on this Mac",
   drift_ok: "Memory index matches the database",
   graph_drift_ok: "Connections index matches the database",
@@ -232,7 +233,48 @@ export function hubSnapshotDetail(block: HubSnapshotBlock | undefined): string |
   return parts.length ? parts.join(" · ") : undefined;
 }
 
+/** Doctor's `ledger_copy` block (packages/cli/khipu/replica_heal.py
+ *  `ledger_copy_status`): the ledger part of the offline copy, refreshed on
+ *  its own retry timer. */
+export type LedgerCopyBlock = {
+  ok?: boolean;
+  state?: string;
+  age_seconds?: number | null;
+  error?: string;
+  last_error?: { error?: string; since?: string | null; next_retry_at?: string | null } | null;
+};
+
+const LEDGER_COPY_STATE_WORDS: Record<string, string> = {
+  fresh: "in step",
+  retrying: "an update failed, trying again",
+  failing: "updates keep failing",
+  old: "out of date",
+  unknown: "could not be checked",
+};
+
+/** "updates keep failing · last caught up 3 h ago · the last update failed:
+ *  database is locked · failing since 45 min ago · next try at 9:06 PM". */
+export function ledgerCopyDetail(block: LedgerCopyBlock | undefined): string | undefined {
+  if (!block || typeof block !== "object") return undefined;
+  if (block.state === "not_applicable") return "no ledger in the offline copy yet";
+  const parts: string[] = [];
+  const words = LEDGER_COPY_STATE_WORDS[block.state ?? ""];
+  if (words) parts.push(words);
+  if (block.error) parts.push(block.error);
+  parts.push(block.age_seconds != null ? `last caught up ${fmtAgo(block.age_seconds)}` : "never caught up");
+  const err = block.last_error;
+  if (err) {
+    parts.push(`the last update failed: ${err.error ?? "unknown error"}`);
+    const since = fmtAgoSince(err.since);
+    if (since) parts.push(`failing since ${since}`);
+    const next = err.next_retry_at ? new Date(err.next_retry_at) : null;
+    if (next && !Number.isNaN(next.getTime())) parts.push(`next try at ${fmtClock(next)}`);
+  }
+  return parts.join(" · ");
+}
+
 function detailFor(key: string, parsed: Record<string, unknown>): string | undefined {
+  if (key === "ledger_copy_ok") return ledgerCopyDetail(parsed.ledger_copy as LedgerCopyBlock | undefined);
   if (key === "hub_snapshot_ok") return hubSnapshotDetail(parsed.hub_snapshot as HubSnapshotBlock | undefined);
   if (key === "synth_provider_ok") return synthProviderDetail(parsed.synth_provider as DoctorSynthProvider | undefined);
   if (key === "synth_budget_ok") return synthBudgetDetail(parsed.synth_budget as SynthBudget | undefined);

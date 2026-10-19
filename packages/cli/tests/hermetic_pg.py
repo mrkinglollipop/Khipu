@@ -16,16 +16,92 @@ for you; ``hub.dsn`` is the database's DSN.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
+OWNER = "owner.json"
+
+
+def _process_start(pid: int) -> str | None:
+    result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=", "-o", "stat="],
+                            capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"},
+                            timeout=5)
+    if result.returncode == 1 and not result.stdout.strip():
+        return None
+    result.check_returncode()
+    fields = result.stdout.split()
+    if not fields or fields[-1].startswith("Z"):
+        return None
+    return " ".join(fields[:-1])
+
+
+def _owner_alive(owner: dict) -> bool:
+    return _process_start(owner["pid"]) == owner["start"]
+
+
+def _read_owner(root: Path) -> dict | None:
+    try:
+        owner = json.loads((root / OWNER).read_text())
+        if (type(owner["pid"]) is int and owner["pid"] > 0
+                and isinstance(owner["start"], str) and owner["start"]):
+            return owner
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _stop_orphan(root: Path, pg_ctl: str) -> None:
+    result = subprocess.run([pg_ctl, "-D", str(root / "data"), "-m", "immediate", "stop"],
+                            capture_output=True, timeout=60)
+    if result.returncode == 0 or not (root / "data" / "postmaster.pid").exists():
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _watch_cluster(root: Path, pg_ctl: str) -> None:
+    owner = _read_owner(root)
+    if owner is None:
+        return
+    while (root / "data" / "postmaster.pid").exists():
+        if not _owner_alive(owner):
+            _stop_orphan(root, pg_ctl)
+            return
+        time.sleep(2)
+
+
+def _sweep_orphans(temp_root: Path, pg_ctl: str) -> None:
+    candidates = list(temp_root.glob("khipu-hermetic-pg-*"))
+    candidates.extend(temp_root.glob("kt-*/khipu-hermetic-pg-*"))
+    for root in candidates:
+        if root.is_symlink() or root.parent.is_symlink() or not root.is_dir():
+            continue
+        owner = _read_owner(root)
+        if owner is not None and not _owner_alive(owner):
+            _stop_orphan(root, pg_ctl)
+
+
+def _system_temp() -> Path:
+    root = Path(tempfile.gettempdir())
+    while root.name.startswith("kt-"):
+        root = root.parent
+    return root
+
+
+# The detached watcher needs only the standard library, even after pytest dies.
+if __name__ == "__main__":
+    _watch_cluster(Path(sys.argv[1]), sys.argv[2])
+    sys.exit(0)
+
 import pytest
+
 
 REPO = Path(__file__).resolve().parents[3]
 MIGRATIONS = REPO / "ops" / "migrations"
@@ -114,6 +190,7 @@ class Cluster:
         self.root, self.port = root, port
         self.data = root / "data"
         self.env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+        self.watchdog: subprocess.Popen | None = None
 
     def dsn(self, dbname: str) -> str:
         return f"postgresql://khipu@127.0.0.1:{self.port}/{dbname}"
@@ -125,16 +202,30 @@ class Cluster:
         return conn
 
     def start(self) -> None:
+        owner = {"pid": os.getpid(), "start": _process_start(os.getpid())}
+        if owner["start"] is None:
+            raise RuntimeError("cannot identify the PostgreSQL test owner")
+        (self.root / OWNER).write_text(json.dumps(owner))
         subprocess.run([INITDB, "-D", str(self.data), "-U", "khipu", "--auth=trust", "-E", "UTF8",
                         "--locale=C"], check=True, capture_output=True, env=self.env, timeout=120)
         subprocess.run([PG_CTL, "-D", str(self.data), "-l", str(self.root / "log"), "-w", "-t", "60",
                         "-o", f"-c unix_socket_directories='' -c listen_addresses=127.0.0.1 "
                               f"-p {self.port} -c fsync=off -c max_connections=60",
                         "start"], check=True, capture_output=True, env=self.env, timeout=120)
+        try:
+            self.watchdog = subprocess.Popen(
+                [sys.executable, "-I", str(Path(__file__).resolve()), str(self.root), PG_CTL],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, env=self.env)
+        except Exception:
+            self.stop()
+            raise
 
     def stop(self) -> None:
         subprocess.run([PG_CTL, "-D", str(self.data), "-m", "immediate", "stop"],
                        capture_output=True, env=self.env, timeout=60)
+        if self.watchdog is not None:
+            self.watchdog.wait(timeout=10)
 
     def build_template(self) -> None:
         from khipu import migrate
@@ -165,6 +256,7 @@ class Cluster:
 def pg_cluster():
     if not INITDB or not PG_CTL:
         pytest.skip("needs PostgreSQL's initdb and pg_ctl on PATH")
+    _sweep_orphans(_system_temp(), PG_CTL)
     root = Path(tempfile.mkdtemp(prefix="khipu-hermetic-pg-"))
     cluster = Cluster(root, _free_port())
     started = False

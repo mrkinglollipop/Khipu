@@ -665,6 +665,14 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         status.get("latest_ingested_at") if hub_ok else None,
         lag=status.pop("replica_lag", None),
     )
+    # The ledger part of that copy, refreshed on its own backoff by the
+    # replica job; its retained failure is otherwise never read.
+    try:
+        from khipu import replica_heal as _replica_heal
+
+        ledger_copy = _replica_heal.ledger_copy_status(hub_ok)
+    except Exception as exc:  # noqa: BLE001  (a failed check must not crash doctor, nor read green)
+        ledger_copy = {"ok": False, "state": "unknown", "error": f"{type(exc).__name__}: {exc}"}
     # A check whose input is not configured on this machine is SKIPPED and
     # named in `not_configured` — distinct from red (configured but broken)
     # and from green (checked and clean). A fresh install has no legacy file
@@ -944,6 +952,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "hub_snapshot": hub_snapshot,
         # Its own row in the app's health report; red only when stale.
         "hub_snapshot_ok": bool(hub_snapshot.get("ok", True)),
+        "ledger_copy": ledger_copy,
+        "ledger_copy_ok": bool(ledger_copy.get("ok")),
         "drift": drift,
         "graph_drift": graph,
         "outbox": outbox,
@@ -1019,6 +1029,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             # into the aggregate — a snapshot stuck behind ingest by hours
             # still read doctor.ok == true (W6, 2026-09-03).
             and bool(hub_snapshot.get("ok", True))
+            and bool(ledger_copy.get("ok"))
             # recall_probe_ok: the end-to-end "capture then search finds it"
             # signal (W6.1) — red when no probe has run, the last one failed,
             # or it is older than 7 days. This is a hard gate, not a warning.

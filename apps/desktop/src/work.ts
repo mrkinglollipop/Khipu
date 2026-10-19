@@ -183,6 +183,7 @@ export type WorkCounts = {
   flagged: number;
   stale_sources: number;
   ledger_outbox: number;
+  ledger_refused?: number;
 };
 export type WorkView = {
   format: string;
@@ -196,6 +197,8 @@ export type WorkView = {
   problems?: Record<string, string>;
   ledger_offline?: boolean;
   ledger_as_of?: string | null;
+  /** The hub is away and this Mac has no offline copy of the ledger yet. */
+  ledger_copy_unavailable?: boolean;
   refresh_s?: number;
 };
 
@@ -214,6 +217,8 @@ export type LedgerRow = {
   project: string;
   history: HistoryEntry[];
   queued?: boolean;
+  /** The hub's row version: it changes with every change, even two in one second. */
+  version?: number | null;
 };
 export type HistoryEntry = {
   ts?: string;
@@ -225,14 +230,51 @@ export type HistoryEntry = {
   by?: string;
   changes?: Record<string, unknown>;
 };
+export type LedgerQueue = {
+  pending: number | null;
+  busy: boolean;
+  stopped_early: boolean;
+  refused: number;
+  unreadable: string | null;
+};
 export type LedgerList = {
   ok: boolean;
   project: string;
   offline: boolean;
   as_of?: string | null;
+  /** The hub is away and this Mac has no offline copy yet: only waiting writes show. */
+  copy_unavailable?: boolean;
+  /** Writes saved on this Mac that have not reached the database yet. */
+  pending?: number | null;
+  queue?: LedgerQueue;
   vocab: Vocab;
   rows: LedgerRow[];
 };
+/** What `khipu ledger set --json` answered. */
+export type LedgerSetReply = { ok?: boolean; state?: string | null; queued?: boolean; late?: boolean; retried?: boolean };
+
+/** Whether a ledger set reply is a change the ledger applied, to a finished
+ *  (done or dropped) state: only then may the Owed item close. A change still
+ *  waiting to be sent, or one that arrived late and was kept as history only,
+ *  leaves it open. */
+export function appliedFinished(reply: LedgerSetReply | null | undefined, vocab: Vocab | null): boolean {
+  if (!reply || reply.ok === false || reply.queued || reply.late || !reply.state) return false;
+  const m = meaningOf(vocab, reply.state);
+  return m === "done" || m === "dropped";
+}
+
+/** Words for a set reply that did not apply now, or null. */
+export function unappliedWords(reply: LedgerSetReply | null | undefined, owed: boolean): string | null {
+  if (!reply) return null;
+  const tail = owed ? " The Owed item stays open until the ledger takes it." : "";
+  if (reply.queued) return `Saved on this Mac; the change is waiting to be sent to the database.${tail}`;
+  if (reply.late) {
+    const where = reply.state ? ` to ${stateWords(reply.state)}` : "";
+    return `That change arrived late: the row had moved${where}, so it was kept in the row's history and not applied.${tail}`;
+  }
+  return null;
+}
+
 export type RemovedRow = {
   project: string;
   id: string;
@@ -606,9 +648,10 @@ export function goalBar(
 export const WORK_READ_FAILED = "Khipu couldn't read the work view. It tries again shortly.";
 export const WORK_READ_UNREADABLE = "The work view gave an answer Khipu could not read.";
 
-/** Polls `khipu_work_view` every refresh_s while the tab is open, once a
- *  minute otherwise (the rail badge). `load(true)` after a write waits for a
- *  read already under way, then reads again, so the badge moves at once. */
+/** Polls `khipu_work_view` refresh_s after the previous read ends while the
+ *  tab is open, a minute after otherwise (the rail badge): a slow read never
+ *  has another start behind it. `load(true)` after a write waits for a read
+ *  already under way, then reads again, so the badge moves at once. */
 export function useWork(active: boolean, enabled = true) {
   const [data, setData] = useState<WorkView | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -645,9 +688,16 @@ export function useWork(active: boolean, enabled = true) {
   const every = active ? Math.max(1, data?.refresh_s ?? 5) * 1000 : 60_000;
   useEffect(() => {
     if (!enabled) return;
-    void load();
-    const tick = window.setInterval(() => void load(), every);
-    return () => window.clearInterval(tick);
+    let stopped = false;
+    let timer: number | undefined;
+    const next = () => {
+      if (!stopped) timer = window.setTimeout(() => void load().then(next), every);
+    };
+    void load().then(next);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
   }, [enabled, every, load]);
 
   return { data, error, loading, readAt, load };

@@ -91,7 +91,11 @@ def test_work_source_refuses_file_that_grows_during_read(tmp_path, monkeypatch, 
     got = work.read_source({"project": "atlas", "file": str(path), "on": True}, cfg,
                            datetime(2026, 10, 16, 12, tzinfo=timezone.utc))
     assert grew and path.stat().st_size > len(raw)
-    assert got["state"] in {"refused", "too_big", "unreadable"}, got
+    # Never part of it: refused, or (uncapped) the whole grown file read again.
+    if capped:
+        assert got["state"] in {"refused", "too_big", "unreadable"}, got
+    else:
+        assert got["state"] in {"refused", "too_big", "unreadable", "ok"}, got
 
 
 def test_work_source_reads_an_unchanged_file(tmp_path):

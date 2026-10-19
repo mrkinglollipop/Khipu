@@ -180,6 +180,28 @@ def table_columns(cur, table: str) -> set[str]:
     return _TABLE_COLUMNS_CACHE[table]
 
 
+def prime_table_columns(conn, *tables: str) -> None:
+    """``table_columns`` for every one of ``tables`` not cached yet, in one
+    query instead of one each. Best-effort: an answer it can't read caches
+    nothing, and ``table_columns`` asks again table by table."""
+    missing = [t for t in tables if t not in _TABLE_COLUMNS_CACHE]
+    if not missing:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name, column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = ANY(%s)",
+                (missing,),
+            )
+            got: dict[str, set[str]] = {t: set() for t in missing}
+            for table, column in cur.fetchall():
+                got[table].add(column)
+    except Exception:  # noqa: BLE001  (the per-table reads still answer)
+        return
+    _TABLE_COLUMNS_CACHE.update(got)
+
+
 def has_columns(cur, table: str, *names: str) -> bool:
     cols = table_columns(cur, table)
     return all(name in cols for name in names)

@@ -577,14 +577,21 @@ def _project_text(text: str, table: _Table) -> str:
     return text
 
 
-def _project_walk(value, table):
+def _project_walk(value, table, seen: dict | None = None):
+    # One walk has one table, so a string's projection never changes within
+    # it (``seen``); a view repeats its keys and words thousands of times.
+    if seen is None:
+        seen = {}
     if isinstance(value, str):
-        return _project_text(value, table)
+        got = seen.get(value)
+        if got is None:
+            got = seen[value] = _project_text(value, table)
+        return got
     if isinstance(value, dict):
-        return {(_project_text(k, table) if isinstance(k, str) else k): _project_walk(v, table)
+        return {(_project_walk(k, table, seen) if isinstance(k, str) else k): _project_walk(v, table, seen)
                 for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return type(value)(_project_walk(v, table) for v in value)
+        return type(value)(_project_walk(v, table, seen) for v in value)
     return value
 
 

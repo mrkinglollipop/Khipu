@@ -13,8 +13,8 @@ work, and does it only when the hub answers:
 
 An update is an incremental pull (``hub_snapshot.pull_changes``: what other
 machines and the gateway wrote, missed patches, re-built vectors, decisions);
-a full dump is its fallback, when the pull has too much to catch up or fails
-while the hub answers.
+a full dump is its fallback when memory parts fail while the hub answers.
+Ledger failures rebuild only the ledger, with a separate 15-minute backoff.
 
 Otherwise it does nothing and opens no connection. It never runs from a hook,
 a status read or a tab click. Every dump goes through ``hub_snapshot.refresh``
@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -41,6 +41,11 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
                           "After a failed connection to the database, skip new attempts for this long (0: never skip)"),
 }
 CHECK_EVERY_MIN_S = 60
+LEDGER_RETRY_AFTER_S = 15 * 60
+# Doctor's ledger_copy row: red once a ledger failure has outlived two retries,
+# or the ledger copy is this old while the hub answers.
+LEDGER_ERROR_RED_AFTER_S = 2 * LEDGER_RETRY_AFTER_S
+LEDGER_COPY_MAX_AGE_S = 2 * 3600
 STATE_NAME = "replica-heal.json"
 WAKE_NAME = "replica-wake"
 
@@ -284,25 +289,129 @@ def _full_dump() -> dict[str, Any]:
     return {k: v for k, v in out.items() if k != "path"}
 
 
-def _sync() -> dict[str, Any]:
+def _ledger_retry_due(state: Mapping[str, Any], now: datetime) -> bool:
+    age = _age(now, state.get("last_ledger_refresh_at"))
+    return age is None or age >= LEDGER_RETRY_AFTER_S
+
+
+def _record_ledger_error(state: dict[str, Any], error: Mapping[str, Any], now: datetime) -> None:
+    """Keep the failure's first time across retries: doctor ages it."""
+    since = (state.get("last_ledger_error") or {}).get("since") or now.isoformat()
+    state["last_ledger_error"] = {**error, "needs_refresh": True, "since": since}
+
+
+def _refresh_ledger(state: dict[str, Any], now: datetime) -> dict[str, Any]:
     from khipu import hub_snapshot
 
+    if not _ledger_retry_due(state, now):
+        return {**state["last_ledger_error"],
+                "retry_after": (_utc(state["last_ledger_refresh_at"]) +
+                                timedelta(seconds=LEDGER_RETRY_AFTER_S)).isoformat()}
+    state["last_ledger_refresh_at"] = now.isoformat()
     try:
-        pulled = hub_snapshot.pull_changes()
+        result = hub_snapshot.refresh_ledger()
+    except Exception as exc:  # noqa: BLE001 - retained across checks and reported
+        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    if result.get("ok"):
+        state.pop("last_ledger_error", None)
+    else:
+        result = {**result, "needs_refresh": True}
+        _record_ledger_error(state, result, now)
+    return result
+
+
+def _sync(state: dict[str, Any] | None = None, now: datetime | None = None) -> dict[str, Any]:
+    from khipu import hub_snapshot
+
+    state = {} if state is None else state
+    now = _now() if now is None else now
+    deferred = bool(state.get("last_ledger_error")) and not _ledger_retry_due(state, now)
+    try:
+        pulled = (hub_snapshot.pull_changes(include_ledger=False) if deferred
+                  else hub_snapshot.pull_changes())
     except Exception as exc:  # noqa: BLE001 - a pull that cannot run is a dump's job
         pulled = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     if pulled.get("ok"):
+        ledger = pulled.get("ledger") or {}
+        if deferred or ledger.get("needs_refresh") or not ledger.get("ok", True):
+            if not deferred:
+                _record_ledger_error(state, ledger, now)
+            result = {**pulled, "ledger": _refresh_ledger(state, now)}
+            if result["ledger"].get("ok"):
+                result.pop("failed", None)
+                result.pop("error", None)
+            return result
+        if ledger.get("ok"):
+            state.pop("last_ledger_error", None)
         return pulled
-    # Waiting out a dump in progress or an unreachable hub is the caller's job;
-    # anything else means the pull cannot bring the copy level.
+    # Only memory failures fall back to a full dump. An unreachable hub or a
+    # dump already in progress is waited out by the caller.
     if pulled.get("hub_unreachable") or "in progress" in str(pulled.get("error") or ""):
         return pulled
-    return {**_full_dump(), "fallback_from_pull": pulled.get("error")}
+    result = {**_full_dump(), "fallback_from_pull": pulled.get("error")}
+    if result.get("ok"):
+        state.pop("last_ledger_error", None)
+    return result
+
+
+def _has_ledger_tables() -> bool:
+    import sqlite3
+
+    from khipu.hub_snapshot import snapshot_path
+
+    try:
+        con = sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)
+        try:
+            return con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ledger_rows'"
+                               ).fetchone() is not None
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+
+
+def ledger_copy_status(hub_ok: bool, now: datetime | None = None) -> dict[str, Any]:
+    """Doctor's ``ledger_copy`` block: how old the offline ledger copy is and
+    the retained ledger refresh failure, if any. ``last_ledger_error`` is
+    otherwise read only by this job, so without this a failing refresh left
+    the copy hours old behind a green doctor. Never opens a hub connection."""
+    from khipu import hub_snapshot
+
+    now = _now() if now is None else now
+    state = read_state()
+    err = state.get("last_ledger_error") if isinstance(state.get("last_ledger_error"), dict) else None
+    if err is None and not _has_ledger_tables():
+        return {"ok": True, "state": "not_applicable"}
+    caught_up = hub_snapshot.caught_up_at(ledger=True)
+    age = _age(now, caught_up)
+    out: dict[str, Any] = {"ok": True, "state": "fresh", "ledger_caught_up_at": caught_up, "age_seconds": age}
+    attempted = _utc(state.get("last_ledger_refresh_at"))
+    caught_at = _utc(caught_up)
+    if err is not None and attempted is not None and caught_at is not None and caught_at > attempted:
+        # A full dump (the nightly's, or the app's refresh) caught the ledger
+        # up after the failed attempt; the job clears the error on its next run.
+        err = None
+    if err is not None:
+        since = err.get("since") or state.get("last_ledger_refresh_at")
+        out["last_error"] = {
+            "error": err.get("error") or "failed",
+            "at": state.get("last_ledger_refresh_at"),
+            "since": since,
+            "next_retry_at": (attempted + timedelta(seconds=LEDGER_RETRY_AFTER_S)).isoformat() if attempted else None,
+        }
+        failing_for = _age(now, since)
+        if failing_for is not None and failing_for > LEDGER_ERROR_RED_AFTER_S:
+            out.update(ok=False, state="failing")
+            return out
+        out["state"] = "retrying"
+    if hub_ok and (age is None or age > LEDGER_COPY_MAX_AGE_S):
+        out.update(ok=False, state="old")
+    return out
 
 
 def run() -> dict[str, Any]:
-    """One check. ``ok`` is false only when the hub answered and the work
-    failed; an unreachable hub is waited out, not a failure."""
+    """One check. An unreachable hub is waited out; a retained ledger
+    failure stays visible between retry attempts."""
     from khipu import hub_snapshot
 
     now = _now()
@@ -312,9 +421,14 @@ def run() -> dict[str, Any]:
         now=now, state=state, health=health, sidecar=hub_snapshot._read_sidecar(),
         last_known=hub_snapshot._read_last_known(), refresh_after=float(settings()["replica_refresh_after"]),
     )
+    if action == "none" and state.get("last_ledger_error") and _ledger_retry_due(state, now):
+        action, reason = "ledger", "ledger_needs_refresh"
     state["last_run_at"] = now.isoformat()
     out: dict[str, Any] = {"ok": True, "action": action, "reason": reason}
     if action == "none":
+        if state.get("last_ledger_error"):
+            out.update(ok=False, error=f"ledger: {state['last_ledger_error'].get('error') or 'failed'}",
+                       result={"ledger": _refresh_ledger(state, now)})
         _write_state(state)
         return out
     reachable, error = _hub_reachable()
@@ -325,12 +439,22 @@ def run() -> dict[str, Any]:
         return {**out, "action": "waiting", "planned": action, "reason": "hub_unreachable",
                 "since": state["hub_unreachable_since"], "error": error}
     state.pop("hub_unreachable_since", None)
-    result = _full_dump() if action == "dump" else _sync()
+    if action == "dump":
+        result = _full_dump()
+        if result.get("ok"):
+            state.pop("last_ledger_error", None)
+    elif action == "ledger":
+        result = {"ok": True, "ledger": _refresh_ledger(state, now)}
+    else:
+        result = _sync(state, now)
     out["result"] = result
     if result.get("ok"):
-        state["last_synced_at"] = _now().isoformat()
-        state.pop("last_failed_at", None)
-        state.pop("last_error", None)
+        if action != "ledger":
+            state["last_synced_at"] = _now().isoformat()
+            state.pop("last_failed_at", None)
+            state.pop("last_error", None)
+        elif not state.get("last_failed_at"):
+            state.pop("last_error", None)
     elif "in progress" in str(result.get("error") or ""):
         out["action"] = "skipped"
         out["reason"] = "refresh_in_progress"
@@ -344,5 +468,8 @@ def run() -> dict[str, Any]:
         state["last_failed_at"] = _now().isoformat()
         state["last_error"] = result.get("error")
         out["ok"] = False
+    if result.get("ok") and state.get("last_ledger_error"):
+        out["ok"] = False
+        state["last_error"] = out["error"] = f"ledger: {state['last_ledger_error'].get('error') or 'failed'}"
     _write_state(state)
     return out
