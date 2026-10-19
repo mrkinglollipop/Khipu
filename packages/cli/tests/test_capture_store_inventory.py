@@ -47,6 +47,8 @@ NOT_CAPTURE = {
     "identity.observe_checkout": "per checkout key: its root commit; a hash and the key, no capture text",
     "capture._spool_edit": "per checkout key: observations not yet on the hub (key, root commit, "
                            "project name, kind, time), no capture text",
+    "project_renames._write_last": "the last GitHub rename sweep: time, result, reason words and the project names "
+                                   "renamed, no capture text",
     "discover._save_store": "account discovery results: folder names, CLI kinds and check times",
     "discover.run_once": "a temporary empty folder a CLI status check runs in, removed after",
     "accounts._save_declined": "the logins the owner chose not to be offered again: folder names and CLI kinds",
