@@ -72,7 +72,8 @@ def _write_last(result: dict[str, Any]) -> None:
     prev = _read_last() or {}
     now = datetime.now(timezone.utc).isoformat()
     payload = {"at": now, "result": result["result"], "reason": result.get("reason"),
-               "checked": result.get("checked", 0), "renamed": result.get("renamed", [])}
+               "checked": result.get("checked", 0), "renamed": result.get("renamed", []),
+               "skipped_by_owner": result.get("skipped_by_owner", [])}
     if result["result"] == "ok":
         payload["non_ok_since"] = None
     else:
@@ -92,7 +93,7 @@ def sweep(conn: Any = None, lookup: Callable[[str], tuple[str | None, str | None
 
     lookup = lookup or github_full_name
     own = conn is None
-    out: dict[str, Any] = {"result": "ok", "checked": 0, "renamed": [], "errors": 0}
+    out: dict[str, Any] = {"result": "ok", "checked": 0, "renamed": [], "skipped_by_owner": [], "errors": 0}
     try:
         if own:
             from khipu.db import connect
@@ -127,6 +128,9 @@ def sweep(conn: Any = None, lookup: Callable[[str], tuple[str | None, str | None
             return name
 
         def rename(cur, old: str, new: str, full: str, *, pair: tuple[str, str] | None) -> None:
+            if identity.pair_kept_separate(cur, old, new):
+                out["skipped_by_owner"].append({"old": old, "new": new})
+                return
             res = identity.record_rename(cur, old, new, source="github", evidence={
                 "full_name": full, "checked_at": datetime.now(timezone.utc).isoformat()})
             if not res.get("ok"):

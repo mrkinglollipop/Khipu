@@ -2383,13 +2383,33 @@ async fn khipu_owner_direction_set(key: String, value: String) -> Result<String,
     run_khipu_cli_async(owner_direction_set_argv(&key, &value)?).await
 }
 
-/// A project name as the app sends it: one line, no control characters, and
-/// not so long it is not a name. The CLI checks the rest (an alias of itself,
-/// an unknown pair).
+/// A project name as the app sends it, held to the safe shape the CLI holds
+/// it to (`identity.safe_project_name`): a remote's `owner/repo`
+/// (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,100}`) or a folder name
+/// (`[A-Za-z0-9._][A-Za-z0-9._ -]{0,99}`). Anything else (a `|`, a newline,
+/// a backtick, a leading dash) is refused here, before the CLI is run.
 fn checked_project_name(name: &str) -> Result<String, String> {
     let name = name.trim();
-    if name.is_empty() || name.chars().count() > 300 || has_control(name) {
-        return Err("that is not a project name".to_string());
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
+    let slug = match name.split_once('/') {
+        Some((owner, repo)) => {
+            let n = owner.chars().count();
+            let r = repo.chars().count();
+            owner.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+                && n <= 100
+                && owner.chars().all(word)
+                && (1..=100).contains(&r)
+                && repo.chars().all(word)
+        }
+        None => false,
+    };
+    let folder = name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+        && name.chars().count() <= 100
+        && name.chars().all(|c| word(c) || c == ' ');
+    if !(slug || folder) {
+        return Err("that is not a project name Khipu uses (letters, digits, dots, dashes and underscores, \
+                    with one owner/repo slash at most)"
+            .to_string());
     }
     Ok(name.to_string())
 }
@@ -2424,6 +2444,11 @@ async fn khipu_project_name_add(older: String, current: String) -> Result<String
 #[tauri::command]
 async fn khipu_project_name_remove(older: String) -> Result<String, String> {
     run_khipu_cli_async(project_owner_argv(&["alias", "remove"], &[], &[&older])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_separate(name: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["separate"], &[], &[&name])?).await
 }
 
 #[tauri::command]
@@ -4956,6 +4981,7 @@ pub fn run() {
             khipu_projects_list,
             khipu_project_name_add,
             khipu_project_name_remove,
+            khipu_project_separate,
             khipu_project_merge,
             khipu_project_keep_separate,
             khipu_route_clear,
@@ -5549,11 +5575,25 @@ mod settings_command_tests {
             v(&["project", "merge", "--from-app", "--show-as", "o/b", "--", "o/a", "o/b"])
         );
         assert_eq!(
-            project_owner_argv(&["keep-separate"], &[], &["--x", "o/b"]).unwrap(),
-            v(&["project", "keep-separate", "--from-app", "--", "--x", "o/b"])
+            project_owner_argv(&["separate"], &[], &["o/old"]).unwrap(),
+            v(&["project", "separate", "--from-app", "--", "o/old"])
         );
         assert!(project_owner_argv(&["alias", "remove"], &[], &[""]).is_err());
         assert!(project_owner_argv(&["alias", "remove"], &[], &["a\nb"]).is_err());
+    }
+
+    #[test]
+    fn project_names_are_held_to_the_safe_shape_before_the_cli_runs() {
+        for ok in ["o/old", "my-folder", "my folder.v2", "_x", "a.b/c_d-e", "  o/padded  "] {
+            assert!(checked_project_name(ok).is_ok(), "{ok:?} should pass");
+        }
+        let long_owner = format!("{}/r", "a".repeat(101));
+        let long_folder = "a".repeat(101);
+        for bad in ["", "o/a|o/b", "a|b", "o/a\no/b", "o/a`x`", "--x", "-x", "o/", "/r", "a/b/c", "o /r", "o/a b", "é/x", &long_owner, &long_folder] {
+            assert!(checked_project_name(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert!(project_owner_argv(&["keep-separate"], &[], &["--x", "o/b"]).is_err());
+        assert!(project_owner_argv(&["merge"], &[("--show-as", "o/a|o/b")], &["o/a", "o/b"]).is_err());
     }
 
     #[test]

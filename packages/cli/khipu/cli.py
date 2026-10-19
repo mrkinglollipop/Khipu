@@ -2866,7 +2866,7 @@ def cmd_project(args: argparse.Namespace) -> int:
         from khipu import project_group
 
         return project_group.cmd_list(args)
-    if getattr(args, "project_cmd", None) in ("merge", "keep-separate") or (
+    if getattr(args, "project_cmd", None) in ("merge", "keep-separate", "separate") or (
             getattr(args, "project_cmd", None) == "alias" and getattr(args, "alias_cmd", None) in ("add", "remove")):
         from khipu import project_group
 
@@ -5898,7 +5898,10 @@ def build_parser() -> argparse.ArgumentParser:
     proj_keep = proj_sub.add_parser("keep-separate", help="Keep an asked pair as two projects (owner)")
     proj_keep.add_argument("a")
     proj_keep.add_argument("b")
-    for _p in (proj_merge, proj_keep):
+    proj_sep = proj_sub.add_parser("separate", help="NAME is not its canonical's project: remove it as an older "
+                                   "name and never link them again (owner)")
+    proj_sep.add_argument("name")
+    for _p in (proj_merge, proj_keep, proj_sep):
         owner_direction.add_owner_flags(_p)
         _p.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     proj_ren = proj_sub.add_parser("renames", help="GitHub rename detection")

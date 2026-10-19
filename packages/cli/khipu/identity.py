@@ -406,6 +406,15 @@ def _pair(a: str, b: str) -> tuple[str, str]:
     return (a, b) if a < b else (b, a)
 
 
+def pair_kept_separate(cur, a: str, b: str) -> bool:
+    """The owner said ``a`` and ``b`` are different projects: no automatic
+    linker (the GitHub sweep, the same-checkout path) may link them. A hub
+    without ``project_pairs`` reads as False."""
+    a, b = _pair(a, b)
+    cur.execute("SELECT 1 FROM project_pairs WHERE a = %s AND b = %s AND state = 'kept_separate'", (a, b))
+    return cur.fetchone() is not None
+
+
 def observation_fields(obs: Any) -> tuple[str, str, str, str, float] | None:
     """``(checkout_key, root_commit, project, project_kind, observed_at)`` of a
     well-formed observation, else None."""
@@ -472,6 +481,13 @@ def record_checkout_observation(cur, obs: dict[str, Any]) -> dict[str, Any]:
             elif old_project == project:
                 cur.execute("UPDATE project_checkouts SET project_kind = %s, last_seen_at = to_timestamp(%s) "
                             "WHERE checkout_key = %s", (kind, at, key))
+            elif pair_kept_separate(cur, old_project, project):
+                # The owner said these two are different projects: record
+                # nothing, but follow the checkout's name so this is not
+                # re-evaluated on every capture.
+                cur.execute("UPDATE project_checkouts SET project = %s, project_kind = %s, "
+                            "last_seen_at = to_timestamp(%s) WHERE checkout_key = %s", (project, kind, at, key))
+                out["action"] = "kept_separate"
             elif old_kind == "remote" and kind == "folder":
                 # Origin removed: not a rename, and the remote name stays the
                 # last known one so re-adding it later is not a transition.

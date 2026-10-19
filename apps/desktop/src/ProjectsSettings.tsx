@@ -5,9 +5,12 @@
 
    Every change is one fixed-argv Tauri command that runs `khipu project ...
    --from-app`; the section then re-reads `khipu project list --json`, so what
-   it shows is what the CLI reports. Undo of an older name removes that name;
-   Undo of a kept-separate answer is the owner-actions Undo of the line that
-   recorded it. Reading never runs the GitHub check. */
+   it shows is what the CLI reports. Undo beside an older name is `project
+   separate`: that name becomes its own project again and Khipu records that
+   the pair is kept separate, so no automatic link comes back. Undo of a
+   kept-separate answer is the owner-actions Undo of the line that recorded it
+   (the keep-separate answer, or the separation). Reading never runs the
+   GitHub check. */
 
 import { useEffect, useId, useState } from "react";
 import { Loader2, MessageSquare, HelpCircle } from "lucide-react";
@@ -113,6 +116,16 @@ function newest(g: ProjectGroup): string {
   return g.names.map((n) => n.created_at ?? "").sort().pop() ?? "";
 }
 
+/** The owner-actions line that put `p` in Kept separate: the keep-separate
+ * answer (both names) or the separation of one of them. Names come from the
+ * line's own `facts.names`, never parsed out of its target. */
+function recordedPair(a: OwnerAction, p: ProjectPair): boolean {
+  const names = Array.isArray(a.facts?.names) ? (a.facts?.names as unknown[]) : [];
+  if (a.action === "project.keep_separate") return names.length === 2 && names.includes(p.a) && names.includes(p.b);
+  if (a.action === "project.separate") return names.length === 1 && (names[0] === p.a || names[0] === p.b);
+  return false;
+}
+
 export function ProjectsSettings({ active, state }: { active: boolean; state: ProjectsState }) {
   const { data, error, loading, reload } = state;
   const [busy, setBusy] = useState<string | null>(null);
@@ -121,6 +134,7 @@ export function ProjectsSettings({ active, state }: { active: boolean; state: Pr
   const [older, setOlder] = useState("");
   const [current, setCurrent] = useState("");
   const [showAs, setShowAs] = useState<Record<string, string>>({});
+  const [confirming, setConfirming] = useState<string | null>(null);
   const base = useId();
 
   useEffect(() => {
@@ -152,11 +166,7 @@ export function ProjectsSettings({ active, state }: { active: boolean; state: Pr
       const log = await callCli<{ actions: OwnerAction[] }>("khipu_owner_direction_actions");
       if (!log.ok) return { ok: false, error: `Could not read the record of your answer: ${log.error}` };
       const line = log.data.actions.find(
-        (a) =>
-          a.action === "project.keep_separate" &&
-          a.target === `${p.a}|${p.b}` &&
-          !a.no_undo &&
-          (a.state === "applied" || a.state == null),
+        (a) => recordedPair(a, p) && !a.no_undo && (a.state === "applied" || a.state == null),
       );
       if (!line) {
         return {
@@ -347,17 +357,37 @@ export function ProjectsSettings({ active, state }: { active: boolean; state: Pr
                             className="sm"
                             aria-label={`Undo: ${n.name} is no longer an older name of ${g.canonical}`}
                             disabled={busy !== null}
-                            onClick={() =>
-                              void act(id, async () => {
-                                const res = await callCli("khipu_project_name_remove", { older: n.name });
-                                return res.ok ? { ok: true } : { ok: false, error: res.error };
-                              })
-                            }
+                            onClick={() => setConfirming(confirming === id ? null : id)}
                           >
-                            {busy === id ? <Loader2 size={14} className="spin" aria-hidden /> : null}
                             Undo
                           </button>
                         </div>
+                        {confirming === id ? (
+                          <div className="proj-confirm" role="group" aria-label={`Separate ${n.name}`}>
+                            <p>
+                              {n.name} becomes its own project again. Khipu won&apos;t link them again; you can undo
+                              this from Kept separate.
+                            </p>
+                            <button
+                              type="button"
+                              className="sm"
+                              disabled={busy !== null}
+                              onClick={() =>
+                                void act(id, async () => {
+                                  const res = await callCli("khipu_project_separate", { name: n.name });
+                                  if (res.ok) setConfirming(null);
+                                  return res.ok ? { ok: true } : { ok: false, error: res.error };
+                                })
+                              }
+                            >
+                              {busy === id ? <Loader2 size={14} className="spin" aria-hidden /> : null}
+                              Separate
+                            </button>
+                            <button type="button" className="sm" onClick={() => setConfirming(null)}>
+                              Cancel
+                            </button>
+                          </div>
+                        ) : null}
                         {errors[id] ? (
                           <p className="set-error proj-row-error" role="alert">
                             {errors[id]}

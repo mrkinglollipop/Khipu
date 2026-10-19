@@ -81,14 +81,28 @@ it("lists each project with its older names, how Khipu knew, and no word 'alias'
   expect(document.body.textContent).not.toMatch(/alias/i);
 });
 
-it("Undo on an older name removes that name from the app", async () => {
+it("Undo on an older name asks first, then separates it (not a plain remove)", async () => {
   bridge(LIST);
   render(<Harness />);
   const group = await screen.findByRole("group", { name: NEW });
   fireEvent.click(within(group).getByRole("button", { name: /Undo/ }));
-  await waitFor(() => expect(calls("khipu_project_name_remove")).toEqual([{ older: OLD }]));
+  expect(calls("khipu_project_separate")).toEqual([]);
+  expect(within(group).getByText(`${OLD} becomes its own project again. Khipu won't link them again; you can undo this from Kept separate.`)).toBeTruthy();
+  fireEvent.click(within(group).getByRole("button", { name: "Separate" }));
+  await waitFor(() => expect(calls("khipu_project_separate")).toEqual([{ name: OLD }]));
+  expect(calls("khipu_project_name_remove")).toEqual([]);
   // Two reads on open (the app's start-up read and the section's own), then one after the change.
   await waitFor(() => expect(calls("khipu_projects_list").length).toBe(3));
+});
+
+it("Cancel on the separate question changes nothing", async () => {
+  bridge(LIST);
+  render(<Harness />);
+  const group = await screen.findByRole("group", { name: NEW });
+  fireEvent.click(within(group).getByRole("button", { name: /Undo/ }));
+  fireEvent.click(within(group).getByRole("button", { name: "Cancel" }));
+  expect(within(group).queryByText(/becomes its own project again/)).toBeNull();
+  expect(calls("khipu_project_separate")).toEqual([]);
 });
 
 it("asks the pair with no default answer, offers the most recently used name, and Merge sends it", async () => {
@@ -123,8 +137,8 @@ it("Undo on a kept-separate pair undoes the owner-action line that recorded it",
   bridge(LIST, {
     khipu_owner_direction_actions: () => ({
       actions: [
-        { id: "aaaaaaaa", at: "x", action: "project.keep_separate", target: `${SITE}|${SITE_OLD}`, state: "undone" },
-        { id: "bbbbbbbb", at: "x", action: "project.keep_separate", target: `${SITE}|${SITE_OLD}`, state: "applied" },
+        { id: "aaaaaaaa", at: "x", action: "project.keep_separate", target: "x", facts: { names: [SITE_OLD, SITE] }, state: "undone" },
+        { id: "bbbbbbbb", at: "x", action: "project.keep_separate", target: "x", facts: { names: [SITE_OLD, SITE] }, state: "applied" },
       ],
     }),
   });
@@ -133,6 +147,19 @@ it("Undo on a kept-separate pair undoes the owner-action line that recorded it",
   const row = screen.getByText(SITE).closest(".oldname") as HTMLElement;
   fireEvent.click(within(row).getByRole("button", { name: /Undo/ }));
   await waitFor(() => expect(calls("khipu_owner_direction_undo")).toEqual([{ id: "bbbbbbbb" }]));
+});
+
+it("Undo on a pair that was separated undoes the separation line", async () => {
+  bridge(LIST, {
+    khipu_owner_direction_actions: () => ({
+      actions: [{ id: "cccccccc", at: "x", action: "project.separate", target: SITE_OLD, facts: { names: [SITE_OLD] }, state: "applied" }],
+    }),
+  });
+  render(<Harness />);
+  await screen.findByText("Kept separate");
+  const row = screen.getByText(SITE).closest(".oldname") as HTMLElement;
+  fireEvent.click(within(row).getByRole("button", { name: /Undo/ }));
+  await waitFor(() => expect(calls("khipu_owner_direction_undo")).toEqual([{ id: "cccccccc" }]));
 });
 
 it("Undo on a kept-separate pair with no undoable record says so and changes nothing", async () => {

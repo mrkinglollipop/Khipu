@@ -82,6 +82,7 @@ ACTIONS: frozenset[str] = frozenset({
     "ledger.restore", "ledger.purge", "ledger.project", "ledger.add", "ledger.set", "ledger.remove", "work.hide", "work.unhide",
     "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
     "direction.undo", "project.alias_add", "project.alias_remove", "project.merge", "project.keep_separate",
+    "project.separate",
 })
 
 
@@ -1495,6 +1496,7 @@ _UNDO = {
     "project.alias_remove": _undo_project_group,
     "project.merge": _undo_project_group,
     "project.keep_separate": _undo_project_group,
+    "project.separate": _undo_project_group,
     "owed.change": _undo_owed_change,
     "owed.tidy": _undo_owed_tidy,
     "direction.off": _undo_direction,

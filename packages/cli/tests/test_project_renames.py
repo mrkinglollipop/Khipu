@@ -711,3 +711,17 @@ def test_an_older_pull_never_replaces_newer_aliases(replica):
     con = sqlite3.connect(str(replica))
     assert con.execute("SELECT alias, project FROM project_aliases").fetchall() == [("o/x", B)]
     con.close()
+
+
+def test_a_kept_separate_pair_is_not_linked_by_the_checkout_path(cur):
+    cur.execute("INSERT INTO project_pairs (a, b, state, decided_at) VALUES (%s, %s, 'kept_separate', now())", (A, B))
+    cur.execute("INSERT INTO project_pairs (a, b, state, decided_at) VALUES ('newdir', 'olddir', 'kept_separate', now())")
+    with mock.patch.object(identity, "github_confirms_rename", side_effect=AssertionError("asked GitHub")):
+        out = _observe(cur, _obs("1:10", B, "remote", 1), _obs("1:10", A, "remote", 2),
+                       _obs("2:20", "olddir", "folder", 1), _obs("2:20", "newdir", "folder", 2))
+    assert [o["action"] for o in out] == ["first", "kept_separate", "first", "kept_separate"]
+    assert _aliases(cur) == {}
+    cur.execute("SELECT state FROM project_pairs")
+    assert {r[0] for r in cur.fetchall()} == {"kept_separate"}
+    cur.execute("SELECT project FROM project_checkouts WHERE checkout_key = '1:10'")
+    assert cur.fetchone()[0] == A

@@ -26,7 +26,8 @@ ACTION_ALIAS_ADD = "project.alias_add"
 ACTION_ALIAS_REMOVE = "project.alias_remove"
 ACTION_MERGE = "project.merge"
 ACTION_KEEP_SEPARATE = "project.keep_separate"
-ACTIONS = (ACTION_ALIAS_ADD, ACTION_ALIAS_REMOVE, ACTION_MERGE, ACTION_KEEP_SEPARATE)
+ACTION_SEPARATE = "project.separate"
+ACTIONS = (ACTION_ALIAS_ADD, ACTION_ALIAS_REMOVE, ACTION_MERGE, ACTION_KEEP_SEPARATE, ACTION_SEPARATE)
 
 ASKED, MERGED, KEPT = "asked", "merged", "kept_separate"
 _PAIR_COLS = "a, b, root_commit, state, created_at, decided_at"
@@ -246,6 +247,27 @@ def keep_separate(cur, a: str, b: str) -> dict:
     return {"ok": True, "pair": [row["a"], row["b"]], "pair_state": KEPT}
 
 
+def separate(cur, name: str) -> dict:
+    """``name`` is not its canonical's project: its alias row is removed and
+    the pair (name, canonical) is recorded as kept separate, so no automatic
+    linker (the GitHub sweep, the same-checkout path) links it again."""
+    name = (name or "").strip()
+    cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (name,))
+    row = cur.fetchone()
+    if row is None:
+        return {"ok": False, "error": f"{name} is not an older name of another project; nothing was changed"}
+    canonical = str(row[0])
+    res = identity.remove_project_alias(cur, name)
+    if not res.get("ok"):
+        return res
+    a, b = identity._pair(name, canonical)
+    if _pair_row(cur, name, canonical) is None:
+        cur.execute("INSERT INTO project_pairs (a, b, state, decided_at) VALUES (%s, %s, %s, now())", (a, b, KEPT))
+    else:
+        _set_pair(cur, name, canonical, KEPT)
+    return {"ok": True, "name": name, "canonical": canonical, "pair": [a, b], "pair_state": KEPT}
+
+
 # ---- one owner action, its exact delta, and its Undo -----------------------------------------
 #
 # Every owner action runs under the one lock ``identity.record_rename`` takes
@@ -305,35 +327,40 @@ def _delta(before: dict[str, dict], after: dict[str, dict]) -> list[dict]:
     return out
 
 
-def apply(cur, action: str, target: str, show_as: str | None = None) -> dict:
-    """One owner action (``target`` as the log has it: ``alias|canonical``,
-    ``alias`` or ``a|b``) under the group lock, its result carrying ``delta``.
-    The caller commits on ``ok`` and rolls back otherwise."""
+def apply(cur, action: str, names: list[str], show_as: str | None = None) -> dict:
+    """One owner action on ``names`` (alias then canonical, a then b, or the
+    one name) under the group lock, its result carrying ``delta``. The caller
+    commits on ``ok`` and rolls back otherwise."""
     _lock(cur)
     pair = None
     if action == ACTION_ALIAS_ADD:
-        alias, _, canonical = target.partition("|")
-        names = [alias, canonical]
-    elif action == ACTION_ALIAS_REMOVE:
-        names = [target]
+        group = list(names)
+    elif action in (ACTION_ALIAS_REMOVE, ACTION_SEPARATE):
+        group = list(names)
+        if action == ACTION_SEPARATE:
+            cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (names[0],))
+            row = cur.fetchone()
+            if row is not None:
+                pair, group = (names[0], str(row[0])), [names[0], str(row[0])]
     else:
-        a, _, b = target.partition("|")
-        pair, names = (a, b), _members(cur, [a, b])
-    before = _alias_snapshot(cur, names)
+        pair, group = (names[0], names[1]), _members(cur, names)
+    before = _alias_snapshot(cur, group)
     pair_before = _pair_state(cur, *pair) if pair else None
     if action == ACTION_ALIAS_ADD:
-        out = identity.add_project_alias(cur, alias, canonical)
+        out = identity.add_project_alias(cur, names[0], names[1])
     elif action == ACTION_ALIAS_REMOVE:
-        out = identity.remove_project_alias(cur, target)
+        out = identity.remove_project_alias(cur, names[0])
     elif action == ACTION_MERGE:
-        out = merge(cur, pair[0], pair[1], show_as or "")
+        out = merge(cur, names[0], names[1], show_as or "")
     elif action == ACTION_KEEP_SEPARATE:
-        out = keep_separate(cur, *pair)
+        out = keep_separate(cur, names[0], names[1])
+    elif action == ACTION_SEPARATE:
+        out = separate(cur, names[0])
     else:
         return {"ok": False, "error": f"unknown project action {action}"}
     if not out.get("ok"):
         return out
-    delta: dict[str, Any] = {"aliases": _delta(before, _alias_snapshot(cur, names))}
+    delta: dict[str, Any] = {"names": list(names), "aliases": _delta(before, _alias_snapshot(cur, group))}
     if pair:
         pair_after = _pair_state(cur, *pair)
         if pair_after != pair_before:
@@ -423,6 +450,8 @@ def undo(cur, action: str, target: str, result: dict | None) -> dict:
     if pair and pair.get("old"):
         cur.execute("UPDATE project_pairs SET state = %s, decided_at = %s::timestamptz WHERE a = %s AND b = %s",
                     (pair["old"]["state"], pair["old"]["decided_at"], pair["a"], pair["b"]))
+    elif pair:
+        cur.execute("DELETE FROM project_pairs WHERE a = %s AND b = %s", (pair["a"], pair["b"]))
     # A row put back must not point at a name that has since become an alias,
     # nor be pointed at while being an alias itself (groups have no chains).
     touched = sorted({*names, *(c["old"]["project"] for c in changes if c["op"] != "insert")})
@@ -561,21 +590,42 @@ def _gate(args, want: dict) -> int | None:
                            "typing in (owner direction) can make this change; nothing was changed"}, 2)
 
 
+def check_names(names: list[Any]) -> str | None:
+    """A plain refusal when any of ``names`` is not of the safe shape a project
+    name has (a remote's ``owner/repo`` or a folder name), else None. Run
+    before the owner's gate and before anything is written."""
+    for n in names:
+        if not identity.safe_project_name(n):
+            return ("that is not a project name Khipu uses (letters, digits, dots, dashes and underscores, "
+                    "with one owner/repo slash at most); nothing was changed")
+    return None
+
+
 def cmd_owner(args) -> int:
-    """``khipu project alias add|remove``, ``merge`` and ``keep-separate``
-    behind the owner's gate, with the owner-actions log and Undo."""
+    """``khipu project alias add|remove``, ``merge``, ``keep-separate`` and
+    ``separate`` behind the owner's gate, with the owner-actions log and Undo.
+    The names travel as a list (the log keeps them in ``facts.names``); the
+    log's ``target`` is only a label to read."""
     from khipu import owner_direction
     from khipu.db import connect
 
     cmd, sub = args.project_cmd, getattr(args, "alias_cmd", None)
     if cmd == "alias" and sub == "add":
-        action, target = ACTION_ALIAS_ADD, f"{args.alias.strip()}|{args.canonical.strip()}"
+        action, names = ACTION_ALIAS_ADD, [args.alias.strip(), args.canonical.strip()]
     elif cmd == "alias":
-        action, target = ACTION_ALIAS_REMOVE, args.alias.strip()
+        action, names = ACTION_ALIAS_REMOVE, [args.alias.strip()]
+    elif cmd == "separate":
+        action, names = ACTION_SEPARATE, [args.name.strip()]
     else:
-        pa, pb = identity._pair(args.a.strip(), args.b.strip())
-        action, target = (ACTION_MERGE if cmd == "merge" else ACTION_KEEP_SEPARATE), f"{pa}|{pb}"
-    facts = {"show_as": args.show_as.strip()} if cmd == "merge" else None
+        names = list(identity._pair(args.a.strip(), args.b.strip()))
+        action = ACTION_MERGE if cmd == "merge" else ACTION_KEEP_SEPARATE
+    show_as = args.show_as.strip() if cmd == "merge" else None
+    why = check_names([*names, *([show_as] if show_as else [])])
+    if why:
+        return _emit({"ok": False, "code": "bad_name", "error": why}, 2)
+    target, facts = " and ".join(names), {"names": names}
+    if show_as:
+        facts["show_as"] = show_as
     try:
         refused = _gate(args, owner_direction.intent(action, target, facts=facts))
     except Exception as exc:  # noqa: BLE001
@@ -585,7 +635,7 @@ def cmd_owner(args) -> int:
     try:
         with connect() as conn:
             with conn.cursor() as cur:
-                out = apply(cur, action, target, show_as=(facts or {}).get("show_as"))
+                out = apply(cur, action, names, show_as=show_as)
             # The log's finish line (which keeps ``delta`` for Undo) is
             # written below, only after this commit succeeded.
             if out.get("ok"):

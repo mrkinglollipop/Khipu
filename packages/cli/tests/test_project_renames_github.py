@@ -190,3 +190,15 @@ def test_doctor_block_skipped_recently_is_ok_then_yellow_after_three_days(conn):
     assert pr.doctor_block(conn.cursor())["severity"] == "yellow"
     pr._write_last({"result": "ok"})
     assert pr.doctor_block(conn.cursor())["severity"] == "ok"
+
+
+def test_a_kept_separate_pair_is_never_linked_by_the_sweep(conn):
+    _episode(conn, OLD)
+    conn.execute("INSERT INTO project_pairs (a, b, state, decided_at) VALUES (%s, %s, 'kept_separate', now())",
+                 tuple(sorted((OLD, NEW))))
+    conn.commit()
+    out = pr.sweep(conn, _answers({OLD: (NEW, None)}))
+    assert out["result"] == "ok" and out["renamed"] == []
+    assert out["skipped_by_owner"] == [{"old": OLD, "new": NEW}]
+    assert _rows(conn, "SELECT alias FROM project_aliases") == []
+    assert _rows(conn, "SELECT state FROM project_pairs") == [("kept_separate",)]

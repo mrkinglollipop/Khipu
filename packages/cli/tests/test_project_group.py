@@ -156,7 +156,8 @@ def test_alias_add_applies_logs_and_undoes(pg):
     assert not is_error and out["changed"] is True and out["owner_action"]
     assert [(r[0], r[1], r[2]) for r in _aliases(pg)] == [(A, B, "owner")]
     line = _line("project.alias_add")
-    assert (line["auth"], line["state"], line["target"]) == ("direction", "applied", f"{A}|{B}")
+    assert (line["auth"], line["state"], line["target"]) == ("direction", "applied", f"{A} and {B}")
+    assert line["facts"]["names"] == [A, B]
     is_error, undone = _act("direction.undo", {"id": out["owner_action"]})
     assert not is_error and undone["ok"]
     assert _aliases(pg) == []
@@ -383,3 +384,91 @@ def test_an_unsafe_name_never_reaches_the_slice_text():
     assert len(block) <= project_group.SLICE_BLOCK_CHARS
     worst = [{"a": "(", "b": ")"}] * 5
     assert len("\n".join(project_group.slice_lines(worst))) <= project_group.SLICE_BLOCK_CHARS
+
+
+# ---- separate: "this name is not that project", and every automatic linker respects it -----------
+
+
+def _github_alias(cur, alias=A, canonical=B):
+    cur.execute("INSERT INTO project_aliases (alias, project, source, evidence) VALUES (%s, %s, 'github', %s::jsonb)",
+                (alias, canonical, json.dumps({"full_name": canonical})))
+    cur.connection.commit()
+
+
+def test_separate_removes_the_alias_records_the_pair_logs_and_undoes_exactly(pg):
+    _github_alias(pg)
+    before = _aliases(pg)
+    is_error, out = _act("project.separate", {"name": A})
+    assert not is_error and out["pair_state"] == "kept_separate" and out["canonical"] == B, out
+    assert _aliases(pg) == [] and _pairs(pg) == {(A, B): "kept_separate"}
+    line = _line("project.separate")
+    assert (line["state"], line["facts"]["names"], line["target"]) == ("applied", [A], A)
+    delta = line["result"]["delta"]
+    assert [c["op"] for c in delta["aliases"]] == ["delete"] and delta["pair"]["old"] is None
+    assert not _act("direction.undo", {"id": out["owner_action"]})[0]
+    assert _aliases(pg) == before and _pairs(pg) == {}
+
+
+def test_separate_undo_restores_a_previous_pair_state(pg):
+    _seed(pg)
+    pg.execute("UPDATE project_pairs SET state = 'merged', decided_at = now() WHERE a = %s AND b = %s", (A, B))
+    _github_alias(pg)
+    before_pair = _pairs(pg)
+    is_error, out = _act("project.separate", {"name": A})
+    assert not is_error and _pairs(pg)[(A, B)] == "kept_separate"
+    assert not _act("direction.undo", {"id": out["owner_action"]})[0]
+    assert _pairs(pg) == before_pair and [r[0] for r in _aliases(pg)] == [A]
+
+
+def test_separate_refuses_a_name_that_is_not_an_older_name(pg):
+    _seed(pg)
+    is_error, out = _act("project.separate", {"name": OTHER})
+    assert is_error and "not an older name" in json.dumps(out)
+    assert _aliases(pg) == [] and _pairs(pg)[(A, B)] == "asked"
+
+
+def test_separate_undo_refuses_after_a_later_change_and_changes_nothing(pg):
+    _github_alias(pg)
+    is_error, out = _act("project.separate", {"name": A})
+    assert not is_error
+    pg.execute("INSERT INTO project_aliases (alias, project) VALUES (%s, %s)", (A, OTHER))
+    pg.connection.commit()
+    state = (_aliases(pg), _pairs(pg))
+    is_error, err = _act("direction.undo", {"id": out["owner_action"]})
+    assert is_error and "alias again" in json.dumps(err), err
+    assert (_aliases(pg), _pairs(pg)) == state
+    # and when the pair itself was changed since
+    pg.execute("DELETE FROM project_aliases")
+    pg.execute("UPDATE project_pairs SET state = 'asked', decided_at = NULL")
+    pg.connection.commit()
+    is_error, err = _act("direction.undo", {"id": out["owner_action"]})
+    assert is_error and "was changed since" in json.dumps(err), err
+    assert _pairs(pg) == {(A, B): "asked"}
+
+
+def test_separate_through_the_cli_with_the_app_flag(pg, monkeypatch, capsys):
+    from khipu import routing
+
+    _github_alias(pg)
+    monkeypatch.setattr(routing, "_caller", lambda: {"app": True})
+    assert cli.main(["project", "separate", "--from-app", A]) == 0
+    assert json.loads(capsys.readouterr().out)["pair_state"] == "kept_separate"
+    assert _aliases(pg) == [] and _pairs(pg) == {(A, B): "kept_separate"}
+
+
+@pytest.mark.parametrize("bad", ["o/a|o/b", "o/a\no/b", "o/a\n", "o/a`x`", "-x", "a b|c"])
+def test_unsafe_names_are_refused_before_the_gate_and_any_write(pg, capsys, bad):
+    _seed(pg)
+    before = (_aliases(pg), _pairs(pg), list(owner_direction.actions()))
+    # The CLI strips whitespace, and argparse takes a leading dash for a flag.
+    for argv in () if bad.strip() != bad or bad.startswith("-") else (["project", "alias", "add", bad, B], ["project", "alias", "remove", bad],
+                 ["project", "merge", bad, B, "--show-as", B], ["project", "keep-separate", A, bad],
+                 ["project", "separate", bad]):
+        assert cli.main(argv) == 2
+        assert json.loads(capsys.readouterr().out)["code"] == "bad_name"
+    for action, args in (("project.alias_add", {"alias": bad, "canonical": B}), ("project.alias_remove", {"alias": bad}),
+                         ("project.merge", {"a": A, "b": bad, "show_as": A}),
+                         ("project.keep_separate", {"a": bad, "b": B}), ("project.separate", {"name": bad})):
+        is_error, out = _act(action, args)
+        assert is_error and out["code"] == "bad_args", out
+    assert (_aliases(pg), _pairs(pg), list(owner_direction.actions())) == before
