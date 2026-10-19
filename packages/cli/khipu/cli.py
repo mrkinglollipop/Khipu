@@ -820,6 +820,18 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         t3_health = _t3.health()
     except Exception:  # noqa: BLE001 — doctor must never fail on T3 drift
         t3_health = None
+    # Advisory: aliases, pairs waiting for the owner and the last GitHub
+    # sweep. Never gates `ok`; yellow is a severity field, not a failure.
+    project_renames_block = None
+    if hub_ok:
+        try:
+            from khipu import project_renames as _pr
+            from khipu.db import connect as _pr_connect
+
+            with _pr_connect() as _pr_conn, _pr_conn.cursor() as _pr_cur:
+                project_renames_block = _pr.doctor_block(_pr_cur)
+        except Exception as e:  # noqa: BLE001
+            project_renames_block = {"error": f"{type(e).__name__}: {e}"}
     # The switch registry's states, for visibility only — never gates `ok`.
     try:
         from khipu import features
@@ -988,6 +1000,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "launchers": launchers,
         "claude_homes": claude_homes_block,
         **({"t3": t3_health} if t3_health is not None else {}),
+        **({"project_renames": project_renames_block} if project_renames_block is not None else {}),
         "features": features_block,
         "decision_links": decision_links_block,
         "plan_usage": plan_usage_block,
@@ -2856,8 +2869,10 @@ def cmd_project(args: argparse.Namespace) -> int:
         return project_group.cmd_owner(args)
     if getattr(args, "project_cmd", None) == "alias":
         return cmd_project_alias(args)
+    if getattr(args, "project_cmd", None) == "renames":
+        return cmd_project_renames(args)
     if getattr(args, "project_cmd", None) != "backfill":
-        print(json.dumps({"ok": False, "error": "usage: khipu project backfill [--dry-run|--apply] | alias add|list|remove"}))
+        print(json.dumps({"ok": False, "error": "usage: khipu project backfill [--dry-run|--apply] | alias add|list|remove | renames check"}))
         return 2
     from khipu.db import connect
     from khipu import hygiene
@@ -2875,6 +2890,24 @@ def cmd_project(args: argparse.Namespace) -> int:
     report["dry_run"] = not apply
     print(json.dumps(report, indent=2, default=str))
     return 0
+
+
+def cmd_project_renames(args: argparse.Namespace) -> int:
+    """`khipu project renames check [--json]`: run the GitHub rename sweep now.
+    Exit 0 for ok and skipped (no gh is not an error), 1 when the sweep failed."""
+    from khipu import project_renames
+
+    res = project_renames.sweep()
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2, default=str))
+    elif res["result"] == "ok":
+        print(f"checked {res['checked']}, renames recorded {len(res['renamed'])}"
+              + "".join(f"\n  {r['old']} -> {r['new']}" for r in res["renamed"]))
+    elif res["result"] == "skipped":
+        print(f"skipped: {res.get('reason')}; nothing changed")
+    else:
+        print(f"failed: {res.get('error')}", file=sys.stderr)
+    return 1 if res["result"] == "failed" else 0
 
 
 def cmd_project_alias(args: argparse.Namespace) -> int:
@@ -5862,6 +5895,10 @@ def build_parser() -> argparse.ArgumentParser:
     for _p in (proj_merge, proj_keep):
         owner_direction.add_owner_flags(_p)
         _p.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
+    proj_ren = proj_sub.add_parser("renames", help="GitHub rename detection")
+    ren_sub = proj_ren.add_subparsers(dest="renames_cmd", required=True)
+    ren_check = ren_sub.add_parser("check", help="Ask GitHub what recent projects are called now; record renames")
+    ren_check.add_argument("--json", action="store_true")
     proj.set_defaults(func=cmd_project)
 
     hy = sub.add_parser("hygiene", help="Graph hygiene jobs (memory reliability W5.2)")

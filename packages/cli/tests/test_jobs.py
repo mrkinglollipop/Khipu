@@ -22,6 +22,11 @@ class JobsRunTest(unittest.TestCase):
         self.data_dir = self.root / "data"
         self.log_dir = self.root / "logs"
 
+        # The rename sweep reaches for the hub and gh: never in these tests.
+        patcher = mock.patch.object(jobs, "_project_renames_sweep", return_value={"ok": True})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def tearDown(self):
         self.tmp.cleanup()
 
@@ -81,7 +86,7 @@ class JobsRunTest(unittest.TestCase):
                 self.assertEqual(jobs.run_nightly(), expected)
             script.assert_called_once()
             self.assertFalse(record.call_args_list[0].kwargs["ok"])
-            self.assertEqual(record.call_count, 10)
+            self.assertEqual(record.call_count, 11)
 
     def test_run_nightly_writes_nightly_last_json_with_every_step(self):
         """F3/D1: nightly-last.json is the persisted evidence Phase 6 will
@@ -101,7 +106,7 @@ class JobsRunTest(unittest.TestCase):
             names,
             ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
              "query_cache_prune", "commitments_close_rules", "commitments_mark_stale",
-             "commitments_hygiene", "ledger",
+             "commitments_hygiene", "ledger", "project_renames",
              "snapshot_refresh"],
         )
         for step in payload["steps"]:

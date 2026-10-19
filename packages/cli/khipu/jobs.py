@@ -340,6 +340,8 @@ def run_nightly() -> int:
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
     _record_nightly_step(steps, "commitments_hygiene", **_step_result(_hygiene_commitments()))
     _record_nightly_step(steps, "ledger", **_step_result(_ledger_nightly()))
+    # Before the replica refresh, so a rename found tonight reaches the replica tonight.
+    _record_nightly_step(steps, "project_renames", **_step_result(_project_renames_sweep()))
     _record_nightly_step(steps, "snapshot_refresh", **_step_result(_refresh_snapshot()))
     briefs_result = _briefs_build_if_on()
     if briefs_result is not None:
@@ -349,6 +351,23 @@ def run_nightly() -> int:
     if final_rc != rc:
         _write_job_state("nightly", final_rc)
     return final_rc
+
+
+def _project_renames_sweep() -> dict[str, Any]:
+    """Ask GitHub what each recent project is called now. A skipped sweep (no
+    ``gh``, not signed in) is recorded as ok with its reason under ``why``; it
+    is never a nightly failure."""
+    try:
+        from khipu import project_renames
+
+        res = project_renames.sweep()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    out = {k: v for k, v in res.items() if k != "reason"}
+    out["ok"] = res["result"] != "failed"
+    if res.get("reason"):
+        out["why"] = res["reason"]
+    return out
 
 
 def _ledger_nightly() -> dict[str, Any]:

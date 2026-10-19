@@ -403,6 +403,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
                     mock.patch("khipu.embed.prune_query_cache", return_value=0), \
                     mock.patch.object(jobs, "_commitment_close_rules", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True, "stale": 0}), \
+                    mock.patch.object(jobs, "_project_renames_sweep", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_hygiene_commitments", return_value={"ok": True}):
                 jobs.run_nightly()
             payload = json.loads((Path(data_td) / "nightly-last.json").read_text())
@@ -411,7 +412,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
             names,
             {"sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
              "query_cache_prune", "commitments_close_rules", "commitments_mark_stale", "commitments_hygiene", "ledger",
-             "snapshot_refresh"},
+             "project_renames", "snapshot_refresh"},
         )
         for step in payload["steps"]:
             self.assertIn("ok", step)
