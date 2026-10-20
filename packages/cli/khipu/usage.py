@@ -1416,7 +1416,7 @@ def probe_glm(*, timeout: float = TIMEOUT_S) -> dict:
 ACCOUNTS_MAX = 32
 LABEL_MAX = 64
 HOME_MAX = 1024
-_ACCOUNT_FIELDS = ("label", "harness", "home")
+_ACCOUNT_FIELDS = ("label", "harness", "home", "label_source")
 
 
 class AccountsError(ValueError):
@@ -1471,6 +1471,8 @@ def _account_from_entry(entry) -> dict:
     home = entry.get("home")
     home = str(home).strip() if isinstance(home, str) and home.strip() else None
     account = {"label": label, "harness": harness or "?", "home": home}
+    if entry.get("label_source") in ("owner", "suggested"):
+        account["label_source"] = entry["label_source"]
     problem = _entry_problem(harness, home)
     if problem:
         account["invalid"] = problem[2]
@@ -1651,9 +1653,13 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
         if problem:
             code, field, reason = problem
             raise AccountsError(f"{where}: {reason}", code, index=i, field=field)
+        if entry.get("label_source") not in (None, "owner", "suggested"):
+            raise AccountsError(f"{where}: label_source must be owner or suggested", "bad_entry",
+                                index=i, field="label_source")
         account = _account_from_entry(entry)
+        account["label_source"] = entry.get("label_source") or ("owner" if entry.get("label") else "suggested")
         checked.append((account, False))
-        stored = {"label": account["label"], "harness": account["harness"]}
+        stored = {"label": account["label"], "harness": account["harness"], "label_source": account["label_source"]}
         if account["home"]:
             stored["home"] = account["home"]
         out.append(stored)
@@ -2181,6 +2187,8 @@ def public_row(row: dict) -> dict:
     out = {k: row[k] for k in _PUBLIC_ROW_FIELDS if k in row}
     out["id"] = routing.account_id(_key({"harness": harness, "home": home}))
     out["harness"] = harness if harness in HARNESSES else "?"
+    if routing.account_label_source(_key(row)) == "suggested":
+        out["naming_hint"] = routing.account_identity.NAME_ACCOUNT
     for field in ("error", "live_error", "last_error"):
         if field in out and out[field] is not None and not _is_code(out[field]):
             out[field] = E_INTERNAL

@@ -909,7 +909,8 @@ def accounts() -> list[dict]:
         if account.get("invalid"):
             continue
         out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],
-                    "home": account.get("home")})
+                    "home": account.get("home"),
+                    **({"label_source": account["label_source"]} if "label_source" in account else {})})
     return out
 
 
@@ -939,7 +940,8 @@ def _fold_accounts(config: dict) -> list[dict]:
         if account.get("invalid"):
             continue
         out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],
-                    "home": account.get("home")})
+                    "home": account.get("home"),
+                    **({"label_source": account["label_source"]} if "label_source" in account else {})})
     return out
 
 
@@ -2177,6 +2179,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
     underlying = {"state": state, "until": _iso(behind["until"]) if behind and state in (LIMITED, PROBABLY_OPEN)
                   else None, "basis": behind["basis"] if behind and state in (LIMITED, PROBABLY_OPEN) else None}
     entry = {"key": key, "label": account["label"], "harness": account["harness"], "home": account.get("home"),
+             "label_source": account_identity.label_source(account),
              "state": state, "until": underlying["until"], "basis": underlying["basis"], "scope": "all",
              "reason": DOWN_REASONS.get(behind.get("reason") or "", "out of service")
              if state == DOWN and behind else None,
@@ -2415,6 +2418,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     lane_map = cfg.get("routing_lane_map") or {}
     stale_after = cfg["routing_stale_after"]
     events = _in_write_order(events)
+    known = account_identity.with_provenance(known, events)
     key_ids, stable_forwards, aliases = account_identity.state(events, known)
     stable_keys = {v: k for k, v in key_ids.items()}
     # Prefer the current binding over a historical login folder.
@@ -4650,6 +4654,8 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
     if entry.get("configured") is False and (entry.get("note") or [None])[0] == "untracked" \
             and _NOT_CONFIGURED not in text:
         text += "; no longer tracked"
+    if entry.get("label_source") == "suggested" and entry.get("configured") is not False:
+        text += "; " + account_identity.NAME_ACCOUNT
     return text
 
 
@@ -5799,18 +5805,27 @@ def _read_identity_events() -> list[dict]:
 
 def _identity_snapshot(known: list[dict], *, events: list[dict] | None = None) -> tuple:
     """One identity/log walk per input revision, never per public row."""
-    revision = (_identity_revision(), tuple((a["key"], a["label"], a["harness"], a.get("home")) for a in known))
+    revision = (_identity_revision(), tuple((a["key"], a["label"], a["harness"], a.get("home"),
+                                              a.get("label_source")) for a in known))
     cached = _IDENTITY_CACHE.get(revision)
     if cached is not None:
         return cached
     events = _in_write_order(_read_identity_events() if events is None else
                              [e for e in events if e.get("type") in _IDENTITY_KINDS])
-    result = (account_identity.state(events, known), forwarding(events))
+    known = account_identity.with_provenance(known, events)
+    result = (account_identity.state(events, known), forwarding(events),
+              {a["key"]: a["label_source"] for a in known})
     if len(_IDENTITY_CACHE) >= 8:
         _IDENTITY_CACHE.clear()
     _IDENTITY_CACHE[revision] = result
     return result
 
+
+
+def account_label_source(key: str) -> str:
+    from khipu.config import load_config
+
+    return _identity_snapshot(_fold_accounts(load_config()))[2].get(key, "owner")
 
 
 def _id_salt() -> bytes:
@@ -5868,14 +5883,14 @@ def migrate_accounts() -> None:
         if not any(e.get("type") == "account_migration" and
                    (e.get("written_by") or {}).get("kind") in ("owner", "migration") for e in events):
             known = accounts()
-            bindings = account_identity.unique_ids(known)
+            bindings = account_identity.state(_in_write_order(events), known)[0]
             used = set(bindings.values())
             for event in events:
                 for key in _event_keys(event):
                     if "|" not in key or key in bindings:
                         continue
                     provider = key.partition("|")[0]
-                    account = {"harness": provider, "label": provider}
+                    account = {"harness": provider, "label": provider, "label_source": "suggested"}
                     ident = account_identity.allocate(account, used | {provider + ":main"})
                     bindings[key] = ident
                     used.add(ident)
@@ -5890,13 +5905,22 @@ def migrate_accounts() -> None:
                             "via": "migration", "aliases": aliases, "bindings": bindings})
         with mutate_config() as data:
             known = _fold_accounts(data)
-            ids = account_identity.state(_in_write_order(read_events()[0]), known)[0]
+            identity_events = _in_write_order(read_events()[0])
+            ids = account_identity.state(identity_events, known)[0]
+            pinned = account_identity.state(identity_events, [])[0]
+            for account in known:
+                key = account["key"]
+                if key not in pinned and re.fullmatch(r"[a-z]+:a-[a-z2-7]{8}", ids[key]):
+                    stamp = _stamp_locked(_now())[0]
+                    _append_locked({"type": "account_binding", "id": _new_id("e"), **stamp,
+                                    "written_by": {"kind": "owner"}, "via": "migration",
+                                    "account": key, "to": ids[key]})
             data[account_identity.BINDINGS] = account_identity.local_bindings(known, ids)
         _MIGRATION_REVISION = _identity_revision()
 
 
 def _resolve_identity(raw: str, known: list[dict]) -> str:
-    (_keys, forwards, aliases), _moves = _identity_snapshot(known)
+    (_keys, forwards, aliases), _moves, _sources = _identity_snapshot(known)
     if account_identity.LEGACY.fullmatch(raw) and raw not in aliases and (routing_dir() / "id-salt").exists():
         migrate_accounts()
         _keys, forwards, aliases = _identity_snapshot(known)[0]
@@ -5937,14 +5961,14 @@ def account_id(key: str) -> str:
     from khipu.config import load_config
 
     known = _fold_accounts(load_config())
-    (keys, forwards, _aliases), moves = _identity_snapshot(known)
+    (keys, forwards, _aliases), moves, _sources = _identity_snapshot(known)
     moved = _forwarded(key, moves)
-    if moved not in keys:
+    if moved not in keys or re.fullmatch(r"[a-z]+:a-[a-z2-7]{8}", keys[moved]):
         # Migration can bind historical-only keys. Issuing a legacy id first
         # would make the next summary change the account's public identity.
         migrate_accounts()
         known = _fold_accounts(load_config())
-        (keys, forwards, _aliases), moves = _identity_snapshot(known)
+        (keys, forwards, _aliases), moves, _sources = _identity_snapshot(known)
         moved = _forwarded(key, moves)
     if moved in keys:
         return account_identity.forwarded(keys[moved], forwards)
@@ -5965,6 +5989,8 @@ def _pick(item, fields: tuple) -> dict | None:
 
 def _public_account(entry: dict, now: datetime) -> dict:
     out = {"id": account_id(entry["key"]), **_pick(entry, _ACCOUNT_FIELDS)}
+    if entry.get("label_source") == "suggested":
+        out["naming_hint"] = account_identity.NAME_ACCOUNT
     out["models"] = [dict(_pick(m, _MODEL_FIELDS), disagreement=_pick(m.get("disagreement"), _REPORT_FIELDS))
                      for m in entry.get("models") or [] if isinstance(m, dict)]
     out["witness"] = _pick(entry.get("witness"), _WITNESS_FIELDS)

@@ -7,9 +7,10 @@ but the historical binding and rename maps do not.
 from __future__ import annotations
 
 import re
+import base64
+import secrets
 import unicodedata
 from collections import Counter
-from pathlib import PurePath
 
 
 STABLE = re.compile(r"[a-z][a-z0-9_-]*:[a-z0-9]+(?:-[a-z0-9]+)*\Z")
@@ -56,34 +57,60 @@ def forwarded(key: str, forwards: dict[str, str]) -> str:
     return key
 
 
-def declared_id(account: dict) -> str | None:
-    """Legacy folder-derived labels are not a source of public identity.
+NAME_ACCOUNT = "name this account so your Macs can match it"
 
-    A supplied label may name an id, but if its slug overlaps the login
-    basename we cannot distinguish it from discover.default_name's output.
-    Such labels use a provider-scoped opaque allocation instead.
+
+def label_source(account: dict, former_homes=()) -> str:
+    """Missing provenance is owner-authored unless a login suggested it.
+
+    Provider-only legacy labels remain readable. Only an actual recorded
+    non-default folder is evidence of a folder-suggested legacy label.
     """
-    ident = stable_id(account["harness"], account["label"])
-    home = account.get("home") or ""
-    folder = unicodedata.normalize("NFKD", PurePath(home).name).encode("ascii", "ignore").decode().lower()
-    folder = re.sub(r"[^a-z0-9]+", "-", folder).strip("-")
-    provider, slug = ident.split(":", 1)
-    suffix = folder.removeprefix(provider + "-")
-    if home and (slug == folder or slug.startswith(folder + "-") or
-                 (suffix and (slug == suffix or slug.startswith(suffix + "-")))):
-        return None
-    return ident
+    source = account.get("label_source")
+    if source in ("owner", "suggested"):
+        return source
+    from khipu import discover
+
+    for home in [account.get("home"), *former_homes]:
+        if home and account["label"] == discover.default_name(account["harness"], home, default=False):
+            return "suggested"
+    return "owner"
+
+
+def with_provenance(accounts: list[dict], events: list[dict]) -> list[dict]:
+    # Follow all owner-recorded moves backwards, including several moves.
+    parents = {}
+    for event in events:
+        if event.get("type") == "account_move" and (event.get("written_by") or {}).get("kind") == "owner":
+            parents.setdefault(event.get("target"), set()).add(event.get("account"))
+    out = []
+    for account in accounts:
+        todo, seen, homes = [account["key"]], set(), []
+        while todo:
+            key = todo.pop()
+            if key in seen:
+                continue
+            seen.add(key)
+            if isinstance(key, str) and "|" in key:
+                homes.append(key.partition("|")[2])
+            todo.extend(parents.get(key, ()))
+        out.append(dict(account, label_source=label_source(account, homes)))
+    return out
+
+
+def declared_id(account: dict) -> str | None:
+    return stable_id(account["harness"], account["label"]) if label_source(account) == "owner" else None
 
 
 def allocate(account: dict, used: set[str]) -> str:
     declared = declared_id(account)
     if declared is not None and declared not in used:
         return declared
-    provider = account["harness"]
-    n = 1
-    while f"{provider}:account-{n}" in used:
-        n += 1
-    return f"{provider}:account-{n}"
+    while True:
+        token = base64.b32encode(secrets.token_bytes(5)).decode().lower()
+        ident = f"{account['harness']}:a-{token}"
+        if ident not in used:
+            return ident
 
 
 def unique_ids(accounts: list[dict]) -> dict[str, str]:
@@ -95,7 +122,7 @@ def unique_ids(accounts: list[dict]) -> dict[str, str]:
     out = {}
     for account, ident in zip(accounts, declared):
         if ident is None or counts[ident] != 1:
-            ident = allocate(dict(account, label=account["harness"]), used | {account["harness"] + ":main"})
+            ident = allocate(dict(account, label_source="suggested"), used)
         out[account["key"]] = ident
         used.add(ident)
     return out
@@ -109,6 +136,7 @@ def state(events: list[dict], known: list[dict]) -> tuple[dict, dict, dict]:
     A restored migration without local list changes can bind the same
     label on another Mac, as decision 9 requires.
     """
+    known = with_provenance(known, events)
     keys, forwards, aliases = {}, {}, {}
     migrated, pinned, stopped = set(), set(), set()
     for event in events:
@@ -163,15 +191,6 @@ def state(events: list[dict], known: list[dict]) -> tuple[dict, dict, dict]:
             ident = allocate(account, used)
         keys[key] = ident
         used.add(ident)
-    label_counts = Counter(stable_id(a["harness"], a["label"]) for a in known)
-    for account in known:
-        legacy = stable_id(account["harness"], account["label"])
-        if declared_id(account) is None and label_counts[legacy] == 1:
-            key = account["key"]
-            if keys[key] == legacy:
-                keys[key] = allocate(account, used)
-                used.add(keys[key])
-            forwards.setdefault(legacy, keys[key])
     return ({key: forwarded(ident, forwards) for key, ident in keys.items()},
             {key: forwarded(value, forwards) for key, value in forwards.items()}, aliases)
 

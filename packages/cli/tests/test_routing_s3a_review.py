@@ -1,5 +1,6 @@
 """Synthetic regressions adapted from the slice 3a Opus probes."""
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pytest
@@ -226,16 +227,19 @@ def test_identity_log_walk_is_cached_and_invalidated(mac, monkeypatch):
     assert len(calls) == len(walks) == 2
 
 
-def test_folder_derived_stable_alias_survives_migration_and_owner_rename(mac):
+def test_random_alias_survives_migration_and_owner_rename(mac):
     _setup(mac, [{"label": "Claude zqprivate", "harness": "claude", "home": "~/.claude-zqprivate"}])
     key = routing.accounts()[0]["key"]
     old = "claude:zqprivate"
     current = routing.account_id(key)
-    assert current == "claude:account-1"
-    assert routing.resolve_account(old) == current
+    assert re.fullmatch(r"claude:a-[a-z2-7]{8}", current)
+    with pytest.raises(routing.RouteError):
+        routing.resolve_account(old)
     routing.migrate_accounts()
     accounts.rename(key, "Claude work", expect=config.accounts_version(), via="app")
-    assert routing.resolve_account(old) == routing.resolve_account(current) == "claude:work"
+    assert routing.resolve_account(current) == "claude:work"
+    with pytest.raises(routing.RouteError):
+        routing.resolve_account(old)
     assert "zqprivate" not in json.dumps(routing.conversation_view(now=mac.clock["now"]))
 
 
@@ -268,7 +272,7 @@ def test_historical_identity_is_independent_of_reader_order(mac, first_reader, i
     else:
         text = routing.summary()["text"]
         ident = routing.account_id(key)
-    assert ident == "codex:account-1"
+    assert re.fullmatch(r"codex:a-[a-z2-7]{8}", ident)
     assert f"Codex ({ident}): paused by you until you lift it" in text
     assert routing._resolve_account_key(ident) == key
     if alias:
@@ -323,6 +327,8 @@ def test_identity_reader_keeps_mixed_sequence_and_transaction_order(mac):
 def test_owner_rename_cannot_merge_into_another_logins_opaque_id(mac):
     _setup(mac, [{"label": "Claude zqprivate", "harness": "claude", "home": "~/.claude-zqprivate"},
                  {"label": "Claude other", "harness": "claude", "home": "~/.claude-b"}])
+    private = next(a["key"] for a in routing.accounts() if a["label"] == "Claude zqprivate")
+    ident = routing.account_id(private)
     other = next(a["key"] for a in routing.accounts() if a["label"] == "Claude other")
     with pytest.raises(usage.AccountsError, match="another account's stable id"):
-        accounts.rename(other, "Claude account 1", expect=config.accounts_version(), via="app")
+        accounts.rename(other, "Claude " + ident.split(":")[1], expect=config.accounts_version(), via="app")

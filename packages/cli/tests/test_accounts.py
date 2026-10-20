@@ -115,14 +115,16 @@ def test_the_default_write_out_changes_no_key(mac, capsys):
     assert before == {"claude|", "codex|"}
     rc, out = _track(capsys, CLIENT)
     assert rc == 0 and out["ok"] is True
-    assert _stored() == [{"label": "Claude", "harness": "claude"}, {"label": "Codex", "harness": "codex"},
-                         {"label": "Claude client", "harness": "claude", "home": "~/.claude-client"}]
+    assert _stored() == [{"label": "Claude", "harness": "claude", "label_source": "owner"},
+                         {"label": "Codex", "harness": "codex", "label_source": "owner"},
+                         {"label": "Claude client", "harness": "claude", "home": "~/.claude-client",
+                          "label_source": "suggested"}]
     assert {a["key"] for a in routing.accounts()} == before | {_key("~/.claude-client")}
     assert out["accounts"] == [{"key": _key("~/.claude-client"), "label": "Claude client"}]
     view = routing.read_view()
     assert "Claude client: newly tracked, not read yet" in _latest_lines(view)
     line = routing.account_line(_entry(view, _key("~/.claude-client")), T0)
-    assert line == "Claude client: newly tracked, not read yet"
+    assert line == "Claude client: newly tracked, not read yet; " + routing.account_identity.NAME_ACCOUNT
     public = routing.conversation_view()
     client = next(a for a in public["accounts"] if a["label"] == "Claude client")
     assert client["state"] == "unknown" and client["configured"] is True
@@ -141,12 +143,12 @@ def test_stop_then_track_again_gives_back_the_key_and_its_kept_hold(mac, capsys)
                             via="app")["id"]
     rc, out = _stop(capsys, "claude|")
     assert rc == 0 and out["holds_kept"] == [hold] and out["holds_ended"] == []
-    assert _stored() == [{"label": "Codex", "harness": "codex"}]
+    assert _stored() == [{"label": "Codex", "harness": "codex", "label_source": "owner"}]
     assert any(e["cli"] == "claude" and e["why"] == "you stopped tracking it" for e in discover.turned_down())
     assert _entry(routing.read_view(), "claude|") is None
     rc, out = _track(capsys, {"harness": "claude", "home": "~/.claude", "label": None})
     assert rc == 0 and out["accounts"] == [{"key": "claude|", "label": "Claude"}]
-    assert _stored()[-1] == {"label": "Claude", "harness": "claude"}  # stored home-less
+    assert _stored()[-1] == {"label": "Claude", "harness": "claude", "label_source": "suggested"}  # stored home-less
     held = next(h for h in routing.read_view()["holds"] if h["id"] == hold)
     assert held["scope"] == {"kind": "account", "account": "claude|"} and held["scope_label"] == "Claude"
     assert not any(e["cli"] == "claude" for e in discover.turned_down())
@@ -305,7 +307,8 @@ def test_a_move_carries_every_record_to_the_new_folder(mac, capsys):
     rc, out = _cli(["accounts", "move", "--from-app", f"--expect={_version()}", f"--account={old}",
                     "--folder=~/.claude-office"], capsys)
     assert rc == 0 and out["key"] == office and out["lanes"] == 1
-    assert _stored()[1] == {"label": "Claude client", "harness": "claude", "home": "~/.claude-office"}
+    assert _stored()[1] == {"label": "Claude client", "harness": "claude", "home": "~/.claude-office",
+                            "label_source": "suggested"}
     view = routing.read_view()
     shown = [a for a in view["accounts"] if a["label"] == "Claude client"]
     assert [a["key"] for a in shown] == [office] and _entry(view, old) is None
@@ -446,7 +449,7 @@ def test_a_conversation_at_the_owners_request_and_its_undo(mac, capsys):
     assert rc == 2 and out["code"] == "owner_only"
     mac["callers"].as_app()
     rc, out = _cli(["accounts", "request", "undo", "--from-app", f"--expect={_version()}"], capsys)
-    assert rc == 0 and _stored() == [{"label": "Codex", "harness": "codex"}]
+    assert rc == 0 and _stored() == [{"label": "Codex", "harness": "codex", "label_source": "owner"}]
     assert accounts.status()["request"] is None
     rc, out = _cli(["accounts", "request", "confirm", "--from-app", f"--expect={_version()}"], capsys)
     assert rc == 2 and out["code"] == "no_request"
@@ -988,7 +991,7 @@ def test_a_generic_save_of_the_default_login_by_its_full_path_keeps_its_key(mac,
     rc, out = _cli(["config", "--from-app", f"--expect={_version()}", "--set", "usage_accounts", json.dumps(rows)],
                    capsys)
     assert rc == 0, out
-    assert _stored()[0] == {"label": "Claude full", "harness": "claude"}
+    assert _stored()[0] == {"label": "Claude full", "harness": "claude", "label_source": "owner"}
     view = routing.read_view()
     assert [a["key"] for a in routing.accounts()] == ["claude|", "codex|"]
     assert _entry(view, "claude|")["state"] == "limited"
@@ -1081,7 +1084,7 @@ def test_a_save_through_a_symlink_under_a_new_name_is_a_rename(mac):
     view = routing.read_view()
     tracked = [a for a in view["accounts"] if a.get("configured") and a["harness"] == "claude"]
     assert [(a["key"], a["state"]) for a in tracked] == [(old, "paused")]
-    assert _stored()[0] == {"harness": "claude", "label": "Renamed", "home": "~/.claude-client"}
+    assert _stored()[0] == {"harness": "claude", "label": "Renamed", "home": "~/.claude-client", "label_source": "owner"}
     assert config.load_config()["routing_lane_map"] == {"jobs": {"r": old}}
     assert view["priority"]["entries"][0]["account"] == old
 
@@ -1090,7 +1093,7 @@ def test_the_default_name_with_its_default_folder_spelt_out_is_kept(mac):
     _set(usage_accounts=[{"harness": "claude", "label": "Claude"}, {"harness": "codex", "label": "Codex"}])
     accounts.save_list([{"harness": "claude", "label": "Claude", "home": str(mac["home"] / ".claude")},
                         {"harness": "codex", "label": "Codex"}], expect=_version())
-    assert _stored()[0] == {"harness": "claude", "label": "Claude"}
+    assert _stored()[0] == {"harness": "claude", "label": "Claude", "label_source": "owner"}
 
 
 def test_a_priority_read_before_a_move_is_refused_after_the_old_folder_is_tracked_again(mac):
@@ -1204,7 +1207,7 @@ def test_a_renamed_symlink_account_keeps_its_stored_folder_key_and_lanes(mac):
          routing_lane_map={"jobs": {"review": old}})
     accounts.save_list([{"harness": "claude", "label": "Office", "home": "~/client-link"},
                         {"harness": "codex", "label": "Codex"}], expect=_version())
-    assert _stored()[0] == {"harness": "claude", "label": "Office", "home": "~/client-link"}
+    assert _stored()[0] == {"harness": "claude", "label": "Office", "home": "~/client-link", "label_source": "owner"}
     assert config.load_config()["routing_lane_map"] == {"jobs": {"review": old}}
     assert [a["key"] for a in routing.accounts()] == [old, "codex|"]
 
@@ -1230,7 +1233,8 @@ def test_an_answer_to_a_conversations_account_change_needs_the_version_it_read(m
     with pytest.raises(usage.AccountsError) as err:
         accounts.answer_request("undo", expect=stale)
     assert err.value.code == "version_moved"
-    assert _stored() == second and config.load_config()["usage_accounts_request"]["request"] == "second"
+    assert _stored() == [dict(e, label_source="owner") for e in second]
+    assert config.load_config()["usage_accounts_request"]["request"] == "second"
 
 
 def test_a_priority_confirm_or_undo_needs_the_version_it_read(mac):

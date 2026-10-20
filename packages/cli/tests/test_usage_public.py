@@ -10,6 +10,7 @@ probes are replaced, nothing starts a CLI or reaches the hub.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -107,7 +108,8 @@ def test_khipu_usage_never_carries_a_login_folder(owner, monkeypatch, kind):
     if kind == "invalid":
         assert row["id"].startswith("acct-")
     else:
-        assert row["id"] == "claude:account-1"
+        assert re.fullmatch(r"claude:a-[a-z2-7]{8}", row["id"])
+        assert row["id"] == routing.account_id(usage._key(_work()))
         assert "zqprivate" not in row["id"]
         assert FOLDER not in row["id"]
     assert row["ok"] is (kind in ("cached", "fresh"))

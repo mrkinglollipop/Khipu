@@ -312,8 +312,8 @@ def test_the_mcp_tools_answer_with_labels_and_ids_never_a_login_folder(home):
     assert out["ok"] and out["priority"]["pending"]
     answer = ms._tool_route({})
     assert [e["label"] for e in answer["priority"]["entries"]] == ["Claude second", "Codex"]
-    assert [e["id"] for e in answer["priority"]["entries"]] == ["claude:account-1", "codex:main"]
-    assert "second" not in answer["priority"]["entries"][0]["id"]
+    assert [e["id"] for e in answer["priority"]["entries"]] == [routing.account_id(SECOND), "codex:main"]
+    assert answer["priority"]["entries"][0]["id"] == "claude:second"
     blob = json.dumps(out) + json.dumps(answer)
     assert "/logins/claude-second" not in blob and SECOND not in blob
     fact = next(a for a in answer["accounts"] if a["label"] == "Claude second")["plan"]
