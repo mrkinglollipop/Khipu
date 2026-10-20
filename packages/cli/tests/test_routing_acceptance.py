@@ -59,6 +59,7 @@ def future(slice_id, reason):
 class Replay:
     def __init__(self, root, monkeypatch):
         self.root, self.patch, self.now = root, monkeypatch, T0
+        self.request_ids = itertools.count(1)
         self.data = root / "data"
         self.data.mkdir(parents=True)
         self.config = {"usage_accounts": copy.deepcopy(ACCOUNTS), "routing_reset_check": False,
@@ -97,7 +98,7 @@ class Replay:
                 "written_by": {"kind": "owner"}, "via": "app", **fields}
 
     def call(self, name="khipu_route", **args):
-        answer = mcp_server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        answer = mcp_server.handle_message({"jsonrpc": "2.0", "id": next(self.request_ids), "method": "tools/call",
                                            "params": {"name": name, "arguments": args}})
         assert "error" not in answer, answer
         result = answer["result"]

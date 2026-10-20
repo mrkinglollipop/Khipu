@@ -38,7 +38,7 @@ def test_old_rule_numbers_keep_their_meaning_in_mixed_history(mac):
     path.write_bytes(original)
     before = mac.view()
     entity = before["rules"][0]["entity"]
-    assert before["effective"]["rule:11"]["text"] == "edited words"
+    assert before["effective"][f"rule:{entity}"]["text"] == "edited words"
     result = routing.edit_rule(11, "new edit", via="app")
     last = routing.read_events()[0][-1]
     assert last["target"] == last["entity"] == entity == result["entity"]
@@ -80,6 +80,7 @@ def test_local_numbering_and_owner_undo_use_the_entity(mac):
 
 def test_offline_rule_uses_uuid_and_never_publishes_a_number(mac, monkeypatch):
     monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+    monkeypatch.setattr(routing, "_replication_live", lambda: True)
     added = routing.add_rule("offline words", via="app")
     rule = mac.view()["rules"][0]
     assert added["n"] is None and rule["n"] is None and rule["number_pending"]
@@ -95,6 +96,7 @@ def test_offline_rule_uses_uuid_and_never_publishes_a_number(mac, monkeypatch):
 def test_assigned_number_remains_usable_while_another_rule_is_pending(mac, monkeypatch):
     old = routing.add_rule("assigned", via="app")
     monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+    monkeypatch.setattr(routing, "_replication_live", lambda: True)
     new = routing.add_rule("pending", via="app")
     assert new["n"] is None
     routing.edit_rule(1, "assigned edit", via="app")
@@ -148,7 +150,7 @@ def test_saved_pre_identity_view_refolds_without_changing_effective_state(mac):
     old["rules"] = [{k: v for k, v in r.items() if k not in ("entity", "revision")} for r in old["rules"]]
     routing._save_view(old)
     after = mac.view()
-    assert after["event_identity"] == 1
+    assert after["event_identity"] == 2
     assert after["effective"] == before["effective"]
     assert after["version"] == before["version"]
     assert after["rules"][0]["entity"] == before["rules"][0]["entity"]
@@ -158,6 +160,7 @@ def test_sanitizer_omits_a_provisional_rules_null_number(mac, monkeypatch):
     from scripts.routing_fixture_sanitize import load_replay, sanitize
 
     monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+    monkeypatch.setattr(routing, "_replication_live", lambda: True)
     added = routing.add_rule("SYNTHETIC-OFFLINE-RULE", via="app")
     routing.edit_rule(added["entity"], "SYNTHETIC-OFFLINE-EDIT", via="app")
     raw = [json.loads(line) for line in routing.events_file().read_text().splitlines()]

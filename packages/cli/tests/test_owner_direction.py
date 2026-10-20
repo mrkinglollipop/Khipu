@@ -548,6 +548,7 @@ def test_direction_attribution_and_uuid_undo_survive_event_envelopes(world, monk
     from khipu import config
 
     monkeypatch.setattr(routing, "_hub_configured", lambda: offline)
+    monkeypatch.setattr(routing, "_replication_live", lambda: offline)
     entity = None
     if route in {"rule.edit", "rule.retire"}:
         entity = routing.add_rule("Original rule", via="app")["entity"]
@@ -574,6 +575,7 @@ def test_direction_attribution_and_uuid_undo_survive_event_envelopes(world, monk
         route if route.startswith("accounts.") else "route." + route, "direction", OWNER, turn)
     event = routing.read_events()[0][-1]
     assert event["type"] == event_kind
+    assert event["op"] == line["id"]
     assert event["written_by"] == {"kind": "owner"}
     assert (event["via"], event["auth"], event["harness"]) == (
         "direction", "direction", "claude_code")
@@ -680,3 +682,16 @@ def test_an_owner_change_outside_the_routing_record_is_named_in_the_next_push(wo
     assert rc == 0 and owner_turns.settings()["latest_window_h"] == 6.0, out
     diff = routing.since(mark, routing.read_view())
     assert [d.split(" by ")[0] for d in diff["directions"]] == ["Undid an owner change"], diff
+
+
+
+def test_app_click_operation_retries_the_same_rule_through_the_cli(world, khipu_app):
+    khipu_app.as_app()
+    argv = ["route", "rule", "--from-app", "--op=synthetic-app-click", "--", "add", "Synthetic rule"]
+    rc, first = world.run(argv)
+    assert rc == 0 and first["ok"], first
+    rc, second = world.run(argv)
+    assert rc == 0 and second["ok"], second
+    assert second["entity"] == first["entity"] and second["id"] == first["id"]
+    assert len(routing.read_view()["rules"]) == 1
+    assert routing.read_events()[0][0]["op"] == "synthetic-app-click"

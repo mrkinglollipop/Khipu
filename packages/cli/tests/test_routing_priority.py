@@ -731,14 +731,15 @@ def test_many_conversation_requests_take_at_most_half_the_budget(home):
     out = routing.summary(now=home["clock"].now)
     summary = out["text"]
     shown = set(out["shown_entities"])
-    pending = {f"rule:{i}" for i in range(1, 13)}
+    by_number = {r["n"]: f"rule:{r['entity']}" for r in view["rules"]}
+    pending = set(by_number.values())
     omitted = pending - shown
-    assert "rule:1" in shown
+    assert by_number[1] in shown
     assert omitted
     assert f"{len(omitted)} more pending changes: read `khipu_route`." in summary
     assert set(out["owed_entities"]) - shown == omitted
     assert all(re.search(rf"(?:^{i}\. |Standing rule {i} added)", summary, re.M)
-               for i in range(1, 13) if f"rule:{i}" in shown)
+               for i in range(1, 13) if by_number[i] in shown)
     requests = [line for line in summary.splitlines() if "unconfirmed" in line or
                 "the owner has not confirmed it yet" in line]
     assert sum(len(line) + 1 for line in requests) <= 750

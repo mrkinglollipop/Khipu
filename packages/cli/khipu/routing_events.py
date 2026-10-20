@@ -6,6 +6,7 @@ display aliases; only an entity id can identify a rule across machines.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import secrets
 import time
@@ -37,15 +38,21 @@ def revision(event: dict) -> str:
     return str(uuid.uuid5(NAMESPACE, json.dumps(body, sort_keys=True, ensure_ascii=True)))
 
 
+def legacy_mac(event: dict) -> str:
+    """Stable origin for untagged history; a fold supplies its log's origin."""
+    return (event.get("legacy_mac") or event.get("_legacy_mac") or event.get("mac")
+            or derived("mac", event.get("id") or revision(event)))
+
+
 def entity(event: dict) -> str | None:
     if event.get("entity"):
         return event["entity"]
     kind = event.get("type", "")
     if kind == "rule_add":
-        return derived("rule", event.get("n"))
+        return derived("rule", f"{legacy_mac(event)}:{event.get('n')}")
     if kind in RULE_CHANGES:
         target = event.get("target") or ""
-        return target if target.startswith("rule-") else derived("rule", event.get("n"))
+        return target if target.startswith("rule-") else derived("rule", f"{legacy_mac(event)}:{event.get('n')}")
     if kind == "hold":
         return derived("hold", event.get("id") or revision(event))
     if kind == "hold_end":
@@ -65,6 +72,6 @@ def hlc_key(event: dict) -> tuple:
     return stamp["wall"], stamp["counter"], stamp["mac"], revision(event)
 
 
-def body_hash(event: dict) -> str:
+def body_hash(event: dict, salt: bytes) -> str:
     body = {k: v for k, v in event.items() if not k.startswith("_") and k != "op_body"}
-    return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+    return hmac.new(salt, json.dumps(body, sort_keys=True, ensure_ascii=True).encode(), hashlib.sha256).hexdigest()

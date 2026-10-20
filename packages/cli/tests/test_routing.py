@@ -2217,12 +2217,12 @@ def test_owner_requested_rules_are_live_pending_and_owner_can_confirm_undo_or_di
     delta = routing.since(start)
     # The first write creates the record, so every account appears in the
     # same change; the rule is the only thing besides them.
-    assert delta["entities"][0] == "rule:1" and "owner has not confirmed" in delta["lines"][0]
+    assert delta["entities"][0] == f"rule:{added['entity']}" and "owner has not confirmed" in delta["lines"][0]
     assert all(e.startswith("account:") for e in delta["entities"][1:])
     after_add = routing.read_view()["version"]
     routing.request_rule("Keep browser work read-only, always.", n=1, author=ME)
     delta = routing.since(after_add)
-    assert delta["entities"] == ["rule:1"] and "owner has not confirmed" in delta["lines"][0]
+    assert delta["entities"] == [f"rule:{added['entity']}"] and "owner has not confirmed" in delta["lines"][0]
     assert routing.read_view()["rules"][0]["pending_kind"] == "added"
     assert routing.doctor_block()["pending_conversation_rules"] == 1
     routing.confirm_rule(1, via="app")
@@ -2239,7 +2239,7 @@ def test_owner_requested_rules_are_live_pending_and_owner_can_confirm_undo_or_di
     assert changed["pending_by"] == "a Codex conversation"
     assert "it replaced: “Original wording.”" in routing.summary()["text"]
     account_delta = routing.conversation_view(since_version=before_edit, account="Codex")
-    assert account_delta["entities"] == ["rule:2"]
+    assert account_delta["entities"] == [f"rule:{changed['entity']}"]
     assert "it replaced: “Original wording.”" in account_delta["lines"][0]
     routing.confirm_rule(2, via="app")
     assert "owner has not confirmed" not in routing.summary()["text"]

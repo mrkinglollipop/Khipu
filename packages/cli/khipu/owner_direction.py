@@ -681,6 +681,20 @@ def _find(line_id: str) -> dict | None:
 _PENDING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_owner_action", default=None)
 
 
+def operation_id(event: dict) -> str | None:
+    """Only the intended write inherits the written-ahead action's identity."""
+    pend = _PENDING.get()
+    if not pend:
+        return None
+    via = {"direction": "direction", "app": "app", "terminal": "cli"}.get(pend["stamp"].get("auth"))
+    if event.get("via") != via:
+        return None
+    action = pend["intent"]["action"]
+    if action in {"route.rule.add", "route.hold.add"} and event.get("id") != planned_id(action):
+        return None
+    return (pend.get("line") or {}).get("id")
+
+
 def planned_id(action: str) -> str | None:
     """The id the owner action being written chose for the line it adds
     (a rule or a hold), so the writer uses it; None for any other write."""

@@ -56,7 +56,7 @@ HARNESS = {"codex", "claude_code", "grok_build", "shell", "unknown"}
 EVENT_FIELDS = {"type", "id", "account", "state", "source", "written_at", "written_by", "via",
                 "scope", "reason", "text", "until", "owner", "pending", "n", "target", "entries",
                 "owner_request", "seq", "basis", "until_default", "date", "seeded",
-                "mac", "legacy_mac", "entity", "base", "op", "op_body", "hlc", "number_pending", "hub_order", "proposal", "clock_at"}
+                "mac", "legacy_mac", "entity", "base", "op", "op_body", "hlc", "number_pending", "hub_order", "local_order", "proposal", "clock_at"}
 TEXT_FIELDS = {"text", "owner_request", "role"}
 
 
@@ -72,7 +72,7 @@ def load_replay(value):
         number(row["written_at"], integer=True)
         if row.get("until") is not None:
             number(row["until"], integer=True)
-        for key in ("seq", "date", "hub_order"):
+        for key in ("seq", "date", "hub_order", "local_order"):
             if key in row:
                 number(row[key], integer=True)
         if "basis" in row and row["basis"] not in {"cli", "estimated", "checked", "owner"}:

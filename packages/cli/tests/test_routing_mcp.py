@@ -13,6 +13,7 @@ process or reaches the hub.
 from __future__ import annotations
 
 import json
+import itertools
 import re
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -64,8 +65,11 @@ def home(tmp_path, monkeypatch):
     return {"data": data, "clock": clock, "tmp": tmp_path}
 
 
+_REQUEST_IDS = itertools.count(1)
+
+
 def _call(name: str, arguments: dict | None = None) -> tuple[bool, dict]:
-    out = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+    out = handle_message({"jsonrpc": "2.0", "id": next(_REQUEST_IDS), "method": "tools/call",
                           "params": {"name": name, "arguments": arguments or {}}})
     result = out["result"]
     return result["isError"], json.loads(result["content"][0]["text"])

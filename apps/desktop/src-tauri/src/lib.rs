@@ -1829,6 +1829,17 @@ fn route_note_end_argv() -> Vec<String> {
     argv
 }
 
+fn route_operation_argv(mut argv: Vec<String>, op: Option<&str>) -> Result<Vec<String>, String> {
+    if let Some(op) = op {
+        if op.is_empty() || op.len() > 256 || !op.chars().all(|c| c.is_ascii_alphanumeric() || "-_:".contains(c)) {
+            return Err("invalid routing operation id".to_string());
+        }
+        let at = argv.iter().position(|arg| arg == "--").unwrap_or(argv.len());
+        argv.insert(at, format!("--op={op}"));
+    }
+    Ok(argv)
+}
+
 fn route_rule_argv(action: &str, n: Option<u32>, text: Option<&str>) -> Result<Vec<String>, String> {
     if !ROUTE_RULE_ACTIONS.contains(&action) {
         return Err(format!("not a rule change: {action:?}"));
@@ -2281,13 +2292,13 @@ fn sign_in_argv(config: &Value, harness: &str, home: Option<&str>) -> Result<Vec
 }
 
 #[tauri::command]
-async fn khipu_route_pause(account: String, until: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(route_pause_argv(&account, until.as_deref())?).await
+async fn khipu_route_pause(account: String, until: Option<String>, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_pause_argv(&account, until.as_deref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_route_lift(account: String) -> Result<String, String> {
-    run_khipu_cli_async(route_lift_argv(&account)?).await
+async fn khipu_route_lift(account: String, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_lift_argv(&account)?, op.as_deref())?).await
 }
 
 #[tauri::command]
@@ -2384,23 +2395,23 @@ async fn khipu_owner_direction_set(key: String, value: String) -> Result<String,
 }
 
 #[tauri::command]
-async fn khipu_route_clear(account: String, report: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(route_clear_argv(&account, report.as_deref())?).await
+async fn khipu_route_clear(account: String, report: Option<String>, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_clear_argv(&account, report.as_deref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_route_note_set(text: String) -> Result<String, String> {
-    run_khipu_cli_async(route_note_set_argv(&text)?).await
+async fn khipu_route_note_set(text: String, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_note_set_argv(&text)?, op.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_route_note_end() -> Result<String, String> {
-    run_khipu_cli_async(route_note_end_argv()).await
+async fn khipu_route_note_end(op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_note_end_argv(), op.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_route_rule(action: String, n: Option<u32>, text: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(route_rule_argv(&action, n, text.as_deref())?).await
+async fn khipu_route_rule(action: String, n: Option<u32>, text: Option<String>, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_rule_argv(&action, n, text.as_deref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
@@ -2410,13 +2421,14 @@ async fn khipu_route_hold_add(
     scope: String,
     account: Option<String>,
     until: Option<String>,
+    op: Option<String>,
 ) -> Result<String, String> {
-    run_khipu_cli_async(route_hold_add_argv(&text, &reason, &scope, account.as_deref(), until.as_deref())?).await
+    run_khipu_cli_async(route_operation_argv(route_hold_add_argv(&text, &reason, &scope, account.as_deref(), until.as_deref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_route_hold_end(id: String) -> Result<String, String> {
-    run_khipu_cli_async(route_hold_end_argv(&id)?).await
+async fn khipu_route_hold_end(id: String, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_hold_end_argv(&id)?, op.as_deref())?).await
 }
 
 // ---- Work: the live view and the ledger (docs/plans/2026-10-15-work-view.md, phase 4)
@@ -2957,9 +2969,13 @@ async fn khipu_route_priority(
     entries: Option<Vec<PriorityEntry>>,
     until: Option<String>,
     expect: Option<String>,
+    op: Option<String>,
 ) -> Result<String, String> {
     run_khipu_cli_async(
-        route_priority_argv_expect(&action, entries.as_deref().unwrap_or(&[]), until.as_deref(), expect.as_deref())?,
+        route_operation_argv(
+            route_priority_argv_expect(&action, entries.as_deref().unwrap_or(&[]), until.as_deref(), expect.as_deref())?,
+            op.as_deref(),
+        )?,
     )
     .await
 }
@@ -5526,6 +5542,17 @@ mod settings_command_tests {
             assert!(owner_direction_undo_argv(id).is_err(), "{id:?}");
         }
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"owner-direction"));
+    }
+
+    #[test]
+    fn routing_click_operation_is_a_joined_flag_before_the_words() {
+        let base = route_rule_argv("add", None, Some("--synthetic-words")).unwrap();
+        let argv = route_operation_argv(base.clone(), Some("synthetic-click-1")).unwrap();
+        assert_eq!(argv, v(&["route", "rule", "--from-app", "--op=synthetic-click-1", "--", "add", "--synthetic-words"]));
+        assert_eq!(route_operation_argv(base.clone(), None).unwrap(), base);
+        for op in ["", "bad\n--from-app", "bad op", "--flag=value"] {
+            assert!(route_operation_argv(base.clone(), Some(op)).is_err());
+        }
     }
 
     #[test]

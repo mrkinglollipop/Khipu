@@ -197,7 +197,10 @@ afterEach(() => {
 });
 
 function calls(cmd: string) {
-  return invokeMock.mock.calls.filter((c) => c[0] === cmd).map((c) => c[1]);
+  return invokeMock.mock.calls.filter((c) => c[0] === cmd).map((c) => {
+    const { op: _op, ...args } = (c[1] ?? {}) as Record<string, unknown>;
+    return args;
+  });
 }
 
 async function page() {
@@ -743,6 +746,14 @@ describe("Settings -> Routing: standing rules", () => {
     expect(screen.getByText(/Add this rule\?/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Add the rule" }));
     await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "add", text: "-fast is never used" }]));
+    const first = invokeMock.mock.calls.find(([cmd]) => cmd === "khipu_route_rule")?.[1] as { op: string };
+    expect(first.op).toMatch(/^[0-9a-f-]{36}$/);
+    fireEvent.change(box, { target: { value: "another synthetic rule" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add the rule" }));
+    await waitFor(() => expect(calls("khipu_route_rule")).toHaveLength(2));
+    const second = invokeMock.mock.calls.filter(([cmd]) => cmd === "khipu_route_rule")[1][1] as { op: string };
+    expect(second.op).not.toBe(first.op);
   });
 
   it("brings back a removed rule from Recent changes", async () => {
