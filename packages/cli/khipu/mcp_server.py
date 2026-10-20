@@ -49,6 +49,7 @@ Manual harness wiring (Install packs remain P3 — do not auto-edit configs):
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import re
@@ -2223,6 +2224,28 @@ def _tool_usage(args: dict) -> dict:
                                             background=True))
 
 
+# Stdio has one connection per server process. PID scoping also drops any
+# receipts inherited by a fork; a new stdio connection gets a fresh token.
+_ROUTING_RECEIPTS = {}
+_ROUTING_RECEIPTS_LOCK = threading.RLock()
+
+
+def _with_route_receipts(func):
+    @functools.wraps(func)
+    def call(args):
+        from khipu import routing
+
+        with _ROUTING_RECEIPTS_LOCK:
+            key = (os.getpid(), _ROUTING_SESSION, str(routing.routing_dir()))
+            if _ROUTING_RECEIPTS.get("key") != key:
+                _ROUTING_RECEIPTS.clear()
+                _ROUTING_RECEIPTS.update(key=key, reads={})
+            with routing.mcp_read_receipts(_ROUTING_RECEIPTS["reads"]):
+                return func(args)
+    return call
+
+
+@_with_route_receipts
 def _tool_route(args: dict) -> dict:
     """khipu_route: the routing record as ``khipu route --json`` gives it,
     plus the words the push leaves out. Local only until the cloud copy."""
@@ -2255,6 +2278,7 @@ def _tool_route_report(args: dict) -> dict:
     return routing.conversation_write(args, author=routing.conversation_author())
 
 
+@_with_route_receipts
 def _tool_route_rule(args: dict) -> dict:
     """Record a conversation's owner-requested rule through the trusted
     report author path; this tool never lets it speak as the owner."""
@@ -2285,6 +2309,7 @@ def _tool_route_rule(args: dict) -> dict:
                                 author=routing.conversation_author(), via="mcp", holds=holds, base=base)
 
 
+@_with_route_receipts
 def _tool_route_priority(args: dict) -> dict:
     """Record the owner's priority at his request through the conversation
     author path; it never speaks as the owner, and its answer names each
@@ -2729,7 +2754,8 @@ def _dispatch_message(msg: dict) -> dict | None:
 
 
 def main() -> int:
-    global _RELOAD_ON_CHANGE
+    global _RELOAD_ON_CHANGE, _ROUTING_SESSION
+    _ROUTING_SESSION = secrets.token_hex(16)
     _RELOAD_ON_CHANGE = True
     _note_loaded_modules()
     print(f"[khipu-mcp] ready (pid {os.getpid()})", file=sys.stderr, flush=True)

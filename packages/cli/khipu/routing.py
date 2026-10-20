@@ -1195,7 +1195,14 @@ def conversation_author(environ: dict | None = None, cwd: str | None = None, nam
            "session": _clean(session, 64) or None}
     if name and _one_line(name):
         out["name"] = _clean(name, NAME_MAX)
+    provider_session = env.get("CLAUDE_CODE_SESSION_ID") or env.get("CODEX_THREAD_ID")
+    if provider_session and provider_session.strip() != session:
+        out["provider_session"] = _clean(provider_session.strip(), 64)
     return out
+
+
+def _author_sessions(by: dict) -> set[str]:
+    return {by[k] for k in ("session", "provider_session") if by.get(k)}
 
 
 OWNER = {"kind": "owner"}
@@ -1251,6 +1258,19 @@ def routing_dir() -> Path:
     return data_dir().joinpath(*STATE_DIR)
 
 
+_MCP_READ_RECEIPTS = contextvars.ContextVar("routing_mcp_read_receipts", default=None)
+
+
+@contextlib.contextmanager
+def mcp_read_receipts(receipts: dict):
+    """Receipts belong to the transport connection, never to a CLI read."""
+    token = _MCP_READ_RECEIPTS.set(receipts)
+    try:
+        yield
+    finally:
+        _MCP_READ_RECEIPTS.reset(token)
+
+
 def _read_receipt_path() -> Path | None:
     by = conversation_author()
     if not by.get("session"):
@@ -1263,12 +1283,32 @@ def _read_receipt_path() -> Path | None:
 def _read_receipts() -> dict:
     path = _read_receipt_path()
     if path is None:
-        return {}
+        receipts = _MCP_READ_RECEIPTS.get()
+        return receipts if receipts is not None else {}
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _remember_read(data: dict, view: dict, *, rules: bool, priority: bool) -> None:
+    entities = data.setdefault("entities", {})
+    if rules:
+        for rule in view.get("rules") or []:
+            key = rule["entity"]
+            revisions = entities.setdefault(key, [])
+            revision = rule["owner_revision"]
+            entities[key] = [r for r in revisions if r != revision][-31:] + [revision]
+    if priority and isinstance(view.get("priority_owner_revision"), str):
+        # Absence is a snapshot too. Looking up its revision in
+        # the later log would turn an unseen owner write into a read.
+        revision = view["priority_owner_revision"]
+        revisions = entities.setdefault("priority", [])
+        entities["priority"] = [r for r in revisions if r != revision][-31:] + [revision]
+        versions = data.setdefault("priority_versions", {})
+        versions[view.get("priority_version") or "p0"] = revision
+        data["priority_versions"] = dict(list(versions.items())[-64:])
 
 
 def _record_read(view: dict, *, rules: bool = False, priority: bool = False) -> None:
@@ -1280,26 +1320,14 @@ def _record_read(view: dict, *, rules: bool = False, priority: bool = False) -> 
     # App polls and shell reads have no conversation to acknowledge.
     path = _read_receipt_path()
     if path is None:
+        receipts = _MCP_READ_RECEIPTS.get()
+        if receipts is not None:
+            _remember_read(receipts, view, rules=rules, priority=priority)
         return
     try:
         with lock_budget(0.0), _lock():
             data = _read_receipts()
-            entities = data.setdefault("entities", {})
-            if rules:
-                for rule in view.get("rules") or []:
-                    key = rule["entity"]
-                    revisions = entities.setdefault(key, [])
-                    revision = rule["owner_revision"]
-                    entities[key] = [r for r in revisions if r != revision][-31:] + [revision]
-            if priority and isinstance(view.get("priority_owner_revision"), str):
-                # Absence is a snapshot too. Looking up its revision in
-                # the later log would turn an unseen owner write into a read.
-                revision = view["priority_owner_revision"]
-                revisions = entities.setdefault("priority", [])
-                entities["priority"] = [r for r in revisions if r != revision][-31:] + [revision]
-                versions = data.setdefault("priority_versions", {})
-                versions[view.get("priority_version") or "p0"] = revision
-                data["priority_versions"] = dict(list(versions.items())[-64:])
+            _remember_read(data, view, rules=rules, priority=priority)
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, temp = tempfile.mkstemp(dir=path.parent, prefix=".read-")
             try:
@@ -1321,6 +1349,9 @@ def _observed_base(entity: str, *, base=None, expect=None) -> str:
     data = _read_receipts()
     revisions = (data.get("entities") or {}).get(entity) or []
     if base not in revisions:
+        if not conversation_author().get("session"):
+            raise RouteError("this connection has not read that owner revision through this MCP server; "
+                             "read khipu_route on this connection before proposing")
         raise RouteError("this conversation was not shown that revision; read khipu_route again")
     if expect is not None:
         observed = (data.get("priority_versions") or {}).get(str(expect).strip())
@@ -1588,7 +1619,7 @@ _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
                   "observed", "observed_turn", "session_logs", "silent", "unmatched")
-_AUTHOR_FIELDS = ("kind", "harness", "project", "session", "name", "file", "mac")
+_AUTHOR_FIELDS = ("kind", "harness", "project", "session", "provider_session", "name", "file", "mac")
 _HOLD_KINDS = ("account", "machine", "all")
 
 _RESET_STATUSES = frozenset({
@@ -6536,7 +6567,6 @@ def _replacement_notices(view: dict, now: datetime, session: str | None) -> list
 
     if not session:
         return []
-    receipts = None
     items = []
     for item in (view.get("proposals") or {}).values():
         if item.get("status") not in ("replaced", "crossed"):
@@ -6544,14 +6574,13 @@ def _replacement_notices(view: dict, now: datetime, session: str | None) -> list
         by = item.get("notify") or item.get("author") or {}
         # Only the author's session owes delivery. Missing or departed
         # sessions cannot force work or text into other conversations.
-        if by.get("session") != session:
+        if session not in _author_sessions(by):
             continue
         ended = _parse(item.get("ended_at") or item.get("at"))
         if ended is None or now >= ended + timedelta(days=7):
             continue
-        if receipts is None:
-            receipts = recall_prompt.routing_marker(session).get("notices") or {}
-        if item["id"] in receipts:
+        if any(item["id"] in (recall_prompt.routing_marker(ident).get("notices") or {})
+               for ident in _author_sessions(by)):
             continue
         who = author_words(by, push=True)
         if item.get("kind") == "priority":
@@ -7331,7 +7360,7 @@ def _public_proposals(view: dict, *, session: str | None = None) -> list[dict]:
     out = []
     for item in (view.get("proposals") or {}).values():
         told = item.get("notify") or item.get("author")
-        if item.get("status") in ("replaced", "crossed") and (not session or (told or {}).get("session") != session):
+        if item.get("status") in ("replaced", "crossed") and (not session or session not in _author_sessions(told or {})):
             continue
         out.append({"id": item.get("id"), "kind": item.get("kind"), "entity": item.get("entity"),
                     "status": item.get("status"), "base": item.get("base"), "at": item.get("at"), "rule": item.get("n"),
