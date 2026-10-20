@@ -605,7 +605,8 @@ _ROUTING_CHILD_MOST = 60.0
 _ROUTING_CHILD_GRACE = 0.05
 
 
-def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, moment: str = "start") -> None:
+def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, moment: str = "start",
+                   session_id: str | None = None) -> None:
     """The forked child: write the summary's JSON to ``write_fd`` and exit.
     Never returns, and never touches the hook's stdin, stdout or stderr."""
     code = 1
@@ -629,7 +630,7 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
 
         signal.signal(signal.SIGALRM, on_alarm)
         signal.setitimer(signal.ITIMER_REAL, max(0.0, deadline - time.monotonic()) + _ROUTING_CHILD_GRACE)
-        out = routing.start_push(budget, moment)
+        out = routing.start_push(budget, moment, session_id=session_id)
         if isinstance(out, dict):
             data = memoryview(json.dumps({k: out.get(k) for k in (
                 "kind", "text", "version", "epoch", "generation", "owed_entities", "shown_entities",
@@ -646,7 +647,8 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
 
 
 class _RoutingAtStart:
-    def __init__(self, moment: str = "start", *, session_id=None) -> None:
+    def __init__(self, moment: str = "start", *, session_id: str | None = None) -> None:
+        self.session_id = session_id
         # "start", or "delegation" for a subagent's start (routing_delegation).
         self.moment = moment
         self.session = session_id
@@ -680,7 +682,7 @@ class _RoutingAtStart:
                 os.close(write_fd)
                 raise
             if pid == 0:
-                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment)
+                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment, self.session_id)
             os.close(write_fd)
             self.pid, self.fd = pid, read_fd
         except Exception:
@@ -749,6 +751,8 @@ class _RoutingAtStart:
         """Reset the session's last-seen version to the one just printed and
         record the time of this full summary."""
         out = self.out
+        if self.session_id is not None and session_id != self.session_id:
+            return
         if not isinstance(session_id, str) or not session_id or not isinstance(out, dict):
             return
         try:

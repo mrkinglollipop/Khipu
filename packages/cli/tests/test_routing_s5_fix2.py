@@ -14,6 +14,7 @@ def home(tmp_path, monkeypatch, khipu_app):
     data.mkdir()
     (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS}))
     monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
     clock = Clock(T0)
     monkeypatch.setattr(routing, "_now", clock)
     return {"data": data, "clock": clock}
@@ -29,9 +30,9 @@ def read_rule():
     return mcp_server._tool_route({})["rules"][0]["owner_revision"]
 
 
-def proposal(words, author=ME):
-    read_rule()
-    return routing.request_rule(words, n=1, author=author)
+def proposal(words, author=None):
+    base = read_rule()
+    return routing.request_rule(words, n=1, author=author or routing.conversation_author(), base=base)
 
 
 @pytest.mark.parametrize("entry", ["mcp", "writer"])
@@ -147,8 +148,9 @@ def test_f5_replacement_notices_fit_summary_budget(home):
     cfg = json.loads(config.read_text())
     cfg["routing_summary_chars"] = 1500
     config.write_text(json.dumps(cfg))
+    base = read_rule()
     for i in range(160):
-        proposal(f"PROPOSAL {i}")
+        routing.request_rule(f"PROPOSAL {i}", n=1, base=base)
     out = routing.summary()
     # Owner words and heading are exempt; notices are not.
     non_owner = [s for s in out["text"].splitlines() if "proposal by" in s]
@@ -200,9 +202,9 @@ def test_f1_cli_read_provides_a_receipt_for_its_priority_request(home, capsys):
 
     routing.set_priority([{"account": "Claude"}], via="app", expect=routing.priority_version())
     assert cli.main(["route", "priority", "--json"]) == 0
-    capsys.readouterr()
+    shown = json.loads(capsys.readouterr().out)
     out = routing.request_priority([{"account": "Codex"}], owner_request="change",
-                                   expect=routing.priority_version())
+                                   expect=routing.priority_version(), base=shown["owner_revision"])
     assert out["ok"]
     assert routing.read_view()["priority"]["pending"]
 
@@ -223,7 +225,8 @@ def test_f1_empty_priority_read_does_not_observe_a_later_owner_write(home, monke
     monkeypatch.setattr(routing, "_record_read", move_after_response_is_built)
     shown = mcp_server._tool_route({})
     assert shown["priority"] is None
-    mcp_server._tool_route_priority({"entries": [{"account": "Grok"}], "owner_request": "prepared on empty"})
+    mcp_server._tool_route_priority({"entries": [{"account": "Grok"}], "owner_request": "prepared on empty",
+                                     "base": shown["priority_owner_revision"]})
     view = routing.read_view()
     assert [e["label"] for e in view["priority"]["entries"]] == ["Codex"]
     crossed, = view["proposals"].values()

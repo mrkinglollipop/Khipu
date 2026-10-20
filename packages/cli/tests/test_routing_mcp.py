@@ -165,8 +165,8 @@ def _walk(value, path="$"):
 def _assert_no_pick(answer: dict, label: str) -> None:
     for path, key, text in _walk(answer):
         # Phase 4b: the owner's own priority is reported as data, word for
-        # word, under this one key; Khipu computes no pick or ranking of its own.
-        if key is not None and not (path == "$" and key == "priority"):
+        # word, with its revision metadata; Khipu computes no pick or ranking of its own.
+        if key is not None and not (path == "$" and key in ("priority", "priority_owner_revision")):
             assert not _PICK_KEYS.search(key.lower()), f"{label}: key {path}.{key} reads as a pick or a ranking"
         if text is not None:
             assert not _PICK_WORDS.search(text), f"{label}: {path} reads as a pick: {text!r}"

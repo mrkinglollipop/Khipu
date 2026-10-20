@@ -868,6 +868,8 @@ def _race(writers) -> list[str]:
             results.append("saved")
         except (usage.AccountsError, routing.PriorityMoved, routing.PriorityVersionNeeded) as err:
             results.append(err.code)
+        except routing.RouteError as err:
+            results.append(str(err))
 
     threads = [threading.Thread(target=run, args=(fn,), daemon=True) for fn in writers]
     for t in threads:
@@ -998,24 +1000,25 @@ def test_a_generic_save_of_the_default_login_by_its_full_path_keeps_its_key(mac,
     assert config.load_config()["routing_lane_map"] == {"jobs": {"r": "claude|"}}
 
 
-def test_a_requested_priority_needs_its_version(mac, capsys):
+def test_a_requested_priority_needs_its_explicit_base(mac, capsys):
     _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
     routing.set_priority([{"account": "claude|"}], via="app", expect=routing.priority_version())
     mac["callers"].as_shell("/usr/local/bin/claude")
     rc, out = _cli(["route", "priority", "set", "Second", "First", "--at-owner-request=reorder them"], capsys)
-    assert rc == 2 and out.get("code") == "version_needed", out
+    assert rc == 2 and "base must be" in out.get("error", ""), out
     assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == ["claude|"]
 
 
-def test_priority_requests_on_no_version_or_one_version_cannot_both_land(mac):
+def test_priority_requests_without_a_base_are_refused_and_one_version_cannot_both_land(mac):
     _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
 
     def ask(order, expect):
-        routing.conversation_view()
-        return lambda: routing.request_priority(order, owner_request="order them", author=ME, expect=expect)
+        shown = routing.conversation_view()
+        base = shown["priority_owner_revision"] if expect is not None else None
+        return lambda: routing.request_priority(order, owner_request="order them", author=ME, expect=expect, base=base)
 
     assert _race([ask(["First", "Second"], None), ask(["Second", "First"], None)]) == \
-        ["version_needed", "version_needed"]
+        ["base must be the owner revision the request was prepared against"] * 2
     seen = routing.priority_version()
     assert _race([ask(["First", "Second"], seen), ask(["Second", "First"], seen)]) == ["saved", "version_moved"]
 
@@ -1239,14 +1242,14 @@ def test_an_answer_to_a_conversations_account_change_needs_the_version_it_read(m
 
 
 def test_a_priority_confirm_or_undo_needs_the_version_it_read(mac):
-    routing.conversation_view()
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Codex"}], owner_request="first", author=ME,
-                             expect=routing.priority_version())
+                             expect=routing.priority_version(), base=shown["priority_owner_revision"])
     stale = routing.priority_version()
     routing.confirm_priority(via="app", expect=stale)
-    routing.conversation_view()
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Claude"}], owner_request="second", author=ME,
-                             expect=routing.priority_version())
+                             expect=routing.priority_version(), base=shown["priority_owner_revision"])
     for answer in (routing.confirm_priority, routing.undo_priority):
         with pytest.raises(routing.PriorityVersionNeeded):
             answer(via="app")
@@ -1256,20 +1259,23 @@ def test_a_priority_confirm_or_undo_needs_the_version_it_read(mac):
     assert held["pending"] and held["entries"][0]["account"] == "claude|"
 
 
-def test_stop_takes_the_account_out_of_a_waiting_priority_request_and_what_it_replaced(mac):
+def test_stop_ends_the_waiting_priority_request_and_drops_the_account_from_owner_words(mac):
     old = _key("~/.claude-client")
     _set(usage_accounts=[{"harness": "claude", "label": "First", "home": "~/.claude-client"},
                          {"harness": "codex", "label": "Second"}])
     routing.set_priority([{"account": old}, {"account": "codex|"}], via="app", expect=routing.priority_version())
-    routing.conversation_view()
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "First"}, {"account": "Second"}], owner_request="keep order", author=ME,
-                             expect=routing.priority_version())
+                             expect=routing.priority_version(), base=shown["priority_owner_revision"])
     out = accounts.stop(old, expect=_version())
     assert out["priority"] == "removed"
     held = routing.read_view()["priority"]
-    assert held["pending"] and [e["account"] for e in held["entries"]] == ["codex|"]
-    assert [e["account"] for e in held["replaced"]["entries"]] == ["codex|"]
-    routing.undo_priority(via="app", expect=held["version"])
+    assert not held["pending"] and [e["account"] for e in held["entries"]] == ["codex|"]
+    assert held["replaced"] is None
+    proposal, = routing.read_view()["proposals"].values()
+    assert proposal["status"] == "overtaken"
+    with pytest.raises(routing.RouteError):
+        routing.undo_priority(via="app", expect=held["version"])
     assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == ["codex|"]
 
 
@@ -1460,25 +1466,26 @@ def _moved_mid_change(mac, monkeypatch) -> str:
 def test_a_conversations_priority_request_needs_the_version_it_was_built_on(mac):
     _set(usage_accounts=_TWO)
     routing.set_priority([{"account": "claude|"}, {"account": "codex|"}], via="app", expect=routing.priority_version())
-    stale = routing.read_view()["priority"]
+    stale = routing.conversation_view()["priority"]
     routing.set_priority([{"account": "codex|"}, {"account": "claude|"}], via="app", expect=stale["version"])
     entries = [{"account": e["label"]} for e in stale["entries"]]
     with pytest.raises(routing.RouteError):
         routing.conversation_priority(entries, owner_request="keep the order I saw", author=ME,
-                                      expect=stale["version"])
+                                      expect=stale["version"], base=stale["owner_revision"])
     with pytest.raises(routing.RouteError):
         routing.conversation_priority(entries, owner_request="keep the order I saw", author=ME)
     assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == ["codex|", "claude|"]
 
 
-def test_the_mcp_priority_tool_reads_the_version_inside_its_lock_budget(mac, monkeypatch):
+def test_the_mcp_priority_tool_forwards_the_prepared_base_without_filling_a_version(mac, monkeypatch):
     from khipu import mcp_server
 
     _set(usage_accounts=_TWO)
     seen = {}
     monkeypatch.setattr(routing, "conversation_priority", lambda entries, **kw: seen.update(kw) or {"ok": True})
-    mcp_server._tool_route_priority({"entries": [{"account": "First"}], "owner_request": "First first"})
-    assert seen["expect_current"] is True and "expect" not in seen
+    mcp_server._tool_route_priority({"entries": [{"account": "First"}], "owner_request": "First first",
+                                     "base": "prepared-revision"})
+    assert seen["base"] == "prepared-revision" and "expect_current" not in seen and "expect" not in seen
 
 
 def test_undo_of_a_lane_request_never_gives_a_stopped_account_its_lanes_back(mac):
@@ -1642,7 +1649,7 @@ def test_the_mcp_priority_tool_answers_busy_within_its_lock_budget(mac, monkeypa
 
     _set(usage_accounts=_TWO)
     routing.pause("claude|", via="app")
-    # A stale view, so reading the priority's version needs the routing lock.
+    # A stale view, so reading the prepared proposal needs the routing lock.
     _set(routing_stale_after="2h")
     monkeypatch.setattr(mcp_server, "_ensure_path", lambda: None)
     monkeypatch.setattr(mcp_server, "_via_https_gateway", lambda: False)
@@ -1658,7 +1665,7 @@ def test_the_mcp_priority_tool_answers_busy_within_its_lock_budget(mac, monkeypa
     def caller():
         try:
             result.append(mcp_server._tool_route_priority({"entries": [{"account": "First"}],
-                                                           "owner_request": "put First first"}))
+                                                           "owner_request": "put First first", "base": "prepared-revision"}))
         except Exception as exc:  # noqa: BLE001 - the answer under test
             result.append(exc)
         finally:

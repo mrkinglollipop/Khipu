@@ -515,30 +515,32 @@ def proposals(replay):
             replay.event("rule_edit", 3, n=1, text="second", pending=True, base="r1", written_by=OTHER)]
 
 
-def test_4_two_conversations_take_turns_without_refusal(replay):
+def test_4_two_conversations_take_turns_without_refusal(replay, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     routing.add_rule("owner", via="app")
-    routing.conversation_view()
-    routing.request_rule("first", n=1, author=AUTHOR)
+    shown = routing.conversation_view()
+    routing.request_rule("first", n=1, author=AUTHOR, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
     refused = None
     try:
-        routing.conversation_view()
-        routing.request_rule("second", n=1, author=OTHER)
+        shown = routing.conversation_view()
+        routing.request_rule("second", n=1, author=OTHER, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
     except routing.RouteError as error:
         refused = str(error)
     expect(refused, None, "4: the second conversation is refused by the pending-author lock")
     assert replay.view()["rules"][0]["text"] == "second"
 
 
-def test_4_priority_conversations_take_turns_without_refusal(replay):
+def test_4_priority_conversations_take_turns_without_refusal(replay, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     routing.set_priority([{"account": "Codex", "role": "owner"}], via="app", expect=routing.priority_version())
-    routing.conversation_view()
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": "first"}], owner_request="synthetic request",
-                             author=AUTHOR, expect=routing.priority_version())
+                             author=AUTHOR, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     refused = None
     try:
-        routing.conversation_view()
+        shown = routing.conversation_view()
         routing.request_priority([{"account": "Codex", "role": "second"}], owner_request="synthetic request",
-                                 author=OTHER, expect=routing.priority_version())
+                                 author=OTHER, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     except routing.RouteError as error:
         refused = str(error)
     expect(refused, None, "4: a pending priority refuses another conversation's replacement")

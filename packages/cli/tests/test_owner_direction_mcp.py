@@ -254,17 +254,18 @@ def test_a_pending_rule_is_not_confirmed_with_no_owner_turn(world):
     assert routing.read_view()["rules"][0]["pending"] is True
 
 
-def _pending_priority() -> str:
-    routing.conversation_view()
+def _pending_priority(world) -> str:
+    world.server("proposal-author")
+    shown = routing.conversation_view()
     out = routing.request_priority([{"account": "Codex"}, {"account": "Claude"}], owner_request="the owner asked",
                                    author={"harness": "grok_bot", "session": "bot-1"}, via="mcp",
-                                   expect=routing.priority_version())
+                                   expect=routing.priority_version(), base=shown["priority_owner_revision"])
     assert out["ok"] is True
     return routing.priority_version()
 
 
 def test_a_pending_priority_confirmed_by_direction(world):
-    version = _pending_priority()
+    version = _pending_priority(world)
     world.say("yes confirm it", session="s-1")
     world.server("s-1")
     is_error, out = _act("route.priority.confirm", {"expect": version})

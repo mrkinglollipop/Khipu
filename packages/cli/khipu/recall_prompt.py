@@ -519,7 +519,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
 
             try:
                 marker = routing_marker(session_id)
-                out = routing.prompt_push(marker, budget=budget, on_fold=fold_started)
+                out = routing.prompt_push(marker, budget=budget, on_fold=fold_started, session_id=session_id)
                 answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed",
                                                    "owed_entities", "shown_entities", "generation", "notices", "routing_changes")}
                 if isinstance(answer["text"], str) and len(answer["text"]) > _ROUTING_TEXT_MOST:

@@ -894,6 +894,7 @@ TOOLS: list[dict] = [
                 "owner_request": {"type": "string", "description": "This conversation's one-line words describing the owner's request"},
             },
             "required": ["text", "owner_request"],
+            "allOf": [{"if": {"required": ["rule"]}, "then": {"required": ["base"]}}],
         },
     },
     {
@@ -935,7 +936,7 @@ TOOLS: list[dict] = [
                 "owner_request": {"type": "string",
                                   "description": "This conversation's one-line words describing the owner's request"},
             },
-            "required": ["entries", "owner_request"],
+            "required": ["entries", "owner_request", "base"],
         },
     },
     {
@@ -1311,7 +1312,9 @@ def _routing_light() -> dict:
         _ensure_path()
         from khipu import routing
 
-        return routing.light_status()
+        # Status is optional and may finish after its caller has returned.
+        # Notices belong to the delivery-aware route and hook responses.
+        return routing.light_status(session_id="")
     except Exception:  # noqa: BLE001 - an optional field must never break khipu_status
         return {}
 
@@ -2266,8 +2269,8 @@ def _tool_route_rule(args: dict) -> dict:
     if not isinstance(text, str):
         raise ValueError("text must be text")
     base = args.get("base")
-    if base is not None and (not isinstance(base, str) or not base.strip()):
-        raise ValueError("base must be the owner revision the request was prepared against")
+    if (args.get("rule") is not None or base is not None) and (not isinstance(base, str) or not base.strip()):
+        raise routing.RouteError("base must be the owner revision the request was prepared against")
     owner_request = args.get("owner_request")
     if not isinstance(owner_request, str) or not owner_request.strip() or "\n" in owner_request or "\r" in owner_request:
         raise ValueError("owner_request must be one line of text")
@@ -2294,8 +2297,8 @@ def _tool_route_priority(args: dict) -> dict:
     if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request", "base"}:
         raise ValueError("khipu_route_priority takes entries, owner_request and optional until")
     base = args.get("base")
-    if base is not None and (not isinstance(base, str) or not base.strip()):
-        raise ValueError("base must be the owner revision the request was prepared against")
+    if not isinstance(base, str) or not base.strip():
+        raise routing.RouteError("base must be the owner revision the request was prepared against")
     entries = args.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError("entries must be the owner's accounts, in his order")
@@ -2305,13 +2308,8 @@ def _tool_route_priority(args: dict) -> dict:
     until = args.get("until")
     if until is not None and not isinstance(until, str):
         raise ValueError("until must be text")
-    # A base selects a recorded conversation read. Omitting it uses the
-    # last delivered revision, never the owner's current revision.
-    if base is not None:
-        return routing.conversation_priority(entries, until=until, owner_request=owner_request,
-                                             author=routing.conversation_author(), base=base)
     return routing.conversation_priority(entries, until=until, owner_request=owner_request,
-                                         author=routing.conversation_author(), expect_current=True)
+                                         author=routing.conversation_author(), base=base)
 
 
 def _tool_owner_act(args: dict) -> dict:

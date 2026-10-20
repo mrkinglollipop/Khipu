@@ -114,6 +114,8 @@ These are yours:
 
 A conversation can record a rule or a priority only when you asked it to. Khipu keeps it pending until you confirm it in the app. A conversation cannot confirm, retire, dismiss or undo anything.
 
+Rule edits and priority requests must carry `base`, the owner revision returned by the conversation's earlier `khipu_route` read. A missing or unread base is refused; later reads never fill it in. The CLI takes the same revision as `--base` with `--at-owner-request`. Replacement notices name the rule number or priority and go only to their author's session, once delivered; undelivered notices expire after seven days. Sessionless reads, including the app's polling command, create no read receipts.
+
 ### Priority and pace
 
 You can set an order for your accounts, with your own words for each role and an optional end date. An order set by a conversation stays unconfirmed until you confirm or undo it. A warning appears if it stays unconfirmed for more than 24 hours.

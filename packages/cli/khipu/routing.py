@@ -1251,23 +1251,21 @@ def routing_dir() -> Path:
     return data_dir().joinpath(*STATE_DIR)
 
 
-_READ_PROCESS = secrets.token_hex(16)
-
-
-def _read_receipt_path() -> Path:
-    # Missing session ids are scoped to this process, never shared by
-    # unrelated MCP servers or CLI invocations.
+def _read_receipt_path() -> Path | None:
     by = conversation_author()
-    identity = [by.get(k) for k in ("harness", "project", "session")]
     if not by.get("session"):
-        identity.append(_READ_PROCESS)
+        return None
+    identity = [by.get(k) for k in ("harness", "project", "session")]
     key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
     return routing_dir() / "reads" / (key + ".json")
 
 
 def _read_receipts() -> dict:
+    path = _read_receipt_path()
+    if path is None:
+        return {}
     try:
-        value = json.loads(_read_receipt_path().read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -1279,6 +1277,10 @@ def _record_read(view: dict, *, rules: bool = False, priority: bool = False) -> 
     Owner writers and internal folds never call this. A caller's base
     can select a delivered revision but cannot manufacture a receipt.
     """
+    # App polls and shell reads have no conversation to acknowledge.
+    path = _read_receipt_path()
+    if path is None:
+        return
     try:
         with lock_budget(0.0), _lock():
             data = _read_receipts()
@@ -1298,7 +1300,6 @@ def _record_read(view: dict, *, rules: bool = False, priority: bool = False) -> 
                 versions = data.setdefault("priority_versions", {})
                 versions[view.get("priority_version") or "p0"] = revision
                 data["priority_versions"] = dict(list(versions.items())[-64:])
-            path = _read_receipt_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, temp = tempfile.mkstemp(dir=path.parent, prefix=".read-")
             try:
@@ -1315,20 +1316,17 @@ def _record_read(view: dict, *, rules: bool = False, priority: bool = False) -> 
 
 
 def _observed_base(entity: str, *, base=None, expect=None) -> str:
+    if not isinstance(base, str) or not base.strip():
+        raise RouteError("base must be the owner revision the request was prepared against")
     data = _read_receipts()
     revisions = (data.get("entities") or {}).get(entity) or []
+    if base not in revisions:
+        raise RouteError("this conversation was not shown that revision; read khipu_route again")
     if expect is not None:
         observed = (data.get("priority_versions") or {}).get(str(expect).strip())
-        if observed is None or (base is not None and base != observed):
+        if observed != base:
             raise RouteError("this conversation was not shown that revision; read khipu_route again")
-        return observed
-    if base is not None:
-        if base not in revisions:
-            raise RouteError("this conversation was not shown that revision; read khipu_route again")
-        return base
-    if not revisions:
-        raise RouteError("read khipu_route before proposing a change to this revision")
-    return revisions[-1]
+    return base
 
 
 def events_file() -> Path:
@@ -3090,7 +3088,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         base = event.get("base")
         record = {"id": key, "entity": entity_key, "kind": kind, "base": base,
                   "author": info["written_by"], "written_by": info["written_by"],
-                  "at": _iso(info["at"]), "notify": None}
+                  "at": _iso(info["at"]), "notify": None,
+                  "n": event.get("n") or (rules.get(entity_key) or {}).get("n")}
         if base is not None and base != owner_revision:
             proposals[key] = dict(record, status="crossed", notify=info["written_by"], ended_at=_iso(info["at"]))
             return False
@@ -3419,21 +3418,15 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 priority_version = _priority_mark(event)
             priority = None
             end_proposal(entity or "priority", "overtaken")
-        elif kind == "priority_drop" and priority is not None and info["account"]:
-            # An account the owner stopped tracking leaves the priority, a
-            # conversation's request waiting for him and the one it replaced
-            # alike; a request left with no account gives way to that one.
-            def without(held):
-                if held is None:
-                    return None
-                rest = [e for e in held["entries"] if e.get("account") != info["account"]]
-                return dict(held, entries=rest) if rest else None
-            prior = without(priority.get("prior"))
-            rest = without(priority)
-            if rest is None:
-                priority = prior if priority["pending"] else None
-            else:
-                priority = dict(rest, prior=prior) if priority["pending"] else rest
+        elif kind == "priority_drop" and info["account"]:
+            # Stopping tracking advances the owner base. End the overlay
+            # before dropping the account from the owner's own priority.
+            if priority is not None and priority.get("pending"):
+                priority = priority.get("prior")
+            end_proposal(entity or "priority", "overtaken")
+            if priority is not None:
+                rest = [e for e in priority["entries"] if e.get("account") != info["account"]]
+                priority = dict(priority, entries=rest, _owner_revision=priority_owner_revision) if rest else None
             priority_version = _priority_mark(event)
         elif kind == "account_note" and info["account"] and event.get("state") in ACCOUNT_NOTE_STATES \
                 and _list_change(event):
@@ -3582,6 +3575,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                      "written_by": r["written_by"], "via": r["via"], "at": _iso(r["at"])}
                     for r in sorted(rules.values(), key=lambda r: (r["n"] is None, r["n"] or 0, r["entity"]))
                     if not r["retired"]]
+    for proposal in proposals.values():
+        if proposal["kind"] == "rule" and proposal["entity"] in rules:
+            proposal["n"] = rules[proposal["entity"]]["n"]
     note_out = None if note is None else {"text": note["text"], "at": _iso(note["at"]),
                                           "written_by": note["written_by"], "via": note["via"]}
     labels = {e["key"]: e["label"] for e in entries}
@@ -4309,7 +4305,8 @@ def _save_view(view: dict) -> None:
 
 def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
     if (not view or view.get("fingerprint") != fingerprint or "priority_version" not in view
-            or "priority_owner_revision" not in view or view.get("event_identity") != 2):
+            or "priority_owner_revision" not in view or view.get("event_identity") != 2
+            or view.get("proposal_schema") != 1):
         return False
     # A whole-log read of a runner's events still under way goes on at the
     # next read, one bounded chunk at a time, though no file changed.
@@ -4433,7 +4430,7 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
             change["directions"] = directions
         changes.append(change)
         changes = changes[-CHANGES_KEPT:]
-    out = dict(body, schema=SCHEMA, event_identity=2, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
+    out = dict(body, schema=SCHEMA, event_identity=2, proposal_schema=1, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
                record=record, bad_lines=bad, fingerprint=fingerprint, changes=changes)
     if not saved:
         out["saved"] = False
@@ -5420,11 +5417,11 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
 
     The requester is recorded through the report-author path. Repeated
     pending edits retain the original wording, so Undo restores it.
-    The base comes from a recorded conversation read. An optional
-    ``base`` selects a revision actually shown to this conversation;
+    Rule edits require an explicit ``base`` from a recorded conversation
+    read. The receipt only verifies that revision was shown;
     an owner write after that read crosses the request.
     """
-    if base is not None and (not isinstance(base, str) or not base.strip()):
+    if (n is not None or base is not None) and (not isinstance(base, str) or not base.strip()):
         raise RouteError("base must be the owner revision the request was prepared against")
     now = now or _now()
     if not isinstance(text, str) or not text.strip():
@@ -5671,24 +5668,24 @@ def request_priority(entries, *, until=None, owner_request: str | None = None, a
                      via: str = "mcp", now: datetime | None = None, expect=None, base: str | None = None) -> dict:
     """A priority a conversation sets at the owner's request: live at once,
     marked with that conversation and unconfirmed, with the priority it
-    replaced kept for Undo. ``expect`` is the priority's version as read,
-    required, so of two requests made on one read only the first lands. A
+    replaced kept for Undo. An explicit ``expect`` also checks the priority's
+    version, so of two requests made on that version only the first lands. A
     newer request on the same owner revision replaces a waiting one, as
     with a standing rule; the replaced author is named in the view.
     ``base`` is the owner revision the caller read when it prepared the
     request: verified against its read receipt independently of ``expect``, so a
     request delivered after the owner moved on is recorded as crossed,
     never made live."""
-    if base is not None and (not isinstance(base, str) or not base.strip()):
+    if not isinstance(base, str) or not base.strip():
         raise RouteError("base must be the owner revision the request was prepared against")
-    if base is None:
-        _needs_version(expect)
     return _request_priority(entries, until=until, owner_request=owner_request, author=author, via=via, now=now,
                              expect=expect, base=base)
 
 
 def _request_priority(entries, *, until, owner_request, author, via: str, now: datetime | None, expect,
                       base: str | None = None) -> dict:
+    if not isinstance(base, str) or not base.strip():
+        raise RouteError("base must be the owner revision the request was prepared against")
     now = now or _now()
     request_words = _one_line(owner_request)
     if not request_words:
@@ -6534,33 +6531,41 @@ def direction_line(entity: str, cause: dict, body: dict, prev_effective: dict | 
     return f"{what} {how}{when} (undo in Settings)."
 
 
-def _replacement_notices(view: dict, now: datetime) -> list[tuple[str, str, str]]:
+def _replacement_notices(view: dict, now: datetime, session: str | None) -> list[tuple[str, str, str]]:
     from khipu import recall_prompt
 
-    markers = {}
+    if not session:
+        return []
+    receipts = None
     items = []
     for item in (view.get("proposals") or {}).values():
         if item.get("status") not in ("replaced", "crossed"):
             continue
+        by = item.get("notify") or item.get("author") or {}
+        # Only the author's session owes delivery. Missing or departed
+        # sessions cannot force work or text into other conversations.
+        if by.get("session") != session:
+            continue
         ended = _parse(item.get("ended_at") or item.get("at"))
         if ended is None or now >= ended + timedelta(days=7):
             continue
-        by = item.get("notify") or item.get("author") or {}
-        session = by.get("session")
-        if session:
-            if session not in markers:
-                markers[session] = recall_prompt.routing_marker(session)
-            if item["id"] in (markers[session].get("notices") or {}):
-                continue
+        if receipts is None:
+            receipts = recall_prompt.routing_marker(session).get("notices") or {}
+        if item["id"] in receipts:
+            continue
         who = author_words(by, push=True)
-        what = item.get("kind") or "rule"
+        if item.get("kind") == "priority":
+            what = "priority"
+        else:
+            what = f"rule {item['n']}" if item.get("n") is not None else "new rule (number pending)"
         suffix = ("was replaced by a newer proposal." if item["status"] == "replaced" else
                   "was crossed by a newer owner revision and never took effect.")
         items.append(("notice", f"A {what} proposal by {who} {suffix}", item["id"]))
     return items
 
 
-def summary(view: dict | None = None, *, now: datetime | None = None, brief: bool = False) -> dict:
+def summary(view: dict | None = None, *, now: datetime | None = None, brief: bool = False,
+            session_id: str | None = None) -> dict:
     """The full summary (``khipu route --summary``, the session-start text):
     a heading with the time and version, the standing rules whole, the note
     whole, then one line per account and the holds inside the summary budget.
@@ -6622,7 +6627,8 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
     for (i, _line, _pointer, _entity), chosen in zip(theirs, fitted):
         whole[i] = chosen
     lines += [line for line in whole if line]
-    notices = _replacement_notices(view, now)
+    receiver = conversation_author().get("session") if session_id is None else session_id
+    notices = _replacement_notices(view, now, receiver)
     shown_notices = []
     dropped = 0
     if not view.get("record"):
@@ -6645,6 +6651,7 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         fixed = _for_agents(fixed, view)
         lines += fixed
         items: list[tuple[str, str, str]] = list(notices)  # (kind, line, at or notice id)
+        items += [("provider", line, "") for line in provider_lines]
         items += [("account", _clip(runner_line(r, now), width), "") for r in sources.get("runners") or []
                   if r.get("silent") or r.get("unreadable")]
         for entry in accounts_in_order:
@@ -7040,7 +7047,7 @@ LIGHT_LOCK_BUDGET = 0.5
 _FAILED = "Khipu's routing record could not answer that (an internal error); khipu doctor says more on this Mac"
 
 _VIEW_FIELDS = ("schema", "epoch", "version", "folded_at", "checked_at", "record", "bad_lines", "saved",
-                "valid_until", "outside_app", "unchecked", "seed_error")
+                "valid_until", "outside_app", "unchecked", "seed_error", "priority_owner_revision")
 _AUTHOR_PUBLIC = ("kind", "harness", "project", "session", "name")
 _ACCOUNT_FIELDS = ("label", "harness", "state", "until", "basis", "scope", "reason", "checkable", "confirmed_at",
                    "since", "silent", "configured", "matched_by")
@@ -7317,15 +7324,17 @@ def _public_priority(view: dict, now: datetime, facts: dict) -> dict | None:
             "line": priority_line(held, now, view=view, facts=facts)}
 
 
-def _public_proposals(view: dict) -> list[dict]:
+def _public_proposals(view: dict, *, session: str | None = None) -> list[dict]:
     """The proposals a conversation can be told about: each one's kind,
     terminal status and the author it names for notification, in the
     fixed words a push may carry (never a project or session name)."""
     out = []
     for item in (view.get("proposals") or {}).values():
         told = item.get("notify") or item.get("author")
+        if item.get("status") in ("replaced", "crossed") and (not session or (told or {}).get("session") != session):
+            continue
         out.append({"id": item.get("id"), "kind": item.get("kind"), "entity": item.get("entity"),
-                    "status": item.get("status"), "base": item.get("base"), "at": item.get("at"),
+                    "status": item.get("status"), "base": item.get("base"), "at": item.get("at"), "rule": item.get("n"),
                     "author": author_words(item.get("author"), push=True),
                     "notify": author_words(told, push=True) if told else None})
     return out
@@ -7455,7 +7464,8 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     out["note"] = _pick(view.get("note"), ("text", "at", "via"))
     facts = plan_facts(view, now)
     out["priority"] = _public_priority(view, now, facts)
-    out["proposals"] = _public_proposals(view)
+    session = conversation_author().get("session")
+    out["proposals"] = _public_proposals(view, session=session)
     out["accounts"] = [dict(_public_account(e, now), plan=_public_fact(facts.get(e["key"])))
                        for e in view["accounts"] if key is None or e["key"] == key]
     out["providers"] = list((view.get("definitions") or {}).get("providers", {}).values())
@@ -7588,24 +7598,20 @@ def conversation_priority(entries, *, until=None, owner_request: str, author: di
                           lock_wait: float | None = CONVERSATION_LOCK_BUDGET, base: str | None = None) -> dict:
     """What MCP ``khipu_route_priority`` writes (``request_priority``), with
     a conversation's fixed messages and lock budget, answered field by field:
-    each account by its label and its id, never its key. ``expect``, the
-    priority's version as read when the request was built, is required: a
-    request never lands on a newer priority it was not built on.
-    ``expect_current`` uses only the last recorded conversation read.
-    ``base`` selects a delivered owner revision and never bypasses an
+    each account by its label and its id, never its key. An explicit
+    ``expect`` also checks the priority's version as read when the request
+    was built.
+    ``base`` is required and selects a delivered owner revision.
+    The receipt never supplies it and it never bypasses an
     explicit ``expect`` check. An old-base request is recorded as crossed."""
-    if base is not None and (not isinstance(base, str) or not base.strip()):
+    if not isinstance(base, str) or not base.strip():
         raise RouteError("base must be the owner revision the request was prepared against")
     by = dict(author or {})
     if by.get("harness") in (None, "", SHELL):
         by["harness"] = UNKNOWN_HARNESS
     with _for_a_conversation(), lock_budget(lock_wait):
         try:
-            # expect_current is retained for older local callers, but it
-            # can only use a delivered read, never mint the current revision.
             with _lock():
-                if expect is None and base is None:
-                    base = _observed_base("priority")
                 written = _request_priority(entries, until=until, owner_request=owner_request, author=by, via="mcp",
                                             now=now, expect=expect, base=base)
         except LockBusy:
@@ -7627,7 +7633,7 @@ class _StartStatus(dict):
         self.view = view
 
 def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_BUDGET,
-                 start: bool = False) -> dict:
+                 start: bool = False, session_id: str | None = None) -> dict:
     """The ``routing`` field of ``khipu_status``'s light payload: the summary
     a conversation gets at its start (``khipu route --summary``), for a
     harness with no hooks, and the text the session-start hook pushes
@@ -7639,7 +7645,7 @@ def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_B
         now = now or _now()
         _view_seen.stat = None
         view = _start_view(now) if start else read_view(now)
-        out = summary(view, now=now)
+        out = summary(view, now=now, session_id=session_id)
     # The summary is the push: built from labels and names, with the
     # owner's own words whole; it holds no key and no configured path.
     status = {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
@@ -7724,7 +7730,8 @@ def start_budget() -> float:
     return min(max(0, ms), START_BUDGET_MOST_MS) / 1000.0
 
 
-def start_push(budget: float | None = None, moment: str = "start") -> dict | None:
+def start_push(budget: float | None = None, moment: str = "start", *,
+               session_id: str | None = None) -> dict | None:
     """The full summary for the session-start hook (or, with ``moment``
     "delegation", for a subagent at its start), or None when the push is
     off. Folds outside the routing lock and waits for it, to save the view,
@@ -7734,7 +7741,7 @@ def start_push(budget: float | None = None, moment: str = "start") -> dict | Non
     if push_off(moment):
         return None
     budget = start_budget() if budget is None else budget
-    out = light_status(lock_wait=budget / 2, start=True)
+    out = light_status(lock_wait=budget / 2, start=True, session_id=session_id)
     from khipu import routing_delivery
 
     now = _now()
@@ -7784,7 +7791,7 @@ def prompt_imports() -> None:
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
     from khipu import (  # noqa: F401
-        agent_view, claude_homes, config, discover, features, paths, redact, routing_delivery, routing_providers, routing_sources,
+        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_delivery, routing_providers, routing_sources,
         session_capture, usage)
 
 
@@ -8129,7 +8136,7 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
 
 
 def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
-                on_fold=None) -> dict:
+                on_fold=None, session_id: str | None = None) -> dict:
     """What the per-prompt hook adds for a conversation whose last-seen
     marker is ``marker`` (``recall_prompt.routing_marker``):
     ``{"kind": "none" | "changes" | "full", "text", "version", "epoch",
@@ -8165,7 +8172,8 @@ def _prompt_text(marker, view, now, cfg):
     why = _full_reason(marker, view, now, cfg)
     if why is None and view.get("unsaved_change"):
         raise PushUnsaved("the routing view changed and could not be saved")
-    if why is None and _replacement_notices(view, now):
+    session_id = conversation_author().get("session") if session_id is None else session_id
+    if why is None and _replacement_notices(view, now, session_id):
         why = "proposal notices are due"
     if why is None:
         seen = marker["version"]
@@ -8196,7 +8204,7 @@ def _prompt_text(marker, view, now, cfg):
                         owed_entities=changed["delivery_entities"], shown_entities=changed.get("shown_entities") or [],
                         unrefreshed=view.get("checked_at") if stale else None)
         why = "the changes are no longer kept"
-    out = summary(view, now=now)
+    out = summary(view, now=now, session_id=session_id)
     return dict(base, kind="full", text=out["text"], count=0, why=why, notices=out["notices"],
                 owed_entities=out["owed_entities"], shown_entities=out["shown_entities"])
 
@@ -8631,7 +8639,8 @@ def _priority_cli(args, now: datetime) -> int:
         view = read_view(now)
         held = view.get("priority")
         if args.json:
-            _print_json({"priority": _public_priority(view, now, plan_facts(view, now))})
+            _print_json({"priority": _public_priority(view, now, plan_facts(view, now)),
+                         "owner_revision": view["priority_owner_revision"]})
         else:
             print(priority_line(held, now, view=view, facts=plan_facts(view, now)) if held else "No priority set.")
         _record_read(view, priority=True)
@@ -8642,7 +8651,8 @@ def _priority_cli(args, now: datetime) -> int:
                              "the owner's")
         _print_json(request_priority(_priority_entries_arg(args), until=args.until,
                                      owner_request=args.at_owner_request, author=conversation_author(),
-                                     via="cli", now=now, expect=getattr(args, "expect", None)))
+                                     via="cli", now=now, expect=getattr(args, "expect", None),
+                                     base=getattr(args, "base", None)))
         return 0
     via = _owner_via(args, _intent_or_none(_priority_intent, args, action))
     if via is None:
@@ -8789,6 +8799,11 @@ def run_cli(args) -> int:
                     _print_json(text)
                 else:
                     print(text["text"])
+                sys.stdout.flush()
+                session = conversation_author().get("session")
+                if session and text["notices"]:
+                    from khipu import recall_prompt
+                    recall_prompt.mark_routing_notices(session, text["notices"])
                 return 0
             if args.json:
                 _print_json(public_view(view, now, account))
@@ -8863,7 +8878,7 @@ def run_cli(args) -> int:
                 if len(params) < 2:
                     raise RouteError('rule edit takes the rule number and its new words: rule edit 3 "<words>"')
                 out = request_rule(" ".join(params[1:]), n=params[0], owner_request=args.at_owner_request,
-                                   author=conversation_author(), via="cli", now=now)
+                                   author=conversation_author(), via="cli", now=now, base=args.base)
             else:
                 raise RouteError("--at-owner-request is only for rule add or edit")
             _print_json(out)

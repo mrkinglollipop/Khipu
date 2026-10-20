@@ -106,11 +106,12 @@ def _record() -> None:
     routing.report(account="Claude", state="open", author=ME)
 
 
-def test_pending_rule_mark_and_prior_words_repeat_with_an_unrelated_next_push(home):
+def test_pending_rule_mark_and_prior_words_repeat_with_an_unrelated_next_push(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     routing.add_rule("Original rule wording.", via="app")
     before = routing.read_view()
-    routing.conversation_view()
-    routing.request_rule("Requested replacement.", n=1, author=ME)
+    shown = routing.conversation_view()
+    routing.request_rule("Requested replacement.", n=1, author=ME, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
     heard_pending = routing.read_view()
     routing.report(account="Codex", state="limited", until="2h", author=ME)
     marker = {"version": heard_pending["version"], "epoch": heard_pending["epoch"],
