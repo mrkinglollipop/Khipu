@@ -143,20 +143,29 @@ the trailing average".
     a week.
   - An account whose probe is costly (Grok's starts a whole agent) samples at the weekly interval for every
     window. Its five-hour verdict is then usually "unknown", and the line says so.
-- **Cycle identity is decided from evidence, not metadata order.** Each reading carries the provider's
-  `resets_at`. Readings whose `resets_at` agree within 5 minutes name the same cycle, because vendors jitter.
-  A cycle is proven in one of two ways:
-  - by provider evidence: fresh readings carrying a new `resets_at`. This can be later *or earlier* than the
-    old one, since a provider can replace a reset with an earlier one;
-  - by usage evidence: a possible reset (below) that is confirmed.
-
-  The **current cycle** is the one carried by the newest fresh reading, never simply "the later `resets_at`".
-  When readings in one bucket (below) name different cycles, the bucket is **ambiguous**. The next fresh
-  reading's cycle decides it, and until then pace is `unknown`: "reset time disagrees between readings".
-  Stale metadata (a cached row) never decides a cycle, because it never makes a sample.
+- **Cycle identity is a canonical partition of reset times, independent of the witness buckets.**
+  - **With a provider cycle id** (a probe that reports a window or cycle id; none does today), the cycle is
+    that id.
+  - **Otherwise reset times fall on a fixed grid anchored to the Unix epoch.** A reset time's cell is
+    `floor(resets_at / 15 min)`. Occupied cells are then paired in one pass, in ascending cell order: an
+    occupied cell joins the cycle of the occupied cell just before it if that cell is adjacent and has not
+    already been joined by another. So each cycle spans at most two adjacent cells, and a reset time that
+    jitters across a grid edge stays in one cycle.
+  - The pass runs over the set of occupied cells, never over arrival order, so it is canonical and transitive
+    by construction. Codex's example, R, R + 4 min and R + 8 min, falls in one cell or two adjacent ones: one
+    cycle either way.
+  - **Stated limit:** two genuinely different resets less than 30 minutes apart are treated as one cycle. The
+    windows are five hours and a week, so this doesn't arise in practice.
+  - **The representative reset time** of a cycle, used for T, is the `resets_at` of its newest fresh reading,
+    ties going to the earlier value.
+  - **The current cycle** is the cycle of the newest fresh reading, so a provider's earlier replacement reset
+    wins over stale metadata. Stale metadata never makes a sample and never decides a cycle. When the newest
+    witness bucket holds fresh readings of two different cycles, pace is `unknown` ("reset time disagrees
+    between readings") until a fresh reading in a later witness bucket settles it.
+  - A cycle change is also proven by usage evidence: a confirmed possible reset (below).
 - **Possible resets come from the raw readings, before any merging.** In corrected-time order within a cycle,
   a reading more than 5 points below an earlier one is a **possible reset**.
-  - It is **confirmed** when the next fresh reading carries a new `resets_at`, or when the next two readings
+  - It is **confirmed** when the next fresh reading belongs to a different cycle, or when the next two readings
     stay more than 5 points below the earlier high.
   - It is **refuted**, and the low reading is then a correction, when a later reading returns to the earlier
     high or above.
@@ -228,17 +237,31 @@ Each target is computed separately. The schema carries each one apart.
 - **Daily cap** (`per_day d`: points of the window per rolling 24 hours, such as the priority's 13% a day for
   Claude jobs; decision 13).
   - **G**, the rolling-day gain, is the sum of valid gains inside [now − 24 h, now], with the boundary interval
-    interpolated as above. Codex's example, readings (−6 h, 0%), (6 h, 6%), (24 h, 15%) at now = 24 h, gives
-    3 + 9 = **12**, not 15. Its 6 interpolated hours are gap time, so `observed_pct` is 75%.
+    interpolated as above. Gain from before the day is never counted.
+    - Codex's example, readings (−6 h, 0%), (6 h, 6%), (24 h, 15%) at now = 24 h, gives 3 + 9 = 12, not 15.
+      But both of its intervals are longer than the 2-hour gap limit, so every in-window hour is gap time,
+      `observed_pct` is 0%, and the daily total is **`unknown`**: "readings cover only 0 of the last 24 h".
+    - Readings every 30 minutes at 0.5 an hour give G = 12 with `observed_pct` 100%.
   - A daily total needs valid durations covering at least 20 of the 24 hours and `observed_pct` of at least
     50%. Otherwise it is `unknown`: "the last 24 h are covered for only 14 h".
   - **Over** when G > d. **Near** when G ≥ 0.85 d. **Under** otherwise.
-  - **The forecast is of the rolling sum, aging out included.** At the trailing average r, the sum Δ from now
-    is S(Δ) = G + r·Δ − A(Δ), where A(Δ) is the in-window gain that leaves the window by then, read from the
-    history over [now − 24 h, now − 24 h + Δ]. `reaches_cap_at` is the first Δ in (0, 24 h], stepped by the
-    bucket width, where S(Δ) ≥ d.
-  - If no such Δ exists, there is no time, and the line says "stays under at the trailing average". For
-    example, a steady 0.5 an hour keeps S at 12 against 13: near, with no time.
+  - **The forecast is of the rolling sum, aging out included, solved exactly.** At the trailing average r,
+    the sum Δ from now is S(Δ) = G + r·Δ − A(Δ), where A(Δ) is the in-window gain that leaves the window by
+    then.
+    - The history is piecewise linear between its buckets, with the boundary interval interpolated, so A, and
+      therefore S, is piecewise linear in Δ. Its breakpoints are the times at which each history point ages
+      out: t_i − (now − 24 h), for each bucket time t_i in the day.
+    - `reaches_cap_at` is found by walking the segments between breakpoints, over (0, 24 h], in order. If
+      S(a) ≥ d at a segment's start a, the crossing is a. If S(a) < d ≤ S(b) at its end b, the crossing is a
+      + (d − S(a)) / (S(b) − S(a)) · (b − a). The first crossing found is the answer. No sampling at bucket
+      width is involved, so a crossing between scan points can't be missed.
+    - Codex's case shows why. With G = 12.99 and r = 0.54125 an hour, no gain over the oldest 4 minutes, 0.1
+      over the next 2, then 12.89 spread evenly: S crosses 13 at 1.109 minutes and peaks at 13.026 at 4
+      minutes, where every 15-minute scan reads under 13. The exact walk returns 1.109 minutes.
+    - The output also carries `peak_pct` and `peak_at`, the highest S over the next 24 hours, so a brief
+      crossing is visible as one.
+  - If no crossing exists in 24 hours, there is no time, and the line says "stays under at the trailing
+    average". For example, a steady 0.5 an hour keeps S at 12 against 13: near, with no time.
   - The output also carries `settles_at_pct` = 24 · r, where the rolling day ends up if r holds.
 - **Both caps at once.** Each is computed independently. The **headline** is the most urgent: cap reached or
   over, then the earliest run-out among the plan limit and the share cap, then near, then the rest.
@@ -248,7 +271,7 @@ Each target is computed separately. The schema carries each one apart.
   pace: {window, cycle_resets_at, trailing_h, buckets, valid_pct, observed_pct, gappy, rate_pct_per_h, why?,
          plan:      {verdict, needed_pct_per_h, runs_out_at?, before_reset_s?, unused_at_reset_pct?},
          share_cap: {revision, pct, verdict, needed_pct_per_h, runs_out_at?, before_reset_s?, unused_at_reset_pct?}?,
-         day_cap:   {revision, pct, verdict, used_24h_pct, observed_pct, settles_at_pct, reaches_cap_at?}?,
+         day_cap:   {revision, pct, verdict, used_24h_pct, observed_pct, settles_at_pct, peak_pct, peak_at, reaches_cap_at?}?,
          headline:  "plan" | "share_cap" | "day_cap"}
   ```
 
@@ -600,7 +623,7 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 14 | Scanner: flags the two live notes; passes capability rows, evidence dates and quoted history | hermetic | 13 |
 | 15 | Health: each red condition turns red and back to green on its own evidence | hermetic | 16 |
 | 16a | Pace inputs: the extractor's sentinel tests; `pace_fixture_v1` rejects any other key; relative, rounded and repeated readings never become fresh samples; two Macs' samples with the same time and different values, a skewed clock, and different reset times merge to identical buckets in opposite arrival orders; two-minute samples over 24 h make consecutive buckets, not one cluster; a late reading changes only what it would have changed on time; 95% then 1% within 150 s is a possible reset, settled by the next readings either way; an earlier replacement `resets_at` carried by fresh readings wins over stale metadata | hermetic | 4Pa |
-| 16b | Pace results: Codex's gap example gives 1 point an hour; (−6 h, 0%), (6 h, 6%), (24 h, 15%) gives a rolling-day gain of 12 with `observed_pct` 75%; a steady 0.5 an hour against a daily cap of 13 gives near with no time; a rising rate gives a `reaches_cap_at` that accounts for usage aging out; long gaps lower `observed_pct` and mark the line gappy; synthetic outpace, underpace and on-pace; a reset mid-window; a correction drop; a possible-reset drop later confirmed and later refuted; coverage below the floor gives `unknown` with its reason; zero burn; limit and cap already reached; a reset time passed; a share cap and a daily cap together, carried apart in the schema; the sanitized real history within its `t_err` | hermetic | 4Pb |
+| 16b | Pace results: Codex's gap example gives 1 point an hour; (−6 h, 0%), (6 h, 6%), (24 h, 15%) computes 12, not 15, but is `unknown` with `observed_pct` 0%; readings every 30 minutes at 0.5 an hour give 12 with 100%; Codex's aging-out case crosses 13 at 1.109 minutes (exact walk) with `peak_pct` 13.026 at 4 minutes, where a 15-minute scan would miss it; R, R + 4 min and R + 8 min reset times form one cycle, and a reset time jittering across a grid edge stays in one cycle; a steady 0.5 an hour against a daily cap of 13 gives near with no time; a rising rate gives a `reaches_cap_at` that accounts for usage aging out; long gaps lower `observed_pct` and mark the line gappy; synthetic outpace, underpace and on-pace; a reset mid-window; a correction drop; a possible-reset drop later confirmed and later refuted; coverage below the floor gives `unknown` with its reason; zero burn; limit and cap already reached; a reset time passed; a share cap and a daily cap together, carried apart in the schema; the sanitized real history within its `t_err` | hermetic | 4Pb |
 | 16c | Pace pushes: a five-hour run-out moving from 1 h to 10 min while still outpacing pushes; readings alternating at 59 min 59 s and 60 min 01 s push once; a rate hovering at 1.15 n doesn't flip the verdict; a change of limiting window, cycle, cap revision or availability pushes; small moves measured against the last acknowledged forecast push once they add up; numbers alone don't push | hermetic | 4Pa |
 
 ## Slices
@@ -691,7 +714,9 @@ Slices 4Pb, 9a, 10 and 13 can run beside 5 to 8c, and 11a beside 6.
 12. **The pace window and sampling** (revised). *Recommend:*
     - Trailing windows of 24 hours (weekly) and 60 minutes (five-hour).
     - Sampling every 30 minutes (weekly) and 10 minutes (five-hour) while in use.
-    - A forecast only with 3 readings, half the window spanned, 75% of it valid, and a fresh last reading.
+    - A forecast only with at least 3 buckets in the window, valid durations covering half the window,
+      `observed_pct` (valid time minus gap time, over the window) of at least 50%, and a fresh last reading.
+    - A daily total only with 20 of its 24 hours valid and `observed_pct` of at least 50%.
 
     Grok, with its costly probe, samples at the weekly interval, so its five-hour pace is usually unknown.
 13. **What a verdict measures against** (revised). *Recommend:* the plan limit, always, plus each cap you set,
@@ -757,6 +782,17 @@ qualified. No disagreements this round.
 - **e.** Band re-arming with a 25% margin, and verdict hysteresis.
 
 No disagreements this round.
+
+**Round 5.** Both P1s were accepted and answered in section 2a:
+
+- **a.** Cycles are a canonical partition of reset times: a provider cycle id where there is one, otherwise a
+  15-minute grid anchored to the epoch, with adjacent cells paired in one ascending pass. It is independent of
+  the witness buckets.
+- **b.** The rolling-cap forecast is solved exactly over the piecewise-linear segments between aging-out
+  breakpoints, with the peak reported.
+
+The daily example, case 16b and decision 12's coverage wording are corrected: Codex's example is `unknown` at
+0% observed. No disagreements this round.
 
 ## Known limits
 
