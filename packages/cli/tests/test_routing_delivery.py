@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -16,7 +16,7 @@ ME = {"kind": "conversation", "harness": "claude_code", "project": "routing", "s
 OTHER = {"kind": "conversation", "harness": "codex", "project": "routing", "session": "two"}
 SESSION = "routing-delivery-session"
 ACCOUNTS = [{"label": "Grok", "harness": "grok"}, {"label": "Codex", "harness": "codex"}] + [
-    {"label": f"A{i}", "harness": "codex", "home": f"/logins/a{i}"} for i in range(8)
+    {"label": f"A{i}", "harness": "codex", "home": f"/logins/synthetic-login-{i}"} for i in range(8)
 ]
 
 
@@ -90,6 +90,8 @@ def test_c_omitted_changes_stay_behind_the_real_delivery_watermark(home):
     base = routing.read_view()
     marker = {"version": base["version"], "epoch": base["epoch"],
               "full_at": routing._iso(T0)}
+    assert recall_prompt.mark_routing_full(SESSION, version=base["version"], epoch=base["epoch"],
+                                          at=marker["full_at"])
     for i in range(8):
         routing.report(account=f"A{i}", state="open", author=ME)
     first = routing.prompt_push(marker, budget=1.0)
@@ -103,18 +105,22 @@ def test_c_omitted_changes_stay_behind_the_real_delivery_watermark(home):
     two = first["text"] + "\n" + second["text"]
     assert all(f"A{i}:" in two for i in range(8))
     assert not recall_prompt.routing_marker(SESSION).get("owed")
+    assert len(first["shown_entities"] + second["shown_entities"]) == 8
+    assert len(set(first["shown_entities"] + second["shown_entities"])) == 8
     assert routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)["kind"] == "none"
     assert all(len(out["text"].split("\n", 1)[1]) <= 400 for out in (first, second))
 
 
 def test_c_same_version_debt_precedes_newer_priority(home):
     _set(home, routing_line_chars=55)
-    key = lambda i: f"codex|/logins/a{i}"
+    key = lambda i: f"codex|/logins/synthetic-login-{i}"
     routing.report(account="Grok", state="open", author=ME)
     base = routing.read_view()
     routing._write_many([{"type": "evidence", "source": "report", "state": "open", "via": "cli",
                           "written_by": ME, "account": key(i)} for i in range(8)])
     marker = {"version": base["version"], "epoch": base["epoch"], "full_at": routing._iso(T0)}
+    assert recall_prompt.mark_routing_full(SESSION, version=base["version"], epoch=base["epoch"],
+                                          at=marker["full_at"])
     first = routing.prompt_push(marker, budget=1.0)
     _deliver(first)
     owed = recall_prompt.routing_marker(SESSION)["owed"]
@@ -124,6 +130,8 @@ def test_c_same_version_debt_precedes_newer_priority(home):
     second = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
     first_owed = next(f"A{i}" for i in range(8) if f"account:{key(i)}" in owed)
     assert second["text"].index(first_owed) < second["text"].index("Your priority")
+    _deliver(second)
+    assert not recall_prompt.routing_marker(SESSION).get("owed")
 
 
 def test_c_identical_rendered_lines_only_acknowledge_the_selected_entity(home):
@@ -151,6 +159,25 @@ def test_e_stale_level_claim_is_marked_beside_fresh_usage_without_editing_words(
                              expect=routing.priority_version())
     text = routing.summary(now=home["clock"].now)["text"]
     assert role in text and "stale level claim; Khipu read 96% left" in text
+    view = routing.read_view()
+    changed = routing.since(0, view)
+    prompt, _count = routing.changes_text(changed, view, T0)
+    assert role in prompt and "stale level claim; Khipu read 96% left" in prompt
+    assert len(prompt.split("\n", 1)[1]) <= 400
+    assert view["priority"]["entries"][0]["role"] == role
+
+
+def test_e_compact_rule_keeps_the_stale_marker_in_a_prompt(home):
+    _usage(home)
+    words = ("Grok: 2% left. " + "Builder guidance follows. " * 30).strip()
+    routing.request_rule(words, owner_request="add builder guidance", author=ME)
+    view = routing.read_view()
+    changed = routing.since(0, view)
+    prompt, _count = routing.changes_text(changed, view, T0)
+    assert "Standing rule 1 added for Grok" in prompt
+    assert "stale level claim; Grok: Khipu read 96% left" in prompt
+    assert len(prompt.split("\n", 1)[1]) <= 400
+    assert view["rules"][0]["text"] == words
 
 
 def test_f_route_output_makes_end_hold_discoverable(home):
@@ -159,13 +186,20 @@ def test_f_route_output_makes_end_hold_discoverable(home):
     assert f"khipu_route_report action=end_hold hold_id={held['id']}" in text
 
 
-def test_acceptance_real_replay_has_grok_priority_and_hold_contradiction(home, monkeypatch):
-    source = os.environ.get("ROUTING_DELIVERY_REPLAY_EVENTS")
-    if not source or not os.path.isfile(source):
-        pytest.skip("real replay fixture not supplied (set ROUTING_DELIVERY_REPLAY_EVENTS)")
+@pytest.mark.parametrize("colliding_login_names", [False, True])
+def test_acceptance_real_replay_has_grok_priority_and_hold_contradiction(
+        home, monkeypatch, colliding_login_names):
+    # Synthetic events reproduce the dates and transitions, with no copied
+    # sessions, projects, paths or words from the private routing log.
+    if colliding_login_names:
+        _set(home, usage_accounts=ACCOUNTS[:2] + [
+            {"label": f"A{i}", "harness": "codex", "home": f"/logins/a{i}"} for i in range(8)
+        ])
+    source = Path(__file__).parent / "fixtures" / "routing_delivery_oct14_19.jsonl"
     target = routing.events_file()
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, target)
+    routing.add_rule("Every builder result gets a review.", via="app")
     monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
     start = routing.start_push(budget=1.0)
     view = routing.read_view()
@@ -180,6 +214,7 @@ def test_acceptance_real_replay_has_grok_priority_and_hold_contradiction(home, m
     assert len(prompt_text) - len(prompt_text.splitlines()[0]) - 1 <= 400
     assert "Hold on Grok" in prompt_text and "contradicts priority" in prompt_text
     assert all(rule["text"] in start_text for rule in view["rules"] if not rule.get("pending"))
+    assert routing.read_view()["holds"][0]["id"] == "h-synthetic-grok"
 
 
 def test_d_rule_collision_lists_the_existing_author_and_all_replacement_routes(home):

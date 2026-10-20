@@ -4778,13 +4778,15 @@ def rule_line(rule: dict, *, view: dict | None = None, facts: dict | None = None
 _TOO_LONG = "the owner has not confirmed it yet. It is too long to show here: read it with `khipu_route`."
 
 
-def rule_pointer(rule: dict, view: dict | None = None) -> str:
-    """A pending rule's line when its words don't fit the budget: fixed
-    words, none of the conversation's."""
+def rule_pointer(rule: dict, view: dict | None = None, *, facts: dict | None = None) -> str:
+    """An identifying opening and current level markers for a pending rule."""
     names = _named_account_labels(rule.get("text"), view)
     named = f" for {', '.join(names)}" if names else ""
+    markers = "".join(_level_claim_marker(rule.get("text") or "", entry["key"], facts,
+                                         label=entry["label"], labels=names)
+                      for entry in (view or {}).get("accounts") or [] if entry["label"] in names)
     return (f"Standing rule {rule['n']} {rule.get('pending_kind') or 'added'}{named}: "
-            f"\"{their_words(_compact_opening(rule.get('text'), 32))}\"; unconfirmed; khipu_route.")
+            f"\"{their_words(_compact_opening(rule.get('text'), 32))}\"{markers}; unconfirmed; khipu_route.")
 
 
 PRIORITY_POINTER = "Your priority was set by a conversation at the owner's request; " + _TOO_LONG
@@ -4792,21 +4794,23 @@ OWNER_PRIORITY_POINTER = "Your priority is too long to show here: read it with `
 _TOO_LONG_SHORT = "Some lines are too long to show here: read them with `khipu_route`."
 
 
-def priority_pointer(priority: dict, view: dict | None = None, *, width: int = 24) -> str:
+def priority_pointer(priority: dict, view: dict | None = None, *, width: int = 24,
+                     facts: dict | None = None) -> str:
     entries = priority.get("entries") or []
     parts = []
     for item in entries:
         held = _account_holds(view, item.get("account"))
         opening = _compact_opening(item.get("role") or "", max(width, 24) if held else width)
         part = item["label"] + (f': "{their_words(opening)}"' if opening else "")
+        part += _level_claim_marker(item.get("role") or "", item["account"], facts)
         if held:
             part += f" [contradicts active hold {held[0]['id']}]"
         parts.append(part)
     return f"Your priority change: {'; '.join(parts)}; unconfirmed; khipu_route."
 
 
-def _priority_pointers(priority: dict, view: dict | None = None) -> tuple[str, ...]:
-    return tuple(priority_pointer(priority, view, width=width) for width in (24, 16, 8, 4))
+def _priority_pointers(priority: dict, view: dict | None = None, *, facts: dict | None = None) -> tuple[str, ...]:
+    return tuple(priority_pointer(priority, view, width=width, facts=facts) for width in (24, 16, 8, 4))
 
 
 def _ended_words(n: int) -> str:
@@ -5266,7 +5270,7 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         whole.append("Standing rules:")
         for r in view["rules"]:
             if r.get("pending"):
-                theirs.append((len(whole), rule_line(r, view=view, facts=facts), rule_pointer(r, view)))
+                theirs.append((len(whole), rule_line(r, view=view, facts=facts), rule_pointer(r, view, facts=facts)))
             whole.append(rule_line(r, view=view, facts=facts))
     if view.get("note"):
         whole.append(note_line(view["note"], now))
@@ -5274,8 +5278,9 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
     if view.get("priority"):
         line = priority_line(view["priority"], now, view=view, facts=facts)
         if view["priority"].get("pending"):
-            theirs.append((len(whole), line, _priority_pointers(view["priority"], view)))
+            theirs.append((len(whole), line, _priority_pointers(view["priority"], view, facts=facts)))
         whole.append(line)
+    whole = _for_agents(whole, view)
     rules_note_chars = sum(len(line) + 1 for i, line in enumerate(whole) if i not in {t[0] for t in theirs})
     fitted, theirs_chars = _fit_theirs([
         (_for_agents(line, view), tuple(_for_agents(p, view) for p in pointer)
@@ -5302,6 +5307,7 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
             fixed.append("Accounts by how soon their allowance runs out unused (Khipu's arithmetic, not your "
                          "priority):")
             accounts_in_order.sort(key=lambda e: -_pace_of(facts.get(e["key"])))
+        fixed = _for_agents(fixed, view)
         lines += fixed
         items: list[tuple[str, str, str]] = []  # (kind, line, at) in display order
         items += [("account", _clip(runner_line(r, now), width), "") for r in sources.get("runners") or []
@@ -5316,6 +5322,9 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
             items.append(("open" if entry["state"] == OPEN else "account", line, ""))
         items += [("lane", _clip(lane_line(u, now), width), "") for u in view.get("unmatched") or []]
         items += [("hold", _push_clip(hold_line(h, now, view=view), width, view), h["at"]) for h in view.get("holds") or []]
+        # Replacing private names with account IDs can expand a line.
+        items = [(kind, line, at) for (kind, _raw, at), line in
+                 zip(items, _for_agents([item[1] for item in items], view))]
         limit = cfg["routing_summary_chars"]
 
         def size(kept: list, n_dropped: int) -> int:
@@ -6408,7 +6417,7 @@ def _priority_push(view: dict, now: datetime, *, changed: bool = False,
             plain = priority_change_line(view, now) if changed else priority_line(view["priority"], now)
             short = [" ".join([*lead, x]) for x in priority_short_lines(view["priority"], now)]
             return [(line, (plain, *short, " ".join([*lead, OWNER_PRIORITY_POINTER])), PRIORITY)]
-        return [(line, tuple(" ".join([*lead, p]) for p in _priority_pointers(view["priority"], view)), THEIRS)]
+        return [(line, tuple(" ".join([*lead, p]) for p in _priority_pointers(view["priority"], view, facts=facts)), THEIRS)]
     if changed and changed_lines is not None:
         return [(line, (" ".join([*lead, "No priority set."]),), PRIORITY)
                 for e, line in zip(changed_lines["entities"], changed_lines["lines"]) if e == "priority"]
@@ -6497,12 +6506,13 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     # until their owner resolves them, even when this version changes an
     # unrelated account. Every part but the owner's rules and note counts
     # against the budget, together (``_fit_push``).
-    head = [(rule_line(r, view=view, facts=plan_facts(view, now)), rule_pointer(r, view), THEIRS, None)
+    facts = plan_facts(view, now)
+    head = [(rule_line(r, view=view, facts=facts), rule_pointer(r, view, facts=facts), THEIRS, None)
             for e, r in pending.items() if e not in changed_rules]
     for group, e, line in ranked:
         entity = changed["entities"][e]
         if group == 0 and entity != "priority":
-            head.append((line, rule_pointer(pending[entity], view), THEIRS, entity)
+            head.append((line, rule_pointer(pending[entity], view, facts=facts), THEIRS, entity)
                         if entity in pending else (line, None, OWNERS, entity))
     priority_head = [(*item, "priority" if "priority" in changed["entities"] else None)
                      for item in _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)]

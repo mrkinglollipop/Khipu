@@ -866,7 +866,8 @@ def test_holds_from_a_conversation_expire_and_the_owners_words_alone_are_pushed(
     with pytest.raises(routing.RouteError):
         routing.add_hold("x" * 301, reason="other", scope="all", author=ME)
     text = routing.summary()["text"]
-    assert "Hold on all work: disk low, until you clear it; set by you: “disk under 20 GB, no builds”" in text
+    assert ("Hold on all work; end it: only the owner can end it in Settings or on a terminal with --owner; "
+            "until you clear it; disk low; set by you: “disk under 20 GB, no builds”") in text
     assert "load1" not in text and "keep Codex" not in text
     with pytest.raises(routing.RouteError):  # a conversation cannot end the owner's hold
         routing.end_hold(next(h["id"] for h in routing.read_view()["holds"] if h["owner"]), author=ME)

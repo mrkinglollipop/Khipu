@@ -694,7 +694,12 @@ def test_many_conversation_requests_take_at_most_half_the_budget(home):
     assert "more changes" in text
     assert any(x.startswith("Codex") for x in text.splitlines())  # the owner's accounts keep their room
     summary = _summary(home)
-    assert "Standing rule 1 added" in summary and "unconfirmed" in summary
+    first_rule = "rule 0 " + "x" * 500
+    assert first_rule in summary or "Standing rule 1 added" in summary
+    assert "the owner has not confirmed it yet" in summary or "unconfirmed" in summary
+    requests = [line for line in summary.splitlines() if "unconfirmed" in line or
+                "the owner has not confirmed it yet" in line]
+    assert sum(len(line) + 1 for line in requests) <= 750
     assert any(x.startswith("Codex") for x in summary.splitlines())
 
 
