@@ -814,6 +814,7 @@ def public(rec: dict) -> dict:
     return {
         "id": rec["id"], "cli": rec["cli"], "cli_name": usage.CLI_NAMES[rec["cli"]], "path": rec.get("path"),
         "default": bool(rec.get("default")), "sources": sources, "name": rec.get("name"),
+        "label_source": "suggested",
         "first_seen": _iso(rec.get("first_seen")), "last_checked": _iso(rec.get("last_checked")),
         "state": state, "reason": rec.get("reason") if state == COULDNT_CHECK else None,
         "plan": rec.get("plan") if state == SIGNED_IN else None,

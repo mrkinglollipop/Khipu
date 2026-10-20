@@ -490,7 +490,8 @@ def test_no_khipu_route_answer_carries_a_path_on_this_mac(home):
             for path in forbidden:
                 assert path not in text, (path, text)
     third = next(a for a in first["accounts"] if a["label"] == "Claude third")
-    assert "home" not in third and "key" not in third and third["id"].startswith("acct-")
+    assert "home" not in third and "key" not in third and third["id"] == routing.account_id("claude|" + str(private / ".claude-third"))
+    assert "third" not in third["id"]
     assert all("path" not in r for r in first["sources"]["runners"])
     assert "path" not in first["sources"]["table"]
     assert first["holds"][-1]["scope"]["account"] == third["id"]
@@ -657,7 +658,10 @@ def test_no_khipu_route_report_answer_carries_a_path_on_this_mac(home):
     assert answers[0]["label"] == "Claude third" and answers[1]["label"] == "Claude second"
     assert answers[0]["account"] == routing.account_id("claude|" + str(private / ".claude-third"))
     # The record keeps the key; only the answer gives the label.
-    assert _events()[0]["account"] == "claude|" + str(private / ".claude-third")
+    events = _events()
+    assert events[0]["type"] == "account_migration"
+    assert events[1]["type"] == "evidence"
+    assert events[1]["account"] == "claude|" + str(private / ".claude-third")
 
 
 def test_a_write_that_cant_be_appended_says_why_without_a_path(home):
@@ -764,11 +768,16 @@ def test_a_clipped_report_never_keeps_part_of_a_login_folder(home):
     private = _private_accounts(home, deep=True)
     where = str(private / ".claude-third")
     assert len(where) > routing.EVIDENCE_MAX
+    third = routing.account_id(usage_mod._key({"harness": "claude", "home": where}))
+    prefix = _events()
+    assert [e["type"] for e in prefix] == ["account_migration"]
     _report(state="limited", account="Claude second", message="x", evidence=f"saw it in {where}/x.log",
             name=f"from {where}")
     _report(action="hold", scope="all", reason="keep", text=f"keep {where}")
     tmp = str(home["tmp"])
-    stored = _events()
+    assert _events()[:len(prefix)] == prefix
+    stored = _events()[len(prefix):]
+    assert [e["type"] for e in stored] == ["evidence", "hold"]
     for event in stored:
         assert tmp not in json.dumps(event), event
     # A login folder stands as its account's id, never its folder name (slice 9A).
@@ -1009,13 +1018,22 @@ def test_a_down_report_after_khipus_own_read_voids_its_confirmation(home):
 
 
 def test_an_account_id_cannot_be_computed_from_a_guessed_login_folder(home):
-    # A bare hash of the key let a reader confirm a guessed login folder
-    # offline; the id is keyed by this install's own secret.
+    # Stable ids name labels, not folders. Historical aliases still need
+    # the install secret so a guessed login folder cannot recreate one.
     import hashlib
+    import re
 
     key = "claude|/logins/claude-second"
+    raw = json.loads((home["data"] / "config.json").read_text())
+    raw["usage_accounts"][1]["label_source"] = "suggested"
+    (home["data"] / "config.json").write_text(json.dumps(raw))
     listed = routing.account_id(key)
     assert listed == routing.account_id(key)
-    assert listed != "acct-" + hashlib.sha256(key.encode()).hexdigest()[:12]
+    assert re.fullmatch(r"claude:a-[a-z2-7]{8}", listed)
+    assert "second" not in listed
+    assert routing.resolve_account(listed) == listed
+    assert routing.account_id("claude|/logins/unconfigured-guess") != listed
+    legacy = routing._legacy_account_id(key)
+    assert legacy != "acct-" + hashlib.sha256(key.encode()).hexdigest()[:12]
     salt = routing.routing_dir() / "id-salt"
     assert salt.exists() and (salt.stat().st_mode & 0o777) == 0o600

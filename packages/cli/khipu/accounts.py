@@ -10,8 +10,8 @@ syncs through the hub.
 The account list is ``usage_accounts`` in config.json. Each write holds
 ``config.mutate_config`` (the one config write path) from its read to its save and is refused when
 the version the caller read (``--expect``, ``config.accounts_version``) has
-moved. Account keys (``usage._key``: the CLI and the login folder) never
-change on rename (decision 7); a default login stays home-less (decision 6),
+moved. Local cache keys (``usage._key``: the CLI and the login folder) never
+change on rename; stable routing ids gain an owner-written forward; a default login stays home-less (decision 6),
 so writing the default list out changes no key.
 """
 from __future__ import annotations
@@ -95,7 +95,8 @@ def known_of(entries: list) -> list[dict]:
         account = usage._account_from_entry(entry)
         if not account.get("invalid"):
             out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],
-                        "home": account.get("home")})
+                        "home": account.get("home"),
+                        **({"label_source": account["label_source"]} if "label_source" in account else {})})
     return out
 
 
@@ -210,6 +211,8 @@ def _locked(expect):
         raise AccountsError(VERSION_NEEDED, "version_needed")
     with routing._lock():
         recover()
+        if (routing.routing_dir() / "id-salt").exists():
+            routing.migrate_accounts()
         with config.mutate_config() as data:
             config.check_accounts_version(data, expect)
             yield data
@@ -378,7 +381,9 @@ def _plan(before: list[dict], after: list[dict], *, moves: bool) -> list[tuple]:
                 ops.append(("move", key, twin))
                 gone.remove(key)
                 came.remove(twin)
-    ops += [("rename", k) for k in old if k in new and old[k]["label"] != new[k]["label"]]
+    ops += [("rename", k) for k in old if k in new and (old[k]["label"] != new[k]["label"] or
+                       (routing.account_identity.label_source(old[k]) != "owner" and
+                        routing.account_identity.label_source(new[k]) == "owner"))]
     ops += [("stop", k) for k in gone]
     ops += [("track", k) for k in came]
     return ops
@@ -411,9 +416,28 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
     Stop tracking, as above; its other notes are the request's own."""
     owner = request is None
     before = copy.deepcopy(data)
+    prior_events = routing._in_write_order(routing.read_events()[0])
+    prior_accounts = routing.account_identity.with_provenance(known_of(base), prior_events)
+    prior_by_key = {a["key"]: a for a in prior_accounts}
+    for entry in parsed:
+        account = usage._account_from_entry(entry)
+        if account.get("invalid"):
+            continue
+        prior = prior_by_key.get(usage._key(account))
+        if prior and account["label"] != prior["label"]:
+            entry["label_source"] = "owner"
+        elif "label_source" not in entry:
+            entry["label_source"] = (prior["label_source"] if prior else
+                                     routing.account_identity.label_source(account))
     after_list = parsed
-    known, after = known_of(base if confirmed is None else confirmed), known_of(after_list)
+    known = routing.account_identity.with_provenance(
+        known_of(base if confirmed is None else confirmed), prior_events)
+    after = known_of(after_list)
+    routing.account_identity.validate(after)
     ops = _plan(known, after, moves=owner and confirmed is None)
+    if not owner and any(op[0] == "rename" for op in ops):
+        raise AccountsError("only the owner renames an account; use the app or a typed owner confirmation",
+                            "owner_only", field="label")
     waiting = data.get("usage_accounts_request")
     if owner and confirmed is None and isinstance(waiting, dict):
         # Any other owner write ends a conversation's change still waiting
@@ -461,6 +485,59 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
                 if not prior[runner]:
                     prior.pop(runner)
     events: list[dict] = [{"type": "account_move", "account": was, "target": now} for was, now in moves]
+    after_by_key = {a["key"]: a for a in after}
+    known = routing.account_identity.with_provenance(known, prior_events)
+    old = {a["key"]: a for a in known}
+    _keys, forwards, _aliases = routing.account_identity.state(prior_events, known)
+    for account in after:
+        declared = routing.account_identity.stable_id(account["harness"], account["label"])
+        source = next((was for was, target in moves if target == account["key"]), account["key"])
+        prior = old.get(source)
+        unchanged = prior and declared == routing.account_identity.stable_id(prior["harness"], prior["label"])
+        if account["key"] in renames and declared in {_keys[k] for k in old if k != source} and not unchanged:
+            raise AccountsError("that label is another account's stable id; choose a new label", "name_taken",
+                                field="label")
+        if declared in forwards and not unchanged:
+            raise AccountsError("that label is an earlier account id; choose a new label", "name_taken",
+                                field="label")
+    for key in renames:
+        if key not in _keys:
+            continue  # an ambiguous old label cannot forward either login
+        was = _keys[key]
+        new = routing.account_identity.declared_id(after_by_key[key])
+        if new is None:
+            new = routing.account_identity.allocate(after_by_key[key], set(_keys.values()) | set(forwards))
+        if was != new:
+            events.append({"type": "account_rename", "account": was, "to": new})
+    if owner:
+        # Repairing a legacy slug collision leaves the remaining label
+        # unambiguous; retain its formerly listed opaque id as a forward.
+        for account in after:
+            key = account["key"]
+            prior = old.get(key)
+            if prior is None or key in renames:
+                continue
+            declared = routing.account_identity.declared_id(account)
+            old_declared = routing.account_identity.stable_id(prior["harness"], prior["label"])
+            clashes = sum(routing.account_identity.stable_id(a["harness"], a["label"]) == old_declared for a in known)
+            if clashes > 1 and declared and _keys.get(key) != declared:
+                events.append({"type": "account_rename", "account": _keys[key], "to": declared})
+    # Pin the old list before allocating new logins. A stop plus track is
+    # not a move, even when the caller reuses exactly the same label.
+    bindings = [{"type": "account_binding", "account": key, "to": ident}
+                for key, ident in _keys.items() if key in old]
+    preview = [*prior_events, *[dict(e, written_by={"kind": "owner"}) for e in bindings + events]]
+    after_ids = routing.account_identity.state(preview, after)[0]
+    used = set(after_ids.values()) | set(_keys.values()) | set(forwards)
+    if confirmed is None:
+        for key in tracks:
+            if key in _keys:
+                after_ids[key] = routing.account_identity.allocate(after_by_key[key], used)
+                used.add(after_ids[key])
+    bindings += [{"type": "account_binding", "account": a["key"], "to": after_ids[a["key"]],
+                  "state": "tracked" if a["key"] in tracks and confirmed is None else "bound"}
+                 for a in after]
+    events = bindings + events
     notes = [{"type": "account_note", "account": k, "state": "renamed", "text": old[k]["label"]}
              for k in renames if confirmed is None]
     done: dict = {"priority": None, "pause": None}
@@ -480,6 +557,7 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
     if not owner:
         held = dict(request, prior=stored, prior_none=data.get("usage_accounts_none"))
     _store(data, parsed, none=none, unset=unset, request=held)
+    data[routing.account_identity.BINDINGS] = routing.account_identity.local_bindings(after, after_ids)
     version = config.accounts_version(data)
     if owner:
         lines = routing.owner_lines(events, via)
@@ -785,7 +863,7 @@ def _harness(raw) -> str:
 # ---- the owner's actions ------------------------------------------------------------------
 
 
-def _track_entries(raw) -> list[tuple[str, str | None, str | None]]:
+def _track_entries(raw) -> list[tuple[str, str | None, str | None, str | None]]:
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
@@ -796,13 +874,16 @@ def _track_entries(raw) -> list[tuple[str, str | None, str | None]]:
                             "bad_list")
     out = []
     for i, item in enumerate(raw):
-        if not isinstance(item, dict) or set(item) - {"harness", "home", "label"}:
+        if not isinstance(item, dict) or set(item) - {"harness", "home", "label", "label_source"}:
             raise AccountsError(f"entry {i + 1} takes harness, home and label", "bad_entry", index=i)
         harness = str(item.get("harness") or "").strip().lower()
         if harness not in usage.HARNESSES:
             raise AccountsError(f"entry {i + 1} names no CLI Khipu reads", "unknown_cli", index=i, field="harness")
+        if item.get("label_source") not in (None, "owner", "suggested"):
+            raise AccountsError("label_source must be owner or suggested", "bad_entry", index=i,
+                                field="label_source")
         out.append((harness, _one_line(item.get("home"), "a login folder", field="home", index=i),
-                    _one_line(item.get("label"), "a name", field="label", index=i)))
+                    _one_line(item.get("label"), "a name", field="label", index=i), item.get("label_source")))
     return out
 
 
@@ -823,13 +904,14 @@ def track(entries, *, expect=None, shown_defaults=None, read: bool = True, via: 
         stored, base = current_list(data, shown_defaults)
         taken = {usage._account_from_entry(e)["label"].casefold() for e in base if isinstance(e, dict)}
         new: list[dict] = []
-        for i, (harness, raw_home, label) in enumerate(wanted):
+        for i, (harness, raw_home, label, supplied_source) in enumerate(wanted):
             where = len(base) + i
             try:
                 home = canonical_home(harness, raw_home)
             except AccountsError as err:
                 err.index = where
                 raise
+            source = "suggested" if label is None or via == "auto" else supplied_source or "owner"
             if label is None:
                 path = usage.default_login(harness) if home is None else usage._home_path(home)
                 label = discover.default_name(harness, str(path) if path is not None else None, default=home is None)
@@ -838,7 +920,7 @@ def track(entries, *, expect=None, shown_defaults=None, read: bool = True, via: 
                                         "name_needed", index=where, field="label")
                 label = _unique_name(label, taken)
             taken.add(label.casefold())
-            entry = {"label": label, "harness": harness}
+            entry = {"label": label, "harness": harness, "label_source": source}
             if home:
                 entry["home"] = home
             new.append(entry)
@@ -865,7 +947,7 @@ def rename(key, name, *, expect=None, via: str = "app") -> dict:
         i = _find(base, key)
         old = usage._account_from_entry(base[i])["label"]
         changed = list(base)
-        changed[i] = dict(base[i], label=name)
+        changed[i] = dict(base[i], label=name, label_source="owner")
         parsed = usage.parse_usage_accounts(changed, previous=stored)
         res = _commit(data, stored, base, parsed, via=via)
         lanes = len(_lanes_on(data.get("routing_lane_map") or {}, key, known_of(parsed)))
@@ -979,6 +1061,8 @@ def move(key, folder, *, expect=None, via: str = "app") -> dict:
         i = _find(base, key)
         label = usage._account_from_entry(base[i])["label"]
         entry = {k: v for k, v in base[i].items() if k != "home"}
+        entry["label_source"] = routing.account_identity.with_provenance(
+            known_of([base[i]]), routing._in_write_order(routing.read_events()[0]))[0]["label_source"]
         if home:
             entry["home"] = home
         new_key = usage._key(usage._account_from_entry(entry))
@@ -1051,6 +1135,12 @@ def status() -> dict:
     data = config.load_config()
     lane_map = routing.settings(data)["routing_lane_map"]
     accounts = [dict(a, key=usage._key(a)) if not a.get("invalid") else dict(a) for a in st["accounts"]]
+    for account in routing.account_identity.with_provenance(
+            [a for a in accounts if not a.get("invalid")], routing._in_write_order(routing.read_events()[0])):
+        row = next(a for a in accounts if a.get("key") == account["key"])
+        row["label_source"] = account["label_source"]
+        if account["label_source"] == "suggested":
+            row["naming_hint"] = routing.account_identity.NAME_ACCOUNT
     return {"ok": True, "version": st["version"], "none": st["none"], "auto_track": config.auto_track(),
             "value": st["value"], "accounts": accounts, "user_home": st["user_home"],
             "declined": discover.turned_down(), "request": st["request"],

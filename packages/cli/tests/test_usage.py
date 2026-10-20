@@ -1426,8 +1426,9 @@ def test_usage_accounts_are_set_shown_and_unset_through_config(fake, capsys, khi
     ])], capsys)
     assert rc == 0 and out["ok"] is True
     stored = json.loads(config.config_file().read_text())["usage_accounts"]
-    assert stored == [{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"},
-                      {"label": "Grok", "harness": "grok"}]
+    assert stored == [{"label": "Claude second", "harness": "claude", "home": "~/.claude-second",
+                       "label_source": "owner"},
+                      {"label": "Grok", "harness": "grok", "label_source": "owner"}]
     assert out["usage_accounts"]["source"] == "file"
     assert [a["label"] for a in out["usage_accounts"]["accounts"]] == ["Claude second", "Grok"]
     rc, shown = _config_cli([], capsys)

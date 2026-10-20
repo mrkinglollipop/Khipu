@@ -782,7 +782,6 @@ def test_10_fix_round_advisory_never_denies(replay, model, expected):
 # ---- 11a: migration and aliases --------------------------------------------------------
 
 
-@future("3a", "account ids become provider:label and duplicate provider labels are refused")
 def test_11a_account_id_is_stable_across_installations(replay, tmp_path):
     first = routing.account_id("codex|")
     b = Replay(tmp_path / "mac-b", replay.patch)
@@ -792,9 +791,8 @@ def test_11a_account_id_is_stable_across_installations(replay, tmp_path):
 
 
 @pytest.mark.parametrize("age,restored", [(89, False), (91, False), (91, True)], ids=["alias-live", "alias-expired", "restore-keeps-start"])
-@future("3a", "migration aliases have a log-owned 90-day window and explicit expiry errors")
 def test_11a_alias_window_and_restored_migration_start(replay, age, restored):
-    old = routing.account_id("codex|")
+    old = routing._legacy_account_id("codex|")
     migration = replay.event("account_migration", aliases={old: "codex:main"}, started_at=routing._iso(T0))
     replay.write(migration)
     if restored:
@@ -818,22 +816,23 @@ def test_11a_alias_window_and_restored_migration_start(replay, age, restored):
                "11a: expired alias was accepted or lacked its explicit date and replacement")
 
 
-@future("3a", "stable account renames forward the old id")
 def test_11a_rename_keeps_a_forward(replay):
     view = replay.fold([replay.event("account_rename", account="codex:main", to="codex:second")])
     expect(view["forwards"].get("codex:main"), "codex:second", "11a: stable account rename creates no forward")
 
 
-@future("3a", "duplicate labels for one provider must be refused at write time")
 def test_11a_duplicate_label_is_refused(replay):
-    replay.configure(usage_accounts=ACCOUNTS + [{"label": "Codex", "harness": "codex",
-                                               "home": str(replay.root / "synthetic-other")}])
-    refused = False
-    try:
-        routing.accounts()
-    except routing.RouteError:
-        refused = True
-    expect(refused, True, "11a: duplicate provider label is accepted")
+    from khipu import accounts, config, usage
+
+    original = config.load_config()
+    events = routing.read_events()[0]
+    changed = ACCOUNTS + [{"label": "Codex", "harness": "codex",
+                           "home": str(replay.root / "synthetic-other")}]
+    with pytest.raises(usage.AccountsError) as error:
+        accounts.save_list(changed, expect=config.accounts_version(), via="app")
+    assert error.value.code == "name_taken"
+    assert config.load_config() == original
+    assert routing.read_events()[0] == events
 
 
 def test_11a_old_local_log_folds_unchanged_and_is_never_rewritten(replay):
@@ -854,6 +853,156 @@ def test_11a_old_local_log_folds_unchanged_and_is_never_rewritten(replay):
     }
     assert path.read_bytes() == raw
     assert one["holds"][0]["id"] == "h-synthetic-grok"
+
+
+def test_11a_migration_is_append_only_idempotent_and_keeps_the_effective_view(replay):
+    from khipu.config import load_config
+
+    before = seed(replay)
+    path = routing.events_file()
+    original = path.read_bytes()
+    old = routing._legacy_account_id("codex|")
+    after = replay.view()  # A Mac which issued salted ids migrates on read.
+    assert path.read_bytes().startswith(original)
+    assert before["effective"] == after["effective"]
+    migrations = [e for e in routing.read_events()[0] if e["type"] == "account_migration"]
+    assert len(migrations) == 1 and migrations[0]["aliases"][old] == "codex:main"
+    assert migrations[0]["started_at"] == routing._iso(T0)
+    assert load_config()[routing.account_identity.BINDINGS]["codex:main"] == {"harness": "codex", "home": None}
+    migrated = path.read_bytes()
+    replay.advance(91 * 86400)
+    routing.migrate_accounts()
+    assert path.read_bytes() == migrated
+    with pytest.raises(routing.RouteError, match="expired on 2027-01-18; use codex:main"):
+        routing.resolve_account(old)
+
+
+def test_11a_bindings_are_local_and_same_label_is_one_identity(replay, tmp_path):
+    from khipu.config import load_config
+
+    replay.configure(usage_accounts=[{"harness": "claude", "label": "Claude second",
+                                      "home": str(replay.root / "login")}])
+    routing.migrate_accounts()
+    first = routing.account_id("claude|" + str(replay.root / "login"))
+    first_binding = load_config()[routing.account_identity.BINDINGS]
+    assert not next(e for e in routing.read_events()[0] if e["type"] == "account_migration")["aliases"]
+    b = Replay(tmp_path / "mac-b", replay.patch)
+    b.configure(usage_accounts=[{"harness": "claude", "label": "Claude second", "home": str(b.root / "login")}])
+    routing.migrate_accounts()
+    assert routing.account_id("claude|" + str(b.root / "login")) == first == "claude:second"
+    assert load_config()[routing.account_identity.BINDINGS] != first_binding
+    assert not (routing.routing_dir() / "id-salt").exists()
+
+
+def test_11a_alias_expires_at_the_boundary_and_never_rebinds_on_reinstall(replay, tmp_path):
+    old = routing._legacy_account_id("codex|")
+    routing.migrate_accounts()
+    replay.advance(90 * 86400 - 1)
+    assert routing.resolve_account(old) == "codex:main"
+    replay.advance(1)
+    for lookup in (routing.resolve_account, routing._resolve_reported,
+                   lambda name: routing.conversation_view(account=name)):
+        with pytest.raises(routing.RouteError, match="expired on 2027-01-18; use codex:main"):
+            lookup(old)
+    Replay(tmp_path / "reinstalled", replay.patch)
+    with pytest.raises(routing.RouteError, match="doesn't know that old account id"):
+        routing.resolve_account(old)
+    assert not routing.events_file().exists()
+
+
+def test_11a_owner_rename_forwards_ids_aliases_holds_and_history(replay):
+    from khipu import accounts, config
+
+    old = routing._legacy_account_id("codex|")
+    routing.migrate_accounts()
+    routing.report(account="Codex", state="limited", until="2h", author=AUTHOR)
+    routing.add_hold("synthetic hold", account="Codex", scope="account", reason="keep", author=AUTHOR)
+    accounts.rename("codex|", "Codex second", expect=config.accounts_version(), via="app")
+    assert routing.account_id("codex|") == routing.resolve_account("codex:main") == "codex:second"
+    assert routing.resolve_account(old) == "codex:second"
+    assert replay.view()["forwards"]["codex:main"] == "codex:second"
+    assert replay.view()["holds"][0]["scope"]["account"] == "codex|"
+    assert next(a for a in replay.view()["accounts"] if a["key"] == "codex|")["state"] == "limited"
+    assert set(config.load_config()[routing.account_identity.BINDINGS]) == {"claude:main", "grok:main", "codex:second"}
+    replay.advance(91 * 86400)
+    with pytest.raises(routing.RouteError, match="use codex:second"):
+        routing.resolve_account(old)
+    # Expiry affects lookup only: historical alias entries still fold.
+    row = replay.event("evidence", account=old, state="limited", basis="cli", source="report",
+                       until=routing._iso(replay.now + timedelta(hours=1)))
+    replay.write(row)
+    assert next(a for a in replay.view()["accounts"] if a["key"] == "codex|")["state"] == "limited"
+
+
+def test_11a_conversation_cannot_rename_or_supply_identity_events(replay):
+    from khipu import accounts, config
+
+    original = config.load_config()
+    changed = copy.deepcopy(ACCOUNTS)
+    changed[1]["label"] = "Codex second"
+    with pytest.raises(accounts.AccountsError, match="only the owner renames"):
+        accounts.save_list(changed, expect=config.accounts_version(), request={"by": AUTHOR, "request": "rename"})
+    assert config.load_config() == original
+    view = replay.fold([dict(replay.event("account_rename", account="codex:main", to="codex:second"),
+                             written_by=AUTHOR),
+                        dict(replay.event("account_migration", aliases={"acct-000000000000": "codex:main"}),
+                             written_by=AUTHOR)])
+    assert view["forwards"] == {}
+    assert routing.account_identity.state(routing.read_events()[0], routing.accounts())[2] == {}
+
+
+def test_11a_crossing_renames_forward_the_loser_and_conversations_cannot_override(replay):
+    rows = [replay.event("account_rename", 1, account="codex:main", to="codex:second"),
+            replay.event("account_rename", 2, account="codex:main", to="codex:third"),
+            dict(replay.event("account_rename", 3, account="codex:third", to="codex:fourth"), written_by=OTHER)]
+    view = replay.fold(rows)
+    assert view["forwards"] == {"codex:main": "codex:third", "codex:second": "codex:third"}
+
+
+def test_11a_a_forwarded_label_cannot_be_reused_for_another_login(replay):
+    from khipu import accounts, config
+
+    accounts.rename("codex|", "Codex second", expect=config.accounts_version(), via="app")
+    before = config.load_config()
+    changed = before["usage_accounts"] + [{"harness": "codex", "label": "Codex main",
+                                          "home": str(replay.root / "another-login")}]
+    with pytest.raises(accounts.AccountsError, match="earlier account id"):
+        accounts.save_list(changed, expect=config.accounts_version(), via="app")
+    assert config.load_config() == before
+    assert routing.resolve_account("codex:main") == "codex:second"
+
+
+def test_11a_restored_history_uses_the_new_local_binding_forever(replay, tmp_path):
+    account = {"harness": "claude", "label": "Claude second", "home": str(replay.root / "login")}
+    replay.configure(usage_accounts=[account])
+    key = "claude|" + account["home"]
+    old = routing._legacy_account_id(key)
+    routing.migrate_accounts()
+    routing.pause("Claude second", via="app")
+    original = routing.events_file().read_bytes()
+    b = Replay(tmp_path / "restored-bindings", replay.patch)
+    b.configure(usage_accounts=[dict(account, home=str(b.root / "login"))])
+    routing.events_file().parent.mkdir(parents=True, exist_ok=True)
+    routing.events_file().write_bytes(original)
+    routing.migrate_accounts()
+    assert routing.resolve_account(old) == "claude:second"
+    b.advance(91 * 86400)
+    view = b.view()
+    assert [(a["key"], a["state"]) for a in view["accounts"]] == [("claude|" + str(b.root / "login"), "paused")]
+    assert routing.events_file().read_bytes() == original
+    assert not (routing.routing_dir() / "id-salt").exists()
+    with pytest.raises(routing.RouteError, match="expired on 2027-01-18; use claude:second"):
+        routing.resolve_account(old)
+
+
+@pytest.mark.parametrize("labels", [("Codex work!", "Codex work"), ("Codex", "Codex main")])
+def test_11a_slug_collisions_are_refused_even_on_an_unchanged_stored_list(replay, labels):
+    from khipu import usage
+
+    entries = [{"harness": "codex", "label": label, "home": str(replay.root / f"login-{i}")}
+               for i, label in enumerate(labels)]
+    with pytest.raises(usage.AccountsError, match="duplicate account label"):
+        usage.parse_usage_accounts(entries, previous=entries)
 
 
 # ---- 11b: global identities, ordering, retries, tombstones -------------------------------
