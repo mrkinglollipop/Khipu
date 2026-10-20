@@ -64,7 +64,9 @@ def _recent_rows(cur, limit: int) -> list[dict]:
 
 
 def recent_episodes(*, limit: int = 40) -> list[dict]:
-    with connect() as conn:
+    from khipu.db import read_connection
+
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             return _recent_rows(cur, limit)
 
@@ -189,7 +191,9 @@ def media_detail(asset_id: str) -> dict | None:
 
 
 def activity_payload(*, limit: int = 40) -> dict:
-    with connect() as conn:
+    from khipu.db import read_connection
+
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM episodes {_live_where(cur)}")
             n = int(cur.fetchone()[0])
@@ -355,7 +359,9 @@ def project_slice(
     episodes: list[dict[str, Any]] = []
     topics: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
-    with connect() as conn:
+    from khipu.db import read_connection
+
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             if project:
                 # O3: a snoozed row (due_after in the future) is parked — it

@@ -3164,10 +3164,10 @@ def _deliverable_context_line(tokens: list[str], *, cwd: str | None,
 
         if hub_reach.known_unreachable() is not None:
             return ""
-        from khipu.db import connect
+        from khipu.db import connect, read_connection
         from khipu import deliverables as _deliverables
 
-        with connect() as conn:
+        with read_connection(connect) as conn:
             with conn.cursor() as cur:
                 return _deliverables.deliverable_line_for_prompt(
                     cur, tokens, project=project

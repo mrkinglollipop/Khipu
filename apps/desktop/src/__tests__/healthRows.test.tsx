@@ -385,3 +385,29 @@ describe("ledger copy row", () => {
     expect(row.detail).toBe("no ledger in the offline copy yet");
   });
 });
+
+describe("read_role_ok on a hub that cannot host the search role", () => {
+  const parsed = {
+    hub_ok: true,
+    read_role_ok: true,
+    read_role: {
+      state: "cannot_host",
+      level: "amber",
+      warnings: ["Searches share the save connections on this hub: its owner role cannot create roles."],
+    },
+  };
+
+  it("is a warn row between red and green, carrying the sentence", () => {
+    const rows = healthRows({ ...parsed, disk_space_ok: false });
+    const row = rows.find((r) => r.key === "read_role_ok")!;
+    expect(row.status).toBe("warn");
+    expect(row.detail).toContain("share the save connections");
+    expect(rows.map((r) => r.status)).toEqual(["err", "warn", "ok"]);
+  });
+
+  it("renders with the warn icon and the fix sentence", () => {
+    const { container } = render(<HealthReportRows parsed={parsed} attention={[]} />);
+    expect(container.querySelector("svg.warn")).not.toBeNull();
+    expect(screen.getByText(/share the save connections/)).toBeInTheDocument();
+  });
+});

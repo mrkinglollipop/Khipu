@@ -1023,9 +1023,11 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "schema_migrations": schema,
         "work": work_block,
         "read_role": read_role_block,
-        # Its own row in the app: red while this Mac or another client searches
-        # as the owner. Never gates `ok` or a promotion.
-        **({"read_role_ok": (read_role_block.get("state") == "read" and not read_role_block.get("error")
+        # Its own row in the app: red while this Mac cannot use the search role
+        # or another client searches as the owner; amber (true, with the fix)
+        # on a hub that cannot host one. Never gates `ok` or a promotion.
+        **({"read_role_ok": (read_role_block.get("state") in ("read", "cannot_host")
+                             and not read_role_block.get("error")
                              and not read_role_block.get("owner_searchers"))} if hub_ok else {}),
         "promotion": _promotion_block(),
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
@@ -2154,7 +2156,7 @@ def cmd_graph(args: argparse.Namespace) -> int:
     )
 
     try:
-        with try_hub_connect() as conn:
+        with try_hub_connect(role="read") as conn:
             with conn.cursor() as cur:
                 out = _graph_query(cur, args.id, args.hops, args.limit)
     except Exception as exc:
@@ -2674,7 +2676,9 @@ def cmd_decisions(args: argparse.Namespace) -> int:
         status = "retracted"
     elif getattr(args, "all", False):
         status = "all"
-    with connect() as conn:
+    from khipu.db import read_connection
+
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             rows = _decisions.list_decisions(
                 cur, project=getattr(args, "project", None), since=since_dt,
@@ -3653,7 +3657,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
-        print(json.dumps({"ok": True, key: _read_role.settings_status()[key], "config_file": str(path)}))
+        print(json.dumps({"ok": True, key: _read_role.settings_status(read_hub=True)[key], "config_file": str(path)}))
         return 0
     from khipu import routing as _routing
 
@@ -3843,7 +3847,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "work": _work.settings_status(),
         "work_suggested": _work.suggested_files(),
         "offline": _offline.settings_status(),
-        "read_role": _read_role.settings_status(),
+        "read_role": _read_role.settings_status(read_hub=True),
         "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
         "config": load_config(),

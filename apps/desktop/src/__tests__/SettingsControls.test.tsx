@@ -527,6 +527,12 @@ describe("SearchRoleCard", () => {
     await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "read_role_connection_limit" }]));
   });
 
+  it("says when the hub could not be read and the value is this Mac's saved one", async () => {
+    config = { ...config, read_role: { read_role_connection_limit: { ...role(20, 20), on_hub: false } } };
+    render(<SearchRoleCard active />);
+    expect(await screen.findByText(/The hub could not be read, so this is this Mac's saved value/)).toBeInTheDocument();
+  });
+
   it("refuses a value that is not a whole number without calling the CLI", async () => {
     config = { ...config, read_role: { read_role_connection_limit: role(20, 20) } };
     render(<SearchRoleCard active />);

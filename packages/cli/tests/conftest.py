@@ -167,6 +167,7 @@ def _reset_read_role_and_query_cache_queue():
 
     def _clear():
         query_cache_queue._MEMORY.clear()
+        read_role.invalidate_cache()
         for where in (query_cache_queue.queue_file, read_role._memo_file, read_role._read_dsn_file):
             try:
                 where().unlink()

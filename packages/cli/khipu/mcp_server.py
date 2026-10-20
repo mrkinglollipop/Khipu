@@ -1230,10 +1230,10 @@ def _tool_status_light(args: dict) -> dict:
 
     def _probe() -> None:
         try:
-            from khipu.db import connect
+            from khipu.db import connect, read_connection
             from khipu.notes import notes_freshness
 
-            with connect() as conn:
+            with read_connection(connect) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
                     cur.fetchone()

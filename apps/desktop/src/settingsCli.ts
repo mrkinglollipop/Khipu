@@ -123,8 +123,13 @@ export type ConfigShape = {
   >;
   /** `offline.settings_status()`: each duration with the CLI's own words. */
   offline?: Record<string, { value: number; default: number; kind: string; source: string; words: string }>;
-  /** `read_role.settings_status()`: the hub's search role, whole numbers. */
-  read_role?: Record<string, { value: number; default: number; kind: string; source: string; words: string }>;
+  /** `read_role.settings_status(read_hub=True)`: the hub's search role, whole
+   *  numbers. `value` is what the hub holds when `on_hub`; otherwise this
+   *  Mac's stored copy, because the hub could not be read. */
+  read_role?: Record<
+    string,
+    { value: number; default: number; kind: string; source: string; words: string; on_hub?: boolean }
+  >;
 };
 
 export type FeatureState = { enabled: boolean; source: "env" | "file" | "default" };

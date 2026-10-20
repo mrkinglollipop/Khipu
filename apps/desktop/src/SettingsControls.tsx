@@ -517,7 +517,12 @@ export function SearchRoleCard({ active }: { active: boolean }) {
               value={row ? String(row.value) : ""}
               canReset={row?.source === "file"}
               onReset={() => unsetConfig(key, cfg.reload)}
-              help={row ? `${row.words}. Default ${row.default}.` : undefined}
+              help={
+                row
+                  ? `${row.words}. Default ${row.default}.` +
+                    (row.on_hub === false ? " The hub could not be read, so this is this Mac's saved value." : "")
+                  : undefined
+              }
               onSave={async (v) => {
                 const t = v.trim();
                 if (!/^\d+$/.test(t)) return `Enter a whole number of ${unit}, 0 or more.`;

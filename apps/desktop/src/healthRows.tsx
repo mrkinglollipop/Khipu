@@ -32,7 +32,7 @@ import type { RouteView } from "./routing";
 import { fmtAge, fmtAgo, fmtAgoSince, fmtClock } from "./time";
 import { plural, shortProject, timeOnly } from "./work";
 
-export type HealthRowStatus = "ok" | "err" | "skipped";
+export type HealthRowStatus = "ok" | "warn" | "err" | "skipped";
 
 export type HealthRow = {
   /** The `*_ok` field name this row renders, e.g. "hub_ok". */
@@ -452,6 +452,9 @@ export function healthRows(
     if (isNotConfigured(key, notConfigured)) {
       return { key, status: "skipped", label, ...extra };
     }
+    if (key === "read_role_ok" && parsed[key] && (parsed.read_role as { level?: unknown } | undefined)?.level === "amber") {
+      return { key, status: "warn", label, ...extra };
+    }
     return { key, status: parsed[key] ? "ok" : "err", label, ...extra };
   });
   const plansRow = plansHealthRow(plans);
@@ -463,8 +466,9 @@ export function healthRows(
 
   const statusRank: Record<HealthRowStatus, number> = {
     err: 0,
-    skipped: 1,
-    ok: 2,
+    warn: 1,
+    skipped: 2,
+    ok: 3,
   };
   const orderIndex = (key: string) => {
     const i = ORDER.indexOf(key);
@@ -545,6 +549,15 @@ export function HealthReportRows({
               <Check size={16} strokeWidth={1.75} aria-hidden className="ok" />
               <span className="row-main">{row.label}</span>
               {text ? <span className="row-meta wrap">{text}</span> : null}
+            </div>
+          );
+        }
+        if (row.status === "warn") {
+          return (
+            <div key={row.key} className="row-item">
+              <TriangleAlert size={16} strokeWidth={1.75} aria-hidden className="warn" />
+              <span className="row-main">{row.label}</span>
+              {row.detail ? <span className="row-meta wrap">{row.detail}</span> : null}
             </div>
           );
         }

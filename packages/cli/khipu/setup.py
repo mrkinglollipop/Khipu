@@ -368,7 +368,7 @@ def _stage_store(dsn: str, root_crt: str | None) -> dict[str, Any]:
 
 def _store_read_role(conn, dsn: str) -> dict[str, Any]:
     """Create the hub's search role and save this Mac's read DSN. Never fails
-    setup: without it search runs as the owner and doctor says so."""
+    setup: doctor's read role row says what is missing."""
     from khipu import read_role
 
     try:
@@ -376,7 +376,8 @@ def _store_read_role(conn, dsn: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "detail": f"{type(exc).__name__}: {exc}"[:200]}
     if conninfo is None:
-        return {"ok": False, "detail": read_role.provision_blocked() or "the read role could not be set up"}
+        return {"ok": False, "detail": read_role.cannot_host()
+                or "the hub cannot host a search role; searches share the save connections"}
     return {"ok": True, "detail": f"Search connects as {read_role.READ_ROLE}."}
 
 
