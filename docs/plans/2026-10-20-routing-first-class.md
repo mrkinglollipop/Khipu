@@ -917,7 +917,7 @@ change; if it is still red, stop and report the last log. Slices on the per-prom
 | 13 | Scanner and recall's superseded mark | 2a | Grok, against tests Codex writes first (13t) | Codex re-check, then Sonnet | case 14; Matt's files are only read |
 | 14 | Mocks for the five app groups, Pace including section 13's caps, advice and unknown evidence | 4, 4Pa, 5, 6 | Claude Opus | Matt approves | no app work before approval |
 | 15a | App: delivery and health | 14, 16 | Codex Sol, high | Sonnet | `npm run build && tsc`, desktop tests, then the rendered result (at most 3 visual passes, screenshot as proof) |
-| 15b | App: proposals and holds | 14, 5 | Codex Sol, high | Opus (owner actions) | as 15a |
+| 15b | App: proposals and holds, including Settings end-or-keep choices for held or paused accounts | 14, 5 | Codex Sol, high | Opus (owner actions) | as 15a |
 | 15c | App: providers and lanes | 14, 9a | Codex Sol, medium | Sonnet | as 15a |
 | 15d | App: advisory and copies | 14, 10, 13 | Codex Sol, medium | Sonnet | as 15a |
 | 15e | App: pace, caps and advice | 14, 4Pb, 17a, 17c | Codex Sol, medium | Sonnet; Opus for the cap confirm (owner action) | as 15a |

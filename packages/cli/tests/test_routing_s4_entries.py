@@ -143,7 +143,7 @@ def test_renewal_before_base_newest_wins_but_another_source_cannot_renew(replay)
     assert codex(replay.fold([bad, renew, base]))["state"] == "unknown"
 
 
-def test_source_heartbeat_is_throttled_and_never_renews_account(replay, monkeypatch):
+def test_source_heartbeat_writes_on_availability_change_and_never_renews_account(replay, monkeypatch):
     replay.usage()
     replay.view()
     from khipu import routing_sources
@@ -151,7 +151,8 @@ def test_source_heartbeat_is_throttled_and_never_renews_account(replay, monkeypa
     collect = routing_sources.collect
     def heartbeat(*args):
         evidence, status, cache = collect(*args)
-        status["runners"] = [{"name": "runner", "heartbeat_at": routing._iso(replay.now)}]
+        status["runners"] = [{"name": "runner", "heartbeat_at": routing._iso(replay.now),
+                              "silent": False, "unreadable": False, "lanes": []}]
         return evidence, status, cache
     monkeypatch.setattr(routing_sources, "collect", heartbeat)
     with routing._lock():
@@ -164,7 +165,26 @@ def test_source_heartbeat_is_throttled_and_never_renews_account(replay, monkeypa
     replay.advance(1)
     with routing._lock():
         routing._refold_locked(replay.now)
+    assert [e["type"] for e in rows()] == ["observation", "source_seen"]
+    assert rows()[-1]["status"] == '{"lanes":[],"silent":false,"unreadable":false}'
+    replay.advance(3601)  # well beyond the old five-minute heartbeat writer throttle
+    with routing._lock():
+        live = routing._refold_locked(replay.now)
+    assert [e["type"] for e in rows()] == ["observation", "source_seen"]
+    runner = live["sources"]["runners"][0]
+    assert runner["heartbeat_at"] == routing._iso(replay.now) and runner["silent"] is False
+
+    def unavailable(*args):
+        evidence, status, cache = heartbeat(*args)
+        status["runners"][0]["unreadable"] = True
+        return evidence, status, cache
+
+    monkeypatch.setattr(routing_sources, "collect", unavailable)
+    replay.advance(1)
+    with routing._lock():
+        routing._refold_locked(replay.now)
     assert [e["type"] for e in rows()] == ["observation", "source_seen", "source_seen"]
+    assert rows()[-1]["status"] == '{"lanes":[],"silent":false,"unreadable":true}'
     assert not any(e["type"] == "observation_renew" for e in rows())
 
 

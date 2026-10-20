@@ -917,6 +917,9 @@ def accounts() -> list[dict]:
 
 
 _ENTRY_INPUTS: dict[tuple, dict] = {}
+# A bounded parse-only snapshot per mode.  It is deliberately separate from
+# the outer lock cache: no author marks or settled ordering enter this cache.
+_PARSED_LINE_CACHE: dict[bool, tuple[str, bytes, tuple[dict, ...], int]] = {}
 
 
 def _entry_cache(events_stat: list | None = None, mac: str | None = None) -> dict:
@@ -926,21 +929,27 @@ def _entry_cache(events_stat: list | None = None, mac: str | None = None) -> dic
     key = (str(events_file()), tuple(events_stat or ()), mac)
     cached = _ENTRY_INPUTS.get(key)
     if cached is None:
-        events, _bad = read_events()
-        cached = {"definitions": entry_model.definitions(_in_write_order(events), mac),
-                  "events": tuple(events), "overlays": {}}
+        raw, bad = _read_all_events()
+        events, _unfinished = _split_txns(raw, _held_list())
+        ordered = _in_write_order(events)
+        cached = {"definitions": entry_model.definitions(ordered, mac), "events": tuple(events),
+                  "raw": tuple(raw), "bad": bad, "ordered": tuple(ordered), "overlays": {}}
         _ENTRY_INPUTS.clear()
         _ENTRY_INPUTS[key] = cached
     return cached
 
 
-def _remember_entry_inputs(events: list[dict], events_stat: list | None = None, mac: str | None = None) -> dict:
+def _remember_entry_inputs(events: list[dict], events_stat: list | None = None, mac: str | None = None,
+                           ordered: list[dict] | None = None, raw: list[dict] | None = None,
+                           bad: int = 0) -> dict:
     """Refresh the entry cache from a fold that already read the log."""
     events_stat = _stat(events_file()) if events_stat is None else events_stat
     mac = _local_mac() if mac is None else mac
     key = (str(events_file()), tuple(events_stat or ()), mac)
-    cached = {"definitions": entry_model.definitions(_in_write_order(events), mac),
-              "events": tuple(events), "overlays": {}}
+    ordered = _in_write_order(events) if ordered is None else ordered
+    cached = {"definitions": entry_model.definitions(ordered, mac), "events": tuple(events),
+              "raw": tuple(events if raw is None else raw), "bad": bad,
+              "ordered": tuple(ordered), "overlays": {}}
     _ENTRY_INPUTS.clear()
     _ENTRY_INPUTS[key] = cached
     return cached
@@ -969,9 +978,11 @@ def _definition_accounts(known: list[dict], events: list[dict] | None = None, co
     overlay = (entry_cache or {}).get("overlays", {}).get(overlay_key)
     if overlay is not None:
         return [dict(account) for account in overlay]
+    ordered = None
     if events is None:
-        events = (entry_cache or _entry_cache())["events"]
-    ids, forwards, _aliases = account_identity.state(_in_write_order(events), known)
+        cache = entry_cache or _entry_cache()
+        events, ordered = cache["events"], cache["ordered"]
+    ids, forwards, _aliases = account_identity.state(ordered if ordered is not None else _in_write_order(events), known)
     out = [dict(a) for a in known]
     for ident, value in definitions["accounts"].items():
         current = account_identity.forwarded(ident, forwards)
@@ -1388,11 +1399,12 @@ def _pending_numbering() -> bool:
     return _replication_live() and _hub_configured()
 
 
-def _identify_locked(events: Iterable[dict]) -> None:
+def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = None,
+                     ordered: list[dict] | None = None) -> None:
     """Enrich new lines only. All append paths, including seeds and account
     transactions, pass here while holding the routing lock."""
-    observed = _read_all_events()[0]
-    history = _in_write_order(observed)
+    observed = _read_all_events()[0] if observed is None else observed
+    history = _in_write_order(observed) if ordered is None else ordered
     mac = _mac_locked()
     clocks = [e["hlc"] for e in [*observed, *history] if e.get("hlc")]
     clocks += [{"wall": max(0, int(at.timestamp() * 1000)), "counter": 0, "mac": "legacy"}
@@ -1448,14 +1460,16 @@ def _identify_locked(events: Iterable[dict]) -> None:
         event.setdefault("op", event_identity.uuid7())
 
 
-def _append_locked(*events: dict) -> None:
+def _append_locked(*events: dict, observed: list[dict] | None = None,
+                   ordered: list[dict] | None = None, raw_observed: list[dict] | None = None,
+                   bad_lines: int = 0) -> None:
     """Append whole lines in one write, then fsync. A torn last line (a full
     disk or a power loss part way through an earlier write) is ended first,
     so it stays one unreadable line, counted in ``bad_lines``, and never
     swallows the new one. Lone surrogates (text from argv, the environment
     or a seed file) are replaced first: UTF-8 can't hold them."""
-    raw, bad = _read_event_lines()
-    _identify_locked(events)
+    raw, bad = _read_event_lines() if raw_observed is None else (list(raw_observed), bad_lines)
+    _identify_locked(events, observed=observed, ordered=ordered)
     data = "".join(json.dumps(_scrub(e), sort_keys=True, ensure_ascii=False) + "\n"
                    for e in events).encode("utf-8")
     fd = os.open(events_file(), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
@@ -1834,11 +1848,18 @@ def _read_event_lines(identity_only: bool = False) -> tuple[list[dict], int]:
         data = events_file().read_bytes()
     except OSError:
         return [], 0
-    events: list[dict] = []
-    bad = 0
+    path = str(events_file())
+    parsed = _PARSED_LINE_CACHE.get(identity_only)
+    # An append may reuse only complete, byte-for-byte prior lines.  A torn
+    # trailing line is always parsed again once the next read can see it.
+    if parsed is not None and parsed[0] == path and parsed[1].endswith(b"\n") and data.startswith(parsed[1]):
+        events, bad = list(parsed[2]), parsed[3]
+        lines = data[len(parsed[1]):].split(b"\n")
+    else:
+        events, bad, lines = [], 0, data.split(b"\n")
     # Split on the newline byte: UTF-8 never uses it inside a character, and
     # a JSON string may hold U+2028, which splitlines() would cut at.
-    for line in data.split(b"\n"):
+    for line in lines:
         if not line.strip():
             continue
         event = _line_event(line, identity_only=True) if identity_only else _line_event(line)
@@ -1846,6 +1867,7 @@ def _read_event_lines(identity_only: bool = False) -> tuple[list[dict], int]:
             bad += 1
             continue
         events.append(event)
+    _PARSED_LINE_CACHE[identity_only] = (path, data, tuple(events), bad)
     cache[key] = (events, bad)
     return events, bad
 
@@ -1909,7 +1931,7 @@ def _mark_unchecked(events: list[dict]) -> None:
             event["via"] = f"{via or 'unknown'}-unchecked"
 
 
-def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
+def _stamp_locked(clock: datetime, count: int = 1, *, events: list[dict] | None = None) -> list[dict]:
     """The time and sequence number of the next ``count`` lines, settled now,
     while the writer holds the lock and sees the record as it stands.
 
@@ -1926,7 +1948,7 @@ def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
     line from the line written before it. A clock behind only some of the record (a
     line written ahead, then a right clock) keeps its own time, and the fold
     orders the lines as in phase 1a."""
-    events, _bad = _read_all_events()
+    events = _read_all_events()[0] if events is None else events
     mac = _mac_locked()
     legacy_mac = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
     if legacy_mac is None:
@@ -2650,8 +2672,10 @@ def _in_write_order(events: list[dict]) -> list[dict]:
     """Settle each Mac's timestamps, then order the event set by HLC.
     Unstamped history retains its local order and gets derived revisions;
     legacy origin markers keep later replication from changing that origin."""
+    operations_salt = _id_salt(operations=True) if any(not e.get("mac") and not e.get("_revision") for e in events) else None
     origin = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
-    origin = origin or next((event_identity.legacy_mac(e) for e in events if not e.get("mac")), "legacy")
+    origin = origin or next((event_identity.legacy_mac(e, operations_salt=operations_salt)
+                             for e in events if not e.get("mac")), "legacy")
     if not any(e.get("mac") for e in events):
         fixed, _behind, _ahead = _record_times(events)
         out, last_wall, counter = [], 0, 0
@@ -2659,14 +2683,19 @@ def _in_write_order(events: list[dict]) -> list[dict]:
             wall = max(0, int(at.timestamp() * 1000)) if at else 0
             counter = counter + 1 if wall <= last_wall else 0
             last_wall = max(last_wall, wall)
-            out.append(dict(e, _legacy_mac=event_identity.legacy_mac(dict(e, _legacy_mac=origin)),
-                            _revision=event_identity.revision(e),
+            out.append(dict(e, _legacy_mac=event_identity.legacy_mac(dict(e, _legacy_mac=origin),
+                                                                       operations_salt=operations_salt),
+                            _revision=event_identity.revision(e, operations_salt=operations_salt),
                             hlc={"wall": last_wall, "counter": counter, "mac": "legacy"},
                             **({"written_at": _iso(at)} if at else {})))
         return out
     modern_macs = {e["mac"] for e in events if e.get("mac")}
     claims = [e for e in events if e.get("legacy_mac") and e.get("hlc")]
-    claim = min(claims, key=event_identity.hlc_key) if claims else None
+    def claim_key(event):
+        stamp = event["hlc"]
+        return stamp["wall"], stamp["counter"], stamp["mac"], event_identity.revision(event,
+                                                                                            operations_salt=operations_salt)
+    claim = min(claims, key=claim_key) if claims else None
     legacy_origin = claim["legacy_mac"] if claim else origin
     legacy_mac = claim["mac"] if claim else next(iter(modern_macs)) if len(modern_macs) == 1 else legacy_origin
     groups: dict[str, list[dict]] = {}
@@ -2683,8 +2712,9 @@ def _in_write_order(events: list[dict]) -> list[dict]:
         fixed, _behind, _ahead = _record_times(rows)
         last_wall, counter = 0, 0
         for e, at in zip(rows, fixed):
-            row = dict(e, _revision=event_identity.revision(e),
-                       _legacy_mac=event_identity.legacy_mac(dict(e, _legacy_mac=legacy_origin)))
+            row = dict(e, _revision=event_identity.revision(e, operations_salt=operations_salt),
+                       _legacy_mac=event_identity.legacy_mac(dict(e, _legacy_mac=legacy_origin),
+                                                              operations_salt=operations_salt))
             if at is not None:
                 row["written_at"] = _iso(at)
             if not row.get("hlc"):
@@ -2777,7 +2807,8 @@ def _effective_priority(priority: dict) -> dict:
 
 
 def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
-         extra: Iterable[dict] = (), sources: dict | None = None, mac: str | None = None) -> dict:
+         extra: Iterable[dict] = (), sources: dict | None = None, mac: str | None = None,
+         events_ordered: bool = False) -> dict:
     """The view of ``events`` (and of evidence from sources, ``extra``, in the
     same shape with ``seq`` -1) at ``now``. ``sources`` is the sources'
     status (``routing_sources.collect``): a runner that stops reporting or
@@ -2786,7 +2817,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     model."""
     lane_map = cfg.get("routing_lane_map") or {}
     stale_after = cfg["routing_stale_after"]
-    events = _in_write_order(events)
+    events = list(events) if events_ordered else _in_write_order(events)
     # A pure replay may name its Mac; unstamped logs retain their local meaning.
     mac = mac or cfg.get("_mac")
     definitions = entry_model.definitions(events, mac)
@@ -4168,18 +4199,50 @@ def _not_before_last_fold(now: datetime, prev: dict | None) -> datetime:
     return _not_behind(now, _parse((prev or {}).get("folded_at")))
 
 
+def _ordered_after_append(ordered: list[dict], batch: list[dict]) -> list[dict]:
+    """Extend a known full write order with lines just appended under its lock.
+
+    ``_identify_locked`` gives every appended line an HLC while the same lock
+    is held.  A hand-appended legacy line can share its wall clock, so merge
+    the two already ordered runs rather than assuming the new row sorts last.
+    That preserves HLC reconciliation without another full-log sort.
+    """
+    origin = next((row.get("_legacy_mac") for row in ordered if row.get("_legacy_mac")), "legacy")
+    later = [dict(row, _legacy_mac=origin, _revision=event_identity.revision(row)) for row in batch]
+    merged, left, right = [], iter(ordered), iter(later)
+    a, b = next(left, None), next(right, None)
+    while a is not None or b is not None:
+        if b is None or (a is not None and event_identity.hlc_key(a) <= event_identity.hlc_key(b)):
+            merged.append(dict(a))
+            a = next(left, None)
+        else:
+            merged.append(b)
+            b = next(right, None)
+    return [dict(row, _seq=index) for index, row in enumerate(merged)]
+
+
+def _runner_source_state(runner: dict) -> str:
+    """The durable availability state of a runner, excluding its advancing beat."""
+    return json.dumps({"silent": bool(runner.get("silent")), "unreadable": bool(runner.get("unreadable")),
+                       "lanes": list(runner.get("lanes") or [])}, sort_keys=True, separators=(",", ":"))
+
+
 def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
     """Refold and save the view; the caller holds the lock."""
     fingerprint, cfg, known = inputs or _inputs()
-    events, bad = read_events()
+    entry_cache = _entry_cache(fingerprint.get("events"), cfg.get("_mac"))
+    events, raw, bad = list(entry_cache["events"]), list(entry_cache["raw"]), entry_cache["bad"]
+    ordered = list(entry_cache["ordered"])
     seed_error, imported = _import_seed_locked(events, cfg, now)
     if imported:
         fingerprint = dict(fingerprint, events=_stat(events_file()))
-        events, bad = read_events()
+        raw, bad = _read_all_events()
+        events, _unfinished = _split_txns(raw, _held_list())
+        ordered = _in_write_order(events)
     prev = _load_view()
     extra, _status, _cache = _sources(cfg, now, prev)
     if extra or (_status or {}).get("runners"):
-        ids, _forwards, _aliases = account_identity.state(_in_write_order(events), known)
+        ids, _forwards, _aliases = account_identity.state(ordered, known)
         forward = forwarding(events, {a["key"] for a in known})
         cuts = {}
         for event in events:
@@ -4192,34 +4255,38 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
             key = None if not item.get("account") and cut and _before_cut(item, cut) else _evidence_account(
                 item, cfg.get("routing_lane_map") or {}, known, forward)
             matched.append(dict(item, account=key))
-        batch = entry_model.source_events(matched, _in_write_order(events), cfg, _mac_locked(), ids)
+        batch = entry_model.source_events(matched, ordered, cfg, _mac_locked(), ids)
         for runner in (_status or {}).get("runners") or []:
             witness = _parse(runner.get("heartbeat_at"))
-            previous = max((_parse(e.get("witness_at")) for e in events if e.get("type") == "source_seen"
-                            and e.get("runner") == runner["name"] and e.get("mac") == _local_mac()),
-                           default=None)
-            if witness and (previous is None or (witness - previous).total_seconds() >= 300):
+            previous = next((e for e in reversed(ordered) if e.get("type") == "source_seen"
+                             and e.get("runner") == runner["name"] and e.get("mac") == _local_mac()), None)
+            state = _runner_source_state(runner)
+            if witness and (previous is None or previous.get("status") != state):
                 batch.append({"type": "source_seen", "runner": runner["name"], "witness_at": _iso(witness),
-                              "written_by": {"kind": "runner"}, "via": "runner"})
+                              "status": state, "written_by": {"kind": "runner"}, "via": "runner"})
         if batch:
-            for row, stamp in zip(batch, _stamp_locked(now, len(batch))):
+            for row, stamp in zip(batch, _stamp_locked(now, len(batch), events=events)):
                 row.update(stamp)
-            _append_locked(*batch)
-            events, bad = read_events()
+            _append_locked(*batch, observed=raw, ordered=ordered, raw_observed=raw, bad_lines=bad)
+            written = [_checked(_scrub(row)) for row in batch]
+            raw.extend(row for row in written if row is not None)
+            bad += sum(row is None for row in written)
+            events, _unfinished = _split_txns(raw, _held_list())
+            ordered = _ordered_after_append(ordered, batch)
             fingerprint = dict(fingerprint, events=_stat(events_file()))
         cfg["_mac"] = _local_mac()
-    _remember_entry_inputs(events, fingerprint["events"], cfg["_mac"])
-    now, body, status = _fold_body(now, cfg, known, events, prev)
+    _remember_entry_inputs(events, fingerprint["events"], cfg["_mac"], ordered, raw, bad)
+    now, body, status = _fold_body(now, cfg, known, events, prev, events_ordered=ordered)
     body["seed_error"] = seed_error
     view = _assemble(prev, body, now, bad, fingerprint,
                      record=fingerprint["events"] is not None or status is not None)
     _save_view(view)
-    _identity_snapshot(known, events=events)
+    _identity_snapshot(known, events=ordered, events_ordered=True)
     return view
 
 
 def _fold_body(now: datetime, cfg: dict, known: list[dict], events: list[dict],
-               prev: dict | None) -> tuple[datetime, dict, dict | None]:
+               prev: dict | None, events_ordered: list[dict] | None = None) -> tuple[datetime, dict, dict | None]:
     """(the fold's clock, the folded body, the sources' status): the fold
     itself, which reads and never writes."""
     now = _not_before_last_fold(now, prev)
@@ -4231,7 +4298,8 @@ def _fold_body(now: datetime, cfg: dict, known: list[dict], events: list[dict],
         if item.get("id") not in source_ids and source_id not in source_ids:
             remaining.append(item)
     extra = remaining
-    body = fold(events, now=now, cfg=cfg, known=known, extra=extra, sources=status)
+    body = fold(events_ordered if events_ordered is not None else events, now=now, cfg=cfg, known=known,
+                extra=extra, sources=status, events_ordered=events_ordered is not None)
     body["source_cache"] = cache
     return now, body, status
 
@@ -4271,7 +4339,8 @@ def _start_fold(now: datetime, *, save: bool) -> dict:
     prev = _load_view()
     if _fresh(prev, fingerprint, now):
         return dict(prev, checked_at=_iso(now))  # the fold it waited for saved it
-    every, bad = _read_all_events()
+    entry_cache = _entry_cache(fingerprint.get("events"), cfg.get("_mac"))
+    every, bad = list(entry_cache["raw"]), entry_cache["bad"]
     events, unfinished = _split_txns(every, _held_list())
     if unfinished or (cfg.get("routing_rules_seed") and not any(e.get("type") == "seed_import" for e in events)):
         # An account change left unfinished is finished or rolled back
@@ -4711,7 +4780,7 @@ def _require_hold_choices(event: dict, now: datetime) -> None:
         rows = (view.get("priority") or {}).get("entries") or []
     if event["type"] in ("rule_confirm", "rule_restore"):
         rule = next((r for r in view["rules"] if r["entity"] == event.get("entity")), None)
-        words = (rule or {}).get("text") or ""
+        words = (rule or {}).get("text") or _rule_words(event.get("entity"))
     words += "\n" + "\n".join(row.get("role") or "" for row in rows)
     keys = {row["account"] for row in rows}
     named = _named_account_labels(words, view)
@@ -4727,6 +4796,45 @@ def _require_hold_choices(event: dict, now: datetime) -> None:
     missing = sorted(required - set(choices))
     if missing:
         raise RouteError('say end or keep in holds for: ' + ", ".join(missing))
+
+
+def _rule_words(entity: str | None) -> str:
+    """The last stored words for a live or retired rule entity."""
+    if not entity:
+        return ""
+    words = ""
+    for event in _in_write_order(read_events()[0]):
+        if event_identity.entity(event) == entity and event.get("type") in ("rule_add", "rule_edit") \
+                and isinstance(event.get("text"), str):
+            words = event["text"]
+    return words
+
+
+def _undo_hold_choices(holds: dict | None, *, entries: list[dict] = (), words: str = "",
+                       now: datetime | None = None) -> dict:
+    """Add ``keep`` for current relevant holds while the append lock is held.
+
+    Undo carries its original choices and an owner's explicit overrides into
+    this function.  A concurrently added relevant hold is then kept rather
+    than making an otherwise valid inverse fail its append-time check.
+    """
+    choices = dict(holds or {})
+    view = read_view(now)
+    words += "\n" + "\n".join(row.get("role") or "" for row in entries if isinstance(row, dict))
+    scoped = {row.get("account") for row in entries if isinstance(row, dict) and isinstance(row.get("account"), str)}
+    named = _named_account_labels(words, view)
+    for account in view["accounts"]:
+        if account["label"] in named or re.search(r"(?<![\w-])" + re.escape(account_id(account["key"]))
+                                             + r"(?![\w-])", words, re.I):
+            scoped.add(account["key"])
+    if scoped:
+        for hold in view["holds"]:
+            if hold["scope"]["kind"] != "account" or hold["scope"].get("account") in scoped:
+                choices.setdefault(hold["id"], "keep")
+        for account in view["accounts"]:
+            if account["key"] in scoped and account["state"] == PAUSED:
+                choices.setdefault(account["witness"]["id"], "keep")
+    return choices
 
 
 def owner_lines(events: list[dict], via: str) -> list[dict]:
@@ -4932,17 +5040,20 @@ def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | 
     return dict(out, n=rule["n"])
 
 
-def edit_rule(n, text: str, *, via: str, now: datetime | None = None, holds: dict | None = None) -> dict:
-    rule = _rule(n, now)
+def edit_rule(n, text: str, *, via: str, now: datetime | None = None, holds: dict | None = None,
+              _undo_default_holds: bool = False) -> dict:
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
-    return dict(_owner_write({"type": "rule_edit", **_rule_target(rule), "text": text,
-                             **({"holds": holds} if holds is not None else {})}, via), n=rule["n"])
+    with _lock():
+        rule = _rule(n, now)
+        choices = _undo_hold_choices(holds, words=text, now=now) if _undo_default_holds else holds
+        return dict(_owner_write({"type": "rule_edit", **_rule_target(rule), "text": text,
+                                 **({"holds": choices} if choices is not None else {})}, via), n=rule["n"])
 
 
 def request_rule(text: str, *, n: int | None = None, owner_request: str | None = None,
                  author: dict | None = None, via: str = "mcp", now: datetime | None = None,
-                 op: str | None = None) -> dict:
+                 op: str | None = None, holds: dict | None = None) -> dict:
     """Write a live rule that still needs the owner's confirmation.
 
     The requester is recorded through the report-author path. Repeated
@@ -4968,7 +5079,8 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
             written, view = _write({"type": "rule_add", "n": number, "text": text.strip(),
                                     "source": "added at the owner's request", "date": now.date().isoformat(),
                                     "seeded": False, "pending": True, "owner_request": request_words,
-                                    "written_by": by, "via": via, "op": op})
+                                    "written_by": by, "via": via, "op": op,
+                                    **({"holds": holds} if holds is not None else {})})
         rule = next((r for r in view.get("rules", []) if r["entity"] == written["entity"]), None)
         return dict(_done(written, view), n=rule["n"] if rule else _rule_number(written))
     # The predecessor and the append are one locked operation: an owner edit
@@ -4982,7 +5094,8 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
         prior_confirmed = rule.get("prior_confirmed") if rule.get("pending") else rule["confirmed"]
         written, view = _write({"type": "rule_edit", **_rule_target(rule), "text": text.strip(), "pending": True,
                                 "prior_text": prior, "prior_confirmed": prior_confirmed,
-                                "owner_request": request_words, "written_by": by, "via": via, "op": op})
+                                "owner_request": request_words, "written_by": by, "via": via, "op": op,
+                                **({"holds": holds} if holds is not None else {})})
     return dict(_done(written, view), n=rule["n"])
 
 
@@ -5006,14 +5119,18 @@ def retire_rule(n, *, via: str, now: datetime | None = None) -> dict:
     return dict(_owner_write({"type": "rule_retire", **_rule_target(rule)}, via), n=rule["n"])
 
 
-def restore_rule(n, *, via: str, now: datetime | None = None, holds: dict | None = None) -> dict:
+def restore_rule(n, *, via: str, now: datetime | None = None, holds: dict | None = None,
+                 _undo_default_holds: bool = False) -> dict:
     """Bring a removed rule back as it was when it was removed: its number,
     words, source, date and confirmation (the app's Undo after a removal)."""
-    entity, number = rule_reference(n)
-    if any(r["entity"] == entity for r in read_view(now)["rules"]):
-        raise RouteError(f"standing rule {n} is in effect")
-    return dict(_owner_write({"type": "rule_restore", "n": number, "entity": entity, "target": entity,
-                             **({"holds": holds} if holds is not None else {})}, via), n=number)
+    with _lock():
+        entity, number = rule_reference(n)
+        if any(r["entity"] == entity for r in read_view(now)["rules"]):
+            raise RouteError(f"standing rule {n} is in effect")
+        words = _rule_words(entity)
+        choices = _undo_hold_choices(holds, words=words, now=now) if _undo_default_holds else holds
+        return dict(_owner_write({"type": "rule_restore", "n": number, "entity": entity, "target": entity,
+                                 **({"holds": choices} if choices is not None else {})}, via), n=number)
 
 
 def rule_reference(n) -> tuple[str, int | None]:
@@ -5181,7 +5298,7 @@ def _check_priority(expect, now: datetime | None) -> None:
 
 
 def set_priority(entries, *, until=None, via: str, now: datetime | None = None, expect=None,
-                 holds: dict | None = None) -> dict:
+                 holds: dict | None = None, _undo_default_holds: bool = False) -> dict:
     """The owner's priority, as given: confirmed, and in place of any
     request still waiting for him. ``expect`` is the priority's version as
     read (``priority_version``), required: refused once it moved."""
@@ -5190,8 +5307,9 @@ def set_priority(entries, *, until=None, via: str, now: datetime | None = None, 
     rows = _priority_entries(entries, now=now, conversation=False)
     with _lock():
         _check_priority(expect, now)
+        choices = _undo_hold_choices(holds, entries=rows, now=now) if _undo_default_holds else holds
         out = _owner_write({"type": "priority_set", "entries": rows, "until": _priority_until(until, now),
-                            **({"holds": holds} if holds is not None else {})}, via)
+                            **({"holds": choices} if choices is not None else {})}, via)
     return dict(out, entries=[e["label"] for e in rows])
 
 
@@ -6556,15 +6674,16 @@ def _read_identity_events() -> list[dict]:
     return [e for e in _split_txns(events, _held_list())[0] if e.get("type") in _IDENTITY_KINDS]
 
 
-def _identity_snapshot(known: list[dict], *, events: list[dict] | None = None) -> tuple:
+def _identity_snapshot(known: list[dict], *, events: list[dict] | None = None,
+                       events_ordered: bool = False) -> tuple:
     """One identity/log walk per input revision, never per public row."""
     revision = (_identity_revision(), tuple((a["key"], a["label"], a["harness"], a.get("home"),
                                               a.get("label_source")) for a in known))
     cached = _IDENTITY_CACHE.get(revision)
     if cached is not None:
         return cached
-    events = _in_write_order(_read_identity_events() if events is None else
-                             [e for e in events if e.get("type") in _IDENTITY_KINDS])
+    events = _read_identity_events() if events is None else [e for e in events if e.get("type") in _IDENTITY_KINDS]
+    events = list(events) if events_ordered else _in_write_order(events)
     known = account_identity.with_provenance(known, events)
     result = (account_identity.state(events, known), forwarding(events),
               {a["key"]: a["label_source"] for a in known})

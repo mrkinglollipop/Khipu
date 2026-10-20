@@ -802,6 +802,8 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
         undone = _find(want["target"]) or {}
         line = {"kind": "undo", "id": _new_id(), "at": _iso(_clock()), "undoes": want["target"],
                 "action": undone.get("action"), "target": undone.get("target"), "auth": stamp.get("auth")}
+        if want.get("facts"):
+            line["facts"] = want["facts"]
     else:
         line = {"kind": "action", "id": _new_id(), "at": _iso(_clock()), "action": want["action"],
                 "target": want["target"], "before": None if before in (_NO_UNDO, _UNREADABLE) else before,
@@ -1147,12 +1149,13 @@ def _restore_setting(key: str, value, was_set: bool) -> None:
             data.pop(routing.SETTINGS_REQUEST_KEY, None)
 
 
-def _set_priority_back(before: dict, via: str, holds: dict | None = None) -> dict:
+def _set_priority_back(before: dict, via: str, holds: dict | None = None, *, _undo_default_holds: bool = False) -> dict:
     from khipu import routing
 
     if before.get("entries"):
         return routing.set_priority(before["entries"], until=before.get("until"), via=via,
-                                    expect=routing.priority_version(), holds=holds)
+                                    expect=routing.priority_version(), holds=holds,
+                                    _undo_default_holds=_undo_default_holds)
     if routing.read_view().get("priority"):
         return routing.clear_priority(via=via, expect=routing.priority_version())
     return {"ok": True}
@@ -1251,15 +1254,16 @@ def _undo_link(line, via):
     return {"ok": True}
 
 
-def _undo_rule_confirm(line, via):
+def _undo_rule_confirm(line, via, holds=None):
     from khipu import routing
 
     before = line.get("before") or {}
-    holds = (line.get("facts") or {}).get("holds")
+    holds = _undo_holds(line, holds)
     if before.get("seeded"):
         return routing.unconfirm_rule(line["target"], via=via)
     if before.get("pending_kind") == "changed" and isinstance(before.get("prior_text"), str):
-        return routing.edit_rule(line["target"], before["prior_text"], via=via, holds=holds)
+        return routing.edit_rule(line["target"], before["prior_text"], via=via, holds=holds,
+                                 _undo_default_holds=True)
     return routing.retire_rule(line["target"], via=via)
 
 
@@ -1285,6 +1289,20 @@ def _undo_acknowledge(line, via):
 
 def _b(line: dict) -> dict:
     return line.get("before") or {}
+
+
+def _undo_holds(line: dict, explicit: dict | None) -> dict:
+    """Choices for an inverse write.
+
+    Keep the original action's recorded choices, then let this Undo's
+    explicit choices replace them.  The routing write adds current missing
+    choices while it holds the log lock, so a hold that arrives after this
+    direction log entry cannot turn the inverse into a new refusal.
+    """
+    choices = dict((line.get("facts") or {}).get("holds") or {})
+    if explicit:
+        choices.update(explicit)
+    return choices
 
 
 def _undo_clear(line, via):
@@ -1325,11 +1343,12 @@ def _undo_note_end(line, via):
     return routing.set_note(_b(line).get("text") or "", via=via)
 
 
-def _undo_rule_words(line, via):
+def _undo_rule_words(line, via, holds=None):
     from khipu import routing
 
-    return routing.edit_rule(line["target"], _b(line).get("text") or "", via=via,
-                             holds=(line.get("facts") or {}).get("holds"))
+    words = _b(line).get("text") or ""
+    return routing.edit_rule(line["target"], words, via=via, holds=_undo_holds(line, holds),
+                             _undo_default_holds=True)
 
 
 def _retire_rule(n_of):
@@ -1340,10 +1359,11 @@ def _retire_rule(n_of):
     return run
 
 
-def _undo_restore_rule(line, via):
+def _undo_restore_rule(line, via, holds=None):
     from khipu import routing
 
-    return routing.restore_rule(line["target"], via=via, holds=(line.get("facts") or {}).get("holds"))
+    return routing.restore_rule(line["target"], via=via, holds=_undo_holds(line, holds),
+                                _undo_default_holds=True)
 
 
 def _undo_hold_add(line, via):
@@ -1376,8 +1396,10 @@ def _added_rule(line) -> str | int:
     return n
 
 
-def _undo_priority(line, via):
-    return _set_priority_back(_b(line), via, (line.get("facts") or {}).get("holds"))
+def _undo_priority(line, via, holds=None):
+    before = _b(line)
+    return _set_priority_back(before, via, _undo_holds(line, holds),
+                              _undo_default_holds=True)
 
 
 def _undo_decline(line, via):
@@ -1614,7 +1636,7 @@ def _undo_refusal(line: dict | None, line_id: str) -> str | None:
     return None
 
 
-def undo(line_id: str, via: str) -> dict:
+def undo(line_id: str, via: str, *, holds: dict | None = None) -> dict:
     """Apply the inverse of a logged action. Its ``undo`` line is written
     ahead by the owner gate (``gate``/``noted``) and completed by
     ``finish``."""
@@ -1625,7 +1647,13 @@ def undo(line_id: str, via: str) -> dict:
     if line["action"] == "ledger.purge":
         _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line_id, "state": "cancelled"})
         return {"ok": True, "undid": line_id, "state": "cancelled"}
-    out = _UNDO[line["action"]](line, via)
+    inverse = _UNDO[line["action"]]
+    if line["action"] in {"route.rule.confirm", "route.rule.edit", "route.rule.retire",
+                           "route.rule.undo", "route.rule.dismiss", "route.priority.set", "route.priority.confirm",
+                           "route.priority.undo", "route.priority.clear"}:
+        out = inverse(line, via, holds)
+    else:
+        out = inverse(line, via)
     result = dict(out) if isinstance(out, dict) else {"ok": True}
     result.update(ok=True, undid=line_id)
     return result
@@ -1697,12 +1725,13 @@ def run_cli(args) -> int:
                     else "refused"
                 _print({"ok": False, "error": why, "code": code})
                 return 2
-            want = intent("direction.undo", args.id)
+            choices = routing._holds_arg(args)
+            want = intent("direction.undo", args.id, facts={"holds": choices} if choices is not None else None)
             via = routing._owner_via(args, want)
             if via is None:
                 _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
                 return 2
-            out = undo(args.id, via)
+            out = undo(args.id, via, holds=choices)
             _print(finish(out) or out)
             return 0
         if cmd == "on":
@@ -1797,5 +1826,7 @@ def add_parser(sub) -> None:
     add_owner_flags(st)
     un = verbs.add_parser("undo", help="Undo one owner action by its id")
     un.add_argument("id")
+    un.add_argument("--holds", default=None, metavar="JSON",
+                    help='Explicit choices for held or paused accounts: {"id": "end" or "keep"}')
     un.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     add_owner_flags(un)

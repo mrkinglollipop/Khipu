@@ -73,7 +73,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "direction.on": ((), ()),
     "direction.acknowledge": ((), ()),
     "direction.set": (("key", "value"), ()),
-    "direction.undo": (("id",), ()),
+    "direction.undo": (("id",), ("holds",)),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
@@ -274,7 +274,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
             raise _bad(f"key must be one of: {', '.join(_DIRECTION_KEYS)}")
         return ["owner-direction", "set"], [v["key"], v["value"]]
     if action == "direction.undo":
-        return ["owner-direction", "undo"], [v["id"]]
+        return ["owner-direction", "undo", *_opts(v, "holds")], [v["id"]]
     raise Refused("not_by_direction", "That change can't be made by direction.")
 
 
