@@ -1190,7 +1190,7 @@ class SearchRowMetadataTest(unittest.TestCase):
             def fetchall(self):
                 # P5 R6/G5: the topic metadata SELECT also reads
                 # frontmatter->>'type' and superseded_by now.
-                return [("khipu", ts, "active", None, None, None)]
+                return [("khipu", ts, "active", None, None, None, None)]
 
         cur = FakeCur()
         rows = [{"kind": "topic", "id": "khipu", "score": 0.5}]
@@ -1218,7 +1218,7 @@ class SearchRowMetadataTest(unittest.TestCase):
                 self.sql = " ".join(sql.split())
 
             def fetchall(self):
-                return [("note:old", ts, "superseded", None, "feedback", "note:new")]
+                return [("note:old", ts, "superseded", None, "feedback", "note:new", None)]
 
         cur = FakeCur()
         rows = [{"kind": "topic", "id": "note:old", "score": 0.5}]

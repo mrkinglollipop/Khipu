@@ -2575,14 +2575,16 @@ def _apply_search_filters(
         # hit on a superseded page point straight at its replacement.
         cur.execute(
             "SELECT slug, COALESCE(event_at, updated_at, created_at), status, "
-            "frontmatter->>'project', frontmatter->>'type', superseded_by "
+            "frontmatter->>'project', frontmatter->>'type', superseded_by, "
+            "frontmatter->'_routing_state_claim' "
             "FROM topics WHERE deleted_at IS NULL AND slug = ANY(%s)",
             (topic_ids,),
         )
-        for slug, ts, status, proj, note_type, superseded_by in cur.fetchall():
+        for slug, ts, status, proj, note_type, superseded_by, routing_claim in cur.fetchall():
             meta[("topic", slug)] = {
                 "ts": ts, "status": status, "project": proj,
                 "type": note_type, "superseded_by": superseded_by,
+                "_routing_state_claim": routing_claim,
             }
     if node_ids:
         cur.execute("SELECT id, built_at FROM nodes WHERE id = ANY(%s)", (node_ids,))
@@ -2653,6 +2655,8 @@ def _apply_search_filters(
             superseded_by = (m.get("superseded_by") or "").strip()
             if superseded_by:
                 r["superseded_by"] = superseded_by
+            if type(m.get("_routing_state_claim")) is bool:
+                r["_routing_state_claim"] = m["_routing_state_claim"]
         r["_sort_ts"] = ts
         out.append(r)
     out.sort(key=lambda r: (-(r.get("score") or 0.0), _neg_ts_sort_key(r.get("_sort_ts"))))

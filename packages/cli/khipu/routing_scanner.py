@@ -11,6 +11,14 @@ from typing import Any
 
 SUPERSEDED_MARK = "routing state: superseded by Khipu's record"
 
+
+def has_routing_claim(path: str, text: str) -> bool:
+    """Write-time advisory metadata; scanner failure must not block import."""
+    try:
+        return bool(scan_text(path, text))
+    except Exception:  # noqa: BLE001 — never log source text or scanner errors
+        return False
+
 # Providers, accounts, lanes and model names Khipu's record names.
 # "main account" / "primary account" are live phrasings for the primary
 # Claude login; bare "main"/"primary" are ordering words.

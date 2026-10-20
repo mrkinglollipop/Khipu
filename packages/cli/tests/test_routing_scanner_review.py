@@ -132,25 +132,18 @@ def test_nonimported_history_not_marked():
     assert scanner.SUPERSEDED_MARK not in rp.render_block([row])
 
 
-def test_imported_claim_beyond_real_search_snippet():
-    from khipu.snippets import clip_snippet, SNIPPET_LIMIT
-    body = 'Synthetic capability evidence. ' * 40 + '\nCodex is paused until 2026-10-19'
-    # The same clipped shape produced by local and hub search: no body/frontmatter.
-    row = hit(body, snippet=clip_snippet(body, SNIPPET_LIMIT))
-    row.pop('body')
-    row.pop('frontmatter')
-    assert 'paused' not in row['snippet']
-    assert scanner.SUPERSEDED_MARK in rp.render_block([row])
-
-
-def test_actual_snapshot_search_loses_mark(monkeypatch):
+def test_actual_snapshot_search_loses_mark(monkeypatch, tmp_path):
     from khipu import hub_snapshot as hs
+    from khipu import notes
     body = 'Synthetic capability evidence. ' * 40 + '\nCodex is paused until 2026-10-19'
+    path = tmp_path / 'synthetic.md'
+    path.write_text(body)
+    topic = notes._note_topic_dict(path, project=None)
     con = sqlite3.connect(':memory:')
     con.execute('CREATE TABLE topics (slug TEXT, title TEXT, body TEXT, updated_at TEXT, created_at TEXT, status TEXT, frontmatter TEXT, deleted_at TEXT, superseded_by TEXT)')
     con.execute('INSERT INTO topics VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)',
                 ('note:synthetic', 'Synthetic routing note', body, '2026-10-19', '2026-10-19', 'active',
-                 json.dumps({'note_source': '/never/open/synthetic.md'})))
+                 json.dumps(topic['frontmatter'])))
     monkeypatch.setattr(hs, 'open_snapshot', lambda: con)
     rows = hs.search_snapshot('Codex', 3, kind='topic')
     rows = hs.snapshot_row_metadata(con, rows)

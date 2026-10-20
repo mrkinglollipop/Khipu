@@ -2754,8 +2754,8 @@ def _imported_routing_mark(row: dict[str, Any]) -> str:
     ``routing_scanner.scan_text``. A clipped search snippet cannot prove a
     claim past ``SNIPPET_LIMIT``: the teaser dropped that tail, and inventing
     a mark from absent text would flag a note the hit does not carry.
-    Snapshot metadata may attach ``_routing_state_claim`` after scanning the
-    stored body, which the hit then carries without exposing the body.
+    Import-time metadata may attach ``_routing_state_claim``, which the
+    hit carries without exposing or rescanning the stored body.
     Never writes the hit or the note file. A scanner exception omits the
     mark and never breaks the prior-work block.
     """
@@ -2764,8 +2764,8 @@ def _imported_routing_mark(row: dict[str, Any]) -> str:
     from khipu.routing_scanner import SUPERSEDED_MARK, scan_text
 
     try:
-        if row.get("_routing_state_claim"):
-            return SUPERSEDED_MARK
+        if type(row.get("_routing_state_claim")) is bool:
+            return SUPERSEDED_MARK if row["_routing_state_claim"] else ""
         text = str(row.get("body") or row.get("snippet") or "")
         if not text.strip():
             return ""
