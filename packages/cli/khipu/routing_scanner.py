@@ -11,26 +11,64 @@ from typing import Any
 
 SUPERSEDED_MARK = "routing state: superseded by Khipu's record"
 
-# Providers, accounts and lanes Khipu's record names. "main account" is the
-# live phrasing for the primary Claude login; bare "main" is an ordering word.
+# Providers, accounts, lanes and model names Khipu's record names.
+# "main account" / "primary account" are live phrasings for the primary
+# Claude login; bare "main"/"primary" are ordering words.
 _ACCOUNT_RE = re.compile(
-    r"\b(?:main\s+account|anthropic|deepseek|openai|claude|codex|grok|muse|glm|jev|xai)\b",
+    r"\b(?:main\s+account|primary\s+account|anthropic|deepseek|openai|"
+    r"claude|codex|grok|muse|glm|jev|xai|haiku|sonnet|opus)\b",
     re.I,
 )
 _STATE_RE = re.compile(r"\b(?:open|limited|paused|held|tight|low|down)\b", re.I)
 _ORDERING_RE = re.compile(
-    r"\b(?:first|second|before|after|order|priority|prefers|prefer|main|only|not used)\b",
+    r"\b(?:first|second|before|after|order|priority|prefers|prefer|"
+    r"main|primary|only|not used)\b",
     re.I,
 )
-_RANK_RE = re.compile(r"^\s*\d+\.\s+(\S.*?)\s*$")
+_STRONG_ORDER_RE = re.compile(
+    r"\b(?:prefers|prefer|priority|not used|first choice)\b|\border\b",
+    re.I,
+)
+# Numbered ranking whose first token is an account; a trailing description
+# ("1. Codex — builds") is still a ranking.
+_RANK_RE = re.compile(
+    r"^\s*\d{1,3}\.\s+\*{0,2}("
+    r"main\s+account|primary\s+account|anthropic|deepseek|openai|"
+    r"claude|codex|grok|muse|glm|jev|xai|haiku|sonnet|opus"
+    r")\b\*{0,2}",
+    re.I,
+)
 _DATE_RE = re.compile(r"\b20\d{2}-\d{2}-\d{2}\b")
-_DATE_QUALIFIER_RE = re.compile(r"\b(?:as of|until)\b", re.I)
-_LEVEL_RE = re.compile(r"\d+(?:\.\d+)?%\s+left", re.I)
+_WEEKDAY_RE = re.compile(
+    r"\b(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|"
+    r"Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\b",
+    re.I,
+)
+# Bound the percent so a long numeric line cannot retry an unbounded \d+
+# at every offset (O(n^2) on a 4 KB digit run).
+_LEVEL_RE = re.compile(
+    r"(?<!\d)\d{1,3}(?:\.\d{1,2})?\s*%\s*(?:left|used|remaining)",
+    re.I,
+)
 _HOWTO_RE = re.compile(
     r"\bexec\b|(?<!\w)--[A-Za-z]|\bto reach\b|\bstarting the\b",
     re.I,
 )
-_HISTORY_RE = re.compile(r"\b(?:was|were|had been|preferred)\b", re.I)
+_HISTORY_PREFIX_RE = re.compile(r"^\s*history\s*:", re.I)
+_PAST_RE = re.compile(r"\b(?:was|were|had been|preferred|chose)\b", re.I)
+_PRESENT_RE = re.compile(r"\b(?:is|are|stays|stay)\b", re.I)
+_ACTOR_PAUSED_RE = re.compile(
+    r"\b(?:matt|the operator|we|the owner)\s+paused\b",
+    re.I,
+)
+_CAPABILITY_RE = re.compile(
+    r"\bgood for\b|\bweak at\b|\bfirst drafts\b|\bin this example\b",
+    re.I,
+)
+_INCIDENTAL_ORDER_RE = re.compile(r"\bfirst drafts\b|\bsupports only\b", re.I)
+_CURRENT_FRAME_RE = re.compile(r"\bcurrent(?:ly)?(?:\s+routing)?\b", re.I)
+_FENCE_RE = re.compile(r"^(```|~~~)")
+_CLAUSE_SPLIT_RE = re.compile(r"\s*;\s*|\.\s+")
 
 
 def scan_text(path: str, text: str) -> list[dict[str, Any]]:
@@ -38,6 +76,8 @@ def scan_text(path: str, text: str) -> list[dict[str, Any]]:
     file = str(path)
     claims: list[dict[str, Any]] = []
     in_frontmatter = False
+    in_fence = False
+    in_capability_table = False
     for index, line in enumerate(str(text).splitlines(), 1):
         stripped = line.strip()
         if index == 1 and stripped == "---":
@@ -47,7 +87,31 @@ def scan_text(path: str, text: str) -> list[dict[str, Any]]:
             if stripped == "---":
                 in_frontmatter = False
             continue
-        kind, account = _claim_on(line)
+        if _FENCE_RE.match(stripped):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if stripped.startswith("|"):
+            if _CAPABILITY_RE.search(line):
+                in_capability_table = True
+                continue
+            if in_capability_table:
+                continue
+            kind, account = _claim_on(_table_cells(line))
+        else:
+            in_capability_table = False
+            if stripped.startswith(">"):
+                inner = stripped.lstrip(">").strip()
+                # Quoted or past-tense history is not a live claim; a current
+                # claim in a blockquote still is (scope §10). Bare quotations
+                # without a current frame stay quoted, matching the pinned
+                # quote-block fixtures.
+                if _is_history_text(inner) or not _CURRENT_FRAME_RE.search(inner):
+                    continue
+                kind, account = _claim_on(inner)
+            else:
+                kind, account = _claim_on(line)
         if kind is None or account is None:
             continue
         claims.append({
@@ -60,23 +124,54 @@ def scan_text(path: str, text: str) -> list[dict[str, Any]]:
     return claims
 
 
+def _table_cells(line: str) -> str:
+    return " ".join(cell.strip() for cell in line.split("|") if cell.strip())
+
+
 def _claim_on(line: str) -> tuple[str | None, str | None]:
-    stripped = line.lstrip()
-    if not stripped or stripped.startswith((">", "|")):
+    stripped = line.strip()
+    if not stripped:
         return None, None
-    if _HOWTO_RE.search(line) or _HISTORY_RE.search(line):
+    if _HISTORY_PREFIX_RE.match(stripped):
         return None, None
     ranked = _ranked_account(line)
     if ranked is not None:
         return "ordering", ranked
-    account = _account(line)
+    for clause in _clauses(stripped):
+        kind, account = _claim_on_clause(clause)
+        if kind is not None:
+            return kind, account
+    return None, None
+
+
+def _clauses(line: str) -> list[str]:
+    return [part for part in _CLAUSE_SPLIT_RE.split(line) if part.strip()]
+
+
+def _claim_on_clause(clause: str) -> tuple[str | None, str | None]:
+    if _is_history_text(clause):
+        return None, None
+    account = _account(clause)
     if account is None:
         return None, None
-    if _STATE_RE.search(line) and _has_qualifier(line):
+    state_claim = bool(_STATE_RE.search(clause) and _has_qualifier(clause))
+    if _CAPABILITY_RE.search(clause) and not state_claim:
+        return None, None
+    howto = bool(_HOWTO_RE.search(clause))
+    if howto and not state_claim and not _STRONG_ORDER_RE.search(clause):
+        return None, None
+    if state_claim:
         return "state", account
-    if _ORDERING_RE.search(line):
+    masked = _INCIDENTAL_ORDER_RE.sub(" ", clause)
+    if _ORDERING_RE.search(masked):
         return "ordering", account
     return None, None
+
+
+def _is_history_text(text: str) -> bool:
+    if _HISTORY_PREFIX_RE.match(text.strip()) or _ACTOR_PAUSED_RE.search(text):
+        return True
+    return bool(_PAST_RE.search(text) and not _PRESENT_RE.search(text))
 
 
 def _account(line: str) -> str | None:
@@ -86,16 +181,12 @@ def _account(line: str) -> str | None:
 
 def _ranked_account(line: str) -> str | None:
     match = _RANK_RE.match(line)
-    if not match:
-        return None
-    rest = match.group(1)
-    found = _ACCOUNT_RE.match(rest)
-    if found is None or found.end() != len(rest):
-        return None
-    return found.group(0)
+    return match.group(1) if match else None
 
 
 def _has_qualifier(line: str) -> bool:
     if _LEVEL_RE.search(line):
         return True
-    return bool(_DATE_RE.search(line) and _DATE_QUALIFIER_RE.search(line))
+    if _DATE_RE.search(line):
+        return True
+    return bool(_WEEKDAY_RE.search(line))

@@ -5902,6 +5902,22 @@ def cosine_candidates_snapshot(
     return out
 
 
+def _topic_routing_claim(path: str, body: Any) -> bool:
+    """Scan stored topic body for a routing-state claim. Fail-open.
+
+    The search hit itself only carries a clipped snippet; a claim past
+    that clip is still on the stored body, which this pass reads without
+    copying ``body`` onto the hit.
+    """
+    if not body:
+        return False
+    try:
+        from khipu.routing_scanner import scan_text
+        return bool(scan_text(str(path), str(body)))
+    except Exception:  # noqa: BLE001 — advisory; search must still return
+        return False
+
+
 def snapshot_row_metadata(
     con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -5954,9 +5970,10 @@ def snapshot_row_metadata(
             frontmatter_expr = "frontmatter" if "frontmatter" in topic_cols else "NULL"
             deleted_expr = "deleted_at" if "deleted_at" in topic_cols else "NULL"
             superseded_expr = "superseded_by" if "superseded_by" in topic_cols else "NULL"
-            for slug, ts, status, frontmatter, deleted, superseded_by in con.execute(
+            body_expr = "body" if "body" in topic_cols else "NULL"
+            for slug, ts, status, frontmatter, deleted, superseded_by, body in con.execute(
                 f"SELECT slug, {ts_expr}, {status_expr}, {frontmatter_expr}, "
-                f"{deleted_expr}, {superseded_expr} FROM topics "
+                f"{deleted_expr}, {superseded_expr}, {body_expr} FROM topics "
                 f"WHERE slug IN ({placeholders})",
                 topic_ids,
             ).fetchall():
@@ -5969,6 +5986,7 @@ def snapshot_row_metadata(
                 meta[("topic", slug)] = {
                     "ts": ts, "status": status or "active", "project": proj,
                     "deleted": deleted is not None, "superseded_by": superseded_by,
+                    "_routing_state_claim": _topic_routing_claim(slug, body),
                 }
     for r in rows:
         row_kind = r.get("kind")
@@ -5989,6 +6007,8 @@ def snapshot_row_metadata(
             item["status"] = m["status"]
         if m.get("superseded_by"):
             item["superseded_by"] = m["superseded_by"]
+        if m.get("_routing_state_claim"):
+            item["_routing_state_claim"] = True
         out.append(item)
     return out
 
