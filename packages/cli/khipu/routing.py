@@ -4873,7 +4873,7 @@ def telemetry_spend(account: str | None = None, *, days: float | None = None, st
     if account is None:
         keys = sorted({s["account"] for s in streams if s["account"] is not None})
         return {"accounts": {key: routing_sources.spend_total(streams, key, start, end) for key in keys},
-                "unattributed": routing_sources.unattributed_summary(streams)}
+                "unattributed": routing_sources.unattributed_summary(streams, start, end)}
     key = _telemetry_account_key(account, view)
     return routing_sources.spend_total(streams, key, start, end)
 
@@ -4889,7 +4889,8 @@ def telemetry_active(account: str | None = None, *, now: datetime | None = None)
     streams = _telemetry_streams(view)
     totals = routing_sources.active_totals(streams)
     if account is None:
-        return {"accounts": totals, "unattributed": routing_sources.unattributed_summary(streams)}
+        return {"accounts": totals,
+                "unattributed": routing_sources.unattributed_summary(streams, now - timedelta(days=7), now)}
     key = _telemetry_account_key(account, view)
     return totals.get(key, {"jobs": None, "status": "unknown"})
 
