@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import Counter
 
 
 STABLE = re.compile(r"[a-z][a-z0-9_-]*:[a-z0-9]+(?:-[a-z0-9]+)*\Z")
@@ -54,6 +55,13 @@ def forwarded(key: str, forwards: dict[str, str]) -> str:
     return key
 
 
+def unique_ids(accounts: list[dict]) -> dict[str, str]:
+    """Legacy duplicate labels have no unique stable binding until repaired."""
+    declared = {a["key"]: stable_id(a["harness"], a["label"]) for a in accounts}
+    counts = Counter(declared.values())
+    return {key: ident for key, ident in declared.items() if counts[ident] == 1}
+
+
 def state(events: list[dict], known: list[dict]) -> tuple[dict, dict, dict]:
     """Local key -> stable id, stable forwards, alias -> (id, start).
 
@@ -61,14 +69,17 @@ def state(events: list[dict], known: list[dict]) -> tuple[dict, dict, dict]:
     too, so a writer still naming the original id reaches the winner.
     The first migration witness owns an alias's start, even after restore.
     """
-    keys = {a["key"]: stable_id(a["harness"], a["label"]) for a in known}
+    keys = unique_ids(known)
+    known_keys = {a["key"] for a in known}
+    ambiguous = {stable_id(a["harness"], a["label"]) for a in known if a["key"] not in keys}
     forwards, aliases = {}, {}
     for event in events:
         kind = event.get("type")
         author = (event.get("written_by") or {}).get("kind")
         if kind == "account_migration" and author in ("owner", "migration"):
             for key, ident in (event.get("bindings") or {}).items():
-                keys.setdefault(key, ident)
+                if key not in known_keys and ident not in ambiguous:
+                    keys.setdefault(key, ident)
             for alias, ident in (event.get("aliases") or {}).items():
                 aliases.setdefault(alias, (ident, event.get("started_at") or event.get("written_at")))
         elif kind == "account_rename" and author == "owner":
@@ -86,5 +97,6 @@ def state(events: list[dict], known: list[dict]) -> tuple[dict, dict, dict]:
 
 
 def local_bindings(accounts: list[dict]) -> dict:
-    return {stable_id(a["harness"], a["label"]): {"harness": a["harness"], "home": a.get("home")}
-            for a in accounts}
+    ids = unique_ids(accounts)
+    return {ids[a["key"]]: {"harness": a["harness"], "home": a.get("home")}
+            for a in accounts if a["key"] in ids}

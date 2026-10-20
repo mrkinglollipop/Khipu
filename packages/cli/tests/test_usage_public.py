@@ -103,7 +103,11 @@ def test_khipu_usage_never_carries_a_login_folder(owner, monkeypatch, kind):
     row = out["accounts"][0]
     assert "home" not in row
     assert row["account"] == ("Claude broken" if kind == "invalid" else "Claude work")
-    assert row["harness"] == "claude" and row["id"].startswith("acct-")
+    assert row["harness"] == "claude"
+    if kind == "invalid":
+        assert row["id"].startswith("acct-")
+    else:
+        assert row["id"] == "claude:work"
     assert row["ok"] is (kind in ("cached", "fresh"))
     assert out["summary_text"] and out["generated_at"] == raw["generated_at"]
     if kind in ("cached", "fresh"):

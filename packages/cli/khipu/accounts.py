@@ -478,6 +478,8 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
             raise AccountsError("that label is an earlier account id; choose a new label", "name_taken",
                                 field="label")
     for key in renames:
+        if key not in _keys:
+            continue  # an ambiguous old label cannot forward either login
         was = routing.account_identity.stable_id(old[key]["harness"], old[key]["label"])
         new = routing.account_identity.stable_id(after_by_key[key]["harness"], after_by_key[key]["label"])
         if was != new:

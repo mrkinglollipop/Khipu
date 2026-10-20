@@ -910,7 +910,6 @@ def accounts() -> list[dict]:
             continue
         out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],
                     "home": account.get("home")})
-    account_identity.validate(out)
     return out
 
 
@@ -941,7 +940,6 @@ def _fold_accounts(config: dict) -> list[dict]:
             continue
         out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],
                     "home": account.get("home")})
-    account_identity.validate(out)
     return out
 
 
@@ -2410,7 +2408,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     key_ids, stable_forwards, aliases = account_identity.state(events, known)
     stable_keys = {v: k for k, v in key_ids.items()}
     # Prefer the current binding over a historical login folder.
-    stable_keys.update({key_ids[a["key"]]: a["key"] for a in known})
+    stable_keys.update({key_ids[a["key"]]: a["key"] for a in known if a["key"] in key_ids})
     historical = {old: stable_keys.get(account_identity.forwarded(ident, stable_forwards), ident)
                   for old, (ident, _start) in aliases.items()}
     mapping = {**stable_keys, **{old: stable_keys.get(new, new) for old, new in stable_forwards.items()},
@@ -5825,7 +5823,7 @@ def migrate_accounts() -> None:
         if not any(e.get("type") == "account_migration" and
                    (e.get("written_by") or {}).get("kind") in ("owner", "migration") for e in events):
             known = accounts()
-            bindings = {a["key"]: account_identity.stable_id(a["harness"], a["label"]) for a in known}
+            bindings = account_identity.unique_ids(known)
             aliases = ({_legacy_account_id(k): v for k, v in bindings.items()}
                        if (routing_dir() / "id-salt").exists() else {})
             stamp = _stamp_locked(_now())[0]

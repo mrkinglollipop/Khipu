@@ -822,14 +822,17 @@ def test_11a_rename_keeps_a_forward(replay):
 
 
 def test_11a_duplicate_label_is_refused(replay):
-    replay.configure(usage_accounts=ACCOUNTS + [{"label": "Codex", "harness": "codex",
-                                               "home": str(replay.root / "synthetic-other")}])
-    refused = False
-    try:
-        routing.accounts()
-    except routing.RouteError:
-        refused = True
-    expect(refused, True, "11a: duplicate provider label is accepted")
+    from khipu import accounts, config, usage
+
+    original = config.load_config()
+    events = routing.read_events()[0]
+    changed = ACCOUNTS + [{"label": "Codex", "harness": "codex",
+                           "home": str(replay.root / "synthetic-other")}]
+    with pytest.raises(usage.AccountsError) as error:
+        accounts.save_list(changed, expect=config.accounts_version(), via="app")
+    assert error.value.code == "name_taken"
+    assert config.load_config() == original
+    assert routing.read_events()[0] == events
 
 
 def test_11a_old_local_log_folds_unchanged_and_is_never_rewritten(replay):

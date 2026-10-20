@@ -234,4 +234,4 @@ def test_the_routing_summary_lists_glm_by_pace(home):  # noqa: F811
     head = lines.index("Accounts by how soon their allowance runs out unused (Khipu's arithmetic, not your "
                        "priority):")
     assert "GLM" in [x.split(":")[0] for x in lines[head + 1:]]
-    assert routing.resolve_account("glm", routing.accounts()) == "glm|"
+    assert routing.resolve_account("glm", routing.accounts()) == "glm:main"

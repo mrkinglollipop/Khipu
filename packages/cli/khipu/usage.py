@@ -1605,10 +1605,12 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
     if len(raw) > ACCOUNTS_MAX:
         raise AccountsError(f"usage_accounts holds at most {ACCOUNTS_MAX} entries, got {len(raw)}", "too_many")
     kept = list(previous or [])
-    # Ids all start "acct-" (``routing.account_id``): only a name that does
-    # needs them worked out (which makes this install's id secret).
+    from khipu.routing_identity import STABLE
+
+    # Only possible id names need the existing accounts' identities checked.
     ids = _account_ids(raw) if any(isinstance(e, dict)
-                                   and str(e.get("label") or "").strip().casefold().startswith("acct-")
+                                   and (str(e.get("label") or "").strip().casefold().startswith("acct-")
+                                        or STABLE.fullmatch(str(e.get("label") or "").strip().casefold()))
                                    for e in raw) else set()
     out: list[dict] = []
     # (account, kept) per entry: every entry is checked against every other

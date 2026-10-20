@@ -651,6 +651,30 @@ def test_renaming_one_of_two_same_names_leaves_the_lanes_old_reports_unmatched(m
     assert _entry(routing.read_view(), _key("~/.claude-client"))["state"] == "limited"
 
 
+@pytest.mark.parametrize("migrated", [False, True])
+def test_duplicate_stable_labels_never_merge_login_evidence_or_forward_the_other_login(mac, migrated):
+    _set(usage_accounts=[{"label": "Same", "harness": "claude"},
+                         {"label": "Same", "harness": "claude", "home": "~/.claude-client"}])
+    first, second = "claude|", _key("~/.claude-client")
+    if migrated:
+        routing._legacy_account_id(first)
+        routing.migrate_accounts()
+    routing.report(state="limited", account=first, until="2h", author=ME)
+    before = routing.read_view()
+    assert _entry(before, first)["state"] == "limited"
+    assert _entry(before, second)["state"] != "limited"
+    with pytest.raises(routing.RouteError, match="no login binding"):
+        routing.resolve_account("claude:same")
+    accounts.rename(first, "Renamed", expect=_version())
+    after = routing.read_view()
+    assert _entry(after, first)["state"] == "limited"
+    assert _entry(after, second)["state"] != "limited"
+    assert "claude:same" not in after["forwards"]
+    assert routing.resolve_account("claude:same") == "claude:same"
+    assert routing.resolve_account("claude:renamed") == "claude:renamed"
+    assert set(config.load_config()[routing.account_identity.BINDINGS]) == {"claude:same", "claude:renamed"}
+
+
 def test_stop_cannot_end_another_accounts_hold(mac, capsys):
     _two_claudes()
     hold = routing.add_hold("Keep Second", reason="keep", scope="account", account="Second", owner=True,
@@ -1189,14 +1213,19 @@ def test_an_answer_to_a_conversations_account_change_needs_the_version_it_read(m
     _set(usage_accounts=[{"harness": "claude", "label": "First", "home": "~/.claude-client"},
                          {"harness": "codex", "label": "Second"}])
     base = _stored()
-    first = [dict(base[0], label="First A"), base[1]]
+    with pytest.raises(usage.AccountsError) as err:
+        accounts.save_list([dict(base[0], label="First A"), base[1]], expect=_version(),
+                           request={"by": ME, "request": "rename"})
+    assert err.value.code == "owner_only"
+    assert _stored() == base and "usage_accounts_request" not in config.load_config()
+    first = base + [{"harness": "glm", "label": "GLM"}]
     accounts.save_list(first, expect=_version(), request={"by": ME, "request": "first"})
     stale = _version()
     with pytest.raises(usage.AccountsError) as err:
         accounts.answer_request("confirm")
     assert err.value.code == "version_needed"
     accounts.answer_request("confirm", expect=stale)
-    second = [first[0], dict(base[1], label="Second B")]
+    second = first + [{"harness": "muse", "label": "Muse"}]
     accounts.save_list(second, expect=_version(), request={"by": ME, "request": "second"})
     with pytest.raises(usage.AccountsError) as err:
         accounts.answer_request("undo", expect=stale)
