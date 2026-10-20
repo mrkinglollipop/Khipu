@@ -1,5 +1,3 @@
-const CURSOR_NO_FIGURES = "Cursor reports no usage figures; its limits come from runner and conversation reports";
-
 /* Plan usage in the app (docs/plans/2026-10-14-plan-usage.md, phase 2): how
    much of each subscription CLI's plan is left, read from `khipu usage
    --json` through two fixed-argv commands (`khipu_usage_status`, cache first;
@@ -23,6 +21,8 @@ import { fmtAgoSince } from "./time";
 import type { Attention } from "./doctorAttention";
 import { accountState } from "./routing";
 import type { RouteView } from "./routing";
+
+const CURSOR_NO_FIGURES = "Cursor reports no usage figures; its limits come from runner and conversation reports";
 
 export type UsageWindow = {
   name?: string;
@@ -1125,7 +1125,7 @@ const ACCOUNT_REFUSAL: Record<string, (c: RefusalCtx) => string> = {
     c.field === "label"
       ? `${fieldWords(c)} is too long: use ${LABEL_MAX} characters or fewer.`
       : `${fieldWords(c)} is too long.`,
-  unknown_cli: () => "Khipu reads Claude Code, Codex, Grok Build, Muse and the GLM Coding Plan. Choose one of them under CLI.",
+  unknown_cli: () => "Khipu reads Claude Code, Codex, Grok Build, Muse, Cursor and the GLM Coding Plan. Choose one of them under CLI.",
   cursor_folder: () => "Cursor has one sign-in, so leave the Login folder empty.",
   muse_folder: () => "Muse has one sign-in, so leave the Login folder empty.",
   glm_folder: () => "GLM is read with its key, so leave the Login folder empty.",

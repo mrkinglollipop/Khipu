@@ -252,31 +252,21 @@ def parse_cursor(data: dict) -> dict:
 
     if not isinstance(data, dict):
         raise ProbeError(E_BAD)
-    auth = data.get("auth") if isinstance(data.get("auth"), dict) else {}
-    user = data.get("user") or auth.get("user") or {}
-    user = user if isinstance(user, dict) else {"email": user} if isinstance(user, str) else {}
-    logged = next((obj[k] for obj in (data, auth) for k in
-                   ("loggedIn", "isLoggedIn", "authenticated", "isAuthenticated")
-                   if isinstance(obj.get(k), bool)), None)
-    identity = user.get("id") or user.get("email") or auth.get("email") or data.get("email")
-    if auth.get("status") in ("not_signed_in", "not_logged_in", "unauthenticated", "signed_out"):
-        logged = False
-    if logged is False:
-        raise ProbeError(E_SIGNIN)
-    if logged is None and not identity:
+    if "userEmail" not in data:
         raise ProbeError(E_BAD)
-    subscription = data.get("subscription")
-    tier = (subscription.get("tier") or subscription.get("plan") or subscription.get("type")) \
-        if isinstance(subscription, dict) else subscription
-    tier = tier or data.get("subscriptionTier") or data.get("plan")
+    identity = data["userEmail"]
+    if identity is None:
+        raise ProbeError(E_SIGNIN)
+    if not isinstance(identity, str) or not identity.strip():
+        raise ProbeError(E_BAD)
+    tier = data.get("subscriptionTier")
     # Plan names are a vocabulary, never arbitrary text from the CLI.
     plans = {"ultra": "Ultra", "pro": "Pro", "pro+": "Pro+", "pro plus": "Pro+", "free": "Free",
              "business": "Business", "enterprise": "Enterprise", "team": "Team", "teams": "Teams"}
     plan = plans.get(tier.strip().casefold()) if isinstance(tier, str) else None
     row = {"ok": True, "plan": plan, "windows": [], "source": "account_status", "note": CURSOR_NO_FIGURES}
-    if isinstance(identity, str) and identity.strip():
-        row["identity_hash"] = hmac.new(routing._id_salt(), b"cursor\0" + identity.strip().casefold().encode(),
-                                        hashlib.sha256).hexdigest()
+    row["identity_hash"] = hmac.new(routing._id_salt(), b"cursor\0" + identity.strip().casefold().encode(),
+                                    hashlib.sha256).hexdigest()
     return row
 
 

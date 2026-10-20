@@ -78,6 +78,7 @@ _STAMPED = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s")
 _LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+(\S+)\s+(ADDED|LIMITED|LAUNCH|HOLD|ERROR|FAILED|FAIL)\b[ \t]*(.*)$")
 _CURSOR_LIMIT = re.compile(r"\busage limit\b|\brate limit\b|\bquota\b", re.I)
 _FIELD = re.compile(r"(?:^|\s)([a-z_]+)=(\S+)")
+_LANE_FIELD = re.compile(r"(?:^|\s)lane=([^\s:]+)")
 _NOW_BLOCK = re.compile(r"## NOW\s*\n```\n(.*?)\n```", re.S)
 _UPDATED = re.compile(r"^updated:.*$", re.M)
 _STAMP = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?Z")
@@ -559,13 +560,17 @@ def _parse_events(data: bytes, now: datetime, limits: dict[str, datetime] | None
         # kind, and names that pass ``safe_name``.
         kind, pipeline, rest = m.group(3), safe_name(m.group(2)), m.group(4)
         fields = dict(_FIELD.findall(rest))
+        lane_field = _LANE_FIELD.search(rest)
+        fields["lane"] = lane_field.group(1) if lane_field else None
         if kind == "HOLD":
             holds += 1
         elif kind == "LIMITED" or (kind in ("ERROR", "FAILED", "FAIL")
                                    and (fields.get("lane") or "").startswith("cursor-")
                                    and _CURSOR_LIMIT.search(rest)):
             lane, until = safe_name(fields.get("lane")), _parse(fields.get("until"))
-            if lane and lane.startswith("cursor-") and until is None and _CURSOR_LIMIT.search(rest):
+            # LIMITED lines carry the runner's until. Cursor error lines
+            # without one use only the report's default window, as other lanes do.
+            if kind != "LIMITED" and lane and until is None:
                 until = at + timedelta(seconds=GUESS_SECONDS)
             if lane and until:
                 if lane in limits and _same_until(limits[lane], until):

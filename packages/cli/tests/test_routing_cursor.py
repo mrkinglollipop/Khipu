@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import logging
 import sys
 import time
 from datetime import datetime, timezone
@@ -14,6 +15,9 @@ from khipu import accounts, config, discover, routing, routing_sources, usage
 
 NOW = datetime(2026, 10, 20, 16, 0, tzinfo=timezone.utc)
 EMAIL = "cursor-identity-sentinel@example.invalid"
+TOKEN = "cursor-token-sentinel-private"
+REAL_STATUS = {"cliVersion": "2026.10.19-6bbf2c4", "model": "Auto", "subscriptionTier": "Ultra",
+               "osPlatform": "darwin", "userEmail": EMAIL, "lastRequestId": None}
 WHY = "Cursor reports no usage figures; its limits come from runner and conversation reports"
 
 
@@ -53,11 +57,13 @@ else:
     return script, record
 
 
-def test_cursor_probe_private_identity_plan_and_cache(mac, tmp_path, monkeypatch, capsys):
+def test_cursor_probe_private_identity_plan_and_cache(mac, tmp_path, monkeypatch, capsys, caplog):
+    caplog.set_level(logging.DEBUG)
     script, record = fake_cursor(tmp_path, monkeypatch, {
-        "authenticated": True, "user": {"email": EMAIL}, "subscription": {"tier": "ultra"},
-        "untrusted": EMAIL, "usedPercent": 0})
-    monkeypatch.setenv("CURSOR_API_KEY", "secret-sentinel")
+        **REAL_STATUS, "untrusted": EMAIL, "accessToken": TOKEN,
+        "user": {"email": EMAIL, "token": TOKEN}, "auth": {"email": EMAIL, "token": TOKEN},
+        "usedPercent": 0}, stderr=f"warning {EMAIL} {TOKEN}")
+    monkeypatch.setenv("CURSOR_API_KEY", TOKEN)
     original = builtins.open
     def guarded(path, *args, **kwargs):
         assert "API Keys" not in str(path)
@@ -70,30 +76,57 @@ def test_cursor_probe_private_identity_plan_and_cache(mac, tmp_path, monkeypatch
     again = usage.probe_cursor()
     assert again["identity_hash"] == row["identity_hash"]
     assert routing.plan_fact(row, NOW) == {"readable": False, "why": WHY, "tier": "Ultra"}
-    usage.report(fresh=True, accounts=[{"label": "Cursor", "harness": "cursor", "home": None}])
+    report = usage.report(fresh=True, accounts=[{"label": "Cursor", "harness": "cursor", "home": None}])
     public = usage.public_row(row)
     assert public["note"] == WHY and "identity_hash" not in public
     found = discover._check_one({"cli": "cursor", "default": True}, run=usage._Run(), end=time.monotonic() + 10)
     assert found == ("signed_in", None, "Ultra")
+    discovered = discover._gather(NOW.timestamp())[0]
+    routing.report(account="Cursor", state="limited", message="usage limit")
+    view = routing.read_view()
+    conversation = routing.conversation_view()
+    from khipu.cli import main
+    assert main(["usage", "--json"]) == 0
+    assert main(["route", "--summary"]) == 0
     for call in map(json.loads, record.read_text().splitlines()):
         assert call["argv"] == ["about", "--format", "json"]
         assert "CURSOR_API_KEY" not in call["env"] and call["cwd"] == []
-    assert EMAIL not in json.dumps(routing.conversation_view())
-    assert EMAIL not in capsys.readouterr().out
-    assert all(EMAIL.encode() not in p.read_bytes() for p in mac[1].rglob("*") if p.is_file())
+    captured = capsys.readouterr()
+    surface = json.dumps([row, again, report, public, found, discovered, view, conversation])
+    for sentinel in (EMAIL, TOKEN):
+        assert sentinel not in surface + captured.out + captured.err + caplog.text
+        assert all(sentinel.encode() not in p.read_bytes() for p in tmp_path.rglob("*")
+                   if p.is_file() and p != script)
 
 
 @pytest.mark.parametrize("reply,stderr,code,error", [
-    ({"authenticated": False, "user": {"email": EMAIL}}, "", 0, "not_signed_in"),
+    (dict(REAL_STATUS, userEmail=None, subscriptionTier=None), "", 0, "not_signed_in"),
     (None, "Not logged in " + EMAIL, 1, "not_signed_in"),
-    ({"unexpected": EMAIL}, "", 0, "bad_reply"),
+    ({"subscriptionTier": "Ultra"}, "", 0, "bad_reply"),
+    ({}, "", 0, "bad_reply"),
+    (dict(REAL_STATUS, userEmail=""), "", 0, "bad_reply"),
+    (dict(REAL_STATUS, userEmail={"email": EMAIL}), "", 0, "bad_reply"),
     (None, "failed " + EMAIL, 7, "exit_7"),
+    (dict(REAL_STATUS, accessToken=TOKEN), TOKEN, 2, "exit_2"),
 ])
 def test_cursor_failures_never_return_cli_text(mac, tmp_path, monkeypatch, reply, stderr, code, error):
     fake_cursor(tmp_path, monkeypatch, reply, stderr=stderr, code=code)
     row = usage.probe_cursor()
     assert row == {"ok": False, "error": error}
-    assert EMAIL not in json.dumps(row)
+    assert EMAIL not in json.dumps(row) and TOKEN not in json.dumps(row)
+
+
+@pytest.mark.parametrize("reply,plan", [
+    (REAL_STATUS, "Ultra"),
+    ({"userEmail": EMAIL}, None),
+    (dict(REAL_STATUS, extra={"token": TOKEN}, usedPercent=99), "Ultra"),
+])
+def test_cursor_real_status_shapes(mac, tmp_path, monkeypatch, reply, plan):
+    fake_cursor(tmp_path, monkeypatch, reply)
+    row = usage.probe_cursor()
+    assert row["ok"] and row["plan"] == plan and row["windows"] == []
+    assert len(row["identity_hash"]) == 64
+    assert EMAIL not in json.dumps(row) and TOKEN not in json.dumps(row)
 
 
 def test_cursor_timeout_and_ten_second_ceiling(mac, tmp_path, monkeypatch):
@@ -111,7 +144,7 @@ def test_cursor_timeout_and_ten_second_ceiling(mac, tmp_path, monkeypatch):
 
 
 def test_cursor_hash_is_salted_and_plan_is_not_free_text(mac, monkeypatch):
-    data = {"user": {"email": EMAIL}, "plan": EMAIL}
+    data = dict(REAL_STATUS, subscriptionTier=EMAIL)
     one = usage.parse_cursor(data)
     monkeypatch.setattr(routing, "_id_salt", lambda: b"another-install-salt")
     two = usage.parse_cursor(data)
@@ -120,7 +153,7 @@ def test_cursor_hash_is_salted_and_plan_is_not_free_text(mac, monkeypatch):
 
 
 def test_cursor_discovery_and_decline_are_single_login(mac, tmp_path, monkeypatch, khipu_app):
-    fake_cursor(tmp_path, monkeypatch, {"user": {"email": EMAIL}, "subscription": "Ultra"})
+    fake_cursor(tmp_path, monkeypatch, REAL_STATUS)
     config.config_file().write_text(json.dumps({"usage_accounts": [{"harness": "grok", "label": "Grok"}]}))
     found, _, _ = discover._gather(NOW.timestamp())
     cursor = [r for r in found.values() if r["cli"] == "cursor"]
@@ -192,14 +225,16 @@ def runner(mac, lanes, events):
 
 
 @pytest.mark.parametrize("phrase", ["usage limit", "rate limit", "quota"])
-def test_cursor_grok_limit_bills_cursor_and_keeps_grok_open(mac, phrase):
+@pytest.mark.parametrize("separator", [" ", ": "])
+def test_cursor_grok_limit_bills_cursor_and_keeps_grok_open(mac, phrase, separator):
     runner(mac, {"cursor-grok": {"kind": "cursor", "model": "grok-4.7-high"},
                  "cursor-auto": {"provider": "cursor", "model": "auto"}},
-           f"2026-10-20T15:59:00Z job ERROR lane=cursor-grok {phrase} {EMAIL}\n")
+           f"2026-10-20T15:59:00Z job ERROR lane=cursor-grok{separator}{phrase} {EMAIL}\n")
     routing.report(account="Grok", state="open")
     view = routing.read_view()
     rows = {a["harness"]: a for a in view["accounts"]}
     assert rows["cursor"]["state"] == "limited" and rows["grok"]["state"] == "open"
+    assert (rows["cursor"]["until"], rows["cursor"]["basis"]) == ("2026-10-20T16:29:00Z", "estimated")
     assert rows["cursor"]["witness"]["model"] == "grok-4.7-high"
     assert rows["cursor"]["witness"]["family"] == "xAI"
     assert routing_sources.model_family("auto") == "unknown"
@@ -212,6 +247,17 @@ def test_cursor_grok_limit_bills_cursor_and_keeps_grok_open(mac, phrase):
     routing.report(runner="runner", lane="cursor-auto", state="limited", message="quota")
     assert any(e.get("account") == "cursor|" and e.get("family") == "unknown"
                for e in routing._read_all_events()[0] if e.get("type") == "evidence")
+
+
+def test_cursor_church_runner_limited_line_uses_until(mac):
+    runner(mac, {"cursor-grok": {"kind": "cursor", "model": "grok-4.7-high"}},
+           "2026-10-20T15:59:00Z fix-40 LIMITED lane=cursor-grok until=2026-10-20T19:00:00Z "
+           "job=fix-40 (account limit reached); the fix step is retried later\n")
+    routing.report(account="Grok", state="open")
+    rows = {a["harness"]: a for a in routing.read_view()["accounts"]}
+    assert (rows["cursor"]["state"], rows["cursor"]["until"], rows["cursor"]["basis"]) == (
+        "limited", "2026-10-20T19:00:00Z", "cli")
+    assert rows["grok"]["state"] == "open"
 
 
 def test_native_grok_limit_still_bills_grok(mac):
