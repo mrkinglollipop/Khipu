@@ -664,8 +664,8 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 17a | Discovery: a Claude Code home pointing at api.z.ai is offered as GLM; a settings file with a sentinel auth token never shows it anywhere; a folder holding only `worktrees` is not offered; a Keychain-backed Claude home with no auth file is offered when its CLI reports signed in, and a GLM home with a settings token is offered with the token never read out; three Grok homes are one account only when the CLI's account status agrees, otherwise separate candidates an owner can merge; auto-track off survives a restart. Lanes: `budget_account` matches with no `routing_lane_map`; contradictory declarations stay unmatched; a lane report on a declared lane is accepted; a declaration is `claimed` until a reading confirms it | hermetic | 9a, 9c |
 | 17b | Advise: a `pace_target` of 65% with 5 slack at 18% used 11 h into the week (allowance 9.26%) answers `hold_back` for `job` and `go` for `orchestration` from an undispatched attachment, and `hold_back` for a dispatched job claiming `orchestration`; zero current burn is still `hold_back` while ahead; recovery needs 1 point under the allowance; a `spend` of $35 at $35.10 and a full `concurrency` 1 answer `hold_back`; expired telemetry answers `go` with `evidence: unknown`; a pause answers `closed` for both purposes; `orchestration` at a 91% `share` or a reached `spend` answers `hold_back`, and at a full `concurrency` answers `go` | hermetic | 17a, 17c |
 | 17d | Owner direction end to end: an eligible conversation in Claude Code, Codex and Grok Build applies a cap, a rule edit and a priority through `khipu_owner_act`; each is live without a terminal, logged with its undo, and refused from a dispatched job | hermetic | 5, 17a |
-| 17e | Telemetry: duplicate spend events count once and two attempts of one job count twice; a correction nets out; a period with a coverage gap totals `unknown`; a new `active` snapshot replaces the old; two runners' active jobs sum; a silent runner's records expire to `unknown`; a lane's spend with no resolvable account is unattributed, never guessed | hermetic | 17t |
-| 17c | Directions: "use GLM only one job at a time" typed by the owner with no matching owner action opens one owed item naming the words; an unrelated routing write leaves it open; the matching cap closes it, and setting that cap to 4 instead leaves it open; a question, a quote and a job prompt open nothing; two directions with one written leave one open; a dismissal survives the next capture; a runner cap with no Khipu fact is flagged | hermetic | 19a, 19b |
+| 17e | Telemetry: duplicate spend events count once and two attempts of one job count twice; a correction nets out; a period where one of two runners on an account has a gap totals `unknown` even though the other covers the week; two accounts on one provider never pool; a new `active` snapshot replaces the old; two runners' active jobs sum; a silent runner's records expire to `unknown`; a lane's spend with no resolvable account is unattributed, never guessed | hermetic | 17t |
+| 17c | Directions: "use GLM only one job at a time" typed by the owner with no matching owner action opens one owed item naming the words; an unrelated routing write leaves it open; the matching cap closes it, and setting that cap to 4 instead leaves it open; a question, a quote and a job prompt open nothing; two directions with one written leave one open; a dismissal survives the next capture; the same prompt typed twice opens two directions, and the first one's action never closes the second; a runner cap with no Khipu fact is flagged | hermetic | 19a, 19b |
 
 ## 13. Amendment, 2026-10-20 afternoon: routing that runs the day
 
@@ -712,8 +712,13 @@ typed, timestamped records, each attributed to an account through the resolver i
     and its own event, so retries count.
   - A correction is a new event with `corrects: <event>` and the signed difference.
   - Totals sum across runners and Macs (section 7).
-- `spend_coverage {runner, provider, from, to}`: the interval for which that runner vouches it reported every
-  spend. A period's total is known only when the union of coverage for that provider spans the period.
+- `spend_coverage {runner, account, from, to}`: the interval for which that runner vouches it reported every
+  spend for that account. Each runner that launched work on an account during a period is a stream.
+  - **Known:** an account's total for a period is known only when every stream that took part in the period
+    covers its own participation interval.
+  - **Unknown:** one runner with a gap makes the total `unknown`, even when another runner covers the whole
+    week.
+  - **Accounts never pool:** two accounts on one provider are separate.
 
 The producer side is new work. Today's heartbeat (`lanes.py:2308`) publishes no counts. Slice 17t ships the
 contract and a reference emitter in the runner doc, and slice 17b's first step makes the Church Harness runner
@@ -835,9 +840,16 @@ the owner's words.
   - **What counts:** a `routing_direction` is recorded only from the owner's own typed turn (the provenance
     `owner_direction.check` already uses), with the exact span and an actionable intent. Questions,
     quotations, hypotheticals, discussion and dispatched jobs' prompts are abstained on.
-  - **The join:** `owner_direction.check` already matches the owner's typed prompt. Its stamp gains that
-    prompt's sha256 (never the text). Capture computes the same hash for the turn, which joins a direction
-    to the owner actions it caused. `owner_turns`' random turn id stays as it is.
+  - **The join** gives each owner turn an occurrence identity.
+    - **At recording:** when `owner_turns` records an owner turn, it stores `prompt_sha256` of the canonical
+      prompt text (one shared function, used by capture too: Unicode NFC, trimmed, whitespace collapsed). It
+      stores that, never the text, beside the turn's existing random id.
+    - **At the action:** `owner_direction.check` already picks the eligible turn. It copies that turn's id
+      and `prompt_sha256` into its stamp, and the owner-actions log's field allowlist (`owner_direction.py:805`)
+      gains both fields.
+    - **At capture:** a direction is keyed by the session, the turn's position in the transcript and the
+      hash. It joins only actions whose stamp names a turn recorded at or after that position with the same
+      hash. A later identical prompt is a new occurrence, and it never reuses an earlier action.
   - **How it closes:** the direction carries a structured target where one can be read (entity, kind, value:
     "GLM, concurrency, 1"). It closes only when an applied owner action joined to its prompt matches that
     target and value at the resulting revision; setting the cap to 4 leaves it open. A direction with no
