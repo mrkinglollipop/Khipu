@@ -56,7 +56,8 @@ HARNESS = {"codex", "claude_code", "grok_build", "shell", "unknown"}
 EVENT_FIELDS = {"type", "id", "account", "state", "source", "written_at", "written_by", "via",
                 "scope", "reason", "text", "until", "owner", "pending", "n", "target", "entries",
                 "owner_request", "seq", "basis", "until_default", "date", "seeded",
-                "mac", "legacy_mac", "entity", "base", "op", "op_body", "hlc", "number_pending", "hub_order", "local_order", "proposal", "clock_at"}
+                "mac", "legacy_mac", "entity", "base", "op", "op_body", "hlc", "number_pending", "hub_order", "local_order", "proposal", "clock_at",
+                "kind", "witness_at", "expires_at", "observation_scope"}
 TEXT_FIELDS = {"text", "owner_request", "role"}
 
 
@@ -84,6 +85,17 @@ def load_replay(value):
             alias(row["base"], "e")
         if "clock_at" in row:
             number(row["clock_at"], integer=True)
+        if "kind" in row and row["kind"] not in {"observation", "fact", "owner_rule"}:
+            raise FixtureError("fixture_enum")
+        for key in ("witness_at", "expires_at"):
+            if row.get(key) is not None:
+                number(row[key], integer=True)
+        if "observation_scope" in row:
+            closed(row["observation_scope"], {"kind", "mac"}, {"kind"})
+            if row["observation_scope"]["kind"] not in {"account_quota", "machine"}:
+                raise FixtureError("fixture_enum")
+            if row["observation_scope"]["kind"] == "machine":
+                alias(row["observation_scope"].get("mac"), "m")
         if "hlc" in row:
             hlc = row["hlc"]
             closed(hlc, {"wall", "counter", "mac"}, {"wall", "counter", "mac"})
@@ -202,8 +214,11 @@ def sanitize(events):
                 number(value["counter"], integer=True)
                 row[key] = {"wall": value["wall"] - origin * 1000, "counter": value["counter"],
                             "mac": named(value["mac"], "m")}
-            elif key == "clock_at":
-                row[key] = time(value)
+            elif key in {"clock_at", "witness_at", "expires_at"}:
+                row[key] = None if value is None else time(value)
+            elif key == "observation_scope":
+                closed(value, {"kind", "mac"}, {"kind"})
+                row[key] = {k: named(v, "m") if k == "mac" else v for k, v in value.items()}
             elif key == "until":
                 row[key] = None if value is None else time(value)
             elif key == "date":

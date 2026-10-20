@@ -374,7 +374,6 @@ def test_1_hold_priority_contradiction_and_end_route_already_arrive(replay, surf
     assert "contradicts" in text and "Grok" in text and "end_hold" in text
 
 
-@future("4", "held-account owner writes must require an explicit end-or-keep choice")
 def test_1_owner_write_without_a_hold_choice_is_refused(replay):
     seed(replay)
     refused = None
@@ -387,7 +386,6 @@ def test_1_owner_write_without_a_hold_choice_is_refused(replay):
            True, "1: owner priority accepted without end-or-keep for h-synthetic-grok")
 
 
-@future("4", "the structured end choice removes a hold from every delivery")
 def test_1_explicit_end_choice_removes_the_hold(replay):
     rows = [json.loads(line) for line in LEGACY.read_text().splitlines()]
     rows.append(replay.event("priority_set", 9, entries=[{"account": "grok|", "role": "builder"}],
@@ -400,7 +398,6 @@ def test_1_explicit_end_choice_removes_the_hold(replay):
     assert "contradicts active hold" not in replay.offer()[1]
 
 
-@future("4", "owner priority writes consume an explicit keep choice and retain the hold")
 def test_1_explicit_keep_choice_preserves_the_hold(replay):
     seed(replay)
     # The public writer seam is owned by slice 4; the scope names holds.
@@ -442,7 +439,6 @@ def test_5_codex_low_is_marked_against_96_percent_without_rewriting_owner_words(
     assert replay.view()["rules"][0]["text"] == "Codex is low"
 
 
-@future("4", "structured level claims are represented and expire at the next account reset")
 def test_5_structured_level_claim_expires_at_reset(replay):
     reset = T0 + timedelta(hours=1)
     row = replay.event("priority_set", entries=[{"account": "codex|", "role": "builder",

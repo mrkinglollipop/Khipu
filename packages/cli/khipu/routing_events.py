@@ -66,6 +66,10 @@ def entity(event: dict) -> str | None:
         return derived("priority", "owner")
     if kind in ("pause", "lift"):
         return derived("pause", event.get("account"))
+    if kind == "definition_set":
+        value = event.get("value") or {}
+        key = value.get("id") or f"{event.get('mac')}:{value.get('runner')}:{value.get('lane')}"
+        return derived("definition", f"{event.get('definition')}:{key}")
     return None
 
 

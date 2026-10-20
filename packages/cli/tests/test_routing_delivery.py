@@ -336,12 +336,12 @@ def test_review_omitted_pending_changes_are_counted_and_delivered_later(home, mo
 def test_review_overlapping_account_labels_agree_on_hold_conflicts(home):
     _set(home, usage_accounts=[{"label": "Codex", "harness": "codex"},
                                {"label": "Codex second", "harness": "codex", "home": "/logins/second-login"}])
-    routing.add_hold("wait", reason="keep", scope="account", account="Codex", author=ME)
+    held = routing.add_hold("wait", reason="keep", scope="account", account="Codex", author=ME)
     routing.add_rule("Codex second is open for small jobs.", via="app")
     view = routing.read_view()
     assert "contradicts" not in routing.rule_line(view["rules"][0], view=view)
     assert "contradicts" not in routing.hold_line(view["holds"][0], T0, view=view)
-    routing.add_rule("Codex is open for small jobs.", via="app")
+    routing.add_rule("Codex is open for small jobs.", via="app", holds={held["id"]: "keep"})
     view = routing.read_view()
     assert "contradicts active hold" in routing.rule_line(view["rules"][1], view=view)
     assert "contradicts rule 2" in routing.hold_line(view["holds"][0], T0, view=view)
@@ -361,7 +361,7 @@ def test_review_owner_rule_flags_share_the_prompt_budget(home):
     before = routing.read_view()
     words = " and ".join(a["label"] for a in ACCOUNTS) + " can build."
     for _ in range(4):
-        routing.add_rule(words, via="app")
+        routing.add_rule(words, via="app", holds={h["id"]: "keep" for h in before["holds"]})
     view = routing.read_view()
     changed = routing.since(before["version"], view)
     text, _ = routing.changes_text(changed, view, T0)

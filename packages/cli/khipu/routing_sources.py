@@ -966,7 +966,8 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
             continue
         if not (row.get("ok") or row.get("last_good_at")):
             continue
-        at = _parse(row.get("observed_at") or row.get("probed_at"))
+        at = _parse(row.get("observed_at") or (row.get("last_good_at") if not row.get("ok") else None)
+                    or row.get("probed_at"))
         windows = [w for w in row.get("windows") if isinstance(w, dict)] if isinstance(row.get("windows"), list) else []
         if at is None or not windows:
             continue
@@ -994,6 +995,10 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
             base = {"account": key, "runner": None, "lane": None, "scope": scope, "source": "probe",
                     "written_by": by, "via": "probe", "at": at, "reason": None, "message_time": False,
                     "observed": observed, "turn": row.get("source") == "turn"}
+            resets = [_parse(w.get("resets_at")) for w in group]
+            resets = [reset for reset in resets if reset is not None and reset > at]
+            if resets:
+                base["reset_at"] = _iso(min(resets))
             if full:
                 # The newest full window wins, then the latest reset: a fresh refusal must
                 # not hide behind an older full window carried beside it (which an owner

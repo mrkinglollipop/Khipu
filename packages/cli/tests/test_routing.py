@@ -1421,7 +1421,12 @@ def test_a_torn_last_line_does_not_swallow_the_next_write(home):
 
 
 def test_settings_saved_while_a_read_runs_are_not_folded_under_the_new_fingerprint(home, monkeypatch):
-    _report(account="Claude", state="open")
+    # Legacy evidence derives its expiry from settings; new observations carry
+    # the expiry chosen by their writer, independently of a reader's settings.
+    path = routing.events_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"type": "evidence", "id": "legacy-open", "account": "claude|",
+                                "state": "open", "written_at": routing._iso(T0), "source": "report"}) + "\n")
     home["clock"].advance(hours=2)
     real = routing.settings
     armed = [True]

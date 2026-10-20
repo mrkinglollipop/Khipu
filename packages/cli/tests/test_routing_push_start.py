@@ -171,8 +171,8 @@ def test_rules_and_the_note_arrive_whole_whatever_their_length(home, monkeypatch
     _set(home, routing_summary_chars=50, routing_line_chars=40)
     _push_on(monkeypatch)
     lines = _routing_part(_hook(monkeypatch)).splitlines()
-    assert f"1. {long_rule.strip()}" in lines  # whole: not clipped at 200 or at 40
-    assert any(line.endswith(note.strip()) and line.startswith("Note from the owner") for line in lines)
+    assert f"1. {long_rule}" in lines  # owner whitespace survives as well as the words
+    assert any(line.endswith(note) and line.startswith("Note from the owner") for line in lines)
     assert lines.index("Standing rules:") < next(i for i, x in enumerate(lines) if x.startswith("Note from"))
     assert lines[-1].endswith("more lines: run `khipu route`")
 

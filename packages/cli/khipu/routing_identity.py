@@ -105,6 +105,8 @@ def with_provenance(accounts: list[dict], events: list[dict]) -> list[dict]:
 
 
 def declared_id(account: dict) -> str | None:
+    if isinstance(account.get("definition_id"), str) and STABLE.fullmatch(account["definition_id"]):
+        return account["definition_id"]
     return stable_id(account["harness"], account["label"]) if label_source(account) == "owner" else None
 
 

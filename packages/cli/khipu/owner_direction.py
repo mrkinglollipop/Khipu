@@ -968,7 +968,8 @@ def _rule_now(n) -> dict:
 def _priority_rows(held: dict | None) -> list[dict] | None:
     if not held:
         return None
-    return [{"account": e["account"], "role": e.get("role"), "until": e.get("until")} for e in held["entries"]]
+    return [{"account": e["account"], "role": e.get("role"), "until": e.get("until"),
+             **({"level": dict(e["level"])} if e.get("level") else {})} for e in held["entries"]]
 
 
 def _before(want: dict):
