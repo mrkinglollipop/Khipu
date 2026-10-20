@@ -146,19 +146,24 @@ the trailing average".
 - **Cycle identity is a canonical partition of reset times, independent of the witness buckets.**
   - **With a provider cycle id** (a probe that reports a window or cycle id; none does today), the cycle is
     that id.
-  - **Otherwise reset times fall on a fixed grid anchored to the Unix epoch.** A reset time's cell is
-    `floor(resets_at / 15 min)`. **A cycle is a maximal run of adjacent occupied cells.** That is a property
-    of the set of occupied cells alone, so it is order-independent and transitive by construction: a late
-    reading can only extend or join runs, exactly as if it had arrived on time.
-  - Codex's examples: R, R + 4 min and R + 8 min form one run. Estimates of 14:59, 29:59 and 30:01 fall in
-    cells 0, 1 and 2, which is one run and one cycle. A late arrival in cell 0 joins the same run.
-  - **The run bound.** A run longer than 4 cells (1 hour) is **ambiguous**: pace for that window is `unknown`,
-    and the line says "reset time spread over more than an hour". It stays so until the stale end ages out of
-    the trailing window, or the provider's estimates settle into a shorter run.
-  - **The supported jitter** is therefore up to 1 hour of spread in one cycle's reset estimates. Genuine
-    resets of five-hour and weekly windows are at least 5 hours apart, and the run between two of them would
-    need occupied cells covering that whole gap, which goes past the bound. So a run never silently links two
-    real resets: at worst the window reads `unknown`.
+  - **Otherwise cycles are connected components of the reset estimates under single linkage.**
+    - Sort one account window's reset estimates. Consecutive estimates no more than **G = 1 hour** apart
+      join, and a cycle is a resulting connected component.
+    - That depends only on the set of estimates, so it is order-independent and transitive by construction.
+      A late estimate only joins or links components, exactly as if it had arrived on time.
+  - **The span bound.** A component whose span (latest estimate minus earliest) exceeds **S = 1 hour** is
+    **ambiguous**. Pace for that window is `unknown`, and the line says "reset time spread over more than an
+    hour". It stays so until the stale end ages out of the trailing window, or the estimates settle into a
+    narrower component.
+  - **Why it never merges two real resets.** Genuine resets of five-hour and weekly windows are at least 5
+    hours apart, which is more than G.
+    - Two real resets therefore join only if estimates chain across the whole 5-hour gap.
+    - Such a component spans more than S, so it reads `unknown` and is never one silent cycle.
+    - The supported jitter is up to 1 hour of spread in one cycle's estimates.
+  - Codex's examples, each in any arrival order:
+    - 14:59 and 30:01 form one cycle, with no middle reading needed.
+    - 14:59, 15:00, 30:00, 45:00 and 60:01 form one cycle spanning 45 min 02 s, which is not ambiguous.
+    - R, R + 4 min and R + 8 min form one cycle, and so do 14:59, 29:59 and 30:01.
   - **The representative reset time** of a cycle, used for T, is the `resets_at` of its newest fresh reading,
     ties going to the earlier value.
   - **The current cycle** is the cycle of the newest fresh reading, so a provider's earlier replacement reset
@@ -549,8 +554,15 @@ Routing state lives only in Khipu's record. Files point at it.
 - **May stay in files:** durable capability notes (the global CLAUDE.md model table) and how each lane is
   reached. **May not:** whether an account is open, limited, paused, held or "tight", priorities and levels.
 - **The scanner** (slice 13) reads global and per-project CLAUDE.md and AGENTS.md files and the memory notes
-  Khipu imports. It flags a routing-state claim (an account next to a state word plus a date or level) with
-  its file and line. Recall marks such a note "routing state: superseded by Khipu's record" in the prior-work
+  Khipu imports. It flags a routing-state claim with its file and line. A line is a claim when it names an
+  account, provider or lane, and either:
+  - pairs it with a state word (open, limited, paused, held, tight, low, down) plus a date or a level; or
+  - makes a **priority or ordering claim** about it, with or without a date or level: "first", "second",
+    "before", "after", "order", "priority", "prefer", "main", "only", "not used", or a numbered ranking of
+    accounts.
+
+  "Delegation order: second Claude account first" has no date or level, and still matches as an ordering
+  claim. Recall marks such a note "routing state: superseded by Khipu's record" in the prior-work
   block. **False positives it must pass clean:** capability rows ("Weak at", "Good for"), evidence dates in
   those tables, quoted history ("on 2026-10-14 Matt paused…" inside a past-tense record or a quote block), and
   lane how-to text. Live examples it must flag: "Main account tight until Mon 2026-10-19" and "Delegation
@@ -628,7 +640,7 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 14 | Scanner: flags the two live notes; passes capability rows, evidence dates and quoted history | hermetic | 13 |
 | 15 | Health: each red condition turns red and back to green on its own evidence | hermetic | 16 |
 | 16a | Pace inputs: the extractor's sentinel tests; `pace_fixture_v1` rejects any other key; relative, rounded and repeated readings never become fresh samples; two Macs' samples with the same time and different values, a skewed clock, and different reset times merge to identical buckets in opposite arrival orders; two-minute samples over 24 h make consecutive buckets, not one cluster; a late reading changes only what it would have changed on time; 95% then 1% within 150 s is a possible reset, settled by the next readings either way; an earlier replacement `resets_at` carried by fresh readings wins over stale metadata | hermetic | 4Pa |
-| 16b | Pace results: Codex's gap example gives 1 point an hour; (−6 h, 0%), (6 h, 6%), (24 h, 15%) computes 12, not 15, but is `unknown` with `observed_pct` 0%; readings every 30 minutes at 0.5 an hour give 12 with 100%; Codex's aging-out case crosses 13 at 1.109 minutes (exact walk) with `peak_pct` 13.026 at 4 minutes, where a 15-minute scan would miss it; R, R + 4 min and R + 8 min reset times form one cycle; 14:59, 29:59 and 30:01 (cells 0, 1, 2) form one cycle, also when the cell 0 reading arrives last; a run of more than 4 cells gives `unknown` with "reset time spread over more than an hour"; a reset inside the day contributes zero across its interval and no interpolated drop; a steady 0.5 an hour against a daily cap of 13 gives near with no time; a rising rate gives a `reaches_cap_at` that accounts for usage aging out; long gaps lower `observed_pct` and mark the line gappy; synthetic outpace, underpace and on-pace; a reset mid-window; a correction drop; a possible-reset drop later confirmed and later refuted; coverage below the floor gives `unknown` with its reason; zero burn; limit and cap already reached; a reset time passed; a share cap and a daily cap together, carried apart in the schema; the sanitized real history within its `t_err` | hermetic | 4Pb |
+| 16b | Pace results: Codex's gap example gives 1 point an hour; (−6 h, 0%), (6 h, 6%), (24 h, 15%) computes 12, not 15, but is `unknown` with `observed_pct` 0%; readings every 30 minutes at 0.5 an hour give 12 with 100%; Codex's aging-out case crosses 13 at 1.109 minutes (exact walk) with `peak_pct` 13.026 at 4 minutes, where a 15-minute scan would miss it; cycle grouping, each case in every arrival order: 14:59 and 30:01 with no middle reading form one cycle; 14:59, 15:00, 30:00, 45:00 and 60:01 (a 45 min 02 s span) form one cycle and are not ambiguous; R, R + 4 min and R + 8 min form one cycle; 14:59, 29:59 and 30:01 form one cycle; a component spanning more than 1 h gives `unknown` with "reset time spread over more than an hour"; two resets 5 h apart are two cycles; a reset inside the day contributes zero across its interval and no interpolated drop; a steady 0.5 an hour against a daily cap of 13 gives near with no time; a rising rate gives a `reaches_cap_at` that accounts for usage aging out; long gaps lower `observed_pct` and mark the line gappy; synthetic outpace, underpace and on-pace; a reset mid-window; a correction drop; a possible-reset drop later confirmed and later refuted; coverage below the floor gives `unknown` with its reason; zero burn; limit and cap already reached; a reset time passed; a share cap and a daily cap together, carried apart in the schema; the sanitized real history within its `t_err` | hermetic | 4Pb |
 | 16c | Pace pushes: a five-hour run-out moving from 1 h to 10 min while still outpacing pushes; readings alternating at 59 min 59 s and 60 min 01 s push once; a rate hovering at 1.15 n doesn't flip the verdict; a change of limiting window, cycle, cap revision or availability pushes; small moves measured against the last acknowledged forecast push once they add up; numbers alone don't push | hermetic | 4Pa |
 
 ## Slices
@@ -803,6 +815,13 @@ The daily example, case 16b and decision 12's coverage wording are corrected: Co
 than 4 cells is ambiguous and gives `unknown`, and the supported jitter is 1 hour (section 2a). The P2 was
 accepted: the history contributes zero across an invalid interval and never interpolates a usage drop.
 No disagreements this round.
+
+**Round 7.** The grid approach kept producing edge cases, so it is replaced, on the orchestrator's ruling.
+Cycles are now connected components of the sorted reset estimates under single linkage (G = 1 h). A
+component spanning more than S = 1 h is ambiguous and reads `unknown`. The cell wording and the 4-cell bound
+are gone. The rounds 5 and 6 entries above describe the rules they replaced. Case 16b gains Codex's six
+grouping cases, each in every arrival order. The scanner's predicate now includes priority and ordering
+claims. No disagreements this round.
 
 ## Known limits
 
