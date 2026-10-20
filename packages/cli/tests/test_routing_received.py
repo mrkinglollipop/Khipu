@@ -34,7 +34,7 @@ def test_read_received_context_and_mcp_body_not_assistant_echo(tmp_path, format)
                 codex("message", role="assistant", content=[{"type": "output_text", "text": "echo"}])]
         channel = "developer"
     else:
-        rows = [claude("user", [{"type": "text", "text": f"<system-reminder>{SENTINEL}</system-reminder>"}]),
+        rows = [claude("user", [{"type": "text", "text": f"<system-reminder>\n{SENTINEL}\n</system-reminder>"}]),
                 claude("assistant", [{"type": "tool_use", "id": "t1", "name": "mcp__khipu__khipu_route",
                                       "input": {"text": "not-received"}}]),
                 claude("user", [{"type": "tool_result", "tool_use_id": "t1",
@@ -151,6 +151,11 @@ def test_saved_native_child_calibrates_without_decrypting_its_task(tmp_path, mon
     scenario = Session(tmp_path / "unused", replay_root=tmp_path).get("codex")
     assert scenario.children[0].text(channel="tool") == TOOL_SENTINEL
     assert "opaque" not in scenario.children[0].text()
+    pretool_only = json.loads(json.dumps(parent).replace(SENTINEL, SENTINEL + "-PRETOOL"))
+    (sessions / "parent.jsonl").write_text("\n".join(map(json.dumps, pretool_only)))
+    with pytest.raises(ReceiptError, match="known sentinel absent"):
+        Session(tmp_path / "pretool-only", replay_root=tmp_path).get("codex")
+    (sessions / "parent.jsonl").write_text("\n".join(map(json.dumps, parent)))
     # Tool receipt and even the brief's own sentinel cannot stand in for
     # the independent SubagentStart hook control.
     child = [row for row in child if row.get("payload", {}).get("role") != "developer"]
@@ -232,9 +237,9 @@ def test_deferred_rules_reassemble_across_pages_in_order_and_whole():
     rules = OVERSIZED_RULES[1:]
     pages = []
     for number, rule in enumerate(rules):
-        pages.extend([f"Rule {number} page 1\n" + rule[:1200],
-                      f"Rule {number} page 2\n" + rule[1200:2400],
-                      f"Rule {number} page 3\n" + rule[2400:]])
+        pages.extend([f"Rule {number} page 1/3\n" + rule[:1200],
+                      f"Rule {number} page 2/3\n" + rule[1200:2400],
+                      f"Rule {number} page 3/3\n" + rule[2400:]])
     assert rules_received_in_order(pages, rules)
     assert not rules_received_in_order(pages[3:] + pages[:3], rules)
     assert not rules_received_in_order(pages + pages[:3], rules)
@@ -243,6 +248,16 @@ def test_deferred_rules_reassemble_across_pages_in_order_and_whole():
     damaged = list(pages)
     damaged[1] = damaged[1].replace("~", "x", 1)
     assert not rules_received_in_order(damaged, rules)
+    bad_header = list(pages)
+    bad_header[1] = bad_header[1].replace("page 2/3", "page 1/3")
+    assert not rules_received_in_order(bad_header, rules)
+    wrong_total = list(pages)
+    wrong_total[1] = wrong_total[1].replace("page 2/3", "page 2/4")
+    assert not rules_received_in_order(wrong_total, rules)
+    assert not rules_received_in_order(["\n".join(pages)], rules)
+    assert not rules_received_in_order(["Rule 0 page 1/1\n" + "".join(rules)], rules)
+    assert not rules_received_in_order([page.split("\n", 1)[1] for page in pages], rules)
+    assert rules_received_in_order(["unrelated result", *pages, "another result"], rules)
 
 
 def test_run_reservation_is_shared_across_processes_even_on_failure(tmp_path):
@@ -325,7 +340,13 @@ def test_codex_advisory_in_developer_context_satisfies_future_contract(tmp_path)
     test_7b_codex_missing_brief_advisory(lambda name: scenario)
 
 
-def test_parent_tool_control_arms_absent_routing_hook_before_second_child(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("tool,arguments,armed", [
+    ("exec_command", {"cmd": "cat routing-absent-probe.txt"}, True),
+    ("spawn_agent", {"message": "Run cat routing-absent-probe.txt before dispatch"}, False),
+    ("exec_command", {"cmd": "echo routing-absent-probe.txt"}, False),
+    ("exec_command", {"cmd": "cat other.txt", "message": "routing-absent-probe.txt"}, False),
+])
+def test_parent_tool_control_arms_absent_routing_hook_before_second_child(tmp_path, monkeypatch, capsys, tool, arguments, armed):
     import io
     import sys
     import socket
@@ -350,16 +371,89 @@ def test_parent_tool_control_arms_absent_routing_hook_before_second_child(tmp_pa
     monkeypatch.setattr(socket, "create_connection", socket.create_connection)
     monkeypatch.setattr(psycopg, "connect", psycopg.connect)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
-        "hook_event_name": "PreToolUse", "tool_name": "exec_command",
-        "tool_input": {"cmd": "cat routing-absent-probe.txt"}})))
+        "hook_event_name": "PreToolUse", "tool_name": tool,
+        "tool_input": arguments})))
     main()
     pretool = json.loads(capsys.readouterr().out)
     assert pretool["hookSpecificOutput"]["additionalContext"] == "parent-control\n"
-    assert (tmp_path / "child-routing-hook-absent").is_file()
+    assert (tmp_path / "child-routing-hook-absent").is_file() is armed
     command = json.loads(hooks_file.read_text())["hooks"]["SubagentStart"][0]["hooks"][0]["command"]
-    assert command.endswith(" --calibrator-only")
+    assert command.endswith(" --calibrator-only") is armed
     monkeypatch.setattr(sys, "stdin", io.StringIO('{"hook_event_name":"SubagentStart"}'))
     main()
     child = json.loads(capsys.readouterr().out)
-    assert child["hookSpecificOutput"]["additionalContext"] == "child-control-NOHOOK\n"
-    assert len(calls) == 1, "disabled child routing hook still called production"
+    assert child["hookSpecificOutput"]["additionalContext"] == ("child-control-NOHOOK\n" if armed else "child-control\n")
+    assert len(calls) == (1 if armed else 2), "child routing hook control called wrong path"
+
+
+def test_round2_parent_pretool_token_cannot_calibrate_session_start(tmp_path):
+    received = transcript(tmp_path, [codex("message", role="developer", content=SENTINEL + "-PRETOOL"),
+                                     codex("message", role="assistant", content="done")], "codex")
+    with pytest.raises(ReceiptError, match="known sentinel absent"):
+        received.calibrate(SENTINEL, channel="developer")
+
+
+@pytest.mark.parametrize("hooked_routing", [True, False])
+def test_round2_unhooked_child_routing_is_control_failure(tmp_path, hooked_routing):
+    from tests.acceptance.routing_harness.run import Scenario, ADVISORY, ROUTE_OPENING
+    from tests.acceptance.routing_harness.test_received import test_7b_codex_missing_brief_advisory
+
+    def context(text):
+        return transcript(tmp_path, [codex("message", role="developer", content=text),
+                                     codex("message", role="assistant", content="done")], "codex")
+    scenario = Scenario(context(ROUTE_OPENING + "\n" + ADVISORY),
+                        [context("child\n" + (ROUTE_OPENING if hooked_routing else "")),
+                         context("child-NOHOOK\n" + ROUTE_OPENING)],
+                        SENTINEL, "child", tmp_path)
+    with pytest.raises(ReceiptError, match="absent routing hook unexpectedly delivered routing"):
+        test_7b_codex_missing_brief_advisory(lambda name: scenario)
+
+
+@pytest.mark.parametrize("stage", ["metadata", "copy"])
+def test_round2_setup_failure_removes_dummy_auth_and_reservation_blocks_retry(tmp_path, monkeypatch, stage):
+    from tests.acceptance.routing_harness import run
+
+    auth = tmp_path / "dummy-auth" / "codex"
+    auth.mkdir(parents=True)
+    (auth / "auth.json").write_bytes(b"dummy-not-a-credential")
+    evidence = tmp_path / "evidence"
+    rig = Session(evidence, auth_root=auth.parent)
+    monkeypatch.setattr(run.shutil, "which", lambda name: "/synthetic/codex")
+    monkeypatch.setattr(run, "execute", lambda *a, **k: pytest.fail("must not launch"))
+    original = Path.write_text
+    def fail_metadata(path, *args, **kwargs):
+        if path.name == "run.json":
+            assert (evidence / "codex" / ".codex" / "auth.json").is_file()
+            raise OSError("synthetic metadata write failure")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "write_text", fail_metadata)
+    if stage == "copy":
+        def fail_copy(src, dst):
+            dst.write(b"dummy-partial-copy")
+            raise OSError("synthetic metadata write failure")
+        monkeypatch.setattr(run.shutil, "copyfileobj", fail_copy)
+    with pytest.raises(OSError, match="synthetic metadata write failure"):
+        rig.get("codex")
+    assert not (evidence / "codex" / ".codex" / "auth.json").exists()
+    with pytest.raises(ReceiptError, match="synthetic metadata write failure"):
+        Session(evidence, auth_root=auth.parent).get("codex")
+
+
+def test_round2_one_t3_transcript_can_preserve_one_ledger():
+    from types import SimpleNamespace
+    from tests.acceptance.routing_harness.received import Input
+    from tests.acceptance.routing_harness.test_received import test_7c_t3_provider_switch_and_child_doctor
+
+    attachment = SimpleNamespace(inputs=[
+        Input(0, "tool", json.dumps({"routing_changes": {"batch": "batch"}}), "khipu_route",
+              {"session_id": "t3:synthetic"}),
+        Input(1, "tool", json.dumps({"delivery": {"acked_through": 1}}), "khipu_route",
+              {"session_id": "t3:synthetic", "ack": "batch"}),
+        Input(2, "tool", "codex hooks missing", "exec_command", {"cmd": "khipu doctor"}),
+    ])
+    test_7c_t3_provider_switch_and_child_doctor(
+        lambda name: SimpleNamespace(attachments=[attachment], children=[object()]))
+
+
+def test_round2_unpaged_dump_does_not_prove_deferred_pages():
+    assert not rules_received_in_order(["\n".join(OVERSIZED_RULES[1:])], OVERSIZED_RULES[1:])

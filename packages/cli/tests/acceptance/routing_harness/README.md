@@ -59,7 +59,10 @@ the reader instead of buying another run.
 Claude runs `claude -p` with a single Haiku child and eight separate
 `Bash(cat probe.txt)` calls, allowing deferred routing pages to arrive. Its four
 synthetic rules exceed the start budget together, while each rule fits in a
-child block. PreToolUse uses the production installer's delegation matcher.
+child block. Deferred routing results must have ordered `Rule <number> page <n>/<m>`
+headers, with sequential pages and consistent totals per rule. Each result fits
+`routing_prompt_chars` (2,000 in this fixture); a single unpaged dump cannot
+establish paged delivery. PreToolUse uses the production installer's delegation matcher.
 Codex runs `codex exec` once with two sequential Luna `spawn_agent` children
 that each read the same known file. The first gets a synthetic summary over
 4,000 characters (under the native hook limit). Before the second dispatch,
@@ -118,9 +121,9 @@ root to unmodified native received transcripts:
 Formats are `claude`, `codex` and `messages`. Every parent and child must pass
 its own sentinel check. For pull-only clients, a sentinel in a native received
 MCP result is valid (`channel: "tool"`); it need not arrive before the first
-model step. A T3 driver records two parent attachments in order (Claude Code,
-then Codex), both with the same synthetic `t3:` session id. The second must
-acknowledge the first's batch. It also starts a Codex child with no Khipu hooks
+model step. A T3 driver records both providers' MCP bodies in order (Claude Code,
+then Codex), in one or more native transcripts with the same synthetic `t3:`
+session id. The switched provider must acknowledge the first provider's batch. It also starts a Codex child with no Khipu hooks
 and records the parent's received doctor result naming those missing hooks.
 Missing transport evidence is a rig error, not a future-feature xfail.
 

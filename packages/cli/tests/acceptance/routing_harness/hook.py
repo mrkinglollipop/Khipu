@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import socket
 import sys
 from pathlib import Path
@@ -31,7 +32,15 @@ def main():
     payload = json.load(sys.stdin)
     event = payload.get("hook_event_name") or payload.get("hookEventName")
     absent = root / "child-routing-hook-absent"
-    if event == "PreToolUse" and "routing-absent-probe.txt" in json.dumps(payload):
+    tool = payload.get("tool_name") or payload.get("toolName")
+    arguments = payload.get("tool_input") or payload.get("toolInput")
+    command = arguments.get("cmd") if isinstance(arguments, dict) else None
+    try:
+        absent_read = (tool == "exec_command" and isinstance(command, str)
+                       and shlex.split(command) == ["cat", "routing-absent-probe.txt"])
+    except ValueError:
+        absent_read = False
+    if event == "PreToolUse" and absent_read:
         # Keep the independent transport probe, remove the routing hook.
         # Parent-side hook inspection can now observe the absent child hook.
         absent.touch()

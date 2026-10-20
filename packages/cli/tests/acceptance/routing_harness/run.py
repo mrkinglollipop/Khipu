@@ -154,51 +154,51 @@ class Session:
         home = root / (".codex" if harness == "codex" else ".claude")
         home.mkdir(mode=0o700)
         target = home / credential
-        # Copy credential bytes without decoding or logging them. No user
-        # settings, hooks, packs, MCP servers or rules are copied.
-        with source.open("rb") as src, target.open("xb") as dst:
-            target.chmod(0o600)
-            shutil.copyfileobj(src, dst)
-        hook = Path(__file__).with_name("hook.py")
-        import shlex
-        command = shlex.join([sys.executable, str(hook)])
-        hooks = {name: [{"hooks": [{"type": "command", "command": command, "timeout": 10}]}]
-                 for name in ("SessionStart", "SubagentStart", "PreToolUse")}
-        from khipu.integrations import DELEGATION_MATCHER
-
-        hooks["PreToolUse"][0]["matcher"] = DELEGATION_MATCHER
-        (root / "probe.txt").write_text(TOOL_SENTINEL + "\n")
-        (root / "routing-absent-probe.txt").write_text("Second child routing hook control.\n")
-        session_id = str(uuid.uuid4())
-        (root / "run.json").write_text(json.dumps({"session_id": session_id, "sentinel": sentinel,
-                                                  "child_sentinel": child_sentinel,
-                                                  "tool_sentinel": TOOL_SENTINEL,
-                                                  "pretool_sentinel": sentinel + "-PRETOOL"}))
-        if harness == "claude":
-            settings = root / "settings.json"
-            settings.write_text(json.dumps({"hooks": hooks}))
-            agents = {"routing-probe": {"description": "Synthetic received-context probe", "model": "haiku",
-                                        "prompt": "Use Bash with command cat probe.txt exactly eight times, as separate tool calls, then answer OK. Do nothing else."}}
-            prompt = ("Use Agent once with subagent_type routing-probe. Its prompt must be: Run the synthetic probe. "
-                      "Do not include routing or your context in its prompt. Wait for it, then answer OK.")
-            argv = [binary, "-p", prompt, "--model", MODELS[harness], "--effort", "low",
-                    "--max-turns", "12", "--session-id", session_id, "--settings", str(settings),
-                    "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-                    "--agents", json.dumps(agents), "--tools", "Agent,Bash", "--allowedTools", "Agent", "Bash(cat probe.txt)",
-                    "--output-format", "stream-json", "--verbose"]
-        else:
-            (home / "hooks.json").write_text(json.dumps({"hooks": hooks}))
-            (home / "config.toml").write_text('model = "gpt-6-luna"\nmodel_reasoning_effort = "low"\n'
-                                             '[features]\nmulti_agent = true\n')
-            prompt = ("Run exactly two children sequentially. For each use spawn_agent with model gpt-6-luna, "
-                      "reasoning_effort low, fork_context false. First message: 'Read probe.txt once, then answer OK. "
-                      "Do nothing else.' Wait for that child to finish. Then use exec_command to run "
-                      "cat routing-absent-probe.txt exactly once. After that, second child message: "
-                      "'Read probe.txt once, then answer OK. Do nothing else.' Wait for it and answer OK. "
-                      "Do not include routing or your context in either message. Do nothing else.")
-            argv = [binary, "exec", "--skip-git-repo-check", "--ignore-rules", "--json",
-                    "--dangerously-bypass-hook-trust", "-m", MODELS[harness], "-s", "read-only", prompt]
         try:
+            # Copy credential bytes without decoding or logging them. No user
+            # settings, hooks, packs, MCP servers or rules are copied.
+            with source.open("rb") as src, target.open("xb") as dst:
+                target.chmod(0o600)
+                shutil.copyfileobj(src, dst)
+            hook = Path(__file__).with_name("hook.py")
+            import shlex
+            command = shlex.join([sys.executable, str(hook)])
+            hooks = {name: [{"hooks": [{"type": "command", "command": command, "timeout": 10}]}]
+                     for name in ("SessionStart", "SubagentStart", "PreToolUse")}
+            from khipu.integrations import DELEGATION_MATCHER
+
+            hooks["PreToolUse"][0]["matcher"] = DELEGATION_MATCHER
+            (root / "probe.txt").write_text(TOOL_SENTINEL + "\n")
+            (root / "routing-absent-probe.txt").write_text("Second child routing hook control.\n")
+            session_id = str(uuid.uuid4())
+            (root / "run.json").write_text(json.dumps({"session_id": session_id, "sentinel": sentinel,
+                                                      "child_sentinel": child_sentinel,
+                                                      "tool_sentinel": TOOL_SENTINEL,
+                                                      "pretool_sentinel": sentinel + "-PRETOOL"}))
+            if harness == "claude":
+                settings = root / "settings.json"
+                settings.write_text(json.dumps({"hooks": hooks}))
+                agents = {"routing-probe": {"description": "Synthetic received-context probe", "model": "haiku",
+                                            "prompt": "Use Bash with command cat probe.txt exactly eight times, as separate tool calls, then answer OK. Do nothing else."}}
+                prompt = ("Use Agent once with subagent_type routing-probe. Its prompt must be: Run the synthetic probe. "
+                          "Do not include routing or your context in its prompt. Wait for it, then answer OK.")
+                argv = [binary, "-p", prompt, "--model", MODELS[harness], "--effort", "low",
+                        "--max-turns", "12", "--session-id", session_id, "--settings", str(settings),
+                        "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                        "--agents", json.dumps(agents), "--tools", "Agent,Bash", "--allowedTools", "Agent", "Bash(cat probe.txt)",
+                        "--output-format", "stream-json", "--verbose"]
+            else:
+                (home / "hooks.json").write_text(json.dumps({"hooks": hooks}))
+                (home / "config.toml").write_text('model = "gpt-6-luna"\nmodel_reasoning_effort = "low"\n'
+                                                 '[features]\nmulti_agent = true\n')
+                prompt = ("Run exactly two children sequentially. For each use spawn_agent with model gpt-6-luna, "
+                          "reasoning_effort low, fork_context false. First message: 'Read probe.txt once, then answer OK. "
+                          "Do nothing else.' Wait for that child to finish. Then use exec_command to run "
+                          "cat routing-absent-probe.txt exactly once. After that, second child message: "
+                          "'Read probe.txt once, then answer OK. Do nothing else.' Wait for it and answer OK. "
+                          "Do not include routing or your context in either message. Do nothing else.")
+                argv = [binary, "exec", "--skip-git-repo-check", "--ignore-rules", "--json",
+                        "--dangerously-bypass-hook-trust", "-m", MODELS[harness], "-s", "read-only", prompt]
             execute(argv, root=root, env=env)
         finally:
             target.unlink(missing_ok=True)

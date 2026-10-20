@@ -7,6 +7,7 @@ Raw transcripts stay in the session's private evidence directory.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,7 +65,7 @@ class Transcript:
             observed = "\n".join(item.text for item in self.inputs
                                  if item.channel == channel and item.line < self.last_step
                                  and (not before_first or item.line < self.first_step))
-        if not sentinel or sentinel not in observed:
+        if not sentinel or sentinel not in observed.splitlines():
             raise ReceiptError("known sentinel absent from received context")
         return self
 
@@ -150,14 +151,45 @@ def read(path: Path, format: str) -> Transcript:
     return Transcript(inputs, first_step, last_step, format=format)
 
 
-def rules_received_in_order(pages, rules):
+def rules_received_in_order(pages, rules, *, page_budget=2000):
     """Reassemble synthetic rule lines across pages, excluding page headings.
 
     The fixture rules have no newlines. Keep every line containing their
     alphabet, including damaged rule lines, so truncation and duplication
     cannot disappear when page headings are removed.
     """
-    material = "".join(line for page in pages for line in page.splitlines()
+    # Each routing result must be one bounded page with a sequential header.
+    # Unrelated tool results are permitted between deliveries.
+    delivered = []
+    entity, number, total = None, 0, 0
+    completed = set()
+    for page in pages:
+        if "~" not in page and "SYNTHETIC-ROUTING-" not in page:
+            continue
+        lines = page.splitlines()
+        header = re.fullmatch(r"Rule (\d+) page (\d+)/(\d+)", lines[0]) if lines else None
+        if header is None or len(page.encode("utf-16-le")) // 2 > page_budget:
+            return False
+        current, n, m = map(int, header.groups())
+        if n < 1 or m < n:
+            return False
+        if current != entity:
+            if (entity is not None and number != total) or current in completed or n != 1:
+                return False
+            if entity is not None:
+                if current <= entity:
+                    return False
+                completed.add(entity)
+            entity, number, total = current, 0, m
+        if n != number + 1 or m != total:
+            return False
+        number = n
+        delivered.append(page)
+    if not delivered or number != total:
+        return False
+    if sum(len(rule.encode("utf-16-le")) // 2 for rule in rules) > page_budget and len(delivered) < 2:
+        return False
+    material = "".join(line for page in delivered for line in page.splitlines()
                        if "~" in line or "SYNTHETIC-ROUTING-" in line)
     if material.count("~") != sum(rule.count("~") for rule in rules):
         return False
