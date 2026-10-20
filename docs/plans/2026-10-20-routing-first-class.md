@@ -1,319 +1,411 @@
 # Routing as a first-class feature (2026-10-20)
 
 Asked by Matt 2026-10-20: "A routing system that can change dynamically needs to be a first class feature. We
-depend on this." Status: DRAFT for Matt's review. Nothing here is built until he approves it, and no UI is built
-until its mocks are approved.
+depend on this." Status: DRAFT, revised after Codex review round 1 (six P1s, one P2; see Review responses).
+Nothing here is built until Matt approves it, and no UI is built until its mocks are approved.
 
 Read first: `2026-10-14-routing-truth.md` (the record, its sources, the push, decisions 1 to 21) and
 `2026-10-20-routing-delivery.md` (today's fixes A to F, slice 1 here). This page adds to them and never
 restates them. Where it changes a decision, it says so. It replaces phase 7 of the routing-truth plan with
-slices 10 and 11 below, because phase 7 copied the record in one direction only.
+slices 11a to 12 below, because phase 7 copied the record in one direction only and replicated no
+observations.
 
 ## The heart of it
 
-Today Khipu's record is right, and conversations still act on stale routing. Each failure below happened in
-real work on 2026-10-14..20. Every one comes from one of three gaps:
+Khipu's record is right, and conversations still act on stale routing. Each failure below happened in real
+work on 2026-10-14..20. Every one comes from one of three gaps:
 
 1. **Delivery is version-based, not change-based.** A session's marker is a single version number, so "shown"
    and "delivered" are the same thing, and anything a push left out is lost (`recall_prompt.py`
    `mark_routing_seen`, `routing.py` `_fit_push`, `prompt_push`).
 2. **The record mixes kinds of truth.** Owner words carry account levels that go stale, a priority can
-   contradict a hold, and nothing types which is which (`routing.py` `_priority_entries`, `rule_line`).
-3. **The record lives on one Mac, and copies live everywhere else.** The record is
-   `~/.config/khipu/state/routing/` on this Mac only. Memory files and CLAUDE.md hold hand-written routing state
-   that recall and the harness push back into conversations.
+   contradict a hold, and nothing types which is which.
+3. **The record is one Mac's.** Its event sequence, rule numbers and account ids are local (`routing.py`
+   `_stamp_locked`, `_next_rules`, `_id_salt`). Its observations are folded in from local sources and never
+   persisted (`_fold_body`, `routing_sources.collect`). Memory files and CLAUDE.md keep copies of it.
 
 | Failure seen | Gap | Fixed in |
 |---|---|---|
-| A pause stayed live for a day after Matt released it: the release was written as a priority change, and the hold (`h125d608f`, ended by hand 2026-10-20 10:40Z) was never ended | 2 | slice 1 (B, F), slice 4 |
-| Unconfirmed or long changes collapsed to "too long to show here"; this session's own start block (10:55Z) was the summary pointer alone | 1 | slice 1 (A), slice 3 |
-| Changes left out of a prompt update were marked delivered | 1 | slice 1 (C), slice 3 |
-| One conversation's unconfirmed change blocked every other conversation | 2 | slice 1 (D), slice 5 |
-| "Codex is low" beside a reading of 96% left | 2 | slice 1 (E), slice 4 |
-| Nothing compared a dispatch's model with rule 12; every fix round ran on Opus | 2 | slice 7 |
-| GLM and DeepSeek runner lanes match no account unless mapped by hand (live: church-harness lane `glm`, unmatched) | 2 | slice 6 |
-| The record lives on one Mac | 3 | slices 10, 11 |
-| Memory files and CLAUDE.md held their own routing state, and it contradicted Khipu | 3 | slice 12 |
+| A pause stayed live for a day after Matt released it: the release was written as a priority change, and the hold (`h125d608f`, ended by hand 2026-10-20 10:40Z) was never ended | 2 | 1 (B, F), 4 |
+| Unconfirmed or long changes collapsed to "too long to show here"; this session's own start block was the pointer alone | 1 | 1 (A), 6 |
+| Changes left out of a prompt update were marked delivered | 1 | 1 (C), 6 |
+| One conversation's unconfirmed change blocked every other conversation (`request_priority`'s pending check) | 2 | 1 (D), 5 |
+| "Codex is low" beside a reading of 96% left | 2 | 1 (E), 4 |
+| Nothing compared a dispatch's model with rule 12; every fix round ran on Opus | 2 | 10 |
+| GLM and DeepSeek runner lanes match no account unless mapped by hand (live: church-harness lane `glm`, unmatched) | 2 | 9a |
+| The record lives on one Mac | 3 | 3, 11a, 11b, 12 |
+| Memory files and CLAUDE.md held their own routing state, and it contradicted Khipu | 3 | 13 |
 
-Khipu still reports and never routes (routing-truth decision 1, standing rule 7). Every check in this page is
-advisory. The only things that turn red are Khipu's own delivery failures, never a routing choice.
+Khipu still reports and never routes (routing-truth decision 1, standing rule 7). Every check here is
+advisory. No routing warning or advisory mark ever feeds the promotion gate (`khipu promote`) or a dispatch
+decision. A red health check means Khipu's delivery failed; it is a health fact, never a gate on work or on
+content. An unmatched lane, for example, is red as health and changes nothing about what may run.
 
-## 1. The model: three kinds of entry
+## 1. Identity: one record across Macs
 
-Every entry in the record is exactly one of three kinds. The kind decides who may write it, how it is shown and
-how it expires. Inspect `routing.py` `_checked`, `fold` and `_fold_priority` before changing any of them.
+Built first (slice 3), because the ledger, replication and the app all key on it.
 
-| Kind | What it is | Examples today | Who writes it | How it ends |
+- **Accounts get stable ids,** `<provider>:<label-slug>` (for example `claude:second`). Each Mac keeps a local
+  binding from that id to its login home in config. Login homes never leave the Mac. The same label on two
+  Macs is the same account: a login used on both is one quota. Two accounts of one provider must have
+  different labels, and the write refuses a duplicate. A rename is an owner event that leaves the old id as a
+  forward (the view's `forwards` already exists). A rename that crosses a concurrent rename on another Mac
+  resolves by event order, and the loser is shown as a forward.
+- **Migration.** The per-install salted ids (`acct-<hmac>`, `account_id`) stay accepted as aliases by
+  `resolve_account` on the Mac that issued them, for 90 days. New answers name the stable id. The old
+  `<harness>|<home>` keys in the local history are mapped through the binding at fold time, never rewritten.
+- **Events and entities get global ids.** Each event carries `id` (a UUIDv7), `mac` (a random id made at
+  install, kept in the routing folder) and `seq` (per Mac). Rules, holds and proposals get entity ids
+  (`rule-<uuid>`). A rule's display number is given by the fold in first-confirmed order, and it never
+  changes once given. Two rules added at once on two Macs therefore both survive.
+- **Order is causal.** Each event carries a hybrid logical clock stamp (`hlc`: wall time, counter, mac) and,
+  when it changes an entity, the revision it was written against (`base`). The fold orders by `hlc`. Today's
+  clock settling (`CLOCK_TOLERANCE`, `clock_at`) becomes the HLC's skew bound. An event that arrives before
+  the one it ends (a `hold_end` before its `hold`, possible across Macs) is kept as a tombstone and applies
+  when its target arrives. Today's fold drops it (`fold`, the `hold_end` branch).
+- **Retries never double.** A write carries a client `op` id. The same `op` with the same body returns the
+  first result, and with a different body it is refused.
+
+## 2. The model: three kinds of entry
+
+Every entry is exactly one kind. The kind decides who may write it, where it may travel and how it ends.
+
+| Kind | What it is | Scope | Who writes it | How it ends |
 |---|---|---|---|---|
-| **Observation** | Something a source saw, with a witness and a time | probe readings, runner LIMITED lines, conversation reports, reset checks | Khipu's sources and conversations, author-stamped | It goes stale after `routing_stale_after`, or at a limit's end; it is never confirmed |
-| **Structured fact** | A typed value the owner set or confirmed: a field, not prose | pauses, holds, the priority order and each entry's tier role, the lane map, providers, the rule 12 tier table, Clear and Dismiss | the owner (app, terminal, owner direction); conversations may write holds and *proposals* | At its `until`, or when the owner ends it. Conversation holds keep today's 24-hour default and 7-day cap. A proposal ends when it is confirmed, replaced or dismissed, or after 7 days |
-| **Owner rule** | The owner's own words, shown whole and never edited | standing rules, the note, a priority entry's role words | the owner; a conversation may propose a rule (decision 21) | Rules never expire. Home asks for reconfirmation after 90 days, as it does for holds |
+| **Observation** | What a source saw: a probe reading, a runner limit, a reset check, a conversation report, a source's heartbeat | **Account quota** (shared by every Mac: limited, open, the used share) or **machine availability** (this Mac only: CLI not installed, not signed in, runner silent) | Khipu's sources and conversations, author-stamped | It carries `expires_at`, computed when written (a limit's end, or witness time plus `routing_stale_after`), so every Mac expires it the same way by the clock alone |
+| **Structured fact** | A typed value: pauses, holds (account, machine or all), the priority order and its entries' roles, providers, account definitions, lane maps, the rule 12 tier table, Clear and Dismiss | Shared, except machine holds and lane maps, which are keyed by Mac | The owner. Conversations write holds and *proposals* | At its `until`, or when the owner ends it. Conversation holds keep the 24-hour default and 7-day cap |
+| **Owner rule** | The owner's own words: standing rules, the note, a priority entry's role words | Shared | The owner. Conversations propose (decision 21) | Rules never expire. Home asks for reconfirmation after 90 days |
 
-Three changes follow.
+What follows from the table:
 
-- **Owner words carry no state.** An account level ("low", "nearly used up", "N% left", "paused until") is an
-  observation or a structured fact, never part of owner words. Slice 1 (E) marks a stale claim. Slice 4 adds an
-  optional structured `level` claim to a priority entry (`{claim, as_of, until}`, ending at its `until` or the
-  account's next reset), and the app offers to move a level found in the text into that field. Khipu never edits
-  the words.
-- **A write that touches an account says what it does to that account's holds and pauses.** A priority entry,
-  rule or role that names an account with an active hold or pause cannot be written without a `holds:
-  {<id>: "end" | "keep"}` choice for each one. The tool's refusal lists the holds and their ids. Khipu never
-  reads a release from prose (slice 1, B). This is the structural fix for the day-long Grok pause.
-- **Each entry carries a change id.** Every write and every clock-driven change (a limit ending, a hold
-  expiring, a reading going stale) produces a change with a stable id. Versions stay as they are, and delivery
-  counts changes, not versions (section 2).
+- **Observations become events.** Today usage and runner evidence is recomputed on every fold and never
+  stored (`_fold_body` passes it as `extra`). Slice 4 writes an `observation` event whenever a source's
+  folded state for an account changes: on a transition, never on each poll. Sources also write a `source_seen`
+  heartbeat at most every 5 minutes, which is what makes "silent" decidable on another Mac.
+- **Machine availability never makes an account globally down.** "Grok CLI not installed on Mac B" closes Grok
+  on Mac B only, and other Macs still see the account's quota state. Machine holds ("load over 75") carry
+  their Mac. The push shows them only on that Mac, and the app shows them labelled with the Mac.
+- **Definitions are facts.** Providers, account definitions (label, provider, family) and lane maps move from
+  per-Mac config into owner facts. Config keeps only the local binding (login home, runner folder).
+- **Owner words carry no state.** A level ("low", "N% left") is an observation or a structured `level` claim
+  on a priority entry (`{claim, as_of, until}`, ending at its `until` or the account's next reset). The app
+  offers to move a level found in the text into the field. Khipu never edits the words.
+- **A write that touches a held or paused account must say end or keep.** A priority, rule or role naming such
+  an account is refused without a `holds: {<id>: "end" | "keep"}` choice for each one, and the refusal lists
+  them. Khipu never reads a release from prose. This is the structural fix for the day-long Grok pause.
 
-## 2. Delivery guarantees
-
-A conversation is **live** when it has had a prompt in the last 12 hours (a setting), counted from its
-per-session state (`recall--<session>.json`). The guarantees hold for every live conversation that Khipu
-reaches.
-
-1. **When.** On this Mac, a write is in the folded view at once (writes refold under the lock). A clock-driven
-   change is in it within `routing_poll_interval` (10 s). A conversation sees each change **before its next
-   prompt, delegation call or Khipu tool call**, whichever comes first. Nothing interrupts a running turn, and
-   this page states that limit instead of hiding it. Across Macs (slice 10), the bound is 60 s plus the
-   receiving Mac's poll interval while both are online.
-2. **Nothing is silently dropped.** Each session keeps a delivery ledger of change ids: *owed*, then *shown*
-   (with its form: whole, short or page *n/m*), then *acked* once the hook's `op: ack` or `finish_delivery`
-   confirms the write. Owed changes go first in the next push. A change counts as delivered only in a form that
-   names its kind, its accounts and what it does (slice 1, A). Standing rules and the note are only ever
-   delivered whole. When they do not fit, they are split into pages over the following pushes, and each page is
-   tracked. A session-start summary that does not fit the 10,000-character hook limit is no longer replaced by a
-   pointer: its pages are owed to the first prompts. This replaces the "left out whole, arrives with a later
-   push" text in routing-truth's push section, which in practice arrived only as the pointer.
-3. **Delivery is visible.** `khipu_route` tells the caller what it has been shown and what it still owes
-   (`delivery: {owed, shown_at}`). The app lists each live conversation with its owed count (slice 9). Every
-   pushed block ends with a short tail ("3 changes, ids r1a2…; all shown") only when something was owed or
-   paged, never on a quiet prompt.
-4. **Superseded changes are not delivered.** A change that a later change on the same entity replaced is
-   marked *superseded* in the ledger. Only the current state is sent, as routing-truth's push section already
-   requires.
-
-Pull-only harnesses (Grok Build, Aegis, cloud agents through the gateway) get the same ledger, keyed by the
-session id they pass. **Every Khipu MCP tool result** carries the caller's owed routing changes in a fenced
-`routing_changes` field, so a harness that never calls `khipu_route` still hears changes the next time it uses
-memory. Inspect `mcp_server.py` `_AGENT_SCRUBBED` and the tool dispatch before adding the field.
-
-## 3. How a change in one conversation reaches the others
-
-- **Same Mac:** the write goes to the event log. Every other live conversation owes it and receives it under
-  section 2. Nothing changes from routing-truth beyond the ledger.
-- **Another Mac (slice 10):** the event log is replicated through the hub, in both directions. Each Mac appends
-  locally and ships its new events. The hub keeps the union, keyed by event id. Each Mac folds the union, with
-  events ordered by `(written_at, mac_id, seq)` and today's clock settling (`_stamp_locked`, `CLOCK_TOLERANCE`)
-  applied per Mac. Account keys are Mac-specific today (`claude|/Users/…/.claude-t3-second`), so slice 10 first
-  gives each account a stable id (`provider:label`), mapped per Mac to its login home. Login homes never leave
-  the Mac. A Mac that cannot reach the hub keeps working on its own log. Every push it sends says "routing from
-  other Macs is N min old", and doctor turns red after 10 minutes.
-- **Cloud harnesses (slice 11):** the gateway answers `khipu_route` from the hub copy, carries the
-  `routing_changes` field on its tool results, and takes conversation reports and holds (author-stamped as the
-  gateway's harness). Owner writes are refused there, because owner direction needs a local owner turn
-  (`owner_direction.check`). What the cloud copy may hold is Matt's decision 6.
-
-## 4. Owner direction from chat, without dead ends
+## 3. Owner precedence and proposals
 
 The path exists today: `khipu_owner_act`, verified by `owner_direction.check` against Khipu's own record of
-Matt's typed turn, and logged in the hash chain. These changes make it the normal way and remove the dead ends.
+Matt's typed turn. The owner-only set (`_OWNER_ONLY`) and the hash-chained log are unchanged.
 
-- **Pending changes never lock.** A conversation request (an unverified write, `via: mcp`) becomes a
-  **proposal** with an id. A newer proposal on the same entity takes effect live, as decision 21 allows, and
-  the older one is marked *replaced by <id>*. That outcome is owed back to the older proposal's conversation
-  through section 2. The exclusion in `request_priority` and `request_rule` (`PriorityMoved`, the
-  same-author check) goes away for proposals. `expect` (optimistic versioning) stays for owner writes.
-- **The owner's word wins, with nothing to resolve by hand.** An owner write (app, terminal or direction)
-  replaces every open proposal on that entity, and each replaced author is told. Two conversations whose
-  proposals disagree both appear in the app's Proposals list, side by side. One tap, or "use the second one"
-  through owner direction, settles it.
-- **Every refusal names a way forward.** It gives the author and age of what blocked it, the current version,
-  and the exact `khipu_owner_act` action (or the app place) that works (slice 1, D, extended to every write
-  path).
-- **A dispatched job never acts as the owner.** This is unchanged: `owner_turns.note_brief` already keeps a
-  brief from passing for Matt's turn.
+- **The effective value of an entity** is its newest owner revision, overlaid by at most one live proposal
+  whose `base` is that same revision.
+- **Proposal to proposal.** A newer proposal on the same base replaces the older one, live at once (decision
+  21). The older one ends as *replaced by <id>*, which is terminal, and its author is told. Nothing locks: the
+  pending-author refusal in `request_priority` and `request_rule` goes away.
+- **A proposal crossing a newer owner revision never takes effect.** A proposal whose `base` is older than the
+  current owner revision is written as *crossed*. A delayed retry, a queued MCP call and a sync arriving late
+  all end the same way. It is shown to the owner as a stale request and told to its author. It cannot replace
+  a newer confirmed owner write. The `expect` check stays inside the write lock, and across Macs `base`
+  decides.
+- **Concurrent owner writes** (two Macs, same base) resolve by `hlc`. The later one wins, and the earlier is
+  recorded as *overtaken*, shown in the app and named in the next push to both Macs.
+- **Ending a proposal** (expiry after 7 days, Dismiss, Undo) removes the overlay and leaves the owner revision
+  underneath. A replaced or crossed proposal never comes back, so an obsolete direction cannot return.
+  Confirming a proposal makes it the new owner revision.
+- **Attribution stays.** A proposal keeps its `owner_request` words and its Khipu-stamped author. A dispatched
+  job is still refused owner direction (`owner_turns.note_brief`).
+- **Every refusal names a way forward:** the author and age of what blocked it, the current revision, and the
+  exact `khipu_owner_act` action or app place that works (slice 1, D, extended to every write path).
 
-## 5. Lanes, accounts and new providers
+## 4. Delivery guarantees
 
-Today a provider is code: `usage.HARNESSES` and its probes. A lane joins an account only through a hand-written
-`routing_lane_map` entry, and the live GLM limit is unmatched.
+A conversation is **live** when it has had a prompt in the last 12 hours (a setting).
 
-- **Providers become data** (slice 6). A config list `routing_providers` holds entries of the form `{id, label,
-  family, login: folder|none, probe: <adapter>, lane_names: [...]}`. `family` (Anthropic, OpenAI, xAI, Meta,
-  Zhipu, DeepSeek) is what rule 2's "different model family" is checked against. Probe adapters come from a
-  closed set in code: the four CLI probes, `http-quota` (a URL and a JSON-path map, with the key read through
-  `keychain` into a variable and never printed, like `_glm_key`), and `none` (an account Khipu tracks only from
-  runner lines and reports). Adding DeepSeek is then a config entry from the app, with no code change, as long
-  as an existing adapter fits. A new adapter shape is a code change, and doctor names the gap.
-- **Lanes match by name** (Matt's decision 3). A runner lane whose name equals a provider id or one of its
-  `lane_names` matches that provider's single account, marked "matched by name" in Settings and doctor, and the
-  owner can override it. A provider with two or more accounts never matches by name. Those lanes stay
-  unmatched and are listed, as today, and an unmatched lane's limit line names the likely account so a
-  one-step owner direction can map it.
-- The live deploy gap (decision 91270: live-b's `usage.py` predates GLM) is a promotion, not a code change. It
-  goes through `khipu promote` when Matt says so.
+1. **Nothing is silently dropped.** Each delivery identity (section 5) has a ledger of change ids: *owed*, then
+   *in flight* (sent in batch `b`, with a 60-second lease), then *acked*. A hook acks with its existing `op:
+   ack` or `finish_delivery`. An MCP client acks per the protocol in section 5. A lease that runs out returns
+   the change to owed. A change is delivered only in a form that names its kind, its accounts and what it does
+   (slice 1, A). Standing rules and the note are delivered whole, split into pages when they do not fit. A
+   page carries `{entity, revision, page n/m}`. If the entity changes mid-pagination, the old revision's
+   remaining pages are cancelled and the new revision starts at page 1 with "rule 11 changed while being
+   shown". A session start that exceeds the 10,000-character hook limit owes its pages to the next deliveries
+   instead of sending only the pointer.
+2. **Superseded changes are not delivered.** Only an entity's current state is sent.
+3. **Delivery is visible.** `khipu_route` returns the caller's `delivery: {owed, in_flight, acked_through}`.
+   The app lists each live identity with its owed count. A pushed block ends with a short tail only when
+   something was owed or paged.
+4. **When.** This is bounded by the harness matrix below. The honest general bound: **before the next model
+   turn that follows a delivery point** (start, prompt, tool result, Khipu tool call), with the local fold
+   current within `routing_poll_interval` (10 s). Across Macs, add 60 s while both are online (section 7).
+   Nothing interrupts a running turn.
 
-## 6. Advisory checks (rule 7: guidance, never a gate)
+### Harness matrix
 
-Each check produces a marker on the line it concerns, in the push, `khipu_route` and the app, plus a doctor
-warning. None of them refuses, reorders or delays work.
+The replays inspect the context the model received (the transcript's hook attachments, Codex's developer
+messages, the MCP result body), never the hook's stdout.
 
-- **Model tier (rule 12).** Rule 12 gets a structured companion: a tier table of task class to tier, confirmed
-  by Matt once. The task classes are `scope`, `mock`, `ruling`, `hard-security`, `failed-fix`, `build`,
-  `fix-round`, `tests`, `docs`, `synthesis`, `mechanical`. At delegation, `routing_delegation.py` already parses
-  the call. It reads the model (Agent `model`, `claude -p --model`, `codex exec -m`, `CLAUDE_CONFIG_DIR`) and
-  the task class: a declared `task:` line in the brief first, otherwise a keyword guess marked as a guess. On a
-  mismatch, the delegation push carries one line: "Rule 12: fix rounds go to Sonnet; this dispatch is Opus. Say
-  why if intended." Daily mismatch counts go to doctor and the app. Brief text never leaves the Mac and is never
-  sent to a model (decision 5).
-- **Contradictions.** These cover a priority or rule naming an account with an active hold or pause (slice 1,
-  B); two rules, or a rule and a priority entry, giving opposite directions for one account (a structured
-  check only, on the providers and tiers each one names); and a priority entry for an account that is down or
-  untracked.
-- **Stale level claims.** Slice 1 (E) covers owner words. Slice 4 adds the structured `level` claim, which
-  expires by itself, and a doctor warning for any level claim more than one reset old.
-- **Copies elsewhere.** Section 7.
+| Client | Start / compaction | Each prompt | During a turn | Before a dispatch goes out | Achievable boundary |
+|---|---|---|---|---|---|
+| Claude Code parent | full summary, paged | owed changes | PreToolUse context arrives **with the tool's result, after the call ran** (`routing_delegation.py:20-23`) | from the last prompt's push only | the next model step after any prompt or tool result |
+| Claude Code subagent | SubagentStart gives the full summary before its first step (phase 0 fact 3) | none (no prompts) | its PreToolUse is skipped (`:461-462`) | fresh at its start | its start. Slice 8 adds a per-agent ledger so a long subagent hears changes on its own tool results |
+| Codex parent (CLI, `codex exec`) | SessionStart, including compaction and resume (phase 0 fact 4) | owed changes | PreToolUse with the result | from the last prompt | as for the Claude Code parent |
+| Codex native child (`spawn_agent`) | **none: its rollout carries no hook context** | none | none | none from Khipu | only through its brief. Client integration: Khipu's `spawn_agent` PreToolUse writes nothing into the child, so the parent's brief must carry `khipu route --brief` (filed in the Codex instructions; verified in slice 8) |
+| T3 `delegate_task` / provider switch | the child provider's own SessionStart, if Khipu's hooks are installed for it | its own | its own | the parent's PreToolUse context arrives after `delegate_task` returned | the child's start. Client integration: Khipu's T3 integration sets `KHIPU_SESSION_ID=t3:<thread>` for every provider, so a provider switch keeps the thread's ledger instead of starting cold (slice 8) |
+| Job runners' `claude -p` / `codex exec` | their own SessionStart | one prompt | as for the parents | the runner's brief | its start. The runner adds `khipu route --brief` to each brief (runner task, routing-truth) |
+| Grok Build | hook output discarded | discarded | only Khipu tool results | none | its next Khipu tool call ([[grok-build-shares-the-aegis-home-and-has-no-push-recall]]) |
+| Aegis | native pack, no hooks from Khipu | its client pulls `khipu_status` / `khipu_route` | Khipu tool results | none | its next Khipu tool call |
+| Cloud clients through the gateway | MCP instructions line | none | Khipu tool results | none | its next Khipu tool call, as of the hub copy |
 
-## 7. One source of truth
+Pre-dispatch freshness for the parent stays a per-prompt guarantee. A change landing mid-turn reaches the
+parent only after its dispatch has gone out. Holding the dispatch back would make Khipu a gate (rule 7). The
+child of that dispatch gets fresh state at its start where the harness allows it (Claude Code SubagentStart, a
+child's own hooks); where it does not, it relies on the brief integration named in the matrix.
 
-Routing state lives only in Khipu's record. Instruction and memory files point at it.
+## 5. Pull delivery: identity and acks
 
-- **What may stay in files:** durable capability notes (the model table in the global CLAUDE.md: what each
-  model is good for) and how each lane is reached. **What may not:** whether an account is open, limited,
-  paused, held or "tight", priorities, and level claims. Those come from Khipu.
-- **Slice 12** adds a scanner, run by doctor and by the nightly. It reads the global and per-project CLAUDE.md
-  and AGENTS.md files and the memory directories Khipu already imports (`note:` topics). It flags any
-  routing-state claim (an account name next to a state word, a date or a level) and names the file and line.
-  Recall marks such a note "routing state: superseded by Khipu's record" in the prior-work block instead of
-  pushing it as-is. Live example: the memory index still carries "Main account tight until Mon 2026-10-19" and
-  "Delegation order: second Claude account first", and both contradict today's priority.
-- **The one-time cleanup of Matt's own files** (rewriting those memory notes into pointers, trimming CLAUDE.md
-  state lines) is a separate step, done with his go (decision 7). Memory rewrites keep the hand-written lines
-  verbatim, with a backup first ([[index-rewrites-need-verbatim-lines-and-backups]]).
+`khipu_route` takes only `since` and `account` today. Authors come from the environment
+(`conversation_author`), and the gateway is stateless (`gateway.py:14`). Slice 7 adds the following.
 
-## 8. Health: a broken delivery is red
+- **Delivery identity** = `(transport principal, session)`. Locally the principal is the harness the
+  environment names, and the session is the first of `KHIPU_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`,
+  `CODEX_THREAD_ID`. On the gateway the principal is the token's label (`KHIPU_GATEWAY_TOKENS`), and the
+  session is a client-supplied `session_id` argument, bound to that label: the same `session_id` under two
+  labels is two identities.
+- **With no session, nothing is consumed.** A caller without a session gets the current state, the full
+  summary and any open pages, and its result says `delivery: "untracked: pass session_id"`. Nothing is marked
+  delivered for anyone. Two callers sharing a token therefore never consume each other's owed changes.
+- **Batch and ack.** Each result that carries routing has `routing_changes: {batch, items[{change, entity,
+  revision, page?}]}`. The client acks by passing `ack: <batch>` on any later Khipu call. Calling again
+  without an ack re-sends the same in-flight items (a dropped response is re-sent). A duplicate ack is a
+  no-op. Acking an unknown or expired batch is answered, never an error.
+- **Concurrent hook and MCP delivery** to one local identity share its ledger under one lock. Each reserves
+  what it sends as in flight, so the same change is never sent twice at once. A change in flight from the hook
+  is never re-sent through MCP until its lease runs out.
+- **Scrubbing stays.** Routing additions on memory-tool results go through `agent_view`'s routing scrub, and so
+  do their error responses (`_AGENT_SCRUBBED`). The memory content itself is never scrubbed, as today.
 
-The doctor warnings for routing content stay warnings (routing-truth decision 10). Delivery failures become a
-red `routing_delivery` check in `khipu doctor`, in the app's health row and as an attention item (Matt's
-decision 1).
+## 6. Privacy boundary
 
-- A change owed to a live conversation for more than 3 of its prompts.
-- A session whose ledger shows a change *acked* that was never *shown*. This invariant catches today's
-  failure 3 if it ever comes back.
-- A session start that delivered only a pointer while pages were still owed past its third prompt.
-- More than 1 in 100 prompts today skipped routing (`skipped:budget`, `fold-busy`, `busy`). This is the
-  existing rate check, which turns red.
-- The cross-Mac copy is more than 10 minutes behind, or the gateway copy is past its stale bound.
-- A limit from an unmatched lane that stays unmatched for more than 1 hour.
+Four layers, each a projection of the one before. Slices 11a and 12 test each field of each layer.
 
-Doctor reads its evidence from the ledgers and the hook outcome log, not from a health probe
-([[audit-lessons-2026-08-17]]: a check is green only when its evidence arrived. "Not checked" is not clean).
+| Layer | Holds | Never holds |
+|---|---|---|
+| **Local history** (`events.jsonl`) | everything, as today | unchanged; nothing in it is rewritten |
+| **Replication payload** (Mac to hub) | ids, kinds, structured fields, stable account ids, `hlc`, `base`, author as `{kind, harness, mac}`, the owner's confirmed rule and note words, owner hold words | login homes and any nested `<harness>\|<home>` key (mapped to stable ids); conversation free text (`owner_request`, a conversation hold's words, evidence lines, self-given names); project and session names (replaced by keyed hashes); `prior_text` of an unconfirmed rule |
+| **Hub storage** (migration 0041, its own tables) | the payload, append-only, keyed by event id; a per-Mac source status row | anything the payload doesn't hold |
+| **Gateway projection** | labels, states with times and basis, holds (structured; owner hold words under opt-in), rules and the note under opt-in, the caller's own delivery state | paths of any kind (cut to "a path" even inside owner words; local owner words untouched), other identities' delivery state, Mac ids |
 
-## 9. The app
+- **The old cloud opt-ins are amended:** "copy for cloud agents" now names three switches: account state (on
+  when the copy is on), owner hold words, and rules and note. The rules-and-note switch now also covers other
+  Macs (decision 6).
+- **Historical free text with paths** stays as written locally. The payload carries owner words as written
+  between Matt's own Macs. Only the gateway projection cuts paths, and only in the projection
+  (`agent_view.keep_owner_words` keeps its local exception and gains a cloud-side counterpart).
+- **The key floor (slice 9b, the `http-quota` adapter):** HTTPS only, to the exact host the owner confirmed on
+  the provider fact. Redirects are refused, not followed. Bounded time and response size. The key is read
+  through `keychain` into a variable and sent only in the request header to that host, never in argv, env,
+  a URL or a file. Errors carry the status code and a closed error code, never the response body or headers.
+  The proof is a test with a sentinel key asserting its absence from stdout, stderr, the hook log, view.json,
+  events, the replication payload, exception text and every tool result. A log grep is not proof.
 
-Each item needs an approved Opus mock before any build (slice 8). If a mock is missing, stop and ask. The mocks
-extend `docs/mockups/2026-10-14-routing/` and use Better Design (`get-ui-principle`, `get-ux-principle`,
-`get-review-rules`).
+## 7. Replication
 
-- **Settings → Routing → Delivery:** live conversations with harness, Mac, last prompt and owed count, plus
-  each recent change with how many live conversations have it.
-- **Proposals:** open conversation proposals by entity, side by side when they conflict, with Use, Dismiss and
-  "Replaced by".
-- **Hold choice:** the "end or keep" choice wherever an owner write meets an active hold.
-- **Providers:** add, edit and remove a provider and its lane names, "matched by name" marks, and overrides.
-- **Advisory marks:** the tier mismatches of the day, contradictions, stale claims, and copies found in files,
-  each with a plain-words line and where it came from.
-- **Health row:** the red `routing_delivery` check in plain words.
+Slice 11b follows `hub_snapshot`'s contract (`pull_changes`): a per-Mac cursor on the hub's own clock, read
+with an overlap of `FRESHNESS_OVERLAP_S`, idempotent inserts keyed by event id, and a caught-up stamp only
+when a pull read up to the hub's now minus the overlap.
 
-Every owner action stays doable from chat through `khipu_owner_act` ([[owner-direction-through-the-agent]],
-[[khipu-everything-in-the-app-no-terminal]]).
+- **Upload** sends unshipped local events in `seq` order with an upload cursor. A duplicate upload is ignored
+  by event id, and an interrupted upload resumes from the cursor.
+- **Download** pulls other Macs' events past the cursor into a local `remote.jsonl`. The fold reads local and
+  remote together. Each Mac's source status rows say how fresh its sources are.
+- **Restore or reinstall** gives a new `mac` id. The Mac rebuilds its remote set from the hub, and its old id's
+  events stay valid history. A restored local log whose events are already on the hub is deduplicated by id.
+- **Offline.** A Mac that cannot reach the hub keeps working on its own log, and every push says "routing from
+  other Macs is N min old". Delivery health (section 9) turns red after 10 minutes.
+- **The bound** is 60 s from a write on one Mac to the other Mac's fold while both are online (the upload
+  debounce plus the poll). Every observation's `expires_at` makes clock-only expiry the same on every Mac.
 
-## 10. Acceptance: replay the real failures end to end
+## 8. Lanes, accounts and providers
 
-`tests/test_routing_acceptance.py` (slice 2) replays a copy of the real `events.jsonl` (2026-10-14..20, in a
-temporary HOME) together with scripted conversations that run the real hooks (`khipu-recall-hook`,
-`khipu-prompt-recall`, the delegation hook) and the MCP tools. One case per failure in the table at the top.
-Each case starts as `xfail` and is flipped by the slice that fixes it. The feature is done when every case
-passes.
+- **Providers become owner facts** (slice 9a): `{id, label, family, login: folder|none, probe: <adapter>,
+  host?, lane_names: [...]}`. `family` (Anthropic, OpenAI, xAI, Meta, Zhipu, DeepSeek) is what rule 2's
+  "different model family" is checked against. Adapters come from a closed set in code: the four CLI probes,
+  `http-quota` (slice 9b, section 6) and `none` (tracked from runner lines and reports only). Adding DeepSeek
+  is a provider fact written from the app or by owner direction, with no code change, as long as an adapter
+  fits.
+- **Lanes match by name** (decision 3). A lane named after a provider id or one of its `lane_names` matches
+  that provider's account when the provider has exactly one, marked "matched by name". **Ambiguity:** a
+  provider with two or more accounts, or a name claimed by two providers, never matches. The lane stays
+  unmatched and is listed with its candidates, so one owner direction can map it.
+- The live deploy gap (decision 91270: live-b's `usage.py` predates GLM) is a promotion, done when Matt says.
 
-1. The Grok hold and the 10-19 priority: every live session is shown the contradiction. An owner-direction
-   priority write is refused until it says end or keep, and "end" removes the hold from every session's next
-   push.
-2. A 3,000-character pending rule and a 10,500-character session-start context: the rule reaches each session
-   whole across pages, and no session receives only a pointer.
-3. Eight changes against a 400-character budget: all eight are shown within two prompts, and the ledger never
-   acks an unshown change.
-4. Two conversations propose different priorities: both are live in turn, the first author is told it was
-   replaced, and neither is refused.
-5. "Codex is low" against a 96% reading: the marker appears. A structured claim expires at the reset.
-6. An Opus Agent dispatch with a brief declaring `task: fix-round`: the delegation push carries the rule 12
-   line. A Sonnet dispatch gets nothing.
-7. A runner lane `glm` and a `deepseek` provider added as config only: both match by name, with no code change.
-8. Two HOMEs against a test hub: a hold written on Mac A is in Mac B's next push within the bound, and taking
-   the hub down turns doctor red at 10 minutes.
-9. A memory note "Main account tight until Mon": the scanner flags it, and recall marks it superseded.
+## 9. Advisory checks and health
+
+**Advisory checks** (rule 7) put a marker on a line and a doctor warning. They never feed a gate.
+
+- **Rule 12 tiers** (slice 10). Rule 12 gets a structured tier table (task class to tier) that Matt confirms
+  once. The task classes are `scope`, `mock`, `ruling`, `hard-security`, `failed-fix`, `build`, `fix-round`,
+  `tests`, `docs`, `synthesis`, `mechanical`. At delegation, `routing_delegation.py` reads the model (Agent
+  `model`, `--model`, `-m`, `CLAUDE_CONFIG_DIR`) and the class: a `task:` line in the brief first, otherwise a
+  keyword guess marked as a guess. On a mismatch, one line arrives with the tool result (matrix above): "Rule
+  12: fix rounds go to Sonnet; this dispatch is Opus. Say why if intended." Brief text never leaves the Mac or
+  goes to a model.
+- **Contradictions:** a priority or rule naming a held or paused account; two structured directions opposite
+  for one account; a priority entry for an account that is down or untracked.
+- **Stale level claims:** slice 1 (E) for owner words, and the `level` field's own expiry.
+
+**Delivery health** is a red `routing_delivery` check in `khipu doctor`, the app's health row and attention
+items. It is measured as **stalled delivery against a budget-aware bound**: for each live identity, the
+pushes a change needs is the owed characters ahead of it, plus its own, divided by the per-push budget,
+rounded up. It is red when a change is still owed after that many delivery points plus 2, or when it
+expires from in flight twice. It is also red when:
+
+- an ack was recorded for a change never shown (the failure-3 invariant);
+- more than 1 in 100 prompts today skipped routing (the existing rate check);
+- the cross-Mac copy is more than 10 minutes behind, or the gateway copy is past its stale bound;
+- an unmatched lane's limit stays unmatched for an hour. This is a health fact only: it changes nothing about
+  what may run.
+
+The evidence is the ledgers, the hook outcome log, the replication cursors and the gateway's delivery rows,
+never a health probe ([[audit-lessons-2026-08-17]]).
+
+## 10. One source of truth
+
+Routing state lives only in Khipu's record. Files point at it.
+
+- **May stay in files:** durable capability notes (the global CLAUDE.md model table) and how each lane is
+  reached. **May not:** whether an account is open, limited, paused, held or "tight", priorities and levels.
+- **The scanner** (slice 13) reads global and per-project CLAUDE.md and AGENTS.md files and the memory notes
+  Khipu imports. It flags a routing-state claim (an account next to a state word plus a date or level) with
+  its file and line. Recall marks such a note "routing state: superseded by Khipu's record" in the prior-work
+  block. **False positives it must pass clean:** capability rows ("Weak at", "Good for"), evidence dates in
+  those tables, quoted history ("on 2026-10-14 Matt paused…" inside a past-tense record or a quote block), and
+  lane how-to text. Live examples it must flag: "Main account tight until Mon 2026-10-19" and "Delegation
+  order: second Claude account first".
+- **The one-time cleanup** of Matt's own files is a separate step with his go (decision 7), with the
+  hand-written lines kept verbatim and a backup first ([[index-rewrites-need-verbatim-lines-and-backups]]).
+
+## 11. The app
+
+Each group needs an approved Opus mock first (slice 14). If a mock is missing, stop and ask. The mocks extend
+`docs/mockups/2026-10-14-routing/` and use Better Design. Every owner action stays doable from chat through
+`khipu_owner_act` ([[owner-direction-through-the-agent]]).
+
+- **Delivery and health:** live identities (harness, Mac, last prompt, owed), recent changes and who has them,
+  the red check in plain words, other Macs' freshness.
+- **Proposals and holds:** open, crossed and overtaken proposals side by side; the end-or-keep choice.
+- **Providers and lanes:** providers, accounts and their Macs, lane names, "matched by name", ambiguous lanes
+  and their candidates.
+- **Advisory and copies:** the day's tier mismatches, contradictions, stale claims, and copies found in files.
+
+## 12. Acceptance: replay the real failures end to end
+
+`tests/test_routing_acceptance.py` (slice 2). **Fixtures are sanitized:** a script turns the private log into
+a fixture with the same shapes, ids, times and lengths, with synthetic words and no paths. The private log is
+never tracked. The replays drive the real hooks and MCP tools and assert on the context the model received
+(section 4). Each case starts `xfail` and is flipped by the slice named.
+
+| # | Case | Slice |
+|---|---|---|
+| 1 | The Grok hold and the 10-19 priority: the contradiction is shown everywhere; an owner write is refused until it says end or keep; "end" removes the hold from every next delivery | 4 |
+| 2 | A 3,000-character pending rule, a 10,500-character session start, and a rule edited mid-pagination: whole across pages, restarted on the edit, never pointer-only | 6 |
+| 3 | Eight changes against a 400-character budget: all shown within the budget-aware bound; no ack without a show | 6 |
+| 4 | Proposals: two conversations take turns, the first is told it was replaced, neither is refused; a delayed retry after an owner write is crossed; expiry and Undo leave the owner revision and never revive a replaced proposal; a dispatched job's owner act is refused | 5 |
+| 5 | "Codex is low" against a 96% reading is marked; a structured claim expires at the reset | 4 |
+| 6 | Pull protocol: a shared token with no session consumes nothing; a dropped response is re-sent; a duplicate ack is a no-op; hook and MCP deliveries at once never double-send; routing additions on error results are scrubbed | 7 |
+| 7 | Harness matrix: each row's boundary holds in received context, including a Codex child's brief and a T3 provider switch keeping its ledger | 8 |
+| 8 | Providers: `glm` and `deepseek` added as facts match by name; a two-account provider and a name claimed twice stay unmatched with candidates | 9a |
+| 9 | The `http-quota` adapter: a redirect is refused; the sentinel key is absent from every channel | 9b |
+| 10 | An Opus dispatch with `task: fix-round` gets the rule 12 line with its result; a Sonnet one gets nothing; the hook never denies | 10 |
+| 11 | Identity and migration: an old salted id still resolves; a rename forwards; two Macs adding a rule at once keep both; an old local log folds unchanged | 3 |
+| 12 | Two Macs (two HOMEs, test hub): events in opposite arrival order, a skewed clock, a duplicate upload, an interrupted sync, a restore with a new Mac id; probe limits, runner limits, reopening, source silence and clock-only expiry fold the same on both; "not installed on Mac B" leaves the account open on Mac A | 11a, 11b |
+| 13 | Gateway: the projection holds only its listed fields (every nested and history field checked); another token's delivery state is invisible; owner writes are refused | 12 |
+| 14 | Scanner: flags the two live notes; passes capability rows, evidence dates and quoted history | 13 |
+| 15 | Health: each red condition turns red and back to green on its own evidence | 16 |
 
 ## Slices
 
-Each slice fits one session and leads with "Read this scope first; inspect {named code} before writing". One PR
-per slice, in order unless noted. Every slice reaches this Mac only through `khipu promote` and its live gate
-([[khipu-live-launchers-follow-main-checkout]]). The builder and the reviewer always come from different
-families.
+Each slice fits one session and leads with "Read this scope first; inspect {named code} before writing". One
+PR each. Every slice reaches this Mac only through `khipu promote` and its live gate. The builder and the
+reviewer always come from different families.
 
 **Oracle for every slice:** hermetic pytest from `packages/cli` (temp HOME, `KHIPU_KEYCHAIN=0`; the baseline is
-the named failures, not green), `ruff check --no-cache packages/cli`, and the slice's acceptance cases flipped
-to pass. At most 3 oracle runs per change; if it is still red, stop and report the last log. Slices that touch
-the per-prompt path also run `python -m khipu.routing_replay` (200 prompts each way through a warm daemon, with
-no new timeouts).
+the named failures), `ruff check --no-cache packages/cli`, and the slice's acceptance cases flipped to pass with
+no other case regressed. At most 3 oracle runs per change; if it is still red, stop and report the last log.
+Slices on the per-prompt path also run `python -m khipu.routing_replay` (no new timeouts).
 
-| # | Slice | Builds | Reviews | Extra oracle and stop-conditions |
-|---|---|---|---|---|
-| 1 | Today's A to F (`2026-10-20-routing-delivery.md`) | Codex (in flight) | Sonnet | Its own acceptance. Not redesigned here |
-| 2 | Acceptance replay harness: all 9 cases, `xfail` | Codex Sol, high effort | Sonnet | Every case fails for the stated reason (checked in the review), not on a harness error |
-| 3 | Delivery ledger: change ids, owed/shown/acked, pages for rules, the note and the session start, the `delivery` field, `routing_changes` on every MCP result | Codex Sol, high effort | Opus (this is the delivery path every conversation depends on) | Cases 2 and 3 pass. `routing_replay` holds. Budgets stay at today's caps |
-| 4 | The model: entry kinds, the end-or-keep hold choice on owner writes, structured `level` claims | Codex Sol, high effort | Opus (owner-action path) | Cases 1 and 5 pass. Owner words byte-identical before and after |
-| 5 | Proposals instead of locks; the owner write replaces proposals; refusals name a way forward | Codex Sol, high effort | Opus (permission and owner path) | Case 4 passes. `owner_direction.check` is unchanged; a dispatched job is still refused |
-| 6 | Providers as data, match by name, family field, adapters (`http-quota`, `none`) | Codex Sol, medium effort | Sonnet | Case 7 passes. No key value in any log or output (grep the test logs) |
-| 7 | Advisory checks: rule 12 tier table and delegation check, the structured contradiction check | Grok builds against Codex-written tests (tests are 7a, Codex Sol medium); not privacy code | Codex re-check (rule 2), then Sonnet | Case 6 passes. The check never denies a call (assert that `additionalContext` is the only key) |
-| 8 | Mocks for section 9 | Claude Opus | Matt approves | Stop: no slice 9 work before approval |
-| 9 | App build of the approved mocks | Codex Sol, high effort | Sonnet; Opus for the hold choice and Proposals | `npm run build && tsc` and the desktop tests, then the rendered result: build, run, capture, compare with the mock, at most 3 visual passes, screenshot as proof |
-| 10 | Cross-Mac: stable account ids, two-way event replication through the hub (migration 0041), and staleness | Codex Sol, high effort (Astra if Matt prefers, since a miss here is costly) | Opus (what leaves the Mac) | Case 8 passes against the test hub. Login homes never in a hub row (asserted). Inspect how `test_audit1010_hub*` stand up a hub before writing |
-| 11 | Gateway and cloud: `khipu_route` from the hub copy, `routing_changes`, conversation reports, owner writes refused | Codex Sol, medium effort | Opus (gateway exposure) | Gateway tests, then a deploy as its own step ([[merged-is-not-deployed]]) and a live `khipu_route` through the gateway. Matt's go before the deploy |
-| 12 | One source of truth: the scanner, recall's superseded mark, doctor | Grok builds against Codex-written tests (12a); it reads only Matt's own files, writes nothing | Codex re-check, then Sonnet | Case 9 passes. The cleanup of Matt's files is not in this slice (decision 7) |
-| 13 | Health: the red `routing_delivery` check, the app health row, attention items | Codex Sol, medium effort | Sonnet | Each red condition in section 8 has a test that turns it red and back to green |
+| # | Slice | Depends on | Builds | Reviews | Cases, stop-conditions |
+|---|---|---|---|---|---|
+| 1 | Today's A to F | none | Codex (in flight) | Sonnet | its own acceptance |
+| 2 | Acceptance harness, sanitizer, all cases `xfail` | 1 | Codex Sol, high | Sonnet | every case fails for its stated reason, not on a harness error; no private text in the fixture |
+| 3 | Identity contract: stable account ids, bindings, renames and duplicates, alias migration, global event and entity ids, HLC, `base`, `op` dedup (local only) | 2 | Codex Sol, high | Opus | case 11; the existing log folds to the same view |
+| 4 | Entry model: kinds, observations as events with scope and `expires_at`, definitions as facts, end-or-keep, `level` claims | 3 | Codex Sol, high | Opus | cases 1, 5; owner words byte-identical |
+| 5 | Owner precedence and proposals | 3, 4 | Codex Sol, high | Opus | case 4; `owner_direction.check` unchanged |
+| 6 | Delivery ledger and pagination for hooks: owed, in flight, acked, leases, pages with revisions | 3, 4 | Codex Sol, high | Opus | cases 2, 3; `routing_replay` holds; today's budget caps |
+| 7 | Pull delivery: identities, batches, acks, `routing_changes` on tool results, scrubbing incl. errors | 6 | Codex Sol, high | Opus | case 6 |
+| 8 | Harness matrix integrations: per-agent ledger, Codex child briefs, T3 `KHIPU_SESSION_ID` | 6, 7 | Codex Sol, medium | Sonnet | case 7; stop and report any matrix row the received context disproves |
+| 9a | Provider catalog as facts, match by name, ambiguity | 4 | Codex Sol, medium | Sonnet | case 8 |
+| 9b | `http-quota` adapter | 9a | Codex Sol, high | Opus (credential path) | case 9 |
+| 10 | Advisory: rule 12 tier table and check, structured contradictions | 4, 9a | Grok, against tests Codex writes first (10t, Sol medium) | Codex re-check (rule 2), then Sonnet | case 10 |
+| 11a | Hub schema, migration 0041, replication payload projection | 3, 4 | Codex Sol, high | Opus (what leaves the Mac) | case 12's payload-field checks; inspect `test_audit1010_hub*` for the test hub first |
+| 11b | Replication and recovery: cursors, idempotent upload, caught-up, offline, restore | 11a, 6 | Codex Astra, high (a miss here is costly) | Opus | case 12 |
+| 12 | Gateway projection and pull delivery through the gateway | 7, 11b | Codex Sol, medium | Opus (gateway exposure) | case 13; the deploy is its own step with Matt's go ([[merged-is-not-deployed]]), then a live `khipu_route` through the gateway |
+| 13 | Scanner and recall's superseded mark | 2 | Grok, against tests Codex writes first (13t) | Codex re-check, then Sonnet | case 14; Matt's files are only read |
+| 14 | Mocks for the four app groups | 4, 5, 6 | Claude Opus | Matt approves | no app work before approval |
+| 15a | App: delivery and health | 14, 6, 16 | Codex Sol, high | Sonnet | `npm run build && tsc`, desktop tests, then the rendered result (at most 3 visual passes, screenshot as proof) |
+| 15b | App: proposals and holds | 14, 5 | Codex Sol, high | Opus (owner actions) | as 15a |
+| 15c | App: providers and lanes | 14, 9a | Codex Sol, medium | Sonnet | as 15a |
+| 15d | App: advisory and copies | 14, 10, 13 | Codex Sol, medium | Sonnet | as 15a |
+| 16 | Delivery health: the budget-aware bound and red conditions, with evidence from hooks, MCP, replication and the gateway | 6, 7, 11b, 12 | Codex Sol, medium | Sonnet | case 15 |
 
-Slices 6, 7 and 12 can run in parallel with 3 to 5. Slice 8 can start once slice 4's model is merged. Slice 13
-needs slice 3.
+Slices 9a, 10 and 13 can run beside 5 to 8, and 11a beside 6.
 
 ## Matt's decisions (each with a recommendation)
 
-1. **Delivery failures turn doctor red.** This amends routing-truth decision 10 for delivery only; routing
-   content stays a warning. *Recommend yes.* Quiet delivery failures are how the Grok pause lasted a day.
-2. **Conversation requests become proposals: live at once, never locking, newest wins, the replaced author
-   told.** This keeps decision 21's "live immediately" and removes the lock. *Recommend yes.* The alternative,
-   holding a proposal until you confirm it, reintroduces the dead end.
-3. **Lanes match a provider by exact name, marked "matched by name", overridable.** This amends routing-truth's
-   "never guessed" for exact single-account names only. *Recommend yes.* An exact name with one account is not
-   a guess, and hand mapping is why GLM is unmatched today.
-4. **Owner writes that touch an account with a hold or pause must say end or keep.** *Recommend yes.* It is the
-   only fix that does not depend on reading your prose.
-5. **Rule 12 gets a structured tier table that you confirm once; the task class comes from a `task:` line in the
-   brief, otherwise a marked guess; brief text never goes to a model (no Jev on briefs).** *Recommend yes.*
-   Briefs can carry private material.
-6. **What crosses Macs and what the cloud copy holds.** *Recommend:* the full event log between your own Macs,
-   with stable account ids and no login homes. The cloud copy holds labels, states, holds, rules and the note,
-   because Grok Bot needs the rules to follow them. Conversation words stay on the Macs.
-7. **A one-time cleanup of routing state in your CLAUDE.md files and memory notes, turned into pointers, by a
-   Sonnet job with a backup.** *Recommend yes, after slice 12 lists what it found,* so you see the list before
-   anything changes.
-8. **Bounds:** 12 hours for "live", 3 prompts before an owed change turns red, a 60-second cross-Mac target and
-   a 10-minute red. Each is a setting. *Recommend these defaults.*
+1. **Delivery failures turn doctor red** (amends routing-truth decision 10 for delivery only). Routing content
+   and advisory marks stay warnings and never feed a gate. *Recommend yes.*
+2. **Conversation requests become proposals.** They are live at once on the current owner revision, a newer
+   proposal on the same revision replaces an older one, a proposal written against an older revision never
+   takes effect, and nothing locks. *Recommend yes.* (Revised: "newest wins" now applies only between
+   proposals on the same base.)
+3. **Lanes match by exact name when the provider has exactly one account,** marked and overridable; ambiguous
+   names stay unmatched with candidates. *Recommend yes.*
+4. **Owner writes that touch a held or paused account must say end or keep.** *Recommend yes.*
+5. **Rule 12 gets a structured tier table you confirm once;** the class comes from a `task:` line, else a
+   marked guess; brief text never goes to a model. *Recommend yes.*
+6. **What crosses Macs and the cloud** (revised). *Recommend:* between your Macs, the replication payload in
+   section 6 (structured facts, observations, your confirmed words, no login homes and no conversation
+   words). To the cloud, the gateway projection, with paths cut, under three switches: account state on;
+   owner hold words on; rules and note on, since Grok Bot needs them to follow them.
+7. **A one-time cleanup of routing state in your CLAUDE.md files and memory notes,** by a Sonnet job with a
+   backup, after slice 13 shows you what it found. *Recommend yes.*
+8. **Bounds** (revised): 12 hours for "live"; red at the budget-aware bound plus 2 delivery points; a 60-second
+   cross-Mac target and a 10-minute red; a 60-second in-flight lease; 90 days for old account-id aliases. Each
+   is a setting. *Recommend these defaults.*
+9. **Each Mac binds accounts by label** (new): the same label on two Macs is one account and one quota.
+   *Recommend yes;* it matches how your logins work. The alternative is a manual pairing step per Mac.
+
+## Review responses (Codex round 1)
+
+All seven points are accepted and answered in place: 1 in section 4's matrix, 2 in section 5, 3 in sections 2
+and 7, 4 in sections 1 and 7, 5 in section 6, 6 in section 3, 7 in the slice table. The notes are folded into
+the heart of it, section 9, section 10 and section 12. Two places go slightly differently from the request,
+with reasons:
+
+- **Point 1, pre-dispatch freshness for the parent.** No hook can deliver it, and holding a dispatch until
+  routing is read would make Khipu a gate (rule 7). The scope keeps the parent's guarantee at "the last
+  prompt's push" and puts fresh state into the child (SubagentStart, the brief integration) rather than adding
+  a pre-dispatch client step.
+- **Point 5, owner words containing paths.** Between Matt's own Macs they replicate as written, because
+  cutting them would change his words to his own agents. Only the gateway projection cuts paths. This is
+  decision 6's to confirm.
 
 ## Known limits
 
-- An idle conversation, or a turn already running, learns nothing until its next prompt, delegation or Khipu
-  tool call. No harness offers a way to interrupt.
-- Grok Build discards hook output, so it hears changes only through Khipu tool results
-  ([[grok-build-shares-the-aegis-home-and-has-no-push-recall]]).
-- A task class guessed from keywords can be wrong. It is always shown as a guess.
+- A running turn learns nothing until its next delivery point. No harness offers an interrupt.
+- A Codex native child hears routing only through its brief.
+- A keyword-guessed task class can be wrong. It is always shown as a guess.
 - "Owner only" stays a convention (routing-truth decision 6). Owner direction is as strong as
   `owner_direction.check`.
