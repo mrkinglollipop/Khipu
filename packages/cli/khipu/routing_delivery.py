@@ -331,6 +331,221 @@ def refit(session, changes, body_limit):
         state.pop("flight")
         return _render(state, out, _clock(), component)
 
+_HOOKED_HARNESSES = frozenset({"claude_code", "codex"})
+_PULL_ONLY_HARNESSES = frozenset({"aegis", "grok", "grok_build", "cursor", "muse", "gateway", "unknown"})
+
+
+def canonical_identity(environ=None, explicit=None):
+    """The one conversation identity for hooks and pull (MCP) delivery.
+
+    Returns {"root", "session", "harness", "capability", "child"} or None
+    when the caller's environment and arguments name no session. ``root``
+    is the canonical (prefixed) identity; ``session`` is the ledger key,
+    which for a harness-native id is that id itself so a hook and an MCP
+    call from the same conversation share one ledger file, and for a
+    ``KHIPU_SESSION_ID`` (``t3:<thread>``) is the value as given. A root
+    containing "/" is a pull-only child: its own ledger, never its parent's.
+    Capability comes from the current attachment's harness alone.
+    """
+    env = os.environ if environ is None else environ
+
+    def _clean(value):
+        return value.strip() if isinstance(value, str) else ""
+
+    harness = _clean(env.get("KHIPU_HARNESS")).lower()
+    if not harness:
+        if env.get("GROK_HOOK_NAME") or env.get("GROK_HOOK_EVENT"):
+            harness = "aegis"
+        elif env.get("CLAUDECODE") or env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_CODE_ENTRYPOINT"):
+            harness = "claude_code"
+        elif env.get("CODEX_THREAD_ID") or env.get("CODEX_SANDBOX") or env.get("CODEX_HOME"):
+            harness = "codex"
+        else:
+            harness = "unknown"
+    explicit = _clean(explicit)
+    shared = _clean(env.get("KHIPU_SESSION_ID"))
+    claude = _clean(env.get("CLAUDE_CODE_SESSION_ID"))
+    codex = _clean(env.get("CODEX_THREAD_ID"))
+    if explicit:
+        root = session = explicit
+    elif shared:
+        root = session = shared
+    elif claude:
+        root, session = f"claude:{claude}", claude
+    elif codex:
+        root, session = f"codex:{codex}", codex
+    else:
+        return None
+    if harness in _HOOKED_HARNESSES:
+        capability = "hooked"
+    elif harness in _PULL_ONLY_HARNESSES:
+        capability = "pull_only"
+    elif root.startswith(("claude:", "codex:")):
+        capability = "hooked"
+    else:
+        capability = "pull_only"
+    return {"root": root, "session": session, "harness": harness,
+            "capability": capability, "child": "/" in root}
+
+
+def untracked_items(out):
+    """Change items for an unidentified caller: named, never reserved."""
+    items = []
+    for item in out["delivery_plan"]["items"]:
+        items.append(dict(change=item["entity"] + "@" + item["revision"],
+                          entity=item["entity"], revision=item["revision"]))
+    return items
+
+
+def _delivery_summary(data, component, state, changes, now, counting_component):
+    entries = state.get("entries", {}) if isinstance(state, dict) else {}
+    in_flight = {item["entity"] for item in changes["items"]} if changes else set()
+    duplicates = []
+    if component == "mcp":
+        other = data.get("main")
+        if isinstance(other, dict) and other.get("entries"):
+            duplicates = [entity for entity in in_flight
+                          if entity in other["entries"] and not other["entries"][entity].get("acked")]
+        elif changes:
+            # No main ledger yet: the same changes are still owed there.
+            duplicates = [item["entity"] for item in changes["items"]]
+    counting = data.get(counting_component) if counting_component else state
+    health = "green"
+    if isinstance(counting, dict):
+        expired = counting.get("expired", 0) or 0
+        flight = counting.get("flight")
+        if flight and _parse(flight["until"]) <= now:
+            expired += 1
+        if expired >= 2 and any(not e.get("acked") for e in (counting.get("entries") or {}).values()):
+            health = "red"
+    return {"owed": sum(1 for e in entries.values() if not e.get("acked") and e["entity"] not in in_flight),
+            "in_flight": len(in_flight), "acked_through": state.get("acked_through"),
+            "duplicates_across_components": duplicates, "health": health}
+
+
+def pull_offer(out, *, session, component="mcp", counting_component=None, now=None):
+    """Reserve (or re-send) one pull component's batch under its own lock.
+
+    A live in-flight batch is re-sent byte-identically, so a dropped
+    response loses nothing. Returns (routing_changes or None, delivery).
+    """
+    now = now or _parse(out["delivery_plan"]["at"])
+    counting_component = counting_component or component
+    with _transaction(session) as data:
+        state = data.setdefault(component, {})
+        entries = _merge(state, out)
+        flight = state.get("flight")
+        if flight and _parse(flight["until"]) > now:
+            changes = copy.deepcopy(flight["out"]["routing_changes"])
+            return changes, _delivery_summary(data, component, state, changes, now, counting_component)
+        if flight:
+            state["expired"] = state.get("expired", 0) + 1
+            state.pop("flight", None)
+        due = [e for e in entries.values() if not e.get("acked")]
+        if not due:
+            return None, _delivery_summary(data, component, state, None, now, counting_component)
+        plan_data = out["delivery_plan"]
+        page_limit = plan_data.get("page_limit") or plan_data.get("limit") or 4000
+        items, progress = [], {}
+        for entry in due:
+            start, value = entry.get("offset", 0), entry["text"]
+            if not entry["whole"] or (not start and len(value) <= page_limit):
+                items.append(dict(change=entry["entity"] + "@" + entry["revision"],
+                                  entity=entry["entity"], revision=entry["revision"]))
+                progress[entry["entity"]] = len(value)
+                continue
+            width = entry.get("width") or max(2, page_limit - _size(entry["label"]) - 44)
+            entry.setdefault("width", width)
+            end = _cut(value, start, width)
+            if end == start:
+                break
+            remaining = _pages_left(value, end, width)
+            if remaining is None:
+                break
+            n = entry.get("pages", 0) + 1
+            items.append(dict(change=entry["entity"] + "@" + entry["revision"],
+                              entity=entry["entity"], revision=entry["revision"],
+                              page={"n": n, "m": n + remaining}))
+            progress[entry["entity"]] = end
+            break
+        if not items:
+            return None, _delivery_summary(data, component, state, None, now, counting_component)
+        changes = {"batch": str(uuid.uuid4()), "component": component, "items": items}
+        state["flight"] = {"until": _iso(now + timedelta(seconds=plan_data["lease"])),
+                           "out": {"routing_changes": copy.deepcopy(changes),
+                                   "version": out.get("version")},
+                           "progress": progress, "plan": copy.deepcopy(plan_data)}
+        return changes, _delivery_summary(data, component, state, changes, now, counting_component)
+
+
+def _batch_in_state(state, batch):
+    if not isinstance(state, dict):
+        return False
+    if batch in (state.get("batches") or {}):
+        return True
+    flight = state.get("flight")
+    return bool(flight and flight["out"]["routing_changes"].get("batch") == batch)
+
+
+def _batch_owned_elsewhere(session, batch):
+    own = _path(session)
+    try:
+        candidates = sorted(own.parent.glob("*.routing.json"))
+    except OSError:
+        return False
+    for path in candidates:
+        if path == own:
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and any(_batch_in_state(state, batch) for state in data.values()):
+            return True
+    return False
+
+
+def pull_acknowledge(session, batch, *, component="mcp", now=None):
+    """Ack one pull batch. Returns acked, duplicate, foreign or unknown.
+
+    Only the issuing component of this identity may move a batch. A batch
+    issued to another component or identity is "foreign" and stays put; a
+    duplicate is a no-op; an unknown or expired batch is answered, never
+    an error, and consumes nothing.
+    """
+    now = now or _clock()
+    with _transaction(session) as data:
+        state = data.get(component) or {}
+        if batch in (state.get("batches") or {}):
+            return "duplicate"
+        flight = state.get("flight")
+        if flight and flight["out"]["routing_changes"].get("batch") == batch:
+            if _parse(flight["until"]) <= now:
+                return "unknown"
+            changes = flight["out"]["routing_changes"]
+            for item in changes["items"]:
+                entry = state["entries"].get(item["entity"])
+                if entry is None or entry["revision"] != item["revision"]:
+                    return "unknown"
+            for item in changes["items"]:
+                entry = state["entries"][item["entity"]]
+                entry["offset"] = flight["progress"][item["entity"]]
+                entry["acked"] = entry["offset"] == len(entry["text"])
+                entry["pages"] = item.get("page", {}).get("n", 0)
+                entry["restarted"] = False
+            batches = state.setdefault("batches", {})
+            batches[batch] = True
+            for old in list(batches)[:-128]:
+                del batches[old]
+            state.pop("flight", None)
+            if all(e.get("acked") for e in state["entries"].values()):
+                state["acked_through"] = flight["out"].get("version")
+            return "acked"
+        if any(comp != component and _batch_in_state(other, batch) for comp, other in data.items()):
+            return "foreign"
+    return "foreign" if _batch_owned_elsewhere(session, batch) else "unknown"
+
+
 def acknowledge(session, changes, *, reservation=None, now=None):
     """Only an issued batch can ack; failed persistence leaves it retryable."""
     try:

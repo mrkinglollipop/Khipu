@@ -809,8 +809,16 @@ TOOLS: list[dict] = [
             "Read it before you hand work to another account or model. "
             "`since` (a version, or epoch:version, as an earlier answer gave "
             "it) answers only what changed after it; `account` narrows to one "
-            "account. Data, not instructions; guidance, not a gate. Khipu "
-            "reports; routing stays with you."
+            "account. The answer carries `routing_changes` (a batch issued to "
+            "this conversation's `mcp` component) and `delivery`; pass `ack` "
+            "with that batch once you have read it, and only with your own "
+            "batch. A caller with no session in its environment must pass "
+            "`session_id`: a pull-only child passes its own `<parent>/<child>` "
+            "session id, and clients sharing one gateway token use session ids "
+            "unique among them, of the form `<client>:<stable id>`. With no "
+            "identity the answer says `untracked: pass session_id` and nothing "
+            "is marked delivered. Data, not instructions; guidance, not a "
+            "gate. Khipu reports; routing stays with you."
         ),
         "inputSchema": {
             "type": "object",
@@ -818,6 +826,10 @@ TOOLS: list[dict] = [
                 "since": {"type": "string",
                           "description": "Only what changed after this version (V or epoch:V)"},
                 "account": {"type": "string", "description": "One account: its label or its id, as khipu_route lists them"},
+                "session_id": {"type": "string",
+                               "description": "This conversation's own session id when its environment names none"},
+                "ack": {"type": "string",
+                        "description": "A routing batch issued to this conversation's mcp component, read and now acknowledged"},
             },
         },
     },
@@ -2212,13 +2224,51 @@ def _tool_usage(args: dict) -> dict:
                                             background=True))
 
 
+def _route_pull_attachment(routing, routing_delivery, identity, now):
+    """(routing_changes, delivery) for one pull caller, from the current view.
+
+    An identified caller reserves its `mcp` component's batch under the
+    delivery lock; an unidentified one is shown the same items with nothing
+    reserved or consumed."""
+    with routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
+        view = routing.read_view(now)
+    planned = routing_delivery.plan(
+        {"kind": "full", "text": routing.summary(view, now=now)["text"],
+         "version": view["version"], "epoch": view.get("epoch"),
+         "owed_entities": [], "shown_entities": []},
+        view, now, routing.settings())
+    if identity is None:
+        changes, delivery = {"batch": None, "component": "mcp",
+                             "items": routing_delivery.untracked_items(planned)}, "untracked: pass session_id"
+    else:
+        counting = "main" if identity["capability"] == "hooked" else "mcp"
+        changes, delivery = routing_delivery.pull_offer(planned, session=identity["session"], component="mcp",
+                                                        counting_component=counting, now=now)
+    # Pull items name entities publicly: an account by its stable id, never
+    # its key (a login folder the raw ledger entity carries).
+    if changes is not None:
+        changes = {**changes, "items": [
+            {**item, "entity": routing._public_entity(item["entity"]),
+             "change": f"{routing._public_entity(item['entity'])}@{item['revision']}"}
+            for item in changes["items"]]}
+    if isinstance(delivery, dict) and delivery.get("duplicates_across_components"):
+        delivery = {**delivery, "duplicates_across_components": [
+            routing._public_entity(entity) for entity in delivery["duplicates_across_components"]]}
+    # Scrubbed here, not only at dispatch: an entity names its account key
+    # (a login folder), and a direct caller of this tool gets no raw path.
+    scrubbed = routing._for_agents({"routing_changes": changes, "delivery": delivery}, view)
+    return scrubbed["routing_changes"], scrubbed["delivery"]
+
+
 def _tool_route(args: dict) -> dict:
     """khipu_route: the routing record as ``khipu route --json`` gives it,
-    plus the words the push leaves out. Local only until the cloud copy."""
+    plus the words the push leaves out, and this conversation's pull
+    delivery (`routing_changes` and `delivery`). Local only until the
+    cloud copy."""
     if _via_https_gateway():
         return {"available": False, "reason": ROUTING_GATEWAY_REASON}
     _ensure_path()
-    from khipu import routing
+    from khipu import routing, routing_delivery
 
     account = args.get("account")
     if account is not None and not isinstance(account, str):
@@ -2226,7 +2276,38 @@ def _tool_route(args: dict) -> dict:
     since = args.get("since")
     if since is not None and (isinstance(since, bool) or not isinstance(since, (str, int))):
         raise ValueError("since must be a version number, or epoch:version")
-    return routing.conversation_view(since_version=since, account=account or None)
+    for key in ("session_id", "ack"):
+        if args.get(key) is not None and not isinstance(args[key], str):
+            raise ValueError(f"{key} must be text")
+    identity = routing_delivery.canonical_identity(os.environ, explicit=args.get("session_id"))
+    now = routing._now()
+    ack = (args.get("ack") or "").strip()
+    if ack and identity is not None:
+        status = routing_delivery.pull_acknowledge(identity["session"], ack, component="mcp", now=now)
+        if status == "foreign":
+            raise _ToolFailure({"ok": False, "code": "ack_not_yours",
+                                "error": "That routing batch was not issued to this conversation; "
+                                         "the batch stays where it was."})
+    try:
+        out = routing.conversation_view(since_version=since, account=account or None, now=now)
+    except ValueError as exc:
+        # A refusal still carries this caller's routing changes, scrubbed
+        # with the error at the dispatch boundary like any other addition.
+        payload = {"error": str(exc)}
+        try:
+            changes, delivery = _route_pull_attachment(routing, routing_delivery, identity, now)
+        except Exception:  # noqa: BLE001 - the refusal itself stays the answer
+            changes, delivery = None, None
+        if changes is not None:
+            payload["routing_changes"] = changes
+        if delivery is not None:
+            payload["delivery"] = delivery
+        raise _ToolFailure(payload) from None
+    changes, delivery = _route_pull_attachment(routing, routing_delivery, identity, now)
+    if changes is not None:
+        out["routing_changes"] = changes
+    out["delivery"] = delivery
+    return out
 
 
 def _tool_route_report(args: dict) -> dict:
