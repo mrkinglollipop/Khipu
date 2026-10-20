@@ -1330,3 +1330,9 @@ describe("one rule for passing gaps and codes that need the owner (shared with S
     }
   });
 });
+
+it("shows Cursor's Ultra tier with an honest absence of usage figures", () => {
+  const row = { ...realReport().accounts![0], harness: "cursor", account: "Cursor", key: "cursor|", plan: "Ultra", windows: [] };
+  expect(planStatus(row, NOW).say).toBe("Cursor reports no usage figures; its limits come from runner and conversation reports");
+  expect(accountClash([{ harness: "cursor", label: "Cursor", home: null }], { harness: "cursor", label: "Another Cursor", home: null })?.field).toBe("name");
+});

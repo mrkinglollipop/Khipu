@@ -756,7 +756,7 @@ def auto_track() -> bool:
 # folder holding an executable ``node`` is stored.
 # ---------------------------------------------------------------------------
 
-CLI_SETTINGS = ("cli_path.claude", "cli_path.codex", "cli_path.grok", "cli_path.muse", "node_folder")
+CLI_SETTINGS = ("cli_path.claude", "cli_path.codex", "cli_path.grok", "cli_path.muse", "cli_path.cursor", "node_folder")
 
 
 def _executable_file(path: Path) -> bool:

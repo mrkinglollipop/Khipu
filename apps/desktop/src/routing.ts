@@ -110,6 +110,7 @@ export type RouteRunner = {
   files?: Record<string, RouteRunnerFile>;
   lanes?: string[];
   unmatched_lanes?: string[];
+  lane_matches?: Record<string, { account: string | null; matched_by: string | null; candidates: string[] }>;
 };
 
 export type RouteLane = { runner: string; lane: string; until?: string | null };
@@ -378,7 +379,7 @@ export function midSentence(reason: string): string {
   return reason;
 }
 
-const CLI_NAMES: Record<string, string> = { claude: "Claude", codex: "Codex", grok: "Grok", muse: "Muse", glm: "GLM" };
+const CLI_NAMES: Record<string, string> = { claude: "Claude", codex: "Codex", grok: "Grok", muse: "Muse", glm: "GLM", cursor: "Cursor" };
 
 function cliName(harness: string): string {
   return CLI_NAMES[harness] ?? harness;

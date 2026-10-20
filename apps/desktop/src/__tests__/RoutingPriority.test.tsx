@@ -221,6 +221,18 @@ describe("the priority and the pace in Settings -> Routing", () => {
 
   const sent = () => calls("khipu_route_priority");
 
+  it("offers tracked Cursor in Settings without adding it until the owner chooses", async () => {
+    const data = view();
+    data.accounts!.push({ key: "cursor|", label: "Cursor", harness: "cursor", state: "open", configured: true });
+    await page(data);
+    expect(within(screen.getByLabelText("Add to the end")).getByRole("option", { name: "Cursor" })).toBeInTheDocument();
+    expect(sent()).toEqual([]);
+    fireEvent.change(screen.getByLabelText("Add to the end"), { target: { value: "cursor|" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() => expect((sent()[0] as { entries: { account: string }[] }).entries.map((e) => e.account))
+      .toEqual([SECOND, "codex|", "claude|", "cursor|"]));
+  });
+
   it("moves, removes and adds accounts, always sending the whole list in the order shown", async () => {
     await page();
     const list = screen.getByRole("list", { name: "Your priority, first to last" });

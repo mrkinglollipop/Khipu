@@ -75,8 +75,10 @@ LAUNCH_KEEP = timedelta(days=2)
 INTERVAL_MAX = 24 * 3600
 
 _STAMPED = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s")
-_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+(\S+)\s+(ADDED|LIMITED|LAUNCH|HOLD)\b[ \t]*(.*)$")
+_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+(\S+)\s+(ADDED|LIMITED|LAUNCH|HOLD|ERROR|FAILED|FAIL)\b[ \t]*(.*)$")
+_CURSOR_LIMIT = re.compile(r"\busage limit\b|\brate limit\b|\bquota\b", re.I)
 _FIELD = re.compile(r"(?:^|\s)([a-z_]+)=(\S+)")
+_LANE_FIELD = re.compile(r"(?:^|\s)lane=([^\s:]+)")
 _NOW_BLOCK = re.compile(r"## NOW\s*\n```\n(.*?)\n```", re.S)
 _UPDATED = re.compile(r"^updated:.*$", re.M)
 _STAMP = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?Z")
@@ -142,7 +144,7 @@ _SECRET_FLAG_ONLY = re.compile(r"(?i)^--?[a-z0-9_-]*" + _FLAG_WORDS + r"[a-z0-9_
 # by a view saved under an older version is dropped, never carried forward,
 # so text that older rules let through cannot outlive the fix. 3: no free
 # text at all, only parsed fields and names that pass ``safe_name``.
-REDACTION = 3
+REDACTION = 4
 
 
 def _redacted(text, limit: int = LINE_MAX) -> str:
@@ -421,6 +423,34 @@ def launch_facts(model, launch) -> dict:
             "script": _script_name(args)}
 
 
+def model_family(model) -> str:
+    """The model's family, independent of the transport and paying account."""
+    name = str(model or "").casefold()
+    for prefixes, family in ((("grok-",), "xAI"), (("claude-", "opus", "sonnet", "haiku"), "Anthropic"),
+                             (("gpt-", "codex", "o1", "o3", "o4"), "OpenAI"), (("glm-",), "Zhipu"),
+                             (("deepseek-",), "DeepSeek"), (("gemini-",), "Google"), (("muse-",), "Meta")):
+        if name.startswith(prefixes):
+            return family
+    return "unknown"
+
+
+def lane_identity(spec: dict) -> dict:
+    """Keep declarations only when they name a tracked identity; drop raw text."""
+    from khipu import routing
+
+    out = {k: safe_name(spec.get(k)) for k in ("kind", "provider") if spec.get(k) is not None}
+    if spec.get("identity_invalid") or any(v is None for v in out.values()):
+        out["identity_invalid"] = True
+    known = None
+    for field in ("account", "budget_account"):
+        if field in spec:
+            known = routing.accounts() if known is None else known
+            value = spec[field]
+            key = routing._lane_target(value, known) if isinstance(value, str) else None
+            out[field] = key if key in {a["key"] for a in known} else WITHHELD
+    return out
+
+
 def _config_facts(lanes) -> dict:
     """A config read kept by an older view, rebuilt from the allowed fields
     only: names that pass ``safe_name``, the launch facts (any launch list it
@@ -438,7 +468,7 @@ def _config_facts(lanes) -> dict:
                      "script": script if isinstance(script, str) and safe_name(script) == script
                      else _LAUNCH_COMMAND}
         out[lane_name] = {"kind": safe_name(spec.get("kind")), "model": safe_name(spec.get("model")),
-                          "confirm_lane": safe_name(spec.get("confirm_lane")), **facts}
+                          "confirm_lane": safe_name(spec.get("confirm_lane")), **facts, **lane_identity(spec)}
     return out
 
 
@@ -468,6 +498,7 @@ def _parse_config(data: bytes) -> dict:
             "kind": safe_name(spec.get("kind")), "model": safe_name(spec.get("model")),
             "confirm_lane": safe_name(spec.get("confirm_lane")),
             **launch_facts(spec.get("model"), spec.get("launch")),
+            **lane_identity(spec),
         }
     defaults = doc.get("defaults") if isinstance(doc.get("defaults"), dict) else {}
     fix = defaults.get("fix_lanes")
@@ -529,10 +560,18 @@ def _parse_events(data: bytes, now: datetime, limits: dict[str, datetime] | None
         # kind, and names that pass ``safe_name``.
         kind, pipeline, rest = m.group(3), safe_name(m.group(2)), m.group(4)
         fields = dict(_FIELD.findall(rest))
+        lane_field = _LANE_FIELD.search(rest)
+        fields["lane"] = lane_field.group(1) if lane_field else None
         if kind == "HOLD":
             holds += 1
-        elif kind == "LIMITED":
+        elif kind == "LIMITED" or (kind in ("ERROR", "FAILED", "FAIL")
+                                   and (fields.get("lane") or "").startswith("cursor-")
+                                   and _CURSOR_LIMIT.search(rest)):
             lane, until = safe_name(fields.get("lane")), _parse(fields.get("until"))
+            # LIMITED lines carry the runner's until. Cursor error lines
+            # without one use only the report's default window, as other lanes do.
+            if kind != "LIMITED" and lane and until is None:
+                until = at + timedelta(seconds=GUESS_SECONDS)
             if lane and until:
                 if lane in limits and _same_until(limits[lane], until):
                     matched[lane] = at if lane not in matched else max(matched[lane], at)
@@ -864,6 +903,10 @@ def runner_evidence(status: dict, cache: dict) -> list[dict]:
                     "via": "runner", "at": at, "reason": None, "message_time": exact,
                     "evidence": _runner_words(name, lane, at, until, file=True),
                     "silent": status["silent"]})
+    specs = ((cache.get("config") or {}).get("data") or {}).get("lanes") or {}
+    for item in out:
+        spec = specs.get(item["lane"]) or {}
+        item.update(declaration=lane_identity(spec), model=spec.get("model"), family=model_family(spec.get("model")))
     return out
 
 
@@ -1010,7 +1053,10 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
     """(evidence for the fold, the sources' status, the cache to keep in the
     view). Reads files only: starts no process, probes nothing, writes
     nothing, takes no runner's lock."""
+    from khipu import routing
+
     entries, refused, invalid = registered(config)
+    known = routing.accounts()
     prev_cache = prev_cache if isinstance(prev_cache, dict) else {}
     if prev_cache.get("redaction") != REDACTION:
         prev_cache = {}
@@ -1023,8 +1069,15 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
                                    cfg.get("routing_runner_silent_intervals") or 0,
                                    cfg.get("routing_runner_tail_bytes", TAIL_BYTES),
                                    cfg.get("routing_runner_limited_lines", KEEP_LINES["LIMITED"]))
-        mapped = lane_map.get(entry["name"]) or {}
-        status["unmatched_lanes"] = [lane for lane in status["lanes"] if lane not in mapped]
+        specs = ((kept.get("config") or {}).get("data") or {}).get("lanes") or {}
+        matches = {lane: routing.resolve_lane(entry["name"], lane, lane_map, known, specs.get(lane))
+                   for lane in status["lanes"]}
+        labels = {a["key"]: a["label"] for a in known}
+        status["unmatched_lanes"] = [lane for lane, match in matches.items() if not match["key"]]
+        status["lane_matches"] = {lane: {"account": labels.get(match["key"]),
+                                         "matched_by": match["matched_by"],
+                                         "candidates": [labels[k] for k in match["candidates"]]}
+                                   for lane, match in matches.items()}
         runners.append(status)
         cache["runners"][entry["name"]] = kept
         evidence += runner_evidence(status, kept)
@@ -1101,11 +1154,12 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
                 out.append({"rule": watch["paid_xai"], "check": "paid_xai", "status": "cannot_check", **on_settings,
                             "text": f"{name}'s {lane} lane: whether it uses the paid xAI API can't be checked: "
                                     f"the launch environment is set inside {script}"})
-            if "grok_confirm" in watch and kind == "grokcheck":
+            if "grok_confirm" in watch and (kind == "grokcheck" or
+                                            (spec.get("confirm_lane") and model_family(spec.get("model")) == "xAI")):
                 confirm = spec.get("confirm_lane")
                 other = lanes.get(confirm) if confirm else None
                 other_kind = ((other or {}).get("kind") or "").lower()
-                if other is None or other_kind.startswith("grok"):  # none named, or a lane the settings lack
+                if other is None or other_kind.startswith("grok") or model_family(other.get("model")) == "xAI":
                     out.append({"rule": watch["grok_confirm"], "check": "grok_confirm", "status": "broken", **on_settings,
                                 "text": f"A standing rule may be broken: {name}'s Grok check lane has no "
                                         "confirming lane from another model family."})
@@ -1114,7 +1168,8 @@ def rule_checks(cache: dict, rules: list[dict]) -> list[dict]:
                                 "text": f"{name}'s Grok check lane: whether its confirming lane {confirm} is from "
                                         "another model family can't be checked: its kind isn't set"})
         if "grok_private" in watch:
-            grok = {lane for lane, spec in lanes.items() if (spec.get("kind") or "").lower().startswith("grok")}
+            grok = {lane for lane, spec in lanes.items() if (spec.get("kind") or "").lower().startswith("grok")
+                    or model_family(spec.get("model")) == "xAI"}
             events_kept = kept.get("events") or {}
             scan = events_kept.get("scan") if isinstance(events_kept.get("scan"), dict) else None
             events = events_kept.get("data") or {}
@@ -1146,11 +1201,12 @@ def _check_lanes(check: str, lanes: dict) -> tuple[int, int]:
             judged += bool(spec.get("fast") or spec.get("model_in_launch"))
         elif check == "paid_xai" and kind.startswith("grok"):
             about += 1  # the launch environment is never read
-        elif check == "grok_confirm" and kind == "grokcheck":
+        elif check == "grok_confirm" and (kind == "grokcheck" or
+                                         (spec.get("confirm_lane") and model_family(spec.get("model")) == "xAI")):
             about += 1
             other = lanes.get(spec.get("confirm_lane")) if spec.get("confirm_lane") else None
             judged += other is None or bool((other or {}).get("kind"))
-        elif check == "grok_private" and kind.startswith("grok"):
+        elif check == "grok_private" and (kind.startswith("grok") or model_family(spec.get("model")) == "xAI"):
             about += 1
             judged += 1
     return about, judged
@@ -1313,5 +1369,8 @@ def launches(cache: dict) -> list[dict]:
     out = []
     for name, kept in sorted(((cache or {}).get("runners") or {}).items()):
         events = (kept.get("events") or {}).get("data") or {}
-        out += [{"runner": name, "lane": item["lane"], "at": item["at"]} for item in events.get("launches") or []]
+        specs = ((kept.get("config") or {}).get("data") or {}).get("lanes") or {}
+        out += [{"runner": name, "lane": item["lane"], "at": item["at"],
+                 "declaration": lane_identity(specs.get(item["lane"]) or {})}
+                for item in events.get("launches") or []]
     return out
