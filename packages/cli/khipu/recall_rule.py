@@ -632,7 +632,8 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
         out = routing.start_push(budget, moment)
         if isinstance(out, dict):
             data = memoryview(json.dumps({k: out.get(k) for k in (
-                "text", "version", "epoch", "generation", "owed_entities", "shown_entities")}).encode("utf-8"))
+                "kind", "text", "version", "epoch", "generation", "owed_entities", "shown_entities",
+                "routing_changes", "delivery_reservation", "delivery_plan")}).encode("utf-8"))
             while data:
                 data = data[os.write(write_fd, data):]
             os.close(write_fd)  # the hook has its answer; nothing below delays it
@@ -645,9 +646,10 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
 
 
 class _RoutingAtStart:
-    def __init__(self, moment: str = "start") -> None:
+    def __init__(self, moment: str = "start", *, session_id=None) -> None:
         # "start", or "delegation" for a subagent's start (routing_delegation).
         self.moment = moment
+        self.session = session_id
         self.out: dict | None = None
         self.deadline = time.monotonic()
         self.pid: int | None = None
@@ -713,6 +715,11 @@ class _RoutingAtStart:
 
             if not recall_prompt._routing_generation_current(out.get("generation")):
                 return None  # the record changed since the child read it
+            if self.session and out.get("delivery_plan"):
+                from khipu.routing_delivery import offer
+
+                out = offer(out, session=self.session)
+                text = out.get("text")
             self.out = out
             return text
         except Exception:
@@ -747,6 +754,11 @@ class _RoutingAtStart:
         try:
             from khipu import recall_prompt, routing
 
+            if out.get("routing_changes"):
+                from khipu.routing_delivery import acknowledge
+
+                if not acknowledge(session_id, out["routing_changes"], reservation=out.get("delivery_reservation")):
+                    return
             recall_prompt.mark_routing_full(session_id, version=out["version"], epoch=out.get("epoch"),
                                             at=routing._iso(routing._now()),
                                             owed=out.get("owed_entities"), shown=out.get("shown_entities"))
@@ -776,7 +788,7 @@ def session_start_main(*, shape: str | None = None) -> None:
         if is_helper_session(cwd):
             print("{}")  # T3's thread-title helper: no recall
             return
-        routing = _RoutingAtStart().begin()
+        routing = _RoutingAtStart(session_id=payload.get("session_id") or payload.get("sessionId")).begin()
         token = _START_IS_JOB.set(_session_is_job(payload))
         try:
             memory = session_start_context(cwd)

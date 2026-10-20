@@ -454,7 +454,6 @@ def test_5_structured_level_claim_expires_at_reset(replay):
 # ---- 2, 3: pages, revisions, leases -----------------------------------------------------
 
 
-@future("6", "a 3000-character pending rule must arrive whole across acknowledged pages")
 def test_2_pending_rule_is_whole_across_pages(replay):
     words = "Grok " + "~" * 2995
     routing.request_rule(words, author=AUTHOR)
@@ -469,7 +468,6 @@ def test_2_pending_rule_is_whole_across_pages(replay):
     expect("".join(delivered).count("~"), 2995, "2: pending rule was acknowledged as a preview, with text lost")
 
 
-@future("6", "10500-character session starts owe pages instead of a pointer-only start")
 def test_2_oversized_session_start_has_a_first_page(replay):
     routing.add_rule("x" * 10500, via="app")
     at = recall_rule._RoutingAtStart().begin()
@@ -481,7 +479,6 @@ def test_2_oversized_session_start_has_a_first_page(replay):
     assert recall_prompt.routing_marker("s1").get("owed")
 
 
-@future("6", "editing during pagination cancels old pages and starts revision page one")
 def test_2_edit_mid_pagination_restarts_revision(replay):
     routing.request_rule("Grok " + "x" * 2995, author=AUTHOR)
     first, _, info = replay.offer()
@@ -494,7 +491,6 @@ def test_2_edit_mid_pagination_restarts_revision(replay):
     assert first["routing_changes"]["items"][0]["revision"] != second["routing_changes"]["items"][0]["revision"]
 
 
-@future("6", "in-flight leases expire after 60 seconds and return undelivered items to owed")
 def test_3_unacknowledged_hook_batch_expires_to_owed(replay):
     routing.report(account="Codex", state="open", author=AUTHOR)
     out, _, _ = replay.offer()

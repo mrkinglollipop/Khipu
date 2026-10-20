@@ -56,6 +56,7 @@ _TAIL = rf"(?:/{_SEG}(?:\s{_SEG})*(?=/))*(?:/[^\s\"'`,;)\]}}]*)?"
 # Each harness's login folder when none is configured: its key is "harness|".
 _DEFAULT_FOLDERS = {"claude": ".claude", "codex": ".codex", "grok": ".grok"}
 _LOCK = threading.Lock()
+_FORM_CACHE = threading.local()
 _CHAR_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})")
 _NUMERIC_ENTITY = re.compile(r"&#(?:[xX][0-9a-fA-F]+|[0-9]+);?")
 
@@ -278,6 +279,10 @@ def _symlink_forms(path: str) -> set[str]:
 
 def _forms(raw: str, home: str | None) -> set[str]:
     """``raw`` as typed, expanded, each symlink hop and resolved, also ~/ and NFC."""
+    cache = getattr(_FORM_CACHE, "current", None)
+    key = (raw, home)
+    if cache is not None and key in cache:
+        return set(cache[key])
     raw = raw.strip()
     forms = {raw.rstrip("/") or raw}
     with contextlib.suppress(Exception):
@@ -288,7 +293,10 @@ def _forms(raw: str, home: str | None) -> set[str]:
         for base in {home, os.path.realpath(home)}:
             forms |= {"~" + f[len(base):] for f in list(forms) if f.startswith(base + "/")}
     forms |= {unicodedata.normalize("NFC", f) for f in forms}
-    return {f for f in forms if len(f) > 1 and f not in ("~", "/")}
+    result = {f for f in forms if len(f) > 1 and f not in ("~", "/")}
+    if cache is not None:
+        cache[key] = result
+    return set(result)
 
 
 def _user_names(paths: Iterable[str]) -> set[str]:
@@ -410,7 +418,7 @@ def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
         add_name(unicodedata.normalize("NFC", user), USER_WORD,
                  plain=re.fullmatch(r"[a-z]+", user) is not None)
     order = sorted(root_to, key=len, reverse=True)
-    alts = "|".join(re.escape(r) for r in order)
+    alts = "|".join(r"(?<!~)~" if r == "~" else re.escape(r) for r in order)
     roots = re.compile(rf"(?:{alts})(?![^\s/\"'`,;)\]}}]){_TAIL}", re.I) if alts else None
     names = _name_regex(set(name_to) | spelled, token_names)
     return _Table(roots, [(r, root_to[r]) for r in order], names, name_to,
@@ -451,7 +459,7 @@ def _signature(extra_keys) -> tuple:
         paths.extend(_forms(raw, home))
     if home:
         paths.append(home)
-    forms = tuple(sorted((path, tuple(sorted(_forms(path, home)))) for path in paths))
+    forms = tuple(sorted((path, tuple(sorted(_forms(path, home)))) for path in set(paths)))
     keys = tuple(sorted(str(k) for k in extra_keys)) if extra_keys is not None else None
     discovered = hashlib.sha256(repr((homes, forms, sorted(_user_names(paths)))).encode("utf-8")).digest()
     return (stat(config_file()), stat(routing.view_file()), stat(t3.settings_path()),
@@ -459,9 +467,37 @@ def _signature(extra_keys) -> tuple:
             discovered, keys, home)
 
 
+_PROJECTION = threading.local()
+
+
+@contextlib.contextmanager
+def routing_projection(extra_keys):
+    """One hook read uses one path inventory; the next read checks again."""
+    keys = tuple(extra_keys)
+    table = _table(keys)
+    previous = getattr(_PROJECTION, "current", None)
+    _PROJECTION.current = (keys, table)
+    try:
+        yield
+    finally:
+        _PROJECTION.current = previous
+
+
 def _table(extra_keys) -> _Table:
     """The cached table, rebuilt on any source change or TTL expiry."""
     extra_keys = tuple(extra_keys) if extra_keys is not None else None
+    current = getattr(_PROJECTION, "current", None)
+    if current is not None and current[0] == extra_keys:
+        return current[1]
+    previous = getattr(_FORM_CACHE, "current", None)
+    _FORM_CACHE.current = {}
+    try:
+        return _fresh_table(extra_keys)
+    finally:
+        _FORM_CACHE.current = previous
+
+
+def _fresh_table(extra_keys):
     try:
         sig = _signature(extra_keys)
     except Exception:  # noqa: BLE001
@@ -481,12 +517,12 @@ def _lookup(mapping: dict, found: str, fallback: str) -> str:
 
 
 def _scrub_text(text: str, table: _Table, keep: list[str]) -> str:
-    if not text.isascii():
-        text = unicodedata.normalize("NFC", text)
     pathy = "/" in text or "~" in text
     held = [w for w in keep if w and w in text]
     for i, word in enumerate(held):
         text = text.replace(word, f"\x00{i}\x00")
+    if not text.isascii():
+        text = unicodedata.normalize("NFC", text)
     if pathy:
         if table.roots is not None:
             def root(m: re.Match) -> str:

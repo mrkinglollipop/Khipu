@@ -171,6 +171,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_push_prompt": ("switch", True, "Tell conversations before each prompt"),
     "routing_push_delegation": ("switch", True, "Tell conversations before handing work to another agent"),
     "routing_dispatch_scripts": ("names", [], "Your own scripts that hand work to another agent, by file name"),
+    "routing_delivery_lease": ("duration", 60, "How long an unacknowledged routing batch stays in flight"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
     "routing_prompt_budget_ms": ("count", 50, "Time allowed before a prompt, in milliseconds"),
     "routing_start_budget_ms": ("count", 1000, "Time allowed at the start of a conversation, in milliseconds"),
@@ -7359,6 +7360,14 @@ def conversation_priority(entries, *, until=None, owner_request: str, author: di
         return _for_agents(out, view)
 
 
+
+class _StartStatus(dict):
+    """Internal fold evidence stays off the public status projection."""
+
+    def __init__(self, value, view):
+        super().__init__(value)
+        self.view = view
+
 def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_BUDGET,
                  start: bool = False) -> dict:
     """The ``routing`` field of ``khipu_status``'s light payload: the summary
@@ -7382,7 +7391,7 @@ def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_B
         status["generation"] = _generation(view, settings())
         status["owed_entities"] = out["owed_entities"]
         status["shown_entities"] = out["shown_entities"]
-    return status
+    return _StartStatus(status, view) if start else status
 
 
 # ---- the push at session start (phase 3a) ------------------------------------------------
@@ -7466,7 +7475,17 @@ def start_push(budget: float | None = None, moment: str = "start") -> dict | Non
     if push_off(moment):
         return None
     budget = start_budget() if budget is None else budget
-    return light_status(lock_wait=budget / 2, start=True)
+    out = light_status(lock_wait=budget / 2, start=True)
+    from khipu import routing_delivery
+
+    now = _now()
+    view = out.view
+    out = routing_delivery.plan(dict(out, kind="full"), view, now, settings())
+    from khipu import recall_rule
+
+    out["delivery_plan"]["max_chars"] = min(9000, recall_rule._HOOK_CONTEXT_BUDGET -
+        recall_rule._utf16_len(recall_rule.RULE_MD.strip()) - recall_rule._utf16_len(recall_rule._START_SEP))
+    return routing_delivery.offer(out)
 
 
 # ---- the push on every prompt (phase 3b) -------------------------------------------------
@@ -7850,7 +7869,7 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     return "\n".join(lines), len(changed["entities"])
 
 
-def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
+def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
                 on_fold=None) -> dict:
     """What the per-prompt hook adds for a conversation whose last-seen
     marker is ``marker`` (``recall_prompt.routing_marker``):
@@ -7868,7 +7887,29 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
         _view_seen.stat = None
         view = _prompt_view(now, on_fold=on_fold)
     cfg = settings()
-    base = {"version": view["version"], "epoch": view.get("epoch"), "generation": _generation(view, cfg)}
+    session = getattr(marker, "session", None)
+    if session:
+        from khipu import agent_view, routing_delivery
+
+        keys = [a.get("key") for a in view.get("accounts") or []]
+        with agent_view.routing_projection(keys):
+            out = _prompt_text(marker, view, now, cfg)
+            if not out.pop("_reserved", False):
+                out = routing_delivery.offer(routing_delivery.plan(out, view, now, cfg),
+                                             session=session, component=marker.component)
+            return dict(out, _delivery_view=view, _reserved=True)
+    return _prompt_text(marker, view, now, cfg)
+
+
+def _prompt_text(marker, view, now, cfg):
+    base = {"version": view["version"], "epoch": view.get("epoch"), "generation": _generation(view, cfg), "_delivery_view": view}
+    session = getattr(marker, "session", None)
+    if session and not view.get("unsaved_change"):
+        from khipu import routing_delivery
+
+        flight = routing_delivery.in_flight(session, marker.component, view, now)
+        if flight is not None:
+            return dict(flight, generation=base["generation"], _delivery_view=view, _reserved=True)
     why = _full_reason(marker, view, now, cfg)
     if why is None and view.get("unsaved_change"):
         raise PushUnsaved("the routing view changed and could not be saved")
@@ -7904,6 +7945,21 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
     out = summary(view, now=now)
     return dict(base, kind="full", text=out["text"], count=0, why=why,
                 owed_entities=out["owed_entities"], shown_entities=out["shown_entities"])
+
+
+def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
+                on_fold=None) -> dict:
+    """Offer a leased batch when the marker carries a hook delivery identity."""
+    out = _prompt_push(marker, budget=budget, now=now, on_fold=on_fold)
+    view = out.pop("_delivery_view")
+    session = getattr(marker, "session", None)
+    if not session or out.pop("_reserved", False):
+        return out
+    from khipu import routing_delivery
+
+    now = now or _now()
+    out = routing_delivery.plan(out, view, now, settings())
+    return routing_delivery.offer(out, session=session, component=marker.component)
 
 
 # ---- the recall daemon's poll (phase 3c) --------------------------------------------------
