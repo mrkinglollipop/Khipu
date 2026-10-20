@@ -98,7 +98,9 @@ def scan_text(path: str, text: str) -> list[dict[str, Any]]:
             ch, n = marker
             if fence is None:
                 fence = (ch, n)
-            elif ch == fence[0] and n >= fence[1]:
+            elif ch == fence[0] and n >= fence[1] and stripped[n:] == "":
+                # Closer: same marker, at least the opener's length, and
+                # nothing after it but whitespace (already stripped).
                 fence = None
             continue
         if fence is not None:
@@ -183,7 +185,11 @@ def _clauses(line: str) -> list[str]:
 
 
 def _fence_marker(stripped: str) -> tuple[str, int] | None:
-    """Opening/closing fence: the same character, three or more, at the start."""
+    """Fence run: the same character, three or more, at the start of the line.
+
+    An opener may carry an info string after the marker. A closer is that
+    same marker, at least as long as the opener, with only whitespace after.
+    """
     if len(stripped) < 3:
         return None
     ch = stripped[0]
@@ -210,9 +216,10 @@ def _claim_on_clause(clause: str) -> tuple[str | None, str | None]:
         return "state", account
     masked = _INCIDENTAL_ORDER_RE.sub(" ", clause)
     ordering = bool(_ORDERING_RE.search(masked))
-    # Capability/how-to exclusions apply to this clause only, and never to a
-    # clause that already states a current ordering claim.
-    if _CAPABILITY_RE.search(clause) and not ordering:
+    # "good for", "weak at", and other capability phrases are task wording
+    # even when an ordinal follows ("good for second opinions"). A strong
+    # current ordering claim in the same clause still counts.
+    if _CAPABILITY_RE.search(clause) and not _STRONG_ORDER_RE.search(clause):
         return None, None
     howto = bool(_HOWTO_RE.search(clause))
     if howto and not _STRONG_ORDER_RE.search(clause):

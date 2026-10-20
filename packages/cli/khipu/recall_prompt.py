@@ -2498,32 +2498,53 @@ _BUDGET_SAFETY_SLACK_S = 0.3
 _VALIDITY_QUERY_MIN_S = 0.05
 
 
-def _attach_hub_routing_state(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _attach_hub_routing_state(
+    rows: list[dict[str, Any]],
+    *,
+    deadline: float | None = None,
+) -> list[dict[str, Any]]:
     """Carry stored routing-state flags onto budgeted hub hits.
 
     Same boolean the local snapshot metadata pass already attaches. Reads
     only ``frontmatter->'_routing_state_claim'``, never ``topics.body``.
-    Fail-open: a missing column, a closed cursor, or a type that is not a
-    strict boolean leaves hits unmarked and never drops a row.
+    Fail-open: a missing column, a closed cursor, a type that is not a
+    strict boolean, a missed deadline, or a statement timeout leaves hits
+    unmarked and never drops a row.
     """
     topic_ids = [str(r["id"]) for r in rows if r.get("kind") == "topic"]
     if not topic_ids:
         return rows
-    try:
+    remaining = None if deadline is None else deadline - time.monotonic()
+    # Same headroom as the validity counts query: starting this with less
+    # than _VALIDITY_QUERY_MIN_S left only makes a tight lane worse, and
+    # connect() itself may take up to five seconds without a wall-clock cap.
+    if remaining is not None and remaining <= _VALIDITY_QUERY_MIN_S:
+        return rows
+
+    def _fetch() -> dict[str, bool]:
         from khipu.db import connect
 
-        with connect() as conn:
+        timeout_kw = {}
+        if remaining is not None:
+            timeout_kw["statement_timeout_s"] = remaining
+        with connect(**timeout_kw) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT slug, frontmatter->'_routing_state_claim' "
                     "FROM topics WHERE deleted_at IS NULL AND slug = ANY(%s)",
                     (topic_ids,),
                 )
-                flags = {
+                return {
                     str(slug): flag
                     for slug, flag in cur.fetchall()
                     if type(flag) is bool
                 }
+
+    try:
+        flags = (
+            _fetch() if remaining is None
+            else _run_with_timeout(_fetch, remaining)
+        )
     except Exception as exc:  # noqa: BLE001 — advisory; never a search failure
         _log(f"budgeted routing metadata skipped: {type(exc).__name__}: {exc}")
         return rows
@@ -2659,7 +2680,7 @@ def _hub_hits_budgeted(
     fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
     fused = _relevance_gate(fused, tokens)
     fused = apply_project_and_status(fused, project=project)
-    fused = _attach_hub_routing_state(fused)
+    fused = _attach_hub_routing_state(fused, deadline=deadline)
 
     # Validity annotation (Phase 2, session B): one counts query for the
     # fused rows, reusing decisions.enrich_search_results (the exact same

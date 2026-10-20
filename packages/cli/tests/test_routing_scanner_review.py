@@ -264,3 +264,116 @@ def test_budgeted_hub_carries_stored_routing_flag():
     assert row.get('_routing_state_claim') is True
     assert scanner.SUPERSEDED_MARK in rp.render_block(out['hits']), \
         'Budgeted hub path discards stored routing metadata'
+
+
+class _FlagCursor:
+    """Synthetic hub cursor for advisory-flag probes. Never a live connection."""
+
+    def __init__(self, flags=(), error=None, delay=0):
+        self.flags = flags
+        self.error = error
+        self.delay = delay
+        self.queries = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, params=None):
+        self.queries.append((sql, params))
+        assert 'body' not in sql.lower()
+        if self.delay:
+            time.sleep(self.delay)
+        if self.error:
+            raise self.error
+
+    def fetchall(self):
+        return self.flags
+
+
+def _hub_flag_run(delay):
+    from khipu import cli, db, embed
+
+    row = dict(
+        kind='topic', id='note:synthetic', label='Synthetic capability note',
+        snippet='Synthetic capability evidence',
+        rank_text='Synthetic capability evidence', status='active',
+        lexical_hits=2,
+    )
+    cur = _FlagCursor([('note:synthetic', True)], delay=delay)
+    with patch.object(db, 'connect', return_value=cur), \
+            patch.object(cli, '_literal_candidates', return_value=[row]), \
+            patch.object(embed, '_cosine_candidates', return_value=[]):
+        start = time.perf_counter()
+        out = rp._hub_hits_budgeted(
+            'Synthetic capability', ['synthetic', 'capability'],
+            project=None, budget_ms=50, limit=3,
+        )
+        elapsed = time.perf_counter() - start
+    assert len(out['hits']) == 1
+    return elapsed
+
+
+def test_new_hub_query_honors_deadline():
+    baseline = statistics.median(_hub_flag_run(0) for _ in range(3))
+    delayed = _hub_flag_run(.25)
+    print('HUB_DELAY ' + json.dumps(dict(
+        budget_ms=50, baseline_ms=baseline * 1000, delayed_ms=delayed * 1000,
+    )))
+    assert delayed < .10, 'Advisory query blocks recall beyond its budget'
+
+
+def test_outer_pipeline_retains_hits_when_metadata_slow():
+    from khipu import cli, db, embed
+
+    def run(delay):
+        row = dict(
+            kind='topic', id='note:synthetic',
+            label='Synthetic capability note',
+            snippet='Synthetic capability evidence',
+            rank_text='Synthetic capability evidence',
+            status='active', lexical_hits=2,
+        )
+        cur = _FlagCursor([('note:synthetic', True)], delay=delay)
+        with patch.object(db, 'connect', return_value=cur), \
+                patch.object(cli, '_literal_candidates', return_value=[row]), \
+                patch.object(embed, '_cosine_candidates', return_value=[]), \
+                patch.object(rp, '_snapshot_search_hits',
+                             side_effect=rp._SnapshotUnusable('synthetic missing replica')), \
+                patch.object(rp, '_hub_known_down', return_value=None), \
+                patch.object(rp, '_project_for_cwd', return_value=None), \
+                patch.object(rp, '_deliverable_context_line', return_value=''):
+            out = rp.prior_work_for_prompt(
+                'Synthetic capability evidence', budget_ms=50,
+            )
+            if delay:
+                time.sleep(delay)
+        return out
+
+    fast = run(0)
+    slow = run(.45)
+    print('OUTER ' + json.dumps(dict(
+        fast_hits=len(fast['hits']), slow_hits=len(slow['hits']),
+        slow_reason=slow['reason'], slow_ms=slow['ms'],
+    )))
+    assert fast['hits']
+    assert slow['hits'], 'Advisory metadata delay discarded completed lexical hit'
+
+
+@pytest.mark.parametrize('text', [
+    'Codex is good for second opinions.',
+    'Codex is good for first drafts only.',
+    '1. Codex is good for second opinions.',
+])
+def test_capability_prose_remains_clean(text):
+    assert not scanner.scan_text('/synthetic/note.md', text)
+
+
+def test_fence_with_info_string_does_not_close():
+    text = '~~~~markdown\n~~~~text\nCodex is paused until 2026-10-19\n~~~~'
+    assert not scanner.scan_text('/synthetic/note.md', text)
