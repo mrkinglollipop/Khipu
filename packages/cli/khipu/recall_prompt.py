@@ -471,6 +471,9 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
         from khipu import routing
 
         routing.prompt_imports()
+        from khipu import agent_view
+
+        agent_view.prepare_routing_table()
         off = None if decided else routing.push_off(moment, environ=environ)
         budget = 0.0
         if not off and isinstance(session_id, str) and session_id:
@@ -1342,6 +1345,9 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
     from khipu import routing
 
     routing.prompt_imports()
+    from khipu import agent_view
+
+    agent_view.prepare_routing_table()
     import warnings
 
     if schedule is None:

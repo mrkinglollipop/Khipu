@@ -502,22 +502,45 @@ class _InventoryDeadline(BaseException):
 
 
 
+class InventoryUnavailable(RuntimeError):
+    """No complete alias inventory exists; the hook must withhold routing."""
+
+
+def prepare_routing_table() -> None:
+    """Give the helper's children a full inventory before its first fork.
+
+    This runs before readiness, outside every prompt's budget. A stalled
+    mount still has a bounded wait; without a last good table the children
+    withhold routing rather than use a scrub missing resolved aliases.
+    """
+    if _TABLE.get("table") is not None or _TABLE.get("prepared"):
+        return
+    # A child inherits even a failed preparation: never repeat the startup
+    # wait per prompt when the helper's volume is still stalled.
+    _TABLE["prepared"] = True
+    with contextlib.suppress(InventoryUnavailable):
+        _prompt_table(None, budget=0.25)
+
+
 def _fallback_table(keys):
+    previous = _TABLE.get("table")
+    if previous is None:
+        raise InventoryUnavailable()
     table = _rules(keys, local_only=True)
     # Retain discovered private aliases, but only today's owner exemptions.
-    table.previous = _TABLE.get("table")
+    table.previous = previous
     return table
 
 
-def _prompt_table(keys):
+def _prompt_table(keys, *, budget=0.005):
     """A stalled mount must not consume the hook's routing budget.
 
     A 5ms refresh preserves full discovery when it is responsive. On expiry,
-    use configured and saved login names without resolving links or listing
-    directories; the generic private-path scrub still applies. Keep the
-    caller's process deadline and signal handler intact.
+    combine configured and saved login names with the last complete table,
+    without resolving links or listing directories. With no complete table,
+    raise so the hook sends nothing. Keep the caller's process deadline and
+    signal handler intact.
     """
-    budget = 0.005
     if threading.current_thread() is not threading.main_thread():
         return _fallback_table(keys)
     timer = signal.getitimer(signal.ITIMER_REAL)

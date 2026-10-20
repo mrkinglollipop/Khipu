@@ -326,7 +326,7 @@ def test_stalled_volume_refresh_keeps_prompt_routing_and_restores_alarm(replay, 
     routing.add_rule("Grok builds", via="app")
     view = replay.view()
     routing._entry_definitions()
-    monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
+    agent_view._table([a["key"] for a in view["accounts"]])
     original = agent_view.os.listdir
     visited = []
     def stalled(path):
