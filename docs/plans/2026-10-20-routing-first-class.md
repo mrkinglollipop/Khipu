@@ -934,7 +934,7 @@ Slices 4Pb, 9a, 9c, 10, 13 and 17t can run beside 5 to 8c, and 11a beside 6.
 
 ## Matt's decisions (each with a recommendation)
 
-Approved 2026-10-20: all 14 as recommended. Decisions 15 to 17 added the same afternoon (section 13), approved with Matt's "proceed as you recommend".
+Approved 2026-10-20: all 14 as recommended. Decisions 15 to 17 added the same afternoon (section 13), approved with Matt's "proceed as you recommend"; section 13 cleared Codex review rounds 1 to 7.
 
 1. **Delivery failures turn doctor red** (amends routing-truth decision 10 for delivery only). Routing content
    and advisory marks stay warnings and never feed a gate. *Recommend yes.*
