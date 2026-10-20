@@ -236,17 +236,20 @@ def _session_lock(session_id: str, wait: float):
         yield True
 
 
-def mark_routing_full(session_id: str, *, version: int, epoch: str | None, at: str) -> bool:
+def mark_routing_full(session_id: str, *, version: int, epoch: str | None, at: str,
+                      owed: list[str] | None = None, shown: list[str] | None = None) -> bool:
     """Record that the full summary at ``version`` was delivered at ``at``:
     the session's last-seen version starts again from it. Takes the
     session's lock without waiting; a busy lock or a failed write records
     nothing (the next prompt then sends the full summary again) and is never
     raised."""
-    return mark_routing_seen(session_id, version=version, epoch=epoch, full_at=at, wait=0.0)
+    return mark_routing_seen(session_id, version=version, epoch=epoch, full_at=at,
+                             owed=owed, shown=shown, wait=0.0)
 
 
 def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_at: str | None = None,
-                      unrefreshed: str | None = None, based_on=None, wait: float = 0.05) -> bool:
+                      unrefreshed: str | None = None, based_on=None, owed: list[str] | None = None,
+                      shown: list[str] | None = None, wait: float = 0.05) -> bool:
     """Move the session's last-seen routing version to ``version`` once a
     block was delivered (routing truth, phases 3a and 3b). With ``full_at``
     the marker starts again from a full summary; otherwise only the version
@@ -269,9 +272,27 @@ def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_
         else:
             new = dict(old, epoch=epoch)
             new.pop("pointer", None)  # heard: a pointer said earlier no longer matters
-            if not (old.get("epoch") == epoch and isinstance(old.get("version"), int)
-                    and old["version"] > version):
+            older = (old.get("epoch") == epoch and isinstance(old.get("version"), int)
+                     and old["version"] > version)
+            if not older:
                 new["version"] = version
+        if owed is not None and (full_at is not None or not older):
+            old_owed = old.get("owed") if old.get("epoch") == epoch and isinstance(old.get("owed"), list) else []
+            same_version = old.get("epoch") == epoch and old.get("version") == version
+            # The first delivery at a version records all its omissions.
+            # A late duplicate must not recreate debt a later page cleared.
+            due = [entity for entity in (old_owed if same_version else [*old_owed, *owed])
+                   if isinstance(entity, str)]
+            done = set(shown or [])
+            left = list(dict.fromkeys(entity for entity in due if entity not in done))
+            if left:
+                new["owed"] = left
+            else:
+                new.pop("owed", None)
+        elif full_at is not None and old.get("epoch") == epoch and old.get("owed"):
+            # A budgeted full summary may omit these too. Keep them owed
+            # until an identified change line has actually been delivered.
+            new["owed"] = old["owed"]
         if unrefreshed is not None:
             new["unrefreshed"] = unrefreshed
         return new
@@ -472,7 +493,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
                 marker = routing_marker(session_id)
                 out = routing.prompt_push(marker, budget=budget, on_fold=fold_started)
                 answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed",
-                                                "generation")}
+                                                   "owed_entities", "shown_entities", "generation")}
                 if isinstance(answer["text"], str) and len(answer["text"]) > _ROUTING_TEXT_MOST:
                     answer["text"] = answer["text"][:_ROUTING_TEXT_MOST]
                 answer["seen"] = marker.get("version")  # what the marker was when this answer was read
@@ -1664,7 +1685,8 @@ class _RoutingAtPrompt:
         if recall_rule._utf16_len(combined) <= recall_rule._HOOK_CONTEXT_BUDGET:
             pending = {"session": self.session, "version": out["version"], "epoch": out.get("epoch"),
                        "full": out["kind"] == "full", "unrefreshed": out.get("unrefreshed"),
-                       "at": out.get("at"), "based_on": out.get("seen")}
+                       "at": out.get("at"), "based_on": out.get("seen"),
+                       "owed": out.get("owed_entities"), "shown": out.get("shown_entities")}
             return combined, {"status": label, "pending": pending}
         # Too long to go with this prompt. The block is not delivered, so the
         # session's last-seen version does not move and a later prompt with
@@ -1696,7 +1718,8 @@ def _routing_delivered(info: dict | None, delivered: bool) -> str:
             full_at = pending.get("at") if pending["full"] else None
             if not mark_routing_seen(pending["session"], version=pending["version"], epoch=pending["epoch"],
                                      full_at=full_at, unrefreshed=pending.get("unrefreshed"),
-                                     based_on=pending.get("based_on") if pending["full"] else None):
+                                     based_on=pending.get("based_on") if pending["full"] else None,
+                                     owed=pending.get("owed"), shown=pending.get("shown")):
                 status = f"{status}:unmarked"
     return f" routing={status}"
 

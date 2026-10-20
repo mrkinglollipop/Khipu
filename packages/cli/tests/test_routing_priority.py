@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 
@@ -641,7 +642,8 @@ def test_a_conversations_long_priority_fits_the_summary_budget_as_a_pointer(home
     routing.request_priority([{"account": "Codex", "role": LONG}], owner_request="the owner asked", author=ME, expect=routing.priority_version())
     out = routing.summary(now=home["clock"].now)
     text = out["text"]
-    assert LONG.strip() not in text and routing.PRIORITY_POINTER in text
+    assert LONG.strip() not in text and "Your priority change: Codex:" in text
+    assert "unconfirmed" in text and "khipu_route" in text
     head = text.splitlines()[0]
     assert len(text) - len(head) - 1 - len("Note from the owner (") <= 1500 + 40
     # The owner's own words stay whole, however long.
@@ -656,7 +658,8 @@ def test_a_conversations_long_priority_fits_the_push_budget_as_a_pointer(home):
     view = routing.read_view()
     changed = routing.since(start["version"], view, now=home["clock"].now)
     text, _count = routing.changes_text(changed, view, home["clock"].now)
-    assert LONG.strip() not in text and routing.PRIORITY_POINTER in text
+    assert LONG.strip() not in text and "Your priority change: Codex:" in text
+    assert "unconfirmed" in text and "khipu_route" in text
     assert len(text) - len(text.splitlines()[0]) - 1 <= 400
 
 
@@ -667,10 +670,11 @@ def test_a_conversations_long_rule_request_fits_both_budgets_as_a_pointer(home):
     view = routing.read_view()
     changed = routing.since(start["version"], view, now=home["clock"].now)
     text, _count = routing.changes_text(changed, view, home["clock"].now)
-    assert LONG.strip() not in text and "too long to show here" in text
+    assert LONG.strip() not in text and "Standing rule 1 added" in text
+    assert "unconfirmed" in text and "khipu_route" in text
     assert len(text) - len(text.splitlines()[0]) - 1 <= 400
     summary = _summary(home)
-    assert LONG.strip() not in summary and "1. A conversation added this rule" in summary
+    assert LONG.strip() not in summary and "Standing rule 1 added" in summary
     # A short request still arrives whole.
     routing.request_rule("Short words.", owner_request="the owner asked", author=ME)
     assert "Short words." in _summary(home)
@@ -687,10 +691,24 @@ def test_many_conversation_requests_take_at_most_half_the_budget(home):
     changed = routing.since(start["version"], view, now=home["clock"].now)
     text, _count = routing.changes_text(changed, view, home["clock"].now)
     assert len(text) - len(text.splitlines()[0]) - 1 <= 400
-    assert "12 unconfirmed changes a conversation made" in text
+    assert "Standing rule 1 added" in text and "unconfirmed" in text
+    assert "more changes" in text
     assert any(x.startswith("Codex") for x in text.splitlines())  # the owner's accounts keep their room
-    summary = _summary(home)
-    assert "unconfirmed changes a conversation made" in summary and any(x.startswith("Codex") for x in summary.splitlines())
+    out = routing.summary(now=home["clock"].now)
+    summary = out["text"]
+    shown = set(out["shown_entities"])
+    pending = {f"rule:{i}" for i in range(1, 13)}
+    omitted = pending - shown
+    assert "rule:1" in shown
+    assert omitted
+    assert f"{len(omitted)} more pending changes: read `khipu_route`." in summary
+    assert set(out["owed_entities"]) - shown == omitted
+    assert all(re.search(rf"(?:^{i}\. |Standing rule {i} added)", summary, re.M)
+               for i in range(1, 13) if f"rule:{i}" in shown)
+    requests = [line for line in summary.splitlines() if "unconfirmed" in line or
+                "the owner has not confirmed it yet" in line]
+    assert sum(len(line) + 1 for line in requests) <= 750
+    assert any(x.startswith("Codex") for x in summary.splitlines())
 
 
 def _many_accounts(home, n: int) -> list[str]:
