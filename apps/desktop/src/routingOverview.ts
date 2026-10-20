@@ -88,7 +88,7 @@ export function lanesWithoutAccount(view: RouteView, s: OverviewSettings): { run
     if (!out.some((x) => x.runner === runner && x.lane === lane)) out.push({ runner, lane });
   };
   if (s.routing) {
-    for (const r of view.sources?.runners ?? []) for (const lane of r.lanes ?? []) if (!map[r.name]?.[lane]) add(r.name, lane);
+    for (const r of view.sources?.runners ?? []) for (const lane of r.lanes ?? []) if (!map[r.name]?.[lane] && !r.lane_matches?.[lane]?.account) add(r.name, lane);
     // Matched to a name Khipu doesn't know: the lane row says so in warn.
     const known = (t: string) => (view.accounts ?? []).some((a) => a.label === t || a.key === t);
     for (const [runner, lanes] of Object.entries(map)) {

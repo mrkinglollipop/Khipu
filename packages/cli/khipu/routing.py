@@ -980,7 +980,7 @@ def _resolve_account_key(name: str, known: list[dict] | None = None, *, conversa
         harness, _, home = raw.partition("|")
         harness, home = harness.strip().lower(), home.strip()
         if harness not in usage.HARNESSES:
-            raise RouteError("that names no CLI Khipu reads (claude, codex, grok, muse, glm)")
+            raise RouteError("that names no CLI Khipu reads (claude, codex, grok, muse, glm, cursor)")
         if home and (credential_location(home) or redact_secrets(home, force=True)[1]):
             raise RouteError("that login folder is inside a private folder or its name looks like a secret; "
                              "Khipu won't record it")
@@ -1291,7 +1291,7 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "evidence", "until", "written_at", "via", "text", "file", "date", "sha256", "clock_at",
                 "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
                 "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
-                "harness", "to", "started_at")
+                "harness", "to", "started_at", "model", "family")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries")
 _WHOLE_MOST = 2 ** 53
@@ -1750,9 +1750,37 @@ def _evidence_account(event: dict, lane_map: dict, known: list[dict],
     if key or not event.get("runner"):
         found = key or None
     else:
-        target = (lane_map.get(event["runner"]) or {}).get(event.get("lane") or "")
-        found = _lane_target(target, known) if target else None
+        found = resolve_lane(event["runner"], event.get("lane") or "", lane_map, known,
+                             event.get("declaration"))["key"]
     return _forwarded(found, forward) if found and forward else found
+
+
+def resolve_lane(runner: str, lane: str, lane_map: dict, known: list[dict], spec: dict | None = None) -> dict:
+    """One payer resolver for source health, evidence and conversation reports."""
+    spec = spec if isinstance(spec, dict) else {}
+    keys = {a["key"] for a in known}
+    override = (lane_map.get(runner) or {}).get(lane)
+    if override:
+        key = _lane_target(override, known)
+        return {"key": key if key in keys else None, "matched_by": "override" if key in keys else None,
+                "candidates": [a["key"] for a in _label_matches(override, known)]}
+    if spec.get("identity_invalid"):
+        return {"key": None, "matched_by": None, "candidates": []}
+    providers = {str(spec[k]).casefold() for k in ("kind", "provider") if spec.get(k)}
+    # Legacy Grok checking lanes share the Grok subscription.
+    providers = {"grok" if p == "grokcheck" else p for p in providers}
+    candidates = [a["key"] for a in known if a["harness"] in providers]
+    declared = [spec[k] for k in ("account", "budget_account") if k in spec]
+    if len(providers) > 1:
+        return {"key": None, "matched_by": None, "candidates": candidates}
+    if declared:
+        targets = [_lane_target(value, known) for value in declared]
+        key = targets[0]
+        valid = key in keys and all(t == key for t in targets) and (not providers or key in candidates)
+        return {"key": key if valid else None, "matched_by": "declaration" if valid else None,
+                "candidates": sorted(set(candidates + [t for t in targets if t in keys]))}
+    key = candidates[0] if len(candidates) == 1 else None
+    return {"key": key, "matched_by": "provider" if key else None, "candidates": candidates}
 
 
 def _label_matches(target: str, known: list[dict]) -> list[dict]:
@@ -2002,6 +2030,7 @@ def _evidence(event: dict, cfg: dict) -> dict | None:
             "source": event.get("source") if event.get("source") in SOURCES else "report",
             "written_by": event.get("written_by") or {}, "via": event.get("via"), "at": at, "seq": event["_seq"],
             "evidence": event.get("evidence"), "reason": event.get("reason"),
+            "model": event.get("model"), "family": event.get("family"),
             "message_time": bool(event.get("message_time")), "until_default": until_default}
 
 
@@ -2174,7 +2203,8 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
                 "evidence": e.get("evidence"), "message_time": e.get("message_time", False),
                 "cleared": bool(e.get("cleared")), "observed": bool(e.get("observed")),
                 "turn": bool(e.get("turn")), "session_logs": bool(e.get("session_logs")),
-                "until_default": bool(e.get("until_default"))}
+                "until_default": bool(e.get("until_default")),
+                **{k: e[k] for k in ("model", "family") if e.get(k) is not None}}
 
     underlying = {"state": state, "until": _iso(behind["until"]) if behind and state in (LIMITED, PROBABLY_OPEN)
                   else None, "basis": behind["basis"] if behind and state in (LIMITED, PROBABLY_OPEN) else None}
@@ -2184,7 +2214,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
              "reason": DOWN_REASONS.get(behind.get("reason") or "", "out of service")
              if state == DOWN and behind else None,
              "models": models, "witness": witness(behind), "disagreement": disagreement, "last_seen": None,
-             "underlying": None, "checkable": account["harness"] not in ("muse", "glm"), "confirmed_at": confirmed_at}
+             "underlying": None, "checkable": account["harness"] not in ("muse", "glm", "cursor"), "confirmed_at": confirmed_at}
     if state == LIMITED:
         # When the limit now shown was first reported (doctor's launch check).
         entry["since"] = _iso(min((e["at"] for e in whole if whole_holds(e)), default=None))
@@ -3271,7 +3301,7 @@ def check_account(account: str, *, scheduled: bool = False, now: datetime | None
         if scheduled and not due_now(entry):
             return {"ok": True, "account": key, "outcome": "not_due"}
         s = current(entry)
-        if entry.get("harness") in ("muse", "glm") or entry.get("checkable") is False:
+        if entry.get("harness") in ("muse", "glm", "cursor") or entry.get("checkable") is False:
             return done(s, "cannot_check", _CANNOT_CHECK)
         load1 = (load or (lambda: os.getloadavg()[0]))()
         busy_load = float(_setting(cfg, "routing_busy_load"))
@@ -3963,12 +3993,20 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
     else:
         runner, lane = str(runner).strip(), str(lane).strip()
         lane_map = cfg.get("routing_lane_map") or {}
-        if not _lane_mapped(runner, lane, lane_map):
+        view = read_view()
+        kept = ((view.get("source_cache") or {}).get("runners") or {}).get(runner) or {}
+        spec = (((kept.get("config") or {}).get("data") or {}).get("lanes") or {}).get(lane) or {}
+        matched = resolve_lane(runner, lane, lane_map, accounts(), spec)
+        if not matched["key"] and not _lane_mapped(runner, lane, lane_map):
             runners = _clip(", ".join(sorted(lane_map)), 300) or "none"
             raise RouteError("Khipu doesn't know that runner's lane; a conversation can report on a lane only "
-                             "when the lane map (Settings \u2192 Routing, routing_lane_map) names it, or on the "
+                             "when its provider or account declaration resolves, or the lane map "
+                             "(Settings \u2192 Routing, routing_lane_map) names it, or on the "
                              f"account with --account. Runners in the lane map: {runners}")
-        event.update(runner=runner, lane=lane)
+        from khipu.routing_sources import model_family
+
+        event.update(runner=runner, lane=lane, account=matched["key"], model=spec.get("model"),
+                     family=model_family(spec.get("model")))
     if scope:
         event["scope"] = scope
     if window_key:
@@ -4977,6 +5015,8 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
         if error == usage.E_NOT_INSTALLED:
             return {"readable": False, "why": "plan figures can't be read: its CLI is not installed", "error": error}
         return {"readable": False, "why": "plan figures can't be read just now", "error": error}
+    if row.get("harness") == "cursor":
+        return {"readable": False, "why": usage.CURSOR_NO_FIGURES, "tier": row.get("plan")}
     window = _longest_window(row, now)
     longest = _longest_window(row, None)
     # Compared like _longest_window ranks them: a model's window of the same
@@ -5637,7 +5677,7 @@ def prompt_budget_block(cfg: dict | None = None) -> dict:
 def _sources_brief(sources: dict) -> dict:
     """The sources' status as doctor and ``khipu route sources`` show it."""
     return {"runners": [{k: r.get(k) for k in ("name", "path", "files", "heartbeat_at", "interval", "silent",
-                                                 "unreadable", "unreadable_since", "lanes", "unmatched_lanes")}
+                                                 "unreadable", "unreadable_since", "lanes", "unmatched_lanes", "lane_matches")}
                         for r in sources.get("runners") or []],
             "refused": sources.get("refused") or [], "invalid": sources.get("invalid") or 0,
             "usage": sources.get("usage"), "table": sources.get("table")}
@@ -5654,7 +5694,7 @@ def _launch_warnings(view: dict, launched: list[dict], cfg: dict, now: datetime)
     out: list[str] = []
     said: set[str] = set()
     for item in launched:
-        key = _evidence_account({"runner": item["runner"], "lane": item["lane"]}, lane_map, known,
+        key = _evidence_account(item, lane_map, known,
                                 view.get("forwards"))
         entry = by_key.get(key or "")
         at = _parse(item["at"])
@@ -5772,7 +5812,7 @@ _AUTHOR_PUBLIC = ("kind", "harness", "project", "session", "name")
 _ACCOUNT_FIELDS = ("label", "harness", "state", "until", "basis", "scope", "reason", "checkable", "confirmed_at",
                    "since", "silent", "configured")
 _WITNESS_FIELDS = ("id", "source", "at", "evidence", "message_time", "cleared", "observed", "turn",
-                   "until_default")
+                   "until_default", "model", "family")
 _REPORT_FIELDS = ("id", "state", "source", "at", "since", "until")
 _LAST_SEEN_FIELDS = (*_REPORT_FIELDS, "cleared")
 _MODEL_FIELDS = ("model", "until", "basis", "source", "at", "id")
@@ -5781,7 +5821,7 @@ _RULE_FIELDS = ("n", "text", "source", "date", "seeded", "confirmed", "pending",
                 "pending_by", "prior_text", "via", "at")
 _LANE_FIELDS = ("runner", "lane", "state", "until", "basis", "at", "id")
 _RUNNER_FIELDS = ("name", "heartbeat_at", "interval", "silent", "silent_deadline", "unreadable",
-                  "unreadable_since", "lanes", "unmatched_lanes")
+                  "unreadable_since", "lanes", "unmatched_lanes", "lane_matches")
 _TABLE_FIELDS = ("hash", "stamped_at", "changed_at", "error")
 _WRITE_FIELDS = ("ok", "id", "state", "until", "basis", "ended", "version", "saved")
 
@@ -7195,6 +7235,11 @@ def _print_sources(out: dict, now: datetime) -> None:
             last = f"last good read {_clock(good, now)}" if good else "never read"
             print(f"  {name}: " + (f"can't read it ({f['error']}) since {_clock(_parse(f['since']), now)}; {last}"
                                    if f.get("error") else last))
+        for lane, match in (runner.get("lane_matches") or {}).items():
+            if match.get("account"):
+                print(f"  {lane}: {match['account']}, matched by {match['matched_by']}")
+            elif match.get("candidates"):
+                print(f"  {lane}: not matched; candidates: " + ", ".join(match["candidates"]))
         if runner.get("unmatched_lanes"):
             print("  lanes not matched to an account: " + ", ".join(runner["unmatched_lanes"]))
     for name in out["refused"]:

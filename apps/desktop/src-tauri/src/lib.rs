@@ -688,7 +688,7 @@ const ACCOUNTS_DISCOVER_NOW_ARGV: &[&str] = &["usage", "--discover", "--now", "-
 const ACCOUNTS_FORGET_LOGIN_PATHS_ARGV: &[&str] = &["usage", "--forget-login-paths"];
 /// `config --set KEY PATH` / `config --unset=KEY` for where Khipu finds each
 /// CLI and its Node (`khipu.config.CLI_SETTINGS`, decision 10).
-const CLI_PATH_KEYS: &[&str] = &["cli_path.claude", "cli_path.codex", "cli_path.grok", "cli_path.muse"];
+const CLI_PATH_KEYS: &[&str] = &["cli_path.claude", "cli_path.codex", "cli_path.grok", "cli_path.muse", "cli_path.cursor"];
 const NODE_FOLDER_KEY: &str = "node_folder";
 /// Home -> Routing, the health report's Routing row and the routing
 /// attention items (docs/plans/2026-10-14-routing-truth.md, phase 4): the
@@ -893,7 +893,7 @@ fn checked_work_projects(raw: &str) -> Result<String, String> {
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
-const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse", "glm"];
+const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse", "glm", "cursor"];
 const USAGE_ACCOUNTS_MAX: usize = 32;
 /// Settings -> Routing (routing truth phase 4): the sizes, times and switches
 /// the page offers, each `config --set KEY VALUE` or `config --unset=KEY`
@@ -1154,7 +1154,7 @@ fn checked_usage_accounts_kept(raw: &str, stored: &[Value]) -> Result<String, St
             .to_lowercase();
         if !USAGE_HARNESSES.contains(&harness.as_str()) {
             return Err(format!(
-                "usage_accounts entry {n}: harness must be claude, codex, grok, muse or glm"
+                "usage_accounts entry {n}: harness must be claude, codex, grok, muse, cursor or glm"
             ));
         }
         clean.insert("harness".to_string(), serde_json::Value::String(harness));
@@ -1630,7 +1630,7 @@ fn checked_usage_harness(raw: &str) -> Result<String, String> {
     if USAGE_HARNESSES.contains(&h.as_str()) {
         Ok(h)
     } else {
-        Err("harness must be claude, codex, grok, muse or glm".to_string())
+        Err("harness must be claude, codex, grok, muse, cursor or glm".to_string())
     }
 }
 
@@ -1655,8 +1655,8 @@ fn accounts_try_argv(harness: &str, folder: Option<&str>) -> Result<Vec<String>,
     let h = checked_usage_harness(harness)?;
     let mut argv = vec!["usage".to_string(), "--try".to_string(), format!("--harness={h}")];
     if let Some(f) = folder.map(str::trim).filter(|f| !f.is_empty()) {
-        if h == "muse" || h == "glm" {
-            return Err(format!("{} has one sign-in, so it takes no login folder", if h == "glm" { "GLM" } else { "Muse" }));
+        if h == "muse" || h == "glm" || h == "cursor" {
+            return Err(format!("{} has one sign-in, so it takes no login folder", if h == "glm" { "GLM" } else if h == "cursor" { "Cursor" } else { "Muse" }));
         }
         argv.push(format!("--folder={}", checked_login_folder(f)?));
     }
@@ -1981,7 +1981,7 @@ fn checked_harness(raw: &str) -> Result<String, String> {
     if USAGE_HARNESSES.contains(&h.as_str()) {
         Ok(h)
     } else {
-        Err("harness must be claude, codex, grok, muse or glm".to_string())
+        Err("harness must be claude, codex, grok, muse, cursor or glm".to_string())
     }
 }
 
@@ -7317,9 +7317,11 @@ mod accounts_command_tests {
 
     #[test]
     fn try_refuses_unknown_harnesses_muse_folders_and_bad_folders() {
-        for bad in ["", "cursor", "--harness", "clau\nde", "claude --now", "-claude"] {
+        for bad in ["", "unknown", "--harness", "clau\nde", "claude --now", "-claude"] {
             assert!(accounts_try_argv(bad, None).is_err(), "accepted harness {bad:?}");
         }
+        assert!(accounts_try_argv("cursor", Some("~/.cursor")).is_err());
+        assert_eq!(accounts_try_argv("cursor", None).unwrap(), v(&["usage", "--try", "--harness=cursor"]));
         assert!(accounts_try_argv("muse", Some("~/.muse")).is_err());
         assert!(accounts_try_argv("glm", Some("~/.claude-glm")).is_err());
         assert_eq!(accounts_try_argv("glm", None).unwrap(), v(&["usage", "--try", "--harness=glm"]));
@@ -7330,7 +7332,7 @@ mod accounts_command_tests {
 
     #[test]
     fn cli_settings_save_and_clear_through_config() {
-        for key in ["cli_path.claude", "cli_path.codex", "cli_path.grok", "cli_path.muse"] {
+        for key in ["cli_path.claude", "cli_path.codex", "cli_path.grok", "cli_path.muse", "cli_path.cursor"] {
             assert_eq!(
                 config_set_argv(key, "/opt/tools/bin/cli").unwrap(),
                 v(&["config", "--set", key, "/opt/tools/bin/cli"])
@@ -7351,7 +7353,7 @@ mod accounts_command_tests {
                 assert!(config_set_argv(key, bad).is_err(), "{key} accepted {bad:?}");
             }
         }
-        for unknown in ["cli_path.cursor", "cli_path.", "cli_path", "node", "node_folders"] {
+        for unknown in ["cli_path.unknown", "cli_path.", "cli_path", "node", "node_folders"] {
             assert!(config_set_argv(unknown, "/opt/x").is_err(), "accepted key {unknown:?}");
             assert!(config_unset_argv(unknown).is_err(), "unset accepted key {unknown:?}");
         }

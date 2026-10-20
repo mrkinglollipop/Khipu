@@ -1,3 +1,5 @@
+const CURSOR_NO_FIGURES = "Cursor reports no usage figures; its limits come from runner and conversation reports";
+
 /* Plan usage in the app (docs/plans/2026-10-14-plan-usage.md, phase 2): how
    much of each subscription CLI's plan is left, read from `khipu usage
    --json` through two fixed-argv commands (`khipu_usage_status`, cache first;
@@ -433,7 +435,7 @@ export function liveWords(row: UsageAccount): { text: string; live: boolean; che
 /** The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
  *  each opens the browser and asks nothing on a terminal. */
 const SIGN_IN_CLIS = new Set(["claude", "codex"]);
-const CLI_TITLE: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", muse: "Muse", glm: "GLM Coding Plan" };
+const CLI_TITLE: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", muse: "Muse", glm: "GLM Coding Plan", cursor: "Cursor" };
 
 /** "button" when the app can start this account's own login, "elsewhere"
  *  when the owner signs in from the CLI itself, null when it is live or its
@@ -639,6 +641,7 @@ export function planStatus(row: UsageAccount, now: Date = new Date()): PlanStatu
   }
   if (onlyResetWindows(row, now)) return { figures, say: "Every limit has reset since it was read", tone: "grey", code };
   if (!hasFigures) {
+    if (row.harness === "cursor") return { figures, say: CURSOR_NO_FIGURES, tone: "grey", code };
     if (row.harness === "muse") return { figures, say: MUSE_NO_TURN, tone: "grey", code };
     // A read that worked but found no figures says when it was checked.
     const checked = fmtAgoSince(row.last_attempt_at || row.probed_at);
@@ -868,7 +871,7 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
         </div>
       ) : !windows.length ? (
         <p className="plan-empty">
-          {status.code === "pending" ? "Reading it for the first time." : row.harness === "muse" ? MUSE_NO_TURN : NO_RESETTING_LIMIT}
+          {status.code === "pending" ? "Reading it for the first time." : row.harness === "cursor" ? CURSOR_NO_FIGURES : row.harness === "muse" ? MUSE_NO_TURN : NO_RESETTING_LIMIT}
         </p>
       ) : null}
       <div className="plan-reads">
@@ -981,6 +984,7 @@ export const USAGE_HARNESS_OPTIONS: Array<[string, string]> = [
   ["codex", "Codex"],
   ["grok", "Grok Build"],
   ["muse", "Muse"],
+  ["cursor", "Cursor"],
   ["glm", "GLM Coding Plan"],
 ];
 
@@ -1059,8 +1063,8 @@ export function accountClash(
   const valid = entries.filter((e) => !e.invalid);
   const key = loginKey(entry.home, userHome);
   const login = valid.find((e) => e.harness === entry.harness && loginKey(e.home, userHome) === key);
-  if (login && entry.harness === "muse") {
-    return { field: "name", message: `Muse is already listed as ${login.label}. Muse has one login, so it is read once.` };
+  if (login && (entry.harness === "muse" || entry.harness === "cursor")) {
+    return { field: "name", message: `${harnessName(entry.harness)} is already listed as ${login.label}. ${harnessName(entry.harness)} has one login, so it is read once.` };
   }
   if (login) {
     const where = key ? `the login folder ${entry.home}` : "its default login";
@@ -1122,6 +1126,7 @@ const ACCOUNT_REFUSAL: Record<string, (c: RefusalCtx) => string> = {
       ? `${fieldWords(c)} is too long: use ${LABEL_MAX} characters or fewer.`
       : `${fieldWords(c)} is too long.`,
   unknown_cli: () => "Khipu reads Claude Code, Codex, Grok Build, Muse and the GLM Coding Plan. Choose one of them under CLI.",
+  cursor_folder: () => "Cursor has one sign-in, so leave the Login folder empty.",
   muse_folder: () => "Muse has one sign-in, so leave the Login folder empty.",
   glm_folder: () => "GLM is read with its key, so leave the Login folder empty.",
   zai_home: () => "That login folder runs Claude Code against z.ai, so it is the GLM account. Track GLM instead.",
@@ -1254,7 +1259,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       setClash(null);
       return;
     }
-    const folder = harness === "muse" || harness === "glm" ? null : home.trim() || null;
+    const folder = harness === "muse" || harness === "cursor" || harness === "glm" ? null : home.trim() || null;
     const entry: UsageAccountEntry = {
       label: label.trim() || defaultAccountLabel(harness, folder),
       harness,
@@ -1354,10 +1359,10 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
         <input
           id={`${id}-home`}
           ref={homeRef}
-          value={harness === "muse" || harness === "glm" ? "" : home}
+          value={harness === "muse" || harness === "cursor" || harness === "glm" ? "" : home}
           maxLength={FOLDER_MAX}
-          placeholder={harness === "muse" ? "Muse has one login" : harness === "glm" ? "GLM is read with its key" : "~/.claude-second…"}
-          disabled={harness === "muse" || harness === "glm"}
+          placeholder={harness === "cursor" ? "Cursor has one login" : harness === "muse" ? "Muse has one login" : harness === "glm" ? "GLM is read with its key" : "~/.claude-second…"}
+          disabled={harness === "muse" || harness === "cursor" || harness === "glm"}
           autoComplete="off"
           spellCheck={false}
           aria-invalid={clash === "home" || undefined}

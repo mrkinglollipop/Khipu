@@ -1689,3 +1689,16 @@ describe("Settings -> Routing: nothing shows a false off while it is read", () =
     expect(screen.queryByRole("group", { name: /^A conversation changed:/ })).toBeNull();
   });
 });
+
+it("shows a provider-matched Cursor lane without writing a lane override", async () => {
+  const v = view();
+  v.accounts!.push(acct("Cursor", "cursor", {}));
+  v.sources!.runners = [{ name: "Project A", lanes: ["cursor-grok"], unmatched_lanes: [],
+    lane_matches: { "cursor-grok": { account: "Cursor", matched_by: "provider", candidates: ["Cursor"] } } }];
+  answers.khipu_route_view = v;
+  await page();
+  const lanes = await screen.findByRole("list", { name: "Project A lanes" });
+  expect(lanes).toHaveTextContent("Cursor · matched by provider");
+  expect(within(lanes).queryByText("Not matched")).toBeNull();
+  expect(calls("khipu_config_set")).toEqual([]);
+});

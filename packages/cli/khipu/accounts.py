@@ -107,7 +107,7 @@ def normal_key(key) -> str:
     harness, _, home = key.partition("|")
     harness = harness.strip().lower()
     if harness not in usage.HARNESSES:
-        raise AccountsError("that names no CLI Khipu reads (claude, codex, grok, muse, glm)", "not_tracked")
+        raise AccountsError("that names no CLI Khipu reads (claude, codex, grok, muse, glm, cursor)", "not_tracked")
     return usage._key({"harness": harness, "home": home.strip() or None})
 
 
@@ -855,7 +855,7 @@ def offer_again(harness: str, folder=None) -> dict:
 def _harness(raw) -> str:
     harness = str(raw or "").strip().lower()
     if harness not in usage.HARNESSES:
-        raise AccountsError("that names no CLI Khipu reads (claude, codex, grok, muse, glm)", "unknown_cli",
+        raise AccountsError("that names no CLI Khipu reads (claude, codex, grok, muse, glm, cursor)", "unknown_cli",
                             field="harness")
     return harness
 

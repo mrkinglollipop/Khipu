@@ -205,7 +205,7 @@ function ComingNote({ id, text }: { id: string; text: string }) {
 }
 
 function loginTitle(c: Candidate): ReactNode {
-  if (c.cli === "muse") return <>Muse, one login on this Mac</>;
+  if (c.cli === "muse" || c.cli === "cursor") return <>{serviceName(c.cli)}, one login on this Mac</>;
   if (c.cli === "glm") return <>GLM Coding Plan, read with its key</>;
   if (c.default) {
     return (
@@ -222,7 +222,7 @@ function loginTitle(c: Candidate): ReactNode {
 }
 
 function shownPath(c: Candidate): string {
-  return c.cli === "muse" ? "Muse" : c.cli === "glm" ? "GLM" : c.path ?? `the ${serviceName(c.cli)} default login`;
+  return (c.cli === "muse" || c.cli === "cursor") ? serviceName(c.cli) : c.cli === "glm" ? "GLM" : c.path ?? `the ${serviceName(c.cli)} default login`;
 }
 
 /** The Found rows, as listitems inside the Accounts list. */
@@ -478,7 +478,7 @@ export function NotOfferedAgain({
           ) : (
             <div className="aa-rows" role="list" aria-label="Logins Khipu won't offer again">
               {list.map((e, i) => {
-                const where = e.cli === "muse" ? "Muse" : e.cli === "glm" ? "GLM" : e.path ?? `${serviceName(e.cli)} default login`;
+                const where = (e.cli === "muse" || e.cli === "cursor") ? serviceName(e.cli) : e.cli === "glm" ? "GLM" : e.path ?? `${serviceName(e.cli)} default login`;
                 const when = e.at ? new Date(e.at) : null;
                 const date = when && !Number.isNaN(when.getTime()) ? ` on ${when.toLocaleDateString([], { month: "short", day: "numeric" })}` : "";
                 return (
@@ -960,7 +960,7 @@ export function StopTrackingDialog({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [stale, setStale] = useState(false);
-  const folder = account.harness === "muse" ? "Muse's one login" : account.harness === "glm" ? "the GLM key" : account.home ?? `the default login ${account.harness === "claude" ? "~/.claude" : account.harness === "codex" ? "~/.codex" : "~/.grok"}`;
+  const folder = (account.harness === "muse" || account.harness === "cursor") ? `${serviceName(account.harness)}'s one login` : account.harness === "glm" ? "the GLM key" : account.home ?? `the default login ${account.harness === "claude" ? "~/.claude" : account.harness === "codex" ? "~/.codex" : "~/.grok"}`;
   async function stop() {
     if (!here) return;
     const expect = readVersion(support);

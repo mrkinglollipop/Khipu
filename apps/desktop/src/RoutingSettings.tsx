@@ -2846,7 +2846,7 @@ function FoldersSection({
   const query = searchLanes ? lists.laneQuery.trim() : "";
   const laneSearchId = `lane-search-${base}`;
   const laneSearch = useRef<HTMLInputElement>(null);
-  const laneMatches = (name: string, lane: string) => !query || matchesQuery(query, lane, name, map[name]?.[lane]);
+  const laneMatches = (name: string, lane: string) => !query || matchesQuery(query, lane, name, map[name]?.[lane], runners.find((r) => r.name === name)?.lane_matches?.[lane]?.account ?? undefined);
   const matchingLanes = laneGroups.reduce((n, g) => n + g.lanes.filter((l) => laneMatches(g.name, l)).length, 0);
   const hiddenNoAccount = data
     ? lanesWithoutAccount(data, { routing: cfg?.routing ?? null, push: null }).filter(
@@ -2859,7 +2859,9 @@ function FoldersSection({
     return (
       <div className="lane-sub" role="list" aria-label={`${name} lanes`}>
         {shownLanes.map((lane) => (
-          <LaneRow key={lane} runner={name} lane={lane} target={map[name]?.[lane]} accounts={accounts} w={w} reread={reread} />
+          <LaneRow key={lane} runner={name} lane={lane} target={map[name]?.[lane]}
+            match={runners.find((r) => r.name === name)?.lane_matches?.[lane]}
+            accounts={accounts} w={w} reread={reread} />
         ))}
       </div>
     );
@@ -3110,6 +3112,7 @@ function LaneRow({
   runner,
   lane,
   target,
+  match,
   accounts,
   w,
   reread,
@@ -3117,12 +3120,14 @@ function LaneRow({
   runner: string;
   lane: string;
   target: string | undefined;
+  match?: { account: string | null; matched_by: string | null; candidates: string[] };
   accounts: RouteAccount[];
   w: Writer;
   reread: () => Promise<unknown>;
 }) {
-  const known = target ? accounts.find((a) => a.label === target || a.key === target) : undefined;
-  const [open, setOpen] = useState(!target);
+  const resolved = target || match?.account;
+  const known = resolved ? accounts.find((a) => a.label === resolved || a.key === resolved) : undefined;
+  const [open, setOpen] = useState(!resolved);
   const [choice, setChoice] = useState(known?.label ?? "");
   const selId = `lane-${useId().replace(/:/g, "")}`;
   const id = `lane:${runner}/${lane}`;
@@ -3156,7 +3161,8 @@ function LaneRow({
       <span aria-hidden>→</span>
       {open ? (
         <form className="toolbar" aria-label={`Account for ${runner}'s ${lane} lane`} onSubmit={save}>
-          {!target ? <Tag tone="warn">Not matched</Tag> : null}
+          {!resolved ? <Tag tone="warn">Not matched</Tag> : null}
+          {!resolved && !!match?.candidates.length ? <span>Candidates: {match.candidates.join(", ")}</span> : null}
           <label className="sr-only" htmlFor={selId}>
             Account for {lane}
           </label>
@@ -3180,7 +3186,8 @@ function LaneRow({
         </form>
       ) : (
         <span>
-          {known?.label ?? target}
+          {known?.label ?? resolved}
+          {!target && match?.matched_by ? <span className="t2"> · matched by {match.matched_by}</span> : null}
           {!known ? (
             <>
               {" "}

@@ -175,9 +175,9 @@ describe("Add an account: step 1, the service", () => {
     expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
   });
 
-  it("nothing installed: all four not installed, download pages and Choose the CLI…, Next off", () => {
+  it("nothing installed: all five not installed, download pages and Choose the CLI…, Next off", () => {
     render(<Dialog disc={discovery({ clis: CLIS_NONE })} tracked={[]} />);
-    expect(screen.getAllByText("Not installed")).toHaveLength(4);
+    expect(screen.getAllByText("Not installed")).toHaveLength(5);
     expect(screen.getByRole("link", { name: "Claude Code download page" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Codex download page" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Choose the CLI…" })).toBeInTheDocument();
@@ -1166,5 +1166,26 @@ describe("every account save carries the version it read", () => {
     expect(versionRefused({ ok: false, error: "the account list save needs the version it read; reload and try again" })).toBe(true);
     expect(versionRefused({ ok: false, error: "x", refusal: { code: "version_needed" } })).toBe(true);
     expect(versionRefused({ ok: false, error: "taken", refusal: { code: "name_taken" } })).toBe(false);
+  });
+});
+
+describe("Cursor uses the existing single-login account flow", () => {
+  const cursor = { cli: "cursor" as const, cli_name: "Cursor", path: "/fake/cursor-agent", state: "installed" as const,
+    version: "2026.10.19", reason: null };
+  it("offers Cursor and proceeds directly to its existing login", async () => {
+    fakeKhipu();
+    render(<Dialog tracked={[]} disc={discovery({ clis: { cursor } })} start={{ cli: "cursor", step: 1 }} />);
+    expect(screen.getByRole("radio", { name: /Cursor/ })).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await screen.findByText(/Cursor's one login on this Mac\./);
+    expect(screen.queryByLabelText("Login folder")).toBeNull();
+    await waitFor(() => expect(calls("khipu_accounts_try")).toHaveLength(1));
+    expect(calls("khipu_accounts_try")[0][1]).toEqual({ harness: "cursor", folder: null });
+  });
+  it("does not offer a duplicate Cursor login", () => {
+    render(<Dialog tracked={[{ harness: "cursor", label: "Cursor" }]}
+      disc={discovery({ clis: { cursor } })} start={{ cli: "cursor", step: 1 }} />);
+    expect(screen.getByRole("radio", { name: /Cursor/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
   });
 });

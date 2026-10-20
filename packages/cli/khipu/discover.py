@@ -57,7 +57,7 @@ from types import MappingProxyType
 
 from khipu import claude_homes, t3, usage
 
-CLIS = ("claude", "codex", "grok", "muse")
+CLIS = ("claude", "codex", "grok", "muse", "cursor")
 FOLDER_CLIS = ("claude", "codex", "grok")
 NAME_RE = re.compile(r"^\.(claude|codex|grok)(-[A-Za-z0-9._-]+)?$")
 _SKIP_ENDINGS = ("-backup", "-backups", "-logs")
@@ -70,6 +70,7 @@ T3_DRIVERS = MappingProxyType({t3.CLAUDE_DRIVER: "claude", t3.CODEX_DRIVER: "cod
 # The only argv discovery builds, by lookup, never from text.
 STATUS_ARGV = MappingProxyType({"claude": ("auth", "status", "--json"), "codex": ("login", "status")})
 VERSION_ARGV = ("--version",)
+CURSOR_ABOUT_ARGV = ("about", "--format", "json")
 # CLIs whose status check writes into the folder it is asked about (decision 20).
 WRITES_WHEN_CHECKED = frozenset({"claude", "codex", "grok"})
 
@@ -564,7 +565,8 @@ def argv_allowed(cli: str, argv) -> bool:
     binary, rest = argv[0], argv[1:]
     if not isinstance(binary, str) or not binary or not os.path.isabs(binary):
         return False
-    return rest == VERSION_ARGV or (cli in STATUS_ARGV and rest == STATUS_ARGV[cli])
+    return (rest == VERSION_ARGV or (cli in STATUS_ARGV and rest == STATUS_ARGV[cli])
+            or (cli == "cursor" and rest == CURSOR_ABOUT_ARGV))
 
 
 def run_once(cli: str, argv, *, home: str | None = None, timeout: float | None = None,
@@ -711,6 +713,8 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
         return settle(*_from_probe(usage.probe_grok(home, timeout=left())))
     if cli == "muse":
         return settle(*_from_probe(usage.probe_muse(timeout=left(), turn=False)))
+    if cli == "cursor":
+        return settle(*_from_probe(usage.probe_cursor(timeout=left())))
     return COULDNT_CHECK, R_BAD, None
 
 

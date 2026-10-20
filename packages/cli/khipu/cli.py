@@ -2309,7 +2309,7 @@ def cmd_usage(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(rep, indent=2))
     elif not rep["accounts"]:
-        print("No subscription account found (claude, codex, grok, muse, glm); set usage_accounts in config.json.")
+        print("No subscription account found (claude, codex, grok, muse, glm, cursor); set usage_accounts in config.json.")
     else:
         print(usage.table(rep))
     return 0
@@ -5640,7 +5640,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Check one found login folder now (the owner's Check; the CLI may write into it)")
     us.add_argument("--try", dest="try_account", action="store_true",
                     help="One read of an account that is not saved: --harness H and optionally --folder F")
-    us.add_argument("--harness", default=None, choices=("claude", "codex", "grok", "muse", "glm"),
+    us.add_argument("--harness", default=None, choices=("claude", "codex", "grok", "muse", "glm", "cursor"),
                     help="With --try: the CLI")
     us.add_argument("--folder", default=None, metavar="F",
                     help="With --try: the login folder (~/... or a full path); none = the default login")
@@ -6282,7 +6282,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, words in (("decline", "Not this one: do not offer this login again"),
                         ("offer-again", "Offer a login turned down again")):
         adec = acc_sub.add_parser(name, parents=[acc_owner], help=words)
-        adec.add_argument("--harness", required=True, choices=("claude", "codex", "grok", "muse", "glm"))
+        adec.add_argument("--harness", required=True, choices=("claude", "codex", "grok", "muse", "glm", "cursor"))
         adec.add_argument("--folder", default=None, metavar="F", help="The login folder; none = the default login")
     aauto = acc_sub.add_parser("auto-track", parents=[acc_owner],
                                help="Track found logins a conversation used without asking (on this Mac)")
