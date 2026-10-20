@@ -144,8 +144,14 @@ the trailing average".
   - An account whose probe is costly (Grok's starts a whole agent) samples at the weekly interval for every
     window. Its five-hour verdict is then usually "unknown", and the line says so.
 - **Cycle identity is a canonical partition of reset times, independent of the witness buckets.**
-  - **With a provider cycle id** (a probe that reports a window or cycle id; none does today), the cycle is
-    that id.
+  - **With a provider cycle id** (a probe that reports one; none does today), the cycle is that id, but only
+    if the id is unique to one reset cycle. A reusable window id such as "weekly" or "five_hour" names the
+    window, not the cycle, and never merges successive resets. Such ids are ignored for cycle identity, and
+    the estimates are grouped as below.
+  - **When ids are mixed,** some readings carrying a unique cycle id and some carrying none, the id-bearing
+    readings define their cycles. An id-less reading joins a cycle only if its reset estimate falls within
+    that cycle's single-linkage component. Otherwise it is grouped with the other id-less readings, as
+    below.
   - **Otherwise cycles are connected components of the reset estimates under single linkage.**
     - Sort one account window's reset estimates. Consecutive estimates no more than **G = 1 hour** apart
       join, and a cycle is a resulting connected component.
@@ -274,7 +280,9 @@ Each target is computed separately. The schema carries each one apart.
     average". For example, a steady 0.5 an hour keeps S at 12 against 13: near, with no time.
   - The output also carries `settles_at_pct` = 24 · r, where the rolling day ends up if r holds.
 - **Both caps at once.** Each is computed independently. The **headline** is the most urgent: cap reached or
-  over, then the earliest run-out among the plan limit and the share cap, then near, then the rest.
+  over; then the earliest crossing among the plan limit's run-out, the share cap's run-out and the daily cap's
+  `reaches_cap_at`; then near; then the rest. A daily cap 2 hours from its crossing beats a plan run-out 120
+  hours away.
 - **Schema** (`khipu_route`, per account and window):
 
   ```
@@ -438,11 +446,15 @@ One canonical identity mapping covers hooks, MCP, provider switches and children
   a subagent's MCP call is not the parent's view. Duplicates are never allowed within one component: within
   a component, hook and MCP deliveries reserve what they send as in flight under one lock.
 - **Which component's ack counts for delivery health** (section 9). This depends on what the client can do:
-  - **Hooked conversations** (Claude Code, Codex, job-runner jobs). These are conversations whose ledger has
-    had a hook delivery, so Khipu knows the hooks reach them. `main` counts, and `mcp` acks don't, because a
-    subagent may have made the call.
-  - **Pull-only conversations** (Aegis, Grok Build, gateway clients). These are known by harness or by the
-    gateway principal, and they have no hook delivery. `mcp` counts.
+  - **Capability comes from the current attachment, never from history.** Each delivery records the
+    harness of the conversation's attachment at that moment: the provider now serving it, from the hook
+    payload or the MCP caller's environment. Health judges a change by the capability of the attachment
+    current when the change was owed and delivered.
+  - **Hooked attachments** (Claude Code, Codex, job-runner jobs). `main` counts, and `mcp` acks don't,
+    because a subagent may have made the call.
+  - **Pull-only attachments** (Aegis, Grok Build, gateway clients). `mcp` counts.
+  - So after a T3 switch from a hooked provider to a pull-only one, valid MCP acks clear stalled health, even
+    though the conversation's ledger once had hook deliveries. A switch back makes `main` count again.
   - **A child's ack never satisfies its parent.** `agent:<id>` acks count only for that subagent. A Codex or
     T3 child is its own conversation. On a pull-only client, a child must pass its own session id
     `<parent>/<child>` (the MCP instructions say so). A session id containing `/` is a child, and its ack
@@ -626,7 +638,7 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 3 | Eight changes against a 400-character budget: all shown within the budget-aware bound; no ack without a show | hermetic | 6 |
 | 4 | Proposals: two conversations take turns, the first is told it was replaced, neither is refused; a delayed retry after an owner write is crossed; expiry and Undo leave the owner revision and never revive a replaced proposal; a dispatched job's owner act is refused; with proposal text off, Mac B shows the placeholder and converges at confirmation | hermetic | 5 (Mac part: 11b) |
 | 5 | "Codex is low" against a 96% reading is marked; a structured claim expires at the reset | hermetic | 4 |
-| 6 | Pull protocol: no identity consumes nothing; a dropped response is re-sent; a duplicate ack is a no-op; an ack for another component or identity is refused; hook and MCP in one component never double-send; `main` and `mcp` duplicates are named; routing additions on error results are scrubbed | hermetic | 7 |
+| 6 | Pull protocol: no identity consumes nothing; a dropped response is re-sent; a duplicate ack is a no-op; an ack for another component or identity is refused; hook and MCP in one component never double-send; `main` and `mcp` duplicates are named; routing additions on error results are scrubbed; after a provider switch from a hooked attachment to a pull-only one, valid MCP acks clear stalled health | hermetic | 7 |
 | 7a | Claude Code subagent: the child block arrives before its first step with an oversized summary; deferred pages arrive on its tool results | received context | 8a |
 | 7b | Codex `spawn_agent` child: no routing reaches it; a brief without routing gets the advisory line on the parent's result | received context | 8b |
 | 7c | T3: a Claude Code to Codex switch in one thread keeps one ledger; a T3 child without Khipu's hooks is named in doctor | received context | 8c |
@@ -640,7 +652,7 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 14 | Scanner: flags the two live notes; passes capability rows, evidence dates and quoted history | hermetic | 13 |
 | 15 | Health: each red condition turns red and back to green on its own evidence | hermetic | 16 |
 | 16a | Pace inputs: the extractor's sentinel tests; `pace_fixture_v1` rejects any other key; relative, rounded and repeated readings never become fresh samples; two Macs' samples with the same time and different values, a skewed clock, and different reset times merge to identical buckets in opposite arrival orders; two-minute samples over 24 h make consecutive buckets, not one cluster; a late reading changes only what it would have changed on time; 95% then 1% within 150 s is a possible reset, settled by the next readings either way; an earlier replacement `resets_at` carried by fresh readings wins over stale metadata | hermetic | 4Pa |
-| 16b | Pace results: Codex's gap example gives 1 point an hour; (−6 h, 0%), (6 h, 6%), (24 h, 15%) computes 12, not 15, but is `unknown` with `observed_pct` 0%; readings every 30 minutes at 0.5 an hour give 12 with 100%; Codex's aging-out case crosses 13 at 1.109 minutes (exact walk) with `peak_pct` 13.026 at 4 minutes, where a 15-minute scan would miss it; cycle grouping, each case in every arrival order: 14:59 and 30:01 with no middle reading form one cycle; 14:59, 15:00, 30:00, 45:00 and 60:01 (a 45 min 02 s span) form one cycle and are not ambiguous; R, R + 4 min and R + 8 min form one cycle; 14:59, 29:59 and 30:01 form one cycle; a component spanning more than 1 h gives `unknown` with "reset time spread over more than an hour"; two resets 5 h apart are two cycles; a reset inside the day contributes zero across its interval and no interpolated drop; a steady 0.5 an hour against a daily cap of 13 gives near with no time; a rising rate gives a `reaches_cap_at` that accounts for usage aging out; long gaps lower `observed_pct` and mark the line gappy; synthetic outpace, underpace and on-pace; a reset mid-window; a correction drop; a possible-reset drop later confirmed and later refuted; coverage below the floor gives `unknown` with its reason; zero burn; limit and cap already reached; a reset time passed; a share cap and a daily cap together, carried apart in the schema; the sanitized real history within its `t_err` | hermetic | 4Pb |
+| 16b | Pace results: Codex's gap example gives 1 point an hour; (−6 h, 0%), (6 h, 6%), (24 h, 15%) computes 12, not 15, but is `unknown` with `observed_pct` 0%; readings every 30 minutes at 0.5 an hour give 12 with 100%; Codex's aging-out case crosses 13 at 1.109 minutes (exact walk) with `peak_pct` 13.026 at 4 minutes, where a 15-minute scan would miss it; cycle grouping, each case in every arrival order: 14:59 and 30:01 with no middle reading form one cycle; 14:59, 15:00, 30:00, 45:00 and 60:01 (a 45 min 02 s span) form one cycle and are not ambiguous; R, R + 4 min and R + 8 min form one cycle; 14:59, 29:59 and 30:01 form one cycle; a component spanning more than 1 h gives `unknown` with "reset time spread over more than an hour"; two resets 5 h apart are two cycles; a reusable provider window id ("weekly") on two successive resets gives two cycles, and a unique provider cycle id groups its readings; mixed readings with and without ids group as specified; a daily cap 2 h from its crossing is the headline over a plan run-out 120 h away; a reset inside the day contributes zero across its interval and no interpolated drop; a steady 0.5 an hour against a daily cap of 13 gives near with no time; a rising rate gives a `reaches_cap_at` that accounts for usage aging out; long gaps lower `observed_pct` and mark the line gappy; synthetic outpace, underpace and on-pace; a reset mid-window; a correction drop; a possible-reset drop later confirmed and later refuted; coverage below the floor gives `unknown` with its reason; zero burn; limit and cap already reached; a reset time passed; a share cap and a daily cap together, carried apart in the schema; the sanitized real history within its `t_err` | hermetic | 4Pb |
 | 16c | Pace pushes: a five-hour run-out moving from 1 h to 10 min while still outpacing pushes; readings alternating at 59 min 59 s and 60 min 01 s push once; a rate hovering at 1.15 n doesn't flip the verdict; a change of limiting window, cycle, cap revision or availability pushes; small moves measured against the last acknowledged forecast push once they add up; numbers alone don't push | hermetic | 4Pa |
 
 ## Slices
@@ -822,6 +834,11 @@ component spanning more than S = 1 h is ambiguous and reads `unknown`. The cell 
 are gone. The rounds 5 and 6 entries above describe the rules they replaced. Case 16b gains Codex's six
 grouping cases, each in every arrival order. The scanner's predicate now includes priority and ordering
 claims. No disagreements this round.
+
+**Round 8.** Codex called the scope ready. Its three P2s are folded in: a provider cycle id counts only when it
+is unique to one reset cycle, with mixed ids handled; the headline's earliest crossing includes the daily cap;
+and delivery health uses the current attachment's capability, so a switch to a pull-only provider clears with
+MCP acks. No disagreements this round.
 
 ## Known limits
 
