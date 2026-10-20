@@ -125,7 +125,7 @@ Each slice is one session and one PR, merged on its own. The oracle is hermetic 
 4. **Server guard rails.** The read role and second DSN, reserved connections, the server settings, the doctor check, Docker setup, and gateway search on the read role. Oracle: on a hermetic Postgres, saturate the read role and show a capture still lands within 2 s; kill a client and show its backend ends within 15 s. Stop before the Linode (Decision 2).
 5. **Acceptance load test.** Design item E, kept as a script the promotion gate can run. Never tune thresholds to pass.
 
-## Immediate server changes (recommended now, not applied)
+## Immediate server changes (applied 2026-10-20 ~00:05Z on Matt's go)
 
 Each one applies with `SELECT pg_reload_conf()`, needs no restart, and is undone with `ALTER SYSTEM RESET <name>` (`DROP INDEX CONCURRENTLY` for the index).
 
