@@ -197,6 +197,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_cloud_copy": ("switch", False, "Copy for cloud agents"),
     "routing_cloud_copy_hold_words": ("switch", False, "Include hold words in the copy"),
     "routing_cloud_copy_rules": ("switch", False, "Include the rules and the note in the copy"),
+    "routing_proposal_text_between_macs": ("switch", True, "Proposal text between your Macs"),
     "routing_cloud_copy_stale_after": ("duration", 600, "The copy counts as out of date after"),
     "routing_cloud_copy_debounce": ("duration", 30, "Wait for a burst of changes to end before copying"),
 }
@@ -2990,6 +2991,40 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     clear_stacks: dict[str, list[dict]] = {}
     holds: dict[str, dict] = {}
     rules: dict[str, dict] = {}
+    # One live proposal may overlay each entity's newest owner revision.
+    # Replaced and crossed proposals are terminal: they never overlay again.
+    proposals: dict[str, dict] = {}
+    live_proposals: dict[str, str] = {}
+    priority_owner_revision = "0"
+
+    def proposal_key(event: dict) -> str:
+        return event.get("proposal") or event.get("id") or event_identity.revision(event)
+
+    def start_proposal(entity_key: str, kind: str, event: dict, info: dict, owner_revision: str) -> bool:
+        """Register a pending write as the entity's live proposal. A write
+        based on an older owner revision is crossed: it is recorded and its
+        author is named for notification, but it never takes effect and it
+        never displaces a live proposal."""
+        key = proposal_key(event)
+        base = event.get("base")
+        record = {"id": key, "entity": entity_key, "kind": kind, "base": base,
+                  "author": info["written_by"], "written_by": info["written_by"],
+                  "at": _iso(info["at"]), "notify": None}
+        if base is not None and base != owner_revision:
+            proposals[key] = dict(record, status="crossed", notify=info["written_by"])
+            return False
+        previous = live_proposals.get(entity_key)
+        if previous is not None and previous != key and previous in proposals:
+            proposals[previous] = dict(proposals[previous], status="replaced",
+                                       replaced_by=key, notify=proposals[previous]["written_by"])
+        proposals[key] = dict(record, status="live")
+        live_proposals[entity_key] = key
+        return True
+
+    def end_proposal(entity_key: str, status: str) -> None:
+        key = live_proposals.pop(entity_key, None)
+        if key is not None and key in proposals:
+            proposals[key] = dict(proposals[key], status=status)
     hold_ends: dict[str, datetime] = {}
     note: dict | None = None
     priority: dict | None = None
@@ -3091,6 +3126,20 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 for account, paused in owner["pauses"].items():
                     if target in (paused["id"], event_identity.derived("pause", account)):
                         owner["lifts"][account] = info
+        # A pending write is registered as a proposal before it can overlay
+        # anything; a crossed one is recorded here and applied nowhere below.
+        # Writers stamp a priority proposal's base from the last non-pending
+        # priority line (``_identify_locked``), so the fold tracks the same.
+        if isinstance(kind, str) and kind.startswith("priority_") and not event.get("pending"):
+            priority_owner_revision = event_identity.revision(event)
+        proposal_crossed = False
+        if event.get("pending") and kind == "rule_add" and entity:
+            proposal_crossed = not start_proposal(entity, "rule", event, info, "0")
+        elif event.get("pending") and kind == "rule_edit" and entity in rules:
+            proposal_crossed = not start_proposal(entity, "rule", event, info, rules[entity]["owner_revision"])
+        elif event.get("pending") and kind == "priority_set":
+            proposal_crossed = not start_proposal(entity or "priority", "priority", event, info,
+                                                  priority_owner_revision)
         touched = _touched(kind, event, info)
         if kind in event_identity.RULE_CHANGES and entity in rules:
             touched = _rule_component(rules[entity])
@@ -3137,7 +3186,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             for held in holds.values():
                 if held["entity"] == entity:
                     held.setdefault("ended_at", info["at"])
-        elif kind == "rule_add" and entity and isinstance(event.get("text"), str):
+        elif kind == "rule_add" and entity and isinstance(event.get("text"), str) and not proposal_crossed:
             pending = bool(event.get("pending"))
             rules[entity] = {"entity": entity,
                                  "component": _rule_add_component(event),
@@ -3155,7 +3204,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                  "pending_author": info["written_by"] if pending else None,
                                  "written_by": info["written_by"], "via": info["via"], "at": info["at"]}
         elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_unconfirm",
-                      "rule_dismiss") and entity in rules:
+                      "rule_dismiss") and entity in rules and not proposal_crossed:
             rule = rules[entity]
             rule["revision"] = event_identity.revision(event)
             if not event.get("pending") and kind not in ("rule_undo", "rule_dismiss"):
@@ -3177,6 +3226,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                     # unless it replaced a seeded rule the owner never confirmed.
                     rule.update(pending=False, pending_kind=None, prior_text=None, prior_confirmed=None, pending_by=None,
                                 pending_author=None, confirmed=not rule["seeded"] or bool(prior_confirmed))
+                    end_proposal(entity, "overtaken")
             elif kind == "rule_retire":
                 rule["retired"] = True
             elif kind == "rule_restore":
@@ -3184,42 +3234,63 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             elif kind == "rule_confirm":
                 rule.update(confirmed=True, pending=False, pending_kind=None, prior_text=None, prior_confirmed=None,
                             pending_by=None, pending_author=None)
+                end_proposal(entity, "confirmed")
             elif kind == "rule_undo" and isinstance(rule.get("prior_text"), str):
                 rule.update(text=rule["prior_text"], pending=False, pending_kind=None, prior_text=None,
                             prior_confirmed=None, pending_by=None, pending_author=None,
                             confirmed=bool(rule.get("prior_confirmed")))
+                end_proposal(entity, "undone")
             elif kind == "rule_unconfirm" and rule["seeded"]:
                 rule["confirmed"] = False
             elif kind == "rule_dismiss":
-                rule["retired"] = True
+                # Dismiss ends the proposal, not the owner revision beneath
+                # it: a changed rule returns to the owner's words, and only
+                # a proposed addition leaves nothing behind.
+                if rule.get("pending") and isinstance(rule.get("prior_text"), str):
+                    rule.update(text=rule["prior_text"], pending=False, pending_kind=None, prior_text=None,
+                                prior_confirmed=None, pending_by=None, pending_author=None,
+                                confirmed=bool(rule.get("prior_confirmed")))
+                else:
+                    rule["retired"] = True
+                end_proposal(entity, "dismissed")
             rule.update(written_by=info["written_by"], via=info["via"], at=info["at"])
         elif kind == "note_set" and isinstance(event.get("text"), str):
             note = {"text": event["text"], "at": info["at"], "written_by": info["written_by"], "via": info["via"]}
         elif kind == "note_end":
             note = None
-        elif kind == "priority_set" and isinstance(event.get("entries"), list):
+        elif kind == "priority_set" and isinstance(event.get("entries"), list) and not proposal_crossed:
             pending = bool(event.get("pending"))
             new = {"entries": event["entries"], "until": info["until"], "at": info["at"],
                    "written_by": info["written_by"], "via": info["via"], "pending": pending,
-                   "owner_request": event.get("owner_request") if pending else None, "prior": None}
+                   "owner_request": event.get("owner_request") if pending else None, "prior": None,
+                   "_owner_revision": priority_owner_revision}
             if pending:
                 # Undo brings back what the owner last had: a second request
                 # before he answers keeps the priority the first replaced.
                 new["prior"] = priority["prior"] if priority and priority["pending"] else priority
+            else:
+                new["_owner_revision"] = event_identity.revision(event)
+                priority_owner_revision = new["_owner_revision"]
+                end_proposal(entity or "priority", "overtaken")
             priority = new
             priority_version = _priority_mark(event)
         elif kind == "priority_confirm" and priority is not None and priority["pending"]:
             # Confirmed, it is the owner's: his write, through the app or a typed yes.
+            priority_owner_revision = event_identity.revision(event)
             priority = dict(priority, pending=False, prior=None, confirmed_at=info["at"],
-                            written_by=info["written_by"], via=info["via"])
+                            written_by=info["written_by"], via=info["via"],
+                            _owner_revision=priority_owner_revision)
+            end_proposal(entity or "priority", "confirmed")
             priority_version = _priority_mark(event)
         elif kind == "priority_undo" and priority is not None and priority["pending"]:
             priority = priority["prior"]
+            end_proposal(entity or "priority", "undone")
             priority_version = _priority_mark(event)
         elif kind == "priority_clear":
             if priority is not None:
                 priority_version = _priority_mark(event)
             priority = None
+            end_proposal(entity or "priority", "overtaken")
         elif kind == "priority_drop" and priority is not None and info["account"]:
             # An account the owner stopped tracking leaves the priority, a
             # conversation's request waiting for him and the one it replaced
@@ -3248,6 +3319,29 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                     lane_cuts[(pair[0], pair[1])] = (info["seq"], info["at"])
         elif kind == "seed_import":
             seed = {"at": _iso(info["at"]), "file": event.get("file"), "count": event.get("count")}
+    # A proposal lives for seven days. Expiry ends only the overlay: the
+    # owner revision underneath (or, for a proposed addition, nothing)
+    # remains, and a replaced or crossed proposal never returns.
+    for entity_key, key in list(live_proposals.items()):
+        written = _parse(proposals[key].get("at"))
+        if written is None or now < written + timedelta(days=7):
+            continue
+        proposals[key] = dict(proposals[key], status="expired")
+        del live_proposals[entity_key]
+        if proposals[key]["kind"] == "priority":
+            if priority is not None and priority.get("pending"):
+                priority = priority.get("prior")
+        elif entity_key in rules:
+            rule = rules[entity_key]
+            if rule.get("pending_kind") == "added":
+                rule.update(retired=True, pending=False, pending_kind=None, prior_text=None,
+                            prior_confirmed=None, pending_by=None, pending_author=None)
+            elif isinstance(rule.get("prior_text"), str):
+                rule.update(text=rule["prior_text"], pending=False, pending_kind=None, prior_text=None,
+                            prior_confirmed=None, pending_by=None, pending_author=None,
+                            confirmed=bool(rule.get("prior_confirmed")))
+            else:
+                rule.update(pending=False, pending_kind=None, pending_by=None, pending_author=None)
     evidence.extend(dict(item, seq=item.get("seq", -1)) for item in extra)
 
     by_key = {a["key"]: dict(a) for a in known}
@@ -3432,6 +3526,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
 
     # The next change the clock alone will cause.
     times: list[datetime] = []
+    for key in live_proposals.values():
+        written = _parse(proposals[key].get("at"))
+        if written is not None:
+            times.append(written + timedelta(days=7))
     for item in evidence:
         if item["state"] == LIMITED and item["until"] and item["until"] > now:
             times.append(item["until"])
@@ -3491,6 +3589,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         if values:
             effective["definition:" + name] = values
     return {"accounts": entries, "holds": active_holds, "rules": active_rules, "note": note_out,
+            "proposals": proposals,
             "machine_holds": machine_holds,
             "definitions": definitions,
             "priority": priority_out, "priority_version": priority_version, "priority_ended": priority_ended,
@@ -5242,9 +5341,6 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
     # between them must become the wording Undo restores.
     with _lock():
         rule = _rule(n, now)
-        if rule.get("pending") and not _same_author(rule.get("pending_author"), by):
-            raise RouteError(f"standing rule {rule['n']} has "
-                             f"{_pending_collision(rule.get('pending_author'), rule.get('at'), str(read_view(now)['version']), now)}")
         prior = rule.get("prior_text") if rule.get("pending") else rule["text"]
         prior_confirmed = rule.get("prior_confirmed") if rule.get("pending") else rule["confirmed"]
         written, view = _write({"type": "rule_edit", **_rule_target(rule), "text": text.strip(), "pending": True,
@@ -5252,21 +5348,6 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
                                 "owner_request": request_words, "written_by": by, "via": via, "op": op,
                                 **({"holds": holds} if holds is not None else {})})
     return dict(_done(written, view), n=rule["n"])
-
-
-def _same_author(a: dict | None, b: dict | None) -> bool:
-    """One conversation, by what Khipu set (never the name it gives itself)."""
-    keys = ("kind", "harness", "project", "session")
-    return isinstance(a, dict) and isinstance(b, dict) and all(a.get(k) == b.get(k) for k in keys)
-
-
-def _pending_collision(author: dict | None, at, version: str, now: datetime) -> str:
-    by = author_words(author or {"kind": "conversation", "harness": UNKNOWN_HARNESS})
-    when = _ago(_parse(at), now) if _parse(at) else "at an unknown time"
-    return (f"an unconfirmed change from another conversation ({by}), {when}, is pending at current version {version}; "
-            "that conversation may replace it, or the owner can replace, confirm or undo it by owner direction "
-            "(`khipu owner-direction`), "
-            "in Settings → Routing or on a terminal")
 
 
 def retire_rule(n, *, via: str, now: datetime | None = None) -> dict:
@@ -5475,8 +5556,8 @@ def request_priority(entries, *, until=None, owner_request: str | None = None, a
     marked with that conversation and unconfirmed, with the priority it
     replaced kept for Undo. ``expect`` is the priority's version as read,
     required, so of two requests made on one read only the first lands. A
-    request waiting from another conversation is the owner's to answer
-    first, as with a standing rule."""
+    newer request on the same owner revision replaces a waiting one, as
+    with a standing rule; the replaced author is named in the view."""
     _needs_version(expect)
     return _request_priority(entries, until=until, owner_request=owner_request, author=author, via=via, now=now,
                              expect=expect)
@@ -5494,10 +5575,6 @@ def _request_priority(entries, *, until, owner_request, author, via: str, now: d
         by = conversation_author()
     with _lock():
         _check_priority(expect, now)
-        held = read_view(now).get("priority")
-        if held and held.get("pending") and not _same_author(held.get("pending_author"), by):
-            raise RouteError("the priority has " + _pending_collision(held.get("pending_author"), held.get("at"),
-                                                                       priority_version(now), now))
         written, view = _write({"type": "priority_set", "entries": rows, "until": end, "pending": True,
                                 "owner_request": _clean(request_words, 0), "written_by": by, "via": via})
     return dict(_done(written, view), entries=[e["label"] for e in rows])
@@ -7344,9 +7421,8 @@ def conversation_priority(entries, *, until=None, owner_request: str, author: di
         try:
             if expect_current:
                 expect = priority_version(now)
-            # Under the routing lock it can replace only the owner's priority, as
-            # of ``expect``, or this conversation's own request, never another
-            # conversation's waiting one.
+            # Under the routing lock it replaces the owner's priority as of
+            # ``expect``, or a waiting request on that same revision.
             _needs_version(expect)
             written = _request_priority(entries, until=until, owner_request=owner_request, author=by, via="mcp",
                                         now=now, expect=expect)

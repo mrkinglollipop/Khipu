@@ -178,11 +178,17 @@ def test_set_at_the_owners_request_is_live_marked_and_shows_what_it_replaced(hom
     assert "set by a Claude Code conversation at the owner's request; the owner has not confirmed it yet" in line
     assert "1. Codex: “everything this week”" in line
     assert "It replaced: 1. Claude second" in line and "3. Claude: orchestration only" in line
-    # The same conversation may refine its own request; another waits for the owner.
+    # The same conversation may refine its own request; another conversation's
+    # newer request on the same revision replaces it, and Undo still brings
+    # back the owner's priority the first request replaced.
     routing.request_priority([{"account": "Codex", "role": "builds"}], owner_request="refined", author=ME, expect=routing.priority_version())
     assert routing.read_view()["priority"]["replaced"]["entries"][0]["label"] == "Claude second"
-    with pytest.raises(routing.RouteError, match="another conversation"):
-        routing.request_priority([{"account": "Claude"}], owner_request="other", author=OTHER, expect=routing.priority_version())
+    routing.request_priority([{"account": "Claude"}], owner_request="other", author=OTHER, expect=routing.priority_version())
+    view = routing.read_view()
+    assert _labels(view) == ["Claude"]
+    assert view["priority"]["replaced"]["entries"][0]["label"] == "Claude second"
+    replaced = [p for p in view["proposals"].values() if p["status"] == "replaced"]
+    assert replaced and all(p["notify"] == ME for p in replaced)
     # The owner's Undo puts his own priority back; Confirm makes a request his.
     routing.undo_priority(via="app", expect=routing.priority_version())
     view = routing.read_view()

@@ -150,13 +150,15 @@ def test_c_identical_rendered_lines_only_acknowledge_the_selected_entity(home):
     assert changed["shown_entities"] == ["account:one"]
 
 
-def test_d_collision_names_author_age_version_and_replacement_routes(home):
+def test_d_replacement_takes_effect_and_names_the_replaced_author(home):
     routing.request_priority([{"account": "Grok"}], owner_request="use Grok", author=ME,
                              expect=routing.priority_version())
-    with pytest.raises(routing.RouteError,
-                       match=r"Claude Code conversation.*just now.*current version.*owner direction.*Settings.*terminal"):
-        routing.request_priority([{"account": "Codex"}], owner_request="replace it", author=OTHER,
-                                 expect=routing.priority_version())
+    routing.request_priority([{"account": "Codex"}], owner_request="replace it", author=OTHER,
+                             expect=routing.priority_version())
+    view = routing.read_view()
+    assert [e["label"] for e in view["priority"]["entries"]] == ["Codex"]
+    replaced = [p for p in view["proposals"].values() if p["status"] == "replaced"]
+    assert len(replaced) == 1 and replaced[0]["notify"] == ME
 
 
 def test_e_stale_level_claim_is_marked_beside_fresh_usage_without_editing_words(home):
@@ -225,13 +227,14 @@ def test_acceptance_real_replay_has_grok_priority_and_hold_contradiction(
     assert routing.read_view()["holds"][0]["id"] == "h-synthetic-grok"
 
 
-def test_d_rule_collision_lists_the_existing_author_and_all_replacement_routes(home):
+def test_d_rule_replacement_takes_effect_and_names_the_replaced_author(home):
     routing.request_rule("Grok builds.", author=ME)
-    with pytest.raises(routing.RouteError) as error:
-        routing.request_rule("Grok reviews.", n=1, author=OTHER)
-    text = str(error.value)
-    assert all(word in text for word in ("Claude Code conversation", "just now", "current version",
-                                         "owner direction", "Settings", "terminal"))
+    routing.request_rule("Grok reviews.", n=1, author=OTHER)
+    view = routing.read_view()
+    assert view["rules"][0]["text"] == "Grok reviews."
+    assert view["rules"][0]["pending_by"] == "a Codex conversation"
+    replaced = [p for p in view["proposals"].values() if p["status"] == "replaced"]
+    assert len(replaced) == 1 and replaced[0]["notify"] == ME
 
 
 def test_f_owner_hold_names_only_the_owner_route_and_never_ends_from_prose(home):

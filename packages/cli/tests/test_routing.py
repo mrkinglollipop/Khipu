@@ -2365,6 +2365,9 @@ NOT_IN_THE_APP_YET = {
     # Phase 7: the copy for cloud agents.
     "routing_cloud_copy", "routing_cloud_copy_hold_words", "routing_cloud_copy_rules",
     "routing_cloud_copy_stale_after", "routing_cloud_copy_debounce",
+    # Routing slice 5 registers the switch; its app control arrives with
+    # the proposals app group (slice 15b).
+    "routing_proposal_text_between_macs",
     # Read once, by phase 1a's import of the standing rules, and never again
     # after it ran: a control for it would do nothing.
     "routing_rules_seed",
@@ -2591,20 +2594,23 @@ def test_a_reset_check_reason_reads_mid_sentence_after_the_semicolon():
     assert routing._mid_sentence("Khipu could not check this account") == "Khipu could not check this account"
 
 
-def test_a_conversation_cannot_overwrite_another_conversations_unconfirmed_change(home):
+def test_a_conversation_replaces_another_conversations_unconfirmed_change(home):
     routing.add_rule("Original wording.", via="app")
     routing.request_rule("Mine.", n=1, author=ME)
-    with pytest.raises(routing.RouteError, match="another conversation"):
-        routing.request_rule("Theirs.", n=1, author=OTHER)
-    rule = routing.read_view()["rules"][0]
-    assert (rule["text"], rule["prior_text"], rule["pending_by"]) == ("Mine.", "Original wording.",
-                                                                     "a Claude Code conversation")
-    # The same conversation may refine its own request; once the owner
-    # resolves it, another conversation may ask again.
-    routing.request_rule("Mine, refined.", n=1, author=ME)
-    routing.confirm_rule(1, via="app")
     routing.request_rule("Theirs.", n=1, author=OTHER)
-    assert routing.read_view()["rules"][0]["prior_text"] == "Mine, refined."
+    view = routing.read_view()
+    rule = view["rules"][0]
+    assert (rule["text"], rule["prior_text"], rule["pending_by"]) == ("Theirs.", "Original wording.",
+                                                                     "a Codex conversation")
+    # The replaced proposal is terminal and its author is named to be told.
+    replaced = [p for p in view["proposals"].values() if p["status"] == "replaced"]
+    assert len(replaced) == 1 and replaced[0]["notify"] == ME
+    # The replacing conversation may refine its own request; once the owner
+    # resolves it, another conversation may ask again.
+    routing.request_rule("Theirs, refined.", n=1, author=OTHER)
+    routing.confirm_rule(1, via="app")
+    routing.request_rule("Mine.", n=1, author=ME)
+    assert routing.read_view()["rules"][0]["prior_text"] == "Theirs, refined."
 
 
 def test_a_pending_rule_keeps_its_requester_after_the_owner_retires_and_restores_it(home):
