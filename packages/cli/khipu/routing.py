@@ -2227,7 +2227,8 @@ def _lane_target(target: str, known: list[dict], *, provider_word: bool = False)
             return None
     if provider_matches:
         return provider_matches[0] if len(provider_matches) == 1 else None
-    return _resolve_quiet(raw, known)
+    key = _resolve_quiet(raw, known)
+    return key if key in {a["key"] for a in known} else None
 
 
 def _lane_repairs(lane_map: dict, known: list[dict]) -> list[dict]:
@@ -4393,6 +4394,17 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
                 item, cfg.get("routing_lane_map") or {}, known, forward, cfg.get("_providers"))
             matched.append(dict(item, account=key))
         batch = entry_model.source_events(matched, ordered, cfg, _mac_locked(), ids)
+        # An allocated id must have a durable login binding before an
+        # observation refers to it; a later fold otherwise allocates anew.
+        observed_accounts = {row.get("account") for row in batch if row["type"] == "observation"}
+        allocated = {key: ident for key, ident in ids.items() if ident in observed_accounts
+                     and re.fullmatch(r"[a-z]+:a-[a-z2-7]{8}", ident)}
+        if allocated:
+            pinned = account_identity.state(ordered, [])[0]
+            batch[:0] = [{"type": "account_binding", "id": _new_id("e"),
+                          "account": key, "to": ident,
+                          "written_by": {"kind": "owner"}, "via": "migration"}
+                         for key, ident in allocated.items() if key not in pinned]
         for runner in (_status or {}).get("runners") or []:
             witness = _parse(runner.get("heartbeat_at"))
             previous = next((e for e in reversed(ordered) if e.get("type") == "source_seen"
