@@ -665,7 +665,7 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 17b | Advise: a `pace_target` of 65% with 5 slack at 18% used 11 h into the week (allowance 9.26%) answers `hold_back` for `job` and `go` for `orchestration` from an undispatched attachment, and `hold_back` for a dispatched job claiming `orchestration`; zero current burn is still `hold_back` while ahead; recovery needs 1 point under the allowance; a `spend` of $35 at $35.10 and a full `concurrency` 1 answer `hold_back`; expired telemetry answers `go` with `evidence: unknown`; a pause answers `closed` for both purposes; `orchestration` at a 91% `share` or a reached `spend` answers `hold_back`, and at a full `concurrency` answers `go` | hermetic | 17a, 17c |
 | 17d | Owner direction end to end: an eligible conversation in Claude Code, Codex and Grok Build applies a cap, a rule edit and a priority through `khipu_owner_act`; each is live without a terminal, logged with its undo, and refused from a dispatched job | hermetic | 5, 17a |
 | 17e | Telemetry: duplicate spend events count once and two attempts of one job count twice; a correction nets out; a period where one of two runners on an account has a gap totals `unknown` even though the other covers the week; two accounts on one provider never pool; a new `active` snapshot replaces the old; two runners' active jobs sum; a silent runner's records expire to `unknown`; a lane's spend with no resolvable account is unattributed, never guessed | hermetic | 17t |
-| 17c | Directions: "use GLM only one job at a time" typed by the owner with no matching owner action opens one owed item naming the words; an unrelated routing write leaves it open; the matching cap closes it, and setting that cap to 4 instead leaves it open; a question, a quote and a job prompt open nothing; two directions with one written leave one open; a dismissal survives the next capture; the same prompt typed twice opens two directions, and each closes only on its own occurrence's action (when only the second acts, the first stays open); a recorder that missed a turn leaves the direction `unjoined`; a conversation resumed after the 24-hour turn prune keeps its occurrence numbers and its directions still join; a runner cap with no Khipu fact is flagged | hermetic | 19a, 19b |
+| 17c | Directions: "use GLM only one job at a time" typed by the owner with no matching owner action opens one owed item naming the words; an unrelated routing write leaves it open; the matching cap closes it, and setting that cap to 4 instead leaves it open; a question, a quote and a job prompt open nothing; two directions with one written leave one open; a dismissal survives the next capture; the same prompt typed twice opens two directions, and each closes only on its own occurrence's action (when only the second acts, the first stays open); a recorder that missed a turn leaves the direction `unjoined`; a conversation resumed after the 24-hour turn prune keeps its occurrence numbers and its directions still join; after 31 idle days the same prompt typed again is occurrence 2, and its action never closes occurrence 1; a deleted counter file leaves the session's earlier directions `unjoined`; a runner cap with no Khipu fact is flagged | hermetic | 19a, 19b |
 
 ## 13. Amendment, 2026-10-20 afternoon: routing that runs the day
 
@@ -849,9 +849,10 @@ the owner's words.
       gains both fields.
     - **Occurrence:** a durable per-session counter numbers each hash: the first time a prompt is typed it is
       1, an identical later prompt is 2, and so on. The counter lives in its own file per session
-      (`owner_turns/occurrences/<session>.json`). It is kept 30 days after its last update, apart from the
-      turn records that are pruned at 24 hours (`owner_turns.py:528`), so a conversation resumed the next day
-      keeps counting.
+      (`owner_turns/occurrences/<session>.json`). It never expires: it is kept as long as the session's episodes
+      exist, and removed only when they are forgotten for good. That is apart from the turn records, which are
+      pruned at 24 hours (`owner_turns.py:528`). An occurrence number is therefore never reused in a session,
+      however long it sits idle.
     - **At the action:** the owner-actions log entry, which is append-only and never pruned, carries the
       triple `(session, prompt_sha256, occurrence)` itself, copied from the turn when the action is made.
       Capture joins on the log's triple, so pruned turn records don't matter.
@@ -861,7 +862,8 @@ the owner's words.
     - **Repeated prompts:** each occurrence joins only its own actions. If only the second of two identical
       prompts acted, the first stays open.
     - **Counts that disagree:** if the transcript and the recorder count occurrences differently (a missed
-      hook, or a counter expired after 30 idle days), the direction is `unjoined`. It stays open with that reason, and nothing is
+      hook, or a counter file lost from disk), the direction is `unjoined`. A lost counter is recreated with a
+      marker, and every direction in that session from before the marker stays `unjoined`, never matched. It stays open with that reason, and nothing is
       guessed.
   - **How it closes:** the direction carries a structured target where one can be read (entity, kind, value:
     "GLM, concurrency, 1"). It closes only when an applied owner action joined to its prompt matches that
