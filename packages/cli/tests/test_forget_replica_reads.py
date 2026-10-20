@@ -223,3 +223,67 @@ class ForgottenEpisodeStaysForgottenInTheReplicaTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PendingCaptureOfAForgottenSourceStaysHiddenOfflineTest(unittest.TestCase):
+    """The offline answer adds captures still waiting in the outbox. A forget
+    can leave its job there, so each pending capture passes the forgotten-
+    source registry first, and none is shown when the registry is unreadable."""
+
+    PENDING_LIVE = {"ts": TS, "summary": "alpha billing pending and kept",
+                    "session_id": "codex:kept", "project": "acme"}
+    PENDING_GONE = {"ts": TS, "summary": "alpha billing pending then forgotten",
+                    "session_id": "codex:gone", "project": "acme"}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.data = Path(tmp.name)
+        self.snap = self.data / "hub_snapshot.sqlite"
+        con = sqlite3.connect(str(self.snap))
+        hs._create_schema(con)
+        _fill(con, gone_deleted_at=None)
+        con.commit()
+        con.close()
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        for patch in (
+            mock.patch.object(hs, "snapshot_path", return_value=self.snap),
+            mock.patch.object(hs, "meta_path", return_value=self.data / "meta.json"),
+            mock.patch("khipu.paths.ensure_data_dir", return_value=self.data),
+            mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(self.data / "outbox")}),
+        ):
+            stack.enter_context(patch)
+        from khipu import outbox
+
+        for payload in (self.PENDING_LIVE, self.PENDING_GONE):
+            outbox.enqueue(dict(payload), reason="test")
+
+    def summaries(self) -> str:
+        out = hs.search_stale_payload("alpha billing pending", 20)
+        return json.dumps([r for r in out["results"] if r.get("outbox")])
+
+    def test_a_normal_pending_capture_still_appears(self):
+        found = self.summaries()
+        self.assertIn(self.PENDING_LIVE["summary"], found)
+        self.assertIn(self.PENDING_GONE["summary"], found)
+
+    def test_a_pending_capture_whose_source_was_forgotten_never_appears(self):
+        from khipu import tombstones
+
+        tombstones.publish_payloads([dict(self.PENDING_GONE)])
+        found = self.summaries()
+        self.assertIn(self.PENDING_LIVE["summary"], found)
+        self.assertNotIn(self.PENDING_GONE["summary"], found)
+
+    def test_an_unreadable_registry_shows_no_pending_capture(self):
+        from khipu import tombstones
+
+        path = tombstones.registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+        found = self.summaries()
+        self.assertNotIn(self.PENDING_LIVE["summary"], found)
+        self.assertNotIn(self.PENDING_GONE["summary"], found)
+        out = hs.search_stale_payload("alpha billing", 20)
+        self.assertTrue(any(str(r.get("id")) == "1" for r in out["results"]), out["results"])
