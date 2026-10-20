@@ -300,6 +300,14 @@ def write_guard(payload: dict[str, Any], *also: dict[str, Any]) -> Iterator[bool
         yield all(gate.allows(p) for p in (payload, *also))
 
 
+def read_gate() -> Gate:
+    """One registry snapshot for a reader that writes nothing (a search
+    deciding which pending captures it may show). ``RegistryError`` when the
+    registry cannot be read: the reader must then show none of them."""
+    with _locked_registry() as (_path, value, _lease):
+        return Gate(copy.deepcopy(value))
+
+
 def is_forgotten(payload: dict[str, Any]) -> bool:
     with _locked_registry() as (_path, value, _lease):
         return _known(value, payload)

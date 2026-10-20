@@ -4921,8 +4921,12 @@ def merge_outbox_episodes(
     since: str | None = None, until: str | None = None, project: str | None = None,
     session_id: str | None = None, harness: str | None = None, t3_thread=None, via=None,
 ) -> list[dict[str, Any]]:
+    """``results`` plus each capture still waiting in the outbox that passes
+    the query and filters and whose source has not been forgotten. When the
+    forgotten-source registry cannot be read, no pending capture is added."""
     from khipu.outbox import jobs
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
+    from khipu.tombstones import read_gate
 
     merged = list(results)
     seen: set[str] = {f"{r.get('kind')}:{r.get('id')}" for r in merged}
@@ -4932,6 +4936,7 @@ def merge_outbox_episodes(
     since_dt = parse_time_filter(since) if since else None
     until_dt = parse_time_filter(until) if until else None
     query_tokens = [token.lower() for token in search_tokens(query or "")]
+    found: list[tuple[Path, dict[str, Any], str]] = []
     for jp in jobs():
         try:
             job = json.loads(jp.read_text(encoding="utf-8"))
@@ -4968,23 +4973,33 @@ def merge_outbox_episodes(
                 ts = _parse_snapshot_ts(payload.get("ts"))
                 if ts is None or (since_dt is not None and ts < since_dt) or (until_dt is not None and ts > until_dt):
                     continue
-            key = f"episode:outbox:{jp.stem}"
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(
-                {
-                    "kind": "episode",
-                    "id": f"outbox:{jp.stem}",
-                    "label": clip_snippet(summary, LABEL_LIMIT),
-                    "snippet": clip_snippet(summary, SNIPPET_LIMIT),
-                    "outbox": True,
-                    "t3_thread_id": payload.get("t3_thread_id"),
-                    "via": payload.get("via"),
-                }
-            )
+            found.append((jp, payload, summary))
         except (OSError, ValueError, TypeError):
             continue
+    if not found:
+        return merged
+    try:
+        # Read after the jobs, so a forget published before this point is seen.
+        gate = read_gate()
+        found = [m for m in found if gate.allows(m[1])]
+    except Exception:  # noqa: BLE001 — RegistryError or anything else: fail closed
+        return merged
+    for jp, payload, summary in found:
+        key = f"episode:outbox:{jp.stem}"
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(
+            {
+                "kind": "episode",
+                "id": f"outbox:{jp.stem}",
+                "label": clip_snippet(summary, LABEL_LIMIT),
+                "snippet": clip_snippet(summary, SNIPPET_LIMIT),
+                "outbox": True,
+                "t3_thread_id": payload.get("t3_thread_id"),
+                "via": payload.get("via"),
+            }
+        )
     return merged
 
 
