@@ -255,6 +255,7 @@ def test_a_pending_rule_is_not_confirmed_with_no_owner_turn(world):
 
 
 def _pending_priority() -> str:
+    routing.conversation_view()
     out = routing.request_priority([{"account": "Codex"}, {"account": "Claude"}], owner_request="the owner asked",
                                    author={"harness": "grok_bot", "session": "bot-1"}, via="mcp",
                                    expect=routing.priority_version())

@@ -888,7 +888,7 @@ TOOLS: list[dict] = [
                 "holds": {"type": "object", "additionalProperties": {"type": "string", "enum": ["end", "keep"]},
                           "description": "Explicit end-or-keep choices for held or paused accounts"},
                 "base": {"type": "string", "minLength": 1, "maxLength": 256,
-                         "description": "The rule's owner revision (owner_revision, as khipu_route lists it) "
+                         "description": "A rule owner revision this conversation was shown by khipu_route "
                                         "when this request was prepared; a request delivered after the owner "
                                         "changed the rule is recorded as crossed, never made live"},
                 "owner_request": {"type": "string", "description": "This conversation's one-line words describing the owner's request"},
@@ -2305,12 +2305,8 @@ def _tool_route_priority(args: dict) -> dict:
     until = args.get("until")
     if until is not None and not isinstance(until, str):
         raise ValueError("until must be text")
-    # A request that carries the owner revision it was prepared against
-    # keeps it through the write, so one delivered after the owner moved
-    # on is recorded as crossed. Without one, the version as of building
-    # this request is read inside the call's lock budget: one that moves
-    # before the write lands refuses it, and the request still waits for
-    # the owner.
+    # A base selects a recorded conversation read. Omitting it uses the
+    # last delivered revision, never the owner's current revision.
     if base is not None:
         return routing.conversation_priority(entries, until=until, owner_request=owner_request,
                                              author=routing.conversation_author(), base=base)

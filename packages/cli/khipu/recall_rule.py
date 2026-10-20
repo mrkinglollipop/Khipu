@@ -633,7 +633,7 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
         if isinstance(out, dict):
             data = memoryview(json.dumps({k: out.get(k) for k in (
                 "kind", "text", "version", "epoch", "generation", "owed_entities", "shown_entities",
-                "routing_changes", "delivery_reservation", "delivery_plan")}).encode("utf-8"))
+                "notices", "routing_changes", "delivery_reservation", "delivery_plan")}).encode("utf-8"))
             while data:
                 data = data[os.write(write_fd, data):]
             os.close(write_fd)  # the hook has its answer; nothing below delays it
@@ -761,7 +761,8 @@ class _RoutingAtStart:
                     return
             recall_prompt.mark_routing_full(session_id, version=out["version"], epoch=out.get("epoch"),
                                             at=routing._iso(routing._now()),
-                                            owed=out.get("owed_entities"), shown=out.get("shown_entities"))
+                                            owed=out.get("owed_entities"), shown=out.get("shown_entities"),
+                                            notices=out.get("notices"))
         except Exception:
             pass
 

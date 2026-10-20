@@ -109,6 +109,7 @@ def _record() -> None:
 def test_pending_rule_mark_and_prior_words_repeat_with_an_unrelated_next_push(home):
     routing.add_rule("Original rule wording.", via="app")
     before = routing.read_view()
+    routing.conversation_view()
     routing.request_rule("Requested replacement.", n=1, author=ME)
     heard_pending = routing.read_view()
     routing.report(account="Codex", state="limited", until="2h", author=ME)

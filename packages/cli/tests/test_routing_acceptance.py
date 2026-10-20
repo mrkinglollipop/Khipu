@@ -517,9 +517,11 @@ def proposals(replay):
 
 def test_4_two_conversations_take_turns_without_refusal(replay):
     routing.add_rule("owner", via="app")
+    routing.conversation_view()
     routing.request_rule("first", n=1, author=AUTHOR)
     refused = None
     try:
+        routing.conversation_view()
         routing.request_rule("second", n=1, author=OTHER)
     except routing.RouteError as error:
         refused = str(error)
@@ -529,10 +531,12 @@ def test_4_two_conversations_take_turns_without_refusal(replay):
 
 def test_4_priority_conversations_take_turns_without_refusal(replay):
     routing.set_priority([{"account": "Codex", "role": "owner"}], via="app", expect=routing.priority_version())
+    routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": "first"}], owner_request="synthetic request",
                              author=AUTHOR, expect=routing.priority_version())
     refused = None
     try:
+        routing.conversation_view()
         routing.request_priority([{"account": "Codex", "role": "second"}], owner_request="synthetic request",
                                  author=OTHER, expect=routing.priority_version())
     except routing.RouteError as error:

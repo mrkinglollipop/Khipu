@@ -1011,6 +1011,7 @@ def test_priority_requests_on_no_version_or_one_version_cannot_both_land(mac):
     _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
 
     def ask(order, expect):
+        routing.conversation_view()
         return lambda: routing.request_priority(order, owner_request="order them", author=ME, expect=expect)
 
     assert _race([ask(["First", "Second"], None), ask(["Second", "First"], None)]) == \
@@ -1238,10 +1239,12 @@ def test_an_answer_to_a_conversations_account_change_needs_the_version_it_read(m
 
 
 def test_a_priority_confirm_or_undo_needs_the_version_it_read(mac):
+    routing.conversation_view()
     routing.request_priority([{"account": "Codex"}], owner_request="first", author=ME,
                              expect=routing.priority_version())
     stale = routing.priority_version()
     routing.confirm_priority(via="app", expect=stale)
+    routing.conversation_view()
     routing.request_priority([{"account": "Claude"}], owner_request="second", author=ME,
                              expect=routing.priority_version())
     for answer in (routing.confirm_priority, routing.undo_priority):
@@ -1258,6 +1261,7 @@ def test_stop_takes_the_account_out_of_a_waiting_priority_request_and_what_it_re
     _set(usage_accounts=[{"harness": "claude", "label": "First", "home": "~/.claude-client"},
                          {"harness": "codex", "label": "Second"}])
     routing.set_priority([{"account": old}, {"account": "codex|"}], via="app", expect=routing.priority_version())
+    routing.conversation_view()
     routing.request_priority([{"account": "First"}, {"account": "Second"}], owner_request="keep order", author=ME,
                              expect=routing.priority_version())
     out = accounts.stop(old, expect=_version())

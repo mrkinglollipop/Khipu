@@ -73,6 +73,7 @@ def test_rule_edit_undo_reuses_its_original_hold_choice(world):
 def test_rule_confirm_undo_reuses_its_original_hold_choice(world):
     _hold, choices = _held_grok()
     routing.add_rule("Grok old rule", via="app", holds=choices)
+    routing.conversation_view()
     pending = routing.request_rule("Grok new rule", n=1, owner_request="the owner asked", author=REPORTER, via="mcp")
     assert pending["ok"] is True
     world.say("confirm Grok's edited rule")

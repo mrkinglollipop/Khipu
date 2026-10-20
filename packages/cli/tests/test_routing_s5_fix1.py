@@ -81,6 +81,7 @@ def test_f1_queued_mcp_priority_request_prepared_against_an_old_revision_is_cros
 
 def test_f2_confirm_after_expiry_keeps_the_owner_words(home):
     routing.add_rule("Owner original.", via="app")
+    routing.conversation_view()
     routing.request_rule("Proposal one.", n=1, author=ME)
     home["clock"].advance(days=8)
     view = routing.read_view()
@@ -93,28 +94,35 @@ def test_f2_confirm_after_expiry_keeps_the_owner_words(home):
 
 def test_f2_a_write_after_expiry_never_sees_the_expired_overlay(home):
     routing.add_rule("Owner original.", via="app")
+    routing.conversation_view()
     routing.request_rule("Proposal one.", n=1, author=ME)
     home["clock"].advance(days=8)
     # A fresh request after expiry is built on the owner's words, not on
     # the expired proposal's.
+    routing.conversation_view()
     routing.request_rule("Proposal two.", n=1, author=OTHER)
     rule = routing.read_view()["rules"][0]
     assert (rule["text"], rule["prior_text"]) == ("Proposal two.", "Owner original.")
 
 
-# ---- finding 3: Retire/Restore reconciles the overlay's base ------------------
+# ---- finding 3: Retire/Restore ends an old-base overlay ---------------------
 
 
-def test_f3_retire_and_restore_reconcile_the_live_proposals_base(home):
+def test_f3_retire_and_restore_end_the_live_proposal_without_rebasing(home):
     routing.add_rule("Owner original.", via="app")
+    routing.conversation_view()
+    original = routing.read_view()["rules"][0]["owner_revision"]
     routing.request_rule("Proposal one.", n=1, author=ME)
     routing.retire_rule(1, via="app")
     routing.restore_rule(1, via="app")
     view = routing.read_view()
     rule = view["rules"][0]
     live = [p for p in view["proposals"].values() if p["status"] == "live"]
-    assert len(live) == 1
-    assert live[0]["base"] == rule["owner_revision"]
+    assert live == []
+    assert rule["text"] == "Owner original."
+    ended = list(view["proposals"].values())
+    assert ended[0]["base"] == original
+    assert ended[0]["status"] == "overtaken"
 
 
 # ---- finding 4: the replaced author is actually told ---------------------------
@@ -122,7 +130,9 @@ def test_f3_retire_and_restore_reconcile_the_live_proposals_base(home):
 
 def test_f4_replacement_is_delivered_in_the_conversation_response_and_summary(home):
     routing.add_rule("Owner original.", via="app")
+    routing.conversation_view()
     routing.request_rule("Mine.", n=1, author=ME)
+    routing.conversation_view()
     routing.request_rule("Theirs.", n=1, author=OTHER)
     answer = routing.conversation_view()
     told = [p for p in answer.get("proposals") or [] if p["status"] == "replaced"]
@@ -136,6 +146,7 @@ def test_f4_replacement_is_delivered_in_the_conversation_response_and_summary(ho
 
 def test_f5_dismiss_of_a_changed_rule_proposal_restores_the_owner_words(home):
     routing.add_rule("Owner original.", via="app")
+    routing.conversation_view()
     routing.request_rule("Changed words.", n=1, author=ME)
     routing.dismiss_rule_request(1, via="app")
     view = routing.read_view()

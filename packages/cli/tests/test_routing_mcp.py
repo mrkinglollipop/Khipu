@@ -88,6 +88,8 @@ def _report(**arguments) -> dict:
 
 
 def _rule(**arguments) -> tuple[bool, dict]:
+    if arguments.get("rule") is not None:
+        _route()
     return _call("khipu_route_rule", arguments)
 
 

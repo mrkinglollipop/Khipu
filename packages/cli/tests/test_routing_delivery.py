@@ -79,6 +79,7 @@ def test_a_compact_rule_change_names_kind_account_and_opening(home):
 
 def test_b_priority_and_hold_name_their_contradiction_and_end_route(home):
     held = routing.add_hold("do not launch", reason="keep", scope="account", account="Grok", author=ME)
+    routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": "Grok builder"}],
                              owner_request="make Grok builder", author=ME, expect=routing.priority_version())
     text = routing.summary(now=home["clock"].now)["text"]
@@ -131,6 +132,7 @@ def test_c_same_version_debt_precedes_newer_priority(home):
     _deliver(first)
     owed = recall_prompt.routing_marker(SESSION)["owed"]
     assert owed
+    routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": "newer priority"}], owner_request="use Grok",
                              author=ME, expect=routing.priority_version())
     agent_view.prepare_routing_table(refresh=True)
@@ -151,8 +153,10 @@ def test_c_identical_rendered_lines_only_acknowledge_the_selected_entity(home):
 
 
 def test_d_replacement_takes_effect_and_names_the_replaced_author(home):
+    routing.conversation_view()
     routing.request_priority([{"account": "Grok"}], owner_request="use Grok", author=ME,
                              expect=routing.priority_version())
+    routing.conversation_view()
     routing.request_priority([{"account": "Codex"}], owner_request="replace it", author=OTHER,
                              expect=routing.priority_version())
     view = routing.read_view()
@@ -164,6 +168,7 @@ def test_d_replacement_takes_effect_and_names_the_replaced_author(home):
 def test_e_stale_level_claim_is_marked_beside_fresh_usage_without_editing_words(home):
     _usage(home)
     role = "Grok is low: 2% left"
+    routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": role}], owner_request="use Grok", author=ME,
                              expect=routing.priority_version())
     text = routing.summary(now=home["clock"].now)["text"]
@@ -229,6 +234,7 @@ def test_acceptance_real_replay_has_grok_priority_and_hold_contradiction(
 
 def test_d_rule_replacement_takes_effect_and_names_the_replaced_author(home):
     routing.request_rule("Grok builds.", author=ME)
+    routing.conversation_view()
     routing.request_rule("Grok reviews.", n=1, author=OTHER)
     view = routing.read_view()
     assert view["rules"][0]["text"] == "Grok reviews."
@@ -240,6 +246,7 @@ def test_d_rule_replacement_takes_effect_and_names_the_replaced_author(home):
 def test_f_owner_hold_names_only_the_owner_route_and_never_ends_from_prose(home):
     held = routing.add_hold("Wait for the owner.", reason="keep", scope="account", account="Grok",
                             owner=True, via="app")
+    routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": "Regular builder"}], owner_request="use Grok",
                              author=ME, expect=routing.priority_version())
     view = routing.read_view()
@@ -295,6 +302,7 @@ def test_review_omitted_pending_changes_are_counted_and_delivered_later(home, mo
     before = routing.read_view()
     for i in range(12):
         routing.request_rule(f"pending {i} " + "x" * 500, author=ME)
+    routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": "builder " * 150}],
                              owner_request="use Grok", author=ME, expect=routing.priority_version())
     if path == "start":

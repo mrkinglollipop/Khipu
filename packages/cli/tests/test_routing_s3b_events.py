@@ -134,7 +134,9 @@ def test_hlc_survives_same_clock_and_restart_and_records_base(mac):
 def test_proposal_base_is_the_owner_revision(mac):
     owner = routing.add_rule("owner words", via="app")
     author = {"kind": "conversation", "harness": "codex", "session": "one"}
+    routing.conversation_view()
     routing.request_rule("first proposal", n=1, author=author)
+    routing.conversation_view()
     routing.request_rule("second proposal", n=1, author=author)
     rows = routing.read_events()[0]
     assert rows[1]["base"] == rows[2]["base"] == owner["id"]
