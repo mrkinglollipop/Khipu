@@ -162,6 +162,9 @@ _INDEX_STMT_RE = re.compile(
 # The definition the finished index must have, exactly as pg_get_indexdef
 # prints it, on a comment line inside the autocommit section.
 _EXPECT_RE = re.compile(r"^-- khipu:expect (.+)$", re.MULTILINE)
+# An extension the statement needs; when it is not installed the step is
+# skipped (and the version still recorded) instead of failing the run.
+_REQUIRES_RE = re.compile(r"^-- khipu:requires ([a-z_][a-z0-9_]*)$", re.MULTILINE)
 
 
 def steps(sql: str) -> list[str]:
@@ -384,10 +387,21 @@ def _run_autocommit_index(conn, part: str, version: str, filename: str, *,
             f"{filename}: an autocommit step must be one CREATE INDEX CONCURRENTLY "
             "statement with a '-- khipu:expect <pg_get_indexdef>' line")
     name, expected = m.group(1), e.group(1).strip()
+    needs = _REQUIRES_RE.search(part)
     conn.commit()  # autocommit cannot be switched on mid-transaction
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
+            if needs:
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = %s", (needs.group(1),))
+                if cur.fetchone() is None:
+                    if record:
+                        cur.execute(
+                            "INSERT INTO schema_migrations (version, note) VALUES (%s, %s) "
+                            "ON CONFLICT (version) DO NOTHING",
+                            (version, f"applied by khipu migrate from {filename}; "
+                                      f"{name} skipped, extension {needs.group(1)} not installed"))
+                    return
             cur.execute("SELECT i.indisvalid, pg_get_indexdef(i.indexrelid) "
                         "FROM pg_index i WHERE i.indexrelid = to_regclass(%s)", (name,))
             row = cur.fetchone()
