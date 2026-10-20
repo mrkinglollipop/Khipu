@@ -238,8 +238,7 @@ def definitions(events: list[dict], mac: str | None) -> dict:
                 continue
             from khipu.routing_identity import STABLE
 
-            if any(not isinstance(a, str) or not STABLE.fullmatch(a)
-                   or a.partition(":")[0] != value["id"] for a in refs):
+            if any(not isinstance(a, str) or not STABLE.fullmatch(a) for a in refs):
                 continue
             out["providers"][value["id"]] = value
             for ident in refs:

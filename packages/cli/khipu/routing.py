@@ -1793,8 +1793,7 @@ def _checked(data: dict) -> dict | None:
         checked = entry_model.checked_definition("provider", value)
         refs = data.get("accounts", [])
         if checked is None or not isinstance(refs, list) or any(
-                not isinstance(a, str) or not account_identity.STABLE.fullmatch(a)
-                or a.partition(":")[0] != checked["id"] for a in refs):
+                not isinstance(a, str) or not account_identity.STABLE.fullmatch(a) for a in refs):
             return None
         out.update(checked, accounts=list(refs))
     if "observation_scope" in data:

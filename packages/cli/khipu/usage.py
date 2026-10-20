@@ -124,6 +124,10 @@ E_NO_KEY = "no_key"
 E_NO_PLAN = "no_plan"
 # z.ai refused the key: not a sign-in an owner can redo in a CLI, so it has its own code.
 E_BAD_KEY = "key_rejected"
+# The http-quota endpoint tried to send Khipu to a host the owner never confirmed.
+E_REDIRECT = "redirect_refused"
+HTTP_QUOTA_TIMEOUT_S = 15.0
+HTTP_QUOTA_MAX_BYTES = 1 << 20
 NO_FOLDER_NOTE = "Khipu can't find this account's login folder on this Mac"
 # The CLIs by the names the app's form gives them.
 CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok Build", "muse": "Muse",
@@ -139,6 +143,8 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
     """Khipu's own sentence for a failure ``code`` on one account, or None."""
     name = CLI_NAMES.get(harness or "", "This CLI")
     folder = " with this login folder" if home else ""
+    if code == E_REDIRECT:
+        return "The quota endpoint tried to send Khipu to another host, so Khipu refused the answer"
     if harness == "glm":
         return _glm_note(code)
     if code == E_NOT_INSTALLED:
@@ -1410,6 +1416,170 @@ def probe_glm(*, timeout: float = TIMEOUT_S) -> dict:
     return parse_glm(status, body)
 
 
+# ---- http-quota (owner-confirmed HTTPS quota endpoints, slice 9b) --------------
+#
+# The key floor (plan section 6): HTTPS only, to the exact host the owner
+# confirmed on the provider fact. Redirects are refused, never followed. The
+# key is read through ``keychain`` into a local at request time and goes only
+# into the request header to that host: never argv, env, a URL or a file.
+# Only the parsed quota numbers leave the parser; no response body, header
+# or exception text is returned, cached or logged anywhere.
+
+_HTTP_HOST = re.compile(r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\Z")
+
+
+def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes]:
+    """(HTTP status, bounded body on 200 only) of the quota call. A redirect
+    is a ProbeError, and no error body is ever read."""
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(f"https://{host}/",
+                                     headers={"Authorization": key, "Accept": "application/json"})
+    try:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):  # noqa: ARG002 - refusing is the whole job
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect())
+        previous = getattr(urllib.request, "_opener", None)
+        urllib.request.install_opener(opener)
+        try:
+            response = urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - owner-confirmed https host
+        finally:
+            urllib.request.install_opener(previous)
+        with response:
+            status = getattr(response, "status", None)
+            if not isinstance(status, int) or isinstance(status, bool):
+                status = getattr(response, "code", None)
+            if isinstance(status, int) and 300 <= status < 400:
+                raise ProbeError(E_REDIRECT)
+            if status != 200:
+                return (status if isinstance(status, int) else 0), b""
+            body = response.read(HTTP_QUOTA_MAX_BYTES + 1)
+            if len(body) > HTTP_QUOTA_MAX_BYTES:
+                raise ProbeError(E_BAD)
+            return 200, body
+    except ProbeError:
+        raise
+    except urllib.error.HTTPError as exc:
+        # With redirects refused, urllib raises for a 3xx; its body (which a
+        # hostile endpoint could fill with echoed material) is never read.
+        if 300 <= exc.code < 400:
+            raise ProbeError(E_REDIRECT) from None
+        return exc.code, b""
+    except TimeoutError:
+        raise ProbeError(E_TIMEOUT) from None
+    except urllib.error.URLError as exc:
+        raise ProbeError(E_TIMEOUT if isinstance(exc.reason, TimeoutError) else E_NO_ANSWER) from None
+    except Exception:  # noqa: BLE001 - any text could echo the key or the body
+        raise ProbeError(E_NO_ANSWER) from None
+
+
+def parse_http_quota(status: int, body: bytes) -> dict:
+    """Only quota numbers out of a quota reply: window figures and resets.
+    Names are Khipu's own, derived from each window's length, never copied."""
+    if 300 <= status < 400:
+        raise ProbeError(E_REDIRECT)
+    if status in (401, 403):
+        raise ProbeError(E_BAD_KEY)
+    if status != 200:
+        raise ProbeError(E_CLI)
+    try:
+        reply = json.loads(body.decode("utf-8")) if body else None
+    except (ValueError, UnicodeError):
+        reply = None
+    if not isinstance(reply, dict):
+        raise ProbeError(E_BAD)
+    code = reply.get("code")
+    if isinstance(code, int) and not isinstance(code, bool) and code != 200:
+        if code in _GLM_NO_PLAN:
+            raise ProbeError(E_NO_PLAN)
+        raise ProbeError(E_BAD_KEY if code in _GLM_BAD_KEY else E_CLI)
+    data = reply.get("data") if isinstance(reply.get("data"), dict) else reply
+    raw_windows = data.get("windows") if isinstance(data.get("windows"), list) else None
+    windows = []
+    if raw_windows is not None:
+        for i, item in enumerate(raw_windows):
+            if not isinstance(item, dict):
+                raise ProbeError(E_BAD)
+            used = item.get("used_pct", item.get("percentage", item.get("used_percent")))
+            mins = _mins(item.get("window_mins", item.get("window_minutes")))
+            name = _window_name(mins) if mins else ("quota" if i == 0 else f"quota_{i + 1}")
+            resets = item.get("resets_at", item.get("reset_at", item.get("nextResetTime")))
+            window = _window(name, _glm_pct(item) if used is None and ("currentValue" in item or "usage" in item)
+                             else used, resets, mins)
+            if window:
+                windows.append(window)
+    else:
+        for limit in _list(data, "limits"):
+            if not isinstance(limit, dict):
+                raise ProbeError(E_BAD)
+            unit = limit.get("unit")
+            if isinstance(unit, bool) or unit not in _GLM_UNITS:
+                continue
+            if isinstance(limit.get("type"), str) and limit["type"] != "TOKENS_LIMIT":
+                continue
+            name, mins = _GLM_UNITS[unit]
+            if any(w["name"] == name for w in windows):
+                continue
+            window = _window(name, _glm_pct(limit), limit.get("nextResetTime"), mins)
+            if window:
+                windows.append(window)
+        if not windows and ("used_pct" in data or "percentage" in data):
+            used = data.get("used_pct", data.get("percentage"))
+            window = _window("quota", used, data.get("resets_at", data.get("reset_at")))
+            if window:
+                windows.append(window)
+    if not windows:
+        raise ProbeError(E_NO_LIMITS)
+    return {"ok": True, "plan": None, "windows": windows, "credits": None, "version": None, "source": "live"}
+
+
+@_guard
+def probe_http_quota(account: dict, *, timeout: float = TIMEOUT_S) -> dict:
+    """One http-quota provider account, read at its owner-confirmed host."""
+    host = account.get("host")
+    if not isinstance(host, str) or not _HTTP_HOST.fullmatch(host) or ".." in host:
+        raise ProbeError(E_INVALID)
+    from khipu import keychain
+
+    provider = account.get("provider") or account.get("harness") or ""
+    try:
+        key = keychain.get_password(f"{provider}_api_key")
+    except Exception:  # noqa: BLE001 - no key anywhere; the message is never used
+        key = None
+    if not key:
+        raise ProbeError(E_NO_KEY)
+    try:
+        status, body = _http_quota_request(key, host,
+                                           HTTP_QUOTA_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
+    finally:
+        key = None  # the key lives only for the request above
+    return parse_http_quota(status, body)
+
+
+def http_quota_accounts() -> list[dict]:
+    """The accounts whose provider fact names the http-quota adapter, keyed
+    in the usage cache by their stable account id."""
+    try:
+        from khipu import routing
+
+        definitions, _cache = routing._entry_definitions()
+    except Exception:  # noqa: BLE001 - no record, no quota accounts
+        return []
+    providers = definitions.get("providers") or {}
+    out = []
+    for ident, value in sorted((definitions.get("accounts") or {}).items()):
+        provider = providers.get((value or {}).get("provider") or "")
+        if not provider or provider.get("probe") != "http-quota":
+            continue
+        out.append({"label": value.get("label") or ident, "harness": provider["id"], "home": None,
+                    "probe": "http-quota", "host": provider.get("host"), "provider": provider["id"],
+                    "quota_key": ident})
+    return out
+
+
 # ---- accounts ----------------------------------------------------------------
 
 
@@ -1749,7 +1919,11 @@ def accounts_status() -> dict:
 
 def _key(account: dict) -> str:
     """Cache identity: the harness and the home whose login answers (labels
-    are display names and may change)."""
+    are display names and may change). An http-quota account has no login:
+    its stable account id is its cache key."""
+    quota_key = account.get("quota_key")
+    if isinstance(quota_key, str) and quota_key:
+        return quota_key
     home = account.get("home")
     if not home:
         return f"{account['harness']}|"
@@ -1776,6 +1950,8 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
         if account.get("invalid"):
             data = {"ok": False, "error": E_INVALID,
                     "note": f"This account entry is not valid: {account['invalid']}"}
+        elif account.get("probe") == "http-quota" or account.get("quota_key"):
+            data = probe_http_quota(account, timeout=timeout)
         elif harness in _HOME_VARS and not _login_folder_there(home or str(default_login(harness))):
             # Checked on the folder itself (nothing inside it is read): a CLI
             # pointed at a missing folder answers "not signed in", which a
@@ -1958,7 +2134,8 @@ def _store(accounts: list[dict], rows: list[dict]) -> list[dict]:
         # still running when its account was stopped or moved writes no row
         # under a key the list no longer holds. Read unsettled: an account
         # change takes this cache's lock after the routing lock.
-        current = configured_keys(read_config_unsettled())
+        current = configured_keys(read_config_unsettled()) | {
+            _key(a) for a in accounts if a.get("quota_key")}
         merged = []
         for account, row in zip(accounts, rows):
             key = _key(account)
@@ -2040,7 +2217,10 @@ def refresh_due(*, max_age: float = PERIODIC_MAX_AGE_S, timeout: float = TIMEOUT
     lock is held, so callers that race refresh once. Never raises:
     ``{"refreshed": n, "skipped": None | "fresh" | "busy" | "error"}``."""
     try:
+        discover_quota = accounts is None
         accounts = configured_accounts() if accounts is None else accounts
+        if discover_quota:
+            accounts = [*accounts, *http_quota_accounts()]
         if not _due(accounts, _load_cache(), _now(), max_age):
             return {"refreshed": 0, "skipped": "fresh"}
         fd = _try_refresh_lock()
@@ -2069,7 +2249,7 @@ def kick_refresh(*, max_age: float = PROMPT_MAX_AGE_S, spawn=None) -> bool:
         with contextlib.suppress(OSError):
             if 0 <= time.time() - stamp.stat().st_mtime < KICK_EVERY_S:
                 return False
-        if not _due(configured_accounts(), _load_cache(), _now(), max_age):
+        if not _due([*configured_accounts(), *http_quota_accounts()], _load_cache(), _now(), max_age):
             return False
         fd = _try_refresh_lock()
         if fd is None:

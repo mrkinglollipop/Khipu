@@ -702,7 +702,6 @@ def test_8_provider_catalog_matches_by_name(replay, providers, lane, expected, c
 # ---- 9: fake HTTP adapter boundary, no key or response body copied to an artifact --------
 
 
-@future("9b", "http-quota provider facts must refuse redirects without leaking any key channel")
 def test_9_http_quota_redirect_and_key_channels(replay, monkeypatch, capsys):
     from khipu import keychain, usage
     sentinel = "SYNTHETIC-QUOTA-KEY-SENTINEL"
