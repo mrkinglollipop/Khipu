@@ -350,6 +350,8 @@ def test_stalled_volume_refresh_keeps_prompt_routing_and_restores_alarm(replay, 
 
 def test_ack_history_is_bounded_and_recent_ack_is_idempotent(replay):
     routing.add_rule("x" * 100000, via="app")
+    # This direct renderer call starts with the complete inventory a helper prepares.
+    agent_view._table([a["key"] for a in replay.view()["accounts"]])
     batches = []
     for _ in range(140):
         out, _, info = replay.offer()

@@ -981,6 +981,8 @@ def test_the_routing_imports_cover_everything_the_read_imports(home):
     code = ("import sys\n"
             "from khipu import recall_prompt, routing\n"
             "routing.prompt_imports()\n"
+            "from khipu import agent_view\n"
+            "agent_view.prepare_routing_table()\n"
             "before = set(sys.modules)\n"
             "routing.prompt_push(recall_prompt.routing_marker('fresh'), budget=1.0)\n"
             "print(sorted(m for m in set(sys.modules) - before if m.startswith('khipu')))\n")

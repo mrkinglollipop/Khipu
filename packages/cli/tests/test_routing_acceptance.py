@@ -417,6 +417,9 @@ def test_3_eight_short_changes_fit_two_pushes_and_only_shown_entities_ack(replay
     assert recall_prompt.mark_routing_full("s1", version=before["version"], epoch=before["epoch"], at=routing._iso(T0))
     for i in range(8):
         routing.report(account=f"A{i}", state="open", author=AUTHOR)
+    # This direct renderer call starts with the complete inventory a helper prepares.
+    from khipu import agent_view
+    agent_view._table([a["key"] for a in replay.view()["accounts"]])
     seen = []
     for _ in range(2):
         before_delivery = copy.deepcopy(recall_prompt.routing_marker("s1"))

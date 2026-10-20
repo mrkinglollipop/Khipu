@@ -461,15 +461,18 @@ def _signature(extra_keys) -> tuple:
 
     view = _saved_view()
     home = _home_dir()
-    homes = _homes(extra_keys, view)
+    homes = sorted(set(_homes(extra_keys, view)), key=repr)
     paths = _other_paths()
+    watched = set()
     for harness, raw in homes:
         if raw is None:
             folder = _DEFAULT_FOLDERS.get(harness)
             if not folder or not home:
                 continue
             raw = os.path.join(home, folder)
-        paths.extend(_forms(raw, home))
+        login_forms = _forms(raw, home)
+        paths.extend(login_forms)
+        watched.update(os.path.expanduser(p) for p in login_forms)
     if home:
         paths.append(home)
     forms = tuple(sorted((path, tuple(sorted(_forms(path, home)))) for path in set(paths)))
@@ -477,7 +480,7 @@ def _signature(extra_keys) -> tuple:
     discovered = hashlib.sha256(repr((homes, forms, sorted(_user_names(paths)))).encode("utf-8")).digest()
     return (stat(config_file()), stat(routing.view_file()), stat(t3.settings_path()),
             view.get("epoch"), view.get("version"), tuple(keep_owner_words(view)),
-            discovered, keys, home)
+            discovered, keys, home, tuple(sorted(watched)))
 
 
 _PROJECTION = threading.local()
@@ -506,46 +509,117 @@ class InventoryUnavailable(RuntimeError):
     """No complete alias inventory exists; the hook must withhold routing."""
 
 
-def prepare_routing_table() -> None:
-    """Give the helper's children a full inventory before its first fork.
+def _inventory_signature(keys, watched):
+    """Check inventory inputs without building alias forms or walking login directories.
 
-    This runs before readiness, outside every prompt's budget. A stalled
-    mount still has a bounded wait; without a last good table the children
-    withhold routing rather than use a scrub missing resolved aliases.
+    Login-shaped home entries detect newly discoverable names. Stamps
+    along known login paths detect retargeted links, including parent links.
+    Owner words are refreshed separately and do not authorize new aliases.
     """
-    if _TABLE.get("table") is not None or _TABLE.get("prepared"):
+    from khipu import discover, t3
+    from khipu.config import config_file
+
+    from khipu.usage import _HOME_VARS
+
+    home = _home_dir()
+    accounts = {a.get("key") for a in _saved_view().get("accounts") or [] if isinstance(a, dict)}
+    accounts.update(keys or ())
+    uncovered = []
+    for key in accounts:
+        if not isinstance(key, str) or "|" not in key:
+            continue
+        harness, _, raw = key.partition("|")
+        if not raw:
+            folder = _DEFAULT_FOLDERS.get(harness)
+            if not folder or not home:
+                continue
+            raw = os.path.join(home, folder)
+        # A read can supply configured keys before any routing view is saved.
+        # Their aliases are already covered by the prepared inventory.
+        if os.path.expanduser(raw).rstrip("/") not in watched:
+            uncovered.append(key)
+    accounts = tuple(sorted(uncovered))
+    environment = tuple((var, os.environ.get(var)) for var in sorted(_HOME_VARS.values()))
+    files = {config_file(), t3.settings_path(), discover.store_file()}
+    paths = set(files)
+    names = ()
+    if home:
+        paths.add(Path(home))
+        try:
+            with os.scandir(home) as entries:
+                found = []
+                for entry in entries:
+                    if not discover.name_match(entry.name):
+                        continue
+                    try:
+                        st = entry.stat()
+                        identity = (st.st_dev, st.st_ino, st.st_mode)
+                    except FileNotFoundError:
+                        identity = None
+                    found.append((entry.name, identity))
+                names = tuple(sorted(found))
+        except FileNotFoundError:
+            pass
+    for raw in watched:
+        path = Path(os.path.expanduser(raw))
+        paths.update((path, *path.parents))
+    stamps = []
+    for path in sorted(paths):
+        try:
+            st = path.stat() if path in files else path.lstat()
+            if path in files or stat.S_ISLNK(st.st_mode):
+                stamps.append((str(path), st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino))
+            else:
+                # A file created inside an ordinary directory changes no alias.
+                stamps.append((str(path), st.st_dev, st.st_ino))
+        except FileNotFoundError:
+            stamps.append((str(path), None))
+    return home, accounts, environment, names, tuple(stamps)
+
+
+def prepare_routing_table(*, refresh=False) -> None:
+    """Prepare before readiness, and retry on the helper's idle ticks.
+
+    Children inherit ``prepared`` even after a timeout so they never repeat
+    the 250 ms wait inside a prompt. Only the helper requests later refreshes.
+    """
+    if not refresh and _TABLE.get("prepared"):
         return
-    # A child inherits even a failed preparation: never repeat the startup
-    # wait per prompt when the helper's volume is still stalled.
     _TABLE["prepared"] = True
+    _TABLE["at"] = 0.0
     with contextlib.suppress(InventoryUnavailable):
         _prompt_table(None, budget=0.25)
 
 
 def _fallback_table(keys):
     previous = _TABLE.get("table")
-    if previous is None:
+    watched = _TABLE.get("watched")
+    if previous is None or watched is None or _TABLE.get("inventory_changed"):
+        raise InventoryUnavailable()
+    if _inventory_signature(keys, watched) != _TABLE.get("inventory"):
         raise InventoryUnavailable()
     table = _rules(keys, local_only=True)
+    if _inventory_signature(keys, watched) != _TABLE.get("inventory"):
+        raise InventoryUnavailable()
     # Retain discovered private aliases, but only today's owner exemptions.
     table.previous = previous
     return table
 
 
-def _prompt_table(keys, *, budget=0.005):
+def _prompt_table(keys, *, budget=0.005, fallback=True):
     """A stalled mount must not consume the hook's routing budget.
 
     A 5ms refresh preserves full discovery when it is responsive. On expiry,
     combine configured and saved login names with the last complete table,
-    without resolving links or listing directories. With no complete table,
-    raise so the hook sends nothing. Keep the caller's process deadline and
-    signal handler intact.
+    without resolving links or walking login directories, only if its inventory
+    inputs are unchanged. Otherwise raise so the hook sends nothing. Keep
+    the caller's process deadline and signal handler intact.
     """
     if threading.current_thread() is not threading.main_thread():
-        return _fallback_table(keys)
+        raise InventoryUnavailable()
     timer = signal.getitimer(signal.ITIMER_REAL)
     if timer[0] and timer[0] <= budget:
-        return _fallback_table(keys)
+        raise InventoryUnavailable()
     handler = signal.getsignal(signal.SIGALRM)
     began = time.monotonic()
 
@@ -560,19 +634,25 @@ def _prompt_table(keys, *, budget=0.005):
         try:
             signal.signal(signal.SIGALRM, expired)
             signal.setitimer(signal.ITIMER_REAL, budget)
-            table = _table(keys)
+            table = _table(keys) if fallback else _fallback_table(keys)
         finally:
             # A one-shot alarm may already be pending when the timer is
             # cancelled. It must become harmless before restoring handlers.
             refreshing = False
     except _InventoryDeadline:
         refreshing = False
+    except (OSError, ValueError) as exc:
+        raise InventoryUnavailable() from exc
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, handler)
         if timer[0]:
             signal.setitimer(signal.ITIMER_REAL, max(0.000001, timer[0] - (time.monotonic() - began)), timer[1])
-    return table if table is not None else _fallback_table(keys)
+    if table is not None:
+        return table
+    if fallback:
+        return _prompt_table(keys, budget=0.005, fallback=False)
+    raise InventoryUnavailable()
 
 
 def _table(extra_keys) -> _Table:
@@ -598,9 +678,16 @@ def _fresh_table(extra_keys):
     with _LOCK:
         if _TABLE["sig"] == sig and now - _TABLE["at"] < _TABLE_TTL_S:
             return _TABLE["table"]
+        old = _TABLE["sig"]
+        if old is not None and old[6] != sig[6]:
+            _TABLE["inventory_changed"] = True
+    watched = sig[-1]
+    inventory = _inventory_signature(extra_keys, watched)
     table = _rules(extra_keys)
+    if _inventory_signature(extra_keys, watched) != inventory:
+        raise InventoryUnavailable()
     with _LOCK:
-        _TABLE.update(sig=sig, at=now, table=table)
+        _TABLE.update(sig=sig, at=now, table=table, inventory=inventory, watched=watched, inventory_changed=False)
     return table
 
 

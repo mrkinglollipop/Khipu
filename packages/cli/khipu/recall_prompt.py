@@ -1361,6 +1361,7 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
     poll_fd: int | None = None
     poll_buf = b""
     next_look = 0.0
+    next_inventory = time.monotonic() + _HELPER_TICK_S
 
     def reap() -> None:
         while children or pollers:
@@ -1425,6 +1426,9 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
                     poll_fd = None
                     _take_poll_answer(schedule, _poll_answer(poll_buf))
             if sock not in ready:
+                if time.monotonic() >= next_inventory:
+                    agent_view.prepare_routing_table(refresh=True)
+                    next_inventory = time.monotonic() + _HELPER_TICK_S
                 continue
             try:
                 msg, fds, _flags, _addr = socket.recv_fds(sock, _FORKSERVER_REQUEST_MOST * 2, 4)
@@ -1457,6 +1461,9 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
                 _prompt_routing_child(write_fd, session_id, None, cap, decided=True)
             children.add(pid)
             os.close(write_fd)
+            if time.monotonic() >= next_inventory:
+                agent_view.prepare_routing_table(refresh=True)
+                next_inventory = time.monotonic() + _HELPER_TICK_S
     finally:
         if poll_fd is not None:
             os.close(poll_fd)

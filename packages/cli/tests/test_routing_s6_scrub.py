@@ -7,6 +7,7 @@ import select
 import signal
 import socket
 import time
+from pathlib import Path
 
 import pytest
 
@@ -25,8 +26,14 @@ def _read_pipe(fd, *, timeout=5):
         result += part
 
 
-@pytest.mark.parametrize("refresh", ["slow-signature", "stalled-volume", "cold-stalled-volume", "one-shot"])
-def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, refresh):
+@pytest.mark.parametrize("refresh,added", [
+    ("slow-signature", None), ("stalled-volume", None),
+    ("cold-stalled-volume", None), ("one-shot", None),
+    ("slow-signature", "configured"), ("slow-signature", "discovered"),
+    ("stalled-volume", "configured"), ("stalled-volume", "discovered"),
+    ("cold-recovery", None),
+])
+def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, refresh, added):
     target = replay.root / "SecretAliasZZZ"
     target.mkdir()
     login = replay.root / "configured-login"
@@ -38,6 +45,11 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
     # Establish the full scrub's result, then start the helper with no inherited table.
     assert "SecretAliasZZZ" not in agent_view.scrub("Use SecretAliasZZZ")
     monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
+    allow_refresh = replay.data / "allow-refresh"
+    release_stall = replay.data / "release-stall"
+    refreshed = replay.data / "inventory-refreshed"
+    if not added and refresh != "cold-recovery":
+        allow_refresh.touch()
     parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
     stdin_read, stdin_write = os.pipe()
     ready_read, ready_write = os.pipe()
@@ -51,14 +63,32 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
         original_signature = agent_view._signature
         original_listdir = agent_view.os.listdir
         original_write = recall_prompt._write_all
+        original_prepare = agent_view.prepare_routing_table
+
+        def prepare(*, refresh=False):
+            if refresh and not allow_refresh.exists():
+                return
+            if refresh:
+                original_prepare(refresh=True)
+            else:
+                original_prepare()
+            if refresh:
+                table = agent_view._TABLE.get("table")
+                word = "SecretNewYYY" if added == "configured" else "codex-SideKKK"
+                if table is not None and (not added or agent_view._scrub_text(word, table, []) != word):
+                    refreshed.touch()
+
+        agent_view.prepare_routing_table = prepare
+        recall_prompt._HELPER_TICK_S = 0.05
 
         def slow_signature(keys):
-            time.sleep(0.015)  # Every warm walk exceeds the prompt's 5ms window.
+            if refresh != "stalled-volume" or release_stall.exists():
+                time.sleep(0.015)  # Every warm walk exceeds the prompt's 5ms window.
             return original_signature(keys)
 
         def stalled_volume(path):
-            if str(path) == "/Volumes":
-                (replay.root / "volume-stalled").touch()
+            if str(path) == "/Volumes" and not release_stall.exists():
+                (replay.data / "volume-stalled").touch()
                 time.sleep(2)
             return original_listdir(path)
 
@@ -67,10 +97,10 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
                 agent_view.os.listdir = stalled_volume
             original_write(fd, data)
 
-        if refresh in ("slow-signature", "one-shot"):
+        if refresh in ("slow-signature", "one-shot", "cold-recovery") or added:
             agent_view._signature = slow_signature
         recall_prompt._write_all = write
-        if refresh == "cold-stalled-volume":
+        if refresh in ("cold-stalled-volume", "cold-recovery"):
             agent_view.os.listdir = stalled_volume
         try:
             if refresh == "one-shot":
@@ -93,7 +123,35 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
             return
         assert select.select([ready_read], [], [], 5)[0], "helper never became ready"
         assert os.read(ready_read, 100) == b"ready\n"
-        for index in range(2):
+        word = None
+        if added == "configured":
+            word = "SecretNewYYY"
+            (replay.root / word).mkdir()
+            second_login = replay.root / "second-login"
+            second_login.symlink_to(replay.root / word, target_is_directory=True)
+            replay.configure(usage_accounts=[
+                {"label": "Work", "harness": "codex", "home": str(login)},
+                {"label": "Home", "harness": "codex", "home": str(second_login)},
+            ])
+        elif added == "discovered":
+            word = "codex-SideKKK"
+            discovered = Path(os.environ["HOME"]) / ("." + word)
+            discovered.mkdir()
+            (discovered / "auth.json").write_text("{}")
+        if added:
+            # Full discovery knows the new alias; the helper still has its startup inventory.
+            assert word not in agent_view.scrub("Use " + word)
+            routing.request_rule("Use " + word, author=AUTHOR)
+            replay.view()
+        for index in range(3 if added or refresh == "cold-recovery" else 2):
+            if index == 2:
+                # Let the real helper's idle tick rebuild its inherited table.
+                release_stall.touch()
+                allow_refresh.touch()
+                deadline = time.monotonic() + 5
+                while not refreshed.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert refreshed.exists(), "helper did not refresh its inventory after recovery"
             read_fd, write_fd = os.pipe()
             try:
                 start = time.monotonic()
@@ -105,16 +163,18 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
                 assert time.monotonic() - start < 1.5, "prompt waited on the stalled volume"
                 answer = json.loads(wire.split(b"\n")[1])
                 assert b"SecretAliasZZZ" not in wire
-                if refresh == "cold-stalled-volume":
+                if word:
+                    assert word.encode() not in wire
+                if refresh == "cold-stalled-volume" or ((added or refresh == "cold-recovery") and index < 2):
                     assert answer == {"skip": "error-InventoryUnavailable", "done": answer["done"]}
                     assert not recall_prompt.routing_marker(f"alias-{index}")
                 else:
-                    assert answer["kind"] == "full", answer
+                    assert answer.get("kind") == "full", answer
                     assert "Use " in answer["text"]
                     assert "Work: open" in answer["text"]
                     assert answer["routing_changes"]["batch"]
-                if refresh != "slow-signature":
-                    assert (replay.root / "volume-stalled").exists()
+                if refresh in ("stalled-volume", "cold-stalled-volume", "cold-recovery"):
+                    assert (replay.data / "volume-stalled").exists()
             finally:
                 os.close(read_fd)
                 if write_fd is not None:
