@@ -4926,7 +4926,7 @@ def merge_outbox_episodes(
     forgotten-source registry cannot be read, no pending capture is added."""
     from khipu.outbox import jobs
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
-    from khipu.tombstones import RegistryError, read_gate
+    from khipu.tombstones import read_gate
 
     merged = list(results)
     seen: set[str] = {f"{r.get('kind')}:{r.get('id')}" for r in merged}
@@ -4982,7 +4982,7 @@ def merge_outbox_episodes(
         # Read after the jobs, so a forget published before this point is seen.
         gate = read_gate()
         found = [m for m in found if gate.allows(m[1])]
-    except RegistryError:
+    except Exception:  # noqa: BLE001 — RegistryError or anything else: fail closed
         return merged
     for jp, payload, summary in found:
         key = f"episode:outbox:{jp.stem}"
