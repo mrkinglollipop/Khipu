@@ -1,141 +1,88 @@
-# Swarm-ready search (scope, 2026-10-19)
+# Swarm-ready search (scope, 2026-10-19; revised 2026-10-20)
 
-Status: scope for review; no code changed. Kept: no lost captures, no lost quality or function, every limit a liftable app setting. Must work on local Docker Postgres and on a small shared remote hub.
+Status: scope with Matt's decisions recorded and a Codex (gpt-6.1-sol) review folded in; no code changed. Kept: no lost captures, no lost quality or function, every limit a liftable owner setting in the app. Must work on local Docker Postgres and on a small shared remote hub.
 
 ## The incident
 
-At 22:56Z about 35 Grok Build jobs started at once on the Mac. Each agent ran its own `python -m khipu.mcp_server` (45 processes), and each fired about 3 `khipu_search` calls at startup. One search took 39 minutes. The hub (Postgres 19 beta 3, 2 CPUs, 4 GB, `max_connections` 40, `shared_buffers` 128 MB) refused new clients, which blocked saves and searches from every Mac and from the cloud gateway. After the clients were killed, 31 orphaned SELECTs ran for another 20 to 46 minutes until they were terminated by hand.
+At 22:56Z on 2026-10-19 about 35 Grok Build jobs started at once on the Mac. Each agent ran its own `python -m khipu.mcp_server` (45 processes), and each fired about 3 `khipu_search` calls at startup. One search took 39 minutes. The hub (Postgres 19 beta 3, 2 CPUs, 4 GB, `max_connections` 40) refused new clients, which blocked saves and searches from every Mac and from the cloud gateway. After the clients were killed, 31 orphaned SELECTs ran for another 20 to 46 minutes. At 23:55Z it was building again: 47 MCP servers, 8 copies of the memory cosine query each running 340 to 620 s.
 
-It was building again while this doc was written. At 23:55Z the Mac had 47 `khipu.mcp_server` processes (church-harness Grok and Claude jobs), and the hub had 8 copies of the memory-cosine query from this Mac, each running 340 to 620 s.
-
-Evidence: code at `67732f0` (live slot `eefa03d`); read-only catalog, `pg_stat_*` and EXPLAIN on the hub; the query log; a throwaway Postgres 16 + pgvector with synthetic data of the hub's shape (23,600 episodes, 7,080 in one project, 38,750 vectors).
+Evidence: code at `67732f0`; read-only catalog, `pg_stat_*` and EXPLAIN on the hub; the query log; a throwaway Postgres 16 + pgvector loaded with synthetic data of the hub's shape (23,600 episodes, 7,080 in one project, 38,750 vectors).
 
 ## Findings
 
-### 1. Root cause: a project-filtered search scans `episodes` once per matching episode
+1. **Root cause: a project-filtered search scans `episodes` once per matching episode.** The cosine leg (`embed._cosine_candidates`, `packages/cli/khipu/embed.py:2098`) checks liveness and the project filter with `EXISTS (… WHERE e.id::text = m.ref …)` nested inside an `OR` across kinds (`embed.py:2141-2165`). No index covers `id::text`, and the `OR` prevents hashing. The hub estimated 2 matching episodes for church-harness; there are 7,092, each running a sequential scan of a 6,868-page table. Since 2026-08-17 the hub has run 5.4 million sequential scans of `episodes`, reading 70.1 billion tuples. On the hermetic copy the filtered query took 8,035 ms; with an index on `(id::text)` it took 51 ms. 131 of 134 swarm searches carried `project`.
+2. **Every search pays the same cast** in the episode label subquery (`embed.py:2203`), up to 50 scans per search. The index brought unfiltered search from 41.5 ms to 6.0 ms.
+3. **The project filter is a substring match** (`COALESCE(project, scope) ILIKE '%…%'`, `embed.py:2386`, params at `:2366`), so no ordinary index can serve it. Run once per search it is one scan; run per candidate it multiplies the cost.
+4. **Unfiltered semantic search returns fewer rows than asked.** `hnsw.ef_search` is never set on the memory leg, so pgvector's default 40 sits below `LIMIT 50` and the commitment and liveness filters run after the index scan: 27 of 50 rows on the hermetic copy. The library leg already sets it (`library_search.py:319`).
+5. **No end-to-end bound.** The cosine leg sets no statement timeout (`embed.py:2131`, `hub_snapshot.py:386-405`). The query is embedded while its connection sits open (`embed.py:2169`). The library worker cancels only its statement in flight (`embed.py:2684`) and carries on.
+6. **Search writes on its own connection.** `_query_vec` commits an `UPDATE` on a cache hit and an `INSERT … ON CONFLICT` on a miss, both on the search connection (`embed.py:651-680`).
+7. **Connections are uncounted across entry points.** An unfiltered search holds two at once (memory leg plus library thread). Each MCP server, the CLI and the per-prompt recall lane connect independently. Recall's hub legs (`recall_prompt.py:2515-2556`) are daemon threads that keep running and holding a connection after the 600 ms budget ends. The gateway serves up to 32 requests at once (`gateway.py:74`), each able to open two.
+8. **Orphans and saves.** `client_connection_check_interval` was 0 and keepalive idle 7,200 s, so a backend outlived its dead client. Every client connects as one superuser role, so no slot was reserved for saves. Captures on Macs were delayed, not lost (outbox, `capture.py:113`); the gateway's callers were not checked.
+9. **The replica can carry overflow, but not with today's engines.** `replica_heal` pulls at most once a minute (`replica_heal.py:43`). The MCP offline fallback (`hub_snapshot.search_stale_payload`, `:6032`) is keyword-only in hybrid mode. Recall's replica engine (`recall_prompt.py:2052-2134`) does cosine plus keyword but returns 8 candidates with no filters (`_SEARCH_LIMIT = 8`, `:94`).
 
-The memory cosine leg (`embed._cosine_candidates`, `packages/cli/khipu/embed.py:2098`) checks that each candidate is still live with `EXISTS (SELECT 1 FROM episodes e WHERE e.id::text = m.ref …)` (`embed.py:2141-2147`). The project filter is another `EXISTS` on the same join (`embed.py:2153`). The cast `e.id::text` rules out the primary key, and no index exists on that expression. The liveness check also sits inside an `OR` across kinds, so the planner cannot hash it.
+## Decisions (Matt, 2026-10-20)
 
-The hub's plan for `project = mrkinglollipop/church-harness` estimates **2** matching episodes. There are **7,092** (counted). The planner picks a nested loop, and every one of those episodes runs `SubPlan exists_3 -> Seq Scan on episodes … Filter: ((deleted_at IS NULL) AND ((id)::text = m.ref))`. One probe measured on the hub read 363 to 501 buffers in 6 to 9 ms. The table has 6,868 pages, so a typical probe reads thousands. That is **minutes of CPU per search, unloaded**; 45 on 2 CPUs take tens of minutes.
-
-The hub's statistics have never been reset (postmaster up since 2026-08-17). They show 5,377,637 sequential scans of `episodes`, reading 70.1 billion tuples. No other table comes close.
-
-On the hermetic copy (1/17 of the hub's page count) the filtered query took **8,035 ms** and 1.53 M buffer hits. After `CREATE INDEX ON episodes ((id::text))` it took **51 ms**, and both the liveness probe and the label lookup used the index.
-
-This is the common path. 131 of the 134 searches logged between 22:40 and 23:59Z carried `project`, because agents pass their repo.
-
-### 2. Every search pays for the same cast
-
-The episode label is `(SELECT e.summary FROM episodes e WHERE e.id::text = m.ref)` (`embed.py:2203`). That is one sequential scan per returned row, up to 50 per search; the unfiltered hub plan shows it as `SubPlan expr_3 -> Seq Scan on episodes`. On the hermetic copy the index brought the unfiltered query from 41.5 ms to 6.0 ms.
-
-### 3. Unfiltered semantic search returns fewer candidates than it asks for (a quality defect)
-
-The unfiltered leg does use `idx_memory_embeddings_hnsw_gemini2_768`. But the memory leg never sets `hnsw.ef_search`, so pgvector's default of 40 sits below the query's `LIMIT 50`. The commitment filter (13,591 of the 40,841 active-profile vectors) and the liveness filter run after the index scan. On the hermetic copy the query returned **27 of 50** rows. With `hnsw.iterative_scan = relaxed_order` and `ef_search = 100` (pgvector 0.8; the hub has 0.8.6) it returned 50 in 88 ms. The library leg already sets `ef_search` (`library_search.py:319-320`).
-
-There is no `idx_embeddings_hnsw` index. The real ones and their scan counts:
-
-| Index | Scans | Note |
-|---|---|---|
-| memory `gemini2_768` | 1,476 | active profile |
-| memory `gemini768` | 0 | inactive profile, 21 MB |
-| memory `voyage_3_1024` | 0 | empty |
-| library `voyage_3_1024` | 669 | |
-
-Statistics were not reset (`stats_reset` is null), so the zero that prompted the question belongs to an inactive profile's index.
-
-### 4. The memory legs have no time limit
-
-- `_cosine_candidates` connects with no statement timeout (`embed.py:2131`). `hybrid_search` uses `try_hub_connect()` (`embed.py:2861`), which sets no timeout and no keepalives (`hub_snapshot.py:386-405`). Owed and decision reads do get `hub_statement_timeout` (30 s, `offline.py:14`); search does not.
-- The library legs are bounded per statement (`library_search.py:393-410`). When the 6 s budget runs out, the code cancels only the statement in flight (`embed.py:2684`). The worker thread treats that as one failed leg and carries on with its next statements.
-- The query is embedded while the cosine connection is open (`embed.py:2169`). The connection then sits idle on the hub for up to the embed timeout plus retries. A cache hit also writes and commits an `UPDATE` (`embed.py:626-684`).
-
-### 5. Connections are opened per call, but nothing limits them across processes
-
-`mcp_server` reads stdio one frame at a time (`mcp_server.py:2687-2716`), so each process has at most one search in flight. It does not hold a connection for its lifetime; each leg opens and closes its own. A default unfiltered search holds two connections at once (the memory leg plus the library thread). Forty-five processes therefore need 45 to 90 connections against a limit of 40, and nothing on the Mac caps how many processes reach the hub.
-
-### 6. Libraries were not the cause
-
-Any filter turns the library legs off (`embed.py:2820`), so 131 of 134 swarm searches never touched the 5 GB library tables. The memory literal leg is a two-worker parallel sequential scan of `episodes` across five ILIKE columns.
-
-### 7. Orphaned queries and saves
-
-- `client_connection_check_interval` is 0 and `tcp_keepalives_idle` is 7200, so a backend whose client has died keeps running until it tries to send. That is why the orphans outlived their clients. `idle_in_transaction_session_timeout` is 0.
-- Every client connects as one superuser role, `alzy`. `superuser_reserved_connections = 3` therefore reserves nothing for captures, and `reserved_connections` is 0.
-- Captures on Macs were delayed, not lost: the outbox keeps them until the hub accepts them (`capture.py:113`). Whether the gateway's callers lost anything was not checked.
-
-### 8. The local replica is fresh enough to carry search under load
-
-`replica_heal` pulls incremental changes at most once a minute (`replica_heal.py:43`, `:330`). The last measurement found episodes 233 s behind and vectors 0 s behind. Per-prompt recall already answers from the replica, using both cosine and keyword matching (`recall_prompt.py:2052-2134`).
-
-The MCP tool's fallback is weaker. `search_stale_payload` (`hub_snapshot.py:6032`) runs keyword-only for hybrid mode, and cosine only when the mode is semantic (`:6061`). In the window, 71 of 134 searches were answered this way.
+1. **Immediate server changes: approved and applied ~00:05Z.** `idx_episodes_id_text` was built and is valid; `client_connection_check_interval = 10s`; `tcp_keepalives_idle/interval/count = 60/10/6`; `idle_in_transaction_session_timeout = 10min`. All reload-only, each undone with `ALTER SYSTEM RESET` (`DROP INDEX CONCURRENTLY` for the index).
+2. **Split the database role:** a separate read role for search. Approved.
+3. **4 search slots and a 1.5 s wait per Mac, then a labelled replica answer.** Approved.
 
 ## Design
 
-**A. Make the query cheap.** A migration adds `idx_episodes_id_text ON episodes ((id::text))`. It is tiny and fixes the liveness check, the label lookup and the backfill path at `embed.py:1805` without changing any result. The cosine SQL is then split into an episode branch and a topic branch, so liveness and filters are top-level conditions and never an `EXISTS` inside an `OR`. With a project filter, an exact sort of about 7,000 vectors is cheap and more accurate than an approximate scan. The unfiltered leg sets `ef_search` to at least the limit, and turns on `iterative_scan` where pgvector is 0.8 or later. Local Docker installs get the same migration.
+**A. Protect captures first.**
 
-**B. Bound every search statement and degrade one leg at a time.**
+- A non-superuser `khipu_read` role serves search, owed, decisions and the gateway's read tools: `CONNECTION LIMIT 20`, `statement_timeout = 30s`, `idle_in_transaction_session_timeout = 60s`, `SELECT` only. The owner role keeps captures, the outbox drain, migrations and the nightly.
+- **Provisioning is automatic everywhere.** `khipu setup` creates the role on a fresh local Docker database. On an existing install (Docker or remote), the first upgraded client that connects as owner runs an idempotent `ensure_read_role`, which creates the role with a generated password and stores it in a hub table only the owner can read. Every other upgraded client, holding the owner DSN, reads the password from there and stores the read DSN in its keychain. No owner step at the computer.
+- **Old clients.** A client that has not upgraded keeps searching as the owner superuser, which no role limit can bound (Postgres exempts superusers from `CONNECTION LIMIT`). Every connection sets `application_name` to `khipu/<role>/<machine>/<version>`, and doctor and the app name any client still searching as owner. Rotating the owner password to cut such a client off is Matt's call, offered in the app, never automatic.
+- **Owner-liftable.** The connection limit and both timeouts are app settings; changing one runs `ALTER ROLE` through the owner connection. 0 means no limit.
+- **Search never writes.** Both the cache-hit `UPDATE` and the miss `INSERT` leave the read connection. The vector is cached in-process at once and queued to the outbox, whose drain writes cache rows in batches on the owner connection it already holds, so a swarm opens no extra owner connections. A cache read stays on the read role.
+- **Restart-only setting.** `reserved_connections = 6` (postmaster context; it gives the owner superuser 6 + 3 slots `khipu_read` can never take). It is written with `ALTER SYSTEM` before the Linode reboot scheduled **Wednesday 2026-10-21 04:00 ET** and takes effect then. `max_connections` stays 40. Every other setting here reloads. Check `SELECT context FROM pg_settings WHERE name = 'reserved_connections'` reads `postmaster` before relying on this.
 
-- A new owner setting, `hub_search_timeout` (default 8 s; 0 means no limit), puts the memory legs under `SET LOCAL statement_timeout`. A leg that times out is dropped and named in `degraded_legs`, as library legs already are.
-- The query is embedded before a hub connection opens.
-- The cache-hit write moves off the search path.
-- The library thread stops at its next leg once cancelled.
-- Search connections get keepalives.
+**B. Make the query cheap without changing results.**
 
-**C. Admission control on each Mac.**
+- **Non-transactional migrations.** The runner commits each step as a transaction (`migrate.py:301-330`), and `CREATE INDEX CONCURRENTLY` cannot run inside one. A new step marker runs one statement in autocommit. Before creating, it checks `pg_index.indisvalid` and compares `pg_get_indexdef` with the expected definition: valid and matching is adopted (the live hub's `idx_episodes_id_text`); invalid is dropped concurrently and rebuilt; a different definition under the same name stops the migration with a named error.
+- **Kind-specific branches.** The cosine SQL becomes a `UNION ALL` of an episode branch (join `episodes` for liveness, project and label), a topic branch (join `topics`) and a media branch (left join `media_assets` on `a.id = m.ref`, text to text). Each branch orders by distance with the full limit, and the outer query re-sorts by distance and limits again, which preserves global ordering exactly. Commitments stay excluded.
+- **Review disagreement, cast matching.** The review asks for no cast-matching. I keep `e.id::text = m.ref`: it casts the bigint side, which never fails, and the expression index serves it. Casting the other way (`m.ref::bigint`) is the unsafe cast the review warns about, because the planner may evaluate it on topic and media rows before the kind test. The defect was the missing index and the `OR`, not the cast.
+- **Project filter once.** The episode ids matching the substring filter (alias group included) are computed once in a `MATERIALIZED` CTE and hash-joined. The substring semantics stay; they are a documented contract (`embed.py:2321`). A trigram index on `COALESCE(project, scope)` is added only if that CTE measures over 50 ms at hub size.
+- **Literal leg.** The full five-column episode `ILIKE` (`cli.py:1162`) is a sequential scan because only `summary` has a trigram index (migration 0015). Add trigram indexes on the four remaining expressions so the planner can `BitmapOr`, measured against capture insert latency; if inserts slow by more than 10 ms, keep the scan and rely on the deadline.
+- **HNSW.** Unfiltered branches set `hnsw.ef_search = min(1000, max(100, 2 × fetch))`, where `fetch` is the oversampled candidate count (up to 200), and `hnsw.iterative_scan = relaxed_order` where pgvector is 0.8 or later. Relaxed order can return rows slightly out of order, so each branch re-sorts by exact distance before rank fusion. Filtered branches use an exact sort over the few thousand matching vectors.
 
-- A machine-wide gate of `hub_search_slots` (default 4) is built from `flock` on slot files, shared by MCP servers, the CLI and the recall fallback. No new process is involved, and a crashed holder frees its slot automatically.
-- A search waits up to `hub_search_wait` (1.5 s) for a slot. It then answers from the replica using the recall lane's engine (cosine plus keyword), labelled `answered_from: "replica"` with `replica_lag_seconds`.
-- Library searches, which have no replica, wait up to the timeout and then say plainly that the hub is busy.
-- The same replica engine replaces the keyword-only offline fallback.
+**C. One end-to-end deadline.** `hub_search_timeout` (owner setting, default 8 s, 0 = none) is one budget for the whole search: slot wait, connect, embed, SQL and cancel. The query is embedded before any connection opens. Each statement runs under `SET LOCAL statement_timeout` equal to the time left. A leg that runs out is cancelled, dropped and named in `degraded_legs`; the library worker checks a stop flag between statements. Connections carry keepalives and `connect_timeout`. On `too many clients`, search does not retry the hub: it goes to overflow (D). Captures retry through the outbox with jittered exponential backoff (base 1 s, cap 60 s, full jitter), so a crowd of Macs does not reconnect in step.
+
+**D. Admission control at every entry point.**
+
+- A machine-wide gate of `hub_search_slots` (default 4; 0 = no limit) built from `flock` on slot files. A slot is one hub connection, so a search that opens the memory leg and the library thread takes two, or runs the library leg after the memory leg on one. A crashed holder frees its slot.
+- Every hub search path takes a slot: MCP servers, the CLI, the recall lane's hub legs (non-blocking: no slot means the leg is skipped and recall answers from the replica, as it already can) and the offline fallback's refresh.
+- The gateway is one process with its own in-process pool of `gateway_search_slots` (default 4), separate from its 32 request workers.
+- A search waits up to `hub_search_wait` (1.5 s) for a slot, then overflows.
 - Captures never take a search slot.
 
-**D. Server limits that protect saves.**
+**E. Overflow keeps search parity.**
 
-- Searches and reads connect as a non-superuser role, `khipu_read`, with a connection limit (default 20 of 40), `statement_timeout = 30s` and `idle_in_transaction_session_timeout = 60s`.
-- Captures, the outbox drain, migrations and the nightly keep the owner role, which gets `pg_use_reserved_connections` with `reserved_connections = 6`.
-- Setup creates both roles for local Docker; joining a hub stores the second DSN; the gateway's search tools use the read role.
-- `client_connection_check_interval`, server keepalives and the idle-in-transaction timeout are set on every install, and a doctor check reports any that are missing.
-
-**E. Acceptance.** A hermetic Postgres at the hub's real size and project skew, loaded by 40 processes × 3 searches (half with a project filter) while a writer saves an episode every second. Pass requires all of:
-
-- hub search p95 ≤ 2 s;
-- every search answers, from the hub or as a labelled replica answer, within `hub_search_timeout` + 2 s;
-- search connections never exceed slots × Macs;
-- no capture fails or waits more than 2 s;
-- no backend outlives its killed client by more than 15 s;
-- `khipu recall eval` shows no loss.
+- **A replica engine with the full search contract,** not recall's 8-candidate engine reused: every mode (hybrid, semantic, literal), the caller's limit, every filter, the same RRF fusion and relevance gate, tombstones and forgotten episodes excluded. Recall and the offline fallback move onto it. Any filter the replica cannot honour is named in `filters_dropped`, as today.
+- **Labels.** `answered_from: "replica"`, `replica_synced_at` and `replica_sync_age_seconds` (time since the last successful pull), and, separately, `replica_lag_seconds` only when measured against the hub (the last heal measured it). An unmeasured lag is `null`, never estimated.
+- **Libraries** have no replica; a library leg that cannot get a slot is named in `degraded_legs` and the memory answer stands.
+- **No replica** (fresh install, gateway, cloud agents): wait for a slot with bounded retries until the deadline, then answer `{"status": "busy", "retry_after_s": N}` in plain words. Never an empty result set that reads as "nothing found".
+- **Full-fidelity path.** Owner setting `search_overflow`: `replica` (default) or `wait`, which waits for a hub slot up to the deadline instead of overflowing.
+- **Review disagreement, pending captures.** Parity means matching the hub, and the hub path does not search the outbox today. A replica answer will not include captures still in the outbox either. Searching the outbox would be new function; it is proposed separately, not built here.
 
 ## Rejected
 
-- **One search service per Mac (the proposal's item 1).** The statement itself took minutes, so a pool of 4 would only have queued every agent behind four of them. Once A and B make searches cheap, what's left is a concurrency cap, and slot files provide it without a daemon. A broker would add a process to every search path. It restarts on every code change (`recall_daemon.py:28-32`), and the direct path would still be needed for when it is down.
-- **PgBouncer.** It caps connections but cannot stop a 6-minute statement. It is one more service for every self-hoster, and it is awkward with the `options=-c statement_timeout` that `db._with_statement_timeout` sends. The role limit gives saves the same guarantee.
-- **Running all search from the replica.** The replica has no libraries, runs minutes behind, and does not exist for the gateway or for cloud agents. It is the right tool for overflow (C), not for everything.
+- **A search service per Mac.** The statement took minutes, so a pool of 4 would only have queued every agent behind four of them. Once B and C make searches cheap, a concurrency cap is what's left, and slot files give it without a daemon that restarts on every code change (`recall_daemon.py:28-32`).
+- **PgBouncer.** It caps connections but cannot stop a long statement, adds a service for every self-hoster, and conflicts with the `options=-c statement_timeout` that `db._with_statement_timeout` sends. The role limit gives saves the same guarantee.
+- **All search from the replica.** It has no libraries, runs minutes behind, and does not exist for the gateway or cloud agents.
 - **A bigger Linode.** Cost grows with project size × table size; more CPUs only divide it.
-- **A short cache for identical queries.** 138 of the 140 queries in the window were distinct.
-- **Library search only on request.** Libraries were already off for 98% of these searches. Removing them from the default would lose function, and B fixes the cancel.
-- **A global `statement_timeout`.** The nightly dump (29 to 70 s), backfills and imports legitimately run long. The bound belongs on the read role and on search statements.
+- **A cache for identical queries.** 138 of 140 queries in the window were distinct.
+- **A global `statement_timeout`.** The nightly dump (29 to 70 s), backfills and imports run long legitimately. The bound belongs on the read role and on search.
 
 ## Slices
 
-Each slice is one session and one PR, merged on its own. The oracle is hermetic pytest from `packages/cli` with a temp HOME and `KHIPU_KEYCHAIN=0`, plus the check named for the slice. Allow at most 3 oracle runs per change; if it is still red, stop and report the last log. Any change to the live hub waits for Matt's go.
+One session and one PR each, merged on its own, in this order. Oracle for every slice: hermetic pytest from `packages/cli` with a temp HOME and `KHIPU_KEYCHAIN=0`, plus the check named. At most 3 oracle runs per change; still red, stop and report the last log. Any change to the live hub waits for Matt's go.
 
-1. **Cheap cosine query.** Migration (`CREATE INDEX CONCURRENTLY IF NOT EXISTS`, so it adopts the index if it was created early), the per-kind SQL split, and `ef_search` with iterative scan behind a feature check. Oracle: a hermetic Postgres test asserting that the filtered plan has no `Seq Scan on episodes` under a loop and that unfiltered searches return 50 rows, plus `khipu recall eval`. Stop if the loop remains or golden recall drops at all.
-2. **Bounded legs.** The `hub_search_timeout` setting in the CLI and the app, `SET LOCAL` with per-leg degrade, embedding before connecting, the cache write moved off the search path, the library stop flag, and keepalives. Oracle: pytest with `pg_sleep` legs proving that a slow leg is dropped and named while the search still answers, and that the library thread is silent after cancel. Stop if any timeout fails the whole search.
-3. **Slots and replica fallback.** Slot files, `hub_search_slots` and `hub_search_wait` in the app, a replica hybrid engine shared with recall, the labelled payload, and the offline path switched to that engine. Oracle: pytest with 20 processes and 2 slots, proving at most 2 hub connections, that every caller answers, and that overflow answers are labelled; the two new setting rows render in the app. Stop if a replica answer is unlabelled.
-4. **Server guard rails.** The read role and second DSN, reserved connections, the server settings, the doctor check, Docker setup, and gateway search on the read role. Oracle: on a hermetic Postgres, saturate the read role and show a capture still lands within 2 s; kill a client and show its backend ends within 15 s. Stop before the Linode (Decision 2).
-5. **Acceptance load test.** Design item E, kept as a script the promotion gate can run. Never tune thresholds to pass.
-
-## Immediate server changes (applied 2026-10-20 ~00:05Z on Matt's go)
-
-Each one applies with `SELECT pg_reload_conf()`, needs no restart, and is undone with `ALTER SYSTEM RESET <name>` (`DROP INDEX CONCURRENTLY` for the index).
-
-- `ALTER SYSTEM SET client_connection_check_interval = '10s';` ends orphans: a backend stops within 10 s of losing its client.
-- `ALTER SYSTEM SET tcp_keepalives_idle = 60;`, `tcp_keepalives_interval = 10;` and `tcp_keepalives_count = 6;` give up on a silent client after about 2 minutes instead of 2 hours.
-- `ALTER SYSTEM SET idle_in_transaction_session_timeout = '10min';` is far above any Khipu transaction.
-- `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_episodes_id_text ON episodes ((id::text));` is a schema write. It takes seconds and does not block writers. It removes the minutes-long search (8,035 ms to 51 ms on the hermetic copy), and slice 1 adopts it by name. It is the most valuable of the four, and the one that most needs an explicit go.
-
-## Decisions for Matt
-
-1. **Apply the four immediate changes before slice 1?** Recommendation: yes. Each one is undone with a single command, and the index alone stops a swarm from taking the hub down while the slices are built.
-2. **Split the database role (a second, read-only DSN for search) or keep one role?** Recommendation: split. It is the only way to guarantee that searches never block saves, including from old clients, other Macs and the gateway.
-3. **Defaults: 4 search slots and a 1.5 s wait per Mac, then a labelled replica answer?** Recommendation: yes. Both are app settings (0 slots means no limit), and the replica answer is the recall lane's engine, at most minutes behind.
+1. **Migration path and index adoption.** The autocommit step marker, definition and validity checks, and migration 0040 (`idx_episodes_id_text`). Oracle: a hermetic Postgres test covering absent (created), valid (adopted, no rebuild), invalid (rebuilt) and different definition (stops with a named error). Stop if any case leaves a half-applied migration recorded.
+2. **Capture protection.** The read role and its automatic provisioning (Docker setup, `ensure_read_role` on upgrade, keychain DSN), `application_name`, the doctor and app rows for old clients and the three role settings, both cache writes off the read connection, gateway reads on the read role, and the `reserved_connections` statement staged for Wednesday. Oracle: on a hermetic Postgres, saturate `khipu_read` and show a capture lands within 2 s; a fresh Docker setup and an upgraded install both end with a working read DSN and no owner step; the settings rows render in the app. Stop if any capture path ends up on the read role.
+3. **Cosine SQL.** The per-kind `UNION ALL`, the materialized project CTE, and HNSW `ef_search` plus iterative scan with the distance re-sort. Oracle: on a hermetic Postgres at hub shape, no `Seq Scan on episodes` under a loop in the filtered plan; top-k recall against exact search (index scans off) of at least 0.95 at k = 50, unfiltered and filtered; identical results to the old SQL on the golden set; `khipu recall eval` shows no loss. Stop if the loop remains or any recall number drops.
+4. **Literal leg.** Trigram indexes on the four remaining episode expressions (concurrent, via slice 1's path) and the project trigram index if the CTE measured over 50 ms. Oracle: literal p95 at hub size with and without the indexes, capture insert latency within 10 ms of baseline, literal results unchanged. Stop if insert latency regresses past that.
+5. **End-to-end deadline.** `hub_search_timeout`, embedding before connecting, per-statement `SET LOCAL` from the remaining budget, the library stop flag, keepalives and `connect_timeout`, outbox jittered backoff. Oracle: `pg_sleep` legs prove a slow leg is cancelled and named while the search answers within the deadline + 0.5 s; the library worker issues nothing after cancel; a `too many clients` stub produces no hub retry from search and spread-out retries from captures. Stop if any timeout fails the whole search.
+6. **Admission control.** Slot files counted per connection, the MCP, CLI and recall entry points, the gateway pool, and the settings in the app. Oracle: 20 processes with 2 slots plus a gateway under load never exceed 2 Mac connections plus the gateway pool, and recall never waits on a slot. Stop if any entry point opens a hub connection without a slot.
+7. **Replica parity and overflow.** The full-contract replica engine shared by recall and the offline fallback, the labels, the no-replica `busy` answer, and `search_overflow`. Oracle: for every mode and filter, the replica answer on a synced copy matches the hub answer on the same data (same ids and order, allowing ties); tombstoned and forgotten rows never appear; a missing replica yields `busy`, not an empty list. Stop if a replica answer is unlabelled or differs without a named reason.
+8. **Acceptance load test,** kept as a script the promotion gate can run. Hermetic Postgres at the hub's real size and project skew; three simulated Macs (40 processes × 3 searches each, half filtered) plus the gateway at its worker cap, one writer saving an episode a second. Cases: replica fresh, stale and missing on different Macs; overload with retries; owner overrides (slots 0, timeout 0, `search_overflow = wait`) behaving as set; the hub restarted mid-run, after which every outbox capture lands exactly once. Pass: hub search p95 ≤ 2 s; every search answers or says `busy` within its deadline + 2 s; connections never exceed the configured slots; no capture fails or waits over 2 s outside the restart; no backend outlives its killed client by more than 15 s; `khipu recall eval` shows no loss. Never tune thresholds to pass.
