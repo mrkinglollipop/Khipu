@@ -27,6 +27,16 @@ from khipu.profiles import ProfileSpec
 TINY = ProfileSpec("voyage-t@4", "voyage", "voyage-t", 4)
 
 
+class ConnectionTimeout(Exception):
+    """Fake psycopg connection-timeout error (its class name is what
+    khipu.hub_errors classifies on)."""
+
+
+class OperationalError(Exception):
+    """Fake psycopg operational error (its class name is what
+    khipu.hub_errors classifies on)."""
+
+
 def _md5(t: str) -> str:
     return hashlib.md5(t.encode()).hexdigest()
 
@@ -1449,6 +1459,134 @@ class NightlyAndDoctorTest(_Base):
             jobs._library_backfill()
         self.assertTrue(any("backfill partial" in line for line in logged))
         self.assertFalse(any("backfill ok" in line for line in logged))
+
+    def test_nightly_retries_a_connection_timeout_and_succeeds_on_the_second_try(self):
+        conn = mock.MagicMock()
+        conn.__enter__.return_value = conn
+        conn.__exit__.return_value = False
+        receipt = {"ok": True, "libraries": 0}
+        with mock.patch(
+            "khipu.db.connect",
+            side_effect=[ConnectionTimeout("connection timeout expired"), conn],
+        ) as connect, mock.patch.object(
+            library, "backfill_all", return_value=receipt
+        ), mock.patch.object(library.time, "sleep") as sleep:
+            out = library.nightly()
+        self.assertEqual(out, receipt)
+        self.assertEqual(connect.call_count, 2)
+        sleep.assert_called_once_with(library.NIGHTLY_CONNECT_DELAY_S)
+
+    def test_nightly_gives_up_after_the_bound_and_jobs_records_the_error(self):
+        with mock.patch(
+            "khipu.db.connect",
+            side_effect=ConnectionTimeout("connection timeout expired"),
+        ) as connect, mock.patch.object(library.time, "sleep") as sleep:
+            with self.assertRaises(ConnectionTimeout):
+                library.nightly()
+        self.assertEqual(connect.call_count, library.NIGHTLY_CONNECT_ATTEMPTS)
+        self.assertEqual(sleep.call_count, library.NIGHTLY_CONNECT_ATTEMPTS - 1)
+        self.assertEqual(
+            [c.args[0] for c in sleep.call_args_list],
+            [library.NIGHTLY_CONNECT_DELAY_S, library.NIGHTLY_CONNECT_DELAY_S * 2],
+        )
+        with mock.patch("khipu.db.dsn_configured", return_value=True), \
+                mock.patch.object(
+                    library, "nightly",
+                    side_effect=ConnectionTimeout("connection timeout expired"),
+                ), mock.patch.object(jobs, "_nightly_log"):
+            out = jobs._library_backfill()
+        self.assertEqual(
+            out, {"ok": False, "error": "ConnectionTimeout: connection timeout expired"}
+        )
+
+    def test_nightly_does_not_retry_an_error_from_a_hub_that_answered(self):
+        with mock.patch(
+            "khipu.db.connect", side_effect=ValueError("invalid connect adapter")
+        ) as connect, mock.patch.object(library.time, "sleep") as sleep:
+            with self.assertRaises(ValueError):
+                library.nightly()
+        self.assertEqual(connect.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_nightly_does_not_rerun_the_sweep_when_connection_exit_raises(self):
+        """The sweep commits per batch; if closing the connection then
+        raises an OperationalError, reconnecting and sweeping again could
+        replay committed work — exactly one sweep call must happen."""
+        class ExitBoomConn:
+            def __init__(self):
+                self.commits = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                raise OperationalError("server closed the connection")
+
+        conn = ExitBoomConn()
+
+        def sweep(opened):
+            opened.commits += 1  # a batch committed before the exit failure
+            return {"ok": True, "libraries": 0}
+
+        with mock.patch(
+            "khipu.db.connect", return_value=conn
+        ) as connect, mock.patch.object(
+            library, "backfill_all", side_effect=sweep
+        ) as backfill_all, mock.patch.object(library.time, "sleep") as sleep:
+            with self.assertRaises(OperationalError):
+                library.nightly()
+        self.assertEqual(conn.commits, 1)
+        self.assertEqual(connect.call_count, 1)
+        self.assertEqual(backfill_all.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_nightly_does_not_retry_a_query_failure_after_connect(self):
+        conn = mock.MagicMock()
+        conn.__enter__.return_value = conn
+        conn.__exit__.return_value = False
+        with mock.patch(
+            "khipu.db.connect", return_value=conn
+        ) as connect, mock.patch.object(
+            library, "backfill_all",
+            side_effect=OperationalError("connection is lost"),
+        ) as backfill_all, mock.patch.object(library.time, "sleep") as sleep:
+            with self.assertRaises(OperationalError):
+                library.nightly()
+        self.assertEqual(connect.call_count, 1)
+        self.assertEqual(backfill_all.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_a_real_429_after_retries_reaches_doctors_fix_text(self):
+        """Drive the real batch path: the fake provider raises HTTP 429 on
+        every attempt, embed_batch exhausts its retries, and the structured
+        failure in the sweep receipt — not an injected error string — is
+        what doctor's fix reads."""
+        calls = {"n": 0}
+
+        def transport(url, data, headers, timeout):  # noqa: ARG001
+            calls["n"] += 1
+            raise urllib.error.HTTPError(
+                "https://x", 429, "err", {},
+                io.BytesIO(b"quota exceeded for vk-secret-body"),
+            )
+
+        embed.set_transport(transport)
+        self.addCleanup(embed.set_transport, None)
+        out = library.backfill_all(self.hub)
+        self.assertFalse(out["ok"])
+        # One chunk, one batch: the initial attempt plus every retry.
+        self.assertEqual(calls["n"], embed.BACKFILL_RETRIES + 1)
+        item = out["results"][0]
+        self.assertEqual(
+            item["last_provider_failure"],
+            {"http_status": 429, "kind": "rate_limited"},
+        )
+        self.assertNotIn("vk-secret-body", json.dumps(out))
+        fix = jobs._embed_backfill_fix({"counts": {"library": out}})
+        self.assertIn("embedding provider", fix)
+        self.assertTrue("quota" in fix or "spending cap" in fix)
+        self.assertIn("429", fix)
+        self.assertNotIn("hub database", fix)
 
     def test_a_hub_without_library_tables_is_a_skip_not_a_failure(self):
         self.hub.library_tables = False

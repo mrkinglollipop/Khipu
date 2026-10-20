@@ -543,5 +543,75 @@ class IndexFreshnessTest(unittest.TestCase):
         self.assertTrue(out["reasons"])
 
 
+class EmbedProviderFixTextTest(unittest.TestCase):
+    """Doctor's embed_provider_ok fix follows the recorded embed_backfill
+    failure instead of always blaming the provider key."""
+
+    def _embed_provider_row(self, entry: dict) -> dict:
+        from datetime import datetime, timezone
+
+        entry.setdefault("name", "embed_backfill")
+        entry.setdefault("ok", False)
+        entry.setdefault("counts", {})
+        entry.setdefault("error", None)
+        entry.setdefault("ts", datetime.now(timezone.utc).isoformat())
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "nightly-last.json").write_text(
+                json.dumps({"steps": [entry]}), encoding="utf-8"
+            )
+            with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
+                    mock.patch.object(jobs, "ensure_data_dir", return_value=tmp):
+                out = jobs.nightly_step_health()
+        return out["embed_provider_ok"]
+
+    def test_fix_names_the_database_on_a_connection_timeout(self):
+        row = self._embed_provider_row(
+            {"error": "ConnectionTimeout: connection timeout expired"}
+        )
+        self.assertFalse(row["ok"])
+        self.assertIn("hub database", row["fix"])
+        self.assertIn("reachable", row["fix"])
+        self.assertNotIn("provider key", row["fix"])
+
+    def test_fix_names_the_database_on_a_library_connection_timeout(self):
+        row = self._embed_provider_row({
+            "counts": {"ok": False, "library": {
+                "ok": False, "error": "ConnectionTimeout: connection timeout expired"}},
+        })
+        self.assertFalse(row["ok"])
+        self.assertIn("hub database", row["fix"])
+        self.assertNotIn("provider key", row["fix"])
+
+    def test_fix_names_the_provider_on_an_http_auth_error(self):
+        kinds = {"401": "unauthorized", "403": "forbidden"}
+        for code, kind in kinds.items():
+            with self.subTest(code=code):
+                row = self._embed_provider_row({
+                    "counts": {"last_provider_failure":
+                               {"http_status": int(code), "kind": kind}},
+                })
+                self.assertIn("embedding provider", row["fix"])
+                self.assertIn(code, row["fix"])
+                self.assertNotIn("hub database", row["fix"])
+
+    def test_fix_names_quota_or_spending_cap_on_http_429(self):
+        # The structured shape the real batch-failure path records (driven
+        # end-to-end in test_embed.py / test_library.py); no error string
+        # is injected here because the real path records none.
+        row = self._embed_provider_row({
+            "counts": {"library": {"results": [{
+                "last_provider_failure": {"http_status": 429, "kind": "rate_limited"},
+            }]}},
+        })
+        self.assertIn("embedding provider", row["fix"])
+        self.assertTrue("quota" in row["fix"] or "spending cap" in row["fix"])
+        self.assertIn("429", row["fix"])
+
+    def test_fix_falls_back_to_the_provider_hint_on_other_failures(self):
+        row = self._embed_provider_row({"error": "missing key"})
+        self.assertIn("check the embedding provider key/credentials", row["fix"])
+
+
 if __name__ == "__main__":
     unittest.main()
