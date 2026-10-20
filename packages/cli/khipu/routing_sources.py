@@ -1466,7 +1466,7 @@ def launches(cache: dict) -> list[dict]:
     return out
 
 
-def provider_checks(cache: dict, providers: dict, known: list[dict]) -> list[dict]:
+def provider_checks(cache: dict, providers: dict, known: list[dict], lane_map: dict | None = None) -> list[dict]:
     """Provider model facts checked against each runner's declared settings."""
     from khipu import routing
     from khipu.routing_providers import advisory
@@ -1475,12 +1475,12 @@ def provider_checks(cache: dict, providers: dict, known: list[dict]) -> list[dic
     for runner, kept in (cache.get("runners") or {}).items():
         specs = ((kept.get("config") or {}).get("data") or {}).get("lanes") or {}
         for lane, spec in specs.items():
-            match = routing.resolve_lane(runner, lane, {}, known, spec, providers)
+            match = routing.resolve_lane(runner, lane, lane_map or {}, known, spec, providers)
             account = next((a for a in known if a["key"] == match["key"]), None)
             provider = providers.get(account["harness"]) if account else providers.get(
                 routing._provider_id(spec.get("provider") or spec.get("kind")))
             if provider:
                 out += [{"check": "provider_models", "runner": runner, "lane": lane, "status": "broken",
                          "text": f"{runner} lane {lane}: {text}"}
-                        for text in advisory(provider, spec.get("model"))]
+                        for text in advisory(provider, spec.get("model"), include_use=False)]
     return out

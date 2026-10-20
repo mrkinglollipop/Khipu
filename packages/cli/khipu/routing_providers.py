@@ -27,6 +27,11 @@ def checked(value):
         return None
     if value.get("use", "normal") not in {"normal", "on_request"}:
         return None
+    from khipu.routing_sources import _key_like, _redacted
+
+    label = value["label"]
+    if any(c in label for c in "/\\|") or _key_like(label) or _redacted(label, len(label) + 1) != label:
+        return None
     host = value.get("host")
     if host is not None and (len(host) > 253 or not re.fullmatch(
             r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?", host) or ".." in host):
@@ -36,7 +41,7 @@ def checked(value):
     return {k: list(v) if isinstance(v, list) else v for k, v in value.items()}
 
 
-def advisory(provider: dict, model: str | None) -> list[str]:
+def advisory(provider: dict, model: str | None, *, include_use: bool = True) -> list[str]:
     """Exact declared model ids, never inferred aliases or a routing decision."""
     warnings = []
     label = provider.get("label") or provider["id"]
@@ -45,7 +50,7 @@ def advisory(provider: dict, model: str | None) -> list[str]:
     allowed = provider.get("models_allowed")
     if model and model != "(name withheld)" and allowed is not None and model not in allowed:
         warnings.append(f"{label}: model {model or 'unknown'} is outside models_allowed ({', '.join(allowed)}).")
-    if provider.get("use") == "on_request":
+    if include_use and provider.get("use") == "on_request":
         warnings.append(f"{label}: use: on_request; follow the owner's request when choosing this provider.")
     return warnings
 

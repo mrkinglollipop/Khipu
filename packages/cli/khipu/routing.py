@@ -3254,8 +3254,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     for item in evidence:
         cut = lane_cuts.get((item.get("runner") or "", item.get("lane") or ""))
         before_cut = cut is not None and not item.get("account") and _before_cut(item, cut)
-        match = resolve_lane(item.get("runner") or "", item.get("lane") or "", lane_map, known,
-                             item.get("declaration"), definitions["providers"])
+        match = resolve_lane(item["runner"], item.get("lane") or "", lane_map, known,
+                             item.get("declaration"), definitions["providers"]) if item.get("runner") else None
         key = None if before_cut else _evidence_account(item, lane_map, known, forward, definitions["providers"])
         if item.get("runner"):
             item["lane_match"] = match
@@ -3267,7 +3267,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 unmatched_raw.append(item)
             continue
         item["account"] = key
-        if match["key"] == key:
+        if match and match["key"] == key:
             by_key[key].update(matched_by=match["matched_by"])
         per_account.setdefault(key, []).append(item)
     known_keys = {a["key"] for a in known}
@@ -6593,7 +6593,11 @@ def doctor_block(now: datetime | None = None) -> dict:
 
     cache = view.get("source_cache") or {}
     checks = routing_sources.rule_checks(cache, view.get("rules") or [])
-    checks += routing_sources.provider_checks(cache, (view.get("definitions") or {}).get("providers", {}), accounts())
+    definitions = view.get("definitions") or {}
+    lane_map = {runner: dict(lanes) for runner, lanes in cfg["routing_lane_map"].items()}
+    for runner, lanes in definitions.get("lane_maps", {}).items():
+        lane_map.setdefault(runner, {}).update(lanes)
+    checks += routing_sources.provider_checks(cache, definitions.get("providers", {}), accounts(), lane_map)
     warnings += [c["text"] for c in checks if c["status"] == "broken"]
     warnings += _launch_warnings(view, routing_sources.launches(cache), cfg, now)
     budget = prompt_budget_block(cfg)

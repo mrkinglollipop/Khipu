@@ -38,6 +38,9 @@ The first three are strong. An estimate is not.
 
 - **Plan usage cache.** An account at 100% of a window counts as limited. Headroom after that reopens it as checked. "Not signed in" and "not installed" count as down.
 - **Job runner folders.** Folders you point Khipu at (setting `routing_sources`). Khipu only reads them, never writes. It reads the runner's limited flag, the tail of its event log, its heartbeat and a few config keys. Folders inside credential locations are refused.
+- **Conversation reports.** An agent that hits a limit can report it.
+- **You, in the app.**
+- **The routing table file** (setting `routing_table`). Read only, as a pointer. It is never treated as account state.
 
 Provider definitions are owner facts (`definition_set`, `definition: provider`),
 written with `khipu route definition set provider --value='<JSON>'` (terminal
@@ -87,9 +90,6 @@ Runner identity contract:
 - Health lists `identity_state: claimed|confirmed`, match origin, candidates,
   and repair guidance. Stale or contradictory bindings never match. A failed
   or silent heartbeat cannot confirm identity.
-- **Conversation reports.** An agent that hits a limit can report it.
-- **You, in the app.**
-- **The routing table file** (setting `routing_table`). Read only, as a pointer. It is never treated as account state.
 
 A runner's lane maps to an account through the lane map (`routing_lane_map`). A lane with no match is shown and pushed as one line. Khipu does not guess.
 

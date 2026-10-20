@@ -190,7 +190,7 @@ def test_provider_checks_flag_real_runner_model_settings(mac, monkeypatch):
     monkeypatch.setattr(routing, 'prompt_budget_block', lambda cfg=None: {'warn': False})
     checks = routing.doctor_block()['rule_checks']
     assert any(c['lane'] == 'ds' and 'models_allowed' in c['text'] for c in checks)
-    assert any(c['lane'] == 'gemini' and 'on_request' in c['text'] for c in checks)
+    assert not any(c['lane'] == 'gemini' for c in checks)
 
 
 def test_compact_provider_fact_roundtrips_and_conflicting_heartbeat_refuses_report(mac):

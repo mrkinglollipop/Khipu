@@ -148,6 +148,9 @@ def source_events(extra: list[dict], events: list[dict], cfg: dict, mac: str,
                                    "used_pct", "source", "written_by", "via", "evidence", "reason",
                                    "model", "family", "transport", "observed", "session_logs",
                                    "message_time", "until_default", "reset_at", "declaration") if k in item}
+        if "declaration" in row:
+            # Login bindings are local; the observation already carries a stable account id.
+            row["declaration"] = {k: v for k, v in row["declaration"].items() if k != "login_account"}
         row.update(type="observation", id=identity.uuid7(), witness_at=r._iso(witness),
                    written_at=r._iso(witness), until=r._iso(item.get("until")),
                    account=key_ids.get(item.get("account"), item.get("account")))
