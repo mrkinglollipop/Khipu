@@ -27,6 +27,11 @@ from khipu.profiles import ProfileSpec
 TINY = ProfileSpec("voyage-t@4", "voyage", "voyage-t", 4)
 
 
+class ConnectionTimeout(Exception):
+    """Fake psycopg connection-timeout error (its class name is what
+    khipu.hub_errors classifies on)."""
+
+
 def _md5(t: str) -> str:
     return hashlib.md5(t.encode()).hexdigest()
 
@@ -1449,6 +1454,54 @@ class NightlyAndDoctorTest(_Base):
             jobs._library_backfill()
         self.assertTrue(any("backfill partial" in line for line in logged))
         self.assertFalse(any("backfill ok" in line for line in logged))
+
+    def test_nightly_retries_a_connection_timeout_and_succeeds_on_the_second_try(self):
+        conn = mock.MagicMock()
+        conn.__enter__.return_value = conn
+        conn.__exit__.return_value = False
+        receipt = {"ok": True, "libraries": 0}
+        with mock.patch(
+            "khipu.db.connect",
+            side_effect=[ConnectionTimeout("connection timeout expired"), conn],
+        ) as connect, mock.patch.object(
+            library, "backfill_all", return_value=receipt
+        ), mock.patch.object(library.time, "sleep") as sleep:
+            out = library.nightly()
+        self.assertEqual(out, receipt)
+        self.assertEqual(connect.call_count, 2)
+        sleep.assert_called_once_with(library.NIGHTLY_CONNECT_DELAY_S)
+
+    def test_nightly_gives_up_after_the_bound_and_jobs_records_the_error(self):
+        with mock.patch(
+            "khipu.db.connect",
+            side_effect=ConnectionTimeout("connection timeout expired"),
+        ) as connect, mock.patch.object(library.time, "sleep") as sleep:
+            with self.assertRaises(ConnectionTimeout):
+                library.nightly()
+        self.assertEqual(connect.call_count, library.NIGHTLY_CONNECT_ATTEMPTS)
+        self.assertEqual(sleep.call_count, library.NIGHTLY_CONNECT_ATTEMPTS - 1)
+        self.assertEqual(
+            [c.args[0] for c in sleep.call_args_list],
+            [library.NIGHTLY_CONNECT_DELAY_S, library.NIGHTLY_CONNECT_DELAY_S * 2],
+        )
+        with mock.patch("khipu.db.dsn_configured", return_value=True), \
+                mock.patch.object(
+                    library, "nightly",
+                    side_effect=ConnectionTimeout("connection timeout expired"),
+                ), mock.patch.object(jobs, "_nightly_log"):
+            out = jobs._library_backfill()
+        self.assertEqual(
+            out, {"ok": False, "error": "ConnectionTimeout: connection timeout expired"}
+        )
+
+    def test_nightly_does_not_retry_an_error_from_a_hub_that_answered(self):
+        with mock.patch(
+            "khipu.db.connect", side_effect=ValueError("invalid connect adapter")
+        ) as connect, mock.patch.object(library.time, "sleep") as sleep:
+            with self.assertRaises(ValueError):
+                library.nightly()
+        self.assertEqual(connect.call_count, 1)
+        sleep.assert_not_called()
 
     def test_a_hub_without_library_tables_is_a_skip_not_a_failure(self):
         self.hub.library_tables = False

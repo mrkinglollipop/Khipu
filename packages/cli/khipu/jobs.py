@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -543,6 +544,8 @@ def _embed_backfill() -> dict[str, Any]:
         out["library"] = lib
         if not lib.get("ok", False):
             out["ok"] = False
+            if lib.get("error") and not out.get("error"):
+                out["error"] = str(lib["error"])
     return out
 
 
@@ -755,6 +758,54 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     ),
 }
 
+_EMBED_HTTP_STATUS_RE = re.compile(r"\b(401|403|429)\b")
+
+
+def _recorded_error_texts(value: Any) -> list[str]:
+    """Every ``error``/``reason`` string recorded in a nightly step entry,
+    including the library sub-receipt nested in its counts."""
+    texts: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in ("error", "reason") and item:
+                texts.append(str(item))
+            else:
+                texts.extend(_recorded_error_texts(item))
+    elif isinstance(value, list):
+        for item in value:
+            texts.extend(_recorded_error_texts(item))
+    return texts
+
+
+def _embed_backfill_fix(entry: dict[str, Any]) -> str:
+    """Doctor fix for a failed embed_backfill step, following the recorded
+    failure instead of always blaming the provider key: a hub connection
+    failure names the database, a provider HTTP error names the provider
+    (for 429, its quota or spending cap), and anything else keeps the
+    generic provider hint."""
+    from khipu.hub_errors import unreachable_text
+
+    texts = _recorded_error_texts(entry)
+    if any(unreachable_text(text) for text in texts):
+        return (
+            "check the hub database is reachable (its connection timed out or was refused), "
+            "then run `khipu jobs install nightly` or wait for the next nightly"
+        )
+    for text in texts:
+        match = _EMBED_HTTP_STATUS_RE.search(text)
+        if match:
+            code = match.group(1)
+            if code == "429":
+                return (
+                    "check the embedding provider quota or spending cap (HTTP 429), "
+                    "then run `khipu jobs install nightly` or wait for the next nightly"
+                )
+            return (
+                f"check the embedding provider key/credentials (HTTP {code}), "
+                "then run `khipu jobs install nightly` or wait for the next nightly"
+            )
+    return _NIGHTLY_STEP_CHECKS["embed_provider_ok"][1]
+
 
 # A step whose last recorded run is older than this is treated as "the
 # nightly stopped running", not "it hasn't run yet today" — same idea as
@@ -940,7 +991,9 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
         out[doctor_key] = {
             "ok": ok, "applicable": True,
             "error": None if ok else entry.get("error"),
-            "fix": None if ok else fix,
+            "fix": None if ok else (
+                _embed_backfill_fix(entry) if doctor_key == "embed_provider_ok" else fix
+            ),
             "ts": entry.get("ts"),
             "source": source,
         }

@@ -47,6 +47,8 @@ IMPORTED_HASH_PREFIX = "imported:"
 MASS_REBUILD_MIN_DOCS = 20
 MASS_REBUILD_MAX_FRACTION = 0.10
 NIGHTLY_LIBRARY_CHUNKS = int(os.environ.get("KHIPU_LIBRARY_NIGHTLY_CHUNKS", "500"))
+NIGHTLY_CONNECT_ATTEMPTS = 3
+NIGHTLY_CONNECT_DELAY_S = 1.0
 SCAN_COMMIT_EVERY = 25          # documents per commit
 IMPORT_BATCH = 500              # rows per executemany + commit
 STATUS_SAMPLE = 10
@@ -811,11 +813,31 @@ def backfill_all(conn) -> dict[str, Any]:
 
 
 def nightly() -> dict[str, Any]:
-    """``backfill_all`` over one short connection (the job's entry point)."""
-    from khipu.db import connect
+    """``backfill_all`` over one short connection (the job's entry point).
 
-    with connect() as conn:
-        return backfill_all(conn)
+    A hub connection failure (the hub_errors rule: the connect timed out,
+    was refused, or dropped) is retried a bounded number of times with
+    doubling backoff — one transient timeout must not leave every library
+    unswept until tomorrow. An error from a hub that answered raises at once.
+    """
+    from khipu.db import connect
+    from khipu.hub_errors import unreachable_error
+
+    delay = NIGHTLY_CONNECT_DELAY_S
+    for attempt in range(1, NIGHTLY_CONNECT_ATTEMPTS + 1):
+        try:
+            with connect() as conn:
+                return backfill_all(conn)
+        except Exception as exc:  # noqa: BLE001 — re-raised unless a retryable hub failure
+            if attempt >= NIGHTLY_CONNECT_ATTEMPTS or not unreachable_error(exc):
+                raise
+            _log(
+                f"nightly: {type(exc).__name__}: {exc}; "
+                f"retry {attempt + 1}/{NIGHTLY_CONNECT_ATTEMPTS} in {delay:.0f}s"
+            )
+            time.sleep(delay)
+            delay *= 2
+    raise AssertionError("nightly retry loop exhausted")
 
 
 # ---- doctor ---------------------------------------------------------------------
