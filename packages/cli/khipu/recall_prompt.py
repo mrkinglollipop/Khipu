@@ -1461,9 +1461,8 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
                 _prompt_routing_child(write_fd, session_id, None, cap, decided=True)
             children.add(pid)
             os.close(write_fd)
-            if time.monotonic() >= next_inventory:
-                agent_view.prepare_routing_table(refresh=True)
-                next_inventory = time.monotonic() + _HELPER_TICK_S
+            agent_view.prepare_routing_table(refresh=True)
+            next_inventory = time.monotonic() + _HELPER_TICK_S
     finally:
         if poll_fd is not None:
             os.close(poll_fd)

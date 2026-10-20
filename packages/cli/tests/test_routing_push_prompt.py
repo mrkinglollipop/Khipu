@@ -30,6 +30,7 @@ from pathlib import Path
 
 import pytest
 
+from khipu import agent_view
 from khipu import paths, promote, recall_daemon, recall_prompt, routing
 
 T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
@@ -113,6 +114,7 @@ def test_pending_rule_mark_and_prior_words_repeat_with_an_unrelated_next_push(ho
     routing.report(account="Codex", state="limited", until="2h", author=ME)
     marker = {"version": heard_pending["version"], "epoch": heard_pending["epoch"],
               "full_at": routing._iso(home["clock"].now)}
+    agent_view.prepare_routing_table(refresh=True)
     pushed = routing.prompt_push(marker, budget=1.0)
     assert pushed["kind"] == "changes"
     assert "changed by a Claude Code conversation at the owner's request" in pushed["text"]
@@ -836,8 +838,10 @@ def _block_of(text_len_target: int, marker: dict) -> str:
     """Set the note so the routing block for ``marker`` is ``text_len_target``
     UTF-16 units long; returns the block."""
     routing.set_note("short", via="app")
+    agent_view.prepare_routing_table(refresh=True)
     small = routing.prompt_push(dict(marker), budget=1.0)["text"]
     routing.set_note("n" * (len("short") + text_len_target - _u16(small)), via="app")
+    agent_view.prepare_routing_table(refresh=True)
     text = routing.prompt_push(dict(marker), budget=1.0)["text"]
     assert _u16(text) == text_len_target
     return text
@@ -1858,6 +1862,7 @@ def test_an_unsaved_change_is_never_taken_for_no_change(home, monkeypatch):
     with monkeypatch.context() as m:
         _lock_contended(m)
         with pytest.raises(routing.PushUnsaved):
+            agent_view.prepare_routing_table(refresh=True)
             routing.prompt_push(before, budget=1.0)
         assert "## Routing" not in _cold(monkeypatch)
         assert _last_log().endswith(" routing=skipped:unsaved")
@@ -1876,6 +1881,7 @@ def test_an_unsaved_view_that_changed_nothing_still_sends_nothing(home, monkeypa
     Path(routing.events_file()).touch()  # an input changed; the state did not
     with monkeypatch.context() as m:
         _lock_contended(m)
+        agent_view.prepare_routing_table(refresh=True)
         assert routing.prompt_push(before, budget=1.0)["kind"] == "none"
         assert "## Routing" not in _cold(monkeypatch)
         assert _last_log().endswith(" routing=none")

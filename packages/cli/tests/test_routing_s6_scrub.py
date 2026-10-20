@@ -31,6 +31,7 @@ def _read_pipe(fd, *, timeout=5):
     ("cold-stalled-volume", None), ("one-shot", None),
     ("slow-signature", "configured"), ("slow-signature", "discovered"),
     ("stalled-volume", "configured"), ("stalled-volume", "discovered"),
+    ("fast-signature", "configured"), ("fast-signature", "discovered"),
     ("cold-recovery", None),
 ])
 def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, refresh, added):
@@ -73,7 +74,7 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
             else:
                 original_prepare()
             if refresh:
-                table = agent_view._TABLE.get("table")
+                table = agent_view._TABLE.get("helper_table")
                 word = "SecretNewYYY" if added == "configured" else "codex-SideKKK"
                 if table is not None and (not added or agent_view._scrub_text(word, table, []) != word):
                     refreshed.touch()
@@ -97,7 +98,7 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
                 agent_view.os.listdir = stalled_volume
             original_write(fd, data)
 
-        if refresh in ("slow-signature", "one-shot", "cold-recovery") or added:
+        if refresh in ("slow-signature", "one-shot", "cold-recovery") or (added and refresh != "fast-signature"):
             agent_view._signature = slow_signature
         recall_prompt._write_all = write
         if refresh in ("cold-stalled-volume", "cold-recovery"):
@@ -143,6 +144,9 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
             assert word not in agent_view.scrub("Use " + word)
             routing.request_rule("Use " + word, author=AUTHOR)
             replay.view()
+        if added and refresh != "fast-signature":
+            # An incomplete probe may use the prior table only within two seconds.
+            time.sleep(agent_view._PROMPT_TABLE_MAX_AGE_S + 0.05)
         for index in range(3 if added or refresh == "cold-recovery" else 2):
             if index == 2:
                 # Let the real helper's idle tick rebuild its inherited table.
@@ -173,7 +177,7 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
                     assert "Use " in answer["text"]
                     assert "Work: open" in answer["text"]
                     assert answer["routing_changes"]["batch"]
-                if refresh in ("stalled-volume", "cold-stalled-volume", "cold-recovery"):
+                if refresh in ("stalled-volume", "cold-stalled-volume", "cold-recovery") and not added:
                     assert (replay.data / "volume-stalled").exists()
             finally:
                 os.close(read_fd)
@@ -191,3 +195,65 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
         else:
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
+
+
+def test_helper_table_expires_without_a_completed_prompt_signature(replay, monkeypatch):
+    routing.report(account="Codex", state="open", author=AUTHOR)
+    monkeypatch.setattr(agent_view, "_TABLE", {})
+    agent_view.prepare_routing_table()
+    assert agent_view._PROMPT_TABLE_MAX_AGE_S == 2 * recall_prompt._HELPER_TICK_S == 2.0
+    built = agent_view._TABLE["helper_at"]
+    built_sig = agent_view._TABLE["helper_sig"]
+    # A login appears immediately after the helper's last build.
+    folder = Path(os.environ["HOME"]) / ".codex-NewLoginXYZ"
+    folder.mkdir()
+    (folder / "auth.json").write_text("{}")
+    changed = agent_view._signature(None)
+    assert agent_view._login_signature(changed) != agent_view._login_signature(built_sig)
+    # A completed prompt probe catches it even inside the permitted window.
+    monkeypatch.setattr(agent_view, "_signature", lambda _: changed)
+    with pytest.raises(agent_view.InventoryUnavailable):
+        agent_view._prompt_table(())
+
+    def stalled(_):
+        time.sleep(0.1)
+        pytest.fail("prompt signature exceeded its deadline")
+
+    monkeypatch.setattr(agent_view, "_signature", stalled)
+    monkeypatch.setattr(agent_view.time, "monotonic", lambda: built + 1.99)
+    assert agent_view._prompt_table(()) is not None
+    assert agent_view._TABLE["helper_at"] == built
+    monkeypatch.setattr(agent_view.time, "monotonic", lambda: built + 2.001)
+    with pytest.raises(agent_view.InventoryUnavailable):
+        agent_view._prompt_table(())
+
+
+def test_helper_rebuilds_unchanged_inputs_and_failed_refresh_does_not_renew(replay, monkeypatch):
+    monkeypatch.setattr(agent_view, "_TABLE", {})
+    agent_view.prepare_routing_table()
+    previous = agent_view._TABLE["helper_table"]
+    built = agent_view._TABLE["helper_at"]
+    agent_view.prepare_routing_table(refresh=True)
+    assert agent_view._TABLE["helper_table"] is not previous
+    assert agent_view._TABLE["helper_at"] >= built
+    built = agent_view._TABLE["helper_at"]
+
+    def stalled(_):
+        time.sleep(0.5)
+        pytest.fail("helper refresh exceeded its deadline")
+
+    monkeypatch.setattr(agent_view, "_signature", stalled)
+    agent_view.prepare_routing_table(refresh=True)
+    assert agent_view._TABLE["helper_at"] == built
+
+
+@pytest.mark.parametrize("wall_change", [3.0, -3.0])
+def test_helper_table_expires_across_sleep_or_a_backwards_clock(replay, monkeypatch, wall_change):
+    agent_view.prepare_routing_table()
+    built = agent_view._TABLE["helper_at"]
+    wall = agent_view._TABLE["helper_wall_at"]
+    monkeypatch.setattr(agent_view.time, "monotonic", lambda: built)
+    monkeypatch.setattr(agent_view.time, "time", lambda: wall + wall_change)
+    monkeypatch.setattr(agent_view, "_signature", lambda _: pytest.fail("expired table reached discovery"))
+    with pytest.raises(agent_view.InventoryUnavailable):
+        agent_view._prompt_table(())

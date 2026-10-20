@@ -115,6 +115,14 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
 
 
 @pytest.fixture(autouse=True)
+def _isolate_routing_inventory(monkeypatch):
+    """Each hermetic runtime needs its own process-local helper inventory."""
+    from khipu import agent_view
+
+    monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
+
+
+@pytest.fixture(autouse=True)
 def _reset_table_columns_cache():
     from khipu import db
 

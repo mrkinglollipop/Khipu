@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from khipu import agent_view
 from khipu import recall_prompt, recall_rule, routing
 
 
@@ -95,12 +96,14 @@ def test_c_omitted_changes_stay_behind_the_real_delivery_watermark(home):
                                           at=marker["full_at"])
     for i in range(8):
         routing.report(account=f"A{i}", state="open", author=ME)
+    agent_view.prepare_routing_table(refresh=True)
     first = routing.prompt_push(marker, budget=1.0)
     assert first["kind"] == "changes"
     assert "more changes" in first["text"]
     _deliver(first)
     heard = recall_prompt.routing_marker(SESSION)
     assert heard.get("owed")
+    agent_view.prepare_routing_table(refresh=True)
     second = routing.prompt_push(heard, budget=1.0)
     _deliver(second)
     two = first["text"] + "\n" + second["text"]
@@ -108,6 +111,7 @@ def test_c_omitted_changes_stay_behind_the_real_delivery_watermark(home):
     assert not recall_prompt.routing_marker(SESSION).get("owed")
     assert len(first["shown_entities"] + second["shown_entities"]) == 8
     assert len(set(first["shown_entities"] + second["shown_entities"])) == 8
+    agent_view.prepare_routing_table(refresh=True)
     assert routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)["kind"] == "none"
     assert all(len(out["text"].split("\n", 1)[1]) <= 400 for out in (first, second))
 
@@ -122,12 +126,14 @@ def test_c_same_version_debt_precedes_newer_priority(home):
     marker = {"version": base["version"], "epoch": base["epoch"], "full_at": routing._iso(T0)}
     assert recall_prompt.mark_routing_full(SESSION, version=base["version"], epoch=base["epoch"],
                                           at=marker["full_at"])
+    agent_view.prepare_routing_table(refresh=True)
     first = routing.prompt_push(marker, budget=1.0)
     _deliver(first)
     owed = recall_prompt.routing_marker(SESSION)["owed"]
     assert owed
     routing.request_priority([{"account": "Grok", "role": "newer priority"}], owner_request="use Grok",
                              author=ME, expect=routing.priority_version())
+    agent_view.prepare_routing_table(refresh=True)
     second = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
     first_owed = next(f"A{i}" for i in range(8) if f"account:{key(i)}" in owed)
     assert second["text"].index(first_owed) < second["text"].index("Your priority")
@@ -206,6 +212,7 @@ def test_acceptance_real_replay_has_grok_priority_and_hold_contradiction(
     view = routing.read_view()
     routing.report(account="Codex", state="open", author=ME)
     marker = {"version": view["version"], "epoch": view["epoch"], "full_at": routing._iso(T0)}
+    agent_view.prepare_routing_table(refresh=True)
     prompt = routing.prompt_push(marker, budget=1.0)
     start_text, prompt_text = (start or {}).get("text", ""), prompt.get("text") or ""
     for rendered in (start_text, prompt_text):
@@ -296,6 +303,7 @@ def test_review_omitted_pending_changes_are_counted_and_delivered_later(home, mo
         if path == "changes":
             assert recall_prompt.mark_routing_full(SESSION, version=before["version"], epoch=before["epoch"],
                                                    at=routing._iso(T0))
+        agent_view.prepare_routing_table(refresh=True)
         out = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
     view = routing.read_view()
     pending = {*[routing._rule_component(r) for r in view["rules"]], "priority"}
@@ -318,6 +326,7 @@ def test_review_omitted_pending_changes_are_counted_and_delivered_later(home, mo
         _deliver(dict(out, kind=out.get("kind") or "full", at=routing._iso(T0)))
         if not recall_prompt.routing_marker(SESSION).get("owed"):
             break
+        agent_view.prepare_routing_table(refresh=True)
         out = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
         assert out["kind"] == "changes"
     state = routing_delivery.snapshot(SESSION)

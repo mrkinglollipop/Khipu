@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import pytest
 
+from khipu import agent_view
 from khipu import accounts, owner_direction, routing, routing_entries
 from tests.test_routing_acceptance import AUTHOR, FIXTURES, LEGACY, T0
 
@@ -402,6 +403,7 @@ def test_cached_definition_inputs_borrow_without_whole_log_work(replay, monkeypa
     monkeypatch.setattr(routing, "fold", counted_fold)
     monkeypatch.setattr(routing, "_in_write_order", counted_order)
     assert replay.view()["version"] == view["version"]
+    agent_view.prepare_routing_table(refresh=True)
     routing.prompt_push({"version": view["version"], "epoch": view["epoch"], "full_at": routing._iso(replay.now)},
                         budget=1.0, now=replay.now)
     routing.accounts()

@@ -27,6 +27,7 @@ can't be matched whole) is scrubbed like anything else.
 from __future__ import annotations
 
 import contextlib
+import copy
 import getpass
 import hashlib
 import html
@@ -439,6 +440,8 @@ def _rules(extra_keys: Iterable[str] | None = None, *, local_only=False) -> _Tab
 
 
 _TABLE_TTL_S = 60.0
+# Two one-second helper ticks; incomplete prompt probes never renew this age.
+_PROMPT_TABLE_MAX_AGE_S = 2.0
 _TABLE: dict = {"sig": None, "at": 0.0, "table": None}
 
 
@@ -577,44 +580,8 @@ def _inventory_signature(keys, watched):
     return home, accounts, environment, names, tuple(stamps)
 
 
-def prepare_routing_table(*, refresh=False) -> None:
-    """Prepare before readiness, and retry on the helper's idle ticks.
-
-    Children inherit ``prepared`` even after a timeout so they never repeat
-    the 250 ms wait inside a prompt. Only the helper requests later refreshes.
-    """
-    if not refresh and _TABLE.get("prepared"):
-        return
-    _TABLE["prepared"] = True
-    _TABLE["at"] = 0.0
-    with contextlib.suppress(InventoryUnavailable):
-        _prompt_table(None, budget=0.25)
-
-
-def _fallback_table(keys):
-    previous = _TABLE.get("table")
-    watched = _TABLE.get("watched")
-    if previous is None or watched is None or _TABLE.get("inventory_changed"):
-        raise InventoryUnavailable()
-    if _inventory_signature(keys, watched) != _TABLE.get("inventory"):
-        raise InventoryUnavailable()
-    table = _rules(keys, local_only=True)
-    if _inventory_signature(keys, watched) != _TABLE.get("inventory"):
-        raise InventoryUnavailable()
-    # Retain discovered private aliases, but only today's owner exemptions.
-    table.previous = previous
-    return table
-
-
-def _prompt_table(keys, *, budget=0.005, fallback=True):
-    """A stalled mount must not consume the hook's routing budget.
-
-    A 5ms refresh preserves full discovery when it is responsive. On expiry,
-    combine configured and saved login names with the last complete table,
-    without resolving links or walking login directories, only if its inventory
-    inputs are unchanged. Otherwise raise so the hook sends nothing. Keep
-    the caller's process deadline and signal handler intact.
-    """
+def _bounded_inventory(call, budget):
+    """Bound filesystem discovery without consuming the caller's alarm."""
     if threading.current_thread() is not threading.main_thread():
         raise InventoryUnavailable()
     timer = signal.getitimer(signal.ITIMER_REAL)
@@ -622,25 +589,21 @@ def _prompt_table(keys, *, budget=0.005, fallback=True):
         raise InventoryUnavailable()
     handler = signal.getsignal(signal.SIGALRM)
     began = time.monotonic()
-
-    refreshing = True
-    table = None
+    active = True
 
     def expired(*_):
-        if refreshing:
+        if active:
             raise _InventoryDeadline()
 
     try:
         try:
             signal.signal(signal.SIGALRM, expired)
             signal.setitimer(signal.ITIMER_REAL, budget)
-            table = _table(keys) if fallback else _fallback_table(keys)
+            return call()
         finally:
-            # A one-shot alarm may already be pending when the timer is
-            # cancelled. It must become harmless before restoring handlers.
-            refreshing = False
+            active = False
     except _InventoryDeadline:
-        refreshing = False
+        return None
     except (OSError, ValueError) as exc:
         raise InventoryUnavailable() from exc
     finally:
@@ -648,11 +611,68 @@ def _prompt_table(keys, *, budget=0.005, fallback=True):
         signal.signal(signal.SIGALRM, handler)
         if timer[0]:
             signal.setitimer(signal.ITIMER_REAL, max(0.000001, timer[0] - (time.monotonic() - began)), timer[1])
-    if table is not None:
-        return table
-    if fallback:
-        return _prompt_table(keys, budget=0.005, fallback=False)
-    raise InventoryUnavailable()
+
+
+def prepare_routing_table(*, refresh=False) -> None:
+    """Rebuild the helper's full inventory within 250 ms, retrying failed starts.
+
+    Prompt children inherit ``prepared`` even after a timeout. Only successful
+    full builds renew the two-second freshness window.
+    """
+    if not refresh and _TABLE.get("prepared"):
+        return
+    _TABLE["prepared"] = True
+
+    def rebuild():
+        previous = getattr(_FORM_CACHE, "current", None)
+        _FORM_CACHE.current = {}
+        try:
+            sig = _signature(None)
+            inventory = _inventory_signature(None, sig[-1])
+            table = _rules(None)
+            if _inventory_signature(None, sig[-1]) != inventory:
+                raise InventoryUnavailable()
+            _TABLE.update(helper_table=table, helper_sig=sig, helper_at=time.monotonic(), helper_wall_at=time.time())
+            return table
+        finally:
+            _FORM_CACHE.current = previous
+
+    with contextlib.suppress(InventoryUnavailable):
+        _bounded_inventory(rebuild, 0.25)
+
+
+def _login_signature(sig):
+    # Routing revisions and current owner exemptions do not change login aliases.
+    return sig[0], sig[2], sig[6], sig[8], sig[9]
+
+
+def _helper_table_fresh():
+    # Wall time includes Mac sleep; monotonic time still bounds a backwards
+    # clock adjustment. A wall clock earlier than the build is untrusted.
+    mono_age = time.monotonic() - _TABLE.get("helper_at", 0.0)
+    wall_age = time.time() - _TABLE.get("helper_wall_at", 0.0)
+    return 0 <= mono_age <= _PROMPT_TABLE_MAX_AGE_S and 0 <= wall_age <= _PROMPT_TABLE_MAX_AGE_S
+
+
+def _prompt_table(keys):
+    """Use the helper's complete table for at most two seconds.
+
+    A completed 5 ms login probe can reject it earlier. An incomplete probe
+    cannot extend its lifetime or prevent use while it is fresh.
+    """
+    previous = _TABLE.get("helper_table")
+    built_sig = _TABLE.get("helper_sig")
+    if previous is None or built_sig is None or not _helper_table_fresh():
+        raise InventoryUnavailable()
+    sig = _bounded_inventory(lambda: _signature(keys), 0.005)
+    if sig is not None and _login_signature(sig) != _login_signature(built_sig):
+        raise InventoryUnavailable()
+    if not _helper_table_fresh():
+        raise InventoryUnavailable()
+    # Never inherit ended owner exemptions from the helper's older routing view.
+    table = copy.copy(previous)
+    table.owner = keep_owner_words(_saved_view())
+    return table
 
 
 def _table(extra_keys) -> _Table:

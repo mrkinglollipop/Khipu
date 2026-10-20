@@ -22,6 +22,7 @@ from unittest import mock
 
 import pytest
 
+from khipu import agent_view
 from khipu import integrations as integ
 from khipu import recall_prompt, routing, routing_delegation
 
@@ -302,6 +303,7 @@ def test_the_seen_marker_is_shared_with_the_per_prompt_push(home, monkeypatch):
     assert marker["version"] == routing.read_view()["version"]
     assert marker["full_at"] == "2026-10-14T15:00:00Z"
     # The per-prompt push reads the same marker: the change is not repeated at the next prompt.
+    agent_view.prepare_routing_table(refresh=True)
     assert routing.prompt_push(marker, budget=1.0)["kind"] == "none"
 
 

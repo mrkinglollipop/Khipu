@@ -39,6 +39,7 @@ def test_reservation_retries_do_not_ack_and_lease_reissues_same_page(replay):
 def test_components_and_sessions_cannot_consume_each_others_batches(replay):
     routing.request_rule("Grok " + "z" * 3000, author=AUTHOR)
     main, _, info = replay.offer()
+    agent_view.prepare_routing_table(refresh=True)
     child = routing.prompt_push(recall_prompt.routing_marker("s1", "agent:child"), budget=1.0)
     assert child["routing_changes"]["component"] == "agent:child"
     assert child["routing_changes"]["items"] == main["routing_changes"]["items"]
@@ -53,6 +54,7 @@ def test_components_and_sessions_cannot_consume_each_others_batches(replay):
 
 def test_overlapping_offers_reserve_exactly_one_batch(replay):
     routing.report(account="Codex", state="open", author=AUTHOR)
+    agent_view.prepare_routing_table(refresh=True)
     out = routing._prompt_push({}, budget=1.0)
     view = out.pop("_delivery_view")
     planned = routing_delivery.plan(out, view, replay.now, routing.settings())
@@ -151,6 +153,7 @@ def test_projection_checks_paths_once_per_read_and_refreshes_between_reads(repla
     replay.configure(usage_accounts=[{"label": "Work", "harness": "codex", "home": path}])
     view = replay.view()
     keys = [entry["key"] for entry in view["accounts"]]
+    agent_view.prepare_routing_table(refresh=True)
     original = agent_view._signature
     calls = []
     def signature(extra_keys):
@@ -165,14 +168,18 @@ def test_projection_checks_paths_once_per_read_and_refreshes_between_reads(repla
     replay.configure(usage_accounts=[{"label": "Work", "harness": "codex", "home": other}])
     view = replay.view()
     keys = [entry["key"] for entry in view["accounts"]]
+    # The helper refreshes between these two independently rendered prompts.
+    agent_view.prepare_routing_table(refresh=True)
+    calls.clear()
     with agent_view.routing_projection(keys):
         assert other not in routing._for_agents(other, view)
-    assert len(calls) == 2
+    assert len(calls) == 1
 
 
 def test_crowded_recall_repacks_an_unshown_batch_without_losing_words(replay):
     words = "owner words " * 580
     routing.add_rule(words, via="app")
+    agent_view.prepare_routing_table(refresh=True)
     out = routing.prompt_push(recall_prompt.routing_marker("s1"), budget=1.0)
     original = out["routing_changes"]
     at = recall_prompt._RoutingAtPrompt()
@@ -326,7 +333,7 @@ def test_stalled_volume_refresh_keeps_prompt_routing_and_restores_alarm(replay, 
     routing.add_rule("Grok builds", via="app")
     view = replay.view()
     routing._entry_definitions()
-    agent_view._table([a["key"] for a in view["accounts"]])
+    agent_view.prepare_routing_table(refresh=True)
     original = agent_view.os.listdir
     visited = []
     def stalled(path):
@@ -338,7 +345,7 @@ def test_stalled_volume_refresh_keeps_prompt_routing_and_restores_alarm(replay, 
     monkeypatch.setattr(agent_view.os, "listdir", stalled)
     handler = signal.getsignal(signal.SIGALRM)
     start = time.monotonic()
-    out, context, _ = replay.offer()
+    out, context, _ = replay.offer(helper_tick=False)
     elapsed = time.monotonic() - start
     assert visited
     assert elapsed < 0.15, elapsed
@@ -351,7 +358,7 @@ def test_stalled_volume_refresh_keeps_prompt_routing_and_restores_alarm(replay, 
 def test_ack_history_is_bounded_and_recent_ack_is_idempotent(replay):
     routing.add_rule("x" * 100000, via="app")
     # This direct renderer call starts with the complete inventory a helper prepares.
-    agent_view._table([a["key"] for a in replay.view()["accounts"]])
+    agent_view.prepare_routing_table(refresh=True)
     batches = []
     for _ in range(140):
         out, _, info = replay.offer()
@@ -369,6 +376,7 @@ def test_refit_page_total_never_claims_completion_with_text_still_owed(replay):
     out, _, info = replay.offer()
     replay.ack(info)
     for _ in range(50):
+        agent_view.prepare_routing_table(refresh=True)
         out = routing.prompt_push(recall_prompt.routing_marker("s1"), budget=1.0)
         if not out.get("routing_changes"):
             break
@@ -414,7 +422,7 @@ def test_stalled_refresh_keeps_known_aliases_without_retired_owner_exemptions(re
     routing.add_rule("Use PrivateAlias9", via="app")
     view = replay.view()
     keys = [a["key"] for a in view["accounts"]]
-    agent_view._table(keys)
+    agent_view.prepare_routing_table(refresh=True)
     routing.retire_rule(1, via="app")
     def stalled(_keys):
         time.sleep(0.2)

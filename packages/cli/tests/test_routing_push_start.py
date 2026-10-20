@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from khipu import agent_view
 from khipu import features, recall_prompt, recall_rule, routing
 from khipu import session_capture as sc
 
@@ -641,6 +642,7 @@ def test_a_large_start_pages_the_note_and_keeps_mandatory_memory(home, monkeypat
         offset = end
         if entry["acked"]:
             break
+        agent_view.prepare_routing_table(refresh=True)
         out = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
         at = recall_prompt._RoutingAtPrompt()
         at.session = SESSION
