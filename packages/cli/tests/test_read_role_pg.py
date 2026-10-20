@@ -34,6 +34,7 @@ def owner_env(hub, monkeypatch):  # noqa: F811
     monkeypatch.setenv("KHIPU_DATABASE_URL", hub.dsn)
     monkeypatch.delenv("KHIPU_READ_DATABASE_URL", raising=False)
     monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
+    _drop_read_role(hub.connect())
     return hub
 
 
@@ -43,27 +44,65 @@ def _who(conn) -> tuple[str, str]:
         return cur.fetchone()
 
 
-def test_the_read_role_is_select_only_and_cannot_read_its_password(owner_env):
+def _drop_read_role(conn) -> None:
+    """Roles are the whole cluster's and outlive a test's database."""
+    conn.rollback()
+    was = conn.autocommit
+    conn.autocommit = True
+    try:
+        if conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (read_role.READ_ROLE,)).fetchone():
+            conn.execute(f"DROP OWNED BY {read_role.READ_ROLE}")
+            conn.execute(f"DROP ROLE {read_role.READ_ROLE}")
+    finally:
+        conn.autocommit = was
+
+
+def _pw_dsn(owner_env, password: str = "owner-secret") -> str:
+    # Trust auth ignores it; the derivation and the verifier use it.
+    return owner_env.dsn.replace("postgresql://khipu@", f"postgresql://khipu:{password}@")
+
+
+def _verifies(verifier: str, password: str) -> bool:
+    import base64
+
+    iterations, salt = verifier.split("$")[1].split(":")
+    return read_role.scram_verifier(password, salt=base64.b64decode(salt), iterations=int(iterations)) == verifier
+
+
+def _rolpassword(owner) -> str | None:
+    with owner.cursor() as cur:
+        cur.execute("SELECT rolpassword FROM pg_authid WHERE rolname = %s", (read_role.READ_ROLE,))
+        row = cur.fetchone()
+    owner.rollback()
+    return row[0] if row else None
+
+
+def test_the_read_role_is_select_only_and_no_password_is_kept_on_the_hub(owner_env, monkeypatch):
     owner = owner_env.connect()
-    result = read_role.ensure_read_role(owner)
-    assert result["ok"], result
-    conninfo = read_role.read_conninfo_for(owner_env.dsn, read_role.hub_password(owner))
-    with psycopg.connect(conninfo) as reader, reader.cursor() as cur:
+    # A table an earlier build kept the plaintext in is removed.
+    owner.execute(f"CREATE TABLE {read_role.LEGACY_SECRETS_TABLE} (role text, secret text)")
+    owner.commit()
+    dsn = _pw_dsn(owner_env)
+    monkeypatch.setenv("KHIPU_DATABASE_URL", dsn)
+    result = read_role.ensure_read_role(owner, owner_dsn=dsn)
+    assert result["ok"] and result["created"], result
+    with psycopg.connect(read_role.read_conninfo_for(dsn)) as reader, reader.cursor() as cur:
         cur.execute("SELECT count(*) FROM episodes")
         cur.fetchone()
         reader.rollback()
         with pytest.raises(psycopg.Error):
             cur.execute("INSERT INTO memory_query_cache (profile, query_hash, embedding) VALUES ('x', 'y', NULL)")
         reader.rollback()
-        with pytest.raises(psycopg.errors.InsufficientPrivilege):
-            cur.execute(f"SELECT secret FROM {read_role.SECRETS_TABLE}")
-        reader.rollback()
     with owner.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (read_role.LEGACY_SECRETS_TABLE,))
+        assert cur.fetchone()[0] is None
         cur.execute("SELECT rolsuper, rolconnlimit, rolconfig FROM pg_roles WHERE rolname = %s", (read_role.READ_ROLE,))
         sup, limit, config = cur.fetchone()
+    owner.rollback()
     assert sup is False and limit == 20
     assert "statement_timeout=30000ms" in config
     assert "idle_in_transaction_session_timeout=60000ms" in config
+    assert _verifies(_rolpassword(owner), read_role.derived_password(dsn))
 
 
 def test_a_capture_lands_within_two_seconds_while_the_read_role_is_full(owner_env, monkeypatch):
@@ -108,38 +147,30 @@ def test_a_capture_lands_within_two_seconds_while_the_read_role_is_full(owner_en
         assert cur.fetchone()[0] == 1
 
 
-def test_setup_creates_the_role_and_saves_a_working_read_dsn(owner_env):
+def test_setup_creates_the_role_and_search_needs_nothing_stored(owner_env):
     from khipu import setup
 
     owner = owner_env.connect()
     entry = setup._store_read_role(owner, owner_env.dsn)
     assert entry["ok"], entry
-    assert read_role._read_dsn_file().is_file()
-    assert oct(read_role._read_dsn_file().stat().st_mode & 0o777) == "0o600"
+    assert not (read_role._memo_file().parent / "read_dsn").exists()
     with db.connect(role="read") as conn:
         user, app = _who(conn)
     assert user == read_role.READ_ROLE
     assert app.startswith("khipu/read/")
 
 
-def test_an_upgraded_install_provisions_on_first_search_and_a_second_mac_reuses_the_password(owner_env):
-    assert read_role.stored_read_dsn() is None
+def test_an_upgraded_install_provisions_on_first_search_and_a_second_mac_needs_no_owner_step(
+        owner_env, monkeypatch):
     with db.connect(role="read") as conn:
         assert _who(conn)[0] == read_role.READ_ROLE
-    owner = owner_env.connect()
-    with owner.cursor() as cur:
-        cur.execute(f"SELECT secret, rotated_at FROM {read_role.SECRETS_TABLE} WHERE role = %s",
-                    (read_role.READ_ROLE,))
-        first = cur.fetchone()
-    owner.rollback()
-    # Another Mac: nothing stored locally, the hub already holds the password.
-    read_role._read_dsn_file().unlink()
+    # Another Mac (another process): it derives the same password and logs in
+    # without any owner connection.
+    read_role.invalidate_cache()
+    labels = _watch_labels(monkeypatch)
     with db.connect(role="read") as conn:
         assert _who(conn)[0] == read_role.READ_ROLE
-    with owner.cursor() as cur:
-        cur.execute(f"SELECT secret, rotated_at FROM {read_role.SECRETS_TABLE} WHERE role = %s",
-                    (read_role.READ_ROLE,))
-        assert cur.fetchone() == first
+    assert labels == ["read"], labels
     # Captures and writes keep the owner role.
     with db.connect() as conn:
         user, app = _who(conn)
@@ -160,7 +191,7 @@ def test_a_hub_that_cannot_host_the_role_searches_as_the_owner_records_it_and_do
             user, app = _who(conn)
         assert user == "khipu_limited_owner"
         assert app.startswith("khipu/owner-read/")
-        assert "cannot create roles" in (read_role.cannot_host() or "")
+        assert "cannot create roles" in (read_role.cannot_host(limited) or "")
         # Recorded: the next search does not ask the hub again.
         monkeypatch.setattr(read_role, "ensure_read_role", lambda *a, **k: pytest.fail("re-checked every search"))
         with db.connect(role="read") as conn:
@@ -200,18 +231,23 @@ def test_a_failed_provisioning_never_falls_back_to_the_owner(owner_env, monkeypa
     # Recorded, so the next search answers at once, still never as the owner.
     with pytest.raises(read_role.ReadRoleUnavailable):
         db.connect(role="read")
-    assert "owner-read" not in labels and "read" not in labels, labels
+    assert "owner-read" not in labels and labels.count("owner") == 1, labels
 
 
 def test_a_refused_password_that_cannot_be_repaired_never_falls_back_to_the_owner(owner_env, monkeypatch):
     with db.connect(role="read") as conn:
         assert _who(conn)[0] == read_role.READ_ROLE
-    assert read_role._CACHED
+    assert read_role._VALIDATED
     labels = _watch_labels(monkeypatch, refuse_read=True)
     with pytest.raises(read_role.ReadRoleUnavailable):
         db.connect(role="read")
     assert "owner-read" not in labels, labels
-    assert not read_role._CACHED and read_role.stored_read_dsn() is None
+    assert not read_role._VALIDATED
+    # Recorded: the next search does not open an owner connection to retry.
+    labels.clear()
+    with pytest.raises(read_role.ReadRoleUnavailable):
+        db.connect(role="read")
+    assert labels == ["read"], labels
 
 
 def test_read_entry_points_connect_as_the_read_role(owner_env, monkeypatch, capsys):
@@ -303,25 +339,23 @@ def test_an_existing_read_role_with_more_rights_is_refused_not_altered(owner_env
         owner.execute(f"DROP ROLE IF EXISTS {read_role.READ_ROLE}")
 
 
-def _kept_secret(owner) -> str:
-    with owner.cursor() as cur:
-        cur.execute(f"SELECT secret FROM {read_role.SECRETS_TABLE} WHERE role = %s", (read_role.READ_ROLE,))
-        secret = cur.fetchone()[0]
-    owner.rollback()
-    return secret
-
-
-def test_a_refused_password_is_rotated_only_while_it_is_still_the_kept_one(owner_env):
+def test_a_repair_sets_the_same_derived_password_whichever_client_runs_it(owner_env, monkeypatch):
     owner = owner_env.connect()
-    assert read_role.ensure_read_role(owner)["ok"]
-    current = _kept_secret(owner)
-    # Another Mac already rotated: the password this one was refused is not kept.
-    result = read_role.ensure_read_role(owner, refused_password="an-older-password")
-    assert result["ok"] and not result["password_reset"], result
-    assert _kept_secret(owner) == current
-    result = read_role.ensure_read_role(owner, refused_password=current)
-    assert result["ok"] and result["password_reset"], result
-    assert _kept_secret(owner) != current
+    dsn = _pw_dsn(owner_env)
+    assert read_role.ensure_read_role(owner, owner_dsn=dsn)["ok"]
+    first = _rolpassword(owner)
+    # Two clients repairing at once set verifiers for one password.
+    assert read_role.ensure_read_role(owner, owner_dsn=dsn, repair=True)["password_reset"]
+    assert read_role.ensure_read_role(owner, owner_dsn=dsn, repair=True)["password_reset"]
+    assert _verifies(_rolpassword(owner), read_role.derived_password(dsn))
+    assert _verifies(first, read_role.derived_password(dsn))
+    # It follows the owner password, and the hub's name for it does not matter.
+    assert read_role.derived_password(_pw_dsn(owner_env, "rotated")) != read_role.derived_password(dsn)
+    assert read_role.derived_password(dsn.replace("127.0.0.1", "hub.example")) == read_role.derived_password(dsn)
+    # A setting change leaves the password alone.
+    before = _rolpassword(owner)
+    read_role.set_setting("read_role_statement_timeout", 9, conn=owner)
+    assert _rolpassword(owner) == before
 
 
 class _Recording:
@@ -358,17 +392,17 @@ class _Recording:
         return _Cursor(self._conn.cursor())
 
 
-def test_the_password_never_appears_in_statement_text_and_the_hub_keeps_a_scram_verifier(owner_env):
+def test_no_password_is_ever_sent_to_the_hub_and_the_verifier_is_postgresqls_own(owner_env, monkeypatch):
     owner = owner_env.connect()
+    dsn = _pw_dsn(owner_env)
     recording = _Recording(owner)
-    assert read_role.ensure_read_role(recording)["ok"]
-    secret = _kept_secret(owner)
-    assert not [text for text, _ in recording.statements if secret in text]
-    assert ("log_statement", "none", ) == next(p[:2] for t, p in recording.statements if p and "set_config" in t)
+    assert read_role.ensure_read_role(recording, owner_dsn=dsn)["ok"]
+    assert read_role.ensure_read_role(recording, owner_dsn=dsn, repair=True)["ok"]
+    password = read_role.derived_password(dsn)
+    assert not [t for t, p in recording.statements if password in t or password in repr(p)]
+    assert not [t for t, _ in recording.statements if read_role.LEGACY_SECRETS_TABLE in t and "DROP" not in t]
+    assert _verifies(_rolpassword(owner), password)
     with owner.cursor() as cur:
-        cur.execute("SELECT rolpassword FROM pg_authid WHERE rolname = %s", (read_role.READ_ROLE,))
-        stored = cur.fetchone()[0]
-        # The local verifier is the one PostgreSQL computes itself.
         cur.execute("SET password_encryption = 'scram-sha-256'")
         cur.execute("DROP ROLE IF EXISTS khipu_scram_probe")
         cur.execute("CREATE ROLE khipu_scram_probe PASSWORD 'probe-password'")
@@ -376,35 +410,111 @@ def test_the_password_never_appears_in_statement_text_and_the_hub_keeps_a_scram_
         server_made = cur.fetchone()[0]
         cur.execute("DROP ROLE khipu_scram_probe")
     owner.rollback()
-
-    def again(verifier: str, password: str) -> str:
-        import base64
-
-        iterations, salt = verifier.split("$")[1].split(":")
-        return read_role.scram_verifier(password, salt=base64.b64decode(salt), iterations=int(iterations))
-
-    assert stored.startswith("SCRAM-SHA-256$") and again(stored, secret) == stored
-    assert again(server_made, "probe-password") == server_made
+    assert _verifies(server_made, "probe-password")
 
 
-def test_the_read_dsn_is_cached_and_the_file_is_preferred_over_the_keychain(owner_env, monkeypatch):
+def test_an_owner_dsn_without_a_password_gives_the_read_role_none(owner_env):
+    owner = owner_env.connect()
+    assert read_role.derived_password(owner_env.dsn) is None
+    assert read_role.ensure_read_role(owner, owner_dsn=owner_env.dsn)["ok"]
+    assert _rolpassword(owner) is None
+    assert "password" not in read_role.read_conninfo_for(owner_env.dsn)
+
+
+def test_the_read_check_is_once_per_process_and_needs_no_file_or_keychain(owner_env, monkeypatch):
     from khipu import keychain
 
     asked: list[str] = []
     monkeypatch.setattr(keychain, "get_password", lambda account, **k: asked.append(account))
-    with db.connect(role="read") as conn:  # provisions, writes the file
-        assert _who(conn)[0] == read_role.READ_ROLE
-    asked.clear()  # with no file yet, the Keychain was the place left to look
+    with db.connect(role="read"):
+        pass
+    checks: list[int] = []
+    real = read_role._role_attributes
+    monkeypatch.setattr(read_role, "_role_attributes", lambda cur: checks.append(1) or real(cur))
+    with db.connect(role="read"), db.connect(role="read"):
+        pass
+    assert checks == [] and asked == []
     read_role.invalidate_cache()
-    with db.connect(role="read") as conn:  # from the file, validated
-        assert _who(conn)[0] == read_role.READ_ROLE
-    assert asked == []
-    read_role._read_dsn_file().unlink()
-    with db.connect(role="read") as conn:  # from memory: no file, no Keychain
-        assert _who(conn)[0] == read_role.READ_ROLE
-    assert asked == []
+    with db.connect(role="read"):
+        pass
+    assert checks == [1]
+
+
+def test_a_failed_lookup_is_never_read_as_a_hub_that_cannot_host(owner_env, monkeypatch):
+    owner = owner_env.connect()
+    owner.autocommit = True
+    owner.execute("DROP ROLE IF EXISTS khipu_limited_owner")
+    owner.execute("CREATE ROLE khipu_limited_owner LOGIN NOSUPERUSER NOCREATEROLE")
+    limited = owner_env.dsn.replace("postgresql://khipu@", "postgresql://khipu_limited_owner@")
+    monkeypatch.setenv("KHIPU_DATABASE_URL", limited)
+
+    def flaky(cur):
+        raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(read_role, "_role_attributes", flaky)
+    labels = _watch_labels(monkeypatch)
+    try:
+        with pytest.raises(read_role.ReadRoleUnavailable):
+            db.connect(role="read")
+        assert "owner-read" not in labels
+        assert read_role.cannot_host(limited) is None
+    finally:
+        owner.execute("DROP ROLE IF EXISTS khipu_limited_owner")
+
+
+def test_an_elevated_existing_role_is_refused_even_when_its_password_works(owner_env, monkeypatch):
+    owner = owner_env.connect()
+    with db.connect(role="read"):
+        pass
+    owner.autocommit = True
+    owner.execute(f"ALTER ROLE {read_role.READ_ROLE} CREATEROLE")  # widened by someone else
     read_role.invalidate_cache()
-    assert read_role.read_conninfo(owner_env.dsn) is None
+    labels = _watch_labels(monkeypatch)
+    with pytest.raises(read_role.ReadRoleUnavailable) as err:
+        db.connect(role="read")
+    assert "createrole" in str(err.value)
+    assert "owner-read" not in labels and "owner" not in labels, labels
+
+
+def test_the_cannot_host_memo_is_per_hub_and_owner_and_clears_when_the_owner_gains_the_right(
+        owner_env, monkeypatch):
+    other = owner_env.dsn.replace("postgresql://khipu@", "postgresql://someone_else@")
+    read_role._note(other, {"cannot_host_at": time.time(), "reason": "the owner role cannot create roles"})
+    assert read_role.cannot_host(other) and read_role.cannot_host(owner_env.dsn) is None
+    with db.connect(role="read") as conn:  # this hub and owner: the read role
+        assert _who(conn)[0] == read_role.READ_ROLE
+    read_role.invalidate_cache(other)
+    assert read_role.cannot_host(other) is None
+    # A stale memo for this owner, who can create roles: the owner-read
+    # connection it gives drops it, and the next search is the read role.
+    read_role._note(owner_env.dsn, {"cannot_host_at": time.time(), "reason": "stale"})
+    read_role._VALIDATED.clear()
+    with db.connect(role="read") as conn:
+        assert _who(conn)[1].startswith("khipu/owner-read/")
+    assert read_role.cannot_host(owner_env.dsn) is None
+    with db.connect(role="read") as conn:
+        assert _who(conn)[0] == read_role.READ_ROLE
+
+
+def test_an_isolated_run_uses_the_read_role_and_never_the_owner(owner_env, monkeypatch, tmp_path):
+    from khipu.paths import dsn_file
+
+    with db.connect(role="read"):
+        pass
+    # The promotion gate's home holds no read credentials of its own.
+    dsn_file().with_name("read_dsn").unlink(missing_ok=True)
+    monkeypatch.setenv("KHIPU_ISOLATED_DIR", str(tmp_path))
+    read_role.invalidate_cache()
+    with db.connect(role="read") as conn:
+        assert _who(conn)[0] == read_role.READ_ROLE
+    # The role refused and nothing may be set up: an explicit failure.
+    owner = owner_env.connect()
+    _drop_read_role(owner)
+    read_role.invalidate_cache()
+    labels = _watch_labels(monkeypatch)
+    with pytest.raises(read_role.ReadRoleUnavailable):
+        db.connect(role="read")
+    assert "owner-read" not in labels, labels
 
 
 def _cache_profile(owner) -> tuple[str, int]:

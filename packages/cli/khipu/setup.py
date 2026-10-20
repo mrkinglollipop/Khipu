@@ -372,11 +372,11 @@ def _store_read_role(conn, dsn: str) -> dict[str, Any]:
     from khipu import read_role
 
     try:
-        conninfo = read_role.provision(owner_conn=conn, owner_dsn=dsn, force=True)
+        hosted = read_role.provision(owner_conn=conn, owner_dsn=dsn, force=True)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "detail": f"{type(exc).__name__}: {exc}"[:200]}
-    if conninfo is None:
-        return {"ok": False, "detail": read_role.cannot_host()
+    if not hosted:
+        return {"ok": False, "detail": read_role.cannot_host(dsn)
                 or "the hub cannot host a search role; searches share the save connections"}
     return {"ok": True, "detail": f"Search connects as {read_role.READ_ROLE}."}
 

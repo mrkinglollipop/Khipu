@@ -6,13 +6,14 @@ timeouts. Captures, the outbox drain, migrations and the nightly stay on the
 owner role, so a crowd of searches can fill ``khipu_read`` without taking a
 connection a save needs.
 
-Provisioning needs no owner step. The first upgraded client that connects as
-owner runs ``ensure_read_role``: it creates the role with a generated password
-and keeps that password in ``khipu_role_secrets``, which only the owner can
-read. Every other client holding the owner DSN reads the password from there
-and stores the read DSN (Keychain, plus a 0600 file for hosts without one).
-Only a hub that cannot host the role at all (the owner has neither
-CREATEROLE nor superuser, and no password is kept) searches as the owner,
+Provisioning needs no owner step. The read password is derived on each
+client from the owner DSN's password (``derived_password``), so every client
+holding the owner DSN knows it and nothing secret is stored on the hub or on
+disk. The first search the hub refuses runs ``ensure_read_role`` as the
+owner: it creates the role, or sets the derived password, from a SCRAM
+verifier computed here. Only a hub confirmed unable to host the role (the
+owner has neither CREATEROLE nor superuser and the role does not exist)
+searches as the owner,
 labelled ``khipu/owner-read/...`` in ``application_name``; doctor says so.
 Anywhere else a read role that cannot be used right now (refused password
 that could not be repaired, a failed provisioning, an existing role with
@@ -23,10 +24,9 @@ The three role settings are the owner's in the app; saving one runs
 ``ALTER ROLE`` for that setting only, through the owner connection (0 means
 no limit), and the app shows the values the hub holds.
 
-The password never appears in statement text: the role gets a SCRAM-SHA-256
-verifier computed here, and the plaintext kept for other clients is written
-as a bound parameter with statement and parameter logging off for that
-transaction where the owner may turn it off.
+No plaintext password is ever sent to the hub: statement text carries only
+the SCRAM-SHA-256 verifier, so a hub logging every statement logs nothing a
+client could log in with.
 """
 from __future__ import annotations
 
@@ -46,9 +46,8 @@ import psycopg
 from khipu.output_guard import secret_result
 
 READ_ROLE = "khipu_read"
-SECRETS_TABLE = "khipu_role_secrets"
+LEGACY_SECRETS_TABLE = "khipu_role_secrets"
 READ_DSN_ENV = "KHIPU_READ_DATABASE_URL"
-READ_DSN_ACCOUNT = "read_database_url"
 # A failed provisioning is not retried on every search.
 PROVISION_RETRY_AFTER_S = 600
 # A hub found unable to host the role is asked again this often.
@@ -65,9 +64,6 @@ class ReadRoleUnavailable(psycopg.OperationalError):
     now. Search answers as for an unreachable hub (khipu.hub_errors), never
     through the owner role."""
 
-
-class UnsafeReadRole(RuntimeError):
-    """An existing ``khipu_read`` has rights beyond SELECT-only search."""
 
 SETTINGS: dict[str, tuple[str, Any, str]] = {
     "read_role_connection_limit": (
@@ -337,83 +333,51 @@ def _apply_grants(cur) -> None:
     cur.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(role))
     # Tables a later migration creates (as this owner) are readable too.
     cur.execute(sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {}").format(role))
-    cur.execute(sql.SQL("REVOKE ALL ON {} FROM PUBLIC, {}").format(sql.Identifier(SECRETS_TABLE), role))
+    # An earlier build kept the password in plaintext here; nothing reads it now.
+    cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(LEGACY_SECRETS_TABLE)))
 
 
-# Logging off for the transaction that writes the plaintext. Statement and
-# duration logging are superuser settings (or granted with GRANT SET); a
-# CREATEROLE owner without them still writes the secret as a bound
-# parameter, so only a hub configured to log every statement's parameters
-# would keep it.
-_QUIET_LOGGING = (("log_statement", "none"), ("log_min_duration_statement", "-1"),
-                  ("log_parameter_max_length", "0"), ("log_parameter_max_length_on_error", "0"))
-
-
-def _quiet_logging(cur) -> list[str]:
-    quiet = []
-    for name, value in _QUIET_LOGGING:
-        cur.execute("SAVEPOINT khipu_quiet")
-        try:
-            cur.execute("SELECT set_config(%s, %s, true)", (name, value))
-            cur.execute("RELEASE SAVEPOINT khipu_quiet")
-            quiet.append(name)
-        except psycopg.Error:
-            cur.execute("ROLLBACK TO SAVEPOINT khipu_quiet")
-    return quiet
-
-
-def _set_password(cur, *, exists: bool, limit: int | None) -> None:
-    """A new password: the verifier on the role, the plaintext (a bound
-    parameter, logging off) in the secrets table for other clients."""
+def _password_clause(owner_dsn: str):
+    """``PASSWORD <verifier>``, or ``PASSWORD NULL`` when the owner DSN has
+    no password (trust or peer auth): the read role then logs in the same way."""
     from psycopg import sql
 
-    password = secrets.token_urlsafe(32)
-    if exists:
-        cur.execute(sql.SQL("ALTER ROLE {} PASSWORD {}").format(
-            sql.Identifier(READ_ROLE), sql.Literal(scram_verifier(password))))
-    else:
-        cur.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {} CONNECTION LIMIT {}").format(
-            sql.Identifier(READ_ROLE), sql.Literal(scram_verifier(password)),
-            sql.Literal(limit if limit and limit > 0 else -1)))
-    _quiet_logging(cur)
-    cur.execute(sql.SQL(
-        "INSERT INTO {} (role, secret) VALUES (%s, %s) ON CONFLICT (role) DO UPDATE"
-        " SET secret = EXCLUDED.secret, rotated_at = now()").format(sql.Identifier(SECRETS_TABLE)),
-        (READ_ROLE, password))
+    password = derived_password(owner_dsn)
+    if password is None:
+        return sql.SQL("PASSWORD NULL")
+    return sql.SQL("PASSWORD {}").format(sql.Literal(scram_verifier(password)))
 
 
-def ensure_read_role(conn, *, values: dict[str, Any] | None = None,
-                     refused_password: str | None = None) -> dict[str, Any]:
+def ensure_read_role(conn, *, owner_dsn: str | None = None, values: dict[str, Any] | None = None,
+                     repair: bool = False) -> dict[str, Any]:
     """Create or bring up to date ``khipu_read`` on the owner connection
     ``conn`` and return ``{"ok", "created", "password_reset", "reason"}``
     (plus ``"cannot_host"`` or ``"unsafe"`` naming why it refused).
 
     Idempotent and safe to run from several clients at once (an advisory
-    lock serialises them). A new role takes every setting (``values`` over
-    this Mac's stored ones); an existing one changes only the settings in
-    ``values``. ``refused_password`` is the password the hub just refused
-    this client: it is replaced only when it is still the one kept, so two
-    clients repairing at once rotate once. Never returns the password."""
+    lock serialises them; every client derives the same password, so two
+    repairs set the same one). A new role takes every setting (``values``
+    over this Mac's stored ones); an existing one changes only the settings
+    in ``values``, and its password only with ``repair`` (the hub refused
+    the derived one). A lookup that fails raises; only a confirmed answer
+    decides ``cannot_host``."""
     from psycopg import sql
 
     out: dict[str, Any] = {"ok": False, "created": False, "password_reset": False}
     try:
         with conn.cursor() as cur:
-            if not _can_create_roles(cur):
+            can_create = _can_create_roles(cur)
+            attributes = _role_attributes(cur)
+            if not can_create:
                 conn.rollback()
-                out["cannot_host"] = True
-                out["reason"] = "the owner role cannot create roles (needs CREATEROLE or superuser)"
+                if attributes is None:
+                    out["cannot_host"] = True
+                    out["reason"] = "the owner role cannot create roles (needs CREATEROLE or superuser)"
+                else:
+                    out["reason"] = (f"{READ_ROLE} exists but the owner role cannot change it "
+                                     "(needs CREATEROLE or superuser)")
                 return out
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (_ADVISORY_KEY,))
-            cur.execute(sql.SQL(
-                "CREATE TABLE IF NOT EXISTS {} (role text PRIMARY KEY, secret text NOT NULL,"
-                " created_at timestamptz NOT NULL DEFAULT now(),"
-                " rotated_at timestamptz NOT NULL DEFAULT now())").format(sql.Identifier(SECRETS_TABLE)))
-            cur.execute(sql.SQL("REVOKE ALL ON {} FROM PUBLIC").format(sql.Identifier(SECRETS_TABLE)))
-            cur.execute(sql.SQL("SELECT secret FROM {} WHERE role = %s").format(sql.Identifier(SECRETS_TABLE)),
-                        (READ_ROLE,))
-            row = cur.fetchone()
-            current = row[0] if row else None
             attributes = _role_attributes(cur)
             if attributes is not None:
                 unsafe = _unsafe_reason(cur, attributes)
@@ -422,16 +386,23 @@ def ensure_read_role(conn, *, values: dict[str, Any] | None = None,
                     out["unsafe"] = True
                     out["reason"] = f"{unsafe}; it was left as it is (drop it or remove those rights)"
                     return out
+            if owner_dsn is None and (attributes is None or repair):
+                from khipu.db import resolve_dsn
+
+                owner_dsn = resolve_dsn()
+            role = sql.Identifier(READ_ROLE)
             if attributes is None:
                 initial = {**settings(), **(values or {})}
-                _set_password(cur, exists=False, limit=int(initial["read_role_connection_limit"]))
+                limit = int(initial["read_role_connection_limit"])
+                cur.execute(sql.SQL("CREATE ROLE {} LOGIN {} CONNECTION LIMIT {}").format(
+                    role, _password_clause(owner_dsn), sql.Literal(limit if limit > 0 else -1)))
                 _apply_settings(cur, {k: v for k, v in initial.items() if k != "read_role_connection_limit"})
                 out["created"] = True
             else:
                 if not attributes["rolcanlogin"]:
-                    cur.execute(sql.SQL("ALTER ROLE {} LOGIN").format(sql.Identifier(READ_ROLE)))
-                if current is None or (refused_password is not None and refused_password == current):
-                    _set_password(cur, exists=True, limit=None)
+                    cur.execute(sql.SQL("ALTER ROLE {} LOGIN").format(role))
+                if repair:
+                    cur.execute(sql.SQL("ALTER ROLE {} {}").format(role, _password_clause(owner_dsn)))
                     out["password_reset"] = True
                 _apply_settings(cur, values or {})
             _apply_grants(cur)
@@ -442,67 +413,73 @@ def ensure_read_role(conn, *, values: dict[str, Any] | None = None,
         except Exception:  # noqa: BLE001
             pass
         out["reason"] = f"{type(exc).__name__}: {exc}"[:300]
+        out["error"] = exc
         return out
     out["ok"] = True
     return out
 
 
-@secret_result("read_role_password")
-def hub_password(conn) -> str | None:
-    """The read role's password as the hub keeps it (owner connection)."""
-    from psycopg import sql
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"public.{SECRETS_TABLE}",))
-            if not cur.fetchone()[0]:
-                conn.rollback()
-                return None
-            cur.execute(sql.SQL("SELECT secret FROM {} WHERE role = %s").format(sql.Identifier(SECRETS_TABLE)),
-                        (READ_ROLE,))
-            row = cur.fetchone()
-        conn.rollback()
-        return row[0] if row else None
-    except Exception:  # noqa: BLE001
-        conn.rollback()
-        return None
-
-
 # ---- this client's read DSN -----------------------------------------------------
+#
+# The read password is derived from the owner DSN's password, so every client
+# that holds the owner DSN knows it and none is ever written to the hub or to
+# disk. It follows the owner password: when that changes, the next refused
+# search sets the new one.
 
-def _target(conninfo: str) -> tuple[str, str, str]:
+def _owner_params(owner_dsn: str) -> dict[str, str]:
     from psycopg.conninfo import conninfo_to_dict
 
-    params = conninfo_to_dict(conninfo)
-    return (str(params.get("host") or params.get("hostaddr") or ""), str(params.get("port") or "5432"),
-            str(params.get("dbname") or params.get("user") or ""))
-
-
-def read_conninfo_for(owner_dsn: str, password: str) -> str:
-    """The owner DSN with the read role's user and password."""
-    from psycopg.conninfo import conninfo_to_dict, make_conninfo
-
-    params = {key: val for key, val in conninfo_to_dict(owner_dsn).items() if val is not None}
+    params = {key: str(val) for key, val in conninfo_to_dict(owner_dsn).items() if val is not None}
     if not params.get("dbname") and params.get("user"):
         params["dbname"] = params["user"]
+    return params
+
+
+def hub_key(owner_dsn: str) -> str:
+    """Which hub and owner a memo or cache entry is about (no secret in it)."""
+    params = _owner_params(owner_dsn)
+    ident = "|".join(params.get(k, "") for k in ("host", "hostaddr", "port", "dbname", "user"))
+    return hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
+
+
+@secret_result("read_role_password")
+def derived_password(owner_dsn: str) -> str | None:
+    """HMAC-SHA256 of the owner's password over this role and the owner's
+    name; None when the owner DSN carries no password. Not over the host
+    (each Mac may reach the hub by another name) nor the database (a role's
+    password is the whole server's, and two databases must not take turns
+    replacing it)."""
+    params = _owner_params(owner_dsn)
+    secret = params.get("password")
+    if not secret:
+        return None
+    message = f"{READ_ROLE}/{params.get('user', '')}".encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), message, "sha256").digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+@secret_result("database_url")
+def read_conninfo_for(owner_dsn: str) -> str:
+    """The owner DSN with the read role's user and derived password."""
+    from psycopg.conninfo import make_conninfo
+
+    params = _owner_params(owner_dsn)
     params["user"] = READ_ROLE
-    params["password"] = password
+    password = derived_password(owner_dsn)
+    if password is None:
+        params.pop("password", None)
+    else:
+        params["password"] = password
     return make_conninfo(**params)
 
 
-def _password_of(conninfo: str) -> str | None:
-    from psycopg.conninfo import conninfo_to_dict
+@secret_result("database_url")
+def read_conninfo(owner_dsn: str) -> str:
+    """``KHIPU_READ_DATABASE_URL`` when set, else the derived read DSN."""
+    import os
 
-    try:
-        return conninfo_to_dict(conninfo).get("password") or None
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _read_dsn_file() -> Path:
-    from khipu.paths import dsn_file
-
-    return dsn_file().with_name("read_dsn")
+    env = (os.environ.get(READ_DSN_ENV) or "").strip()
+    return env or read_conninfo_for(owner_dsn)
 
 
 def _memo_file() -> Path:
@@ -511,104 +488,33 @@ def _memo_file() -> Path:
     return data_dir() / "read_role_memo.json"
 
 
-# The validated read DSN, so a search does not read the file or ask the
-# Keychain (a subprocess) on every connection. Dropped when the hub refuses it.
-_CACHED: dict[str, str] = {}
+# Hubs whose read role passed ``check_connection`` in this process.
+_VALIDATED: set[str] = set()
 
 
-def invalidate_cache() -> None:
-    _CACHED.clear()
+def forget_validated(owner_dsn: str) -> None:
+    """The hub refused this process's read connection: check again next time."""
+    _VALIDATED.discard(hub_key(owner_dsn))
 
 
-def cache_validated(owner_dsn: str, conninfo: str) -> None:
-    """Keep ``conninfo`` for this process once the hub accepted it."""
-    try:
-        _CACHED["|".join(_target(owner_dsn))] = conninfo
-    except Exception:  # noqa: BLE001
-        pass
-
-
-@secret_result("database_url")
-def stored_read_dsn() -> str | None:
-    """Environment, then the private 0600 file, then the Keychain: the file
-    answers without a subprocess, and both hold the same value."""
-    import os
-
-    env = (os.environ.get(READ_DSN_ENV) or "").strip()
-    if env:
-        return env
-    try:
-        path = _read_dsn_file()
-        if path.is_file():
-            value = path.read_text(encoding="utf-8").strip()
-            if value:
-                return value
-    except OSError:
-        pass
-    try:
-        from khipu.keychain import get_password
-
-        value = get_password(READ_DSN_ACCOUNT)
-        if value:
-            return value
-    except Exception:  # noqa: BLE001
-        pass
-    return None
-
-
-def store_read_dsn(conninfo: str) -> None:
-    from khipu.join import write_private_file
-    from khipu.keychain import keychain_available, set_password
-
-    invalidate_cache()
-    write_private_file(_read_dsn_file(), (conninfo.strip() + "\n").encode("utf-8"))
-    if keychain_available():
-        set_password(READ_DSN_ACCOUNT, conninfo.strip())
-
-
-def forget_read_dsn() -> None:
-    invalidate_cache()
-    try:
-        _read_dsn_file().unlink()
-    except OSError:
-        pass
-    try:
-        from khipu.keychain import SERVICE, _security, keychain_available
-        from khipu.paths import isolated_dir
-
-        if keychain_available() and isolated_dir() is None:
-            _security("delete-generic-password", "-s", SERVICE, "-a", READ_DSN_ACCOUNT)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-@secret_result("database_url")
-def read_conninfo(owner_dsn: str) -> str | None:
-    """This client's read DSN when it targets the owner DSN's database."""
-    import os
-
-    if (os.environ.get(READ_DSN_ENV) or "").strip():
-        return os.environ[READ_DSN_ENV].strip()
-    try:
-        cached = _CACHED.get("|".join(_target(owner_dsn)))
-    except Exception:  # noqa: BLE001
-        return None
-    if cached:
-        return cached
-    stored = stored_read_dsn()
-    if not stored:
-        return None
-    try:
-        if _target(stored) != _target(owner_dsn):
-            return None
-    except Exception:  # noqa: BLE001
-        return None
-    return stored
+def invalidate_cache(owner_dsn: str | None = None) -> None:
+    """Forget what this process and the memo know about one hub (all with
+    no ``owner_dsn``): the next search checks again."""
+    if owner_dsn is None:
+        _VALIDATED.clear()
+        _write_memo({})
+        return
+    key = hub_key(owner_dsn)
+    _VALIDATED.discard(key)
+    memo = _memo()
+    if memo.pop(key, None) is not None:
+        _write_memo(memo)
 
 
 def _memo() -> dict[str, Any]:
     try:
-        return json.loads(_memo_file().read_text(encoding="utf-8"))
+        data = json.loads(_memo_file().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -628,22 +534,41 @@ def _write_memo(data: dict[str, Any]) -> None:
         pass
 
 
-def provision_blocked() -> str | None:
-    """Why provisioning failed within the retry window, or None."""
+def _note(owner_dsn: str, entry: dict[str, Any] | None) -> None:
     memo = _memo()
-    failed_at = memo.get("failed_at")
+    key = hub_key(owner_dsn)
+    if entry is None:
+        memo.pop(key, None)
+    else:
+        memo[key] = entry
+    _write_memo(memo)
+
+
+def note_failure(owner_dsn: str, reason: str) -> None:
+    _note(owner_dsn, {"failed_at": time.time(), "reason": reason})
+
+
+def _entry(owner_dsn: str) -> dict[str, Any]:
+    entry = _memo().get(hub_key(owner_dsn))
+    return entry if isinstance(entry, dict) else {}
+
+
+def provision_blocked(owner_dsn: str) -> str | None:
+    """Why provisioning this hub failed within the retry window, or None."""
+    entry = _entry(owner_dsn)
+    failed_at = entry.get("failed_at")
     if isinstance(failed_at, (int, float)) and time.time() - failed_at < PROVISION_RETRY_AFTER_S:
-        return str(memo.get("reason") or "provisioning failed recently")
+        return str(entry.get("reason") or "provisioning failed recently")
     return None
 
 
-def cannot_host() -> str | None:
-    """Why this hub cannot host a read role, while that finding is fresh, or
-    None. Only this case searches as the owner."""
-    memo = _memo()
-    checked_at = memo.get("cannot_host_at")
+def cannot_host(owner_dsn: str) -> str | None:
+    """Why this hub, for this owner, cannot host a read role, while that
+    finding is fresh, or None. Only this case searches as the owner."""
+    entry = _entry(owner_dsn)
+    checked_at = entry.get("cannot_host_at")
     if isinstance(checked_at, (int, float)) and time.time() - checked_at < CANNOT_HOST_RECHECK_S:
-        return str(memo.get("reason") or "the owner role cannot create roles")
+        return str(entry.get("reason") or "the owner role cannot create roles")
     return None
 
 
@@ -651,63 +576,77 @@ def _unavailable(reason: str) -> ReadRoleUnavailable:
     return ReadRoleUnavailable(f"the hub's search role ({READ_ROLE}) cannot be used now: {reason}")
 
 
-@secret_result("database_url")
-def provision(owner_conn=None, owner_dsn: str | None = None, *, refused: str | None = None,
-              force: bool = False) -> str | None:
-    """Make sure this client holds a working read DSN and return it.
+def confirmed_cannot_host(owner_conn) -> bool:
+    """Read-only: the owner has neither CREATEROLE nor superuser and the
+    role does not exist. A failed lookup raises, never answers yes."""
+    with owner_conn.cursor() as cur:
+        can_create = _can_create_roles(cur)
+        attributes = _role_attributes(cur)
+    owner_conn.rollback()
+    return not can_create and attributes is None
 
-    Returns None only when the hub cannot host a read role (the owner has
-    neither CREATEROLE nor superuser and no password is kept): search then
-    shares the owner's connections. Raises ``ReadRoleUnavailable`` when the
-    role exists or could be made but this attempt failed, and lets a hub
-    that cannot be reached raise as itself. ``refused`` is the read DSN the
-    hub just refused: the kept password is replaced only when it is that one."""
+
+def recheck_capability(owner_conn, owner_dsn: str) -> None:
+    """On an owner-read connection already open: drop the cannot-host memo
+    the moment the owner gains the right, so the next search sets the role
+    up instead of waiting out the memo. Never raises."""
+    try:
+        if not confirmed_cannot_host(owner_conn):
+            _note(owner_dsn, None)
+    except Exception:  # noqa: BLE001
+        try:
+            owner_conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def provision(owner_conn=None, owner_dsn: str | None = None, *, repair: bool = True,
+              force: bool = False) -> bool:
+    """Make sure the hub's read role exists, is safe and takes this
+    client's derived password. Returns True when it does, False only when
+    the hub confirmed it cannot host one (the owner has neither CREATEROLE
+    nor superuser and the role does not exist): search then shares the
+    owner's connections. Raises ``ReadRoleUnavailable`` when the role exists
+    or could be made but this attempt failed, and lets a hub that cannot be
+    reached raise as itself. Isolated runs (the promotion gate) never write."""
     from khipu import hub_errors
     from khipu.paths import isolated_dir
 
     if isolated_dir() is not None:
         raise _unavailable("an isolated run never sets up the role")
-    if not force:
-        if cannot_host() and refused is None:
-            return None
-        blocked = provision_blocked()
-        if blocked:
-            raise _unavailable(blocked)
     from khipu import db
 
     owner_dsn = owner_dsn or db.resolve_dsn()
+    if not force:
+        blocked = provision_blocked(owner_dsn)
+        if blocked:
+            raise _unavailable(blocked)
     own = owner_conn
     opened = None
     try:
         if own is None:
             opened = db.connect(role="owner")
             own = opened
-        password = hub_password(own)
-        refused_password = _password_of(refused) if refused else None
-        if not password or (refused_password is not None and password == refused_password):
-            result = ensure_read_role(own, refused_password=refused_password)
-            if not result.get("ok"):
-                if result.get("cannot_host") and refused is None and not password:
-                    _write_memo({"cannot_host_at": time.time(), "reason": result.get("reason")})
-                    return None
-                _write_memo({"failed_at": time.time(), "reason": result.get("reason"),
-                             **({"unsafe": True} if result.get("unsafe") else {})})
-                raise _unavailable(str(result.get("reason")))
-            password = hub_password(own)
-        if not password:
-            _write_memo({"failed_at": time.time(), "reason": "no read role password on the hub"})
-            raise _unavailable("no read role password on the hub")
-        conninfo = read_conninfo_for(owner_dsn, password)
-        store_read_dsn(conninfo)
-        _write_memo({"provisioned_at": time.time()})
-        return conninfo
+        result = ensure_read_role(own, owner_dsn=owner_dsn, repair=repair)
+        if not result.get("ok"):
+            error = result.get("error")
+            if error is not None and hub_errors.unreachable_error(error):
+                raise error
+            if result.get("cannot_host"):
+                _note(owner_dsn, {"cannot_host_at": time.time(), "reason": result.get("reason")})
+                return False
+            _note(owner_dsn, {"failed_at": time.time(), "reason": result.get("reason"),
+                              **({"unsafe": True} if result.get("unsafe") else {})})
+            raise _unavailable(str(result.get("reason")))
+        _note(owner_dsn, {"provisioned_at": time.time()})
+        return True
     except ReadRoleUnavailable:
         raise
     except Exception as exc:  # noqa: BLE001
         if hub_errors.unreachable_error(exc):
             raise
         reason = f"{type(exc).__name__}: {exc}"[:300]
-        _write_memo({"failed_at": time.time(), "reason": reason})
+        _note(owner_dsn, {"failed_at": time.time(), "reason": reason})
         raise _unavailable(reason) from exc
     finally:
         if opened is not None:
@@ -715,6 +654,32 @@ def provision(owner_conn=None, owner_dsn: str | None = None, *, refused: str | N
                 opened.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def check_connection(conn, owner_dsn: str) -> bool:
+    """Before this process first searches on a read connection: the role it
+    logged in as has no rights beyond SELECT-only search, checked on the
+    read connection itself, so a role made or widened by someone else is
+    caught even where no owner step ran (raises ``ReadRoleUnavailable``).
+    Returns False when the role can log in but was never granted this
+    database (a role is the whole server's; grants are per database)."""
+    key = hub_key(owner_dsn)
+    if key in _VALIDATED:
+        return True
+    with conn.cursor() as cur:
+        attributes = _role_attributes(cur)
+        reason = (f"{READ_ROLE} is missing" if attributes is None else _unsafe_reason(cur, attributes))
+        cur.execute("SELECT to_regclass('public.episodes') IS NULL"
+                    " OR has_table_privilege(current_user, 'public.episodes', 'SELECT')")
+        granted = bool(cur.fetchone()[0])
+    conn.rollback()
+    if reason:
+        _note(owner_dsn, {"failed_at": time.time(), "reason": reason, "unsafe": True})
+        raise _unavailable(reason)
+    if not granted:
+        return False
+    _VALIDATED.add(key)
+    return True
 
 
 def role_limit_error(exc: BaseException) -> bool:
@@ -726,7 +691,7 @@ def role_limit_error(exc: BaseException) -> bool:
 def auth_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     return ("password authentication failed" in text or f'role "{READ_ROLE}" does not exist' in text
-            or "permission denied for database" in text)
+            or "permission denied for database" in text or "is not permitted to log in" in text)
 
 
 def stage_reserved_connections(conn) -> dict[str, Any]:
@@ -745,6 +710,25 @@ def stage_reserved_connections(conn) -> dict[str, Any]:
 
 # ---- doctor ------------------------------------------------------------------------
 
+def _read_login_problem(owner_dsn: str) -> str | None:
+    """Why this Mac cannot log in as the read role right now, or None."""
+    from khipu import db
+
+    blocked = provision_blocked(owner_dsn)
+    if blocked:
+        return blocked
+    try:
+        db._open(read_conninfo(owner_dsn), "read", autocommit=True, statement_timeout_s=None,
+                 connect_timeout=db.CONNECT_TIMEOUT_SECONDS).close()
+    except psycopg.OperationalError as exc:
+        if auth_error(exc):
+            return "the hub refused this Mac's search password; the next search sets it"
+        if role_limit_error(exc):
+            return None
+        raise
+    return None
+
+
 def doctor_block(conn=None) -> dict[str, Any]:
     """This client's search role, the role settings, and clients still
     searching as the owner. Warns; never gates doctor's ``ok``.
@@ -762,7 +746,6 @@ def doctor_block(conn=None) -> dict[str, Any]:
     except RuntimeError:
         out["state"] = "not_configured"
         return out
-    has_read = read_conninfo(owner_dsn) is not None
     opened = None
     try:
         if conn is None:
@@ -770,15 +753,13 @@ def doctor_block(conn=None) -> dict[str, Any]:
             conn = opened
         with conn.cursor() as cur:
             can_create = _can_create_roles(cur)
-            cur.execute("SELECT rolconnlimit FROM pg_roles WHERE rolname = %s", (READ_ROLE,))
-            row = cur.fetchone()
-            out["role_exists"] = row is not None
-            if row is not None:
-                out["role_connection_limit"] = row[0]
+            attributes = _role_attributes(cur)
+            unsafe = _unsafe_reason(cur, attributes) if attributes is not None else None
         conn.rollback()
-        if has_read:
-            out["state"] = "read"
-        elif not can_create and not hub_password(conn):
+        out["role_exists"] = attributes is not None
+        if attributes is not None:
+            out["role_connection_limit"] = attributes["rolconnlimit"]
+        if not can_create and attributes is None:
             out["state"] = "cannot_host"
             out["level"] = "amber"
             out["message"] = (
@@ -787,11 +768,16 @@ def doctor_block(conn=None) -> dict[str, Any]:
                 "superuser: ALTER ROLE <owner> CREATEROLE); the next search then sets up the search role.")
             out["warnings"].append(out["message"])
         else:
-            out["state"] = "unavailable"
-            reason = provision_blocked() or "this Mac has no search role password yet; the next search sets it up"
-            out["warnings"].append(
-                f"This Mac cannot search as {READ_ROLE} ({reason}). Searches answer from this Mac's copy "
-                "until it can; they never borrow the connections saves need.")
+            if cannot_host(owner_dsn):
+                _note(owner_dsn, None)  # the owner gained the right: the next search sets the role up
+            reason = unsafe or _read_login_problem(owner_dsn)
+            if reason is None:
+                out["state"] = "read"
+            else:
+                out["state"] = "unavailable"
+                out["warnings"].append(
+                    f"This Mac cannot search as {READ_ROLE} ({reason}). Searches answer from this Mac's copy "
+                    "until it can; they never borrow the connections saves need.")
         with conn.cursor() as cur:
             # On a hub that cannot host the role, owner-read clients are expected.
             labelled = "" if out["state"] == "cannot_host" else " OR application_name LIKE 'khipu/owner-read/%%'"
@@ -811,7 +797,7 @@ def doctor_block(conn=None) -> dict[str, Any]:
                 "Clients connected as the hub owner that are not labelled as capture or upkeep, so they may be "
                 f"searching as the owner (not upgraded, or no read role): {named}.")
     except Exception as exc:  # noqa: BLE001 - a failed check must not crash doctor
-        out.setdefault("state", "read" if has_read else "unavailable")
+        out.setdefault("state", "unknown")
         out["error"] = f"{type(exc).__name__}: {exc}"[:200]
     finally:
         if opened is not None:
