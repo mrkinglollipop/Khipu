@@ -2287,7 +2287,10 @@ def _cosine_sql(
     return (
         f"{head}SELECT kind, ref, chunk_idx, score, snippet, rank_src, label FROM ("
         + " UNION ALL ".join(branches)
-        + ") u ORDER BY dist LIMIT %(lim)s"
+        # ``dist + 0`` forces a real sort over the union: with
+        # hnsw.iterative_scan = relaxed_order a branch can emit rows slightly
+        # out of order, and a Merge Append on plain ``dist`` would trust it.
+        + ") u ORDER BY dist + 0 LIMIT %(lim)s"
     )
 
 

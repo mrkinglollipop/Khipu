@@ -151,6 +151,20 @@ def test_unfiltered_plan_joins_episodes_through_an_index_not_a_subplan(seeded):
     assert "SubPlan" not in plan, plan
 
 
+def test_the_union_is_re_sorted_not_merged_on_trusted_branch_order(seeded):
+    # relaxed_order iterative scans can emit a branch's rows slightly out of
+    # order; a Merge Append on plain ``dist`` would trust that order.
+    hub_, rng = seeded
+    conn = hub_.connect()
+    cur = conn.cursor()
+    sql = _sql_for(cur, None)
+    cur.execute("EXPLAIN (COSTS OFF) " + sql, {
+        "q": _lit(_vec(rng)), "p": PROFILE, "kind": None, "lim": 50, "fetch": 200, "rank_fetch": 800})
+    plan = "\n".join(r[0] for r in cur.fetchall())
+    assert "Merge Append" not in plan, plan
+    assert "Sort" in plan.splitlines()[1], plan
+
+
 @pytest.mark.parametrize("project", [None, "church-harness"])
 def test_results_match_the_old_statement(seeded, project):
     hub_, rng = seeded
