@@ -1423,7 +1423,6 @@ def steady(rate=0.5, *, start=0, end=86400, used=0, reset=604800, step=1800):
 
 
 @pytest.mark.parametrize("malformed", [False, True], ids=["readings", "error-path"])
-@future("4Pa", "the local extractor reads real routing blocks and scrubs success and error channels")
 def test_16a_extractor_sentinels_witness_age_and_rounding(replay, monkeypatch, capsys, malformed):
     script = Path(__file__).resolve().parents[3] / "tools" / "pace_fixture_extract.py"
     transcript = replay.root / "synthetic-transcript.jsonl"
@@ -1475,7 +1474,6 @@ def test_16a_extractor_sentinels_witness_age_and_rounding(replay, monkeypatch, c
 
 
 @pytest.mark.parametrize("kind", ["rounded-age", "error-too-large", "cached-repeat"])
-@future("4Pa", "rounded or cached witnesses cannot become fresh usage samples")
 def test_16a_uncertain_readings_are_not_new_samples(replay, kind):
     samples = steady(end=84600)
     if kind == "cached-repeat":
@@ -1494,7 +1492,6 @@ def test_16a_uncertain_readings_are_not_new_samples(replay, kind):
 
 
 @pytest.mark.parametrize("kind", ["same-time-values", "skewed-clock", "different-reset", "late-reading", "two-minute-day"])
-@future("4Pa", "canonical Mac merging is a pure function of the whole sample set")
 def test_16a_mac_merge_is_arrival_order_independent(replay, kind):
     samples = steady()
     if kind == "same-time-values":
@@ -1524,7 +1521,6 @@ def test_16a_mac_merge_is_arrival_order_independent(replay, kind):
 @pytest.mark.parametrize("resolution,tail", [
     ("pending", []), ("confirmed", [(86700, 1), (87000, 2)]), ("refuted", [(86700, 95)]),
 ])
-@future("4Pa", "95 then 1 within 150 seconds must retain raw possible-reset evidence")
 def test_16a_raw_possible_reset_survives_bucket_merge(replay, resolution, tail):
     samples = steady(0.5, used=83) + [sample(86550, 1)]
     pending = pace_view(replay, samples, now=86550)
@@ -1537,7 +1533,6 @@ def test_16a_raw_possible_reset_survives_bucket_merge(replay, resolution, tail):
         assert pace["plan"]["verdict"] != "unknown", f"16a/{resolution}: settled readings still block the forecast"
 
 
-@future("4Pa", "fresh earlier replacement reset beats stale metadata")
 def test_16a_fresh_earlier_replacement_reset_wins(replay):
     samples = steady(reset=604800)
     samples += [sample(86401, 12, reset=604800 - 1200)]
@@ -1704,7 +1699,6 @@ def test_16b_synthetic_history_with_uncertainty(replay):
 
 @pytest.mark.parametrize("scenario", ["one-hour-to-ten-minutes", "band-jitter", "verdict-hysteresis", "limiting-window",
                                      "cycle", "cap-revision", "availability", "cumulative-small-moves", "numbers-alone"])
-@future("4Pa", "pace push selection must use the last acknowledged forecast and hysteretic urgency bands")
 def test_16c_pace_pushes(replay, scenario):
     # Feed scope-defined usage_sample inputs through the production fold.
     # No invented pace_forecast events or precomputed verdict labels.
