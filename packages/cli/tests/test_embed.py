@@ -468,7 +468,7 @@ class CosineCandidatesExcludesCommitmentsTest(unittest.TestCase):
         # Two execute() calls happen (media_assets check, then the main
         # SELECT) — the fake cursor only remembers the last, which is the
         # one that matters here.
-        self.assertIn("m.kind != 'commitment'", cur.sql)
+        self.assertIn("m.kind NOT IN ('episode', 'topic', 'commitment')", cur.sql)
 
 
 class ApplySearchFiltersHarnessTest(unittest.TestCase):
