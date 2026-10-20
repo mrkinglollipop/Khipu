@@ -4245,8 +4245,8 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
     with _lock():
         rule = _rule(n, now)
         if rule.get("pending") and not _same_author(rule.get("pending_author"), by):
-            raise RouteError(f"standing rule {rule['n']} already has an unconfirmed change from another "
-                             "conversation; the owner confirms or undoes it in Settings \u2192 Routing first")
+            raise RouteError(f"standing rule {rule['n']} has "
+                             f"{_pending_collision(rule.get('pending_author'), rule.get('at'), str(read_view(now)['version']), now)}")
         prior = rule.get("prior_text") if rule.get("pending") else rule["text"]
         prior_confirmed = rule.get("prior_confirmed") if rule.get("pending") else rule["confirmed"]
         written, view = _write({"type": "rule_edit", "n": rule["n"], "text": text.strip(), "pending": True,
@@ -4259,6 +4259,15 @@ def _same_author(a: dict | None, b: dict | None) -> bool:
     """One conversation, by what Khipu set (never the name it gives itself)."""
     keys = ("kind", "harness", "project", "session")
     return isinstance(a, dict) and isinstance(b, dict) and all(a.get(k) == b.get(k) for k in keys)
+
+
+def _pending_collision(author: dict | None, at, version: str, now: datetime) -> str:
+    by = author_words(author or {"kind": "conversation", "harness": UNKNOWN_HARNESS})
+    when = _ago(_parse(at), now) if _parse(at) else "at an unknown time"
+    return (f"an unconfirmed change from another conversation ({by}), {when}, is pending at current version {version}; "
+            "that conversation may replace it, or the owner can replace, confirm or undo it by owner direction "
+            "(`khipu owner-direction`), "
+            "in Settings → Routing or on a terminal")
 
 
 def retire_rule(n, *, via: str, now: datetime | None = None) -> dict:
@@ -4435,8 +4444,8 @@ def _request_priority(entries, *, until, owner_request, author, via: str, now: d
         _check_priority(expect, now)
         held = read_view(now).get("priority")
         if held and held.get("pending") and not _same_author(held.get("pending_author"), by):
-            raise RouteError("the priority already has an unconfirmed change from another conversation; the owner "
-                             "confirms or undoes it in Settings → Routing first")
+            raise RouteError("the priority has " + _pending_collision(held.get("pending_author"), held.get("at"),
+                                                                       priority_version(now), now))
         written, view = _write({"type": "priority_set", "entries": rows, "until": end, "pending": True,
                                 "owner_request": _clean(request_words, 0), "written_by": by, "via": via})
     return dict(_done(written, view), entries=[e["label"] for e in rows])
@@ -4597,7 +4606,20 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
     return text
 
 
-def hold_line(hold: dict, now: datetime, *, push: bool = True, relative: bool = True) -> str:
+def _end_hold_route(hold: dict) -> str:
+    if hold.get("owner"):
+        return "only the owner can end it in Settings or on a terminal with --owner"
+    return f"khipu_route_report action=end_hold hold_id={hold['id']}"
+
+
+def _account_holds(view: dict | None, key: str) -> list[dict]:
+    return [h for h in (view or {}).get("holds") or []
+            if (h.get("scope") or {}).get("kind") == "account"
+            and (h.get("scope") or {}).get("account") == key]
+
+
+def hold_line(hold: dict, now: datetime, *, push: bool = True, relative: bool = True,
+              view: dict | None = None) -> str:
     """A hold in plain words. A conversation's own words are left out of a
     push; the owner's words are pushed."""
     until = _parse(hold.get("until"))
@@ -4605,8 +4627,18 @@ def hold_line(hold: dict, now: datetime, *, push: bool = True, relative: bool = 
         end = "until you clear it"
     else:
         end = f"until {_clock(until, now)}" + (f", {_remaining(until, now)}" if relative else "")
-    text = f"Hold on {hold['scope_label']}: {HOLD_REASONS.get(hold['reason'], 'other')}, {end}; set by " \
-           f"{author_words(hold['written_by'], push=push)}"
+    key = (hold.get("scope") or {}).get("account")
+    conflicts = []
+    if key and view:
+        if any(item.get("account") == key for item in (view.get("priority") or {}).get("entries") or []):
+            conflicts.append("priority")
+        label = _label_of(key, view.get("accounts") or [])
+        if not conflicts:
+            conflicts += [f"rule {r['n']}" for r in view.get("rules") or []
+                          if label in _named_account_labels(r.get("text"), view)]
+    flag = f" (contradicts {', '.join(conflicts)})" if conflicts else ""
+    text = f"Hold on {hold['scope_label']}{flag}; end it: {_end_hold_route(hold)}; {end}; " \
+           f"{HOLD_REASONS.get(hold['reason'], 'other')}; set by {author_words(hold['written_by'], push=push)}"
     if hold.get("text") and (hold.get("owner") or not push):
         text += f": “{hold['text'] if hold.get('owner') else their_words(hold['text'])}”"
     return text
@@ -4654,7 +4686,69 @@ def table_precedence(table: dict | None, now: datetime) -> str | None:
     return f"These account lines are newer than the routing table's account rows; the table's NOW block{when}."
 
 
-def rule_line(rule: dict) -> str:
+def _compact_opening(text: str, width: int = 64) -> str:
+    words = " ".join(str(text or "").split())
+    if len(words) <= width:
+        return words
+    cut = words[:max(1, width - 3)].rsplit(" ", 1)[0]
+    return (cut or words[:max(1, width - 3)]).rstrip(" ,;:.") + "..."
+
+
+def _push_clip(text: str, width: int, view: dict) -> str:
+    text = _for_agents(text, view)
+    if width and len(text) > width:
+        return text[:max(0, width - 3)].rstrip() + "." * min(width, 3)
+    return text
+
+
+def _named_account_labels(text: str, view: dict | None) -> list[str]:
+    labels = [entry["label"] for entry in (view or {}).get("accounts") or [] if entry.get("label")]
+    if not labels:
+        return []
+    pattern = r"(?<!\w)(?:" + "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True)) + r")(?!\w)"
+    found = {match.group().casefold() for match in re.finditer(pattern, str(text or ""), re.IGNORECASE)}
+    return [label for label in labels if label.casefold() in found]
+
+
+def _level_claim_marker(text: str, key: str, facts: dict | None, *, label: str | None = None,
+                        labels=()) -> str:
+    fact = (facts or {}).get(key) or {}
+    if not fact.get("readable") or fact.get("stale"):
+        return ""
+    left = fact.get("left_pct")
+    if not isinstance(left, (int, float)):
+        return ""
+    lower = str(text or "").casefold()
+    scopes = [lower]
+    if label:
+        scopes = []
+        names = sorted(set([label, *labels]), key=len, reverse=True)
+        pattern = re.compile(r"(?<!\w)(?:" + "|".join(re.escape(n.casefold()) for n in names) + r")(?!\w)")
+        for clause in re.split(r"[;\n]|(?<!\d)\.(?!\d)|\b(?:but|whereas|while)\b", lower):
+            hits = list(pattern.finditer(clause))
+            for i, hit in enumerate(hits):
+                if hit.group() != label.casefold():
+                    continue
+                end = len(clause)
+                for j in range(i + 1, len(hits)):
+                    between = clause[hits[j - 1].end():hits[j].start()].strip(" ,&")
+                    if between not in ("", "and", "or"):
+                        end = hits[j].start()
+                        break
+                scopes.append(clause[hit.start():end])
+    for scope in scopes:
+        numeric = re.search(r"\b(\d{1,3}(?:\.\d+)?)%\s+left\b", scope)
+        qualitative = re.search(r"(?:^|\b(?:is|are|was|were|still|currently|now|also)\s+)(?:low|limited)\b"
+                                r"|\bnearly used up\b", scope)
+        stale = (numeric is not None and abs(float(numeric.group(1)) - left) >= 10) or (
+            qualitative is not None and left >= 50)
+        if stale:
+            name = f"{label}: " if label else ""
+            return f" (stale level claim; {name}Khipu read {left:g}% left)"
+    return ""
+
+
+def rule_line(rule: dict, *, view: dict | None = None, facts: dict | None = None) -> str:
     """A standing rule, whole. A seeded rule the owner has not confirmed
     says so: that mark is its only claim of ownership."""
     if rule.get("pending"):
@@ -4667,24 +4761,52 @@ def rule_line(rule: dict) -> str:
             if action == "changed" and rule.get("prior_text") else ""
         by = rule.get("pending_by") or "a conversation"
         mark = f" ({action} by {by} at the owner's request; the owner has not confirmed it yet{replaced})"
-        return f"{rule['n']}. {their_words(rule['text'])}{mark}"
-    mark = "" if rule.get("confirmed", True) else " (seeded; the owner has not confirmed it yet)"
-    return f"{rule['n']}. {rule['text']}{mark}"
+        text = f"{rule['n']}. {their_words(rule['text'])}{mark}"
+    else:
+        mark = "" if rule.get("confirmed", True) else " (seeded; the owner has not confirmed it yet)"
+        text = f"{rule['n']}. {rule['text']}{mark}"
+    for entry in (view or {}).get("accounts") or []:
+        if entry["label"].casefold() in str(rule.get("text") or "").casefold():
+            holds = _account_holds(view, entry["key"])
+            if holds:
+                text += f" (contradicts active hold {holds[0]['id']}; end it: {_end_hold_route(holds[0])})"
+            text += _level_claim_marker(rule.get("text") or "", entry["key"], facts, label=entry["label"],
+                                         labels=[a["label"] for a in view.get("accounts") or []])
+    return text
 
 
 _TOO_LONG = "the owner has not confirmed it yet. It is too long to show here: read it with `khipu_route`."
 
 
-def rule_pointer(rule: dict) -> str:
+def rule_pointer(rule: dict, view: dict | None = None) -> str:
     """A pending rule's line when its words don't fit the budget: fixed
     words, none of the conversation's."""
-    return f"{rule['n']}. A conversation {rule.get('pending_kind') or 'added'} this rule at the owner's request; " \
-        + _TOO_LONG
+    names = _named_account_labels(rule.get("text"), view)
+    named = f" for {', '.join(names)}" if names else ""
+    return (f"Standing rule {rule['n']} {rule.get('pending_kind') or 'added'}{named}: "
+            f"\"{their_words(_compact_opening(rule.get('text'), 32))}\"; unconfirmed; khipu_route.")
 
 
 PRIORITY_POINTER = "Your priority was set by a conversation at the owner's request; " + _TOO_LONG
 OWNER_PRIORITY_POINTER = "Your priority is too long to show here: read it with `khipu_route`."
 _TOO_LONG_SHORT = "Some lines are too long to show here: read them with `khipu_route`."
+
+
+def priority_pointer(priority: dict, view: dict | None = None, *, width: int = 24) -> str:
+    entries = priority.get("entries") or []
+    parts = []
+    for item in entries:
+        held = _account_holds(view, item.get("account"))
+        opening = _compact_opening(item.get("role") or "", max(width, 24) if held else width)
+        part = item["label"] + (f': "{their_words(opening)}"' if opening else "")
+        if held:
+            part += f" [contradicts active hold {held[0]['id']}]"
+        parts.append(part)
+    return f"Your priority change: {'; '.join(parts)}; unconfirmed; khipu_route."
+
+
+def _priority_pointers(priority: dict, view: dict | None = None) -> tuple[str, ...]:
+    return tuple(priority_pointer(priority, view, width=width) for width in (24, 16, 8, 4))
 
 
 def _ended_words(n: int) -> str:
@@ -4693,37 +4815,25 @@ def _ended_words(n: int) -> str:
     return "One priority entry ended." if n == 1 else f"{n} priority entries ended."
 
 
-def _fit_theirs(items: list[tuple[str, str]], limit: int, room: int | None = None) -> tuple[list[str], int]:
-    """Conversation-written lines (a pending rule or priority) against a
-    size budget, in order: each whole when it fits in what is left of
-    ``room`` (half of ``limit`` unless given; the rest stays for the account
-    lines), never clipped. One fixed line stands, in the place of the first,
-    for those that don't fit: its own pointer when it is one, else how many,
-    else a shorter one, each only when it fits ``room`` too. Returns one
-    entry per item ("" for the others the fixed line covers) and the
-    characters they take. ``limit`` 0: no limit."""
+def _fit_theirs(items, limit: int, room: int | None = None) -> tuple[list[str], int]:
+    """Fit whole requests or identifying previews; omitted requests stay empty.
+
+    A count-only pointer cannot acknowledge any particular request.
+    """
     room = limit // 2 if room is None else room
-    # Whole lines leave room for the shortest fixed line unless all of them
-    # fit, so a line that doesn't fit is never left out without a word.
-    whole = sum(len(line) + 1 for line, _pointer in items)
-    keep = 0 if not limit or whole <= room else len(_TOO_LONG_SHORT) + 1
-    out: list[str] = []
+    out = []
     used = 0
-    missed: list[int] = []
-    for i, (line, _pointer) in enumerate(items):
-        if not limit or used + len(line) + 1 + keep <= room:
-            out.append(line)
-            used += len(line) + 1
-        else:
-            out.append("")
-            missed.append(i)
-    if missed:
-        first = missed[0]
-        ladder = ([items[first][1]] if len(missed) == 1 else [
-            f"{len(missed)} unconfirmed changes a conversation made at the owner's request are too long to show "
-            "here: read them with `khipu_route`."]) + [_TOO_LONG_SHORT]
-        out[first] = next((line for line in ladder if used + len(line) + 1 <= room), "")
-        used += len(out[first]) + 1 if out[first] else 0
+    for i, (line, pointer) in enumerate(items):
+        previews = (pointer,) if isinstance(pointer, str) else tuple(pointer or ())
+        later = items[i + 1:]
+        reserve = 0
+        if limit and later and used + sum(len(item[0]) + 1 for item in items[i:]) > room:
+            pointers = [(p,) if isinstance(p, str) else tuple(p or ()) for _, p in later]
+            reserve = min((len(p) + 1 for group in pointers for p in group), default=0)
+        chosen = line if not limit or used + len(line) + 1 + reserve <= room else next(
+            (text for text in previews if used + len(text) + 1 <= room), "")
+        out.append(chosen)
+        used += len(chosen) + 1 if chosen else 0
     return out, used
 
 
@@ -4930,6 +5040,10 @@ def _priority_items(entries: list[dict], now: datetime, *, theirs: bool, view: d
             # A conversation's words are quoted, so a role can't read as more
             # entries of the list; the owner's are his, word for word.
             text += f": “{their_words(item['role'])}”" if theirs else f": {item['role']}"
+            text += _level_claim_marker(item["role"], item["account"], facts)
+        holds = _account_holds(view, item["account"])
+        if holds:
+            text += f" (contradicts active hold {holds[0]['id']}; end it: {_end_hold_route(holds[0])})"
         if facts is not None:
             said = []
             entry = by_key.get(item["account"])
@@ -5054,7 +5168,7 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
         return account_line(entry, now, relative=False)
     if kind == "hold":
         hold = next((h for h in view["holds"] if h["id"] == ident), None)
-        return hold_line(hold, now, relative=False) if hold else f"Hold on {prev.get('scope') or '?'} ended"
+        return hold_line(hold, now, relative=False, view=view) if hold else f"Hold on {prev.get('scope') or '?'} ended"
     if kind == "rule":
         rule = next((r for r in view["rules"] if str(r["n"]) == ident), None)
         return f"Standing rule {rule_line(rule)}" if rule else f"Standing rule {ident} retired"
@@ -5145,25 +5259,28 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         lines.append(f"Khipu's record has not been refreshed since {_clock(checked, now)}.")
     # The owner's words are whole and outside the budget; a conversation's
     # (a pending rule or priority) count against it (``_fit_theirs``).
+    facts = plan_facts(view, now) if view.get("record") else {}
     whole: list[str] = []
     theirs: list[tuple[int, str, str]] = []  # (place in whole, line, pointer)
     if view.get("rules"):
         whole.append("Standing rules:")
         for r in view["rules"]:
             if r.get("pending"):
-                theirs.append((len(whole), rule_line(r), rule_pointer(r)))
-            whole.append(rule_line(r))
+                theirs.append((len(whole), rule_line(r, view=view, facts=facts), rule_pointer(r, view)))
+            whole.append(rule_line(r, view=view, facts=facts))
     if view.get("note"):
         whole.append(note_line(view["note"], now))
-    facts = plan_facts(view, now) if view.get("record") else {}
     # The owner's priority, whole and before every account line (phase 4b).
     if view.get("priority"):
         line = priority_line(view["priority"], now, view=view, facts=facts)
         if view["priority"].get("pending"):
-            theirs.append((len(whole), line, PRIORITY_POINTER))
+            theirs.append((len(whole), line, _priority_pointers(view["priority"], view)))
         whole.append(line)
     rules_note_chars = sum(len(line) + 1 for i, line in enumerate(whole) if i not in {t[0] for t in theirs})
-    fitted, theirs_chars = _fit_theirs([(line, pointer) for _i, line, pointer in theirs], cfg["routing_summary_chars"])
+    fitted, theirs_chars = _fit_theirs([
+        (_for_agents(line, view), tuple(_for_agents(p, view) for p in pointer)
+         if isinstance(pointer, tuple) else _for_agents(pointer, view))
+        for _i, line, pointer in theirs], cfg["routing_summary_chars"])
     for (i, _line, _pointer), chosen in zip(theirs, fitted):
         whole[i] = chosen
     lines += [line for line in whole if line]
@@ -5198,7 +5315,7 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
                 line += f"; {pace_words(fact, now)}"
             items.append(("open" if entry["state"] == OPEN else "account", line, ""))
         items += [("lane", _clip(lane_line(u, now), width), "") for u in view.get("unmatched") or []]
-        items += [("hold", _clip(hold_line(h, now), width), h["at"]) for h in view.get("holds") or []]
+        items += [("hold", _push_clip(hold_line(h, now, view=view), width, view), h["at"]) for h in view.get("holds") or []]
         limit = cfg["routing_summary_chars"]
 
         def size(kept: list, n_dropped: int) -> int:
@@ -5263,7 +5380,11 @@ def _current_line(entity: str, view: dict, now: datetime) -> str:
     if kind == "hold":
         hold = next((h for h in view["holds"] if h["id"] == ident), None)
         if hold:
-            return hold_line(hold, now)
+            return hold_line(hold, now, view=view)
+    if kind == "rule":
+        rule = next((r for r in view.get("rules") or [] if str(r["n"]) == ident), None)
+        if rule:
+            return "Standing rule " + rule_line(rule, view=view, facts=plan_facts(view, now))
     if kind == "lane":
         runner, _, lane = ident.partition("/")
         item = next((u for u in view["unmatched"] if u["runner"] == runner and u["lane"] == lane), None)
@@ -6287,67 +6408,72 @@ def _priority_push(view: dict, now: datetime, *, changed: bool = False,
             plain = priority_change_line(view, now) if changed else priority_line(view["priority"], now)
             short = [" ".join([*lead, x]) for x in priority_short_lines(view["priority"], now)]
             return [(line, (plain, *short, " ".join([*lead, OWNER_PRIORITY_POINTER])), PRIORITY)]
-        return [(line, " ".join([*lead, PRIORITY_POINTER]), THEIRS)]
+        return [(line, tuple(" ".join([*lead, p]) for p in _priority_pointers(view["priority"], view)), THEIRS)]
     if changed and changed_lines is not None:
         return [(line, (" ".join([*lead, "No priority set."]),), PRIORITY)
                 for e, line in zip(changed_lines["entities"], changed_lines["lines"]) if e == "priority"]
     return []
 
 
-def _fit_push(head: list[tuple[str, str | tuple[str, ...] | None, str]], others: list[str], limit: int, *,
-              stale: str | None = None, overflow=None) -> list[str]:
-    """Every budgeted part of a push against ``limit`` together, so no
-    combination exceeds it: the not-refreshed line, a conversation's words
-    (at most half, ``_fit_theirs``), the owner's priority (whole, else
-    without the facts, else its pointer), the other lines dropped whole from
-    the bottom, and ``overflow(n)`` naming how many were dropped. A part that can't fit even as its
-    pointer is left out. The owner's rules and note (``OWNERS``) are whole
-    and outside the budget. ``limit`` 0: no limit."""
-    def fits(n: int) -> bool:
-        return not limit or used + n + 1 <= limit
+def _fit_push(head, others, limit: int, *, stale: str | None = None, overflow=None,
+              first_entities=()) -> tuple[list[str], list[str]]:
+    """Fit budgeted lines while retaining the identity of every selected entity.
 
+    Owner rules and notes stay whole, outside the budget. Owed entities take
+    room before new requests, even when both share one record version.
+    """
+    tagged = [(None, line) if isinstance(line, str) else line for line in others]
+    headed = [(*item, None) if len(item) == 3 else item for item in head]
+    first_entities = set(first_entities)
+    headed.sort(key=lambda item: 0 if item[3] in first_entities else 1)
     used = 0
-    top: list[str] = []
-    if stale and fits(len(stale)):
-        top.append(stale)
+    selected = []
+    if stale and (not limit or len(stale) + 1 <= limit):
+        selected.append((None, stale))
         used += len(stale) + 1
-    theirs = [(line, pointer) for line, pointer, whose in head if whose == THEIRS]
-    fitted, taken = _fit_theirs(theirs, limit, room=min(limit // 2, limit - used))
+    reserve = sum(len(line) + 1 for entity, line in tagged if entity in first_entities)
+    room = max(0, min(limit // 2, limit - used - reserve)) if limit else 0
+    theirs = [(line, pointer) for line, pointer, whose, _ in headed if whose == THEIRS]
+    fitted, taken = _fit_theirs(theirs, limit, room=room)
     used += taken
-    # Room kept before the owner's priority takes the rest: the first other
-    # line (an account changing state is news) and the overflow line.
-    tail = len(overflow(len(others))) + 1 if others and overflow and limit else 0
-    first = len(others[0]) + 1 + (tail if len(others) > 1 else 0) if others and limit else 0
-    chosen: dict[int, str] = {}
-    for i, (line, fallback, whose) in enumerate(head):
-        if whose != PRIORITY:
-            continue
-        # Every form that shows the priority (whole, without the facts,
-        # shortened, the order alone) before the pointer that shows none of it.
-        shows, last = (line, *fallback[:-1]), fallback[-1]
-        ladder = [(x, keep) for keep in (first, tail, 0) for x in shows] + [(last, keep) for keep in (first, tail, 0)]
-        pick = next((x for x, keep in ladder if fits(len(x) + keep)), "")
-        chosen[i] = pick
-        used += len(pick) + 1 if pick else 0
-    theirs_left = iter(fitted)
-    for i, (line, _pointer, whose) in enumerate(head):
-        shown = line if whose == OWNERS else next(theirs_left) if whose == THEIRS else chosen[i]
-        if shown:
-            top.append(shown)
-    kept = list(others)
+    fitted = iter(fitted)
+    chosen = {}
+    for i, (line, fallback, whose, entity) in enumerate(headed):
+        if whose == OWNERS:
+            chosen[i] = line
+        elif whose == THEIRS:
+            chosen[i] = next(fitted)
+        else:
+            tail = len(overflow(len(tagged))) + 1 if tagged and overflow and limit else 0
+            first = len(tagged[0][1]) + 1 + (tail if len(tagged) > 1 else 0) if tagged else 0
+            keeps = (reserve,) if first_entities else (first, tail, 0)
+            ladder = [(text, keep) for keep in keeps for text in (line, *fallback[:-1])]
+            ladder += [(fallback[-1], keep) for keep in keeps]
+            pick = next((text for text, keep in ladder
+                         if not limit or used + len(text) + 1 + keep <= limit), "")
+            chosen[i] = pick
+            used += len(pick) + 1 if pick else 0
+    missing_head = sum(1 for i, item in enumerate(headed) if item[3] is not None and not chosen[i])
+    selected += [(item[3], chosen[i]) for i, item in enumerate(headed) if chosen[i]]
+    kept = list(tagged)
     if limit:
         while kept:
-            dropped = len(others) - len(kept)
-            size = sum(len(line) + 1 for line in kept) + (len(overflow(dropped)) + 1 if dropped else 0)
+            dropped = len(tagged) - len(kept) + missing_head
+            size = sum(len(line) + 1 for _, line in kept)
+            size += len(overflow(dropped)) + 1 if dropped and overflow else 0
             if used + size <= limit:
                 break
             kept.pop()
-    top += kept
-    if len(kept) < len(others) and overflow:
-        line = overflow(len(others) - len(kept))
-        if fits(len(line) + sum(len(x) + 1 for x in kept)):
-            top.append(line)
-    return top
+    selected += kept
+    if first_entities:
+        selected.sort(key=lambda item: 0 if item[0] in first_entities else 1)
+    lines = [line for _, line in selected]
+    dropped = len(tagged) - len(kept) + missing_head
+    if dropped and overflow:
+        tail = overflow(dropped)
+        if not limit or used + sum(len(line) + 1 for _, line in kept) + len(tail) + 1 <= limit:
+            lines.append(tail)
+    return lines, [entity for entity, _ in selected if entity is not None]
 
 
 def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = None,
@@ -6360,31 +6486,55 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     cfg = cfg or settings()
     lines = [CHANGES_HEADING.format(at=_clock(now, now))]
     width, limit = cfg["routing_line_chars"], cfg["routing_prompt_chars"]
+    owed = [entity for entity in changed.get("owed_entities") or [] if entity in changed["entities"]]
+    owed_set = set(owed)
     ranked = sorted(((_change_group(e, view), i, line) for i, (e, line)
-                     in enumerate(zip(changed["entities"], changed["lines"]))), key=lambda t: (t[0], t[1]))
+                     in enumerate(zip(changed["entities"], changed["lines"]))),
+                    key=lambda t: (0 if changed["entities"][t[1]] in owed_set else 1, t[0], t[1]))
     changed_rules = {e for e in changed["entities"] if e.startswith("rule:")}
     pending = {f"rule:{r['n']}": r for r in view.get("rules") or [] if r.get("pending")}
     # Pending conversation requests remain explicit in every change push
     # until their owner resolves them, even when this version changes an
     # unrelated account. Every part but the owner's rules and note counts
     # against the budget, together (``_fit_push``).
-    head: list[tuple[str, str | None, str]] = [(rule_line(r), rule_pointer(r), THEIRS)
-                                               for e, r in pending.items() if e not in changed_rules]
+    head = [(rule_line(r, view=view, facts=plan_facts(view, now)), rule_pointer(r, view), THEIRS, None)
+            for e, r in pending.items() if e not in changed_rules]
     for group, e, line in ranked:
         entity = changed["entities"][e]
         if group == 0 and entity != "priority":
-            head.append((line, "Standing rule " + rule_pointer(pending[entity]), THEIRS) if entity in pending
-                        else (line, None, OWNERS))
-    head += _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)
+            head.append((line, rule_pointer(pending[entity], view), THEIRS, entity)
+                        if entity in pending else (line, None, OWNERS, entity))
+    priority_head = [(*item, "priority" if "priority" in changed["entities"] else None)
+                     for item in _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)]
+    conflicting = any(_account_holds(view, item.get("account"))
+                      for item in (view.get("priority") or {}).get("entries") or [])
+    head = priority_head + head if conflicting else head + priority_head
     # What the owner did since (by direction, in the app, on a terminal),
     # each named once and first among the budgeted lines: Khipu's fixed words (``direction_line``).
-    others = [_clip(line, width) for line in changed.get("directions") or []]
-    others += [_clip(line, width) for group, _, line in ranked if group != 0]
+    others = [(None, _push_clip(line, width, view)) for line in changed.get("directions") or []]
+    others += [(changed["entities"][index], _push_clip(line, width, view))
+               for group, index, line in ranked if group != 0]
 
     def overflow(n: int) -> str:
         return f"{n} more change{'s' if n != 1 else ''}: `khipu_route` since {changed['since']}"
 
-    lines += _fit_push(head, others, limit, stale=stale, overflow=overflow)
+    if conflicting:
+        current_holds = {entity for entity, _ in others}
+        context = [(None, _push_clip(hold_line(hold, now, view=view), min(width, 150) if width else 150, view))
+                   for hold in view.get("holds") or []
+                   if f"hold:{hold['id']}" not in current_holds and
+                   any(item.get("account") == (hold.get("scope") or {}).get("account")
+                       for item in (view.get("priority") or {}).get("entries") or [])]
+        others = context + others
+    others.sort(key=lambda item: 0 if item[0] in owed_set else 1)
+    head = [(_for_agents(line, view),
+             tuple(_for_agents(p, view) for p in fallback) if isinstance(fallback, tuple)
+             else _for_agents(fallback, view) if fallback else fallback, whose, entity)
+            for line, fallback, whose, entity in head]
+    rendered, shown = _fit_push(head, others, limit, stale=stale, overflow=overflow,
+                                first_entities=owed_set)
+    changed["shown_entities"] = shown
+    lines += rendered
     return "\n".join(lines), len(changed["entities"])
 
 
@@ -6414,7 +6564,8 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
         seen = marker["version"]
         stale = _not_refreshed(view, now, cfg)
         said = stale is not None and marker.get("unrefreshed") == view.get("checked_at")
-        if seen == view["version"]:
+        owed = marker.get("owed") if marker.get("epoch") == view.get("epoch") and isinstance(marker.get("owed"), list) else []
+        if seen == view["version"] and not owed:
             if stale and not said:
                 # Nothing changed, but the record has not been refreshed past its bound: one line, once,
                 # under the same budget as any change push.
@@ -6424,9 +6575,18 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
                             unrefreshed=view.get("checked_at"))
             return dict(base, kind="none", text=None, count=0)
         changed = since(seen, view, now=now, epoch=marker.get("epoch"))
+        if owed:
+            current = {entity: line for entity, line in zip(changed["entities"], changed["lines"])}
+            for entity in owed:
+                current.setdefault(entity, _current_line(entity, view, now))
+            ordered = [*owed, *[entity for entity in changed["entities"] if entity not in owed]]
+            changed["entities"] = ordered
+            changed["lines"] = [current[entity] for entity in ordered]
+            changed["owed_entities"] = owed
         if changed["complete"]:
             text, count = changes_text(changed, view, now, cfg, stale=stale)
             return dict(base, kind="changes", text=_for_agents(text, view), count=count,
+                        owed_entities=changed["entities"], shown_entities=changed.get("shown_entities") or [],
                         unrefreshed=view.get("checked_at") if stale else None)
         why = "the changes are no longer kept"
     out = summary(view, now=now)
