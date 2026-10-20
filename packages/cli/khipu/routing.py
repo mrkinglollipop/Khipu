@@ -4833,6 +4833,67 @@ def read_view(now: datetime | None = None) -> dict:
         return _unsaved_view(now)
 
 
+def _telemetry_streams(view: dict) -> list[dict]:
+    from khipu import routing_sources
+
+    cfg = settings()
+    known = [{"key": a["key"], "label": a["label"], "harness": a["harness"], "home": a.get("home")}
+             for a in view.get("accounts") or []]
+    return routing_sources.telemetry_streams(
+        view.get("source_cache") or {}, known=known, lane_map=cfg.get("routing_lane_map") or {},
+        providers=(view.get("definitions") or {}).get("providers"),
+        silent={r["name"]: bool(r.get("silent")) for r in (view.get("sources") or {}).get("runners") or []})
+
+
+def _telemetry_account_key(account: str, view: dict) -> str:
+    known = [{"key": a["key"], "label": a["label"], "harness": a["harness"], "home": a.get("home")}
+             for a in view.get("accounts") or []]
+    if account in {a["key"] for a in known}:
+        return account
+    return _account_for_a_conversation(account, known)
+
+
+def telemetry_spend(account: str | None = None, *, days: float | None = None, start=None, end=None,
+                    now: datetime | None = None) -> dict:
+    """Runner spend totals from the accumulated telemetry (slice 17t).
+
+    With an account, that account's total over the period; without one,
+    every account's total plus the unattributed bucket. A total is known
+    only on complete coverage; a missing or partial stream reads
+    ``unknown`` with no figure, never zero. ``start``/``end`` are
+    datetimes; the default period is the trailing ``days`` (7) to ``now``.
+    """
+    from khipu import routing_sources
+
+    now = now or _now()
+    end = end or now
+    start = start or (end - timedelta(days=days if days is not None else 7))
+    view = read_view(now)
+    streams = _telemetry_streams(view)
+    if account is None:
+        keys = sorted({s["account"] for s in streams if s["account"] is not None})
+        return {"accounts": {key: routing_sources.spend_total(streams, key, start, end) for key in keys},
+                "unattributed": routing_sources.unattributed_summary(streams)}
+    key = _telemetry_account_key(account, view)
+    return routing_sources.spend_total(streams, key, start, end)
+
+
+def telemetry_active(account: str | None = None, *, now: datetime | None = None) -> dict:
+    """Current runner active jobs (slice 17t): per account, or one
+    account's ``{jobs, status}``. Expired (silent-runner) snapshots read
+    ``unknown``, never a partial sum."""
+    from khipu import routing_sources
+
+    now = now or _now()
+    view = read_view(now)
+    streams = _telemetry_streams(view)
+    totals = routing_sources.active_totals(streams)
+    if account is None:
+        return {"accounts": totals, "unattributed": routing_sources.unattributed_summary(streams)}
+    key = _telemetry_account_key(account, view)
+    return totals.get(key, {"jobs": None, "status": "unknown"})
+
+
 _OP = contextvars.ContextVar("routing_operation", default=None)
 
 
