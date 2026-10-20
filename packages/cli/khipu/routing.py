@@ -5018,10 +5018,14 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
     error = row.get("error") if not row.get("ok") else row.get("live_error")
     if error in (usage.E_SIGNIN, usage.E_NO_LIMITS):
         return {"readable": False, "why": "plan figures can't be read: sign in again", "error": error}
+    kept_failure = False
     if not row.get("ok"):
         if error == usage.E_NOT_INSTALLED:
             return {"readable": False, "why": "plan figures can't be read: its CLI is not installed", "error": error}
-        return {"readable": False, "why": "plan figures can't be read just now", "error": error}
+        if row.get("last_good_at") and row.get("windows"):
+            kept_failure = True
+        else:
+            return {"readable": False, "why": "plan figures can't be read just now", "error": error}
     window = _longest_window(row, now)
     longest = _longest_window(row, None)
     # Compared like _longest_window ranks them: a model's window of the same
@@ -5051,7 +5055,15 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
             "resets_at": _iso(resets), "seconds": int(seconds), "pace_pct_per_hour": round(pace, 3),
             "hurry": left > 0 and pace >= even * PACE_HURRY, "words": words}
     figures_at = _parse(row.get("observed_at") or row.get("probed_at"))
-    if figures_at is None or (now - figures_at).total_seconds() > FIGURES_STALE_S:
+    if kept_failure:
+        # A provider can return figures older than the probe that fetched them: their own time wins.
+        figures_at = _parse(row.get("observed_at")) or _parse(row.get("last_good_at")) or figures_at
+        last_read = "the last read timed out" if error == usage.E_TIMEOUT else "the last read failed"
+        if figures_at is not None:
+            last_read = f"figures from {_clock(figures_at, now)}; {last_read}"
+        fact.update(stale=True, figures_at=_iso(figures_at) if figures_at else None, pace_pct_per_hour=None,
+                    hurry=False, words=last_read)
+    elif figures_at is None or (now - figures_at).total_seconds() > FIGURES_STALE_S:
         # Shown as what was read, with its age; never a pace or a verdict.
         fact.update(stale=True, figures_at=_iso(figures_at) if figures_at else None, pace_pct_per_hour=None,
                     hurry=False, words="figures may be out of date")

@@ -372,6 +372,39 @@ def test_nothing_left_and_everything_left(home):
     assert rushed["words"] == "a lot left, little time"
 
 
+def test_a_timed_out_probe_keeps_its_last_good_figures_marked_stale(home):
+    kept_at = routing._iso(T0 - timedelta(hours=2))
+    row = _row("Grok", "grok", None, _week(25, T0 + timedelta(days=2)), ok=False, error=usage.E_TIMEOUT,
+               probed_at=kept_at, last_good_at=kept_at)
+    fact = routing.plan_fact(row, T0)
+    assert fact["readable"] is True and fact["stale"] is True
+    assert fact["used_pct"] == 25 and fact["left_pct"] == 75
+    assert fact["resets_at"] == routing._iso(T0 + timedelta(days=2))
+    assert fact["figures_at"] == kept_at
+    assert fact["words"] == "figures from 12:00Z; the last read timed out"
+    assert fact["pace_pct_per_hour"] is None and fact["hurry"] is False
+    # No kept figures: still unreadable.
+    failed = routing.plan_fact(_row("Grok", "grok", None, ok=False, error=usage.E_TIMEOUT), T0)
+    assert failed == {"readable": False, "why": "plan figures can't be read just now", "error": usage.E_TIMEOUT}
+    # Sign-in and not-installed are unchanged, even with kept figures.
+    for error, why in ((usage.E_SIGNIN, "plan figures can't be read: sign in again"),
+                       (usage.E_NOT_INSTALLED, "plan figures can't be read: its CLI is not installed")):
+        kept = _row("Grok", "grok", None, _week(25, T0 + timedelta(days=2)), ok=False, error=error,
+                    probed_at=kept_at, last_good_at=kept_at)
+        assert routing.plan_fact(kept, T0) == {"readable": False, "why": why, "error": error}
+
+
+def test_kept_figures_keep_the_providers_own_time_after_a_timeout(home):
+    # The provider's figures are older than the probe that fetched them; a later timeout must not make them look newer.
+    observed = routing._iso(T0 - timedelta(hours=8))
+    probed = routing._iso(T0 - timedelta(minutes=5))
+    row = _row("Grok", "grok", None, _week(25, T0 + timedelta(days=2)), ok=False, error=usage.E_TIMEOUT,
+               probed_at=probed, last_good_at=probed, observed_at=observed)
+    fact = routing.plan_fact(row, T0)
+    assert fact["stale"] is True and fact["figures_at"] == observed
+    assert fact["words"].startswith("figures from 06:00Z")
+
+
 def test_an_account_whose_figures_cannot_be_read_says_so_and_gets_no_pace(home):
     for error in (usage.E_SIGNIN, usage.E_NO_LIMITS):
         fact = routing.plan_fact(_row("Grok", "grok", None, ok=False, error=error), T0)
