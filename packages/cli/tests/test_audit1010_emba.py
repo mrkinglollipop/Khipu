@@ -130,7 +130,11 @@ class QueryIdentityTest(unittest.TestCase):
             def commit(self): pass
             def rollback(self): pass
         spec = ProfileSpec("cache@2", "voyage", "cache", 2, "none")
+        from khipu import query_cache_queue
+
         for cached in ("[0,0]", "[NaN,1]", "[1]", '["1","2"]'):
+            # Each case is a fresh process: no vector kept from the last one.
+            query_cache_queue._MEMORY.clear()
             with self.subTest(cached=cached), \
                     mock.patch.object(embed, "resolve_spec", return_value=spec), \
                     mock.patch.object(embed, "embed_one", return_value=[1.0, 0.0]) as provider:
@@ -339,8 +343,11 @@ class ProviderInputRedactionTest(unittest.TestCase):
         self.assertNotIn("sk-querysecret", seen[0])
         import hashlib
         expected = hashlib.md5(f"{embed.QUERY_CACHE_SCHEME}\n{embed.PROFILE_2}\nquery\n{seen[0]}".encode()).hexdigest()
-        keys = [params[1] for sql, params in cur.calls if sql.startswith(("SELECT embedding", "INSERT INTO memory_query_cache"))]
-        self.assertEqual(keys, [expected, expected])
+        from khipu import query_cache_queue
+
+        keys = [params[1] for sql, params in cur.calls if sql.startswith("SELECT embedding")]
+        queued = [json.loads(line)["hash"] for line in query_cache_queue.queue_file().read_text().splitlines()]
+        self.assertEqual(keys + queued, [expected, expected])
 
 
 class BudgetReservationTest(unittest.TestCase):

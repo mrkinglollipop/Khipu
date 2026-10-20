@@ -123,6 +123,8 @@ export type ConfigShape = {
   >;
   /** `offline.settings_status()`: each duration with the CLI's own words. */
   offline?: Record<string, { value: number; default: number; kind: string; source: string; words: string }>;
+  /** `read_role.settings_status()`: the hub's search role, whole numbers. */
+  read_role?: Record<string, { value: number; default: number; kind: string; source: string; words: string }>;
 };
 
 export type FeatureState = { enabled: boolean; source: "env" | "file" | "default" };

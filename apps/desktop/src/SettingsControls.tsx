@@ -479,6 +479,59 @@ export function OfflineWaitsCard({ active }: { active: boolean }) {
 }
 
 // ---------------------------------------------------------------------------
+// Searches on the hub: the read role's limit and two timeouts (whole numbers).
+// Saving one changes the role on the hub itself, for every Mac.
+// ---------------------------------------------------------------------------
+
+const READ_ROLE_ROWS: ReadonlyArray<readonly [string, string, string]> = [
+  ["read_role_connection_limit", "Most hub connections searches may hold", "connections"],
+  ["read_role_statement_timeout", "Longest one search may run on the hub (seconds)", "seconds"],
+  ["read_role_idle_in_transaction_timeout", "Close a search connection left idle after (seconds)", "seconds"],
+];
+
+export function SearchRoleCard({ active }: { active: boolean }) {
+  const cfg = useCliState<ConfigShape>("khipu_config_show", active);
+  const rows = cfg.data?.read_role ?? {};
+  return (
+    <>
+      <div className="section-head">Searches on the hub</div>
+      <div className="section-body">
+        <p className="set-help">
+          Searches use their own database role, so they can never take the connections saves need. These limits
+          apply on the hub for every Mac and the gateway. 0 means no limit.
+        </p>
+        {cfg.error && !cfg.data ? (
+          <p className="set-error" role="alert">
+            Could not read the settings: {cfg.error}
+          </p>
+        ) : null}
+        {READ_ROLE_ROWS.map(([key, label, unit]) => {
+          const row = rows[key];
+          return (
+            <SettingField
+              key={key}
+              label={label}
+              mono
+              narrow
+              inputMode="decimal"
+              value={row ? String(row.value) : ""}
+              canReset={row?.source === "file"}
+              onReset={() => unsetConfig(key, cfg.reload)}
+              help={row ? `${row.words}. Default ${row.default}.` : undefined}
+              onSave={async (v) => {
+                const t = v.trim();
+                if (!/^\d+$/.test(t)) return `Enter a whole number of ${unit}, 0 or more.`;
+                return writeConfig(key, t, cfg.reload);
+              }}
+            />
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Another Mac: gateway_url.
 // ---------------------------------------------------------------------------
 
@@ -743,6 +796,7 @@ export function HubAwayCard({ active }: { active: boolean }) {
       </div>
       <ReplicaCopyCard active={active} />
       <OfflineWaitsCard active={active} />
+      <SearchRoleCard active={active} />
     </section>
   );
 }

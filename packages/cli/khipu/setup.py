@@ -366,6 +366,20 @@ def _stage_store(dsn: str, root_crt: str | None) -> dict[str, Any]:
     return {"id": "store", "ok": True, "title": "Saved", "detail": f"Connection saved for {mask_dsn(dsn)}."}
 
 
+def _store_read_role(conn, dsn: str) -> dict[str, Any]:
+    """Create the hub's search role and save this Mac's read DSN. Never fails
+    setup: without it search runs as the owner and doctor says so."""
+    from khipu import read_role
+
+    try:
+        conninfo = read_role.provision(owner_conn=conn, owner_dsn=dsn, force=True)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "detail": f"{type(exc).__name__}: {exc}"[:200]}
+    if conninfo is None:
+        return {"ok": False, "detail": read_role.provision_blocked() or "the read role could not be set up"}
+    return {"ok": True, "detail": f"Search connects as {read_role.READ_ROLE}."}
+
+
 def _stage_upkeep() -> dict[str, Any]:
     from khipu.launchd_gen import ensure_scheduled_jobs
 
@@ -585,6 +599,8 @@ def connect_database(
     if store:
         t0 = time.monotonic()
         entry = _stage_store(dsn, root_crt)
+        if entry.get("ok"):
+            entry = {**entry, "read_role": _store_read_role(conn, dsn)}
         if not record(entry, time.monotonic() - t0):
             return fail(STAGE_ORDER[6:])
     else:

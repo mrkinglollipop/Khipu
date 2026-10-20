@@ -281,12 +281,18 @@ class ReflectionCacheContractTest(unittest.TestCase):
                         )):
                     out = reflect.reflect("Cursor pagination")
                 self.assertFalse(out["abstained"], out)
-                self.assertEqual(hub.cache_writes, 1)
-                self.assertEqual(hub.commits, 1)
+                # The retrieval cache is queued for the drain, never written
+                # on the search connection.
+                self.assertEqual(hub.cache_writes, 0)
+                self.assertEqual(hub.commits, 0)
                 self.assertEqual(transport.call_count, 0 if hit else 1)
                 mutations = [sql for sql in hub.statements if sql.startswith(("INSERT", "UPDATE", "DELETE"))]
-                self.assertTrue(mutations)
-                self.assertTrue(all("memory_query_cache" in sql for sql in mutations))
+                self.assertEqual(mutations, [])
+                from khipu import query_cache_queue
+
+                self.assertEqual(query_cache_queue.pending(), 1)
+                query_cache_queue._MEMORY.clear()
+                query_cache_queue.queue_file().unlink()
                 self.assertEqual(hub.briefs, [])
                 self.assertEqual(hub.decisions, {})
                 self.assertIn("retrieval caches", reflect.__doc__)

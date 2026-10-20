@@ -69,6 +69,7 @@ const LABELS: Record<string, string> = {
   recall_probe_ok: "Memory round trip works",
   bundle_seal_ok: "App bundle intact",
   schema_migrations_ok: "Database has every update this version expects",
+  read_role_ok: "Searches keep clear of captures",
   // Phase 6 (honesty): per-nightly-step evidence (D1), instead of trusting
   // only the legacy driver's exit code.
   notes_reconcile_ok: "Notes reconciled by the nightly",
@@ -283,6 +284,12 @@ function detailFor(key: string, parsed: Record<string, unknown>): string | undef
   if (key === "disk_space_ok") {
     const ds = parsed.disk_space as { level?: string; message?: string } | undefined;
     return ds?.level === "amber" && ds.message ? ds.message : undefined;
+  }
+  if (key === "read_role_ok") {
+    const rr = parsed.read_role as { warnings?: unknown; error?: unknown } | undefined;
+    const words = Array.isArray(rr?.warnings) ? rr!.warnings.filter((w): w is string => typeof w === "string") : [];
+    if (typeof rr?.error === "string") words.push(`Could not check: ${rr.error}`);
+    return words.length ? words.join(" ") : undefined;
   }
   if (key === "prompt_recall_snapshot_ok") {
     const prs = parsed.prompt_recall_snapshot as { level?: string; message?: string } | undefined;

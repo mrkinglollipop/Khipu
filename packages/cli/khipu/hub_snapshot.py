@@ -384,18 +384,25 @@ def hub_connection_failed(exc: BaseException) -> bool:
 
 
 def try_hub_connect(
-    *, connect_timeout: int = HUB_CONNECT_TIMEOUT_S
+    *, connect_timeout: int = HUB_CONNECT_TIMEOUT_S, role: str | None = None
 ) -> psycopg.Connection:
+    """The read role (``role="read"``, or inside ``db.read_connection``)
+    connects as the search role through ``db.connect``."""
     import psycopg
 
-    from khipu.db import conninfo_with_local_root_cert, resolve_dsn
+    from khipu.db import conninfo_with_local_root_cert, current_role, resolve_dsn
 
-    from khipu import hub_reach
+    from khipu import hub_reach, read_role
 
+    if (role or current_role()) == "read":
+        from khipu.db import connect
+
+        return connect(role="read", connect_timeout=connect_timeout)
     try:
         conn = psycopg.connect(
             conninfo_with_local_root_cert(resolve_dsn()),
             connect_timeout=connect_timeout,
+            application_name=read_role.application_name("owner"),
         )
     except Exception as exc:
         if hub_connection_failed(exc):
