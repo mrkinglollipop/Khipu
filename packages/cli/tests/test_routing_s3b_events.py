@@ -38,7 +38,7 @@ def test_old_rule_numbers_keep_their_meaning_in_mixed_history(mac):
     path.write_bytes(original)
     before = mac.view()
     entity = before["rules"][0]["entity"]
-    assert before["effective"][f"rule:{entity}"]["text"] == "edited words"
+    assert before["effective"]["rule:11"]["text"] == "edited words"
     result = routing.edit_rule(11, "new edit", via="app")
     last = routing.read_events()[0][-1]
     assert last["target"] == last["entity"] == entity == result["entity"]

@@ -3628,7 +3628,8 @@ def _rule_number(event: dict) -> int | None:
 
 
 def _rule_add_component(event: dict) -> str:
-    return f"rule:{event_identity.entity(event)}"
+    number = _rule_number(event)
+    return f"rule:{number if number is not None else event_identity.entity(event)}"
 
 
 def _touched(kind: str | None, event: dict, info: dict) -> str | None:
@@ -4645,8 +4646,7 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
     by = dict(author or conversation_author())
     if by.get("kind") != "conversation":
         by = conversation_author()
-    op = op or _OP.get() or request_op({"author": by, "rule": n, "text": text.strip(),
-                                       "owner_request": request_words})
+    op = op or _OP.get() or event_identity.uuid7()
     if n is None:
         with _lock():
             events, _bad = read_events()
@@ -4655,8 +4655,8 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
                                     "source": "added at the owner's request", "date": now.date().isoformat(),
                                     "seeded": False, "pending": True, "owner_request": request_words,
                                     "written_by": by, "via": via, "op": op})
-        rule = next(r for r in view["rules"] if r["entity"] == written["entity"])
-        return dict(_done(written, view), n=rule["n"])
+        rule = next((r for r in view.get("rules", []) if r["entity"] == written["entity"]), None)
+        return dict(_done(written, view), n=rule["n"] if rule else _rule_number(written))
     # The predecessor and the append are one locked operation: an owner edit
     # between them must become the wording Undo restores.
     with _lock():

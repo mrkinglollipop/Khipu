@@ -52,11 +52,13 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 from pathlib import Path
 
 SERVER_NAME = "khipu"
+_ROUTING_SESSION = secrets.token_hex(16)
 
 
 def _server_version() -> str:
@@ -2669,7 +2671,8 @@ def _dispatch_message(msg: dict) -> dict | None:
 
                 op = arguments.pop("op", None)
                 if op is None and req_id is not None:
-                    op = routing.request_op({"request": req_id, "tool": name, "arguments": arguments,
+                    op = routing.request_op({"session": _ROUTING_SESSION, "request": req_id,
+                                             "tool": name, "arguments": arguments,
                                              "author": routing.conversation_author()})
                 with routing.operation(op):
                     payload = func(arguments)

@@ -46,14 +46,15 @@ def test_P1_hlc_dominates_the_base_it_was_written_against(mac):
     assert mac.view()["rules"][0]["text"] == "from this mac"
 
 
-def test_P2_two_macs_local_rule_1_stay_two_rules_in_effective(mac):
+def test_P2_two_macs_provisional_rule_1_stay_two_rules_in_effective(mac):
     a, b = "a" * 32, "b" * 32
-    rows = [dict(mac.event("rule_add", 1, n=1, hub_order=1, text="A words", entity="rule-" + routing_events.uuid7()),
+    rows = [dict(mac.event("rule_add", 1, n=1, number_pending=True, text="A words", entity="rule-" + routing_events.uuid7()),
                  mac=a, id=routing_events.uuid7(), hlc={"wall": 1, "counter": 0, "mac": a}),
-            dict(mac.event("rule_add", 2, n=1, hub_order=1, text="B words", entity="rule-" + routing_events.uuid7()),
+            dict(mac.event("rule_add", 2, n=1, number_pending=True, text="B words", entity="rule-" + routing_events.uuid7()),
                  mac=b, id=routing_events.uuid7(), hlc={"wall": 2, "counter": 0, "mac": b})]
     view = mac.fold(rows)
     assert len(view["rules"]) == 2
+    assert all(rule["n"] is None and rule["number_pending"] for rule in view["rules"])
     assert len([k for k in view["effective"] if k.startswith("rule:")]) == 2
 
 
@@ -72,9 +73,9 @@ def test_P2_a_retried_owner_write_with_the_same_event_id_does_not_double(mac):
 
 def test_P2_a_retried_conversation_request_does_not_double(mac):
     author = {"kind": "conversation", "harness": "codex", "project": "p", "session": "s1"}
-    routing.request_rule("same words", owner_request="please", author=author)
+    routing.request_rule("same words", owner_request="please", author=author, op="synthetic-retry")
     try:
-        routing.request_rule("same words", owner_request="please", author=author)
+        routing.request_rule("same words", owner_request="please", author=author, op="synthetic-retry")
     except routing.RouteError:
         pass
     assert len(mac.view()["rules"]) == 1

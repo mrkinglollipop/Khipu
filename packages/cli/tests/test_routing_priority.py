@@ -731,7 +731,7 @@ def test_many_conversation_requests_take_at_most_half_the_budget(home):
     out = routing.summary(now=home["clock"].now)
     summary = out["text"]
     shown = set(out["shown_entities"])
-    by_number = {r["n"]: f"rule:{r['entity']}" for r in view["rules"]}
+    by_number = {r["n"]: f"rule:{r['n']}" for r in view["rules"]}
     pending = set(by_number.values())
     omitted = pending - shown
     assert by_number[1] in shown

@@ -296,7 +296,7 @@ def test_review_omitted_pending_changes_are_counted_and_delivered_later(home, mo
         marker = {} if path == "full_prompt" else {
             "version": before["version"], "epoch": before["epoch"], "full_at": routing._iso(T0)}
         out = routing.prompt_push(marker, budget=1.0)
-    rule_numbers = {f"rule:{r['entity']}": r["n"] for r in routing.read_view()["rules"]}
+    rule_numbers = {f"rule:{r['n']}": r["n"] for r in routing.read_view()["rules"]}
     pending = {*rule_numbers, "priority"}
     shown = set(out.get("shown_entities") or []) & pending
     omitted = pending - shown

@@ -34,8 +34,10 @@ def revision(event: dict) -> str:
         return event["_revision"]
     if event.get("mac") and event.get("id"):
         return event["id"]
+    from khipu.routing import _id_salt
+
     body = {k: v for k, v in event.items() if not k.startswith("_")}
-    return str(uuid.uuid5(NAMESPACE, json.dumps(body, sort_keys=True, ensure_ascii=True)))
+    return body_hash(body, _id_salt(operations=True))
 
 
 def legacy_mac(event: dict) -> str:
