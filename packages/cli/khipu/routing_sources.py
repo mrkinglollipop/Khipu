@@ -144,7 +144,7 @@ _SECRET_FLAG_ONLY = re.compile(r"(?i)^--?[a-z0-9_-]*" + _FLAG_WORDS + r"[a-z0-9_
 # by a view saved under an older version is dropped, never carried forward,
 # so text that older rules let through cannot outlive the fix. 3: no free
 # text at all, only parsed fields and names that pass ``safe_name``.
-REDACTION = 4
+REDACTION = 5
 
 
 def _redacted(text, limit: int = LINE_MAX) -> str:
@@ -339,7 +339,12 @@ def fingerprint(config: dict, cfg: dict) -> dict:
         folder = Path(entry["path"])
         runners.append([entry["name"], [_stat(folder.joinpath(*parts)) for parts in RUNNER_FILES.values()]])
     table = cfg.get("routing_table")
-    return {"runners": runners, "usage": _stat(usage.cache_file()), "table": _stat(Path(table)) if table else None,
+    from khipu import session_capture
+
+    # Capture state is replaced atomically; the directory changes on new
+    # attachments, updates and Forget, without reading a session's contents.
+    capture = _stat(session_capture.state_dir()) if entries else None
+    return {"captures": capture, "runners": runners, "usage": _stat(usage.cache_file()), "table": _stat(Path(table)) if table else None,
             "redaction": REDACTION}
 
 
@@ -384,7 +389,16 @@ def _parse_heartbeat(data: bytes) -> dict:
     interval = _number(doc["interval"])
     if interval is None or not 0 < interval <= INTERVAL_MAX:
         raise OutOfRange("interval out of range")
-    return {"time": _number(doc["time"]), "interval": interval}
+    out = {"time": _number(doc["time"]), "interval": interval}
+    lanes = doc.get("lanes")
+    if isinstance(lanes, dict):
+        from khipu import routing
+
+        known = routing.accounts()
+        out["lanes"] = {lane: routing.login_binding(spec, known)
+                        for lane, spec in list(lanes.items())[:LANES_MAX]
+                        if safe_name(lane) == lane and isinstance(spec, dict)}
+    return out
 
 
 _SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".rb", ".pl")
@@ -448,6 +462,15 @@ def lane_identity(spec: dict) -> dict:
             value = spec[field]
             key = routing._lane_target(value, known) if isinstance(value, str) else None
             out[field] = key if key in {a["key"] for a in known} else WITHHELD
+    known = routing.accounts() if known is None else known
+    local = routing.login_binding(spec, known)
+    if local:
+        out.update(local)
+    elif "login_account" in spec:
+        key = spec["login_account"]
+        out["login_account"] = key if key in {a["key"] for a in known} else None
+        if out["login_account"] is None:
+            out["identity_invalid"] = True
     return out
 
 
@@ -590,7 +613,9 @@ def _parse_events(data: bytes, now: datetime, limits: dict[str, datetime] | None
         elif kind == "LAUNCH":
             lane = safe_name(fields.get("lane"))
             if lane and now - at <= LAUNCH_KEEP:
-                out["LAUNCH"].append({"at": _iso(at), "pipeline": pipeline, "lane": lane})
+                out["LAUNCH"].append({"at": _iso(at), "pipeline": pipeline, "lane": lane,
+                    **({"attachment_ref": _sid(fields["harness"], fields["session"])}
+                       if fields.get("harness") in {"claude_code", "codex", "aegis"} and fields.get("session") else {})})
     for kind, cap in dict(KEEP_LINES, **(keep or {})).items():
         if cap:
             out[kind] = out[kind][-cap:]
@@ -1055,6 +1080,47 @@ def read_table(path: str | None) -> dict | None:
 # ---- all sources --------------------------------------------------------------------
 
 
+def job_identities(cache: dict, known: list[dict], now: datetime) -> dict:
+    """Join a runner's LAUNCH reference to the job's own captured login."""
+    events = (cache.get("events") or {}).get("data") or {}
+    launches = [row for row in events.get("launches", []) if row.get("attachment_ref")]
+    if not launches:
+        return {}
+    from khipu import routing, session_capture as sc
+
+    forgotten = sc.login_homes_forgotten_at()
+    attachments = {}
+    refs = {row["attachment_ref"] for row in launches}
+    for name, state in sc.iter_states():
+        harness, sep, sid = name.removesuffix(".json").partition("--")
+        ref = _sid(harness, sid)
+        if not sep or ref not in refs or state.get("origin") != "job":
+            continue
+        seen = _epoch(state.get("seen_ts"))
+        if seen is None or (now - seen).total_seconds() > sc.LOGIN_HOME_KEEP_S or (
+                forgotten is not None and seen.timestamp() <= forgotten):
+            continue
+        # The captured harness is the transport; the local login binding
+        # identifies the payer (for example GLM through Claude Code).
+        binding = routing.login_binding({"login_home": state.get(sc.LOGIN_HOME_FIELD)}, known)
+        attachments[ref] = dict(binding, source="job_attachment")
+    out = {}
+    for row in sorted(launches, key=lambda x: x["at"]):
+        if row["attachment_ref"] in attachments:
+            out[row["lane"]] = attachments[row["attachment_ref"]]
+    return out
+
+
+def lane_witnesses(cache: dict, known: list[dict], now: datetime, status: dict) -> dict:
+    heartbeat = (cache.get("heartbeat") or {}).get("data") or {}
+    identities = job_identities(cache, known, now)
+    # The current heartbeat outranks a historical captured launch.
+    if not status.get("silent") and not (cache.get("heartbeat") or {}).get("since"):
+        identities.update({lane: dict(binding, source="heartbeat") for lane, binding in heartbeat.get("lanes", {}).items()
+                           if binding})
+    return identities
+
+
 def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> tuple[list[dict], dict, dict]:
     """(evidence for the fold, the sources' status, the cache to keep in the
     view). Reads files only: starts no process, probes nothing, writes
@@ -1076,17 +1142,25 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
                                    cfg.get("routing_runner_tail_bytes", TAIL_BYTES),
                                    cfg.get("routing_runner_limited_lines", KEEP_LINES["LIMITED"]))
         specs = ((kept.get("config") or {}).get("data") or {}).get("lanes") or {}
-        matches = {lane: routing.resolve_lane(entry["name"], lane, lane_map, known, specs.get(lane))
+        identities = lane_witnesses(kept, known, now, status)
+        matches = {lane: routing.resolve_lane(entry["name"], lane, lane_map, known, specs.get(lane),
+                                             cfg.get("_providers"), identities.get(lane))
                    for lane in status["lanes"]}
         labels = {a["key"]: a["label"] for a in known}
         status["unmatched_lanes"] = [lane for lane, match in matches.items() if not match["key"]]
         status["lane_matches"] = {lane: {"account": labels.get(match["key"]),
                                          "matched_by": match["matched_by"],
+                                         "identity_state": match["identity_state"], "reason": match["reason"],
+                                         "field_to_add": match["field_to_add"],
                                          "candidates": [labels[k] for k in match["candidates"]]}
                                    for lane, match in matches.items()}
         runners.append(status)
         cache["runners"][entry["name"]] = kept
-        evidence += runner_evidence(status, kept)
+        for item in runner_evidence(status, kept):
+            match = matches.get(item["lane"])
+            if match is not None and not match["key"]:
+                item["unmatched"] = True
+            evidence.append(item)
     usage_items, usage_status = usage_evidence(configured_keys(config))
     evidence += usage_items
     status = {"runners": runners, "refused": refused, "invalid": invalid, "usage": usage_status,
@@ -1379,4 +1453,24 @@ def launches(cache: dict) -> list[dict]:
         out += [{"runner": name, "lane": item["lane"], "at": item["at"],
                  "declaration": lane_identity(specs.get(item["lane"]) or {})}
                 for item in events.get("launches") or []]
+    return out
+
+
+def provider_checks(cache: dict, providers: dict, known: list[dict]) -> list[dict]:
+    """Provider model facts checked against each runner's declared settings."""
+    from khipu import routing
+    from khipu.routing_providers import advisory
+
+    out = []
+    for runner, kept in (cache.get("runners") or {}).items():
+        specs = ((kept.get("config") or {}).get("data") or {}).get("lanes") or {}
+        for lane, spec in specs.items():
+            match = routing.resolve_lane(runner, lane, {}, known, spec, providers)
+            account = next((a for a in known if a["key"] == match["key"]), None)
+            provider = providers.get(account["harness"]) if account else providers.get(
+                routing._provider_id(spec.get("provider") or spec.get("kind")))
+            if provider:
+                out += [{"check": "provider_models", "runner": runner, "lane": lane, "status": "broken",
+                         "text": f"{runner} lane {lane}: {text}"}
+                        for text in advisory(provider, spec.get("model"))]
     return out

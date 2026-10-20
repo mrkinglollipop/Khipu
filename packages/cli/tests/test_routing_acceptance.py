@@ -686,7 +686,6 @@ def test_6_pull_protocol(replay, monkeypatch, protocol):
       {"id": "deepseek", "accounts": ["deepseek:main"], "lane_names": ["shared"]}],
      "shared", None, ["glm:main", "deepseek:main"]),
 ], ids=["glm", "deepseek", "two-accounts", "name-claimed-twice"])
-@future("9a", "provider facts match unambiguous lane names and preserve ambiguity candidates")
 def test_8_provider_catalog_matches_by_name(replay, providers, lane, expected, candidates):
     rows = [replay.event("provider_set", i + 1, **p) for i, p in enumerate(providers)]
     rows.append(replay.event("evidence", 10, runner="synthetic-runner", lane=lane, state="limited", source="runner"))

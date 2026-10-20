@@ -147,7 +147,7 @@ def source_events(extra: list[dict], events: list[dict], cfg: dict, mac: str,
         row = {k: item[k] for k in ("account", "runner", "lane", "state", "basis", "scope", "window",
                                    "used_pct", "source", "written_by", "via", "evidence", "reason",
                                    "model", "family", "transport", "observed", "session_logs",
-                                   "message_time", "until_default", "reset_at") if k in item}
+                                   "message_time", "until_default", "reset_at", "declaration") if k in item}
         row.update(type="observation", id=identity.uuid7(), witness_at=r._iso(witness),
                    written_at=r._iso(witness), until=r._iso(item.get("until")),
                    account=key_ids.get(item.get("account"), item.get("account")))
@@ -193,6 +193,10 @@ def checked_level(value):
 
 def checked_definition(name, value):
     """Closed facts carry no local binding or runner folder."""
+    if name == "provider":
+        from khipu.routing_providers import checked
+
+        return checked(value)
     if not isinstance(value, dict):
         return None
     fields = {"provider": {"id", "label", "family"},
@@ -218,6 +222,26 @@ def checked_definition(name, value):
 def definitions(events: list[dict], mac: str | None) -> dict:
     out = {"providers": {}, "accounts": {}, "lane_maps": {}}
     for event in events:
+        # The acceptance replay and imported provider facts use the compact
+        # provider_set spelling. New owner writes use definition_set.
+        if event.get("type") == "provider_set" and (event.get("written_by") or {}).get("kind") == "owner":
+            from khipu.routing_providers import FIELDS
+
+            value = {k: v for k, v in event.items() if k in FIELDS}
+            value.setdefault("label", event.get("id"))
+            value = checked_definition("provider", value)
+            refs = event.get("accounts", [])
+            if value is None or not isinstance(refs, list):
+                continue
+            from khipu.routing_identity import STABLE
+
+            if any(not isinstance(a, str) or not STABLE.fullmatch(a)
+                   or a.partition(":")[0] != value["id"] for a in refs):
+                continue
+            out["providers"][value["id"]] = value
+            for ident in refs:
+                out["accounts"].setdefault(ident, {"id": ident, "label": ident, "provider": value["id"]})
+            continue
         if event.get("type") != "definition_set" or (event.get("written_by") or {}).get("kind") != "owner":
             continue
         name = event.get("definition")

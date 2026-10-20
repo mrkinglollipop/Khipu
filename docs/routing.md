@@ -38,6 +38,39 @@ The first three are strong. An estimate is not.
 
 - **Plan usage cache.** An account at 100% of a window counts as limited. Headroom after that reopens it as checked. "Not signed in" and "not installed" count as down.
 - **Job runner folders.** Folders you point Khipu at (setting `routing_sources`). Khipu only reads them, never writes. It reads the runner's limited flag, the tail of its event log, its heartbeat and a few config keys. Folders inside credential locations are refused.
+
+Provider definitions are owner facts (`definition_set`, `definition: provider`),
+written through the existing owner `routing.set_definition` API. Fields are `id`,
+`label`, `family`, `login` (`folder` or `none`), `probe` (`claude`, `codex`,
+`grok`, `muse`, `glm`, `http-quota`, or `none`), optional hostname `host`,
+`lane_names`, optional exact model ids in `models_allowed` and `models_never`,
+and `use` (`normal` or `on_request`). `http-quota` is reserved for slice 9b.
+Account definitions name the provider; login folders remain local bindings.
+No adapter or provider fact launches a probe by itself. Model and use checks
+are advisory. Rule 13 remains until its budget and concurrency lines also have facts.
+
+Runner identity contract:
+
+- A lane's `config.json` entry may declare `account`, `budget_account`,
+  `provider` (or existing `kind`), and `login_home` (or `home`). All supplied
+  fields must agree. A tier name such as `main-sonnet` needs a declaration.
+- One resolver serves health, evidence, and reports: the owner's lane map,
+  declared identity, provider plus local login binding, then provider id or
+  `lane_names`. A provider with several accounts or a name claimed by several
+  providers stays unmatched, with candidates and `budget_account` as the repair field.
+- Declarations are `claimed`. An ordinary usage or limit reading never confirms
+  one. A fresh `state/heartbeat.json` can confirm it with
+  `{"time": 1792512000, "interval": 20, "lanes": {"main-sonnet":
+  {"provider": "claude", "login_home": "/local/login"}}}`. Raw home fields
+  are resolved immediately into local account references and discarded.
+- Alternatively, a `LAUNCH` line can carry `lane=main-sonnet
+  harness=claude_code session=<job-session-id>`. Khipu joins that reference to
+  the job's own capture state (`origin: job` and its hook-recorded `login_home`).
+  The line alone cannot confirm identity. Only a hash of the attachment
+  reference survives runner parsing; capture retention and Forget apply.
+- Health lists `identity_state: claimed|confirmed`, match origin, candidates,
+  and repair guidance. Stale or contradictory bindings never match. A failed
+  or silent heartbeat cannot confirm identity.
 - **Conversation reports.** An agent that hits a limit can report it.
 - **You, in the app.**
 - **The routing table file** (setting `routing_table`). Read only, as a pointer. It is never treated as account state.

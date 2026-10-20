@@ -454,6 +454,63 @@ def _helper(payload: dict) -> bool:
     return is_helper_session(payload.get("cwd"))
 
 
+def provider_advisory(payload: dict) -> list[str]:
+    """Read model/provider facts for this dispatch; return context only."""
+    from khipu import routing
+    from khipu.routing_providers import advisory
+    from khipu.routing_sources import model_family, safe_name
+
+    name = _tool_name(payload)
+    data = payload.get("tool_input") or payload.get("toolInput") or {}
+    if not isinstance(data, dict):
+        return []
+    specs = []
+    if name in AGENT_TOOLS or name == "delegate_task" or str(name).endswith("__delegate_task"):
+        specs.append({k: data[k] for k in ("provider", "model", "account", "budget_account") if k in data})
+    elif name in SHELL_TOOLS:
+        command = _command(payload, name)
+        deadline = time.monotonic() + _SCAN_BUDGET_S
+        try:
+            argvs = [_bounded_argv(command, deadline) or []] if isinstance(command, list) else _segments(command, deadline)
+            for argv in argvs:
+                assignments = dict(w.split("=", 1) for w in argv if _ASSIGNMENT.fullmatch(w))
+                argv = _strip_prefix(argv, deadline)
+                if not argv:
+                    continue
+                base = os.path.basename(argv[0])
+                if base not in {"claude", "codex", "grok", "muse", "cursor-agent"}:
+                    continue
+                model = None
+                for i, word in enumerate(argv[1:], 1):
+                    if word in {"-m", "--model"} and i + 1 < len(argv):
+                        model = argv[i + 1]
+                    elif word.startswith("--model="):
+                        model = word.partition("=")[2]
+                spec = {"provider": "grok" if base == "cursor-agent" else base, "model": model}
+                home = assignments.get({"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "grok": "GROK_HOME"}.get(base))
+                if home:
+                    # A Claude-compatible transport can point at a GLM login.
+                    spec = {"model": model, **routing.login_binding({"login_home": home}, routing.accounts())}
+                specs.append(spec)
+        except _OutOfTime:
+            return []
+    view = routing.read_view()
+    providers = (view.get("definitions") or {}).get("providers", {})
+    known = routing.accounts()
+    warnings = []
+    for spec in specs:
+        match = routing.resolve_lane("", "", {}, known, spec, providers)
+        account = next((a for a in known if a["key"] == match["key"]), None)
+        fact = providers.get(account["harness"]) if account else providers.get(spec.get("provider"))
+        if fact is None and not spec.get("provider"):
+            family = model_family(spec.get("model"))
+            choices = [p for p in providers.values() if family != "unknown" and p.get("family") == family]
+            fact = choices[0] if len(choices) == 1 else None
+        if fact:
+            warnings += advisory(fact, safe_name(spec.get("model")))
+    return list(dict.fromkeys(warnings))
+
+
 def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | None]:
     """(what to print, what to record once it is printed, the call's kind)
     for one PreToolUse call. Never a permission decision of any kind. Most
@@ -473,6 +530,12 @@ def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | 
         ctx, info = routing.add_to("", routing.collect())
     except Exception:  # noqa: BLE001 - routing never breaks the hook
         ctx, info = "", {"status": "skipped:error"}
+    try:
+        warnings = provider_advisory(payload)
+    except Exception:  # noqa: BLE001 - advisory failure never fails a dispatch
+        warnings = []
+    if warnings:
+        ctx += ("\n" if ctx else "") + "Provider advisory (guidance, not a gate): " + " ".join(warnings)
     if not ctx:
         return {}, info, kind
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": ctx}}, info, kind
