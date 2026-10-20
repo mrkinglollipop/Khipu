@@ -119,6 +119,69 @@ What follows from the table:
   an account is refused without a `holds: {<id>: "end" | "keep"}` choice for each one, and the refusal lists
   them. Khipu never reads a release from prose. This is the structural fix for the day-long Grok pause.
 
+## 2a. Pace: are we outpacing a limit?
+
+Matt, 2026-10-20: "a way for the conversation to see a pace for how much the usage limit is getting used.
+Knowing if we are outpacing our limit for something or underpacing is very helpful."
+
+Today's pace (phase 4b, `routing.py` `plan_fact`, `pace_words`, ~4788-4915) gives only the even rate that
+would use what is left by the reset ("about 0.5% an hour to use it all; plenty of time"). It never measures
+the real burn rate. This section adds that, as an advisory. It never gates anything (rule 7), and Khipu still
+returns no pick.
+
+- **Readings.** Slice 4P persists `usage_sample` observations, per `(account, window)`. Each holds
+  `used_pct`, the witness time and the window's `resets_at`, so its cycle is known.
+  - A sample is written when the witness is newer and either `used_pct` moved by at least 0.5 points or 60
+    minutes have passed since the last sample. That is a few dozen a day per account.
+  - Witness rules are those of section 2: a cached or `last_good_at` row never makes a sample.
+  - Quota is per account (decision 9), so samples from every Mac merge, deduplicated by `(account, window,
+    witness time)`.
+- **Trailing window** (decision 12). A weekly window is measured over the **last 24 hours**, so a night's
+  pause is part of the rate, not noise. A five-hour window is measured over the **last 60 minutes**.
+  Model-scoped windows (Opus weekly) are measured separately.
+- **The burn rate** is the used points gained divided by the time covered, over the trailing window.
+  - **A reset mid-window** splits the samples into cycles by `resets_at`. The rate sums each cycle's gain
+    over its own covered time, so a reset never reads as negative use. A drop of more than 5 points inside a
+    cycle counts as an early reset. A smaller drop counts as no change (a vendor correction).
+  - **Probes that couldn't read** leave gaps. A gap longer than a quarter of the trailing window is excluded
+    from the covered time instead of being spread across it.
+- **No verdict without enough readings.** A verdict needs at least 3 readable samples, covering at least half
+  the trailing window (12 h for a week, 30 min for five hours). Otherwise the line says why: "pace unknown:
+  only 2 readings in the last 24 h", "pace unknown: plan figures couldn't be read for 14 of the last 24 h",
+  or "pace unknown: this account can't be probed".
+- **The verdict.** It is computed against a target: the owner's cap where one exists, otherwise the plan's
+  limit of 100% (decision 13). The rate needed is `(target − used) / (time to reset)`.
+  - **Outpacing** when the burn rate is above 1.15 × the rate needed (decision 14). At the current rate it
+    runs out at T, which is X before the reset.
+  - **Underpacing** when the burn rate is below 0.85 × the rate needed. At the current rate about Y% will be
+    left unused at the reset.
+  - **On pace** otherwise.
+  - Every line states the rate needed to land on the target.
+- **Owner caps are structured facts, never read from prose.**
+  - A cap is `{account, window, kind: share | per_day, pct}`. A `share` cap is a ceiling on the window, for
+    example rule 10's "stop near 90% of Grok's week" as `share 90`. A `per_day` cap limits how much of the
+    window a day may use, for example the priority's "jobs may use up to 13% of the week a day" as `per_day
+    13` on Claude.
+  - Matt confirms each cap once. The app offers to create a cap from words it finds, as it does for level
+    claims, and never changes the words.
+  - Against a `share` cap, the target is the cap. Against a `per_day` cap, the last 24 hours' gain is
+    compared with the cap: "today 18% against your 13% a day".
+  - The plan-limit verdict is always in the structured fields too.
+- **Where it shows.**
+  - **The routing block:** one short line per account, on the window that would run out first, at most 160
+    characters. For example: "Claude weekly: outpacing; at 1.1%/h runs out Fri 02:00Z, 1 d 13 h before
+    reset; 0.5%/h lands on 100%". Or: "Codex weekly: underpacing; at 0.2%/h about 65% unused at reset; 0.6%/h
+    uses it".
+  - **Push churn is kept down:** the full summary and `khipu_route` always carry the current numbers. A
+    per-prompt push sends a pace line only when the verdict changes, or when the projected run-out moves by
+    more than 6 hours. Changed numbers alone are not a change in the ledger (section 4).
+  - **`khipu_route`** carries `pace` per account and window: `{window, trailing_h, samples, coverage_pct,
+    rate_pct_per_h, needed_pct_per_h, target: {kind: plan | share_cap | per_day_cap, pct}, verdict:
+    outpacing | on_pace | underpacing | unknown, runs_out_at, before_reset_s, unused_at_reset_pct, why}`.
+  - **The app** shows it after its mock is approved (slice 14, the Pace group).
+- **What it replaces.** Phase 4b's "fastest first" arithmetic list keeps its place and its heading. It gains
+  the measured rate beside the even rate.
+
 ## 3. Owner precedence and proposals
 
 The path exists today: `khipu_owner_act`, verified by `owner_direction.check` against Khipu's own record of
@@ -369,6 +432,8 @@ Each group needs an approved Opus mock first (slice 14). If a mock is missing, s
 - **Providers and lanes:** providers, accounts and their Macs, lane names, "matched by name", ambiguous lanes
   and their candidates.
 - **Advisory and copies:** the day's tier mismatches, contradictions, stale claims, and copies found in files.
+- **Pace:** each account's windows with burn rate, the rate needed, the verdict and its target (plan or cap), a
+  small trend of the trailing window, and the caps with their confirm state.
 
 ## 12. Acceptance: replay the real failures end to end
 
@@ -406,6 +471,7 @@ and is flipped by the slice named.
 | 13 | Gateway: the projection holds only its listed fields (every nested and history field checked); another identity's delivery state is invisible and its acks are refused; owner writes are refused | hermetic | 12 |
 | 14 | Scanner: flags the two live notes; passes capability rows, evidence dates and quoted history | hermetic | 13 |
 | 15 | Health: each red condition turns red and back to green on its own evidence | hermetic | 16 |
+| 16 | Pace: a sanitized real history (account, read time, used share and reset, taken from the routing blocks already pushed into this Mac's Claude Code and Codex transcripts, and later from slice 4P's own samples) gives the verdicts a hand calculation gives; synthetic outpace, underpace and on-pace cases; a reset mid-window; gaps from unreadable probes; too few readings gives "pace unknown" with its reason; samples from two Macs merge into one account; a `share` cap and a `per_day` cap; a number-only change sends no push line | hermetic | 4P |
 
 ## Slices
 
@@ -427,6 +493,7 @@ change; if it is still red, stop and report the last log. Slices on the per-prom
 | 3a | Account migration: stable ids, bindings, renames and duplicates, aliases with the 90-day window and explicit failure | 2a | Codex Sol, high | Opus | case 11a; the existing log folds to the same view |
 | 3b | Event identity and ordering: global event and entity ids, uuid targets, provisional rule numbers, HLC, `base`, `op` dedup, tombstones | 3a | Codex Sol, high | Opus | case 11b |
 | 4 | Entry model: kinds, observations and renewals with scope and `expires_at`, definitions as facts, end-or-keep, `level` claims | 3b | Codex Sol, high | Opus | cases 1, 5; owner words byte-identical |
+| 4P | Pace: usage samples, burn rate, verdicts, structured caps, the block line and `khipu_route` fields | 4 | Grok, against tests Codex writes first (4Pt, Sol medium); arithmetic, no privacy code | Codex re-check (rule 2), then Sonnet | case 16; `routing_replay` holds; no verdict without its reading floor |
 | 5 | Owner precedence and proposals, with the proposal-text switch | 3b, 4 | Codex Sol, high | Opus | case 4 (local part); `owner_direction.check` unchanged |
 | 6 | Delivery ledger and pagination for hooks: components, owed, in flight, acked, leases, pages with revisions | 3b, 4 | Codex Sol, high | Opus | cases 2, 3; `routing_replay` holds; today's budget caps |
 | 7 | Pull delivery: canonical identity, components, batches, ack ownership, `routing_changes` on tool results, scrubbing incl. errors | 6 | Codex Sol, high | Opus | case 6 |
@@ -440,14 +507,15 @@ change; if it is still red, stop and report the last log. Slices on the per-prom
 | 11b | Replication and recovery: cursors, idempotent upload, caught-up, offline, restore, rule numbering by hub order | 11a, 6 | Codex Astra, high (a miss here is costly) | Opus | cases 12 and 4's Mac part |
 | 12 | Gateway projection and pull delivery through the gateway | 7, 11b | Codex Sol, medium | Opus (gateway exposure) | case 13; the deploy is its own step with Matt's go ([[merged-is-not-deployed]]), then a live `khipu_route` through the gateway |
 | 13 | Scanner and recall's superseded mark | 2a | Grok, against tests Codex writes first (13t) | Codex re-check, then Sonnet | case 14; Matt's files are only read |
-| 14 | Mocks for the four app groups | 4, 5, 6 | Claude Opus | Matt approves | no app work before approval |
+| 14 | Mocks for the five app groups | 4, 4P, 5, 6 | Claude Opus | Matt approves | no app work before approval |
 | 15a | App: delivery and health | 14, 16 | Codex Sol, high | Sonnet | `npm run build && tsc`, desktop tests, then the rendered result (at most 3 visual passes, screenshot as proof) |
 | 15b | App: proposals and holds | 14, 5 | Codex Sol, high | Opus (owner actions) | as 15a |
 | 15c | App: providers and lanes | 14, 9a | Codex Sol, medium | Sonnet | as 15a |
 | 15d | App: advisory and copies | 14, 10, 13 | Codex Sol, medium | Sonnet | as 15a |
+| 15e | App: pace and caps | 14, 4P | Codex Sol, medium | Sonnet; Opus for the cap confirm (owner action) | as 15a |
 | 16 | Delivery health: the budget-aware bound and red conditions, with evidence from hooks, MCP, children, replication and the gateway | 6, 7, 8a, 11b, 12 | Codex Sol, medium | Sonnet | case 15 |
 
-Slices 9a, 10 and 13 can run beside 5 to 8c, and 11a beside 6.
+Slices 4P, 9a, 10 and 13 can run beside 5 to 8c, and 11a beside 6.
 
 ## Matt's decisions (each with a recommendation)
 
@@ -489,6 +557,14 @@ Slices 9a, 10 and 13 can run beside 5 to 8c, and 11a beside 6.
 11. **Parent freshness before a dispatch stays "as of its last prompt"** (new). This is a scope choice. A
     bounded read before dispatch would need a client step in every harness. *Recommend keeping it out of
     scope;* it can be its own slice later.
+12. **The pace window** (new). *Recommend:* 24 hours for weekly windows and 60 minutes for five-hour windows,
+    with no verdict below 3 readings covering half that span. A shorter weekly window reacts faster but
+    swings with day and night.
+13. **What a verdict measures against** (new). *Recommend:* your cap where one exists, otherwise the plan's
+    limit. Both are always in `khipu_route`. Caps are structured facts you confirm once. Rule 10's 90% and
+    the 13%-a-day line would become caps after you confirm them.
+14. **The on-pace band** (new). *Recommend ±15%* of the rate needed. A narrower band flips the verdict on
+    ordinary noise.
 
 ## Review responses
 
@@ -523,5 +599,7 @@ gateway session uniqueness with refused foreign acks. No disagreements this roun
 - A Codex native child hears routing only through its brief or its own Khipu tool calls.
 - Two gateway clients that share a token and reuse one `session_id` look the same to Khipu.
 - A keyword-guessed task class can be wrong. It is always shown as a guess.
+- Pace is as good as its readings. Accounts that can't be probed (Muse today) get no verdict, and a burst
+  inside the trailing window shows only as an average.
 - "Owner only" stays a convention (routing-truth decision 6). Owner direction is as strong as
   `owner_direction.check`.
