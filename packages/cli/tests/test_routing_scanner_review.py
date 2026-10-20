@@ -9,6 +9,7 @@ import sqlite3
 import statistics
 import subprocess
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -49,10 +50,13 @@ def hit(body, *, ident='note:synthetic', kind='topic', snippet=None):
     'Prefer Codex for builds; reach it with codex exec.',
     '1. **Codex** — first choice for builds',
     '1. Codex — builds',
+    'History: Codex was down yesterday; Current routing: Codex is first choice for builds.',
+    'Codex is good for builds, and Codex is first choice for builds.',
 ], ids=['first-choice', 'live-main', 'date-on', 'date-bare', 'level-used',
         'level-remaining', 'haiku-primary', 'sonnet-first', 'table-row',
         'state-table', 'current-blockquote', 'mixed-history-current',
-        'ordering-with-howto', 'bold-ranked', 'ranked-description'])
+        'ordering-with-howto', 'bold-ranked', 'ranked-description',
+        'history-prefix-current', 'capability-with-current-order'])
 def test_current_claims(text):
     assert scanner.scan_text('/synthetic/AGENTS.md', text), 'Current claim was missed'
 
@@ -67,8 +71,12 @@ def test_current_claims(text):
     'Codex supports only local execution in this example.',
     'History: on 2026-10-19 Matt paused Codex; the order changed.',
     'To reach Codex, open the terminal first.',
+    '~~~markdown\n```text\nCodex is paused until 2026-10-19\n```\n~~~',
+    '````markdown\n```text\nCodex is paused until 2026-10-19\n```\n````',
+    '1. Codex is good for first drafts.',
 ], ids=['capability-table', 'quoted-history', 'lane-command', 'backtick-fence',
-        'tilde-fence', 'capability-prose', 'capability-only', 'past-record', 'howto-prose'])
+        'tilde-fence', 'capability-prose', 'capability-only', 'past-record', 'howto-prose',
+        'mixed-fence', 'longer-fence', 'numbered-capability'])
 def test_clean_shapes(text):
     assert not scanner.scan_text('/synthetic/note.md', text), 'Non-routing text was marked'
 
@@ -193,3 +201,66 @@ def test_long_numeric_level_latency():
         report[str(size)] = measure(lambda: scanner.scan_text('/synthetic/note.md', text), count=3)
     print('NUMERIC_LATENCY ' + json.dumps(report, sort_keys=True))
     assert report['4000']['median_ms'] < 5, 'Scanner exceeds a few ms on one 4 KB line'
+
+
+def test_whitespace_clause_split_64kb_is_linear():
+    prefix = 'Codex is low: '
+    text = prefix + (' ' * (65536 - len(prefix)))
+    assert len(text) == 65536
+    report = measure(lambda: scanner.scan_text('/synthetic/note.md', text), count=3)
+    print('WHITESPACE_64K_LATENCY ' + json.dumps(report, sort_keys=True))
+    assert not scanner.scan_text('/synthetic/note.md', text)
+    assert report['median_ms'] < 50, f'64 KB line exceeded 50 ms: {report}'
+
+
+def test_budgeted_hub_carries_stored_routing_flag():
+    from khipu import cli, db, embed
+
+    body = 'Synthetic capability evidence. ' * 40 + '\nCodex is paused until 2026-10-19'
+    stored = {
+        'slug': 'note:synthetic',
+        'title': 'Synthetic capability note',
+        'body': body,
+        'frontmatter': {'_routing_state_claim': True},
+    }
+    queries = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return self
+
+        def execute(self, sql, params=None):
+            self.sql = sql
+            queries.append(' '.join(sql.split()))
+
+        def fetchall(self):
+            if 'FROM topics' in self.sql:
+                if "frontmatter" in self.sql:
+                    return [(stored['slug'], True)]
+                return [(stored['slug'], stored['title'], stored['body'], None, 2)]
+            return []
+
+    with patch.object(db, 'connect', return_value=Cursor()), \
+            patch.object(embed, '_cosine_candidates', return_value=[]), \
+            patch.object(cli, '_episode_verbatim_select', return_value='NULL'):
+        out = rp._hub_hits_budgeted(
+            'Synthetic capability', ['synthetic', 'capability'],
+            project=None, budget_ms=600, limit=3,
+        )
+    assert len(out['hits']) == 1, out
+    row = out['hits'][0]
+    assert 'paused' not in row['snippet']
+    assert stored['frontmatter']['_routing_state_claim'] is True
+    assert scanner.scan_text('/synthetic/note.md', stored['body'])
+    candidate_sql = [q for q in queries if 'FROM topics' in q and "frontmatter" not in q]
+    assert candidate_sql, queries
+    assert any("frontmatter->'_routing_state_claim'" in q for q in queries), queries
+    assert row.get('_routing_state_claim') is True
+    assert scanner.SUPERSEDED_MARK in rp.render_block(out['hits']), \
+        'Budgeted hub path discards stored routing metadata'

@@ -75,8 +75,6 @@ _CAPABILITY_RE = re.compile(
 )
 _INCIDENTAL_ORDER_RE = re.compile(r"\bfirst drafts\b|\bsupports only\b", re.I)
 _CURRENT_FRAME_RE = re.compile(r"\bcurrent(?:ly)?(?:\s+routing)?\b", re.I)
-_FENCE_RE = re.compile(r"^(```|~~~)")
-_CLAUSE_SPLIT_RE = re.compile(r"\s*;\s*|\.\s+")
 
 
 def scan_text(path: str, text: str) -> list[dict[str, Any]]:
@@ -84,7 +82,7 @@ def scan_text(path: str, text: str) -> list[dict[str, Any]]:
     file = str(path)
     claims: list[dict[str, Any]] = []
     in_frontmatter = False
-    in_fence = False
+    fence: tuple[str, int] | None = None
     in_capability_table = False
     for index, line in enumerate(str(text).splitlines(), 1):
         stripped = line.strip()
@@ -95,10 +93,15 @@ def scan_text(path: str, text: str) -> list[dict[str, Any]]:
             if stripped == "---":
                 in_frontmatter = False
             continue
-        if _FENCE_RE.match(stripped):
-            in_fence = not in_fence
+        marker = _fence_marker(stripped)
+        if marker is not None:
+            ch, n = marker
+            if fence is None:
+                fence = (ch, n)
+            elif ch == fence[0] and n >= fence[1]:
+                fence = None
             continue
-        if in_fence:
+        if fence is not None:
             continue
         if stripped.startswith("|"):
             if _CAPABILITY_RE.search(line):
@@ -140,8 +143,6 @@ def _claim_on(line: str) -> tuple[str | None, str | None]:
     stripped = line.strip()
     if not stripped:
         return None, None
-    if _HISTORY_PREFIX_RE.match(stripped):
-        return None, None
     ranked = _ranked_account(line)
     if ranked is not None:
         return "ordering", ranked
@@ -153,7 +154,49 @@ def _claim_on(line: str) -> tuple[str | None, str | None]:
 
 
 def _clauses(line: str) -> list[str]:
-    return [part for part in _CLAUSE_SPLIT_RE.split(line) if part.strip()]
+    """Split on ';' or '. ' in one left-to-right pass (linear in ``line``)."""
+    parts: list[str] = []
+    start = 0
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if ch == ";":
+            part = line[start:i].strip()
+            if part:
+                parts.append(part)
+            start = i + 1
+            i += 1
+            continue
+        if ch == "." and i + 1 < n and line[i + 1].isspace():
+            part = line[start:i].strip()
+            if part:
+                parts.append(part)
+            start = i + 1
+            i += 1
+            continue
+        i += 1
+    tail = line[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _fence_marker(stripped: str) -> tuple[str, int] | None:
+    """Opening/closing fence: the same character, three or more, at the start."""
+    if len(stripped) < 3:
+        return None
+    ch = stripped[0]
+    if ch not in "`~":
+        return None
+    n = 0
+    for c in stripped:
+        if c != ch:
+            break
+        n += 1
+    if n < 3:
+        return None
+    return ch, n
 
 
 def _claim_on_clause(clause: str) -> tuple[str | None, str | None]:
@@ -163,15 +206,18 @@ def _claim_on_clause(clause: str) -> tuple[str | None, str | None]:
     if account is None:
         return None, None
     state_claim = bool(_STATE_RE.search(clause) and _has_qualifier(clause))
-    if _CAPABILITY_RE.search(clause) and not state_claim:
-        return None, None
-    howto = bool(_HOWTO_RE.search(clause))
-    if howto and not state_claim and not _STRONG_ORDER_RE.search(clause):
-        return None, None
     if state_claim:
         return "state", account
     masked = _INCIDENTAL_ORDER_RE.sub(" ", clause)
-    if _ORDERING_RE.search(masked):
+    ordering = bool(_ORDERING_RE.search(masked))
+    # Capability/how-to exclusions apply to this clause only, and never to a
+    # clause that already states a current ordering claim.
+    if _CAPABILITY_RE.search(clause) and not ordering:
+        return None, None
+    howto = bool(_HOWTO_RE.search(clause))
+    if howto and not _STRONG_ORDER_RE.search(clause):
+        return None, None
+    if ordering:
         return "ordering", account
     return None, None
 
@@ -189,7 +235,13 @@ def _account(line: str) -> str | None:
 
 def _ranked_account(line: str) -> str | None:
     match = _RANK_RE.match(line)
-    return match.group(1) if match else None
+    if match is None:
+        return None
+    # Numbered capability prose ("1. Codex is good for first drafts.") is a
+    # capability row, not a ranking of accounts.
+    if _CAPABILITY_RE.search(line):
+        return None
+    return match.group(1)
 
 
 def _has_qualifier(line: str) -> bool:

@@ -2498,6 +2498,46 @@ _BUDGET_SAFETY_SLACK_S = 0.3
 _VALIDITY_QUERY_MIN_S = 0.05
 
 
+def _attach_hub_routing_state(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Carry stored routing-state flags onto budgeted hub hits.
+
+    Same boolean the local snapshot metadata pass already attaches. Reads
+    only ``frontmatter->'_routing_state_claim'``, never ``topics.body``.
+    Fail-open: a missing column, a closed cursor, or a type that is not a
+    strict boolean leaves hits unmarked and never drops a row.
+    """
+    topic_ids = [str(r["id"]) for r in rows if r.get("kind") == "topic"]
+    if not topic_ids:
+        return rows
+    try:
+        from khipu.db import connect
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT slug, frontmatter->'_routing_state_claim' "
+                    "FROM topics WHERE deleted_at IS NULL AND slug = ANY(%s)",
+                    (topic_ids,),
+                )
+                flags = {
+                    str(slug): flag
+                    for slug, flag in cur.fetchall()
+                    if type(flag) is bool
+                }
+    except Exception as exc:  # noqa: BLE001 — advisory; never a search failure
+        _log(f"budgeted routing metadata skipped: {type(exc).__name__}: {exc}")
+        return rows
+    if not flags:
+        return rows
+    for r in rows:
+        if r.get("kind") != "topic":
+            continue
+        flag = flags.get(str(r.get("id")))
+        if type(flag) is bool:
+            r["_routing_state_claim"] = flag
+    return rows
+
+
 def _hub_hits_budgeted(
     prompt: str,
     tokens: list[str],
@@ -2619,6 +2659,7 @@ def _hub_hits_budgeted(
     fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
     fused = _relevance_gate(fused, tokens)
     fused = apply_project_and_status(fused, project=project)
+    fused = _attach_hub_routing_state(fused)
 
     # Validity annotation (Phase 2, session B): one counts query for the
     # fused rows, reusing decisions.enrich_search_results (the exact same
