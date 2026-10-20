@@ -24,8 +24,11 @@ Khipu's own process environment is not a source. Every candidate is
 de-duplicated by real identity (``claude_homes.path_identity``) against the
 tracked accounts, the turned-down folders and the default logins.
 
-Nothing here opens, lists or reads a file inside a login folder: it lists
-``$HOME``, stats a folder itself and asks the CLI. The check is a one-shot
+Nothing here opens, lists or reads a file inside a login folder, with one
+named exception (slice 9c, section 13 C): ``bounded_settings`` may open a
+Claude home's ``settings.json`` and outputs only a validated provider
+hostname and whether a token is present. Auth files are stat-only. Otherwise
+discovery lists ``$HOME``, stats a folder itself and asks the CLI. The check is a one-shot
 child per folder whose argv comes only from ``STATUS_ARGV`` (or
 ``VERSION_ARGV`` for the can't-run state), or the existing plan reads
 (``usage.probe_grok``, ``usage.probe_muse``, ``usage.probe_account`` with
@@ -110,6 +113,18 @@ GLM = "glm"
 # (``~/.claude-glm``) is the signal.
 ZAI_FOLDER = re.compile(r"^\.claude-glm([-.].*)?$")
 _VERSION_RE = re.compile(rb"(\d+\.\d+(?:\.\d+)*)")
+
+# Slice 9c (section 13 C): the one named exception to "discovery opens no
+# file inside a login home". A bounded parser may open a Claude home's
+# settings.json; its only outputs are a validated provider hostname and
+# whether a token is present. Every other byte is dropped in that function.
+SETTINGS_NAME = "settings.json"
+SETTINGS_MAX = 64 * 1024
+PROVIDER_HOSTS = MappingProxyType({"api.z.ai": "glm", "api.deepseek.com": "deepseek",
+                                   "api.anthropic.com": "claude"})
+AUTH_FILES = MappingProxyType({"claude": (".credentials.json", ".claude.json"),
+                               "codex": ("auth.json",), "grok": ("auth.json",)})
+R_UNREADABLE = "unreadable"
 
 
 class RefusedArgv(ValueError):
@@ -386,6 +401,140 @@ def zai_home(path) -> bool:
     return path is not None and bool(ZAI_FOLDER.match(Path(path).name))
 
 
+def bounded_settings(path) -> dict:
+    """The bounded settings parser: the only read inside a login home.
+
+    Returns ``{host, provider, has_token, unreadable}``. ``host`` is a
+    validated hostname from ``env.ANTHROPIC_BASE_URL`` (no userinfo, path
+    or query survives; only allow-listed provider hosts are reported).
+    ``has_token`` reports only that a settings token is present; its value
+    is dropped here. A parse failure is ``unreadable`` with no error text.
+    A missing settings file is neither a host nor unreadable."""
+    out = {"host": None, "provider": None, "has_token": False, "unreadable": False}
+    if path is None:
+        return out
+    target = Path(path) / SETTINGS_NAME
+    try:
+        info = os.stat(target)
+    except OSError:
+        return out
+    if not stat.S_ISREG(info.st_mode) or info.st_size > SETTINGS_MAX:
+        out["unreadable"] = True
+        return out
+    try:
+        with open(target, "rb") as handle:
+            raw = handle.read(SETTINGS_MAX + 1)
+    except OSError:
+        out["unreadable"] = True
+        return out
+    if len(raw) > SETTINGS_MAX:
+        out["unreadable"] = True
+        return out
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        out["unreadable"] = True
+        return out
+    if not isinstance(data, dict):
+        out["unreadable"] = True
+        return out
+    env = data.get("env") if isinstance(data.get("env"), dict) else {}
+    url = env.get("ANTHROPIC_BASE_URL")
+    if isinstance(url, str) and url.strip():
+        from urllib.parse import urlsplit
+
+        try:
+            parts = urlsplit(url.strip())
+            host = parts.hostname.lower().rstrip(".") if parts.hostname else None
+        except ValueError:
+            host = None
+        if host and parts.username is None and parts.password is None and host in PROVIDER_HOSTS:
+            out["host"] = host
+            out["provider"] = PROVIDER_HOSTS[host]
+    out["has_token"] = any(isinstance(env.get(k), str) and bool(env[k].strip())
+                           for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"))
+    return out
+
+
+def provider_home(path) -> str | None:
+    """The provider a Claude home points at, by settings or folder name."""
+    if path is None:
+        return None
+    if zai_home(path):
+        return GLM
+    return bounded_settings(path)["provider"]
+
+
+def _auth_present(cli: str, path) -> bool:
+    """An auth file exists in this home, by stat only; never opened."""
+    if path is None:
+        return False
+    for name in AUTH_FILES.get(cli, ()):
+        try:
+            if stat.S_ISREG(os.stat(Path(path) / name).st_mode):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _login_evidence(cli: str, path, settings: dict | None = None) -> list[str]:
+    evidence = []
+    if _auth_present(cli, path):
+        evidence.append("auth_file")
+    if settings and settings.get("has_token"):
+        evidence.append("settings_token")
+    return evidence
+
+
+def _worktree_container(cli: str, path, settings: dict | None = None) -> bool:
+    """A folder holding only a ``worktrees`` folder is a worktree container,
+    not a login: it has a worktrees folder (by stat) and no login marker."""
+    if path is None or cli not in FOLDER_CLIS:
+        return False
+    try:
+        if not stat.S_ISDIR(os.stat(Path(path) / "worktrees").st_mode):
+            return False
+    except OSError:
+        return False
+    if _auth_present(cli, path):
+        return False
+    try:
+        os.stat(Path(path) / SETTINGS_NAME)
+        return False
+    except OSError:
+        return True
+
+
+def _subscription_key(cli: str, account_id) -> str | None:
+    """A grouping key from a CLI-reported account id. Only equality matters,
+    so only a digest of the id is kept, never the id's surrounding output."""
+    if not isinstance(account_id, str) or not account_id.strip():
+        return None
+    import hashlib
+
+    return "sub:" + hashlib.sha256(f"{cli}:{account_id.strip()}".encode()).hexdigest()[:24]
+
+
+def subscription_key_from_status(cli: str, out: bytes) -> str | None:
+    """The account id in a CLI's own status output, parsed for that id only."""
+    if cli != "claude":
+        return None
+    try:
+        data = json.loads(out.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    account = data.get("account") if isinstance(data.get("account"), dict) else {}
+    for source in (data, account):
+        for key in ("account_id", "accountId", "account_uuid", "user_id", "userId"):
+            key_found = _subscription_key(cli, source.get(key))
+            if key_found:
+                return key_found
+    return None
+
+
 # ---- sources -----------------------------------------------------------------------
 
 
@@ -507,8 +656,21 @@ def _gather(now_ts: float) -> tuple[dict, set, set]:
     installed = {cli: bool(usage._command(cli)) for cli in CLIS}
     found: dict[str, dict] = {}
 
+    settings_cache: dict[str, dict] = {}
+
+    def settings_for(path) -> dict:
+        key = str(path)
+        if key not in settings_cache:
+            settings_cache[key] = bounded_settings(path)
+        return settings_cache[key]
+
     def add(cli: str, path: Path | None, source: str, *, count: int | None = None) -> None:
-        if cli == "claude" and zai_home(path):
+        settings = settings_for(path) if cli == "claude" and path is not None else None
+        if cli in FOLDER_CLIS and path is not None and source == "name" \
+                and _worktree_container(cli, path, settings):
+            return  # a folder holding only worktrees is not offered
+        evidence_home = path
+        if cli == "claude" and (zai_home(path) or (settings and settings["provider"] == GLM)):
             cli, path = GLM, None  # one GLM login, whatever folder ran it
         ident = identity(path) if path is not None else MUSE_IDENTITY
         is_default = path is None or defaults.get(cli) == ident
@@ -529,6 +691,16 @@ def _gather(now_ts: float) -> tuple[dict, set, set]:
             rec["sources"].append(source)
         if count is not None:
             rec["conversations_7d"] = min(COUNT_CAP, (rec["conversations_7d"] or 0) + count)
+        if evidence_home is not None:
+            evidence_cli = "claude" if settings is not None else cli
+            found_evidence = _login_evidence(evidence_cli, evidence_home, settings)
+            if settings is not None:
+                if settings["host"]:
+                    rec["provider_host"] = settings["host"]
+                if settings["unreadable"]:
+                    rec["settings"] = R_UNREADABLE
+            if found_evidence:
+                rec["login_evidence"] = sorted(set(rec.get("login_evidence") or ()) | set(found_evidence))
 
     for cli, path in _source_names():
         add(cli, path, "name")
@@ -692,6 +864,10 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
             raise _CutOff
         return state, reason, plan
 
+    if "settings_token" in (rec.get("login_evidence") or ()):
+        # A provider-pointed home whose settings hold a token is a login on
+        # that token's presence alone; the token itself is never read out.
+        return settle(SIGNED_IN, None)
     if cli == GLM:
         return settle(*_from_probe(usage.probe_glm(timeout=left())))
     binary = usage._command(cli)
@@ -699,6 +875,9 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
         return COULDNT_CHECK, R_NOT_INSTALLED, None
     if cli in STATUS_ARGV:
         res = run_once(cli, (binary, *STATUS_ARGV[cli]), home=home, timeout=left(), run=run)
+        subscription = subscription_key_from_status(cli, res["out"])
+        if subscription:
+            rec["subscription"] = subscription
         state, reason, _ = settle(*classify_status(cli, res))
         del res
         plan = None
@@ -707,10 +886,13 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
                                       timeout=left(), rollout=False, turn=False)
             plan = row.get("plan") if row.get("ok") else None
         return state, reason, plan
-    if cli == "grok":
-        return settle(*_from_probe(usage.probe_grok(home, timeout=left())))
-    if cli == "muse":
-        return settle(*_from_probe(usage.probe_muse(timeout=left(), turn=False)))
+    if cli in ("grok", "muse"):
+        data = usage.probe_grok(home, timeout=left()) if cli == "grok" else \
+            usage.probe_muse(timeout=left(), turn=False)
+        subscription = _subscription_key(cli, data.get("account_id"))
+        if subscription:
+            rec["subscription"] = subscription
+        return settle(*_from_probe(data))
     return COULDNT_CHECK, R_BAD, None
 
 
@@ -806,6 +988,65 @@ def _iso(ts) -> str | None:
     return usage._iso(ts) if isinstance(ts, (int, float)) else None
 
 
+def _collapse(found: dict, groups: list | None = None) -> dict:
+    """One subscription is one account: candidates whose CLI account status
+    named the same subscription (``subscription`` key), or that the owner
+    merged, collapse into one candidate keeping every home. Homes with no
+    agreeing source stay separate; Khipu never guesses."""
+    group_of: dict[str, str] = {}
+    for group in groups or ():
+        if isinstance(group, dict):
+            for ident in group.get("identities") or ():
+                group_of[ident] = str(group.get("id"))
+    buckets: dict[str, list[dict]] = {}
+    for rec in found.values():
+        key = group_of.get(rec.get("identity")) and f"group:{group_of[rec['identity']]}" \
+            or (f"sub:{rec['cli']}:{rec['subscription']}" if rec.get("subscription") else rec["id"])
+        buckets.setdefault(key, []).append(rec)
+    out: dict[str, dict] = {}
+    for recs in buckets.values():
+        primary = sorted(recs, key=lambda r: (r.get("state") != SIGNED_IN,
+                                              "conversation" not in (r.get("sources") or ())))[0]
+        if len(recs) > 1:
+            primary = dict(primary)
+            primary["sources"] = sorted({s for r in recs for s in (r.get("sources") or ())})
+            primary["homes"] = [r.get("path") for r in recs]
+            primary["merged"] = True
+            primary["conversations_7d"] = min(COUNT_CAP, sum(r.get("conversations_7d") or 0 for r in recs)) or None
+            if any(r.get("state") == SIGNED_IN for r in recs):
+                primary["state"] = SIGNED_IN
+        out[primary["id"]] = primary
+    return out
+
+
+def merge_same_subscription(candidate_ids) -> dict:
+    """The owner's one merge action ("same subscription") for candidates:
+    they are offered as one account from then on, persisted in the store."""
+    ids = [str(c) for c in candidate_ids or ()]
+    if len(set(ids)) < 2:
+        raise ValueError("merge needs at least two different candidates")
+    store = _load_store()
+    cands = store["candidates"]
+    chosen = []
+    for cid in ids:
+        rec = cands.get(cid)
+        if rec is None:
+            raise ValueError("that candidate is not in the last discovery")
+        chosen.append(rec)
+    if len({r["cli"] for r in chosen}) != 1:
+        raise ValueError("only candidates of one CLI can be one subscription")
+    identities = sorted({r["identity"] for r in chosen})
+    groups = [g for g in store.get("subscription_groups") or () if isinstance(g, dict)]
+    groups = [g for g in groups if not (set(g.get("identities") or ()) & set(identities))]
+    group = {"id": "subgroup:" + identities[0], "cli": chosen[0]["cli"], "identities": identities}
+    groups.append(group)
+    store["subscription_groups"] = groups
+    _save_store(store)
+    merged = _collapse(cands, groups)
+    return {"ok": True, "group": group, "candidate": public(merged[chosen[0]["id"]])
+            if chosen[0]["id"] in merged else None}
+
+
 def public(rec: dict) -> dict:
     """One candidate as the app sees it (never an agent: it carries a path)."""
     owner = needs_owner_check(rec)
@@ -820,8 +1061,14 @@ def public(rec: dict) -> dict:
         "plan": rec.get("plan") if state == SIGNED_IN else None,
         "conversations_7d": rec.get("conversations_7d"),
         "needs_owner_check": owner,
-        # Home's Found card lists only signed-in finds a conversation used.
-        "offer_on_home": state == SIGNED_IN and "conversation" in sources,
+        "provider_host": rec.get("provider_host"),
+        "login_evidence": sorted(rec.get("login_evidence") or ()),
+        "settings": rec.get("settings") if rec.get("settings") == R_UNREADABLE else None,
+        "merged": bool(rec.get("merged")), "homes": rec.get("homes"),
+        # Home's Found card lists only signed-in finds a conversation used,
+        # or a provider-pointed home whose settings token is its evidence.
+        "offer_on_home": state == SIGNED_IN and ("conversation" in sources
+                                                 or "settings_token" in (rec.get("login_evidence") or ())),
     }
 
 
@@ -930,6 +1177,8 @@ def discover(*, now: bool = False, check: str | None = None, at: float | None = 
                 continue
             for key in ("last_checked", "state", "reason", "plan"):
                 rec[key] = old.get(key)
+            if old.get("subscription"):
+                rec["subscription"] = old["subscription"]
         store["candidates"] = found  # a folder no source finds any more is pruned
         result = None
         if check is not None:
@@ -948,6 +1197,7 @@ def discover(*, now: bool = False, check: str | None = None, at: float | None = 
             stats["left_for_later"] += max(0, len(due) - CHECK_CAP)
             stats["not_checked"] = sum(1 for r in found.values() if needs_owner_check(r))
             store["last_run"] = dict(stats, at=now_ts)
+        store["candidates"] = _collapse(found, store.get("subscription_groups"))
         _save_store(store)
         out = _view(store)
         out["looking"] = False

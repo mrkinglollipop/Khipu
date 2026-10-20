@@ -947,8 +947,19 @@ def parse_grok(frames: list[dict]) -> dict:
                      period.get("end") or config.get("billingPeriodEnd"))
     balance = _number(_dict(config, "prepaidBalance").get("val"))
     credits = {"prepaid_balance": balance} if balance is not None else None
-    return {"ok": True, "plan": _text(result.get("subscription_tier")), "windows": [window] if window else [],
-            "credits": credits, "version": version, "source": "live"}
+    account_id = None
+    for source in (result, config):
+        for key in ("account_id", "accountId", "user_id", "userId"):
+            if isinstance(source.get(key), str) and source[key].strip():
+                account_id = source[key].strip()
+                break
+        if account_id:
+            break
+    out = {"ok": True, "plan": _text(result.get("subscription_tier")), "windows": [window] if window else [],
+           "credits": credits, "version": version, "source": "live"}
+    if account_id:
+        out["account_id"] = account_id
+    return out
 
 
 def _grok_budget(timeout: float) -> float:
@@ -1455,7 +1466,7 @@ def _entry_problem(harness: str, home: str | None) -> tuple[str, str, str] | Non
     if harness == "claude" and path is not None:
         from khipu import discover
 
-        if discover.zai_home(path):
+        if discover.provider_home(path) == "glm":
             return "zai_home", "home", ("This login folder runs Claude Code against z.ai, so it is the GLM "
                                         "account; track GLM instead of reading it as Claude")
     return None

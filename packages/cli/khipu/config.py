@@ -742,8 +742,10 @@ AUTO_TRACK_KEY = "usage_auto_track"
 
 def auto_track() -> bool:
     """Whether found accounts a conversation used are tracked without asking
-    (settings clarity phase 9; per Mac, off by default)."""
-    return load_config().get(AUTO_TRACK_KEY) is True
+    (settings clarity phase 9; per Mac). On by default for a new install
+    with no setting (decision 15); an explicit off persists as ``false``
+    and stays off until the owner turns it on again."""
+    return load_config().get(AUTO_TRACK_KEY) is not False
 
 
 # ---------------------------------------------------------------------------
