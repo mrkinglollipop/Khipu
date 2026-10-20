@@ -6,6 +6,7 @@ from datetime import timedelta
 
 import pytest
 
+from khipu import agent_view
 from khipu import mcp_server, owner_act, owner_direction, routing, routing_events
 from tests.routing_s4_cost_workload import T0, build
 
@@ -203,6 +204,8 @@ def test_changed_log_prompt_with_source_append_reads_and_orders_once(replay, mon
         calls["order"] += 1
         return order(*args, **kwargs)
 
+    # The helper's preparation is outside the prompt's measured read boundary.
+    agent_view.prepare_routing_table(refresh=True)
     monkeypatch.setattr(routing, "_read_event_lines", counted_read)
     monkeypatch.setattr(routing, "_in_write_order", counted_order)
     replay.advance(1)

@@ -2360,6 +2360,8 @@ def test_recent_changes_name_the_owner_in_settings_for_every_change_made_in_the_
 # setting that is not an option at all. Each leaves this list in the PR that
 # builds it, so the test below then asks for its control.
 NOT_IN_THE_APP_YET = {
+    # First-class routing slice 14 owns the delivery and health controls.
+    "routing_delivery_lease",
     # Phase 7: the copy for cloud agents.
     "routing_cloud_copy", "routing_cloud_copy_hold_words", "routing_cloud_copy_rules",
     "routing_cloud_copy_stale_after", "routing_cloud_copy_debounce",

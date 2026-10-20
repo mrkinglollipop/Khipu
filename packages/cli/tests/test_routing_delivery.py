@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from khipu import agent_view
 from khipu import recall_prompt, recall_rule, routing
 
 
@@ -95,12 +96,14 @@ def test_c_omitted_changes_stay_behind_the_real_delivery_watermark(home):
                                           at=marker["full_at"])
     for i in range(8):
         routing.report(account=f"A{i}", state="open", author=ME)
+    agent_view.prepare_routing_table(refresh=True)
     first = routing.prompt_push(marker, budget=1.0)
     assert first["kind"] == "changes"
     assert "more changes" in first["text"]
     _deliver(first)
     heard = recall_prompt.routing_marker(SESSION)
     assert heard.get("owed")
+    agent_view.prepare_routing_table(refresh=True)
     second = routing.prompt_push(heard, budget=1.0)
     _deliver(second)
     two = first["text"] + "\n" + second["text"]
@@ -108,6 +111,7 @@ def test_c_omitted_changes_stay_behind_the_real_delivery_watermark(home):
     assert not recall_prompt.routing_marker(SESSION).get("owed")
     assert len(first["shown_entities"] + second["shown_entities"]) == 8
     assert len(set(first["shown_entities"] + second["shown_entities"])) == 8
+    agent_view.prepare_routing_table(refresh=True)
     assert routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)["kind"] == "none"
     assert all(len(out["text"].split("\n", 1)[1]) <= 400 for out in (first, second))
 
@@ -122,12 +126,14 @@ def test_c_same_version_debt_precedes_newer_priority(home):
     marker = {"version": base["version"], "epoch": base["epoch"], "full_at": routing._iso(T0)}
     assert recall_prompt.mark_routing_full(SESSION, version=base["version"], epoch=base["epoch"],
                                           at=marker["full_at"])
+    agent_view.prepare_routing_table(refresh=True)
     first = routing.prompt_push(marker, budget=1.0)
     _deliver(first)
     owed = recall_prompt.routing_marker(SESSION)["owed"]
     assert owed
     routing.request_priority([{"account": "Grok", "role": "newer priority"}], owner_request="use Grok",
                              author=ME, expect=routing.priority_version())
+    agent_view.prepare_routing_table(refresh=True)
     second = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
     first_owed = next(f"A{i}" for i in range(8) if f"account:{key(i)}" in owed)
     assert second["text"].index(first_owed) < second["text"].index("Your priority")
@@ -206,6 +212,7 @@ def test_acceptance_real_replay_has_grok_priority_and_hold_contradiction(
     view = routing.read_view()
     routing.report(account="Codex", state="open", author=ME)
     marker = {"version": view["version"], "epoch": view["epoch"], "full_at": routing._iso(T0)}
+    agent_view.prepare_routing_table(refresh=True)
     prompt = routing.prompt_push(marker, budget=1.0)
     start_text, prompt_text = (start or {}).get("text", ""), prompt.get("text") or ""
     for rendered in (start_text, prompt_text):
@@ -289,48 +296,44 @@ def test_review_omitted_pending_changes_are_counted_and_delivered_later(home, mo
                              owner_request="use Grok", author=ME, expect=routing.priority_version())
     if path == "start":
         monkeypatch.setattr(routing, "kick_plan_refresh", lambda: None)
-        at = recall_rule._RoutingAtStart().begin()
+        at = recall_rule._RoutingAtStart(session_id=SESSION).begin()
         assert at.text()
         out = at.out
     else:
-        marker = {} if path == "full_prompt" else {
-            "version": before["version"], "epoch": before["epoch"], "full_at": routing._iso(T0)}
-        out = routing.prompt_push(marker, budget=1.0)
-    rule_numbers = {f"rule:{r['n']}": r["n"] for r in routing.read_view()["rules"]}
-    pending = {*rule_numbers, "priority"}
-    shown = set(out.get("shown_entities") or []) & pending
-    omitted = pending - shown
-    assert omitted
-    match = re.search(r"(\d+) more (?:pending changes|changes): .*khipu_route", out["text"])
-    assert match and int(match[1]) == len(omitted)
-    assert set(out["owed_entities"]) - set(out["shown_entities"]) == omitted
-    if path == "start":
-        at.delivered(SESSION)
-    else:
-        _deliver(dict(out, at=routing._iso(T0)))
-    assert set(recall_prompt.routing_marker(SESSION)["owed"]) == omitted
-    seen = set(shown)
-    for _ in range(15):
-        next_out = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
-        assert next_out["kind"] == "changes"
-        newly_shown = set(next_out["shown_entities"]) & omitted
-        assert newly_shown - seen
-        for entity in newly_shown:
-            if entity == "priority":
-                assert "Your priority" in next_out["text"]
-            else:
-                number = rule_numbers[entity]
-                assert re.search(rf"(?:^{number}\. |Standing rule {number} added)", next_out["text"], re.M)
-        seen.update(newly_shown)
-        _deliver(next_out)
+        if path == "changes":
+            assert recall_prompt.mark_routing_full(SESSION, version=before["version"], epoch=before["epoch"],
+                                                   at=routing._iso(T0))
+        agent_view.prepare_routing_table(refresh=True)
+        out = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
+    view = routing.read_view()
+    pending = {*[routing._rule_component(r) for r in view["rules"]], "priority"}
+    from khipu import routing_delivery
+
+    payloads = {entity: [] for entity in pending}
+    for _ in range(80):
+        # A preview never completes a rule. Every reserved payload has to
+        # occur in the actual offered context before its ack advances it.
+        state = routing_delivery.snapshot(SESSION)
+        for item in out["routing_changes"]["items"]:
+            entity = item["entity"]
+            if entity in pending:
+                entry = state["entries"][entity]
+                end = state["flight"]["progress"][entity]
+                payload = entry["text"][entry["offset"]:end]
+                assert payload in out["text"]
+                payloads[entity].append(payload)
+                assert (entity in out["shown_entities"]) == (end == len(entry["text"]))
+        _deliver(dict(out, kind=out.get("kind") or "full", at=routing._iso(T0)))
         if not recall_prompt.routing_marker(SESSION).get("owed"):
             break
-    assert seen == pending
-    if path == "start":
-        at.delivered(SESSION)
-    elif path == "full_prompt":
-        _deliver(dict(out, at=routing._iso(T0)))
+        agent_view.prepare_routing_table(refresh=True)
+        out = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
+        assert out["kind"] == "changes"
+    state = routing_delivery.snapshot(SESSION)
     assert not recall_prompt.routing_marker(SESSION).get("owed")
+    for entity in pending:
+        assert state["entries"][entity]["acked"]
+        assert "".join(payloads[entity]) == state["entries"][entity]["text"]
 
 
 def test_review_overlapping_account_labels_agree_on_hold_conflicts(home):

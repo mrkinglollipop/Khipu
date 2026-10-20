@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from khipu import mcp_server, recall_prompt, recall_rule, routing, routing_delegation
+from khipu import agent_view, mcp_server, recall_prompt, recall_rule, routing, routing_delegation
 from scripts.routing_fixture_sanitize import FixtureError, load_pace, load_replay, main, sanitize
 
 
@@ -109,7 +109,9 @@ class Replay:
         assert not error, body
         return body
 
-    def offer(self, session="s1"):
+    def offer(self, session="s1", *, helper_tick=True):
+        if helper_tick:
+            agent_view.prepare_routing_table(refresh=True)
         out = routing.prompt_push(recall_prompt.routing_marker(session), budget=1.0, now=self.now)
         at = recall_prompt._RoutingAtPrompt()
         at.session = session
@@ -417,6 +419,9 @@ def test_3_eight_short_changes_fit_two_pushes_and_only_shown_entities_ack(replay
     assert recall_prompt.mark_routing_full("s1", version=before["version"], epoch=before["epoch"], at=routing._iso(T0))
     for i in range(8):
         routing.report(account=f"A{i}", state="open", author=AUTHOR)
+    # This direct renderer call starts with the complete inventory a helper prepares.
+    from khipu import agent_view
+    agent_view.prepare_routing_table(refresh=True)
     seen = []
     for _ in range(2):
         before_delivery = copy.deepcopy(recall_prompt.routing_marker("s1"))
@@ -454,7 +459,6 @@ def test_5_structured_level_claim_expires_at_reset(replay):
 # ---- 2, 3: pages, revisions, leases -----------------------------------------------------
 
 
-@future("6", "a 3000-character pending rule must arrive whole across acknowledged pages")
 def test_2_pending_rule_is_whole_across_pages(replay):
     words = "Grok " + "~" * 2995
     routing.request_rule(words, author=AUTHOR)
@@ -469,7 +473,6 @@ def test_2_pending_rule_is_whole_across_pages(replay):
     expect("".join(delivered).count("~"), 2995, "2: pending rule was acknowledged as a preview, with text lost")
 
 
-@future("6", "10500-character session starts owe pages instead of a pointer-only start")
 def test_2_oversized_session_start_has_a_first_page(replay):
     routing.add_rule("x" * 10500, via="app")
     at = recall_rule._RoutingAtStart().begin()
@@ -481,7 +484,6 @@ def test_2_oversized_session_start_has_a_first_page(replay):
     assert recall_prompt.routing_marker("s1").get("owed")
 
 
-@future("6", "editing during pagination cancels old pages and starts revision page one")
 def test_2_edit_mid_pagination_restarts_revision(replay):
     routing.request_rule("Grok " + "x" * 2995, author=AUTHOR)
     first, _, info = replay.offer()
@@ -494,7 +496,6 @@ def test_2_edit_mid_pagination_restarts_revision(replay):
     assert first["routing_changes"]["items"][0]["revision"] != second["routing_changes"]["items"][0]["revision"]
 
 
-@future("6", "in-flight leases expire after 60 seconds and return undelivered items to owed")
 def test_3_unacknowledged_hook_batch_expires_to_owed(replay):
     routing.report(account="Codex", state="open", author=AUTHOR)
     out, _, _ = replay.offer()

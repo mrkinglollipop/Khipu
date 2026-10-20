@@ -6,6 +6,7 @@ from datetime import timedelta
 
 import pytest
 
+from khipu import agent_view
 from khipu import config, routing, routing_delegation, routing_entries
 from tests.test_routing_acceptance import T0
 from tests.test_routing_cursor import runner, NOW
@@ -53,6 +54,7 @@ def test_model_facts_reach_mcp_both_pushes_and_advisory(replay, monkeypatch):
         'provider': 'muse', 'model': 'muse-wonder-full-1.0'}}) == []
     assert routing_delegation.provider_advisory({'tool_name': 'Bash', 'tool_input': {
         'command': 'muse exec --model other "do the task"'}})
+    agent_view.prepare_routing_table(refresh=True)
     changed = routing.prompt_push({'version': 0}, budget=1.0, now=T0)
     assert 'models_allowed' in changed['text']
 

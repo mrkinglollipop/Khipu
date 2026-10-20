@@ -30,6 +30,7 @@ from pathlib import Path
 
 import pytest
 
+from khipu import agent_view
 from khipu import paths, promote, recall_daemon, recall_prompt, routing
 
 T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
@@ -113,6 +114,7 @@ def test_pending_rule_mark_and_prior_words_repeat_with_an_unrelated_next_push(ho
     routing.report(account="Codex", state="limited", until="2h", author=ME)
     marker = {"version": heard_pending["version"], "epoch": heard_pending["epoch"],
               "full_at": routing._iso(home["clock"].now)}
+    agent_view.prepare_routing_table(refresh=True)
     pushed = routing.prompt_push(marker, budget=1.0)
     assert pushed["kind"] == "changes"
     assert "changed by a Claude Code conversation at the owner's request" in pushed["text"]
@@ -773,43 +775,51 @@ def _u16(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def test_a_block_too_long_for_the_harness_limit_leaves_a_pointer(home, monkeypatch):
+def _assert_note_arrives_whole_in_context(first, pull):
+    from khipu import routing_delivery
+
+    output, offset, payloads = first, 0, []
+    for _ in range(80):
+        ctx = _ctx(output)
+        assert _u16(ctx) <= 10_000
+        state = routing_delivery.snapshot(SESSION)
+        note = state["entries"]["note"]
+        end = note["offset"]
+        payload = note["text"][offset:end]
+        assert end > offset and payload in ctx
+        payloads.append(payload)
+        offset = end
+        if note["acked"]:
+            break
+        assert "note" in _marker()["owed"]
+        output = pull()
+    assert note["acked"]
+    assert "".join(payloads) == note["text"]
+    assert "note" not in _marker().get("owed", [])
+    assert _marker()["version"] == routing.read_view()["version"]
+
+
+def test_a_block_too_long_for_the_harness_limit_arrives_as_pages(home, monkeypatch):
     _record()
     routing.set_note("Codex first for builds today; Grok for surveys. " * 250, via="app")
     _push_on(monkeypatch)
-    ctx = _ctx(_cold(monkeypatch))
-    assert ctx.startswith("## Prior work")
-    assert ctx.endswith(recall_prompt.ROUTING_TOO_LONG)
-    assert _u16(ctx) <= 10_000
-    assert _last_log().endswith(" routing=pointer:full")
-    view = routing.read_view()
-    # Told where to read it, not given it: the session has not heard the summary.
-    assert _marker() == {"pointer": {"version": view["version"], "epoch": view["epoch"]}}
-    # The pointer is said once per version, not on every prompt.
-    home["search"]["hits"] = [dict(HITS[0], id="42")]
-    out = _cold(monkeypatch)
-    assert "## Routing" not in out and "## Prior work" in out
-    assert _last_log().endswith(" routing=pointer-said:full")
+    first = _cold(monkeypatch)
+    assert _ctx(first).startswith("## Prior work")
+    assert "page 1/" in _ctx(first)
+    assert "note" in _marker()["owed"]
+    _assert_note_arrives_whole_in_context(first, lambda: _cold(monkeypatch))
     home["search"]["hits"] = []
     assert json.loads(_cold(monkeypatch)) == {}
-    assert _last_log().endswith(" routing=pointer-said:full")
-    # A new version says it again, once.
-    routing.add_rule("Never a -fast tier.", via="app")
-    home["search"]["hits"] = [dict(HITS[0], id="43")]
-    assert _ctx(_cold(monkeypatch)).endswith(recall_prompt.ROUTING_TOO_LONG)
-    assert _last_log().endswith(" routing=pointer:full")
-    assert "version" not in _marker()
+    assert _last_log().endswith(" routing=none")
 
 
 def test_a_block_and_the_recall_part_together_stay_within_the_harness_limit(home, monkeypatch):
     _record()
-    note = "Codex first for builds today; Grok for surveys. " * 180  # about 8,800 characters
-    routing.set_note(note, via="app")
+    routing.set_note("Codex first for builds today; Grok for surveys. " * 180, via="app")
     _push_on(monkeypatch)
-    ctx = _ctx(_cold(monkeypatch))
-    assert _u16(ctx) <= 10_000
-    assert ctx.startswith("## Prior work")
-    assert note.strip() in ctx or ctx.endswith(recall_prompt.ROUTING_TOO_LONG)
+    first = _cold(monkeypatch)
+    assert _ctx(first).startswith("## Prior work")
+    _assert_note_arrives_whole_in_context(first, lambda: _cold(monkeypatch))
 
 
 def test_a_mac_with_no_record_hears_it_once_and_nothing_is_written(home, monkeypatch):
@@ -828,55 +838,47 @@ def _block_of(text_len_target: int, marker: dict) -> str:
     """Set the note so the routing block for ``marker`` is ``text_len_target``
     UTF-16 units long; returns the block."""
     routing.set_note("short", via="app")
-    small = routing.prompt_push(marker, budget=1.0)["text"]
+    agent_view.prepare_routing_table(refresh=True)
+    small = routing.prompt_push(dict(marker), budget=1.0)["text"]
     routing.set_note("n" * (len("short") + text_len_target - _u16(small)), via="app")
-    text = routing.prompt_push(marker, budget=1.0)["text"]
+    agent_view.prepare_routing_table(refresh=True)
+    text = routing.prompt_push(dict(marker), budget=1.0)["text"]
     assert _u16(text) == text_len_target
     return text
 
 
 @pytest.mark.parametrize("kind", ["full", "changes"])
-def test_a_block_pushed_out_by_the_recall_part_is_not_recorded_as_heard(home, monkeypatch, kind):
-    """Finding F1 of fix round 1: the pointer replaced the block, yet the
-    session was marked as having heard it, so the next prompt with room sent
-    nothing."""
+def test_a_paged_block_does_not_ack_its_undelivered_remainder(home, monkeypatch, kind):
     from khipu import recall_rule
 
     _record()
     seen = _seen_now() if kind == "changes" else {}
-    block = _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, seen)  # fits alone, not with recall
+    _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, seen)
     _push_on(monkeypatch)
-    ctx = _ctx(_cold(monkeypatch))
-    assert ctx.startswith("## Prior work") and ctx.endswith(recall_prompt.ROUTING_TOO_LONG)
-    label = "full" if kind == "full" else "changes:1"
-    assert _last_log().endswith(f" routing=pointer:{label}")
-    assert _marker().get("version") == seen.get("version")  # not heard: the marker did not move
-    assert _marker().get("full_at") == seen.get("full_at")
-    # The same hits again: recall is deduplicated, so the block now fits and is sent whole.
-    out = _cold(monkeypatch)
-    assert " reason=dedup " in _last_log()
-    assert _routing_part(out) == block
-    assert _last_log().endswith(f" routing={label}")
-    view = routing.read_view()
-    assert _marker()["version"] == view["version"] and "pointer" not in _marker()
-    if kind == "full":
-        assert _marker()["full_at"] == routing._iso(routing._now())
+    first = _cold(monkeypatch)
+    assert _ctx(first).startswith("## Prior work")
+    assert "page 1/" in _ctx(first)
+    assert "note" in _marker()["owed"]
+    _assert_note_arrives_whole_in_context(first, lambda: _cold(monkeypatch))
+    assert "pointer" not in _marker()
 
 
-def test_a_pushed_out_block_is_sent_again_on_the_daemon_path(home, monkeypatch, daemon):
+def test_paged_delivery_continues_on_the_daemon_path(home, monkeypatch, daemon):
     from khipu import recall_rule
 
     _record()
-    block = _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, {})
+    _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, {})
     _push_on(monkeypatch)
-    code, out = _client(home)
-    assert code == 0 and _ctx(out).endswith(recall_prompt.ROUTING_TOO_LONG)
-    assert _wait_log(1).endswith(" routing=pointer:full")
-    assert "version" not in _marker()
-    code, out = _client(home)  # deduplicated: room for the block
-    assert code == 0 and _routing_part(out) == block
-    assert _wait_log(2).endswith(" routing=full")
-    assert _marker()["version"] == routing.read_view()["version"]
+    def pull():
+        expected = len(_log_lines()) + 1
+        code, output = _client(home)
+        assert code == 0
+        _wait_log(expected)
+        return output
+    first = pull()
+    assert "page 1/" in _ctx(first)
+    assert "note" in _marker()["owed"]
+    _assert_note_arrives_whole_in_context(first, pull)
 
 
 def test_the_routing_clock_starts_when_the_read_starts(home, monkeypatch):
@@ -983,6 +985,8 @@ def test_the_routing_imports_cover_everything_the_read_imports(home):
     code = ("import sys\n"
             "from khipu import recall_prompt, routing\n"
             "routing.prompt_imports()\n"
+            "from khipu import agent_view\n"
+            "agent_view.prepare_routing_table()\n"
             "before = set(sys.modules)\n"
             "routing.prompt_push(recall_prompt.routing_marker('fresh'), budget=1.0)\n"
             "print(sorted(m for m in set(sys.modules) - before if m.startswith('khipu')))\n")
@@ -1858,6 +1862,7 @@ def test_an_unsaved_change_is_never_taken_for_no_change(home, monkeypatch):
     with monkeypatch.context() as m:
         _lock_contended(m)
         with pytest.raises(routing.PushUnsaved):
+            agent_view.prepare_routing_table(refresh=True)
             routing.prompt_push(before, budget=1.0)
         assert "## Routing" not in _cold(monkeypatch)
         assert _last_log().endswith(" routing=skipped:unsaved")
@@ -1876,6 +1881,7 @@ def test_an_unsaved_view_that_changed_nothing_still_sends_nothing(home, monkeypa
     Path(routing.events_file()).touch()  # an input changed; the state did not
     with monkeypatch.context() as m:
         _lock_contended(m)
+        agent_view.prepare_routing_table(refresh=True)
         assert routing.prompt_push(before, budget=1.0)["kind"] == "none"
         assert "## Routing" not in _cold(monkeypatch)
         assert _last_log().endswith(" routing=none")
@@ -2094,9 +2100,10 @@ def test_an_answer_finished_after_the_request_deadline_is_not_taken(home):
     assert out is not None and out["kind"] == "full"
 
 
-def test_a_routing_text_too_long_for_any_answer_still_sends_the_pointer(home, monkeypatch):
-    """Review of fix round 5: a text over the answer's byte cap was dropped
-    as no answer, so the pointer to khipu_route never went out."""
+def test_transport_oversize_repacks_the_reserved_changes(home, monkeypatch):
+    """An oversized transport answer still delivers the canonical reservation."""
+    from khipu import routing_delivery
+
     _record()
     _push_on(monkeypatch)
     huge = "x" * (recall_prompt._ROUTING_ANSWER_MOST + 10)
@@ -2107,6 +2114,13 @@ def test_a_routing_text_too_long_for_any_answer_still_sends_the_pointer(home, mo
         return dict(out, kind="full", text="## Routing\n" + huge)
 
     monkeypatch.setattr(routing, "prompt_push", push)
-    out = _cold(monkeypatch)
-    assert "khipu_route" in json.dumps(out)
-    assert " routing=pointer:full" in _last_log()
+    output = _cold(monkeypatch)
+    ctx = _ctx(output)
+    assert _u16(ctx) <= 10_000
+    assert "x" * 100 not in ctx
+    assert "Claude: open" in ctx and "Codex: limit reached" in ctx
+    state = routing_delivery.snapshot(SESSION)
+    assert all(entry["acked"] for entry in state["entries"].values())
+    assert not _marker().get("owed")
+    assert _marker()["version"] == routing.read_view()["version"]
+    assert _last_log().endswith(" routing=full")
