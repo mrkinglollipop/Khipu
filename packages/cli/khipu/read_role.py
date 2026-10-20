@@ -442,20 +442,35 @@ def hub_key(owner_dsn: str) -> str:
     return hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
 
 
+# The derivation is versioned so a later change can rotate every client's
+# password at once. scrypt, not a plain HMAC: a leaked read password or a
+# logged verifier must not let anyone test owner-password guesses at hash
+# speed. About 50 ms on an M-series Mac, paid once per process.
+DERIVATION_VERSION = "v1"
+_SCRYPT = {"n": 2 ** 15, "r": 8, "p": 1, "maxmem": 64 * 1024 * 1024, "dklen": 32}
+# (owner user, digest of the owner password) -> derived password, in memory only.
+_DERIVED: dict[tuple[str, str], str] = {}
+
+
 @secret_result("read_role_password")
 def derived_password(owner_dsn: str) -> str | None:
-    """HMAC-SHA256 of the owner's password over this role and the owner's
-    name; None when the owner DSN carries no password. Not over the host
-    (each Mac may reach the hub by another name) nor the database (a role's
-    password is the whole server's, and two databases must not take turns
-    replacing it)."""
+    """scrypt of the owner's password, salted with the derivation version and
+    the owner's name; None when the owner DSN carries no password. Not over
+    the host (each Mac may reach the hub by another name) nor the database
+    (a role's password is the whole server's, and two databases must not
+    take turns replacing it)."""
     params = _owner_params(owner_dsn)
     secret = params.get("password")
     if not secret:
         return None
-    message = f"{READ_ROLE}/{params.get('user', '')}".encode("utf-8")
-    digest = hmac.new(secret.encode("utf-8"), message, "sha256").digest()
-    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    user = params.get("user", "")
+    key = (user, hashlib.sha256(secret.encode("utf-8")).hexdigest())
+    cached = _DERIVED.get(key)
+    if cached is None:
+        salt = f"{READ_ROLE}/{DERIVATION_VERSION}/{user}".encode("utf-8")
+        digest = hashlib.scrypt(secret.encode("utf-8"), salt=salt, **_SCRYPT)
+        cached = _DERIVED[key] = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return cached
 
 
 @secret_result("database_url")

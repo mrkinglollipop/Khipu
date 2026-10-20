@@ -413,6 +413,26 @@ def test_no_password_is_ever_sent_to_the_hub_and_the_verifier_is_postgresqls_own
     assert _verifies(server_made, "probe-password")
 
 
+def test_the_read_password_is_scrypt_v1_derived_once_per_process(owner_env, monkeypatch):
+    import base64
+    import hashlib
+    import hmac
+
+    dsn = _pw_dsn(owner_env, "a-fresh-owner-password")
+    calls: list[bytes] = []
+    real = hashlib.scrypt
+    monkeypatch.setattr(hashlib, "scrypt", lambda pw, **kw: calls.append(kw["salt"]) or real(pw, **kw))
+    first = read_role.derived_password(dsn)
+    assert read_role.derived_password(dsn) == first and read_role.read_conninfo_for(dsn)
+    assert calls == [b"khipu_read/v1/khipu"]
+    old_hmac = base64.urlsafe_b64encode(hmac.new(b"a-fresh-owner-password", b"khipu_read/khipu", "sha256")
+                                        .digest()).decode("ascii").rstrip("=")
+    assert first != old_hmac
+    assert first == base64.urlsafe_b64encode(real(b"a-fresh-owner-password", salt=b"khipu_read/v1/khipu",
+                                                  n=2 ** 15, r=8, p=1, maxmem=64 * 1024 * 1024, dklen=32)
+                                             ).decode("ascii").rstrip("=")
+
+
 def test_an_owner_dsn_without_a_password_gives_the_read_role_none(owner_env):
     owner = owner_env.connect()
     assert read_role.derived_password(owner_env.dsn) is None
