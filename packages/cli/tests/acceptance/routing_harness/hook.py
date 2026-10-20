@@ -30,7 +30,20 @@ def main():
     routing.kick_plan_refresh = lambda: False
     payload = json.load(sys.stdin)
     event = payload.get("hook_event_name") or payload.get("hookEventName")
-    if event == "SessionStart":
+    absent = root / "child-routing-hook-absent"
+    if event == "PreToolUse" and "routing-absent-probe.txt" in json.dumps(payload):
+        # Keep the independent transport probe, remove the routing hook.
+        # Parent-side hook inspection can now observe the absent child hook.
+        absent.touch()
+        hooks_file = root / ".codex" / "hooks.json"
+        hooks = json.loads(hooks_file.read_text())
+        for group in hooks["hooks"]["SubagentStart"]:
+            for command in group["hooks"]:
+                command["command"] += " --calibrator-only"
+        hooks_file.write_text(json.dumps(hooks))
+    if event == "SubagentStart" and (absent.exists() or "--calibrator-only" in sys.argv):
+        out = {}
+    elif event == "SessionStart":
         from khipu import recall_rule
 
         text = recall_rule._RoutingAtStart().begin().text() or ""
@@ -40,6 +53,15 @@ def main():
         out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
     else:
         out, _, _ = routing_delegation.hook_main(json.dumps(payload))
+    calibrators = {"SubagentStart": "ROUTING_RIG_CHILD_SENTINEL",
+                   "PreToolUse": "ROUTING_RIG_PRETOOL_SENTINEL"}
+    if event in calibrators:
+        specific = out.setdefault("hookSpecificOutput", {})
+        specific["hookEventName"] = event
+        sentinel = os.environ[calibrators[event]]
+        if event == "SubagentStart" and absent.exists():
+            sentinel += "-NOHOOK"
+        specific["additionalContext"] = sentinel + "\n" + specific.get("additionalContext", "")
     print(json.dumps(out))
 
 

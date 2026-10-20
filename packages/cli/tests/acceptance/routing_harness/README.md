@@ -2,8 +2,8 @@
 
 Read `docs/plans/2026-10-20-routing-first-class.md`, sections 4 and 12, first.
 This is slice 2b's rig. Cases 7a, 7b and 7c remain **strict** expected failures
-owned by slices 8a, 8b and 8c. An unexpected routing delivery is a matrix
-contradiction and fails normally, even inside an expected-failure case.
+owned by slices 8a, 8b and 8c. Codex SubagentStart receipt is a plain passing
+assertion; bounded child blocks and the absent-hook advisory remain slice 8b contracts.
 
 ## Run it deliberately
 
@@ -49,28 +49,39 @@ Each pytest session starts at most **one scenario per harness**, including any
 parent and child needed to measure it. Claude uses Haiku; Codex uses Luna with
 low effort. Both parent and child use that tier. No fast tier or paid xAI API
 is used. Results, missing prerequisites, launch failures and timeouts are all
-cached. There are no retries or automatic model fallbacks. A scenario has a
+cached under the session temp directory with a per-harness file lock. Reruns,
+nested pytest invocations and xdist workers share the reservation and replay
+successful native receipts. There are no retries or automatic model fallbacks. A scenario has a
 120-second timeout; timeout kills the entire process group, including children.
 Run at most once per slice touching the matrix; inspect saved receipts to fix
 the reader instead of buying another run.
 
-Claude runs `claude -p` with a single Haiku child and one `Bash(cat probe.txt)` call. Its four
+Claude runs `claude -p` with a single Haiku child and eight separate
+`Bash(cat probe.txt)` calls, allowing deferred routing pages to arrive. Its four
 synthetic rules exceed the start budget together, while each rule fits in a
 child block. PreToolUse uses the production installer's delegation matcher.
-Codex runs `codex exec` with a single Luna `spawn_agent` child and
-one read of the same known file. Both use persistent native transcripts;
+Codex runs `codex exec` once with two sequential Luna `spawn_agent` children
+that each read the same known file. The first gets a synthetic summary over
+4,000 characters (under the native hook limit). Before the second dispatch,
+the parent reads `routing-absent-probe.txt`; its PreToolUse hook removes the
+routing SubagentStart command, retaining only its
+independent transport calibrator. The wrapper also suppresses routing for
+that event in clients that cached their hook configuration. This measures
+the absent-routing-hook advisory separately from successful hook delivery. Both use persistent native transcripts;
 `exec --json`, hook lifecycle output, debug logs and assistant answers are not
 received-input proof.
 
 The parent must contain a random known hook sentinel in its received context
-before its first model step. The child must contain known probe-file contents
-in a recorded tool-result input. This also works with Codex versions that
+before its first model step. Each child must independently receive its SubagentStart sentinel in the hook
+channel before its first step, and known probe-file contents in a recorded
+tool-result input. The parent also calibrates PreToolUse context before a
+subsequent model step. Child sentinels are never included in the brief. This also works with Codex versions that
 encrypt their native child task messages: the rig does not decrypt them.
 Calibration runs in fixture setup, outside the xfail assertions. A malformed
 receipt, missing sentinel or incomplete scenario fails; it cannot xfail.
 
 The readers retain input channels and line order. They accept Claude native
-user/tool-result messages, Codex persisted `response_item` developer messages
+hook-additional-context attachments and user/tool-result messages, Codex persisted `response_item` developer messages
 and tool outputs, and Messages-format native input envelopes. Assistant text,
 tool-call arguments, ACP UI updates and hook stdout cannot satisfy calibration.
 Tool arguments are associated with their returned body only to verify the

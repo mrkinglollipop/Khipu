@@ -58,11 +58,11 @@ class Transcript:
 
     def calibrate(self, sentinel, *, channel, before_first=True):
         observed = self.text(channel=channel, before_first=before_first)
-        if channel == "tool":
+        if channel == "tool" or not before_first:
             # A result recorded after the final model step might never have
             # been consumed. Require a subsequent native model step too.
             observed = "\n".join(item.text for item in self.inputs
-                                 if item.channel == "tool" and item.line < self.last_step
+                                 if item.channel == channel and item.line < self.last_step
                                  and (not before_first or item.line < self.first_step))
         if not sentinel or sentinel not in observed:
             raise ReceiptError("known sentinel absent from received context")
@@ -110,6 +110,14 @@ def read(path: Path, format: str) -> Transcript:
         else:
             # Claude JSONL (also Grok's Messages-format received transcript).
             # An ACP update / hook_response / debug log is never input proof.
+            if format == "claude" and row.get("type") == "attachment":
+                attachment = row.get("attachment")
+                if isinstance(attachment, dict) and attachment.get("type") == "hook_additional_context":
+                    content = attachment.get("content")
+                    if isinstance(content, list) and all(isinstance(part, str) for part in content):
+                        content = "\n".join(content)
+                    inputs.append(Input(number, "hook", text_blocks(content)))
+                continue
             msg = row.get("message") if format == "claude" else row
             if not isinstance(msg, dict):
                 continue
@@ -140,3 +148,25 @@ def read(path: Path, format: str) -> Transcript:
                 elif block.get("type") in {"text", "input_text"}:
                     inputs.append(Input(number, role, text_blocks([block])))
     return Transcript(inputs, first_step, last_step, format=format)
+
+
+def rules_received_in_order(pages, rules):
+    """Reassemble synthetic rule lines across pages, excluding page headings.
+
+    The fixture rules have no newlines. Keep every line containing their
+    alphabet, including damaged rule lines, so truncation and duplication
+    cannot disappear when page headings are removed.
+    """
+    material = "".join(line for page in pages for line in page.splitlines()
+                       if "~" in line or "SYNTHETIC-ROUTING-" in line)
+    if material.count("~") != sum(rule.count("~") for rule in rules):
+        return False
+    position = 0
+    for rule in rules:
+        if material.count(rule) != 1:
+            return False
+        start = material.find(rule, position)
+        if start < 0:
+            return False
+        position = start + len(rule)
+    return True

@@ -1,6 +1,7 @@
 """One bounded headless scenario per harness, shared by all session tests."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
@@ -36,6 +37,7 @@ class Scenario:
     child_sentinel: str
     evidence: Path
     attachments: list | None = None
+    pretool_sentinel: str = ""
 
 
 def environment(root):
@@ -71,12 +73,13 @@ def execute(argv, *, root, env, timeout=120):
 
 
 class Session:
-    def __init__(self, root, auth_root=None, adapters=None, replay_root=None):
+    def __init__(self, root, auth_root=None, adapters=None, replay_root=None, cache_dir=None):
         self.root = root
         self.auth_root = auth_root
         self.adapters = adapters or {}
         self.replay_root = replay_root
         self.results = {}
+        self.cache_dir = cache_dir or root / ".run-cache"
 
     def get(self, harness):
         if harness not in HARNESS_BINARIES:
@@ -96,12 +99,39 @@ class Session:
                     raise Unavailable(f"{harness}: no saved received-context scenario")
                 result = load_native(root, harness)
             else:
-                result = self._run(harness)
+                result = self._once(harness)
         except Exception as exc:
             self.results[harness] = exc
             raise
         self.results[harness] = result
         return result
+
+    def _once(self, harness):
+        # A durable reservation survives pytest reruns and worker crashes.
+        # flock serializes xdist workers; no second process buys another run.
+        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cache = self.cache_dir / f"{harness}.json"
+        with (self.cache_dir / f"{harness}.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if cache.exists():
+                saved = json.loads(cache.read_text())
+                if saved["state"] == "complete":
+                    root = Path(saved["root"])
+                    if harness in MODELS:
+                        return load_native(root, harness)
+                    return self._read_adapter(root, saved["sentinel"], saved["child_sentinel"])
+                error = Unavailable if saved["state"] == "unavailable" else ReceiptError
+                raise error(saved["reason"])
+            cache.write_text(json.dumps({"state": "reserved", "reason": f"{harness}: scenario already reserved; no retry"}))
+            try:
+                result = self._run(harness)
+            except Exception as exc:
+                cache.write_text(json.dumps({"state": "unavailable" if isinstance(exc, Unavailable) else "failed",
+                                             "reason": str(exc)}))
+                raise
+            cache.write_text(json.dumps({"state": "complete", "root": str(result.evidence),
+                                         "sentinel": result.sentinel, "child_sentinel": result.child_sentinel}))
+            return result
 
     def _run(self, harness):
         binary = shutil.which(HARNESS_BINARIES[harness])
@@ -113,8 +143,8 @@ class Session:
         sentinel, child_sentinel = (f"RECEIVED-{uuid.uuid4().hex}" for _ in range(2))
         env = environment(root)
         env.update(ROUTING_RIG_SENTINEL=sentinel, ROUTING_RIG_CHILD_SENTINEL=child_sentinel,
-                   ROUTING_RIG_PYTHON=sys.executable)
-        prepare(root, oversized=harness == "claude")
+                   ROUTING_RIG_PRETOOL_SENTINEL=sentinel + "-PRETOOL", ROUTING_RIG_PYTHON=sys.executable)
+        prepare(root, oversized=harness == "claude", bounded_probe=harness == "codex")
         if harness not in MODELS:
             return self._adapter(harness, binary, root, env, sentinel, child_sentinel)
         credential = "auth.json" if harness == "codex" else ".credentials.json"
@@ -138,19 +168,21 @@ class Session:
 
         hooks["PreToolUse"][0]["matcher"] = DELEGATION_MATCHER
         (root / "probe.txt").write_text(TOOL_SENTINEL + "\n")
+        (root / "routing-absent-probe.txt").write_text("Second child routing hook control.\n")
         session_id = str(uuid.uuid4())
         (root / "run.json").write_text(json.dumps({"session_id": session_id, "sentinel": sentinel,
                                                   "child_sentinel": child_sentinel,
-                                                  "tool_sentinel": TOOL_SENTINEL}))
+                                                  "tool_sentinel": TOOL_SENTINEL,
+                                                  "pretool_sentinel": sentinel + "-PRETOOL"}))
         if harness == "claude":
             settings = root / "settings.json"
             settings.write_text(json.dumps({"hooks": hooks}))
             agents = {"routing-probe": {"description": "Synthetic received-context probe", "model": "haiku",
-                                        "prompt": "Use Bash once with command cat probe.txt, then answer OK. Do nothing else."}}
-            prompt = (f"Use Agent once with subagent_type routing-probe. Its prompt must be: {child_sentinel}. "
+                                        "prompt": "Use Bash with command cat probe.txt exactly eight times, as separate tool calls, then answer OK. Do nothing else."}}
+            prompt = ("Use Agent once with subagent_type routing-probe. Its prompt must be: Run the synthetic probe. "
                       "Do not include routing or your context in its prompt. Wait for it, then answer OK.")
             argv = [binary, "-p", prompt, "--model", MODELS[harness], "--effort", "low",
-                    "--max-turns", "4", "--session-id", session_id, "--settings", str(settings),
+                    "--max-turns", "12", "--session-id", session_id, "--settings", str(settings),
                     "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
                     "--agents", json.dumps(agents), "--tools", "Agent,Bash", "--allowedTools", "Agent", "Bash(cat probe.txt)",
                     "--output-format", "stream-json", "--verbose"]
@@ -158,10 +190,12 @@ class Session:
             (home / "hooks.json").write_text(json.dumps({"hooks": hooks}))
             (home / "config.toml").write_text('model = "gpt-6-luna"\nmodel_reasoning_effort = "low"\n'
                                              '[features]\nmulti_agent = true\n')
-            prompt = ("Call spawn_agent exactly once with model gpt-6-luna, reasoning_effort low, "
-                      f"fork_context false, and message '{child_sentinel}. Read probe.txt once, then answer OK. "
-                      "Do nothing else.'. Do not put routing or your context in that message. "
-                      "Wait for the child and answer OK. Do nothing else.")
+            prompt = ("Run exactly two children sequentially. For each use spawn_agent with model gpt-6-luna, "
+                      "reasoning_effort low, fork_context false. First message: 'Read probe.txt once, then answer OK. "
+                      "Do nothing else.' Wait for that child to finish. Then use exec_command to run "
+                      "cat routing-absent-probe.txt exactly once. After that, second child message: "
+                      "'Read probe.txt once, then answer OK. Do nothing else.' Wait for it and answer OK. "
+                      "Do not include routing or your context in either message. Do nothing else.")
             argv = [binary, "exec", "--skip-git-repo-check", "--ignore-rules", "--json",
                     "--dangerously-bypass-hook-trust", "-m", MODELS[harness], "-s", "read-only", prompt]
         try:
@@ -184,6 +218,9 @@ class Session:
             raise Unavailable(f"{harness}: no isolated headless received-context adapter provisioned")
         argv = [str(Path(adapter).resolve()), binary, str(root)]
         execute(argv, root=root, env=env)
+        return self._read_adapter(root, sentinel, child_sentinel)
+
+    def _read_adapter(self, root, sentinel, child_sentinel):
         try:
             manifest = json.loads((root / "receipts.json").read_text())
             if set(manifest) != {"parents", "children"} or not manifest["parents"]:
@@ -212,7 +249,7 @@ def load_native(root, harness):
         if json.loads((root / "exit.json").read_text()) != {"status": 0}:
             raise ReceiptError("saved headless scenario did not exit successfully")
         metadata = json.loads((root / "run.json").read_text())
-        if set(metadata) != {"session_id", "sentinel", "child_sentinel", "tool_sentinel"}:
+        if set(metadata) != {"session_id", "sentinel", "child_sentinel", "tool_sentinel", "pretool_sentinel"}:
             raise ValueError
         if any(not isinstance(value, str) or not value for value in metadata.values()):
             raise ValueError
@@ -224,7 +261,7 @@ def load_native(root, harness):
         home = root / ".claude"
         candidates = list((home / "projects").rglob(f"{metadata['session_id']}.jsonl"))
         children = list((home / "projects").rglob("agent-*.jsonl"))
-        channel = "user"
+        channel = "hook"
     else:
         candidates, children = [], []
         for path in (root / ".codex" / "sessions").rglob("*.jsonl"):
@@ -236,27 +273,42 @@ def load_native(root, harness):
                 raise ReceiptError("invalid native session metadata") from None
             (children if isinstance(source, dict) and "subagent" in source else candidates).append(path)
         channel = "developer"
-    if len(candidates) != 1 or len(children) != 1:
-        raise ReceiptError("expected one parent and one child received transcript")
+    expected_children = 2 if harness == "codex" else 1
+    if len(candidates) != 1 or len(children) != expected_children:
+        raise ReceiptError(f"expected one parent and {expected_children} child received transcripts")
     parent = read(candidates[0], harness).calibrate(metadata["sentinel"], channel=channel)
-    # Current Codex encrypts NEW_TASK payloads. A native tool-result input
-    # with known file contents calibrates the child without decrypting it or
-    # treating an assistant's answer as proof of receipt.
-    child = read(children[0], harness).calibrate(metadata["tool_sentinel"], channel="tool", before_first=False)
-    return Scenario(parent, [child], metadata["sentinel"], metadata["child_sentinel"], root, [parent])
+    parent.calibrate(metadata["pretool_sentinel"], channel=channel, before_first=False)
+    # The child sentinel is emitted only by SubagentStart, never its brief.
+    observed = [read(path, harness) for path in children]
+    ordered = []
+    for suffix in (["", "-NOHOOK"] if harness == "codex" else [""]):
+        sentinel = metadata["child_sentinel"] + suffix
+        matches = [child for child in observed
+                   if sentinel in child.text(channel=channel, before_first=True).splitlines()]
+        if len(matches) != 1:
+            probe = "absent-routing-hook" if suffix else "hooked"
+            raise ReceiptError(f"{probe} child hook sentinel absent or duplicated in received context")
+        child = matches[0].calibrate(sentinel, channel=channel)
+        child.calibrate(metadata["tool_sentinel"], channel="tool", before_first=False)
+        ordered.append(child)
+    if len({id(child) for child in ordered}) != expected_children:
+        raise ReceiptError("child hook controls did not identify separate native children")
+    return Scenario(parent, ordered, metadata["sentinel"], metadata["child_sentinel"], root, [parent],
+                    metadata["pretool_sentinel"])
 
 
-def prepare(root, *, oversized):
+def prepare(root, *, oversized, bounded_probe=False):
     data = root / "data"
     log = data / "state" / "routing" / "events.jsonl"
     log.parent.mkdir(parents=True)
     (data / "config.json").write_text(json.dumps({
         "usage_accounts": [{"label": "Synthetic Codex", "harness": "codex"}],
         "routing_reset_check": False, "routing_start_budget_ms": 5000,
-        "routing_prompt_budget_ms": 1000,
+        "routing_prompt_budget_ms": 1000, "routing_prompt_chars": 2000,
     }))
     stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    rules = OVERSIZED_RULES if oversized else (ROUTE_OPENING + " synthetic rule " + ROUTE_END,)
+    rules = (OVERSIZED_RULES if oversized else OVERSIZED_RULES[:2] if bounded_probe
+             else (ROUTE_OPENING + " synthetic rule " + ROUTE_END,))
     rows = [{"type": "rule_add", "id": f"synthetic-rule-{i}", "seq": i + 1, "n": i + 1, "text": words,
              "written_at": stamp, "written_by": {"kind": "owner"}, "via": "app"}
             for i, words in enumerate(rules)]
