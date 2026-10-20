@@ -1,5 +1,6 @@
 """Approved section 4 matrix, measured only after sentinel calibration."""
 import json
+import re
 
 import pytest
 
@@ -44,7 +45,10 @@ def test_codex_child_receives_subagent_start_routing(received):
         raise ReceiptError("parent did not receive synthetic routing; cannot test child receipt")
     assert scenario.child_sentinel in child.text(channel="developer", before_first=True)
     assert ROUTE_OPENING in child.text(channel="developer", before_first=True)
-    assert scenario.sentinel not in child.text(), "parent SessionStart context leaked into child"
+    # The PreToolUse calibrator is "<sentinel>-PRETOOL" and fires on the child's own tool calls too;
+    # only the bare SessionStart token would mean the parent's start context reached the child.
+    leaked = re.search(re.escape(scenario.sentinel) + r"(?![-\w])", child.text())
+    assert not leaked, "parent SessionStart context leaked into child"
 
 
 @future("8b", "7b: bounded child block and missing-hook routing-free brief advisory")
