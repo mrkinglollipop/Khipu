@@ -187,6 +187,8 @@ def sanitize(events):
         for key, value in raw.items():
             if key in row:
                 continue
+            if key == "n" and value is None and raw["type"] in {"rule_add", "rule_edit"}:
+                continue
             if key in TEXT_FIELDS:
                 row[key] = words(value)
             elif key in {"account", "target"}:

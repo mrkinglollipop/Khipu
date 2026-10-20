@@ -154,6 +154,24 @@ def test_saved_pre_identity_view_refolds_without_changing_effective_state(mac):
     assert after["rules"][0]["entity"] == before["rules"][0]["entity"]
 
 
+def test_sanitizer_omits_a_provisional_rules_null_number(mac, monkeypatch):
+    from scripts.routing_fixture_sanitize import load_replay, sanitize
+
+    monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+    added = routing.add_rule("SYNTHETIC-OFFLINE-RULE", via="app")
+    routing.edit_rule(added["entity"], "SYNTHETIC-OFFLINE-EDIT", via="app")
+    raw = [json.loads(line) for line in routing.events_file().read_text().splitlines()]
+    assert raw[0]["n"] is None and raw[0]["number_pending"] is True
+    clean = sanitize(raw)
+    assert load_replay(clean) == clean
+    first, edit = clean["events"]
+    assert "n" not in first and "n" not in edit
+    assert first["number_pending"] is True
+    assert first["entity"] == edit["entity"] == edit["target"]
+    assert edit["base"] == first["id"]
+    assert "SYNTHETIC" not in json.dumps(clean)
+
+
 def test_new_identity_fields_are_sanitized_with_relationships_intact(mac):
     from scripts.routing_fixture_sanitize import FixtureError, load_replay, sanitize
 

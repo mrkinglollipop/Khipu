@@ -531,6 +531,95 @@ def test_a_rule_by_direction_is_named_in_the_block(world):
     assert "Added standing rule 1 by your direction in a Claude Code conversation" in push["text"]
 
 
+@pytest.mark.parametrize("offline", [False, True], ids=["numbered", "provisional"])
+@pytest.mark.parametrize("route,event_kind,verb", [
+    ("rule.add", "rule_add", "Added standing rule"),
+    ("rule.edit", "rule_edit", "Changed standing rule"),
+    ("rule.retire", "rule_retire", "Retired standing rule"),
+    ("priority.set", "priority_set", "Set the priority"),
+    ("hold.add", "hold", "Added a hold"),
+    ("hold.end", "hold_end", "Ended a hold"),
+    ("accounts.auto_track", "owner_change", "Changed whether new accounts are tracked"),
+])
+def test_direction_attribution_and_uuid_undo_survive_event_envelopes(world, monkeypatch, offline,
+                                                                  route, event_kind, verb):
+    from uuid import UUID
+
+    from khipu import config
+
+    monkeypatch.setattr(routing, "_hub_configured", lambda: offline)
+    entity = None
+    if route in {"rule.edit", "rule.retire"}:
+        entity = routing.add_rule("Original rule", via="app")["entity"]
+    if route == "hold.end":
+        entity = routing.add_hold("Original hold", reason="keep", scope="all", owner=True, via="app")["entity"]
+    auto_before = config.auto_track()
+    commands = {
+        "rule.add": ["route", "rule", "add", "Directed rule"],
+        "rule.edit": ["route", "rule", "edit", entity, "Directed edit"],
+        "rule.retire": ["route", "rule", "retire", entity],
+        "priority.set": ["route", "priority", "set", "Codex", "--expect", routing.priority_version()],
+        "hold.add": ["route", "hold", "Directed hold", "--all", "--reason", "keep"],
+        "hold.end": ["route", "hold", "end", entity],
+        "accounts.auto_track": ["accounts", "auto-track", "off" if auto_before else "on"],
+    }
+    marker = _marker()
+    turn = world.say("Make this routing change on my direction")
+    rc, out = world.run(commands[route], True)
+    assert rc == 0 and out["ok"], out
+    (line,) = _log()
+    assert out["owner_action"] == line["id"]
+    assert line["state"] == "applied" and not line.get("no_undo")
+    assert (line["action"], line["auth"], line["session"], line["turn"]) == (
+        route if route.startswith("accounts.") else "route." + route, "direction", OWNER, turn)
+    event = routing.read_events()[0][-1]
+    assert event["type"] == event_kind
+    assert event["written_by"] == {"kind": "owner"}
+    assert (event["via"], event["auth"], event["harness"]) == (
+        "direction", "direction", "claude_code")
+    assert {"id", "mac", "seq", "hlc", "op"} <= event.keys()
+    assert event["hlc"]["mac"] == event["mac"]
+    if event_kind != "owner_change":
+        entity = event["entity"]
+        UUID(entity.split("-", 1)[1])
+        assert "base" in event
+    else:
+        assert event["target"] == line["id"]
+    if route in {"rule.edit", "rule.retire", "hold.end"}:
+        assert event["target"] == line["target"] == entity
+    if route == "rule.add":
+        assert line["after"]["entity"] == owner_direction._added_rule(line) == entity
+        assert (out["n"] is None) == offline
+    push = routing.prompt_push(marker, budget=5.0)
+    assert verb in push["text"]
+    assert "by your direction in a Claude Code conversation" in push["text"]
+    assert "(undo in Settings)" in push["text"]
+
+    world.say("Undo that routing change")
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
+    assert rc == 0 and undone["ok"] and undone["undid"] == line["id"], undone
+    assert owner_direction.line_state(line["id"]) == "undone"
+    (undo_line,) = [row for row in owner_direction.read_log() if row.get("kind") == "undo"]
+    assert undo_line["undoes"] == line["id"] and undo_line["state"] == "pending"
+    assert owner_direction.line_state(undo_line["id"]) == "applied"
+    inverse = routing.read_events()[0][-1]
+    assert inverse["written_by"] == {"kind": "owner"} and inverse["via"] == "direction"
+    view = routing.read_view()
+    if route.startswith("rule."):
+        assert inverse["entity"] == inverse["target"] == entity
+        assert [r["text"] for r in view["rules"]] == ([] if route == "rule.add" else ["Original rule"])
+    elif route == "priority.set":
+        assert inverse["entity"] == entity and view["priority"] is None
+    elif route == "hold.add":
+        assert inverse["target"] == entity and view["holds"] == []
+    elif route == "hold.end":
+        assert [h["text"] for h in view["holds"]] == ["Original hold"]
+        UUID(view["holds"][0]["entity"].split("-", 1)[1])
+    else:
+        assert config.auto_track() == auto_before
+        assert inverse["target"] == undo_line["id"]
+
+
 def test_the_apps_owner_direction_argv_apply_at_once_and_only_from_the_app(world, khipu_app):
     """Settings, Owner actions: the argv the app's Rust commands build
     (``owner_direction_*_argv`` in lib.rs). The app is the owner, so a

@@ -1111,7 +1111,7 @@ def _before(want: dict):
 def _after(want: dict, result) -> Any:
     if not isinstance(result, dict):
         return None
-    keep = ("id", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts")
+    keep = ("id", "entity", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts")
     return {k: result[k] for k in keep if k in result} or None
 
 

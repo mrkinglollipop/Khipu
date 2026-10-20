@@ -2756,9 +2756,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         elif kind == "rule_add" and entity and isinstance(event.get("text"), str):
             pending = bool(event.get("pending"))
             rules[entity] = {"entity": entity,
-                                 "component": (f"rule:{event.get('hub_order', event.get('n'))}" if
-                                     (event.get("hub_order") is not None or not event.get("entity"))
-                                     and not event.get("number_pending") else f"rule:{entity}"),
+                                 "component": _rule_add_component(event),
                                  "revision": event_identity.revision(event),
                                  "owner_revision": "0" if pending else event_identity.revision(event),
                                  "number_pending": bool(event.get("number_pending") or
@@ -3579,6 +3577,13 @@ def _rule_component(rule: dict) -> str:
     return rule.get("component") or f"rule:{rule['n']}"
 
 
+def _rule_add_component(event: dict) -> str:
+    # Attribution and effective state must use the same delivery alias.
+    if (event.get("hub_order") is not None or not event.get("entity")) and not event.get("number_pending"):
+        return f"rule:{event.get('hub_order', event.get('n'))}"
+    return f"rule:{event_identity.entity(event)}"
+
+
 def _touched(kind: str | None, event: dict, info: dict) -> str | None:
     """The entity a written (non-evidence) line changes, as the view's
     ``effective`` names it, or None."""
@@ -3590,7 +3595,9 @@ def _touched(kind: str | None, event: dict, info: dict) -> str | None:
         return f"hold:{event.get('entity') or event['id']}"
     if kind == "hold_end" and info["target"]:
         return f"hold:{info['target']}"
-    if kind == "rule_add" or kind in event_identity.RULE_CHANGES:
+    if kind == "rule_add":
+        return _rule_add_component(event)
+    if kind in event_identity.RULE_CHANGES:
         if event.get("entity"):
             return f"rule:{event['entity']}"
         if isinstance(event.get("n"), int):
