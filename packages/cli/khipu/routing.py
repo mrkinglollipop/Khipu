@@ -967,8 +967,10 @@ def _resolve_account_key(name: str, known: list[dict] | None = None, *, conversa
         raise RouteError("name an account")
     if account_identity.LEGACY.fullmatch(raw) or account_identity.STABLE.fullmatch(raw):
         stable = _resolve_identity(raw, known)
-        key_ids, _forward, _aliases = account_identity.state(_in_write_order(read_events()[0]), known)
+        key_ids, _forward, _aliases = _identity_snapshot(known)[0]
         candidates = [a["key"] for a in known if key_ids.get(a["key"]) == stable]
+        if not candidates:
+            candidates = [key for key, ident in key_ids.items() if ident == stable]
         if len(set(candidates)) == 1:
             return candidates[0]
         raise RouteError("that account id has no unique login binding on this Mac")
@@ -1502,7 +1504,7 @@ def _checked(data: dict) -> dict | None:
     return out
 
 
-def _line_event(raw: bytes) -> dict | None:
+def _line_event(raw: bytes, *, identity_only: bool = False) -> dict | None:
     """One line of the log, decoded on its own from its bytes: the checked
     event (``_checked``), or None when the line is not UTF-8 (a write cut
     off inside a character), not JSON, nested too deeply to read, has no
@@ -1513,10 +1515,18 @@ def _line_event(raw: bytes) -> dict | None:
         return None
     if not isinstance(data, dict) or not isinstance(data.get("type"), str):
         return None
+    if identity_only and data["type"] not in _IDENTITY_KINDS:
+        # Keep ordering slots around old unsequenced identity events. The
+        # identity fold needs no evidence body or timestamp normalization.
+        seq = data.get("seq")
+        return {"type": "_identity_skip", **({"seq": seq} if isinstance(seq, int)
+                and not isinstance(seq, bool) and abs(seq) <= _WHOLE_MOST else {})}
     return _checked(data)
 
 
 ACCOUNT_TXN = "account_txn"
+_IDENTITY_KINDS = frozenset({ACCOUNT_TXN, "account_migration", "account_binding", "account_rename",
+                             "account_move", "account_note"})
 
 
 def _split_txns(events: list[dict], held: str | None = None) -> tuple[list[dict], list[tuple[dict, list[dict]]]]:
@@ -1568,7 +1578,7 @@ def account_txns_open() -> list[tuple[dict, list[dict]]]:
     return _split_txns(_read_all_events()[0])[1]
 
 
-def _read_all_events() -> tuple[list[dict], int]:
+def _read_all_events(*, identity_only: bool = False) -> tuple[list[dict], int]:
     """Every line Khipu could have written, transaction lines included, in
     write order with its place in that order (``_seq``), and how many lines
     could not be read (kept in the file, left out of the
@@ -1592,7 +1602,7 @@ def _read_all_events() -> tuple[list[dict], int]:
     for line in data.split(b"\n"):
         if not line.strip():
             continue
-        event = _line_event(line)
+        event = _line_event(line, identity_only=True) if identity_only else _line_event(line)
         if event is None:
             bad += 1
             continue
@@ -1712,7 +1722,7 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
 
     cfg["_accounts_version"] = accounts_version(config)
     seed = cfg.get("routing_rules_seed")
-    fingerprint = {"account_identity": 1, "events": events_stat, "config": config_stat, "seed": _stat(Path(seed)) if seed else None,
+    fingerprint = {"account_identity": 2, "events": events_stat, "config": config_stat, "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
     return fingerprint, cfg, _fold_accounts(config)
 
@@ -3671,6 +3681,7 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
     view = _assemble(prev, body, now, bad, fingerprint,
                      record=fingerprint["events"] is not None or status is not None)
     _save_view(view)
+    _identity_snapshot(known, events=events)
     return view
 
 
@@ -5770,6 +5781,36 @@ _WRITE_FIELDS = ("ok", "id", "state", "until", "basis", "ended", "version", "sav
 
 
 _ID_SALTS: dict[str, bytes] = {}
+_IDENTITY_CACHE: dict[tuple, tuple] = {}
+_MIGRATION_REVISION = None
+
+
+def _identity_revision() -> tuple:
+    from khipu.config import config_file
+
+    return (str(events_file()), tuple(_stat(events_file()) or ()),
+            tuple(_stat(config_file()) or ()))
+
+
+def _read_identity_events() -> list[dict]:
+    events = _read_all_events(identity_only=True)[0]
+    return [e for e in _split_txns(events, _held_list())[0] if e.get("type") in _IDENTITY_KINDS]
+
+
+def _identity_snapshot(known: list[dict], *, events: list[dict] | None = None) -> tuple:
+    """One identity/log walk per input revision, never per public row."""
+    revision = (_identity_revision(), tuple((a["key"], a["label"], a["harness"], a.get("home")) for a in known))
+    cached = _IDENTITY_CACHE.get(revision)
+    if cached is not None:
+        return cached
+    events = _in_write_order(_read_identity_events() if events is None else
+                             [e for e in events if e.get("type") in _IDENTITY_KINDS])
+    result = (account_identity.state(events, known), forwarding(events))
+    if len(_IDENTITY_CACHE) >= 8:
+        _IDENTITY_CACHE.clear()
+    _IDENTITY_CACHE[revision] = result
+    return result
+
 
 
 def _id_salt() -> bytes:
@@ -5818,12 +5859,29 @@ def migrate_accounts() -> None:
     """
     from khipu.config import mutate_config
 
+    global _MIGRATION_REVISION
+    revision = _identity_revision()
+    if revision == _MIGRATION_REVISION:
+        return
     with _lock():
         events, _bad = read_events()
         if not any(e.get("type") == "account_migration" and
                    (e.get("written_by") or {}).get("kind") in ("owner", "migration") for e in events):
             known = accounts()
             bindings = account_identity.unique_ids(known)
+            used = set(bindings.values())
+            for event in events:
+                for key in _event_keys(event):
+                    if "|" not in key or key in bindings:
+                        continue
+                    provider = key.partition("|")[0]
+                    account = {"harness": provider, "label": provider}
+                    ident = account_identity.allocate(account, used | {provider + ":main"})
+                    bindings[key] = ident
+                    used.add(ident)
+            for old, target in forwarding(events, {a["key"] for a in known}).items():
+                if target in bindings:
+                    bindings[old] = bindings[target]
             aliases = ({_legacy_account_id(k): v for k, v in bindings.items()}
                        if (routing_dir() / "id-salt").exists() else {})
             stamp = _stamp_locked(_now())[0]
@@ -5831,15 +5889,17 @@ def migrate_accounts() -> None:
                             "started_at": stamp["written_at"], "written_by": {"kind": "migration"},
                             "via": "migration", "aliases": aliases, "bindings": bindings})
         with mutate_config() as data:
-            data[account_identity.BINDINGS] = account_identity.local_bindings(_fold_accounts(data))
+            known = _fold_accounts(data)
+            ids = account_identity.state(_in_write_order(read_events()[0]), known)[0]
+            data[account_identity.BINDINGS] = account_identity.local_bindings(known, ids)
+        _MIGRATION_REVISION = _identity_revision()
 
 
 def _resolve_identity(raw: str, known: list[dict]) -> str:
-    events = _in_write_order(read_events()[0])
-    _keys, forwards, aliases = account_identity.state(events, known)
+    (_keys, forwards, aliases), _moves = _identity_snapshot(known)
     if account_identity.LEGACY.fullmatch(raw) and raw not in aliases and (routing_dir() / "id-salt").exists():
         migrate_accounts()
-        _keys, forwards, aliases = account_identity.state(_in_write_order(read_events()[0]), known)
+        _keys, forwards, aliases = _identity_snapshot(known)[0]
     if account_identity.LEGACY.fullmatch(raw):
         if raw not in aliases:
             raise RouteError("Khipu doesn't know that old account id; reread the account list")
@@ -5859,7 +5919,7 @@ def resolve_account(name: str, known: list[dict] | None = None, *, conversation:
     raw = str(name or "").strip()
     if account_identity.LEGACY.fullmatch(raw) or account_identity.STABLE.fullmatch(raw):
         stable = _resolve_identity(raw, known)
-        keys, _forwards, _aliases = account_identity.state(_in_write_order(read_events()[0]), known)
+        keys, _forwards, _aliases = _identity_snapshot(known)[0]
         if stable in keys.values():
             return stable
         raise RouteError("that account id has no login binding on this Mac")
@@ -5873,13 +5933,12 @@ def account_id(key: str) -> str:
     supplies a label; no folder name is ever turned into a public label.
     """
     if account_identity.STABLE.fullmatch(key):
-        return _resolve_identity(key, [])
+        return _resolve_identity(key, accounts())
     from khipu.config import load_config
 
     known = _fold_accounts(load_config())
-    events = _in_write_order(read_events()[0])
-    keys, forwards, _aliases = account_identity.state(events, known)
-    moved = _forwarded(key, forwarding(events))
+    (keys, forwards, _aliases), moves = _identity_snapshot(known)
+    moved = _forwarded(key, moves)
     if moved in keys:
         return account_identity.forwarded(keys[moved], forwards)
     return _legacy_account_id(key)

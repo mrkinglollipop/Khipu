@@ -842,20 +842,14 @@ def test_11a_old_local_log_folds_unchanged_and_is_never_rewritten(replay):
     one = replay.view()
     unknown = {"state": "unknown", "until": None, "basis": None, "scope": "all", "reason": None,
                "models": [], "disagreement": None, "reset_check": None}
-    effective = copy.deepcopy(one["effective"])
-    # Presentation labels and attribution phrasing are outside this contract.
-    effective.get("priority", {}).pop("by", None)
-    for key, item in effective.items():
-        if key.startswith("account:"):
-            item.pop("label", None)
-    assert effective == {
-        "account:claude|": dict(unknown, last_seen=None),
-        "account:codex|": dict(unknown, last_seen="open"),
-        "account:grok|": dict(unknown, last_seen="open"),
+    assert one["effective"] == {
+        "account:claude|": dict(unknown, label="Claude", last_seen=None),
+        "account:codex|": dict(unknown, label="Codex", last_seen="open"),
+        "account:grok|": dict(unknown, label="Grok", last_seen="open"),
         "hold:h-synthetic-grok": {"scope": "Grok", "reason": "keep", "until": "2026-10-21T12:00:00Z",
                                   "owner": False, "text": None},
         "priority": {"entries": [["Grok", "x" * 324, None, True]], "until": None, "pending": True,
-                     "replaced": None},
+                     "by": "a Claude Code conversation", "replaced": None},
     }
     assert path.read_bytes() == raw
     assert one["holds"][0]["id"] == "h-synthetic-grok"

@@ -472,18 +472,57 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
     _keys, forwards, _aliases = routing.account_identity.state(prior_events, known)
     for account in after:
         declared = routing.account_identity.stable_id(account["harness"], account["label"])
-        prior = old.get(account["key"])
+        source = next((was for was, target in moves if target == account["key"]), account["key"])
+        prior = old.get(source)
         unchanged = prior and declared == routing.account_identity.stable_id(prior["harness"], prior["label"])
+        if account["key"] in renames and declared in {_keys[k] for k in old if k != source} and not unchanged:
+            raise AccountsError("that label is another account's stable id; choose a new label", "name_taken",
+                                field="label")
         if declared in forwards and not unchanged:
             raise AccountsError("that label is an earlier account id; choose a new label", "name_taken",
                                 field="label")
     for key in renames:
         if key not in _keys:
             continue  # an ambiguous old label cannot forward either login
-        was = routing.account_identity.stable_id(old[key]["harness"], old[key]["label"])
-        new = routing.account_identity.stable_id(after_by_key[key]["harness"], after_by_key[key]["label"])
+        was = _keys[key]
+        new = routing.account_identity.declared_id(after_by_key[key])
+        if new is None:
+            new = routing.account_identity.allocate(after_by_key[key], set(_keys.values()) | set(forwards))
         if was != new:
             events.append({"type": "account_rename", "account": was, "to": new})
+    if owner:
+        # Repairing a legacy slug collision leaves the remaining label
+        # unambiguous; retain its formerly listed opaque id as a forward.
+        for account in after:
+            key = account["key"]
+            prior = old.get(key)
+            if prior is None or key in renames:
+                continue
+            declared = routing.account_identity.declared_id(account)
+            old_declared = routing.account_identity.stable_id(prior["harness"], prior["label"])
+            clashes = sum(routing.account_identity.stable_id(a["harness"], a["label"]) == old_declared for a in known)
+            if clashes > 1 and declared and _keys.get(key) != declared:
+                events.append({"type": "account_rename", "account": _keys[key], "to": declared})
+    # Pin the old list before allocating new logins. A stop plus track is
+    # not a move, even when the caller reuses exactly the same label.
+    bindings = [{"type": "account_binding", "account": key, "to": ident}
+                for key, ident in _keys.items() if key in old]
+    for binding in bindings:
+        prior = old[binding["account"]]
+        if routing.account_identity.declared_id(prior) is None:
+            binding["target"] = routing.account_identity.stable_id(prior["harness"], prior["label"])
+    preview = [*prior_events, *[dict(e, written_by={"kind": "owner"}) for e in bindings + events]]
+    after_ids = routing.account_identity.state(preview, after)[0]
+    used = set(after_ids.values()) | set(_keys.values()) | set(forwards)
+    if confirmed is None:
+        for key in tracks:
+            if key in _keys:
+                after_ids[key] = routing.account_identity.allocate(after_by_key[key], used)
+                used.add(after_ids[key])
+    bindings += [{"type": "account_binding", "account": a["key"], "to": after_ids[a["key"]],
+                  "state": "tracked" if a["key"] in tracks and confirmed is None else "bound"}
+                 for a in after]
+    events = bindings + events
     notes = [{"type": "account_note", "account": k, "state": "renamed", "text": old[k]["label"]}
              for k in renames if confirmed is None]
     done: dict = {"priority": None, "pause": None}
@@ -503,7 +542,7 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
     if not owner:
         held = dict(request, prior=stored, prior_none=data.get("usage_accounts_none"))
     _store(data, parsed, none=none, unset=unset, request=held)
-    data[routing.account_identity.BINDINGS] = routing.account_identity.local_bindings(after)
+    data[routing.account_identity.BINDINGS] = routing.account_identity.local_bindings(after, after_ids)
     version = config.accounts_version(data)
     if owner:
         lines = routing.owner_lines(events, via)

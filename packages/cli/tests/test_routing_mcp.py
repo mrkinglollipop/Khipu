@@ -490,7 +490,8 @@ def test_no_khipu_route_answer_carries_a_path_on_this_mac(home):
             for path in forbidden:
                 assert path not in text, (path, text)
     third = next(a for a in first["accounts"] if a["label"] == "Claude third")
-    assert "home" not in third and "key" not in third and third["id"] == "claude:third"
+    assert "home" not in third and "key" not in third and third["id"] == "claude:account-2"
+    assert "third" not in third["id"]
     assert all("path" not in r for r in first["sources"]["runners"])
     assert "path" not in first["sources"]["table"]
     assert first["holds"][-1]["scope"]["account"] == third["id"]
@@ -1015,7 +1016,8 @@ def test_an_account_id_cannot_be_computed_from_a_guessed_login_folder(home):
 
     key = "claude|/logins/claude-second"
     listed = routing.account_id(key)
-    assert listed == routing.account_id(key) == "claude:second"
+    assert listed == routing.account_id(key) == "claude:account-1"
+    assert "second" not in listed
     assert routing.resolve_account(listed) == listed
     assert routing.account_id("claude|/logins/unconfigured-guess") != listed
     legacy = routing._legacy_account_id(key)
