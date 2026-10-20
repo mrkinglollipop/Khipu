@@ -679,14 +679,13 @@ def test_6_pull_protocol(replay, monkeypatch, protocol):
 
 
 @pytest.mark.parametrize("providers,lane,expected,candidates", [
-    ([{"id": "glm", "accounts": ["glm:main"]}], "glm", "glm:main", []),
-    ([{"id": "deepseek", "accounts": ["deepseek:main"]}], "deepseek", "deepseek:main", []),
-    ([{"id": "glm", "accounts": ["glm:one", "glm:two"]}], "glm", None, ["glm:one", "glm:two"]),
-    ([{"id": "glm", "accounts": ["glm:main"], "lane_names": ["shared"]},
-      {"id": "deepseek", "accounts": ["deepseek:main"], "lane_names": ["shared"]}],
+    ([{"id": "glm", "family": "Zhipu", "accounts": ["glm:main"]}], "glm", "glm:main", []),
+    ([{"id": "deepseek", "family": "DeepSeek", "accounts": ["deepseek:main"]}], "deepseek", "deepseek:main", []),
+    ([{"id": "glm", "family": "Zhipu", "accounts": ["glm:one", "glm:two"]}], "glm", None, ["glm:one", "glm:two"]),
+    ([{"id": "glm", "family": "Zhipu", "accounts": ["glm:main"], "lane_names": ["shared"]},
+      {"id": "deepseek", "family": "DeepSeek", "accounts": ["deepseek:main"], "lane_names": ["shared"]}],
      "shared", None, ["glm:main", "deepseek:main"]),
 ], ids=["glm", "deepseek", "two-accounts", "name-claimed-twice"])
-@future("9a", "provider facts match unambiguous lane names and preserve ambiguity candidates")
 def test_8_provider_catalog_matches_by_name(replay, providers, lane, expected, candidates):
     rows = [replay.event("provider_set", i + 1, **p) for i, p in enumerate(providers)]
     rows.append(replay.event("evidence", 10, runner="synthetic-runner", lane=lane, state="limited", source="runner"))

@@ -234,7 +234,20 @@ export type PlanFact = {
   reset_passed?: boolean;
 };
 
+export type RouteProvider = {
+  id: string;
+  label: string;
+  family: string;
+  login?: string;
+  probe?: string;
+  lane_names?: string[];
+  models_allowed?: string[];
+  models_never?: string[];
+  use?: string;
+};
+
 export type RouteView = {
+  definitions?: { providers?: Record<string, RouteProvider>; accounts?: Record<string, unknown> };
   record?: boolean;
   version?: number;
   /** The priority's version, also when none is set (`version_moved` guard). */

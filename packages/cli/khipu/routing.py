@@ -989,6 +989,8 @@ def _definition_accounts(known: list[dict], events: list[dict] | None = None, co
         account = next((a for a in out if ids.get(a["key"]) == current), None)
         if account is None:
             binding = bindings.get(current) or {}
+            if binding.get("harness", value["provider"]) != value["provider"]:
+                binding = {}
             home = binding.get("home")
             key = f"{value['provider']}|{home or ''}" if binding else current
             account = {"key": key, "home": home}
@@ -1653,17 +1655,36 @@ def _checked(data: dict) -> dict | None:
         return None
     if "expires_at" in data and data["expires_at"] is None:
         out["expires_at"] = None
+    if "declaration" in data:
+        declaration = data["declaration"]
+        if not isinstance(declaration, dict) or any(
+                not isinstance(v, (str, bool)) and v is not None for v in declaration.values()):
+            return None
+        out["declaration"] = {k: v for k, v in declaration.items() if k in {
+            "kind", "provider", "model", "account", "budget_account", "login_account", "identity_invalid"}}
     if "holds" in data:
         choices = data["holds"]
         if not isinstance(choices, dict) or not all(isinstance(k, str) and v in ("end", "keep")
                                                     for k, v in choices.items()):
             return None
         out["holds"] = dict(choices)
-    if out["type"] == "definition_set":
+    if out["type"] in ("definition_set", "definition_remove"):
         value = entry_model.checked_definition(out.get("definition"), data.get("value"))
         if value is None:
             return None
         out["value"] = value
+    if out["type"] == "provider_set":
+        from khipu.routing_providers import FIELDS
+
+        value = {k: v for k, v in data.items() if k in FIELDS}
+        value.setdefault("label", data.get("id"))
+        checked = entry_model.checked_definition("provider", value)
+        refs = data.get("accounts", [])
+        if checked is None or not isinstance(refs, list) or any(
+                not isinstance(a, str) or not account_identity.STABLE.fullmatch(a)
+                or a.partition(":")[0] != checked["id"] for a in refs):
+            return None
+        out.update(checked, accounts=list(refs))
     if "observation_scope" in data:
         locality = data["observation_scope"]
         if not isinstance(locality, dict) or locality.get("kind") not in ("machine", "account_quota"):
@@ -2002,6 +2023,7 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     for runner, lanes in definitions["lane_maps"].items():
         lane_map.setdefault(runner, {}).update(lanes)
     cfg["routing_lane_map"] = lane_map
+    cfg["_providers"] = definitions["providers"]
     known = _definition_accounts(_fold_accounts(config), config=config, definitions=definitions, entry_cache=entry_cache)
     # routing_sources is read entry by entry (one bad entry costs only itself);
     # usage_accounts says which usage cache rows are read at all.
@@ -2021,7 +2043,7 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     cfg["_accounts_version"] = accounts_version(config)
     seed = cfg.get("routing_rules_seed")
     cfg["_mac"] = mac
-    fingerprint = {"entry_model": 1, "account_identity": 2, "payer_identity": 1, "events": events_stat, "config": config_stat,
+    fingerprint = {"entry_model": 1, "account_identity": 2, "payer_identity": 3, "events": events_stat, "config": config_stat,
                    "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
     return fingerprint, cfg, known
@@ -2039,7 +2061,7 @@ def _sources(cfg: dict, now: datetime, prev: dict | None) -> tuple[list[dict], d
 
 
 def _evidence_account(event: dict, lane_map: dict, known: list[dict],
-                      forward: dict | None = None) -> str | None:
+                      forward: dict | None = None, providers: dict | None = None) -> str | None:
     """The account an evidence entry is about: its own, or its runner's lane
     through ``routing_lane_map``; None when the lane isn't in the map or
     names a label two accounts carry (never guessed). A key a login-folder
@@ -2051,36 +2073,129 @@ def _evidence_account(event: dict, lane_map: dict, known: list[dict],
         found = key or None
     else:
         found = resolve_lane(event["runner"], event.get("lane") or "", lane_map, known,
-                             event.get("declaration"))["key"]
+                             event.get("declaration"), providers)["key"]
     return _forwarded(found, forward) if found and forward else found
 
 
-def resolve_lane(runner: str, lane: str, lane_map: dict, known: list[dict], spec: dict | None = None) -> dict:
-    """One payer resolver for source health, evidence and conversation reports."""
+def _provider_id(value) -> str:
+    value = str(value or "").casefold()
+    return "grok" if value in ("grokcheck", "cursor") else value
+
+
+def _lane_home(home) -> str | None:
+    if not isinstance(home, str) or not home.strip() or not (home.startswith("/") or home.startswith("~/")):
+        return None
+    return os.path.abspath(os.path.expanduser(home))
+
+
+def _model_providers(spec: dict, catalog: dict | None = None) -> set[str]:
+    from khipu import routing_sources
+
+    # Cursor's payer is the unified xAI plan; its model family stays independent.
+    if _provider_id(spec.get("kind")) == "grok" and str(spec.get("kind")).casefold() == "cursor":
+        return {"grok"}
+    family = routing_sources.model_family(spec.get("model"))
+    if family == "unknown":
+        return set()
+    matches = {_provider_id(p) for p, fact in (catalog or {}).items() if fact.get("family") == family}
+    defaults = {"Zhipu": "glm", "DeepSeek": "deepseek", "Anthropic": "claude", "OpenAI": "codex",
+                "xAI": "grok", "Meta": "muse", "Google": "antigravity"}
+    return matches or {defaults[family]}
+
+
+def login_binding(spec: dict, known: list[dict]) -> dict:
+    """Resolve local home fields immediately; raw paths never enter a cache."""
+    homes = [spec[k] for k in ("home", "login_home") if k in spec]
+    if not homes:
+        return {}
+    providers = {_provider_id(spec["provider"])} if spec.get("provider") else _model_providers(spec)
+    targets = []
+    for home in homes:
+        matches = [a["key"] for a in known if _lane_home(home) is not None
+                   and _lane_home(a.get("home") or (f"~/.{a['harness']}" if "|" in a["key"]
+                                  and a["harness"] in {"claude", "codex", "grok"} else None)) == _lane_home(home)
+                   and (not providers or _provider_id(a["harness"]) in providers)]
+        targets.append(matches[0] if len(matches) == 1 else None)
+    valid = bool(targets[0]) and all(t == targets[0] for t in targets)
+    return {"login_account": targets[0] if valid else None, "identity_invalid": not valid}
+
+
+def resolve_lane(runner: str, lane: str, lane_map: dict, known: list[dict], spec: dict | None = None,
+                 providers: dict | None = None, identity: dict | None = None) -> dict:
+    """One payer resolver: override, declaration, local binding, then name.
+
+    Only a separately witnessed heartbeat or captured job attachment confirms
+    a declaration. A provider's quota reading carries no launcher identity.
+    """
     spec = spec if isinstance(spec, dict) else {}
+    catalog = providers or {}
     keys = {a["key"] for a in known}
+    explicit_providers = {_provider_id(spec["provider"])} if spec.get("provider") else set()
+    model_providers = _model_providers(spec, catalog)
+    declared_providers = explicit_providers or model_providers
+    if not declared_providers and not any(k in spec for k in ("account", "budget_account", "home", "login_home", "login_account")):
+        declared_providers = {_provider_id(spec["kind"])} if spec.get("kind") else set()
+    candidates = [a["key"] for a in known if _provider_id(a["harness"]) in declared_providers]
+    declared = [spec[k] for k in ("account", "budget_account") if k in spec]
+    targets = [_lane_target(value, known, provider_word=True) if isinstance(value, str) else None for value in declared]
+    declared_candidates = [a["key"] for value in declared if isinstance(value, str)
+                           for a in _label_matches(value, known)] + [t for t in targets if t in keys]
+    declared_candidates += [a["key"] for value in declared if isinstance(value, str) for a in known
+                            if _provider_id(a["harness"]) == _provider_id(value)]
+
+    def result(key=None, by=None, reason=None, choices=None):
+        confirmation = None
+        if key and by in ("declaration", "login_home", "provider"):
+            confirmation = "claimed"
+            if isinstance(identity, dict) and identity.get("source") in ("heartbeat", "job_attachment"):
+                binding = login_binding(identity, known) if any(k in identity for k in ("home", "login_home")) else identity
+                if not binding.get("identity_invalid") and binding.get("login_account") == key and key in keys:
+                    confirmation = "confirmed"
+                elif binding.get("identity_invalid") or binding.get("login_account") in keys:
+                    choices = list(choices or candidates + declared_candidates)
+                    if binding.get("login_account") in keys:
+                        choices.append(binding["login_account"])
+                    return {"key": None, "matched_by": None, "candidates": sorted(set(choices)),
+                            "identity_state": None, "reason": "launcher evidence contradicts the declaration",
+                            "field_to_add": "budget_account"}
+        return {"key": key, "matched_by": by, "candidates": sorted(set(
+                    candidates + declared_candidates if choices is None else choices)), "identity_state": confirmation,
+                "reason": reason, "field_to_add": None if key else "budget_account"}
+
     override = (lane_map.get(runner) or {}).get(lane)
     if override:
         key = _lane_target(override, known)
-        return {"key": key if key in keys else None, "matched_by": "override" if key in keys else None,
-                "candidates": [a["key"] for a in _label_matches(override, known)]}
-    if spec.get("identity_invalid"):
-        return {"key": None, "matched_by": None, "candidates": []}
-    providers = {str(spec[k]).casefold() for k in ("kind", "provider") if spec.get(k)}
-    # Cursor is a transport on the same xAI subscription as Grok Build.
-    providers = {"grok" if p in ("grokcheck", "cursor") else p for p in providers}
-    candidates = [a["key"] for a in known if a["harness"] in providers]
-    declared = [spec[k] for k in ("account", "budget_account") if k in spec]
-    if len(providers) > 1:
-        return {"key": None, "matched_by": None, "candidates": candidates}
+        return result(key if key in keys else None, "override" if key in keys else None,
+                      None if key in keys else "override has no unique current binding",
+                      [a["key"] for a in _label_matches(str(override), known)])
+    local = login_binding(spec, known)
+    if spec.get("identity_invalid") or local.get("identity_invalid"):
+        return result(reason="invalid or stale login binding")
+    if (explicit_providers and model_providers and not explicit_providers <= model_providers):
+        return result(reason="explicit provider conflicts with model provider")
+    if len(declared_providers) > 1:
+        return result(reason="model family has no unique provider")
+    login = local.get("login_account", spec.get("login_account"))
     if declared:
-        targets = [_lane_target(value, known) for value in declared]
         key = targets[0]
-        valid = key in keys and all(t == key for t in targets) and (not providers or key in candidates)
-        return {"key": key if valid else None, "matched_by": "declaration" if valid else None,
-                "candidates": sorted(set(candidates + [t for t in targets if t in keys]))}
-    key = candidates[0] if len(candidates) == 1 else None
-    return {"key": key, "matched_by": "provider" if key else None, "candidates": candidates}
+        valid = key in keys and all(t == key for t in targets) and (
+            not declared_providers or key in candidates) and (login is None or login == key)
+        return result(key if valid else None, "declaration" if valid else None,
+                      None if valid else "account, provider or login binding conflict",
+                      candidates + declared_candidates + ([login] if login in keys else []))
+    if login is not None:
+        valid = login in keys and (not declared_providers or login in candidates)
+        return result(login if valid else None, "login_home" if valid else None,
+                      None if valid else "login binding conflicts with model or provider")
+    # Existing provider-only declarations retain their established match label.
+    if declared_providers:
+        key = candidates[0] if len(candidates) == 1 else None
+        return result(key, "provider" if key else None, None if key else "provider has no unique account")
+    names = [p for p, fact in catalog.items() if lane.casefold() in
+             {p.casefold(), *(n.casefold() for n in fact.get("lane_names", []))}]
+    choices = [a["key"] for a in known if _provider_id(a["harness"]) in {_provider_id(p) for p in names}]
+    key = choices[0] if len(names) == 1 and len(choices) == 1 else None
+    return result(key, "name" if key else None, None if key else "name has no unique provider account", choices)
 
 
 def _label_matches(target: str, known: list[dict]) -> list[dict]:
@@ -2088,19 +2203,30 @@ def _label_matches(target: str, known: list[dict]) -> list[dict]:
     return [a for a in known if a["label"].casefold() == raw]
 
 
-def _lane_target(target: str, known: list[dict]) -> str | None:
+def _lane_target(target: str, known: list[dict], *, provider_word: bool = False) -> str | None:
     """The account a lane-map entry names: a key as it is; a label only when
     exactly one known account carries it (a hand-edited list can hold two);
-    else an account id or a bare CLI word as ``resolve_account`` takes them."""
+    else an account id or a bare CLI word. A declaration's provider word
+    requires a unique provider account; an owner map can name a unique label."""
     raw = str(target or "").strip()
+    if raw in {a["key"] for a in known}:
+        return raw
+    stable = [a["key"] for a in known if a.get("definition_id") == raw or a.get("stable_id") == raw]
+    if len(stable) == 1:
+        return stable[0]
     if not raw:
         return None
+    provider_matches = [a["key"] for a in known if _provider_id(a["harness"]) == _provider_id(raw)]
+    if provider_word and provider_matches:
+        return provider_matches[0] if len(provider_matches) == 1 else None
     if "|" not in raw:
         matches = _label_matches(raw, known)
         if len(matches) == 1:
             return matches[0]["key"]
         if matches:
             return None
+    if provider_matches:
+        return provider_matches[0] if len(provider_matches) == 1 else None
     return _resolve_quiet(raw, known)
 
 
@@ -2333,7 +2459,7 @@ def _evidence(event: dict, cfg: dict) -> dict | None:
             "evidence": event.get("evidence"), "reason": event.get("reason"),
             "model": event.get("model"), "family": event.get("family"), "transport": event.get("transport"),
             "message_time": bool(event.get("message_time")), "until_default": until_default,
-            **{k: event[k] for k in ("expires_at", "observation_scope", "observed", "session_logs", "silent", "reset_at", "unmatched", "source_id")
+            **{k: event[k] for k in ("expires_at", "observation_scope", "observed", "session_logs", "silent", "reset_at", "unmatched", "source_id", "declaration")
                if k in event}, "turn": bool(event.get("observed_turn"))}
 
 
@@ -2840,6 +2966,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             stable_keys[ident] = key
         else:
             account.update(label=value["label"], harness=value["provider"], label_source="owner")
+    known = [dict(a, stable_id=key_ids.get(a["key"], a.get("definition_id"))) for a in known]
     historical = {old: stable_keys.get(account_identity.forwarded(ident, stable_forwards), ident)
                   for old, (ident, _start) in aliases.items()}
     mapping = {**stable_keys, **{old: stable_keys.get(new, new) for old, new in stable_forwards.items()},
@@ -3127,7 +3254,11 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     for item in evidence:
         cut = lane_cuts.get((item.get("runner") or "", item.get("lane") or ""))
         before_cut = cut is not None and not item.get("account") and _before_cut(item, cut)
-        key = None if before_cut else _evidence_account(item, lane_map, known, forward)
+        match = resolve_lane(item["runner"], item.get("lane") or "", lane_map, known,
+                             item.get("declaration"), definitions["providers"]) if item.get("runner") else None
+        key = None if before_cut else _evidence_account(item, lane_map, known, forward, definitions["providers"])
+        if item.get("runner"):
+            item["lane_match"] = match
         if not key:
             # A conversation's runner and lane count only as a pair the lane
             # map names (the owner's words); never its own text as a lane.
@@ -3136,6 +3267,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 unmatched_raw.append(item)
             continue
         item["account"] = key
+        if match and match["key"] == key:
+            by_key[key].update(matched_by=match["matched_by"])
         per_account.setdefault(key, []).append(item)
     known_keys = {a["key"] for a in known}
 
@@ -3180,6 +3313,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # With "Read no accounts" no default login is read either.
     none = bool(cfg.get("_accounts_none"))
     for entry in entries:
+        origin = by_key[entry["key"]]
+        if origin.get("matched_by"):
+            entry["matched_by"] = origin["matched_by"]
         entry["configured"] = (entry["key"] in known_keys if known_keys else not entry.get("home") and not none) \
             and "|" in entry["key"]
         marked = notes.get(entry["key"])
@@ -3207,7 +3343,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         if slot not in unmatched or _k(item) > _k(unmatched[slot]):
             unmatched[slot] = item
     lanes = [{"runner": r, "lane": lane, "state": e["state"], "until": _iso(e["until"]), "basis": e["basis"],
-              "at": _iso(e["at"]), "written_by": e["written_by"], "id": e["id"]}
+              "at": _iso(e["at"]), "written_by": e["written_by"], "id": e["id"],
+              **{k: e.get("lane_match", {}).get(k) for k in ("candidates", "reason", "field_to_add")}}
              for (r, lane), e in sorted(unmatched.items())
              if e["state"] == LIMITED and e["until"] and e["until"] > now]
 
@@ -4253,7 +4390,7 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
         for item in extra:
             cut = cuts.get((item.get("runner"), item.get("lane")))
             key = None if not item.get("account") and cut and _before_cut(item, cut) else _evidence_account(
-                item, cfg.get("routing_lane_map") or {}, known, forward)
+                item, cfg.get("routing_lane_map") or {}, known, forward, cfg.get("_providers"))
             matched.append(dict(item, account=key))
         batch = entry_model.source_events(matched, ordered, cfg, _mac_locked(), ids)
         for runner in (_status or {}).get("runners") or []:
@@ -4651,7 +4788,12 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
         view = read_view()
         kept = ((view.get("source_cache") or {}).get("runners") or {}).get(runner) or {}
         spec = (((kept.get("config") or {}).get("data") or {}).get("lanes") or {}).get(lane) or {}
-        matched = resolve_lane(runner, lane, lane_map, accounts(), spec)
+        from khipu.routing_sources import lane_witnesses
+
+        known = accounts()
+        status = next((s for s in (view.get("sources") or {}).get("runners", []) if s["name"] == runner), {})
+        identity = lane_witnesses(kept, known, now, status).get(lane)
+        matched = resolve_lane(runner, lane, lane_map, known, spec, cfg.get("_providers"), identity)
         if not matched["key"] and not _lane_mapped(runner, lane, lane_map):
             runners = _clip(", ".join(sorted(lane_map)), 300) or "none"
             raise RouteError("Khipu doesn't know that runner's lane; a conversation can report on a lane only "
@@ -5209,6 +5351,7 @@ def set_definition(definition: str, value: dict, *, via: str) -> dict:
     checked = entry_model.checked_definition(definition, value)
     if checked is None:
         raise RouteError("a definition takes provider (id, label, family), account (id, label, provider, family), "
+                         "with login, probe, host, lane_names, models_allowed, models_never and use, "
                          "or lane_map (runner, lane, account); login homes and runner folders are local bindings")
     return _owner_write({"type": "definition_set", "definition": definition, "value": checked}, via)
 
@@ -6109,6 +6252,11 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
         item = next((u for u in view["unmatched"] if u["runner"] == runner and u["lane"] == lane), None)
         return lane_line(item, now, relative=False) if item else f"{runner} lane {lane}: its limit is over"
     sources = view.get("sources") or {}
+    if entity == "definition:providers":
+        from khipu.routing_providers import line as provider_line
+
+        return "Provider facts: " + "; ".join(provider_line(p) or p["label"]
+                    for p in (view.get("definitions") or {}).get("providers", {}).values())
     if kind == "runner":
         item = next((r for r in sources.get("runners") or [] if r["name"] == ident), None)
         return runner_line(item, now) if item else f"The {ident} job runner folder is no longer read"
@@ -6210,6 +6358,10 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         if view["priority"].get("pending"):
             theirs.append((len(whole), line, _priority_pointers(view["priority"], view, facts=facts), "priority"))
         whole.append(line)
+    from khipu.routing_providers import line as provider_line
+
+    provider_lines = [line for p in (view.get("definitions") or {}).get("providers", {}).values()
+                      if (line := provider_line(p))]
     whole = _for_agents(whole, view)
     rules_note_chars = sum(len(line) + 1 for i, line in enumerate(whole) if i not in {t[0] for t in theirs})
     requests = [
@@ -6247,7 +6399,7 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
             accounts_in_order.sort(key=lambda e: -_pace_of(facts.get(e["key"])))
         fixed = _for_agents(fixed, view)
         lines += fixed
-        items: list[tuple[str, str, str]] = []  # (kind, line, at) in display order
+        items: list[tuple[str, str, str]] = [("provider", line, "") for line in provider_lines]
         items += [("account", _clip(runner_line(r, now), width), "") for r in sources.get("runners") or []
                   if r.get("silent") or r.get("unreadable")]
         for entry in accounts_in_order:
@@ -6441,6 +6593,11 @@ def doctor_block(now: datetime | None = None) -> dict:
 
     cache = view.get("source_cache") or {}
     checks = routing_sources.rule_checks(cache, view.get("rules") or [])
+    definitions = view.get("definitions") or {}
+    lane_map = {runner: dict(lanes) for runner, lanes in cfg["routing_lane_map"].items()}
+    for runner, lanes in definitions.get("lane_maps", {}).items():
+        lane_map.setdefault(runner, {}).update(lanes)
+    checks += routing_sources.provider_checks(cache, definitions.get("providers", {}), accounts(), lane_map)
     warnings += [c["text"] for c in checks if c["status"] == "broken"]
     warnings += _launch_warnings(view, routing_sources.launches(cache), cfg, now)
     budget = prompt_budget_block(cfg)
@@ -6640,7 +6797,7 @@ _VIEW_FIELDS = ("schema", "epoch", "version", "folded_at", "checked_at", "record
                 "valid_until", "outside_app", "unchecked", "seed_error")
 _AUTHOR_PUBLIC = ("kind", "harness", "project", "session", "name")
 _ACCOUNT_FIELDS = ("label", "harness", "state", "until", "basis", "scope", "reason", "checkable", "confirmed_at",
-                   "since", "silent", "configured")
+                   "since", "silent", "configured", "matched_by")
 _WITNESS_FIELDS = ("id", "source", "at", "evidence", "message_time", "cleared", "observed", "turn",
                    "until_default", "model", "family", "transport")
 _REPORT_FIELDS = ("id", "state", "source", "at", "since", "until")
@@ -6650,7 +6807,7 @@ _HOLD_FIELDS = ("id", "entity", "revision", "scope_label", "reason", "text", "un
 _RULE_FIELDS = ("entity", "revision", "owner_revision", "number_pending", "n", "text", "source", "date",
                 "seeded", "confirmed", "pending", "pending_kind",
                 "pending_by", "prior_text", "via", "at")
-_LANE_FIELDS = ("runner", "lane", "state", "until", "basis", "at", "id")
+_LANE_FIELDS = ("runner", "lane", "state", "until", "basis", "at", "id", "reason", "field_to_add")
 _RUNNER_FIELDS = ("name", "heartbeat_at", "interval", "silent", "silent_deadline", "unreadable",
                   "unreadable_since", "lanes", "unmatched_lanes", "lane_matches")
 _TABLE_FIELDS = ("hash", "stamped_at", "changed_at", "error")
@@ -7039,11 +7196,14 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     out["priority"] = _public_priority(view, now, facts)
     out["accounts"] = [dict(_public_account(e, now), plan=_public_fact(facts.get(e["key"])))
                        for e in view["accounts"] if key is None or e["key"] == key]
+    out["providers"] = list((view.get("definitions") or {}).get("providers", {}).values())
     out["sources"] = _public_sources(view.get("sources"))
     out["holds"] = [_public_hold(h, now) for h in view.get("holds") or []
                     if key is None or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
     if key is None:
-        out["unmatched"] = [dict(_pick(u, _LANE_FIELDS), line=lane_line(u, now)) for u in view.get("unmatched") or []]
+        out["unmatched"] = [dict(_pick(u, _LANE_FIELDS), line=lane_line(u, now),
+                                 candidates=[account_id(k) for k in u.get("candidates") or []])
+                            for u in view.get("unmatched") or []]
         out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
                                if r.get("silent") or r.get("unreadable")]
     out["about"] = ABOUT
@@ -7334,8 +7494,8 @@ def prompt_imports() -> None:
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
     from khipu import (  # noqa: F401
-        agent_view, claude_homes, config, discover, features, paths, redact, routing_sources, session_capture,
-        usage)
+        agent_view, claude_homes, config, discover, features, paths, redact, routing_providers, routing_sources,
+        session_capture, usage)
 
 
 def prompt_budget() -> float:
@@ -8084,8 +8244,12 @@ def _print_sources(out: dict, now: datetime) -> None:
         for lane, match in (runner.get("lane_matches") or {}).items():
             if match.get("account"):
                 print(f"  {lane}: {match['account']}, matched by {match['matched_by']}")
+                if match.get("identity_state"):
+                    print(f"    identity: {match['identity_state']}")
             elif match.get("candidates"):
                 print(f"  {lane}: not matched; candidates: " + ", ".join(match["candidates"]))
+            if not match.get("account"):
+                print(f"    {match.get('reason') or 'unmatched'}; add {match.get('field_to_add') or 'budget_account'}")
         if runner.get("unmatched_lanes"):
             print("  lanes not matched to an account: " + ", ".join(runner["unmatched_lanes"]))
     for name in out["refused"]:
@@ -8216,6 +8380,17 @@ def _route_intent(cmd: str, args) -> dict | None:
     and the owner-actions log (``owner_direction.ACTIONS``)."""
     from khipu import owner_direction
 
+    if cmd == "definition":
+        try:
+            value = json.loads(args.value)
+        except (ValueError, TypeError):
+            raise RouteError("--value must be a JSON definition") from None
+        value = entry_model.checked_definition(args.definition, value)
+        if value is None:
+            raise RouteError("invalid definition; provider facts require id, label and family")
+        target = value.get("id") or value["runner"] + ":" + value["lane"]
+        return owner_direction.intent("route.definition.set", target,
+                                      facts={"definition": args.definition, "value": value})
     if cmd in ("pause", "lift", "clear"):
         facts = {"report": args.report} if cmd == "clear" and getattr(args, "report", None) else None
         return owner_direction.intent(f"route.{cmd}", _resolve_account_key(args.account), facts=facts)
@@ -8369,12 +8544,15 @@ def run_cli(args) -> int:
                 raise RouteError("--at-owner-request is only for rule add or edit")
             _print_json(out)
             return 0
-        via = _owner_via(args, _intent_or_none(_route_intent, cmd, args))
+        want = _route_intent(cmd, args) if cmd == "definition" else _intent_or_none(_route_intent, cmd, args)
+        via = _owner_via(args, want)
         if via is None:
             _print_json({"ok": False, "error": _REFUSED})
             return 2
         now = _now()
-        if cmd == "pause":
+        if cmd == "definition":
+            out = set_definition(args.definition, want["facts"]["value"], via=via)
+        elif cmd == "pause":
             out = pause(args.account, until=args.until, via=via, now=now)
         elif cmd == "lift":
             out = lift(args.account, via=via, now=now)

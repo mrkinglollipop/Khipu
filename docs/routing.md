@@ -42,6 +42,55 @@ The first three are strong. An estimate is not.
 - **You, in the app.**
 - **The routing table file** (setting `routing_table`). Read only, as a pointer. It is never treated as account state.
 
+Provider definitions are owner facts (`definition_set`, `definition: provider`),
+written with `khipu route definition set provider --value='<JSON>'` (terminal
+confirmation), `--owner-direction` in an eligible owner conversation, or
+`khipu_owner_act` action `route.definition.set` with
+`{"definition": "provider", "value": {"id": "glm", "label": "GLM", "family": "Zhipu"}}`.
+Use the same action with `definition: account` and
+`{"id": "glm:main", "label": "GLM", "provider": "glm"}` to track an account.
+Both writes are logged and support Undo, which appends a restoration or removal
+fact. Settings → Accounts and routing → Add provider account creates GLM or
+DeepSeek provider facts and an account; existing provider restrictions are kept. Fields are `id`,
+`label`, `family`, `login` (`folder` or `none`), `probe` (`claude`, `codex`,
+`grok`, `muse`, `glm`, `http-quota`, or `none`), optional hostname `host`,
+`lane_names`, optional exact model ids in `models_allowed` and `models_never`,
+and `use` (`normal` or `on_request`). `http-quota` is reserved for slice 9b.
+Account definitions name the provider; login folders remain local bindings.
+No adapter or provider fact launches a probe by itself. Model and use checks
+are advisory. DeepSeek's rule 13 model restriction is `models_allowed: [deepseek-flash]`,
+not merely a ban on one Pro model. Spend and concurrency remain with slices
+17a/17b; rule 13 stays standing until those facts are represented and verified.
+An undeclared model causes no model-violation warning. `use: on_request` is a
+neutral reminder: the dispatch hook does not establish whether the owner asked.
+
+Runner identity contract:
+
+- A lane's `config.json` entry may declare `account`, `budget_account`,
+  `provider` (or existing `kind`), and `login_home` (or `home`). All supplied
+  explicit identity fields must agree with the model's known provider.
+  A known model family outranks transport `kind` (for example `kind: deepseek`,
+  `model: glm-5.3` bills GLM). Claude transport can bill GLM or DeepSeek.
+  Cursor always bills the unified Grok account; Auto's model family remains
+  unknown for cross-family checks. A tier name such as `main-sonnet` needs a declaration.
+- One resolver serves health, evidence, and reports: the owner's lane map,
+  declared identity, provider plus local login binding, then provider id or
+  `lane_names`. A provider with several accounts or a name claimed by several
+  providers stays unmatched, with candidates and `budget_account` as the repair field.
+- Declarations are `claimed`. An ordinary usage or limit reading never confirms
+  one. A fresh `state/heartbeat.json` can confirm it with
+  `{"time": 1792512000, "interval": 20, "lanes": {"main-sonnet":
+  {"provider": "claude", "login_home": "/local/login"}}}`. Raw home fields
+  are resolved immediately into local account references and discarded.
+- Alternatively, a `LAUNCH` line can carry `lane=main-sonnet
+  harness=claude_code session=<job-session-id>`. Khipu joins that reference to
+  the job's own capture state (`origin: job` and its hook-recorded `login_home`).
+  The line alone cannot confirm identity. Only a hash of the attachment
+  reference survives runner parsing; capture retention and Forget apply.
+- Health lists `identity_state: claimed|confirmed`, match origin, candidates,
+  and repair guidance. Stale or contradictory bindings never match. A failed
+  or silent heartbeat cannot confirm identity.
+
 A runner's lane maps to an account through the lane map (`routing_lane_map`). A lane with no match is shown and pushed as one line. Khipu does not guess.
 
 ### Holds

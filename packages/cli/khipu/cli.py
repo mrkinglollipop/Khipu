@@ -5773,7 +5773,14 @@ def build_parser() -> argparse.ArgumentParser:
     rrule.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rrule)
 
-    for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule):
+    rdef = rt_sub.add_parser("definition", parents=[rt_json], help="Owner: write a provider, account or lane definition")
+    rdef.add_argument("action", choices=("set",))
+    rdef.add_argument("definition", choices=("provider", "account", "lane_map"))
+    rdef.add_argument("--value", required=True, metavar="JSON")
+    rdef.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rdef)
+
+    for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule, rdef):
         writer.add_argument("--op", default=None, help="Retry identity; reuse for the same change")
 
     dec = sub.add_parser(

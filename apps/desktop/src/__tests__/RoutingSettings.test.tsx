@@ -1713,3 +1713,35 @@ it("shows a Cursor lane matched to Grok without writing a lane override", async 
   expect(within(lanes).queryByText("Not matched")).toBeNull();
   expect(calls("khipu_config_set")).toEqual([]);
 });
+
+it("creates a tracked GLM account and its provider facts from Settings", async () => {
+  await page();
+  fireEvent.click(screen.getByRole("button", { name: "Add provider account" }));
+  const form = screen.getByRole("form", { name: "Add provider account" });
+  fireEvent.change(within(form).getByLabelText("Account name"), { target: { value: "GLM work" } });
+  fireEvent.submit(form);
+  await waitFor(() => expect(calls("khipu_route_definition")).toEqual([
+    { definition: "provider", value: { id: "glm", label: "GLM", family: "Zhipu", login: "none", probe: "none",
+      lane_names: ["glm"], models_allowed: ["glm-5.3", "glm-5.3-flash"] } },
+    { definition: "account", value: { id: "glm:main", label: "GLM work", provider: "glm" } },
+  ]));
+  await waitFor(() => expect(screen.queryByRole("form", { name: "Add provider account" })).not.toBeInTheDocument());
+});
+
+it("retains a failed account form and existing provider facts", async () => {
+  answers.khipu_route_view = { ...view(), definitions: { providers: { deepseek: {
+    id: "deepseek", label: "DS", family: "DeepSeek", models_allowed: ["deepseek-flash"], use: "on_request",
+  } } } };
+  answers.khipu_route_definition = { ok: false, error: "The definition could not be saved." };
+  await page();
+  fireEvent.click(screen.getByRole("button", { name: "Add provider account" }));
+  const form = screen.getByRole("form", { name: "Add provider account" });
+  fireEvent.change(within(form).getByLabelText("Provider"), { target: { value: "deepseek" } });
+  fireEvent.change(within(form).getByLabelText("Account name"), { target: { value: "DeepSeek" } });
+  fireEvent.submit(form);
+  await waitFor(() => expect(within(form).getByRole("alert")).toHaveTextContent("Khipu didn't make that change: The definition could not be saved."));
+  expect(calls("khipu_route_definition")).toEqual([{ definition: "account", value: {
+    id: "deepseek:main", label: "DeepSeek", provider: "deepseek",
+  } }]);
+  expect(form).toBeInTheDocument();
+});

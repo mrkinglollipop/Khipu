@@ -1888,6 +1888,19 @@ fn route_hold_end_argv(id: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+fn route_definition_argv(definition: &str, value: &Value) -> Result<Vec<String>, String> {
+    if !matches!(definition, "provider" | "account" | "lane_map") || !value.is_object() {
+        return Err("choose a provider, account or lane definition".to_string());
+    }
+    let encoded = serde_json::to_string(value).map_err(|_| "could not read the definition".to_string())?;
+    if encoded.len() > ROUTE_WORDS_MAX_BYTES {
+        return Err("the definition is too long".to_string());
+    }
+    // JSON stays joined to its option. The CLI applies the closed definition schema and owner gate.
+    Ok(vec!["route".into(), "definition".into(), "set".into(), definition.into(),
+            format!("--value={encoded}"), "--from-app".into()])
+}
+
 /// The owner's priority verbs (`khipu route priority ACTION`, routing truth
 /// phase 4b).
 const ROUTE_PRIORITY_ACTIONS: &[&str] = &["set", "confirm", "undo", "clear"];
@@ -2993,6 +3006,11 @@ async fn khipu_route_priority(
         )?,
     )
     .await
+}
+
+#[tauri::command]
+async fn khipu_route_definition(definition: String, value: Value, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_definition_argv(&definition, &value)?, op.as_deref())?).await
 }
 
 /// Sign in again: the CLI starts the account's own login (it opens the
@@ -4939,6 +4957,7 @@ pub fn run() {
             khipu_route_hold_add,
             khipu_route_hold_end,
             khipu_route_priority,
+            khipu_route_definition,
             khipu_work_view,
             khipu_ledger_list,
             khipu_ledger_get,
@@ -5775,6 +5794,18 @@ mod settings_command_tests {
                          ("routing_runner_tail_bytes", "-5"), ("routing_poll_interval", "10s")] {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
+    }
+
+    #[test]
+    fn provider_definitions_use_fixed_app_argv_and_never_turn_values_into_flags() {
+        let value = serde_json::json!({"id": "glm", "label": "--owner-direction", "family": "Zhipu"});
+        let argv = route_definition_argv("provider", &value).unwrap();
+        assert_eq!(&argv[..4], v(&["route", "definition", "set", "provider"]));
+        assert_eq!(argv.last().unwrap(), "--from-app");
+        assert_eq!(argv.len(), 6);
+        assert_eq!(serde_json::from_str::<Value>(argv[4].strip_prefix("--value=").unwrap()).unwrap(), value);
+        assert!(route_definition_argv("--from-app", &value).is_err());
+        assert!(route_definition_argv("account", &Value::Null).is_err());
     }
 
     #[test]
