@@ -980,7 +980,7 @@ def _resolve_account_key(name: str, known: list[dict] | None = None, *, conversa
         harness, _, home = raw.partition("|")
         harness, home = harness.strip().lower(), home.strip()
         if harness not in usage.HARNESSES:
-            raise RouteError("that names no CLI Khipu reads (claude, codex, grok, muse, glm, cursor)")
+            raise RouteError("that names no CLI Khipu reads (claude, codex, grok, muse, glm)")
         if home and (credential_location(home) or redact_secrets(home, force=True)[1]):
             raise RouteError("that login folder is inside a private folder or its name looks like a secret; "
                              "Khipu won't record it")
@@ -1291,7 +1291,7 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "evidence", "until", "written_at", "via", "text", "file", "date", "sha256", "clock_at",
                 "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
                 "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
-                "harness", "to", "started_at", "model", "family")
+                "harness", "to", "started_at", "model", "family", "transport")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries")
 _WHOLE_MOST = 2 ** 53
@@ -1724,7 +1724,8 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
 
     cfg["_accounts_version"] = accounts_version(config)
     seed = cfg.get("routing_rules_seed")
-    fingerprint = {"account_identity": 2, "events": events_stat, "config": config_stat, "seed": _stat(Path(seed)) if seed else None,
+    fingerprint = {"account_identity": 2, "payer_identity": 1, "events": events_stat, "config": config_stat,
+                   "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
     return fingerprint, cfg, _fold_accounts(config)
 
@@ -1767,8 +1768,8 @@ def resolve_lane(runner: str, lane: str, lane_map: dict, known: list[dict], spec
     if spec.get("identity_invalid"):
         return {"key": None, "matched_by": None, "candidates": []}
     providers = {str(spec[k]).casefold() for k in ("kind", "provider") if spec.get(k)}
-    # Legacy Grok checking lanes share the Grok subscription.
-    providers = {"grok" if p == "grokcheck" else p for p in providers}
+    # Cursor is a transport on the same xAI subscription as Grok Build.
+    providers = {"grok" if p in ("grokcheck", "cursor") else p for p in providers}
     candidates = [a["key"] for a in known if a["harness"] in providers]
     declared = [spec[k] for k in ("account", "budget_account") if k in spec]
     if len(providers) > 1:
@@ -2030,7 +2031,7 @@ def _evidence(event: dict, cfg: dict) -> dict | None:
             "source": event.get("source") if event.get("source") in SOURCES else "report",
             "written_by": event.get("written_by") or {}, "via": event.get("via"), "at": at, "seq": event["_seq"],
             "evidence": event.get("evidence"), "reason": event.get("reason"),
-            "model": event.get("model"), "family": event.get("family"),
+            "model": event.get("model"), "family": event.get("family"), "transport": event.get("transport"),
             "message_time": bool(event.get("message_time")), "until_default": until_default}
 
 
@@ -2204,7 +2205,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
                 "cleared": bool(e.get("cleared")), "observed": bool(e.get("observed")),
                 "turn": bool(e.get("turn")), "session_logs": bool(e.get("session_logs")),
                 "until_default": bool(e.get("until_default")),
-                **{k: e[k] for k in ("model", "family") if e.get(k) is not None}}
+                **{k: e[k] for k in ("model", "family", "transport") if e.get(k) is not None}}
 
     underlying = {"state": state, "until": _iso(behind["until"]) if behind and state in (LIMITED, PROBABLY_OPEN)
                   else None, "basis": behind["basis"] if behind and state in (LIMITED, PROBABLY_OPEN) else None}
@@ -2214,7 +2215,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
              "reason": DOWN_REASONS.get(behind.get("reason") or "", "out of service")
              if state == DOWN and behind else None,
              "models": models, "witness": witness(behind), "disagreement": disagreement, "last_seen": None,
-             "underlying": None, "checkable": account["harness"] not in ("muse", "glm", "cursor"), "confirmed_at": confirmed_at}
+             "underlying": None, "checkable": account["harness"] not in ("muse", "glm"), "confirmed_at": confirmed_at}
     if state == LIMITED:
         # When the limit now shown was first reported (doctor's launch check).
         entry["since"] = _iso(min((e["at"] for e in whole if whole_holds(e)), default=None))
@@ -2391,6 +2392,8 @@ def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,
     whole = held.get("until")
     for item in held["entries"]:
         key = item["account"]
+        if key.partition("|")[0] == "cursor":
+            continue
         label = labels.get(key) or item.get("label") or _label_for_key(key)
         until = _parse(item.get("until"))
         if (until is not None and until <= now) or (whole is not None and whole <= now):
@@ -2709,6 +2712,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     known_keys = {a["key"] for a in known}
 
     def shown(key: str) -> bool:
+        # Old Cursor account history stays in the log without reviving an account row.
+        if key.partition("|")[0] == "cursor":
+            return False
         # An account the owner stopped tracking keeps a row only for what
         # still says something after he did: a pause in effect, a clear or
         # evidence newer than his Stop tracking. Its older history stays in
@@ -3301,7 +3307,7 @@ def check_account(account: str, *, scheduled: bool = False, now: datetime | None
         if scheduled and not due_now(entry):
             return {"ok": True, "account": key, "outcome": "not_due"}
         s = current(entry)
-        if entry.get("harness") in ("muse", "glm", "cursor") or entry.get("checkable") is False:
+        if entry.get("harness") in ("muse", "glm") or entry.get("checkable") is False:
             return done(s, "cannot_check", _CANNOT_CHECK)
         load1 = (load or (lambda: os.getloadavg()[0]))()
         busy_load = float(_setting(cfg, "routing_busy_load"))
@@ -4006,7 +4012,8 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
         from khipu.routing_sources import model_family
 
         event.update(runner=runner, lane=lane, account=matched["key"], model=spec.get("model"),
-                     family=model_family(spec.get("model")))
+                     family=model_family(spec.get("model")), transport="cursor" if spec.get("kind") == "cursor"
+                     or spec.get("provider") == "cursor" else None)
     if scope:
         event["scope"] = scope
     if window_key:
@@ -5015,8 +5022,6 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
         if error == usage.E_NOT_INSTALLED:
             return {"readable": False, "why": "plan figures can't be read: its CLI is not installed", "error": error}
         return {"readable": False, "why": "plan figures can't be read just now", "error": error}
-    if row.get("harness") == "cursor":
-        return {"readable": False, "why": usage.CURSOR_NO_FIGURES, "tier": row.get("plan")}
     window = _longest_window(row, now)
     longest = _longest_window(row, None)
     # Compared like _longest_window ranks them: a model's window of the same
@@ -5812,7 +5817,7 @@ _AUTHOR_PUBLIC = ("kind", "harness", "project", "session", "name")
 _ACCOUNT_FIELDS = ("label", "harness", "state", "until", "basis", "scope", "reason", "checkable", "confirmed_at",
                    "since", "silent", "configured")
 _WITNESS_FIELDS = ("id", "source", "at", "evidence", "message_time", "cleared", "observed", "turn",
-                   "until_default", "model", "family")
+                   "until_default", "model", "family", "transport")
 _REPORT_FIELDS = ("id", "state", "source", "at", "since", "until")
 _LAST_SEEN_FIELDS = (*_REPORT_FIELDS, "cleared")
 _MODEL_FIELDS = ("model", "until", "basis", "source", "at", "id")

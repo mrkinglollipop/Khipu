@@ -1,24 +1,16 @@
-"""Slice 9d: fake Cursor status, payer resolution and model provenance only."""
+"""Cursor transport: shared xAI payer, legacy account removal and model evidence."""
 from __future__ import annotations
 
-import builtins
 import json
-import logging
-import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from khipu import accounts, config, discover, routing, routing_sources, usage
+from khipu import config, discover, routing, routing_sources, usage
 
 NOW = datetime(2026, 10, 20, 16, 0, tzinfo=timezone.utc)
 EMAIL = "cursor-identity-sentinel@example.invalid"
-TOKEN = "cursor-token-sentinel-private"
-REAL_STATUS = {"cliVersion": "2026.10.19-6bbf2c4", "model": "Auto", "subscriptionTier": "Ultra",
-               "osPlatform": "darwin", "userEmail": EMAIL, "lastRequestId": None}
-WHY = "Cursor reports no usage figures; its limits come from runner and conversation reports"
 
 
 @pytest.fixture
@@ -37,153 +29,34 @@ def mac(tmp_path, monkeypatch):
     return home, data
 
 
-def fake_cursor(tmp_path, monkeypatch, reply=None, *, stderr="", code=0, delay=0):
-    script = tmp_path / "cursor-agent"
-    record = tmp_path / "calls.jsonl"
-    script.write_text(f'''#!{sys.executable}
-import json, os, sys, time
-with open({str(record)!r}, "a") as f:
-    f.write(json.dumps({{"argv": sys.argv[1:], "env": list(os.environ), "cwd": os.listdir(".")}}) + "\\n")
-time.sleep({delay})
-if sys.argv[1:] == ["--version"]:
-    print("2026.10.19")
-else:
-    print({json.dumps(reply)!r})
-    sys.stderr.write({stderr!r})
-    sys.exit({code})
-''')
-    script.chmod(0o755)
-    monkeypatch.setattr(usage, "_command", lambda h: str(script) if h == "cursor" else None)
-    return script, record
-
-
-def test_cursor_probe_private_identity_plan_and_cache(mac, tmp_path, monkeypatch, capsys, caplog):
-    caplog.set_level(logging.DEBUG)
-    script, record = fake_cursor(tmp_path, monkeypatch, {
-        **REAL_STATUS, "untrusted": EMAIL, "accessToken": TOKEN,
-        "user": {"email": EMAIL, "token": TOKEN}, "auth": {"email": EMAIL, "token": TOKEN},
-        "usedPercent": 0}, stderr=f"warning {EMAIL} {TOKEN}")
-    monkeypatch.setenv("CURSOR_API_KEY", TOKEN)
-    original = builtins.open
-    def guarded(path, *args, **kwargs):
-        assert "API Keys" not in str(path)
-        assert ".cursor/" not in str(path)
-        return original(path, *args, **kwargs)
-    monkeypatch.setattr(builtins, "open", guarded)
-    row = usage.probe_account({"label": "Cursor", "harness": "cursor", "home": None})
-    assert row["ok"] and row["plan"] == "Ultra" and row["windows"] == []
-    assert len(row["identity_hash"]) == 64 and EMAIL not in json.dumps(row)
-    again = usage.probe_cursor()
-    assert again["identity_hash"] == row["identity_hash"]
-    assert routing.plan_fact(row, NOW) == {"readable": False, "why": WHY, "tier": "Ultra"}
-    report = usage.report(fresh=True, accounts=[{"label": "Cursor", "harness": "cursor", "home": None}])
-    public = usage.public_row(row)
-    assert public["note"] == WHY and "identity_hash" not in public
-    found = discover._check_one({"cli": "cursor", "default": True}, run=usage._Run(), end=time.monotonic() + 10)
-    assert found == ("signed_in", None, "Ultra")
-    discovered = discover._gather(NOW.timestamp())[0]
-    routing.report(account="Cursor", state="limited", message="usage limit")
-    view = routing.read_view()
-    conversation = routing.conversation_view()
-    from khipu.cli import main
-    assert main(["usage", "--json"]) == 0
-    assert main(["route", "--summary"]) == 0
-    for call in map(json.loads, record.read_text().splitlines()):
-        assert call["argv"] == ["about", "--format", "json"]
-        assert "CURSOR_API_KEY" not in call["env"] and call["cwd"] == []
-    captured = capsys.readouterr()
-    surface = json.dumps([row, again, report, public, found, discovered, view, conversation])
-    for sentinel in (EMAIL, TOKEN):
-        assert sentinel not in surface + captured.out + captured.err + caplog.text
-        assert all(sentinel.encode() not in p.read_bytes() for p in tmp_path.rglob("*")
-                   if p.is_file() and p != script)
-
-
-@pytest.mark.parametrize("reply,stderr,code,error", [
-    (dict(REAL_STATUS, userEmail=None, subscriptionTier=None), "", 0, "not_signed_in"),
-    (None, "Not logged in " + EMAIL, 1, "not_signed_in"),
-    ({"subscriptionTier": "Ultra"}, "", 0, "bad_reply"),
-    ({}, "", 0, "bad_reply"),
-    (dict(REAL_STATUS, userEmail=""), "", 0, "bad_reply"),
-    (dict(REAL_STATUS, userEmail={"email": EMAIL}), "", 0, "bad_reply"),
-    (None, "failed " + EMAIL, 7, "exit_7"),
-    (dict(REAL_STATUS, accessToken=TOKEN), TOKEN, 2, "exit_2"),
-])
-def test_cursor_failures_never_return_cli_text(mac, tmp_path, monkeypatch, reply, stderr, code, error):
-    fake_cursor(tmp_path, monkeypatch, reply, stderr=stderr, code=code)
-    row = usage.probe_cursor()
-    assert row == {"ok": False, "error": error}
-    assert EMAIL not in json.dumps(row) and TOKEN not in json.dumps(row)
-
-
-@pytest.mark.parametrize("reply,plan", [
-    (REAL_STATUS, "Ultra"),
-    ({"userEmail": EMAIL}, None),
-    (dict(REAL_STATUS, extra={"token": TOKEN}, usedPercent=99), "Ultra"),
-])
-def test_cursor_real_status_shapes(mac, tmp_path, monkeypatch, reply, plan):
-    fake_cursor(tmp_path, monkeypatch, reply)
-    row = usage.probe_cursor()
-    assert row["ok"] and row["plan"] == plan and row["windows"] == []
-    assert len(row["identity_hash"]) == 64
-    assert EMAIL not in json.dumps(row) and TOKEN not in json.dumps(row)
-
-
-def test_cursor_timeout_and_ten_second_ceiling(mac, tmp_path, monkeypatch):
-    fake_cursor(tmp_path, monkeypatch, {}, delay=2)
-    began = time.monotonic()
-    assert usage.probe_cursor(timeout=0.05) == {"ok": False, "error": "timeout"}
-    assert time.monotonic() - began < 1
-    captured = []
-    def run(*args, **kw):
-        captured.append(kw["timeout"])
-        return {"outcome": "timeout"}
-    monkeypatch.setattr(discover, "run_once", run)
-    usage.probe_cursor(timeout=100)
-    assert captured == [10]
-
-
-def test_cursor_hash_is_salted_and_plan_is_not_free_text(mac, monkeypatch):
-    data = dict(REAL_STATUS, subscriptionTier=EMAIL)
-    one = usage.parse_cursor(data)
-    monkeypatch.setattr(routing, "_id_salt", lambda: b"another-install-salt")
-    two = usage.parse_cursor(data)
-    assert one["identity_hash"] != two["identity_hash"]
-    assert one["plan"] is None and EMAIL not in json.dumps(one)
-
-
-def test_cursor_discovery_and_decline_are_single_login(mac, tmp_path, monkeypatch, khipu_app):
-    fake_cursor(tmp_path, monkeypatch, REAL_STATUS)
-    config.config_file().write_text(json.dumps({"usage_accounts": [{"harness": "grok", "label": "Grok"}]}))
-    found, _, _ = discover._gather(NOW.timestamp())
-    cursor = [r for r in found.values() if r["cli"] == "cursor"]
-    assert len(cursor) == 1 and cursor[0]["default"] and cursor[0]["abs"] is None
-    accounts.decline("cursor")
+def test_cursor_is_not_a_trackable_or_discovered_account(mac, monkeypatch):
+    calls = []
+    def command(h):
+        calls.append(h)
+        return "/fake/cursor-agent" if h == "cursor" else None
+    monkeypatch.setattr(usage, "_command", command)
+    assert [a["harness"] for a in usage.configured_accounts()] == ["grok"]
+    assert [a["harness"] for a in usage.accounts_status()["accounts"]] == ["grok"]
+    assert [a["harness"] for a in routing.accounts()] == ["grok"]
+    assert "cursor" not in usage.HARNESSES and "cursor" not in discover.CLIS
+    assert "cursor" not in discover.cli_states()
     assert not [r for r in discover._gather(NOW.timestamp())[0].values() if r["cli"] == "cursor"]
-    accounts.offer_again("cursor")
-    assert [r for r in discover._gather(NOW.timestamp())[0].values() if r["cli"] == "cursor"]
-    accounts.track([{"harness": "cursor", "label": "Cursor"}], read=False, expect=accounts.status()["version"])
-    assert any(a["key"] == "cursor|" for a in routing.accounts())
-    assert not [r for r in discover._gather(NOW.timestamp())[0].values() if r["cli"] == "cursor"]
-    assert routing.read_view()["priority"] is None
-
-
-def test_cursor_cli_choice_and_binary_name(mac, tmp_path, monkeypatch):
-    from khipu import synth_cli
-    from khipu.cli import main
-    # main's parser accepts Cursor for both discovery reads and decline.
-    assert main(["usage", "--try", "--harness", "cursor", "--json"]) == 0
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    fake = bin_dir / "cursor-agent"
-    fake.write_text("#!/bin/sh\nexit 0\n")
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", str(bin_dir))
-    assert synth_cli.binary("cursor") == str(fake)
-    assert "cli_path.cursor" in config.CLI_SETTINGS
-    assert discover.argv_allowed("cursor", (str(fake), "about", "--format", "json"))
-    assert not discover.argv_allowed("cursor", (str(fake), "--api-key", "secret", "about"))
-    assert not discover.argv_allowed("cursor", (str(fake), "a prompt"))
+    discover._save_store({"version": discover.STORE_VERSION, "candidates": {
+        "cursor:default": {"id": "cursor:default", "cli": "cursor", "identity": "default", "sources": ["installed"]}}})
+    assert discover._view(discover._load_store())["candidates"] == []
+    assert "cursor" not in calls
+    assert not hasattr(usage, "probe_cursor") and not hasattr(usage, "parse_cursor")
+    assert not discover.argv_allowed("cursor", ("/fake/cursor-agent", "about", "--format", "json"))
+    with pytest.raises(usage.AccountsError) as exc:
+        usage.parse_usage_accounts([{"harness": "cursor", "label": "Cursor"}])
+    assert exc.value.code == "unknown_cli"
+    with pytest.raises(routing.RouteError):
+        routing.report(account="Cursor", state="limited")
+    before = config.config_file().read_bytes()
+    doctor = usage.doctor_block()
+    assert [a["harness"] for a in doctor["accounts"]] == ["grok"]
+    assert doctor["warnings"] == ["Ignored a tracked Cursor entry: Cursor is a transport on the xAI account; its usage and limits count against Grok"]
+    assert config.config_file().read_bytes() == before
 
 
 @pytest.mark.parametrize("provider", usage.HARNESSES)
@@ -202,11 +75,15 @@ def test_declaration_conflicts_overrides_and_tier_keys(mac):
                                   {"key": "claude|/second", "label": "Second", "harness": "claude", "home": "/second"}]
     assert routing.resolve_lane("r", "main-sonnet", {}, known,
         {"kind": "claude", "budget_account": "claude|"})["key"] == "claude|"
-    for spec in ({"kind": "cursor", "provider": "grok"},
-                 {"kind": "cursor", "budget_account": "grok|"},
-                 {"account": "cursor|", "budget_account": "grok|"},
+    for spec in ({"kind": "cursor", "provider": "claude"},
+                 {"kind": "claude", "budget_account": "grok|"},
+                 {"account": "claude|", "budget_account": "grok|"},
                  {"kind": "cursor", "budget_account": "missing|"}):
         assert routing.resolve_lane("r", "x", {}, known, spec)["key"] is None
+    for spec in ({"kind": "cursor", "provider": "grok"},
+                 {"kind": "cursor", "budget_account": "grok|"},
+                 {"kind": "cursor", "provider": "grok", "budget_account": "grok|"}):
+        assert routing.resolve_lane("r", "x", {}, known, spec)["key"] == "grok|"
     assert routing.resolve_lane("r", "x", {"r": {"x": "grok|"}}, known,
                                 {"kind": "cursor"})["key"] == "grok|"
 
@@ -226,17 +103,17 @@ def runner(mac, lanes, events):
 
 @pytest.mark.parametrize("phrase", ["usage limit", "rate limit", "quota"])
 @pytest.mark.parametrize("separator", [" ", ": "])
-def test_cursor_grok_limit_bills_cursor_and_keeps_grok_open(mac, phrase, separator):
+def test_cursor_grok_limit_bills_shared_grok_account(mac, phrase, separator):
     runner(mac, {"cursor-grok": {"kind": "cursor", "model": "grok-4.7-high"},
-                 "cursor-auto": {"provider": "cursor", "model": "auto"}},
+                 "cursor-auto": {"kind": "cursor", "budget_account": "grok|", "model": "auto"}},
            f"2026-10-20T15:59:00Z job ERROR lane=cursor-grok{separator}{phrase} {EMAIL}\n")
-    routing.report(account="Grok", state="open")
     view = routing.read_view()
     rows = {a["harness"]: a for a in view["accounts"]}
-    assert rows["cursor"]["state"] == "limited" and rows["grok"]["state"] == "open"
-    assert (rows["cursor"]["until"], rows["cursor"]["basis"]) == ("2026-10-20T16:29:00Z", "estimated")
-    assert rows["cursor"]["witness"]["model"] == "grok-4.7-high"
-    assert rows["cursor"]["witness"]["family"] == "xAI"
+    assert "cursor" not in rows and rows["grok"]["state"] == "limited"
+    assert (rows["grok"]["until"], rows["grok"]["basis"]) == ("2026-10-20T16:29:00Z", "estimated")
+    assert rows["grok"]["witness"]["model"] == "grok-4.7-high"
+    assert rows["grok"]["witness"]["family"] == "xAI"
+    assert rows["grok"]["witness"]["transport"] == "cursor"
     assert routing_sources.model_family("auto") == "unknown"
     matches = view["sources"]["runners"][0]["lane_matches"]
     assert matches["cursor-grok"]["matched_by"] == "provider"
@@ -245,27 +122,31 @@ def test_cursor_grok_limit_bills_cursor_and_keeps_grok_open(mac, phrase, separat
     assert EMAIL not in json.dumps(public)
     assert all(EMAIL.encode() not in p.read_bytes() for p in mac[1].rglob("*") if p.is_file())
     routing.report(runner="runner", lane="cursor-auto", state="limited", message="quota")
-    assert any(e.get("account") == "cursor|" and e.get("family") == "unknown"
+    assert any(e.get("account") == "grok|" and e.get("family") == "unknown" and e.get("transport") == "cursor"
                for e in routing._read_all_events()[0] if e.get("type") == "evidence")
 
 
-def test_cursor_church_runner_limited_line_uses_until(mac):
-    runner(mac, {"cursor-grok": {"kind": "cursor", "model": "grok-4.7-high"}},
-           "2026-10-20T15:59:00Z fix-40 LIMITED lane=cursor-grok until=2026-10-20T19:00:00Z "
+@pytest.mark.parametrize("lane,model,family", [("cursor-grok", "grok-4.7-high", "xAI"),
+                                               ("cursor-auto", "auto", "unknown")])
+def test_cursor_church_runner_limited_line_uses_until(mac, lane, model, family):
+    runner(mac, {lane: {"kind": "cursor", "model": model, "budget_account": "grok|"}},
+           f"2026-10-20T15:59:00Z fix-40 LIMITED lane={lane} until=2026-10-20T19:00:00Z "
            "job=fix-40 (account limit reached); the fix step is retried later\n")
-    routing.report(account="Grok", state="open")
     rows = {a["harness"]: a for a in routing.read_view()["accounts"]}
-    assert (rows["cursor"]["state"], rows["cursor"]["until"], rows["cursor"]["basis"]) == (
+    assert (rows["grok"]["state"], rows["grok"]["until"], rows["grok"]["basis"]) == (
         "limited", "2026-10-20T19:00:00Z", "cli")
-    assert rows["grok"]["state"] == "open"
+    assert "cursor" not in rows
+    assert {k: rows["grok"]["witness"][k] for k in ("transport", "model", "family")} == {
+        "transport": "cursor", "model": model, "family": family}
+    public = routing.conversation_view()
+    assert public["accounts"][0]["witness"]["transport"] == "cursor"
 
 
 def test_native_grok_limit_still_bills_grok(mac):
     runner(mac, {"native": {"kind": "grok", "model": "grok-4.7-high"}},
            "2026-10-20T15:59:00Z job LIMITED lane=native until=2026-10-20T17:00:00Z\n")
-    routing.report(account="Cursor", state="open")
     rows = {a["harness"]: a for a in routing.read_view()["accounts"]}
-    assert rows["grok"]["state"] == "limited" and rows["cursor"]["state"] == "open"
+    assert rows["grok"]["state"] == "limited" and "cursor" not in rows
 
 
 def test_declared_tier_reports_and_ambiguous_health(mac):
@@ -283,3 +164,48 @@ def test_declared_tier_reports_and_ambiguous_health(mac):
     assert next(a for a in routing.read_view()["accounts"] if a["key"] == "claude|")["state"] == "limited"
     with pytest.raises(routing.RouteError):
         routing.report(runner="runner", lane="ambiguous", state="limited")
+
+
+def test_cursor_transport_keeps_multiple_grok_accounts_ambiguous():
+    known = [{"key": "grok|", "label": "Grok", "harness": "grok"},
+             {"key": "grok|/second", "label": "Second", "harness": "grok"}]
+    assert routing.resolve_lane("r", "cursor-auto", {}, known, {"kind": "cursor"})["key"] is None
+    assert routing.resolve_lane("r", "cursor-auto", {}, known, {
+        "kind": "cursor", "budget_account": "grok|"})["key"] == "grok|"
+
+
+def test_legacy_cursor_history_does_not_revive_account_or_priority(mac):
+    routing._write_many([
+        {"type": "evidence", "account": "cursor|", "state": "limited", "source": "report",
+         "until": "2026-10-20T19:00:00Z"},
+        {"type": "pause", "account": "cursor|", "until": "2026-10-20T19:00:00Z"},
+        {"type": "priority_set", "entries": [{"account": "cursor|", "label": "Cursor"},
+                                                {"account": "grok|", "label": "Grok"}]}])
+    view = routing.read_view()
+    assert [a["harness"] for a in view["accounts"]] == ["grok"]
+    assert [e["account"] for e in view["priority"]["entries"]] == ["grok|"]
+    assert usage.doctor_block()["warnings"]
+
+
+def test_old_view_with_cursor_account_is_refolded(mac):
+    routing.report(account="Grok", state="open")
+    view = routing.read_view()
+    view["fingerprint"].pop("payer_identity")
+    view["accounts"].append({"key": "cursor|", "label": "Cursor", "harness": "cursor", "state": "open"})
+    routing._save_view(view)
+    assert [a["harness"] for a in routing.read_view()["accounts"]] == ["grok"]
+
+
+def test_grok_aggregate_usage_includes_cursor_without_another_usage_row(mac, monkeypatch):
+    frames = [json.loads(line) for line in (Path(__file__).parent / "fixtures/usage/grok.jsonl").read_text().splitlines()]
+    billing = frames[-1]["result"]["config"]
+    billing["creditUsagePercent"] = 14
+    billing["currentPeriod"]["end"] = "2026-10-26T23:52:00Z"
+    row = dict(usage.parse_grok(frames), account="Grok", harness="grok", home=None, key="grok|",
+               probed_at=NOW.isoformat(), last_attempt_at=NOW.isoformat())
+    monkeypatch.setattr(usage, "_load_cache", lambda: {"grok|": row, "cursor|": dict(row, harness="cursor")})
+    report = usage.report()
+    assert [r["harness"] for r in report["accounts"]] == ["grok"]
+    assert report["accounts"][0]["windows"][0]["used_pct"] == 14
+    assert routing.plan_fact(report["accounts"][0], NOW)["used_pct"] == 14
+    assert "breakdown" not in report["accounts"][0]

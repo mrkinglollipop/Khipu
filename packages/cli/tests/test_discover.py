@@ -849,8 +849,8 @@ def test_discovery_check_and_try_never_read_inside_a_login_folder(mac, monkeypat
     assert check["check"]["ok"] and check["check"]["candidate"]["state"] == "signed_in"
     assert tried["ok"] is False and tried["row"]["error"] == "not_signed_in" and tried["row"].get("source") != "rollout"
     assert tried_default["ok"] is True and tried_default["default"] is True
-    assert {c: s["state"] for c, s in states.items()} == {**dict.fromkeys(("claude", "codex", "grok", "muse"),
-                                                                                       "installed"), "cursor": "not_installed"}
+    assert {c: s["state"] for c, s in states.items()} == dict.fromkeys(("claude", "codex", "grok", "muse"),
+                                                                       "installed")
 
 
 @pytest.mark.parametrize("grok_installed", [True, False])
@@ -1279,7 +1279,7 @@ def test_version_checks_run_at_most_two_at_a_time(mac, monkeypatch):
     states = discover.cli_states()
     assert all(states[c]["state"] == "installed" for c in discover.CLIS), states
     rows = [tuple(map(float, line.split())) for line in spans.read_text().splitlines()]
-    assert len(rows) == len(discover.CLIS)
+    assert len(rows) == 4
     most = max(sum(1 for s, e in rows if s <= t < e) for t, _ in rows)
     assert most <= discover.PARALLEL == 2
 

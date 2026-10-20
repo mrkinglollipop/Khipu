@@ -84,7 +84,6 @@ _CANDIDATES = {
     # The plan usage probes (khipu.usage) look these two up the same way.
     "grok": ("~/.grok/bin/grok", "/opt/homebrew/bin/grok", "/usr/local/bin/grok", "~/.local/bin/grok"),
     "muse": ("/opt/homebrew/bin/muse", "/usr/local/bin/muse", "~/.local/bin/muse"),
-    "cursor": ("~/.local/bin/cursor-agent", "/opt/homebrew/bin/cursor-agent", "/usr/local/bin/cursor-agent"),
     # The owed close rules' read-only `gh pr view` (khipu.close_rules).
     "gh": ("/opt/homebrew/bin/gh", "/usr/local/bin/gh"),
 }
@@ -159,15 +158,14 @@ def binary(name: str) -> str | None:
     chosen = _chosen(name)
     if chosen:
         return chosen
-    executable = "cursor-agent" if name == "cursor" else name
-    found = shutil.which(executable)
+    found = shutil.which(name)
     if found:
         return found
     for candidate in _CANDIDATES.get(name, ()):
         p = Path(candidate).expanduser()
         if p.is_file() or p.is_symlink():
             return str(p)
-    for p in _node_manager_candidates(executable):
+    for p in _node_manager_candidates(name):
         if _executable(p):
             return str(p)
     return None

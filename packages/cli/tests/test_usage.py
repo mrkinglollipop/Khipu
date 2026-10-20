@@ -776,7 +776,7 @@ def test_configured_accounts_keep_invalid_entries_visible(fake, tmp_path):
     accounts = usage.configured_accounts()
     assert accounts[0] == {"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}
     assert accounts[1]["invalid"] == ('Khipu does not read the CLI "gemini"; it reads Claude Code, Codex, '
-                                      "Grok Build, Muse, Cursor and the GLM Coding Plan")
+                                      "Grok Build, Muse and the GLM Coding Plan")
     assert "Muse" in accounts[2]["invalid"]
     row = usage.probe_account(accounts[1])
     assert row["ok"] is False and row["error"] == "invalid_account"
