@@ -143,51 +143,70 @@ the trailing average".
     a week.
   - An account whose probe is costly (Grok's starts a whole agent) samples at the weekly interval for every
     window. Its five-hour verdict is then usually "unknown", and the line says so.
-- **Cycle identity.** A cycle is `(account, window, resets_at)`. The vendor's reset time is an absolute time,
-  so Mac clock skew doesn't touch it. Readings whose `resets_at` agree within 5 minutes are the same cycle,
-  because vendors jitter. A reset is proven only by a new cycle, never by a drop in usage.
-- **Merging Macs.** Quota is per account (decision 9). Samples from every Mac merge, deterministically, and
-  in any arrival order:
-  1. Each Mac's `witness_at` is corrected by that Mac's offset from hub time, which is measured at each sync,
-     as `hub_snapshot` takes the hub's clock.
-  2. Within a cycle, readings within `CLOCK_TOLERANCE` of each other form one **cluster**. A cluster's value
-     is the highest `used_pct` in it, because usage only rises within a cycle. Its time is its latest
-     corrected witness. Two readings at the same time with different values are one cluster, so skew can't
-     make a false drop.
-  3. When readings within tolerance name different cycles, the later `resets_at` is the current cycle, since
-     resets only move forward. Old-cycle readings after that time are discarded as stale.
-  4. Ties sort by `(cycle, time, used_pct, mac, source)`.
+- **Cycle identity is decided from evidence, not metadata order.** Each reading carries the provider's
+  `resets_at`. Readings whose `resets_at` agree within 5 minutes name the same cycle, because vendors jitter.
+  A cycle is proven in one of two ways:
+  - by provider evidence: fresh readings carrying a new `resets_at`. This can be later *or earlier* than the
+    old one, since a provider can replace a reset with an earlier one;
+  - by usage evidence: a possible reset (below) that is confirmed.
 
-  Replays of one set of samples in opposite arrival orders give identical clusters and results.
+  The **current cycle** is the one carried by the newest fresh reading, never simply "the later `resets_at`".
+  When readings in one bucket (below) name different cycles, the bucket is **ambiguous**. The next fresh
+  reading's cycle decides it, and until then pace is `unknown`: "reset time disagrees between readings".
+  Stale metadata (a cached row) never decides a cycle, because it never makes a sample.
+- **Possible resets come from the raw readings, before any merging.** In corrected-time order within a cycle,
+  a reading more than 5 points below an earlier one is a **possible reset**.
+  - It is **confirmed** when the next fresh reading carries a new `resets_at`, or when the next two readings
+    stay more than 5 points below the earlier high.
+  - It is **refuted**, and the low reading is then a correction, when a later reading returns to the earlier
+    high or above.
+  - The raw disagreement is kept on the possible reset, so aggregation never hides it. For example, 95% then
+    1% within 150 s of each other is a possible reset, not a 95% bucket.
+  - Until it is settled, the pace for that window is `unknown`: "possible reset; waiting for the next reading".
+- **Merging Macs uses a canonical partition.** Quota is per account (decision 9). The result is a pure
+  function of the set of samples. It is recomputed from that whole set on each fold, so a late reading only
+  changes the answer it would have changed had it arrived on time, and arrival order never matters.
+  1. Each Mac's `witness_at` is corrected by that Mac's offset from hub time, measured at each sync, as
+     `hub_snapshot` takes the hub's clock.
+  2. Within each settled cycle segment (split at confirmed resets), readings fall into **fixed buckets
+     anchored to the Unix epoch**: `floor(corrected_witness / B)`, where B is 5 minutes for a five-hour window
+     and 15 minutes for a weekly one. Buckets don't chain: two-minute samples fill consecutive buckets, never
+     one endless cluster.
+  3. A bucket's value is its highest reading, since usage only rises within a settled segment. Its time is
+     its latest corrected witness. It also keeps its lowest reading, so that its spread is visible.
+  4. Between adjacent buckets, a negative gain of 2 points or less, between readings from different Macs, is
+     a skew inversion: that interval is excluded as invalid. A larger one is a possible reset (above).
+  5. Ties sort by `(segment, bucket, used_pct, mac, source)`.
+
+  Replays of one set of samples in opposite arrival orders give identical buckets, segments and results.
 
 ### Burn rate
 
-- **Paired intervals.** Over the trailing window (decision 12: **24 hours** for a weekly window, **60
-  minutes** for a five-hour window), take consecutive clusters, starting from an anchor. The anchor is the
-  last cluster at or before the window start, if it is within a quarter of the window before it; otherwise it
-  is the first cluster inside the window. Each pair of consecutive clusters is an interval with a gain and a
-  duration.
-- **Rate = sum of valid gains / sum of the same intervals' durations.** A gain and its duration are always
-  kept or dropped together, and per-cycle rates are never summed.
-  - Codex's example (0 h, 10%), (6 h, 10%), (18 h, 34%), (24 h, 34%) gives 24 / 24 = **1 point an hour**. The
-    12-hour gap's 24-point gain is kept with its 12 hours.
-  - A gap only lowers confidence (below). It never moves the average.
-- **Invalid intervals** are excluded, gain and duration both:
-  - an interval that crosses a cycle boundary (a reset);
-  - an interval whose gain is negative inside one cycle, which is a **correction**, not a reset. A drop of
-    more than 5 points with the same `resets_at` is flagged as a possible reset, and only becomes one if the
-    next reading shows a new cycle.
+- **Everything is clipped to the trailing window** (decision 12: **24 hours** for a weekly window, **60
+  minutes** for a five-hour window). Consecutive buckets form intervals with a gain and a duration. An
+  interval that straddles the window start contributes only its part inside the window: its gain is
+  interpolated linearly by the fraction of its duration inside, with that duration. Gain from before the
+  window is never counted.
+- **Rate = sum of valid in-window gains / sum of the same in-window durations.** A gain and its duration are
+  kept or dropped together, and per-cycle rates are never summed. Codex's example (0 h, 10%), (6 h, 10%),
+  (18 h, 34%), (24 h, 34%) at now = 24 h gives 24 / 24 = **1 point an hour**.
+- **Invalid intervals** are excluded, gain and duration both: one that crosses a confirmed reset, a
+  correction, a skew inversion, or one that touches an unsettled possible reset.
+- **Long gaps lower confidence; they don't move the average.** An interval longer than the window's gap
+  limit (15 minutes for five hours, 2 hours for a week), or an interpolated boundary part of such an interval,
+  counts as **gap time**. `observed_pct` = (valid in-window duration − gap time) / the trailing window.
 - **When a forecast is allowed.** All of these must hold:
-  - at least 3 clusters from the anchor on;
-  - a span (last cluster time minus anchor time) of at least half the trailing window;
-  - valid durations of at least 75% of the span;
-  - a last cluster no older than the window's sampling interval × 2 (20 minutes for five hours, 1 hour for a
-    week);
-  - a current cycle whose `resets_at` is still ahead.
+  - at least 3 buckets in the window;
+  - valid in-window durations covering at least half the trailing window;
+  - `observed_pct` of at least 50%;
+  - a last bucket no older than twice the window's sampling interval (20 minutes for five hours, 1 hour for
+    a week);
+  - a settled current cycle whose `resets_at` is still ahead.
 
-  Otherwise the verdict is `unknown` with its reason: "only 2 readings in the last 24 h", "readings disagree
-  for 9 of 24 h", "last reading 3 h old", "reset passed; waiting for a new reading", or "this account can't be
-  probed".
+  With gap time over 25% of the window, the line adds "(gappy readings)". Otherwise the verdict is `unknown`
+  with its reason: "only 2 readings in the last 24 h", "readings disagree for 9 of 24 h", "readings cover
+  only 9 of the last 24 h", "last reading 3 h old", "possible reset; waiting for the next reading", "reset
+  passed; waiting for a new reading", or "this account can't be probed".
 
 ### Verdicts
 
@@ -201,25 +220,35 @@ Each target is computed separately. The schema carries each one apart.
   - Otherwise needed n = H / T. **Outpacing** when r > 1.15 n (decision 14): runs out at now + H / r, which
     is T − H / r before the reset. **Underpacing** when r < 0.85 n: about H − r·T left unused at the reset.
     **On pace** otherwise. Every verdict states n, the rate that lands on the limit.
+  - **Verdicts have hysteresis.** Outpacing starts above 1.15 n and ends below 1.10 n. Underpacing starts
+    below 0.85 n and ends above 0.90 n. A rate near a threshold can't flip the verdict back and forth.
 - **Share cap** (`share c`: a ceiling on the window, such as rule 10's 90% of Grok's week). This is the same
   calculation with H = c − used.
   - H ≤ 0: `cap_reached` ("at 92% against your 90%"), with no forecast.
 - **Daily cap** (`per_day d`: points of the window per rolling 24 hours, such as the priority's 13% a day for
   Claude jobs; decision 13).
-  - G = the gain over the last 24 hours by the same paired-interval rule, needing the same coverage, otherwise
-    `unknown`.
-  - **Over** when G > d. **Near** when G ≥ 0.85 d; then, at r, it reaches d at now + (d − G) / r. **Under**
-    otherwise.
-  - The output is G, d, r and the time it reaches the cap. The rolling day needs no time zone.
+  - **G**, the rolling-day gain, is the sum of valid gains inside [now − 24 h, now], with the boundary interval
+    interpolated as above. Codex's example, readings (−6 h, 0%), (6 h, 6%), (24 h, 15%) at now = 24 h, gives
+    3 + 9 = **12**, not 15. Its 6 interpolated hours are gap time, so `observed_pct` is 75%.
+  - A daily total needs valid durations covering at least 20 of the 24 hours and `observed_pct` of at least
+    50%. Otherwise it is `unknown`: "the last 24 h are covered for only 14 h".
+  - **Over** when G > d. **Near** when G ≥ 0.85 d. **Under** otherwise.
+  - **The forecast is of the rolling sum, aging out included.** At the trailing average r, the sum Δ from now
+    is S(Δ) = G + r·Δ − A(Δ), where A(Δ) is the in-window gain that leaves the window by then, read from the
+    history over [now − 24 h, now − 24 h + Δ]. `reaches_cap_at` is the first Δ in (0, 24 h], stepped by the
+    bucket width, where S(Δ) ≥ d.
+  - If no such Δ exists, there is no time, and the line says "stays under at the trailing average". For
+    example, a steady 0.5 an hour keeps S at 12 against 13: near, with no time.
+  - The output also carries `settles_at_pct` = 24 · r, where the rolling day ends up if r holds.
 - **Both caps at once.** Each is computed independently. The **headline** is the most urgent: cap reached or
   over, then the earliest run-out among the plan limit and the share cap, then near, then the rest.
 - **Schema** (`khipu_route`, per account and window):
 
   ```
-  pace: {window, cycle_resets_at, trailing_h, clusters, span_h, valid_pct, rate_pct_per_h, why?,
+  pace: {window, cycle_resets_at, trailing_h, buckets, valid_pct, observed_pct, gappy, rate_pct_per_h, why?,
          plan:      {verdict, needed_pct_per_h, runs_out_at?, before_reset_s?, unused_at_reset_pct?},
          share_cap: {revision, pct, verdict, needed_pct_per_h, runs_out_at?, before_reset_s?, unused_at_reset_pct?}?,
-         day_cap:   {revision, pct, verdict, used_24h_pct, reaches_cap_at?}?,
+         day_cap:   {revision, pct, verdict, used_24h_pct, observed_pct, settles_at_pct, reaches_cap_at?}?,
          headline:  "plan" | "share_cap" | "day_cap"}
   ```
 
@@ -237,7 +266,10 @@ Each target is computed separately. The schema carries each one apart.
   that component (the ledger keeps it):
   - **Always:** the verdict of the headline target; the limiting window; the cycle; the target or a cap's
     revision; availability (known to unknown and back).
-  - **Urgency bands:** the time to run-out or to reaching a cap crosses 24 h, 6 h, 1 h or 15 min.
+  - **Urgency bands:** the time to run-out or to reaching a cap crosses 24 h, 6 h, 1 h or 15 min on its way
+    down. A band fires once, and **re-arms only after the time goes back above the band plus 25%** (30 h,
+    7 h 30 min, 1 h 15 min, 18 min 45 s). Readings that alternate between 59 min 59 s and 60 min 01 s push
+    once.
   - **Movement:** the projected time moved, against the acknowledged one, by more than max(15 min, 25% of the
     time that remained in the acknowledged forecast).
 
@@ -567,9 +599,9 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 13 | Gateway: the projection holds only its listed fields (every nested and history field checked); another identity's delivery state is invisible and its acks are refused; owner writes are refused | hermetic | 12 |
 | 14 | Scanner: flags the two live notes; passes capability rows, evidence dates and quoted history | hermetic | 13 |
 | 15 | Health: each red condition turns red and back to green on its own evidence | hermetic | 16 |
-| 16a | Pace inputs: the extractor's sentinel tests; `pace_fixture_v1` rejects any other key; relative, rounded and repeated readings never become fresh samples; two Macs' samples with the same time and different values, a skewed clock, and different reset times merge to identical clusters in opposite arrival orders | hermetic | 4Pa |
-| 16b | Pace results: Codex's gap example gives 1 point an hour; synthetic outpace, underpace and on-pace; a reset mid-window; a correction drop; a possible-reset drop later confirmed and later refuted; coverage below the floor gives `unknown` with its reason; zero burn; limit and cap already reached; a reset time passed; a share cap and a daily cap together, carried apart in the schema; the sanitized real history within its `t_err` | hermetic | 4Pb |
-| 16c | Pace pushes: a five-hour run-out moving from 1 h to 10 min while still outpacing pushes; a change of limiting window, cycle, cap revision or availability pushes; small moves measured against the last acknowledged forecast push once they add up; numbers alone don't push | hermetic | 4Pa |
+| 16a | Pace inputs: the extractor's sentinel tests; `pace_fixture_v1` rejects any other key; relative, rounded and repeated readings never become fresh samples; two Macs' samples with the same time and different values, a skewed clock, and different reset times merge to identical buckets in opposite arrival orders; two-minute samples over 24 h make consecutive buckets, not one cluster; a late reading changes only what it would have changed on time; 95% then 1% within 150 s is a possible reset, settled by the next readings either way; an earlier replacement `resets_at` carried by fresh readings wins over stale metadata | hermetic | 4Pa |
+| 16b | Pace results: Codex's gap example gives 1 point an hour; (−6 h, 0%), (6 h, 6%), (24 h, 15%) gives a rolling-day gain of 12 with `observed_pct` 75%; a steady 0.5 an hour against a daily cap of 13 gives near with no time; a rising rate gives a `reaches_cap_at` that accounts for usage aging out; long gaps lower `observed_pct` and mark the line gappy; synthetic outpace, underpace and on-pace; a reset mid-window; a correction drop; a possible-reset drop later confirmed and later refuted; coverage below the floor gives `unknown` with its reason; zero burn; limit and cap already reached; a reset time passed; a share cap and a daily cap together, carried apart in the schema; the sanitized real history within its `t_err` | hermetic | 4Pb |
+| 16c | Pace pushes: a five-hour run-out moving from 1 h to 10 min while still outpacing pushes; readings alternating at 59 min 59 s and 60 min 01 s push once; a rate hovering at 1.15 n doesn't flip the verdict; a change of limiting window, cycle, cap revision or availability pushes; small moves measured against the last acknowledged forecast push once they add up; numbers alone don't push | hermetic | 4Pa |
 
 ## Slices
 
@@ -666,7 +698,8 @@ Slices 4Pb, 9a, 10 and 13 can run beside 5 to 8c, and 11a beside 6.
     computed and carried separately. The line shows the most urgent. Caps are structured facts you confirm
     once: rule 10's 90% as a share cap, and the 13%-a-day line as a daily cap over a rolling 24 hours (no time
     zone). A calendar day would reset at a midnight you'd have to choose.
-14. **The on-pace band** (new). *Recommend ±15%* of the rate needed. A narrower band flips the verdict on
+14. **The on-pace band** (revised). *Recommend ±15%* of the rate needed to enter outpacing or underpacing,
+    and ±10% to leave it. A narrower band flips the verdict on
     ordinary noise.
 
 ## Review responses
@@ -712,6 +745,18 @@ gateway session uniqueness with refused foreign acks. No disagreements this roun
 
 The notes are folded in: forecasts are labelled "at the trailing average", and section 4's child freshness is
 qualified. No disagreements this round.
+
+**Round 4.** All five pace items were accepted and answered in section 2a:
+
+- **a.** A canonical partition into fixed, epoch-anchored buckets, recomputed from the whole sample set so
+  late readings don't depend on arrival order, and `observed_pct` as the long-gap confidence penalty.
+- **b.** Gains clipped to the window with an interpolated boundary, and a coverage floor for daily totals.
+- **c.** A rolling-sum forecast that includes usage aging out, or no time.
+- **d.** Possible resets judged on raw readings, and the current cycle taken from the newest fresh evidence,
+  so an earlier replacement reset can win.
+- **e.** Band re-arming with a 25% margin, and verdict hysteresis.
+
+No disagreements this round.
 
 ## Known limits
 
