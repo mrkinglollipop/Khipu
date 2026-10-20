@@ -50,12 +50,12 @@ def load_pace(rows):
     return rows
 
 
-KINDS = {"evidence", "hold", "hold_end", "rule_add", "rule_edit", "priority_set"}
+KINDS = {"evidence", "hold", "hold_end", "rule_add", "rule_edit", "priority_set", "note_set"}
 STATES = {"open", "limited", "down"}
 HARNESS = {"codex", "claude_code", "grok_build", "shell", "unknown"}
 EVENT_FIELDS = {"type", "id", "account", "state", "source", "written_at", "written_by", "via",
                 "scope", "reason", "text", "until", "owner", "pending", "n", "target", "entries",
-                "owner_request"}
+                "owner_request", "seq", "basis", "until_default", "date", "seeded"}
 TEXT_FIELDS = {"text", "owner_request", "role"}
 
 
@@ -69,8 +69,13 @@ def load_replay(value):
             raise FixtureError("fixture_enum")
         alias(row["id"], "e")
         number(row["written_at"], integer=True)
-        if "until" in row:
+        if row.get("until") is not None:
             number(row["until"], integer=True)
+        for key in ("seq", "date"):
+            if key in row:
+                number(row[key], integer=True)
+        if "basis" in row and row["basis"] not in {"cli", "estimated", "checked", "owner"}:
+            raise FixtureError("fixture_enum")
         if "account" in row:
             alias(row["account"], "a")
         if "target" in row:
@@ -78,14 +83,15 @@ def load_replay(value):
         for key in TEXT_FIELDS & row.keys():
             if not isinstance(row[key], str) or not re.fullmatch("x*", row[key]):
                 raise FixtureError("fixture_text")
-        for key in ("owner", "pending"):
+        for key in ("owner", "pending", "until_default", "seeded"):
             if key in row and type(row[key]) is not bool:
                 raise FixtureError("fixture_schema")
         if "n" in row:
             number(row["n"], integer=True)
         if "state" in row and row["state"] not in STATES:
             raise FixtureError("fixture_enum")
-        if "source" in row and row["source"] != "report":
+        if "source" in row and (not isinstance(row["source"], str)
+                                or (row["source"] != "report" and not re.fullmatch("x*", row["source"]))):
             raise FixtureError("fixture_enum")
         if "reason" in row and row["reason"] != "keep":
             raise FixtureError("fixture_enum")
@@ -109,8 +115,10 @@ def load_replay(value):
             if type(row["entries"]) is not list:
                 raise FixtureError("fixture_schema")
             for entry in row["entries"]:
-                closed(entry, {"account", "label", "role"}, {"account"})
+                closed(entry, {"account", "label", "role", "until"}, {"account"})
                 alias(entry["account"], "a")
+                if entry.get("until") is not None:
+                    number(entry["until"], integer=True)
                 if "label" in entry:
                     alias(entry["label"], "a")
                 if "role" in entry and (not isinstance(entry["role"], str)
@@ -168,7 +176,14 @@ def sanitize(events):
             elif key in {"account", "target"}:
                 row[key] = named(value, "a" if key == "account" else "e")
             elif key == "until":
-                row[key] = time(value)
+                row[key] = None if value is None else time(value)
+            elif key == "date":
+                # Dates travel as relative seconds too; the original date is never copied.
+                if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                    raise FixtureError("fixture_time")
+                row[key] = time(value + "T00:00:00Z")
+            elif key == "source":
+                row[key] = value if value == "report" else words(value)
             elif key == "scope":
                 closed(value, {"kind", "account"}, {"kind"})
                 row[key] = {k: named(v, "a") if k == "account" else v for k, v in value.items()}
@@ -177,9 +192,16 @@ def sanitize(events):
                     raise FixtureError("fixture_schema")
                 row[key] = []
                 for entry in value:
-                    closed(entry, {"account", "label", "role"}, {"account"})
-                    row[key].append({k: words(v) if k == "role" else named(entry["account"], "a")
-                                     for k, v in entry.items()})
+                    closed(entry, {"account", "label", "role", "until"}, {"account"})
+                    clean_entry = {}
+                    for k, v in entry.items():
+                        if k == "until":
+                            clean_entry[k] = None if v is None else time(v)
+                        elif k == "role":
+                            clean_entry[k] = words(v)
+                        else:
+                            clean_entry[k] = named(entry["account"], "a")
+                    row[key].append(clean_entry)
             else:
                 row[key] = value
         out.append(row)

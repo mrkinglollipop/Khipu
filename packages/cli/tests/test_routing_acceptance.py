@@ -171,7 +171,8 @@ def test_contract_gap_is_narrow_and_names_the_specific_assertion():
 def test_every_replay_fixture_has_a_closed_schema_and_no_private_strings():
     # The older runner-adapter fixtures are a different format. This inventory
     # covers every routing replay/pace fixture, including slice 1's input.
-    inventory = set(FIXTURES.glob("routing_*.*"))
+    inventory = {p for p in FIXTURES.rglob("*") if p.is_file()
+                 and (p.name.startswith(("routing_", "pace_")) or "pace" in p.stem)}
     assert inventory == {LEGACY, REPLAY, PACE}
     legacy = [json.loads(line) for line in LEGACY.read_text().splitlines()]
     sanitized = sanitize(legacy)
@@ -270,6 +271,44 @@ def test_sanitizer_is_deterministic_preserves_lengths_relations_and_clock_interv
     assert json.loads(output.out) == clean
 
 
+def test_sanitizer_accepts_current_production_writers_and_closes_new_fields(replay, monkeypatch, capsys):
+    routing.report(account="Codex", state="limited", author=AUTHOR)
+    routing.add_rule("SYNTHETIC-RULE-PRIVATE", via="app")
+    routing.add_rule("SYNTHETIC-OTHER-RULE", source="/Users/SYNTHETIC-SOURCE", via="app")
+    routing.set_priority([{"account": "Grok", "role": "SYNTHETIC-ROLE"},
+                          {"account": "Codex", "role": "SYNTHETIC-TIMED-ROLE",
+                           "until": "2026-10-20T16:00:00Z"}], via="app",
+                         expect=routing.priority_version())
+    routing.set_note("/Users/SYNTHETIC-NOTE", via="app")
+    raw = [json.loads(line) for line in routing.events_file().read_text().splitlines()]
+    assert [r["type"] for r in raw] == ["evidence", "rule_add", "rule_add", "priority_set", "note_set"]
+    assert {"seq", "basis", "until_default"} <= raw[0].keys()
+    assert {"date", "seeded", "source"} <= raw[1].keys()
+    assert raw[1]["source"] == "added by you" and raw[3]["until"] is None
+    clean = sanitize(raw)
+    assert load_replay(clean) == clean
+    assert clean["events"][3]["until"] is None
+    assert clean["events"][3]["entries"][0]["until"] is None
+    assert clean["events"][3]["entries"][1]["until"] == 7200
+    assert clean["events"][0]["until"] - clean["events"][0]["written_at"] == 1800
+    assert clean["events"][1]["date"] == -14 * 3600
+    assert clean["events"][2]["source"] == "x" * len(raw[2]["source"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(map(json.dumps, raw))))
+    assert main() == 0
+    captured = capsys.readouterr()
+    assert "SYNTHETIC" not in captured.out + captured.err and "/Users/" not in captured.out + captured.err
+    assert json.loads(captured.out) == clean
+    # Newly admitted fields are typed or scrubbed, never an extension bag.
+    for key, bad in (("seq", "PRIVATE"), ("basis", "PRIVATE"), ("until_default", "PRIVATE"),
+                     ("date", "PRIVATE"), ("seeded", "PRIVATE"), ("unknown", "PRIVATE")):
+        damaged = copy.deepcopy(raw)
+        damaged[1][key] = bad
+        monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(map(json.dumps, damaged))))
+        assert main() == 2
+        rejected = capsys.readouterr()
+        assert rejected.out == "" and rejected.err == "fixture_rejected\n"
+
+
 @pytest.mark.parametrize("raw", ['{"PRIVATE-PATH-SENTINEL":1}', '{"text":"PRIVATE-TEXT-SENTINEL"}', 'bad-json'])
 def test_sanitizer_errors_never_echo_the_input(raw, monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", io.StringIO(raw))
@@ -360,11 +399,16 @@ def test_1_explicit_end_choice_removes_the_hold(replay):
     assert "contradicts active hold" not in replay.offer()[1]
 
 
+@future("4", "owner priority writes consume an explicit keep choice and retain the hold")
 def test_1_explicit_keep_choice_preserves_the_hold(replay):
-    rows = legacy_fixture()
-    rows.append(replay.event("priority_set", 9, entries=[{"account": "grok|", "role": "builder"}],
-                             holds={"h-synthetic-grok": "keep"}))
-    assert replay.fold(rows)["holds"][0]["id"] == "h-synthetic-grok"
+    seed(replay)
+    # The public writer seam is owned by slice 4; the scope names holds.
+    import inspect
+    expect("holds" in inspect.signature(routing.set_priority).parameters, True,
+           "1: owner priority writer has no explicit holds choice")
+    routing.set_priority([{"account": "Grok", "role": "builder"}], via="app",
+                         expect=routing.priority_version(), holds={"h-synthetic-grok": "keep"})
+    assert replay.view()["holds"][0]["id"] == "h-synthetic-grok"
 
 
 def test_3_eight_short_changes_fit_two_pushes_and_only_shown_entities_ack(replay):
@@ -415,7 +459,7 @@ def test_5_structured_level_claim_expires_at_reset(replay):
 
 @future("6", "a 3000-character pending rule must arrive whole across acknowledged pages")
 def test_2_pending_rule_is_whole_across_pages(replay):
-    words = "Grok " + "x" * 2995
+    words = "Grok " + "~" * 2995
     routing.request_rule(words, author=AUTHOR)
     delivered = []
     for _ in range(12):
@@ -425,7 +469,7 @@ def test_2_pending_rule_is_whole_across_pages(replay):
         delivered.append(context)
         replay.ack(info)
     # Match the complete synthetic payload, not its identifying preview.
-    expect("".join(delivered).count("x"), 2995, "2: pending rule was acknowledged as a preview, with text lost")
+    expect("".join(delivered).count("~"), 2995, "2: pending rule was acknowledged as a preview, with text lost")
 
 
 @future("6", "10500-character session starts owe pages instead of a pointer-only start")
@@ -588,6 +632,12 @@ def test_6_pull_protocol(replay, monkeypatch, protocol):
     if protocol == "provider-switch":
         monkeypatch.setenv("KHIPU_SESSION_ID", "t3:synthetic-thread")
     routing.add_rule("synthetic owner rule", via="app")
+    if protocol == "provider-switch":
+        # Leave two hook leases unacknowledged under the original hooked
+        # attachment, before the pull-only provider takes over this root.
+        for _ in range(2):
+            replay.offer(session="t3:synthetic-thread")
+            replay.advance(61)
     first = replay.pull()
     changes = first.get("routing_changes")
     expect(bool(isinstance(changes, dict) and changes.get("batch") and changes.get("items")), True,
@@ -618,6 +668,7 @@ def test_6_pull_protocol(replay, monkeypatch, protocol):
         assert main_batch["batch"] != batch
         assert first["delivery"]["duplicates_across_components"]
     elif protocol == "provider-switch":
+        assert first["delivery"]["health"] == "red"
         monkeypatch.delenv("CODEX_THREAD_ID")
         monkeypatch.setenv("KHIPU_HARNESS", "grok_build")
         assert replay.pull(ack=batch)["delivery"]["health"] == "green"
@@ -662,8 +713,14 @@ def test_9_http_quota_redirect_and_key_channels(replay, monkeypatch, capsys):
     sentinel = "SYNTHETIC-QUOTA-KEY-SENTINEL"
     calls = []
     monkeypatch.setattr(keychain, "get_password", lambda *a, **k: sentinel)
-    for probe in ("probe_claude", "probe_codex", "probe_grok", "probe_muse"):
-        monkeypatch.setattr(usage, probe, lambda *a, **k: {"ok": False, "error": "no_limits", "windows": []})
+    probed = []
+    original_probe = usage.probe_account
+    def fake_probe(account, **kwargs):
+        if account["harness"] not in {"claude", "codex", "grok"}:
+            return original_probe(account, **kwargs)
+        probed.append(account["harness"])
+        return {**account, "ok": False, "error": "no_limits", "windows": []}
+    monkeypatch.setattr(usage, "probe_account", fake_probe)
     # The fake transport is installed at the standard library boundary;
     # production must explicitly disable redirects and stay on this host.
     import urllib.request
@@ -683,6 +740,7 @@ def test_9_http_quota_redirect_and_key_channels(replay, monkeypatch, capsys):
                               login="none", probe="http-quota", host="quota.invalid", accounts=["synthetic:main"]))
     # The existing refresh entry point must dispatch the configured adapter.
     usage.refresh_due()
+    assert sorted(probed) == ["claude", "codex", "grok"]
     expect(bool(calls), True, "9: http-quota provider fact is ignored by the refresh adapter")
     assert len(calls) == 1 and calls[0].full_url.startswith("https://quota.invalid/")
     output = capsys.readouterr()
@@ -706,11 +764,19 @@ def test_10_fix_round_advisory_never_denies(replay, model, expected):
     out, _, _ = routing_delegation.hook_main(json.dumps(payload))
     assert "permissionDecision" not in json.dumps(out)
     context = out.get("hookSpecificOutput", {}).get("additionalContext", "")
-    # The standing rule itself is not an advisory about this dispatch.
+    # Slice 10 owns advisory wording. Compare the additional context with
+    # the same hook without a task class, so the standing rule cannot pass.
+    control = copy.deepcopy(payload)
+    control["tool_input"]["prompt"] = "Repair the fixture."
+    ordinary, _, _ = routing_delegation.hook_main(json.dumps(control))
+    baseline = ordinary.get("hookSpecificOutput", {}).get("additionalContext", "")
+    assert "Rule 12" in baseline
     if expected:
-        expect("this dispatch is Opus" in context, True, "10: Opus fix-round has no rule-12 dispatch advisory")
+        advisory = context.replace(baseline, "")
+        expect(context != baseline and "Sonnet" in advisory and "12" in advisory, True,
+               "10: Opus fix-round has no rule-12 dispatch advisory")
     else:
-        assert "this dispatch is" not in context
+        assert context == baseline
 
 
 # ---- 11a: migration and aliases --------------------------------------------------------
@@ -774,8 +840,18 @@ def test_11a_old_local_log_folds_unchanged_and_is_never_rewritten(replay):
     seed(replay)
     path = routing.events_file()
     raw = path.read_bytes()
-    one, two = replay.view(), replay.view()
-    assert one["effective"] == two["effective"]
+    one = replay.view()
+    unknown = {"state": "unknown", "until": None, "basis": None, "scope": "all", "reason": None,
+               "models": [], "disagreement": None, "reset_check": None}
+    assert one["effective"] == {
+        "account:claude|": dict(unknown, label="Claude", last_seen=None),
+        "account:codex|": dict(unknown, label="Codex", last_seen="open"),
+        "account:grok|": dict(unknown, label="Grok", last_seen="open"),
+        "hold:h-synthetic-grok": {"scope": "Grok", "reason": "keep", "until": "2026-10-21T12:00:00Z",
+                                  "owner": False, "text": None},
+        "priority": {"entries": [["Grok", "x" * 324, None, True]], "until": None, "pending": True,
+                     "by": "a Claude Code conversation", "replaced": None},
+    }
     assert path.read_bytes() == raw
     assert one["holds"][0]["id"] == "h-synthetic-grok"
 
@@ -1208,44 +1284,75 @@ def steady(rate=0.5, *, start=0, end=86400, used=0, reset=604800, step=1800):
     return [sample(t, used + rate * (t - start) / 3600, reset=reset) for t in range(start, end + 1, step)]
 
 
-@future("4Pa", "the local extractor must keep only fenced routing readings and suppress all surrounding sentinels")
-def test_16a_extractor_sentinels_witness_age_and_rounding(replay, monkeypatch, capsys):
+@pytest.mark.parametrize("malformed", [False, True], ids=["readings", "error-path"])
+@future("4Pa", "the local extractor reads real routing blocks and scrubs success and error channels")
+def test_16a_extractor_sentinels_witness_age_and_rounding(replay, monkeypatch, capsys, malformed):
     script = Path(__file__).resolve().parents[3] / "tools" / "pace_fixture_extract.py"
-    expect(script.is_file(), True, "16a: the deterministic fenced-routing extractor is not implemented")
     transcript = replay.root / "synthetic-transcript.jsonl"
     surrounding = "SYNTHETIC-FREE-TEXT-SENTINEL"
     tool_arg, tool_result, path_word = "SYNTHETIC-ARG-SENTINEL", "SYNTHETIC-RESULT-SENTINEL", "/Users/SYNTHETIC-PATH"
-    transcript.write_text(json.dumps({"timestamp": routing._iso(T0), "role": "user", "content": surrounding,
-                                      "tool_args": {"path": path_word, "text": tool_arg}, "tool_result": tool_result}) + "\n" +
-                          json.dumps({"timestamp": routing._iso(T0), "role": "assistant", "content":
-                                      "```Routing\nCodex: open; read from Codex 4 min ago; "
-                                      "4% of its week used, resets 2026-10-27T14:00:00Z\n```"}) + "\n")
+    # An owner rule creates the record without a newer conversation
+    # report overriding the probe's four-minute-old witness.
+    routing.add_rule("Synthetic extractor fixture.", via="app")
+    replay.usage(witness=T0 - timedelta(minutes=4), reset=T0 + timedelta(days=6))
+    block = routing.summary(now=T0)["text"]
+    assert block.startswith("## Routing at 14:00Z (")
+    assert "96% of its week left, resets Mon 14:00Z (6 d)" in block
+    assert "read from Codex 4 min ago" in block
+    # Claude Code transcript envelopes, including tool payloads with a decoy
+    # routing block. Only the delivered text block supplies a reading.
+    stamp = routing._iso(T0 + timedelta(minutes=5))
+    rows = [
+        {"type": "user", "timestamp": stamp, "message": {"role": "user", "content": [
+            {"type": "text", "text": surrounding + "\n" + block}]}},
+        {"type": "assistant", "timestamp": stamp, "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "tool1", "name": "Read", "input": {
+                "file_path": path_word, "text": tool_arg, "decoy": block.replace("96%", "2%")}}]}},
+        {"type": "user", "timestamp": stamp, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tool1", "content": tool_result + "\n" + block}]}},
+    ]
+    transcript.write_text("\n".join(map(json.dumps, rows)) + ("\n{" + surrounding if malformed else "\n"))
+    expect(script.is_file(), True, "16a: the deterministic routing-block extractor is not implemented")
     monkeypatch.setattr(sys, "argv", [str(script), str(transcript)])
-    # CLI execution in-process keeps the oracle hermetic; no signed-in CLI.
+    exit_code = 0
     try:
         runpy.run_path(str(script), run_name="__main__")
     except SystemExit as error:
-        assert error.code in (None, 0)
+        exit_code = error.code
     captured = capsys.readouterr()
     for sentinel in (surrounding, tool_arg, tool_result, path_word):
         assert sentinel not in captured.out + captured.err
-    rows = load_pace(json.loads(captured.out))
-    assert len(rows) == 1 and rows[0]["used"] == 4
-    assert abs(rows[0]["t"] + 240) <= rows[0]["t_err"]
+    if malformed:
+        # Slice 4Pa defines the error wording; it must reject without echoing
+        # input or leaving a partly emitted fixture that looks successful.
+        assert isinstance(exit_code, int) and exit_code != 0
+        assert captured.out == ""
+    else:
+        assert exit_code in (None, 0)
+        rows = load_pace(json.loads(captured.out))
+        assert len(rows) == 1 and rows[0]["used"] == 4
+        assert 0 < rows[0]["t_err"] <= 120
+        assert abs(rows[0]["t"] + 240) <= rows[0]["t_err"]
+        assert abs(rows[0]["reset"] - 6 * 86400) <= rows[0]["t_err"]
 
 
 @pytest.mark.parametrize("kind", ["rounded-age", "error-too-large", "cached-repeat"])
 @future("4Pa", "rounded or cached witnesses cannot become fresh usage samples")
 def test_16a_uncertain_readings_are_not_new_samples(replay, kind):
-    samples = steady()
-    if kind == "rounded-age":
-        samples.append(sample(86401, 12, error=3600))
-    elif kind == "error-too-large":
-        samples.append(sample(86401, 12, error=1801))
+    samples = steady(end=84600)
+    if kind == "cached-repeat":
+        samples.append(sample(86399, 12))
+        extra, expected = sample(86400, 12, error=60), 49
+        assert extra["t"] - samples[-1]["t"] <= extra["t_err"]
     else:
-        samples.append(sample(86401, 12, error=60))
-    pace = pace_view(replay, samples)
-    expect(pace.get("buckets"), 49, f"16a/{kind}: accepted-bucket count is missing or treats uncertain/cached input as fresh")
+        extra = sample(86400, 12, error=3600 if kind == "rounded-age" else 1801)
+        expected = 48
+    assert (T0.timestamp() + samples[-1]["t"]) // 900 != (T0.timestamp() + extra["t"]) // 900
+    baseline = pace_view(replay, samples)
+    expect(baseline.get("buckets"), expected, f"16a/{kind}: baseline sample buckets are missing")
+    pace = pace_view(replay, samples + [extra])
+    assert pace["buckets"] == expected, f"16a/{kind}: uncertain/cached input was accepted as a fresh bucket"
+    assert pace["rate_pct_per_h"] == baseline["rate_pct_per_h"]
 
 
 @pytest.mark.parametrize("kind", ["same-time-values", "skewed-clock", "different-reset", "late-reading", "two-minute-day"])
@@ -1276,18 +1383,20 @@ def test_16a_mac_merge_is_arrival_order_independent(replay, kind):
         assert first == pace_view(replay, on_time)
 
 
-@pytest.mark.parametrize("resolution,tail,verdict", [
-    ("pending", [], "unknown"), ("confirmed", [(300, 1), (600, 2)], "settled"),
-    ("refuted", [(300, 95)], "correction"),
+@pytest.mark.parametrize("resolution,tail", [
+    ("pending", []), ("confirmed", [(86700, 1), (87000, 2)]), ("refuted", [(86700, 95)]),
 ])
 @future("4Pa", "95 then 1 within 150 seconds must retain raw possible-reset evidence")
-def test_16a_raw_possible_reset_survives_bucket_merge(replay, resolution, tail, verdict):
-    samples = [sample(0, 95), sample(150, 1)] + [sample(t, value) for t, value in tail]
-    pace = pace_view(replay, samples, now=600)
-    expect(pace.get("reset_status"), verdict,
-           f"16a/{resolution}: raw possible reset is missing, hidden by the bucket maximum, or misclassified")
-    if resolution == "pending":
-        assert pace["why"] == "possible reset; waiting for the next reading"
+def test_16a_raw_possible_reset_survives_bucket_merge(replay, resolution, tail):
+    samples = steady(0.5, used=83) + [sample(86550, 1)]
+    pending = pace_view(replay, samples, now=86550)
+    expect(pending.get("why"), "possible reset; waiting for the next reading",
+           "16a: raw possible reset is missing or hidden by the bucket maximum")
+    assert pending["plan"]["verdict"] == "unknown"
+    if tail:
+        pace = pace_view(replay, samples + [sample(t, value) for t, value in tail], now=tail[-1][0])
+        assert pace.get("why") != "possible reset; waiting for the next reading"
+        assert pace["plan"]["verdict"] != "unknown", f"16a/{resolution}: settled readings still block the forecast"
 
 
 @future("4Pa", "fresh earlier replacement reset beats stale metadata")
@@ -1313,14 +1422,20 @@ def result_vectors():
     yield "half-hour-total", steady(), day, {"day_cap.used_24h_pct": 12, "observed_pct": 100, "rate_pct_per_h": 0.5}
     yield "steady-near-no-crossing", steady(), day, {"day_cap.verdict": "near", "day_cap.reaches_cap_at": None,
                                                      "day_cap.settles_at_pct": 12}
-    aging = [sample(0, 0), sample(240, 0), sample(360, 0.1)]
-    aging += [sample(t, 0.1 + 12.89 * (t - 360) / (86400 - 360)) for t in range(1800, 86401, 1800)]
-    yield "exact-aging-crossing", aging, day, {"day_cap.reaches_cap_at": routing._iso(T0 + timedelta(seconds=86400 + 0.01 / 0.54125 * 3600)),
+    # Phase the trailing window ten minutes past the epoch bucket edge.
+    # A pre-window anchor, minute-four endpoint and minute-six endpoint
+    # occupy distinct buckets while keeping the narrow peak that a
+    # fifteen-minute scan misses. This vector alone is evaluated at 87000.
+    aging = [sample(-300, 0), sample(840, 0), sample(960, 0.1)]
+    aging += [sample(t, 0.1 + 12.89 * (t - 960) / (87000 - 960)) for t in range(2400, 87001, 1800)]
+    assert len({int((T0.timestamp() + s["t"]) // 900) for s in aging}) == len(aging)
+    yield "exact-aging-crossing", aging, day, {"day_cap.reaches_cap_at": routing._iso(T0 + timedelta(seconds=87000 + 0.01 / 0.54125 * 3600)),
                                              "day_cap.peak_pct": pytest.approx(13.0260833333),
-                                             "day_cap.peak_at": routing._iso(T0 + timedelta(seconds=86640))}
+                                             "day_cap.peak_at": routing._iso(T0 + timedelta(seconds=87240))}
     yield "rising-rate-ages-out", steady(0.4, end=43200) + steady(0.8, start=45000, used=5.2), (
         {"kind": "per_day", "pct": 15, "revision": "cap1"},), {
-        "day_cap.verdict": "near", "day_cap.settles_at_pct": pytest.approx(14.4)}
+        "day_cap.verdict": "near", "day_cap.settles_at_pct": pytest.approx(14.4),
+        "day_cap.reaches_cap_at": routing._iso(T0 + timedelta(seconds=86400 + 3 * 3600))}
     # H=88, r=.5, n differs by the reset chosen for each target ratio.
     for label, seconds in (("outpacing", 900000), ("underpacing", 200000), ("on_pace", 633600)):
         yield label, steady(reset=seconds), (), {"plan.verdict": label}
@@ -1367,7 +1482,7 @@ RESULTS = list(result_vectors())
 @pytest.mark.parametrize("name,samples,caps,expected", RESULTS, ids=[row[0] for row in RESULTS])
 @future("4Pb", "the pure pace calculation must satisfy the numerical vector named in this case")
 def test_16b_pace_results(replay, name, samples, caps, expected):
-    pace = pace_view(replay, samples, caps=caps)
+    pace = pace_view(replay, samples, caps=caps, now=87000 if name == "exact-aging-crossing" else 86400)
     for key, wanted in expected.items():
         # Absence is distinct from an optional null output. Otherwise a
         # missing pace object could accidentally pass every 'no forecast'.
@@ -1384,50 +1499,66 @@ def test_16b_pace_results(replay, name, samples, caps, expected):
 ], ids=["no-middle", "45m02-span", "four-minute-chain", "jitter-chain", "over-hour-span"])
 @future("4Pb", "single-linkage reset components must be transitive and order-independent")
 def test_16b_cycle_grouping_in_every_arrival_order(replay, offsets, ambiguous):
-    samples = [sample(86400, 12, reset=604800 + offset, mac=f"m{i + 1}") for i, offset in enumerate(offsets)]
-    expected = "reset time spread over more than an hour" if ambiguous else 1
-    for arrival in itertools.permutations(samples):
-        pace = pace_view(replay, arrival)
-        actual = pace.get("why") if ambiguous else pace.get("cycles")
-        expect(actual, expected, "16b: canonical cycle component count/span is missing or depends on arrival order")
+    samples = steady(reset=604800 + min(offsets))
+    samples += [sample(86400, 12, reset=604800 + offset, mac=f"m{i + 2}") for i, offset in enumerate(offsets)]
+    # Permute the disputed readings while retaining enough real history for
+    # a known forecast. A false split gives newest-bucket disagreement.
+    history, disputed = samples[:-len(offsets)], samples[-len(offsets):]
+    for arrival in itertools.permutations(disputed):
+        pace = pace_view(replay, history + list(arrival))
+        if ambiguous:
+            expect(pace.get("why"), "reset time spread over more than an hour",
+                   "16b: reset component span is missing or depends on arrival order")
+        else:
+            expect(pace.get("cycle_resets_at"), routing._iso(T0 + timedelta(seconds=604800 + min(offsets))),
+                   "16b: representative reset is missing or depends on arrival order")
+            assert pace["plan"]["verdict"] == "underpacing"
+            assert pace["valid_pct"] == 100
 
 
 @pytest.mark.parametrize("kind", ["two-real-resets", "reusable-weekly-id", "unique-cycle-id", "mixed-cycle-ids",
-                                  "newest-witness-disagrees"])
+                                  "idless-outside-component", "newest-witness-disagrees"])
 @future("4Pb", "cycle identity follows reset components and unique provider cycle ids")
 def test_16b_cycle_identity(replay, kind):
-    samples = [sample(82800, 10, reset=604800), sample(84600, 11, reset=604800 + 240), sample(86400, 12, reset=604800 + 480)]
-    count = 1
-    if kind in {"two-real-resets", "reusable-weekly-id"}:
-        samples[-1]["reset"] = 604800 + 5 * 3600
-        count = 2
+    samples = steady()
+    for s in samples[24:]:
+        s["reset"] += 5 * 3600
     if kind == "reusable-weekly-id":
         for s in samples:
             s["cycle"] = "weekly"
-    elif kind == "unique-cycle-id":
+    elif kind in {"unique-cycle-id", "mixed-cycle-ids", "idless-outside-component"}:
         for s in samples:
             s["cycle"] = "unique-cycle-1"
-    elif kind == "mixed-cycle-ids":
-        samples[0]["cycle"] = "unique-cycle-1"
+        if kind != "unique-cycle-id":
+            samples[-1]["cycle"] = None
+            samples[-1]["reset"] += 240 if kind == "mixed-cycle-ids" else 5 * 3600
     elif kind == "newest-witness-disagrees":
-        samples += [sample(86400, 12, reset=604800 + 5 * 3600, mac="m2")]
-    for arrival in itertools.permutations(samples):
+        samples += [sample(86400, 12, reset=604800, mac="m2")]
+    assert max(s["reset"] for s in samples) - min(s["reset"] for s in samples) >= 5 * 3600
+    # Intervals crossing cycle boundaries are excluded as a pair (gain and
+    # duration). This scope field exposes identity without inventing cycles.
+    joins = kind in {"unique-cycle-id", "mixed-cycle-ids"}
+    expected_valid = 100 if joins else 100 * 23.5 / 24
+    for arrival in (samples, list(reversed(samples)), samples[24:] + samples[:24]):
         pace = pace_view(replay, arrival)
         if kind == "newest-witness-disagrees":
             expect(pace.get("why"), "reset time disagrees between readings", "16b: newest witness bucket hides disagreeing cycles")
         else:
-            expect(pace.get("cycles"), count, f"16b/{kind}: provider cycle-id partition is missing or incorrect")
+            expect(pace.get("valid_pct"), pytest.approx(expected_valid),
+                   f"16b/{kind}: cycle boundary intervals are missing or incorrectly included")
+            assert pace["cycle_resets_at"] == routing._iso(T0 + timedelta(seconds=samples[-1]["reset"]))
+            assert pace["rate_pct_per_h"] == pytest.approx(0.5)
 
 
-@future("4Pb", "sanitized history verdicts allow for each sample's t_err")
-def test_16b_sanitized_history_with_uncertainty(replay):
+@future("4Pb", "synthetic history verdicts allow for each sample's t_err")
+def test_16b_synthetic_history_with_uncertainty(replay):
     rows = load_pace(json.loads(PACE.read_text()))
     samples = [sample(row["t"], row["used"], reset=row["reset"], error=row["t_err"]) for row in rows]
     pace = pace_view(replay, samples)
     # Synthetic history rises twelve points in a day; rounding allows 60 s
     # at either boundary, rather than pretending the clocks were exact.
     expect(pace.get("rate_pct_per_h"), pytest.approx(0.5, abs=0.002),
-           "16b: sanitized uncertainty-bounded history has no correct trailing rate")
+           "16b: synthetic uncertainty-bounded history has no correct trailing rate")
 
 
 # ---- 16c: pushes compare with the last acknowledged forecast ----------------------------
@@ -1437,41 +1568,70 @@ def test_16b_sanitized_history_with_uncertainty(replay):
                                      "cycle", "cap-revision", "availability", "cumulative-small-moves", "numbers-alone"])
 @future("4Pa", "pace push selection must use the last acknowledged forecast and hysteretic urgency bands")
 def test_16c_pace_pushes(replay, scenario):
-    # These are measured forecast states at the producer/ledger boundary,
-    # not a second implementation of the pace calculator in the rig.
-    base = {"window": "five_hour", "cycle": "c1", "verdict": "outpacing", "target": "plan",
-            "available": True, "runs_out_in_s": 3600, "rate_pct_per_h": 2, "needed_pct_per_h": 1,
-            "cap_revision": None}
-    updates, wanted = [], 1
+    # Feed scope-defined usage_sample inputs through the production fold.
+    # No invented pace_forecast events or precomputed verdict labels.
+    base = {"eta": 3600, "window": "five_hour", "reset": 86400 + 4 * 3600,
+            "revision": "cap1", "available": True}
+    wanted = 1
     if scenario == "one-hour-to-ten-minutes":
-        updates = [dict(base, runs_out_in_s=600)]
+        updates = [dict(base, eta=600)]
     elif scenario == "band-jitter":
-        updates = [dict(base, runs_out_in_s=s) for s in (3599, 3601, 3599, 3601)]
+        updates = [dict(base, eta=s) for s in (3599, 3601, 3599, 3601)]
     elif scenario == "verdict-hysteresis":
-        base.update(verdict="on_pace", rate_pct_per_h=1.14)
-        updates = [dict(base, rate_pct_per_h=r) for r in (1.151, 1.149, 1.151)]
+        base["ratio"] = 1.14
+        updates = [dict(base, ratio=r) for r in (1.151, 1.149, 1.151)]
     elif scenario == "limiting-window":
         updates = [dict(base, window="weekly")]
     elif scenario == "cycle":
-        updates = [dict(base, cycle="c2")]
+        updates = [dict(base, reset=base["reset"] + 5 * 3600)]
     elif scenario == "cap-revision":
-        updates = [dict(base, cap_revision="cap2")]
+        updates = [dict(base, revision="cap2")]
     elif scenario == "availability":
         updates, wanted = [dict(base, available=False), dict(base, available=True)], 2
     elif scenario == "cumulative-small-moves":
-        base["runs_out_in_s"] = 24000
-        updates = [dict(base, runs_out_in_s=24000 + i * 2000) for i in (1, 2, 3, 4)]
+        base.update(eta=24000, window="weekly", reset=86400 + 7 * 86400)
+        updates = [dict(base, eta=24000 + i * 2000) for i in (1, 2, 3, 4)]
     else:
-        updates, wanted = [dict(base, rate_pct_per_h=2.01)], 0
-    replay.write(replay.event("pace_forecast", account="codex|", pace=base))
+        base["eta"] = 7200
+        updates, wanted = [dict(base, eta=7190)], 0
+
+    def install_readings(state):
+        now = int((replay.now - T0).total_seconds())
+        # Two points of headroom, or one against the share cap, sets the
+        # forecast time. Hysteresis inputs straddle 1.15 of the needed rate.
+        headroom = 1 if scenario == "cap-revision" else 2
+        rate = headroom * 3600 / state["eta"]
+        if "ratio" in state:
+            rate = state["ratio"] * 2 * 3600 / (state["reset"] - now)
+        span, step = (3600, 600) if state["window"] == "five_hour" else (86400, 1800)
+        history = steady(rate, start=now - span, end=now, used=98 - rate * span / 3600,
+                         reset=state["reset"], step=step)
+        if not state["available"]:
+            history = history[-2:]
+        rows = [replay.event("usage_sample", i + 1, account="codex|", window=state["window"],
+                             witness_at=routing._iso(T0 + timedelta(seconds=s["t"])), used_pct=s["used"],
+                             resets_at=routing._iso(T0 + timedelta(seconds=s["reset"])), mac="m1", source="probe")
+                for i, s in enumerate(history)]
+        if scenario == "cap-revision":
+            rows.append(replay.event("cap_set", len(rows) + 1, account="codex|", window=state["window"],
+                                     kind="share", pct=99, revision=state["revision"]))
+        # Replace only this isolated sample snapshot. Component delivery
+        # markers stay intact, so comparisons use the acknowledged forecast.
+        path = routing.events_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        return rate
+
+    replay.now = T0 + timedelta(seconds=86400)
+    install_readings(base)
     first, _, info = replay.offer()
-    expect("pace" in first.get("text", "").lower(), True,
-           f"16c/{scenario}: baseline measured forecast has no delivered pace line")
+    expect("at the trailing average" in first.get("text", ""), True,
+           f"16c/{scenario}: usage samples produce no delivered pace forecast")
     replay.ack(info)
     count = 0
-    for i, update in enumerate(updates, start=2):
+    for i, update in enumerate(updates, start=1):
         replay.advance(1)
-        replay.write(replay.event("pace_forecast", i, account="codex|", pace=update))
+        install_readings(update)
         out, _, info = replay.offer()
         if out["kind"] != "none":
             count += 1
