@@ -332,3 +332,15 @@ def test_owner_rename_cannot_merge_into_another_logins_opaque_id(mac):
     other = next(a["key"] for a in routing.accounts() if a["label"] == "Claude other")
     with pytest.raises(usage.AccountsError, match="another account's stable id"):
         accounts.rename(other, "Claude " + ident.split(":")[1], expect=config.accounts_version(), via="app")
+
+
+def test_a_numbered_legacy_suggestion_stays_suggested():
+    # Opus round-3 N4: "Claude zqprivate 2" is Khipu's own numbered suggestion, never the owner's label.
+    from khipu import discover, routing_identity
+
+    home = "~/.claude-zqprivate"
+    suggestion = discover.default_name("claude", home, default=False)
+    for label in (f"{suggestion} 2", f"{suggestion} 13"):
+        assert routing_identity.label_source({"label": label, "harness": "claude", "home": home}) == "suggested"
+    assert routing_identity.label_source({"label": f"{suggestion} two", "harness": "claude", "home": home}) == "owner"
+    assert routing_identity.label_source({"label": "Claude work", "harness": "claude", "home": home}) == "owner"

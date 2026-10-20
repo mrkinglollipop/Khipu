@@ -71,8 +71,14 @@ def label_source(account: dict, former_homes=()) -> str:
         return source
     from khipu import discover
 
+    label = str(account["label"]).casefold()
     for home in [account.get("home"), *former_homes]:
-        if home and account["label"] == discover.default_name(account["harness"], home, default=False):
+        suggestion = discover.default_name(account["harness"], home, default=False) if home else None
+        if not suggestion:
+            continue
+        suggestion = suggestion.casefold()
+        # accounts._unique_name numbers a taken suggestion "<name> 2", "<name> 3", ...
+        if label == suggestion or re.fullmatch(re.escape(suggestion) + r" (?:[2-9]|[1-9]\d+)", label):
             return "suggested"
     return "owner"
 
