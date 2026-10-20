@@ -792,6 +792,10 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
         line = {"kind": "action", "id": _new_id(), "at": _iso(_clock()), "action": want["action"],
                 "target": want["target"], "before": None if before in (_NO_UNDO, _UNREADABLE) else before,
                 "auth": stamp.get("auth")}
+        if want["action"].startswith("route.rule.") and want["action"] != "route.rule.add":
+            from khipu import routing
+
+            line["target"] = routing.rule_reference(want["target"])[0]
         why = _no_undo(want["action"], before)
         if why:
             line.update(undo=None, no_undo=why)
@@ -944,7 +948,7 @@ def _entry(key: str) -> dict:
 def _rule_now(n) -> dict:
     from khipu import routing
 
-    return next((r for r in routing.read_view()["rules"] if str(r["n"]) == str(n)), {}) or {}
+    return next((r for r in routing.read_view()["rules"] if (str(r["n"]) == str(n) or r.get("entity") == str(n))), {}) or {}
 
 
 def _priority_rows(held: dict | None) -> list[dict] | None:
@@ -1340,16 +1344,16 @@ def _undo_hold_add(line, via):
     return routing.end_hold(hold_id, owner=True, via=via)
 
 
-def _added_rule(line) -> int:
+def _added_rule(line) -> str | int:
     from khipu import routing
 
-    n = (line.get("after") or {}).get("n")
+    n = (line.get("after") or {}).get("entity") or (line.get("after") or {}).get("n")
     if n is None:
         # Unconfirmed: the rule written under the id this action chose.
         planned = _b(line).get("event")
         events, _bad = routing.read_events()
-        n = next((e["n"] for e in events if planned and e.get("type") == "rule_add" and e.get("id") == planned
-                  and isinstance(e.get("n"), int)), None)
+        n = next((e.get("entity") or e.get("n") for e in events if planned and e.get("type") == "rule_add"
+                  and e.get("id") == planned), None)
     if n is None:
         raise ValueError("Khipu can't tell which rule this added, so it can't undo it")
     return n

@@ -55,7 +55,8 @@ STATES = {"open", "limited", "down"}
 HARNESS = {"codex", "claude_code", "grok_build", "shell", "unknown"}
 EVENT_FIELDS = {"type", "id", "account", "state", "source", "written_at", "written_by", "via",
                 "scope", "reason", "text", "until", "owner", "pending", "n", "target", "entries",
-                "owner_request", "seq", "basis", "until_default", "date", "seeded"}
+                "owner_request", "seq", "basis", "until_default", "date", "seeded",
+                "mac", "legacy_mac", "entity", "base", "op", "op_body", "hlc", "number_pending", "hub_order", "proposal", "clock_at"}
 TEXT_FIELDS = {"text", "owner_request", "role"}
 
 
@@ -71,11 +72,26 @@ def load_replay(value):
         number(row["written_at"], integer=True)
         if row.get("until") is not None:
             number(row["until"], integer=True)
-        for key in ("seq", "date"):
+        for key in ("seq", "date", "hub_order"):
             if key in row:
                 number(row[key], integer=True)
         if "basis" in row and row["basis"] not in {"cli", "estimated", "checked", "owner"}:
             raise FixtureError("fixture_enum")
+        for key, prefix in (("mac", "m"), ("legacy_mac", "m"), ("entity", "e"), ("op", "o"), ("op_body", "b"), ("proposal", "e")):
+            if key in row:
+                alias(row[key], prefix)
+        if "base" in row and row["base"] != "0":
+            alias(row["base"], "e")
+        if "clock_at" in row:
+            number(row["clock_at"], integer=True)
+        if "hlc" in row:
+            hlc = row["hlc"]
+            closed(hlc, {"wall", "counter", "mac"}, {"wall", "counter", "mac"})
+            number(hlc["wall"], integer=True)
+            number(hlc["counter"], integer=True)
+            if hlc["counter"] < 0:
+                raise FixtureError("fixture_range")
+            alias(hlc["mac"], "m")
         if "account" in row:
             alias(row["account"], "a")
         if "target" in row:
@@ -83,7 +99,7 @@ def load_replay(value):
         for key in TEXT_FIELDS & row.keys():
             if not isinstance(row[key], str) or not re.fullmatch("x*", row[key]):
                 raise FixtureError("fixture_text")
-        for key in ("owner", "pending", "until_default", "seeded"):
+        for key in ("owner", "pending", "until_default", "seeded", "number_pending"):
             if key in row and type(row[key]) is not bool:
                 raise FixtureError("fixture_schema")
         if "n" in row:
@@ -131,7 +147,7 @@ def sanitize(events):
     """Preserve relationships, intervals, nesting and text lengths; copy no prose."""
     if type(events) is not list:
         raise FixtureError("fixture_schema")
-    names = {prefix: {} for prefix in ("a", "e", "p", "s")}
+    names = {prefix: {} for prefix in ("a", "e", "p", "s", "m", "o", "b")}
 
     def named(value, prefix):
         if not isinstance(value, str):
@@ -175,6 +191,17 @@ def sanitize(events):
                 row[key] = words(value)
             elif key in {"account", "target"}:
                 row[key] = named(value, "a" if key == "account" else "e")
+            elif key in {"mac", "legacy_mac", "entity", "base", "op", "op_body", "proposal"}:
+                prefix = {"mac": "m", "legacy_mac": "m", "op": "o", "op_body": "b"}.get(key, "e")
+                row[key] = "0" if key == "base" and value == "0" else named(value, prefix)
+            elif key == "hlc":
+                closed(value, {"wall", "counter", "mac"}, {"wall", "counter", "mac"})
+                number(value["wall"], integer=True)
+                number(value["counter"], integer=True)
+                row[key] = {"wall": value["wall"] - origin * 1000, "counter": value["counter"],
+                            "mac": named(value["mac"], "m")}
+            elif key == "clock_at":
+                row[key] = time(value)
             elif key == "until":
                 row[key] = None if value is None else time(value)
             elif key == "date":
