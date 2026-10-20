@@ -989,7 +989,7 @@ def _definition_accounts(known: list[dict], events: list[dict] | None = None, co
         account = next((a for a in out if ids.get(a["key"]) == current), None)
         if account is None:
             binding = bindings.get(current) or {}
-            if binding.get("harness") != value["provider"]:
+            if binding.get("harness", value["provider"]) != value["provider"]:
                 binding = {}
             home = binding.get("home")
             key = f"{value['provider']}|{home or ''}" if binding else current
@@ -1661,14 +1661,14 @@ def _checked(data: dict) -> dict | None:
                 not isinstance(v, (str, bool)) and v is not None for v in declaration.values()):
             return None
         out["declaration"] = {k: v for k, v in declaration.items() if k in {
-            "kind", "provider", "account", "budget_account", "login_account", "identity_invalid"}}
+            "kind", "provider", "model", "account", "budget_account", "login_account", "identity_invalid"}}
     if "holds" in data:
         choices = data["holds"]
         if not isinstance(choices, dict) or not all(isinstance(k, str) and v in ("end", "keep")
                                                     for k, v in choices.items()):
             return None
         out["holds"] = dict(choices)
-    if out["type"] == "definition_set":
+    if out["type"] in ("definition_set", "definition_remove"):
         value = entry_model.checked_definition(out.get("definition"), data.get("value"))
         if value is None:
             return None
@@ -2043,7 +2043,7 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     cfg["_accounts_version"] = accounts_version(config)
     seed = cfg.get("routing_rules_seed")
     cfg["_mac"] = mac
-    fingerprint = {"entry_model": 1, "account_identity": 2, "payer_identity": 2, "events": events_stat, "config": config_stat,
+    fingerprint = {"entry_model": 1, "account_identity": 2, "payer_identity": 3, "events": events_stat, "config": config_stat,
                    "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
     return fingerprint, cfg, known
@@ -2088,12 +2088,27 @@ def _lane_home(home) -> str | None:
     return os.path.abspath(os.path.expanduser(home))
 
 
+def _model_providers(spec: dict, catalog: dict | None = None) -> set[str]:
+    from khipu import routing_sources
+
+    # Cursor's payer is the unified xAI plan; its model family stays independent.
+    if _provider_id(spec.get("kind")) == "grok" and str(spec.get("kind")).casefold() == "cursor":
+        return {"grok"}
+    family = routing_sources.model_family(spec.get("model"))
+    if family == "unknown":
+        return set()
+    matches = {_provider_id(p) for p, fact in (catalog or {}).items() if fact.get("family") == family}
+    defaults = {"Zhipu": "glm", "DeepSeek": "deepseek", "Anthropic": "claude", "OpenAI": "codex",
+                "xAI": "grok", "Meta": "muse", "Google": "antigravity"}
+    return matches or {defaults[family]}
+
+
 def login_binding(spec: dict, known: list[dict]) -> dict:
     """Resolve local home fields immediately; raw paths never enter a cache."""
     homes = [spec[k] for k in ("home", "login_home") if k in spec]
     if not homes:
         return {}
-    providers = {_provider_id(spec[k]) for k in ("kind", "provider") if spec.get(k)}
+    providers = {_provider_id(spec["provider"])} if spec.get("provider") else _model_providers(spec)
     targets = []
     for home in homes:
         matches = [a["key"] for a in known if _lane_home(home) is not None
@@ -2115,12 +2130,18 @@ def resolve_lane(runner: str, lane: str, lane_map: dict, known: list[dict], spec
     spec = spec if isinstance(spec, dict) else {}
     catalog = providers or {}
     keys = {a["key"] for a in known}
-    declared_providers = {_provider_id(spec[k]) for k in ("kind", "provider") if spec.get(k)}
+    explicit_providers = {_provider_id(spec["provider"])} if spec.get("provider") else set()
+    model_providers = _model_providers(spec, catalog)
+    declared_providers = explicit_providers or model_providers
+    if not declared_providers and not any(k in spec for k in ("account", "budget_account", "home", "login_home", "login_account")):
+        declared_providers = {_provider_id(spec["kind"])} if spec.get("kind") else set()
     candidates = [a["key"] for a in known if _provider_id(a["harness"]) in declared_providers]
     declared = [spec[k] for k in ("account", "budget_account") if k in spec]
-    targets = [_lane_target(value, known) if isinstance(value, str) else None for value in declared]
+    targets = [_lane_target(value, known, provider_word=True) if isinstance(value, str) else None for value in declared]
     declared_candidates = [a["key"] for value in declared if isinstance(value, str)
                            for a in _label_matches(value, known)] + [t for t in targets if t in keys]
+    declared_candidates += [a["key"] for value in declared if isinstance(value, str) for a in known
+                            if _provider_id(a["harness"]) == _provider_id(value)]
 
     def result(key=None, by=None, reason=None, choices=None):
         confirmation = None
@@ -2150,27 +2171,29 @@ def resolve_lane(runner: str, lane: str, lane_map: dict, known: list[dict], spec
     local = login_binding(spec, known)
     if spec.get("identity_invalid") or local.get("identity_invalid"):
         return result(reason="invalid or stale login binding")
+    if (explicit_providers and model_providers and not explicit_providers <= model_providers):
+        return result(reason="explicit provider conflicts with model provider")
     if len(declared_providers) > 1:
-        return result(reason="provider fields disagree")
+        return result(reason="model family has no unique provider")
     login = local.get("login_account", spec.get("login_account"))
     if declared:
         key = targets[0]
         valid = key in keys and all(t == key for t in targets) and (
             not declared_providers or key in candidates) and (login is None or login == key)
         return result(key if valid else None, "declaration" if valid else None,
-                      None if valid else "account, provider or login binding disagrees",
+                      None if valid else "account, provider or login binding conflict",
                       candidates + declared_candidates + ([login] if login in keys else []))
     if login is not None:
         valid = login in keys and (not declared_providers or login in candidates)
         return result(login if valid else None, "login_home" if valid else None,
-                      None if valid else "login binding disagrees")
+                      None if valid else "login binding conflicts with model or provider")
     # Existing provider-only declarations retain their established match label.
     if declared_providers:
         key = candidates[0] if len(candidates) == 1 else None
         return result(key, "provider" if key else None, None if key else "provider has no unique account")
     names = [p for p, fact in catalog.items() if lane.casefold() in
              {p.casefold(), *(n.casefold() for n in fact.get("lane_names", []))}]
-    choices = [a["key"] for a in known if a["harness"] in names]
+    choices = [a["key"] for a in known if _provider_id(a["harness"]) in {_provider_id(p) for p in names}]
     key = choices[0] if len(names) == 1 and len(choices) == 1 else None
     return result(key, "name" if key else None, None if key else "name has no unique provider account", choices)
 
@@ -2180,10 +2203,11 @@ def _label_matches(target: str, known: list[dict]) -> list[dict]:
     return [a for a in known if a["label"].casefold() == raw]
 
 
-def _lane_target(target: str, known: list[dict]) -> str | None:
+def _lane_target(target: str, known: list[dict], *, provider_word: bool = False) -> str | None:
     """The account a lane-map entry names: a key as it is; a label only when
     exactly one known account carries it (a hand-edited list can hold two);
-    else an account id or a bare CLI word as ``resolve_account`` takes them."""
+    else an account id or a bare CLI word. A declaration's provider word
+    requires a unique provider account; an owner map can name a unique label."""
     raw = str(target or "").strip()
     if raw in {a["key"] for a in known}:
         return raw
@@ -2192,12 +2216,17 @@ def _lane_target(target: str, known: list[dict]) -> str | None:
         return stable[0]
     if not raw:
         return None
+    provider_matches = [a["key"] for a in known if _provider_id(a["harness"]) == _provider_id(raw)]
+    if provider_word and provider_matches:
+        return provider_matches[0] if len(provider_matches) == 1 else None
     if "|" not in raw:
         matches = _label_matches(raw, known)
         if len(matches) == 1:
             return matches[0]["key"]
         if matches:
             return None
+    if provider_matches:
+        return provider_matches[0] if len(provider_matches) == 1 else None
     return _resolve_quiet(raw, known)
 
 
@@ -8347,6 +8376,17 @@ def _route_intent(cmd: str, args) -> dict | None:
     and the owner-actions log (``owner_direction.ACTIONS``)."""
     from khipu import owner_direction
 
+    if cmd == "definition":
+        try:
+            value = json.loads(args.value)
+        except (ValueError, TypeError):
+            raise RouteError("--value must be a JSON definition") from None
+        value = entry_model.checked_definition(args.definition, value)
+        if value is None:
+            raise RouteError("invalid definition; provider facts require id, label and family")
+        target = value.get("id") or value["runner"] + ":" + value["lane"]
+        return owner_direction.intent("route.definition.set", target,
+                                      facts={"definition": args.definition, "value": value})
     if cmd in ("pause", "lift", "clear"):
         facts = {"report": args.report} if cmd == "clear" and getattr(args, "report", None) else None
         return owner_direction.intent(f"route.{cmd}", _resolve_account_key(args.account), facts=facts)
@@ -8500,12 +8540,15 @@ def run_cli(args) -> int:
                 raise RouteError("--at-owner-request is only for rule add or edit")
             _print_json(out)
             return 0
-        via = _owner_via(args, _intent_or_none(_route_intent, cmd, args))
+        want = _route_intent(cmd, args) if cmd == "definition" else _intent_or_none(_route_intent, cmd, args)
+        via = _owner_via(args, want)
         if via is None:
             _print_json({"ok": False, "error": _REFUSED})
             return 2
         now = _now()
-        if cmd == "pause":
+        if cmd == "definition":
+            out = set_definition(args.definition, want["facts"]["value"], via=via)
+        elif cmd == "pause":
             out = pause(args.account, until=args.until, via=via, now=now)
         elif cmd == "lift":
             out = lift(args.account, via=via, now=now)

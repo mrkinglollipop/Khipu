@@ -20,6 +20,7 @@ from contextlib import redirect_stderr, redirect_stdout
 # action: (required keys, optional keys). Every key is text unless named in
 # _LISTS (a JSON list), _INTS (a whole number) or _FLAGS (true or false).
 SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "route.definition.set": (("definition", "value"), ()),
     "route.pause": (("account",), ("until",)),
     "route.lift": (("account",), ()),
     "route.clear": (("account",), ("report",)),
@@ -112,11 +113,20 @@ def _values(action: str, args) -> dict:
     missing = [k for k in required if args.get(k) is None]
     if missing:
         raise _bad(f"{action} needs {', '.join(missing)}")
+    # The value schema depends on this enum, regardless of JSON key order.
+    if action == "route.definition.set" and args["definition"] not in ("provider", "account", "lane_map"):
+        raise _bad("definition must be provider, account or lane_map")
     out: dict = {}
     for key, value in args.items():
         if value is None:
             continue
-        if key in _LISTS:
+        if action == "route.definition.set" and key == "value":
+            from khipu import routing_entries
+
+            value = routing_entries.checked_definition(args.get("definition"), value)
+            if value is None:
+                raise _bad("value must be a valid provider, account or lane_map definition")
+        elif key in _LISTS:
             if key == "checks" and isinstance(value, str):
                 value = [c.strip() for c in value.split(",") if c.strip()]
             if not isinstance(value, list) or not value:
@@ -195,6 +205,8 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
 
     v = values
     verb = action.rsplit(".", 1)[-1]
+    if action == "route.definition.set":
+        return ["route", "definition", "set", "--value=" + json.dumps(v["value"])], [v["definition"]]
     if action in ("route.pause", "route.lift", "route.clear"):
         return ["route", verb, *_opts(v, "until", "report")], [v["account"]]
     if action == "route.note.set":

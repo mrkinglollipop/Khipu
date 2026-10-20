@@ -12,7 +12,7 @@ NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 
 
 def checked(value):
-    if not isinstance(value, dict) or set(value) - FIELDS or not {"id", "label"} <= value.keys():
+    if not isinstance(value, dict) or set(value) - FIELDS or not {"id", "label", "family"} <= value.keys():
         return None
     for field, item in value.items():
         if field in {"lane_names", "models_allowed", "models_never"}:
@@ -36,17 +36,17 @@ def checked(value):
     return {k: list(v) if isinstance(v, list) else v for k, v in value.items()}
 
 
-def advisory(provider: dict, model: str | None, *, requested: bool = False) -> list[str]:
+def advisory(provider: dict, model: str | None) -> list[str]:
     """Exact declared model ids, never inferred aliases or a routing decision."""
     warnings = []
     label = provider.get("label") or provider["id"]
     if model in provider.get("models_never", []):
         warnings.append(f"{label}: model {model} is listed in models_never.")
     allowed = provider.get("models_allowed")
-    if allowed is not None and model not in allowed:
+    if model and model != "(name withheld)" and allowed is not None and model not in allowed:
         warnings.append(f"{label}: model {model or 'unknown'} is outside models_allowed ({', '.join(allowed)}).")
-    if provider.get("use") == "on_request" and not requested:
-        warnings.append(f"{label}: use is on_request; an owner request is needed for this dispatch.")
+    if provider.get("use") == "on_request":
+        warnings.append(f"{label}: use: on_request; follow the owner's request when choosing this provider.")
     return warnings
 
 

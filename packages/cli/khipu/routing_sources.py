@@ -449,10 +449,10 @@ def model_family(model) -> str:
 
 
 def lane_identity(spec: dict) -> dict:
-    """Keep declarations only when they name a tracked identity; drop raw text."""
+    """Keep safe declarations unresolved so new owner facts can resolve them."""
     from khipu import routing
 
-    out = {k: safe_name(spec.get(k)) for k in ("kind", "provider") if spec.get(k) is not None}
+    out = {k: safe_name(spec.get(k)) for k in ("kind", "provider", "model") if spec.get(k) is not None}
     if spec.get("identity_invalid") or any(v is None for v in out.values()):
         out["identity_invalid"] = True
     known = None
@@ -461,7 +461,17 @@ def lane_identity(spec: dict) -> dict:
             known = routing.accounts() if known is None else known
             value = spec[field]
             key = routing._lane_target(value, known) if isinstance(value, str) else None
-            out[field] = key if key in {a["key"] for a in known} else WITHHELD
+            if key in {a["key"] for a in known} and isinstance(value, str) and ("/" in value or "\\" in value):
+                out[field] = key
+            elif isinstance(value, str) and value.endswith("|") and safe_name(value[:-1]) not in (None, WITHHELD):
+                out[field] = value
+            elif isinstance(value, str) and value.count(":") == 1 and all(
+                    safe_name(part) not in (None, WITHHELD) for part in value.split(":")):
+                out[field] = value
+            elif key in {a["key"] for a in known} and safe_name(value) in (None, WITHHELD):
+                out[field] = key
+            else:
+                out[field] = safe_name(value) or WITHHELD
     known = routing.accounts() if known is None else known
     local = routing.login_binding(spec, known)
     if local:

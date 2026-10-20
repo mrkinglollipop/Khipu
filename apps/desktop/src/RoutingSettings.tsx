@@ -1113,6 +1113,81 @@ function homeOfKey(key: string): string | null {
   return i >= 0 && key.slice(i + 1) ? key.slice(i + 1) : null;
 }
 
+function AddProviderAccount({ data, w }: { data: RouteView; w: Writer }) {
+  const [open, setOpen] = useState(false);
+  const [provider, setProvider] = useState("glm");
+  const [label, setLabel] = useState("");
+  const [slug, setSlug] = useState("main");
+  const [saving, setSaving] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const prefix = useId();
+  const id = "provider-account";
+  const close = () => {
+    if (saving) return;
+    setOpen(false);
+    focusAfter(() => trigger.current);
+  };
+  return <div className="route-form">
+    {!open ? <button type="button" className="sm" ref={trigger} onClick={() => {
+      w.fail(id, null);
+      w.fail(`${id}:provider`, null);
+      w.fail(`${id}:account`, null);
+      setOpen(true);
+    }}>Add provider account</button> : null}
+    {open ? <form className="route-pause" aria-label="Add provider account" onKeyDown={escapeCloses(close)}
+      onSubmit={async (e) => {
+        e.preventDefault();
+        if (saving) return;
+        const accountId = `${provider}:${slug.trim()}`;
+        if (!label.trim() || !/^[a-z0-9][a-z0-9-]*$/.test(slug.trim())) {
+          w.fail(id, "Enter an account name and an ID using lowercase letters, numbers or hyphens.");
+          return;
+        }
+        if (data.definitions?.accounts?.[accountId] || data.accounts?.some((a) => a.key === accountId)) {
+          w.fail(id, "That account ID is already tracked. Choose another ID.");
+          return;
+        }
+        w.fail(id, null);
+        setSaving(true);
+        try {
+          // Keep owner facts already in the record, including restrictions absent from this form.
+          if (!data.definitions?.providers?.[provider]) {
+            const value = provider === "glm"
+              ? { id: "glm", label: "GLM", family: "Zhipu", login: "none", probe: "none", lane_names: ["glm"],
+                  models_allowed: ["glm-5.3", "glm-5.3-flash"] }
+              : { id: "deepseek", label: "DeepSeek", family: "DeepSeek", login: "none", probe: "none", lane_names: ["deepseek"],
+                  models_allowed: ["deepseek-flash"] };
+            if (!await w.run(`${id}:provider`, "khipu_route_definition", { definition: "provider", value })) return;
+          }
+          if (await w.run(`${id}:account`, "khipu_route_definition", { definition: "account",
+            value: { id: accountId, label: label.trim(), provider } }, null, () => trigger.current)) {
+            setOpen(false);
+            setLabel("");
+            setSlug("main");
+            focusAfter(() => trigger.current);
+          }
+        } finally { setSaving(false); }
+      }}>
+      <div className="toolbar">
+        <label htmlFor={`${prefix}-provider`}>Provider</label>
+        <select id={`${prefix}-provider`} value={provider} disabled={saving} autoFocus onChange={(e) => setProvider(e.target.value)}>
+          <option value="glm">GLM</option><option value="deepseek">DeepSeek</option>
+        </select>
+        <label htmlFor={`${prefix}-name`}>Account name</label>
+        <input id={`${prefix}-name`} value={label} disabled={saving} onChange={(e) => setLabel(e.target.value)} />
+        <label htmlFor={`${prefix}-id`}>Account ID</label>
+        <input id={`${prefix}-id`} value={slug} disabled={saving} onChange={(e) => setSlug(e.target.value)} />
+      </div>
+      <p className="set-help">{provider === "glm" ? "Models: glm-5.3, glm-5.3-flash." : "Model: deepseek-flash."} Existing provider rules are kept. Usage comes from runner reports.</p>
+      <WriteError w={w} id={id} /><WriteError w={w} id={`${id}:provider`} /><WriteError w={w} id={`${id}:account`} />
+      <div className="toolbar">
+        <button type="submit" className="primary sm" disabled={saving}><Busy on={saving} />Add account</button>
+        <button type="button" className="sm link" disabled={saving} onClick={close}>Cancel</button>
+      </div>
+    </form> : null}
+  </div>;
+}
+
 function AccountsSection({
   data,
   plansState,
@@ -1168,6 +1243,7 @@ function AccountsSection({
   return (
     <div className="section-body">
       {finder ? <FinderTop finder={finder} rows={rows} /> : null}
+      <AddProviderAccount data={data} w={w} />
       {accounts.length ? (
         <>
           <div className="route-filter">

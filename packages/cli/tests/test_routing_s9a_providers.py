@@ -6,9 +6,11 @@ from datetime import timedelta
 
 import pytest
 
-from khipu import config, routing, routing_delegation, routing_entries, routing_sources
-from tests.test_routing_acceptance import replay, T0
-from tests.test_routing_cursor import mac, runner, NOW
+from khipu import config, routing, routing_delegation, routing_entries
+from tests.test_routing_acceptance import T0
+from tests.test_routing_cursor import runner, NOW
+
+pytest_plugins = ("tests.test_routing_acceptance", "tests.test_routing_cursor")
 
 
 @pytest.mark.parametrize('bad', [
@@ -17,12 +19,12 @@ from tests.test_routing_cursor import mac, runner, NOW
     {'host': 'https://example.invalid/path?token=secret'}, {'home': '/private'},
 ])
 def test_closed_provider_schema(bad):
-    assert routing_entries.checked_definition('provider', {'id': 'custom', 'label': 'Custom', **bad}) is None
+    assert routing_entries.checked_definition('provider', {'id': 'custom', 'label': 'Custom', 'family': 'Custom', **bad}) is None
 
 
 def facts(replay):
     for ident, family, fields in [
-        ('deepseek', 'DeepSeek', {'models_never': ['v4-pro']}),
+        ('deepseek', 'DeepSeek', {'models_allowed': ['deepseek-flash']}),
         ('muse', 'Meta', {'models_allowed': ['muse-wonder-full-1.0']}),
         ('antigravity', 'Google', {'use': 'on_request'}),
     ]:
@@ -35,15 +37,15 @@ def test_model_facts_reach_mcp_both_pushes_and_advisory(replay, monkeypatch):
     facts(replay)
     body = replay.pull()
     providers = {p['id']: p for p in body['providers']}
-    assert providers['deepseek']['models_never'] == ['v4-pro']
+    assert providers['deepseek']['models_allowed'] == ['deepseek-flash']
     assert providers['muse']['models_allowed'] == ['muse-wonder-full-1.0']
     assert providers['antigravity']['use'] == 'on_request'
     summary = routing.summary()['text']
-    assert all(word in summary for word in ['models_never: [v4-pro]', 'models_allowed: [muse-wonder-full-1.0]',
+    assert all(word in summary for word in ['models_allowed: [deepseek-flash]', 'models_allowed: [muse-wonder-full-1.0]',
                                              'use: on_request'])
     # Both recall paths call these common production delivery functions.
-    assert 'models_never' in routing.start_push(1.0)['text']
-    for provider, model, field in [('deepseek', 'v4-pro', 'models_never'), ('muse', 'other', 'models_allowed'),
+    assert 'models_allowed' in routing.start_push(1.0)['text']
+    for provider, model, field in [('deepseek', 'v4-pro', 'models_allowed'), ('muse', 'other', 'models_allowed'),
                                    ('antigravity', 'gemini-3', 'on_request')]:
         payload = {'tool_name': 'spawn_agent', 'tool_input': {'provider': provider, 'model': model}}
         assert field in ' '.join(routing_delegation.provider_advisory(payload))
@@ -52,7 +54,7 @@ def test_model_facts_reach_mcp_both_pushes_and_advisory(replay, monkeypatch):
     assert routing_delegation.provider_advisory({'tool_name': 'Bash', 'tool_input': {
         'command': 'muse exec --model other "do the task"'}})
     changed = routing.prompt_push({'version': 0}, budget=1.0, now=T0)
-    assert 'models_never' in changed['text']
+    assert 'models_allowed' in changed['text']
 
 
 def test_provider_owner_boundary_and_words_unchanged(replay):
@@ -95,10 +97,10 @@ def test_resolver_order_conflicts_stale_bindings_and_confirmation():
 
 
 def test_fact_name_match_and_lane_report_share_resolver(mac):
-    routing.set_definition('provider', {'id': 'deepseek', 'label': 'DeepSeek', 'probe': 'none',
+    routing.set_definition('provider', {'id': 'deepseek', 'label': 'DeepSeek', 'family': 'DeepSeek', 'probe': 'none',
                            'lane_names': ['small']}, via='app')
     routing.set_definition('account', {'id': 'deepseek:main', 'label': 'DeepSeek', 'provider': 'deepseek'}, via='app')
-    runner(mac, {'small': {'model': 'deepseek-flash'}},
+    runner(mac, {'small': {}},
            '2026-10-20T15:59:00Z job LIMITED lane=small until=2026-10-20T17:00:00Z\n')
     view = routing.read_view()
     assert view['sources']['runners'][0]['lane_matches']['small']['matched_by'] == 'name'
@@ -132,7 +134,7 @@ def test_heartbeat_confirms_only_identity_and_never_keeps_paths(mac):
 
 def test_captured_job_confirms_by_its_own_binding(mac):
     from khipu import session_capture as sc
-    folder = runner(mac, {'tier': {'kind': 'grok', 'budget_account': 'Grok'}},
+    runner(mac, {'tier': {'kind': 'grok', 'budget_account': 'Grok'}},
                     '2026-10-20T15:59:00Z job LAUNCH lane=tier harness=aegis session=job123\n')
     assert routing.read_view()['sources']['runners'][0]['lane_matches']['tier']['identity_state'] == 'claimed'
     sc.save_state('aegis', 'job123', {'origin': 'job', 'seen_ts': NOW.timestamp(), 'login_home': str(mac[0] / '.grok')})
@@ -180,19 +182,19 @@ def test_provider_advisory_hook_never_returns_a_permission_decision(replay, monk
 
 
 def test_provider_checks_flag_real_runner_model_settings(mac, monkeypatch):
-    for ident, fields in [('deepseek', {'models_never': ['v4-pro']}), ('antigravity', {'use': 'on_request'})]:
-        routing.set_definition('provider', {'id': ident, 'label': ident.title(), 'probe': 'none', **fields}, via='app')
+    for ident, fields in [('deepseek', {'models_allowed': ['deepseek-flash']}), ('antigravity', {'use': 'on_request'})]:
+        routing.set_definition('provider', {'id': ident, 'label': ident.title(), 'family': ident.title(), 'probe': 'none', **fields}, via='app')
         routing.set_definition('account', {'id': ident + ':main', 'label': ident.title(), 'provider': ident}, via='app')
     runner(mac, {'ds': {'provider': 'deepseek', 'model': 'v4-pro'},
                  'gemini': {'provider': 'antigravity', 'model': 'gemini-3'}}, '')
     monkeypatch.setattr(routing, 'prompt_budget_block', lambda cfg=None: {'warn': False})
     checks = routing.doctor_block()['rule_checks']
-    assert any(c['lane'] == 'ds' and 'models_never' in c['text'] for c in checks)
+    assert any(c['lane'] == 'ds' and 'models_allowed' in c['text'] for c in checks)
     assert any(c['lane'] == 'gemini' and 'on_request' in c['text'] for c in checks)
 
 
 def test_compact_provider_fact_roundtrips_and_conflicting_heartbeat_refuses_report(mac):
-    routing._write_many([{'type': 'provider_set', 'id': 'deepseek', 'accounts': ['deepseek:main'],
+    routing._write_many([{'type': 'provider_set', 'id': 'deepseek', 'accounts': ['deepseek:main'], 'family': 'DeepSeek',
                           'written_by': {'kind': 'owner'}, 'lane_names': ['small']}])
     folder = runner(mac, {'small': {}}, '')
     assert routing.read_view()['sources']['runners'][0]['lane_matches']['small']['matched_by'] == 'name'
@@ -215,7 +217,7 @@ def test_claude_compatible_job_uses_billing_login_binding(mac):
     cfg = json.loads(config.config_file().read_text())
     cfg['routing_account_bindings'] = {'glm:work': {'harness': 'glm', 'home': login}}
     config.config_file().write_text(json.dumps(cfg))
-    routing.set_definition('provider', {'id': 'glm', 'label': 'GLM', 'probe': 'none'}, via='app')
+    routing.set_definition('provider', {'id': 'glm', 'label': 'GLM', 'family': 'Zhipu', 'probe': 'none'}, via='app')
     routing.set_definition('account', {'id': 'glm:work', 'label': 'GLM work', 'provider': 'glm'}, via='app')
     runner(mac, {'tier': {'provider': 'glm', 'budget_account': 'glm:work'}},
            '2026-10-20T15:59:00Z job LAUNCH lane=tier harness=claude_code session=glm-job\n')

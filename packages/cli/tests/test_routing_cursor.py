@@ -76,11 +76,12 @@ def test_declaration_conflicts_overrides_and_tier_keys(mac):
     assert routing.resolve_lane("r", "main-sonnet", {}, known,
         {"kind": "claude", "budget_account": "claude|"})["key"] == "claude|"
     for spec in ({"kind": "cursor", "provider": "claude"},
-                 {"kind": "claude", "budget_account": "grok|"},
                  {"account": "claude|", "budget_account": "grok|"},
                  {"kind": "cursor", "budget_account": "missing|"}):
         assert routing.resolve_lane("r", "x", {}, known, spec)["key"] is None
-    for spec in ({"kind": "cursor", "provider": "grok"},
+    # Transport kind does not constrain an explicitly declared payer.
+    for spec in ({"kind": "claude", "budget_account": "grok|"},
+                 {"kind": "cursor", "provider": "grok"},
                  {"kind": "cursor", "budget_account": "grok|"},
                  {"kind": "cursor", "provider": "grok", "budget_account": "grok|"}):
         assert routing.resolve_lane("r", "x", {}, known, spec)["key"] == "grok|"

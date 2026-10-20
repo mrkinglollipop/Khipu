@@ -936,7 +936,8 @@ TOOLS: list[dict] = [
         "description": (
             "Make an owner's change because the owner asked for it in this "
             "conversation (owner direction): pause or lift an account, a rule, "
-            "the note, a hold, the priority, the tracked accounts, a routing "
+            "the note, a hold, the priority, provider/account definitions (route.definition.set: "
+            "definition plus a structured value), the tracked accounts, a routing "
             "setting, a ledger row, several of the owner's Owed items at once "
             "(owed.change: \"close those\"), apply or undo an Owed clean-up "
             "(owed.tidy, after showing the owner the plan's summary), or confirm a request that is "

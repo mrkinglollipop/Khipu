@@ -72,7 +72,7 @@ class DirectionRefused(Exception):
 # its log line is ``_UNDO``.
 
 ACTIONS: frozenset[str] = frozenset({
-    "route.pause", "route.lift", "route.clear", "route.note.set", "route.note.end", "route.rule.add",
+    "route.definition.set", "route.pause", "route.lift", "route.clear", "route.note.set", "route.note.end", "route.rule.add",
     "route.rule.edit", "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo",
     "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.confirm",
     "route.priority.undo", "route.priority.clear", "accounts.track", "accounts.rename", "accounts.stop",
@@ -980,6 +980,16 @@ def _before(want: dict):
     from khipu import routing
 
     action, target = want["action"], want["target"]
+    if action == "route.definition.set":
+        facts = want["facts"]
+        value = facts["value"]
+        definitions = routing.read_view().get("definitions") or {}
+        if facts["definition"] == "lane_map":
+            account = (definitions.get("lane_maps", {}).get(value["runner"]) or {}).get(value["lane"])
+            prior = dict(value, account=account) if account else None
+        else:
+            prior = definitions.get("providers" if facts["definition"] == "provider" else "accounts", {}).get(target)
+        return {"value": prior}
     if action == "route.pause":
         entry = _entry(target)
         paused = entry.get("state") == routing.PAUSED
@@ -1480,7 +1490,19 @@ def _ledger_undo(verb: str):
     return run
 
 
+def _undo_definition(line: dict, via: str) -> dict:
+    from khipu import routing
+
+    facts = line["facts"]
+    previous = line["before"]["value"]
+    if previous is not None:
+        return routing.set_definition(facts["definition"], previous, via=via)
+    return routing._owner_write({"type": "definition_remove", "definition": facts["definition"],
+                                 "value": facts["value"]}, via)
+
+
 _UNDO = {
+    "route.definition.set": _undo_definition,
     "route.pause": _undo_pause,
     "route.lift": _undo_lift,
     "route.clear": _undo_clear,

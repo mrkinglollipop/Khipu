@@ -242,16 +242,25 @@ def definitions(events: list[dict], mac: str | None) -> dict:
             for ident in refs:
                 out["accounts"].setdefault(ident, {"id": ident, "label": ident, "provider": value["id"]})
             continue
-        if event.get("type") != "definition_set" or (event.get("written_by") or {}).get("kind") != "owner":
+        if event.get("type") not in ("definition_set", "definition_remove") or (event.get("written_by") or {}).get("kind") != "owner":
             continue
         name = event.get("definition")
         value = checked_definition(name, event.get("value"))
         if value is None:
             continue
+        remove = event.get("type") == "definition_remove"
         if name == "lane_map":
             if event.get("mac") != mac:
                 continue
-            out["lane_maps"].setdefault(value["runner"], {})[value["lane"]] = value["account"]
+            lanes = out["lane_maps"].setdefault(value["runner"], {})
+            if remove:
+                lanes.pop(value["lane"], None)
+            else:
+                lanes[value["lane"]] = value["account"]
         else:
-            out["providers" if name == "provider" else "accounts"][value["id"]] = value
+            values = out["providers" if name == "provider" else "accounts"]
+            if remove:
+                values.pop(value["id"], None)
+            else:
+                values[value["id"]] = value
     return out
