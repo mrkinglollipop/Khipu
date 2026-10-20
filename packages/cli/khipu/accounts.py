@@ -986,7 +986,8 @@ def _stop_events(view: dict, keys: list[str], *, keep_priority: bool, keep_pause
         else:
             events.append({"type": "priority_set", "until": held.get("until"),
                            "entries": [{"account": e["account"], "label": e["label"], "role": e.get("role"),
-                                        "until": e.get("until")} for e in rest]}
+                                        "until": e.get("until"),
+                                        **({"level": dict(e["level"])} if e.get("level") else {})} for e in rest]}
                           if rest else {"type": "priority_clear"})
             done["priority"] = "removed"
     for key in keys:

@@ -1147,12 +1147,12 @@ def _restore_setting(key: str, value, was_set: bool) -> None:
             data.pop(routing.SETTINGS_REQUEST_KEY, None)
 
 
-def _set_priority_back(before: dict, via: str) -> dict:
+def _set_priority_back(before: dict, via: str, holds: dict | None = None) -> dict:
     from khipu import routing
 
     if before.get("entries"):
         return routing.set_priority(before["entries"], until=before.get("until"), via=via,
-                                    expect=routing.priority_version())
+                                    expect=routing.priority_version(), holds=holds)
     if routing.read_view().get("priority"):
         return routing.clear_priority(via=via, expect=routing.priority_version())
     return {"ok": True}
@@ -1255,10 +1255,11 @@ def _undo_rule_confirm(line, via):
     from khipu import routing
 
     before = line.get("before") or {}
+    holds = (line.get("facts") or {}).get("holds")
     if before.get("seeded"):
         return routing.unconfirm_rule(line["target"], via=via)
     if before.get("pending_kind") == "changed" and isinstance(before.get("prior_text"), str):
-        return routing.edit_rule(line["target"], before["prior_text"], via=via)
+        return routing.edit_rule(line["target"], before["prior_text"], via=via, holds=holds)
     return routing.retire_rule(line["target"], via=via)
 
 
@@ -1327,7 +1328,8 @@ def _undo_note_end(line, via):
 def _undo_rule_words(line, via):
     from khipu import routing
 
-    return routing.edit_rule(line["target"], _b(line).get("text") or "", via=via)
+    return routing.edit_rule(line["target"], _b(line).get("text") or "", via=via,
+                             holds=(line.get("facts") or {}).get("holds"))
 
 
 def _retire_rule(n_of):
@@ -1341,7 +1343,7 @@ def _retire_rule(n_of):
 def _undo_restore_rule(line, via):
     from khipu import routing
 
-    return routing.restore_rule(line["target"], via=via)
+    return routing.restore_rule(line["target"], via=via, holds=(line.get("facts") or {}).get("holds"))
 
 
 def _undo_hold_add(line, via):
@@ -1375,7 +1377,7 @@ def _added_rule(line) -> str | int:
 
 
 def _undo_priority(line, via):
-    return _set_priority_back(_b(line), via)
+    return _set_priority_back(_b(line), via, (line.get("facts") or {}).get("holds"))
 
 
 def _undo_decline(line, via):

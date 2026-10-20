@@ -5,6 +5,9 @@ is local; a quota reading can travel with its original witness and expiry.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+
 from khipu import routing_events as identity
 
 
@@ -85,7 +88,21 @@ def observations(events: list[dict], cfg: dict) -> list[dict]:
                           and renewal.get("mac") == row.get("mac")]
             if candidates:
                 at, renewal = max(candidates, key=lambda pair: (pair[0], identity.hlc_key(pair[1])))
-                row.update(witness_at=r._iso(at), expires_at=renewal.get("expires_at"))
+                base_expiry = r._parse(row.get("expires_at"))
+                lifetime = base_expiry - witness if base_expiry is not None and witness is not None else None
+                renewed_expiry = r._parse(renewal.get("expires_at"))
+                # A renewal proves a newer witness, never a longer kind of
+                # observation.  A remote or damaged line therefore cannot
+                # turn a twelve-hour observation into a year-long one.
+                expires_at = (min(renewed_expiry, at + lifetime) if renewed_expiry is not None
+                              and lifetime is not None and lifetime.total_seconds() >= 0 else base_expiry)
+                # A LIMITED observation's reset/limit end belongs to its
+                # original scope.  A later reader may have a longer default
+                # lifetime, but it cannot move that fixed end forward.
+                scope_end = r._parse(row.get("until")) if row.get("state") == "limited" else None
+                if scope_end is not None and (expires_at is None or expires_at > scope_end):
+                    expires_at = scope_end
+                row.update(witness_at=r._iso(at), expires_at=r._iso(expires_at))
                 if "used_pct" in renewal:
                     row["used_pct"] = renewal["used_pct"]
             row["written_at"] = row.get("witness_at") or row["written_at"]
@@ -98,6 +115,13 @@ def slot(event: dict) -> tuple:
     locality = scope(event)
     return (event.get("account"), event.get("runner"), event.get("lane"), event.get("window"),
             event.get("scope") or "all", event.get("source"), locality["kind"], locality.get("mac"))
+
+
+def source_id(value: str) -> str:
+    """The persisted source key, salted before a local path-derived id travels."""
+    from khipu import routing as r
+
+    return hmac.new(r._id_salt(operations=True), value.encode("utf-8", "replace"), hashlib.sha256).hexdigest()[:12]
 
 
 def state(event: dict) -> tuple:
@@ -129,7 +153,7 @@ def source_events(extra: list[dict], events: list[dict], cfg: dict, mac: str,
                    account=key_ids.get(item.get("account"), item.get("account")))
         row["observed_turn"] = bool(item.get("turn"))
         row["unmatched"] = bool(item.get("runner") and not item.get("account"))
-        row["source_id"] = item["id"]
+        row["source_id"] = source_id(item["id"])
         enrich(row, cfg, mac)
         previous = latest.get(slot(row))
         if previous is None and row.get("runner"):

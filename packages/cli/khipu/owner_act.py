@@ -25,7 +25,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.clear": (("account",), ("report",)),
     "route.note.set": (("text",), ()),
     "route.note.end": ((), ()),
-    "route.rule.add": (("text",), ()),
+    "route.rule.add": (("text",), ("holds",)),
     "route.rule.edit": (("rule", "text"), ()),
     "route.rule.retire": (("rule",), ()),
     "route.rule.restore": (("rule",), ()),
@@ -34,7 +34,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.rule.dismiss": (("rule",), ()),
     "route.hold.add": (("text", "reason", "scope"), ("account", "until")),
     "route.hold.end": (("hold",), ()),
-    "route.priority.set": (("entries",), ("until", "expect")),
+    "route.priority.set": (("entries",), ("until", "expect", "holds")),
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
@@ -76,6 +76,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "direction.undo": (("id",), ()),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
+_HOLDS = {"holds"}
 _INTS = {"rule"}
 _FLAGS = {"catch_up", "hide", "show"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
@@ -124,6 +125,11 @@ def _values(action: str, args) -> dict:
                 raise _bad("checks must be the checks' names")
             if key == "ids" and not all(type(c) is int and c > 0 for c in value):
                 raise _bad("ids must be the items' ids, whole numbers above 0")
+        elif key in _HOLDS:
+            if not isinstance(value, dict) or not all(isinstance(hold, str) and choice in ("end", "keep")
+                                                      for hold, choice in value.items()):
+                raise _bad('holds must map each hold id to "end" or "keep"')
+            value = dict(value)
         elif key in _INTS:
             if isinstance(value, str) and value.strip().isdigit():
                 value = int(value.strip())
@@ -157,7 +163,7 @@ def _opts(values: dict, *keys: str) -> list[str]:
         if value is True:
             out.append(flag)
         else:
-            out.append(f"{flag}={json.dumps(value) if isinstance(value, list) else value}")
+            out.append(f"{flag}={json.dumps(value) if isinstance(value, (dict, list)) else value}")
     return out
 
 
@@ -196,7 +202,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     if action == "route.note.end":
         return ["route", "note", "end"], []
     if action == "route.rule.add":
-        return ["route", "rule", "add"], [v["text"]]
+        return ["route", "rule", "add", *_opts(v, "holds")], [v["text"]]
     if action == "route.rule.edit":
         return ["route", "rule", "edit"], [str(v["rule"]), v["text"]]
     if action.startswith("route.rule."):
@@ -210,7 +216,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     if action == "route.hold.end":
         return ["route", "hold"], ["end", v["hold"]]
     if action.startswith("route.priority."):
-        return ["route", "priority", verb, *_opts(v, "entries", "until", "expect")], []
+        return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
     if action == "accounts.track":
         return ["accounts", "track", *_opts(v, "entries", "expect")], []
     if action in ("accounts.rename", "accounts.stop", "accounts.move"):

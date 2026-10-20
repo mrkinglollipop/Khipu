@@ -40,6 +40,14 @@ def test_a_positional_starting_with_a_dash_is_refused():
     assert not ok and out["code"] == "bad_args"
 
 
+def test_priority_and_rule_add_forward_each_hold_choice_as_json():
+    holds = {"h-grok": "keep"}
+    for action, args in (("route.priority.set", {"entries": [{"account": "Grok"}], "holds": holds}),
+                         ("route.rule.add", {"text": "Grok builds", "holds": holds})):
+        head, _positionals = owner_act.argv(action, owner_act._values(action, args))
+        assert "--holds={\"h-grok\": \"keep\"}" in head
+
+
 @pytest.mark.skipif(not os.path.exists(PY311), reason="python3.11 not installed")
 def test_real_parser_reads_the_argv_under_python311():
     code = (

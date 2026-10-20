@@ -4,8 +4,10 @@ from datetime import timedelta
 
 import pytest
 
-from khipu import owner_direction, routing, routing_entries
-from tests.test_routing_acceptance import AUTHOR, FIXTURES, LEGACY, T0, replay
+from khipu import accounts, owner_direction, routing, routing_entries
+from tests.test_routing_acceptance import AUTHOR, FIXTURES, LEGACY, T0
+
+pytest_plugins = ("tests.test_routing_acceptance",)
 
 
 def rows():
@@ -288,3 +290,119 @@ def test_empty_wrong_type_hold_choices_are_refused_without_appending(replay):
     with pytest.raises(routing.RouteError, match="holds"):
         routing.set_priority([{"account": "Codex"}], via="app", expect=routing.priority_version(), holds=[])
     assert not routing.events_file().exists()
+
+
+def test_same_state_newer_used_share_is_live_while_renewal_stays_throttled(replay):
+    reset = T0 + timedelta(days=6)
+    replay.usage(40, reset=reset)
+    replay.view()
+    replay.advance(4 * 60)
+    replay.usage(96, reset=reset)
+    account = codex(replay.view())
+    assert "96" in account["witness"]["evidence"]
+    assert [event["type"] for event in rows()] == ["observation"]
+
+
+def test_renewal_expiry_cannot_outlive_the_base_lifetime(replay):
+    base = replay.event("observation", 1, account="codex|", state="open", source="probe",
+                        witness_at=routing._iso(T0), expires_at=routing._iso(T0 + timedelta(hours=12)))
+    renewal = replay.event("observation_renew", 2, target="e1", witness_at=routing._iso(T0 + timedelta(seconds=1)),
+                           expires_at=routing._iso(T0 + timedelta(days=365)))
+    replay.now = T0 + timedelta(days=30)
+    assert codex(replay.fold([base, renewal]))["state"] == "unknown"
+
+
+def test_limited_renewal_cannot_slide_past_its_original_limit_end(replay):
+    until = T0 + timedelta(hours=1)
+    base = replay.event("observation", 1, account="codex|", state="limited", source="probe",
+                        witness_at=routing._iso(T0), until=routing._iso(until), expires_at=routing._iso(until))
+    renewal = replay.event("observation_renew", 2, target="e1", witness_at=routing._iso(T0 + timedelta(minutes=30)),
+                           expires_at=routing._iso(T0 + timedelta(days=1)))
+    renewal["hlc"] = {"wall": 1, "counter": 0, "mac": "synthetic"}
+    resolved = routing_entries.observations([base, renewal], routing.settings(replay.config))
+    assert resolved[0]["expires_at"] == routing._iso(until)
+    replay.now = T0 + timedelta(minutes=61)
+    assert codex(replay.fold([base, renewal]))["state"] != "limited"
+
+
+def test_persisted_source_id_is_salted_and_depends_on_the_local_salt(replay, monkeypatch):
+    from khipu import routing_sources
+
+    replay.usage()
+    replay.view()
+    persisted = next(event for event in rows() if event["type"] == "observation")
+    evidence, _status = routing_sources.usage_evidence({"codex|"})
+    raw_source_id = evidence[0]["id"]
+    assert persisted["source_id"] == routing_entries.source_id(raw_source_id)
+    monkeypatch.setattr(routing, "_id_salt", lambda operations=False: b"a" * 32)
+    first = routing_entries.source_id(raw_source_id)
+    monkeypatch.setattr(routing, "_id_salt", lambda operations=False: b"b" * 32)
+    assert routing_entries.source_id(raw_source_id) != first
+
+
+def test_stop_tracking_keeps_a_priority_level_and_checks_its_remaining_entries(replay):
+    level = {"claim": "low", "as_of": routing._iso(T0), "until": routing._iso(T0 + timedelta(days=1))}
+    view = {"priority": {"entries": [{"account": "codex|", "label": "Codex", "role": "build", "level": level},
+                                  {"account": "grok|", "label": "Grok", "role": "review"}]},
+            "accounts": []}
+    events, _done = accounts._stop_events(view, ["grok|"], keep_priority=False, keep_pause=False, end_holds=[])
+    assert events[0]["entries"] == [{"account": "codex|", "label": "Codex", "role": "build", "until": None,
+                                      "level": level}]
+    routing.add_hold("wait", scope="account", account="Grok", reason="keep", owner=True, via="app")
+    with pytest.raises(routing.RouteError, match="end or keep"):
+        routing.account_txn_begin([{"type": "priority_set", "entries": [{"account": "codex|", "role": "Grok"}],
+                                    "written_by": routing.OWNER, "via": "app"}], before="a", after="b")
+
+
+def test_cached_definition_inputs_borrow_without_whole_log_work(replay, monkeypatch):
+    path = routing.events_file()
+    path.parent.mkdir(parents=True)
+    rows = [replay.event("evidence", i, account="codex|", state="open", source="report") for i in range(1, 20_001)]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    view = replay.view()
+    routing._entry_definitions()  # warm the unchanged event-stat cache after source writes
+    calls = {"parse": 0, "fold": 0, "order": 0}
+    read = routing._read_event_lines
+    fold = routing.fold
+    order = routing._in_write_order
+
+    def counted_read(*args, **kwargs):
+        calls["parse"] += 1
+        return read(*args, **kwargs)
+
+    def counted_fold(*args, **kwargs):
+        calls["fold"] += 1
+        return fold(*args, **kwargs)
+
+    def counted_order(*args, **kwargs):
+        calls["order"] += 1
+        return order(*args, **kwargs)
+
+    monkeypatch.setattr(routing, "_read_event_lines", counted_read)
+    monkeypatch.setattr(routing, "fold", counted_fold)
+    monkeypatch.setattr(routing, "_in_write_order", counted_order)
+    assert replay.view()["version"] == view["version"]
+    routing.prompt_push({"version": view["version"], "epoch": view["epoch"], "full_at": routing._iso(replay.now)},
+                        budget=1.0, now=replay.now)
+    routing.accounts()
+    routing._inputs()
+    assert calls == {"parse": 0, "fold": 0, "order": 0}
+
+    replay.usage()
+    routing._start_view(replay.now)
+    assert calls["fold"] == 1
+
+    routing.set_definition("account", {"id": "codex:main", "provider": "codex", "label": "Builder"}, via="app")
+    routing._inputs()  # one walk populates the definition overlay after the changed log.
+    calls.update(parse=0, fold=0, order=0)
+    assert next(account for account in routing.accounts() if account["harness"] == "codex")["label"] == "Builder"
+    assert next(account for account in routing._inputs()[2] if account["harness"] == "codex")["label"] == "Builder"
+    assert calls == {"parse": 0, "fold": 0, "order": 0}
+
+    replay.configure(usage_accounts=[], routing_account_bindings={"codex:main": {"home": "/bound"}})
+    changed = routing._inputs()[2]
+    assert changed == [{"key": "codex|/bound", "home": "/bound", "label": "Builder", "harness": "codex",
+                        "label_source": "owner", "definition_id": "codex:main"}]
+    calls.update(parse=0, fold=0, order=0)
+    assert routing._inputs()[2] == changed
+    assert calls == {"parse": 0, "fold": 0, "order": 0}

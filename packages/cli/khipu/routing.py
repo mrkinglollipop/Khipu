@@ -916,16 +916,61 @@ def accounts() -> list[dict]:
     return _definition_accounts(out)
 
 
-def _definition_accounts(known: list[dict], events: list[dict] | None = None, config: dict | None = None) -> list[dict]:
+_ENTRY_INPUTS: dict[tuple, dict] = {}
+
+
+def _entry_cache(events_stat: list | None = None, mac: str | None = None) -> dict:
+    """Definitions and their read-only event snapshot while the log is unchanged."""
+    events_stat = _stat(events_file()) if events_stat is None else events_stat
+    mac = _local_mac() if mac is None else mac
+    key = (str(events_file()), tuple(events_stat or ()), mac)
+    cached = _ENTRY_INPUTS.get(key)
+    if cached is None:
+        events, _bad = read_events()
+        cached = {"definitions": entry_model.definitions(_in_write_order(events), mac),
+                  "events": tuple(events), "overlays": {}}
+        _ENTRY_INPUTS.clear()
+        _ENTRY_INPUTS[key] = cached
+    return cached
+
+
+def _remember_entry_inputs(events: list[dict], events_stat: list | None = None, mac: str | None = None) -> dict:
+    """Refresh the entry cache from a fold that already read the log."""
+    events_stat = _stat(events_file()) if events_stat is None else events_stat
+    mac = _local_mac() if mac is None else mac
+    key = (str(events_file()), tuple(events_stat or ()), mac)
+    cached = {"definitions": entry_model.definitions(_in_write_order(events), mac),
+              "events": tuple(events), "overlays": {}}
+    _ENTRY_INPUTS.clear()
+    _ENTRY_INPUTS[key] = cached
+    return cached
+
+
+def _entry_definitions(events_stat: list | None = None, mac: str | None = None) -> tuple[dict, dict]:
+    """Definitions and their cache record, without copying every event on a hit."""
+    cached = _entry_cache(events_stat, mac)
+    return cached["definitions"], cached
+
+
+def _definition_accounts(known: list[dict], events: list[dict] | None = None, config: dict | None = None,
+                         definitions: dict | None = None, entry_cache: dict | None = None) -> list[dict]:
     """New definitions live in facts; legacy config remains a read fallback."""
     from khipu.config import load_config
 
-    events = read_events()[0] if events is None else events
-    definitions = entry_model.definitions(_in_write_order(events), _local_mac())
+    if definitions is None and events is None:
+        definitions, entry_cache = _entry_definitions()
+    elif definitions is None:
+        definitions = entry_model.definitions(_in_write_order(events), _local_mac())
     if not definitions["accounts"]:
         return known
     config = load_config() if config is None else config
     bindings = config.get(account_identity.BINDINGS) or {}
+    overlay_key = json.dumps({"bindings": bindings, "known": known}, sort_keys=True, default=str)
+    overlay = (entry_cache or {}).get("overlays", {}).get(overlay_key)
+    if overlay is not None:
+        return [dict(account) for account in overlay]
+    if events is None:
+        events = (entry_cache or _entry_cache())["events"]
     ids, forwards, _aliases = account_identity.state(_in_write_order(events), known)
     out = [dict(a) for a in known]
     for ident, value in definitions["accounts"].items():
@@ -938,6 +983,8 @@ def _definition_accounts(known: list[dict], events: list[dict] | None = None, co
             account = {"key": key, "home": home}
             out.append(account)
         account.update(label=value["label"], harness=value["provider"], label_source="owner", definition_id=current)
+    if entry_cache is not None:
+        entry_cache["overlays"][overlay_key] = tuple(dict(account) for account in out)
     return out
 
 
@@ -1927,13 +1974,13 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     events_stat, config_stat = _stat(events_file()), _stat(config_file())
     config = load_config()
     cfg = settings(config)
-    events = read_events()[0]
-    definitions = entry_model.definitions(_in_write_order(events), _local_mac())
+    mac = _local_mac()
+    definitions, entry_cache = _entry_definitions(events_stat, mac)
     lane_map = {runner: dict(lanes) for runner, lanes in cfg["routing_lane_map"].items()}
     for runner, lanes in definitions["lane_maps"].items():
         lane_map.setdefault(runner, {}).update(lanes)
     cfg["routing_lane_map"] = lane_map
-    known = _definition_accounts(_fold_accounts(config), events, config)
+    known = _definition_accounts(_fold_accounts(config), config=config, definitions=definitions, entry_cache=entry_cache)
     # routing_sources is read entry by entry (one bad entry costs only itself);
     # usage_accounts says which usage cache rows are read at all.
     cfg["_raw_sources"] = {"routing_sources": config.get("routing_sources"),
@@ -1951,7 +1998,7 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
 
     cfg["_accounts_version"] = accounts_version(config)
     seed = cfg.get("routing_rules_seed")
-    cfg["_mac"] = _local_mac()
+    cfg["_mac"] = mac
     fingerprint = {"entry_model": 1, "account_identity": 2, "payer_identity": 1, "events": events_stat, "config": config_stat,
                    "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
@@ -2296,7 +2343,10 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
     # A runner's limit whose LIMITED line has left the tail keeps the time
     # Khipu saw that line (``routing_sources._sightings``), so a clear is
     # weighed against it like any other evidence.
+    legacy_source_ids = ({entry_model.source_id(value) for value in owner["dismissed"]}
+                         if any(e.get("source_id") for e in items) else set())
     live = [e for e in items if e["id"] not in owner["dismissed"] and e.get("source_id") not in owner["dismissed"]
+            and e.get("source_id") not in legacy_source_ids
             and (clear is None or _k(e) > _k(clear))]
     # Unknown when the only source that still counts is a runner that has
     # stopped reporting: other evidence counts only while it is fresh (open
@@ -4158,6 +4208,7 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
             events, bad = read_events()
             fingerprint = dict(fingerprint, events=_stat(events_file()))
         cfg["_mac"] = _local_mac()
+    _remember_entry_inputs(events, fingerprint["events"], cfg["_mac"])
     now, body, status = _fold_body(now, cfg, known, events, prev)
     body["seed_error"] = seed_error
     view = _assemble(prev, body, now, bad, fingerprint,
@@ -4173,15 +4224,11 @@ def _fold_body(now: datetime, cfg: dict, known: list[dict], events: list[dict],
     itself, which reads and never writes."""
     now = _not_before_last_fold(now, prev)
     extra, status, cache = _sources(cfg, now, prev)
-    ids, _forwards, _aliases = account_identity.state(_in_write_order(events), known)
-    stored = {entry_model.slot(e) for e in events if e.get("type") == "observation"}
     source_ids = {e.get("source_id") for e in events if e.get("source_id")}
-    forward = forwarding(events, {a["key"] for a in known})
     remaining = []
     for item in extra:
-        key = _evidence_account(item, cfg.get("routing_lane_map") or {}, known, forward)
-        candidate = dict(item, account=ids.get(key, key), mac=cfg.get("_mac"))
-        if item.get("id") not in source_ids and entry_model.slot(candidate) not in stored:
+        source_id = entry_model.source_id(item["id"]) if source_ids and item.get("id") else None
+        if item.get("id") not in source_ids and source_id not in source_ids:
             remaining.append(item)
     extra = remaining
     body = fold(events, now=now, cfg=cfg, known=known, extra=extra, sources=status)
@@ -4230,6 +4277,23 @@ def _start_fold(now: datetime, *, save: bool) -> dict:
         # An account change left unfinished is finished or rolled back
         # first, under the locks, by ``read_view``.
         return read_view(now)
+    from khipu import routing_sources
+
+    # A source-backed fold writes observations before it can save the view.
+    # Going through ``_fold_body`` first would collect and fold the complete
+    # record only to immediately do the same work again under the lock.
+    if routing_sources.any_configured(cfg["_raw_sources"], cfg):
+        with _finishing():
+            try:
+                if not save:
+                    raise LockBusy("another fold is running")
+                with _lock():
+                    current = _inputs()
+                    if _fresh(_load_view(), current[0], now):
+                        return dict(_load_view(), checked_at=_iso(now))
+                    return _refold_locked(now, current)
+            except OSError:
+                pass
     with _finishing():
         fold_now, body, status = _fold_body(now, cfg, known, events, prev)
         body["seed_error"] = None
@@ -4701,7 +4765,10 @@ def account_txn_begin(lines: list[dict], *, before: str, after: str, declines: l
     lines = [begin, *(dict(line, txn=txn) for line in lines)]
     try:
         with _lock():
-            for line, stamp in zip(lines, _stamp_locked(_now(), len(lines))):
+            clock = _now()
+            for line in lines:
+                _require_hold_choices(line, clock)
+            for line, stamp in zip(lines, _stamp_locked(clock, len(lines))):
                 line.update(stamp)
             _append_locked(*lines)
     except OSError as exc:
@@ -8038,12 +8105,19 @@ def _route_intent(cmd: str, args) -> dict | None:
     if cmd == "rule":
         params = [str(p) for p in args.params]
         if args.action == "add":
-            return owner_direction.intent("route.rule.add", "new")
+            choices = _holds_arg(args)
+            return owner_direction.intent("route.rule.add", "new",
+                                          facts={"holds": choices} if choices is not None else None)
         if args.action == "edit":
-            return owner_direction.intent("route.rule.edit", params[0]) if len(params) >= 2 else None
+            choices = _holds_arg(args)
+            return (owner_direction.intent("route.rule.edit", params[0],
+                                           facts={"holds": choices} if choices is not None else None)
+                    if len(params) >= 2 else None)
         if len(params) != 1:
             return None
-        return owner_direction.intent(f"route.rule.{args.action}", params[0].strip())
+        choices = _holds_arg(args)
+        return owner_direction.intent(f"route.rule.{args.action}", params[0].strip(),
+                                      facts={"holds": choices} if choices is not None else None)
     return None
 
 

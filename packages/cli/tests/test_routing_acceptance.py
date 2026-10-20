@@ -1204,11 +1204,10 @@ def test_12_renewal_source_silence_and_clock_only_expiry(replay):
     assert next(a for a in replay.fold(rows)["accounts"] if a["key"] == "codex|")["state"] == "unknown"
 
 
-@future("4", "unchanged usage evidence never emits a renewal or extends its witness")
 def test_12_cached_reading_never_renews(replay):
     replay.usage()
     replay.view()
-    replay.advance(600)
+    replay.advance(4 * 3600)
     replay.view()
     events, bad = routing.read_events()
     assert bad == 0

@@ -271,6 +271,22 @@ def test_a_pending_priority_confirmed_by_direction(world):
     assert routing.read_view()["priority"]["pending"] is False
 
 
+def test_owner_act_accepts_hold_choices_for_priority_and_rule_add(world):
+    hold = routing.add_hold("wait for Grok", scope="account", account="Grok", reason="keep", owner=True, via="app")
+    choices = {hold["id"]: "keep"}
+    world.say("set Grok's priority", session="s-priority")
+    world.server("s-priority")
+    is_error, out = _act("route.priority.set", {"entries": [{"account": "Grok", "role": "build"}],
+                                                  "expect": routing.priority_version(), "holds": choices})
+    assert not is_error and out["ok"] is True, out
+    world.say("add Grok's rule", session="s-rule")
+    world.server("s-rule")
+    is_error, out = _act("route.rule.add", {"text": "Grok builds", "holds": choices})
+    assert not is_error and out["ok"] is True, out
+    actions = _log()
+    assert [line["facts"]["holds"] for line in actions[-2:]] == [choices, choices]
+
+
 def _pending_setting(world) -> None:
     from khipu import cli
 

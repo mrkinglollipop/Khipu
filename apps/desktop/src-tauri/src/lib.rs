@@ -1908,9 +1908,14 @@ struct PriorityEntry {
 /// webview sends can become a flag or an argument of its own; their order is
 /// the owner's, kept as sent.
 #[cfg(test)]
-fn route_priority_argv(action: &str, entries: &[PriorityEntry], until: Option<&str>) -> Result<Vec<String>, String> {
+fn route_priority_argv(
+    action: &str,
+    entries: &[PriorityEntry],
+    until: Option<&str>,
+    holds: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<String>, String> {
     // The shape tests below are about the entries, not the version.
-    route_priority_argv_expect(action, entries, until, Some("p1"))
+    route_priority_argv_expect(action, entries, until, Some("p1"), holds)
 }
 
 /// `expect` is the priority's version as the owner read it (`--expect=V`,
@@ -1920,11 +1925,20 @@ fn route_priority_argv_expect(
     entries: &[PriorityEntry],
     until: Option<&str>,
     expect: Option<&str>,
+    holds: Option<&serde_json::Map<String, Value>>,
 ) -> Result<Vec<String>, String> {
     if !ROUTE_PRIORITY_ACTIONS.contains(&action) {
         return Err(format!("not a change to the priority: {action:?}"));
     }
     let mut argv = route_base("priority");
+    if let Some(holds) = holds {
+        if holds.len() > ROUTE_PRIORITY_MOST || holds.iter().any(|(id, choice)| {
+            id.trim().is_empty() || id.len() > 256 || !matches!(choice.as_str(), Some("end" | "keep"))
+        }) {
+            return Err("holds must map each hold id to end or keep".to_string());
+        }
+        argv.push(format!("--holds={}", Value::Object(holds.clone())));
+    }
     if action == "set" {
         if entries.is_empty() {
             return Err("put at least one account in the priority, or clear it".to_string());
@@ -2969,11 +2983,12 @@ async fn khipu_route_priority(
     entries: Option<Vec<PriorityEntry>>,
     until: Option<String>,
     expect: Option<String>,
+    holds: Option<serde_json::Map<String, Value>>,
     op: Option<String>,
 ) -> Result<String, String> {
     run_khipu_cli_async(
         route_operation_argv(
-            route_priority_argv_expect(&action, entries.as_deref().unwrap_or(&[]), until.as_deref(), expect.as_deref())?,
+            route_priority_argv_expect(&action, entries.as_deref().unwrap_or(&[]), until.as_deref(), expect.as_deref(), holds.as_ref())?,
             op.as_deref(),
         )?,
     )
@@ -6723,48 +6738,50 @@ mod priority_and_sign_in_tests {
             entry("codex|", Some("--from-app -- clear"), None),
             entry("claude|", None, None),
         ];
-        let argv = route_priority_argv("set", &entries, Some("2026-10-20T09:00:00Z")).unwrap();
+        let holds = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("keep")))]);
+        let argv = route_priority_argv("set", &entries, Some("2026-10-20T09:00:00Z"), Some(&holds)).unwrap();
         assert_eq!(argv[..3], v(&["route", "priority", "--from-app"])[..]);
         assert_eq!(argv[argv.len() - 2..], v(&["--", "set"])[..]);
-        assert_eq!(argv.len(), 8);
-        assert_eq!(argv[5], "--expect=p1");
-        let json = argv[3].strip_prefix("--entries=").unwrap();
+        assert_eq!(argv.len(), 9);
+        assert_eq!(argv[3], "--holds={\"h-grok\":\"keep\"}");
+        assert_eq!(argv[6], "--expect=p1");
+        let json = argv[4].strip_prefix("--entries=").unwrap();
         let parsed: Value = serde_json::from_str(json).unwrap();
         let order: Vec<&str> = parsed.as_array().unwrap().iter().map(|e| e["account"].as_str().unwrap()).collect();
         assert_eq!(order, ["claude|/logins/claude-second", "codex|", "claude|"]);
         // A role that looks like a flag stays words inside the JSON.
         assert_eq!(parsed[1]["role"], "--from-app -- clear");
-        assert_eq!(argv[4], "--until=2026-10-20T09:00:00Z");
+        assert_eq!(argv[5], "--until=2026-10-20T09:00:00Z");
     }
 
     #[test]
     fn a_value_can_never_become_an_option() {
-        assert!(route_priority_argv("set", &[entry("--from-app", None, None)], None).is_err());
-        assert!(route_priority_argv("set", &[entry("Codex\n--x", None, None)], None).is_err());
-        assert!(route_priority_argv("set", &[entry("Codex", Some("a\nb"), None)], None).is_err());
-        assert!(route_priority_argv("set", &[entry("Codex", None, Some("--until"))], None).is_err());
-        assert!(route_priority_argv("set", &[entry("Codex", None, None)], Some("1h")).is_err());
-        assert!(route_priority_argv("--clear", &[], None).is_err());
-        assert!(route_priority_argv("set", &[], None).is_err());
+        assert!(route_priority_argv("set", &[entry("--from-app", None, None)], None, None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex\n--x", None, None)], None, None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex", Some("a\nb"), None)], None, None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex", None, Some("--until"))], None, None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex", None, None)], Some("1h"), None).is_err());
+        assert!(route_priority_argv("--clear", &[], None, None).is_err());
+        assert!(route_priority_argv("set", &[], None, None).is_err());
         let many: Vec<PriorityEntry> = (0..65).map(|_| entry("Codex", None, None)).collect();
-        assert!(route_priority_argv("set", &many, None).is_err());
+        assert!(route_priority_argv("set", &many, None, None).is_err());
         // Confirm, undo and clear carry nothing but their version and verb, whatever is sent.
         for action in ["confirm", "undo"] {
-            let argv = route_priority_argv_expect(action, &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), Some("p1")).unwrap();
+            let argv = route_priority_argv_expect(action, &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), Some("p1"), None).unwrap();
             assert_eq!(argv, v(&["route", "priority", "--from-app", "--expect=p1", "--", action]));
         }
-        let clear = route_priority_argv_expect("clear", &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), Some("p1")).unwrap();
+        let clear = route_priority_argv_expect("clear", &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), Some("p1"), None).unwrap();
         assert_eq!(clear, v(&["route", "priority", "--from-app", "--expect=p1", "--", "clear"]));
     }
 
     #[test]
     fn the_priority_version_joins_its_flag_before_the_verb() {
-        let argv = route_priority_argv_expect("clear", &[], None, Some("p9f")).unwrap();
+        let argv = route_priority_argv_expect("clear", &[], None, Some("p9f"), None).unwrap();
         assert_eq!(argv, v(&["route", "priority", "--from-app", "--expect=p9f", "--", "clear"]));
-        let set = route_priority_argv_expect("set", &[entry("Codex", None, None)], None, Some("p0")).unwrap();
+        let set = route_priority_argv_expect("set", &[entry("Codex", None, None)], None, Some("p0"), None).unwrap();
         assert_eq!(set[set.len() - 3], "--expect=p0");
         for bad in ["", "--x", "p 1", "p=1", "p\n1", "p|1", ".p1", "p1.", "p1..a2", "p-1"] {
-            assert!(route_priority_argv_expect("clear", &[], None, Some(bad)).is_err(), "{bad:?}");
+            assert!(route_priority_argv_expect("clear", &[], None, Some(bad), None).is_err(), "{bad:?}");
         }
     }
 
@@ -6782,12 +6799,12 @@ mod priority_and_sign_in_tests {
     #[test]
     fn a_priority_change_without_its_version_is_refused() {
         for missing in [None, Some(""), Some("  ")] {
-            let clear = route_priority_argv_expect("clear", &[], None, missing).unwrap_err();
+            let clear = route_priority_argv_expect("clear", &[], None, missing, None).unwrap_err();
             assert!(clear.contains("needs the version it read"), "{clear}");
-            assert!(route_priority_argv_expect("set", &[entry("Codex", None, None)], None, missing).is_err());
+            assert!(route_priority_argv_expect("set", &[entry("Codex", None, None)], None, missing, None).is_err());
             // Confirm and undo answer the request the owner saw, so a newer one is never answered unseen.
-            assert!(route_priority_argv_expect("confirm", &[], None, missing).is_err());
-            assert!(route_priority_argv_expect("undo", &[], None, missing).is_err());
+            assert!(route_priority_argv_expect("confirm", &[], None, missing, None).is_err());
+            assert!(route_priority_argv_expect("undo", &[], None, missing, None).is_err());
         }
     }
 
