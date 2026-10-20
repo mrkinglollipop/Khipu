@@ -584,19 +584,26 @@ class EmbedProviderFixTextTest(unittest.TestCase):
         self.assertNotIn("provider key", row["fix"])
 
     def test_fix_names_the_provider_on_an_http_auth_error(self):
-        for code in ("401", "403"):
+        kinds = {"401": "unauthorized", "403": "forbidden"}
+        for code, kind in kinds.items():
             with self.subTest(code=code):
-                row = self._embed_provider_row(
-                    {"error": f"RuntimeError: embed HTTP {code}: denied"}
-                )
+                row = self._embed_provider_row({
+                    "counts": {"last_provider_failure":
+                               {"http_status": int(code), "kind": kind}},
+                })
                 self.assertIn("embedding provider", row["fix"])
                 self.assertIn(code, row["fix"])
                 self.assertNotIn("hub database", row["fix"])
 
     def test_fix_names_quota_or_spending_cap_on_http_429(self):
-        row = self._embed_provider_row(
-            {"error": "RuntimeError: embed HTTP 429: too many requests"}
-        )
+        # The structured shape the real batch-failure path records (driven
+        # end-to-end in test_embed.py / test_library.py); no error string
+        # is injected here because the real path records none.
+        row = self._embed_provider_row({
+            "counts": {"library": {"results": [{
+                "last_provider_failure": {"http_status": 429, "kind": "rate_limited"},
+            }]}},
+        })
         self.assertIn("embedding provider", row["fix"])
         self.assertTrue("quota" in row["fix"] or "spending cap" in row["fix"])
         self.assertIn("429", row["fix"])

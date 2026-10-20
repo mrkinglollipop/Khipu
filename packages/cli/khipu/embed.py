@@ -1757,6 +1757,38 @@ def memory_coverage_fields(plan, missing, stale, *, sample: int = 5) -> dict[str
     }
 
 
+_PROVIDER_HTTP_RE = re.compile(r"\bembed(?:-image)? HTTP (\d{3})\b")
+
+
+def provider_failure(exc: BaseException) -> dict[str, Any]:
+    """The structured record of one provider failure for a sweep receipt:
+    the HTTP status (or None) and a short kind only. Never the request, the
+    key, or the response body — the exception text carries the provider's
+    body, so it is classified here and otherwise kept out of the receipt."""
+    msg = str(exc)
+    match = _PROVIDER_HTTP_RE.search(msg)
+    if match:
+        status = int(match.group(1))
+        if status == 429:
+            kind = "rate_limited"
+        elif status == 401:
+            kind = "unauthorized"
+        elif status == 403:
+            kind = "forbidden"
+        elif status == 400:
+            kind = "bad_request"
+        elif 500 <= status < 600:
+            kind = "server_error"
+        else:
+            kind = "http_error"
+        return {"http_status": status, "kind": kind}
+    if "API key not found" in msg:
+        return {"http_status": None, "kind": "missing_key"}
+    if "network error" in msg:
+        return {"http_status": None, "kind": "network_error"}
+    return {"http_status": None, "kind": "provider_error"}
+
+
 def _backfill_outcome(stats: dict[str, Any]) -> dict[str, Any]:
     """Classify a completed sweep without changing its existing counters."""
     failed = int(stats.get("failed_chunks") or 0)
@@ -1884,6 +1916,7 @@ def backfill(
                         # takes the rest of tonight's coverage down with it.
                         stats["failed_chunks"] += len(batch)
                         failed_refs.update((k, r) for k, r, *_rest in batch)
+                        stats["last_provider_failure"] = provider_failure(exc)
                         if "API key not found" in msg and not stats.get("embed_provider"):
                             stats["embed_provider"] = "missing key"
                         _log(f"batch failed ({type(exc).__name__}): {exc}; continuing")
