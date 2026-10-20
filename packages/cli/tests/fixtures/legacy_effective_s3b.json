@@ -1,0 +1,59 @@
+{
+  "account:claude|": {
+    "basis": null,
+    "disagreement": null,
+    "label": "Claude",
+    "last_seen": null,
+    "models": [],
+    "reason": null,
+    "reset_check": null,
+    "scope": "all",
+    "state": "unknown",
+    "until": null
+  },
+  "account:codex|": {
+    "basis": null,
+    "disagreement": null,
+    "label": "Codex",
+    "last_seen": "open",
+    "models": [],
+    "reason": null,
+    "reset_check": null,
+    "scope": "all",
+    "state": "unknown",
+    "until": null
+  },
+  "account:grok|": {
+    "basis": null,
+    "disagreement": null,
+    "label": "Grok",
+    "last_seen": "open",
+    "models": [],
+    "reason": null,
+    "reset_check": null,
+    "scope": "all",
+    "state": "unknown",
+    "until": null
+  },
+  "hold:h-synthetic-grok": {
+    "owner": false,
+    "reason": "keep",
+    "scope": "Grok",
+    "text": null,
+    "until": "2026-10-21T12:00:00Z"
+  },
+  "priority": {
+    "by": "a Claude Code conversation",
+    "entries": [
+      [
+        "Grok",
+        "Regular builder for ordinary implementation, fixes, tests and documentation. Keep enough allowance for the other scheduled work. Review completed changes with another model family before integrating them. This synthetic role is intentionally long enough to exercise the identifying preview instead of the full priority line.",
+        null,
+        true
+      ]
+    ],
+    "pending": true,
+    "replaced": null,
+    "until": null
+  }
+}

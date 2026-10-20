@@ -197,6 +197,8 @@ The routing record: which accounts are open, limited (with the end time and whet
 | `since` | A version from an earlier answer. Returns only what changed after it. |
 | `account` | Narrow to one account, by label or id. |
 
+Routing write tools (`khipu_route_report`, `khipu_route_rule`, and `khipu_route_priority`) accept an optional `op` string (1–256 characters). Reuse it when retrying the same operation; use a fresh value for a new change. Without `op`, the server derives a private, salted identity from the MCP request id, tool arguments, and conversation identity. Retries keep the first event; reusing an explicit `op` with a different body is refused. `op` never changes who the server records as the author.
+
 ### khipu_route_report
 
 Record what this conversation learned, so other conversations hear it.

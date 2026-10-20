@@ -211,7 +211,7 @@ def _locked(expect):
         raise AccountsError(VERSION_NEEDED, "version_needed")
     with routing._lock():
         recover()
-        if (routing.routing_dir() / "id-salt").exists():
+        if routing._legacy_ids_issued():
             routing.migrate_accounts()
         with config.mutate_config() as data:
             config.check_accounts_version(data, expect)

@@ -681,6 +681,20 @@ def _find(line_id: str) -> dict | None:
 _PENDING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_owner_action", default=None)
 
 
+def operation_id(event: dict) -> str | None:
+    """Only the intended write inherits the written-ahead action's identity."""
+    pend = _PENDING.get()
+    if not pend:
+        return None
+    via = {"direction": "direction", "app": "app", "terminal": "cli"}.get(pend["stamp"].get("auth"))
+    if event.get("via") != via:
+        return None
+    action = pend["intent"]["action"]
+    if action in {"route.rule.add", "route.hold.add"} and event.get("id") != planned_id(action):
+        return None
+    return (pend.get("line") or {}).get("id")
+
+
 def planned_id(action: str) -> str | None:
     """The id the owner action being written chose for the line it adds
     (a rule or a hold), so the writer uses it; None for any other write."""
@@ -792,6 +806,10 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
         line = {"kind": "action", "id": _new_id(), "at": _iso(_clock()), "action": want["action"],
                 "target": want["target"], "before": None if before in (_NO_UNDO, _UNREADABLE) else before,
                 "auth": stamp.get("auth")}
+        if want["action"].startswith("route.rule.") and want["action"] != "route.rule.add":
+            from khipu import routing
+
+            line["target"] = routing.rule_reference(want["target"])[0]
         why = _no_undo(want["action"], before)
         if why:
             line.update(undo=None, no_undo=why)
@@ -944,7 +962,7 @@ def _entry(key: str) -> dict:
 def _rule_now(n) -> dict:
     from khipu import routing
 
-    return next((r for r in routing.read_view()["rules"] if str(r["n"]) == str(n)), {}) or {}
+    return next((r for r in routing.read_view()["rules"] if (str(r["n"]) == str(n) or r.get("entity") == str(n))), {}) or {}
 
 
 def _priority_rows(held: dict | None) -> list[dict] | None:
@@ -1107,7 +1125,7 @@ def _before(want: dict):
 def _after(want: dict, result) -> Any:
     if not isinstance(result, dict):
         return None
-    keep = ("id", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts")
+    keep = ("id", "entity", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts")
     return {k: result[k] for k in keep if k in result} or None
 
 
@@ -1340,16 +1358,16 @@ def _undo_hold_add(line, via):
     return routing.end_hold(hold_id, owner=True, via=via)
 
 
-def _added_rule(line) -> int:
+def _added_rule(line) -> str | int:
     from khipu import routing
 
-    n = (line.get("after") or {}).get("n")
+    n = (line.get("after") or {}).get("entity") or (line.get("after") or {}).get("n")
     if n is None:
         # Unconfirmed: the rule written under the id this action chose.
         planned = _b(line).get("event")
         events, _bad = routing.read_events()
-        n = next((e["n"] for e in events if planned and e.get("type") == "rule_add" and e.get("id") == planned
-                  and isinstance(e.get("n"), int)), None)
+        n = next((e.get("entity") or e.get("n") for e in events if planned and e.get("type") == "rule_add"
+                  and e.get("id") == planned), None)
     if n is None:
         raise ValueError("Khipu can't tell which rule this added, so it can't undo it")
     return n

@@ -52,11 +52,13 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 from pathlib import Path
 
 SERVER_NAME = "khipu"
+_ROUTING_SESSION = secrets.token_hex(16)
 
 
 def _server_version() -> str:
@@ -838,6 +840,8 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "op": {"type": "string", "minLength": 1, "maxLength": 256,
+                       "description": "Optional retry id: reuse it for retries of this operation; use a new id for a new change. If omitted, Khipu derives one from the MCP request id and conversation."},
                 "action": {"type": "string", "enum": ["report", "hold", "end_hold"],
                            "description": "Default report"},
                 "state": {"type": "string", "enum": ["limited", "open", "down"], "description": "report: the state"},
@@ -875,6 +879,8 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "op": {"type": "string", "minLength": 1, "maxLength": 256,
+                       "description": "Optional retry id: reuse it for retries of this operation; use a new id for a new change. If omitted, Khipu derives one from the MCP request id and conversation."},
                 "text": {"type": "string", "description": "The owner's requested rule wording"},
                 "rule": {"type": "integer", "minimum": 1,
                          "description": "Existing standing rule number to change; omit to add"},
@@ -899,6 +905,8 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "op": {"type": "string", "minLength": 1, "maxLength": 256,
+                       "description": "Optional retry id: reuse it for retries of this operation; use a new id for a new change. If omitted, Khipu derives one from the MCP request id and conversation."},
                 "entries": {
                     "type": "array", "minItems": 1,
                     "description": "The accounts in the owner's order",
@@ -2657,7 +2665,19 @@ def _dispatch_message(msg: dict) -> dict | None:
         # through agent_view.project, whatever raised it.
         scrub = agent_view.project if name in _AGENT_PROJECTED else agent_view.scrub
         try:
-            payload = func(params.get("arguments") or {})
+            arguments = dict(params.get("arguments") or {})
+            if name in {"khipu_route_report", "khipu_route_rule", "khipu_route_priority"} and not _via_https_gateway():
+                from khipu import routing
+
+                op = arguments.pop("op", None)
+                if op is None and req_id is not None:
+                    op = routing.request_op({"session": _ROUTING_SESSION, "request": req_id,
+                                             "tool": name, "arguments": arguments,
+                                             "author": routing.conversation_author()})
+                with routing.operation(op):
+                    payload = func(arguments)
+            else:
+                payload = func(arguments)
             if name in _AGENT_SCRUBBED:
                 payload = _scrub_for_agents(name, payload)
             elif name in _AGENT_PROJECTED:

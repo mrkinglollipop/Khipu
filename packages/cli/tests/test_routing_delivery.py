@@ -296,7 +296,8 @@ def test_review_omitted_pending_changes_are_counted_and_delivered_later(home, mo
         marker = {} if path == "full_prompt" else {
             "version": before["version"], "epoch": before["epoch"], "full_at": routing._iso(T0)}
         out = routing.prompt_push(marker, budget=1.0)
-    pending = {*(f"rule:{i}" for i in range(1, 13)), "priority"}
+    rule_numbers = {f"rule:{r['n']}": r["n"] for r in routing.read_view()["rules"]}
+    pending = {*rule_numbers, "priority"}
     shown = set(out.get("shown_entities") or []) & pending
     omitted = pending - shown
     assert omitted
@@ -318,7 +319,7 @@ def test_review_omitted_pending_changes_are_counted_and_delivered_later(home, mo
             if entity == "priority":
                 assert "Your priority" in next_out["text"]
             else:
-                number = entity.split(":")[1]
+                number = rule_numbers[entity]
                 assert re.search(rf"(?:^{number}\. |Standing rule {number} added)", next_out["text"], re.M)
         seen.update(newly_shown)
         _deliver(next_out)

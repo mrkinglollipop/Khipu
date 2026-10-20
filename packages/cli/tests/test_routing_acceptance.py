@@ -59,6 +59,7 @@ def future(slice_id, reason):
 class Replay:
     def __init__(self, root, monkeypatch):
         self.root, self.patch, self.now = root, monkeypatch, T0
+        self.request_ids = itertools.count(1)
         self.data = root / "data"
         self.data.mkdir(parents=True)
         self.config = {"usage_accounts": copy.deepcopy(ACCOUNTS), "routing_reset_check": False,
@@ -97,7 +98,7 @@ class Replay:
                 "written_by": {"kind": "owner"}, "via": "app", **fields}
 
     def call(self, name="khipu_route", **args):
-        answer = mcp_server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        answer = mcp_server.handle_message({"jsonrpc": "2.0", "id": next(self.request_ids), "method": "tools/call",
                                            "params": {"name": name, "arguments": args}})
         assert "error" not in answer, answer
         result = answer["result"]
@@ -1008,7 +1009,6 @@ def test_11a_slug_collisions_are_refused_even_on_an_unchanged_stored_list(replay
 # ---- 11b: global identities, ordering, retries, tombstones -------------------------------
 
 
-@future("3b", "concurrent same-number rules keep distinct entity ids and provisional numbers")
 def test_11b_two_macs_keep_both_rules_until_hub_numbering(replay):
     rows = [replay.event("rule_add", i, n=1, text=word, mac=f"m{i}", entity=f"rule-{i}",
                          hlc={"wall": 1, "counter": 0, "mac": f"m{i}"}) for i, word in [(1, "first"), (2, "second")]]
@@ -1017,7 +1017,6 @@ def test_11b_two_macs_keep_both_rules_until_hub_numbering(replay):
     assert all(r["n"] is None for r in view["rules"])
 
 
-@future("3b", "writes need globally unique UUIDv7 events, a Mac identity and entity uuids")
 def test_11b_writes_carry_global_event_and_entity_identity(replay):
     routing.add_rule("synthetic owner rule", via="app")
     events, bad = routing.read_events()
@@ -1029,7 +1028,6 @@ def test_11b_writes_carry_global_event_and_entity_identity(replay):
     assert re.fullmatch(r"rule-[0-9a-f-]{36}", row["entity"])
 
 
-@future("3b", "numeric targets on provisional numbers are refused with the entity uuid")
 def test_11b_provisional_numeric_target_is_refused(replay):
     replay.write(replay.event("rule_add", n=1, entity="rule-synthetic-1", number_pending=True, text="first"))
     refused = None
@@ -1041,7 +1039,6 @@ def test_11b_provisional_numeric_target_is_refused(replay):
 
 
 @pytest.mark.parametrize("different_body", [False, True], ids=["retry-first-result", "retry-body-refused"])
-@future("3b", "client op ids deduplicate identical retries and refuse changed bodies")
 def test_11b_op_retry(replay, different_body):
     row = replay.event("rule_add", n=1, text="first", op="op-synthetic-1")
     first, _ = replay.write(row)
@@ -1057,7 +1054,6 @@ def test_11b_op_retry(replay, different_body):
         expect(second, first, "11b: identical op retry wrote a second event instead of returning the first")
 
 
-@future("3b", "hold-end tombstones survive arriving before their hold")
 def test_11b_hold_end_before_hold_applies_on_arrival(replay):
     end = replay.event("hold_end", 1, target="h1")
     hold = replay.event("hold", 2, id="h1", scope={"kind": "account", "account": "grok|"}, reason="keep", text="wait")

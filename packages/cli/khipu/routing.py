@@ -69,6 +69,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from khipu import routing_identity as account_identity
+from khipu import routing_events as event_identity
 
 SCHEMA = 1
 STATE_DIR = ("state", "routing")
@@ -1248,10 +1249,12 @@ def _lock():
     try:
         _acquire(fd)
         _held.depth = 1
+        _held.event_cache = {}
         try:
             yield
         finally:
             _held.depth = 0
+            _held.event_cache = {}
             with contextlib.suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
@@ -1259,7 +1262,108 @@ def _lock():
 
 
 def _new_id(prefix: str) -> str:
-    return prefix + secrets.token_hex(4)
+    return event_identity.uuid7()
+
+
+def _mac_locked() -> str:
+    path = routing_dir() / "mac-id"
+    try:
+        value = path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        value = secrets.token_hex(16)
+        fd, temporary = tempfile.mkstemp(prefix=".mac-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as stream:
+                stream.write(value + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+    if not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise RouteError("the routing Mac identity is unreadable; restore its mac-id file")
+    return value
+
+
+def _hub_configured() -> bool:
+    # Detection only: never connect, migrate credentials or start a probe.
+    from khipu import keychain
+    from khipu.paths import dsn_file
+
+    return bool(os.environ.get("KHIPU_DATABASE_URL") or os.environ.get("ALZY_DATABASE_URL")
+                or dsn_file().is_file() or keychain.get_password(keychain.DSN_ACCOUNT)
+                or keychain.get_password(keychain.DSN_ACCOUNT, service=keychain.LEGACY_SERVICE))
+
+
+def _replication_live() -> bool:
+    # Slice 11 enables this only once hub acceptance can assign numbers.
+    from khipu.config import load_config
+
+    return bool(load_config().get("routing_replication_live", False))
+
+
+def _pending_numbering() -> bool:
+    return _replication_live() and _hub_configured()
+
+
+def _identify_locked(events: Iterable[dict]) -> None:
+    """Enrich new lines only. All append paths, including seeds and account
+    transactions, pass here while holding the routing lock."""
+    observed = _read_all_events()[0]
+    history = _in_write_order(observed)
+    mac = _mac_locked()
+    clocks = [e["hlc"] for e in [*observed, *history] if e.get("hlc")]
+    clocks += [{"wall": max(0, int(at.timestamp() * 1000)), "counter": 0, "mac": "legacy"}
+               for e in observed if not e.get("mac") and (at := _parse(e.get("written_at"))) is not None]
+    revisions = {}
+    rule_ids = {}
+    for row in history:
+        entity = event_identity.entity(row)
+        if entity and not row.get("pending"):
+            revisions[entity] = event_identity.revision(row)
+        if row.get("type") == "rule_add":
+            rule_ids[row.get("hub_order", row.get("n"))] = entity
+    for event in events:
+        event.setdefault("id", _new_id("e"))
+        event.setdefault("mac", mac)
+        if not event.get("hlc"):
+            wall = max(0, int((_parse(event["written_at"]) or _now()).timestamp() * 1000))
+            # Skew is a health fact; every observed clock still constrains causality.
+            prior = max(clocks, key=lambda h: (h["wall"], h["counter"], h["mac"]), default=None)
+            counter = prior["counter"] + 1 if prior and prior["wall"] >= wall else 0
+            wall = max(wall, prior["wall"]) if prior else wall
+            event["hlc"] = {"wall": wall, "counter": counter, "mac": mac}
+        clocks.append(event["hlc"])
+        kind = event.get("type")
+        if kind in ("rule_add", "hold"):
+            prefix = "rule" if kind == "rule_add" else "hold"
+            event.setdefault("entity", prefix + "-" + event_identity.uuid7())
+            if kind == "rule_add":
+                if not event.get("number_pending") and not _pending_numbering():
+                    event.setdefault("local_order", event.get("n"))
+                else:
+                    event["number_pending"] = True
+                rule_ids[event.get("n")] = event["entity"]
+        elif kind in event_identity.RULE_CHANGES:
+            entity = event.get("target") or event.get("entity") or rule_ids.get(event.get("n"))
+            if not entity:
+                raise RouteError("a rule change needs an existing rule uuid")
+            event.update(entity=entity, target=entity)
+        elif kind == "hold_end":
+            held = next((h for h in history if h.get("type") == "hold" and
+                         (h.get("id") == event.get("target") or h.get("entity") == event.get("target"))), None)
+            event["entity"] = event_identity.entity(held) if held else event_identity.entity(event)
+            event["target"] = event["entity"]
+        entity = event_identity.entity(event)
+        if entity:
+            event.setdefault("entity", entity)
+            event.setdefault("base", revisions.get(entity, "0"))
+            if not event.get("pending"):
+                revisions[entity] = event["id"]
+        if event.get("pending"):
+            event.setdefault("proposal", "proposal-" + event_identity.uuid7())
+        event.setdefault("op", event_identity.uuid7())
 
 
 def _append_locked(*events: dict) -> None:
@@ -1268,6 +1372,8 @@ def _append_locked(*events: dict) -> None:
     so it stays one unreadable line, counted in ``bad_lines``, and never
     swallows the new one. Lone surrogates (text from argv, the environment
     or a seed file) are replaced first: UTF-8 can't hold them."""
+    raw, bad = _read_event_lines()
+    _identify_locked(events)
     data = "".join(json.dumps(_scrub(e), sort_keys=True, ensure_ascii=False) + "\n"
                    for e in events).encode("utf-8")
     fd = os.open(events_file(), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
@@ -1281,6 +1387,11 @@ def _append_locked(*events: dict) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+    if getattr(_held, "depth", 0):
+        key = (str(events_file()), False, tuple(_stat(events_file()) or ()))
+        checked = [_checked(_scrub(e)) for e in events]
+        _held.event_cache[key] = ([*raw, *[e for e in checked if e is not None]],
+                                  bad + sum(e is None for e in checked))
 
 
 # The fields Khipu writes, by the type each has. A line is read into these
@@ -1291,12 +1402,13 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "evidence", "until", "written_at", "via", "text", "file", "date", "sha256", "clock_at",
                 "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
                 "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
-                "harness", "to", "started_at", "model", "family", "transport")
+                "harness", "to", "started_at", "model", "family", "transport", "mac", "legacy_mac", "entity", "base",
+                "op", "op_body", "proposal")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at")
-_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries")
+_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order")
 _WHOLE_MOST = 2 ** 53
-_SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed")
-_AUTHOR_FIELDS = ("kind", "harness", "project", "session", "name", "file")
+_SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending")
+_AUTHOR_FIELDS = ("kind", "harness", "project", "session", "name", "file", "mac")
 _HOLD_KINDS = ("account", "machine", "all")
 
 _RESET_STATUSES = frozenset({
@@ -1347,10 +1459,13 @@ def _crowded(numbers: Iterable[int]) -> bool:
     return any(n + 1 > _WHOLE_MOST for n in numbers)
 
 
-def _next_rules(events: list[dict], count: int) -> int:
-    """The number of the next rule (of ``count`` new rules), one ``_checked``
-    reads back and no rule already holds (a rule's number is its name)."""
-    taken = {e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)}
+def _next_rules(events: list[dict], count: int) -> int | None:
+    """Reserve this Mac's display numbers until replication assigns hub numbers."""
+    if _pending_numbering():
+        return None
+    mac = _mac_locked()
+    taken = {e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)
+             and e.get("mac") in (None, mac)}
     first = _next_after(taken, count, 1)
     if not any(first + i in taken for i in range(count)):
         return first
@@ -1445,6 +1560,14 @@ def _checked(data: dict) -> dict | None:
         if not isinstance(value, bool):
             return None
         out[field] = value
+    hlc = data.get("hlc")
+    if hlc is not None:
+        if (not isinstance(hlc, dict) or set(hlc) != {"wall", "counter", "mac"}
+                or not isinstance(hlc.get("mac"), str) or not hlc["mac"]
+                or any(isinstance(hlc.get(k), bool) or not isinstance(hlc.get(k), int)
+                       or not 0 <= hlc[k] <= _WHOLE_MOST for k in ("wall", "counter"))):
+            return None
+        out["hlc"] = dict(hlc)
     used = data.get("used_pct")
     if used is not None:
         if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
@@ -1580,19 +1703,15 @@ def account_txns_open() -> list[tuple[dict, list[dict]]]:
     return _split_txns(_read_all_events()[0])[1]
 
 
-def _read_all_events(*, identity_only: bool = False) -> tuple[list[dict], int]:
-    """Every line Khipu could have written, transaction lines included, in
-    write order with its place in that order (``_seq``), and how many lines
-    could not be read (kept in the file, left out of the
-    fold). The file is read as bytes and each line decoded on its own, so one
-    line that is not UTF-8, not JSON or not of a shape Khipu writes
-    (``_line_event``) costs that line alone, never the read.
-
-    Write order is settled when a line is written: the writer holds the lock,
-    sees the last line and records the next sequence number (``seq``) with
-    its line, and the lines that carry one are put in that order. Lines with
-    no ``seq`` (written by phase 1a, or appended by hand) keep their place in
-    the file."""
+def _read_event_lines(identity_only: bool = False) -> tuple[list[dict], int]:
+    """Cache parsed lines only for the duration of the outer routing lock."""
+    key = (str(events_file()), identity_only, tuple(_stat(events_file()) or ()))
+    cache = getattr(_held, "event_cache", {}) if getattr(_held, "depth", 0) else {}
+    if key in cache:
+        return cache[key]
+    full_key = (key[0], False, key[2])
+    if identity_only and full_key in cache:
+        return cache[full_key]
     try:
         data = events_file().read_bytes()
     except OSError:
@@ -1609,12 +1728,35 @@ def _read_all_events(*, identity_only: bool = False) -> tuple[list[dict], int]:
             bad += 1
             continue
         events.append(event)
-    _mark_unchecked(events)  # in file order: a line's own seq can't move it before the first stamped one
-    slots = [i for i, e in enumerate(events) if isinstance(e.get("seq"), int)]
+    cache[key] = (events, bad)
+    return events, bad
+
+
+def _read_all_events(*, identity_only: bool = False, author_check: bool = True) -> tuple[list[dict], int]:
+    """Every line Khipu could have written, transaction lines included, in
+    write order with its place in that order (``_seq``), and how many lines
+    could not be read (kept in the file, left out of the
+    fold). The file is read as bytes and each line decoded on its own, so one
+    line that is not UTF-8, not JSON or not of a shape Khipu writes
+    (``_line_event``) costs that line alone, never the read.
+
+    Write order is settled when a line is written: the writer holds the lock,
+    sees the last line and records the next sequence number (``seq``) with
+    its line, and the lines that carry one are put in that order. Lines with
+    no ``seq`` (written by phase 1a, or appended by hand) keep their place in
+    the file."""
+    raw, bad = _read_event_lines(identity_only)
+    events = [dict(event) for event in raw]
+    if author_check:
+        _mark_unchecked(events)  # a sequence cannot move a line before the first author check
+    slots = [i for i, e in enumerate(events) if isinstance(e.get("seq"), int) and not e.get("mac")]
     if slots:
         ordered = sorted((events[i] for i in slots), key=lambda e: e["seq"])  # stable: file order breaks a tie
         for i, event in zip(slots, ordered):
             events[i] = event
+    modern = [i for i, e in enumerate(events) if e.get("hlc") and e.get("mac")]
+    for i, event in zip(modern, sorted((events[i] for i in modern), key=event_identity.hlc_key)):
+        events[i] = event
     for i, event in enumerate(events):
         event["_seq"] = i
     return events, bad
@@ -1667,8 +1809,13 @@ def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
     line written ahead, then a right clock) keeps its own time, and the fold
     orders the lines as in phase 1a."""
     events, _bad = _read_all_events()
-    seqs = [e["seq"] for e in events if isinstance(e.get("seq"), int)]
-    first = _next_after(seqs, count, len(events))
+    mac = _mac_locked()
+    legacy_mac = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
+    if legacy_mac is None:
+        legacy_mac = next((event_identity.legacy_mac(e) for e in events if not e.get("mac")), None)
+    seqs = [e["seq"] for e in events if isinstance(e.get("seq"), int) and e.get("mac") in (None, mac)]
+    first = _next_after(seqs, count, max(1, len([e for e in events if not e.get("mac")])))
+    events = [e for e in events if e.get("mac") in (None, mac)]
     times = [t for t in (_parse(e.get("written_at")) for e in events) if t is not None]
     last = _parse(events[-1].get("written_at")) if events else None
     settled = [t for t in _record_times(events)[0] if t is not None]
@@ -1678,7 +1825,9 @@ def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
         stamp, clock_at = settled[-1], clock
     out = []
     for i in range(count):
-        line = {"written_at": _iso(stamp), "seq": first + i}
+        line = {"written_at": _iso(stamp), "seq": first + i, "mac": mac}
+        if legacy_mac is not None:
+            line["legacy_mac"] = legacy_mac
         if clock_at is not None:
             line["clock_at"] = _iso(clock_at)
         out.append(line)
@@ -2360,12 +2509,57 @@ def _record_times(events: list[dict]) -> tuple[list[datetime | None], list[datet
 
 
 def _in_write_order(events: list[dict]) -> list[dict]:
-    """The log's lines with times that never run backwards: no line counts as
-    later than a line written after it (``_record_times``)."""
-    raw = [_parse(e.get("written_at")) for e in events]
-    fixed, _behind, _ahead = _record_times(events)
-    return [dict(e, written_at=_iso(f)) if f is not None and f != r else e
-            for e, r, f in zip(events, raw, fixed)]
+    """Settle each Mac's timestamps, then order the event set by HLC.
+    Unstamped history retains its local order and gets derived revisions;
+    legacy origin markers keep later replication from changing that origin."""
+    origin = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
+    origin = origin or next((event_identity.legacy_mac(e) for e in events if not e.get("mac")), "legacy")
+    if not any(e.get("mac") for e in events):
+        fixed, _behind, _ahead = _record_times(events)
+        out, last_wall, counter = [], 0, 0
+        for e, at in zip(events, fixed):
+            wall = max(0, int(at.timestamp() * 1000)) if at else 0
+            counter = counter + 1 if wall <= last_wall else 0
+            last_wall = max(last_wall, wall)
+            out.append(dict(e, _legacy_mac=event_identity.legacy_mac(dict(e, _legacy_mac=origin)),
+                            _revision=event_identity.revision(e),
+                            hlc={"wall": last_wall, "counter": counter, "mac": "legacy"},
+                            **({"written_at": _iso(at)} if at else {})))
+        return out
+    modern_macs = {e["mac"] for e in events if e.get("mac")}
+    claims = [e for e in events if e.get("legacy_mac") and e.get("hlc")]
+    claim = min(claims, key=event_identity.hlc_key) if claims else None
+    legacy_origin = claim["legacy_mac"] if claim else origin
+    legacy_mac = claim["mac"] if claim else next(iter(modern_macs)) if len(modern_macs) == 1 else legacy_origin
+    groups: dict[str, list[dict]] = {}
+    for event in events:
+        groups.setdefault(event.get("mac") or (event.get("legacy_mac") if event.get("legacy_mac") != legacy_origin else None)
+                          or legacy_mac, []).append(event)
+    settled = []
+    for mac, rows in groups.items():
+        rows = list(rows)
+        slots = [i for i, e in enumerate(rows) if isinstance(e.get("seq"), int)]
+        ordered = sorted((rows[i] for i in slots), key=lambda e: (e["seq"], e.get("id", "")))
+        for i, row in zip(slots, ordered):
+            rows[i] = row
+        fixed, _behind, _ahead = _record_times(rows)
+        last_wall, counter = 0, 0
+        for e, at in zip(rows, fixed):
+            row = dict(e, _revision=event_identity.revision(e),
+                       _legacy_mac=event_identity.legacy_mac(dict(e, _legacy_mac=legacy_origin)))
+            if at is not None:
+                row["written_at"] = _iso(at)
+            if not row.get("hlc"):
+                wall = max(0, int(at.timestamp() * 1000)) if at else 0
+                counter = counter + 1 if wall <= last_wall else 0
+                last_wall = max(last_wall, wall)
+                row["hlc"] = {"wall": last_wall, "counter": counter, "mac": mac}
+            last_wall, counter = max((last_wall, counter), (row["hlc"]["wall"], row["hlc"]["counter"]))
+            settled.append(row)
+    unique = {}
+    for row in sorted(settled, key=event_identity.hlc_key):
+        unique.setdefault(row.get("id") or ("anonymous", len(unique)), row)
+    return [dict(row, _seq=i) for i, row in enumerate(unique.values())]
 
 
 def _lane_mapped(runner, lane, lane_map: dict) -> bool:
@@ -2476,7 +2670,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # and the newest left (the one it superseded, unless it was older) counts.
     clear_stacks: dict[str, list[dict]] = {}
     holds: dict[str, dict] = {}
-    rules: dict[int, dict] = {}
+    rules: dict[str, dict] = {}
+    hold_ends: dict[str, datetime] = {}
     note: dict | None = None
     priority: dict | None = None
     # The last priority line that changed it ("p0": none ever did): what a
@@ -2494,6 +2689,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     owner_changes: list[dict] = []
     for event in events:
         kind = event.get("type")
+        entity = event_identity.entity(event)
         if kind == "evidence":
             item = _evidence(event, cfg)
             if item is not None:
@@ -2555,9 +2751,14 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         if info["at"] is None:
             continue
         touched = _touched(kind, event, info)
+        if kind in event_identity.RULE_CHANGES and entity in rules:
+            touched = _rule_component(rules[entity])
+        if kind == "hold_end" and entity in holds:
+            touched = f"hold:{holds[entity]['id']}"
         if touched:
             causes[touched] = {"at": info["at"], "seq": info["seq"], "written_by": info["written_by"],
-                               "via": info["via"], "type": kind, "state": event.get("state")}
+                               "via": info["via"], "type": kind, "state": event.get("state"),
+                               "n": rules[entity]["n"] if entity in rules else event.get("n")}
             if event.get("auth") in _OWNER_AUTHS:
                 # Named in the next push in fixed words (``direction_line``).
                 causes[touched].update(auth=event["auth"], harness=event.get("harness"))
@@ -2583,16 +2784,28 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             dismissals = [d for d in dismissals if str(d["target"]) != str(info["target"])]
         elif kind == "hold" and event.get("id"):
             scope = event.get("scope") if isinstance(event.get("scope"), dict) else {"kind": "all"}
-            holds[str(event["id"])] = {
-                "id": str(event["id"]), "scope": scope, "reason": event.get("reason") if event.get("reason")
+            holds[entity] = {
+                "id": event.get("entity") or str(event["id"]), "scope": scope, "reason": event.get("reason") if event.get("reason")
                 in HOLD_REASONS else "other", "text": event.get("text") or "", "until": info["until"],
                 "owner": bool(event.get("owner")), "written_by": info["written_by"], "via": info["via"],
-                "at": info["at"]}
-        elif kind == "hold_end" and info["target"] in holds:
-            holds[info["target"]].setdefault("ended_at", info["at"])
-        elif kind == "rule_add" and isinstance(event.get("n"), int) and isinstance(event.get("text"), str):
+                "at": info["at"], "entity": entity, "revision": event_identity.revision(event)}
+            if entity in hold_ends:
+                holds[entity]["ended_at"] = hold_ends[entity]
+        elif kind == "hold_end" and entity:
+            hold_ends.setdefault(entity, info["at"])
+            for held in holds.values():
+                if held["entity"] == entity:
+                    held.setdefault("ended_at", info["at"])
+        elif kind == "rule_add" and entity and isinstance(event.get("text"), str):
             pending = bool(event.get("pending"))
-            rules[event["n"]] = {"n": event["n"], "text": event["text"], "source": event.get("source") or "",
+            rules[entity] = {"entity": entity,
+                                 "component": _rule_add_component(event),
+                                 "revision": event_identity.revision(event),
+                                 "owner_revision": "0" if pending else event_identity.revision(event),
+                                 "number_pending": bool(event.get("number_pending") or
+                                     (event.get("mac") and event.get("entity") and _rule_number(event) is None)),
+                                 "provisional_n": event.get("n"),
+                                 "n": _rule_number(event), "text": event["text"], "source": event.get("source") or "",
                                  "date": event.get("date") or "", "seeded": bool(event.get("seeded")),
                                  "confirmed": not event.get("seeded") and not pending, "retired": False,
                                  "pending": pending, "pending_kind": "added" if pending else None,
@@ -2601,8 +2814,11 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                  "pending_author": info["written_by"] if pending else None,
                                  "written_by": info["written_by"], "via": info["via"], "at": info["at"]}
         elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_unconfirm",
-                      "rule_dismiss") and event.get("n") in rules:
-            rule = rules[event["n"]]
+                      "rule_dismiss") and entity in rules:
+            rule = rules[entity]
+            rule["revision"] = event_identity.revision(event)
+            if not event.get("pending") and kind not in ("rule_undo", "rule_dismiss"):
+                rule["owner_revision"] = rule["revision"]
             if kind == "rule_edit" and isinstance(event.get("text"), str):
                 was_pending = bool(rule.get("pending"))
                 prior = rule.get("prior_text") if was_pending else rule["text"]
@@ -2792,16 +3008,19 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         remind = due is not None and now >= due
         if due is not None and not remind:
             reminders.append(due)
-        active_holds.append({"id": hold["id"], "scope": hold["scope"], "scope_label": hold["scope_label"],
+        active_holds.append({"id": hold["id"], "entity": hold["entity"], "revision": hold["revision"], "scope": hold["scope"], "scope_label": hold["scope_label"],
                              "reason": hold["reason"], "text": hold["text"], "until": _iso(hold["until"]),
                              "owner": hold["owner"], "written_by": hold["written_by"], "via": hold["via"],
                              "at": _iso(hold["at"]), "remind": remind})
-    active_rules = [{"n": r["n"], "text": r["text"], "source": r["source"], "date": r["date"], "seeded": r["seeded"],
+    active_rules = [{"entity": r["entity"], "revision": r["revision"], "component": r["component"],
+                     "owner_revision": r["owner_revision"], "number_pending": r["number_pending"], "provisional_n": r["provisional_n"],
+                     "n": r["n"], "text": r["text"], "source": r["source"], "date": r["date"], "seeded": r["seeded"],
                      "confirmed": r["confirmed"], "pending": r.get("pending"), "pending_kind": r.get("pending_kind"),
                      "pending_by": r.get("pending_by"), "prior_text": r.get("prior_text"),
                      "pending_author": r.get("pending_author"),
                      "written_by": r["written_by"], "via": r["via"], "at": _iso(r["at"])}
-                    for _n, r in sorted(rules.items()) if not r["retired"]]
+                    for r in sorted(rules.values(), key=lambda r: (r["n"] is None, r["n"] or 0, r["entity"]))
+                    if not r["retired"]]
     note_out = None if note is None else {"text": note["text"], "at": _iso(note["at"]),
                                           "written_by": note["written_by"], "via": note["via"]}
     labels = {e["key"]: e["label"] for e in entries}
@@ -2871,7 +3090,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     effective.update({f"hold:{h['id']}": {"scope": h["scope_label"], "reason": h["reason"], "until": h["until"],
                                           "owner": h["owner"], "text": h["text"] if h["owner"] else None}
                       for h in active_holds})
-    effective.update({f"rule:{r['n']}": {"text": r["text"], "seeded": r["seeded"] and not r["confirmed"],
+    effective.update({_rule_component(r): {"text": r["text"], "seeded": r["seeded"] and not r["confirmed"],
                                            "pending": bool(r.get("pending")), "pending_kind": r.get("pending_kind"),
                                            "prior_text": r.get("prior_text"),
                                            "pending_by": r.get("pending_by") if r.get("pending") else None}
@@ -3396,6 +3615,23 @@ def run_due_reset_checks(now: datetime | None = None, *, probe=None, load=None,
     return out
 
 
+def _rule_component(rule: dict) -> str:
+    return rule.get("component") or f"rule:{rule['n']}"
+
+
+def _rule_number(event: dict) -> int | None:
+    if event.get("number_pending"):
+        return None
+    if event.get("mac") and event.get("entity"):
+        return event.get("hub_order", event.get("local_order"))
+    return event.get("n")
+
+
+def _rule_add_component(event: dict) -> str:
+    number = _rule_number(event)
+    return f"rule:{number if number is not None else event_identity.entity(event)}"
+
+
 def _touched(kind: str | None, event: dict, info: dict) -> str | None:
     """The entity a written (non-evidence) line changes, as the view's
     ``effective`` names it, or None."""
@@ -3404,13 +3640,16 @@ def _touched(kind: str | None, event: dict, info: dict) -> str | None:
     if kind == "account_move" and info["target"]:
         return f"account:{info['target']}"
     if kind == "hold" and event.get("id"):
-        return f"hold:{event['id']}"
+        return f"hold:{event.get('entity') or event['id']}"
     if kind == "hold_end" and info["target"]:
         return f"hold:{info['target']}"
-    if kind in ("rule_add", "rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_unconfirm",
-                "rule_dismiss") \
-            and isinstance(event.get("n"), int):
-        return f"rule:{event['n']}"
+    if kind == "rule_add":
+        return _rule_add_component(event)
+    if kind in event_identity.RULE_CHANGES:
+        if event.get("entity"):
+            return f"rule:{event['entity']}"
+        if isinstance(event.get("n"), int):
+            return f"rule:{event['n']}"
     if kind in ("note_set", "note_end"):
         return "note"
     if kind == "owner_change" and info["target"]:
@@ -3473,7 +3712,8 @@ def _save_view(view: dict) -> None:
 
 
 def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
-    if not view or view.get("fingerprint") != fingerprint or "priority_version" not in view:
+    if (not view or view.get("fingerprint") != fingerprint or "priority_version" not in view
+            or view.get("event_identity") != 2):
         return False
     # A whole-log read of a runner's events still under way goes on at the
     # next read, one bounded chunk at a time, though no file changed.
@@ -3536,11 +3776,13 @@ def _import_seed_locked(events: list[dict], cfg: dict, now: datetime) -> tuple[s
         if rule["text"] not in present:
             present.add(rule["text"])
             fresh.append(rule)
-    n = _next_rules(events, len(fresh)) - 1 if fresh else 0
+    first = _next_rules(events, len(fresh)) if fresh else 1
+    n = first - 1 if first is not None else None
     by = {"kind": "seed", "file": Path(path).name}
     batch = []
     for rule in fresh:
-        n += 1
+        if n is not None:
+            n += 1
         batch.append({"type": "rule_add", "id": _new_id("o"), "n": n, "text": rule["text"],
                       "source": rule["source"], "date": rule["date"], "seeded": True, "written_by": by,
                       "via": "seed"})
@@ -3595,7 +3837,7 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
             change["directions"] = directions
         changes.append(change)
         changes = changes[-CHANGES_KEPT:]
-    out = dict(body, schema=SCHEMA, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
+    out = dict(body, schema=SCHEMA, event_identity=2, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
                record=record, bad_lines=bad, fingerprint=fingerprint, changes=changes)
     if not saved:
         out["saved"] = False
@@ -3641,7 +3883,7 @@ def _change_item(entity: str, body: dict, prev_effective: dict, causes: dict | N
             author, via = cause.get("written_by"), cause.get("via")
         if kind == "rule" and item["now"] is None:
             # A removed rule's words, so the app can offer to bring it back.
-            item["n"] = int(ident) if ident.isdigit() else None
+            item["n"] = (latest or {}).get("n", int(ident) if ident.isdigit() else None)
     else:
         source = kind
     item.update(source=source, written_by=author, via=via)
@@ -3829,7 +4071,7 @@ def read_view(now: datetime | None = None) -> dict:
     view has ``record: false`` and version 0."""
     explicit = now is not None
     now = now or _now()
-    if (routing_dir() / "id-salt").exists():
+    if _legacy_ids_issued():
         migrate_accounts()
     fingerprint, cfg, known = _inputs()
     prev = _load_view()
@@ -3860,6 +4102,32 @@ def read_view(now: datetime | None = None) -> dict:
         return _unsaved_view(now)
 
 
+_OP = contextvars.ContextVar("routing_operation", default=None)
+
+
+@contextlib.contextmanager
+def operation(op: str | None):
+    if op is not None and (not isinstance(op, str) or not op.strip() or len(op) > 256):
+        raise RouteError("op must be nonempty text of at most 256 characters")
+    token = _OP.set(op)
+    try:
+        yield
+    finally:
+        _OP.reset(token)
+
+
+def request_op(value: dict) -> str:
+    return event_identity.body_hash(_scrub(value), _id_salt(operations=True))
+
+
+def _operation_body(event: dict) -> dict:
+    # Derived state can change between an append and its transport retry.
+    body = {k: v for k, v in event.items() if k not in ("base", "prior_text", "prior_confirmed", "auth_chain", "id")}
+    if body.get("type") == "rule_add":
+        body = {k: v for k, v in body.items() if k not in ("n", "date")}
+    return body
+
+
 def _write_many(events: list[dict]) -> tuple[list[dict], dict]:
     """Append one outcome's events atomically and refold.
 
@@ -3868,17 +4136,45 @@ def _write_many(events: list[dict]) -> tuple[list[dict], dict]:
     without another writer observing or interleaving half of the result.
     """
     events = [dict(event) for event in events]
-    for event in events:
-        event.setdefault("id", _new_id("e"))
+    if _OP.get():
+        for i, event in enumerate(events):
+            event.setdefault("op", _OP.get() if len(events) == 1 else f"{_OP.get()}:{i}")
     view: dict | None = None
     appended = False
     clock: datetime | None = None
     try:
         with _lock():
             clock = _now()
-            for event, stamp in zip(events, _stamp_locked(clock, len(events))):
-                event.update(stamp)
-            _append_locked(*events)
+            existing = {}
+            observed = _read_all_events(author_check=False)[0]
+            for row in observed:
+                if row.get("op"):
+                    existing.setdefault(row["op"], row)
+            event_ids = {row["id"] for row in observed if row.get("id")}
+            fresh, results = [], []
+            for event in events:
+                digest = event_identity.body_hash(_scrub(_operation_body(event)), _id_salt(operations=True))
+                prior = existing.get(event.get("op"))
+                if prior:
+                    if prior.get("op_body") != digest:
+                        raise RouteError("that op id already wrote a different body; use a new op id")
+                    results.append(prior if any(prior is row for row in fresh) else
+                                   {k: v for k, v in prior.items() if not k.startswith("_")})
+                    continue
+                if event.get("id") in event_ids:
+                    raise RouteError("that event id is already in the routing record")
+                event["op_body"] = digest
+                event.setdefault("id", _new_id("e"))
+                event_ids.add(event["id"])
+                event.setdefault("op", event_identity.uuid7())
+                fresh.append(event)
+                results.append(event)
+                existing[event["op"]] = event
+            if fresh:
+                for event, stamp in zip(fresh, _stamp_locked(clock, len(fresh))):
+                    event.update(stamp)
+                _append_locked(*fresh)
+            events = [dict(_checked(_scrub(event)) or event) for event in results]
             appended = True
             view = _refold_locked(clock)
     except Exception as exc:  # noqa: BLE001 - after the append, nothing here may fail the write
@@ -3931,6 +4227,11 @@ def _io_phrase(exc: OSError, verb: str) -> str:
 
 def _done(written: dict, view: dict, **extra) -> dict:
     out = {"ok": True, "id": written["id"], **extra, "version": view.get("version")}
+    if written.get("type") == "hold":
+        out["id"] = written["entity"]
+    if written.get("entity"):
+        out["entity"] = written["entity"]
+        out["revision"] = written["id"]
     if view.get("saved") is False:
         out["saved"] = False
     return out
@@ -4095,13 +4396,13 @@ def add_hold(text: str, *, reason: str, scope: str, account: str | None = None, 
              "text": words if owner else _clean(words, most), "until": _iso(stop), "owner": owner,
              "written_by": OWNER if owner else (author or conversation_author()), "via": via}
     written, view = _write(_owner_stamp(event) if owner else event)
-    return _done(written, view, until=written["until"])
+    return _done(written, view, until=written.get("until"))
 
 
 def end_hold(hold_id: str, *, owner: bool = False, author: dict | None = None, via: str = "cli",
              now: datetime | None = None) -> dict:
     view = read_view(now)
-    hold = next((h for h in view["holds"] if h["id"] == hold_id), None)
+    hold = next((h for h in view["holds"] if h["id"] == hold_id or h.get("revision") == hold_id), None)
     if hold is None:
         raise RouteError(f"no hold {hold_id!r} is in effect", public="no hold with that id is in effect")
     if hold["owner"] and not owner:
@@ -4114,7 +4415,6 @@ def end_hold(hold_id: str, *, owner: bool = False, author: dict | None = None, v
 
 def _owner_write(event: dict, via: str) -> dict:
     event = _owner_stamp(dict(event, written_by=OWNER, via=via))
-    event.setdefault("id", _new_id("o"))
     written, view = _write(event)
     return _done(written, view)
 
@@ -4122,7 +4422,12 @@ def _owner_write(event: dict, via: str) -> dict:
 def owner_lines(events: list[dict], via: str) -> list[dict]:
     """The owner's lines about an account change (an account's Stop
     tracking: its priority, its pause, its holds, its note)."""
-    return [_owner_stamp(dict(e, written_by=OWNER, via=via, id=e.get("id") or _new_id("o"))) for e in events]
+    lines = [_owner_stamp(dict(e, written_by=OWNER, via=via, id=e.get("id") or _new_id("o"))) for e in events]
+    if len(lines) > 1:
+        for i, line in enumerate(lines):
+            if line.get("op"):
+                line["op"] = f"{line['op']}:{i}"
+    return lines
 
 
 def request_lines(events: list[dict], author: dict, owner_request: str) -> list[dict]:
@@ -4275,14 +4580,26 @@ def end_note(*, via: str, now: datetime | None = None) -> dict:
 
 
 def _rule(n, now) -> dict:
+    rules = read_view(now)["rules"]
+    rule = next((r for r in rules if r.get("entity") == str(n)), None)
+    if rule is not None:
+        return rule
     try:
         number = int(n)
     except (TypeError, ValueError):
-        raise RouteError(f"{n!r} is not a rule number") from None
-    rule = next((r for r in read_view(now)["rules"] if r["n"] == number), None)
+        raise RouteError(f"{n!r} is not a rule number or uuid") from None
+    rule = next((r for r in rules if r["n"] == number), None)
     if rule is None:
+        provisional = [r["entity"] for r in rules if r.get("number_pending") and
+                       r.get("provisional_n") in (None, number)]
+        if provisional:
+            raise RouteError("new rule (number pending); use its uuid: " + ", ".join(provisional))
         raise RouteError(f"there is no standing rule {number}")
     return rule
+
+
+def _rule_target(rule: dict) -> dict:
+    return {"n": rule["n"], "entity": rule["entity"], "target": rule["entity"], "base": rule["owner_revision"]}
 
 
 def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | None = None,
@@ -4298,18 +4615,20 @@ def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | 
         out = _owner_write({"type": "rule_add", "n": n, "text": text.strip(),
                             "source": _one_line(source) or "added by you", "date": now.date().isoformat(),
                             "seeded": False, **({"id": event_id} if event_id else {})}, via)
-    return dict(out, n=n)
+    rule = next(r for r in read_view(now)["rules"] if r["entity"] == out["entity"])
+    return dict(out, n=rule["n"])
 
 
 def edit_rule(n, text: str, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
-    return dict(_owner_write({"type": "rule_edit", "n": rule["n"], "text": text.strip()}, via), n=rule["n"])
+    return dict(_owner_write({"type": "rule_edit", **_rule_target(rule), "text": text.strip()}, via), n=rule["n"])
 
 
 def request_rule(text: str, *, n: int | None = None, owner_request: str | None = None,
-                 author: dict | None = None, via: str = "mcp", now: datetime | None = None) -> dict:
+                 author: dict | None = None, via: str = "mcp", now: datetime | None = None,
+                 op: str | None = None) -> dict:
     """Write a live rule that still needs the owner's confirmation.
 
     The requester is recorded through the report-author path. Repeated
@@ -4327,6 +4646,7 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
     by = dict(author or conversation_author())
     if by.get("kind") != "conversation":
         by = conversation_author()
+    op = op or _OP.get() or event_identity.uuid7()
     if n is None:
         with _lock():
             events, _bad = read_events()
@@ -4334,8 +4654,9 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
             written, view = _write({"type": "rule_add", "n": number, "text": text.strip(),
                                     "source": "added at the owner's request", "date": now.date().isoformat(),
                                     "seeded": False, "pending": True, "owner_request": request_words,
-                                    "written_by": by, "via": via})
-        return dict(_done(written, view), n=number)
+                                    "written_by": by, "via": via, "op": op})
+        rule = next((r for r in view.get("rules", []) if r["entity"] == written["entity"]), None)
+        return dict(_done(written, view), n=rule["n"] if rule else _rule_number(written))
     # The predecessor and the append are one locked operation: an owner edit
     # between them must become the wording Undo restores.
     with _lock():
@@ -4345,9 +4666,9 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
                              f"{_pending_collision(rule.get('pending_author'), rule.get('at'), str(read_view(now)['version']), now)}")
         prior = rule.get("prior_text") if rule.get("pending") else rule["text"]
         prior_confirmed = rule.get("prior_confirmed") if rule.get("pending") else rule["confirmed"]
-        written, view = _write({"type": "rule_edit", "n": rule["n"], "text": text.strip(), "pending": True,
+        written, view = _write({"type": "rule_edit", **_rule_target(rule), "text": text.strip(), "pending": True,
                                 "prior_text": prior, "prior_confirmed": prior_confirmed,
-                                "owner_request": request_words, "written_by": by, "via": via})
+                                "owner_request": request_words, "written_by": by, "via": via, "op": op})
     return dict(_done(written, view), n=rule["n"])
 
 
@@ -4368,27 +4689,45 @@ def _pending_collision(author: dict | None, at, version: str, now: datetime) -> 
 
 def retire_rule(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
-    return dict(_owner_write({"type": "rule_retire", "n": rule["n"]}, via), n=rule["n"])
+    return dict(_owner_write({"type": "rule_retire", **_rule_target(rule)}, via), n=rule["n"])
 
 
 def restore_rule(n, *, via: str, now: datetime | None = None) -> dict:
     """Bring a removed rule back as it was when it was removed: its number,
     words, source, date and confirmation (the app's Undo after a removal)."""
+    entity, number = rule_reference(n)
+    if any(r["entity"] == entity for r in read_view(now)["rules"]):
+        raise RouteError(f"standing rule {n} is in effect")
+    return dict(_owner_write({"type": "rule_restore", "n": number, "entity": entity, "target": entity}, via), n=number)
+
+
+def rule_reference(n) -> tuple[str, int | None]:
+    """Resolve a display alias for history/Undo, including a retired rule."""
+    rows = _in_write_order(read_events()[0])
+    additions = [e for e in rows if e.get("type") == "rule_add"]
+    by_uuid = next((e for e in additions if event_identity.entity(e) == str(n)), None)
+    if by_uuid:
+        return event_identity.entity(by_uuid), _rule_number(by_uuid)
     try:
         number = int(n)
     except (TypeError, ValueError):
-        raise RouteError(f"{n!r} is not a rule number") from None
-    if any(r["n"] == number for r in read_view(now)["rules"]):
-        raise RouteError(f"standing rule {number} is in effect")
-    events, _bad = read_events()
-    if not any(e.get("type") == "rule_add" and e.get("n") == number for e in events):
-        raise RouteError(f"there is no standing rule {number}")
-    return dict(_owner_write({"type": "rule_restore", "n": number}, via), n=number)
+        raise RouteError(f"{n!r} is not a rule number or uuid") from None
+    matches = [e for e in additions if _rule_number(e) == number]
+    settled = [e for e in matches if not e.get("number_pending") and
+               _rule_number(e) is not None]
+    if settled:
+        return event_identity.entity(settled[-1]), number
+    provisional = [e for e in additions if (e in matches or e.get("n") is None) and
+                   (e.get("number_pending") or (e.get("entity") and _rule_number(e) is None))]
+    if provisional:
+        raise RouteError("new rule (number pending); use its uuid: " +
+                         ", ".join(event_identity.entity(e) for e in provisional))
+    raise RouteError(f"there is no standing rule {number}")
 
 
 def confirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
-    return dict(_owner_write({"type": "rule_confirm", "n": rule["n"]}, via), n=rule["n"])
+    return dict(_owner_write({"type": "rule_confirm", **_rule_target(rule)}, via), n=rule["n"])
 
 
 def unconfirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
@@ -4397,21 +4736,21 @@ def unconfirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
     if not rule["seeded"]:
         raise RouteError(f"standing rule {rule['n']} is not a seeded rule")
-    return dict(_owner_write({"type": "rule_unconfirm", "n": rule["n"]}, via), n=rule["n"])
+    return dict(_owner_write({"type": "rule_unconfirm", **_rule_target(rule)}, via), n=rule["n"])
 
 
 def undo_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
     if not rule.get("pending") or rule.get("pending_kind") != "changed" or not isinstance(rule.get("prior_text"), str):
         raise RouteError(f"standing rule {rule['n']} has no pending edit to undo")
-    return dict(_owner_write({"type": "rule_undo", "n": rule["n"]}, via), n=rule["n"])
+    return dict(_owner_write({"type": "rule_undo", **_rule_target(rule)}, via), n=rule["n"])
 
 
 def dismiss_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
     if not rule.get("pending") or rule.get("pending_kind") != "added":
         raise RouteError(f"standing rule {rule['n']} is not a pending addition")
-    return dict(_owner_write({"type": "rule_dismiss", "n": rule["n"]}, via), n=rule["n"])
+    return dict(_owner_write({"type": "rule_dismiss", **_rule_target(rule)}, via), n=rule["n"])
 
 
 # ---- the owner's priority (phase 4b) -----------------------------------------------------
@@ -4854,6 +5193,7 @@ def _level_claim_marker(text: str, key: str, facts: dict | None, *, label: str |
 def rule_line(rule: dict, *, view: dict | None = None, facts: dict | None = None) -> str:
     """A standing rule, whole. A seeded rule the owner has not confirmed
     says so: that mark is its only claim of ownership."""
+    number = rule["n"] if rule["n"] is not None else "new rule (number pending)"
     if rule.get("pending"):
         # A conversation's words until the owner confirms them: one line, as
         # a conversation's words are shown, so they can't open a line of
@@ -4864,10 +5204,10 @@ def rule_line(rule: dict, *, view: dict | None = None, facts: dict | None = None
             if action == "changed" and rule.get("prior_text") else ""
         by = rule.get("pending_by") or "a conversation"
         mark = f" ({action} by {by} at the owner's request; the owner has not confirmed it yet{replaced})"
-        text = f"{rule['n']}. {their_words(rule['text'])}{mark}"
+        text = f"{number}. {their_words(rule['text'])}{mark}"
     else:
         mark = "" if rule.get("confirmed", True) else " (seeded; the owner has not confirmed it yet)"
-        text = f"{rule['n']}. {rule['text']}{mark}"
+        text = f"{number}. {rule['text']}{mark}"
     names = _named_account_labels(rule.get("text"), view)
     for entry in (view or {}).get("accounts") or []:
         if entry["label"] in names:
@@ -4889,7 +5229,7 @@ def rule_pointer(rule: dict, view: dict | None = None, *, facts: dict | None = N
     markers = "".join(_level_claim_marker(rule.get("text") or "", entry["key"], facts,
                                          label=entry["label"], labels=names)
                       for entry in (view or {}).get("accounts") or [] if entry["label"] in names)
-    return (f"Standing rule {rule['n']} {rule.get('pending_kind') or 'added'}{named}: "
+    return (f"Standing rule {rule['n'] if rule['n'] is not None else 'new rule (number pending)'} {rule.get('pending_kind') or 'added'}{named}: "
             f"\"{their_words(_compact_opening(_for_agents(rule.get('text') or '', view), 32))}\"{markers}; unconfirmed; khipu_route.")
 
 
@@ -5294,8 +5634,9 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
         hold = next((h for h in view["holds"] if h["id"] == ident), None)
         return hold_line(hold, now, relative=False, view=view) if hold else f"Hold on {prev.get('scope') or '?'} ended"
     if kind == "rule":
-        rule = next((r for r in view["rules"] if str(r["n"]) == ident), None)
-        return f"Standing rule {rule_line(rule)}" if rule else f"Standing rule {ident} retired"
+        rule = next((r for r in view["rules"] if (str(r["n"]) == ident or r.get("entity") == ident)), None)
+        return (f"Standing rule {rule_line(rule)}" if rule else
+                f"Standing rule {(view.get('causes', {}).get(entity) or {}).get('n') or ident} retired")
     if entity == "note":
         return note_line(view["note"], now) if view.get("note") else "The owner's note ended"
     if entity == "priority":
@@ -5339,6 +5680,11 @@ def direction_line(entity: str, cause: dict, body: dict, prev_effective: dict | 
     conversation (``author_words``)."""
     kind, _, ident = entity.partition(":")
     label = ""
+    number = cause.get("n") or ident
+    if kind == "rule":
+        rule = next((r for r in body.get("rules") or [] if r.get("entity") == ident or str(r["n"]) == ident), None)
+        if rule:
+            number = rule["n"] if rule["n"] is not None else "new rule (number pending)"
     if kind == "account":
         entry = next((a for a in body.get("accounts") or [] if a["key"] == ident), None) or {}
         label = entry.get("label") or ((prev_effective or {}).get(entity) or {}).get("label") or _label_for_key(ident)
@@ -5347,7 +5693,7 @@ def direction_line(entity: str, cause: dict, body: dict, prev_effective: dict | 
     if cause.get("type") == "owner_change":
         what = cause.get("text") or "Made an owner change"
     else:
-        what = verbs.get(key, "Changed the routing record").format(a=label, n=ident)
+        what = verbs.get(key, "Changed the routing record").format(a=label, n=number)
     if cause.get("auth") == "app":
         how = "in the app"
     elif cause.get("auth") == "terminal":
@@ -5391,7 +5737,7 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         for r in view["rules"]:
             if r.get("pending"):
                 theirs.append((len(whole), rule_line(r, view=view, facts=facts), rule_pointer(r, view, facts=facts),
-                               f"rule:{r['n']}"))
+                               _rule_component(r)))
             whole.append(rule_line(r, view=view, facts=facts))
     if view.get("note"):
         whole.append(note_line(view["note"], now))
@@ -5524,7 +5870,7 @@ def _current_line(entity: str, view: dict, now: datetime) -> str:
         if hold:
             return hold_line(hold, now, view=view)
     if kind == "rule":
-        rule = next((r for r in view.get("rules") or [] if str(r["n"]) == ident), None)
+        rule = next((r for r in view.get("rules") or [] if (str(r["n"]) == ident or r.get("entity") == ident)), None)
         if rule:
             return "Standing rule " + rule_line(rule, view=view, facts=plan_facts(view, now))
     if kind == "lane":
@@ -5598,6 +5944,10 @@ def doctor_block(now: datetime | None = None) -> dict:
     if newest is not None and (newest - now).total_seconds() > CLOCK_TOLERANCE:
         warnings.append(f"The routing record holds times ahead of this Mac's clock (as late as "
                         f"{_iso(newest)}); Khipu goes by the clock. Check the Mac's date and time.")
+    if any(e.get("hlc", {}).get("wall", 0) > int(now.timestamp() * 1000) + CLOCK_TOLERANCE * 1000
+           for e in events):
+        warnings.append("The routing record holds a causal clock ahead of this Mac's clock; "
+                        "Khipu preserves its order. Check the originating Mac's date and time.")
     numbers = [e[f] for e in events for f in ("seq", "n") if isinstance(e.get(f), int)]
     if _crowded(numbers):
         warnings.append("The routing record holds a line numbered at the most a line can hold (edited by hand or "
@@ -5756,7 +6106,7 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
     # A pending rule's requester as the fold keeps it, for Khipu's own
     # same-conversation check; ``pending_by`` is its words.
-    out["rules"] = [{k: v for k, v in r.items() if k != "pending_author"} for r in view.get("rules") or []]
+    out["rules"] = [{k: v for k, v in r.items() if k not in ("pending_author", "component", "provisional_n")} for r in view.get("rules") or []]
     # The owner's priority and each account's plan facts (phase 4b); the app
     # words them itself, in local times.
     if view.get("priority"):
@@ -5833,14 +6183,15 @@ _WITNESS_FIELDS = ("id", "source", "at", "evidence", "message_time", "cleared", 
 _REPORT_FIELDS = ("id", "state", "source", "at", "since", "until")
 _LAST_SEEN_FIELDS = (*_REPORT_FIELDS, "cleared")
 _MODEL_FIELDS = ("model", "until", "basis", "source", "at", "id")
-_HOLD_FIELDS = ("id", "scope_label", "reason", "text", "until", "owner", "via", "at", "remind")
-_RULE_FIELDS = ("n", "text", "source", "date", "seeded", "confirmed", "pending", "pending_kind",
+_HOLD_FIELDS = ("id", "entity", "revision", "scope_label", "reason", "text", "until", "owner", "via", "at", "remind")
+_RULE_FIELDS = ("entity", "revision", "owner_revision", "number_pending", "n", "text", "source", "date",
+                "seeded", "confirmed", "pending", "pending_kind",
                 "pending_by", "prior_text", "via", "at")
 _LANE_FIELDS = ("runner", "lane", "state", "until", "basis", "at", "id")
 _RUNNER_FIELDS = ("name", "heartbeat_at", "interval", "silent", "silent_deadline", "unreadable",
                   "unreadable_since", "lanes", "unmatched_lanes", "lane_matches")
 _TABLE_FIELDS = ("hash", "stamped_at", "changed_at", "error")
-_WRITE_FIELDS = ("ok", "id", "state", "until", "basis", "ended", "version", "saved")
+_WRITE_FIELDS = ("ok", "id", "entity", "revision", "state", "until", "basis", "ended", "version", "saved")
 
 
 _ID_SALTS: dict[str, bytes] = {}
@@ -5885,13 +6236,22 @@ def account_label_source(key: str) -> str:
     return _identity_snapshot(_fold_accounts(load_config()))[2].get(key, "owner")
 
 
-def _id_salt() -> bytes:
+def _legacy_ids_issued() -> bool:
+    return ((routing_dir() / "id-salt").exists()
+            and not (routing_dir() / "operation-salt-only").exists())
+
+
+def _id_salt(*, operations: bool = False) -> bytes:
     """This install's secret for account ids, made once and kept 0600 in the
     routing folder. Without it an id would be a bare hash of the key, and a
     reader could confirm a guessed login folder offline. If the folder can't
     be written, a salt for this process only: ids then change between
     processes, which costs a conversation a re-read, never a leak."""
     path = routing_dir() / "id-salt"
+    marker = path.with_name("operation-salt-only")
+    if not operations:
+        with contextlib.suppress(FileNotFoundError):
+            marker.unlink()
     cached = _ID_SALTS.get(str(path))
     if cached is not None:
         return cached
@@ -5900,6 +6260,8 @@ def _id_salt() -> bytes:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as fh:
+            if operations:
+                marker.touch(mode=0o600)
             fh.write(os.urandom(32))
     except FileExistsError:
         pass
@@ -5955,7 +6317,7 @@ def migrate_accounts() -> None:
                 if target in bindings:
                     bindings[old] = bindings[target]
             aliases = ({_legacy_account_id(k): v for k, v in bindings.items()}
-                       if (routing_dir() / "id-salt").exists() else {})
+                       if _legacy_ids_issued() else {})
             stamp = _stamp_locked(_now())[0]
             _append_locked({"type": "account_migration", "id": _new_id("e"), **stamp,
                             "started_at": stamp["written_at"], "written_by": {"kind": "migration"},
@@ -5978,7 +6340,7 @@ def migrate_accounts() -> None:
 
 def _resolve_identity(raw: str, known: list[dict]) -> str:
     (_keys, forwards, aliases), _moves, _sources = _identity_snapshot(known)
-    if account_identity.LEGACY.fullmatch(raw) and raw not in aliases and (routing_dir() / "id-salt").exists():
+    if account_identity.LEGACY.fullmatch(raw) and raw not in aliases and _legacy_ids_issued():
         migrate_accounts()
         _keys, forwards, aliases = _identity_snapshot(known)[0]
     if account_identity.LEGACY.fullmatch(raw):
@@ -6148,7 +6510,7 @@ def _holds_on(key: str, view: dict) -> set[str]:
            if h["scope"].get("kind") == "account" and h["scope"].get("account") == key}
     with contextlib.suppress(Exception):
         events, _bad = read_events()
-        ids |= {str(e.get("id")) for e in events if e.get("type") == "hold" and isinstance(e.get("scope"), dict)
+        ids |= {str(e.get("entity") or e.get("id")) for e in events if e.get("type") == "hold" and isinstance(e.get("scope"), dict)
                 and e["scope"].get("kind") == "account" and e["scope"].get("account") == key}
     return ids
 
@@ -6801,7 +7163,7 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
                      in enumerate(zip(changed["entities"], changed["lines"]))),
                     key=lambda t: (0 if changed["entities"][t[1]] in owed_set else 1, t[0], t[1]))
     changed_rules = {e for e in changed["entities"] if e.startswith("rule:")}
-    pending = {f"rule:{r['n']}": r for r in view.get("rules") or [] if r.get("pending")}
+    pending = {_rule_component(r): r for r in view.get("rules") or [] if r.get("pending")}
     # Pending conversation requests remain explicit in every change push
     # until their owner resolves them, even when this version changes an
     # unrelated account. Every part but the owner's rules and note counts
@@ -6809,7 +7171,7 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     facts = plan_facts(view, now)
     head = [(rule_line(r, view=view, facts=facts), rule_pointer(r, view, facts=facts), THEIRS, e)
             for e, r in pending.items() if e not in changed_rules]
-    rules = {f"rule:{r['n']}": r for r in view.get("rules") or []}
+    rules = {_rule_component(r): r for r in view.get("rules") or []}
     for group, e, line in ranked:
         entity = changed["entities"][e]
         if group == 0 and entity != "priority":
@@ -7150,7 +7512,10 @@ def _owner_stamp(event: dict) -> dict:
     auth = _OWNER_AUTH.get() or {}
     if auth.get("auth"):
         _owner_stamped[0] += 1
-    return dict(event, **auth)
+    from khipu import owner_direction
+
+    op = _OP.get() or owner_direction.operation_id(event)
+    return dict(event, **auth, **({"op": op} if op else {}))
 
 
 # How many owner's lines this process stamped: an owner change that wrote
@@ -7164,7 +7529,7 @@ def owner_change(text: str, line_id: str, auth: str, harness: str | None = None)
     promotion or owner-direction change), so the next push names it once,
     in ``text``'s fixed words, with how it was made."""
     event = {"type": "owner_change", "target": line_id, "text": text, "auth": auth, "written_by": OWNER,
-             "via": {"direction": "direction", "app": "app", "terminal": "cli"}.get(auth, auth)}
+             "via": {"direction": "direction", "app": "app", "terminal": "cli"}.get(auth, auth), "op": line_id}
     if harness:
         event["harness"] = harness
     written, view = _write(event)
@@ -7418,6 +7783,7 @@ def run_cli(args) -> int:
     cmd = getattr(args, "route_cmd", None)
     now = _now()
     auth = _OWNER_AUTH.set(None)
+    operation_token = _OP.set(getattr(args, "op", None))
     try:
         if cmd is None:
             view = read_view(now)
@@ -7569,3 +7935,4 @@ def run_cli(args) -> int:
     finally:
         owner_direction.noted(None, {})
         _OWNER_AUTH.reset(auth)
+        _OP.reset(operation_token)

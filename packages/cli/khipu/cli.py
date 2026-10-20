@@ -5769,6 +5769,9 @@ def build_parser() -> argparse.ArgumentParser:
     rrule.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rrule)
 
+    for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule):
+        writer.add_argument("--op", default=None, help="Retry identity; reuse for the same change")
+
     dec = sub.add_parser(
         "decisions", help="Decisions registry: list / supersede / restore / retract / links (O2, Phase 2A)"
     )

@@ -171,6 +171,7 @@ function useWriter(reread: () => Promise<unknown>): Writer {
     const at = document.activeElement;
     const from = at instanceof HTMLElement && at !== document.body ? at : null;
     setPending((p) => [...p, id]);
+    const op = crypto.randomUUID();
     const job = queue.current.then(async () => {
       const k = { from, back, done: false };
       keep.current = k;
@@ -180,7 +181,8 @@ function useWriter(reread: () => Promise<unknown>): Writer {
         if (typeof built === "string") {
           fail(id, built);
         } else {
-          const res = await callCli(command, built);
+          const res = await callCli(command, command.startsWith("khipu_route_") && command !== "khipu_route_check"
+            ? { ...built, op } : built);
           await (after ?? reread)();
           fail(
             id,

@@ -565,7 +565,8 @@ def test_a_run_of_lines_from_a_clock_reading_2001_never_ages_the_history(home, n
         clock.now = T0 + timedelta(minutes=10 + i)
         routing.report(account="Codex", state="open", author={"kind": "conversation", "harness": "codex"})
     events, _bad = routing.read_events()
-    assert [e["seq"] for e in events] == list(range(len(events)))
+    # Slice 3b sequences start at one on each Mac.
+    assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
     assert routing._in_write_order(events)[0]["written_at"] == routing._iso(T0)  # the history keeps its times
     assert routing._in_write_order(events)[1]["written_at"] == routing._iso(T0 + timedelta(minutes=1))
     clock.now = T0 + timedelta(minutes=30)
@@ -586,15 +587,15 @@ def test_the_fold_orders_lines_by_their_sequence_number(home):
     lines = path.read_text().splitlines()
     path.write_text("\n".join(reversed(lines)) + "\n")  # a copy that came back out of order
     events, _bad = routing.read_events()
-    assert [e["seq"] for e in events] == [0, 1] and [e["_seq"] for e in events] == [0, 1]
+    assert [e["seq"] for e in events] == [1, 2] and [e["_seq"] for e in events] == [0, 1]
     # A line with no sequence number (phase 1a) keeps its place in the file.
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps({"type": "evidence", "id": "old", "source": "report", "state": "open",
                              "account": "muse|", "written_at": routing._iso(T0)}) + "\n")
     events, _bad = routing.read_events()
-    assert [e.get("seq") for e in events] == [0, 1, None]
+    assert [e.get("seq") for e in events] == [1, 2, None]
     routing.report(account="Muse", state="limited", until="1h", author={"kind": "conversation", "harness": "codex"})
-    assert routing.read_events()[0][-1]["seq"] == 2
+    assert routing.read_events()[0][-1]["seq"] == 3
 
 
 # ---- doctor's checks from the runner files ------------------------------------------------

@@ -1,0 +1,503 @@
+{
+  "events": [
+    {
+      "date": "2026-10-20",
+      "id": "od23c63f1",
+      "n": 1,
+      "seeded": false,
+      "seq": 0,
+      "source": "added by you",
+      "text": "synthetic rule 1",
+      "type": "rule_add",
+      "via": "app",
+      "written_at": "2026-10-20T14:00:00Z",
+      "written_by": {
+        "kind": "owner"
+      }
+    },
+    {
+      "date": "2026-10-20",
+      "id": "o7cd11b01",
+      "n": 2,
+      "seeded": false,
+      "seq": 1,
+      "source": "added by you",
+      "text": "synthetic rule 2",
+      "type": "rule_add",
+      "via": "app",
+      "written_at": "2026-10-20T14:00:10Z",
+      "written_by": {
+        "kind": "owner"
+      }
+    },
+    {
+      "date": "2026-10-20",
+      "id": "o8bfc8b85",
+      "n": 3,
+      "seeded": false,
+      "seq": 2,
+      "source": "added by you",
+      "text": "synthetic rule 3",
+      "type": "rule_add",
+      "via": "app",
+      "written_at": "2026-10-20T14:00:20Z",
+      "written_by": {
+        "kind": "owner"
+      }
+    },
+    {
+      "date": "2026-10-20",
+      "id": "oe2e26d01",
+      "n": 4,
+      "seeded": false,
+      "seq": 3,
+      "source": "added by you",
+      "text": "synthetic rule 4",
+      "type": "rule_add",
+      "via": "app",
+      "written_at": "2026-10-20T14:00:30Z",
+      "written_by": {
+        "kind": "owner"
+      }
+    },
+    {
+      "date": "2026-10-20",
+      "id": "o655dc704",
+      "n": 5,
+      "seeded": false,
+      "seq": 4,
+      "source": "added by you",
+      "text": "synthetic rule 5",
+      "type": "rule_add",
+      "via": "app",
+      "written_at": "2026-10-20T14:00:40Z",
+      "written_by": {
+        "kind": "owner"
+      }
+    },
+    {
+      "id": "o32738e21",
+      "n": 1,
+      "seq": 5,
+      "text": "synthetic edited rule",
+      "type": "rule_edit",
+      "via": "app",
+      "written_at": "2026-10-20T14:00:50Z",
+      "written_by": {
+        "kind": "owner"
+      }
+    },
+    {
+      "id": "o8ac9a376",
+      "n": 2,
+      "seq": 6,
+      "type": "rule_retire",
+      "via": "app",
+      "written_at": "2026-10-20T14:01:00Z",
+      "written_by": {
+        "kind": "owner"
+      }
+    },
+    {
+      "id": "ofb8ecd77",
+      "n": 2,
+      "seq": 7,
+      "type": "rule_restore",
+      "via": "app",
+      "written_at": "2026-10-20T14:01:10Z",
+      "written_by": {
+        "kind": "owner"
+      }
+    }
+  ],
+  "saved_view": {
+    "changes": [
+      {
+        "at": "2026-10-20T14:00:00Z",
+        "entities": [
+          "rule:1",
+          "account:claude|",
+          "account:codex|",
+          "account:grok|"
+        ],
+        "items": [
+          {
+            "entity": "rule:1",
+            "now": {
+              "pending": false,
+              "pending_by": null,
+              "pending_kind": null,
+              "prior_text": null,
+              "seeded": false,
+              "text": "synthetic rule 1"
+            },
+            "source": null,
+            "via": "app",
+            "was": null,
+            "written_by": {
+              "kind": "owner"
+            }
+          },
+          {
+            "entity": "account:claude|",
+            "now": {
+              "basis": null,
+              "disagreement": null,
+              "label": "Claude",
+              "last_seen": null,
+              "models": [],
+              "reason": null,
+              "reset_check": null,
+              "scope": "all",
+              "state": "unknown",
+              "until": null
+            },
+            "source": null,
+            "via": null,
+            "was": null,
+            "written_by": null
+          },
+          {
+            "entity": "account:codex|",
+            "now": {
+              "basis": null,
+              "disagreement": null,
+              "label": "Codex",
+              "last_seen": null,
+              "models": [],
+              "reason": null,
+              "reset_check": null,
+              "scope": "all",
+              "state": "unknown",
+              "until": null
+            },
+            "source": null,
+            "via": null,
+            "was": null,
+            "written_by": null
+          },
+          {
+            "entity": "account:grok|",
+            "now": {
+              "basis": null,
+              "disagreement": null,
+              "label": "Grok",
+              "last_seen": null,
+              "models": [],
+              "reason": null,
+              "reset_check": null,
+              "scope": "all",
+              "state": "unknown",
+              "until": null
+            },
+            "source": null,
+            "via": null,
+            "was": null,
+            "written_by": null
+          }
+        ],
+        "lines": [
+          "Standing rule 1. synthetic rule 1",
+          "Claude: unknown: no report yet",
+          "Codex: unknown: no report yet",
+          "Grok: unknown: no report yet"
+        ],
+        "version": 1
+      },
+      {
+        "at": "2026-10-20T14:00:10Z",
+        "entities": [
+          "rule:2"
+        ],
+        "items": [
+          {
+            "entity": "rule:2",
+            "now": {
+              "pending": false,
+              "pending_by": null,
+              "pending_kind": null,
+              "prior_text": null,
+              "seeded": false,
+              "text": "synthetic rule 2"
+            },
+            "source": null,
+            "via": "app",
+            "was": null,
+            "written_by": {
+              "kind": "owner"
+            }
+          }
+        ],
+        "lines": [
+          "Standing rule 2. synthetic rule 2"
+        ],
+        "version": 2
+      },
+      {
+        "at": "2026-10-20T14:00:20Z",
+        "entities": [
+          "rule:3"
+        ],
+        "items": [
+          {
+            "entity": "rule:3",
+            "now": {
+              "pending": false,
+              "pending_by": null,
+              "pending_kind": null,
+              "prior_text": null,
+              "seeded": false,
+              "text": "synthetic rule 3"
+            },
+            "source": null,
+            "via": "app",
+            "was": null,
+            "written_by": {
+              "kind": "owner"
+            }
+          }
+        ],
+        "lines": [
+          "Standing rule 3. synthetic rule 3"
+        ],
+        "version": 3
+      },
+      {
+        "at": "2026-10-20T14:00:30Z",
+        "entities": [
+          "rule:4"
+        ],
+        "items": [
+          {
+            "entity": "rule:4",
+            "now": {
+              "pending": false,
+              "pending_by": null,
+              "pending_kind": null,
+              "prior_text": null,
+              "seeded": false,
+              "text": "synthetic rule 4"
+            },
+            "source": null,
+            "via": "app",
+            "was": null,
+            "written_by": {
+              "kind": "owner"
+            }
+          }
+        ],
+        "lines": [
+          "Standing rule 4. synthetic rule 4"
+        ],
+        "version": 4
+      },
+      {
+        "at": "2026-10-20T14:00:40Z",
+        "entities": [
+          "rule:5"
+        ],
+        "items": [
+          {
+            "entity": "rule:5",
+            "now": {
+              "pending": false,
+              "pending_by": null,
+              "pending_kind": null,
+              "prior_text": null,
+              "seeded": false,
+              "text": "synthetic rule 5"
+            },
+            "source": null,
+            "via": "app",
+            "was": null,
+            "written_by": {
+              "kind": "owner"
+            }
+          }
+        ],
+        "lines": [
+          "Standing rule 5. synthetic rule 5"
+        ],
+        "version": 5
+      },
+      {
+        "at": "2026-10-20T14:00:50Z",
+        "entities": [
+          "rule:1"
+        ],
+        "items": [
+          {
+            "entity": "rule:1",
+            "now": {
+              "pending": false,
+              "pending_by": null,
+              "pending_kind": null,
+              "prior_text": null,
+              "seeded": false,
+              "text": "synthetic edited rule"
+            },
+            "source": null,
+            "via": "app",
+            "was": {
+              "pending": false,
+              "pending_by": null,
+              "pending_kind": null,
+              "prior_text": null,
+              "seeded": false,
+              "text": "synthetic rule 1"
+            },
+            "written_by": {
+              "kind": "owner"
+            }
+          }
+        ],
+        "lines": [
+          "Standing rule 1. synthetic edited rule"
+        ],
+        "version": 6
+      },
+      {
+        "at": "2026-10-20T14:01:00Z",
+        "entities": [
+          "rule:2"
+        ],
+        "items": [
+          {
+            "entity": "rule:2",
+            "n": 2,
+            "now": null,
+            "source": null,
+            "via": "app",
+            "was": {
+              "pending": false,
+              "pending_by": null,
+              "pending_kind": null,
+              "prior_text": null,
+              "seeded": false,
+              "text": "synthetic rule 2"
+            },
+            "written_by": {
+              "kind": "owner"
+            }
+          }
+        ],
+        "lines": [
+          "Standing rule 2 retired"
+        ],
+        "version": 7
+      },
+      {
+        "at": "2026-10-20T14:01:10Z",
+        "entities": [
+          "rule:2"
+        ],
+        "items": [
+          {
+            "entity": "rule:2",
+            "now": {
+              "pending": false,
+              "pending_by": null,
+              "pending_kind": null,
+              "prior_text": null,
+              "seeded": false,
+              "text": "synthetic rule 2"
+            },
+            "source": null,
+            "via": "app",
+            "was": null,
+            "written_by": {
+              "kind": "owner"
+            }
+          }
+        ],
+        "lines": [
+          "Standing rule 2. synthetic rule 2"
+        ],
+        "version": 8
+      }
+    ],
+    "effective": {
+      "account:claude|": {
+        "basis": null,
+        "disagreement": null,
+        "label": "Claude",
+        "last_seen": null,
+        "models": [],
+        "reason": null,
+        "reset_check": null,
+        "scope": "all",
+        "state": "unknown",
+        "until": null
+      },
+      "account:codex|": {
+        "basis": null,
+        "disagreement": null,
+        "label": "Codex",
+        "last_seen": null,
+        "models": [],
+        "reason": null,
+        "reset_check": null,
+        "scope": "all",
+        "state": "unknown",
+        "until": null
+      },
+      "account:grok|": {
+        "basis": null,
+        "disagreement": null,
+        "label": "Grok",
+        "last_seen": null,
+        "models": [],
+        "reason": null,
+        "reset_check": null,
+        "scope": "all",
+        "state": "unknown",
+        "until": null
+      },
+      "rule:1": {
+        "pending": false,
+        "pending_by": null,
+        "pending_kind": null,
+        "prior_text": null,
+        "seeded": false,
+        "text": "synthetic edited rule"
+      },
+      "rule:2": {
+        "pending": false,
+        "pending_by": null,
+        "pending_kind": null,
+        "prior_text": null,
+        "seeded": false,
+        "text": "synthetic rule 2"
+      },
+      "rule:3": {
+        "pending": false,
+        "pending_by": null,
+        "pending_kind": null,
+        "prior_text": null,
+        "seeded": false,
+        "text": "synthetic rule 3"
+      },
+      "rule:4": {
+        "pending": false,
+        "pending_by": null,
+        "pending_kind": null,
+        "prior_text": null,
+        "seeded": false,
+        "text": "synthetic rule 4"
+      },
+      "rule:5": {
+        "pending": false,
+        "pending_by": null,
+        "pending_kind": null,
+        "prior_text": null,
+        "seeded": false,
+        "text": "synthetic rule 5"
+      }
+    },
+    "epoch": "b7b22b84",
+    "folded_at": "2026-10-20T14:01:10Z",
+    "schema": 1,
+    "version": 8
+  },
+  "source_commit": "6151f23"
+}
