@@ -48,6 +48,8 @@ FAKE_CLI = textwrap.dedent("""
         record["grandchild"] = subprocess.Popen(["/bin/sleep", "60"]).pid  # inherits stdout and the group
     with open(out, "w") as fh:
         json.dump(record, fh)
+    if mode == "slow_start":
+        time.sleep(2.5)
     if mode in ("hang", "deaf", "grandchild_hang"):
         time.sleep(60)
     if mode == "grandchild":
@@ -1161,6 +1163,30 @@ def test_held_open_stdin_does_not_hold_the_probe(fake, tmp_path):
     assert row == {"ok": False, "error": "timeout"}
     assert time.monotonic() - started < 2
     assert _gone(_child(out)["pid"])
+
+
+def test_grok_probe_gets_its_own_budget_unless_the_caller_gives_one(monkeypatch):
+    seen = []
+    monkeypatch.setattr(usage, "_command", lambda harness: "/bin/grok")
+    monkeypatch.setattr(usage, "_converse", lambda *a, deadline, **k: seen.append(deadline - time.monotonic()) or [])
+    usage.probe_grok(None)
+    usage.probe_grok(None, timeout=1)
+    assert usage.GROK_TIMEOUT_S == 20.0 and usage.TIMEOUT_S == 5.0
+    assert 19 < seen[0] <= 20 and 0 < seen[1] <= 1
+
+
+def test_probe_all_lets_a_slow_grok_finish_without_holding_the_others(fake, monkeypatch):
+    monkeypatch.setattr(usage, "TIMEOUT_S", 1.0)
+    monkeypatch.setattr(usage, "GROK_TIMEOUT_S", 6.0)
+    monkeypatch.setattr(usage, "OVERALL_GRACE_S", 0.3)
+    fake("claude", "claude.jsonl", mode="hang")
+    fake("grok", "grok.jsonl", mode="slow_start")
+    accounts = [{"label": "Claude", "harness": "claude", "home": None},
+                {"label": "Grok", "harness": "grok", "home": None}]
+    rows = usage.probe_all(accounts, timeout=usage.TIMEOUT_S)
+    by = {r["harness"]: r for r in rows}
+    assert by["grok"]["ok"] is True and by["grok"]["ms"] > 2000
+    assert by["claude"]["error"] == "timeout" and by["claude"]["ms"] < 1800
 
 
 def test_probe_all_returns_by_its_overall_deadline(monkeypatch):

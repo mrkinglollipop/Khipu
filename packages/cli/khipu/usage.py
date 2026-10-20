@@ -54,6 +54,9 @@ from pathlib import Path
 HARNESSES = ("claude", "codex", "grok", "muse")
 LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok", "muse": "Muse"}
 TIMEOUT_S = 5.0
+# Grok's probe starts a whole `grok agent` (and its MCP servers), which took
+# longer than TIMEOUT_S under load; the other harnesses' probes stay cheap.
+GROK_TIMEOUT_S = 20.0
 DEFAULT_MAX_AGE_S = 120
 CACHE_NAME = "usage.json"
 CACHE_VERSION = 2
@@ -900,6 +903,12 @@ def parse_grok(frames: list[dict]) -> dict:
             "credits": credits, "version": version, "source": "live"}
 
 
+def _grok_budget(timeout: float) -> float:
+    """Grok's own budget when the caller left the default; an explicit
+    timeout (anything but the default) is honoured as given."""
+    return GROK_TIMEOUT_S if timeout == TIMEOUT_S else timeout
+
+
 @_guard
 def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
     """Grok Build's ``_x.ai/billing`` (ACP, undocumented) for the login in
@@ -918,7 +927,7 @@ def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S) -> d
     billing = {"jsonrpc": "2.0", "id": 2, "method": "_x.ai/billing", "params": {}}
     frames = _converse([binary, "agent", "--no-leader", "stdio"], [initialize],
                        lambda f: f.get("id") == 2 or (f.get("id") == 1 and f.get("error") is not None),
-                       env=probe_environment("grok", grok_home, binary), deadline=time.monotonic() + timeout,
+                       env=probe_environment("grok", grok_home, binary), deadline=time.monotonic() + _grok_budget(timeout),
                        close_stdin=False, follow=lambda f: [billing] if f.get("id") == 1 else None)
     return parse_grok(frames)
 
@@ -1609,7 +1618,8 @@ def _failed_row(account: dict, code: str) -> dict:
 def probe_all(accounts: list[dict], *, timeout: float = TIMEOUT_S) -> list[dict]:
     """Every account in parallel; one hung CLI never delays the others past
     its own timeout, and a failed probe never hides the rest. Returns by an
-    overall deadline (``timeout`` + ``OVERALL_GRACE_S``) whatever happens: a
+    overall deadline (the longest per-harness budget in play, Grok's
+    included, + ``OVERALL_GRACE_S``) whatever happens: a
     probe still running then is reported ``timeout`` and its process group is
     killed. Daemon threads, no executor: nothing waits on a stuck worker,
     interpreter exit included."""
@@ -1631,7 +1641,8 @@ def probe_all(accounts: list[dict], *, timeout: float = TIMEOUT_S) -> list[dict]
                for i, a in enumerate(accounts)]
     for thread in threads:
         thread.start()
-    end = time.monotonic() + timeout + OVERALL_GRACE_S
+    longest = max([timeout] + [_grok_budget(timeout) for a in accounts if a.get("harness") == "grok"])
+    end = time.monotonic() + longest + OVERALL_GRACE_S
     for thread in threads:
         thread.join(max(0.0, end - time.monotonic()))
     later = run.until + 0.25
