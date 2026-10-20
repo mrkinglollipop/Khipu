@@ -917,6 +917,82 @@ def _withhold_names(value, fixed=None, names=None):
     return value
 
 
+def _strict_text(text: str, table: _Table, keep: list[str]) -> str:
+    held = [w for w in keep if w and w in text]
+    for i, word in enumerate(held):
+        text = text.replace(word, f"\x00{i}\x00")
+    from khipu.redact import redact_secrets
+
+    for variant in _decoded_variants(text):
+        if _ANY_ACCOUNT_KEY.search(variant) or redact_secrets(variant, force=True)[1]:
+            text = WITHHELD + "".join(f" \x00{i}\x00" for i in range(len(held)))
+            break
+    for i, word in enumerate(held):
+        text = text.replace(f"\x00{i}\x00", word)
+    return text
+
+
+def scrub_strict(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] | None = None):
+    """``scrub``, then the strict projection's final scan: any string still
+    holding an account key (``harness|``) or a secret-shaped token is
+    withheld whole. The owner's own words (``keep`` plus the saved
+    record's) still pass as written, as in ``scrub``."""
+    table = _table(extra_keys)
+    words = sorted({w for w in [*keep, *table.owner] if isinstance(w, str) and w}, key=len, reverse=True)
+    scrubbed = scrub(value, keep=keep, extra_keys=extra_keys)
+
+    def walk(item):
+        if isinstance(item, str):
+            return _strict_text(item, table, words)
+        if isinstance(item, dict):
+            return {(walk(k) if isinstance(k, str) else k): walk(v) for k, v in item.items()}
+        if isinstance(item, list):
+            return [walk(v) for v in item]
+        if isinstance(item, tuple):
+            return tuple(walk(v) for v in item)
+        return item
+
+    return walk(scrubbed)
+
+
+def login_inventory_available() -> bool:
+    """Whether any live source inventories a login folder beyond the
+    home-less defaults: a discovered candidate, a login-shaped folder in
+    the home folder now, a discovered Claude home, or a configured
+    account with a folder. A stored run whose candidates are its only
+    evidence counts only while its last run is within the seven days
+    discovery itself counts conversations over. When this is false, a
+    login folder's alias can be a name the scrub table has never seen,
+    so alias-bearing lines must fail closed rather than be shown."""
+    try:
+        from khipu import discover
+
+        store = discover._load_store()
+        if discover._source_names():
+            return True
+        candidates = store.get("candidates") or {}
+        if candidates:
+            last = store.get("last_run") if isinstance(store.get("last_run"), dict) else {}
+            at = last.get("at")
+            if isinstance(at, (int, float)) and not isinstance(at, bool):
+                return time.time() - float(at) <= 7 * 86400
+            return True
+    except Exception:  # noqa: BLE001 - no inventory is itself the answer
+        pass
+    with contextlib.suppress(Exception):
+        from khipu import claude_homes
+
+        if any(not found.is_default for found in claude_homes.discover()):
+            return True
+    with contextlib.suppress(Exception):
+        from khipu.config import load_config
+
+        if any(isinstance(entry, dict) and isinstance(entry.get("home"), str) and entry["home"].strip()
+               for entry in load_config().get("usage_accounts") or []):
+            return True
+    return False
+
+
 def _projected(value):
     """(``value`` projected, whether it is complete)."""
     try:

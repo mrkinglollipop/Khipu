@@ -2237,13 +2237,23 @@ def _route_pull_attachment(routing, routing_delivery, identity, now):
          "version": view["version"], "epoch": view.get("epoch"),
          "owed_entities": [], "shown_entities": []},
         view, now, routing.settings())
+    # An unmatched lane's name comes from outside the known accounts: when
+    # no live source inventories a login folder, that name may be a login
+    # alias the scrub table has never seen, so lane items fail closed
+    # (neither shown nor reserved) until an inventory exists.
+    from khipu import agent_view
+
+    skip = frozenset() if agent_view.login_inventory_available() else frozenset(
+        item["entity"] for item in planned["delivery_plan"]["items"]
+        if item["entity"].startswith("lane:"))
     if identity is None:
         changes, delivery = {"batch": None, "component": "mcp",
-                             "items": routing_delivery.untracked_items(planned)}, "untracked: pass session_id"
+                             "items": [item for item in routing_delivery.untracked_items(planned)
+                                       if item["entity"] not in skip]}, "untracked: pass session_id"
     else:
         counting = "main" if identity["capability"] == "hooked" else "mcp"
         changes, delivery = routing_delivery.pull_offer(planned, session=identity["session"], component="mcp",
-                                                        counting_component=counting, now=now)
+                                                        counting_component=counting, now=now, skip_entities=skip)
     # Pull items name entities publicly: an account by its stable id, never
     # its key (a login folder the raw ledger entity carries).
     if changes is not None:
@@ -2254,9 +2264,15 @@ def _route_pull_attachment(routing, routing_delivery, identity, now):
     if isinstance(delivery, dict) and delivery.get("duplicates_across_components"):
         delivery = {**delivery, "duplicates_across_components": [
             routing._public_entity(entity) for entity in delivery["duplicates_across_components"]]}
-    # Scrubbed here, not only at dispatch: an entity names its account key
-    # (a login folder), and a direct caller of this tool gets no raw path.
+    # Projected strictly here, not only scrubbed at dispatch: an entity can
+    # carry an account key or a secret-shaped lane name, and a direct
+    # caller of this tool gets neither.
+    from khipu import agent_view
+
     scrubbed = routing._for_agents({"routing_changes": changes, "delivery": delivery}, view)
+    scrubbed = agent_view.scrub_strict(scrubbed, keep=agent_view.keep_owner_words(view),
+                                       extra_keys=[a.get("key") for a in view.get("accounts") or []
+                                                   if isinstance(a, dict)])
     return scrubbed["routing_changes"], scrubbed["delivery"]
 
 
@@ -2558,10 +2574,14 @@ _MEMORY_FIELDS = ("prior_work", "prior_work_text", "prior_work_meta")
 def _scrub_for_agents(name: str, payload):
     from khipu import agent_view
 
+    # khipu_route's answers carry conversation-written words (pending
+    # rules, lane names) that scrub alone leaves secret-shaped tokens and
+    # account keys in: they leave through the strict projection's scan.
+    strict = agent_view.scrub_strict if name == "khipu_route" else agent_view.scrub
     if not isinstance(payload, dict):
-        return agent_view.scrub(payload)
+        return strict(payload)
     memory = {k: payload[k] for k in _MEMORY_FIELDS if k in payload}
-    out = agent_view.scrub({k: v for k, v in payload.items() if k not in memory})
+    out = strict({k: v for k, v in payload.items() if k not in memory})
     out.update(memory)
     return out
 
@@ -2751,8 +2771,14 @@ def _dispatch_message(msg: dict) -> dict | None:
         from khipu import agent_view
 
         # Every error leaves through the tool's own pass: a projected tool's
-        # through agent_view.project, whatever raised it.
-        scrub = agent_view.project if name in _AGENT_PROJECTED else agent_view.scrub
+        # through agent_view.project, khipu_route's through the strict
+        # projection's scan, whatever raised it.
+        if name in _AGENT_PROJECTED:
+            scrub = agent_view.project
+        elif name == "khipu_route":
+            scrub = agent_view.scrub_strict
+        else:
+            scrub = agent_view.scrub
         try:
             arguments = dict(params.get("arguments") or {})
             if name in {"khipu_route_report", "khipu_route_rule", "khipu_route_priority"} and not _via_https_gateway():
@@ -2785,7 +2811,8 @@ def _dispatch_message(msg: dict) -> dict | None:
             # Its own text may name a file: fixed words for a filesystem
             # error, anything else scrubbed (agent_view.error_text).
             error = {"error": agent_view.error_text(exc)}
-            return _result(req_id, _tool_text(scrub(error) if name in _AGENT_PROJECTED else error, is_error=True))
+            return _result(req_id, _tool_text(
+                scrub(error) if name in _AGENT_PROJECTED or name == "khipu_route" else error, is_error=True))
         finally:
             if _RELOAD_ON_CHANGE:
                 _note_loaded_modules()

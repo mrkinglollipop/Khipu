@@ -41,10 +41,35 @@ def _size(text):
     return len(text) + sum(ord(c) > 0xffff for c in text)
 
 
+def _canonical_session(session):
+    """The ledger identity for a session argument: a harness-native id the
+    caller's own environment confirms becomes its canonical (prefixed)
+    root, so a hook and an MCP call from one conversation share a ledger
+    while ``claude:<id>`` and ``codex:<id>`` never do. Anything else (an
+    already-canonical root, a daemon serving another conversation) is
+    taken as given, never replaced by this process's own identity."""
+    if not isinstance(session, str) or not session:
+        return session
+    env = os.environ
+    shared = (env.get("KHIPU_SESSION_ID") or "").strip()
+    if shared and session == shared:
+        return shared
+    claude = (env.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    if claude and session == claude:
+        return f"claude:{claude}"
+    codex = (env.get("CODEX_THREAD_ID") or "").strip()
+    if codex and session == codex:
+        return f"codex:{codex}"
+    return session
+
+
 def _path(session):
     from khipu import recall_prompt
 
-    return recall_prompt._dedup_path(session).with_suffix(".routing.json")
+    # A collision-resistant name for the complete canonical identity:
+    # sanitizing or truncating it made distinct identities share a file.
+    digest = hashlib.sha256(_canonical_session(session).encode("utf-8")).hexdigest()
+    return recall_prompt._dedup_path("ledger").parent / f"recall--{digest}.routing.json"
 
 
 @contextlib.contextmanager
@@ -339,13 +364,16 @@ def canonical_identity(environ=None, explicit=None):
     """The one conversation identity for hooks and pull (MCP) delivery.
 
     Returns {"root", "session", "harness", "capability", "child"} or None
-    when the caller's environment and arguments name no session. ``root``
-    is the canonical (prefixed) identity; ``session`` is the ledger key,
-    which for a harness-native id is that id itself so a hook and an MCP
-    call from the same conversation share one ledger file, and for a
-    ``KHIPU_SESSION_ID`` (``t3:<thread>``) is the value as given. A root
-    containing "/" is a pull-only child: its own ledger, never its parent's.
-    Capability comes from the current attachment's harness alone.
+    when the caller's environment and arguments name no session. An
+    identity the environment itself knows (``KHIPU_SESSION_ID``, then a
+    harness-native id) always wins: an explicit ``session_id`` may only
+    fill in when the environment names no session, never impersonate
+    another identified caller. ``root`` is the canonical (prefixed)
+    identity and ``session`` is that same root, the ledger key; a hook
+    carrying the bare native id reaches the same file through
+    ``_canonical_session``. A root containing "/" is a pull-only child:
+    its own ledger, never its parent's. Capability comes from the
+    current attachment's harness alone.
     """
     env = os.environ if environ is None else environ
 
@@ -366,14 +394,14 @@ def canonical_identity(environ=None, explicit=None):
     shared = _clean(env.get("KHIPU_SESSION_ID"))
     claude = _clean(env.get("CLAUDE_CODE_SESSION_ID"))
     codex = _clean(env.get("CODEX_THREAD_ID"))
-    if explicit:
-        root = session = explicit
-    elif shared:
+    if shared:
         root = session = shared
     elif claude:
-        root, session = f"claude:{claude}", claude
+        root = session = f"claude:{claude}"
     elif codex:
-        root, session = f"codex:{codex}", codex
+        root = session = f"codex:{codex}"
+    elif explicit:
+        root = session = explicit
     else:
         return None
     if harness in _HOOKED_HARNESSES:
@@ -423,11 +451,15 @@ def _delivery_summary(data, component, state, changes, now, counting_component):
             "duplicates_across_components": duplicates, "health": health}
 
 
-def pull_offer(out, *, session, component="mcp", counting_component=None, now=None):
+def pull_offer(out, *, session, component="mcp", counting_component=None, now=None, skip_entities=frozenset()):
     """Reserve (or re-send) one pull component's batch under its own lock.
 
     A live in-flight batch is re-sent byte-identically, so a dropped
-    response loses nothing. Returns (routing_changes or None, delivery).
+    response loses nothing. Every item carries the exact text it reserves
+    (``text``: the whole line, or the one page being shown), so a batch
+    never reserves content the response did not return. Entities in
+    ``skip_entities`` are neither reserved nor sent. Returns
+    (routing_changes or None, delivery).
     """
     now = now or _parse(out["delivery_plan"]["at"])
     counting_component = counting_component or component
@@ -435,13 +467,17 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
         state = data.setdefault(component, {})
         entries = _merge(state, out)
         flight = state.get("flight")
+        if flight and any(item["entity"] in skip_entities
+                          for item in flight["out"]["routing_changes"]["items"]):
+            state.pop("flight", None)  # withdrawn, not expired: it may not be shown at all now
+            flight = None
         if flight and _parse(flight["until"]) > now:
             changes = copy.deepcopy(flight["out"]["routing_changes"])
             return changes, _delivery_summary(data, component, state, changes, now, counting_component)
         if flight:
             state["expired"] = state.get("expired", 0) + 1
             state.pop("flight", None)
-        due = [e for e in entries.values() if not e.get("acked")]
+        due = [e for e in entries.values() if not e.get("acked") and e["entity"] not in skip_entities]
         if not due:
             return None, _delivery_summary(data, component, state, None, now, counting_component)
         plan_data = out["delivery_plan"]
@@ -451,7 +487,7 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
             start, value = entry.get("offset", 0), entry["text"]
             if not entry["whole"] or (not start and len(value) <= page_limit):
                 items.append(dict(change=entry["entity"] + "@" + entry["revision"],
-                                  entity=entry["entity"], revision=entry["revision"]))
+                                  entity=entry["entity"], revision=entry["revision"], text=value))
                 progress[entry["entity"]] = len(value)
                 continue
             width = entry.get("width") or max(2, page_limit - _size(entry["label"]) - 44)
@@ -465,7 +501,7 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
             n = entry.get("pages", 0) + 1
             items.append(dict(change=entry["entity"] + "@" + entry["revision"],
                               entity=entry["entity"], revision=entry["revision"],
-                              page={"n": n, "m": n + remaining}))
+                              page={"n": n, "m": n + remaining}, text=value[start:end]))
             progress[entry["entity"]] = end
             break
         if not items:
