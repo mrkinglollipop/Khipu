@@ -32,6 +32,7 @@ import hashlib
 import html
 import os
 import re
+import signal
 import stat
 import threading
 import time
@@ -126,7 +127,7 @@ def _saved_view() -> dict:
     return {}
 
 
-def _homes(extra_keys: Iterable[str] | None, view: dict) -> list[tuple[str, str | None]]:
+def _homes(extra_keys: Iterable[str] | None, view: dict, *, local_only=False) -> list[tuple[str, str | None]]:
     """Every (harness, login folder) Khipu knows: configured (invalid entries
     included), discovered Claude homes, the routing record's accounts, the
     caller's ``extra_keys`` ("harness|home"), each default login and each
@@ -149,7 +150,7 @@ def _homes(extra_keys: Iterable[str] | None, view: dict) -> list[tuple[str, str 
     with contextlib.suppress(Exception):
         from khipu import claude_homes
 
-        for found in claude_homes.discover():
+        for found in (() if local_only else claude_homes.discover()):
             out.append(("claude", None if found.is_default else str(found.path)))
     with contextlib.suppress(Exception):
         # Account discovery's finds (settings clarity phase 9): its last
@@ -160,7 +161,7 @@ def _homes(extra_keys: Iterable[str] | None, view: dict) -> list[tuple[str, str 
         for rec in discover._load_store()["candidates"].values():
             if rec["cli"] in _DEFAULT_FOLDERS and rec.get("abs") and not rec.get("default"):
                 out.append((rec["cli"], rec["abs"]))
-        for cli, folder in discover._source_names():
+        for cli, folder in (() if local_only else discover._source_names()):
             # A default login stays home-less (its name is the CLI's own
             # word, which agents must still read): it is already in ``out``.
             if folder.name != _DEFAULT_FOLDERS.get(cli):
@@ -277,20 +278,22 @@ def _symlink_forms(path: str) -> set[str]:
     return forms
 
 
-def _forms(raw: str, home: str | None) -> set[str]:
+def _forms(raw: str, home: str | None, *, local_only=False) -> set[str]:
     """``raw`` as typed, expanded, each symlink hop and resolved, also ~/ and NFC."""
     cache = getattr(_FORM_CACHE, "current", None)
-    key = (raw, home)
+    key = (raw, home, local_only)
     if cache is not None and key in cache:
         return set(cache[key])
     raw = raw.strip()
     forms = {raw.rstrip("/") or raw}
     with contextlib.suppress(Exception):
         expanded = os.path.expanduser(raw).rstrip("/")
-        forms |= {expanded, os.path.realpath(expanded).rstrip("/")}
-        forms |= _symlink_forms(expanded)
+        forms.add(expanded)
+        if not local_only:
+            forms.add(os.path.realpath(expanded).rstrip("/"))
+            forms |= _symlink_forms(expanded)
     if home:
-        for base in {home, os.path.realpath(home)}:
+        for base in ({home} if local_only else {home, os.path.realpath(home)}):
             forms |= {"~" + f[len(base):] for f in list(forms) if f.startswith(base + "/")}
     forms |= {unicodedata.normalize("NFC", f) for f in forms}
     result = {f for f in forms if len(f) > 1 and f not in ("~", "/")}
@@ -337,9 +340,10 @@ class _Table:
     ``names`` distinctive tokens and lowercase words in path components; and the
     owner's words as the saved record holds them now."""
 
-    __slots__ = ("roots", "root_to", "names", "name_to", "owner", "secrets", "name_secrets")
+    __slots__ = ("roots", "root_to", "names", "name_to", "owner", "secrets", "name_secrets", "previous")
 
     def __init__(self, roots, root_to, names, name_to, owner, token_names):
+        self.previous = None
         self.roots, self.root_to, self.names, self.name_to, self.owner = roots, root_to, names, name_to, owner
         self.secrets = tuple({r for r, _ in root_to if r != "~"}
                              | {n for n in name_to if not n.isalnum()})
@@ -348,14 +352,23 @@ class _Table:
         self.name_secrets = _name_regex(name_to, token_names, whole_value=True)
 
 
-def _other_paths() -> list[str]:
+def _other_paths(*, local_only=False) -> list[str]:
     others: list[str] = []
     with contextlib.suppress(Exception):
         from khipu import routing
 
-        others += routing._configured_paths()
+        if local_only:
+            from khipu.config import load_config
+
+            cfg = load_config()
+            others += [cfg[k] for k in ("routing_table", "routing_rules_seed") if isinstance(cfg.get(k), str)]
+            others += [item["path"] for item in cfg.get("routing_sources") or []
+                       if isinstance(item, dict) and isinstance(item.get("path"), str)]
+        else:
+            others += routing._configured_paths()
     with contextlib.suppress(Exception):
-        others += [os.path.join("/Volumes", n) for n in os.listdir("/Volumes")]
+        if not local_only:
+            others += [os.path.join("/Volumes", n) for n in os.listdir("/Volumes")]
     with contextlib.suppress(Exception):
         from khipu.config import path_setting
 
@@ -365,7 +378,7 @@ def _other_paths() -> list[str]:
     return others
 
 
-def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
+def _rules(extra_keys: Iterable[str] | None = None, *, local_only=False) -> _Table:
     view = _saved_view()
     home = _home_dir()
     root_to: dict[str, object] = {}  # folded path -> an _Id or a word
@@ -380,7 +393,7 @@ def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
         if not plain:
             token_names.add(_fold(form))
 
-    for harness, raw in _homes(extra_keys, view):
+    for harness, raw in _homes(extra_keys, view, local_only=local_only):
         ident = _Id(harness, raw)
         default = raw is None
         if raw is None:
@@ -388,7 +401,7 @@ def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
             if not folder or not home:
                 continue
             raw = os.path.join(home, folder)
-        for path in sorted(_forms(raw, home)):
+        for path in sorted(_forms(raw, home, local_only=local_only)):
             root_to.setdefault(_fold(path), ident)
             paths.append(path)
             folder = unicodedata.normalize("NFC", Path(path.rstrip("/")).name).strip()
@@ -405,12 +418,12 @@ def _rules(extra_keys: Iterable[str] | None = None) -> _Table:
                     # Aliases retain the original name's classification:
                     # stripping a dot or casefolding must not make it prose.
                     add_name(form, ident, plain=re.fullmatch(r"[a-z]+", folder) is not None)
-    for path in _other_paths():
+    for path in _other_paths(local_only=local_only):
         if len(path.rstrip("/")) > 1:
             root_to.setdefault(_fold(path.rstrip("/")), FOLDER_WORD)
             paths.append(path)
     if home:
-        for form in {home, os.path.realpath(home)}:
+        for form in ({home} if local_only else {home, os.path.realpath(home)}):
             root_to.setdefault(_fold(form), HOME_WORD)
         root_to.setdefault("~", HOME_WORD)
         paths.append(home)
@@ -472,15 +485,71 @@ _PROJECTION = threading.local()
 
 @contextlib.contextmanager
 def routing_projection(extra_keys):
-    """One hook read uses one path inventory; the next read checks again."""
+    """Bound discovery before projecting a hook's routing output."""
     keys = tuple(extra_keys)
-    table = _table(keys)
+    table = _prompt_table(keys)
     previous = getattr(_PROJECTION, "current", None)
     _PROJECTION.current = (keys, table)
     try:
         yield
     finally:
         _PROJECTION.current = previous
+
+
+class _InventoryDeadline(BaseException):
+    # Discovery helpers deliberately suppress ordinary filesystem errors.
+    pass
+
+
+
+def _fallback_table(keys):
+    table = _rules(keys, local_only=True)
+    # Retain discovered private aliases, but only today's owner exemptions.
+    table.previous = _TABLE.get("table")
+    return table
+
+
+def _prompt_table(keys):
+    """A stalled mount must not consume the hook's routing budget.
+
+    A 5ms refresh preserves full discovery when it is responsive. On expiry,
+    use configured and saved login names without resolving links or listing
+    directories; the generic private-path scrub still applies. Keep the
+    caller's process deadline and signal handler intact.
+    """
+    budget = 0.005
+    if threading.current_thread() is not threading.main_thread():
+        return _fallback_table(keys)
+    timer = signal.getitimer(signal.ITIMER_REAL)
+    if timer[0] and timer[0] <= budget:
+        return _fallback_table(keys)
+    handler = signal.getsignal(signal.SIGALRM)
+    began = time.monotonic()
+
+    refreshing = True
+    table = None
+
+    def expired(*_):
+        if refreshing:
+            raise _InventoryDeadline()
+
+    try:
+        try:
+            signal.signal(signal.SIGALRM, expired)
+            signal.setitimer(signal.ITIMER_REAL, budget)
+            table = _table(keys)
+        finally:
+            # A one-shot alarm may already be pending when the timer is
+            # cancelled. It must become harmless before restoring handlers.
+            refreshing = False
+    except _InventoryDeadline:
+        refreshing = False
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, handler)
+        if timer[0]:
+            signal.setitimer(signal.ITIMER_REAL, max(0.000001, timer[0] - (time.monotonic() - began)), timer[1])
+    return table if table is not None else _fallback_table(keys)
 
 
 def _table(extra_keys) -> _Table:
@@ -517,6 +586,8 @@ def _lookup(mapping: dict, found: str, fallback: str) -> str:
 
 
 def _scrub_text(text: str, table: _Table, keep: list[str]) -> str:
+    if table.previous is not None:
+        text = _scrub_text(text, table.previous, keep)
     pathy = "/" in text or "~" in text
     held = [w for w in keep if w and w in text]
     for i, word in enumerate(held):

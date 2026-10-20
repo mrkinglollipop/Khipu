@@ -92,6 +92,9 @@ def plan(out, view, now, cfg):
     if full and view.get("record"):
         entities = list(dict.fromkeys([*entities, *[e for e in view.get("effective", {})
                                                   if not e.startswith("owner:")]]))
+    # Other entities can change the suffix of an unchanged rule or priority.
+    entities = list(dict.fromkeys([*entities, *[e for e in view.get("effective", {})
+                                               if e.startswith("rule:") or e in ("note", "priority")]]))
     rules = {r._rule_component(rule): rule for rule in view.get("rules") or []}
     items = []
     facts = r.plan_facts(view, now)
@@ -99,7 +102,7 @@ def plan(out, view, now, cfg):
     shown = set(out.get("shown_entities") or [])
     for entity in entities:
         rule = rules.get(entity)
-        whole = entity in ("note", "priority") or rule is not None
+        whole = entity in ("note", "priority") or entity.startswith("rule:")
         if rule:
             line = r.rule_line(rule, view=view, facts=facts)
             label = f"Standing rule {rule['n']}"
@@ -113,11 +116,15 @@ def plan(out, view, now, cfg):
         effective = view.get("effective", {}).get(entity)
         if effective is None:
             effective = line
-        revision = hashlib.sha256(json.dumps(effective, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
-        items.append(dict(entity=entity, revision=revision, text=line, label=label, whole=whole))
+        items.append(dict(entity=entity, effective=effective, text=line, label=label, whole=whole))
     projected = r._for_agents([(item["text"], item["label"]) for item in items], view) if items else []
     for item, (line, label) in zip(items, projected):
-        item.update(text=line, label=label)
+        effective = item.pop("effective")
+        # Relative account ages are presentation, not a new change. Rules
+        # and priority also depend on the rendered hold and level suffixes.
+        fingerprint = [effective, line, label] if item["entity"].startswith("rule:") or item["entity"] == "priority" else effective
+        revision = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+        item.update(text=line, label=label, revision=revision)
         # Rules and notes require their complete words. Accounts and holds
         # may use the existing renderer's identifying line projection.
         visible = line in text if item["whole"] else item["entity"] in shown
@@ -126,7 +133,10 @@ def plan(out, view, now, cfg):
             clipped = line[:max(0, width - 3)].rstrip() + "." * min(width, 3) if width and len(line) > width else line
             visible = bool(line and (line in text or clipped in text or r._clip(line, width) in text))
         item["visible"] = visible
-    return dict(out, delivery_plan={"items": items, "at": r._iso(now),
+    removed = {e: r.change_line(e, view, now) for e in view.get("causes", {})
+               if e not in view.get("effective", {}) and (e == "note" or e.startswith("rule:"))}
+    return dict(out, delivery_plan={"items": items, "current_entities": list(view.get("effective", {})),
+                                   "removed": removed, "at": r._iso(now),
                                    "limit": cfg["routing_summary_chars"] if full else cfg["routing_prompt_chars"],
                                    "full": full, "page_limit": cfg["routing_prompt_chars"], "text": out.get("text"),
                                    "lease": cfg["routing_delivery_lease"],
@@ -150,24 +160,6 @@ def _pages_left(text, start, width):
         start, count = end, count + 1
     return count
 
-def in_flight(session, component, view, now):
-    """Reuse an unchanged reservation before rendering or scrubbing again."""
-    state = snapshot(session, component)
-    flight = state.get("flight")
-    if state.get("epoch") != view.get("epoch") or not flight:
-        return None
-    until = datetime.fromisoformat(flight["until"].replace("Z", "+00:00"))
-    if until <= now:
-        return None
-    for item in flight["out"]["routing_changes"]["items"]:
-        effective = view.get("effective", {}).get(item["entity"])
-        if effective is None:
-            return None
-        revision = hashlib.sha256(json.dumps(effective, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
-        if revision != item["revision"]:
-            return None
-    return copy.deepcopy(flight["out"])
-
 def _merge(state, out):
     epoch = out.get("epoch")
     if state.get("epoch") != epoch:
@@ -175,7 +167,21 @@ def _merge(state, out):
         state.update(epoch=epoch, entries={}, batches={})
     entries = state.setdefault("entries", {})
     replaced = set()
-    for item in out["delivery_plan"]["items"]:
+    plan = out["delivery_plan"]
+    items = list(plan["items"])
+    planned = {i["entity"] for i in items}
+    current = set(plan.get("current_entities", entries))
+    # SessionStart's parent has only the scrubbed plan, not the routing view.
+    # Missing saved debt needs a removal message, never its former words.
+    for entity, old in entries.items():
+        if not old.get("acked") and entity not in planned and entity not in current:
+            fallback = ("The owner's note ended" if entity == "note" else
+                        old["label"] + (" retired" if entity.startswith("rule:") else " is no longer current"))
+            line = plan.get("removed", {}).get(entity, fallback)
+            fingerprint = [line, line, old["label"]] if entity.startswith("rule:") or entity == "priority" else line
+            revision = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+            items.append(dict(entity=entity, revision=revision, text=line, label=old["label"], whole=True, visible=False))
+    for item in items:
         entity = item["entity"]
         old = entries.get(entity)
         if old is None or old["revision"] != item["revision"]:
@@ -203,6 +209,8 @@ def _render(state, out, now, component):
         state["expired"] = state.get("expired", 0) + 1
         state.pop("flight", None)
     due = [e for e in entries.values() if not e.get("acked")]
+    # A new hold must precede the remaining pages of an older, long rule.
+    due.sort(key=lambda e: not e["entity"].startswith("hold:"))
     if not due:
         # Informational full/stale blocks have no change debt to reserve.
         answer = {k: v for k, v in out.items() if k not in
@@ -353,7 +361,11 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
             e["acked"] = e["offset"] == len(e["text"])
             e["pages"] = item.get("page", {}).get("n", 0)
             e["restarted"] = False
-        state.setdefault("batches", {})[batch] = True
+        batches = state.setdefault("batches", {})
+        batches[batch] = True
+        # Idempotence covers recent retries; older ids fail closed.
+        for old in list(batches)[:-128]:
+            del batches[old]
         state.pop("flight", None)
         if all(e.get("acked") for e in state["entries"].values()):
             state["acked_through"] = flight["out"]["version"]

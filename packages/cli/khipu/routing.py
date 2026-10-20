@@ -7903,13 +7903,6 @@ def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = N
 
 def _prompt_text(marker, view, now, cfg):
     base = {"version": view["version"], "epoch": view.get("epoch"), "generation": _generation(view, cfg), "_delivery_view": view}
-    session = getattr(marker, "session", None)
-    if session and not view.get("unsaved_change"):
-        from khipu import routing_delivery
-
-        flight = routing_delivery.in_flight(session, marker.component, view, now)
-        if flight is not None:
-            return dict(flight, generation=base["generation"], _delivery_view=view, _reserved=True)
     why = _full_reason(marker, view, now, cfg)
     if why is None and view.get("unsaved_change"):
         raise PushUnsaved("the routing view changed and could not be saved")

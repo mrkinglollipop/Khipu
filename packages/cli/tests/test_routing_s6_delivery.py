@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import copy
+import contextlib
+import time
+
+import pytest
 from concurrent.futures import ThreadPoolExecutor
 
 from khipu import agent_view, recall_prompt, recall_rule, routing, routing_delivery
@@ -66,6 +70,15 @@ def test_revision_change_cancels_unacknowledged_batch(replay):
     assert newer["routing_changes"]["items"][0]["revision"] != first["routing_changes"]["items"][0]["revision"]
     replay.ack(info)
     assert not recall_prompt.routing_marker("s1")
+    state = routing_delivery.snapshot("s1")
+    entity = first["routing_changes"]["items"][0]["entity"]
+    assert not state["entries"][entity]["acked"]
+    assert state["entries"][entity]["offset"] == 0
+    again, context, info = replay.offer()
+    assert again["routing_changes"] == newer["routing_changes"]
+    assert "y" * 100 in context
+    replay.ack(info)
+    assert routing_delivery.snapshot("s1")["entries"][entity]["offset"] > 0
 
 
 def test_owner_words_reassemble_byte_identically_with_unicode_and_paths(replay):
@@ -121,6 +134,16 @@ def test_expired_ack_without_a_retry_cannot_consume_debt(replay):
     replay.advance(60)
     assert not routing_delivery.acknowledge("s1", out["routing_changes"])
     assert not recall_prompt.routing_marker("s1")
+    entity = out["routing_changes"]["items"][0]["entity"]
+    state = routing_delivery.snapshot("s1")
+    assert not state["entries"][entity]["acked"]
+    assert state["entries"][entity]["offset"] == 0
+    again, context, info = replay.offer()
+    assert again["routing_changes"]["items"] == out["routing_changes"]["items"]
+    assert again["routing_changes"]["batch"] != out["routing_changes"]["batch"]
+    assert context
+    replay.ack(info)
+    assert routing_delivery.snapshot("s1")["entries"][entity]["acked"]
 
 
 def test_projection_checks_paths_once_per_read_and_refreshes_between_reads(replay, monkeypatch):
@@ -210,3 +233,212 @@ def test_start_pages_leave_room_for_the_mandatory_memory_rules(replay):
     assert "x" * 100 in text and "page 1/" in text
     start.delivered("s1")
     assert recall_prompt.routing_marker("s1")["owed"]
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_new_hold_invalidates_rule_pages_and_arrives_on_next_prompt(replay, partial):
+    routing.request_rule("Grok builds " + "x" * 10000, author=AUTHOR)
+    first, _, info = replay.offer()
+    entity = first["routing_changes"]["items"][0]["entity"]
+    if partial:
+        replay.ack(info)
+        replay.offer()
+    hold = routing.add_hold("Launch no new Grok jobs", scope="account", account="Grok",
+                            reason="keep", author=AUTHOR)
+    newer, context, _ = replay.offer()
+    state = routing_delivery.snapshot("s1")
+    assert "contradicts active hold" in state["entries"][entity]["text"]
+    assert state["entries"][entity]["revision"] != first["routing_changes"]["items"][0]["revision"]
+    assert hold["id"] in context
+    assert any(i["entity"] == "hold:" + hold["id"] for i in newer["routing_changes"]["items"])
+
+
+def test_level_suffix_invalidates_live_rule_page(replay):
+    routing.request_rule("Codex is low. " + "x" * 3000, author=AUTHOR)
+    first, _, _ = replay.offer()
+    routing.report(account="Codex", state="open", author=AUTHOR)
+    replay.usage(used=4)
+    newer, _, _ = replay.offer()
+    entity = first["routing_changes"]["items"][0]["entity"]
+    state = routing_delivery.snapshot("s1")
+    assert "stale level claim" in state["entries"][entity]["text"]
+    assert state["entries"][entity]["revision"] != first["routing_changes"]["items"][0]["revision"]
+    assert newer["routing_changes"]["batch"] != first["routing_changes"]["batch"]
+
+
+def test_prompt_offer_serializes_with_ack_instead_of_reusing_unlocked_snapshot(replay, monkeypatch):
+    routing.request_rule("x" * 3000, author=AUTHOR)
+    first, _, _ = replay.offer()
+    snapshot = routing_delivery.snapshot
+    transaction = routing_delivery._transaction
+    acked = []
+    def ack_once():
+        if not acked:
+            acked.append(True)
+            assert routing_delivery.acknowledge("s1", first["routing_changes"])
+    def stale_snapshot(*args, **kwargs):
+        state = snapshot(*args, **kwargs)
+        ack_once()
+        return state
+    @contextlib.contextmanager
+    def racing_transaction(session):
+        ack_once()
+        with transaction(session) as data:
+            yield data
+    monkeypatch.setattr(routing_delivery, "snapshot", stale_snapshot)
+    monkeypatch.setattr(routing_delivery, "_transaction", racing_transaction)
+    second, _, _ = replay.offer()
+    assert acked
+    assert second["routing_changes"]["batch"] != first["routing_changes"]["batch"]
+    assert second["routing_changes"]["items"][0]["page"]["n"] == 2
+
+
+@pytest.mark.parametrize("entity_kind", ["note", "rule"])
+@pytest.mark.parametrize("expired", [False, True])
+def test_full_summary_replaces_deleted_entity_debt(replay, entity_kind, expired):
+    words = "OLD OWNER WORDS " * 250
+    if entity_kind == "note":
+        routing.set_note(words, via="app")
+    else:
+        routing.add_rule(words, via="app")
+    first, _, _ = replay.offer()
+    entity = next(i["entity"] for i in first["routing_changes"]["items"] if i["entity"].startswith(entity_kind))
+    if entity_kind == "note":
+        routing.end_note(via="app")
+    else:
+        routing.retire_rule(1, via="app")
+    if expired:
+        replay.advance(61)
+    # No marker was acknowledged: this must take the full-summary path.
+    newer, context, info = replay.offer()
+    assert newer["kind"] == "full"
+    assert "OLD OWNER WORDS" not in context
+    state = routing_delivery.snapshot("s1")
+    assert "OLD OWNER WORDS" not in state["entries"][entity]["text"]
+    assert "ended" in context if entity_kind == "note" else "retired" in context
+    assert not routing_delivery.acknowledge("s1", first["routing_changes"])
+    replay.ack(info)
+    assert routing_delivery.snapshot("s1")["entries"][entity]["acked"]
+
+
+def test_stalled_volume_refresh_keeps_prompt_routing_and_restores_alarm(replay, monkeypatch):
+    import signal
+    routing.add_rule("Grok builds", via="app")
+    view = replay.view()
+    routing._entry_definitions()
+    monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
+    original = agent_view.os.listdir
+    visited = []
+    def stalled(path):
+        if str(path) == "/Volumes":
+            visited.append(True)
+            time.sleep(0.2)
+            return []
+        return original(path)
+    monkeypatch.setattr(agent_view.os, "listdir", stalled)
+    handler = signal.getsignal(signal.SIGALRM)
+    start = time.monotonic()
+    out, context, _ = replay.offer()
+    elapsed = time.monotonic() - start
+    assert visited
+    assert elapsed < 0.15, elapsed
+    assert "Grok builds" in context
+    assert out["version"] == view["version"]
+    assert signal.getsignal(signal.SIGALRM) == handler
+    assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
+
+
+def test_ack_history_is_bounded_and_recent_ack_is_idempotent(replay):
+    routing.add_rule("x" * 100000, via="app")
+    batches = []
+    for _ in range(140):
+        out, _, info = replay.offer()
+        batches.append(out["routing_changes"])
+        replay.ack(info)
+    state = routing_delivery.snapshot("s1")
+    assert len(state["batches"]) <= 128
+    assert routing_delivery.acknowledge("s1", batches[-1])
+    assert not routing_delivery.acknowledge("s1", batches[0])
+    assert not state["entries"][batches[-1]["items"][0]["entity"]]["acked"]
+
+
+def test_refit_page_total_never_claims_completion_with_text_still_owed(replay):
+    routing.add_rule("x" * 1800, via="app")
+    out, _, info = replay.offer()
+    replay.ack(info)
+    for _ in range(50):
+        out = routing.prompt_push(recall_prompt.routing_marker("s1"), budget=1.0)
+        if not out.get("routing_changes"):
+            break
+        out = routing_delivery.refit("s1", out["routing_changes"], 200)
+        assert out and out.get("routing_changes")
+        state = routing_delivery.snapshot("s1")
+        for item in out["routing_changes"]["items"]:
+            if item.get("page"):
+                end = state["flight"]["progress"][item["entity"]]
+                length = len(state["entries"][item["entity"]]["text"])
+                assert (item["page"]["n"] == item["page"]["m"]) == (end == length)
+        assert routing_delivery.acknowledge("s1", out["routing_changes"])
+    else:
+        pytest.fail("refitted pages did not finish")
+
+
+@pytest.mark.parametrize("entity_kind", ["note", "rule"])
+def test_session_start_plan_reconciles_deleted_debt_without_the_view(replay, entity_kind):
+    words = "OLD OWNER WORDS " * 250
+    if entity_kind == "note":
+        routing.set_note(words, via="app")
+    else:
+        routing.add_rule(words, via="app")
+    first, _, _ = replay.offer()
+    if entity_kind == "note":
+        routing.end_note(via="app")
+    else:
+        routing.retire_rule(1, via="app")
+    out = routing.start_push()
+    assert "_delivery_view" not in out
+    newer = routing_delivery.offer(out, session="s1")
+    assert "OLD OWNER WORDS" not in newer["text"]
+    assert not routing_delivery.acknowledge("s1", first["routing_changes"])
+    assert routing_delivery.acknowledge("s1", newer["routing_changes"])
+
+
+def test_stalled_refresh_keeps_known_aliases_without_retired_owner_exemptions(replay, monkeypatch):
+    target = replay.root / "PrivateAlias9"
+    target.mkdir()
+    login = replay.root / "configured-login"
+    login.symlink_to(target, target_is_directory=True)
+    replay.configure(usage_accounts=[{"label": "Work", "harness": "codex", "home": str(login)}])
+    routing.add_rule("Use PrivateAlias9", via="app")
+    view = replay.view()
+    keys = [a["key"] for a in view["accounts"]]
+    agent_view._table(keys)
+    routing.retire_rule(1, via="app")
+    def stalled(_keys):
+        time.sleep(0.2)
+        raise AssertionError("refresh deadline was not enforced")
+    monkeypatch.setattr(agent_view, "_signature", stalled)
+    with agent_view.routing_projection(keys):
+        assert "PrivateAlias9" not in routing._for_agents("Use PrivateAlias9", replay.view())
+
+
+def test_projection_deadline_cannot_escape_during_alarm_restoration(replay, monkeypatch):
+    import signal
+    routing.report(account="Codex", state="open", author=AUTHOR)
+    handler = signal.getsignal(signal.SIGALRM)
+    install = signal.signal
+    restored = []
+    def late_alarm(sig, value):
+        if sig == signal.SIGALRM and value == handler:
+            restored.append(True)
+            signal.getsignal(sig)(sig, None)
+        return install(sig, value)
+    monkeypatch.setattr(signal, "signal", late_alarm)
+    try:
+        out, context, _ = replay.offer()
+        assert restored
+        assert "Codex" in context
+        assert out.get("routing_changes")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        install(signal.SIGALRM, handler)
