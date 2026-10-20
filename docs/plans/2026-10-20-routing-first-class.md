@@ -401,7 +401,7 @@ happens when its brief carries no routing.
 | Child | Guaranteed before the first step | Deferred | Brief without routing |
 |---|---|---|---|
 | Claude Code subagent | A bounded **child block** from SubagentStart, at most `routing_child_chars` (4,000; a setting). In order: account states and holds, then each standing rule and the note whole if they fit, otherwise each one's number, kind, accounts and opening. Today an oversized summary returns nothing (`routing_delegation.py:481`); slice 8a replaces that with the child block | The rest of the rules and the note as pages on the subagent's own tool results, through its per-agent ledger (slice 8a; its PreToolUse is skipped today, `:461-462`) | Irrelevant: SubagentStart doesn't depend on the brief |
-| Codex native child (`spawn_agent`) | **Nothing.** Its rollout carries no hook context | Changes only on its own Khipu tool calls, under its own `CODEX_THREAD_ID` identity | It runs with no routing. Slice 8b reads the brief at the parent's `spawn_agent` PreToolUse (`briefs_of`). When the brief has no routing block, the parent's result carries one advisory line: "This child got no routing: add `khipu route --brief` to its brief." Nothing is added automatically |
+| Codex native child (`spawn_agent`) | Whatever Khipu's SubagentStart hook returns. Codex records it in the child's rollout as a `developer` message (`hooks.additional_context`) before the child's first call. This was observed once, on Codex CLI 0.163.0, by slice 2b's rig on 2026-10-20; the row said "Nothing" before that run disproved it. Khipu installs SubagentStart for Codex (`integrations.py:1685`). Slice 8b bounds it to the same child block a Claude Code subagent gets | Changes only on its own Khipu tool calls, under its own `CODEX_THREAD_ID` identity | Irrelevant while the hook fires. When Codex's hooks aren't installed, or no SubagentStart delivery was recorded for that child, slice 8b reads the brief at the parent's `spawn_agent` PreToolUse (`briefs_of`). When that brief has no routing block, the parent's result carries one advisory line: "This child got no routing: add `khipu route --brief` to its brief." Nothing is added automatically |
 | T3 `delegate_task` child | The child provider's own paged start block, if Khipu's hooks are installed for that provider. Otherwise nothing, and doctor names the provider | Pages on its own prompts and tool results | As for a Codex child: the advisory line on the parent's result (slice 8c) |
 | Job-runner job | Its SessionStart start block | Its prompts | The runner task (routing-truth) adds `khipu route --brief`. Until it does, the job relies on its SessionStart |
 
@@ -410,8 +410,8 @@ mid-turn reaches the parent only after its dispatch has gone out. A bounded, fai
 would not by itself make routing a gate. This scope doesn't take it on because no hook in Claude Code or
 Codex delivers context before the call runs. It would need a client-side step in every harness for a window
 of one turn. For children that get a start block (Claude Code subagents, and T3 and job-runner children whose
-provider has Khipu's hooks), that block covers the freshness that matters for the delegated work. A Codex
-native child, or a child whose provider lacks the hooks, gets no block and relies on its brief. Matt can
+provider has Khipu's hooks, and Codex native children while Codex's SubagentStart fires), that block covers the
+freshness that matters for the delegated work. A child whose provider lacks the hooks gets no block and relies on its brief. Matt can
 reopen it as its own slice.
 
 ## 5. Pull delivery: identity and acks
@@ -647,7 +647,7 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 5 | "Codex is low" against a 96% reading is marked; a structured claim expires at the reset | hermetic | 4 |
 | 6 | Pull protocol: no identity consumes nothing; a dropped response is re-sent; a duplicate ack is a no-op; an ack for another component or identity is refused; hook and MCP in one component never double-send; `main` and `mcp` duplicates are named; routing additions on error results are scrubbed; after a provider switch from a hooked attachment to a pull-only one, valid MCP acks clear stalled health | hermetic | 7 |
 | 7a | Claude Code subagent: the child block arrives before its first step with an oversized summary; deferred pages arrive on its tool results | received context | 8a |
-| 7b | Codex `spawn_agent` child: no routing reaches it; a brief without routing gets the advisory line on the parent's result | received context | 8b |
+| 7b | Codex `spawn_agent` child: the bounded child block arrives from SubagentStart before its first call; with Codex's hooks absent, a brief without routing gets the advisory line on the parent's result | received context | 8b |
 | 7c | T3: a Claude Code to Codex switch in one thread keeps one ledger; a T3 child without Khipu's hooks is named in doctor | received context | 8c |
 | 8 | Providers: `glm` and `deepseek` added as facts match by name; a two-account provider and a name claimed twice stay unmatched with candidates; DeepSeek with `models_never: [v4-pro]`, Muse with `models_allowed: [muse-wonder-full-1.0]` and Antigravity with `use: on_request` show in `khipu_route` and the advisory check flags a dispatch that breaks them | hermetic | 9a |
 | 9 | The `http-quota` adapter: a redirect is refused; the sentinel key is absent from every channel | hermetic | 9b |
@@ -906,7 +906,7 @@ change; if it is still red, stop and report the last log. Slices on the per-prom
 | 6 | Delivery ledger and pagination for hooks: components, owed, in flight, acked, leases, pages with revisions | 3b, 4 | Codex Sol, high | Opus | cases 2, 3; `routing_replay` holds; today's budget caps |
 | 7 | Pull delivery: canonical identity, components, batches, ack ownership, `routing_changes` on tool results, scrubbing incl. errors | 6 | Codex Sol, high | Opus | case 6 |
 | 8a | Claude Code child: the bounded child block, the per-agent ledger and deferred pages | 7, 2b | Codex Sol, medium | Sonnet | case 7a |
-| 8b | Codex native child: brief inspection and the advisory line | 7, 2b | Codex Sol, medium | Sonnet | case 7b |
+| 8b | Codex native child: the bounded child block from SubagentStart; brief inspection and the advisory line when the hook is absent | 7, 2b | Codex Sol, medium | Sonnet | case 7b |
 | 8c | T3: `KHIPU_SESSION_ID=t3:<thread>` in Khipu's T3 integration; doctor names providers without hooks | 7, 2b | Codex Sol, medium | Sonnet | case 7c; stop and report any matrix row the received context disproves |
 | 9a | Provider catalog as facts; lane matching by declared identity, then login home, then name; ambiguity | 4 | Codex Sol, medium | Sonnet | case 8 |
 | 9b | `http-quota` adapter | 9a | Codex Sol, high | Opus (credential path) | case 9 |
@@ -1086,7 +1086,8 @@ MCP acks. No disagreements this round.
 
 - A running turn learns nothing until its next delivery point. No harness offers an interrupt.
 - A parent's view before a dispatch is as of its last prompt (decision 11).
-- A Codex native child hears routing only through its brief or its own Khipu tool calls.
+- A Codex native child hears routing only through SubagentStart, its brief, or its own Khipu tool calls. If a Codex release stops
+  firing SubagentStart for `spawn_agent` children, only the brief and its own calls remain.
 - Two gateway clients that share a token and reuse one `session_id` look the same to Khipu.
 - A keyword-guessed task class can be wrong. It is always shown as a guess.
 - Pace is as good as its readings. Accounts that can't be probed (Muse today) get no verdict, and a burst
