@@ -5929,8 +5929,8 @@ def resolve_account(name: str, known: list[dict] | None = None, *, conversation:
 def account_id(key: str) -> str:
     """A configured account's stable id, independent of its login folder.
 
-    Unknown historical keys retain their opaque local id until the owner
-    supplies a label; no folder name is ever turned into a public label.
+    Historical keys use their migration binding before an id is issued;
+    keys absent from both config and history retain an opaque local id.
     """
     if account_identity.STABLE.fullmatch(key):
         return _resolve_identity(key, accounts())
@@ -5939,6 +5939,13 @@ def account_id(key: str) -> str:
     known = _fold_accounts(load_config())
     (keys, forwards, _aliases), moves = _identity_snapshot(known)
     moved = _forwarded(key, moves)
+    if moved not in keys:
+        # Migration can bind historical-only keys. Issuing a legacy id first
+        # would make the next summary change the account's public identity.
+        migrate_accounts()
+        known = _fold_accounts(load_config())
+        (keys, forwards, _aliases), moves = _identity_snapshot(known)
+        moved = _forwarded(key, moves)
     if moved in keys:
         return account_identity.forwarded(keys[moved], forwards)
     return _legacy_account_id(key)

@@ -253,6 +253,39 @@ def test_owner_move_preserves_id_alias_and_pause(mac):
     assert next(a for a in routing.read_view(now=mac.clock["now"])["accounts"] if a["key"] == new_key)["state"] == "paused"
 
 
+@pytest.mark.parametrize("first_reader", ["account_id", "summary"])
+@pytest.mark.parametrize("issued_alias", [False, True])
+def test_historical_identity_is_independent_of_reader_order(mac, first_reader, issued_alias):
+    _setup(mac, [{"label": "Grok", "harness": "grok"}])
+    key = "codex|/synthetic/old-login"
+    routing.pause(key, via="app")
+    path = routing.events_file()
+    original = path.read_bytes()
+    alias = routing._legacy_account_id(key) if issued_alias else None
+    if first_reader == "account_id":
+        ident = routing.account_id(key)
+        text = routing.summary()["text"]
+    else:
+        text = routing.summary()["text"]
+        ident = routing.account_id(key)
+    assert ident == "codex:account-1"
+    assert f"Codex ({ident}): paused by you until you lift it" in text
+    assert routing._resolve_account_key(ident) == key
+    if alias:
+        assert routing.resolve_account(alias) == ident
+    after = path.read_bytes()
+    assert after.startswith(original)
+    migrations = [e for e in routing.read_events()[0] if e["type"] == "account_migration"]
+    assert len(migrations) == 1
+    before_config = (mac.data / "config.json").read_bytes()
+    for _ in range(3):
+        assert routing.account_id(key) == ident
+        assert f"Codex ({ident}): paused by you until you lift it" in routing.summary()["text"]
+        routing.migrate_accounts()
+    assert path.read_bytes() == after
+    assert (mac.data / "config.json").read_bytes() == before_config
+
+
 def test_historical_listed_ids_roundtrip_even_after_alias_expiry(mac):
     _setup(mac, [{"label": "Grok", "harness": "grok"}])
     path = routing.events_file()
