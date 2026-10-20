@@ -246,7 +246,7 @@ Each target is computed separately. The schema carries each one apart.
     **On pace** otherwise. Every verdict states n, the rate that lands on the limit.
   - **Verdicts have hysteresis.** Outpacing starts above 1.15 n and ends below 1.10 n. Underpacing starts
     below 0.85 n and ends above 0.90 n. A rate near a threshold can't flip the verdict back and forth.
-- **Share cap** (`share c`: a ceiling on the window, such as rule 1's Grok Bot headroom, held as 90% of Grok's week). This is the same
+- **Share cap** (`share c`: a ceiling on the window, such as rule 1's Grok Bot headroom, held as 80% of Grok's week (Matt 2026-10-19: "I don't want to use anymore than 80%")). This is the same
   calculation with H = c − used.
   - H ≤ 0: `cap_reached` ("at 92% against your 90%"), with no forecast.
 - **Daily cap** (`per_day d`: points of the window per rolling 24 hours, such as the priority's 13% a day for
@@ -682,6 +682,13 @@ What went wrong that day:
   state. Matt's consolidation (owner direction, 2026-10-20) left seven: 1, 3, 5, 6, 7, 9 and 12. Rule 1 now
   carries the old 2 and 10, and rule 3 the old 4. Rules 8 and 11 were retired; their content lives in the
   priority roles. Rule 11 had sat pending all day because a conversation wrote it through the proposing tool.
+- A sweep of the last ten days (Codex, read-only) found directions Khipu lacked or held differently: Grok's
+  ceiling (80%, not 90%), DeepSeek (Flash only, $35 a rolling week, never privacy or money code, checked by
+  another family), GLM (one request at a time, the same floor), Muse's model, Antigravity unused, Opus for
+  documents third parties read, workflows always encouraged, and main's 13% a day. They were written into
+  Khipu by owner direction the same day: rule 1 now covers Grok, GLM and DeepSeek; rule 12 gained the
+  documents and workflows lines; a new rule 13 holds the per-provider model and budget facts until slices 9a
+  and 17a make them account facts, when rule 13 retires.
 - Slice 1's fixes merged as #260 but were not live: this Mac ran #243 until the next promote, so the push
   still said "too long to show here".
 
@@ -861,7 +868,7 @@ Approved 2026-10-20: all 14 as recommended. Decisions 15 to 17 added the same af
     Grok, with its costly probe, samples at the weekly interval, so its five-hour pace is usually unknown.
 13. **What a verdict measures against** (revised). *Recommend:* the plan limit, always, plus each cap you set,
     computed and carried separately. The line shows the most urgent. Caps are structured facts you confirm
-    once: rule 1's Grok Bot headroom (90%) as a share cap, and the 13%-a-day line as a daily cap over a rolling 24 hours (no time
+    once: rule 1's Grok Bot headroom (80%) as a share cap, and the 13%-a-day line as a daily cap over a rolling 24 hours (no time
     zone). A calendar day would reset at a midnight you'd have to choose.
 14. **The on-pace band** (revised). *Recommend ±15%* of the rate needed to enter outpacing or underpacing,
     and ±10% to leave it. A narrower band flips the verdict on
