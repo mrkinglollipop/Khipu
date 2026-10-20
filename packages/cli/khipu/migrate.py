@@ -10,7 +10,9 @@ may split itself with top-level step marker lines (two dashes, a space and
 transaction, so a lock taken by one step is released before the next, and the
 file records its version only in its last step: a failed step leaves the
 version unrecorded and a re-run applies the whole file again (each step must
-therefore be idempotent).
+therefore be idempotent). A marker line that reads "-- khipu:step autocommit"
+makes the section after it a single statement run outside any transaction,
+which CREATE INDEX CONCURRENTLY needs; see _run_autocommit_index.
 
 Until this existed the schema was applied by hand from a private runbook, which
 is fine for one operator and useless for anyone else setting Khipu up.
@@ -148,10 +150,30 @@ def _lex(sql: str) -> tuple[list[tuple[int, int]], list[bool]]:
     return markers, has_code
 
 
+class MigrationIndexError(RuntimeError):
+    """An index already exists under the name a migration would create, but
+    with a different definition (or is not an index at all). Replacing it
+    could change what the hub does, so the migration stops and names it."""
+
+
+_INDEX_STMT_RE = re.compile(
+    r"^\s*CREATE\s+INDEX\s+CONCURRENTLY\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z_][a-z0-9_]*)\s",
+    re.IGNORECASE)
+# The definition the finished index must have, exactly as pg_get_indexdef
+# prints it, on a comment line inside the autocommit section.
+_EXPECT_RE = re.compile(r"^-- khipu:expect (.+)$", re.MULTILINE)
+
+
 def steps(sql: str) -> list[str]:
     """The transactions a migration file runs as, in order. Raises
     MigrationStepError when marker text appears anywhere but as a top-level
     line of its own."""
+    return [part for _, part in step_modes(sql)]
+
+
+def step_modes(sql: str) -> list[tuple[bool, str]]:
+    """Like steps(), with whether each section runs in autocommit (its
+    marker line says "autocommit") instead of inside a transaction."""
     markers, has_code = _lex(sql)
     starts = {start for start, _ in markers}
     stray = [m.start() for m in _STEP_ANYWHERE_RE.finditer(sql) if m.start() not in starts]
@@ -161,11 +183,13 @@ def steps(sql: str) -> list[str]:
             f"'{_STEP_MARKER}' on line {line} is inside a string, quoted identifier, "
             "dollar-quoted body or comment; a step marker must be a top-level line of its own")
     if not markers:
-        return [sql]
+        return [(False, sql)]
     bounds = [0, *(x for m in markers for x in m), len(sql)]
     parts = [sql[bounds[k]:bounds[k + 1]] for k in range(0, len(bounds), 2)]
+    # Section k > 0 follows marker k - 1; the header section has no marker.
+    modes = [False] + [sql[a:b].split()[2:3] == ["autocommit"] for a, b in markers]
     # A section of comments alone (the file's header) is not a transaction.
-    return [p for p, code in zip(parts, has_code) if code] or [sql]
+    return [(m, p) for m, p, code in zip(modes, parts, has_code) if code] or [(False, sql)]
 
 
 def migrations_dir() -> Path:
@@ -289,7 +313,7 @@ def _run_migrations(conn, *, dry_run: bool, directory: Path | None,
     # Every file is split before any runs, so a refused file never leaves
     # the database partly migrated.
     split = [(version, path, path.read_text(encoding="utf-8")) for version, path in pending]
-    split = [(version, path, sql, steps(sql)) for version, path, sql in split]
+    split = [(version, path, sql, step_modes(sql)) for version, path, sql in split]
     for version, path, sql, parts in split:
         value = None
         if LOCAL_ORIGIN_SETTING in sql:
@@ -301,7 +325,11 @@ def _run_migrations(conn, *, dry_run: bool, directory: Path | None,
         # One transaction per file, or per step of a file that splits itself.
         # psycopg's connection is a transaction already; commit after each so
         # a later failure cannot roll back an earlier, successful one.
-        for i, part in enumerate(parts):
+        for i, (autocommit, part) in enumerate(parts):
+            if autocommit:
+                _run_autocommit_index(conn, part, version, path.name,
+                                      record=i == len(parts) - 1)
+                continue
             for attempt in range(LOCK_RETRIES + 1):
                 started = time.monotonic()
                 try:
@@ -338,6 +366,54 @@ def _run_migrations(conn, *, dry_run: bool, directory: Path | None,
     if held:
         _save_lock_notes(held, result["notes"])
     return result
+
+
+def _run_autocommit_index(conn, part: str, version: str, filename: str, *,
+                          record: bool) -> None:
+    """One CREATE INDEX CONCURRENTLY, outside any transaction, made safe to
+    re-run. A valid index of that name whose definition matches the section's
+    "-- khipu:expect" line is adopted without a rebuild (the hub's index was
+    built by hand before the migration existed). An invalid one, left by an
+    interrupted build, is dropped concurrently and rebuilt. Any other
+    definition under that name raises MigrationIndexError and changes
+    nothing. The version is recorded in the same autocommit when ``record``."""
+    m = _INDEX_STMT_RE.match(re.sub(r"^\s*--.*$", "", part, flags=re.MULTILINE))
+    e = _EXPECT_RE.search(part)
+    if not m or not e:
+        raise MigrationIndexError(
+            f"{filename}: an autocommit step must be one CREATE INDEX CONCURRENTLY "
+            "statement with a '-- khipu:expect <pg_get_indexdef>' line")
+    name, expected = m.group(1), e.group(1).strip()
+    conn.commit()  # autocommit cannot be switched on mid-transaction
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT i.indisvalid, pg_get_indexdef(i.indexrelid) "
+                        "FROM pg_index i WHERE i.indexrelid = to_regclass(%s)", (name,))
+            row = cur.fetchone()
+            if row is None:
+                cur.execute("SELECT to_regclass(%s) IS NOT NULL", (name,))
+                if cur.fetchone()[0]:
+                    raise MigrationIndexError(
+                        f"{filename}: {name} exists but is not an index; refusing to replace it")
+            else:
+                valid, actual = row
+                if actual != expected:
+                    raise MigrationIndexError(
+                        f"{filename}: index {name} exists with a different definition "
+                        f"({actual}); expected ({expected}). Not replaced.")
+                if not valid:
+                    cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
+                    row = None
+            if row is None:
+                cur.execute(part)
+            if record:
+                cur.execute(
+                    "INSERT INTO schema_migrations (version, note) VALUES (%s, %s) "
+                    "ON CONFLICT (version) DO NOTHING",
+                    (version, f"applied by khipu migrate from {filename}"))
+    finally:
+        conn.autocommit = False
 
 
 def lock_notes(held: list[dict]) -> list[str]:
