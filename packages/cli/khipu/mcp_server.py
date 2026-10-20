@@ -884,6 +884,8 @@ TOOLS: list[dict] = [
                 "text": {"type": "string", "description": "The owner's requested rule wording"},
                 "rule": {"type": "integer", "minimum": 1,
                          "description": "Existing standing rule number to change; omit to add"},
+                "holds": {"type": "object", "additionalProperties": {"type": "string", "enum": ["end", "keep"]},
+                          "description": "Explicit end-or-keep choices for held or paused accounts"},
                 "owner_request": {"type": "string", "description": "This conversation's one-line words describing the owner's request"},
             },
             "required": ["text", "owner_request"],
@@ -2248,8 +2250,8 @@ def _tool_route_rule(args: dict) -> dict:
     _ensure_path()
     from khipu import routing
 
-    if not isinstance(args, dict) or set(args) - {"text", "rule", "owner_request"}:
-        raise ValueError("khipu_route_rule takes text, owner_request and optional rule")
+    if not isinstance(args, dict) or set(args) - {"text", "rule", "holds", "owner_request"}:
+        raise ValueError("khipu_route_rule takes text, owner_request and optional rule and holds")
     text = args.get("text")
     if not isinstance(text, str):
         raise ValueError("text must be text")
@@ -2259,8 +2261,12 @@ def _tool_route_rule(args: dict) -> dict:
     number = args.get("rule")
     if number is not None and (type(number) is not int or number < 1):
         raise ValueError("rule must be a positive integer")
+    holds = args.get("holds")
+    if holds is not None and (not isinstance(holds, dict) or not all(isinstance(hold, str) and choice in ("end", "keep")
+                                                                      for hold, choice in holds.items())):
+        raise ValueError('holds must map each hold id to "end" or "keep"')
     return routing.request_rule(text, n=number, owner_request=owner_request,
-                                author=routing.conversation_author(), via="mcp")
+                                author=routing.conversation_author(), via="mcp", holds=holds)
 
 
 def _tool_route_priority(args: dict) -> dict:

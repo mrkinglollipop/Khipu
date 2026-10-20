@@ -390,8 +390,8 @@ def test_a_changed_rule_longer_than_the_budget_is_sent_whole(home, monkeypatch):
     home["clock"].advance(minutes=1)
     routing.report(account="Claude", state="limited", until="2h", author=ME)
     lines = _routing_part(_cold(monkeypatch)).splitlines()
-    assert f"Standing rule 1. {rule.strip()}" in lines  # whole: not clipped at 40, not capped at 60
-    assert any(line.startswith("Note from the owner") and line.endswith(note.strip()) for line in lines)
+    assert f"Standing rule 1. {rule}" in lines  # owner whitespace survives as well as the words
+    assert any(line.startswith("Note from the owner") and line.endswith(note) for line in lines)
     claude = next(line for line in lines if line.startswith("Claude"))
     assert len(claude) <= 40
 

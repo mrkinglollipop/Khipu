@@ -70,6 +70,7 @@ from typing import Any, Iterable
 
 from khipu import routing_identity as account_identity
 from khipu import routing_events as event_identity
+from khipu import routing_entries as entry_model
 
 SCHEMA = 1
 STATE_DIR = ("state", "routing")
@@ -912,6 +913,89 @@ def accounts() -> list[dict]:
         out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],
                     "home": account.get("home"),
                     **({"label_source": account["label_source"]} if "label_source" in account else {})})
+    return _definition_accounts(out)
+
+
+_ENTRY_INPUTS: dict[tuple, dict] = {}
+# A bounded parse-only snapshot per mode.  It is deliberately separate from
+# the outer lock cache: no author marks or settled ordering enter this cache.
+_PARSED_LINE_CACHE: dict[bool, tuple[str, bytes, tuple[dict, ...], int]] = {}
+
+
+def _entry_cache(events_stat: list | None = None, mac: str | None = None) -> dict:
+    """Definitions and their read-only event snapshot while the log is unchanged."""
+    events_stat = _stat(events_file()) if events_stat is None else events_stat
+    mac = _local_mac() if mac is None else mac
+    key = (str(events_file()), tuple(events_stat or ()), mac)
+    cached = _ENTRY_INPUTS.get(key)
+    if cached is None:
+        raw, bad = _read_all_events()
+        events, _unfinished = _split_txns(raw, _held_list())
+        ordered = _in_write_order(events)
+        cached = {"definitions": entry_model.definitions(ordered, mac), "events": tuple(events),
+                  "raw": tuple(raw), "bad": bad, "ordered": tuple(ordered), "overlays": {}}
+        _ENTRY_INPUTS.clear()
+        _ENTRY_INPUTS[key] = cached
+    return cached
+
+
+def _remember_entry_inputs(events: list[dict], events_stat: list | None = None, mac: str | None = None,
+                           ordered: list[dict] | None = None, raw: list[dict] | None = None,
+                           bad: int = 0) -> dict:
+    """Refresh the entry cache from a fold that already read the log."""
+    events_stat = _stat(events_file()) if events_stat is None else events_stat
+    mac = _local_mac() if mac is None else mac
+    key = (str(events_file()), tuple(events_stat or ()), mac)
+    ordered = _in_write_order(events) if ordered is None else ordered
+    cached = {"definitions": entry_model.definitions(ordered, mac), "events": tuple(events),
+              "raw": tuple(events if raw is None else raw), "bad": bad,
+              "ordered": tuple(ordered), "overlays": {}}
+    _ENTRY_INPUTS.clear()
+    _ENTRY_INPUTS[key] = cached
+    return cached
+
+
+def _entry_definitions(events_stat: list | None = None, mac: str | None = None) -> tuple[dict, dict]:
+    """Definitions and their cache record, without copying every event on a hit."""
+    cached = _entry_cache(events_stat, mac)
+    return cached["definitions"], cached
+
+
+def _definition_accounts(known: list[dict], events: list[dict] | None = None, config: dict | None = None,
+                         definitions: dict | None = None, entry_cache: dict | None = None) -> list[dict]:
+    """New definitions live in facts; legacy config remains a read fallback."""
+    from khipu.config import load_config
+
+    if definitions is None and events is None:
+        definitions, entry_cache = _entry_definitions()
+    elif definitions is None:
+        definitions = entry_model.definitions(_in_write_order(events), _local_mac())
+    if not definitions["accounts"]:
+        return known
+    config = load_config() if config is None else config
+    bindings = config.get(account_identity.BINDINGS) or {}
+    overlay_key = json.dumps({"bindings": bindings, "known": known}, sort_keys=True, default=str)
+    overlay = (entry_cache or {}).get("overlays", {}).get(overlay_key)
+    if overlay is not None:
+        return [dict(account) for account in overlay]
+    ordered = None
+    if events is None:
+        cache = entry_cache or _entry_cache()
+        events, ordered = cache["events"], cache["ordered"]
+    ids, forwards, _aliases = account_identity.state(ordered if ordered is not None else _in_write_order(events), known)
+    out = [dict(a) for a in known]
+    for ident, value in definitions["accounts"].items():
+        current = account_identity.forwarded(ident, forwards)
+        account = next((a for a in out if ids.get(a["key"]) == current), None)
+        if account is None:
+            binding = bindings.get(current) or {}
+            home = binding.get("home")
+            key = f"{value['provider']}|{home or ''}" if binding else current
+            account = {"key": key, "home": home}
+            out.append(account)
+        account.update(label=value["label"], harness=value["provider"], label_source="owner", definition_id=current)
+    if entry_cache is not None:
+        entry_cache["overlays"][overlay_key] = tuple(dict(account) for account in out)
     return out
 
 
@@ -1286,6 +1370,14 @@ def _mac_locked() -> str:
     return value
 
 
+def _local_mac() -> str | None:
+    try:
+        value = (routing_dir() / "mac-id").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value if re.fullmatch(r"[0-9a-f]{32}", value) else None
+
+
 def _hub_configured() -> bool:
     # Detection only: never connect, migrate credentials or start a probe.
     from khipu import keychain
@@ -1307,11 +1399,12 @@ def _pending_numbering() -> bool:
     return _replication_live() and _hub_configured()
 
 
-def _identify_locked(events: Iterable[dict]) -> None:
+def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = None,
+                     ordered: list[dict] | None = None) -> None:
     """Enrich new lines only. All append paths, including seeds and account
     transactions, pass here while holding the routing lock."""
-    observed = _read_all_events()[0]
-    history = _in_write_order(observed)
+    observed = _read_all_events()[0] if observed is None else observed
+    history = _in_write_order(observed) if ordered is None else ordered
     mac = _mac_locked()
     clocks = [e["hlc"] for e in [*observed, *history] if e.get("hlc")]
     clocks += [{"wall": max(0, int(at.timestamp() * 1000)), "counter": 0, "mac": "legacy"}
@@ -1327,6 +1420,7 @@ def _identify_locked(events: Iterable[dict]) -> None:
     for event in events:
         event.setdefault("id", _new_id("e"))
         event.setdefault("mac", mac)
+        entry_model.enrich(event, settings(), mac)
         if not event.get("hlc"):
             wall = max(0, int((_parse(event["written_at"]) or _now()).timestamp() * 1000))
             # Skew is a health fact; every observed clock still constrains causality.
@@ -1366,14 +1460,16 @@ def _identify_locked(events: Iterable[dict]) -> None:
         event.setdefault("op", event_identity.uuid7())
 
 
-def _append_locked(*events: dict) -> None:
+def _append_locked(*events: dict, observed: list[dict] | None = None,
+                   ordered: list[dict] | None = None, raw_observed: list[dict] | None = None,
+                   bad_lines: int = 0) -> None:
     """Append whole lines in one write, then fsync. A torn last line (a full
     disk or a power loss part way through an earlier write) is ended first,
     so it stays one unreadable line, counted in ``bad_lines``, and never
     swallows the new one. Lone surrogates (text from argv, the environment
     or a seed file) are replaced first: UTF-8 can't hold them."""
-    raw, bad = _read_event_lines()
-    _identify_locked(events)
+    raw, bad = _read_event_lines() if raw_observed is None else (list(raw_observed), bad_lines)
+    _identify_locked(events, observed=observed, ordered=ordered)
     data = "".join(json.dumps(_scrub(e), sort_keys=True, ensure_ascii=False) + "\n"
                    for e in events).encode("utf-8")
     fd = os.open(events_file(), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
@@ -1403,11 +1499,13 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
                 "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
                 "harness", "to", "started_at", "model", "family", "transport", "mac", "legacy_mac", "entity", "base",
-                "op", "op_body", "proposal")
-_TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at")
+                "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id")
+_TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
+                "witness_at", "expires_at", "reset_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order")
 _WHOLE_MOST = 2 ** 53
-_SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending")
+_SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
+                  "observed", "observed_turn", "session_logs", "silent", "unmatched")
 _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "name", "file", "mac")
 _HOLD_KINDS = ("account", "machine", "all")
 
@@ -1520,6 +1618,11 @@ def _checked_entries(kind: str, entries) -> list[dict] | None:
             if until is None:
                 return None
         entry["until"] = until
+        if item.get("level") is not None:
+            level = entry_model.checked_level(item["level"])
+            if level is None:
+                return None
+            entry["level"] = level
         out.append(entry)
     return out
 
@@ -1546,6 +1649,31 @@ def _checked(data: dict) -> dict | None:
                 return None
     if "written_at" not in out:
         return None  # every line Khipu writes carries its time
+    if "kind" in out and out["kind"] != entry_model.kind(out):
+        return None
+    if "expires_at" in data and data["expires_at"] is None:
+        out["expires_at"] = None
+    if "holds" in data:
+        choices = data["holds"]
+        if not isinstance(choices, dict) or not all(isinstance(k, str) and v in ("end", "keep")
+                                                    for k, v in choices.items()):
+            return None
+        out["holds"] = dict(choices)
+    if out["type"] == "definition_set":
+        value = entry_model.checked_definition(out.get("definition"), data.get("value"))
+        if value is None:
+            return None
+        out["value"] = value
+    if "observation_scope" in data:
+        locality = data["observation_scope"]
+        if not isinstance(locality, dict) or locality.get("kind") not in ("machine", "account_quota"):
+            return None
+        if locality["kind"] == "machine":
+            if not isinstance(locality.get("mac"), str) or not locality["mac"]:
+                return None
+            out["observation_scope"] = {"kind": "machine", "mac": locality["mac"]}
+        else:
+            out["observation_scope"] = {"kind": "account_quota"}
     for field in _WHOLE_FIELDS:
         value = data.get(field)
         if value is None:
@@ -1626,6 +1754,10 @@ def _checked(data: dict) -> dict | None:
                 out["scope"] = {"kind": kind, "account": _no_surrogates(account)}
             else:
                 out["scope"] = {"kind": kind}
+                if kind == "machine" and "mac" in scope:
+                    if not isinstance(scope["mac"], str) or not scope["mac"]:
+                        return None
+                    out["scope"]["mac"] = scope["mac"]
     return out
 
 
@@ -1716,11 +1848,18 @@ def _read_event_lines(identity_only: bool = False) -> tuple[list[dict], int]:
         data = events_file().read_bytes()
     except OSError:
         return [], 0
-    events: list[dict] = []
-    bad = 0
+    path = str(events_file())
+    parsed = _PARSED_LINE_CACHE.get(identity_only)
+    # An append may reuse only complete, byte-for-byte prior lines.  A torn
+    # trailing line is always parsed again once the next read can see it.
+    if parsed is not None and parsed[0] == path and parsed[1].endswith(b"\n") and data.startswith(parsed[1]):
+        events, bad = list(parsed[2]), parsed[3]
+        lines = data[len(parsed[1]):].split(b"\n")
+    else:
+        events, bad, lines = [], 0, data.split(b"\n")
     # Split on the newline byte: UTF-8 never uses it inside a character, and
     # a JSON string may hold U+2028, which splitlines() would cut at.
-    for line in data.split(b"\n"):
+    for line in lines:
         if not line.strip():
             continue
         event = _line_event(line, identity_only=True) if identity_only else _line_event(line)
@@ -1728,6 +1867,7 @@ def _read_event_lines(identity_only: bool = False) -> tuple[list[dict], int]:
             bad += 1
             continue
         events.append(event)
+    _PARSED_LINE_CACHE[identity_only] = (path, data, tuple(events), bad)
     cache[key] = (events, bad)
     return events, bad
 
@@ -1791,7 +1931,7 @@ def _mark_unchecked(events: list[dict]) -> None:
             event["via"] = f"{via or 'unknown'}-unchecked"
 
 
-def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
+def _stamp_locked(clock: datetime, count: int = 1, *, events: list[dict] | None = None) -> list[dict]:
     """The time and sequence number of the next ``count`` lines, settled now,
     while the writer holds the lock and sees the record as it stands.
 
@@ -1808,7 +1948,7 @@ def _stamp_locked(clock: datetime, count: int = 1) -> list[dict]:
     line from the line written before it. A clock behind only some of the record (a
     line written ahead, then a right clock) keeps its own time, and the fold
     orders the lines as in phase 1a."""
-    events, _bad = _read_all_events()
+    events = _read_all_events()[0] if events is None else events
     mac = _mac_locked()
     legacy_mac = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
     if legacy_mac is None:
@@ -1856,6 +1996,13 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     events_stat, config_stat = _stat(events_file()), _stat(config_file())
     config = load_config()
     cfg = settings(config)
+    mac = _local_mac()
+    definitions, entry_cache = _entry_definitions(events_stat, mac)
+    lane_map = {runner: dict(lanes) for runner, lanes in cfg["routing_lane_map"].items()}
+    for runner, lanes in definitions["lane_maps"].items():
+        lane_map.setdefault(runner, {}).update(lanes)
+    cfg["routing_lane_map"] = lane_map
+    known = _definition_accounts(_fold_accounts(config), config=config, definitions=definitions, entry_cache=entry_cache)
     # routing_sources is read entry by entry (one bad entry costs only itself);
     # usage_accounts says which usage cache rows are read at all.
     cfg["_raw_sources"] = {"routing_sources": config.get("routing_sources"),
@@ -1873,10 +2020,11 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
 
     cfg["_accounts_version"] = accounts_version(config)
     seed = cfg.get("routing_rules_seed")
-    fingerprint = {"account_identity": 2, "payer_identity": 1, "events": events_stat, "config": config_stat,
+    cfg["_mac"] = mac
+    fingerprint = {"entry_model": 1, "account_identity": 2, "payer_identity": 1, "events": events_stat, "config": config_stat,
                    "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
-    return fingerprint, cfg, _fold_accounts(config)
+    return fingerprint, cfg, known
 
 
 def _sources(cfg: dict, now: datetime, prev: dict | None) -> tuple[list[dict], dict | None, dict]:
@@ -1896,6 +2044,8 @@ def _evidence_account(event: dict, lane_map: dict, known: list[dict],
     through ``routing_lane_map``; None when the lane isn't in the map or
     names a label two accounts carry (never guessed). A key a login-folder
     move forwards (``forwarding``) is the account it moved to."""
+    if event.get("unmatched"):
+        return None
     key = event.get("account")
     if key or not event.get("runner"):
         found = key or None
@@ -2178,10 +2328,13 @@ def _evidence(event: dict, cfg: dict) -> dict | None:
             "basis": event.get("basis") if event.get("basis") in BASES else "estimated",
             "scope": event.get("scope") or "all", "window": event.get("window"), "used_pct": event.get("used_pct"),
             "source": event.get("source") if event.get("source") in SOURCES else "report",
-            "written_by": event.get("written_by") or {}, "via": event.get("via"), "at": at, "seq": event["_seq"],
+            "written_by": event.get("written_by") or {}, "via": event.get("via"), "at": at,
+            "seq": -1 if event.get("type") == "observation" else event["_seq"],
             "evidence": event.get("evidence"), "reason": event.get("reason"),
             "model": event.get("model"), "family": event.get("family"), "transport": event.get("transport"),
-            "message_time": bool(event.get("message_time")), "until_default": until_default}
+            "message_time": bool(event.get("message_time")), "until_default": until_default,
+            **{k: event[k] for k in ("expires_at", "observation_scope", "observed", "session_logs", "silent", "reset_at", "unmatched", "source_id")
+               if k in event}, "turn": bool(event.get("observed_turn"))}
 
 
 def _owner_event(event: dict) -> dict:
@@ -2198,6 +2351,9 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         # Stale from the moment it turns stale_after old: the same instant
         # fold() hands on as valid_until, so a read at that instant can't
         # see it fresh and drop its last clock change.
+        if "expires_at" in e:
+            end = _parse(e["expires_at"])
+            return e["state"] in (OPEN, DOWN) and end is not None and now >= end
         return e["state"] in (OPEN, DOWN) and stale_after > 0 and (now - e["at"]).total_seconds() >= stale_after
 
     def counts(e: dict) -> bool:
@@ -2209,7 +2365,11 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
     # A runner's limit whose LIMITED line has left the tail keeps the time
     # Khipu saw that line (``routing_sources._sightings``), so a clear is
     # weighed against it like any other evidence.
-    live = [e for e in items if e["id"] not in owner["dismissed"] and (clear is None or _k(e) > _k(clear))]
+    legacy_source_ids = ({entry_model.source_id(value) for value in owner["dismissed"]}
+                         if any(e.get("source_id") for e in items) else set())
+    live = [e for e in items if e["id"] not in owner["dismissed"] and e.get("source_id") not in owner["dismissed"]
+            and e.get("source_id") not in legacy_source_ids
+            and (clear is None or _k(e) > _k(clear))]
     # Unknown when the only source that still counts is a runner that has
     # stopped reporting: other evidence counts only while it is fresh (open
     # or down) or its limit has not passed (``counts``).
@@ -2512,8 +2672,10 @@ def _in_write_order(events: list[dict]) -> list[dict]:
     """Settle each Mac's timestamps, then order the event set by HLC.
     Unstamped history retains its local order and gets derived revisions;
     legacy origin markers keep later replication from changing that origin."""
+    operations_salt = _id_salt(operations=True) if any(not e.get("mac") and not e.get("_revision") for e in events) else None
     origin = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
-    origin = origin or next((event_identity.legacy_mac(e) for e in events if not e.get("mac")), "legacy")
+    origin = origin or next((event_identity.legacy_mac(e, operations_salt=operations_salt)
+                             for e in events if not e.get("mac")), "legacy")
     if not any(e.get("mac") for e in events):
         fixed, _behind, _ahead = _record_times(events)
         out, last_wall, counter = [], 0, 0
@@ -2521,14 +2683,19 @@ def _in_write_order(events: list[dict]) -> list[dict]:
             wall = max(0, int(at.timestamp() * 1000)) if at else 0
             counter = counter + 1 if wall <= last_wall else 0
             last_wall = max(last_wall, wall)
-            out.append(dict(e, _legacy_mac=event_identity.legacy_mac(dict(e, _legacy_mac=origin)),
-                            _revision=event_identity.revision(e),
+            out.append(dict(e, _legacy_mac=event_identity.legacy_mac(dict(e, _legacy_mac=origin),
+                                                                       operations_salt=operations_salt),
+                            _revision=event_identity.revision(e, operations_salt=operations_salt),
                             hlc={"wall": last_wall, "counter": counter, "mac": "legacy"},
                             **({"written_at": _iso(at)} if at else {})))
         return out
     modern_macs = {e["mac"] for e in events if e.get("mac")}
     claims = [e for e in events if e.get("legacy_mac") and e.get("hlc")]
-    claim = min(claims, key=event_identity.hlc_key) if claims else None
+    def claim_key(event):
+        stamp = event["hlc"]
+        return stamp["wall"], stamp["counter"], stamp["mac"], event_identity.revision(event,
+                                                                                            operations_salt=operations_salt)
+    claim = min(claims, key=claim_key) if claims else None
     legacy_origin = claim["legacy_mac"] if claim else origin
     legacy_mac = claim["mac"] if claim else next(iter(modern_macs)) if len(modern_macs) == 1 else legacy_origin
     groups: dict[str, list[dict]] = {}
@@ -2545,8 +2712,9 @@ def _in_write_order(events: list[dict]) -> list[dict]:
         fixed, _behind, _ahead = _record_times(rows)
         last_wall, counter = 0, 0
         for e, at in zip(rows, fixed):
-            row = dict(e, _revision=event_identity.revision(e),
-                       _legacy_mac=event_identity.legacy_mac(dict(e, _legacy_mac=legacy_origin)))
+            row = dict(e, _revision=event_identity.revision(e, operations_salt=operations_salt),
+                       _legacy_mac=event_identity.legacy_mac(dict(e, _legacy_mac=legacy_origin),
+                                                              operations_salt=operations_salt))
             if at is not None:
                 row["written_at"] = _iso(at)
             if not row.get("hlc"):
@@ -2598,6 +2766,9 @@ def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,
         configured = in_settings.get(key, key in known_keys if known_keys else not key.partition("|")[2] and not none)
         active.append({"account": key, "label": label, "role": item.get("role"), "until": item.get("until"),
                        "in_settings": bool(configured)})
+        level = entry_model.checked_level(item.get("level"))
+        if level is not None and _parse(level["as_of"]) <= now < _parse(level["until"]):
+            active[-1]["level"] = level
     return active, ended
 
 
@@ -2627,7 +2798,8 @@ def _fold_priority(priority: dict | None, now: datetime, labels: dict, in_settin
 
 def _effective_priority(priority: dict) -> dict:
     def rows(entries: list[dict]) -> list[list]:
-        return [[e["label"], e["role"], e["until"], e["in_settings"]] for e in entries]
+        return [[e["label"], e["role"], e["until"], e["in_settings"], *([e["level"]] if e.get("level") else [])]
+                for e in entries]
 
     replaced = priority.get("replaced")
     return {"entries": rows(priority["entries"]), "until": priority["until"], "pending": priority["pending"],
@@ -2635,7 +2807,8 @@ def _effective_priority(priority: dict) -> dict:
 
 
 def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
-         extra: Iterable[dict] = (), sources: dict | None = None) -> dict:
+         extra: Iterable[dict] = (), sources: dict | None = None, mac: str | None = None,
+         events_ordered: bool = False) -> dict:
     """The view of ``events`` (and of evidence from sources, ``extra``, in the
     same shape with ``seq`` -1) at ``now``. ``sources`` is the sources'
     status (``routing_sources.collect``): a runner that stops reporting or
@@ -2644,12 +2817,29 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     model."""
     lane_map = cfg.get("routing_lane_map") or {}
     stale_after = cfg["routing_stale_after"]
-    events = _in_write_order(events)
+    events = list(events) if events_ordered else _in_write_order(events)
+    # A pure replay may name its Mac; unstamped logs retain their local meaning.
+    mac = mac or cfg.get("_mac")
+    definitions = entry_model.definitions(events, mac)
+    lane_map = {r: dict(lanes) for r, lanes in lane_map.items()}
+    for runner, lanes in definitions["lane_maps"].items():
+        lane_map.setdefault(runner, {}).update(lanes)
     known = account_identity.with_provenance(known, events)
     key_ids, stable_forwards, aliases = account_identity.state(events, known)
     stable_keys = {v: k for k, v in key_ids.items()}
     # Prefer the current binding over a historical login folder.
     stable_keys.update({key_ids[a["key"]]: a["key"] for a in known if a["key"] in key_ids})
+    known = [dict(a) for a in known]
+    for ident, value in definitions["accounts"].items():
+        ident = account_identity.forwarded(ident, stable_forwards)
+        key = stable_keys.get(ident, ident)
+        account = next((a for a in known if a["key"] == key), None)
+        if account is None:
+            known.append({"key": key, "label": value["label"], "harness": value["provider"],
+                          "home": None, "label_source": "owner", "definition_id": ident})
+            stable_keys[ident] = key
+        else:
+            account.update(label=value["label"], harness=value["provider"], label_source="owner")
     historical = {old: stable_keys.get(account_identity.forwarded(ident, stable_forwards), ident)
                   for old, (ident, _start) in aliases.items()}
     mapping = {**stable_keys, **{old: stable_keys.get(new, new) for old, new in stable_forwards.items()},
@@ -2687,13 +2877,21 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # author from this, never from the state left after it (fix round 1).
     causes: dict[str, dict] = {}
     owner_changes: list[dict] = []
+    observed = entry_model.observations(events, cfg)
+    runner_status = {r["name"]: r for r in (sources or {}).get("runners") or []}
+    for event in observed:
+        locality = event.get("observation_scope") or {}
+        if locality.get("kind") == "machine" and locality.get("mac") != mac:
+            continue
+        item = _evidence(event, cfg)
+        if item is not None:
+            if item.get("runner") in runner_status:
+                item["silent"] = bool(runner_status[item["runner"]].get("silent"))
+            evidence.append(item)
     for event in events:
         kind = event.get("type")
         entity = event_identity.entity(event)
-        if kind == "evidence":
-            item = _evidence(event, cfg)
-            if item is not None:
-                evidence.append(item)
+        if kind in entry_model.OBSERVATIONS:
             continue
         if kind == "reset_check":
             account, until = event.get("account"), _parse(event.get("reset_until"))
@@ -2750,6 +2948,20 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         info = _owner_event(event)
         if info["at"] is None:
             continue
+        if info["written_by"].get("kind") == "owner" and not event.get("pending"):
+            for target, choice in (event.get("holds") or {}).items():
+                if choice != "end":
+                    continue
+                held_entity = next((h["entity"] for h in holds.values()
+                                    if target in (h["id"], h["entity"], h["revision"])), None)
+                held_entity = held_entity or (target if target.startswith("hold-") else event_identity.derived("hold", target))
+                hold_ends.setdefault(held_entity, info["at"])
+                if held_entity in holds:
+                    holds[held_entity].setdefault("ended_at", info["at"])
+                # A pause's event id is its explicit end-or-keep target.
+                for account, paused in owner["pauses"].items():
+                    if target in (paused["id"], event_identity.derived("pause", account)):
+                        owner["lifts"][account] = info
         touched = _touched(kind, event, info)
         if kind in event_identity.RULE_CHANGES and entity in rules:
             touched = _rule_component(rules[entity])
@@ -2968,7 +3180,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # With "Read no accounts" no default login is read either.
     none = bool(cfg.get("_accounts_none"))
     for entry in entries:
-        entry["configured"] = entry["key"] in known_keys if known_keys else not entry.get("home") and not none
+        entry["configured"] = (entry["key"] in known_keys if known_keys else not entry.get("home") and not none) \
+            and "|" in entry["key"]
         marked = notes.get(entry["key"])
         if marked is not None:
             entry["note"] = [marked["state"], _iso(marked["at"])]
@@ -3000,8 +3213,16 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
 
     reminder = cfg["routing_owner_hold_reminder"]
     active_holds = []
+    machine_holds = []
     reminders: list[datetime] = []  # owner holds whose reminder is still to come
     for hold in sorted(holds.values(), key=lambda h: h["at"], reverse=True):
+        if hold["scope"].get("kind") == "machine" and "ended_at" not in hold \
+                and (hold["until"] is None or hold["until"] > now):
+            machine_holds.append({"id": hold["id"], "scope": hold["scope"], "text": hold["text"],
+                                  "until": _iso(hold["until"]), "mac": hold["scope"].get("mac"),
+                                  "scope_label": "Mac " + hold["scope"]["mac"] if hold["scope"].get("mac") else "this Mac"})
+        if hold["scope"].get("kind") == "machine" and hold["scope"].get("mac") not in (None, mac):
+            continue
         if "ended_at" in hold or (hold["until"] is not None and hold["until"] <= now):
             continue
         due = _after(hold["at"], reminder) if hold["owner"] and reminder else None
@@ -3028,6 +3249,17 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     if cfg.get("_accounts_version"):
         priority_version = f"{priority_version}.{cfg['_accounts_version']}"
     priority_out, priority_ended = _fold_priority(priority, now, labels, in_settings, known_keys, none=none)
+    if priority_out:
+        for item in priority_out["entries"]:
+            level = item.get("level")
+            if level:
+                resets = [_parse(e.get("reset_at") or e.get("until")) for e in evidence
+                          if e.get("account") == item["account"]]
+                resets = [t for t in resets if t is not None and t > _parse(level["as_of"])]
+                if resets:
+                    level["until"] = _iso(min(_parse(level["until"]), *resets))
+                    if _parse(level["until"]) <= now:
+                        item.pop("level")
     if priority_out is not None:
         priority_out["version"] = priority_version
 
@@ -3064,6 +3296,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     for item in evidence:
         if item["state"] == LIMITED and item["until"] and item["until"] > now:
             times.append(item["until"])
+        elif "expires_at" in item:
+            times.append(_parse(item["expires_at"]))
         elif item["state"] in (OPEN, DOWN) and stale_after > 0:
             times.append(_after(item["at"], stale_after))
     for clear in owner["clears"].values():
@@ -3072,11 +3306,14 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     times += [p["until"] for p in owner["pauses"].values() if p["until"] is not None]
     times += [_parse(h["until"]) for h in active_holds if h["until"]]
     times += reminders
+    times += [_parse(e["level"]["until"]) for e in (priority_out or {}).get("entries", []) if e.get("level")]
     # Each end in the priority (and in the one a pending request replaced,
     # which Undo brings back) is a change the clock makes.
     for held in (priority, (priority or {}).get("prior")):
         if held:
             times += [held["until"], *(_parse(e.get("until")) for e in held["entries"])]
+            times += [_parse(e["level"]["until"]) for e in held["entries"] if e.get("level")]
+            times += [_parse(e["level"]["as_of"]) for e in held["entries"] if e.get("level")]
     for entry in entries:
         due = reset_check_due(entry, now, cfg)
         if due is not None:
@@ -3111,7 +3348,12 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     table = (sources or {}).get("table")
     if table is not None:
         effective["table"] = {"hash": table.get("hash"), "error": bool(table.get("error"))}
+    for name, values in definitions.items():
+        if values:
+            effective["definition:" + name] = values
     return {"accounts": entries, "holds": active_holds, "rules": active_rules, "note": note_out,
+            "machine_holds": machine_holds,
+            "definitions": definitions,
             "priority": priority_out, "priority_version": priority_version, "priority_ended": priority_ended,
             "lane_repairs": _lane_repairs(lane_map, known), "forwards": {**forward, **stable_forwards},
             "unmatched": lanes, "outside_app": outside_app,
@@ -3245,6 +3487,14 @@ def _check_evidence(account: str, row: dict) -> tuple[list[dict], list[datetime]
         # named models remain closed.
         events.insert(0, {"type": "evidence", "source": "check", "account": account, "state": OPEN,
                           "basis": "checked", "written_by": _check_author(), "via": "check"})
+    for event in events:
+        witness = _parse(row.get("observed_at") or row.get("probed_at"))
+        if event["state"] == LIMITED:
+            window = next((w for w in limits if w.get("name") == event.get("window")
+                           and (w.get("model") or "all") == event.get("scope", "all")), {})
+            witness = _parse(window.get("observed_at")) or witness
+        if witness is not None:
+            event["witness_at"] = _iso(witness)
     return events, whole_limits, headroom
 
 
@@ -3949,31 +4199,107 @@ def _not_before_last_fold(now: datetime, prev: dict | None) -> datetime:
     return _not_behind(now, _parse((prev or {}).get("folded_at")))
 
 
+def _ordered_after_append(ordered: list[dict], batch: list[dict]) -> list[dict]:
+    """Extend a known full write order with lines just appended under its lock.
+
+    ``_identify_locked`` gives every appended line an HLC while the same lock
+    is held.  A hand-appended legacy line can share its wall clock, so merge
+    the two already ordered runs rather than assuming the new row sorts last.
+    That preserves HLC reconciliation without another full-log sort.
+    """
+    origin = next((row.get("_legacy_mac") for row in ordered if row.get("_legacy_mac")), "legacy")
+    later = [dict(row, _legacy_mac=origin, _revision=event_identity.revision(row)) for row in batch]
+    merged, left, right = [], iter(ordered), iter(later)
+    a, b = next(left, None), next(right, None)
+    while a is not None or b is not None:
+        if b is None or (a is not None and event_identity.hlc_key(a) <= event_identity.hlc_key(b)):
+            merged.append(dict(a))
+            a = next(left, None)
+        else:
+            merged.append(b)
+            b = next(right, None)
+    return [dict(row, _seq=index) for index, row in enumerate(merged)]
+
+
+def _runner_source_state(runner: dict) -> str:
+    """The durable availability state of a runner, excluding its advancing beat."""
+    return json.dumps({"silent": bool(runner.get("silent")), "unreadable": bool(runner.get("unreadable")),
+                       "lanes": list(runner.get("lanes") or [])}, sort_keys=True, separators=(",", ":"))
+
+
 def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
     """Refold and save the view; the caller holds the lock."""
     fingerprint, cfg, known = inputs or _inputs()
-    events, bad = read_events()
+    entry_cache = _entry_cache(fingerprint.get("events"), cfg.get("_mac"))
+    events, raw, bad = list(entry_cache["events"]), list(entry_cache["raw"]), entry_cache["bad"]
+    ordered = list(entry_cache["ordered"])
     seed_error, imported = _import_seed_locked(events, cfg, now)
     if imported:
         fingerprint = dict(fingerprint, events=_stat(events_file()))
-        events, bad = read_events()
+        raw, bad = _read_all_events()
+        events, _unfinished = _split_txns(raw, _held_list())
+        ordered = _in_write_order(events)
     prev = _load_view()
-    now, body, status = _fold_body(now, cfg, known, events, prev)
+    extra, _status, _cache = _sources(cfg, now, prev)
+    if extra or (_status or {}).get("runners"):
+        ids, _forwards, _aliases = account_identity.state(ordered, known)
+        forward = forwarding(events, {a["key"] for a in known})
+        cuts = {}
+        for event in events:
+            if event.get("type") == "account_note" and _list_change(event):
+                for pair in event.get("lanes_cut") or []:
+                    cuts[tuple(pair)] = (event["_seq"], _parse(event["written_at"]))
+        matched = []
+        for item in extra:
+            cut = cuts.get((item.get("runner"), item.get("lane")))
+            key = None if not item.get("account") and cut and _before_cut(item, cut) else _evidence_account(
+                item, cfg.get("routing_lane_map") or {}, known, forward)
+            matched.append(dict(item, account=key))
+        batch = entry_model.source_events(matched, ordered, cfg, _mac_locked(), ids)
+        for runner in (_status or {}).get("runners") or []:
+            witness = _parse(runner.get("heartbeat_at"))
+            previous = next((e for e in reversed(ordered) if e.get("type") == "source_seen"
+                             and e.get("runner") == runner["name"] and e.get("mac") == _local_mac()), None)
+            state = _runner_source_state(runner)
+            if witness and (previous is None or previous.get("status") != state):
+                batch.append({"type": "source_seen", "runner": runner["name"], "witness_at": _iso(witness),
+                              "status": state, "written_by": {"kind": "runner"}, "via": "runner"})
+        if batch:
+            for row, stamp in zip(batch, _stamp_locked(now, len(batch), events=events)):
+                row.update(stamp)
+            _append_locked(*batch, observed=raw, ordered=ordered, raw_observed=raw, bad_lines=bad)
+            written = [_checked(_scrub(row)) for row in batch]
+            raw.extend(row for row in written if row is not None)
+            bad += sum(row is None for row in written)
+            events, _unfinished = _split_txns(raw, _held_list())
+            ordered = _ordered_after_append(ordered, batch)
+            fingerprint = dict(fingerprint, events=_stat(events_file()))
+        cfg["_mac"] = _local_mac()
+    _remember_entry_inputs(events, fingerprint["events"], cfg["_mac"], ordered, raw, bad)
+    now, body, status = _fold_body(now, cfg, known, events, prev, events_ordered=ordered)
     body["seed_error"] = seed_error
     view = _assemble(prev, body, now, bad, fingerprint,
                      record=fingerprint["events"] is not None or status is not None)
     _save_view(view)
-    _identity_snapshot(known, events=events)
+    _identity_snapshot(known, events=ordered, events_ordered=True)
     return view
 
 
 def _fold_body(now: datetime, cfg: dict, known: list[dict], events: list[dict],
-               prev: dict | None) -> tuple[datetime, dict, dict | None]:
+               prev: dict | None, events_ordered: list[dict] | None = None) -> tuple[datetime, dict, dict | None]:
     """(the fold's clock, the folded body, the sources' status): the fold
     itself, which reads and never writes."""
     now = _not_before_last_fold(now, prev)
     extra, status, cache = _sources(cfg, now, prev)
-    body = fold(events, now=now, cfg=cfg, known=known, extra=extra, sources=status)
+    source_ids = {e.get("source_id") for e in events if e.get("source_id")}
+    remaining = []
+    for item in extra:
+        source_id = entry_model.source_id(item["id"]) if source_ids and item.get("id") else None
+        if item.get("id") not in source_ids and source_id not in source_ids:
+            remaining.append(item)
+    extra = remaining
+    body = fold(events_ordered if events_ordered is not None else events, now=now, cfg=cfg, known=known,
+                extra=extra, sources=status, events_ordered=events_ordered is not None)
     body["source_cache"] = cache
     return now, body, status
 
@@ -4013,12 +4339,30 @@ def _start_fold(now: datetime, *, save: bool) -> dict:
     prev = _load_view()
     if _fresh(prev, fingerprint, now):
         return dict(prev, checked_at=_iso(now))  # the fold it waited for saved it
-    every, bad = _read_all_events()
+    entry_cache = _entry_cache(fingerprint.get("events"), cfg.get("_mac"))
+    every, bad = list(entry_cache["raw"]), entry_cache["bad"]
     events, unfinished = _split_txns(every, _held_list())
     if unfinished or (cfg.get("routing_rules_seed") and not any(e.get("type") == "seed_import" for e in events)):
         # An account change left unfinished is finished or rolled back
         # first, under the locks, by ``read_view``.
         return read_view(now)
+    from khipu import routing_sources
+
+    # A source-backed fold writes observations before it can save the view.
+    # Going through ``_fold_body`` first would collect and fold the complete
+    # record only to immediately do the same work again under the lock.
+    if routing_sources.any_configured(cfg["_raw_sources"], cfg):
+        with _finishing():
+            try:
+                if not save:
+                    raise LockBusy("another fold is running")
+                with _lock():
+                    current = _inputs()
+                    if _fresh(_load_view(), current[0], now):
+                        return dict(_load_view(), checked_at=_iso(now))
+                    return _refold_locked(now, current)
+            except OSError:
+                pass
     with _finishing():
         fold_now, body, status = _fold_body(now, cfg, known, events, prev)
         body["seed_error"] = None
@@ -4028,6 +4372,8 @@ def _start_fold(now: datetime, *, save: bool) -> dict:
                 raise LockBusy("another fold is running")
             with _lock():
                 if _inputs()[0] == fingerprint and (_load_view() or {}).get("digest") == (prev or {}).get("digest"):
+                    if status is not None:
+                        return _refold_locked(fold_now)
                     view = _assemble(prev, body, fold_now, bad, fingerprint, record=record)
                     _save_view(view)
                     return view
@@ -4171,6 +4517,8 @@ def _write_many(events: list[dict]) -> tuple[list[dict], dict]:
                 results.append(event)
                 existing[event["op"]] = event
             if fresh:
+                for event in fresh:
+                    _require_hold_choices(event, clock)
                 for event, stamp in zip(fresh, _stamp_locked(clock, len(fresh))):
                     event.update(stamp)
                 _append_locked(*fresh)
@@ -4265,7 +4613,7 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
     limit is reported with ``--state limited``, and down is about the whole
     account."""
     now = now or _now()
-    cfg = settings()
+    cfg = _inputs()[1]
     if state not in (LIMITED, OPEN, DOWN):
         raise RouteError("--state must be limited, open or down")
     if bool(account) == bool(runner or lane):
@@ -4365,8 +4713,8 @@ def add_hold(text: str, *, reason: str, scope: str, account: str | None = None, 
     most ``routing_hold_chars`` long (0: no limit)."""
     now = now or _now()
     cfg = settings()
-    words = _one_line(text)
-    if not words:
+    words = text if owner and isinstance(text, str) else _one_line(text)
+    if not words or not words.strip():
         raise RouteError("a hold needs its words")
     most = cfg["routing_hold_chars"]
     if most and len(words) > most:
@@ -4419,6 +4767,76 @@ def _owner_write(event: dict, via: str) -> dict:
     return _done(written, view)
 
 
+def _require_hold_choices(event: dict, now: datetime) -> None:
+    """Validate against the state at append, never just the writer's read."""
+    if event.get("type") not in ("priority_set", "priority_confirm", "rule_add", "rule_edit", "rule_confirm", "rule_restore"):
+        return
+    if (event.get("written_by") or {}).get("kind") != "owner" or event.get("pending"):
+        return
+    view = read_view(now)
+    rows = event.get("entries") or []
+    words = event.get("text") or ""
+    if event["type"] == "priority_confirm":
+        rows = (view.get("priority") or {}).get("entries") or []
+    if event["type"] in ("rule_confirm", "rule_restore"):
+        rule = next((r for r in view["rules"] if r["entity"] == event.get("entity")), None)
+        words = (rule or {}).get("text") or _rule_words(event.get("entity"))
+    words += "\n" + "\n".join(row.get("role") or "" for row in rows)
+    keys = {row["account"] for row in rows}
+    named = _named_account_labels(words, view)
+    for account in view["accounts"]:
+        if account["label"] in named or re.search(r"(?<![\w-])" + re.escape(account_id(account["key"])) + r"(?![\w-])", words, re.I):
+            keys.add(account["key"])
+    required = {h["id"] for h in view["holds"] if keys and (h["scope"]["kind"] != "account"
+                 or h["scope"].get("account") in keys)}
+    required.update(a["witness"]["id"] for a in view["accounts"] if a["key"] in keys and a["state"] == PAUSED)
+    choices = event.get("holds") if event.get("holds") is not None else {}
+    if not isinstance(choices, dict) or any(not isinstance(k, str) or v not in ("end", "keep") for k, v in choices.items()):
+        raise RouteError('holds must name each hold or pause id with "end" or "keep"')
+    missing = sorted(required - set(choices))
+    if missing:
+        raise RouteError('say end or keep in holds for: ' + ", ".join(missing))
+
+
+def _rule_words(entity: str | None) -> str:
+    """The last stored words for a live or retired rule entity."""
+    if not entity:
+        return ""
+    words = ""
+    for event in _in_write_order(read_events()[0]):
+        if event_identity.entity(event) == entity and event.get("type") in ("rule_add", "rule_edit") \
+                and isinstance(event.get("text"), str):
+            words = event["text"]
+    return words
+
+
+def _undo_hold_choices(holds: dict | None, *, entries: list[dict] = (), words: str = "",
+                       now: datetime | None = None) -> dict:
+    """Add ``keep`` for current relevant holds while the append lock is held.
+
+    Undo carries its original choices and an owner's explicit overrides into
+    this function.  A concurrently added relevant hold is then kept rather
+    than making an otherwise valid inverse fail its append-time check.
+    """
+    choices = dict(holds or {})
+    view = read_view(now)
+    words += "\n" + "\n".join(row.get("role") or "" for row in entries if isinstance(row, dict))
+    scoped = {row.get("account") for row in entries if isinstance(row, dict) and isinstance(row.get("account"), str)}
+    named = _named_account_labels(words, view)
+    for account in view["accounts"]:
+        if account["label"] in named or re.search(r"(?<![\w-])" + re.escape(account_id(account["key"]))
+                                             + r"(?![\w-])", words, re.I):
+            scoped.add(account["key"])
+    if scoped:
+        for hold in view["holds"]:
+            if hold["scope"]["kind"] != "account" or hold["scope"].get("account") in scoped:
+                choices.setdefault(hold["id"], "keep")
+        for account in view["accounts"]:
+            if account["key"] in scoped and account["state"] == PAUSED:
+                choices.setdefault(account["witness"]["id"], "keep")
+    return choices
+
+
 def owner_lines(events: list[dict], via: str) -> list[dict]:
     """The owner's lines about an account change (an account's Stop
     tracking: its priority, its pause, its holds, its note)."""
@@ -4455,7 +4873,10 @@ def account_txn_begin(lines: list[dict], *, before: str, after: str, declines: l
     lines = [begin, *(dict(line, txn=txn) for line in lines)]
     try:
         with _lock():
-            for line, stamp in zip(lines, _stamp_locked(_now(), len(lines))):
+            clock = _now()
+            for line in lines:
+                _require_hold_choices(line, clock)
+            for line, stamp in zip(lines, _stamp_locked(clock, len(lines))):
                 line.update(stamp)
             _append_locked(*lines)
     except OSError as exc:
@@ -4570,7 +4991,7 @@ def set_note(text: str, *, via: str, now: datetime | None = None) -> dict:
     """The owner's note to every conversation, kept and shown word for word."""
     if not isinstance(text, str) or not text.strip():
         raise RouteError("the note needs its words")
-    return _owner_write({"type": "note_set", "text": text.strip()}, via)
+    return _owner_write({"type": "note_set", "text": text}, via)
 
 
 def end_note(*, via: str, now: datetime | None = None) -> dict:
@@ -4603,7 +5024,7 @@ def _rule_target(rule: dict) -> dict:
 
 
 def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | None = None,
-             event_id: str | None = None) -> dict:
+             event_id: str | None = None, holds: dict | None = None) -> dict:
     """``event_id``: the id an owner action chose for this line before it
     was written, so its Undo finds this rule and no other."""
     now = now or _now()
@@ -4612,23 +5033,27 @@ def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | 
     with _lock():
         events, _bad = read_events()
         n = _next_rules(events, 1)
-        out = _owner_write({"type": "rule_add", "n": n, "text": text.strip(),
+        out = _owner_write({"type": "rule_add", "n": n, "text": text, **({"holds": holds} if holds is not None else {}),
                             "source": _one_line(source) or "added by you", "date": now.date().isoformat(),
                             "seeded": False, **({"id": event_id} if event_id else {})}, via)
     rule = next(r for r in read_view(now)["rules"] if r["entity"] == out["entity"])
     return dict(out, n=rule["n"])
 
 
-def edit_rule(n, text: str, *, via: str, now: datetime | None = None) -> dict:
-    rule = _rule(n, now)
+def edit_rule(n, text: str, *, via: str, now: datetime | None = None, holds: dict | None = None,
+              _undo_default_holds: bool = False) -> dict:
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
-    return dict(_owner_write({"type": "rule_edit", **_rule_target(rule), "text": text.strip()}, via), n=rule["n"])
+    with _lock():
+        rule = _rule(n, now)
+        choices = _undo_hold_choices(holds, words=text, now=now) if _undo_default_holds else holds
+        return dict(_owner_write({"type": "rule_edit", **_rule_target(rule), "text": text,
+                                 **({"holds": choices} if choices is not None else {})}, via), n=rule["n"])
 
 
 def request_rule(text: str, *, n: int | None = None, owner_request: str | None = None,
                  author: dict | None = None, via: str = "mcp", now: datetime | None = None,
-                 op: str | None = None) -> dict:
+                 op: str | None = None, holds: dict | None = None) -> dict:
     """Write a live rule that still needs the owner's confirmation.
 
     The requester is recorded through the report-author path. Repeated
@@ -4654,7 +5079,8 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
             written, view = _write({"type": "rule_add", "n": number, "text": text.strip(),
                                     "source": "added at the owner's request", "date": now.date().isoformat(),
                                     "seeded": False, "pending": True, "owner_request": request_words,
-                                    "written_by": by, "via": via, "op": op})
+                                    "written_by": by, "via": via, "op": op,
+                                    **({"holds": holds} if holds is not None else {})})
         rule = next((r for r in view.get("rules", []) if r["entity"] == written["entity"]), None)
         return dict(_done(written, view), n=rule["n"] if rule else _rule_number(written))
     # The predecessor and the append are one locked operation: an owner edit
@@ -4668,7 +5094,8 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
         prior_confirmed = rule.get("prior_confirmed") if rule.get("pending") else rule["confirmed"]
         written, view = _write({"type": "rule_edit", **_rule_target(rule), "text": text.strip(), "pending": True,
                                 "prior_text": prior, "prior_confirmed": prior_confirmed,
-                                "owner_request": request_words, "written_by": by, "via": via, "op": op})
+                                "owner_request": request_words, "written_by": by, "via": via, "op": op,
+                                **({"holds": holds} if holds is not None else {})})
     return dict(_done(written, view), n=rule["n"])
 
 
@@ -4692,13 +5119,18 @@ def retire_rule(n, *, via: str, now: datetime | None = None) -> dict:
     return dict(_owner_write({"type": "rule_retire", **_rule_target(rule)}, via), n=rule["n"])
 
 
-def restore_rule(n, *, via: str, now: datetime | None = None) -> dict:
+def restore_rule(n, *, via: str, now: datetime | None = None, holds: dict | None = None,
+                 _undo_default_holds: bool = False) -> dict:
     """Bring a removed rule back as it was when it was removed: its number,
     words, source, date and confirmation (the app's Undo after a removal)."""
-    entity, number = rule_reference(n)
-    if any(r["entity"] == entity for r in read_view(now)["rules"]):
-        raise RouteError(f"standing rule {n} is in effect")
-    return dict(_owner_write({"type": "rule_restore", "n": number, "entity": entity, "target": entity}, via), n=number)
+    with _lock():
+        entity, number = rule_reference(n)
+        if any(r["entity"] == entity for r in read_view(now)["rules"]):
+            raise RouteError(f"standing rule {n} is in effect")
+        words = _rule_words(entity)
+        choices = _undo_hold_choices(holds, words=words, now=now) if _undo_default_holds else holds
+        return dict(_owner_write({"type": "rule_restore", "n": number, "entity": entity, "target": entity,
+                                 **({"holds": choices} if choices is not None else {})}, via), n=number)
 
 
 def rule_reference(n) -> tuple[str, int | None]:
@@ -4725,9 +5157,10 @@ def rule_reference(n) -> tuple[str, int | None]:
     raise RouteError(f"there is no standing rule {number}")
 
 
-def confirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
+def confirm_rule(n, *, via: str, now: datetime | None = None, holds: dict | None = None) -> dict:
     rule = _rule(n, now)
-    return dict(_owner_write({"type": "rule_confirm", **_rule_target(rule)}, via), n=rule["n"])
+    return dict(_owner_write({"type": "rule_confirm", **_rule_target(rule),
+                             **({"holds": holds} if holds is not None else {})}, via), n=rule["n"])
 
 
 def unconfirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
@@ -4762,6 +5195,24 @@ def dismiss_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
 # confirming, undoing and clearing are the owner's.
 
 
+def _level_at_reset(level: dict, key: str) -> dict:
+    from khipu import usage
+
+    row = usage._load_cache().get(key) or {}
+    resets = [_parse(w.get("resets_at")) for w in row.get("windows") or [] if isinstance(w, dict)]
+    resets = [t for t in resets if t is not None and t > _parse(level["as_of"])]
+    return dict(level, until=_iso(min(_parse(level["until"]), *resets))) if resets else level
+
+
+def set_definition(definition: str, value: dict, *, via: str) -> dict:
+    """Owner-authored shared definitions; lane bindings belong to this Mac."""
+    checked = entry_model.checked_definition(definition, value)
+    if checked is None:
+        raise RouteError("a definition takes provider (id, label, family), account (id, label, provider, family), "
+                         "or lane_map (runner, lane, account); login homes and runner folders are local bindings")
+    return _owner_write({"type": "definition_set", "definition": definition, "value": checked}, via)
+
+
 def _priority_entries(raw, *, now: datetime, conversation: bool) -> list[dict]:
     """The ordered entries a write stores, in the order given: each account
     resolved to its key (a conversation names one by its label or its id),
@@ -4776,8 +5227,8 @@ def _priority_entries(raw, *, now: datetime, conversation: bool) -> list[dict]:
     for i, item in enumerate(raw, 1):
         if isinstance(item, str):
             item = {"account": item}
-        if not isinstance(item, dict) or set(item) - {"account", "role", "until"}:
-            raise RouteError(f"priority entry {i} takes account, role and until")
+        if not isinstance(item, dict) or set(item) - {"account", "role", "until", "level"}:
+            raise RouteError(f"priority entry {i} takes account, role, until and level")
         name = item.get("account")
         if not isinstance(name, str) or not name.strip():
             raise RouteError(f"priority entry {i} needs its account")
@@ -4788,7 +5239,7 @@ def _priority_entries(raw, *, now: datetime, conversation: bool) -> list[dict]:
         role = item.get("role")
         if role is not None and not isinstance(role, str):
             raise RouteError(f"priority entry {i}: the role must be words")
-        role = (_clean(role, 0) if conversation else _one_line(role)) if role else ""
+        role = (_clean(role, 0) if conversation else role) if role else ""
         until = item.get("until")
         end = None
         if until is not None and str(until).strip():
@@ -4796,6 +5247,13 @@ def _priority_entries(raw, *, now: datetime, conversation: bool) -> list[dict]:
             if end <= now:
                 raise RouteError(f"priority entry {i}: its end must be in the future")
         out.append({"account": key, "label": label, "role": role or None, "until": _iso(end)})
+        if item.get("level") is not None:
+            level = entry_model.checked_level(item["level"])
+            if level is None:
+                raise RouteError("level takes claim, as_of and until, with until after as_of")
+            if conversation:
+                level["claim"] = _clean(level["claim"], 0)
+            out[-1]["level"] = _level_at_reset(level, key)
     return out
 
 
@@ -4839,7 +5297,8 @@ def _check_priority(expect, now: datetime | None) -> None:
         raise PriorityMoved("the priority changed after it was read; read it again")
 
 
-def set_priority(entries, *, until=None, via: str, now: datetime | None = None, expect=None) -> dict:
+def set_priority(entries, *, until=None, via: str, now: datetime | None = None, expect=None,
+                 holds: dict | None = None, _undo_default_holds: bool = False) -> dict:
     """The owner's priority, as given: confirmed, and in place of any
     request still waiting for him. ``expect`` is the priority's version as
     read (``priority_version``), required: refused once it moved."""
@@ -4848,7 +5307,9 @@ def set_priority(entries, *, until=None, via: str, now: datetime | None = None, 
     rows = _priority_entries(entries, now=now, conversation=False)
     with _lock():
         _check_priority(expect, now)
-        out = _owner_write({"type": "priority_set", "entries": rows, "until": _priority_until(until, now)}, via)
+        choices = _undo_hold_choices(holds, entries=rows, now=now) if _undo_default_holds else holds
+        out = _owner_write({"type": "priority_set", "entries": rows, "until": _priority_until(until, now),
+                            **({"holds": choices} if choices is not None else {})}, via)
     return dict(out, entries=[e["label"] for e in rows])
 
 
@@ -4895,14 +5356,14 @@ def _held_priority(now: datetime | None, *, pending: bool | None = None) -> dict
     return held
 
 
-def confirm_priority(*, via: str, now: datetime | None = None, expect=None) -> dict:
+def confirm_priority(*, via: str, now: datetime | None = None, expect=None, holds: dict | None = None) -> dict:
     """Confirm the request the owner saw: ``expect``, the priority's version
     as read, is required, so a newer request is never confirmed unseen."""
     _needs_version(expect)
     with _lock():
         _check_priority(expect, now)
         _held_priority(now, pending=True)
-        return _owner_write({"type": "priority_confirm"}, via)
+        return _owner_write({"type": "priority_confirm", **({"holds": holds} if holds is not None else {})}, via)
 
 
 def undo_priority(*, via: str, now: datetime | None = None, expect=None) -> dict:
@@ -5505,6 +5966,8 @@ def _priority_items(entries: list[dict], now: datetime, *, theirs: bool, view: d
             # entries of the list; the owner's are his, word for word.
             text += f": “{their_words(item['role'])}”" if theirs else f": {item['role']}"
             text += _level_claim_marker(item["role"], item["account"], facts)
+        if item.get("level"):
+            text += f" (level: {item['level']['claim']}, as of {item['level']['as_of']}, until {item['level']['until']})"
         holds = _account_holds(view, item["account"])
         if holds:
             text += f" (contradicts active hold {holds[0]['id']}; end it: {_end_hold_route(holds[0])})"
@@ -6211,15 +6674,16 @@ def _read_identity_events() -> list[dict]:
     return [e for e in _split_txns(events, _held_list())[0] if e.get("type") in _IDENTITY_KINDS]
 
 
-def _identity_snapshot(known: list[dict], *, events: list[dict] | None = None) -> tuple:
+def _identity_snapshot(known: list[dict], *, events: list[dict] | None = None,
+                       events_ordered: bool = False) -> tuple:
     """One identity/log walk per input revision, never per public row."""
     revision = (_identity_revision(), tuple((a["key"], a["label"], a["harness"], a.get("home"),
                                               a.get("label_source")) for a in known))
     cached = _IDENTITY_CACHE.get(revision)
     if cached is not None:
         return cached
-    events = _in_write_order(_read_identity_events() if events is None else
-                             [e for e in events if e.get("type") in _IDENTITY_KINDS])
+    events = _read_identity_events() if events is None else [e for e in events if e.get("type") in _IDENTITY_KINDS]
+    events = list(events) if events_ordered else _in_write_order(events)
     known = account_identity.with_provenance(known, events)
     result = (account_identity.state(events, known), forwarding(events),
               {a["key"]: a["label_source"] for a in known})
@@ -6420,7 +6884,7 @@ def _public_account(entry: dict, now: datetime) -> dict:
     return out
 
 
-_PRIORITY_ENTRY_FIELDS = ("label", "role", "until", "in_settings")
+_PRIORITY_ENTRY_FIELDS = ("label", "role", "until", "in_settings", "level")
 _FACT_FIELDS = ("readable", "why", "window", "used_pct", "left_pct", "resets_at", "seconds", "pace_pct_per_hour",
                 "hurry", "words", "figures_at", "stale", "reset_passed")
 
@@ -7659,6 +8123,19 @@ def _priority_entries_arg(args) -> list:
     return list(args.accounts or [])
 
 
+def _holds_arg(args) -> dict | None:
+    raw = getattr(args, "holds", None)
+    if raw is None:
+        return None
+    try:
+        value = _loads(raw)
+    except ValueError:
+        raise RouteError('holds must be JSON: {"hold-or-pause-id": "end" or "keep"}') from None
+    if not isinstance(value, dict) or any(not isinstance(k, str) or v not in ("end", "keep") for k, v in value.items()):
+        raise RouteError('holds must name each hold or pause id with "end" or "keep"')
+    return value
+
+
 def _priority_cli(args, now: datetime) -> int:
     """``khipu route priority``: show it; set it at the owner's request (a
     conversation, ``--at-owner-request``); or the owner's set, confirm, undo
@@ -7688,9 +8165,10 @@ def _priority_cli(args, now: datetime) -> int:
     expect = getattr(args, "expect", None)
     _needs_version(expect)
     if action == "set":
-        out = set_priority(_priority_entries_arg(args), until=args.until, via=via, now=now, expect=expect)
+        out = set_priority(_priority_entries_arg(args), until=args.until, via=via, now=now, expect=expect,
+                           holds=_holds_arg(args))
     elif action == "confirm":
-        out = confirm_priority(via=via, now=now, expect=expect)
+        out = confirm_priority(via=via, now=now, expect=expect, holds=_holds_arg(args))
     elif action == "undo":
         out = undo_priority(via=via, now=now, expect=expect)
     else:
@@ -7728,7 +8206,9 @@ def _priority_intent(args, action: str) -> dict | None:
         item = {"account": item} if isinstance(item, str) else item
         if isinstance(item, dict) and isinstance(item.get("account"), str):
             keys.append(_resolve_account_key(item["account"]))
-    return owner_direction.intent("route.priority.set", ",".join(keys))
+    choices = _holds_arg(args)
+    return owner_direction.intent("route.priority.set", ",".join(keys),
+                                  facts={"holds": choices} if choices is not None else None)
 
 
 def _route_intent(cmd: str, args) -> dict | None:
@@ -7744,12 +8224,19 @@ def _route_intent(cmd: str, args) -> dict | None:
     if cmd == "rule":
         params = [str(p) for p in args.params]
         if args.action == "add":
-            return owner_direction.intent("route.rule.add", "new")
+            choices = _holds_arg(args)
+            return owner_direction.intent("route.rule.add", "new",
+                                          facts={"holds": choices} if choices is not None else None)
         if args.action == "edit":
-            return owner_direction.intent("route.rule.edit", params[0]) if len(params) >= 2 else None
+            choices = _holds_arg(args)
+            return (owner_direction.intent("route.rule.edit", params[0],
+                                           facts={"holds": choices} if choices is not None else None)
+                    if len(params) >= 2 else None)
         if len(params) != 1:
             return None
-        return owner_direction.intent(f"route.rule.{args.action}", params[0].strip())
+        choices = _holds_arg(args)
+        return owner_direction.intent(f"route.rule.{args.action}", params[0].strip(),
+                                      facts={"holds": choices} if choices is not None else None)
     return None
 
 
@@ -7902,23 +8389,23 @@ def run_cli(args) -> int:
             params = list(args.params)
             if args.action == "add":
                 out = add_rule(" ".join(params), source=args.source, via=via, now=now,
-                               event_id=_planned_id("route.rule.add"))
+                               event_id=_planned_id("route.rule.add"), holds=_holds_arg(args))
             elif args.action == "edit":
                 if len(params) < 2:
                     raise RouteError('rule edit takes the rule number and its new words: rule edit 3 "<words>"')
-                out = edit_rule(params[0], " ".join(params[1:]), via=via, now=now)
+                out = edit_rule(params[0], " ".join(params[1:]), via=via, now=now, holds=_holds_arg(args))
             elif len(params) != 1:
                 raise RouteError(f"rule {args.action} takes one rule number")
             elif args.action == "retire":
                 out = retire_rule(params[0], via=via, now=now)
             elif args.action == "restore":
-                out = restore_rule(params[0], via=via, now=now)
+                out = restore_rule(params[0], via=via, now=now, holds=_holds_arg(args))
             elif args.action == "undo":
                 out = undo_rule_request(params[0], via=via, now=now)
             elif args.action == "dismiss":
                 out = dismiss_rule_request(params[0], via=via, now=now)
             else:
-                out = confirm_rule(params[0], via=via, now=now)
+                out = confirm_rule(params[0], via=via, now=now, holds=_holds_arg(args))
         else:
             raise RouteError(f"unknown route command {cmd!r}")
         _print_json(_finish_owner(out))

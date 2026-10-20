@@ -299,10 +299,10 @@ def test_a_move_carries_every_record_to_the_new_folder(mac, capsys):
     until = T0 + timedelta(hours=3)
     routing.report(state="limited", account="Claude client", author=ME,
                    message=f"Limit reached, resets at {routing._iso(until)}")
-    routing.pause(old, via="app")
+    paused = routing.pause(old, via="app")
     hold = routing.add_hold("reviews only", reason="keep", scope="account", account=old, owner=True,
                             via="app")["id"]
-    routing.set_priority([{"account": "Claude client"}], via="app", expect=routing.priority_version())
+    routing.set_priority([{"account": "Claude client"}], via="app", expect=routing.priority_version(), holds={paused["id"]: "keep", hold: "keep"})
     usage._save_cache({old: {"harness": "claude", "account": "Claude client", "ok": True, "windows": []}})
     rc, out = _cli(["accounts", "move", "--from-app", f"--expect={_version()}", f"--account={old}",
                     "--folder=~/.claude-office"], capsys)
@@ -1077,8 +1077,8 @@ def test_a_save_through_a_symlink_under_a_new_name_is_a_rename(mac):
     _set(usage_accounts=[{"harness": "claude", "label": "Client", "home": "~/.claude-client"},
                          {"harness": "codex", "label": "Codex"}],
          routing_lane_map={"jobs": {"r": old}})
-    routing.pause(old, via="app")
-    routing.set_priority([{"account": old}, {"account": "codex|"}], via="app", expect=routing.priority_version())
+    paused = routing.pause(old, via="app")
+    routing.set_priority([{"account": old}, {"account": "codex|"}], via="app", expect=routing.priority_version(), holds={paused["id"]: "keep"})
     accounts.save_list([{"harness": "claude", "label": "Renamed", "home": str(mac["home"] / "client-link")},
                         {"harness": "codex", "label": "Codex"}], expect=_version())
     view = routing.read_view()
@@ -1398,9 +1398,9 @@ def test_the_app_accepts_every_version_the_python_code_makes(mac, tmp_path):
 
 def test_confirming_a_requested_removal_runs_the_owners_stop(mac):
     _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
-    routing.pause("claude|", via="app")
+    paused = routing.pause("claude|", via="app")
     routing.set_priority([{"account": "claude|"}, {"account": "codex|"}], via="app",
-                         expect=routing.priority_version())
+                         expect=routing.priority_version(), holds={paused["id"]: "keep"})
     routing.set_setting("routing_lane_map", {"jobs": {"r": "claude|"}})
     accounts.save_list([{"harness": "codex", "label": "Second"}], expect=_version(),
                        request={"by": ME, "request": "remove First"})
@@ -1512,8 +1512,8 @@ def test_a_move_that_cannot_be_finished_refuses_every_account_write(mac, monkeyp
 
 def test_an_owner_write_gives_a_waiting_requested_removal_its_full_stop(mac):
     _set(usage_accounts=_TWO)
-    routing.pause("claude|", via="app")
-    routing.set_priority([{"account": "claude|"}, {"account": "codex|"}], via="app", expect=routing.priority_version())
+    paused = routing.pause("claude|", via="app")
+    routing.set_priority([{"account": "claude|"}, {"account": "codex|"}], via="app", expect=routing.priority_version(), holds={paused["id"]: "keep"})
     routing.set_setting("routing_lane_map", {"jobs": {"r": "claude|"}})
     accounts.save_list([_TWO[1]], expect=_version(), request={"by": ME, "request": "remove First"})
     accounts.rename("codex|", "Renamed second", expect=_version())
@@ -1615,8 +1615,8 @@ def test_last_valid_account_needs_confirmation_beside_invalid_entries(mac):
 
 def test_only_invalid_entries_left_read_a_kept_default_as_not_tracked(mac):
     _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "old-cli", "label": "Legacy"}])
-    routing.pause("claude|", via="app")
-    routing.set_priority([{"account": "claude|"}], via="app", expect=routing.priority_version())
+    paused = routing.pause("claude|", via="app")
+    routing.set_priority([{"account": "claude|"}], via="app", expect=routing.priority_version(), holds={paused["id"]: "keep"})
     accounts.stop("claude|", expect=_version(), keep_pause=True, keep_priority=True, confirm_last=True)
     assert not accounts.known_of(config.load_config()["usage_accounts"])
     view = routing.read_view()

@@ -29,7 +29,7 @@ def derived(kind: str, key) -> str:
     return f"{kind}-{uuid.uuid5(NAMESPACE, f'{kind}:{key}')}"
 
 
-def revision(event: dict) -> str:
+def revision(event: dict, *, operations_salt: bytes | None = None) -> str:
     if event.get("_revision"):
         return event["_revision"]
     if event.get("mac") and event.get("id"):
@@ -37,13 +37,13 @@ def revision(event: dict) -> str:
     from khipu.routing import _id_salt
 
     body = {k: v for k, v in event.items() if not k.startswith("_")}
-    return body_hash(body, _id_salt(operations=True))
+    return body_hash(body, operations_salt if operations_salt is not None else _id_salt(operations=True))
 
 
-def legacy_mac(event: dict) -> str:
+def legacy_mac(event: dict, *, operations_salt: bytes | None = None) -> str:
     """Stable origin for untagged history; a fold supplies its log's origin."""
     return (event.get("legacy_mac") or event.get("_legacy_mac") or event.get("mac")
-            or derived("mac", event.get("id") or revision(event)))
+            or derived("mac", event.get("id") or revision(event, operations_salt=operations_salt)))
 
 
 def entity(event: dict) -> str | None:
@@ -66,6 +66,10 @@ def entity(event: dict) -> str | None:
         return derived("priority", "owner")
     if kind in ("pause", "lift"):
         return derived("pause", event.get("account"))
+    if kind == "definition_set":
+        value = event.get("value") or {}
+        key = value.get("id") or f"{event.get('mac')}:{value.get('runner')}:{value.get('lane')}"
+        return derived("definition", f"{event.get('definition')}:{key}")
     return None
 
 

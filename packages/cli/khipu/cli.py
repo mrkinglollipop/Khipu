@@ -5754,6 +5754,8 @@ def build_parser() -> argparse.ArgumentParser:
     rprio.add_argument("--entries", default=None, metavar="JSON",
                        help='set: [{"account": "...", "role": "your words", "until": "T"}, ...] in your order')
     rprio.add_argument("--until", default=None, metavar="T", help="set: when the whole priority ends")
+    rprio.add_argument("--holds", default=None, metavar="JSON",
+                       help='Explicit choices for held or paused accounts: {"id": "end" or "keep"}')
     rprio.add_argument("--at-owner-request", default=None, metavar="REQUEST",
                        help="A conversation: the owner's request, in one line (set only; stays unconfirmed)")
     rprio.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
@@ -5764,6 +5766,8 @@ def build_parser() -> argparse.ArgumentParser:
     rrule.add_argument("action", choices=("add", "edit", "retire", "restore", "confirm", "undo", "dismiss"))
     rrule.add_argument("params", nargs="*")
     rrule.add_argument("--source", default=None, help="Where the rule comes from (rule add)")
+    rrule.add_argument("--holds", default=None, metavar="JSON",
+                       help='Explicit choices for held or paused accounts: {"id": "end" or "keep"}')
     rrule.add_argument("--at-owner-request", default=None, metavar="REQUEST",
                        help="A conversation: the owner's request, in one line (rule add or edit; stays unconfirmed)")
     rrule.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)

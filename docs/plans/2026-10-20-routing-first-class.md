@@ -908,16 +908,16 @@ change; if it is still red, stop and report the last log. Slices on the per-prom
 | 8a | Claude Code child: the bounded child block, the per-agent ledger and deferred pages | 7, 2b | Codex Sol, medium | Sonnet | case 7a |
 | 8b | Codex native child: the bounded child block from SubagentStart; brief inspection and the advisory line when the hook is absent | 7, 2b | Codex Sol, medium | Sonnet | case 7b |
 | 8c | T3: `KHIPU_SESSION_ID=t3:<thread>` in Khipu's T3 integration; doctor names providers without hooks | 7, 2b | Codex Sol, medium | Sonnet | case 7c; stop and report any matrix row the received context disproves |
-| 9a | Provider catalog as facts; lane matching by declared identity, then login home, then name; ambiguity | 4 | Codex Sol, medium | Sonnet | case 8 |
+| 9a | Provider catalog as facts; lane matching by declared identity, then login home, then name; ambiguity; owner-reachable definition writer (CLI, owner direction and app) | 4 | Codex Sol, medium | Sonnet | case 8 |
 | 9b | `http-quota` adapter | 9a | Codex Sol, high | Opus (credential path) | case 9 |
 | 10 | Advisory: rule 12 tier table and check, structured contradictions, rule hygiene (section 13 D) | 4, 9a | Grok, against tests Codex writes first (10t, Sol medium) | Codex re-check (rule 1), then Sonnet | case 10 |
-| 11a | Hub schema (the next free migration, 0042 today), replication payload projection | 3b, 4, 5 | Codex Sol, high | Opus (what leaves the Mac) | case 12's payload-field checks; inspect `test_audit1010_hub*` for the test hub first |
+| 11a | Hub schema (the next free migration, 0042 today), replication payload projection; omit local `source_id` and evidence text from the payload | 3b, 4, 5 | Codex Sol, high | Opus (what leaves the Mac) | case 12's payload-field checks; inspect `test_audit1010_hub*` for the test hub first |
 | 11b | Replication and recovery: cursors, idempotent upload, caught-up, offline, restore, rule numbering by hub order | 11a, 6 | Codex Astra, high (a miss here is costly) | Opus | cases 12 and 4's Mac part |
 | 12 | Gateway projection and pull delivery through the gateway | 7, 11b | Codex Sol, medium | Opus (gateway exposure) | case 13; the deploy is its own step with Matt's go ([[merged-is-not-deployed]]), then a live `khipu_route` through the gateway |
 | 13 | Scanner and recall's superseded mark | 2a | Grok, against tests Codex writes first (13t) | Codex re-check, then Sonnet | case 14; Matt's files are only read |
 | 14 | Mocks for the five app groups, Pace including section 13's caps, advice and unknown evidence | 4, 4Pa, 5, 6 | Claude Opus | Matt approves | no app work before approval |
 | 15a | App: delivery and health | 14, 16 | Codex Sol, high | Sonnet | `npm run build && tsc`, desktop tests, then the rendered result (at most 3 visual passes, screenshot as proof) |
-| 15b | App: proposals and holds | 14, 5 | Codex Sol, high | Opus (owner actions) | as 15a |
+| 15b | App: proposals and holds, including Settings end-or-keep choices for held or paused accounts | 14, 5 | Codex Sol, high | Opus (owner actions) | as 15a |
 | 15c | App: providers and lanes | 14, 9a | Codex Sol, medium | Sonnet | as 15a |
 | 15d | App: advisory and copies | 14, 10, 13 | Codex Sol, medium | Sonnet | as 15a |
 | 15e | App: pace, caps and advice | 14, 4Pb, 17a, 17c | Codex Sol, medium | Sonnet; Opus for the cap confirm (owner action) | as 15a |
