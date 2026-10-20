@@ -631,7 +631,8 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
         signal.setitimer(signal.ITIMER_REAL, max(0.0, deadline - time.monotonic()) + _ROUTING_CHILD_GRACE)
         out = routing.start_push(budget, moment)
         if isinstance(out, dict):
-            data = memoryview(json.dumps({k: out.get(k) for k in ("text", "version", "epoch", "generation")}).encode("utf-8"))
+            data = memoryview(json.dumps({k: out.get(k) for k in (
+                "text", "version", "epoch", "generation", "owed_entities", "shown_entities")}).encode("utf-8"))
             while data:
                 data = data[os.write(write_fd, data):]
             os.close(write_fd)  # the hook has its answer; nothing below delays it
@@ -747,7 +748,8 @@ class _RoutingAtStart:
             from khipu import recall_prompt, routing
 
             recall_prompt.mark_routing_full(session_id, version=out["version"], epoch=out.get("epoch"),
-                                            at=routing._iso(routing._now()))
+                                            at=routing._iso(routing._now()),
+                                            owed=out.get("owed_entities"), shown=out.get("shown_entities"))
         except Exception:
             pass
 

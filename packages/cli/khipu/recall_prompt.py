@@ -236,13 +236,15 @@ def _session_lock(session_id: str, wait: float):
         yield True
 
 
-def mark_routing_full(session_id: str, *, version: int, epoch: str | None, at: str) -> bool:
+def mark_routing_full(session_id: str, *, version: int, epoch: str | None, at: str,
+                      owed: list[str] | None = None, shown: list[str] | None = None) -> bool:
     """Record that the full summary at ``version`` was delivered at ``at``:
     the session's last-seen version starts again from it. Takes the
     session's lock without waiting; a busy lock or a failed write records
     nothing (the next prompt then sends the full summary again) and is never
     raised."""
-    return mark_routing_seen(session_id, version=version, epoch=epoch, full_at=at, wait=0.0)
+    return mark_routing_seen(session_id, version=version, epoch=epoch, full_at=at,
+                             owed=owed, shown=shown, wait=0.0)
 
 
 def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_at: str | None = None,
@@ -274,7 +276,7 @@ def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_
                      and old["version"] > version)
             if not older:
                 new["version"] = version
-        if full_at is None and owed is not None and not older:
+        if owed is not None and (full_at is not None or not older):
             old_owed = old.get("owed") if old.get("epoch") == epoch and isinstance(old.get("owed"), list) else []
             same_version = old.get("epoch") == epoch and old.get("version") == version
             # The first delivery at a version records all its omissions.

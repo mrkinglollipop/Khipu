@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from khipu import recall_prompt, routing
+from khipu import recall_prompt, recall_rule, routing
 
 
 T0 = datetime(2026, 10, 20, 14, 0, tzinfo=timezone.utc)
@@ -276,3 +277,110 @@ def test_f_conversation_route_lists_the_actual_end_hold_action(home):
     held = routing.add_hold("wait", reason="keep", scope="account", account="Grok", author=ME)
     out = routing.conversation_view(now=T0)
     assert f"khipu_route_report action=end_hold hold_id={held['id']}" in out["holds"][0]["line"]
+
+
+@pytest.mark.parametrize("path", ["start", "full_prompt", "changes"])
+def test_review_omitted_pending_changes_are_counted_and_delivered_later(home, monkeypatch, path):
+    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
+    before = routing.read_view()
+    for i in range(12):
+        routing.request_rule(f"pending {i} " + "x" * 500, author=ME)
+    routing.request_priority([{"account": "Grok", "role": "builder " * 150}],
+                             owner_request="use Grok", author=ME, expect=routing.priority_version())
+    if path == "start":
+        monkeypatch.setattr(routing, "kick_plan_refresh", lambda: None)
+        at = recall_rule._RoutingAtStart().begin()
+        assert at.text()
+        out = at.out
+    else:
+        marker = {} if path == "full_prompt" else {
+            "version": before["version"], "epoch": before["epoch"], "full_at": routing._iso(T0)}
+        out = routing.prompt_push(marker, budget=1.0)
+    pending = {*(f"rule:{i}" for i in range(1, 13)), "priority"}
+    shown = set(out.get("shown_entities") or []) & pending
+    omitted = pending - shown
+    assert omitted
+    match = re.search(r"(\d+) more (?:pending changes|changes): .*khipu_route", out["text"])
+    assert match and int(match[1]) == len(omitted)
+    assert set(out["owed_entities"]) - set(out["shown_entities"]) == omitted
+    if path == "start":
+        at.delivered(SESSION)
+    else:
+        _deliver(dict(out, at=routing._iso(T0)))
+    assert set(recall_prompt.routing_marker(SESSION)["owed"]) == omitted
+    seen = set(shown)
+    for _ in range(15):
+        next_out = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
+        assert next_out["kind"] == "changes"
+        newly_shown = set(next_out["shown_entities"]) & omitted
+        assert newly_shown - seen
+        for entity in newly_shown:
+            if entity == "priority":
+                assert "Your priority" in next_out["text"]
+            else:
+                number = entity.split(":")[1]
+                assert re.search(rf"(?:^{number}\. |Standing rule {number} added)", next_out["text"], re.M)
+        seen.update(newly_shown)
+        _deliver(next_out)
+        if not recall_prompt.routing_marker(SESSION).get("owed"):
+            break
+    assert seen == pending
+    if path == "start":
+        at.delivered(SESSION)
+    elif path == "full_prompt":
+        _deliver(dict(out, at=routing._iso(T0)))
+    assert not recall_prompt.routing_marker(SESSION).get("owed")
+
+
+def test_review_overlapping_account_labels_agree_on_hold_conflicts(home):
+    _set(home, usage_accounts=[{"label": "Codex", "harness": "codex"},
+                               {"label": "Codex second", "harness": "codex", "home": "/logins/second-login"}])
+    routing.add_hold("wait", reason="keep", scope="account", account="Codex", author=ME)
+    routing.add_rule("Codex second is open for small jobs.", via="app")
+    view = routing.read_view()
+    assert "contradicts" not in routing.rule_line(view["rules"][0], view=view)
+    assert "contradicts" not in routing.hold_line(view["holds"][0], T0, view=view)
+    routing.add_rule("Codex is open for small jobs.", via="app")
+    view = routing.read_view()
+    assert "contradicts active hold" in routing.rule_line(view["rules"][1], view=view)
+    assert "contradicts rule 2" in routing.hold_line(view["holds"][0], T0, view=view)
+
+
+@pytest.mark.parametrize("words", ["Grok is limited to read-only audits", "Grok is low priority for builds",
+                                  "Keep Grok at 20% left as a floor", "If Grok has 20% left, stop builds"])
+def test_review_policy_words_are_not_current_allowance_claims(home, words):
+    _usage(home)
+    routing.add_rule(words, via="app")
+    assert "stale level claim" not in routing.summary()["text"]
+
+
+def test_review_owner_rule_flags_share_the_prompt_budget(home):
+    for account in ACCOUNTS:
+        routing.add_hold("wait", reason="keep", scope="account", account=account["label"], author=ME)
+    before = routing.read_view()
+    words = " and ".join(a["label"] for a in ACCOUNTS) + " can build."
+    for _ in range(4):
+        routing.add_rule(words, via="app")
+    view = routing.read_view()
+    changed = routing.since(before["version"], view)
+    text, _ = routing.changes_text(changed, view, T0)
+    owner_lines = ["Standing rule " + routing.rule_line(r) for r in view["rules"]]
+    assert all(line in text for line in owner_lines)
+    body = text.split("\n", 1)[1]
+    for line in owner_lines:
+        body = body.replace(line, "", 1)
+    assert len(body) <= 400
+    assert body.count("Rule flags: see `khipu_route`.") == 1
+
+
+@pytest.mark.parametrize("kind", ["rule", "priority"])
+def test_review_previews_scrub_before_truncating_private_names(home, kind):
+    _set(home, usage_accounts=ACCOUNTS + [{"label": "Extra", "harness": "codex",
+                                         "home": "/logins/matthewschwartz_private_login_folder"}])
+    text = "matthewschwartz_private_login_folder " + "x" * 500
+    if kind == "rule":
+        pointer = routing.rule_pointer({"n": 1, "text": text}, routing.read_view())
+    else:
+        pointer = routing.priority_pointer({"entries": [{"label": "Grok", "account": "grok|", "role": text}]},
+                                           routing.read_view())
+    assert "matthew" not in pointer

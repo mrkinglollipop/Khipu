@@ -4729,6 +4729,8 @@ def _level_claim_marker(text: str, key: str, facts: dict | None, *, label: str |
             for i, hit in enumerate(hits):
                 if hit.group() != label.casefold():
                     continue
+                if re.search(r"\b(?:if|when|until|unless|once|keep|leave|reserve)\b", clause[:hit.start()]):
+                    continue
                 end = len(clause)
                 for j in range(i + 1, len(hits)):
                     between = clause[hits[j - 1].end():hits[j].start()].strip(" ,&")
@@ -4737,11 +4739,14 @@ def _level_claim_marker(text: str, key: str, facts: dict | None, *, label: str |
                         break
                 scopes.append(clause[hit.start():end])
     for scope in scopes:
-        numeric = re.search(r"\b(\d{1,3}(?:\.\d+)?)%\s+left\b", scope)
-        qualitative = re.search(r"(?:^|\b(?:is|are|was|were|still|currently|now|also)\s+)(?:low|limited)\b"
+        threshold = re.search(r"\b(?:if|when|until|unless|once|floor|threshold|minimum|at least|at most|"
+                              r"below|above|under|over|less than|more than|keep|leave|reserve)\b", scope)
+        numeric = None if threshold else re.search(r"\b(\d{1,3}(?:\.\d+)?)%\s+left\b", scope)
+        qualitative = re.search(r"(?:^|\b(?:is|are|was|were|still|currently|now|also)\s+)"
+                                r"(?:low\b(?!\s+priority\b)|limited\b(?!\s+to\b))"
                                 r"|\bnearly used up\b", scope)
         stale = (numeric is not None and abs(float(numeric.group(1)) - left) >= 10) or (
-            qualitative is not None and left >= 50)
+            qualitative is not None and not threshold and left >= 50)
         if stale:
             name = f"{label}: " if label else ""
             return f" (stale level claim; {name}Khipu read {left:g}% left)"
@@ -4765,8 +4770,9 @@ def rule_line(rule: dict, *, view: dict | None = None, facts: dict | None = None
     else:
         mark = "" if rule.get("confirmed", True) else " (seeded; the owner has not confirmed it yet)"
         text = f"{rule['n']}. {rule['text']}{mark}"
+    names = _named_account_labels(rule.get("text"), view)
     for entry in (view or {}).get("accounts") or []:
-        if entry["label"].casefold() in str(rule.get("text") or "").casefold():
+        if entry["label"] in names:
             holds = _account_holds(view, entry["key"])
             if holds:
                 text += f" (contradicts active hold {holds[0]['id']}; end it: {_end_hold_route(holds[0])})"
@@ -4786,7 +4792,7 @@ def rule_pointer(rule: dict, view: dict | None = None, *, facts: dict | None = N
                                          label=entry["label"], labels=names)
                       for entry in (view or {}).get("accounts") or [] if entry["label"] in names)
     return (f"Standing rule {rule['n']} {rule.get('pending_kind') or 'added'}{named}: "
-            f"\"{their_words(_compact_opening(rule.get('text'), 32))}\"{markers}; unconfirmed; khipu_route.")
+            f"\"{their_words(_compact_opening(_for_agents(rule.get('text') or '', view), 32))}\"{markers}; unconfirmed; khipu_route.")
 
 
 PRIORITY_POINTER = "Your priority was set by a conversation at the owner's request; " + _TOO_LONG
@@ -4800,7 +4806,7 @@ def priority_pointer(priority: dict, view: dict | None = None, *, width: int = 2
     parts = []
     for item in entries:
         held = _account_holds(view, item.get("account"))
-        opening = _compact_opening(item.get("role") or "", max(width, 24) if held else width)
+        opening = _compact_opening(_for_agents(item.get("role") or "", view), max(width, 24) if held else width)
         part = item["label"] + (f': "{their_words(opening)}"' if opening else "")
         part += _level_claim_marker(item.get("role") or "", item["account"], facts)
         if held:
@@ -4839,6 +4845,10 @@ def _fit_theirs(items, limit: int, room: int | None = None) -> tuple[list[str], 
         out.append(chosen)
         used += len(chosen) + 1 if chosen else 0
     return out, used
+
+
+def _pending_overflow(count: int) -> str:
+    return f"{count} more pending changes: read `khipu_route`."
 
 
 def note_line(note: dict, now: datetime) -> str:
@@ -5265,12 +5275,13 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
     # (a pending rule or priority) count against it (``_fit_theirs``).
     facts = plan_facts(view, now) if view.get("record") else {}
     whole: list[str] = []
-    theirs: list[tuple[int, str, str]] = []  # (place in whole, line, pointer)
+    theirs = []  # (place in whole, line, pointer, entity)
     if view.get("rules"):
         whole.append("Standing rules:")
         for r in view["rules"]:
             if r.get("pending"):
-                theirs.append((len(whole), rule_line(r, view=view, facts=facts), rule_pointer(r, view, facts=facts)))
+                theirs.append((len(whole), rule_line(r, view=view, facts=facts), rule_pointer(r, view, facts=facts),
+                               f"rule:{r['n']}"))
             whole.append(rule_line(r, view=view, facts=facts))
     if view.get("note"):
         whole.append(note_line(view["note"], now))
@@ -5278,15 +5289,23 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
     if view.get("priority"):
         line = priority_line(view["priority"], now, view=view, facts=facts)
         if view["priority"].get("pending"):
-            theirs.append((len(whole), line, _priority_pointers(view["priority"], view, facts=facts)))
+            theirs.append((len(whole), line, _priority_pointers(view["priority"], view, facts=facts), "priority"))
         whole.append(line)
     whole = _for_agents(whole, view)
     rules_note_chars = sum(len(line) + 1 for i, line in enumerate(whole) if i not in {t[0] for t in theirs})
-    fitted, theirs_chars = _fit_theirs([
+    requests = [
         (_for_agents(line, view), tuple(_for_agents(p, view) for p in pointer)
          if isinstance(pointer, tuple) else _for_agents(pointer, view))
-        for _i, line, pointer in theirs], cfg["routing_summary_chars"])
-    for (i, _line, _pointer), chosen in zip(theirs, fitted):
+        for _i, line, pointer, _entity in theirs]
+    limit = cfg["routing_summary_chars"]
+    fitted, theirs_chars = _fit_theirs(requests, limit)
+    if limit and any(not line for line in fitted):
+        room = max(0, limit // 2 - len(_pending_overflow(len(theirs))) - 1)
+        fitted, theirs_chars = _fit_theirs(requests, limit, room=room)
+    omitted = sum(not line for line in fitted)
+    if omitted:
+        theirs_chars += len(_pending_overflow(omitted)) + 1
+    for (i, _line, _pointer, _entity), chosen in zip(theirs, fitted):
         whole[i] = chosen
     lines += [line for line in whole if line]
     dropped = 0
@@ -5346,10 +5365,14 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         lines += [item[1] for item in kept]
         if dropped:
             lines.append(f"{dropped} more lines: run `khipu route`")
+    if omitted:
+        lines.append(_pending_overflow(omitted))
     # Read by conversations (the pushes, khipu_status) and printed by
     # `khipu route --summary`: scrubbed, the owner's words kept whole.
     return {"text": _for_agents("\n".join(lines), view), "dropped": dropped, "rules_note_chars": rules_note_chars,
-            "version": view["version"], "epoch": view.get("epoch")}
+            "version": view["version"], "epoch": view.get("epoch"),
+            "owed_entities": [entity for _i, _line, _pointer, entity in theirs],
+            "shown_entities": [item[3] for item, chosen in zip(theirs, fitted) if chosen]}
 
 
 def since(version: int, view: dict | None = None, *, now: datetime | None = None,
@@ -6101,6 +6124,8 @@ def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_B
     if start:
         # Only for the hook, which checks it and never prints it: it names files.
         status["generation"] = _generation(view, settings())
+        status["owed_entities"] = out["owed_entities"]
+        status["shown_entities"] = out["shown_entities"]
     return status
 
 
@@ -6440,8 +6465,22 @@ def _fit_push(head, others, limit: int, *, stale: str | None = None, overflow=No
     if stale and (not limit or len(stale) + 1 <= limit):
         selected.append((None, stale))
         used += len(stale) + 1
+    owner_flags = [(i, line[len(fallback):]) for i, (line, fallback, whose, _entity) in enumerate(headed)
+                   if whose == OWNERS and isinstance(fallback, str) and line.startswith(fallback) and line != fallback]
+    flag_cost = sum(len(suffix) for _i, suffix in owner_flags)
+    tail = len(overflow(len(tagged) + len(headed))) + 1 if overflow and (tagged or any(
+        whose != OWNERS for _line, _fallback, whose, _entity in headed)) else 0
+    shared_flags = bool(limit and flag_cost > max(0, limit - used - tail))
+    flag_note = None
+    if shared_flags:
+        note = "Rule flags: see `khipu_route`."
+        if len(note) + 1 <= limit - used - tail:
+            flag_note = note
+            used += len(note) + 1
+    else:
+        used += flag_cost
     reserve = sum(len(line) + 1 for entity, line in tagged if entity in first_entities)
-    room = max(0, min(limit // 2, limit - used - reserve)) if limit else 0
+    room = max(0, min(limit // 2, limit - used - reserve - (tail if flag_cost else 0))) if limit else 0
     theirs = [(line, pointer) for line, pointer, whose, _ in headed if whose == THEIRS]
     fitted, taken = _fit_theirs(theirs, limit, room=room)
     used += taken
@@ -6449,11 +6488,12 @@ def _fit_push(head, others, limit: int, *, stale: str | None = None, overflow=No
     chosen = {}
     for i, (line, fallback, whose, entity) in enumerate(headed):
         if whose == OWNERS:
-            chosen[i] = line
+            chosen[i] = fallback if shared_flags and isinstance(fallback, str) else line
         elif whose == THEIRS:
             chosen[i] = next(fitted)
         else:
-            tail = len(overflow(len(tagged))) + 1 if tagged and overflow and limit else 0
+            missing = sum(not text for text in chosen.values())
+            tail = len(overflow(len(tagged) + missing)) + 1 if (tagged or missing) and overflow and limit else 0
             first = len(tagged[0][1]) + 1 + (tail if len(tagged) > 1 else 0) if tagged else 0
             keeps = (reserve,) if first_entities else (first, tail, 0)
             ladder = [(text, keep) for keep in keeps for text in (line, *fallback[:-1])]
@@ -6464,6 +6504,8 @@ def _fit_push(head, others, limit: int, *, stale: str | None = None, overflow=No
             used += len(pick) + 1 if pick else 0
     missing_head = sum(1 for i, item in enumerate(headed) if item[3] is not None and not chosen[i])
     selected += [(item[3], chosen[i]) for i, item in enumerate(headed) if chosen[i]]
+    if flag_note:
+        selected.append((None, flag_note))
     kept = list(tagged)
     if limit:
         while kept:
@@ -6507,14 +6549,16 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     # unrelated account. Every part but the owner's rules and note counts
     # against the budget, together (``_fit_push``).
     facts = plan_facts(view, now)
-    head = [(rule_line(r, view=view, facts=facts), rule_pointer(r, view, facts=facts), THEIRS, None)
+    head = [(rule_line(r, view=view, facts=facts), rule_pointer(r, view, facts=facts), THEIRS, e)
             for e, r in pending.items() if e not in changed_rules]
+    rules = {f"rule:{r['n']}": r for r in view.get("rules") or []}
     for group, e, line in ranked:
         entity = changed["entities"][e]
         if group == 0 and entity != "priority":
+            plain = "Standing rule " + rule_line(rules[entity]) if entity in rules else line
             head.append((line, rule_pointer(pending[entity], view, facts=facts), THEIRS, entity)
-                        if entity in pending else (line, None, OWNERS, entity))
-    priority_head = [(*item, "priority" if "priority" in changed["entities"] else None)
+                        if entity in pending else (line, plain, OWNERS, entity))
+    priority_head = [(*item, "priority" if "priority" in changed["entities"] or item[2] == THEIRS else None)
                      for item in _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)]
     conflicting = any(_account_holds(view, item.get("account"))
                       for item in (view.get("priority") or {}).get("entries") or [])
@@ -6544,6 +6588,8 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
     rendered, shown = _fit_push(head, others, limit, stale=stale, overflow=overflow,
                                 first_entities=owed_set)
     changed["shown_entities"] = shown
+    changed["delivery_entities"] = list(dict.fromkeys([
+        *changed["entities"], *[item[3] for item in head if item[3] is not None]]))
     lines += rendered
     return "\n".join(lines), len(changed["entities"])
 
@@ -6596,11 +6642,12 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
         if changed["complete"]:
             text, count = changes_text(changed, view, now, cfg, stale=stale)
             return dict(base, kind="changes", text=_for_agents(text, view), count=count,
-                        owed_entities=changed["entities"], shown_entities=changed.get("shown_entities") or [],
+                        owed_entities=changed["delivery_entities"], shown_entities=changed.get("shown_entities") or [],
                         unrefreshed=view.get("checked_at") if stale else None)
         why = "the changes are no longer kept"
     out = summary(view, now=now)
-    return dict(base, kind="full", text=out["text"], count=0, why=why)
+    return dict(base, kind="full", text=out["text"], count=0, why=why,
+                owed_entities=out["owed_entities"], shown_entities=out["shown_entities"])
 
 
 # ---- the recall daemon's poll (phase 3c) --------------------------------------------------

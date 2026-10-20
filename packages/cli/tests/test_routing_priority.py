@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 
@@ -693,10 +694,17 @@ def test_many_conversation_requests_take_at_most_half_the_budget(home):
     assert "Standing rule 1 added" in text and "unconfirmed" in text
     assert "more changes" in text
     assert any(x.startswith("Codex") for x in text.splitlines())  # the owner's accounts keep their room
-    summary = _summary(home)
-    first_rule = "rule 0 " + "x" * 500
-    assert first_rule in summary or "Standing rule 1 added" in summary
-    assert "the owner has not confirmed it yet" in summary or "unconfirmed" in summary
+    out = routing.summary(now=home["clock"].now)
+    summary = out["text"]
+    shown = set(out["shown_entities"])
+    pending = {f"rule:{i}" for i in range(1, 13)}
+    omitted = pending - shown
+    assert "rule:1" in shown
+    assert omitted
+    assert f"{len(omitted)} more pending changes: read `khipu_route`." in summary
+    assert set(out["owed_entities"]) - shown == omitted
+    assert all(re.search(rf"(?:^{i}\. |Standing rule {i} added)", summary, re.M)
+               for i in range(1, 13) if f"rule:{i}" in shown)
     requests = [line for line in summary.splitlines() if "unconfirmed" in line or
                 "the owner has not confirmed it yet" in line]
     assert sum(len(line) + 1 for line in requests) <= 750
