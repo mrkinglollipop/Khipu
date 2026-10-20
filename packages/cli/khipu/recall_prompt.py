@@ -2498,6 +2498,67 @@ _BUDGET_SAFETY_SLACK_S = 0.3
 _VALIDITY_QUERY_MIN_S = 0.05
 
 
+def _attach_hub_routing_state(
+    rows: list[dict[str, Any]],
+    *,
+    deadline: float | None = None,
+) -> list[dict[str, Any]]:
+    """Carry stored routing-state flags onto budgeted hub hits.
+
+    Same boolean the local snapshot metadata pass already attaches. Reads
+    only ``frontmatter->'_routing_state_claim'``, never ``topics.body``.
+    Fail-open: a missing column, a closed cursor, a type that is not a
+    strict boolean, a missed deadline, or a statement timeout leaves hits
+    unmarked and never drops a row.
+    """
+    topic_ids = [str(r["id"]) for r in rows if r.get("kind") == "topic"]
+    if not topic_ids:
+        return rows
+    remaining = None if deadline is None else deadline - time.monotonic()
+    # Same headroom as the validity counts query: starting this with less
+    # than _VALIDITY_QUERY_MIN_S left only makes a tight lane worse, and
+    # connect() itself may take up to five seconds without a wall-clock cap.
+    if remaining is not None and remaining <= _VALIDITY_QUERY_MIN_S:
+        return rows
+
+    def _fetch() -> dict[str, bool]:
+        from khipu.db import connect
+
+        timeout_kw = {}
+        if remaining is not None:
+            timeout_kw["statement_timeout_s"] = remaining
+        with connect(**timeout_kw) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT slug, frontmatter->'_routing_state_claim' "
+                    "FROM topics WHERE deleted_at IS NULL AND slug = ANY(%s)",
+                    (topic_ids,),
+                )
+                return {
+                    str(slug): flag
+                    for slug, flag in cur.fetchall()
+                    if type(flag) is bool
+                }
+
+    try:
+        flags = (
+            _fetch() if remaining is None
+            else _run_with_timeout(_fetch, remaining)
+        )
+    except Exception as exc:  # noqa: BLE001 — advisory; never a search failure
+        _log(f"budgeted routing metadata skipped: {type(exc).__name__}: {exc}")
+        return rows
+    if not flags:
+        return rows
+    for r in rows:
+        if r.get("kind") != "topic":
+            continue
+        flag = flags.get(str(r.get("id")))
+        if type(flag) is bool:
+            r["_routing_state_claim"] = flag
+    return rows
+
+
 def _hub_hits_budgeted(
     prompt: str,
     tokens: list[str],
@@ -2619,6 +2680,7 @@ def _hub_hits_budgeted(
     fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
     fused = _relevance_gate(fused, tokens)
     fused = apply_project_and_status(fused, project=project)
+    fused = _attach_hub_routing_state(fused, deadline=deadline)
 
     # Validity annotation (Phase 2, session B): one counts query for the
     # fused rows, reusing decisions.enrich_search_results (the exact same
@@ -2720,7 +2782,7 @@ def _row_date(row: dict[str, Any]) -> str:
     return str(ts)[:10] if ts else ""
 
 
-def _row_tag(row: dict[str, Any]) -> str:
+def _row_tag(row: dict[str, Any], mark: str | None = None) -> str:
     """Phase 2, session B: an episode line now shows its validity marker
     AFTER the project (``khipu.validity.annotate`` only ever sets an episode
     row's ``status`` when its state is not current, so this is a no-op for
@@ -2740,7 +2802,44 @@ def _row_tag(row: dict[str, Any]) -> str:
             bits.append(f"project {row['project']}")
         if status:
             bits.append(f"status {status}")
+    if mark is None:
+        mark = _imported_routing_mark(row)
+    if mark:
+        bits.append(mark)
     return " · ".join(bits)
+
+
+def _imported_routing_mark(row: dict[str, Any]) -> str:
+    """Advisory label when imported text still states routing Khipu owns.
+
+    Reads only text the hit actually carries (body, else snippet) through
+    ``routing_scanner.scan_text``. A clipped search snippet cannot prove a
+    claim past ``SNIPPET_LIMIT``: the teaser dropped that tail, and inventing
+    a mark from absent text would flag a note the hit does not carry.
+    Import-time metadata may attach ``_routing_state_claim``, which the
+    hit carries without exposing or rescanning the stored body.
+    Never writes the hit or the note file. A scanner exception omits the
+    mark and never breaks the prior-work block.
+    """
+    if str(row.get("kind") or "") != "topic":
+        return ""
+    from khipu.routing_scanner import SUPERSEDED_MARK, scan_text
+
+    try:
+        if type(row.get("_routing_state_claim")) is bool:
+            return SUPERSEDED_MARK if row["_routing_state_claim"] else ""
+        text = str(row.get("body") or row.get("snippet") or "")
+        if not text.strip():
+            return ""
+        source = ""
+        frontmatter = row.get("frontmatter")
+        if isinstance(frontmatter, dict):
+            source = str(frontmatter.get("note_source") or "")
+        if not source:
+            source = str(row.get("id") or "")
+        return SUPERSEDED_MARK if scan_text(source, text) else ""
+    except Exception:  # noqa: BLE001 — advisory; never sink prior work
+        return ""
 
 
 def _stale_line(stale: dict[str, Any]) -> str:
@@ -2761,25 +2860,50 @@ def render_block(hits: list[dict[str, Any]], *, produced: str = "", stale: dict[
 
     Drops whole trailing hit lines rather than mid-truncating one — same
     posture as recall_rule._fit_budget — so a rendered line is never cut
-    mid-word.
+    mid-word. Fits hits first, then advisory routing marks, so a mark can
+    never evict a hit that already fit.
     """
     if not hits and not produced:
         return ""
     from khipu.snippets import clip_snippet
 
-    out = [_HEADING]
+    heading = [_HEADING]
     if len(f"{_HEADING}\n{_FOOTER}") > BLOCK_CHAR_BUDGET:
         return ""
     if stale:
         line = _stale_line(stale)
-        if len("\n".join([*out, line, _FOOTER])) <= BLOCK_CHAR_BUDGET:
-            out.append(line)
+        if len("\n".join([*heading, line, _FOOTER])) <= BLOCK_CHAR_BUDGET:
+            heading.append(line)
+
+    def packed(lines: list[str]) -> int:
+        return len("\n".join([*lines, _FOOTER]))
+
+    fitted: list[tuple[dict[str, Any], str, str]] = []
+    lines = list(heading)
     for h in hits:
         snippet = clip_snippet(str(h.get("snippet") or h.get("label") or ""), 90)
-        line = f"- [{_row_tag(h)}] {snippet}"
-        if len("\n".join([*out, line, _FOOTER])) > BLOCK_CHAR_BUDGET:
+        tag = _row_tag(h, mark="")
+        line = f"- [{tag}] {snippet}"
+        if packed([*lines, line]) > BLOCK_CHAR_BUDGET:
             break
-        out.append(line)
+        lines.append(line)
+        fitted.append((h, snippet, tag))
+
+    def try_marks(mark_for) -> list[str] | None:
+        out = list(heading)
+        for h, snippet, tag in fitted:
+            mark = mark_for(h)
+            line = f"- [{tag} · {mark}] {snippet}" if mark else f"- [{tag}] {snippet}"
+            out.append(line)
+        if packed(out) <= BLOCK_CHAR_BUDGET:
+            return out
+        return None
+
+    out = try_marks(_imported_routing_mark)
+    if out is None:
+        out = try_marks(lambda h: "superseded" if _imported_routing_mark(h) else "")
+    if out is None:
+        out = lines
     if produced:
         remaining = BLOCK_CHAR_BUDGET - len("\n".join([*out, _FOOTER])) - 1
         if remaining > 1:
