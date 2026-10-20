@@ -2133,36 +2133,13 @@ def _cosine_candidates(
             # W2.3 fix: metadata filters ride the candidate SQL, so the
             # oversample is drawn from rows that already satisfy them (they
             # used to be applied only after fusion had picked ~50 rows).
-            filter_clause = ""
             filter_params: dict[str, Any] = {}
             episode_flags = _episode_schema_flags(cur)
             episode_live = " AND e.deleted_at IS NULL" if episode_flags["deleted_at"] else ""
-            live_source_clause = (
-                "  AND ((m.kind = 'topic' AND EXISTS (SELECT 1 FROM topics t "
-                "WHERE t.slug = m.ref AND t.deleted_at IS NULL)) "
-                "OR (m.kind = 'episode' AND EXISTS (SELECT 1 FROM episodes e "
-                f"WHERE e.id::text = m.ref{episode_live})) "
-                "OR m.kind NOT IN ('episode', 'topic'))\n"
-            )
-            if filters is not None and filters.active:
+            filtered = filters is not None and filters.active
+            if filtered:
                 filters.expand_project(cur)
                 filter_params = filters.params
-                ep = (
-                    "(m.kind = 'episode' AND EXISTS (SELECT 1 FROM episodes e"
-                    f" WHERE e.id::text = m.ref AND ({filters.episode_sql(cur, 'e')})))"
-                )
-                if filters.episode_only:
-                    filter_clause = f"  AND {ep}\n"
-                else:
-                    tp = (
-                        "(m.kind = 'topic' AND EXISTS (SELECT 1 FROM topics t"
-                        f" WHERE t.slug = m.ref AND ({filters.topic_sql('t')})))"
-                    )
-                    other = "TRUE" if filters.media_allowed else "FALSE"
-                    filter_clause = (
-                        f"  AND ({ep} OR {tp}"
-                        f" OR (m.kind NOT IN ('episode', 'topic') AND {other}))\n"
-                    )
             api_q = prefix_query(query) if uses_task_prefixes(profile) else query
             _t0 = time.monotonic()
             qvec, cache_state = _query_vec(cur, conn, profile, api_q)
@@ -2177,10 +2154,13 @@ def _cosine_candidates(
             _t0 = time.monotonic()
             cur.execute("SELECT to_regclass('public.media_assets') IS NOT NULL")
             has_media = bool(cur.fetchone()[0])
-            media_label = (
-                "(SELECT COALESCE(a.path, m.chunk_text) FROM media_assets a WHERE a.id = m.ref)"
-                if has_media
-                else "m.chunk_text"
+            if not filtered:
+                _tune_hnsw(cur, fetch)
+            sql = _cosine_sql(
+                vcast, filters if filtered else None, kind=kind,
+                episode_live=episode_live, has_media=has_media,
+                episode_filter=filters.episode_sql(cur, "e") if filtered else "",
+                topic_filter=filters.topic_sql("t") if filtered else "",
             )
             # Teasers stay at FETCH_LIMIT. RRF rank_text uses CHUNK_CHARS so
             # extract fields appended after a long summary are not clipped off
@@ -2188,26 +2168,7 @@ def _cosine_candidates(
             # on long summaries; CHUNK_CHARS covers all single-chunk episode
             # embeddings today).
             cur.execute(
-                f"""
-                SELECT m.kind, m.ref, m.chunk_idx,
-                       1 - (m.embedding::{vcast} <=> %(q)s::{vcast}) AS score,
-                       left(m.chunk_text, %(fetch)s) AS snippet,
-                       left(m.chunk_text, %(rank_fetch)s) AS rank_src,
-                       CASE m.kind
-                         WHEN 'topic' THEN
-                           (SELECT COALESCE(t.title, t.slug) FROM topics t WHERE t.slug = m.ref)
-                         WHEN 'media' THEN
-                           {media_label}
-                         ELSE
-                           (SELECT e.summary FROM episodes e WHERE e.id::text = m.ref)
-                       END AS label
-                FROM memory_embeddings m
-                WHERE m.profile = %(p)s
-                  AND m.kind != 'commitment'
-                  AND (%(kind)s::text IS NULL OR m.kind = %(kind)s)
-                {live_source_clause}{filter_clause}    ORDER BY m.embedding::{vcast} <=> %(q)s::{vcast}
-                LIMIT %(lim)s
-                """,
+                sql,
                 {"q": qlit, "p": profile, "kind": kind, "lim": fetch,
                  "fetch": FETCH_LIMIT, "rank_fetch": CHUNK_CHARS, **filter_params},
             )
@@ -2227,6 +2188,109 @@ def _cosine_candidates(
     if timing is not None:
         timing["cosine_ms"] = round((time.monotonic() - _t0) * 1000, 1)
     return out
+
+
+def _tune_hnsw(cur, fetch: int) -> None:
+    """Widen the HNSW scan for this transaction (swarm-ready slice 3).
+
+    ``ef_search`` defaults to 40, which caps how many rows an index scan can
+    return before liveness joins drop some; iterative scan (pgvector 0.8+)
+    keeps scanning until the limit is met. Relaxed order can return rows
+    slightly out of order, which the SQL's outer re-sort by exact distance
+    absorbs. ``set_config`` on an unknown custom GUC never aborts the
+    transaction, so an older pgvector or a scratch database is harmless.
+    """
+    ef = min(1000, max(100, 2 * int(fetch)))
+    try:
+        cur.execute("SELECT set_config('hnsw.ef_search', %s, true)", (str(ef),))
+        cur.execute("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+        row = cur.fetchone()
+        ver = str(row[0]) if row and isinstance(row[0], str) else ""
+        nums = [int(x) for x in re.findall(r"\d+", ver)[:2]]
+        if nums and tuple(nums) >= (0, 8):
+            cur.execute("SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true)")
+    except Exception:  # noqa: BLE001 — tuning is best-effort; never fail a search over it
+        pass
+
+
+def _cosine_sql(
+    vcast: str, filters: "_SearchFilters | None", *, kind: str | None,
+    episode_live: str, has_media: bool, episode_filter: str, topic_filter: str,
+) -> str:
+    """The cosine-candidate statement: one branch per source kind, re-sorted.
+
+    The old statement tested liveness and the project filter with ``EXISTS``
+    subqueries nested in one ``OR`` across kinds, so the planner re-scanned
+    ``episodes`` once per matching vector (5.4M sequential scans on the hub).
+    Each branch now joins only its own table. Each orders by distance with the
+    full limit and the outer query re-sorts and limits again, which keeps the
+    global ordering exact. Commitments stay excluded.
+
+    Filtered branches avoid the HNSW index (``+ 0`` on the ordering key): the
+    index would filter after the scan and starve the limit. They hash-join the
+    matching ids, computed once in a materialized CTE, and sort exactly.
+    """
+    dist = f"m.embedding::{vcast} <=> %(q)s::{vcast}"
+    cols = (
+        "m.kind, m.ref, m.chunk_idx, "
+        f"1 - ({dist}) AS score, "
+        "left(m.chunk_text, %(fetch)s) AS snippet, "
+        "left(m.chunk_text, %(rank_fetch)s) AS rank_src"
+    )
+    filtered = filters is not None
+    order = f"({dist}) + 0" if filtered else dist
+    branches: list[str] = []
+    ctes: list[str] = []
+    kind_ok = "(%(kind)s::text IS NULL OR m.kind = %(kind)s)"
+    if kind in (None, "episode"):
+        if filtered:
+            ctes.append(
+                "ep AS MATERIALIZED (SELECT e.id::text AS ref, e.summary FROM episodes e"
+                f" WHERE TRUE{episode_live} AND ({episode_filter}))"
+            )
+            frm = "memory_embeddings m JOIN ep ON ep.ref = m.ref"
+            label = "ep.summary"
+            live = ""
+        else:
+            frm = "memory_embeddings m JOIN episodes e ON e.id::text = m.ref"
+            label = "e.summary"
+            live = episode_live
+        branches.append(
+            f"(SELECT {cols}, {label} AS label, ({dist}) AS dist FROM {frm}"
+            f" WHERE m.profile = %(p)s AND m.kind = 'episode'{live} AND {kind_ok}"
+            f" ORDER BY {order} LIMIT %(lim)s)"
+        )
+    if kind in (None, "topic") and not (filtered and filters.episode_only):
+        extra = f" AND ({topic_filter})" if filtered else ""
+        branches.append(
+            f"(SELECT {cols}, COALESCE(t.title, t.slug) AS label, ({dist}) AS dist"
+            " FROM memory_embeddings m JOIN topics t ON t.slug = m.ref"
+            " WHERE m.profile = %(p)s AND m.kind = 'topic' AND t.deleted_at IS NULL"
+            f"{extra} AND {kind_ok} ORDER BY {order} LIMIT %(lim)s)"
+        )
+    if kind not in ("episode", "topic") and not (filtered and not filters.media_allowed):
+        if has_media:
+            frm = "memory_embeddings m LEFT JOIN media_assets a ON a.id = m.ref"
+            label = "CASE WHEN m.kind = 'media' THEN COALESCE(a.path, m.chunk_text) END"
+        else:
+            frm = "memory_embeddings m"
+            label = "CASE WHEN m.kind = 'media' THEN m.chunk_text END"
+        branches.append(
+            f"(SELECT {cols}, {label} AS label, ({dist}) AS dist FROM {frm}"
+            " WHERE m.profile = %(p)s AND m.kind NOT IN ('episode', 'topic', 'commitment')"
+            f" AND {kind_ok} ORDER BY {order} LIMIT %(lim)s)"
+        )
+    if not branches:
+        return "SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL WHERE FALSE"
+    head = f"WITH {', '.join(ctes)} " if ctes else ""
+    return (
+        f"{head}SELECT kind, ref, chunk_idx, score, snippet, rank_src, label FROM ("
+        + " UNION ALL ".join(branches)
+        # ``dist + 0`` forces a real sort over the union: with
+        # hnsw.iterative_scan = relaxed_order a branch can emit rows slightly
+        # out of order, and a Merge Append on plain ``dist`` would trust it.
+        + ") u ORDER BY dist + 0 LIMIT %(lim)s"
+    )
 
 
 def semantic_search(

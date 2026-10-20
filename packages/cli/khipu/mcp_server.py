@@ -771,7 +771,7 @@ TOOLS: list[dict] = [
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
         "description": (
             "How much of each subscription plan is left, per configured "
-            "account (Claude, Codex, Grok, Muse): plan, windows (name, "
+            "account (Claude, Codex, Grok, Muse, GLM): plan, windows (name, "
             "used_pct, resets_at), credits, probed_at, ok/error, stale. Read "
             "from each CLI with the login it already holds; no model call, no "
             "tokens spent. Answers at once from the cache and refreshes in "

@@ -122,9 +122,10 @@ describe("keyStatus (pure)", () => {
 });
 
 describe("KeysCard", () => {
-  it("lists the five keys with what uses them and says Keychain once", () => {
+  it("lists the six keys with what uses them and says Keychain once", () => {
     renderKeys({ ...NONE, gemini_in_keychain: true }, { result: okResult, checkedAt: Date.now() - 120_000 });
-    expect(screen.getAllByRole("listitem")).toHaveLength(5);
+    expect(screen.getAllByRole("listitem")).toHaveLength(6);
+    expect(within(rowOf("GLM Coding Plan")).getByText("Optional, not stored")).toBeTruthy();
     expect(screen.getByText("Summaries, the fallback and search by meaning")).toBeTruthy();
     expect(screen.getByText("Works, checked 2 min ago")).toBeTruthy();
     expect(screen.getAllByText(/login Keychain/)).toHaveLength(1);

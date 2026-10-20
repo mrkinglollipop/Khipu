@@ -893,7 +893,7 @@ fn checked_work_projects(raw: &str) -> Result<String, String> {
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
-const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse"];
+const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse", "glm"];
 const USAGE_ACCOUNTS_MAX: usize = 32;
 /// Settings -> Routing (routing truth phase 4): the sizes, times and switches
 /// the page offers, each `config --set KEY VALUE` or `config --unset=KEY`
@@ -1162,7 +1162,7 @@ fn checked_usage_accounts_kept(raw: &str, stored: &[Value]) -> Result<String, St
             .to_lowercase();
         if !USAGE_HARNESSES.contains(&harness.as_str()) {
             return Err(format!(
-                "usage_accounts entry {n}: harness must be claude, codex, grok or muse"
+                "usage_accounts entry {n}: harness must be claude, codex, grok, muse or glm"
             ));
         }
         clean.insert("harness".to_string(), serde_json::Value::String(harness));
@@ -1640,7 +1640,7 @@ fn checked_usage_harness(raw: &str) -> Result<String, String> {
     if USAGE_HARNESSES.contains(&h.as_str()) {
         Ok(h)
     } else {
-        Err("harness must be claude, codex, grok or muse".to_string())
+        Err("harness must be claude, codex, grok, muse or glm".to_string())
     }
 }
 
@@ -1660,13 +1660,13 @@ fn accounts_check_argv(folder: &str) -> Result<Vec<String>, String> {
 }
 
 /// One read of an account that is not saved (the dialog's step 3). No folder
-/// is the CLI's default login; Muse takes none.
+/// is the CLI's default login; Muse and GLM take none.
 fn accounts_try_argv(harness: &str, folder: Option<&str>) -> Result<Vec<String>, String> {
     let h = checked_usage_harness(harness)?;
     let mut argv = vec!["usage".to_string(), "--try".to_string(), format!("--harness={h}")];
     if let Some(f) = folder.map(str::trim).filter(|f| !f.is_empty()) {
-        if h == "muse" {
-            return Err("Muse has one sign-in, so it takes no login folder".to_string());
+        if h == "muse" || h == "glm" {
+            return Err(format!("{} has one sign-in, so it takes no login folder", if h == "glm" { "GLM" } else { "Muse" }));
         }
         argv.push(format!("--folder={}", checked_login_folder(f)?));
     }
@@ -1991,7 +1991,7 @@ fn checked_harness(raw: &str) -> Result<String, String> {
     if USAGE_HARNESSES.contains(&h.as_str()) {
         Ok(h)
     } else {
-        Err("harness must be claude, codex, grok or muse".to_string())
+        Err("harness must be claude, codex, grok, muse or glm".to_string())
     }
 }
 
@@ -4032,6 +4032,7 @@ const SETTABLE_SECRETS: &[&str] = &[
     "database_url",
     "openai_compat_api_key",
     "voyage_api_key",
+    "glm_api_key",
 ];
 
 #[tauri::command]
@@ -5257,6 +5258,7 @@ mod settable_secrets_tests {
                 "database_url",
                 "openai_compat_api_key",
                 "voyage_api_key",
+                "glm_api_key",
             ]
         );
     }
@@ -7348,6 +7350,8 @@ mod accounts_command_tests {
             assert!(accounts_try_argv(bad, None).is_err(), "accepted harness {bad:?}");
         }
         assert!(accounts_try_argv("muse", Some("~/.muse")).is_err());
+        assert!(accounts_try_argv("glm", Some("~/.claude-glm")).is_err());
+        assert_eq!(accounts_try_argv("glm", None).unwrap(), v(&["usage", "--try", "--harness=glm"]));
         for bad in ["-x", "--folder=/x", "relative/folder", "~/.claude\n--now", ".claude-x"] {
             assert!(accounts_try_argv("claude", Some(bad)).is_err(), "accepted folder {bad:?}");
         }
