@@ -472,7 +472,7 @@ def clean_text(value: Any, cap: int) -> str | None:
 # and ends in a file extension. So "a/b/c" and "source/private.txt" are paths;
 # "CI/CD", "and/or" and "3/4" are not. A link's own path is not a local path:
 # links are cut out first.
-_ACCOUNT_KEY = re.compile(r"(?i)(?<![\w-])(?:claude|codex|grok|muse)\|")
+_ACCOUNT_KEY = re.compile(r"(?i)(?<![\w-])(?:claude|codex|grok|muse|glm)\|")
 _PATH_SHAPE = re.compile(r"^~(?:[/\\]|[A-Za-z_]|$)|^\.{1,2}[/\\]|^[/\\](?=[\w.~-])|[^\w.-][/\\]"
                          r"|[A-Za-z]:[/\\]|[/\\].*[/\\]|[/\\][^/\\]*\.[A-Za-z0-9]+$")
 _WRAP_OPEN = "\"'`([{<"

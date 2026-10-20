@@ -378,7 +378,7 @@ export function midSentence(reason: string): string {
   return reason;
 }
 
-const CLI_NAMES: Record<string, string> = { claude: "Claude", codex: "Codex", grok: "Grok", muse: "Muse" };
+const CLI_NAMES: Record<string, string> = { claude: "Claude", codex: "Codex", grok: "Grok", muse: "Muse", glm: "GLM" };
 
 function cliName(harness: string): string {
   return CLI_NAMES[harness] ?? harness;

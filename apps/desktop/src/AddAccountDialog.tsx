@@ -220,7 +220,7 @@ function candidateCheckSummary(cli: CliId, candidates: Candidate[]): string {
 const DEFAULT_HOME: Record<string, string> = { claude: "~/.claude", codex: "~/.codex", grok: "~/.grok" };
 
 function folderOf(c: Candidate): string | null {
-  return c.default || c.cli === "muse" ? null : c.path;
+  return c.default || c.cli === "muse" || c.cli === "glm" ? null : c.path;
 }
 
 // ---------------------------------------------------------------------------
@@ -770,7 +770,7 @@ export function AddAccountDialog({
       const newErr = newName.trim() ? nameProblem(newName, false, takenNames) : null;
       body = (
         <SignInNewAccount
-          cli={cli}
+          cli={cli as Exclude<CliId, "glm">}
           cliName={cliName(cli)}
           accountName={newName.trim()}
           offered

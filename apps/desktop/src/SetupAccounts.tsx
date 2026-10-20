@@ -55,7 +55,7 @@ function foundRowOf(c: Candidate): FoundRow {
   return {
     harness: c.cli,
     account: suggestedName(c),
-    home: c.default || c.cli === "muse" ? null : c.path,
+    home: c.default || c.cli === "muse" || c.cli === "glm" ? null : c.path,
     ok: c.state === "signed_in",
     error: c.state === "not_signed_in" ? "not_signed_in" : c.state === "couldnt_check" ? (c.reason ?? "no_answer") : null,
     plan: c.plan,
@@ -70,7 +70,7 @@ function isFound(r: UsageAccount): r is FoundRow {
 
 /** A found login's name and line, as the setup mock words them. */
 function foundWords(c: Candidate): { name: string; line: string; tone: "ok" | "warn" | null } {
-  const where = c.cli === "muse" ? "Muse" : c.default ? "Default login" : c.path ?? "Its folder";
+  const where = c.cli === "muse" ? "Muse" : c.cli === "glm" ? "GLM" : c.default ? "Default login" : c.path ?? "Its folder";
   if (c.state === "signed_in") {
     const conv = c.conversations_7d ? ` ${plural(c.conversations_7d, "conversation", "conversations")} this week ran on it.` : "";
     return {
@@ -723,7 +723,7 @@ export function SetupAccountsStep({ active, onBack, onNext }: { active: boolean;
               // A default login's line names it, as the setup mock does.
               const line = fw
                 ? { text: fw.line, tone: fw.tone }
-                : !r.home && r.harness !== "muse"
+                : !r.home && r.harness !== "muse" && r.harness !== "glm"
                   ? { text: `Default login: ${read.text.charAt(0).toLowerCase()}${read.text.slice(1)}`, tone: read.tone }
                   : read;
               const name = fw ? fw.name : r.account || cliTitle(r.harness);
