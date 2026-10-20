@@ -1,0 +1,14 @@
+-- Index on episodes((id::text)). The memory cosine search matches an
+-- embedding's text ref to its episode with e.id::text = m.ref; with no index
+-- every match was a sequential scan of episodes (5.4 million of them since
+-- 2026-08-17). Scope: docs/plans/2026-10-19-swarm-ready.md, slice 1.
+--
+-- Built CONCURRENTLY so captures keep writing, which cannot run inside a
+-- transaction: the runner executes the step below in autocommit
+-- (khipu/migrate.py). A hub that already has this index, built by hand on
+-- 2026-10-20, is adopted without a rebuild when the definition matches;
+-- an invalid leftover is rebuilt; a different definition stops the run.
+-- The step is the file's last, so the runner records the version with it.
+-- khipu:step autocommit
+-- khipu:expect CREATE INDEX idx_episodes_id_text ON public.episodes USING btree (((id)::text))
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_episodes_id_text ON episodes ((id::text));
