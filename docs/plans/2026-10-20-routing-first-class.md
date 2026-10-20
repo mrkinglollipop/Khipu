@@ -38,8 +38,9 @@ work on 2026-10-14..20. Every one comes from one of three gaps:
 | Memory files and CLAUDE.md held their own routing state, and it contradicted Khipu | 3 | 13 |
 
 Khipu still reports and never routes (routing-truth decision 1, standing rule 7). Every check here is
-advisory. No routing warning or advisory mark ever feeds the promotion gate (`khipu promote`) or a dispatch
-decision. A red health check means Khipu's delivery failed; it is a health fact, never a gate on work or on
+advisory. Khipu itself never enforces a routing warning or advisory mark: none feeds the promotion gate
+(`khipu promote`), and none stops a dispatch. A runner or conversation may choose to act on `advise`
+(section 13); that is its own launch policy. A red health check means Khipu's delivery failed; it is a health fact, never a gate on work or on
 content. An unmatched lane, for example, is red as health and changes nothing about what may run.
 
 ## 1. Identity: one record across Macs
@@ -645,7 +646,7 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 7c | T3: a Claude Code to Codex switch in one thread keeps one ledger; a T3 child without Khipu's hooks is named in doctor | received context | 8c |
 | 8 | Providers: `glm` and `deepseek` added as facts match by name; a two-account provider and a name claimed twice stay unmatched with candidates | hermetic | 9a |
 | 9 | The `http-quota` adapter: a redirect is refused; the sentinel key is absent from every channel | hermetic | 9b |
-| 10 | An Opus dispatch with `task: fix-round` gets the rule 12 line with its result; a Sonnet one gets nothing; the hook never denies | hermetic | 10 |
+| 10 | An Opus dispatch with `task: fix-round` gets the rule 12 line with its result; a Sonnet one gets nothing; the hook never denies. Rule hygiene: a rule saying "until Saturday" gets the move-to-role flag, a passed one the expired flag; two overlapping rules and a role restating a rule are flagged; a 25-hour-old pending edit is listed with its owner direction; no owner word changes | hermetic | 10 |
 | 11a | Account migration: an old salted id resolves within 90 days and fails explicitly after; a restored log keeps the start; a rename forwards; a duplicate label is refused; an old local log folds unchanged | hermetic | 3a |
 | 11b | Event identity: two Macs adding a rule at once keep both, numbers pending until the hub orders them; a numeric target on a pending number is refused with the uuid; an `op` retry returns the first result; a `hold_end` before its `hold` applies on arrival | hermetic | 3b |
 | 12 | Two Macs (two HOMEs, test hub): opposite arrival order, a skewed clock, a duplicate upload, an interrupted sync, a restore with a new Mac id; probe limits, runner limits, reopening, renewals, source silence and clock-only expiry fold the same on both; an unchanged cached reading never renews; "not installed on Mac B" leaves the account open on Mac A | hermetic | 11a, 11b |
@@ -655,9 +656,11 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 16a | Pace inputs: the extractor's sentinel tests; `pace_fixture_v1` rejects any other key; relative, rounded and repeated readings never become fresh samples; two Macs' samples with the same time and different values, a skewed clock, and different reset times merge to identical buckets in opposite arrival orders; two-minute samples over 24 h make consecutive buckets, not one cluster; a late reading changes only what it would have changed on time; 95% then 1% within 150 s is a possible reset, settled by the next readings either way; an earlier replacement `resets_at` carried by fresh readings wins over stale metadata | hermetic | 4Pa |
 | 16b | Pace results: Codex's gap example gives 1 point an hour; (−6 h, 0%), (6 h, 6%), (24 h, 15%) computes 12, not 15, but is `unknown` with `observed_pct` 0%; readings every 30 minutes at 0.5 an hour give 12 with 100%; Codex's aging-out case crosses 13 at 1.109 minutes (exact walk) with `peak_pct` 13.026 at 4 minutes, where a 15-minute scan would miss it; cycle grouping, each case in every arrival order: 14:59 and 30:01 with no middle reading form one cycle; 14:59, 15:00, 30:00, 45:00 and 60:01 (a 45 min 02 s span) form one cycle and are not ambiguous; R, R + 4 min and R + 8 min form one cycle; 14:59, 29:59 and 30:01 form one cycle; a component spanning more than 1 h gives `unknown` with "reset time spread over more than an hour"; two resets 5 h apart are two cycles; a reusable provider window id ("weekly") on two successive resets gives two cycles, and a unique provider cycle id groups its readings; mixed readings with and without ids group as specified; a daily cap 2 h from its crossing is the headline over a plan run-out 120 h away; a reset inside the day contributes zero across its interval and no interpolated drop; a steady 0.5 an hour against a daily cap of 13 gives near with no time; a rising rate gives a `reaches_cap_at` that accounts for usage aging out; long gaps lower `observed_pct` and mark the line gappy; synthetic outpace, underpace and on-pace; a reset mid-window; a correction drop; a possible-reset drop later confirmed and later refuted; coverage below the floor gives `unknown` with its reason; zero burn; limit and cap already reached; a reset time passed; a share cap and a daily cap together, carried apart in the schema; the sanitized real history within its `t_err` | hermetic | 4Pb |
 | 16c | Pace pushes: a five-hour run-out moving from 1 h to 10 min while still outpacing pushes; readings alternating at 59 min 59 s and 60 min 01 s push once; a rate hovering at 1.15 n doesn't flip the verdict; a change of limiting window, cycle, cap revision or availability pushes; small moves measured against the last acknowledged forecast push once they add up; numbers alone don't push | hermetic | 4Pa |
-| 17a | Discovery: a Claude Code home whose settings point at api.z.ai is offered as GLM, not Claude; a folder holding only `worktrees` is not offered; three Grok homes on one subscription are one account with three bindings; a lane with `budget_account` matches with no `routing_lane_map`, and a tier lane matches its declared account | hermetic | 9a, 9c |
-| 17b | Advise: a `pace_target` 65% with 5 slack at 18% used 11 h into the week answers `hold_back` for jobs and `go` for the orchestrator's own turns; a `spend` of $35 at $35.10 answers `hold_back`; a `concurrency` 1 with one running answers `hold_back`; figures 2 h old answer `go` with that reason; nothing is blocked | hermetic | 17a |
-| 17c | A direction that never reached Khipu: an owner prompt "use GLM only one job at a time" with no routing write opens one owed item naming the words; a routing write closes it; a runner config with a cap Khipu lacks is flagged | hermetic | 19 |
+| 17a | Discovery: a Claude Code home pointing at api.z.ai is offered as GLM; a settings file with a sentinel auth token never shows it anywhere; a folder holding only `worktrees` is not offered; three Grok homes are one account only when the CLI's account status agrees, otherwise separate candidates an owner can merge; auto-track off survives a restart. Lanes: `budget_account` matches with no `routing_lane_map`; contradictory declarations stay unmatched; a lane report on a declared lane is accepted; a declaration is `claimed` until a reading confirms it | hermetic | 9a, 9c |
+| 17b | Advise: a `pace_target` of 65% with 5 slack at 18% used 11 h into the week (allowance 9.26%) answers `hold_back` for `job` and `go` for `orchestration` from an undispatched attachment, and `hold_back` for a dispatched job claiming `orchestration`; zero current burn is still `hold_back` while ahead; recovery needs 1 point under the allowance; a `spend` of $35 at $35.10 and a full `concurrency` 1 answer `hold_back`; expired telemetry answers `go` with `evidence: unknown`; a pause answers `closed` for both purposes | hermetic | 17a, 17c |
+| 17d | Owner direction end to end: an eligible conversation in Claude Code, Codex and Grok Build applies a cap, a rule edit and a priority through `khipu_owner_act`; each is live without a terminal, logged with its undo, and refused from a dispatched job | hermetic | 5, 17a |
+| 17e | Telemetry: duplicate spend records count once; two runners' active jobs sum; a silent runner's records expire to `unknown`; a lane's spend with no resolvable account is unattributed, never guessed | hermetic | 17t |
+| 17c | Directions: "use GLM only one job at a time" typed by the owner with no matching owner action opens one owed item naming the words; an unrelated routing write leaves it open; the matching cap closes it; a question, a quote and a job prompt open nothing; two directions with one written leave one open; a dismissal survives the next capture; a runner cap with no Khipu fact is flagged | hermetic | 19a, 19b |
 
 ## 13. Amendment, 2026-10-20 afternoon: routing that runs the day
 
@@ -692,76 +695,124 @@ What went wrong that day:
 - Slice 1's fixes merged as #260 but were not live: this Mac ran #243 until the next promote, so the push
   still said "too long to show here".
 
-**A. Usage budgets and launch advice** (slices 17a, 17b). Section 2a's caps gain three kinds, all owner
-facts confirmed once, never read from prose:
-- `pace_target {pct, slack}`: stay within `slack` points of an even pace toward `pct` of the window by its
-  reset. This is the main account's guard: 65% with 5 points of slack.
-- `spend {usd, days}`: a money ceiling over a rolling period, for metered providers (DeepSeek: $35 a rolling
-  7 days). It is measured from the provider's own usage readout or the runner's spend lines, never estimated
-  from tokens.
-- `concurrency {n}`: at most n jobs at once (GLM's Lite plan: one request at a time). It is measured from the
-  runner's running counts.
+**A. Usage budgets and launch advice** (slices 17t, 17a, 17c, 17b).
 
-  The window share (91% of the week, 60% of the five hours) is section 2a's `share`.
+*Telemetry first* (slice 17t). Khipu can only judge what it sees, so the runner heartbeat contract gains two
+typed, timestamped records, each attributed to an account through the resolver in B:
+- `active {lane, account, jobs, at}`: jobs running on a lane right now. They expire at the runner's silent
+  deadline. For GLM, one job is one request at a time, because its runner sends a job's requests in turn.
+  The record says `unit: job` so a later runner can report requests instead.
+- `spend {provider, account, usd, at, job}`: deduplicated on `job`. Totals sum across runners and Macs
+  (section 7). The record says how much of the period it covers.
 
-`khipu route advise` (and an `advice` field per account in `khipu_route`) answers for a lane, an account, or
-a tier and kind (`--tier opus|sonnet|haiku`, `--privacy`, `--kind build|fix|check`): `go`, `hold_back` or
-`closed`, each with its reason in words and the numbers behind it. It stays advisory (rule 7). Khipu never
-launches or blocks anything; a runner or conversation that asks decides for itself. This amends section
-2a's "Khipu still returns no pick": `advise` ranks what is open in the owner's priority order and says why,
-and is still not a gate.
-- **`hold_back`** when a cap is reached or crosses within the hour at the trailing average, when the pace
-  verdict is outpacing against a `pace_target`, or at a `concurrency` limit. It never applies to the
-  orchestrator's own turns: an account whose priority role says it orchestrates is `hold_back` for jobs only.
-- **`closed`** when the account is limited, paused or held.
-- **Unknown figures** answer `go` with the reason "figures 2 h old". A runner that wants to fail closed says
-  so in its own config.
-- **A change of advice** for an account in the conversation's priority is pushed under section 2a's push
-  rules.
+Missing or expired coverage is `unknown`, never zero.
 
-Slice 17b moves the Church Harness runner's `account_budget_ok` to call `khipu route advise`, and writes its
-numbers into Khipu as caps by owner direction. Its lanes config keeps only how each lane launches. That
-change is a PR in church-harness, with Matt's go.
+*Cap kinds* (slice 17a). Section 2a's caps gain three kinds. Each is an owner fact, confirmed once and never
+read from prose.
+- **`pace_target {pct, slack}`**, a limit on how far ahead of an even pace an account may run.
+  - **Allowance:** at a time e into a window of length W, the allowance is `pct · e / W + slack`. At 11 hours
+    into the week, a target of 65% with 5 points of slack allows 65·11/168 + 5 ≈ 9.26%.
+  - **Ahead:** the account is `ahead` when used > allowance, whatever its current burn. It recovers once
+    used ≤ allowance − 1 (one point of hysteresis).
+  - **Unknown:** with no reset time or no reading, the verdict is `unknown`.
+  - **Separate from the forecast:** being ahead is reported apart from section 2a's forecast verdict, and
+    both carry their own tests.
+- **`spend {usd, days}`**: the 17t spend total over the rolling period against `usd`. If the period isn't
+  covered, it is `unknown`.
+- **`concurrency {n}`**: 17t's active jobs against `n`. If the record has expired, it is `unknown`.
 
-**B. Runner identity, so lanes match on any Mac** (slice 9a, extended). A lane matches its account by, in
-order:
-1. **The runner's declared identity:** `account` (a Khipu account id or label) or `budget_account` (the
-   provider and login-home key), validated against the tracked accounts.
-2. **The provider and the lane's login home,** resolved through slice 3a's local bindings.
-3. **Its name** (decision 3), as today.
+The window share (91% of the week, 60% of the five hours) is section 2a's `share`.
 
-Ambiguity never matches. A tier lane (`main-sonnet`) is the same account as `main` because it says so, not
-because of its name. `routing_lane_map` stays only as an override. The runner heartbeat contract documents
-the field, and an unmatched lane's health row names the field to add. A new user's runner then needs no
-per-Mac map.
+*Advice* (slice 17c). `khipu route advise` and an `advice` object per account in `khipu_route`.
+- **The request** names a lane, an account, or a tier and kind: `--tier opus|sonnet|haiku`, `--privacy`,
+  `--kind build|fix|check`, and `--purpose job|orchestration`.
+  - `purpose` defaults to `job`.
+  - `orchestration` is accepted only from an attachment that is not a dispatched job. Capture lineage
+    already marks dispatched jobs (`CLAUDE_DISPATCHED_LANE`, the delegation hooks' child identities), and a
+    job that claims `orchestration` is answered as a `job`.
+- **The answer:** `go`, `hold_back` or `closed`, each with its reason, its numbers, and an `evidence` field
+  (`fresh`, `stale`, `unknown`).
+  - **`closed`:** a limit, a pause or a hold, for every purpose.
+  - **`hold_back`:** for `job` only, when a cap is reached, a `pace_target` is ahead, a `spend` cap is
+    reached, a `concurrency` cap is full, or a cap crosses within the hour at the trailing average.
+    `orchestration` is exempt from pacing, never from `closed`.
+  - **Unknown evidence:** the answer is `go` with that evidence status, so the consumer can apply its own
+    policy.
+- **Ranking:** `advise` ranks what is open in the owner's priority order and says why. It replaces section
+  2a's "Khipu still returns no pick" with advice that nothing is obliged to follow.
+- **Pushes:** a change of advice for an account in the conversation's priority is pushed under section 2a's
+  push rules.
+
+*The Church Harness runner* (slice 17b, in church-harness, with Matt's go). Its numbers are converted, not
+copied:
+- the main account's 91% becomes a `share` of 91% on the week;
+- its even pace toward 65% with 5 points of slack becomes a `pace_target`;
+- its five-hour 60% becomes a `share` on that window.
+
+Each is written to Khipu by owner direction. The runner keeps its local lane `cap` as capacity on this Mac,
+which is not a quota. Every budget consumer (`lane_status`, `lane_report`, `budget_check`) calls `advise`
+instead of its own arithmetic. The runner keeps its own fail-closed policy for missing, stale, timed-out or
+malformed advice.
+
+**B. Runner identity, so lanes match on any Mac** (slice 9a, extended).
+- **One resolver** serves evidence, `report()` (which today refuses any lane missing from the hand-written
+  map, `routing.py:3913`), and health. It resolves in this order:
+  1. the owner's override (`routing_lane_map`);
+  2. the runner's declaration: `account` and/or `budget_account`, when every field it gives agrees with the
+     others and with the provider and login-home binding of slice 3a;
+  3. the provider and login home alone;
+  4. the name (decision 3).
+- **Conflicts never match.** Contradictory fields, a label two accounts share, or a stale binding leave the
+  lane unmatched, with candidates.
+- **Claimed, then confirmed.** A declaration is `claimed` until a limit or usage reading from that lane agrees
+  with the account. After that it is `confirmed`, and both states show in health.
+- **Tier lanes** (`main-sonnet`) match by declaration, not by name.
+- The heartbeat contract documents these fields. An unmatched lane's health row names the field to add.
 
 **C. Discovery offers only real logins, and one subscription is one account** (slice 9c).
-- **Claude Code homes pointed at another provider:** a home whose `settings.json` env sets
-  `ANTHROPIC_BASE_URL` to another provider's host (api.z.ai, api.deepseek.com) is offered as that provider,
-  never as a Claude login. Only the host is read, never a key.
-- **Login evidence required:** a folder is offered only with evidence of a login (an auth file, or
-  `.claude.json` naming an account), never on its name alone.
-- **Several homes signed into one subscription** resolve to one account with several local bindings, matched
-  on the account identity the CLI reports. Its usage is then never split or counted twice.
-- **Auto-tracking defaults to on** for new installs (decision 15), and the owner can turn it off. This Mac
-  was switched on by owner direction on 2026-10-20.
+- **Provider-pointed homes.**
+  - **One permitted read:** a bounded local parser may open a Claude Code home's `settings.json`. Its only
+    output is a validated hostname from `env.ANTHROPIC_BASE_URL`: no userinfo, path or query, from an
+    allow-list of provider hosts.
+  - **Nothing else survives:** every other byte is dropped in that function. A parse failure is recorded as
+    `unreadable`, never with its error text. No log, cache, model or replication ever sees the raw settings.
+    Today's rule that discovery opens no files inside a login home (`discover.py:27`) gains this one named
+    exception.
+  - **Tested with sentinels:** a settings file holding a sentinel token in `ANTHROPIC_AUTH_TOKEN` must never
+    show that token in any output, log or cache.
+  - **Auth files** are checked with `stat` for existence only, never opened.
+- **Login evidence required:** a folder is offered only with an auth file present, never on its name.
+- **One subscription is one account.** Several homes count as one subscription only when a supported source
+  names the same account: a CLI's own account-status output, parsed for its account id only. A provider
+  with no such source leaves the homes as separate candidates. The owner can merge them with one owner
+  action ("same subscription"), and Khipu never guesses. Merging reconciles through slice 3a's bindings.
+- **Auto-tracking.**
+  - An explicit "off" persists as `false`; today turning it off deletes the setting (`accounts.py:996`).
+  - "On by default" (decision 15) applies only to a new install with no setting.
+  - This Mac was switched on by owner direction on 2026-10-20.
 
-**D. Rules stay few** (slice 10, extended). These are advisory flags. Khipu never edits the owner's words.
+**D. Rules stay few** (slice 10, extended; case 10 gains these). These are advisory flags. Khipu never edits
+the owner's words.
 - **Wording that belongs in a role:** a standing rule worded for a time ("until", "this week", a weekday, a
   date ahead) gets a suggestion to move it into the account's priority role with an `until`.
 - **Expired rules:** a rule whose date or named reset has passed.
 - **Overlaps:** two rules naming the same account and topic; a priority role that restates a rule.
-- **Long-pending edits:** a conversation's pending edit older than 24 hours is listed as waiting on the
-  owner, with the one-line owner direction that makes it live or drops it.
+- **Long-pending edits:** a conversation's pending edit older than 24 hours is listed as waiting on the owner,
+  with the one-line owner direction that makes it live or drops it.
 
-**E. Directions that never reach Khipu** (slice 19).
-- **From conversations:** capture already extracts decisions and preferences per episode. It adds
-  `routing_direction` for the owner's own prompts: accounts, lanes, providers, models, limits, pacing, caps,
-  holds and reviews. When the session made no routing write after that prompt, an owed item "for the
-  orchestrator" opens in that project ("Routing said here, not in Khipu: '<words>'"). A routing write or a
-  dismissal closes it.
-- **From runner configs:** the scanner (slice 13) also reads job-runner configs and flags a cap or budget
-  value that has no matching Khipu fact.
+**E. Directions that never reach Khipu** (slices 19a, 19b).
+- **19a, capture.**
+  - **What counts:** a `routing_direction` is recorded only from the owner's own typed turn (the provenance
+    `owner_direction.check` already uses), with the exact span and an actionable intent. Questions,
+    quotations, hypotheticals, discussion and dispatched jobs' prompts are abstained on.
+  - **How it closes:** each direction is matched to an owner action applied after it in that session whose
+    entity and kind match it (the owner-actions log). An unrelated routing write doesn't close it.
+  - **The owed item** ("Routing said here, not in Khipu: '<words>'") opens only when no matching action is
+    found. Its stable key is the session, the prompt and the span, and a dismissal persists.
+  - **Tests** include negative cases (a question, a quote, a job prompt), several directions in one prompt,
+    and a partial write.
+- **19b, runner configs.** The scanner (slice 13) compares a runner's caps and budget fields with Khipu's cap
+  facts (17a) and flags any value with no matching fact.
 - **For conversations themselves:** the global CLAUDE.md says so, since 2026-10-20.
 
 **F. Merged is not live.** A slice is done when `khipu promote` has run and a live `khipu_route` (or the
@@ -807,14 +858,17 @@ change; if it is still red, stop and report the last log. Slices on the per-prom
 | 15b | App: proposals and holds | 14, 5 | Codex Sol, high | Opus (owner actions) | as 15a |
 | 15c | App: providers and lanes | 14, 9a | Codex Sol, medium | Sonnet | as 15a |
 | 15d | App: advisory and copies | 14, 10, 13 | Codex Sol, medium | Sonnet | as 15a |
-| 15e | App: pace and caps | 14, 4Pb | Codex Sol, medium | Sonnet; Opus for the cap confirm (owner action) | as 15a |
+| 15e | App: pace, caps and advice | 14, 4Pb, 17a, 17c | Codex Sol, medium | Sonnet; Opus for the cap confirm (owner action) | as 15a |
 | 16 | Delivery health: the budget-aware bound and red conditions, with evidence from hooks, MCP, children, replication and the gateway | 6, 7, 8a, 11b, 12 | Codex Sol, medium | Sonnet | case 15 |
-| 9c | Discovery: provider-pointed Claude Code homes, login evidence, one subscription as one account | 3a, 9a | Codex Sol, high | Sonnet | case 17a; no key value read |
-| 17a | Cap kinds `pace_target`, `spend`, `concurrency`; `khipu route advise` and the `advice` field | 4Pb, 9a | Codex Sol, high | Opus (owner caps) | case 17b; advisory only, never a gate |
-| 17b | Church Harness runner reads `advise`; its numbers become Khipu caps by owner direction | 17a | Codex Sol, medium (in church-harness) | Sonnet | that repo's own oracle; Matt's go |
-| 19 | Directions that never reach Khipu: `routing_direction` capture and the owed item; runner-config scan | 13 | Codex Sol, medium | Opus (reads owner prompts) | case 17c |
+| 9c | Discovery: the bounded settings parser, login evidence, subscription identity sources and the owner merge, auto-track's persistent off and new-install default | 3a, 9a | Codex Sol, high | Opus (reads inside login homes) | case 17a; sentinel tests |
+| 17t | Runner telemetry: `active` and `spend` records, attribution, dedup, coverage and expiry | 9a | Codex Sol, high | Sonnet | case 17e |
+| 17a | Cap kinds `pace_target`, `spend`, `concurrency`: facts, owner confirm, calculations | 4Pb, 17t | Codex Sol, high | Opus (owner caps) | case 17b's cap parts |
+| 17c | `khipu route advise`, the `advice` field, `purpose`, ranking, pushes | 17a, 6 | Codex Sol, high | Opus | case 17b; advisory only |
+| 17b | Church Harness runner: converted caps by owner direction; every budget consumer calls `advise`; its fail-closed policy kept | 17c | Codex Sol, medium (in church-harness) | Sonnet | that repo's oracle; Matt's go |
+| 19a | Directions that never reach Khipu: owner-turn `routing_direction`, correlation with applied owner actions, the owed item | 4, 5 | Codex Sol, high | Opus (reads owner prompts) | case 17c |
+| 19b | Runner-config comparison against Khipu's cap facts | 13, 17a | Codex Sol, medium | Sonnet | case 17c's runner part |
 
-Slices 4Pb, 9a, 9c, 10 and 13 can run beside 5 to 8c, and 11a beside 6. Slice 19 can run once 13 is in.
+Slices 4Pb, 9a, 9c, 10, 13 and 17t can run beside 5 to 8c, and 11a beside 6.
 
 ## Matt's decisions (each with a recommendation)
 
