@@ -115,6 +115,7 @@ def test_the_owner_override_skips_a_check_once_and_the_record_names_it(home, mon
     assert pm.gate_ignore() == ["degraded_rate"]
     out = pm.promote("origin/main")
     assert out["ok"], out
+    assert pm.active_slot() == Path(out["slot"])
     assert out["gate"][0]["ignored_reds"] == ["degraded_rate"]
     logged = pm.records()[-1]
     assert logged["gate"][0]["ignored_reds"] == ["degraded_rate"]
@@ -124,6 +125,89 @@ def test_the_owner_override_skips_a_check_once_and_the_record_names_it(home, mon
     # Used once, then cleared: the next attempt refuses on the same red.
     assert pm.gate_ignore() == []
     assert not pm.promote("origin/main")["ok"]
+
+
+@pytest.mark.parametrize("failed_step", ["doctor", "recall", "capture", "version"])
+def test_a_failed_gate_keeps_the_owner_override(home, monkeypatch, tmp_path, failed_step):
+    live = _promotable(home, monkeypatch, tmp_path)
+    monkeypatch.setattr(pm, "hub_reachable", lambda **kw: True)
+    _doctor_says(monkeypatch, {**_BASE, "nightly_steps_ok": False,
+                               "schema_migrations_ok": failed_step != "doctor"})
+    for name in ("recall", "capture", "version"):
+        monkeypatch.setitem(pm.GATE_STEPS, name,
+                            lambda c, name=name: {"ok": name != failed_step, "ms": 1, "detail": name})
+    pm.set_gate_ignore("nightly_steps", by="app")
+    override = pm.gate_override()
+
+    out = pm.promote("origin/main")
+
+    assert not out["ok"] and out["failed_step"] == failed_step
+    assert pm.active_slot() == live
+    assert pm.queued() is None
+    assert pm.gate_override() == override
+    logged = pm.records()[-1]
+    assert logged["gate"][0]["override"] == override
+    assert logged["override"] == {**override, "skipped": [] if failed_step == "doctor" else ["nightly_steps"],
+                                  "cleared": False}
+    if failed_step == "doctor":
+        assert logged["gate"][0]["red_checks"] == ["schema_migrations"]
+    monkeypatch.setattr(pm, "_override_age_s", lambda _: pm.OVERRIDE_TTL_S + 60)
+    assert pm.gate_override() is None
+
+
+@pytest.mark.parametrize("ignored_red", [False, True])
+def test_a_flip_failure_consumes_only_an_override_that_passed_the_gate(home, monkeypatch, tmp_path, ignored_red):
+    live = _promotable(home, monkeypatch, tmp_path)
+    _doctor_says(monkeypatch, {**_BASE, "ok": not ignored_red, "nightly_steps_ok": not ignored_red},
+                 rc=0 if not ignored_red else 2)
+    for name in ("recall", "capture", "version"):
+        monkeypatch.setitem(pm.GATE_STEPS, name, lambda c: {"ok": True, "ms": 1, "detail": "ok"})
+    monkeypatch.setattr(pm, "flip", lambda slot: {"ok": False, "error": "cannot replace link"})
+    pm.set_gate_ignore("nightly_steps", by="app")
+    override = pm.gate_override()
+
+    out = pm.promote("origin/main")
+
+    assert not out["ok"] and out["error"] == "flip: cannot replace link"
+    assert pm.active_slot() == live
+    assert out["override"]["cleared"] is ignored_red
+    assert pm.gate_override() == (None if ignored_red else override)
+
+
+def test_a_new_override_set_during_the_run_is_never_cleared(home, monkeypatch, tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    _promotable(home, monkeypatch, tmp_path)
+    instant = datetime.now(timezone.utc).replace(microsecond=100)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant
+
+    monkeypatch.setattr(pm, "datetime", Clock)
+    _doctor_says(monkeypatch, {**_BASE, "nightly_steps_ok": False})
+    for name in ("recall", "capture", "version"):
+        monkeypatch.setitem(pm.GATE_STEPS, name, lambda c: {"ok": True, "ms": 1, "detail": "ok"})
+    pm.set_gate_ignore("nightly_steps", by="app")
+    original = pm.gate_override()
+    replacement = None
+    flip = pm.flip
+
+    def replace_then_flip(slot):
+        nonlocal instant, replacement
+        instant += timedelta(microseconds=1)
+        pm.set_gate_ignore("nightly_steps", by="app")
+        replacement = pm.gate_override()
+        return flip(slot)
+
+    monkeypatch.setattr(pm, "flip", replace_then_flip)
+    out = pm.promote("origin/main")
+
+    assert out["ok"] and pm.active_slot() == Path(out["slot"])
+    assert out["override"] == {**original, "skipped": ["nightly_steps"], "cleared": False}
+    assert replacement["set_at"] != original["set_at"]
+    assert pm.gate_override() == replacement
 
 
 def test_an_unused_override_lapses_after_a_day(home, monkeypatch):
