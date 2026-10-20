@@ -5056,7 +5056,8 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
             "hurry": left > 0 and pace >= even * PACE_HURRY, "words": words}
     figures_at = _parse(row.get("observed_at") or row.get("probed_at"))
     if kept_failure:
-        figures_at = _parse(row.get("last_good_at")) or figures_at
+        # A provider can return figures older than the probe that fetched them: their own time wins.
+        figures_at = _parse(row.get("observed_at")) or _parse(row.get("last_good_at")) or figures_at
         last_read = "the last read timed out" if error == usage.E_TIMEOUT else "the last read failed"
         if figures_at is not None:
             last_read = f"figures from {_clock(figures_at, now)}; {last_read}"

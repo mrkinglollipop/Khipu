@@ -394,6 +394,17 @@ def test_a_timed_out_probe_keeps_its_last_good_figures_marked_stale(home):
         assert routing.plan_fact(kept, T0) == {"readable": False, "why": why, "error": error}
 
 
+def test_kept_figures_keep_the_providers_own_time_after_a_timeout(home):
+    # The provider's figures are older than the probe that fetched them; a later timeout must not make them look newer.
+    observed = routing._iso(T0 - timedelta(hours=8))
+    probed = routing._iso(T0 - timedelta(minutes=5))
+    row = _row("Grok", "grok", None, _week(25, T0 + timedelta(days=2)), ok=False, error=usage.E_TIMEOUT,
+               probed_at=probed, last_good_at=probed, observed_at=observed)
+    fact = routing.plan_fact(row, T0)
+    assert fact["stale"] is True and fact["figures_at"] == observed
+    assert fact["words"].startswith("figures from 06:00Z")
+
+
 def test_an_account_whose_figures_cannot_be_read_says_so_and_gets_no_pace(home):
     for error in (usage.E_SIGNIN, usage.E_NO_LIMITS):
         fact = routing.plan_fact(_row("Grok", "grok", None, ok=False, error=error), T0)
