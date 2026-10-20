@@ -147,15 +147,18 @@ the trailing average".
   - **With a provider cycle id** (a probe that reports a window or cycle id; none does today), the cycle is
     that id.
   - **Otherwise reset times fall on a fixed grid anchored to the Unix epoch.** A reset time's cell is
-    `floor(resets_at / 15 min)`. Occupied cells are then paired in one pass, in ascending cell order: an
-    occupied cell joins the cycle of the occupied cell just before it if that cell is adjacent and has not
-    already been joined by another. So each cycle spans at most two adjacent cells, and a reset time that
-    jitters across a grid edge stays in one cycle.
-  - The pass runs over the set of occupied cells, never over arrival order, so it is canonical and transitive
-    by construction. Codex's example, R, R + 4 min and R + 8 min, falls in one cell or two adjacent ones: one
-    cycle either way.
-  - **Stated limit:** two genuinely different resets less than 30 minutes apart are treated as one cycle. The
-    windows are five hours and a week, so this doesn't arise in practice.
+    `floor(resets_at / 15 min)`. **A cycle is a maximal run of adjacent occupied cells.** That is a property
+    of the set of occupied cells alone, so it is order-independent and transitive by construction: a late
+    reading can only extend or join runs, exactly as if it had arrived on time.
+  - Codex's examples: R, R + 4 min and R + 8 min form one run. Estimates of 14:59, 29:59 and 30:01 fall in
+    cells 0, 1 and 2, which is one run and one cycle. A late arrival in cell 0 joins the same run.
+  - **The run bound.** A run longer than 4 cells (1 hour) is **ambiguous**: pace for that window is `unknown`,
+    and the line says "reset time spread over more than an hour". It stays so until the stale end ages out of
+    the trailing window, or the provider's estimates settle into a shorter run.
+  - **The supported jitter** is therefore up to 1 hour of spread in one cycle's reset estimates. Genuine
+    resets of five-hour and weekly windows are at least 5 hours apart, and the run between two of them would
+    need occupied cells covering that whole gap, which goes past the bound. So a run never silently links two
+    real resets: at worst the window reads `unknown`.
   - **The representative reset time** of a cycle, used for T, is the `resets_at` of its newest fresh reading,
     ties going to the earlier value.
   - **The current cycle** is the cycle of the newest fresh reading, so a provider's earlier replacement reset
@@ -249,7 +252,9 @@ Each target is computed separately. The schema carries each one apart.
     the sum Δ from now is S(Δ) = G + r·Δ − A(Δ), where A(Δ) is the in-window gain that leaves the window by
     then.
     - The history is piecewise linear between its buckets, with the boundary interval interpolated, so A, and
-      therefore S, is piecewise linear in Δ. Its breakpoints are the times at which each history point ages
+      therefore S, is piecewise linear in Δ. **Across an invalid interval** (a confirmed or unsettled reset, a
+      correction, a skew inversion), the history contributes **zero**: nothing is interpolated across it, the
+      usage drop is never spread over time as negative gain, and no gain ages out over that span. Its breakpoints are the times at which each history point ages
       out: t_i − (now − 24 h), for each bucket time t_i in the day.
     - `reaches_cap_at` is found by walking the segments between breakpoints, over (0, 24 h], in order. If
       S(a) ≥ d at a segment's start a, the crossing is a. If S(a) < d ≤ S(b) at its end b, the crossing is a
@@ -623,7 +628,7 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 14 | Scanner: flags the two live notes; passes capability rows, evidence dates and quoted history | hermetic | 13 |
 | 15 | Health: each red condition turns red and back to green on its own evidence | hermetic | 16 |
 | 16a | Pace inputs: the extractor's sentinel tests; `pace_fixture_v1` rejects any other key; relative, rounded and repeated readings never become fresh samples; two Macs' samples with the same time and different values, a skewed clock, and different reset times merge to identical buckets in opposite arrival orders; two-minute samples over 24 h make consecutive buckets, not one cluster; a late reading changes only what it would have changed on time; 95% then 1% within 150 s is a possible reset, settled by the next readings either way; an earlier replacement `resets_at` carried by fresh readings wins over stale metadata | hermetic | 4Pa |
-| 16b | Pace results: Codex's gap example gives 1 point an hour; (−6 h, 0%), (6 h, 6%), (24 h, 15%) computes 12, not 15, but is `unknown` with `observed_pct` 0%; readings every 30 minutes at 0.5 an hour give 12 with 100%; Codex's aging-out case crosses 13 at 1.109 minutes (exact walk) with `peak_pct` 13.026 at 4 minutes, where a 15-minute scan would miss it; R, R + 4 min and R + 8 min reset times form one cycle, and a reset time jittering across a grid edge stays in one cycle; a steady 0.5 an hour against a daily cap of 13 gives near with no time; a rising rate gives a `reaches_cap_at` that accounts for usage aging out; long gaps lower `observed_pct` and mark the line gappy; synthetic outpace, underpace and on-pace; a reset mid-window; a correction drop; a possible-reset drop later confirmed and later refuted; coverage below the floor gives `unknown` with its reason; zero burn; limit and cap already reached; a reset time passed; a share cap and a daily cap together, carried apart in the schema; the sanitized real history within its `t_err` | hermetic | 4Pb |
+| 16b | Pace results: Codex's gap example gives 1 point an hour; (−6 h, 0%), (6 h, 6%), (24 h, 15%) computes 12, not 15, but is `unknown` with `observed_pct` 0%; readings every 30 minutes at 0.5 an hour give 12 with 100%; Codex's aging-out case crosses 13 at 1.109 minutes (exact walk) with `peak_pct` 13.026 at 4 minutes, where a 15-minute scan would miss it; R, R + 4 min and R + 8 min reset times form one cycle; 14:59, 29:59 and 30:01 (cells 0, 1, 2) form one cycle, also when the cell 0 reading arrives last; a run of more than 4 cells gives `unknown` with "reset time spread over more than an hour"; a reset inside the day contributes zero across its interval and no interpolated drop; a steady 0.5 an hour against a daily cap of 13 gives near with no time; a rising rate gives a `reaches_cap_at` that accounts for usage aging out; long gaps lower `observed_pct` and mark the line gappy; synthetic outpace, underpace and on-pace; a reset mid-window; a correction drop; a possible-reset drop later confirmed and later refuted; coverage below the floor gives `unknown` with its reason; zero burn; limit and cap already reached; a reset time passed; a share cap and a daily cap together, carried apart in the schema; the sanitized real history within its `t_err` | hermetic | 4Pb |
 | 16c | Pace pushes: a five-hour run-out moving from 1 h to 10 min while still outpacing pushes; readings alternating at 59 min 59 s and 60 min 01 s push once; a rate hovering at 1.15 n doesn't flip the verdict; a change of limiting window, cycle, cap revision or availability pushes; small moves measured against the last acknowledged forecast push once they add up; numbers alone don't push | hermetic | 4Pa |
 
 ## Slices
@@ -793,6 +798,11 @@ No disagreements this round.
 
 The daily example, case 16b and decision 12's coverage wording are corrected: Codex's example is `unknown` at
 0% observed. No disagreements this round.
+
+**Round 6.** The P1 was accepted: a cycle is a maximal run of adjacent occupied 15-minute cells. A run of more
+than 4 cells is ambiguous and gives `unknown`, and the supported jitter is 1 hour (section 2a). The P2 was
+accepted: the history contributes zero across an invalid interval and never interpolates a usage drop.
+No disagreements this round.
 
 ## Known limits
 
