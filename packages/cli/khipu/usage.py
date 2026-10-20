@@ -1698,6 +1698,15 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
                               (ids - {account_id_of(account)}) if ids else ids)
         if named:
             raise AccountsError(f"usage_accounts entry {i + 1}: {named[1]}", named[0], index=i, field="label")
+    # Distinct labels can still collapse to one provider slug ("work!"
+    # and "work"). Never let a write merge those account identities.
+    from khipu.routing_identity import validate
+    from khipu.routing import RouteError
+
+    try:
+        validate([a for a, _kept in checked if not a.get("invalid")])
+    except RouteError as error:
+        raise AccountsError(str(error), "name_taken", field="label") from None
     return out
 
 

@@ -10,8 +10,8 @@ syncs through the hub.
 The account list is ``usage_accounts`` in config.json. Each write holds
 ``config.mutate_config`` (the one config write path) from its read to its save and is refused when
 the version the caller read (``--expect``, ``config.accounts_version``) has
-moved. Account keys (``usage._key``: the CLI and the login folder) never
-change on rename (decision 7); a default login stays home-less (decision 6),
+moved. Local cache keys (``usage._key``: the CLI and the login folder) never
+change on rename; stable routing ids gain an owner-written forward; a default login stays home-less (decision 6),
 so writing the default list out changes no key.
 """
 from __future__ import annotations
@@ -210,6 +210,8 @@ def _locked(expect):
         raise AccountsError(VERSION_NEEDED, "version_needed")
     with routing._lock():
         recover()
+        if (routing.routing_dir() / "id-salt").exists():
+            routing.migrate_accounts()
         with config.mutate_config() as data:
             config.check_accounts_version(data, expect)
             yield data
@@ -413,7 +415,11 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
     before = copy.deepcopy(data)
     after_list = parsed
     known, after = known_of(base if confirmed is None else confirmed), known_of(after_list)
+    routing.account_identity.validate(after)
     ops = _plan(known, after, moves=owner and confirmed is None)
+    if not owner and any(op[0] == "rename" for op in ops):
+        raise AccountsError("only the owner renames an account; use the app or a typed owner confirmation",
+                            "owner_only", field="label")
     waiting = data.get("usage_accounts_request")
     if owner and confirmed is None and isinstance(waiting, dict):
         # Any other owner write ends a conversation's change still waiting
@@ -461,6 +467,21 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
                 if not prior[runner]:
                     prior.pop(runner)
     events: list[dict] = [{"type": "account_move", "account": was, "target": now} for was, now in moves]
+    after_by_key = {a["key"]: a for a in after}
+    prior_events = routing._in_write_order(routing.read_events()[0])
+    _keys, forwards, _aliases = routing.account_identity.state(prior_events, known)
+    for account in after:
+        declared = routing.account_identity.stable_id(account["harness"], account["label"])
+        prior = old.get(account["key"])
+        unchanged = prior and declared == routing.account_identity.stable_id(prior["harness"], prior["label"])
+        if declared in forwards and not unchanged:
+            raise AccountsError("that label is an earlier account id; choose a new label", "name_taken",
+                                field="label")
+    for key in renames:
+        was = routing.account_identity.stable_id(old[key]["harness"], old[key]["label"])
+        new = routing.account_identity.stable_id(after_by_key[key]["harness"], after_by_key[key]["label"])
+        if was != new:
+            events.append({"type": "account_rename", "account": was, "to": new})
     notes = [{"type": "account_note", "account": k, "state": "renamed", "text": old[k]["label"]}
              for k in renames if confirmed is None]
     done: dict = {"priority": None, "pause": None}
@@ -480,6 +501,7 @@ def _commit(data: dict, stored, base: list, parsed: list, *, via: str, request: 
     if not owner:
         held = dict(request, prior=stored, prior_none=data.get("usage_accounts_none"))
     _store(data, parsed, none=none, unset=unset, request=held)
+    data[routing.account_identity.BINDINGS] = routing.account_identity.local_bindings(after)
     version = config.accounts_version(data)
     if owner:
         lines = routing.owner_lines(events, via)

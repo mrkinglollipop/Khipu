@@ -68,6 +68,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from khipu import routing_identity as account_identity
+
 SCHEMA = 1
 STATE_DIR = ("state", "routing")
 EVENTS_NAME = "events.jsonl"
@@ -908,6 +910,7 @@ def accounts() -> list[dict]:
             continue
         out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],
                     "home": account.get("home")})
+    account_identity.validate(out)
     return out
 
 
@@ -938,6 +941,7 @@ def _fold_accounts(config: dict) -> list[dict]:
             continue
         out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],
                     "home": account.get("home")})
+    account_identity.validate(out)
     return out
 
 
@@ -949,7 +953,7 @@ def _label_for_key(key: str) -> str:
     return f"{base} ({_clean(Path(home).name, NAME_MAX)})" if home else base
 
 
-def resolve_account(name: str, known: list[dict] | None = None, *, conversation: bool = False) -> str:
+def _resolve_account_key(name: str, known: list[dict] | None = None, *, conversation: bool = False) -> str:
     """An account's key from its label, its key (``harness|login folder``) or
     a bare harness name; RouteError when Khipu doesn't know it. A login
     folder inside a private folder, or whose name looks like a secret, is
@@ -963,6 +967,13 @@ def resolve_account(name: str, known: list[dict] | None = None, *, conversation:
     raw = (name or "").strip()
     if not raw:
         raise RouteError("name an account")
+    if account_identity.LEGACY.fullmatch(raw) or account_identity.STABLE.fullmatch(raw):
+        stable = _resolve_identity(raw, known)
+        key_ids, _forward, _aliases = account_identity.state(_in_write_order(read_events()[0]), known)
+        candidates = [a["key"] for a in known if key_ids.get(a["key"]) == stable]
+        if len(set(candidates)) == 1:
+            return candidates[0]
+        raise RouteError("that account id has no unique login binding on this Mac")
     if "|" in raw:
         harness, _, home = raw.partition("|")
         harness, home = harness.strip().lower(), home.strip()
@@ -1003,8 +1014,10 @@ def _resolve_reported(name: str) -> str:
     from khipu import usage
 
     try:
-        return resolve_account(name, conversation=True)
+        return _resolve_account_key(name, conversation=True)
     except RouteError:
+        if account_identity.LEGACY.fullmatch(str(name or "").strip()):
+            raise
         forward = forwarding(read_events()[0])
         raw = (name or "").strip()
         if "|" in raw:
@@ -1020,7 +1033,7 @@ def _resolve_reported(name: str) -> str:
 
 def _resolve_quiet(name: str, known: list[dict]) -> str | None:
     try:
-        return resolve_account(name, known)
+        return _resolve_account_key(name, known)
     except RouteError:
         return None
 
@@ -1276,8 +1289,8 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "evidence", "until", "written_at", "via", "text", "file", "date", "sha256", "clock_at",
                 "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
                 "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
-                "harness")
-_TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to")
+                "harness", "to", "started_at")
+_TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed")
@@ -1457,6 +1470,15 @@ def _checked(data: dict) -> dict | None:
         if entries is None:
             return None
         out["entries"] = entries
+    if out["type"] == "account_migration":
+        for field in ("aliases", "bindings"):
+            mapping = data.get(field, {})
+            if not isinstance(mapping, dict) or not all(
+                    isinstance(k, str) and isinstance(v, str) and account_identity.STABLE.fullmatch(v)
+                    and (account_identity.LEGACY.fullmatch(k) if field == "aliases" else "|" in k)
+                    for k, v in mapping.items()):
+                return None
+            out[field] = dict(mapping)
     by = data.get("written_by")
     if by is not None:
         if not isinstance(by, dict) or not all(v is None or isinstance(v, str) for v in by.values()):
@@ -1595,7 +1617,7 @@ _OWNERS_OWN = ("app", "direction")
 # Lines only the owner writes; the fold counts one with no author as his.
 _OWNER_ONLY = frozenset({"pause", "lift", "clear", "clear_undo", "dismiss", "undismiss", "note_set", "note_end", "rule_confirm", "rule_retire",
                          "rule_restore", "rule_undo", "rule_unconfirm", "rule_dismiss", "priority_confirm", "priority_undo",
-                         "priority_clear", "priority_drop", "account_move", "account_note"})
+                         "priority_clear", "priority_drop", "account_move", "account_note", "account_rename"})
 
 
 def _mark_unchecked(events: list[dict]) -> None:
@@ -1692,7 +1714,7 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
 
     cfg["_accounts_version"] = accounts_version(config)
     seed = cfg.get("routing_rules_seed")
-    fingerprint = {"events": events_stat, "config": config_stat, "seed": _stat(Path(seed)) if seed else None,
+    fingerprint = {"account_identity": 1, "events": events_stat, "config": config_stat, "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
     return fingerprint, cfg, _fold_accounts(config)
 
@@ -2385,9 +2407,23 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     lane_map = cfg.get("routing_lane_map") or {}
     stale_after = cfg["routing_stale_after"]
     events = _in_write_order(events)
+    key_ids, stable_forwards, aliases = account_identity.state(events, known)
+    stable_keys = {v: k for k, v in key_ids.items()}
+    # Prefer the current binding over a historical login folder.
+    stable_keys.update({key_ids[a["key"]]: a["key"] for a in known})
+    historical = {old: stable_keys.get(account_identity.forwarded(ident, stable_forwards), ident)
+                  for old, (ident, _start) in aliases.items()}
+    mapping = {**stable_keys, **{old: stable_keys.get(new, new) for old, new in stable_forwards.items()},
+               **historical}
+    events = [_rekey_event(e, mapping) if e.get("type") not in ("account_rename", "account_migration") else e
+              for e in events]
+    extra = [_rekey_event(e, mapping) for e in extra]
     # A moved login folder's records, those written under its old key after
     # the move included, belong to the account it moved to.
     forward, events = forward_events(events, {a["key"] for a in known})
+    local_mapping = {key: stable_keys[ident] for key, ident in key_ids.items() if ident in stable_keys}
+    events = [_rekey_event(e, local_mapping) for e in events]
+    extra = [_rekey_event(e, local_mapping) for e in extra]
     evidence: list[dict] = []
     owner: dict[str, Any] = {"pauses": {}, "lifts": {}, "clears": {}, "dismissed": set()}
     dismissals: list[dict] = []
@@ -2810,7 +2846,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         effective["table"] = {"hash": table.get("hash"), "error": bool(table.get("error"))}
     return {"accounts": entries, "holds": active_holds, "rules": active_rules, "note": note_out,
             "priority": priority_out, "priority_version": priority_version, "priority_ended": priority_ended,
-            "lane_repairs": _lane_repairs(lane_map, known), "forwards": forward,
+            "lane_repairs": _lane_repairs(lane_map, known), "forwards": {**forward, **stable_forwards},
             "unmatched": lanes, "outside_app": outside_app,
             "unchecked": unchecked, "seed": seed, "sources": sources,
             "valid_until": _iso(min(future)) if future else None, "effective": effective,
@@ -3110,7 +3146,7 @@ def check_account(account: str, *, scheduled: bool = False, now: datetime | None
     from khipu import usage
 
     now = now or _now()
-    key = resolve_account(account)
+    key = _resolve_account_key(account)
     cfg = settings()
     wait = float(_setting(cfg, "routing_reset_check_wait"))
 
@@ -3744,6 +3780,8 @@ def read_view(now: datetime | None = None) -> dict:
     view has ``record: false`` and version 0."""
     explicit = now is not None
     now = now or _now()
+    if (routing_dir() / "id-salt").exists():
+        migrate_accounts()
     fingerprint, cfg, known = _inputs()
     prev = _load_view()
     if _fresh(prev, fingerprint, now):
@@ -3981,7 +4019,7 @@ def add_hold(text: str, *, reason: str, scope: str, account: str | None = None, 
     if scope == "account":
         if not account:
             raise RouteError("name the account the hold is about")
-        hold_scope: dict = {"kind": "account", "account": resolve_account(account, conversation=not owner)}
+        hold_scope: dict = {"kind": "account", "account": _resolve_account_key(account, conversation=not owner)}
     elif scope in ("machine", "all"):
         hold_scope = {"kind": scope}
     else:
@@ -4075,7 +4113,7 @@ def account_txn_end(txn: str, state: str) -> dict:
 
 def pause(account: str, *, until: str | None = None, via: str, now: datetime | None = None) -> dict:
     now = now or _now()
-    key = resolve_account(account)
+    key = _resolve_account_key(account)
     stop = parse_until(until, now) if until else None
     if stop is not None and stop <= now:
         raise RouteError("--until must be in the future")
@@ -4083,7 +4121,7 @@ def pause(account: str, *, until: str | None = None, via: str, now: datetime | N
 
 
 def lift(account: str, *, via: str, now: datetime | None = None) -> dict:
-    key = resolve_account(account)
+    key = _resolve_account_key(account)
     entry = next((a for a in read_view(now)["accounts"] if a["key"] == key), None)
     if entry is None or entry["state"] != PAUSED:
         raise RouteError("that account isn't paused")
@@ -4096,7 +4134,7 @@ def clear(account: str, *, report_id: str | None = None, via: str, now: datetime
     counts for that account, one a job runner's lane reaches through the
     lane map included, and one the view shows for it from a source (a job
     runner's limit read from its files; fix round 1, F6)."""
-    key = resolve_account(account)
+    key = _resolve_account_key(account)
     if report_id:
         events, _bad = read_events()
         _fp, cfg, known = _inputs()
@@ -4120,7 +4158,7 @@ def _owner_lines_about(key: str) -> list[dict]:
 def current_clear(account: str) -> str | None:
     """The id of the clear that counts for the account now (the newest not
     undone), or None."""
-    key = resolve_account(account)
+    key = _resolve_account_key(account)
     stack: list[str] = []
     for e in _owner_lines_about(key):
         if e.get("type") == "clear":
@@ -4133,7 +4171,7 @@ def current_clear(account: str) -> str | None:
 def undo_clear(account: str, clear_id: str, *, via: str, now: datetime | None = None) -> dict:
     """Undo the owner's clear ``clear_id``: the fold drops it, and the clear
     before it, if any, counts again."""
-    key = resolve_account(account)
+    key = _resolve_account_key(account)
     lines = _owner_lines_about(key)
     if not any(e.get("type") == "clear" and str(e.get("id")) == clear_id for e in lines):
         raise RouteError(f"{clear_id!r} is not a clear of that account")
@@ -4144,7 +4182,7 @@ def undo_clear(account: str, clear_id: str, *, via: str, now: datetime | None = 
 
 def undismiss(account: str, report_id: str, *, via: str, now: datetime | None = None) -> dict:
     """Bring back a report the owner dismissed."""
-    key = resolve_account(account)
+    key = _resolve_account_key(account)
     dismissed = False
     for e in _owner_lines_about(key):
         if str(e.get("target")) == report_id and e.get("type") in ("dismiss", "undismiss"):
@@ -4346,7 +4384,7 @@ def _priority_entries(raw, *, now: datetime, conversation: bool) -> list[dict]:
         name = item.get("account")
         if not isinstance(name, str) or not name.strip():
             raise RouteError(f"priority entry {i} needs its account")
-        key = _account_for_a_conversation(name, known) if conversation else resolve_account(name, known)
+        key = _account_for_a_conversation(name, known) if conversation else _resolve_account_key(name, known)
         label = _label_of(key, known)
         if any(e["account"] == key for e in out):
             raise RouteError(f"{label} is named twice; each account has one place in the priority")
@@ -5767,13 +5805,86 @@ def _id_salt() -> bytes:
     return salt
 
 
-def account_id(key: str) -> str:
-    """An account's id in a conversation's answers: a keyed hash of its key
-    under this install's secret, the same for the same account every time,
-    that says nothing of the login folder the key holds and can't be
-    computed from a guess of it. ``resolve_account`` takes it back."""
+def _legacy_account_id(key: str) -> str:
+    """The pre-migration id, used only to preserve ids this Mac issued."""
     digest = hmac.new(_id_salt(), str(key).encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()
     return "acct-" + digest[:12]
+
+
+def migrate_accounts() -> None:
+    """Append the alias witness once, then repair this Mac's config bindings.
+
+    The log is authoritative: a crash after append, or restoring only that
+    log, cannot give any alias a new lifetime. No salt means no issued ids.
+    Lock order matches the account writer: routing, then config.
+    """
+    from khipu.config import mutate_config
+
+    with _lock():
+        events, _bad = read_events()
+        if not any(e.get("type") == "account_migration" and
+                   (e.get("written_by") or {}).get("kind") in ("owner", "migration") for e in events):
+            known = accounts()
+            bindings = {a["key"]: account_identity.stable_id(a["harness"], a["label"]) for a in known}
+            aliases = ({_legacy_account_id(k): v for k, v in bindings.items()}
+                       if (routing_dir() / "id-salt").exists() else {})
+            stamp = _stamp_locked(_now())[0]
+            _append_locked({"type": "account_migration", "id": _new_id("e"), **stamp,
+                            "started_at": stamp["written_at"], "written_by": {"kind": "migration"},
+                            "via": "migration", "aliases": aliases, "bindings": bindings})
+        with mutate_config() as data:
+            data[account_identity.BINDINGS] = account_identity.local_bindings(_fold_accounts(data))
+
+
+def _resolve_identity(raw: str, known: list[dict]) -> str:
+    events = _in_write_order(read_events()[0])
+    _keys, forwards, aliases = account_identity.state(events, known)
+    if account_identity.LEGACY.fullmatch(raw) and raw not in aliases and (routing_dir() / "id-salt").exists():
+        migrate_accounts()
+        _keys, forwards, aliases = account_identity.state(_in_write_order(read_events()[0]), known)
+    if account_identity.LEGACY.fullmatch(raw):
+        if raw not in aliases:
+            raise RouteError("Khipu doesn't know that old account id; reread the account list")
+        stable, start = aliases[raw]
+        expiry = _after(_parse(start), account_identity.ALIAS_SECONDS)
+        stable = account_identity.forwarded(stable, forwards)
+        if _now() >= expiry:
+            message = f"this account id expired on {expiry.date().isoformat()}; use {stable}"
+            raise RouteError(message, public=message)
+        return stable
+    return account_identity.forwarded(raw, forwards)
+
+
+def resolve_account(name: str, known: list[dict] | None = None, *, conversation: bool = False) -> str:
+    """Resolve a label, stable id or unexpired local alias to a stable id."""
+    known = accounts() if known is None else known
+    raw = str(name or "").strip()
+    if account_identity.LEGACY.fullmatch(raw) or account_identity.STABLE.fullmatch(raw):
+        stable = _resolve_identity(raw, known)
+        keys, _forwards, _aliases = account_identity.state(_in_write_order(read_events()[0]), known)
+        if stable in keys.values():
+            return stable
+        raise RouteError("that account id has no login binding on this Mac")
+    return account_id(_resolve_account_key(name, known, conversation=conversation))
+
+
+def account_id(key: str) -> str:
+    """A configured account's stable id, independent of its login folder.
+
+    Unknown historical keys retain their opaque local id until the owner
+    supplies a label; no folder name is ever turned into a public label.
+    """
+    if account_identity.STABLE.fullmatch(key):
+        return _resolve_identity(key, [])
+    from khipu.config import load_config
+
+    known = _fold_accounts(load_config())
+    events = _in_write_order(read_events()[0])
+    keys, forwards, _aliases = account_identity.state(events, known)
+    moved = _forwarded(key, forwarding(events))
+    if moved in keys:
+        return account_identity.forwarded(keys[moved], forwards)
+    return _legacy_account_id(key)
 
 
 def _pick(item, fields: tuple) -> dict | None:
@@ -5876,8 +5987,8 @@ def _account_for_a_conversation(name, known: list[dict]) -> str:
         if raw.casefold() == account_id(account["key"]) or account["label"].casefold() == raw.casefold():
             return account["key"]
     low = raw.lower()
-    if low in usage.HARNESSES:
-        return resolve_account(low, known)
+    if low in usage.HARNESSES or account_identity.LEGACY.fullmatch(raw) or account_identity.STABLE.fullmatch(raw):
+        return _resolve_account_key(raw, known)
     labels = ", ".join(sorted({a["label"] for a in known})) or "none"
     raise RouteError("Khipu doesn't know the account you named; name it by its label or its id, as khipu_route "
                      f"lists them. Known: {labels}")
@@ -6729,7 +6840,7 @@ def wait(account: str, *, confirmed: bool = False, timeout: float | None = None,
     no end; 0: check once). Each read waits for the routing lock no longer
     than the time left, and answers from an unsaved fold when it runs out. It waits and reports; it launches, refuses and reorders
     nothing, and each read starts no process."""
-    key = resolve_account(account)
+    key = _resolve_account_key(account)
     start = clock()
     while True:
         now = _now()
@@ -7099,7 +7210,7 @@ def _priority_intent(args, action: str) -> dict | None:
     for item in entries if isinstance(entries, list) else []:
         item = {"account": item} if isinstance(item, str) else item
         if isinstance(item, dict) and isinstance(item.get("account"), str):
-            keys.append(resolve_account(item["account"]))
+            keys.append(_resolve_account_key(item["account"]))
     return owner_direction.intent("route.priority.set", ",".join(keys))
 
 
@@ -7110,7 +7221,7 @@ def _route_intent(cmd: str, args) -> dict | None:
 
     if cmd in ("pause", "lift", "clear"):
         facts = {"report": args.report} if cmd == "clear" and getattr(args, "report", None) else None
-        return owner_direction.intent(f"route.{cmd}", resolve_account(args.account), facts=facts)
+        return owner_direction.intent(f"route.{cmd}", _resolve_account_key(args.account), facts=facts)
     if cmd == "note":
         return owner_direction.intent(f"route.note.{'set' if args.action == 'set' else 'end'}", "note")
     if cmd == "rule":
@@ -7131,7 +7242,7 @@ def _hold_intent(args, words: list[str]) -> dict | None:
     if len(words) == 2 and words[0] == "end":
         return owner_direction.intent("route.hold.end", words[1])
     if args.account:
-        target = f"account:{resolve_account(args.account)}"
+        target = f"account:{_resolve_account_key(args.account)}"
     elif args.machine:
         target = "machine"
     elif args.all:
@@ -7158,7 +7269,7 @@ def run_cli(args) -> int:
     try:
         if cmd is None:
             view = read_view(now)
-            account = resolve_account(args.view_account) if getattr(args, "view_account", None) else None
+            account = _resolve_account_key(args.view_account) if getattr(args, "view_account", None) else None
             if args.since is not None:
                 version, epoch = _parse_since(args.since)
                 out = since(version, view, now=now, epoch=epoch)
