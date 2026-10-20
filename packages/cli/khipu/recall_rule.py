@@ -654,7 +654,9 @@ class _RoutingAtStart:
     def __init__(self, moment: str = "start", *, session_id=None) -> None:
         # "start", or "delegation" for a subagent's start (routing_delegation).
         self.moment = moment
-        self.session = session_id
+        from khipu.routing_delivery import hook_session
+
+        self.session = hook_session(session_id) if session_id else None
         self.out: dict | None = None
         self.deadline = time.monotonic()
         self.pid: int | None = None
@@ -758,6 +760,9 @@ class _RoutingAtStart:
             return
         try:
             from khipu import recall_prompt, routing
+            from khipu.routing_delivery import hook_session
+
+            session_id = self.session or hook_session(session_id)
 
             if out.get("routing_changes"):
                 from khipu.routing_delivery import acknowledge

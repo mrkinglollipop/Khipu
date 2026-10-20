@@ -79,10 +79,12 @@ def test_env_identity_cannot_be_impersonated_by_explicit_session_id(home, monkey
     assert error and body["code"] == "ack_not_yours", body
     monkeypatch.setenv("CODEX_THREAD_ID", "owner-sess")
     assert _route()["routing_changes"]["batch"] == batch  # owner's debt untouched
-    # An explicit canonical id still fills in when no identity is known.
+    # No environment means an explicit native id cannot borrow its ledger.
     monkeypatch.delenv("CODEX_THREAD_ID")
     out = _route(session_id="codex:owner-sess", ack=batch)
-    assert out["delivery"]["acked_through"] is not None, out
+    assert out["delivery"] == "untracked: pass session_id", out
+    monkeypatch.setenv("CODEX_THREAD_ID", "owner-sess")
+    assert _route()["routing_changes"]["batch"] == batch
 
 
 # 2: every distinct canonical identity gets its own ledger --------------------

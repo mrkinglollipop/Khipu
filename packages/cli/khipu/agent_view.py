@@ -128,32 +128,32 @@ def _saved_view() -> dict:
     return {}
 
 
-def _homes(extra_keys: Iterable[str] | None, view: dict, *, local_only=False) -> list[tuple[str, str | None]]:
+def _homes(extra_keys: Iterable[str] | None, view: dict, *, local_only=False, require_complete=False) -> list[tuple[str, str | None]]:
     """Every (harness, login folder) Khipu knows: configured (invalid entries
     included), discovered Claude homes, the routing record's accounts, the
     caller's ``extra_keys`` ("harness|home"), each default login and each
     one set for this process through a harness's own variable
     (``CODEX_HOME``, ``GROK_HOME``, ``CLAUDE_CONFIG_DIR``)."""
     out: list[tuple[str, str | None]] = [(h, None) for h in _DEFAULT_FOLDERS]
-    with contextlib.suppress(Exception):
+    with (contextlib.nullcontext() if require_complete else contextlib.suppress(Exception)):
         from khipu.usage import _HOME_VARS
 
         for harness, var in _HOME_VARS.items():
             value = (os.environ.get(var) or "").strip()
             if value:
                 out.append((harness, value))
-    with contextlib.suppress(Exception):
+    with (contextlib.nullcontext() if require_complete else contextlib.suppress(Exception)):
         from khipu.config import load_config
 
         for entry in load_config().get("usage_accounts") or []:
             if isinstance(entry, dict) and isinstance(entry.get("home"), str) and entry["home"].strip():
                 out.append((str(entry.get("harness") or "").strip().lower(), entry["home"].strip()))
-    with contextlib.suppress(Exception):
+    with (contextlib.nullcontext() if require_complete else contextlib.suppress(Exception)):
         from khipu import claude_homes
 
         for found in (() if local_only else claude_homes.discover()):
             out.append(("claude", None if found.is_default else str(found.path)))
-    with contextlib.suppress(Exception):
+    with (contextlib.nullcontext() if require_complete else contextlib.suppress(Exception)):
         # Account discovery's finds (settings clarity phase 9): its last
         # stored run, which carries every source, and the login-shaped names
         # in the home folder now, so a folder is scrubbed before any run.
@@ -379,7 +379,7 @@ def _other_paths(*, local_only=False) -> list[str]:
     return others
 
 
-def _rules(extra_keys: Iterable[str] | None = None, *, local_only=False) -> _Table:
+def _rules(extra_keys: Iterable[str] | None = None, *, local_only=False, require_complete=False) -> _Table:
     view = _saved_view()
     home = _home_dir()
     root_to: dict[str, object] = {}  # folded path -> an _Id or a word
@@ -394,7 +394,7 @@ def _rules(extra_keys: Iterable[str] | None = None, *, local_only=False) -> _Tab
         if not plain:
             token_names.add(_fold(form))
 
-    for harness, raw in _homes(extra_keys, view, local_only=local_only):
+    for harness, raw in _homes(extra_keys, view, local_only=local_only, require_complete=require_complete):
         ident = _Id(harness, raw)
         default = raw is None
         if raw is None:
@@ -694,8 +694,23 @@ def _table(extra_keys) -> _Table:
     """The cached table, rebuilt on any source change or TTL expiry."""
     extra_keys = tuple(extra_keys) if extra_keys is not None else None
     current = getattr(_PROJECTION, "current", None)
-    if current is not None and current[0] == extra_keys:
-        return current[1]
+    if current is not None:
+        if current[0] is None:
+            keys = getattr(_PROJECTION, "pull_keys", ())
+            if set(extra_keys or ()) - set(keys):
+                keys = tuple(dict.fromkeys((*keys, *extra_keys)))
+                try:
+                    table = _rules(keys, require_complete=True)
+                except Exception:
+                    raise PullInventoryUnavailable() from None
+                # Owner provenance comes from the view being projected,
+                # never from a saved view preceding this pull's fold.
+                table.owner = []
+                _PROJECTION.current = (None, table)
+                _PROJECTION.pull_keys = keys
+            return _PROJECTION.current[1]
+        if current[0] == extra_keys:
+            return current[1]
     previous = getattr(_FORM_CACHE, "current", None)
     _FORM_CACHE.current = {}
     try:
@@ -767,6 +782,8 @@ def _scrub_text(text: str, table: _Table, keep: list[str]) -> str:
 
 
 def _walk(value, table, keep):
+    if isinstance(value, RoutingPage):
+        return value
     if isinstance(value, str):
         return _scrub_text(value, table, keep)
     if isinstance(value, dict):
@@ -917,14 +934,29 @@ def _withhold_names(value, fixed=None, names=None):
     return value
 
 
+class RoutingPage(str):
+    """An internal fragment of a fully projected routing entry.
+
+    JSON callers cannot supply this provenance. Only delivery may create it,
+    after scanning the complete source and before cutting a page.
+    """
+
+
+def _has_secret(text: str) -> bool:
+    from khipu.redact import redact_secrets
+
+    return any(redact_secrets(variant, force=True)[1] for variant in _decoded_variants(text))
+
+
 def _strict_text(text: str, table: _Table, keep: list[str]) -> str:
+    # An exemption must never split a credential into undetectable pieces.
+    if _has_secret(text):
+        return WITHHELD
     held = [w for w in keep if w and w in text]
     for i, word in enumerate(held):
         text = text.replace(word, f"\x00{i}\x00")
-    from khipu.redact import redact_secrets
-
     for variant in _decoded_variants(text):
-        if _ANY_ACCOUNT_KEY.search(variant) or redact_secrets(variant, force=True)[1]:
+        if _ANY_ACCOUNT_KEY.search(variant):
             text = WITHHELD + "".join(f" \x00{i}\x00" for i in range(len(held)))
             break
     for i, word in enumerate(held):
@@ -939,11 +971,14 @@ def scrub_strict(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] |
     record's) still pass as written, as in ``scrub``."""
     table = _table(extra_keys)
     words = sorted({w for w in [*keep, *table.owner] if isinstance(w, str) and w}, key=len, reverse=True)
-    scrubbed = scrub(value, keep=keep, extra_keys=extra_keys)
-
     def walk(item):
+        if isinstance(item, RoutingPage):
+            return item
         if isinstance(item, str):
-            return _strict_text(item, table, words)
+            # Scan the source before any path/name or owner-word masking.
+            if _has_secret(item):
+                return WITHHELD
+            return _strict_text(_scrub_text(item, table, words), table, words)
         if isinstance(item, dict):
             return {(walk(k) if isinstance(k, str) else k): walk(v) for k, v in item.items()}
         if isinstance(item, list):
@@ -952,45 +987,60 @@ def scrub_strict(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] |
             return tuple(walk(v) for v in item)
         return item
 
-    return walk(scrubbed)
+    return walk(value)
+
+
+class PullInventoryUnavailable(RuntimeError):
+    """The pull cannot be projected with a complete login table."""
+
+
+@contextlib.contextmanager
+def pull_projection():
+    """Use one complete login table for a pull, or withhold the answer.
+
+    Unlike the bounded hook projection, a pull must not use a local-only
+    fallback. The full inventory and its resolved aliases must finish.
+    """
+    try:
+        _config_whole()
+        # Discovery intentionally tolerates unreadable directories. That is
+        # not evidence of completeness at this privacy boundary.
+        from khipu import discover
+
+        with os.scandir(_home_dir()) as entries:
+            for entry in entries:
+                if discover.name_match(entry.name):
+                    entry.is_dir(follow_symlinks=True)
+        # The existing routing read supplies fresh account keys through
+        # _table. Another read here would add a third lock wait and would
+        # misclassify routing-read failures as inventory failures.
+        keys = ()
+        table = _rules(keys, require_complete=True)
+        table.owner = []
+    except Exception:
+        raise PullInventoryUnavailable() from None
+    previous = getattr(_PROJECTION, "current", None)
+    previous_keys = getattr(_PROJECTION, "pull_keys", ())
+    _PROJECTION.current = (None, table)
+    _PROJECTION.pull_keys = keys
+    try:
+        yield
+    finally:
+        _PROJECTION.current = previous
+        _PROJECTION.pull_keys = previous_keys
 
 
 def login_inventory_available() -> bool:
-    """Whether any live source inventories a login folder beyond the
-    home-less defaults: a discovered candidate, a login-shaped folder in
-    the home folder now, a discovered Claude home, or a configured
-    account with a folder. A stored run whose candidates are its only
-    evidence counts only while its last run is within the seven days
-    discovery itself counts conversations over. When this is false, a
-    login folder's alias can be a name the scrub table has never seen,
-    so alias-bearing lines must fail closed rather than be shown."""
-    try:
-        from khipu import discover
+    """Only the complete table prepared for this pull can cover lane aliases.
 
-        store = discover._load_store()
-        if discover._source_names():
-            return True
-        candidates = store.get("candidates") or {}
-        if candidates:
-            last = store.get("last_run") if isinstance(store.get("last_run"), dict) else {}
-            at = last.get("at")
-            if isinstance(at, (int, float)) and not isinstance(at, bool):
-                return time.time() - float(at) <= 7 * 86400
-            return True
-    except Exception:  # noqa: BLE001 - no inventory is itself the answer
-        pass
-    with contextlib.suppress(Exception):
-        from khipu import claude_homes
-
-        if any(not found.is_default for found in claude_homes.discover()):
-            return True
-    with contextlib.suppress(Exception):
-        from khipu.config import load_config
-
-        if any(isinstance(entry, dict) and isinstance(entry.get("home"), str) and entry["home"].strip()
-               for entry in load_config().get("usage_accounts") or []):
-            return True
-    return False
+    Default folders alone cannot inventory private login names. A partial,
+    absent or stale cached table is never evidence of coverage.
+    """
+    current = getattr(_PROJECTION, "current", None)
+    if current is None or current[0] is not None or current[1].previous is not None:
+        return False
+    table = current[1]
+    return any(isinstance(to, _Id) and to.home for _root, to in table.root_to)
 
 
 def _projected(value):

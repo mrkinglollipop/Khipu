@@ -2232,18 +2232,22 @@ def _route_pull_attachment(routing, routing_delivery, identity, now):
     reserved or consumed."""
     with routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
         view = routing.read_view(now)
+    from khipu import agent_view
+
+    def project(value):
+        return agent_view.scrub_strict(value, keep=agent_view.keep_owner_words(view),
+                                       extra_keys=[a.get("key") for a in view.get("accounts") or []
+                                                   if isinstance(a, dict)])
+
     planned = routing_delivery.plan(
         {"kind": "full", "text": routing.summary(view, now=now)["text"],
          "version": view["version"], "epoch": view.get("epoch"),
          "owed_entities": [], "shown_entities": []},
-        view, now, routing.settings())
-    # An unmatched lane's name comes from outside the known accounts: when
-    # no live source inventories a login folder, that name may be a login
-    # alias the scrub table has never seen, so lane items fail closed
-    # (neither shown nor reserved) until an inventory exists.
-    from khipu import agent_view
-
-    skip = frozenset() if agent_view.login_inventory_available() else frozenset(
+        view, now, routing.settings(), project=project)
+    # Unmatched names need the complete pull table's alias coverage;
+    # discovering a default folder alone cannot grant it.
+    skip = frozenset(item["entity"] for item in planned["delivery_plan"]["items"] if item.get("withheld"))
+    skip |= frozenset() if agent_view.login_inventory_available() else frozenset(
         item["entity"] for item in planned["delivery_plan"]["items"]
         if item["entity"].startswith("lane:"))
     if identity is None:
@@ -2267,16 +2271,24 @@ def _route_pull_attachment(routing, routing_delivery, identity, now):
     # Projected strictly here, not only scrubbed at dispatch: an entity can
     # carry an account key or a secret-shaped lane name, and a direct
     # caller of this tool gets neither.
-    from khipu import agent_view
-
-    scrubbed = routing._for_agents({"routing_changes": changes, "delivery": delivery}, view)
-    scrubbed = agent_view.scrub_strict(scrubbed, keep=agent_view.keep_owner_words(view),
-                                       extra_keys=[a.get("key") for a in view.get("accounts") or []
-                                                   if isinstance(a, dict)])
+    scrubbed = project({"routing_changes": changes, "delivery": delivery})
     return scrubbed["routing_changes"], scrubbed["delivery"]
 
 
 def _tool_route(args: dict) -> dict:
+    if _via_https_gateway():
+        return {"available": False, "reason": ROUTING_GATEWAY_REASON}
+    from khipu import agent_view
+
+    try:
+        with agent_view.pull_projection():
+            return _tool_route_projected(args)
+    except agent_view.PullInventoryUnavailable:
+        # No reservation or acknowledgement happens without the full table.
+        return {"available": False, "reason": agent_view.INCOMPLETE}
+
+
+def _tool_route_projected(args: dict) -> dict:
     """khipu_route: the routing record as ``khipu route --json`` gives it,
     plus the words the push leaves out, and this conversation's pull
     delivery (`routing_changes` and `delivery`). Local only until the
@@ -2299,6 +2311,9 @@ def _tool_route(args: dict) -> dict:
     now = routing._now()
     ack = (args.get("ack") or "").strip()
     if ack and identity is not None:
+        # Revalidate the complete source and final representation first.
+        # A pre-upgrade or newly withheld reservation cannot consume debt.
+        _route_pull_attachment(routing, routing_delivery, identity, now)
         status = routing_delivery.pull_acknowledge(identity["session"], ack, component="mcp", now=now)
         if status == "foreign":
             raise _ToolFailure({"ok": False, "code": "ack_not_yours",

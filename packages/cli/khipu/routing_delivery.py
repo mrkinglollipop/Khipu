@@ -41,34 +41,12 @@ def _size(text):
     return len(text) + sum(ord(c) > 0xffff for c in text)
 
 
-def _canonical_session(session):
-    """The ledger identity for a session argument: a harness-native id the
-    caller's own environment confirms becomes its canonical (prefixed)
-    root, so a hook and an MCP call from one conversation share a ledger
-    while ``claude:<id>`` and ``codex:<id>`` never do. Anything else (an
-    already-canonical root, a daemon serving another conversation) is
-    taken as given, never replaced by this process's own identity."""
-    if not isinstance(session, str) or not session:
-        return session
-    env = os.environ
-    shared = (env.get("KHIPU_SESSION_ID") or "").strip()
-    if shared and session == shared:
-        return shared
-    claude = (env.get("CLAUDE_CODE_SESSION_ID") or "").strip()
-    if claude and session == claude:
-        return f"claude:{claude}"
-    codex = (env.get("CODEX_THREAD_ID") or "").strip()
-    if codex and session == codex:
-        return f"codex:{codex}"
-    return session
-
-
 def _path(session):
     from khipu import recall_prompt
 
     # A collision-resistant name for the complete canonical identity:
     # sanitizing or truncating it made distinct identities share a file.
-    digest = hashlib.sha256(_canonical_session(session).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(session.encode("utf-8")).hexdigest()
     return recall_prompt._dedup_path("ledger").parent / f"recall--{digest}.routing.json"
 
 
@@ -108,7 +86,7 @@ def snapshot(session, component="main"):
         return {}
     return data.get(component, {})
 
-def plan(out, view, now, cfg):
+def plan(out, view, now, cfg, *, project=None):
     """Attach current, scrubbed entity revisions to a hook's rendered offer."""
     from khipu import routing as r
 
@@ -142,9 +120,14 @@ def plan(out, view, now, cfg):
         if effective is None:
             effective = line
         items.append(dict(entity=entity, effective=effective, text=line, label=label, whole=whole))
-    projected = r._for_agents([(item["text"], item["label"]) for item in items], view) if items else []
+    raw = [(item["text"], item["label"]) for item in items]
+    projected = (project(raw) if project else r._for_agents(raw, view)) if items else []
     for item, (line, label) in zip(items, projected):
         effective = item.pop("effective")
+        if project:
+            # A projection is not evidence that the source characters were
+            # delivered. Withheld/changed entries stay owed at offset zero.
+            item["withheld"] = (line, label) != (item["text"], item["label"])
         # Relative account ages are presentation, not a new change. Rules
         # and priority also depend on the rendered hold and level suffixes.
         fingerprint = [effective, line, label] if item["entity"].startswith("rule:") or item["entity"] == "priority" else effective
@@ -368,10 +351,11 @@ def canonical_identity(environ=None, explicit=None):
     identity the environment itself knows (``KHIPU_SESSION_ID``, then a
     harness-native id) always wins: an explicit ``session_id`` may only
     fill in when the environment names no session, never impersonate
-    another identified caller. ``root`` is the canonical (prefixed)
-    identity and ``session`` is that same root, the ledger key; a hook
-    carrying the bare native id reaches the same file through
-    ``_canonical_session``. A root containing "/" is a pull-only child:
+    another identified caller. Native and T3 roots cannot be supplied by
+    an unidentified caller. Other explicit ids use an isolated pull
+    namespace, so they cannot borrow custom environment-owned roots.
+    ``root`` is the conversation name and ``session`` its ledger key. A root
+    containing "/" is a pull-only child:
     its own ledger, never its parent's. Capability comes from the
     current attachment's harness alone.
     """
@@ -400,8 +384,11 @@ def canonical_identity(environ=None, explicit=None):
         root = session = f"claude:{claude}"
     elif codex:
         root = session = f"codex:{codex}"
-    elif explicit:
-        root = session = explicit
+    elif explicit and not explicit.startswith(("claude:", "codex:", "t3:")):
+        root = explicit
+        # Environment strings cannot contain NUL. Explicit pull ids thus
+        # cannot borrow even a custom environment-owned root's ledger.
+        session = "pull\0" + explicit
     else:
         return None
     if harness in _HOOKED_HARNESSES:
@@ -414,6 +401,17 @@ def canonical_identity(environ=None, explicit=None):
         capability = "pull_only"
     return {"root": root, "session": session, "harness": harness,
             "capability": capability, "child": "/" in root}
+
+
+def hook_session(session, environ=None):
+    """Resolve a trusted hook payload once, before helper IPC or a writer.
+
+    Payload-only harness hooks historically use bare ids. The caller's
+    environment supplies the shared root or native namespace when present.
+    Delivery helpers and ledger paths must never resolve it again.
+    """
+    identity = canonical_identity(environ)
+    return identity["session"] if identity else session
 
 
 def untracked_items(out):
@@ -466,6 +464,7 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
     with _transaction(session) as data:
         state = data.setdefault(component, {})
         entries = _merge(state, out)
+        skip_entities = skip_entities | frozenset(e["entity"] for e in entries.values() if e.get("withheld"))
         flight = state.get("flight")
         if flight and any(item["entity"] in skip_entities
                           for item in flight["out"]["routing_changes"]["items"]):
@@ -473,7 +472,7 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
             flight = None
         if flight and _parse(flight["until"]) > now:
             changes = copy.deepcopy(flight["out"]["routing_changes"])
-            return changes, _delivery_summary(data, component, state, changes, now, counting_component)
+            return _projected_pages(changes), _delivery_summary(data, component, state, changes, now, counting_component)
         if flight:
             state["expired"] = state.get("expired", 0) + 1
             state.pop("flight", None)
@@ -511,7 +510,17 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
                            "out": {"routing_changes": copy.deepcopy(changes),
                                    "version": out.get("version")},
                            "progress": progress, "plan": copy.deepcopy(plan_data)}
-        return changes, _delivery_summary(data, component, state, changes, now, counting_component)
+        return _projected_pages(changes), _delivery_summary(data, component, state, changes, now, counting_component)
+
+
+def _projected_pages(changes):
+    from khipu.agent_view import RoutingPage
+
+    # The full entry was projected before reservation. Retain that fact
+    # across disk retransmission so a fragment keeps its owner exemption.
+    for item in changes["items"]:
+        item["text"] = RoutingPage(item["text"])
+    return changes
 
 
 def _batch_in_state(state, batch):

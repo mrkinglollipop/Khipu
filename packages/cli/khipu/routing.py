@@ -789,7 +789,7 @@ def _for_agents(value, view: dict | None = None):
     from khipu import agent_view
 
     keys = [a.get("key") for a in (view or {}).get("accounts") or [] if isinstance(a, dict)] if view else None
-    return agent_view.scrub(value, keep=agent_view.keep_owner_words(view), extra_keys=keys)
+    return agent_view.scrub_strict(value, keep=agent_view.keep_owner_words(view), extra_keys=keys)
 
 
 def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime:
@@ -7193,6 +7193,10 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
         version, epoch = _parse_since(since_version)
         out = since(version, view, now=now, epoch=epoch)
         pairs = list(zip(out["entities"], out["lines"]))
+        from khipu import agent_view
+
+        if not agent_view.login_inventory_available():
+            pairs = [(e, line) for e, line in pairs if not e.startswith("lane:")]
         if key is not None:
             mine = {f"account:{key}"} | {f"hold:{i}" for i in _holds_on(key, view)}
             pairs = [(e, line) for e, line in pairs
@@ -7214,9 +7218,12 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     out["holds"] = [_public_hold(h, now) for h in view.get("holds") or []
                     if key is None or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
     if key is None:
-        out["unmatched"] = [dict(_pick(u, _LANE_FIELDS), line=lane_line(u, now),
-                                 candidates=[account_id(k) for k in u.get("candidates") or []])
-                            for u in view.get("unmatched") or []]
+        from khipu import agent_view
+
+        out["unmatched"] = ([dict(_pick(u, _LANE_FIELDS), line=lane_line(u, now),
+                                  candidates=[account_id(k) for k in u.get("candidates") or []])
+                             for u in view.get("unmatched") or []]
+                            if agent_view.login_inventory_available() else [])
         out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
                                if r.get("silent") or r.get("unreadable")]
     out["about"] = ABOUT
