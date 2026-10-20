@@ -343,7 +343,7 @@ describe("Setup › Accounts step, review fixes", () => {
     });
     mount();
     await screen.findByText("Default login: signed in, Max, 62% of its week left");
-    await screen.findByText(/Not in your account list: Codex, Grok Build, Muse, Cursor and GLM Coding Plan/);
+    await screen.findByText(/Not in your account list: Codex, Grok Build, Muse and GLM Coding Plan/);
     expect(screen.queryByText(/Not found on this Mac/)).not.toBeInTheDocument();
   });
 

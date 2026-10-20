@@ -51,13 +51,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-HARNESSES = ("claude", "codex", "grok", "muse", "glm", "cursor")
-LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok", "muse": "Muse", "glm": "GLM", "cursor": "Cursor"}
+HARNESSES = ("claude", "codex", "grok", "muse", "glm")
+LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok", "muse": "Muse", "glm": "GLM"}
 # One sign-in each and no login folder: Muse's is its own login, GLM's is the
 # Coding Plan key (a Claude Code lane pointed at z.ai, not an Anthropic home).
-NO_FOLDER = ("muse", "glm", "cursor")
-CURSOR_TIMEOUT_S = 10.0
-CURSOR_NO_FIGURES = "Cursor reports no usage figures; its limits come from runner and conversation reports"
+NO_FOLDER = ("muse", "glm")
 TIMEOUT_S = 5.0
 # Grok's probe starts a whole `grok agent` (and its MCP servers), which took
 # longer than TIMEOUT_S under load; the other harnesses' probes stay cheap.
@@ -129,7 +127,7 @@ E_BAD_KEY = "key_rejected"
 NO_FOLDER_NOTE = "Khipu can't find this account's login folder on this Mac"
 # The CLIs by the names the app's form gives them.
 CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok Build", "muse": "Muse",
-             "glm": "GLM Coding Plan", "cursor": "Cursor"}
+             "glm": "GLM Coding Plan"}
 # Plain words only: the app shows notes as written to an owner who is not
 # technical, so a note names a login folder, never a home, a PATH, a token or
 # a probe. The live read's own code goes in the row's ``live_error`` field,
@@ -242,55 +240,6 @@ def _command(harness: str) -> str | None:
     from khipu import synth_cli
 
     return synth_cli.binary(harness)
-
-
-def parse_cursor(data: dict) -> dict:
-    """Project account status immediately; no CLI text or user identity survives."""
-    import hashlib
-    import hmac
-    from khipu import routing
-
-    if not isinstance(data, dict):
-        raise ProbeError(E_BAD)
-    if "userEmail" not in data:
-        raise ProbeError(E_BAD)
-    identity = data["userEmail"]
-    if identity is None:
-        raise ProbeError(E_SIGNIN)
-    if not isinstance(identity, str) or not identity.strip():
-        raise ProbeError(E_BAD)
-    tier = data.get("subscriptionTier")
-    # Plan names are a vocabulary, never arbitrary text from the CLI.
-    plans = {"ultra": "Ultra", "pro": "Pro", "pro+": "Pro+", "pro plus": "Pro+", "free": "Free",
-             "business": "Business", "enterprise": "Enterprise", "team": "Team", "teams": "Teams"}
-    plan = plans.get(tier.strip().casefold()) if isinstance(tier, str) else None
-    row = {"ok": True, "plan": plan, "windows": [], "source": "account_status", "note": CURSOR_NO_FIGURES}
-    row["identity_hash"] = hmac.new(routing._id_salt(), b"cursor\0" + identity.strip().casefold().encode(),
-                                    hashlib.sha256).hexdigest()
-    return row
-
-
-def probe_cursor(*, timeout: float = CURSOR_TIMEOUT_S) -> dict:
-    """Cursor's own stored sign-in, without a turn or a credential-file read."""
-    from khipu import discover
-
-    binary = _command("cursor")
-    if not binary:
-        return {"ok": False, "error": E_NOT_INSTALLED}
-    result = discover.run_once("cursor", (binary, "about", "--format", "json"),
-                               timeout=min(timeout, CURSOR_TIMEOUT_S), run=getattr(_local, "run", None))
-    try:
-        if result["outcome"] != "exited":
-            raise ProbeError(E_TIMEOUT if result["outcome"] == "timeout" else E_START)
-        if result["code"]:
-            raise ProbeError(_classify((result["out"] + result["err"]).decode("utf-8", "replace"), _exit_code(result["code"])))
-        try:
-            data = json.loads(result["out"])
-        except (ValueError, UnicodeDecodeError):
-            raise ProbeError(_classify((result["out"] + result["err"]).decode("utf-8", "replace"), E_BAD)) from None
-        return parse_cursor(data)
-    except ProbeError as exc:
-        return {"ok": False, "error": exc.code}
 
 
 def _home_path(home: str) -> Path | None:
@@ -1492,7 +1441,7 @@ def _entry_problem(harness: str, home: str | None) -> tuple[str, str, str] | Non
     if harness not in HARNESSES:
         named = f'the CLI "{harness}"' if harness else "an entry with no CLI"
         return "unknown_cli", "harness", (f"Khipu does not read {named}; it reads Claude Code, Codex, "
-                                          "Grok Build, Muse, Cursor and the GLM Coding Plan")
+                                          "Grok Build, Muse and the GLM Coding Plan")
     if harness in NO_FOLDER and home:
         return (f"{harness}_folder", "home",
                 f"{LABELS[harness]} has one sign-in, so it takes no login folder")
@@ -1548,6 +1497,10 @@ def reads_none(config: dict | None = None) -> bool:
     return config.get("usage_accounts_none") is True and not (isinstance(raw, list) and raw)
 
 
+def _cursor_entry(entry) -> bool:
+    return isinstance(entry, dict) and str(entry.get("harness") or "").strip().lower() == "cursor"
+
+
 def configured_accounts() -> list[dict]:
     """Config ``usage_accounts`` (``[{label, harness, home?}]``), or by default
     every installed CLI with its default home, or none after the owner chose
@@ -1561,7 +1514,7 @@ def configured_accounts() -> list[dict]:
         if reads_none(config):
             return []
         return [{"label": LABELS[h], "harness": h, "home": None} for h in HARNESSES if available(h)]
-    return [_account_from_entry(entry) for entry in raw]
+    return [_account_from_entry(entry) for entry in raw if not _cursor_entry(entry)]
 
 
 def default_login(harness: str) -> Path | None:
@@ -1837,8 +1790,6 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
             data = probe_grok(home, timeout=timeout)
         elif harness == "muse":
             data = probe_muse(timeout=timeout, turn=turn)
-        elif harness == "cursor":
-            data = probe_cursor(timeout=CURSOR_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
         elif harness == "glm":
             data = probe_glm(timeout=timeout)
         else:
@@ -1887,8 +1838,7 @@ def probe_all(accounts: list[dict], *, timeout: float = TIMEOUT_S) -> list[dict]
     for thread in threads:
         thread.start()
     longest = max([timeout] + [_grok_budget(timeout) for a in accounts if a.get("harness") == "grok"]
-                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") == "glm"]
-                  + [CURSOR_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") == "cursor"])
+                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") == "glm"])
     end = time.monotonic() + longest + OVERALL_GRACE_S
     for thread in threads:
         thread.join(max(0.0, end - time.monotonic()))
@@ -2260,8 +2210,7 @@ def public_row(row: dict) -> dict:
         # (a cache edited by hand, a field from elsewhere) is written again.
         note = row.get("note")
         own = {_note(error, harness, home), _note(error, harness, None),
-               _rollout_note(out.get("live_error") or error or "", home), ROLLOUT_NOTE, "no turn observed yet",
-               CURSOR_NO_FIGURES}
+               _rollout_note(out.get("live_error") or error or "", home), ROLLOUT_NOTE, "no turn observed yet"}
         if note is not None and note not in own:
             note = _note(error, harness, home)
     out["note"] = note
@@ -2534,10 +2483,16 @@ def doctor_block(*, max_age: float = DEFAULT_MAX_AGE_S, now: datetime | None = N
     stale flag), and one warning line per window still in force at
     ``ALERT_PCT`` or more. Read from the usage cache only: no CLI is probed,
     no lock is waited on, and nothing here ever gates doctor's ``ok``."""
+    from khipu.config import load_config
+
     now = now or _now()
     cache = _load_cache()
     accounts: list[dict] = []
-    warnings: list[str] = []
+
+    raw = load_config().get("usage_accounts")
+    warnings: list[str] = (["Ignored a tracked Cursor entry: Cursor is a transport on the xAI account; "
+                            "its usage and limits count against Grok"]
+                if isinstance(raw, list) and any(_cursor_entry(e) for e in raw) else [])
     for account in configured_accounts():
         entry = {"account": account["label"], "harness": account["harness"], "home": account.get("home"),
                  "ok": None, "error": None, "plan": None, "window": None, "used_pct": None, "resets_at": None,

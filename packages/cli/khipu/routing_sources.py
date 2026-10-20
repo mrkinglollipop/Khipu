@@ -906,7 +906,8 @@ def runner_evidence(status: dict, cache: dict) -> list[dict]:
     specs = ((cache.get("config") or {}).get("data") or {}).get("lanes") or {}
     for item in out:
         spec = specs.get(item["lane"]) or {}
-        item.update(declaration=lane_identity(spec), model=spec.get("model"), family=model_family(spec.get("model")))
+        item.update(declaration=lane_identity(spec), model=spec.get("model"), family=model_family(spec.get("model")),
+                    transport="cursor" if spec.get("kind") == "cursor" or spec.get("provider") == "cursor" else None)
     return out
 
 

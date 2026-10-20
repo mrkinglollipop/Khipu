@@ -165,13 +165,12 @@ function shortVersion(v: string | null | undefined): string | null {
   return m ? `${m[1]}.${m[2]}` : null;
 }
 
-function serviceLine(cli: CliId, st: CliState | undefined, alreadyTracked: boolean): string {
+function serviceLine(cli: CliId, st: CliState | undefined, museTracked: boolean): string {
   if (!st || st.state === "not_installed") return "Not found on this Mac.";
   if (st.state === "cant_run") return st.path ? `Found at ${st.path}, but Khipu can't start it.` : "Found, but Khipu can't start it.";
   const ver = shortVersion(st.version);
   const is = `${cliName(cli)}${ver ? ` ${ver}` : ""} is installed.`;
-  if (cli === "cursor") return alreadyTracked ? "Cursor has one login per Mac, and Khipu already tracks it." : `${is} Cursor has one login per Mac.`;
-  if (cli === "muse") return alreadyTracked ? "Muse has one login per Mac, and Khipu already tracks it." : `${is} Muse has one login per Mac.`;
+  if (cli === "muse") return museTracked ? "Muse has one login per Mac, and Khipu already tracks it." : `${is} Muse has one login per Mac.`;
   if (cli === "grok") return `${is} Khipu can use a login you made in Grok Build.`;
   return `${is} Can hold several logins.`;
 }
@@ -221,7 +220,7 @@ function candidateCheckSummary(cli: CliId, candidates: Candidate[]): string {
 const DEFAULT_HOME: Record<string, string> = { claude: "~/.claude", codex: "~/.codex", grok: "~/.grok" };
 
 function folderOf(c: Candidate): string | null {
-  return c.default || c.cli === "muse" || c.cli === "cursor" || c.cli === "glm" ? null : c.path;
+  return c.default || c.cli === "muse" || c.cli === "glm" ? null : c.path;
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +341,7 @@ export function AddAccountDialog({
   }, [open, canSignInNew, offers]);
 
   const clis = discovery?.clis ?? null;
-  const singleTracked = (h: CliId) => (h === "muse" || h === "cursor") && tracked.some((t) => t.harness === h && !t.invalid);
+  const museTracked = tracked.some((t) => t.harness === "muse" && !t.invalid);
   const candidates = useMemo(() => {
     const list = (discovery?.candidates ?? []).filter((c) => c.cli === cli);
     if (extra && extra.cli === cli && !list.some((c) => c.id === extra.id)) list.push(extra);
@@ -355,7 +354,7 @@ export function AddAccountDialog({
   // the first signed-in login, so Next is ready when the usual choice is right.
   useEffect(() => {
     if (!open || step !== 1 || cli != null || !clis) return;
-    const first = CLI_IDS.find((c) => clis[c]?.state === "installed" && !singleTracked(c));
+    const first = CLI_IDS.find((c) => clis[c]?.state === "installed" && !(c === "muse" && museTracked));
     if (first) setCli(first);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, step, clis]);
@@ -396,7 +395,7 @@ export function AddAccountDialog({
   // ----- step 1 -------------------------------------------------------------
   const st = cli ? clis?.[cli] : undefined;
   const nothingInstalled = !!clis && CLI_IDS.every((c) => (clis[c]?.state ?? "not_installed") === "not_installed");
-  const step1Next = !!cli && st?.state === "installed" && !singleTracked(cli);
+  const step1Next = !!cli && st?.state === "installed" && !(cli === "muse" && museTracked);
 
   async function checkAgain() {
     if (!cli && !nothingInstalled) return;
@@ -620,7 +619,7 @@ export function AddAccountDialog({
           <ul className="aa-list" role="radiogroup" aria-label="Service">
             {CLI_IDS.map((c) => {
               const s = clis[c];
-              const off = singleTracked(c);
+              const off = c === "muse" && museTracked;
               const id = `${uid}-svc-${c}`;
               return (
                 <li key={c} className={["aa-opt", cli === c ? "chosen" : null, off ? "off" : null].filter(Boolean).join(" ")}>
@@ -633,7 +632,7 @@ export function AddAccountDialog({
                     }} />
                   <label htmlFor={id}>
                     <b>{serviceName(c)}</b>
-                    <span className="t2">{serviceLine(c, s, singleTracked(c))}</span>
+                    <span className="t2">{serviceLine(c, s, museTracked)}</span>
                   </label>
                   {off ? (
                     <Tag>Already tracked</Tag>
@@ -682,7 +681,7 @@ export function AddAccountDialog({
               </button>
             </div>
           </div>
-        ) : cli && clis && st?.state !== "installed" && !singleTracked(cli) ? (
+        ) : cli && clis && st?.state !== "installed" && !(cli === "muse" && museTracked) ? (
           <div className="callout">
             <div className="txt">
               <b>{cliName(cli)} is not installed on this Mac</b>
@@ -719,10 +718,10 @@ export function AddAccountDialog({
           <button type="button" className="primary" disabled={!step1Next}
             onClick={() => {
               setSaid(null);
-              if (cli === "muse" || cli === "cursor") {
-                const muse = (discovery?.candidates ?? []).find((c) => c.cli === cli) ?? {
-                  id: `${cli}:default`, cli, cli_name: cliName(cli), path: null, default: true, sources: ["installed"],
-                  name: serviceName(cli), first_seen: null, last_checked: null, state: "pending" as const, reason: null, plan: null,
+              if (cli === "muse") {
+                const muse = (discovery?.candidates ?? []).find((c) => c.cli === "muse") ?? {
+                  id: "muse:default", cli: "muse" as const, cli_name: "Muse", path: null, default: true, sources: ["installed"],
+                  name: "Muse", first_seen: null, last_checked: null, state: "pending" as const, reason: null, plan: null,
                   conversations_7d: null, needs_owner_check: false, offer_on_home: false,
                 };
                 setExtra(muse);
@@ -771,7 +770,7 @@ export function AddAccountDialog({
       const newErr = newName.trim() ? nameProblem(newName, false, takenNames) : null;
       body = (
         <SignInNewAccount
-          cli={cli as Exclude<CliId, "glm" | "cursor">}
+          cli={cli as Exclude<CliId, "glm">}
           cliName={cliName(cli)}
           accountName={newName.trim()}
           offered
@@ -913,7 +912,7 @@ export function AddAccountDialog({
       </>
     );
   } else if (chosen) {
-    const where = (chosen.cli === "muse" || chosen.cli === "cursor") ? `${serviceName(chosen.cli)}'s one login on this Mac` : chosen.path ?? "its default login";
+    const where = chosen.cli === "muse" ? "Muse's one login on this Mac" : chosen.path ?? "its default login";
     const label = name.trim() || suggestedName(chosen);
     const w = row && row.ok !== false ? tightestWindow(row) : null;
     const pct = w && typeof w.used_pct === "number" ? w.used_pct : null;
@@ -989,7 +988,7 @@ export function AddAccountDialog({
             </div>
           ) : null}
           <p>
-            {(chosen.cli === "muse" || chosen.cli === "cursor") ? `${serviceName(chosen.cli)}'s one login on this Mac.` : <>Login folder <span className="aa-mono">{where}</span>.</>} Reading a plan uses no turn and costs nothing.
+            {chosen.cli === "muse" ? "Muse's one login on this Mac." : <>Login folder <span className="aa-mono">{where}</span>.</>} Reading a plan uses no turn and costs nothing.
           </p>
         </div>
       );
@@ -1078,7 +1077,7 @@ export function AddAccountDialog({
                 Cancel
               </button>
               <button type="button" disabled={saving || signIn?.kind === "running"}
-                onClick={() => { readSeq.current++; setStep((chosen.cli === "muse" || chosen.cli === "cursor") ? 1 : 2); setRead(null); setProblem(null); setSaid(null); }}>
+                onClick={() => { readSeq.current++; setStep(chosen.cli === "muse" ? 1 : 2); setRead(null); setProblem(null); setSaid(null); }}>
                 Back
               </button>
               {duplicate ? (

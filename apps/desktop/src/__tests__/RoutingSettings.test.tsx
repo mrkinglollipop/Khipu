@@ -1690,15 +1690,15 @@ describe("Settings -> Routing: nothing shows a false off while it is read", () =
   });
 });
 
-it("shows a provider-matched Cursor lane without writing a lane override", async () => {
+it("shows a Cursor lane matched to Grok without writing a lane override", async () => {
   const v = view();
-  v.accounts!.push(acct("Cursor", "cursor", {}));
+  v.accounts!.push(acct("Grok", "grok", {}));
   v.sources!.runners = [{ name: "Project A", lanes: ["cursor-grok"], unmatched_lanes: [],
-    lane_matches: { "cursor-grok": { account: "Cursor", matched_by: "provider", candidates: ["Cursor"] } } }];
+    lane_matches: { "cursor-grok": { account: "Grok", matched_by: "declaration", candidates: ["Grok"] } } }];
   answers.khipu_route_view = v;
   await page();
   const lanes = await screen.findByRole("list", { name: "Project A lanes" });
-  expect(lanes).toHaveTextContent("Cursor · matched by provider");
+  expect(lanes).toHaveTextContent("Grok · matched by declaration");
   expect(within(lanes).queryByText("Not matched")).toBeNull();
   expect(calls("khipu_config_set")).toEqual([]);
 });

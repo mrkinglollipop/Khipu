@@ -13,6 +13,9 @@ import { fmtAgoSince } from "./time";
 export type RouteAuthor = { kind?: string; harness?: string; project?: string; session?: string; name?: string };
 
 export type RouteWitness = {
+  model?: string | null;
+  family?: string | null;
+  transport?: string | null;
   id?: string;
   source?: string;
   written_by?: RouteAuthor;
