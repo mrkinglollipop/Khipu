@@ -2740,7 +2740,30 @@ def _row_tag(row: dict[str, Any]) -> str:
             bits.append(f"project {row['project']}")
         if status:
             bits.append(f"status {status}")
+    mark = _imported_routing_mark(row)
+    if mark:
+        bits.append(mark)
     return " · ".join(bits)
+
+
+def _imported_routing_mark(row: dict[str, Any]) -> str:
+    """Advisory label when imported text still states routing Khipu owns.
+
+    Reads the note body (or the snippet if there is no body) through
+    ``routing_scanner.scan_text``. Never writes the hit or the note file.
+    """
+    from khipu.routing_scanner import SUPERSEDED_MARK, scan_text
+
+    text = str(row.get("body") or row.get("snippet") or row.get("label") or "")
+    if not text.strip():
+        return ""
+    source = ""
+    frontmatter = row.get("frontmatter")
+    if isinstance(frontmatter, dict):
+        source = str(frontmatter.get("note_source") or "")
+    if not source:
+        source = str(row.get("id") or "")
+    return SUPERSEDED_MARK if scan_text(source, text) else ""
 
 
 def _stale_line(stale: dict[str, Any]) -> str:

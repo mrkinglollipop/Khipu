@@ -34,14 +34,6 @@ def expect(actual, expected, reason):
         raise ContractGap(reason)
 
 
-scanner_pending = pytest.mark.xfail(
-    strict=True, raises=(ImportError, ContractGap), reason="slice 13: scanner contract"
-)
-recall_pending = pytest.mark.xfail(
-    strict=True, raises=ContractGap, reason="slice 13: imported note superseded mark"
-)
-
-
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -96,7 +88,6 @@ def one_claim(path, text, *, account, kind, cue, line=1):
 
 @pytest.mark.parametrize("state", ["open", "limited", "paused", "held", "tight", "low", "down"])
 @pytest.mark.parametrize("qualifier", ["as of 2031-04-12", "with 18% left"])
-@scanner_pending
 def test_state_word_requires_date_or_level(tmp_path, state, qualifier):
     one_claim(tmp_path / "AGENTS.md", f"Codex is {state} {qualifier}.",
               account="Codex", kind="state", cue=state)
@@ -114,7 +105,6 @@ def test_state_word_requires_date_or_level(tmp_path, state, qualifier):
     ("Claude only for dispatch.", "only"),
     ("Claude is not used for dispatch.", "not used"),
 ])
-@scanner_pending
 def test_ordering_needs_neither_date_nor_level(tmp_path, text, cue):
     one_claim(tmp_path / "CLAUDE.md", text, account="Claude", kind="ordering", cue=cue)
 
@@ -125,12 +115,10 @@ def test_ordering_needs_neither_date_nor_level(tmp_path, text, cue):
     ("OpenAI is limited as of 2031-04-12.", "OpenAI", "state", "limited"),
     ("The codex lane is down with 0% left.", "codex", "state", "down"),
 ])
-@scanner_pending
 def test_live_example_shapes_and_provider_lane_mentions(tmp_path, text, account, kind, cue):
     one_claim(tmp_path / "synthetic-note.md", text, account=account, kind=kind, cue=cue)
 
 
-@scanner_pending
 def test_numbered_account_ranking_without_state_date_or_level(tmp_path):
     text = "# Dispatch ranking\n\n1. Codex\n2. Grok\n3. Claude\n"
     claims = scan(tmp_path / "AGENTS.md", text)
@@ -140,7 +128,6 @@ def test_numbered_account_ranking_without_state_date_or_level(tmp_path):
         expect(account.lower() in claim["account"].lower(), True, "ranked account identity")
 
 
-@scanner_pending
 def test_original_line_numbers_after_frontmatter_quotes_and_blank_lines(tmp_path):
     text = ("---\nname: Synthetic dispatch note\n---\n\n"
             "> Codex is paused as of 2031-04-12.\n\n"
@@ -177,7 +164,6 @@ CLEAN = [
 
 
 @pytest.mark.parametrize("text", CLEAN)
-@scanner_pending
 def test_false_positive_classes_pass_clean(tmp_path, text):
     expect(scan(tmp_path / "AGENTS.md", text), [], "durable capability/how-to/history is not live routing")
 
@@ -186,7 +172,6 @@ def test_false_positive_classes_pass_clean(tmp_path, text):
     "global/CLAUDE.md", "global/AGENTS.md", "project/CLAUDE.md",
     "project/AGENTS.md", "memory/synthetic-note.md",
 ])
-@scanner_pending
 def test_path_is_evidence_not_a_file_to_read(tmp_path, relative):
     path = tmp_path / "absent" / relative
     assert not path.exists()
@@ -210,7 +195,6 @@ def imported_hit(tmp_path, body):
     "Delegation order: second Claude account first",
     "Capability notes for routine builds. " * 12 + "\nCodex is low with 9% left.",
 ], ids=["state", "undated-order", "claim-beyond-snippet"])
-@recall_pending
 def test_imported_claim_has_superseded_mark_in_prior_work(tmp_path, body):
     path, raw, hit = imported_hit(tmp_path, body)
     before = copy.deepcopy(hit)
@@ -231,7 +215,6 @@ def test_clean_imported_note_has_no_routing_superseded_mark(tmp_path, body):
     assert path.read_text(encoding="utf-8") == raw
 
 
-@recall_pending
 def test_recall_mark_belongs_only_to_claim_note(tmp_path):
     _, _, claim = imported_hit(tmp_path, "Prefer Claude for dispatch.")
     clean = dict(claim, id="note:synthetic-capability", body="Codex is good for builds.",
