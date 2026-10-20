@@ -953,31 +953,64 @@ def _strict_text(text: str, table: _Table, keep: list[str]) -> str:
     if _has_secret(text):
         return WITHHELD
     held = [w for w in keep if w and w in text]
-    for i, word in enumerate(held):
-        text = text.replace(word, f"\x00{i}\x00")
     for variant in _decoded_variants(text):
-        if _ANY_ACCOUNT_KEY.search(variant):
-            text = WITHHELD + "".join(f" \x00{i}\x00" for i in range(len(held)))
-            break
-    for i, word in enumerate(held):
-        text = text.replace(f"\x00{i}\x00", word)
+        matches = list(_ANY_ACCOUNT_KEY.finditer(variant))
+        if not matches:
+            continue
+        spans = [(m.start(), m.end()) for word in held
+                 for m in re.finditer(re.escape(word), variant)]
+        if any(not any(start <= match.start() and match.end() <= end for start, end in spans)
+               for match in matches):
+            return WITHHELD
+    return text
+
+
+def _owner_token_replacements(words):
+    from khipu.redact import MASK, redact_secrets
+
+    replacements = []
+    for word in words:
+        if not _has_secret(word):
+            continue
+        cleaned = redact_secrets(word, force=True)[0]
+        # Encoded credentials must be removed before owner-word masking too.
+        cleaned = re.sub(r"\S+", lambda m: MASK if _has_secret(m.group()) else m.group(), cleaned)
+        # A whole owner credential must not mask only the prefix of a longer
+        # pending credential and leave its otherwise unrecognizable suffix.
+        pattern = re.compile(r"(?<![A-Za-z0-9_./%&;=+-])" + re.escape(word) + r"(?![A-Za-z0-9_./%&;=+-])")
+        replacements.append((word, cleaned, pattern))
+    return replacements
+
+
+def redact_owner_tokens(text: str, words: Iterable[str]) -> str:
+    """Remove credentials only inside complete, current owner phrases."""
+    for _word, cleaned, pattern in _owner_token_replacements(sorted(words, key=len, reverse=True)):
+        text = pattern.sub(lambda _m: cleaned, text)
     return text
 
 
 def scrub_strict(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] | None = None):
     """``scrub``, then the strict projection's final scan: any string still
     holding an account key (``harness|``) or a secret-shaped token is
-    withheld whole. The owner's own words (``keep`` plus the saved
-    record's) still pass as written, as in ``scrub``."""
+    withheld whole. Current owner phrases preserve their words while
+    secret tokens inside them are removed before any exemption is applied."""
     table = _table(extra_keys)
     words = sorted({w for w in [*keep, *table.owner] if isinstance(w, str) and w}, key=len, reverse=True)
+    # Only a complete owner phrase may authorize token-level redaction.
+    # A pending credential containing a short owner word still fails closed.
+    replacements = _owner_token_replacements(words)
+    clean_words = {word: cleaned for word, cleaned, _pattern in replacements}
+    words = sorted({clean_words.get(word, word) for word in words}, key=len, reverse=True)
     def walk(item):
         if isinstance(item, RoutingPage):
             return item
         if isinstance(item, str):
+            for _word, cleaned, pattern in replacements:
+                item = pattern.sub(lambda _m: cleaned, item)
             # Scan the source before any path/name or owner-word masking.
             if _has_secret(item):
                 return WITHHELD
+            item = _strict_text(item, table, words)
             return _strict_text(_scrub_text(item, table, words), table, words)
         if isinstance(item, dict):
             return {(walk(k) if isinstance(k, str) else k): walk(v) for k, v in item.items()}
@@ -1001,6 +1034,10 @@ def pull_projection():
     Unlike the bounded hook projection, a pull must not use a local-only
     fallback. The full inventory and its resolved aliases must finish.
     """
+    current = getattr(_PROJECTION, "current", None)
+    if current is not None and current[0] is None:
+        yield
+        return
     try:
         _config_whole()
         # Discovery intentionally tolerates unreadable directories. That is
@@ -1033,14 +1070,14 @@ def pull_projection():
 def login_inventory_available() -> bool:
     """Only the complete table prepared for this pull can cover lane aliases.
 
-    Default folders alone cannot inventory private login names. A partial,
-    absent or stale cached table is never evidence of coverage.
+    A successful complete pull inventory proves coverage even when no
+    private login exists. Hook tables retain their helper freshness gate;
+    a general cached table alone never grants pull coverage.
     """
     current = getattr(_PROJECTION, "current", None)
     if current is None or current[0] is not None or current[1].previous is not None:
         return False
-    table = current[1]
-    return any(isinstance(to, _Id) and to.home for _root, to in table.root_to)
+    return True
 
 
 def _projected(value):

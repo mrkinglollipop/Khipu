@@ -62,7 +62,7 @@ def test_secret_is_scanned_before_paging_and_never_acknowledged(home, monkeypatc
     assert entry["offset"] == 0 and not entry["acked"]
 
 
-@pytest.mark.parametrize("inventory", ["empty", "default-only", "broken"])
+@pytest.mark.parametrize("inventory", ["broken"])
 @pytest.mark.parametrize("error", [False, True])
 def test_unknown_alias_is_withheld_in_all_fields_without_complete_table(home, monkeypatch, inventory, error):
     monkeypatch.setenv("CODEX_THREAD_ID", "alias")

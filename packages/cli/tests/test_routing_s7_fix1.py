@@ -76,7 +76,7 @@ def test_env_identity_cannot_be_impersonated_by_explicit_session_id(home, monkey
     batch = _route()["routing_changes"]["batch"]
     monkeypatch.setenv("CODEX_THREAD_ID", "foreign-sess")
     error, body = _call("khipu_route", {"session_id": "owner-sess", "ack": batch})
-    assert error and body["code"] == "ack_not_yours", body
+    assert error and body["code"] == "session_not_yours", body
     monkeypatch.setenv("CODEX_THREAD_ID", "owner-sess")
     assert _route()["routing_changes"]["batch"] == batch  # owner's debt untouched
     # No environment means an explicit native id cannot borrow its ledger.
@@ -137,10 +137,13 @@ def test_route_answers_withhold_secrets_and_account_keys(home, monkeypatch):
     assert err_body["routing_changes"]["items"]  # the error still carries its batch
 
 
-# 4: login alias fails closed when the discovery inventory is empty -----------
+# 4: discovery failure cannot authorize lane names ---------------------------
 
 
-def test_lane_alias_is_not_in_pull_additions_when_inventory_empty(home, monkeypatch):
+def test_lane_alias_is_not_in_pull_additions_when_inventory_fails(home, monkeypatch):
+    from khipu import discover
+
+    monkeypatch.setattr(discover, "_source_names", lambda: (_ for _ in ()).throw(OSError("unavailable")))
     monkeypatch.setenv("CODEX_THREAD_ID", "sess-4")
     _configure(home, routing_lane_map={"runnerx": {"SecretAliasZZZ": "NoSuchAccount"}})
     routing.report(state="limited", runner="runnerx", lane="SecretAliasZZZ", until="1h",

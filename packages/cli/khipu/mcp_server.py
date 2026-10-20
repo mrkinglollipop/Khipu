@@ -2224,28 +2224,30 @@ def _tool_usage(args: dict) -> dict:
                                             background=True))
 
 
-def _route_pull_attachment(routing, routing_delivery, identity, now):
+def _route_pull_attachment(routing, routing_delivery, identity, now, *, view=None):
     """(routing_changes, delivery) for one pull caller, from the current view.
 
     An identified caller reserves its `mcp` component's batch under the
     delivery lock; an unidentified one is shown the same items with nothing
     reserved or consumed."""
-    with routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
-        view = routing.read_view(now)
+    if view is None:
+        with routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
+            view = routing.read_view(now)
     from khipu import agent_view
 
+    keys = [a.get("key") for a in view.get("accounts") or [] if isinstance(a, dict)]
+    table = agent_view._table(keys)
+    table.owner = agent_view.keep_owner_words(view)
+
     def project(value):
-        return agent_view.scrub_strict(value, keep=agent_view.keep_owner_words(view),
-                                       extra_keys=[a.get("key") for a in view.get("accounts") or []
-                                                   if isinstance(a, dict)])
+        return agent_view.scrub_strict(value, keep=table.owner, extra_keys=keys)
 
     planned = routing_delivery.plan(
         {"kind": "full", "text": routing.summary(view, now=now)["text"],
          "version": view["version"], "epoch": view.get("epoch"),
          "owed_entities": [], "shown_entities": []},
         view, now, routing.settings(), project=project)
-    # Unmatched names need the complete pull table's alias coverage;
-    # discovering a default folder alone cannot grant it.
+    # Only this pull's complete scrub table proves lane alias coverage.
     skip = frozenset(item["entity"] for item in planned["delivery_plan"]["items"] if item.get("withheld"))
     skip |= frozenset() if agent_view.login_inventory_available() else frozenset(
         item["entity"] for item in planned["delivery_plan"]["items"]
@@ -2308,25 +2310,31 @@ def _tool_route_projected(args: dict) -> dict:
         if args.get(key) is not None and not isinstance(args[key], str):
             raise ValueError(f"{key} must be text")
     identity = routing_delivery.canonical_identity(os.environ, explicit=args.get("session_id"))
+    if args.get("session_id") and identity is None and routing_delivery.canonical_identity(os.environ):
+        raise _ToolFailure({"ok": False, "code": "session_not_yours",
+                            "error": "session_id must name this conversation or a strict descendant of its root."})
     now = routing._now()
+    # The body, reserved pages and final scrub share one folded view.
+    with routing._for_a_conversation(), routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
+        view = routing.read_view(now)
     ack = (args.get("ack") or "").strip()
     if ack and identity is not None:
         # Revalidate the complete source and final representation first.
         # A pre-upgrade or newly withheld reservation cannot consume debt.
-        _route_pull_attachment(routing, routing_delivery, identity, now)
+        _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
         status = routing_delivery.pull_acknowledge(identity["session"], ack, component="mcp", now=now)
         if status == "foreign":
             raise _ToolFailure({"ok": False, "code": "ack_not_yours",
                                 "error": "That routing batch was not issued to this conversation; "
                                          "the batch stays where it was."})
     try:
-        out = routing.conversation_view(since_version=since, account=account or None, now=now)
+        out = routing.conversation_view(since_version=since, account=account or None, now=now, view=view)
     except ValueError as exc:
         # A refusal still carries this caller's routing changes, scrubbed
         # with the error at the dispatch boundary like any other addition.
         payload = {"error": str(exc)}
         try:
-            changes, delivery = _route_pull_attachment(routing, routing_delivery, identity, now)
+            changes, delivery = _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
         except Exception:  # noqa: BLE001 - the refusal itself stays the answer
             changes, delivery = None, None
         if changes is not None:
@@ -2334,7 +2342,7 @@ def _tool_route_projected(args: dict) -> dict:
         if delivery is not None:
             payload["delivery"] = delivery
         raise _ToolFailure(payload) from None
-    changes, delivery = _route_pull_attachment(routing, routing_delivery, identity, now)
+    changes, delivery = _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
     if changes is not None:
         out["routing_changes"] = changes
     out["delivery"] = delivery
@@ -2794,7 +2802,12 @@ def _dispatch_message(msg: dict) -> dict | None:
             scrub = agent_view.scrub_strict
         else:
             scrub = agent_view.scrub
+        projection = agent_view.pull_projection() if name == "khipu_route" and not _via_https_gateway() else None
+        projection_entered = False
         try:
+            if projection is not None:
+                projection.__enter__()
+                projection_entered = True
             arguments = dict(params.get("arguments") or {})
             if name in {"khipu_route_report", "khipu_route_rule", "khipu_route_priority"} and not _via_https_gateway():
                 from khipu import routing
@@ -2812,6 +2825,8 @@ def _dispatch_message(msg: dict) -> dict | None:
                 payload = _scrub_for_agents(name, payload)
             elif name in _AGENT_PROJECTED:
                 payload = agent_view.project(payload)
+        except agent_view.PullInventoryUnavailable:
+            return _result(req_id, _tool_text({"available": False, "reason": agent_view.INCOMPLETE}))
         except _ToolFailure as exc:
             return _result(req_id, _tool_text(scrub(exc.payload), is_error=True))
         except ValueError as exc:  # argument/mode rejections → tool error, not crash
@@ -2829,6 +2844,8 @@ def _dispatch_message(msg: dict) -> dict | None:
             return _result(req_id, _tool_text(
                 scrub(error) if name in _AGENT_PROJECTED or name == "khipu_route" else error, is_error=True))
         finally:
+            if projection_entered:
+                projection.__exit__(None, None, None)
             if _RELOAD_ON_CHANGE:
                 _note_loaded_modules()
         return _result(req_id, _tool_text(payload))

@@ -127,10 +127,17 @@ def plan(out, view, now, cfg, *, project=None):
         if project:
             # A projection is not evidence that the source characters were
             # delivered. Withheld/changed entries stay owed at offset zero.
-            item["withheld"] = (line, label) != (item["text"], item["label"])
-        # Relative account ages are presentation, not a new change. Rules
-        # and priority also depend on the rendered hold and level suffixes.
-        fingerprint = [effective, line, label] if item["entity"].startswith("rule:") or item["entity"] == "priority" else effective
+            from khipu import agent_view
+
+            # A token removed from current owner words is safe to deliver;
+            # all other projection changes remain unacknowledgeable.
+            words = agent_view.keep_owner_words(view)
+            expected = tuple(agent_view.redact_owner_tokens(value, words)
+                             for value in (item["text"], item["label"]))
+            item["withheld"] = (line, label) != expected
+        # Relative account ages are presentation, not a new change. Whole
+        # entries also depend on their safe text and rendered suffixes.
+        fingerprint = [effective, line, label] if item["entity"].startswith("rule:") or item["entity"] in ("note", "priority") else effective
         revision = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
         item.update(text=line, label=label, revision=revision)
         # Rules and notes require their complete words. Accounts and holds
@@ -186,7 +193,7 @@ def _merge(state, out):
             fallback = ("The owner's note ended" if entity == "note" else
                         old["label"] + (" retired" if entity.startswith("rule:") else " is no longer current"))
             line = plan.get("removed", {}).get(entity, fallback)
-            fingerprint = [line, line, old["label"]] if entity.startswith("rule:") or entity == "priority" else line
+            fingerprint = [line, line, old["label"]] if entity.startswith("rule:") or entity in ("note", "priority") else line
             revision = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
             items.append(dict(entity=entity, revision=revision, text=line, label=old["label"], whole=True, visible=False))
     for item in items:
@@ -349,10 +356,11 @@ def canonical_identity(environ=None, explicit=None):
     Returns {"root", "session", "harness", "capability", "child"} or None
     when the caller's environment and arguments name no session. An
     identity the environment itself knows (``KHIPU_SESSION_ID``, then a
-    harness-native id) always wins: an explicit ``session_id`` may only
-    fill in when the environment names no session, never impersonate
-    another identified caller. Native and T3 roots cannot be supplied by
-    an unidentified caller. Other explicit ids use an isolated pull
+    harness-native id) cannot be replaced with an unrelated explicit id.
+    Native and T3 roots cannot be supplied by
+    an unidentified caller. An identified caller may extend its own root
+    with a strict, nonempty descendant path for an isolated child ledger.
+    Other explicit ids use an isolated pull
     namespace, so they cannot borrow custom environment-owned roots.
     ``root`` is the conversation name and ``session`` its ledger key. A root
     containing "/" is a pull-only child:
@@ -391,6 +399,13 @@ def canonical_identity(environ=None, explicit=None):
         session = "pull\0" + explicit
     else:
         return None
+    if shared or claude or codex:
+        if explicit and explicit != root:
+            prefix = root + "/"
+            suffix = explicit[len(prefix):] if explicit.startswith(prefix) else ""
+            if not suffix or any(part in ("", ".", "..") for part in suffix.split("/")) or "\0" in suffix:
+                return None
+            root = session = explicit
     if harness in _HOOKED_HARNESSES:
         capability = "hooked"
     elif harness in _PULL_ONLY_HARNESSES:
@@ -533,20 +548,38 @@ def _batch_in_state(state, batch):
 
 
 def _batch_owned_elsewhere(session, batch):
+    """Best-effort foreign classification; never consume another ledger.
+
+    Unknown acknowledgements have a fixed work budget regardless of the
+    number of sessions. Beyond it, "unknown" is equally non-consuming.
+    Read candidate ledgers only while holding their shared delivery lock.
+    """
+    from itertools import islice
+
     own = _path(session)
+    deadline = time.monotonic() + 0.05
+    reads = 0
     try:
-        candidates = sorted(own.parent.glob("*.routing.json"))
+        with os.scandir(own.parent) as entries:
+            for entry in islice(entries, 32):
+                if time.monotonic() >= deadline or reads >= 8:
+                    break
+                path = own.parent / entry.name
+                if path == own or not entry.name.endswith(".routing.json"):
+                    continue
+                reads += 1
+                try:
+                    with path.with_suffix(".lock").open("a") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        if path.stat().st_size > 1_048_576:
+                            continue
+                        data = json.loads(path.read_text())
+                        if isinstance(data, dict) and any(_batch_in_state(state, batch) for state in data.values()):
+                            return True
+                except (OSError, ValueError, TypeError, KeyError):
+                    continue
     except OSError:
-        return False
-    for path in candidates:
-        if path == own:
-            continue
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and any(_batch_in_state(state, batch) for state in data.values()):
-            return True
+        pass
     return False
 
 

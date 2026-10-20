@@ -784,8 +784,7 @@ def _cut_paths(words: str) -> str:
 
 
 def _for_agents(value, view: dict | None = None):
-    """``value`` as an agent may read it (``agent_view.scrub``): the owner's
-    note and standing rules in ``view`` pass as he wrote them."""
+    """Project using this view's owner words, with credentials removed."""
     from khipu import agent_view
 
     keys = [a.get("key") for a in (view or {}).get("accounts") or [] if isinstance(a, dict)] if view else None
@@ -7167,15 +7166,16 @@ def _for_a_conversation():
 
 
 def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
-                      lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+                      lock_wait: float | None = CONVERSATION_LOCK_BUDGET, view: dict | None = None) -> dict:
     """What MCP ``khipu_route`` answers (``_conversation_view``), read
     waiting at most ``lock_wait`` seconds for the routing lock (an unsaved
     fold after that)."""
     with _for_a_conversation(), lock_budget(lock_wait):
-        return _conversation_view(since_version=since_version, account=account, now=now)
+        return _conversation_view(since_version=since_version, account=account, now=now, view=view)
 
 
-def _conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None) -> dict:
+def _conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
+                       view: dict | None = None) -> dict:
     """What MCP ``khipu_route`` answers, built field by field from the view
     (see the note above ``account_id``). With ``since_version`` (V or
     EPOCH:V) the current state of everything that changed after it, as
@@ -7185,7 +7185,7 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     words, each account's evidence line and the name a conversation gave
     itself."""
     now = now or _now()
-    view = read_view(now)
+    view = read_view(now) if view is None else view
     key = None
     if account:
         key = _account_for_a_conversation(account, accounts() + list(view.get("accounts") or []))
