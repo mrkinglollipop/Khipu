@@ -665,7 +665,7 @@ arguments, paths, labels or session ids. A loader rejects any other key.
 | 17b | Advise: a `pace_target` of 65% with 5 slack at 18% used 11 h into the week (allowance 9.26%) answers `hold_back` for `job` and `go` for `orchestration` from an undispatched attachment, and `hold_back` for a dispatched job claiming `orchestration`; zero current burn is still `hold_back` while ahead; recovery needs 1 point under the allowance; a `spend` of $35 at $35.10 and a full `concurrency` 1 answer `hold_back`; expired telemetry answers `go` with `evidence: unknown`; a pause answers `closed` for both purposes; `orchestration` at a 91% `share` or a reached `spend` answers `hold_back`, and at a full `concurrency` answers `go` | hermetic | 17a, 17c |
 | 17d | Owner direction end to end: an eligible conversation in Claude Code, Codex and Grok Build applies a cap, a rule edit and a priority through `khipu_owner_act`; each is live without a terminal, logged with its undo, and refused from a dispatched job | hermetic | 5, 17a |
 | 17e | Telemetry: duplicate spend events count once and two attempts of one job count twice; a correction nets out; a period where one of two runners on an account has a gap totals `unknown` even though the other covers the week; two accounts on one provider never pool; a new `active` snapshot replaces the old; two runners' active jobs sum; a silent runner's records expire to `unknown`; a lane's spend with no resolvable account is unattributed, never guessed | hermetic | 17t |
-| 17c | Directions: "use GLM only one job at a time" typed by the owner with no matching owner action opens one owed item naming the words; an unrelated routing write leaves it open; the matching cap closes it, and setting that cap to 4 instead leaves it open; a question, a quote and a job prompt open nothing; two directions with one written leave one open; a dismissal survives the next capture; the same prompt typed twice opens two directions, and the first one's action never closes the second; a runner cap with no Khipu fact is flagged | hermetic | 19a, 19b |
+| 17c | Directions: "use GLM only one job at a time" typed by the owner with no matching owner action opens one owed item naming the words; an unrelated routing write leaves it open; the matching cap closes it, and setting that cap to 4 instead leaves it open; a question, a quote and a job prompt open nothing; two directions with one written leave one open; a dismissal survives the next capture; the same prompt typed twice opens two directions, and each closes only on its own occurrence's action (when only the second acts, the first stays open); a recorder that missed a turn leaves the direction `unjoined`; a runner cap with no Khipu fact is flagged | hermetic | 19a, 19b |
 
 ## 13. Amendment, 2026-10-20 afternoon: routing that runs the day
 
@@ -847,9 +847,17 @@ the owner's words.
     - **At the action:** `owner_direction.check` already picks the eligible turn. It copies that turn's id
       and `prompt_sha256` into its stamp, and the owner-actions log's field allowlist (`owner_direction.py:805`)
       gains both fields.
-    - **At capture:** a direction is keyed by the session, the turn's position in the transcript and the
-      hash. It joins only actions whose stamp names a turn recorded at or after that position with the same
-      hash. A later identical prompt is a new occurrence, and it never reuses an earlier action.
+    - **Occurrence:** the recorder also stores, per session, the occurrence number of that hash: the first
+      time a prompt is typed it is 1, an identical later prompt is 2, and so on. Both live beside the random
+      turn id.
+    - **At capture:** capture counts the same occurrence numbers from the transcript's owner turns. A
+      direction is keyed `(session, prompt_sha256, occurrence)`, and it joins only the actions whose stamp
+      names the turn with exactly that key.
+    - **Repeated prompts:** each occurrence joins only its own actions. If only the second of two identical
+      prompts acted, the first stays open.
+    - **Counts that disagree:** if the transcript and the recorder count occurrences differently (a missed
+      hook, for example), the direction is `unjoined`. It stays open with that reason, and nothing is
+      guessed.
   - **How it closes:** the direction carries a structured target where one can be read (entity, kind, value:
     "GLM, concurrency, 1"). It closes only when an applied owner action joined to its prompt matches that
     target and value at the resulting revision; setting the cap to 4 leaves it open. A direction with no
