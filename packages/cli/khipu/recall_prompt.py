@@ -1768,6 +1768,8 @@ def _routing_delivered(info: dict | None, delivered: bool) -> str:
                 status = f"{status}:unmarked"
         else:
             changes = pending.get("routing_changes")
+            if pending.get("notices") and not changes:
+                return f" routing={status}:unmarked"
             if changes:
                 from khipu.routing_delivery import acknowledge
 

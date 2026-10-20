@@ -9,7 +9,7 @@ from datetime import timedelta
 
 import pytest
 
-from khipu import mcp_server, recall_prompt, routing
+from khipu import agent_view, mcp_server, recall_prompt, routing
 from tests.test_routing_s5_fix1 import ACCOUNTS, Clock, OTHER, T0
 
 
@@ -27,10 +27,16 @@ def home(tmp_path, monkeypatch, khipu_app):
     return {"data": data, "clock": clock, "tmp": tmp_path}
 
 
+def offer_prompt(*args, **kwargs):
+    # The real hook inherits its helper's complete login inventory.
+    agent_view.prepare_routing_table(refresh=True)
+    return routing.prompt_push(*args, **kwargs)
+
+
 def delivered(session, out, clock):
     info = {"status": "full", "pending": dict(session=session, version=out["version"], epoch=out["epoch"],
             full=out["kind"] == "full", at=routing._iso(clock.now), notices=out.get("notices"),
-            owed=out.get("owed_entities"), shown=out.get("shown_entities"))}
+            owed=out.get("owed_entities"), shown=out.get("shown_entities"), routing_changes=out.get("routing_changes"))}
     recall_prompt._routing_delivered(info, True)
 
 
@@ -71,7 +77,7 @@ def test_p2_other_authors_notice_does_not_force_full_push_forever(home, monkeypa
     bystander = "bystander"
     kinds = []
     for _ in range(4):
-        out = routing.prompt_push(recall_prompt.routing_marker(bystander), budget=2, session_id=bystander)
+        out = offer_prompt(recall_prompt.routing_marker(bystander), budget=2, session_id=bystander)
         kinds.append((out["kind"], out.get("why")))
         delivered(bystander, out, home["clock"])
         home["clock"].advance(minutes=1)
@@ -85,9 +91,9 @@ def test_p2b_sessionless_author_notice_never_acked(home, monkeypatch):
     shown = mcp_server._tool_route({})
     mcp_server._tool_route_rule({"text": "B", "rule": 1, "owner_request": "x", "base": shown["rules"][0]["owner_revision"]})
     home["clock"].advance(days=6)
-    out = routing.prompt_push(recall_prompt.routing_marker("someone"), budget=2, session_id="someone")
+    out = offer_prompt(recall_prompt.routing_marker("someone"), budget=2, session_id="someone")
     delivered("someone", out, home["clock"])
-    out = routing.prompt_push(recall_prompt.routing_marker("someone"), budget=2, session_id="someone")
+    out = offer_prompt(recall_prompt.routing_marker("someone"), budget=2, session_id="someone")
     assert out["kind"] != "full", (out["kind"], out.get("why"))
 
 
@@ -99,7 +105,7 @@ def test_p2c_notice_reaches_only_its_author(home, monkeypatch):
     monkeypatch.setenv("KHIPU_SESSION_ID", "author-b")
     shown = mcp_server._tool_route({})
     mcp_server._tool_route_rule({"text": "B", "rule": 1, "owner_request": "x", "base": shown["rules"][0]["owner_revision"]})
-    out = routing.prompt_push(recall_prompt.routing_marker("bystander"), budget=2, session_id="bystander")
+    out = offer_prompt(recall_prompt.routing_marker("bystander"), budget=2, session_id="bystander")
     assert "was replaced" not in out["text"], out["text"]
 
 
@@ -270,23 +276,23 @@ def test_only_authors_delivery_acknowledges_its_named_notice(home, monkeypatch, 
         else:
             mcp_server._tool_route_priority(dict(entries=[{"account": "Codex", "role": session}], owner_request="x",
                                                 base=shown["priority_owner_revision"]))
-    bystander = routing.prompt_push(None, budget=2, session_id="bystander")
+    bystander = offer_prompt(None, budget=2, session_id="bystander")
     assert not bystander["notices"] and "was replaced" not in bystander["text"]
     delivered("bystander", bystander, home["clock"])
     assert not recall_prompt.routing_marker("author-a").get("notices")
     # The hook's receiver is explicit; its helper process may have another
     # session in its environment. Author A still receives A's own notice.
-    notice = routing.prompt_push(None, budget=2, session_id="author-a")
+    notice = offer_prompt(None, budget=2, session_id="author-a")
     assert f"{kind if kind == 'priority' else 'rule 1'} proposal" in notice["text"]
     assert len(notice["notices"]) == 1
     info = {"status": "full", "pending": dict(session="author-a", version=notice["version"],
              epoch=notice["epoch"], full=True, at=routing._iso(home["clock"].now), notices=notice["notices"],
-             owed=notice.get("owed_entities"), shown=notice.get("shown_entities"))}
+             owed=notice.get("owed_entities"), shown=notice.get("shown_entities"), routing_changes=notice.get("routing_changes"))}
     recall_prompt._routing_delivered(info, False)
     assert routing.summary(session_id="author-a")["notices"] == notice["notices"]
     recall_prompt._routing_delivered(info, True)
     assert set(recall_prompt.routing_marker("author-a")["notices"]) == set(notice["notices"])
-    again = routing.prompt_push(recall_prompt.routing_marker("author-a"), budget=2, session_id="author-a")
+    again = offer_prompt(recall_prompt.routing_marker("author-a"), budget=2, session_id="author-a")
     assert again["kind"] == "none" and again["text"] is None
 
 

@@ -117,7 +117,7 @@ def test_unread_and_stale_owner_revision(sessionless):
 @pytest.mark.parametrize('receiver', ['t3:thread-a', 'provider-a'])
 def test_notice_matches_both_recorded_ids_once(home, monkeypatch, provider_env, receiver):
     from khipu import recall_prompt
-    from tests.test_routing_s5_fix3 import delivered
+    from tests.test_routing_s5_fix3 import delivered, offer_prompt
 
     for name in ('CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID'):
         monkeypatch.delenv(name, raising=False)
@@ -137,7 +137,7 @@ def test_notice_matches_both_recorded_ids_once(home, monkeypatch, provider_env, 
     for bystander in ('provider-b', 't3:thread-b', 'unrelated', ''):
         assert 'was replaced' not in routing.summary(session_id=bystander)['text']
         assert not any(p['status'] == 'replaced' for p in routing._public_proposals(view, session=bystander))
-    out = routing.prompt_push(recall_prompt.routing_marker(receiver), budget=2, session_id=receiver)
+    out = offer_prompt(recall_prompt.routing_marker(receiver), budget=2, session_id=receiver)
     assert 'rule 1 proposal' in out['text'] and 'was replaced' in out['text']
     delivered(receiver, out, home['clock'])
     for alias in ('t3:thread-a', 'provider-a'):

@@ -165,12 +165,15 @@ def test_f5_hook_acknowledges_only_notices_actually_delivered(home):
     routing.add_rule("OWNER", via="app")
     proposal("FIRST", routing.conversation_author())
     proposal("SECOND", OTHER)
-    out = routing.prompt_push(None, budget=2)
+    from khipu import agent_view
+
+    agent_view.prepare_routing_table(refresh=True)
+    out = routing.prompt_push(None, budget=2, session_id="fix2-author")
     assert "was replaced by a newer proposal" in out["text"]
     # Delivery recording uses the same public hook boundary as recall.
     info = {"status": "full", "pending": dict(session="fix2-author", version=out["version"],
              epoch=out["epoch"], full=True, at=routing._iso(home["clock"].now),
-             notices=out.get("notices"))}
+             notices=out.get("notices"), routing_changes=out.get("routing_changes"))}
     recall_prompt._routing_delivered(info, False)
     assert "was replaced by a newer proposal" in routing.summary()["text"]
     recall_prompt._routing_delivered(info, True)

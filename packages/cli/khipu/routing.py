@@ -6563,10 +6563,11 @@ def direction_line(entity: str, cause: dict, body: dict, prev_effective: dict | 
 
 
 def _replacement_notices(view: dict, now: datetime, session: str | None) -> list[tuple[str, str, str]]:
-    from khipu import recall_prompt
+    from khipu import recall_prompt, routing_delivery
 
     if not session:
         return []
+    receipts = {}
     items = []
     for item in (view.get("proposals") or {}).values():
         if item.get("status") not in ("replaced", "crossed"):
@@ -6579,8 +6580,11 @@ def _replacement_notices(view: dict, now: datetime, session: str | None) -> list
         ended = _parse(item.get("ended_at") or item.get("at"))
         if ended is None or now >= ended + timedelta(days=7):
             continue
-        if any(item["id"] in (recall_prompt.routing_marker(ident).get("notices") or {})
-               for ident in _author_sessions(by)):
+        for ident in _author_sessions(by):
+            if ident not in receipts:
+                receipts[ident] = set(recall_prompt.routing_marker(ident).get("notices") or {})
+                receipts[ident].update(routing_delivery.notice_receipts(ident))
+        if any(item["id"] in receipts[ident] for ident in _author_sessions(by)):
             continue
         who = author_words(by, push=True)
         if item.get("kind") == "priority":
@@ -7775,7 +7779,7 @@ def start_push(budget: float | None = None, moment: str = "start", *,
 
     now = _now()
     view = out.view
-    out = routing_delivery.plan(dict(out, kind="full"), view, now, settings())
+    out = routing_delivery.plan(dict(out, kind="full"), view, now, settings(), session=session_id)
     from khipu import recall_rule
 
     out["delivery_plan"]["max_chars"] = min(9000, recall_rule._HOOK_CONTEXT_BUDGET -
@@ -8188,15 +8192,15 @@ def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = N
 
         keys = [a.get("key") for a in view.get("accounts") or []]
         with agent_view.routing_projection(keys):
-            out = _prompt_text(marker, view, now, cfg)
+            out = _prompt_text(marker, view, now, cfg, session_id=session_id)
             if not out.pop("_reserved", False):
-                out = routing_delivery.offer(routing_delivery.plan(out, view, now, cfg),
+                out = routing_delivery.offer(routing_delivery.plan(out, view, now, cfg, session=session),
                                              session=session, component=marker.component)
             return dict(out, _delivery_view=view, _reserved=True)
-    return _prompt_text(marker, view, now, cfg)
+    return _prompt_text(marker, view, now, cfg, session_id=session_id)
 
 
-def _prompt_text(marker, view, now, cfg):
+def _prompt_text(marker, view, now, cfg, *, session_id=None):
     base = {"version": view["version"], "epoch": view.get("epoch"), "generation": _generation(view, cfg), "_delivery_view": view}
     why = _full_reason(marker, view, now, cfg)
     if why is None and view.get("unsaved_change"):
@@ -8209,6 +8213,8 @@ def _prompt_text(marker, view, now, cfg):
         stale = _not_refreshed(view, now, cfg)
         said = stale is not None and marker.get("unrefreshed") == view.get("checked_at")
         owed = marker.get("owed") if marker.get("epoch") == view.get("epoch") and isinstance(marker.get("owed"), list) else []
+        # Notice debt belongs to the delivery ledger, never to since()'s entities.
+        owed = [entity for entity in owed if not entity.startswith("notice:")]
         if seen == view["version"] and not owed:
             if stale and not said:
                 # Nothing changed, but the record has not been refreshed past its bound: one line, once,
@@ -8239,9 +8245,15 @@ def _prompt_text(marker, view, now, cfg):
 
 
 def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
-                on_fold=None) -> dict:
+                on_fold=None, session_id: str | None = None) -> dict:
     """Offer a leased batch when the marker carries a hook delivery identity."""
-    out = _prompt_push(marker, budget=budget, now=now, on_fold=on_fold)
+    if session_id is not None:
+        from khipu.routing_delivery import Marker
+
+        marker = Marker(marker or {}, session=session_id, component=getattr(marker, "component", "main"))
+    else:
+        session_id = getattr(marker, "session", None)
+    out = _prompt_push(marker, budget=budget, now=now, on_fold=on_fold, session_id=session_id)
     view = out.pop("_delivery_view")
     session = getattr(marker, "session", None)
     if not session or out.pop("_reserved", False):
@@ -8249,7 +8261,7 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
     from khipu import routing_delivery
 
     now = now or _now()
-    out = routing_delivery.plan(out, view, now, settings())
+    out = routing_delivery.plan(out, view, now, settings(), session=session)
     return routing_delivery.offer(out, session=session, component=marker.component)
 
 

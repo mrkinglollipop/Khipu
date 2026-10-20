@@ -648,7 +648,6 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
 
 class _RoutingAtStart:
     def __init__(self, moment: str = "start", *, session_id: str | None = None) -> None:
-        self.session_id = session_id
         # "start", or "delegation" for a subagent's start (routing_delegation).
         self.moment = moment
         self.session = session_id
@@ -682,7 +681,7 @@ class _RoutingAtStart:
                 os.close(write_fd)
                 raise
             if pid == 0:
-                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment, self.session_id)
+                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment, self.session)
             os.close(write_fd)
             self.pid, self.fd = pid, read_fd
         except Exception:
@@ -751,13 +750,15 @@ class _RoutingAtStart:
         """Reset the session's last-seen version to the one just printed and
         record the time of this full summary."""
         out = self.out
-        if self.session_id is not None and session_id != self.session_id:
+        if self.session is not None and session_id != self.session:
             return
         if not isinstance(session_id, str) or not session_id or not isinstance(out, dict):
             return
         try:
             from khipu import recall_prompt, routing
 
+            if out.get("notices") and not out.get("routing_changes"):
+                return
             if out.get("routing_changes"):
                 from khipu.routing_delivery import acknowledge
 
@@ -793,7 +794,7 @@ def session_start_main(*, shape: str | None = None) -> None:
         if is_helper_session(cwd):
             print("{}")  # T3's thread-title helper: no recall
             return
-        routing = _RoutingAtStart(session_id=payload.get("session_id") or payload.get("sessionId")).begin()
+        routing = _RoutingAtStart(session_id=payload.get("session_id") or payload.get("sessionId") or "").begin()
         token = _START_IS_JOB.set(_session_is_job(payload))
         try:
             memory = session_start_context(cwd)
