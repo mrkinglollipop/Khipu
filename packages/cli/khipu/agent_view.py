@@ -538,10 +538,10 @@ def scrub(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] | None =
 
 
 # A routing account key, "harness|login folder" (the folder may be empty).
-_ACCOUNT_KEY = re.compile(r"(?i)(?<![\w-])(claude|codex|grok|muse)\|")
+_ACCOUNT_KEY = re.compile(r"(?i)(?<![\w-])(claude|codex|grok|muse|glm)\|")
 # The final scan's: a harness name with anything before or after it ahead
 # of the bar ("x_codex|", "codex2|") is still a key.
-_ANY_ACCOUNT_KEY = re.compile(r"(?i)(?:claude|codex|grok|muse)[^\s|]*\|")
+_ANY_ACCOUNT_KEY = re.compile(r"(?i)(?:claude|codex|grok|muse|glm)[^\s|]*\|")
 _KEY_HOME = re.compile(r"[^\s\"'`,;)\]}]*")
 
 

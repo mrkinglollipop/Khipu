@@ -238,6 +238,8 @@ PATH_SETTINGS: dict[str, tuple[str, ...]] = {
     "anthropic_key_file": ("KHIPU_ANTHROPIC_KEY_FILE",),
     "openai_key_file": ("KHIPU_OPENAI_KEY_FILE",),
     "openrouter_key_file": ("KHIPU_OPENROUTER_KEY_FILE",),
+    # z.ai GLM Coding Plan key (a file holding only the key), read for plan usage
+    "glm_key_file": ("KHIPU_GLM_KEY_FILE",),
 }
 
 

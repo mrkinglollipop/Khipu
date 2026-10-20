@@ -102,6 +102,13 @@ R_BAD = "bad_reply"
 R_INTERNAL = "internal_error"
 
 MUSE_IDENTITY = "default"
+GLM = "glm"
+# A Claude Code login folder run against z.ai's Anthropic-compatible endpoint
+# is the GLM Coding Plan, not an Anthropic account: asking Claude Code about it
+# would read the plan of a key Anthropic never issued. The endpoint is set by
+# a launcher's environment, which Khipu cannot see, so the folder's name
+# (``~/.claude-glm``) is the signal.
+ZAI_FOLDER = re.compile(r"^\.claude-glm([-.].*)?$")
 _VERSION_RE = re.compile(rb"(\d+\.\d+(?:\.\d+)*)")
 
 
@@ -337,14 +344,14 @@ def turned_down() -> list[dict]:
         return []
     if not isinstance(data, list):
         return []
-    return [e for e in data if isinstance(e, dict) and e.get("cli") in CLIS]
+    return [e for e in data if isinstance(e, dict) and (e.get("cli") in CLIS or e.get("cli") == GLM)]
 
 
 def _declined_keys() -> set[tuple[str, str]]:
     keys: set[tuple[str, str]] = set()
     for entry in turned_down():
         cli = entry["cli"]
-        if cli == "muse":
+        if cli in usage.NO_FOLDER:
             keys.add((cli, MUSE_IDENTITY))
             continue
         if isinstance(entry.get("identity"), str) and entry["identity"]:
@@ -363,7 +370,7 @@ def _tracked_keys() -> set[tuple[str, str]]:
         if account.get("invalid"):
             continue
         cli = account["harness"]
-        if cli == "muse":
+        if cli in usage.NO_FOLDER:
             keys.add((cli, MUSE_IDENTITY))
             continue
         home = account.get("home")
@@ -371,6 +378,12 @@ def _tracked_keys() -> set[tuple[str, str]]:
         if path is not None:
             keys.add((cli, identity(path)))
     return keys
+
+
+def zai_home(path) -> bool:
+    """Whether a Claude Code login folder is run against z.ai (GLM). By the
+    folder's own name only: nothing inside a login folder is ever read."""
+    return path is not None and bool(ZAI_FOLDER.match(Path(path).name))
 
 
 # ---- sources -----------------------------------------------------------------------
@@ -495,11 +508,13 @@ def _gather(now_ts: float) -> tuple[dict, set, set]:
     found: dict[str, dict] = {}
 
     def add(cli: str, path: Path | None, source: str, *, count: int | None = None) -> None:
+        if cli == "claude" and zai_home(path):
+            cli, path = GLM, None  # one GLM login, whatever folder ran it
         ident = identity(path) if path is not None else MUSE_IDENTITY
         is_default = path is None or defaults.get(cli) == ident
         if (cli, ident) in tracked or (cli, ident) in declined:
             return
-        if is_default and not installed[cli]:
+        if is_default and not installed.get(cli, cli == GLM):
             return  # a default login only for an installed CLI (source 4)
         cid = f"{cli}:{ident}"
         rec = found.get(cid)
@@ -524,6 +539,8 @@ def _gather(now_ts: float) -> tuple[dict, set, set]:
     for cli in CLIS:
         if installed[cli]:
             add(cli, default_folder(cli), "installed")
+    if usage.available(GLM):
+        add(GLM, None, "installed")
     for rec in found.values():
         rec["name"] = default_name(rec["cli"], rec["abs"], default=rec["default"])
     return found, tracked, declined
@@ -675,6 +692,8 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
             raise _CutOff
         return state, reason, plan
 
+    if cli == GLM:
+        return settle(*_from_probe(usage.probe_glm(timeout=left())))
     binary = usage._command(cli)
     if not binary:
         return COULDNT_CHECK, R_NOT_INSTALLED, None
@@ -1006,8 +1025,8 @@ def try_account(harness: str, folder: str | None = None, *, timeout: float = usa
         return {"ok": False, "error": "unknown_cli"}
     home = None
     if folder:
-        if harness == "muse":
-            return {"ok": False, "error": "muse_folder"}
+        if harness in usage.NO_FOLDER:
+            return {"ok": False, "error": f"{harness}_folder"}
         path = _expand(folder)
         if path is None:
             return {"ok": False, "error": "bad_folder"}
