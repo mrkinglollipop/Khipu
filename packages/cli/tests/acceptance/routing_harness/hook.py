@@ -1,0 +1,78 @@
+"""Disposable hook wiring: actual routing entry points, synthetic state only."""
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import socket
+import sys
+from pathlib import Path
+
+
+def main():
+    root = Path(os.environ["HOME"]).resolve()
+    data = Path(os.environ["KHIPU_DATA_DIR"]).resolve()
+    if data != root / "data" or not (data / "config.json").is_file():
+        raise RuntimeError("rig isolation missing")
+
+    def forbidden(*args, **kwargs):
+        (root / "forbidden-network").touch()
+        raise RuntimeError("routing rig attempted network access")
+
+    socket.socket.connect = forbidden
+    socket.create_connection = forbidden
+    import psycopg
+
+    psycopg.connect = forbidden
+    from khipu import routing, routing_delegation
+
+    # A source refresh is outside received-context acceptance. The real fold,
+    # summary, hook selection and output format remain under test.
+    routing.kick_plan_refresh = lambda: False
+    payload = json.load(sys.stdin)
+    event = payload.get("hook_event_name") or payload.get("hookEventName")
+    absent = root / "child-routing-hook-absent"
+    tool = payload.get("tool_name") or payload.get("toolName")
+    arguments = payload.get("tool_input") or payload.get("toolInput")
+    command = arguments.get("cmd") if isinstance(arguments, dict) else None
+    try:
+        absent_read = (tool == "exec_command" and isinstance(command, str)
+                       and shlex.split(command) == ["cat", "routing-absent-probe.txt"])
+    except ValueError:
+        absent_read = False
+    if event == "PreToolUse" and absent_read:
+        # Keep the independent transport probe, remove the routing hook.
+        # Parent-side hook inspection can now observe the absent child hook.
+        absent.touch()
+        hooks_file = root / ".codex" / "hooks.json"
+        hooks = json.loads(hooks_file.read_text())
+        for group in hooks["hooks"]["SubagentStart"]:
+            for command in group["hooks"]:
+                command["command"] += " --calibrator-only"
+        hooks_file.write_text(json.dumps(hooks))
+    if event == "SubagentStart" and (absent.exists() or "--calibrator-only" in sys.argv):
+        out = {}
+    elif event == "SessionStart":
+        from khipu import recall_rule
+
+        text = recall_rule._RoutingAtStart().begin().text() or ""
+        # This independent calibrator proves the hook's attachment made it
+        # into native received context even when routing itself is broken.
+        text = os.environ["ROUTING_RIG_SENTINEL"] + "\n" + text
+        out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
+    else:
+        out, _, _ = routing_delegation.hook_main(json.dumps(payload))
+    calibrators = {"SubagentStart": "ROUTING_RIG_CHILD_SENTINEL",
+                   "PreToolUse": "ROUTING_RIG_PRETOOL_SENTINEL"}
+    if event in calibrators:
+        specific = out.setdefault("hookSpecificOutput", {})
+        specific["hookEventName"] = event
+        sentinel = os.environ[calibrators[event]]
+        if event == "SubagentStart" and absent.exists():
+            sentinel += "-NOHOOK"
+        specific["additionalContext"] = sentinel + "\n" + specific.get("additionalContext", "")
+    print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main()

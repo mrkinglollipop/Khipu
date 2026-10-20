@@ -257,3 +257,32 @@ class FakeCallers:
 @pytest.fixture
 def khipu_app(tmp_path, monkeypatch):
     return FakeCallers(tmp_path / "apps", monkeypatch)
+
+
+def pytest_addoption(parser):
+    group = parser.getgroup("routing received context")
+    group.addoption("--run-routing-harness", action="store_true", help="Opt in to bounded subscription model runs")
+    group.addoption("--routing-auth-root", help="Credential-only input: codex/auth.json, claude/.credentials.json")
+    group.addoption("--routing-evidence", help="Private evidence directory (outside the checkout)")
+    group.addoption("--routing-replay-evidence", help="Read a saved native run without spending model tokens")
+    for harness in ("t3", "grok", "aegis"):
+        group.addoption(f"--routing-{harness}-adapter", help="Reviewed local native-client headless driver")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "routing_received: opt-in headless received-context acceptance (costs tokens)")
+    # The controller creates this once; xdist workers and nested pytest
+    # invocations inherit it even though their own TMPDIR changes above.
+    shared = os.environ.get("ROUTING_RIG_SESSION_CACHE")
+    if not shared:
+        shared = str(Path(TEMP_ROOT) / "routing-run-cache")
+        os.environ["ROUTING_RIG_SESSION_CACHE"] = shared
+    config._routing_run_cache = Path(shared)
+
+
+def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--run-routing-harness"):
+        skip = pytest.mark.skip(reason="received context is opt-in: --run-routing-harness (costs tokens)")
+        for item in items:
+            if "routing_received" in item.keywords:
+                item.add_marker(skip)
