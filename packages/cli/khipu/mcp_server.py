@@ -887,6 +887,10 @@ TOOLS: list[dict] = [
                          "description": "Existing standing rule number to change; omit to add"},
                 "holds": {"type": "object", "additionalProperties": {"type": "string", "enum": ["end", "keep"]},
                           "description": "Explicit end-or-keep choices for held or paused accounts"},
+                "base": {"type": "string", "minLength": 1, "maxLength": 256,
+                         "description": "The rule's owner revision (owner_revision, as khipu_route lists it) "
+                                        "when this request was prepared; a request delivered after the owner "
+                                        "changed the rule is recorded as crossed, never made live"},
                 "owner_request": {"type": "string", "description": "This conversation's one-line words describing the owner's request"},
             },
             "required": ["text", "owner_request"],
@@ -924,6 +928,10 @@ TOOLS: list[dict] = [
                     },
                 },
                 "until": {"type": "string", "description": "When the whole priority ends (a time, or 3d)"},
+                "base": {"type": "string", "minLength": 1, "maxLength": 256,
+                         "description": "The priority's owner revision (owner_revision, as khipu_route lists "
+                                        "it) when this request was prepared; a request delivered after the "
+                                        "owner changed the priority is recorded as crossed, never made live"},
                 "owner_request": {"type": "string",
                                   "description": "This conversation's one-line words describing the owner's request"},
             },
@@ -2252,11 +2260,14 @@ def _tool_route_rule(args: dict) -> dict:
     _ensure_path()
     from khipu import routing
 
-    if not isinstance(args, dict) or set(args) - {"text", "rule", "holds", "owner_request"}:
+    if not isinstance(args, dict) or set(args) - {"text", "rule", "holds", "owner_request", "base"}:
         raise ValueError("khipu_route_rule takes text, owner_request and optional rule and holds")
     text = args.get("text")
     if not isinstance(text, str):
         raise ValueError("text must be text")
+    base = args.get("base")
+    if base is not None and (not isinstance(base, str) or not base.strip()):
+        raise ValueError("base must be the owner revision the request was prepared against")
     owner_request = args.get("owner_request")
     if not isinstance(owner_request, str) or not owner_request.strip() or "\n" in owner_request or "\r" in owner_request:
         raise ValueError("owner_request must be one line of text")
@@ -2268,7 +2279,7 @@ def _tool_route_rule(args: dict) -> dict:
                                                                       for hold, choice in holds.items())):
         raise ValueError('holds must map each hold id to "end" or "keep"')
     return routing.request_rule(text, n=number, owner_request=owner_request,
-                                author=routing.conversation_author(), via="mcp", holds=holds)
+                                author=routing.conversation_author(), via="mcp", holds=holds, base=base)
 
 
 def _tool_route_priority(args: dict) -> dict:
@@ -2280,8 +2291,11 @@ def _tool_route_priority(args: dict) -> dict:
     _ensure_path()
     from khipu import routing
 
-    if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request"}:
+    if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request", "base"}:
         raise ValueError("khipu_route_priority takes entries, owner_request and optional until")
+    base = args.get("base")
+    if base is not None and (not isinstance(base, str) or not base.strip()):
+        raise ValueError("base must be the owner revision the request was prepared against")
     entries = args.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError("entries must be the owner's accounts, in his order")
@@ -2291,9 +2305,15 @@ def _tool_route_priority(args: dict) -> dict:
     until = args.get("until")
     if until is not None and not isinstance(until, str):
         raise ValueError("until must be text")
-    # The version as of building this request, read inside the call's lock
-    # budget: one that moves before the write lands refuses it, and the
-    # request still waits for the owner.
+    # A request that carries the owner revision it was prepared against
+    # keeps it through the write, so one delivered after the owner moved
+    # on is recorded as crossed. Without one, the version as of building
+    # this request is read inside the call's lock budget: one that moves
+    # before the write lands refuses it, and the request still waits for
+    # the owner.
+    if base is not None:
+        return routing.conversation_priority(entries, until=until, owner_request=owner_request,
+                                             author=routing.conversation_author(), base=base)
     return routing.conversation_priority(entries, until=until, owner_request=owner_request,
                                          author=routing.conversation_author(), expect_current=True)
 
