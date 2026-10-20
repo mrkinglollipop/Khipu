@@ -1,8 +1,9 @@
 # Routing as a first-class feature (2026-10-20)
 
 Asked by Matt 2026-10-20: "A routing system that can change dynamically needs to be a first class feature. We
-depend on this." Status: DRAFT, revised after Codex review rounds 1 and 2 (see Review responses).
-Nothing here is built until Matt approves it, and no UI is built until its mocks are approved.
+depend on this." Status: APPROVED by Matt 2026-10-20 ("Yes proceed as you recommend"): all 14 decisions
+as recommended, after Codex review rounds 1 to 8. Slice 1 shipped as PR #260. No UI is built until its
+mocks are approved.
 
 Read first: `2026-10-14-routing-truth.md` (the record, its sources, the push, decisions 1 to 21) and
 `2026-10-20-routing-delivery.md` (today's fixes A to F, slice 1 here). This page adds to them and never
@@ -701,6 +702,8 @@ change; if it is still red, stop and report the last log. Slices on the per-prom
 Slices 4Pb, 9a, 10 and 13 can run beside 5 to 8c, and 11a beside 6.
 
 ## Matt's decisions (each with a recommendation)
+
+Approved 2026-10-20: all 14 as recommended.
 
 1. **Delivery failures turn doctor red** (amends routing-truth decision 10 for delivery only). Routing content
    and advisory marks stay warnings and never feed a gate. *Recommend yes.*
