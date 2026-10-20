@@ -118,6 +118,22 @@ function withMuseResetAt95(): UsageReport {
   return r;
 }
 
+/** The GLM Coding Plan (z.ai): a keyed account with a five-hour and a weekly window. */
+function withGlm(over: Partial<UsageAccount> = {}): UsageReport {
+  const r = realReport();
+  r.accounts = [...r.accounts!, {
+    key: "glm|", harness: "glm", account: "GLM", home: null, plan: "pro",
+    windows: [
+      { name: "five_hour", used_pct: 15, resets_at: "2026-10-14T18:00:00Z", window_mins: 300 },
+      { name: "weekly", used_pct: 25, resets_at: "2026-10-17T12:00:00Z", window_mins: 10080 },
+    ],
+    credits: null, version: null, source: "live", observed_at: null, error: null, note: null, ok: true,
+    probed_at: "2026-10-14T13:57:29Z", ms: 0, last_attempt_at: "2026-10-14T13:57:29Z", last_error: null,
+    last_good_at: "2026-10-14T13:57:29Z", cached: false, stale: false, ...over,
+  } as UsageAccount];
+  return r;
+}
+
 type Deferred = { resolve: () => void };
 let status: UsageReport;
 let fresh: UsageReport;
@@ -227,6 +243,27 @@ describe("PlansCard on Home", () => {
     expect(muse.queryByText(/Live/)).toBeNull();
     expect(screen.queryByText(/Live/)).toBeNull();
     expect(muse.queryByText(/Sign in/)).toBeNull();
+  });
+
+  it("shows the GLM account with its tightest window", async () => {
+    status = withGlm();
+    render(<Home />);
+    await waitFor(() => expect(screen.getByText("GLM")).toBeTruthy());
+    const glm = within(rowFor("GLM"));
+    expect(glm.getByText("25%")).toBeTruthy();
+    expect(glm.getByRole("meter").getAttribute("aria-valuenow")).toBe("25");
+    expect(glm.queryByText(/Sign in/)).toBeNull();
+  });
+
+  it("says in Khipu's words when the GLM key is missing", async () => {
+    status = withGlm({
+      plan: null, windows: [], ok: false, error: "no_key",
+      note: "Khipu has no GLM key; add it in Settings under Accounts and routing",
+    });
+    render(<Home />);
+    await waitFor(() => expect(screen.getByText("GLM")).toBeTruthy());
+    expect(within(rowFor("GLM")).getByText(/Khipu has no GLM key/)).toBeTruthy();
+    expect(usageErrorPhrase("no_key")).toBe("no GLM key stored");
   });
 
   it("warns at 75% and alerts at 90%", async () => {
@@ -528,7 +565,7 @@ describe("PlansSettingsCard", () => {
     const r = realReport();
     r.accounts!.push(
       { harness: "claude", account: "Typo", ok: false, error: "invalid_account", windows: [],
-        note: 'This account entry is not valid: Khipu does not read the CLI "cluade"; it reads Claude Code, Codex, Grok Build and Muse' },
+        note: 'This account entry is not valid: Khipu does not read the CLI "cluade"; it reads Claude Code, Codex, Grok Build, Muse and the GLM Coding Plan' },
       { harness: "claude", account: "Claude second", ok: false, error: "no_plan_limits", windows: [],
         note: "This sign-in reports no plan limits. Open Claude Code with this login folder and sign in again (/login)",
         last_attempt_at: "2026-10-14T13:59:00Z" },

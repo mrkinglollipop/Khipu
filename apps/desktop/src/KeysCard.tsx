@@ -10,7 +10,7 @@ import { modelCheckFor, type ModelVerifyResult } from "./modelVerify";
 import { fmtAge } from "./time";
 import "./CaptureModels.css";
 
-export type KeyId = "gemini" | "anthropic" | "openai" | "openrouter" | "openai_compat";
+export type KeyId = "gemini" | "anthropic" | "openai" | "openrouter" | "openai_compat" | "glm";
 
 export type KeyInfo = {
   id: KeyId;
@@ -72,6 +72,16 @@ export const KEYS: readonly KeyInfo[] = [
     checks: ["openai_compat_generate"],
     optional: true,
     addLabel: "a local endpoint key",
+  },
+  {
+    id: "glm",
+    name: "GLM Coding Plan",
+    account: "glm_api_key",
+    uses: "Reading how much of the GLM plan is left (z.ai)",
+    env: "GLM_API_KEY",
+    checks: [],
+    optional: true,
+    addLabel: "a GLM key",
   },
 ];
 

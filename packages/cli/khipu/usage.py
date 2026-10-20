@@ -51,12 +51,18 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-HARNESSES = ("claude", "codex", "grok", "muse")
-LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok", "muse": "Muse"}
+HARNESSES = ("claude", "codex", "grok", "muse", "glm")
+LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok", "muse": "Muse", "glm": "GLM"}
+# One sign-in each and no login folder: Muse's is its own login, GLM's is the
+# Coding Plan key (a Claude Code lane pointed at z.ai, not an Anthropic home).
+NO_FOLDER = ("muse", "glm")
 TIMEOUT_S = 5.0
 # Grok's probe starts a whole `grok agent` (and its MCP servers), which took
 # longer than TIMEOUT_S under load; the other harnesses' probes stay cheap.
 GROK_TIMEOUT_S = 20.0
+# GLM's probe is one HTTPS call to z.ai's quota endpoint, no child process.
+GLM_TIMEOUT_S = 15.0
+GLM_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 DEFAULT_MAX_AGE_S = 120
 CACHE_NAME = "usage.json"
 CACHE_VERSION = 2
@@ -114,9 +120,14 @@ E_INVALID = "invalid_account"
 E_INTERNAL = "internal_error"
 E_PENDING = "pending"
 E_NO_FOLDER = "login_folder_missing"
+E_NO_KEY = "no_key"
+E_NO_PLAN = "no_plan"
+# z.ai refused the key: not a sign-in an owner can redo in a CLI, so it has its own code.
+E_BAD_KEY = "key_rejected"
 NO_FOLDER_NOTE = "Khipu can't find this account's login folder on this Mac"
 # The CLIs by the names the app's form gives them.
-CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok Build", "muse": "Muse"}
+CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok Build", "muse": "Muse",
+             "glm": "GLM Coding Plan"}
 # Plain words only: the app shows notes as written to an owner who is not
 # technical, so a note names a login folder, never a home, a PATH, a token or
 # a probe. The live read's own code goes in the row's ``live_error`` field,
@@ -128,6 +139,8 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
     """Khipu's own sentence for a failure ``code`` on one account, or None."""
     name = CLI_NAMES.get(harness or "", "This CLI")
     folder = " with this login folder" if home else ""
+    if harness == "glm":
+        return _glm_note(code)
     if code == E_NOT_INSTALLED:
         return f"{name} is not installed on this Mac"
     if code == E_SIGNIN:
@@ -138,6 +151,8 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return f"{name} did not send its plan figures just now; Khipu keeps the last ones and asks again"
     if code == E_PENDING:
         return "Reading for the first time; ask again in a few seconds"
+    if code in (E_NO_KEY, E_NO_PLAN, E_BAD_KEY):
+        return _glm_note(code)
     # Every other code the probes can return gets its plain cause too, so the
     # app shows Khipu's words for every failure and never invents its own.
     if code == E_TIMEOUT:
@@ -150,6 +165,39 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return f"{name} answered in a way Khipu can't read"
     if code == E_START:
         return f"{name} could not be started"
+    if code == E_INVALID:
+        return "This account entry is not valid"
+    if code == E_NO_FOLDER:
+        return NO_FOLDER_NOTE
+    if code == E_INTERNAL:
+        return "Khipu could not run the check"
+    return None
+
+
+def _glm_note(code: str | None) -> str | None:
+    """GLM has no CLI to open or sign in to: its sign-in is a key Khipu reads."""
+    if code == E_NO_KEY:
+        return "Khipu has no GLM key; add it in Settings under Accounts and routing"
+    if code == E_NOT_INSTALLED:
+        return "Khipu can't reach z.ai from this Mac"
+    if code in (E_SIGNIN, E_BAD_KEY):
+        return "z.ai did not accept the GLM key; replace it in Settings under Accounts and routing"
+    if code == E_NO_PLAN:
+        return "z.ai reports no GLM Coding Plan on this key"
+    if code == E_NO_LIMITS:
+        return "z.ai reported no plan limits for this key"
+    if code == E_NO_FIGURES:
+        return "z.ai did not send its plan figures just now; Khipu keeps the last ones and asks again"
+    if code == E_PENDING:
+        return "Reading for the first time; ask again in a few seconds"
+    if code == E_TIMEOUT:
+        return "z.ai didn't answer in time"
+    if code in (E_NO_ANSWER, E_START) or (code and re.fullmatch(r"(exit|signal)_\d+", code)):
+        return "z.ai didn't answer"
+    if code == E_CLI:
+        return "z.ai reported an error when asked"
+    if code == E_BAD:
+        return "z.ai answered in a way Khipu can't read"
     if code == E_INVALID:
         return "This account entry is not valid"
     if code == E_NO_FOLDER:
@@ -1250,6 +1298,118 @@ def probe_muse(*, timeout: float = TIMEOUT_S, turn: bool = True) -> dict:
     return _muse_carry(row, prev, refusal, now)
 
 
+# ---- GLM (z.ai Coding Plan) ------------------------------------------------
+#
+# Matt's GLM lane is the Claude Code CLI pointed at z.ai, so there is no GLM
+# CLI to ask. z.ai's monitor endpoint answers with the key as the raw
+# ``Authorization`` value (no Bearer). The key is read into a local, goes only
+# into that header, and never reaches a row, the cache, a log, argv or an error.
+
+_GLM_UNITS = {3: ("five_hour", 300), 6: ("weekly", 10080)}
+# z.ai's own codes for a missing plan and for a key it does not accept.
+_GLM_NO_PLAN = {1113}
+_GLM_BAD_KEY = {1000, 1001, 1002, 1003, 1004, 401}
+
+
+def _glm_key() -> str | None:
+    from khipu import keychain
+
+    try:
+        return keychain.resolve_glm_key() or None
+    except Exception:  # noqa: BLE001 - no key anywhere; the message is never used
+        return None
+
+
+def _glm_request(key: str, timeout: float) -> tuple[int, bytes]:
+    """(HTTP status, body) of the quota call; ProbeError for anything that is
+    not an HTTP answer. No exception text is kept: it could echo the URL."""
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(GLM_QUOTA_URL, headers={"Authorization": key, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed https URL
+            return response.status, response.read(1 << 20)
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, exc.read(1 << 20)
+        except Exception:  # noqa: BLE001
+            return exc.code, b""
+    except TimeoutError:
+        raise ProbeError(E_TIMEOUT) from None
+    except urllib.error.URLError as exc:
+        raise ProbeError(E_TIMEOUT if isinstance(exc.reason, TimeoutError) else E_NO_ANSWER) from None
+    except Exception:  # noqa: BLE001 - OSError, ssl, http.client: any text could echo the key
+        raise ProbeError(E_NO_ANSWER) from None
+
+
+def _glm_pct(limit: dict):
+    """Used percent of one limit: z.ai's own ``percentage``, else used / limit."""
+    pct = limit.get("percentage")
+    if pct is None:
+        used, total = limit.get("currentValue"), limit.get("usage")
+        if isinstance(used, bool) or isinstance(total, bool) \
+                or not isinstance(used, (int, float)) or not isinstance(total, (int, float)) or total <= 0:
+            return None
+        pct = used / total * 100
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct):
+        raise ProbeError(E_BAD)
+    return round(min(100.0, max(0.0, float(pct))), 2)
+
+
+def parse_glm(status: int, body: bytes) -> dict:
+    try:
+        reply = json.loads(body.decode("utf-8")) if body else None
+    except (ValueError, UnicodeError):
+        reply = None
+    if not isinstance(reply, dict):
+        if status in (401, 403):
+            raise ProbeError(E_BAD_KEY)
+        raise ProbeError(E_BAD)
+    code = reply.get("code")
+    if isinstance(code, int) and not isinstance(code, bool) and code != 200:
+        if code in _GLM_NO_PLAN:
+            raise ProbeError(E_NO_PLAN)
+        raise ProbeError(E_BAD_KEY if code in _GLM_BAD_KEY or status in (401, 403) else E_CLI)
+    if status in (401, 403):
+        raise ProbeError(E_BAD_KEY)
+    if status != 200:
+        raise ProbeError(E_CLI)
+    data = _dict(reply, "data", required=True)
+    windows = []
+    for limit in _list(data, "limits"):
+        if not isinstance(limit, dict):
+            raise ProbeError(E_BAD)
+        unit = limit.get("unit")
+        if isinstance(unit, bool) or unit not in _GLM_UNITS:
+            continue
+        # unit 3 / 6 are the token windows; a same-unit request-count limit
+        # (type TIME_LIMIT) must not stand in for one.
+        if isinstance(limit.get("type"), str) and limit["type"] != "TOKENS_LIMIT":
+            continue
+        name, mins = _GLM_UNITS[unit]
+        if any(w["name"] == name for w in windows):
+            continue
+        window = _window(name, _glm_pct(limit), limit.get("nextResetTime"), mins)
+        if window:
+            windows.append(window)
+    if not windows:
+        raise ProbeError(E_NO_LIMITS)
+    return {"ok": True, "plan": _text(data.get("level")), "windows": windows, "credits": None, "version": None,
+            "source": "live"}
+
+
+@_guard
+def probe_glm(*, timeout: float = TIMEOUT_S) -> dict:
+    """The Coding Plan's five-hour and weekly windows from z.ai. The default
+    ``timeout`` is widened to ``GLM_TIMEOUT_S`` (an explicit one is honoured)."""
+    key = _glm_key()
+    if not key:
+        raise ProbeError(E_NO_KEY)
+    status, body = _glm_request(key, GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
+    return parse_glm(status, body)
+
+
 # ---- accounts ----------------------------------------------------------------
 
 
@@ -1281,9 +1441,10 @@ def _entry_problem(harness: str, home: str | None) -> tuple[str, str, str] | Non
     if harness not in HARNESSES:
         named = f'the CLI "{harness}"' if harness else "an entry with no CLI"
         return "unknown_cli", "harness", (f"Khipu does not read {named}; it reads Claude Code, Codex, "
-                                          "Grok Build and Muse")
-    if harness == "muse" and home:
-        return "muse_folder", "home", "Muse has one sign-in, so it takes no login folder"
+                                          "Grok Build, Muse and the GLM Coding Plan")
+    if harness in NO_FOLDER and home:
+        return (f"{harness}_folder", "home",
+                f"{LABELS[harness]} has one sign-in, so it takes no login folder")
     path = _home_path(home) if home else None
     # A relative folder (".claude-second", the "~/" left off) can never be
     # read: each probe starts in a fresh empty temp folder, so it would always
@@ -1291,6 +1452,12 @@ def _entry_problem(harness: str, home: str | None) -> tuple[str, str, str] | Non
     if home and (path is None or not path.is_absolute()):
         return "no_such_folder", "home", (f"Khipu cannot find the login folder {home}; start it with ~/ "
                                           "(for example ~/.codex-work) or give the full path")
+    if harness == "claude" and path is not None:
+        from khipu import discover
+
+        if discover.zai_home(path):
+            return "zai_home", "home", ("This login folder runs Claude Code against z.ai, so it is the GLM "
+                                        "account; track GLM instead of reading it as Claude")
     return None
 
 
@@ -1308,6 +1475,12 @@ def _account_from_entry(entry) -> dict:
     if problem:
         account["invalid"] = problem[2]
     return account
+
+
+def available(harness: str) -> bool:
+    """Whether Khipu can read this harness by default: its CLI is installed,
+    or (GLM, which has no CLI) a key is stored."""
+    return bool(_glm_key()) if harness == "glm" else bool(_command(harness))
 
 
 def reads_none(config: dict | None = None) -> bool:
@@ -1334,7 +1507,7 @@ def configured_accounts() -> list[dict]:
     if not isinstance(raw, list):
         if reads_none(config):
             return []
-        return [{"label": LABELS[h], "harness": h, "home": None} for h in HARNESSES if _command(h)]
+        return [{"label": LABELS[h], "harness": h, "home": None} for h in HARNESSES if available(h)]
     return [_account_from_entry(entry) for entry in raw]
 
 
@@ -1356,8 +1529,8 @@ def login_identity(account: dict) -> str:
     from khipu import claude_homes
 
     harness = account.get("harness")
-    if harness == "muse":
-        return "muse|"
+    if harness in NO_FOLDER:
+        return f"{harness}|"
     home = account.get("home")
     path = _home_path(home) if home else default_login(harness)
     if path is None:
@@ -1596,6 +1769,8 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
             data = probe_grok(home, timeout=timeout)
         elif harness == "muse":
             data = probe_muse(timeout=timeout, turn=turn)
+        elif harness == "glm":
+            data = probe_glm(timeout=timeout)
         else:
             data = {"ok": False, "error": E_INVALID}
         row = _blank_row(account)
@@ -1641,7 +1816,8 @@ def probe_all(accounts: list[dict], *, timeout: float = TIMEOUT_S) -> list[dict]
                for i, a in enumerate(accounts)]
     for thread in threads:
         thread.start()
-    longest = max([timeout] + [_grok_budget(timeout) for a in accounts if a.get("harness") == "grok"])
+    longest = max([timeout] + [_grok_budget(timeout) for a in accounts if a.get("harness") == "grok"]
+                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") == "glm"])
     end = time.monotonic() + longest + OVERALL_GRACE_S
     for thread in threads:
         thread.join(max(0.0, end - time.monotonic()))

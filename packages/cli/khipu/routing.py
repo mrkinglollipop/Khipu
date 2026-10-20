@@ -967,7 +967,7 @@ def resolve_account(name: str, known: list[dict] | None = None, *, conversation:
         harness, _, home = raw.partition("|")
         harness, home = harness.strip().lower(), home.strip()
         if harness not in usage.HARNESSES:
-            raise RouteError("that names no CLI Khipu reads (claude, codex, grok, muse)")
+            raise RouteError("that names no CLI Khipu reads (claude, codex, grok, muse, glm)")
         if home and (credential_location(home) or redact_secrets(home, force=True)[1]):
             raise RouteError("that login folder is inside a private folder or its name looks like a secret; "
                              "Khipu won't record it")
@@ -2151,7 +2151,7 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
              "reason": DOWN_REASONS.get(behind.get("reason") or "", "out of service")
              if state == DOWN and behind else None,
              "models": models, "witness": witness(behind), "disagreement": disagreement, "last_seen": None,
-             "underlying": None, "checkable": account["harness"] != "muse", "confirmed_at": confirmed_at}
+             "underlying": None, "checkable": account["harness"] not in ("muse", "glm"), "confirmed_at": confirmed_at}
     if state == LIMITED:
         # When the limit now shown was first reported (doctor's launch check).
         entry["since"] = _iso(min((e["at"] for e in whole if whole_holds(e)), default=None))
@@ -3223,7 +3223,7 @@ def check_account(account: str, *, scheduled: bool = False, now: datetime | None
         if scheduled and not due_now(entry):
             return {"ok": True, "account": key, "outcome": "not_due"}
         s = current(entry)
-        if entry.get("harness") == "muse" or entry.get("checkable") is False:
+        if entry.get("harness") in ("muse", "glm") or entry.get("checkable") is False:
             return done(s, "cannot_check", _CANNOT_CHECK)
         load1 = (load or (lambda: os.getloadavg()[0]))()
         busy_load = float(_setting(cfg, "routing_busy_load"))

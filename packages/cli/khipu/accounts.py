@@ -106,7 +106,7 @@ def normal_key(key) -> str:
     harness, _, home = key.partition("|")
     harness = harness.strip().lower()
     if harness not in usage.HARNESSES:
-        raise AccountsError("that names no CLI Khipu reads (claude, codex, grok, muse)", "not_tracked")
+        raise AccountsError("that names no CLI Khipu reads (claude, codex, grok, muse, glm)", "not_tracked")
     return usage._key({"harness": harness, "home": home.strip() or None})
 
 
@@ -124,9 +124,10 @@ def canonical_home(harness: str, home) -> str | None:
     ``~/...`` under the home folder, else the full path, with symlinks and
     ``..`` resolved first."""
     raw = _one_line(home, "a login folder", field="home")
-    if harness == "muse":
+    if harness in usage.NO_FOLDER:
         if raw:
-            raise AccountsError("Muse has one sign-in, so it takes no login folder", "muse_folder", field="home")
+            raise AccountsError(f"{usage.LABELS[harness]} has one sign-in, so it takes no login folder",
+                                f"{harness}_folder", field="home")
         return None
     if raw is None:
         return None
@@ -354,7 +355,7 @@ def recover() -> None:
 def _installed_defaults() -> list[dict]:
     """The list an unset ``usage_accounts`` reads: each installed CLI's
     default login, home-less."""
-    return [{"label": usage.LABELS[h], "harness": h} for h in usage.HARNESSES if usage._command(h)]
+    return [{"label": usage.LABELS[h], "harness": h} for h in usage.HARNESSES if usage.available(h)]
 
 
 def _plan(before: list[dict], after: list[dict], *, moves: bool) -> list[tuple]:
@@ -704,9 +705,10 @@ def _save_declined(items: list[dict]) -> None:
 def _login_path(harness: str, folder):
     """The folder a decline names: the given one (``~/`` or full), else the
     CLI's default login; None for Muse."""
-    if harness == "muse":
+    if harness in usage.NO_FOLDER:
         if folder:
-            raise AccountsError("Muse has one sign-in, so it takes no login folder", "muse_folder", field="home")
+            raise AccountsError(f"{usage.LABELS[harness]} has one sign-in, so it takes no login folder",
+                                f"{harness}_folder", field="home")
         return None
     raw = _one_line(folder, "a login folder", field="home")
     if raw is None:
@@ -722,7 +724,7 @@ def _same_login(item: dict, harness: str, path) -> bool:
     identity, or by its stored folder (a folder that is gone still matches)."""
     if item.get("cli") != harness:
         return False
-    if harness == "muse":
+    if harness in usage.NO_FOLDER:
         return True
     ident, shown = discover.identity(path), discover.display_path(path)
     if item.get("identity") == ident or item.get("path") == shown:
@@ -752,7 +754,7 @@ def _set_declined(harness: str, path, why: str | None) -> int:
 
 
 def _account_path(account: dict):
-    if account["harness"] == "muse":
+    if account["harness"] in usage.NO_FOLDER:
         return None
     return usage._home_path(account["home"]) if account.get("home") else discover.default_folder(account["harness"])
 
@@ -775,7 +777,7 @@ def offer_again(harness: str, folder=None) -> dict:
 def _harness(raw) -> str:
     harness = str(raw or "").strip().lower()
     if harness not in usage.HARNESSES:
-        raise AccountsError("that names no CLI Khipu reads (claude, codex, grok, muse)", "unknown_cli",
+        raise AccountsError("that names no CLI Khipu reads (claude, codex, grok, muse, glm)", "unknown_cli",
                             field="harness")
     return harness
 
@@ -965,8 +967,9 @@ def move(key, folder, *, expect=None, via: str = "app") -> dict:
     every record on the old key, later ones included, to the new one."""
     key = normal_key(key)
     harness = key.partition("|")[0]
-    if harness == "muse":
-        raise AccountsError("Muse has one sign-in, so it takes no login folder", "muse_folder", field="home")
+    if harness in usage.NO_FOLDER:
+        raise AccountsError(f"{usage.LABELS[harness]} has one sign-in, so it takes no login folder",
+                            f"{harness}_folder", field="home")
     path = discover._expand(_one_line(folder, "a login folder", field="home") or "")
     if path is None or not discover._is_dir(path):
         raise AccountsError("Khipu can't find that folder", "folder_not_found", field="home")

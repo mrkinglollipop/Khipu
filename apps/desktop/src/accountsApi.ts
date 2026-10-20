@@ -21,7 +21,10 @@ import type { UsageAccount, UsageAccountEntry } from "./PlansCard";
 // 9B's packages/cli/khipu/accounts.py).
 // ---------------------------------------------------------------------------
 
-export type CliId = "claude" | "codex" | "grok" | "muse";
+export type CliId = "claude" | "codex" | "grok" | "muse" | "glm";
+/** CLIs with no login folder: Muse has one login, GLM is a key. */
+export const noFolder = (cli: string | null | undefined): boolean => cli === "muse" || cli === "glm";
+/** The programs the Add account dialog offers; GLM is a key, not a program. */
 export const CLI_IDS: CliId[] = ["claude", "codex", "grok", "muse"];
 
 export type CandidateState = "signed_in" | "not_signed_in" | "couldnt_check" | "not_checked" | "pending";
@@ -149,9 +152,9 @@ export type CliSettings = Record<string, { value: string | null; usable: boolean
 // ---------------------------------------------------------------------------
 
 /** The program's name, as Settings says it: "Claude Code", "Codex". */
-export const CLI_NAME: Record<CliId, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", muse: "Muse" };
+export const CLI_NAME: Record<CliId, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", muse: "Muse", glm: "GLM Coding Plan" };
 /** The service's name, as the dialog's step 1 says it: "Claude", "Codex". */
-export const SERVICE_NAME: Record<CliId, string> = { claude: "Claude", codex: "Codex", grok: "Grok Build", muse: "Muse" };
+export const SERVICE_NAME: Record<CliId, string> = { claude: "Claude", codex: "Codex", grok: "Grok Build", muse: "Muse", glm: "GLM" };
 
 /** Download pages checked into the code (plan section 1): Claude Code and
  *  Codex only; Grok Build and Muse get no link until one is verified. */
@@ -203,6 +206,12 @@ export function reasonWords(cli: string | null | undefined, code: string | null 
       return `${name} reports no plan limits for it`;
     case "no_plan_figures":
       return `${name} didn't send its plan figures`;
+    case "no_key":
+      return "Khipu has no GLM key yet";
+    case "key_rejected":
+      return "z.ai did not accept the GLM key";
+    case "no_plan":
+      return "z.ai reports no GLM Coding Plan on this key";
     case "login_folder_missing":
       return "its login folder is not there";
     case "no_answer":
@@ -291,6 +300,7 @@ export function conversationsWords(n: number | null | undefined): string | null 
 /** The login's folder as a row names it. */
 export function folderWords(c: Pick<Candidate, "path" | "default" | "cli">): string {
   if (c.cli === "muse") return "one login on this Mac";
+  if (c.cli === "glm") return "the GLM key on this Mac";
   return c.path ?? "its default login";
 }
 
@@ -595,7 +605,7 @@ export async function signInNow(
 // Name rules (plan section 5), checked before anything is sent
 // ---------------------------------------------------------------------------
 
-const BARE = new Set(["claude", "codex", "grok", "muse"]);
+const BARE = new Set(["claude", "codex", "grok", "muse", "glm"]);
 
 /** Why `name` can't be used, in plain words, or null. `isDefault`: the CLI's
  *  own default login, which may keep the plain name. `taken` are the names in
