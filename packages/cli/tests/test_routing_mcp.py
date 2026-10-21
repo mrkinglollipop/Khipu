@@ -311,7 +311,9 @@ def test_khipu_route_takes_the_same_privacy_path_as_the_cli(home, capsys):
 
 def test_the_gateway_answers_available_false(home, monkeypatch):
     monkeypatch.setenv(ms.GATEWAY_ACTIVE_ENV, "1")
-    assert _route() == {"available": False, "reason": ms.ROUTING_GATEWAY_REASON}
+    # No cloud routing copy is configured in this home, so the gateway
+    # projection fails closed instead of answering.
+    assert _route() == {"available": False, "reason": ms.GATEWAY_COPY_OFF_REASON}
     _, body = _call("khipu_route_report", {"state": "open", "account": "Codex"})
     assert body["available"] is False
     assert ms._routing_light()["available"] is False

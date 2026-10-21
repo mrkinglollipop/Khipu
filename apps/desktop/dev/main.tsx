@@ -28,6 +28,7 @@ import {
   useAccountsFinder,
 } from "../src/FoundAccounts";
 import type { AccountRefs } from "../src/FoundAccounts";
+import { RoutingSettings } from "../src/RoutingSettings";
 import { OfflineBanner, SavedOnThisMac, WaitingToSync } from "../src/OfflineBanner";
 import { OfflineWaitsCard } from "../src/SettingsControls";
 import { SetupAccountsStep } from "../src/SetupAccounts";
@@ -130,7 +131,25 @@ function OfflineOwedStates() {
   );
 }
 
+/** Settings -> Accounts and routing with only Proposals and holds open
+ *  (slice 15b), against the fictional record in fakeTauri. */
+function RoutingProposals() {
+  useState(() => {
+    try {
+      window.localStorage.setItem("khipu.routing.open", JSON.stringify(["holds"]));
+    } catch {
+      // The group can be opened by hand.
+    }
+  });
+  return (
+    <div className="settings-pane" style={{ width: 1184, maxWidth: "none", margin: "0 auto" }}>
+      <RoutingSettings active />
+    </div>
+  );
+}
+
 const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNode }> = {
+  "routing-proposals": { title: "Proposals and holds (slice 15b)", fake: { route15b: true }, render: () => <RoutingProposals /> },
   "offline-owed": { title: "Owed with the hub away: the banners and a waiting row", render: () => <OfflineOwedStates /> },
   "offline-settings": { title: "Settings: When the hub is away", render: () => <div className="route-settings"><OfflineWaitsCard active /></div> },
   "dialog-step1": { title: "Dialog, step 1: choose the service", render: () => <Dlg /> },
@@ -234,6 +253,15 @@ function Page() {
             </li>
           ))}
         </ul>
+      </main>
+    );
+  }
+  if (hash === "routing-proposals") {
+    // The Settings pane at its app width, uncapped by the 960 state frame.
+    return (
+      <main style={{ padding: 24 }} data-state={hash}>
+        <h1 style={{ fontSize: 14, color: "var(--muted)" }}>{st.title}</h1>
+        {st.render()}
       </main>
     );
   }

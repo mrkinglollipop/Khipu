@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { RoutingSettings } from "../RoutingSettings";
 import { revealSettingsGroup } from "../WhatsNew";
-import { GROUPS, accountWeek, routingProblems } from "../routingOverview";
+import { GROUPS, accountWeek, routingOverview, routingProblems } from "../routingOverview";
 import type { PlanUsageState, UsageAccount } from "../PlansCard";
 import type { RouteAccount, RouteView } from "../routing";
 // The stylesheets as written, for the headless Chrome layout check (vitest
@@ -314,7 +314,7 @@ describe("Accounts and routing: every problem shows, once", () => {
     expect(tags("Your note and standing rules")).toEqual(["1 to confirm", "1 may be broken"]);
     expect(tags("Providers and lanes")).toEqual(["1 stopped reporting", "1 can't be read", "1 lane without an account"]);
     expect(tags("Old routing table file")).toEqual(["Can't read the file"]);
-    expect(tags("Holds")).toEqual([]);
+    expect(tags("Proposals and holds")).toEqual([]);
 
     const needs = screen.getByRole("region", { name: "Needs you" });
     const lines = within(needs).getAllByRole("listitem").map((li) => li.querySelector("span")!.textContent);
@@ -352,6 +352,21 @@ describe("Accounts and routing: every problem shows, once", () => {
     expect(grokFailures[0]).toHaveTextContent("Last checked 2 min ago.");
     expect(line("Codex").querySelector(".at")).toHaveTextContent("Not signed in");
     expect(line("Claude main").querySelector(".at")?.textContent).toBe("");
+  });
+
+  it("counts only the crossed proposals still in the main list, never the ended ones", () => {
+    const v = view();
+    v.proposals = {
+      "prop-crossed": { id: "prop-crossed", entity: "rule-b", kind: "rule", n: 6, status: "crossed", at: "2026-10-14T12:00:00Z",
+        author: { kind: "conversation", harness: "grok_build", project: "project-d" } },
+      "prop-overtaken": { id: "prop-overtaken", entity: "rule-z", kind: "rule", n: 8, status: "overtaken", at: "2026-10-13T12:00:00Z",
+        author: { kind: "conversation", harness: "codex", project: "project-b" } },
+      "prop-done": { id: "prop-done", entity: "rule-c", kind: "rule", n: 9, status: "dismissed", at: "2026-10-13T12:00:00Z",
+        ended_at: "2026-10-14T09:00:00Z", author: { kind: "conversation", harness: "codex", project: "project-b" } },
+    };
+    const overview = routingOverview(v, null, null, null, { routing: config().routing, push: { enabled: true } }, MORNING);
+    expect(overview.lines.holds).toContain("1 crossed");
+    expect(overview.lines.holds).not.toContain("2 crossed");
   });
 
   it("counts a lane once when both the runner's lanes and a limit from it say it has no account", () => {
@@ -405,7 +420,7 @@ describe("Accounts and routing: every problem shows, once", () => {
     fireEvent.click(within(none).getByRole("button", { name: "Set up accounts" }));
     expect(onSetUp).toHaveBeenCalledTimes(1);
     expect(groupButton("Accounts")).toHaveTextContent("No accounts yet");
-    expect(groupButton("Holds")).toHaveTextContent("None");
+    expect(groupButton("Proposals and holds")).toHaveTextContent("No proposals · no holds");
   });
 });
 
@@ -494,7 +509,7 @@ describe("Accounts and routing: open and closed, remembered on this Mac", () => 
     for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "true");
     fireEvent.click(screen.getByRole("button", { name: "Close all groups" }));
     for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(groupButton("Holds"));
+    fireEvent.click(groupButton("Proposals and holds"));
     cleanup();
     render(<RoutingSettings active />);
     await settled();
@@ -506,9 +521,9 @@ describe("Accounts and routing: open and closed, remembered on this Mac", () => 
     render(<RoutingSettings active />);
     await settled();
     fireEvent.change(screen.getByLabelText("Words"), { target: { value: "Half written" } });
-    fireEvent.click(groupButton("Holds"));
+    fireEvent.click(groupButton("Proposals and holds"));
     expect(screen.queryByRole("form", { name: "Add a hold" })).toBeNull();
-    fireEvent.click(groupButton("Holds"));
+    fireEvent.click(groupButton("Proposals and holds"));
     expect(screen.getByLabelText("Words")).toHaveValue("Half written");
   });
 
@@ -525,7 +540,7 @@ describe("Accounts and routing: open and closed, remembered on this Mac", () => 
     await settled();
     expect(groupButton("Accounts")).toHaveAttribute("aria-expanded", "true");
     fireEvent.click(screen.getByRole("button", { name: "Open all groups" }));
-    expect(groupButton("Holds")).toHaveAttribute("aria-expanded", "true");
+    expect(groupButton("Proposals and holds")).toHaveAttribute("aria-expanded", "true");
   });
 });
 
