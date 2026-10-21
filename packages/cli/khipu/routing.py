@@ -5544,16 +5544,17 @@ def telemetry_active(account: str | None = None, *, now: datetime | None = None)
     return totals.get(key, {"jobs": None, "status": "unknown"})
 
 
-def runner_cap_flags(view: dict) -> list[dict]:
+def runner_cap_flags(view: dict, account: str | None = None) -> list[dict]:
     """Where a registered job runner's own budget caps have no matching
     Khipu cap fact, or disagree with the fact they have (slice 19b). A
     report only: the runner's files are read through routing_sources'
-    registration, never written, and no runner number becomes a fact."""
+    registration, never written, and no runner number becomes a fact.
+    When ``account`` (a key) is given, only that account's flags are kept."""
     from khipu import routing_scanner, routing_sources
 
     return routing_scanner.compare_runner_caps(
         routing_sources.runner_budget_declarations(view.get("source_cache") or {}),
-        view.get("accounts") or [])
+        view.get("accounts") or [], account_key=account)
 
 
 def cap_statuses(view: dict, entry: dict, now: datetime) -> list[dict]:
@@ -8046,7 +8047,7 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["pace_order"] = cfg["routing_pace_order"]
     # Where a registered runner's own budget caps have no Khipu fact, or
     # disagree with one (slice 19b). Numbers and Khipu's words only.
-    out["runner_caps"] = runner_cap_flags(view)
+    out["runner_caps"] = runner_cap_flags(view, account=account)
     # What the app's Routing card and attention items need beside the view
     # (phase 4): each watched rule's check, as doctor carries it, and the
     # two times the app words its warnings by.
