@@ -8156,6 +8156,11 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
         {key: item.get(key) for key in ("id", "words", "project", "join", "reason")}
         for item in items if isinstance(item, dict)
     ]
+    # Owner-local only, like the directions above: today's rule 12 model
+    # mismatches (labels, never brief text, session ids or paths).
+    from khipu import routing_mismatches
+
+    out["model_mismatches"] = routing_mismatches.today(now)
     return out
 
 
