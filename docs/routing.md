@@ -63,6 +63,19 @@ and sent only in the request header. Only the parsed quota windows are
 kept; failures carry a fixed code (a redirect is `redirect_refused`), never
 a response body or header.
 Account definitions name the provider; login folders remain local bindings.
+
+The rule 12 tier table is a structured fact (`tier_table_set`, `tiers` naming
+every task class: `scope`, `mock`, `ruling`, `hard-security`, `failed-fix`,
+`build`, `fix-round`, `tests`, `docs`, `synthesis`, `mechanical`, each with a
+tier of `opus`, `sonnet` or `haiku`), written with
+`khipu route tier-table set --tiers='<JSON>'` (terminal confirmation),
+`--owner-direction` in an eligible owner conversation, the app's owner path
+(`--from-app`), or `khipu_owner_act` action `route.tier_table.set` with
+`{"tiers": {...}}`. `khipu route tier-table confirm` confirms a table a
+conversation proposed (`set --at-owner-request '...'` writes a proposal that
+never governs on its own), and `clear` removes the table. Only a confirmed,
+owner-written table governs the advisory dispatch check. Each owner write is
+logged, and Undo restores the prior table (or clears it when there was none).
 No adapter or provider fact launches a probe by itself. Model and use checks
 are advisory. DeepSeek's rule 13 model restriction is `models_allowed: [deepseek-flash]`,
 not merely a ban on one Pro model. Spend and concurrency remain with slices

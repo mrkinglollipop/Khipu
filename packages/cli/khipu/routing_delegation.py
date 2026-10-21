@@ -28,6 +28,7 @@ import itertools
 import json
 import os
 import re
+import shlex
 import time
 from typing import Any
 
@@ -511,6 +512,78 @@ def provider_advisory(payload: dict) -> list[str]:
     return list(dict.fromkeys(warnings))
 
 
+def _rule12_line(payload: dict) -> str | None:
+    """The rule 12 tier line for this dispatch, or None. Context only."""
+    from khipu.routing_advisory import dispatch_line
+
+    return dispatch_line(*_dispatch_model_brief(payload))
+
+
+def _text(value) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _dispatch_model_brief(payload: dict) -> tuple[str | None, str | None]:
+    """(model, brief) from an Agent, Task, spawn_agent or claude -p call.
+
+    An explicit ``--model`` or ``-m`` wins over the model named in
+    ``CLAUDE_CONFIG_DIR``'s settings file. That file contributes its model
+    field only.
+    """
+    name = _tool_name(payload)
+    data = payload.get("tool_input") or payload.get("toolInput") or {}
+    if not isinstance(data, dict):
+        return None, None
+    if name in {"Agent", "Task"}:
+        return _text(data.get("model")), _text(data.get("prompt"))
+    if name == "spawn_agent":
+        return _text(data.get("model")), _text(data.get("message"))
+    if name not in SHELL_TOOLS:
+        return None, None
+    return _claude_model_brief(_text(data.get(SHELL_TOOLS[name])))
+
+
+def _claude_model_brief(command: str | None) -> tuple[str | None, str | None]:
+    if not command or len(command) > _SCAN_MOST:
+        return None, None
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return None, None
+    env: dict[str, str] = {}
+    index = 0
+    while index < len(argv) and _ASSIGNMENT.fullmatch(argv[index]):
+        key, _, value = argv[index].partition("=")
+        env[key] = value
+        index += 1
+    if index >= len(argv) or os.path.basename(argv[index]) != "claude":
+        return None, None
+    model, explicit, brief = None, False, None
+    cursor = index + 1
+    while cursor < len(argv):
+        word = argv[cursor]
+        if word in {"-m", "--model"} and cursor + 1 < len(argv):
+            model, explicit, cursor = argv[cursor + 1], True, cursor + 2
+            continue
+        if word.startswith("--model="):
+            model, explicit, cursor = word.split("=", 1)[1], True, cursor + 1
+            continue
+        if word in {"-p", "--print"} and cursor + 1 < len(argv):
+            brief, cursor = argv[cursor + 1], cursor + 2
+            continue
+        if word.startswith("--print="):
+            brief, cursor = word.split("=", 1)[1], cursor + 1
+            continue
+        if word.startswith("-p") and not word.startswith("--") and len(word) > 2:
+            brief = word[2:]
+        cursor += 1
+    if not explicit and env.get("CLAUDE_CONFIG_DIR"):
+        from khipu.routing_advisory import settings_model
+
+        model = settings_model(env["CLAUDE_CONFIG_DIR"])
+    return model, brief
+
+
 def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | None]:
     """(what to print, what to record once it is printed, the call's kind)
     for one PreToolUse call. Never a permission decision of any kind. Most
@@ -536,6 +609,12 @@ def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | 
         warnings = []
     if warnings:
         ctx += ("\n" if ctx else "") + "Provider advisory (guidance, not a gate): " + " ".join(warnings)
+    try:
+        line = _rule12_line(payload)
+    except Exception:  # noqa: BLE001 - a tier check never fails a dispatch
+        line = None
+    if line:
+        ctx += ("\n" if ctx else "") + line
     if not ctx:
         return {}, info, kind
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": ctx}}, info, kind
