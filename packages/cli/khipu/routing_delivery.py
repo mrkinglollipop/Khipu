@@ -224,6 +224,11 @@ def plan(out, view, now, cfg, *, session=None, project=None):
         line = r.pace_line_for(entry, now) if entry else None
         if line:
             items.append(dict(entity=entity, effective=line, text=line, label=fc["label"], whole=False))
+    for entity, ad in (out.get("advice_forecasts") or {}).items():
+        from khipu import routing_advice
+
+        line = routing_advice.advice_line(ad)
+        items.append(dict(entity=entity, effective=line, text=line, label=ad.get("label") or entity, whole=False))
     raw = [(item["text"], item["label"]) for item in items]
     projected = (project(raw) if project else r._for_agents(raw, view)) if items else []
     for item, (line, label) in zip(items, projected):
@@ -260,6 +265,7 @@ def plan(out, view, now, cfg, *, session=None, project=None):
     removed = {e: r.change_line(e, view, now) for e in view.get("causes", {})
                if e not in view.get("effective", {}) and (e == "note" or e.startswith("rule:"))}
     return dict(out, delivery_plan={"items": items, "pace_forecasts": out.get("pace_forecasts") or {},
+                                    "advice_forecasts": out.get("advice_forecasts") or {},
                                     "current_entities": list(view.get("effective", {})),
                                     "removed": removed, "notices": ["notice:" + n[2] for n in notices], "at": r._iso(now),
                                    "limit": cfg["routing_summary_chars"] if full else cfg["routing_prompt_chars"],
@@ -362,7 +368,7 @@ def _render(state, out, now, component):
     if not due:
         # Informational full/stale blocks have no change debt to reserve.
         answer = {k: v for k, v in out.items() if k not in
-                  ("delivery_plan", "delivery_reservation", "routing_changes", "delivery", "_delivery_view", "_reserved", "pace_forecasts")}
+                  ("delivery_plan", "delivery_reservation", "routing_changes", "delivery", "_delivery_view", "_reserved", "pace_forecasts", "advice_forecasts")}
         return answer
     limit = out["delivery_plan"]["limit"]
     # Keep ordinary small offers byte-identical. A preview is never enough
@@ -430,7 +436,7 @@ def _render(state, out, now, component):
             body.append(tail)
         plain = heading + "\n" + "\n".join(body)
     complete = [entity for entity, end in progress.items() if end == len(entries[entity]["text"])]
-    answer = {k: v for k, v in out.items() if k not in ("delivery_plan", "delivery_reservation", "_delivery_view", "_reserved", "pace_forecasts")}
+    answer = {k: v for k, v in out.items() if k not in ("delivery_plan", "delivery_reservation", "_delivery_view", "_reserved", "pace_forecasts", "advice_forecasts")}
     if "notices" in out or out["delivery_plan"].get("notices"):
         answer["notices"] = [entity.removeprefix("notice:") for entity in complete
                              if entity.startswith("notice:")]
@@ -1262,6 +1268,9 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
         forecasts = (flight.get("plan") or {}).get("pace_forecasts") or {}
         if forecasts:
             state["pace_acked"] = {**(state.get("pace_acked") or {}), **forecasts}
+        advice = (flight.get("plan") or {}).get("advice_forecasts") or {}
+        if advice:
+            state["advice_acked"] = {**(state.get("advice_acked") or {}), **advice}
         # Idempotence covers recent retries; older ids fail closed.
         for old in list(batches)[:-128]:
             del batches[old]
