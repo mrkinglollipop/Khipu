@@ -314,7 +314,7 @@ describe("Accounts and routing: every problem shows, once", () => {
     expect(tags("Your note and standing rules")).toEqual(["1 to confirm", "1 may be broken"]);
     expect(tags("Providers and lanes")).toEqual(["1 stopped reporting", "1 can't be read", "1 lane without an account"]);
     expect(tags("Old routing table file")).toEqual(["Can't read the file"]);
-    expect(tags("Holds")).toEqual([]);
+    expect(tags("Proposals and holds")).toEqual([]);
 
     const needs = screen.getByRole("region", { name: "Needs you" });
     const lines = within(needs).getAllByRole("listitem").map((li) => li.querySelector("span")!.textContent);
@@ -405,7 +405,7 @@ describe("Accounts and routing: every problem shows, once", () => {
     fireEvent.click(within(none).getByRole("button", { name: "Set up accounts" }));
     expect(onSetUp).toHaveBeenCalledTimes(1);
     expect(groupButton("Accounts")).toHaveTextContent("No accounts yet");
-    expect(groupButton("Holds")).toHaveTextContent("None");
+    expect(groupButton("Proposals and holds")).toHaveTextContent("No proposals · no holds");
   });
 });
 
@@ -494,7 +494,7 @@ describe("Accounts and routing: open and closed, remembered on this Mac", () => 
     for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "true");
     fireEvent.click(screen.getByRole("button", { name: "Close all groups" }));
     for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(groupButton("Holds"));
+    fireEvent.click(groupButton("Proposals and holds"));
     cleanup();
     render(<RoutingSettings active />);
     await settled();
@@ -506,9 +506,9 @@ describe("Accounts and routing: open and closed, remembered on this Mac", () => 
     render(<RoutingSettings active />);
     await settled();
     fireEvent.change(screen.getByLabelText("Words"), { target: { value: "Half written" } });
-    fireEvent.click(groupButton("Holds"));
+    fireEvent.click(groupButton("Proposals and holds"));
     expect(screen.queryByRole("form", { name: "Add a hold" })).toBeNull();
-    fireEvent.click(groupButton("Holds"));
+    fireEvent.click(groupButton("Proposals and holds"));
     expect(screen.getByLabelText("Words")).toHaveValue("Half written");
   });
 
@@ -525,7 +525,7 @@ describe("Accounts and routing: open and closed, remembered on this Mac", () => 
     await settled();
     expect(groupButton("Accounts")).toHaveAttribute("aria-expanded", "true");
     fireEvent.click(screen.getByRole("button", { name: "Open all groups" }));
-    expect(groupButton("Holds")).toHaveAttribute("aria-expanded", "true");
+    expect(groupButton("Proposals and holds")).toHaveAttribute("aria-expanded", "true");
   });
 });
 
