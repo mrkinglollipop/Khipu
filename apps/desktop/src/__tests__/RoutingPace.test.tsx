@@ -25,6 +25,7 @@ it("shows check allowance beside jobs without changing the job summary", () => {
   fireEvent.click(screen.getByRole("button", { name: /^Codex/ }));
   expect(screen.getByText("Week: Checks: up to 5 over even")).toBeVisible();
   expect(screen.getByText("Checks")).toBeVisible();
+  expect(row.advice?.checks?.label).toBe("Checks");
   expect(row.advice?.checks?.word).toBe("Go");
 });
 
@@ -284,8 +285,10 @@ it("names qualified check windows and says Not for checks", () => {
   claude.check_advice = { ...claude.advice, purpose: "check", verdict: "not_eligible", reason: "tier not allowed" };
   const row = paceModel(view, PACE_PLANS, PACE_NOW).rows.find((a) => a.label === "Claude")!;
   expect(row.caps.map((c) => c.name)).toContain("Week: Sonnet checks of sensitive code: up to 20 over even");
+  expect(row.advice?.checks?.label).toBe("Sonnet checks of sensitive code");
   expect(row.advice?.checks?.word).toBe("Not for checks");
   render(<PaceSection data={view} plans={PACE_PLANS} now={PACE_NOW} folds={{ ...folds, isOpen: () => true }} />);
   expect(screen.getByText("Week: Sonnet checks of sensitive code: up to 20 over even")).toBeVisible();
+  expect(screen.getByText("Sonnet checks of sensitive code")).toBeVisible();
   expect(screen.getByText("Not for checks")).toBeVisible();
 });
