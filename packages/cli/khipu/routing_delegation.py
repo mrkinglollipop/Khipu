@@ -574,12 +574,25 @@ def _keep_mismatch(payload: dict, found: dict, model: str | None) -> None:
     try:
         from khipu import routing, routing_mismatches
 
-        home = _dispatch_config_dir(payload)
-        account = routing._label_for_key(f"claude|{home}") if home else "Claude"
-        routing_mismatches.record(dict(found, account=account, model=model,
+        routing_mismatches.record(dict(found, account=_account_label(_dispatch_config_dir(payload)), model=model,
                                        project=routing._project_name(payload.get("cwd"))))
     except Exception:  # noqa: BLE001 - a record that cannot be kept never changes the advisory
         pass
+
+
+def _account_label(home: str | None) -> str | None:
+    """Khipu's own label for the account a ``claude`` dispatch runs on: plain
+    "Claude" with no login folder, else the label of the account whose login
+    folder it is. A folder no account holds is None (never its name)."""
+    if not home:
+        return "Claude"
+    from khipu import routing, usage
+
+    key = usage._key({"harness": "claude", "home": home})
+    for account in routing.read_view().get("accounts") or []:
+        if isinstance(account, dict) and account.get("key") == key:
+            return account.get("label")
+    return None
 
 
 def _dispatch_config_dir(payload: dict) -> str | None:

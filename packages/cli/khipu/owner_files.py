@@ -35,7 +35,7 @@ PATTERNS: tuple[tuple[str, str, str], ...] = (
     ("temp", "turns", "occurrences/.*.tmp"),
     ("occurrences", "turns", "occurrences/*.json"),
     ("directions", "turns", "routing-directions.json"),
-    ("mismatches", "turns", "routing-mismatches.json"),
+    ("mismatches", "turns", "routing-mismatch-*.json"),
     ("turns", "turns", "*.jsonl"),
     ("temp", "data", ".owner-*.tmp"),
     ("lock", "data", ".owner-*.lock"),

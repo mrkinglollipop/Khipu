@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from datetime import timedelta
 
 import pytest
 
-from khipu import cli, owner_files, owner_turns, routing, routing_delivery, routing_delegation, routing_mismatches
+from khipu import cli, owner_files, owner_turns, recall_prompt, routing, routing_delivery, routing_delegation, routing_mismatches
+from khipu import wire
 from tests import test_routing_acceptance as acceptance
 from tests.test_routing_s10_advisory import payload, table
 
@@ -51,6 +54,15 @@ def mismatched(replay):
     return replay
 
 
+def events():
+    return sorted(owner_turns.folder().glob(routing_mismatches.PREFIX + "*.json"))
+
+
+FOUND = {"task": "tests", "expected": "sonnet", "actual": "opus", "guessed": False,
+         "account": "Claude", "model": "opus", "project": None}
+PLANTED = "/private/BriefSentinelQuokka/synthetic-session-sentinel/opus"
+
+
 def test_a_mismatch_is_recorded_with_labels_only(mismatched):
     assert "Rule 12" in json.dumps(dispatch(mismatched))
     public = routing.public_view(mismatched.view(), mismatched.now)
@@ -58,15 +70,11 @@ def test_a_mismatch_is_recorded_with_labels_only(mismatched):
     assert {k: row[k] for k in ("task", "expected", "actual", "guessed", "project")} == {
         "task": "fix-round", "expected": "sonnet", "actual": "opus", "guessed": False, "project": PROJECT}
     assert row["account"] == "Claude" and row["model"] == "opus" and row["at"]
-    stored = owner_turns.folder() / routing_mismatches.STORE_NAME
-    assert stat_mode(stored) == 0o600
+    stored, = events()
+    assert os.stat(stored).st_mode & 0o777 == 0o600
     text = stored.read_text()
     assert BRIEF_WORDS not in text and SESSION not in text and "synthetic-mismatch-folder" not in text
     assert owner_files.kind_of(stored) == "mismatches"
-
-
-def stat_mode(path):
-    return os.stat(path).st_mode & 0o777
 
 
 def test_a_guess_is_marked_and_a_match_records_nothing(mismatched):
@@ -77,42 +85,100 @@ def test_a_guess_is_marked_and_a_match_records_nothing(mismatched):
     assert row["task"] == "tests" and row["guessed"] is True
 
 
-def test_the_claude_p_account_is_its_login_folder_label(mismatched):
-    command = "CLAUDE_CONFIG_DIR=/private/synthetic-home/.claude-synthetic-second claude --model opus -p 'task: fix-round'"
-    call = {"hook_event_name": "PreToolUse", "session_id": SESSION, "cwd": CWD,
+def shell(command):
+    return {"hook_event_name": "PreToolUse", "session_id": SESSION, "cwd": CWD,
             "tool_name": "Bash", "tool_input": {"command": command}}
-    routing_delegation.hook_main(json.dumps(call))
-    row, = routing.public_view(mismatched.view(), mismatched.now)[FIELD]
-    assert row["account"] == "Claude (.claude-synthetic-second)"
-    assert "synthetic-home" not in json.dumps(row)
 
 
-def test_only_today_is_shown_and_the_store_keeps_seven_days(mismatched):
+def test_the_account_is_khipus_own_label_never_a_folder_name(mismatched):
+    home = "/private/synthetic-home/.claude-listed-second"
+    mismatched.configure(usage_accounts=mismatched.config["usage_accounts"]
+                         + [{"label": "Claude second", "harness": "claude", "home": home}])
+    routing_delegation.hook_main(json.dumps(shell(f"CLAUDE_CONFIG_DIR={home} claude --model opus -p 'task: fix-round'")))
+    unlisted = "/private/synthetic-home/synthetic-session-sentinel"
+    routing_delegation.hook_main(json.dumps(shell(f"CLAUDE_CONFIG_DIR={unlisted} claude --model opus -p 'task: tests'")))
+    rows = routing.public_view(mismatched.view(), mismatched.now)[FIELD]
+    assert sorted(r["account"] for r in rows) == ["Claude second", routing_mismatches.UNLISTED_ACCOUNT]
+    blob = json.dumps(routing.public_view(mismatched.view(), mismatched.now)[FIELD]) + "".join(e.read_text() for e in events())
+    assert "synthetic-session-sentinel" not in blob and "synthetic-home" not in blob
+
+
+def test_private_looking_input_is_dropped_not_truncated(mismatched):
+    for model in (PLANTED, "claude-opus-4/x", "a" * 70, "opus\nnewline", "claude-3f2a9c1e-77aa-4c1d"):
+        assert routing_mismatches.record(dict(FOUND, model=model, account=PLANTED, project=PLANTED), now=mismatched.now)
+    for row in routing.public_view(mismatched.view(), mismatched.now)[FIELD]:
+        assert row["model"] == routing_mismatches.UNLISTED_MODEL
+        assert row["account"] == routing_mismatches.UNLISTED_ACCOUNT and row["project"] is None
+    assert routing_mismatches.record(dict(FOUND, model="claude-opus-4-1"), now=mismatched.now + timedelta(seconds=5))
+    assert routing.public_view(mismatched.view(), mismatched.now + timedelta(seconds=9))[FIELD][-1]["model"] == "claude-opus-4-1"
+    assert not routing_mismatches.record(dict(FOUND, task="not a class"))
+    # A hand-planted file with private text is cleaned on the way out as well.
+    bad = events()[0]
+    bad.write_text(json.dumps(dict(json.loads(bad.read_text()), model=PLANTED, project=PLANTED, task="x" * 10)))
+    shown = json.dumps(routing.public_view(mismatched.view(), mismatched.now)[FIELD])
+    assert "synthetic-session-sentinel" not in shown and "BriefSentinelQuokka" not in shown
+
+
+def test_only_today_is_shown_and_rows_expire_on_read_and_in_the_sweep(mismatched):
     base = mismatched.now
-    for days in (8, 3, 0):
-        routing_mismatches.record({"task": "tests", "expected": "sonnet", "actual": "opus", "guessed": False,
-                                   "account": "Claude", "model": "opus", "project": None}, now=base - timedelta(days=days))
-    routing_mismatches.record({"task": "build", "expected": "sonnet", "actual": "opus", "guessed": False,
-                               "account": "Claude", "model": "opus", "project": None}, now=base)
-    stored = json.loads((owner_turns.folder() / routing_mismatches.STORE_NAME).read_text())
-    assert len(stored["mismatches"]) == 3  # the 8-day-old one was pruned on write
+    for days in (9, 8, 3, 0):
+        routing_mismatches.record(dict(FOUND), now=base - timedelta(days=days))
+    assert len(events()) == 4
     today = routing.public_view(mismatched.view(), base)[FIELD]
-    assert [r["task"] for r in today] == ["tests", "build"]
+    assert len(today) == 1 and len(events()) == 2  # the two past a week went on the read
+    routing_mismatches.record(dict(FOUND), now=base - timedelta(days=10))
+    assert len(events()) == 3
+    out = owner_turns.sweep(now=base.timestamp())
+    assert out["ok"] and out["mismatches"] == 1 and len(events()) == 2
 
 
 def test_a_damaged_store_reads_empty_and_never_breaks_the_view(mismatched):
-    owner_turns._ensure_folder()
-    (owner_turns.folder() / routing_mismatches.STORE_NAME).write_text("{not json")
+    folder = owner_turns._ensure_folder()
+    (folder / (routing_mismatches.PREFIX + "bad.json")).write_text("{not json")
+    (folder / (routing_mismatches.PREFIX + "list.json")).write_text("[1]")
     assert routing.public_view(mismatched.view(), mismatched.now)[FIELD] == []
-    (owner_turns.folder() / routing_mismatches.STORE_NAME).write_text(json.dumps({"mismatches": "x"}))
-    assert routing.public_view(mismatched.view(), mismatched.now)[FIELD] == []
+    assert routing_mismatches.today(mismatched.now) == []
 
 
 def test_a_failing_writer_never_fails_the_dispatch(mismatched, monkeypatch):
     def boom(*a, **k):
         raise OSError("disk")
-    monkeypatch.setattr(owner_turns, "_write_private", boom)
+    monkeypatch.setattr(routing_mismatches, "_write_event", boom)
     assert "Rule 12" in json.dumps(dispatch(mismatched))
+    assert events() == []
+
+
+def test_a_slow_store_never_holds_the_advisory_back(mismatched, monkeypatch):
+    monkeypatch.setattr(routing_mismatches, "_write_event", lambda *a: time.sleep(1.0))
+    started = time.monotonic()
+    assert "Rule 12" in json.dumps(dispatch(mismatched))
+    assert time.monotonic() - started < 0.5
+
+
+def test_a_fifo_in_the_folder_blocks_neither_the_write_nor_the_read(mismatched):
+    folder = owner_turns._ensure_folder()
+    os.mkfifo(folder / (routing_mismatches.PREFIX + "00-fifo.json"))
+    result = []
+    worker = threading.Thread(target=lambda: result.append((
+        "Rule 12" in json.dumps(dispatch(mismatched)), routing.public_view(mismatched.view(), mismatched.now)[FIELD])),
+        daemon=True)
+    worker.start()
+    worker.join(3)
+    assert result and result[0][0] and len(result[0][1]) == 1
+
+
+def test_concurrent_writers_lose_no_rows(mismatched):
+    start = threading.Barrier(8)
+
+    def one():
+        start.wait()
+        assert routing_mismatches.record(dict(FOUND), now=mismatched.now)
+
+    workers = [threading.Thread(target=one) for _ in range(8)]
+    [w.start() for w in workers]
+    [w.join(5) for w in workers]
+    assert len(events()) == 8
+    assert len(routing.public_view(mismatched.view(), mismatched.now)[FIELD]) == 8
 
 
 def test_route_json_carries_it(mismatched, capsys):
@@ -167,7 +233,27 @@ def test_owner_local_mismatches_never_reach_other_surfaces(mismatched, monkeypat
         assert not any(secret in leaf for secret in forbidden), (surface, leaf)
 
 
-def test_the_hook_output_and_log_hold_only_the_rule_12_line(mismatched, capsys):
+def test_the_executable_entry_point_prints_and_logs_no_mismatch_data(mismatched, monkeypatch, capsys):
+    home = "/private/synthetic-home/synthetic-session-sentinel"
+    call = shell(f"CLAUDE_CONFIG_DIR={home} claude --model {PLANTED} -p 'task: fix-round\n{BRIEF_WORDS}'")
+    monkeypatch.setattr(wire, "read_stdin", lambda: json.dumps(call))
+    routing_delegation.main()
+    printed = capsys.readouterr().out
+    assert "Rule 12" in printed
+    log = recall_prompt._log_path()
+    logged = log.read_text() if log.exists() else ""
+    assert "delegation" in logged
+    # The existing delegation log line names the session by design; nothing else
+    # this feature records may be in it, and no sink holds the planted fields.
+    for sink in (printed, logged):
+        for secret in (BRIEF_WORDS, PROJECT, CWD, "synthetic-session-sentinel", "synthetic-home", "BriefSentinelQuokka"):
+            assert secret not in sink, secret
+    row, = routing.public_view(mismatched.view(), mismatched.now)[FIELD]
+    assert row["model"] == routing_mismatches.UNLISTED_MODEL and row["account"] == routing_mismatches.UNLISTED_ACCOUNT
+    assert not any(secret in e.read_text() for e in events() for secret in (BRIEF_WORDS, SESSION, "synthetic-home", CWD))
+
+
+def test_the_hook_output_holds_only_the_rule_12_line(mismatched):
     out = dispatch(mismatched)
     for leaf in strings(out):
         assert not any(w in leaf for w in (BRIEF_WORDS, SESSION, PROJECT, CWD)), leaf
