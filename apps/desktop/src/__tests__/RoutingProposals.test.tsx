@@ -305,7 +305,7 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     const sw = screen.getByRole("switch", { name: /Copy routing between your Macs through the hub/ });
     expect(sw).not.toBeChecked();
     expect(screen.getByText(/Mac-to-Mac copy, separate from the copy for cloud agents/)).toBeInTheDocument();
-    expect(screen.getByText(/Replication: never synced/)).toBeInTheDocument();
+    expect(screen.getByText(/Replication: checking…/)).toBeInTheDocument();
     fireEvent.click(sw);
     await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_replication_live", value: "on" }));
   });
@@ -314,7 +314,12 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     expect(replicationStatusWords({ status: "green", caught_up_at: "2026-10-14T15:00:00Z", stale: false })).toBe("caught up");
     expect(replicationStatusWords({ status: "red", caught_up_at: "2026-10-14T15:00:00Z", stale: true })).toBe("stale");
     expect(replicationStatusWords({ status: "unknown", age_seconds: null, caught_up_at: null })).toBe("never synced");
-    expect(replicationStatusWords(null)).toBe("never synced");
+  });
+
+  it("words replication status as off when not applicable and checking while loading", () => {
+    expect(replicationStatusWords({ status: "not_applicable" })).toBe("off");
+    expect(replicationStatusWords(undefined)).toBe("checking…");
+    expect(replicationStatusWords(null)).toBe("checking…");
   });
 });
 

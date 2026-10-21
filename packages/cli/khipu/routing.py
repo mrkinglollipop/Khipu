@@ -486,7 +486,14 @@ def settings_status() -> dict[str, dict]:
             except (ValueError, TypeError):
                 source = "invalid"
         waiting = requests.get(key)
-        out[key] = {"value": values[key], "default": default, "kind": kind, "source": source, "words": words,
+        value = values[key]
+        if key == "routing_replication_live":
+            # Same strict test as _replication_live: a hand-edited word or
+            # number never shows the switch on (or counts as a stored form).
+            value = config.get(key) is True
+            if config.get(key) is not None and not isinstance(config.get(key), bool):
+                source = "invalid"
+        out[key] = {"value": value, "default": default, "kind": kind, "source": source, "words": words,
                     "request": {"request": waiting.get("request"), "by": waiting.get("by"), "at": waiting.get("at"),
                                 "by_words": author_words(waiting.get("by") if isinstance(waiting.get("by"), dict)
                                                          else None, push=True),
@@ -1546,9 +1553,14 @@ def _replication_live() -> bool:
     # Registered as a switch in SETTINGS (the owner sets it from the app,
     # which stores a JSON boolean), but the live check stays strict: a
     # hand-edited string or number in the file never turns replication on.
+    # A conversation's change at the owner's request is not live either
+    # until he confirms it; undoing it restores the value it replaced.
     from khipu.config import load_config
 
-    return load_config().get("routing_replication_live", False) is True
+    config = load_config()
+    if config.get("routing_replication_live", False) is not True:
+        return False
+    return "routing_replication_live" not in _setting_requests(config)
 
 
 def _pending_numbering() -> bool:

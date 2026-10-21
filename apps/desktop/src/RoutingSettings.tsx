@@ -3252,15 +3252,19 @@ function SubFold({ k, name, line, folds, children }: { k: string; name: string; 
 
 /** The replication status line under the Mac-to-Mac copy switch, in the
  *  words of `khipu route replication status`: caught up, stale, or never
- *  synced. The doctor block carries the same status; no new read is made. */
+ *  synced. Off (the doctor block's `not_applicable`) and still loading
+ *  (no block yet) say so instead. The doctor block carries the same
+ *  status; no new read is made. */
 export function replicationStatusWords(
   freshness: RouteDeliveryFreshness | null | undefined,
   healthError?: string | null,
 ): string {
   if (healthError) return "can't be checked";
-  if (freshness?.caught_up_at) return freshness.stale || freshness.status === "red" ? "stale" : "caught up";
-  if (freshness?.status === "green") return "caught up";
-  if (freshness?.status === "red") return "stale";
+  if (!freshness) return "checking…";
+  if (freshness.status === "not_applicable") return "off";
+  if (freshness.caught_up_at) return freshness.stale || freshness.status === "red" ? "stale" : "caught up";
+  if (freshness.status === "green") return "caught up";
+  if (freshness.status === "red") return "stale";
   return "never synced";
 }
 

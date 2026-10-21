@@ -112,3 +112,74 @@ def test_config_set_replication_live_at_owner_request_waits_for_owner(home, caps
     assert rc == 0, out
     assert routing.settings_status()["routing_replication_live"]["request"] is None
     assert routing._replication_live() is True
+
+
+class _RecordingHub:
+    def __init__(self):
+        self.calls = []
+
+    def reserve_numbers(self, mac, floor):
+        self.calls.append(("reserve_numbers", mac, floor))
+
+    def upload(self, mac, event):
+        self.calls.append(("upload", mac, event))
+
+    def pull(self, after, until, limit):
+        self.calls.append(("pull", after, until, limit))
+
+
+def _request_replication_on(home, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc, out = _cli(["config", "--at-owner-request", "turn replication on",
+                    "--set", "routing_replication_live", "on"], capsys)
+    assert rc == 0, out
+
+
+def test_pending_replication_request_is_not_live_and_makes_no_hub_call(home, capsys, monkeypatch):
+    from khipu import routing_replication
+
+    _request_replication_on(home, capsys, monkeypatch)
+    assert routing.settings_status()["routing_replication_live"]["request"] is not None
+    assert routing._replication_live() is False
+    hub = _RecordingHub()
+    assert routing_replication.sync(hub=hub)["disabled"] is True
+    assert hub.calls == []
+
+
+def test_confirm_pending_replication_request_makes_it_live(home, capsys, monkeypatch):
+    _request_replication_on(home, capsys, monkeypatch)
+    assert routing._replication_live() is False
+    rc, out = _cli(["config", "--from-app", "--answer-request", "routing_replication_live", "confirm"], capsys)
+    assert rc == 0, out
+    assert routing._replication_live() is True
+
+
+def test_undo_pending_replication_request_restores_off(home, capsys, monkeypatch):
+    _request_replication_on(home, capsys, monkeypatch)
+    rc, out = _cli(["config", "--from-app", "--answer-request", "routing_replication_live", "undo"], capsys)
+    assert rc == 0, out
+    assert routing.settings_status()["routing_replication_live"]["request"] is None
+    assert routing._replication_live() is False
+
+
+@pytest.mark.parametrize("raw", ["true", "yes", 1, "1", "on", 1.0, "True"])
+def test_settings_status_replication_live_uses_strict_boolean(home, raw):
+    _set_file(home, routing_replication_live=raw)
+    status = routing.settings_status()["routing_replication_live"]
+    assert status["value"] is False, raw
+    assert status["source"] == "invalid", raw
+    assert routing._replication_live() is False, raw
+
+
+def test_settings_status_replication_live_reports_strict_true(home):
+    _set_file(home, routing_replication_live=True)
+    status = routing.settings_status()["routing_replication_live"]
+    assert status["value"] is True and status["source"] == "file"
+    _set_file(home, routing_replication_live=False)
+    status = routing.settings_status()["routing_replication_live"]
+    assert status["value"] is False and status["source"] == "file"
+
+
+def test_settings_status_other_switches_still_coerce_words(home):
+    _set_file(home, routing_cloud_copy="true")
+    assert routing.settings_status()["routing_cloud_copy"]["value"] is True
