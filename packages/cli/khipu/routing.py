@@ -928,7 +928,9 @@ def _entry_cache(events_stat: list | None = None, mac: str | None = None) -> dic
     """Definitions and their read-only event snapshot while the log is unchanged."""
     events_stat = _stat(events_file()) if events_stat is None else events_stat
     mac = _local_mac() if mac is None else mac
-    key = (str(events_file()), tuple(events_stat or ()), mac)
+    from khipu import routing_replication
+
+    key = (str(events_file()), tuple(events_stat or ()), mac, routing_replication.cache_key())
     cached = _ENTRY_INPUTS.get(key)
     if cached is None:
         raw, bad = _read_all_events()
@@ -947,7 +949,9 @@ def _remember_entry_inputs(events: list[dict], events_stat: list | None = None, 
     """Refresh the entry cache from a fold that already read the log."""
     events_stat = _stat(events_file()) if events_stat is None else events_stat
     mac = _local_mac() if mac is None else mac
-    key = (str(events_file()), tuple(events_stat or ()), mac)
+    from khipu import routing_replication
+
+    key = (str(events_file()), tuple(events_stat or ()), mac, routing_replication.cache_key())
     ordered = _in_write_order(events) if ordered is None else ordered
     cached = {"definitions": entry_model.definitions(ordered, mac), "events": tuple(events),
               "raw": tuple(events if raw is None else raw), "bad": bad,
@@ -1524,7 +1528,7 @@ def _replication_live() -> bool:
     # Slice 11 enables this only once hub acceptance can assign numbers.
     from khipu.config import load_config
 
-    return bool(load_config().get("routing_replication_live", False))
+    return load_config().get("routing_replication_live", False) is True
 
 
 def _pending_numbering() -> bool:
@@ -1569,8 +1573,8 @@ _DECLINE_WHY = frozenset({"you stopped tracking it"})
 # and a frozenset value a closed code set. The structured shapes ("scope",
 # "entries", ...) are projected by name below.
 _COMMON_FIELDS: dict[str, Any] = {
-    "id": "id", "mac": "id", "legacy_mac": "id", "entity": "id",
-    "base": "id", "proposal": "id", "op": "id", "revision": "id",
+    "id": "id", "mac": "mac_id", "legacy_mac": "mac_id", "entity": "id",
+    "base": "revision_id", "proposal": "id", "op": "id", "revision": "revision_id",
     "written_at": "time", "via": "via", "kind": _KIND_CODES,
     "expires_at": "time",
 }
@@ -1648,7 +1652,7 @@ _REPLICATION_FIELDS: dict[str, dict[str, Any]] = {
 # Kinds whose "text" is owner words; a hold's text is owner words only when
 # the hold is the owner's, and priority "role" words follow the same switch
 # as proposal text on a pending priority.
-_TEXT_KINDS = frozenset({"rule_add", "rule_edit", "note_set", "owner_change"})
+_TEXT_KINDS = frozenset({"rule_add", "rule_edit", "rule_confirm", "note_set", "owner_change"})
 _HOLDS_KINDS = frozenset({"priority_set", "priority_confirm", "rule_add",
                           "rule_edit", "rule_confirm", "rule_restore"})
 
@@ -1696,9 +1700,20 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
     def shaped(shape, value):
         if shape == "account":
             return mapped(value)
-        if not isinstance(value, str) or not value or _dangerous(value):
+        if not isinstance(value, str) or not value:
             return None
-        if shape == "id":
+        # Generated identifiers are deliberately high entropy. Only these exact
+        # typed shapes bypass the free-text secret heuristic; paths never do.
+        if shape in ("id", "revision_id", "mac_id") and re.fullmatch(
+                r"(?:(?:rule|hold|proposal|note|priority|pause|definition|mac)-)?[0-9a-f]{8}-[0-9a-f]{4}-[57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", value):
+            return value
+        if shape == "revision_id" and re.fullmatch(r"[0-9a-f]{64}", value):
+            return value
+        if shape == "mac_id" and re.fullmatch(r"[0-9a-f]{32}", value):
+            return value
+        if _dangerous(value):
+            return None
+        if shape in ("id", "mac_id", "revision_id"):
             return value if _SAFE_ID.fullmatch(value) else None
         if shape == "time":
             return value if _TIME_SHAPE.fullmatch(value) else None
@@ -1786,7 +1801,7 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
                 row[field] = value
         hlc = event.get("hlc")
         if isinstance(hlc, dict) and isinstance(hlc.get("mac"), str) and hlc["mac"] \
-                and not _dangerous(hlc["mac"]) and _SAFE_ID.fullmatch(hlc["mac"]) \
+                and shaped("mac_id", hlc["mac"]) is not None \
                 and all(isinstance(hlc.get(k), int) and not isinstance(hlc.get(k), bool)
                         and 0 <= hlc[k] <= _WHOLE_MOST for k in ("wall", "counter")):
             row["hlc"] = {"wall": hlc["wall"], "counter": hlc["counter"], "mac": hlc["mac"]}
@@ -1798,7 +1813,7 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
             harness = shaped("name", by.get("harness"))
             if harness is not None:
                 author["harness"] = harness
-            mac = shaped("id", by.get("mac"))
+            mac = shaped("mac_id", by.get("mac"))
             if mac is not None:
                 author["mac"] = mac
             if author:
@@ -1812,7 +1827,7 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
                     if account is not None:
                         projected_scope["account"] = account
                 if scope["kind"] == "machine":
-                    mac = shaped("id", scope.get("mac"))
+                    mac = shaped("mac_id", scope.get("mac"))
                     if mac is not None:
                         projected_scope["mac"] = mac
                 row["scope"] = projected_scope
@@ -1821,7 +1836,7 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
                 and locality.get("kind") in ("machine", "account_quota"):
             projected_locality: dict[str, Any] = {"kind": locality["kind"]}
             if locality["kind"] == "machine":
-                mac = shaped("id", locality.get("mac"))
+                mac = shaped("mac_id", locality.get("mac"))
                 if mac is not None:
                     projected_locality["mac"] = mac
             row["observation_scope"] = projected_locality
@@ -1840,7 +1855,7 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
                     projected_declaration[field] = value
             if projected_declaration:
                 row["declaration"] = projected_declaration
-        if kind == "priority_set" and isinstance(event.get("entries"), list):
+        if kind in ("priority_set", "priority_confirm") and isinstance(event.get("entries"), list):
             entries = []
             for entry in event["entries"]:
                 if not isinstance(entry, dict):
@@ -1873,7 +1888,7 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
         if kind in _HOLDS_KINDS and isinstance(event.get("holds"), dict):
             holds = {k: v for k, v in event["holds"].items()
                      if isinstance(k, str) and v in ("end", "keep")
-                     and _SAFE_ID.fullmatch(k) and not _dangerous(k)}
+                     and shaped("id", k) is not None}
             row["holds"] = holds
         if kind in ("definition_set", "definition_remove"):
             value = entry_model.checked_definition(event.get("definition"),
@@ -1952,7 +1967,7 @@ def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = No
         if entity and not row.get("pending"):
             revisions[entity] = event_identity.revision(row)
         if row.get("type") == "rule_add":
-            rule_ids[row.get("hub_order", row.get("n"))] = entity
+            rule_ids.setdefault(_rule_number(row), set()).add(entity)
     for event in events:
         event.setdefault("id", _new_id("e"))
         event.setdefault("mac", mac)
@@ -1974,9 +1989,14 @@ def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = No
                     event.setdefault("local_order", event.get("n"))
                 else:
                     event["number_pending"] = True
-                rule_ids[event.get("n")] = event["entity"]
+                rule_ids.setdefault(_rule_number(event), set()).add(event["entity"])
         elif kind in event_identity.RULE_CHANGES:
-            entity = event.get("target") or event.get("entity") or rule_ids.get(event.get("n"))
+            entity = event.get("target") or event.get("entity")
+            if not entity:
+                candidates = rule_ids.get(event.get("n"), set())
+                if len(candidates) > 1:
+                    raise RouteError("ambiguous rule number; use its uuid: " + ", ".join(sorted(candidates)))
+                entity = next(iter(candidates), None)
             if not entity:
                 raise RouteError("a rule change needs an existing rule uuid")
             event.update(entity=entity, target=entity)
@@ -2039,7 +2059,7 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "resets_at", "cycle", "revision", "cap_kind")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
                 "witness_at", "expires_at", "reset_at", "resets_at")
-_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "t_err")
+_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
                   "observed", "observed_turn", "session_logs", "silent", "unmatched")
@@ -2098,9 +2118,8 @@ def _next_rules(events: list[dict], count: int) -> int | None:
     """Reserve this Mac's display numbers until replication assigns hub numbers."""
     if _pending_numbering():
         return None
-    mac = _mac_locked()
-    taken = {e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)
-             and e.get("mac") in (None, mac)}
+    taken = {_rule_number(e) for e in events if e.get("type") == "rule_add"
+             and _rule_number(e) is not None}
     first = _next_after(taken, count, 1)
     if not any(first + i in taken for i in range(count)):
         return first
@@ -2137,7 +2156,7 @@ def _checked_entries(kind: str, entries) -> list[dict] | None:
     account key, the label it had, the owner's words for its role and an
     end), in the order written; None when they are not (the line is
     counted as unreadable)."""
-    if kind != "priority_set" or not isinstance(entries, list) or len(entries) > PRIORITY_MOST:
+    if kind not in ("priority_set", "priority_confirm") or not isinstance(entries, list) or len(entries) > PRIORITY_MOST:
         return None
     out = []
     for item in entries:
@@ -2472,7 +2491,9 @@ def _read_all_events(*, identity_only: bool = False, author_check: bool = True) 
     no ``seq`` (written by phase 1a, or appended by hand) keep their place in
     the file."""
     raw, bad = _read_event_lines(identity_only)
-    events = [dict(event) for event in raw]
+    from khipu import routing_replication
+
+    events = routing_replication.merge(raw)
     if author_check:
         _mark_unchecked(events)  # a sequence cannot move a line before the first author check
     slots = [i for i, e in enumerate(events) if isinstance(e.get("seq"), int) and not e.get("mac")]
@@ -2608,7 +2629,9 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     cfg["_accounts_version"] = accounts_version(config)
     seed = cfg.get("routing_rules_seed")
     cfg["_mac"] = mac
-    fingerprint = {"entry_model": 1, "account_identity": 2, "payer_identity": 3, "events": events_stat, "config": config_stat,
+    from khipu import routing_replication
+
+    fingerprint = {"replication": routing_replication.fingerprint(), "entry_model": 1, "account_identity": 2, "payer_identity": 3, "events": events_stat, "config": config_stat,
                    "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
     return fingerprint, cfg, known
@@ -3483,6 +3506,7 @@ def _fold_priority(priority: dict | None, now: datetime, labels: dict, in_settin
     pending = priority["pending"]
     shown = {"entries": active, "until": _iso(priority["until"]), "at": _iso(priority["at"]), "written_by": by,
              "via": priority["via"], "pending": pending, "confirmed": not pending,
+             "proposal_withheld": bool(priority.get("proposal_withheld")),
              "owner_revision": priority.get("_owner_revision"),
              "pending_by": author_words(by, push=True) if pending else None,
              "pending_author": by if pending else None, "owner_request": priority.get("owner_request"),
@@ -3514,6 +3538,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     lane_map = cfg.get("routing_lane_map") or {}
     stale_after = cfg["routing_stale_after"]
     events = list(events) if events_ordered else _in_write_order(events)
+    from khipu import routing_replication
+
+    events = [routing_replication.proposal(e, cfg) for e in events]
     # A pure replay may name its Mac; unstamped logs retain their local meaning.
     mac = mac or cfg.get("_mac")
     definitions = entry_model.definitions(events, mac)
@@ -3642,13 +3669,25 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     cap_proposals: list[dict] = []
     observed = entry_model.observations(events, cfg)
     runner_status = {r["name"]: r for r in (sources or {}).get("runners") or []}
+    shared_status = {}
+    for event in events:
+        if event.get("type") == "source_seen" and event.get("runner"):
+            try:
+                status = json.loads(event.get("status") or "{}")
+            except ValueError:
+                continue
+            if isinstance(status, dict):
+                shared_status[event.get("mac"), event["runner"]] = status
     for event in observed:
         locality = event.get("observation_scope") or {}
         if locality.get("kind") == "machine" and locality.get("mac") != mac:
             continue
         item = _evidence(event, cfg)
         if item is not None:
-            if item.get("runner") in runner_status:
+            status = shared_status.get((event.get("mac"), item.get("runner")))
+            if status is not None:
+                item["silent"] = bool(status.get("silent"))
+            if event.get("mac") in (None, mac) and item.get("runner") in runner_status:
                 item["silent"] = bool(runner_status[item["runner"]].get("silent"))
             evidence.append(item)
     for event in events:
@@ -3835,8 +3874,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                  "component": _rule_add_component(event),
                                  "revision": event_identity.revision(event),
                                  "owner_revision": "0" if pending else event_identity.revision(event),
-                                 "number_pending": bool(event.get("number_pending") or
-                                     (event.get("mac") and event.get("entity") and _rule_number(event) is None)),
+                                 "number_pending": _rule_number(event) is None,
+                                 "proposal_withheld": bool(event.get("proposal_withheld")),
                                  "provisional_n": event.get("n"),
                                  "n": _rule_number(event), "text": event["text"], "source": event.get("source") or "",
                                  "date": event.get("date") or "", "seeded": bool(event.get("seeded")),
@@ -3858,6 +3897,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 prior = rule.get("prior_text") if was_pending else rule["text"]
                 prior_confirmed = rule.get("prior_confirmed") if was_pending else rule["confirmed"]
                 rule["text"] = event["text"]
+                rule["proposal_withheld"] = bool(event.get("proposal_withheld"))
                 if event.get("pending"):
                     pending_kind = rule.get("pending_kind") if was_pending else "changed"
                     rule.update(pending=True, pending_kind=pending_kind,
@@ -3890,7 +3930,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 # Only an active proposal (or an unconfirmed seed) can be
                 # confirmed; expiry has already ended any stale overlay
                 # above, so its words can never be resurrected here.
-                rule.update(confirmed=True, pending=False, pending_kind=None, prior_text=None, prior_confirmed=None,
+                if isinstance(event.get("text"), str):
+                    rule["text"] = event["text"]
+                rule.update(confirmed=True, pending=False, proposal_withheld=False, pending_kind=None, prior_text=None, prior_confirmed=None,
                             pending_by=None, pending_author=None)
                 end_proposal(entity, "confirmed")
             elif kind == "rule_undo" and isinstance(rule.get("prior_text"), str):
@@ -3920,6 +3962,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         elif kind == "priority_set" and isinstance(event.get("entries"), list) and not proposal_crossed:
             pending = bool(event.get("pending"))
             new = {"entries": event["entries"], "until": info["until"], "at": info["at"],
+                   "proposal_withheld": bool(event.get("proposal_withheld")),
                    "written_by": info["written_by"], "via": info["via"], "pending": pending,
                    "owner_request": event.get("owner_request") if pending else None, "prior": None,
                    "_owner_revision": priority_owner_revision,
@@ -3937,7 +3980,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         elif kind == "priority_confirm" and priority is not None and priority["pending"]:
             # Confirmed, it is the owner's: his write, through the app or a typed yes.
             priority_owner_revision = event_identity.revision(event)
-            priority = dict(priority, pending=False, prior=None, confirmed_at=info["at"],
+            if isinstance(event.get("entries"), list):
+                priority = dict(priority, entries=event["entries"])
+            priority = dict(priority, pending=False, proposal_withheld=False, prior=None, confirmed_at=info["at"],
                             written_by=info["written_by"], via=info["via"],
                             _owner_revision=priority_owner_revision)
             end_proposal(entity or "priority", "confirmed")
@@ -4119,6 +4164,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                      "confirmed": r["confirmed"], "pending": r.get("pending"), "pending_kind": r.get("pending_kind"),
                      "pending_by": r.get("pending_by"), "prior_text": r.get("prior_text"),
                      "pending_author": r.get("pending_author"), "origin_id": r.get("origin_id"),
+                     "proposal_withheld": bool(r.get("proposal_withheld")),
                      "written_by": r["written_by"], "via": r["via"], "at": _iso(r["at"])}
                     for r in sorted(rules.values(), key=lambda r: (r["n"] is None, r["n"] or 0, r["entity"]))
                     if not r["retired"]]
@@ -4764,11 +4810,15 @@ def _rule_component(rule: dict) -> str:
 
 
 def _rule_number(event: dict) -> int | None:
+    if isinstance(event.get("local_order"), int):
+        return event["local_order"]
+    # Old pending rows may have a provisional n that was never displayed.
     if event.get("number_pending"):
-        return None
-    if event.get("mac") and event.get("entity"):
-        return event.get("hub_order", event.get("local_order"))
-    return event.get("n")
+        return event.get("rule_number")
+    for field in ("n", "rule_number"):
+        if isinstance(event.get(field), int):
+            return event[field]
+    return None
 
 
 def _rule_add_component(event: dict) -> str:
@@ -5248,7 +5298,7 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
     now, body, status = _fold_body(now, cfg, known, events, prev, events_ordered=ordered)
     body["seed_error"] = seed_error
     view = _assemble(prev, body, now, bad, fingerprint,
-                     record=fingerprint["events"] is not None or status is not None)
+                     record=bool(events) or status is not None)
     _save_view(view)
     _identity_snapshot(known, events=ordered, events_ordered=True)
     return view
@@ -5267,8 +5317,12 @@ def _fold_body(now: datetime, cfg: dict, known: list[dict], events: list[dict],
         if item.get("id") not in source_ids and source_id not in source_ids:
             remaining.append(item)
     extra = remaining
-    body = fold(events_ordered if events_ordered is not None else events, now=now, cfg=cfg, known=known,
+    from khipu import routing_replication
+
+    body = fold(events_ordered if events_ordered is not None else events,
+                now=routing_replication.hub_clock(now), cfg=cfg, known=known,
                 extra=extra, sources=status, events_ordered=events_ordered is not None)
+    routing_replication.local_deadline(body)
     body["source_cache"] = cache
     return now, body, status
 
@@ -5290,7 +5344,7 @@ def _start_view(now: datetime) -> dict:
         return dict(prev, checked_at=_iso(now))
     from khipu import routing_sources
 
-    if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
+    if fingerprint["events"] is None and not fingerprint["replication"][0] and not cfg.get("routing_rules_seed") \
             and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
         return read_view(now)  # no record: nothing to fold or save, and no lock
     try:
@@ -5335,7 +5389,7 @@ def _start_fold(now: datetime, *, save: bool) -> dict:
     with _finishing():
         fold_now, body, status = _fold_body(now, cfg, known, events, prev)
         body["seed_error"] = None
-        record = fingerprint["events"] is not None or status is not None
+        record = bool(events) or status is not None
         try:
             if not save:
                 raise LockBusy("another fold is running")
@@ -5360,7 +5414,10 @@ def _unsaved_view(now: datetime) -> dict:
     prev = _load_view()
     now = _not_before_last_fold(now, prev)
     extra, status, cache = _sources(cfg, now, prev)
-    body = fold(events, now=now, cfg=cfg, known=known, extra=extra, sources=status)
+    from khipu import routing_replication
+
+    body = fold(events, now=routing_replication.hub_clock(now), cfg=cfg, known=known, extra=extra, sources=status)
+    routing_replication.local_deadline(body)
     body["seed_error"] = None
     body["source_cache"] = cache
     return _assemble(prev, body, now, bad, fingerprint, record=bool(events) or status is not None, saved=False)
@@ -5394,7 +5451,7 @@ def read_view(now: datetime | None = None) -> dict:
         return _with_advisory(dict(prev, checked_at=_iso(now)), now)
     from khipu import routing_sources
 
-    if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
+    if fingerprint["events"] is None and not fingerprint["replication"][0] and not cfg.get("routing_rules_seed") \
             and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
         body = fold([], now=now, cfg=cfg, known=known)
         body["seed_error"] = None
@@ -6184,7 +6241,10 @@ def _rule(n, now) -> dict:
         number = int(n)
     except (TypeError, ValueError):
         raise RouteError(f"{n!r} is not a rule number or uuid") from None
-    rule = next((r for r in rules if r["n"] == number), None)
+    # Resolve against history too: retiring one duplicate cannot redirect an
+    # old numeric reference to an unrelated surviving rule.
+    entity, _ = rule_reference(number)
+    rule = next((r for r in rules if r["entity"] == entity), None)
     if rule is None:
         provisional = [r["entity"] for r in rules if r.get("number_pending") and
                        r.get("provisional_n") in (None, number)]
@@ -6309,12 +6369,13 @@ def rule_reference(n) -> tuple[str, int | None]:
     except (TypeError, ValueError):
         raise RouteError(f"{n!r} is not a rule number or uuid") from None
     matches = [e for e in additions if _rule_number(e) == number]
-    settled = [e for e in matches if not e.get("number_pending") and
-               _rule_number(e) is not None]
-    if settled:
-        return event_identity.entity(settled[-1]), number
-    provisional = [e for e in additions if (e in matches or e.get("n") is None) and
-                   (e.get("number_pending") or (e.get("entity") and _rule_number(e) is None))]
+    entities = sorted({event_identity.entity(e) for e in matches})
+    if len(entities) > 1:
+        raise RouteError("ambiguous rule number; use its uuid: " + ", ".join(entities))
+    if entities:
+        return entities[0], number
+    provisional = [e for e in additions if _rule_number(e) is None and
+                   e.get("n") in (None, number)]
     if provisional:
         raise RouteError("new rule (number pending); use its uuid: " +
                          ", ".join(event_identity.entity(e) for e in provisional))
@@ -6322,11 +6383,14 @@ def rule_reference(n) -> tuple[str, int | None]:
 
 
 def confirm_rule(n, *, via: str, now: datetime | None = None, holds: dict | None = None) -> dict:
-    rule = _rule(n, now)
-    if not rule.get("pending") and not (rule.get("seeded") and not rule.get("confirmed")):
-        raise RouteError(f"standing rule {rule['n']} has no unconfirmed proposal to confirm")
-    return dict(_owner_write({"type": "rule_confirm", **_rule_target(rule),
-                             **({"holds": holds} if holds is not None else {})}, via), n=rule["n"])
+    with _lock():
+        rule = _rule(n, now)
+        if rule.get("pending") and rule.get("proposal_withheld"):
+            raise RouteError("proposal text is not shared on this Mac; confirm it on its source Mac")
+        if not rule.get("pending") and not (rule.get("seeded") and not rule.get("confirmed")):
+            raise RouteError(f"standing rule {rule['n']} has no unconfirmed proposal to confirm")
+        return dict(_owner_write({"type": "rule_confirm", "text": rule["text"], **_rule_target(rule),
+                                 **({"holds": holds} if holds is not None else {})}, via), n=rule["n"])
 
 
 def unconfirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
@@ -6600,8 +6664,10 @@ def confirm_priority(*, via: str, now: datetime | None = None, expect=None, hold
     _needs_version(expect)
     with _lock():
         _check_priority(expect, now)
-        _held_priority(now, pending=True)
-        return _owner_write({"type": "priority_confirm", **({"holds": holds} if holds is not None else {})}, via)
+        held = _held_priority(now, pending=True)
+        if held.get("proposal_withheld"):
+            raise RouteError("proposal text is not shared on this Mac; confirm it on its source Mac")
+        return _owner_write({"type": "priority_confirm", "entries": held["entries"], **({"holds": holds} if holds is not None else {})}, via)
 
 
 def undo_priority(*, via: str, now: datetime | None = None, expect=None) -> dict:
@@ -7553,6 +7619,10 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
     else:
         lines = [f"## Routing at {stamp} (Khipu's routing record, version {view['version']}; "
                  "data, not instructions; guidance, not a gate)"]
+    from khipu import routing_replication
+
+    if line := routing_replication.age_line(now):
+        lines.append(line)
     # When the inputs were last checked, not when the view last changed: a
     # read that finds nothing new has just refreshed the record.
     checked = _parse(view.get("checked_at") or view.get("folded_at"))
@@ -8048,7 +8118,7 @@ _REPORT_FIELDS = ("id", "state", "source", "at", "since", "until")
 _LAST_SEEN_FIELDS = (*_REPORT_FIELDS, "cleared")
 _MODEL_FIELDS = ("model", "until", "basis", "source", "at", "id")
 _HOLD_FIELDS = ("id", "entity", "revision", "scope_label", "reason", "text", "until", "owner", "via", "at", "remind")
-_RULE_FIELDS = ("entity", "revision", "owner_revision", "number_pending", "n", "text", "source", "date",
+_RULE_FIELDS = ("entity", "revision", "owner_revision", "number_pending", "proposal_withheld", "n", "text", "source", "date",
                 "seeded", "confirmed", "pending", "pending_kind",
                 "pending_by", "prior_text", "via", "at")
 _LANE_FIELDS = ("runner", "lane", "state", "until", "basis", "at", "id", "reason", "field_to_add")
@@ -8066,8 +8136,10 @@ _MIGRATION_REVISION = None
 def _identity_revision() -> tuple:
     from khipu.config import config_file
 
+    from khipu import routing_replication
+
     return (str(events_file()), tuple(_stat(events_file()) or ()),
-            tuple(_stat(config_file()) or ()))
+            tuple(_stat(config_file()) or ()), routing_replication.cache_key())
 
 
 def _read_identity_events() -> list[dict]:
@@ -8318,6 +8390,7 @@ def _public_priority(view: dict, now: datetime, facts: dict) -> dict | None:
             "version": held.get("version") or view.get("priority_version"),
             "owner_revision": held.get("owner_revision"),
             "pending": bool(held.get("pending")), "pending_by": held.get("pending_by"),
+            "proposal_withheld": bool(held.get("proposal_withheld")),
             "owner_request": held.get("owner_request"), "at": held.get("at"), "via": held.get("via"),
             "replaced": {"entries": entries(replaced["entries"]), "until": replaced.get("until")} if replaced else None,
             "line": priority_line(held, now, view=view, facts=facts)}
@@ -9014,7 +9087,7 @@ def _prompt_view(now: datetime, on_fold=None) -> dict:
         return dict(prev, checked_at=_iso(now))
     from khipu import routing_sources
 
-    if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
+    if fingerprint["events"] is None and not fingerprint["replication"][0] and not cfg.get("routing_rules_seed") \
             and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
         return read_view(now)  # no record: nothing to fold, and nothing written
     with _fold_turn():
@@ -9035,7 +9108,9 @@ def _generation(view: dict, cfg: dict) -> list[list]:
 
     fingerprint = view.get("fingerprint") if isinstance(view.get("fingerprint"), dict) else {}
     files = [[str(events_file()), fingerprint.get("events")], [str(config_file()), fingerprint.get("config")],
-             [str(view_file()), getattr(_view_seen, "stat", None)]]
+             [str(view_file()), getattr(_view_seen, "stat", None)],
+             [str(routing_dir() / "remote.jsonl"), (fingerprint.get("replication") or (None, None))[0]],
+             [str(routing_dir() / "replication.json"), (fingerprint.get("replication") or (None, None))[1]]]
     seed = cfg.get("routing_rules_seed")
     if seed:
         files.append([str(Path(seed)), fingerprint.get("seed")])
@@ -9431,12 +9506,23 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
     view = out.pop("_delivery_view")
     session = getattr(marker, "session", None)
     if not session or out.pop("_reserved", False):
-        return out
+        return _replication_push_age(out, now)
     from khipu import routing_delivery
 
     now = now or _now()
     out = routing_delivery.plan(out, view, now, settings(), session=session)
-    return routing_delivery.offer(out, session=session, component=marker.component)
+    return _replication_push_age(routing_delivery.offer(out, session=session, component=marker.component), now)
+
+
+def _replication_push_age(out: dict, now=None) -> dict:
+    from khipu import routing_replication
+
+    line = routing_replication.age_line(now)
+    if line and line not in (out.get("text") or ""):
+        out = dict(out, text="\n".join(filter(None, [out.get("text"), line])))
+        if out.get("kind") == "none":
+            out["kind"] = "changes"
+    return out
 
 
 # ---- the recall daemon's poll (phase 3c) --------------------------------------------------
@@ -9460,6 +9546,10 @@ def poll_interval(cfg: dict | None = None) -> float | None:
     (``routing_poll_interval``), or None when the owner turned the look off
     (0): the clock-driven refold at ``valid_until`` still runs."""
     seconds = float((cfg or settings())["routing_poll_interval"])
+    if _replication_live():
+        from khipu.routing_replication import POLL_SECONDS
+
+        return min(seconds, POLL_SECONDS) if seconds > 0 else POLL_SECONDS
     return seconds if seconds > 0 else None
 
 
@@ -9471,7 +9561,10 @@ def poll_refold(now: datetime | None = None, *, on_fold=None) -> dict:
     false when the fold could not be saved (the routing lock was held past
     ``LIGHT_LOCK_BUDGET``, or the data dir is read-only). ``on_fold`` is
     called once the fold lock is held, as for a prompt (``_prompt_view``).
-    Never writes the log."""
+    Replication runs outside the routing lock before the local fold."""
+    from khipu import routing_replication
+
+    routing_replication.sync()
     with lock_budget(LIGHT_LOCK_BUDGET):
         now = now or _now()
         fingerprint, cfg, _known = _inputs()
@@ -10052,6 +10145,17 @@ def run_cli(args) -> int:
     auth = _OWNER_AUTH.set(None)
     operation_token = _OP.set(getattr(args, "op", None))
     try:
+        if cmd == "replication":
+            from khipu import routing_replication
+
+            if args.action == "restore":
+                out = routing_replication.restore()
+            elif args.action == "sync":
+                out = routing_replication.sync()
+            else:
+                out = routing_replication.status()
+            _print_json(out)
+            return 0 if out.get("ok", True) else 1
         if cmd is None:
             view = read_view(now)
             account = _resolve_account_key(args.view_account) if getattr(args, "view_account", None) else None

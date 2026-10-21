@@ -5709,6 +5709,9 @@ def build_parser() -> argparse.ArgumentParser:
     rt_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                          help="Print JSON (writes always do)")
     rt_sub = rt.add_subparsers(dest="route_cmd")
+    replication = rt_sub.add_parser("replication", parents=[rt_json],
+                                   help="Routing sync status, a bounded sync, or local restore with a new Mac id")
+    replication.add_argument("action", choices=("status", "sync", "restore"), default="status", nargs="?")
     rcheck = rt_sub.add_parser("check", help="Check one account now without spending a turn", parents=[rt_json])
     rcheck.add_argument("account", help="The account (its label, or harness|login folder)")
     rep = rt_sub.add_parser("report", help="Record what a conversation learned about an account", parents=[rt_json])

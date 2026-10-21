@@ -130,7 +130,7 @@ def test_every_event_kind_walks_clean(kind, proposal_text):
             # Only owner words may carry a sentinel, and only where the
             # contract allows them for this kind and switch.
             assert kind in ("rule_add", "rule_edit", "note_set", "owner_change", "hold",
-                            "priority_set")
+                            "priority_set", "rule_confirm", "priority_confirm")
     if not proposal_text:
         assert SENT + "-REQUEST" not in dumped
     assert payload.get("account") in (None, "codex:main")
