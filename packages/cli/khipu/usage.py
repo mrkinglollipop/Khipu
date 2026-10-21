@@ -128,6 +128,8 @@ E_BAD_KEY = "key_rejected"
 E_REDIRECT = "redirect_refused"
 HTTP_QUOTA_TIMEOUT_S = 15.0
 HTTP_QUOTA_MAX_BYTES = 1 << 20
+# A quota window longer than a year is not a window, it is a hostile figure.
+HTTP_QUOTA_MAX_WINDOW_MINS = 366 * 24 * 60
 NO_FOLDER_NOTE = "Khipu can't find this account's login folder on this Mac"
 # The CLIs by the names the app's form gives them.
 CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok Build", "muse": "Muse",
@@ -1428,26 +1430,48 @@ def probe_glm(*, timeout: float = TIMEOUT_S) -> dict:
 _HTTP_HOST = re.compile(r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\Z")
 
 
+def _shrink_read_timeout(response, remaining: float) -> None:
+    """Best-effort: give the socket under ``response`` only ``remaining``
+    seconds, so one slow read cannot outlive the overall deadline."""
+    import socket as socket_module
+
+    obj = response
+    for _ in range(8):
+        if obj is None:
+            return
+        if isinstance(obj, socket_module.socket):
+            try:
+                obj.settimeout(max(0.0, remaining))
+            except OSError:
+                return
+            return
+        obj = getattr(obj, "fp", None) or getattr(obj, "raw", None) or getattr(obj, "_sock", None)
+
+
 def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes]:
     """(HTTP status, bounded body on 200 only) of the quota call. A redirect
-    is a ProbeError, and no error body is ever read."""
+    is a ProbeError, and no error body is ever read. Proxies are disabled, so
+    only the owner-confirmed host is ever contacted, and ``timeout`` is an
+    overall deadline (connect plus body read), not a per-read budget."""
     import urllib.error
     import urllib.request
 
+    # P3-4: the key goes out as a bare ``Authorization: <key>`` header value,
+    # with no scheme (no ``Bearer`` prefix) — the form the z.ai-style quota
+    # APIs this adapter targets accept, same as the GLM probe above.
     request = urllib.request.Request(f"https://{host}/",
                                      headers={"Authorization": key, "Accept": "application/json"})
+    deadline = time.monotonic() + timeout
     try:
         class _NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *args, **kwargs):  # noqa: ARG002 - refusing is the whole job
                 return None
 
-        opener = urllib.request.build_opener(_NoRedirect())
-        previous = getattr(urllib.request, "_opener", None)
-        urllib.request.install_opener(opener)
-        try:
-            response = urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - owner-confirmed https host
-        finally:
-            urllib.request.install_opener(previous)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProbeError(E_TIMEOUT)
+        response = opener.open(request, timeout=remaining)  # noqa: S310 - owner-confirmed https host
         with response:
             status = getattr(response, "status", None)
             if not isinstance(status, int) or isinstance(status, bool):
@@ -1456,10 +1480,26 @@ def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes
                 raise ProbeError(E_REDIRECT)
             if status != 200:
                 return (status if isinstance(status, int) else 0), b""
-            body = response.read(HTTP_QUOTA_MAX_BYTES + 1)
-            if len(body) > HTTP_QUOTA_MAX_BYTES:
-                raise ProbeError(E_BAD)
-            return 200, body
+            chunks, total = [], 0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProbeError(E_TIMEOUT)
+                _shrink_read_timeout(response, remaining)
+                # read1 (one raw read) over read: read would wait to fill the
+                # whole count, so a slow drip would never reach the deadline
+                # check between chunks.
+                read_chunk = getattr(response, "read1", response.read)
+                chunk = read_chunk(min(65536, HTTP_QUOTA_MAX_BYTES + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > HTTP_QUOTA_MAX_BYTES:
+                    raise ProbeError(E_BAD)
+                if time.monotonic() >= deadline:
+                    raise ProbeError(E_TIMEOUT)
+            return 200, b"".join(chunks)
     except ProbeError:
         raise
     except urllib.error.HTTPError as exc:
@@ -1487,7 +1527,7 @@ def parse_http_quota(status: int, body: bytes) -> dict:
         raise ProbeError(E_CLI)
     try:
         reply = json.loads(body.decode("utf-8")) if body else None
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError, RecursionError):
         reply = None
     if not isinstance(reply, dict):
         raise ProbeError(E_BAD)
@@ -1533,6 +1573,12 @@ def parse_http_quota(status: int, body: bytes) -> dict:
                 windows.append(window)
     if not windows:
         raise ProbeError(E_NO_LIMITS)
+    # This adapter alone tightens the shared window shape: a figure outside
+    # 0-100% or a window longer than a year is a hostile reply, not data.
+    # Other adapters keep _window's finiteness-only behaviour.
+    for window in windows:
+        if not 0 <= window["used_pct"] <= 100 or window.get("window_mins", 0) > HTTP_QUOTA_MAX_WINDOW_MINS:
+            raise ProbeError(E_BAD)
     return {"ok": True, "plan": None, "windows": windows, "credits": None, "version": None, "source": "live"}
 
 
