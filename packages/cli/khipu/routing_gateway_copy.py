@@ -265,6 +265,21 @@ def _failed(state, now):
     return {"ok": False, "error": "copy_publish_failed"}
 
 
+def _disabled_skip(state, now, *, force):
+    known = _publishers(state)
+    if not known:
+        # A recomputable id is not evidence this Mac ever published. Unknown
+        # state gets at most one configured-hub cleanup, never recurring retries.
+        if state.get("cleanup_attempted") is True or not routing._hub_configured():
+            return {"ok": True, "disabled": True}
+        if _publisher(create=False) is None:
+            return {"ok": True, "disabled": True}
+    retry = routing._parse(state.get("retry_at"))
+    if not force and retry and retry > now:
+        return {"ok": False, "error": "copy_retry_pending"}
+    return None
+
+
 def publish(*, force=False, now=None, hub=None):
     """Trailing debounce and bounded retry, polled independently of refolding."""
     now = now or routing._now()
@@ -272,17 +287,31 @@ def publish(*, force=False, now=None, hub=None):
     try:
         from khipu.routing_replication import _sync_lock
         state = status()
-        if (not routing.settings()["routing_cloud_copy"] and not _publishers(state)
-                and _publisher(create=False) is None):
-            return {"ok": True, "disabled": True}
+        if not routing.settings()["routing_cloud_copy"]:
+            skipped = _disabled_skip(state, now, force=force)
+            if skipped:
+                return skipped
         attempting_lock = True
         with _sync_lock():
             acquired, attempting_lock = True, False
             state = status()
             cfg = routing.settings()
             enabled = cfg["routing_cloud_copy"]
+            if not enabled:
+                skipped = _disabled_skip(state, now, force=force)
+                if skipped:
+                    return skipped
             publisher = _publisher(create=enabled)
             known = _publishers(state)
+            if not enabled and not known:
+                # Commit the attempt marker before remote I/O. If the outcome
+                # is lost, an idle Mac cannot retry this speculative deletion.
+                state = dict(cleanup_attempted=True, cleanup_publisher=publisher)
+                _save(state)
+                (hub or PostgresHub()).delete(publisher)
+                state["disabled"] = True
+                _save(state)
+                return {"ok": True, "disabled": True, "deleted": True}
             if publisher:
                 known.add(publisher)
             if not known:
@@ -309,6 +338,8 @@ def publish(*, force=False, now=None, hub=None):
                 state = dict(publisher=publisher, publishers=used)
                 _save(state)
             state.pop("disabled", None)
+            state.pop("cleanup_attempted", None)
+            state.pop("cleanup_publisher", None)
             from khipu import agent_view
             with agent_view.pull_projection():
                 view = routing.read_view(now)

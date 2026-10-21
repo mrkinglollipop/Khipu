@@ -10,6 +10,7 @@ def gateway_hub(hub, monkeypatch):  # noqa: F811
     conn = hub.connect()
     hub.migrate(conn=conn)
     monkeypatch.setattr(db, "connect", lambda **kwargs: hub.connect())
+    monkeypatch.setattr(routing, "_hub_configured", lambda: True)
     original = gc.PostgresHub.publish
     def publish(self, publisher, projection, stale_after):
         original(self, publisher, projection, stale_after)

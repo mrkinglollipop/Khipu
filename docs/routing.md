@@ -272,7 +272,15 @@ id plus the id recomputed from the persisted salt and Mac id, even if
 for retry; another Mac's row is never included. Completed revocations retain
 the history and skip redundant daemon deletes. A Mac without a persisted
 routing identity or recorded publisher stays offline when the switch is off;
-an existing identity with lost publication state requires a hub cleanup attempt.
+an existing identity with lost publication state gets one speculative cleanup
+only when a hub is configured. Its attempt marker is saved before the delete;
+a failure is recorded but never retried on idle ticks, even after its retry time.
+These ticks write no files and contact no hub. Publishing again clears the
+speculative-cleanup marker. In contrast, recorded publisher ids remain pending
+until revocation succeeds, and delete retries honor `retry_at` before taking a
+lock or rewriting state. A forced manual publish bypasses that backoff for
+recorded publishers. Without a configured hub, recomputed-id cleanup does not
+create files or contact the hub.
 
 Only `gateway_projection` computed with the **Mac's** switches and then strictly
 scrubbed is uploaded. `routing_cloud_copy_rules` controls confirmed rules, note
