@@ -2830,6 +2830,20 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
             out["captured"] += 1
             _release(jp)
             continue
+        # Section 13 E: routing directions in this window's owner turns,
+        # counted from the transcript and joined to applied owner actions.
+        # Deterministic only — no prompt text goes to any model — and a
+        # dispatched job's turns are never the owner's.
+        try:
+            from khipu import routing_directions
+
+            if _job_origin(job) != "job" and job.get("session_id") and job.get("transcript"):
+                texts = re.findall(r"^USER: (.*?)(?=^(?:USER|ASSISTANT): |\Z)",
+                                     job["transcript"], re.M | re.S)
+                if texts:
+                    routing_directions.capture_scan(str(job["session_id"]), texts)
+        except Exception as e:  # noqa: BLE001 — a direction scan never blocks capture
+            _log(f"drain: routing direction scan skipped for {original.name}: {type(e).__name__}: {e}")
         rc = capture(payload, mode=mode)
         if rc != 0:
             out["failed"] += 1

@@ -315,6 +315,8 @@ The Home screen has a Routing card with one row per account, holds, your note, a
 
 `khipu route sources` lists each job runner folder with its last good read and any error. Run `khipu route --help` and each subcommand's `--help` for every flag. See the [CLI reference](cli.md).
 
+**Directions said in a conversation.** If you type a routing direction in a conversation ("use GLM only one job at a time") and no matching owner change reaches Khipu, capture opens an owed item, "Routing said here, not in Khipu", quoting your words; only you see that quote. A direction counts only when it names an account, provider, lane or model Khipu's record knows; ordinary prompts that merely start with a word like "use" or "keep" open nothing. The item appears in `khipu_owed` (kind `routing_direction`), in `khipu owed` on the command line, and in the pushed slice at session start. It closes when the matching owner change is made from that same prompt (setting the cap to a different value leaves it open), when an owner change cites it, or when you dismiss it with `khipu owed --close <id>` (the owed list's close control, also `khipu owed --dismiss <id>`); a dismissal survives later captures. Questions, quotations and job prompts open nothing. If the prompt recorder missed the turn, the item stays open marked unjoined rather than being matched by guesswork.
+
 ## Limits of this feature
 
 - The routing record is local. The HTTPS gateway does not serve it yet, so cloud agents cannot read it. Sharing it with cloud agents through the hub is planned.
