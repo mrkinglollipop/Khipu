@@ -167,6 +167,44 @@ describe("Pace, caps and advice: probe regressions", () => {
     })]), null, NOW);
     expect(model.rows[0].advice?.why).toBe("At your week 91%.");
   });
+
+  it("words the lead-conversation row, the cap confirm date and the reading age from the CLI's fields", () => {
+    const base = { account: "probe", label: "Probe", numbers: {}, eligible: true, why_eligible: "provider facts allow this work", advisory: true };
+    const at = new Date(NOW.getTime() - 3 * 60000).toISOString();
+    const model = paceModel(view([acct({
+      pace: [pace({ used_pct: 31 })],
+      cap_statuses: [
+        { kind: "share", revision: "r-w", window: "weekly", pct: 91, verdict: "ok", confirmed_at: "2026-10-18T09:00:00Z" },
+        { kind: "per_day", revision: "r-d", window: "weekly", pct: 13, verdict: "ok", confirmed_at: "2026-10-20T12:00:00Z" },
+      ],
+      advice: { ...base, purpose: "job", verdict: "go", reason: "provider facts allow this work", evidence: "fresh", newest_reading_at: at },
+      lead_advice: { ...base, purpose: "orchestration", verdict: "go", reason: "provider facts allow this work", evidence: "fresh", newest_reading_at: at,
+        caps: [{ kind: "per_day", pct: 13, applies: false }, { kind: "share", pct: 91, applies: true }] },
+    })]), null, NOW);
+    const row = model.rows[0];
+    expect(row.advice?.evid).toBe("readings fresh, 3 min ago");
+    expect(row.capsEvid).toBe("confirmed by you Oct 20");
+    expect(row.advice?.lead).toEqual({ word: "Go", tone: "go", why: "Your daily cap applies only to jobs. Under 91%." });
+  });
+
+  it("keeps the old words when the CLI carries none of the new fields", () => {
+    const row = paceModel(PACE_VIEW, PACE_PLANS, PACE_NOW).rows[0];
+    expect(row.advice?.lead ?? null).toBeNull();
+    expect(row.capsEvid).toBe("confirmed by you");
+  });
+
+  it("shows the Lead conversations row and the dated caps heading", () => {
+    const base = { account: "probe", label: "Probe", numbers: {}, eligible: true, why_eligible: "x", advisory: true };
+    const data = view([acct({
+      pace: [pace({ used_pct: 95 })],
+      cap_statuses: [{ kind: "share", revision: "r", window: "weekly", pct: 91, verdict: "cap_reached", confirmed_at: "2026-10-20T12:00:00Z" }],
+      advice: { ...base, purpose: "job", verdict: "hold_back", reason: "share cap_reached", evidence: "fresh" },
+      lead_advice: { ...base, purpose: "orchestration", verdict: "hold_back", reason: "share cap_reached", evidence: "fresh" },
+    })]);
+    render(<PaceSection data={data} plans={null} now={NOW} folds={folds} />);
+    expect(screen.getByText("Lead conversations")).toBeTruthy();
+    expect(screen.getByText(/confirmed by you Oct 20/)).toBeTruthy();
+  });
 });
 
 describe("Pace, caps and advice: the group", () => {

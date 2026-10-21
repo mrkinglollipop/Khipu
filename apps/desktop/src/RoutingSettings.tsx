@@ -4352,7 +4352,7 @@ export function PaceSection({ data, plans, now, folds }: {
               ) : null}
               {row.caps.length ? (
                 <div className="pace-sec">
-                  <h4>Your caps <span className="evid">· confirmed by you</span></h4>
+                  <h4>Your caps <span className="evid">· {row.capsEvid}</span></h4>
                   {row.caps.map((cap) => (
                     <div className="cap-row" key={cap.key}>
                       <span className="cname">{cap.name}</span>
@@ -4373,6 +4373,13 @@ export function PaceSection({ data, plans, now, folds }: {
                     <span className={`word ${row.advice.tone}`}>{row.advice.word}</span>
                     <span className="why">{row.advice.why}</span>
                   </div>
+                  {row.advice.lead ? (
+                    <div className="adv-row">
+                      <span className="who">Lead conversations</span>
+                      <span className={`word ${row.advice.lead.tone}`}>{row.advice.lead.word}</span>
+                      <span className="why">{row.advice.lead.why}</span>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </div>
