@@ -442,8 +442,9 @@ class SliceBudgetTest(unittest.TestCase):
 # truth phase 2 (docs/plans/2026-10-14-routing-truth.md, Tools: "The recall
 # rule and the MCP instructions gain one line") added the khipu_route line,
 # about 230 characters, so the ceiling is 5,500: raised for that line, not
-# for growth in general.
-RULE_MD_CEILING = 5500
+# for growth in general. Repo renames slice D added the khipu_project line
+# (about 290 characters), so the ceiling is 5,800.
+RULE_MD_CEILING = 5800
 
 
 class RuleMdCeilingTest(unittest.TestCase):

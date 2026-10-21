@@ -979,6 +979,25 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "khipu_project",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "description": (
+            "Is this one project? For any name of a project, its canonical "
+            "name, every name grouped with it (owner, same checkout or GitHub) "
+            "with the evidence and date, what each name holds (open "
+            "commitments, standing decisions, episodes) and in total, and the "
+            "'same project?' pairs the owner is asked about or kept separate. "
+            "The same answer whichever name is passed; paste it as proof. A "
+            "pair that is asked is the owner's to answer: ask them, then call "
+            "khipu_owner_act with project.merge or project.keep_separate."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Any name of the project, e.g. owner/repo"}},
+            "required": ["name"],
+        },
+    },
+    {
         "name": "khipu_owner_act",
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
         "description": (
@@ -2664,6 +2683,21 @@ def _tool_owner_act(args: dict) -> dict:
     return out
 
 
+def _tool_project(args: dict) -> dict:
+    """``khipu_project``: one project's names, evidence, counts and pairs
+    (``project_group.show``). Read-only."""
+    name = str((args or {}).get("name") or "").strip()
+    if not name:
+        raise _ToolFailure({"ok": False, "code": "bad_args", "error": "khipu_project needs a name"})
+    _ensure_path()
+    from khipu import project_group
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            return project_group.show(cur, name)
+
+
 _LEDGER_VERBS = ("add", "set", "get", "list", "loose-ends", "needs-owner", "needs-matt", "render", "check",
                  "remove", "removed")
 _LEDGER_TEXT = ("project", "id", "title", "kind", "parent", "state", "evidence", "owner", "note", "link", "if_state",
@@ -2799,6 +2833,7 @@ TOOL_FUNCS = {
     "khipu_route_priority": _tool_route_priority,
     "khipu_ledger": _tool_ledger,
     "khipu_owner_act": _tool_owner_act,
+    "khipu_project": _tool_project,
 }
 
 # Tools the HTTPS gateway neither lists nor runs: owner direction needs the
