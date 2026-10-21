@@ -186,6 +186,52 @@ def test_codex_subagent_start_is_a_snapshot_and_defers_to_its_own_pull(home, mon
     assert routing_delivery.snapshot("codex:codex-child-1", "agent:child-1") == {}
 
 
+def _env_without_claude(**updates):
+    env = {k: v for k, v in os.environ.items() if k not in (
+        "CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_HOME", "KHIPU_HARNESS")}
+    env.update(updates)
+    return env
+
+
+def test_codex_home_only_child_is_snapshot_and_not_on_claude_agent_path(home):
+    _oversized_rules(2)
+    env = _env_without_claude(CODEX_HOME=str(home["root"] / ".codex"))
+    before = recall_prompt.routing_marker(SESSION)
+    out, info, kind = routing_delegation.hook_main(json.dumps(
+        {"hook_event_name": "SubagentStart", "session_id": SESSION, "agent_id": "child-1"}), env)
+    text = _ctx(out)
+    assert text.startswith("## Routing at ")
+    assert (info, kind) == (None, None)
+    assert routing_delivery.snapshot(SESSION, "agent:child-1") == {}
+    assert recall_prompt.routing_marker(SESSION) == before
+    # Its payload carries agent_id, but a Codex harness gets no page
+    # from a per-agent (Claude) ledger.
+    page_out, page_info, page_kind = routing_delegation.pre_tool_use(
+        {"hook_event_name": "PreToolUse", "session_id": SESSION, "agent_id": "child-1",
+         "tool_name": "Bash", "tool_input": {"command": "cat probe.txt"}}, environ=env)
+    assert (page_out, page_info, page_kind) == ({}, None, None)
+
+
+def test_claude_subagent_with_codex_sandbox_keeps_its_deferred_pages(home):
+    _oversized_rules(2)
+    transcript = str(home["root"] / ".claude" / "projects" / "probe" / "transcript.jsonl")
+    env = _env_without_claude(CODEX_SANDBOX="1")
+    out, info, kind = routing_delegation.hook_main(json.dumps(
+        {"hook_event_name": "SubagentStart", "session_id": SESSION, "agent_id": "kid-claude",
+         "transcript_path": transcript}), env)
+    assert _ctx(out).startswith("## Routing at ")
+    assert info is not None and kind == "subagent"
+    assert routing_delivery.snapshot(SESSION, "agent:kid-claude") != {}
+    recall_prompt._routing_delivered(info, True)  # as the hook's main() records a printed block
+    page_out, page_info, page_kind = routing_delegation.pre_tool_use(
+        {"hook_event_name": "PreToolUse", "session_id": SESSION, "agent_id": "kid-claude",
+         "transcript_path": transcript, "tool_name": "Bash",
+         "tool_input": {"command": "cat probe.txt"}}, environ=env)
+    assert _ctx(page_out)
+    assert page_info is not None and page_kind == "agent"
+
+
 def test_subagent_start_still_off_when_delegation_push_off(home):
     _set(home, routing_push_delegation=False)
     out, _, _ = routing_delegation.hook_main(json.dumps(
@@ -216,6 +262,35 @@ def test_spawn_gets_no_advisory_when_codex_subagent_hook_installed(home):
         {"hooks": [{"type": "command", "command": "khipu-delegation-hook", "timeout": 10}]}]}}))
     out, _, _ = routing_delegation.pre_tool_use(_spawn(), environ={**os.environ, "CODEX_HOME": str(codex_home)})
     assert ADVISORY not in _ctx(out)
+
+
+@pytest.mark.parametrize("brief", [
+    "Routing at the edge of the network, the build host moves first. Read probe.txt once, then answer OK.",
+    "## Routing table for this job\nRead probe.txt once, then answer OK. Do nothing else at all.",
+    "Before starting, see Khipu's routing record docs for background. Read probe.txt once, then answer OK.",
+])
+def test_spawn_with_prose_mentioning_routing_still_gets_advisory(home, brief):
+    out, _, _ = routing_delegation.pre_tool_use(_spawn(brief), environ={**os.environ, "CODEX_HOME": str(home["root"] / ".codex")})
+    assert ADVISORY in _ctx(out)
+
+
+def _write_codex_hooks(root, entries):
+    codex_home = root / ".codex"
+    codex_home.mkdir(exist_ok=True)
+    (codex_home / "hooks.json").write_text(json.dumps({"hooks": {"SubagentStart": entries}}))
+    return codex_home
+
+
+@pytest.mark.parametrize("entries", [
+    [{"hooks": [{"type": "command", "command": "echo khipu-delegation-hook-disabled #"}]}],
+    [{"hooks": [{"type": "command", "command": "/opt/khipu/bin/khipu-delegation-hook.bak --off"}]}],
+    [{"enabled": False, "hooks": [{"type": "command", "command": "khipu-delegation-hook"}]}],
+    [{"hooks": [{"type": "command", "command": "khipu-delegation-hook", "enabled": False}]}],
+])
+def test_spawn_gets_advisory_when_codex_hook_only_looks_installed(home, entries):
+    codex_home = _write_codex_hooks(home["root"], entries)
+    out, _, _ = routing_delegation.pre_tool_use(_spawn(), environ={**os.environ, "CODEX_HOME": str(codex_home)})
+    assert ADVISORY in _ctx(out)
 
 
 def test_advisory_is_codex_spawn_only_and_never_inside_a_subagent(home):
