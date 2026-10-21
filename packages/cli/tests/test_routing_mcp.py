@@ -284,8 +284,9 @@ def test_khipu_route_returns_the_words_the_push_leaves_out(home, monkeypatch):
     after = _route(since=f"{view['epoch']}:{first}")
     codex_id = routing.account_id("codex|")
     assert after["complete"] is True and after["entities"] == [f"account:{codex_id}"]
-    assert _route(since="0", account="Codex")["entities"] == [f"account:{codex_id}"]
-    assert _route(since="0", account=codex_id)["entities"] == [f"account:{codex_id}"]
+    # The all-work hold above applies to Codex too, so it is in its answer.
+    assert _route(since="0", account="Codex")["entities"] == [f"account:{codex_id}", f"hold:{hold['id']}"]
+    assert _route(since="0", account=codex_id)["entities"] == [f"account:{codex_id}", f"hold:{hold['id']}"]
 
 
 def test_khipu_route_takes_the_same_privacy_path_as_the_cli(home, capsys):
@@ -573,10 +574,13 @@ def test_since_with_an_account_includes_the_holds_on_that_account(home):
     hold_id = _route(account="Codex")["holds"][0]["id"]
     after = _route(account="Codex", since=f"{view['epoch']}:{view['version']}")
     assert after["complete"] is True and after["entities"] == [f"hold:{hold_id}"]
-    # A hold on another account, or on all work, is not this account's.
+    # A hold on another account is not this account's; a hold on all work is
+    # every account's, Codex included.
     _report(action="hold", scope="account", account="Claude", reason="keep", text="keep claude")
     _report(action="hold", scope="all", reason="machine-busy", text="busy")
-    assert _route(account="Codex", since=f"{view['epoch']}:{view['version']}")["entities"] == [f"hold:{hold_id}"]
+    all_id = next(h["id"] for h in _route(account="Codex")["holds"] if h["scope"]["kind"] == "all")
+    assert _route(account="Codex", since=f"{view['epoch']}:{view['version']}")["entities"] == [
+        f"hold:{hold_id}", f"hold:{all_id}"]
     # An ended hold keeps its stored scope.
     mid = _route()
     _report(action="end_hold", hold_id=hold_id)

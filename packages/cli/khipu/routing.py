@@ -8470,14 +8470,17 @@ def _account_for_a_conversation(name, known: list[dict]) -> str:
 
 
 def _holds_on(key: str, view: dict) -> set[str]:
-    """The ids of every hold scoped to the account ``key``: those in effect
-    and those that have ended (their stored scope)."""
+    """The ids of every hold scoped to the account ``key`` or to all work:
+    those in effect and those that have ended (their stored scope). An
+    all-work hold applies to every account, so it is on this one too."""
     ids = {h["id"] for h in view.get("holds") or []
-           if h["scope"].get("kind") == "account" and h["scope"].get("account") == key}
+           if h["scope"].get("kind") == "all"
+           or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)}
     with contextlib.suppress(Exception):
         events, _bad = read_events()
         ids |= {str(e.get("entity") or e.get("id")) for e in events if e.get("type") == "hold" and isinstance(e.get("scope"), dict)
-                and e["scope"].get("kind") == "account" and e["scope"].get("account") == key}
+                and (e["scope"].get("kind") == "all"
+                     or (e["scope"].get("kind") == "account" and e["scope"].get("account") == key))}
     return ids
 
 
@@ -8551,7 +8554,8 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     out["providers"] = list((view.get("definitions") or {}).get("providers", {}).values())
     out["sources"] = _public_sources(view.get("sources"))
     out["holds"] = [_public_hold(h, now) for h in view.get("holds") or []
-                    if key is None or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
+                    if key is None or h["scope"].get("kind") == "all"
+                    or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
     if key is None:
         from khipu import agent_view
 
@@ -8638,7 +8642,8 @@ def gateway_projection(view: dict | None = None, *, now: datetime | None = None,
     hold_words = bool(cfg.get("routing_cloud_copy_hold_words"))
     for hold in view.get("holds") or []:
         pub = _public_hold(hold, now)
-        if key is not None and pub["scope"] != {"kind": "account", "account": account_id(key)}:
+        if key is not None and pub["scope"] not in ({"kind": "all"},
+                                                     {"kind": "account", "account": account_id(key)}):
             continue
         row = {k: pub[k] for k in ("id", "scope", "reason", "until", "owner", "at") if k in pub}
         # As for accounts: the push form of the line (no project, no
