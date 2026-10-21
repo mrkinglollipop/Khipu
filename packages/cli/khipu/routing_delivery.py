@@ -44,6 +44,7 @@ def _size(text):
 def _path(session):
     from khipu import recall_prompt
 
+    session = hook_session(session)
     # A collision-resistant name for the complete canonical identity:
     # sanitizing or truncating it made distinct identities share a file.
     digest = hashlib.sha256(session.encode("utf-8")).hexdigest()
@@ -470,10 +471,39 @@ def hook_session(session, environ=None):
 
     Payload-only harness hooks historically use bare ids. The caller's
     environment supplies the shared root or native namespace when present.
-    Delivery helpers and ledger paths must never resolve it again.
+    Only a payload that names the environment's own conversation (its
+    shared id, its harness-native id, or either's canonical form) resolves
+    to that conversation's canonical session; any other payload is a
+    different conversation and keeps its own identity, so one identity is
+    used end to end without borrowing another conversation's ledger or
+    marker. An empty payload falls back to the environment's identity.
     """
-    identity = canonical_identity(environ)
-    return identity["session"] if identity else session
+    env = os.environ if environ is None else environ
+
+    def _clean(value):
+        return value.strip() if isinstance(value, str) else ""
+
+    shared = _clean(env.get("KHIPU_SESSION_ID"))
+    claude = _clean(env.get("CLAUDE_CODE_SESSION_ID"))
+    codex = _clean(env.get("CODEX_THREAD_ID"))
+    if shared:
+        canonical = shared
+    elif claude:
+        canonical = f"claude:{claude}"
+    elif codex:
+        canonical = f"codex:{codex}"
+    else:
+        return session
+    if not isinstance(session, str) or not session.strip():
+        return canonical
+    session = session.strip()
+    if session == canonical or session.startswith(canonical + "/"):
+        return session
+    own = {value for value in (shared, claude, codex) if value}
+    own.update(f"{prefix}:{value}" for prefix, value in (("claude", claude), ("codex", codex)) if value)
+    if session in own:
+        return canonical
+    return session
 
 
 def untracked_items(out):

@@ -350,6 +350,9 @@ def _update_routing_marker(session_id: str, change, wait: float, *, component: s
     write records nothing and is never raised."""
     if not session_id or fcntl is None:
         return False
+    from khipu.routing_delivery import hook_session
+
+    session_id = hook_session(session_id)
     try:
         with _session_lock(session_id, wait) as taken:
             if not taken:

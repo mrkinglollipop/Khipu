@@ -1204,6 +1204,23 @@ def _author_sessions(by: dict) -> set[str]:
     return {by[k] for k in ("session", "provider_session") if by.get(k)}
 
 
+def _session_forms(session: str | None) -> set[str]:
+    """The forms one conversation identity takes across the two slices:
+    the raw harness-native id an author is recorded with, its canonical
+    ``claude:``/``codex:`` form, a shared id as itself, and the pull
+    namespace's root. Forms of other conversations are never added."""
+    if not session:
+        return set()
+    forms = {session}
+    if session.startswith("pull\0"):
+        forms.add(session[len("pull\0"):])
+    elif session.startswith(("claude:", "codex:")):
+        forms.add(session.split(":", 1)[1])
+    else:
+        forms.update(("claude:" + session, "codex:" + session))
+    return forms
+
+
 OWNER = {"kind": "owner"}
 
 
@@ -6823,16 +6840,17 @@ def _replacement_notices(view: dict, now: datetime, session: str | None) -> list
         by = item.get("notify") or item.get("author") or {}
         # Only the author's session owes delivery. Missing or departed
         # sessions cannot force work or text into other conversations.
-        if session not in _author_sessions(by):
+        authors = set().union(*(_session_forms(ident) for ident in _author_sessions(by))) if _author_sessions(by) else set()
+        if not (_session_forms(session) & authors):
             continue
         ended = _parse(item.get("ended_at") or item.get("at"))
         if ended is None or now >= ended + timedelta(days=7):
             continue
-        for ident in _author_sessions(by):
+        for ident in authors:
             if ident not in receipts:
                 receipts[ident] = set(recall_prompt.routing_marker(ident).get("notices") or {})
                 receipts[ident].update(routing_delivery.notice_receipts(ident))
-        if any(item["id"] in receipts[ident] for ident in _author_sessions(by)):
+        if any(item["id"] in receipts[ident] for ident in authors):
             continue
         who = author_words(by, push=True)
         if item.get("kind") == "priority":
@@ -7616,7 +7634,8 @@ def _public_proposals(view: dict, *, session: str | None = None) -> list[dict]:
     out = []
     for item in (view.get("proposals") or {}).values():
         told = item.get("notify") or item.get("author")
-        if item.get("status") in ("replaced", "crossed") and (not session or session not in _author_sessions(told or {})):
+        authors = set().union(*(_session_forms(ident) for ident in _author_sessions(told or {}))) if _author_sessions(told or {}) else set()
+        if item.get("status") in ("replaced", "crossed") and (not session or not (_session_forms(session) & authors)):
             continue
         out.append({"id": item.get("id"), "kind": item.get("kind"), "entity": item.get("entity"),
                     "status": item.get("status"), "base": item.get("base"), "at": item.get("at"), "rule": item.get("n"),
