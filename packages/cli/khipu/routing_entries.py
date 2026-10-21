@@ -222,8 +222,41 @@ def checked_definition(name, value):
     return dict(value)
 
 
+# Account prefixes a provider-set fact may never hand to another provider:
+# the built-in harness ids another probe already owns.
+RESERVED_ACCOUNT_PREFIXES = frozenset({"claude", "codex", "grok", "muse", "glm"})
+
+
+def provider_set_ref_allowed(provider: dict, ref: str, other_provider_ids=()) -> bool:
+    """A provider-set account ref binds only its own provider's accounts.
+
+    The one relaxation is the http-quota adapter (case 9): its provider id
+    and its stable account prefix need not be the same string
+    (``synthetic-provider`` claiming ``synthetic:main``), so an http-quota
+    provider may claim a prefix that is neither a built-in harness id nor
+    another declared provider's id. It may never claim ``claude:main``,
+    ``glm:main`` or any other provider's account.
+    """
+    prefix = ref.partition(":")[0]
+    if prefix == provider.get("id"):
+        return True
+    return provider.get("probe") == "http-quota" and prefix not in RESERVED_ACCOUNT_PREFIXES \
+        and prefix not in other_provider_ids
+
+
 def definitions(events: list[dict], mac: str | None) -> dict:
     out = {"providers": {}, "accounts": {}, "lane_maps": {}}
+    declared_provider_ids = set()
+    for event in events:
+        if (event.get("written_by") or {}).get("kind") != "owner":
+            continue
+        if event.get("type") == "provider_set" and isinstance(event.get("id"), str):
+            declared_provider_ids.add(event["id"])
+        elif event.get("type") == "definition_set" and event.get("definition") == "provider":
+            value = event.get("value")
+            ident = value.get("id") if isinstance(value, dict) else None
+            if isinstance(ident, str):
+                declared_provider_ids.add(ident)
     for event in events:
         # The acceptance replay and imported provider facts use the compact
         # provider_set spelling. New owner writes use definition_set.
@@ -239,7 +272,8 @@ def definitions(events: list[dict], mac: str | None) -> dict:
             from khipu.routing_identity import STABLE
 
             if any(not isinstance(a, str) or not STABLE.fullmatch(a)
-                   or a.partition(":")[0] != value["id"] for a in refs):
+                   or not provider_set_ref_allowed(value, a, declared_provider_ids - {value["id"]})
+                   for a in refs):
                 continue
             out["providers"][value["id"]] = value
             for ident in refs:

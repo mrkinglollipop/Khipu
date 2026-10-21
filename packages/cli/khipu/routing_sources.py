@@ -1539,13 +1539,16 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
     newest: datetime | None = None
     by = {"kind": "probe"}
     accounts_read = 0
+    from khipu.routing_identity import STABLE
+
     for key, row in sorted(rows.items()):
-        if key.partition("|")[0] not in usage.HARNESSES or (configured is not None and key not in configured):
+        if (key.partition("|")[0] not in usage.HARNESSES and not STABLE.fullmatch(key)) \
+                or (configured is not None and key not in configured):
             continue
         accounts_read += 1
         attempt = _parse(row.get("last_attempt_at") or row.get("probed_at"))
         error = None if row.get("ok") else (row.get("last_error") or row.get("error"))
-        error = next((e for e in (usage.E_SIGNIN, usage.E_NOT_INSTALLED) if e == error), None)
+        error = next((e for e in (usage.E_SIGNIN, usage.E_NOT_INSTALLED, usage.E_REDIRECT) if e == error), None)
         if error is not None and attempt is not None:
             out.append({"id": "p" + _sid(key, "down", _iso(attempt)), "account": key, "runner": None, "lane": None,
                         "state": "down", "until": None, "basis": "checked", "scope": "all", "window": None,
@@ -1725,7 +1728,17 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
             if match is not None and not match["key"]:
                 item["unmatched"] = True
             evidence.append(item)
-    usage_items, usage_status = usage_evidence(configured_keys(config))
+    # http-quota accounts live in provider facts, not in usage_accounts:
+    # their cache rows are keyed by stable account id, which the known
+    # definition accounts already carry (no extra read of the log here).
+    from khipu.routing_identity import STABLE
+
+    providers = cfg.get("_providers") or {}
+    configured = configured_keys(config) | {
+        a.get("definition_id") or a["key"] for a in known
+        if (providers.get(a.get("harness") or "") or {}).get("probe") == "http-quota"
+        and STABLE.fullmatch(a.get("definition_id") or a["key"] or "")}
+    usage_items, usage_status = usage_evidence(configured)
     evidence += usage_items
     streams = telemetry_streams(cache, known=known, lane_map=lane_map, providers=cfg.get("_providers"),
                                 silent={s["name"]: bool(s["silent"]) for s in runners})

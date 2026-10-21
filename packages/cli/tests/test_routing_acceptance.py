@@ -700,7 +700,6 @@ def test_8_provider_catalog_matches_by_name(replay, providers, lane, expected, c
 # ---- 9: fake HTTP adapter boundary, no key or response body copied to an artifact --------
 
 
-@future("9b", "http-quota provider facts must refuse redirects without leaking any key channel")
 def test_9_http_quota_redirect_and_key_channels(replay, monkeypatch, capsys):
     from khipu import keychain, usage
     sentinel = "SYNTHETIC-QUOTA-KEY-SENTINEL"
@@ -725,10 +724,10 @@ def test_9_http_quota_redirect_and_key_channels(replay, monkeypatch, capsys):
             return self
         def __exit__(self, *args):
             return False
-    def request(req, *args, **kwargs):
+    def request(self, req, *args, **kwargs):  # noqa: ARG001 - OpenerDirector.open stand-in
         calls.append(req)
         return Redirect()
-    monkeypatch.setattr(urllib.request, "urlopen", request)
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", request)
     replay.write(replay.event("provider_set", id="synthetic-provider", label="Synthetic", family="Synthetic",
                               login="none", probe="http-quota", host="quota.invalid", accounts=["synthetic:main"]))
     # The existing refresh entry point must dispatch the configured adapter.

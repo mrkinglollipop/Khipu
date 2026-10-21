@@ -1080,12 +1080,19 @@ def move(key, folder, *, expect=None, via: str = "app") -> dict:
 
 def set_auto_track(on: bool) -> dict:
     with config.mutate_config() as data:
-        if on:
-            data[config.AUTO_TRACK_KEY] = True
-        else:
-            data.pop(config.AUTO_TRACK_KEY, None)
+        data[config.AUTO_TRACK_KEY] = bool(on)
+        data[config.AUTO_TRACK_MIGRATION_KEY] = True
         config.save_config(data)
     return {"ok": True, "auto_track": bool(on)}
+
+
+def merge_same_subscription(candidate_ids) -> dict:
+    """The owner's "same subscription" merge for discovery candidates:
+    they are offered as one account from then on (slice 9c)."""
+    try:
+        return discover.merge_same_subscription(candidate_ids)
+    except ValueError as err:
+        raise AccountsError(str(err), "bad_merge") from None
 
 
 def auto_track(found: dict) -> list[dict]:
@@ -1216,6 +1223,8 @@ def run_cli(args) -> int:
             out = offer_again(args.harness, args.folder)
         elif cmd == "auto-track":
             out = set_auto_track(args.state == "on")
+        elif cmd == "merge":
+            out = merge_same_subscription(args.candidate or ())
         elif cmd == "request":
             out = answer_request(args.action, expect=expect, via=via)
         else:
