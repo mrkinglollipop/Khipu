@@ -203,6 +203,10 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_proposal_text_between_macs": ("switch", True, "Proposal text between your Macs"),
     "routing_cloud_copy_stale_after": ("duration", 600, "The copy counts as out of date after"),
     "routing_cloud_copy_debounce": ("duration", 30, "Wait for a burst of changes to end before copying"),
+    # Owner-local delivery labels (survey rows 8-11): names the owner gave
+    # Macs, keyed by their salted Mac id. Set only through the owner-gated
+    # config path; never replicated or pushed.
+    "routing_mac_names": ("mac_names", {}, "Names you gave your Macs, by Mac id"),
 }
 
 _UNITS = {"w": 604800, "wk": 604800, "week": 604800, "weeks": 604800, "d": 86400, "day": 86400, "days": 86400,
@@ -375,6 +379,16 @@ def _coerce(kind: str, value, key: str):
             raise ValueError(f"{key} can't name a file inside a private folder (API Keys, My Portfolio, "
                              "a keychain or an auth.json)")
         return str(path)
+    if kind == "mac_names":
+        data = _loads(value) if isinstance(value, str) else value
+        if not isinstance(data, dict) or len(data) > 32:
+            raise ValueError(f'{key} must be JSON like {{"<mac id>": "MacBook Air"}}')
+        names_out: dict[str, str] = {}
+        for mac, name in data.items():
+            if not isinstance(mac, str) or not re.fullmatch(r"[0-9a-f]{32}", mac):
+                raise ValueError(f"{key}: {mac!r} is not a Mac id")
+            names_out[mac] = _short_text(name, f"{key}: a Mac name")
+        return names_out
     if kind == "lane_map":
         data = _loads(value) if isinstance(value, str) else value
         if not isinstance(data, dict) or len(data) > 64:
@@ -8142,6 +8156,21 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
         {key: item.get(key) for key in ("id", "words", "project", "join", "reason")}
         for item in items if isinstance(item, dict)
     ]
+    # Owner-local only (survey rows 8-11): live delivery rows with friendly
+    # names, Mac labels and last-prompt times, other Macs, and who has each
+    # recent change. Built here and nowhere else; a damaged source reads as
+    # empty lists, never as a broken route view.
+    from khipu import routing_delivery_rows
+
+    try:
+        delivery = routing_delivery_rows.delivery_data(view, now, cfg)
+    except Exception:  # noqa: BLE001 - delivery evidence never breaks the view
+        delivery = {"rows": [], "macs": [], "recipients": {}}
+    out["delivery_rows"] = delivery["rows"]
+    out["delivery_macs"] = delivery["macs"]
+    recipients = delivery["recipients"]
+    out["changes"] = [dict(change, recipients=recipients.get(change.get("version")))
+                       for change in out["changes"]]
     return out
 
 

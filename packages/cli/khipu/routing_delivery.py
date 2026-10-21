@@ -544,6 +544,42 @@ def _render(state, out, now, component, *, delivery_point=True):
         state["flight"]["out"] = copy.deepcopy(answer)
     return answer
 
+def _friendly_name(session, existing=None):
+    """The conversation name Khipu already knows for this ledger, if any.
+
+    Only a T3 thread title (read through ``t3``'s read-only path) is
+    resolved here; anything else keeps a name already stored on the
+    ledger. Fail-open: no title is never a delivery failure."""
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
+    if not isinstance(session, str):
+        return None
+    root = session.split("/", 1)[0]
+    if not root.startswith("t3:"):
+        return None
+    try:
+        from khipu import t3
+
+        return t3.thread_title(root[3:])
+    except Exception:  # noqa: BLE001 - a title lookup never breaks delivery
+        return None
+
+
+def _attachment(data, session, component, now, harness, *, gateway=False):
+    prior = data.get("attachment") if isinstance(data.get("attachment"), dict) else {}
+    attachment = {"component": component, "at": _iso(now), "harness": health_harness(harness)}
+    if gateway or prior.get("gateway"):
+        attachment["gateway"] = True
+        for key in ("copy_epoch", "copy_revision", "copy_revision_at"):
+            if key in prior:
+                attachment[key] = prior[key]
+    friendly = _friendly_name(session, prior.get("friendly_name"))
+    if friendly:
+        attachment["friendly_name"] = friendly
+    data["attachment"] = attachment
+    return attachment
+
+
 def offer(out, *, session=None, component="main"):
     """Reserve one component's batch under its independent delivery lock."""
     now = _parse(out["delivery_plan"]["at"])
@@ -557,8 +593,7 @@ def offer(out, *, session=None, component="main"):
         return answer
     with _transaction(session) as data:
         if component == "main":
-            data["attachment"] = {"component": "main", "at": _iso(now),
-                                  "harness": health_harness(out["delivery_plan"].get("harness"))}
+            _attachment(data, session, "main", now, out["delivery_plan"].get("harness"))
         state = data.setdefault(component, {})
         answer = _render(state, out, now, component)
         _prune_agent_components(data, now, keep=component)
@@ -977,8 +1012,7 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
     with _transaction(session) as data:
         state = data.setdefault(component, {})
         entries = _merge(state, out)
-        data["attachment"] = {"component": counting_component, "at": _iso(now),
-                              "harness": health_harness(harness)}
+        _attachment(data, session, counting_component, now, harness)
         if delivery_point:
             _delivery_point(state, out, now)
         _prune_agent_components(data, now, keep=component)
@@ -1373,8 +1407,7 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
         if reservation is not None and not state:
             state.update(copy.deepcopy(reservation))
             if component == "main":
-                data["attachment"] = {"component": "main", "at": _iso(now),
-                                      "harness": health_harness(state.get("harness"))}
+                _attachment(data, session, "main", now, state.get("harness"))
         if batch in state.get("batches", {}):
             return True
         flight = state.get("flight")

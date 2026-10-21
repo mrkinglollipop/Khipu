@@ -149,7 +149,8 @@ STORES: tuple[Store, ...] = (
           "owner words",
           _w("owner_direction._append", "owner_direction._log_locked", "owner_direction._write_private")),
     Store("routing delivery words", "capture home state/recall--*.routing.json and their rewrite temps",
-          "cached routing rules, proposals and notices, including owner words",
+          "cached routing rules, proposals and notices, including owner words and a "
+          "conversation's friendly name (a T3 thread title) when Khipu knows one",
           "kept: routing words have no episode provenance; they are the owner's rules, notes, holds "
           "and conversations' proposals, removed through the routing commands that manage them "
           "(khipu route rule retire, khipu route note end, khipu route hold end, "

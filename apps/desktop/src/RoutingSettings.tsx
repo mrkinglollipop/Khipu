@@ -57,6 +57,7 @@ import {
   capitalise,
   disagreementWords,
   deliveryConversationLabels,
+  deliveryHarnessName,
   deliveryReason,
   holdWords,
   modelDisagreementWords,
@@ -75,6 +76,7 @@ import type {
   RouteDeliveryFreshness,
   RouteDeliveryHealth,
   RouteDeliveryIdentity,
+  RouteDeliveryRow,
   RouteHold,
   RouteModel,
   RoutePriority,
@@ -2743,6 +2745,17 @@ function identityWords(row: RouteDeliveryIdentity, tellingOff = false): { text: 
   return { text: "Can't be checked", detail: missing?.length ? `Can't check: ${missing.join(", ")}` : undefined, tone: undefined };
 }
 
+function deliveryComponentWord(component: string | null | undefined): string {
+  return component === "main" ? "main" : component === "mcp" ? "MCP helper" : "a helper agent";
+}
+
+function ownerDeliveryRows(value: unknown): RouteDeliveryRow[] | null {
+  if (!Array.isArray(value)) return null;
+  return value.every((row) => row && typeof row === "object" && typeof (row as RouteDeliveryRow).label === "string")
+    ? (value as RouteDeliveryRow[])
+    : null;
+}
+
 function deliveryStatus(health: RouteDeliveryHealth): "green" | "red" | "unknown" {
   if (health.status !== "green" && health.status !== "red" && health.status !== "unknown") return "unknown";
   const missing = health.missing == null ? [] : deliveryStrings(health.missing);
@@ -2778,6 +2791,11 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
     readHealth.gateway?.status === "not_applicable" ? null : freshnessWords("Cloud copy", readHealth.gateway) ?? { label: "Cloud copy", text: "Can't be checked", tone: undefined },
   ].filter((row): row is NonNullable<typeof row> => row != null) : [];
   const labels = deliveryConversationLabels(identities);
+  // Owner-local rows from `route --json` (friendly name, Mac, last prompt,
+  // per-change recipients) when the CLI carries them; the doctor's generic
+  // rows above remain the fallback for an older CLI. Display only.
+  const ownerRows = ownerDeliveryRows(data?.delivery_rows);
+  const otherMacs = (data?.delivery_macs ?? []).filter((mac) => mac && typeof mac.label === "string");
   const readAt = healthReadAt == null ? null : healthReadAt instanceof Date ? healthReadAt : new Date(healthReadAt);
   const readAtWords = readAt && !Number.isNaN(readAt.getTime())
     ? readAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
@@ -2821,7 +2839,28 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
 
       <div className="section-body">
         <h2 className="sub-title">Live conversations <span className="meta">{liveLabel}</span></h2>
-        {identities.length ? (
+        {ownerRows ? (
+          ownerRows.length ? (
+            <div className="mrows" role="list" aria-label="Live conversations">
+              {ownerRows.map((row, index) => {
+                const state = identityWords({ identity: "", component: "", status: row.status ?? "unknown", owed: row.owed ?? undefined, reasons: row.reasons, missing: row.missing }, tellingOff);
+                return (
+                  <div key={`owner-delivery-${index}`} className="mrow delivery" role="listitem">
+                    <span><span className="name">{row.label}</span><br /><span className="src">{[deliveryHarnessName(row.harness), deliveryComponentWord(row.component)].filter(Boolean).join(" · ")}</span></span>
+                    <span className="mac-col">{row.mac ?? "This Mac"}</span>
+                    <span className="num">{row.last_prompt_at ? agoSpan(row.last_prompt_at, now) : "Can't be checked"}</span>
+                    <span className="delivery-state"><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="empty">
+              <b>No live conversations</b>
+              <span>No delivery identity has a recent delivery point.</span>
+            </div>
+          )
+        ) : identities.length ? (
           <div className="mrows" role="list" aria-label="Live conversations">
             {identities.map((row, index) => {
               const state = identityWords(row, tellingOff);
@@ -2854,18 +2893,35 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
               <div key={`${change.subject}:${change.text}:${index}`} className="mrow delivery-change" role="listitem">
                 <span className="when">{whenLocal(change.at, now)}</span>
                 <span>{change.subject} {change.text}<br /><span className="src">{change.who}</span></span>
-                <span className="end"><Tag>Who has it isn&apos;t available</Tag></span>
+                {change.recipients ? (
+                  <span className="end">
+                    <Tag tone={change.recipients.waiting.length ? "warn" : "ok"} dot>{change.recipients.have_count} of {change.recipients.live_count} have it</Tag>
+                    {change.recipients.waiting.length ? <span className="src">Waiting: {change.recipients.waiting.join(", ")}</span> : null}
+                  </span>
+                ) : (
+                  <span className="end"><Tag>Who has it isn&apos;t available</Tag></span>
+                )}
               </div>
             ))}
           </div>
         )}
       </div>
 
-      {freshness.length ? (
+      {freshness.length || otherMacs.length ? (
         <div className="section-body">
           <h2 className="sub-title">Other Macs and the cloud</h2>
           <div className="mrows" role="list" aria-label="Other Macs and the cloud">
-            {freshness.map((row) => (
+            {otherMacs.map((mac, index) => {
+              const age = deliveryAge(mac.age_seconds);
+              return (
+                <div key={`mac-${mac.label}-${index}`} className="mrow delivery-freshness" role="listitem">
+                  <span className="name">{mac.label}</span>
+                  <span>{age ? `Its copy is ${age}` : "Its copy can't be checked"}</span>
+                  <span className="end"><Tag tone={mac.behind ? "err" : age ? "ok" : undefined} dot>{mac.behind ? "Behind" : age ? "Current" : "Can't be checked"}</Tag></span>
+                </div>
+              );
+            })}
+            {(otherMacs.length ? freshness.filter((row) => row.label === "Cloud copy") : freshness).map((row) => (
               <div key={row.label} className="mrow delivery-freshness" role="listitem">
                 <span className="name">{row.label}</span>
                 <span className="end"><Tag tone={row.tone} dot>{row.text}</Tag></span>
