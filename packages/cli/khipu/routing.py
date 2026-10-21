@@ -8161,6 +8161,16 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     from khipu import routing_mismatches
 
     out["model_mismatches"] = routing_mismatches.today(now)
+    # Owner-local only: file paths and quoted owner words from the scan
+    # report never enter the fold or any routing delivery projection.
+    from khipu import routing_scan_report
+
+    try:
+        out["routing_file_copies"] = routing_scan_report.report()
+    except Exception:  # noqa: BLE001 - a damaged scan report must not break the route view
+        out["routing_file_copies"] = {"status": "not_checked", "scanned_at": None,
+                                      "files_checked": 0, "hits": [], "hits_total": 0,
+                                      "more_not_shown": 0, "too_large": []}
     return out
 
 

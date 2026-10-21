@@ -1309,6 +1309,55 @@ describe("Settings -> Routing: checks and copies", () => {
     expect(invokeMock.mock.calls.filter(([cmd]) => /dismiss|owner_act/.test(String(cmd)))).toHaveLength(0);
   });
 
+  it("shows routing copies found in files without offering an owner action", async () => {
+    const v = view();
+    Object.assign(v, { routing_file_copies: {
+      status: "checked", scanned_at: "2026-10-21T18:10:00Z", files_checked: 14,
+      hits: [
+        { file: "~/Projects/project-a/CLAUDE.md", line: 42, quote: "Main account tight until Mon 2026-10-19", superseded: true },
+        { file: "~/.claude/projects/x/memory/note.md", line: 4, quote: "Codex on credits, limited, until Oct 20", superseded: true },
+      ],
+    } });
+    answers.khipu_route_view = v;
+    await page();
+    const list = screen.getByRole("list", { name: "Copies of routing found in files" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    expect(list).toHaveTextContent("~/Projects/project-a/CLAUDE.md line 42");
+    expect(list).toHaveTextContent("“Main account tight until Mon 2026-10-19”");
+    expect(screen.getByText("Conversations are told Khipu's record wins over these.")).toBeInTheDocument();
+    expect(within(list).queryAllByRole("button")).toHaveLength(0);
+    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("2 copies in files");
+    expect(screen.queryByText("Nothing to fix")).toBeNull();
+  });
+
+  it("shows the total count and how many copies are not shown, not every row", async () => {
+    const v = view();
+    Object.assign(v, { routing_file_copies: {
+      status: "checked", scanned_at: "2026-10-21T18:10:00Z", files_checked: 3,
+      hits: [{ file: "RepoA/CLAUDE.md", line: 1, quote: "Prefer Codex first", superseded: true }],
+      hits_total: 501, more_not_shown: 500, too_large: ["~/big.md"],
+    } });
+    answers.khipu_route_view = v;
+    await page();
+    const list = screen.getByRole("list", { name: "Copies of routing found in files" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(1);
+    expect(screen.getByText("500 more not shown.")).toBeInTheDocument();
+    expect(screen.getByText(/Too large to read: ~\/big\.md\./)).toBeInTheDocument();
+    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("501 copies in files");
+  });
+
+  it("keeps files never looked at apart from nothing found, with no action", async () => {
+    const v = view();
+    Object.assign(v, { routing_file_copies: { status: "not_checked", scanned_at: null, files_checked: 0, hits: [] } });
+    answers.khipu_route_view = v;
+    await page();
+    expect(screen.getByText("Khipu hasn't looked at your files yet")).toBeInTheDocument();
+    expect(screen.queryByText("Nothing to fix")).toBeNull();
+    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("Files not looked at yet");
+    const group = screen.getByRole("region", { name: "Checks and copies" });
+    expect(within(group).queryByRole("button", { name: /look now/i })).toBeNull();
+  });
+
   const TIERS = {
     scope: "opus", mock: "opus", ruling: "opus", "hard-security": "opus", "failed-fix": "opus",
     build: "sonnet", "fix-round": "sonnet", tests: "sonnet", docs: "sonnet", synthesis: "sonnet",
