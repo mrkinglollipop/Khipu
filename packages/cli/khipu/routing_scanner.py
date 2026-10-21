@@ -331,7 +331,7 @@ def compare_runner_caps(declarations: list[dict], accounts: list[dict], account_
                               f"{_value_words(kind, declaration)} has no fact to match.")})
             continue
         label = _account_label(matched)
-        facts = _facts_for(matched, kind, window)
+        facts = _facts_for(matched, kind, window, declaration.get("purpose", "job"))
         if not facts:
             flags.append({
                 "runner": runner, "account": label, "account_words": label,
@@ -364,10 +364,12 @@ def _runner_account(account, by_key: dict[str, dict], by_label: dict[str, list[d
     return matches[0] if len(matches) == 1 else None
 
 
-def _facts_for(account: dict, kind: str, window) -> list[dict]:
+def _facts_for(account: dict, kind: str, window, purpose: str = "job") -> list[dict]:
     out = []
     for fact in account.get("caps") or []:
         if not isinstance(fact, dict) or fact.get("kind") != kind:
+            continue
+        if fact.get("purpose", "job") != purpose:
             continue
         if kind in _WINDOW_KINDS and fact.get("window") != window:
             continue
@@ -376,7 +378,7 @@ def _facts_for(account: dict, kind: str, window) -> list[dict]:
 
 
 def _declared_values(declaration: dict) -> dict:
-    out = {k: declaration[k] for k in ("kind", "window") if declaration.get(k) is not None}
+    out = {k: declaration[k] for k in ("kind", "window", "purpose", "tier", "sensitive_only") if declaration.get(k) is not None}
     for field in _CAP_VALUES[declaration["kind"]]:
         if declaration.get(field) is not None:
             out[field] = declaration[field]
@@ -385,6 +387,9 @@ def _declared_values(declaration: dict) -> dict:
 
 def _fact_values(fact: dict, kind: str) -> dict:
     out = {"kind": kind}
+    if fact.get("purpose", "job") != "job":
+        out["purpose"] = fact["purpose"]
+    out.update({k: fact[k] for k in ("tier", "sensitive_only") if k in fact})
     if fact.get("window") is not None:
         out["window"] = fact["window"]
     for field in _CAP_VALUES[kind]:
@@ -396,6 +401,8 @@ def _fact_values(fact: dict, kind: str) -> dict:
 
 
 def _same_cap(kind: str, declaration: dict, fact: dict) -> bool:
+    if declaration.get("tier") != fact.get("tier") or bool(declaration.get("sensitive_only")) != bool(fact.get("sensitive_only")):
+        return False
     for field in _CAP_VALUES[kind]:
         if declaration.get(field) != fact.get(field):
             return False

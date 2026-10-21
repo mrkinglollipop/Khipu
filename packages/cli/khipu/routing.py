@@ -2232,6 +2232,21 @@ def _checked(data: dict) -> dict | None:
     scope keeps only its kind and account, so nothing else in a line, deep
     or odd, reaches the view."""
     out: dict[str, Any] = {"type": _no_surrogates(data["type"])}
+    if out["type"] in ("cap_set", "cap_remove") and "purpose" in data:
+        if data["purpose"] not in ("job", "check"):
+            return None
+        out["purpose"] = data["purpose"]
+    if out["type"] in ("cap_set", "cap_remove"):
+        from khipu.routing_pace import cap_scope_error
+
+        if cap_scope_error(data.get("cap_kind") or data.get("kind"), data.get("purpose", "job"),
+                           tier=data.get("tier"), sensitive_only=data.get("sensitive_only")):
+            return None
+        for field in ("tier", "sensitive_only"):
+            if field in data:
+                if data[field] is None:
+                    return None
+                out[field] = data[field]
     for field in _TEXT_FIELDS:
         value = data.get(field)
         if value is None:
@@ -3764,6 +3779,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             window = event.get("window") if event.get("window") in routing_pace.WINDOWS else None
             account = event.get("account")
             cap_kind = event.get("cap_kind") or event.get("kind")
+            purpose = event.get("purpose", "job")
+            if routing_pace.cap_scope_error(cap_kind, purpose):
+                continue
             # Window caps need their window; spend and concurrency are
             # account facts and carry none.
             scoped = cap_kind in routing_pace.WINDOW_CAP_KINDS
@@ -3772,19 +3790,20 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 slot = window if scoped else ""
                 if kind == "cap_remove":
                     if owner_cap:
-                        pace_caps.pop((account, slot, cap_kind), None)
-                        pace_cap_at.pop((account, slot, cap_kind), None)
+                        pace_caps.pop((account, slot, cap_kind, purpose), None)
+                        pace_cap_at.pop((account, slot, cap_kind, purpose), None)
                     continue
                 cap = routing_pace.checked_cap({k: event.get(k) for k in
-                                                ("kind", "pct", "slack", "usd", "days", "n", "revision")})
+                                                ("kind", "pct", "slack", "usd", "days", "n", "revision", "purpose", "tier", "sensitive_only")
+                                                if k in event})
                 if cap is not None:
                     if owner_cap:
-                        pace_caps[(account, slot, cap["kind"])] = dict(cap, window=window if scoped else None)
+                        pace_caps[(account, slot, cap["kind"], purpose)] = dict(cap, window=window if scoped else None)
                         confirmed = _parse(event.get("written_at"))
                         if confirmed is not None:
-                            pace_cap_at[(account, slot, cap["kind"])] = _iso(confirmed)
+                            pace_cap_at[(account, slot, cap["kind"], purpose)] = _iso(confirmed)
                         else:
-                            pace_cap_at.pop((account, slot, cap["kind"]), None)
+                            pace_cap_at.pop((account, slot, cap["kind"], purpose), None)
                     else:
                         # A conversation's cap is a proposal, never a fact.
                         cap_proposals.append(dict(cap, account=account,
@@ -4175,17 +4194,18 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
 
     for entry in entries:
         windows = sorted({w for (a, w) in pace_samples if a == entry["key"]}
-                         | {w for (a, w, _k2) in pace_caps if a == entry["key"] and w})
+                         | {w for (a, w, _k2, _purpose) in pace_caps if a == entry["key"] and w})
         if windows:
             entry["pace"] = [_pace.compute_pace(pace_samples.get((entry["key"], w), []),
-                                                 [c for (a, ww, _k2), c in pace_caps.items()
+                                                 [c for (a, ww, _k2, _purpose), c in pace_caps.items()
                                                   if a == entry["key"] and ww == w], now, w)
                               for w in windows]
-        mine = [c for (a, _w, _k2), c in sorted(pace_caps.items(), key=lambda kv: (kv[0][0], kv[0][1] or "", kv[0][2]))
+        mine = [c for (a, _w, _k2, _purpose), c in sorted(pace_caps.items(), key=lambda kv: (kv[0][0], kv[0][1] or "", kv[0][2], kv[0][3] != "job"))
                 if a == entry["key"]]
         if mine:
             entry["caps"] = [dict(c) for c in mine]
-            entry["cap_confirmed"] = {f"{w or ''}|{k}": at for (a, w, k), at in pace_cap_at.items()
+            entry["cap_confirmed"] = {f"{w or ''}|{k}" + ("|check" if purpose == "check" else ""): at
+                                      for (a, w, k, purpose), at in pace_cap_at.items()
                                       if a == entry["key"]}
         readings = [s["t"] for (a, _w), group in pace_samples.items() if a == entry["key"]
                     for s in group if s["t"] <= now]
@@ -5660,13 +5680,15 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
     streams = None
     for cap in entry.get("caps") or []:
         kind = cap.get("kind")
-        base = {"kind": kind, "revision": cap.get("revision"), "window": cap.get("window")}
+        purpose = cap.get("purpose", "job")
+        base = {"kind": kind, "revision": cap.get("revision"), "window": cap.get("window"), "purpose": purpose,
+                **{k: cap[k] for k in ("tier", "sensitive_only") if k in cap}}
         if confirmations:
             base["confirmed_at"] = (entry.get("cap_confirmed") or {}).get(
-                f"{cap.get('window') or ''}|{kind}")
+                f"{cap.get('window') or ''}|{kind}" + ("|check" if purpose == "check" else ""))
         if kind == "pace_target":
             pace = next((p for p in entry.get("pace") or [] if p.get("window") == cap.get("window")), {})
-            target = pace.get("pace_target") or {}
+            target = pace.get("check_pace_target" if purpose == "check" else "pace_target") or {}
             out.append({**base, "pct": cap.get("pct"), "slack": cap.get("slack"),
                         "allowance_pct": target.get("allowance_pct"), "used_pct": target.get("used_pct"),
                         "verdict": target.get("verdict", "unknown"), "why": target.get("why")})
@@ -5689,7 +5711,9 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
         elif kind in ("share", "per_day"):
             pace = next((p for p in entry.get("pace") or [] if p.get("window") == cap.get("window")), {})
             obj = pace.get("share_cap" if kind == "share" else "day_cap") or {}
-            out.append({**base, "pct": cap.get("pct"), "verdict": obj.get("verdict", "unknown")})
+            verdict = next((s["verdict"] for s in pace.get("ceiling_verdicts") or []
+                            if s["kind"] == kind and s["purpose"] == purpose), obj.get("verdict", "unknown"))
+            out.append({**base, "pct": cap.get("pct"), "verdict": verdict})
     return out
 
 
@@ -5733,7 +5757,7 @@ def _lane_account_key(lane: str, view: dict) -> str:
 
 
 def advise(account: str | None = None, *, lane: str | None = None, tier: str | None = None,
-           kind: str | None = None, privacy: bool = False, purpose: str = "job",
+           kind: str | None = None, privacy: bool = False, purpose: str = "job", sensitive: bool = False,
            now: datetime | None = None, view: dict | None = None, environ: dict | None = None) -> dict:
     """Launch advice (slice 17c): ``go``, ``hold_back``, ``not_eligible`` or
     ``closed`` per account, ranked in the owner's priority order. Advisory
@@ -5746,7 +5770,9 @@ def advise(account: str | None = None, *, lane: str | None = None, tier: str | N
     if kind is not None and kind not in routing_advice.KINDS:
         raise RouteError("kind must be build, fix or check")
     if purpose not in routing_advice.PURPOSES:
-        raise RouteError("purpose must be job or orchestration")
+        raise RouteError("purpose must be job, check or orchestration")
+    if not isinstance(sensitive, bool):
+        raise RouteError("sensitive must be true or false")
     now = now or _now()
     view = read_view(now) if view is None else view
     dispatched = routing_advice.is_dispatched(environ)
@@ -5757,9 +5783,9 @@ def advise(account: str | None = None, *, lane: str | None = None, tier: str | N
     elif lane:
         target = _lane_account_key(lane, view)
     ranked = routing_advice.rank(view, now, purpose=effective, tier=tier, kind=kind,
-                                 privacy=privacy, target_key=target)
+                                 privacy=privacy, sensitive=sensitive, target_key=target)
     out: dict = {"purpose": effective, "requested_purpose": purpose, "dispatched": dispatched,
-                 "tier": tier, "kind": kind, "privacy": bool(privacy), "ranked": ranked,
+                 "tier": tier, "kind": kind, "privacy": bool(privacy), "sensitive": sensitive, "ranked": ranked,
                  "about": ABOUT, "advisory": True}
     if target is not None and ranked:
         out.update({k: ranked[0][k] for k in
@@ -6546,6 +6572,10 @@ def _checked_cap_or_raise(kind, fields: dict, revision, *, window):
 
     if kind in routing_pace.WINDOW_CAP_KINDS and window not in routing_pace.WINDOWS:
         raise RouteError("window must be weekly or five_hour")
+    error = routing_pace.cap_scope_error(kind, fields.get("purpose", "job"),
+                                         tier=fields.get("tier"), sensitive_only=fields.get("sensitive_only"))
+    if error:
+        raise RouteError(error)
     cap = routing_pace.checked_cap({"kind": kind, "revision": revision or "cap",
                                     **{k: v for k, v in fields.items() if v is not None}})
     if cap is None:
@@ -6557,10 +6587,11 @@ def _checked_cap_or_raise(kind, fields: dict, revision, *, window):
 
 def set_cap(account: str, *, window: str | None = None, kind: str, pct=None, slack=None, usd=None,
             days=None, n=None, revision: str | None = None, via: str,
-            now: datetime | None = None) -> dict:
+            purpose: str = "job", tier=None, sensitive_only=None, now: datetime | None = None) -> dict:
     """Owner-only: confirm a cap as a structured fact, never from prose.
     A runner's numbers are never read here; they only judge the cap later."""
-    cap = _checked_cap_or_raise(kind, {"pct": pct, "slack": slack, "usd": usd, "days": days, "n": n},
+    cap = _checked_cap_or_raise(kind, {"pct": pct, "slack": slack, "usd": usd, "days": days, "n": n, "purpose": purpose,
+                                    "tier": tier, "sensitive_only": sensitive_only},
                                 revision, window=window)
     key = _resolve_account_key(account)
     event = {"type": "cap_set", "account": key, **cap}
@@ -6569,16 +6600,19 @@ def set_cap(account: str, *, window: str | None = None, kind: str, pct=None, sla
     return dict(_owner_write(event, via), account=key)
 
 
-def remove_cap(account: str, *, window: str | None = None, kind: str, via: str,
+def remove_cap(account: str, *, window: str | None = None, kind: str, via: str, purpose: str = "job",
                now: datetime | None = None) -> dict:
     from khipu import routing_pace
 
     if kind not in routing_pace.CAP_KINDS:
         raise RouteError(_CAP_WORDS)
+    error = routing_pace.cap_scope_error(kind, purpose)
+    if error:
+        raise RouteError(error)
     if kind in routing_pace.WINDOW_CAP_KINDS and window not in routing_pace.WINDOWS:
         raise RouteError("window must be weekly or five_hour")
     key = _resolve_account_key(account)
-    event = {"type": "cap_remove", "account": key, "cap_kind": kind}
+    event = {"type": "cap_remove", "account": key, "cap_kind": kind, "purpose": purpose}
     if kind in routing_pace.WINDOW_CAP_KINDS:
         event["window"] = window
     return dict(_owner_write(event, via), account=key)
@@ -6586,9 +6620,10 @@ def remove_cap(account: str, *, window: str | None = None, kind: str, via: str,
 
 def request_cap(account: str, *, window: str | None = None, kind: str, pct=None, slack=None, usd=None,
                 days=None, n=None, revision: str, author: dict,
-                via: str = "mcp", now: datetime | None = None) -> dict:
+                via: str = "mcp", purpose: str = "job", tier=None, sensitive_only=None, now: datetime | None = None) -> dict:
     """A conversation's cap attempt: stored as a proposal, never a fact."""
-    cap = _checked_cap_or_raise(kind, {"pct": pct, "slack": slack, "usd": usd, "days": days, "n": n},
+    cap = _checked_cap_or_raise(kind, {"pct": pct, "slack": slack, "usd": usd, "days": days, "n": n, "purpose": purpose,
+                                    "tier": tier, "sensitive_only": sensitive_only},
                                 revision, window=window)
     key = _account_for_a_conversation(account, accounts())
     by = dict(author or {})
@@ -8128,8 +8163,7 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out = dict(view, generated_at=_iso(now))
     from khipu import routing_advice
 
-    # The owner's app shows two advice rows: jobs, and lead conversations.
-    # Both carry the newest usage reading's time (the app words its age).
+    # Only accounts with a check allowance need a separate check advice row.
     def _advice(e, purpose):
         return dict(routing_advice.account_advice(view, e, now, purpose=purpose),
                     newest_reading_at=e.get("newest_reading_at"))
@@ -8151,7 +8185,9 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["accounts"] = [_with_authors(dict(e, line=account_line(e, now, push=False),
                                           cap_statuses=_owner_caps(e),
                                           advice=_advice(e, "job"),
-                                          lead_advice=_advice(e, "orchestration")))
+                                          lead_advice=_advice(e, "orchestration"),
+                                          **({"check_advice": _advice(e, "check")}
+                                             if routing_advice.has_check_cap(e) else {})))
                        for e in view["accounts"] if account is None or e["key"] == account]
     out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
     # A pending rule's requester as the fold keeps it, for Khipu's own
@@ -8529,6 +8565,8 @@ def _public_account(entry: dict, now: datetime, view: dict | None = None) -> dic
         from khipu import routing_advice
 
         out["advice"] = routing_advice.account_advice(view, entry, now)
+        if routing_advice.has_check_cap(entry):
+            out["check_advice"] = routing_advice.account_advice(view, entry, now, purpose="check")
     out["line"] = account_line(entry, now, push=False)
     return out
 
@@ -9716,13 +9754,17 @@ def _advice_push_adjust(out: dict, view: dict, now: datetime, session: str, comp
     priority_keys = {e.get("account") for e in (view.get("priority") or {}).get("entries") or []}
     if not priority_keys:
         return out
+    acked = routing_delivery.snapshot(session, component).get("advice_acked") or {}
     current: dict[str, dict] = {}
     for entry in view.get("accounts") or []:
         if entry["key"] in priority_keys:
             current[f"advice:{entry['key']}"] = routing_advice.account_advice(view, entry, now)
+            check_id = f"advice:check:{entry['key']}"
+            if check_id in acked or any(c.get("kind") == "pace_target" and c.get("purpose") == "check"
+                                        for c in entry.get("caps") or []):
+                current[check_id] = routing_advice.account_advice(view, entry, now, purpose="check")
     if not current:
         return out
-    acked = routing_delivery.snapshot(session, component).get("advice_acked") or {}
 
     def sig(item):
         return (item.get("verdict"), item.get("reason"), item.get("evidence")) if item else None
@@ -10389,8 +10431,10 @@ def _route_intent(cmd: str, args) -> dict | None:
                                       facts={"definition": args.definition, "value": value})
     if cmd == "cap":
         facts = {"window": args.window, "kind": args.kind,
-                 **{k: getattr(args, k) for k in ("pct", "slack", "usd", "days", "n")
+                 **{k: getattr(args, k) for k in ("pct", "slack", "usd", "days", "n", "tier", "sensitive_only")
                     if getattr(args, k, None) is not None}}
+        if getattr(args, "purpose", "job") != "job":
+            facts["purpose"] = args.purpose
         return owner_direction.intent(f"route.cap.{args.action}", _resolve_account_key(args.account),
                                       facts=facts)
     if cmd in ("pause", "lift", "clear"):
@@ -10510,13 +10554,16 @@ def run_cli(args) -> int:
         if cmd == "advise":
             out = advise(args.account, lane=getattr(args, "lane", None), tier=getattr(args, "tier", None),
                          kind=getattr(args, "kind", None), privacy=bool(getattr(args, "privacy", False)),
-                         purpose=getattr(args, "purpose", "job") or "job", now=now)
+                         purpose=getattr(args, "purpose", "job") or "job",
+                         sensitive=bool(getattr(args, "sensitive", False)), now=now)
             if getattr(args, "json", False):
                 _print_json(out)
             else:
+                from khipu.routing_advice import advice_line
+
                 for row in out["ranked"]:
-                    print(f"{row['rank']}. {row['label']}: {row['verdict'].replace('_', ' ')} "
-                          f"({row['reason']}; evidence {row['evidence']}; {row['why_ranked']})")
+                    print(f"{row['rank']}. {advice_line(row)} "
+                          f"(evidence {row['evidence']}; {row['why_ranked']})")
                 print(ABOUT)
             return 0
         if cmd == "wait":
@@ -10594,9 +10641,10 @@ def run_cli(args) -> int:
                 out = set_cap(args.account, window=args.window, kind=args.kind, pct=args.pct,
                               slack=getattr(args, "slack", None), usd=getattr(args, "usd", None),
                               days=getattr(args, "days", None), n=getattr(args, "n", None),
-                              revision=args.revision, via=via)
+                              revision=args.revision, purpose=args.purpose, tier=args.tier,
+                              sensitive_only=args.sensitive_only, via=via)
             else:
-                out = remove_cap(args.account, window=args.window, kind=args.kind, via=via)
+                out = remove_cap(args.account, window=args.window, kind=args.kind, purpose=args.purpose, via=via)
         elif cmd == "definition":
             out = set_definition(args.definition, want["facts"]["value"], via=via)
         elif cmd == "pause":
