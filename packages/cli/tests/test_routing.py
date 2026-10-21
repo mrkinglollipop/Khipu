@@ -2377,9 +2377,6 @@ NOT_IN_THE_APP_YET = {
     # Phase 7: the copy for cloud agents.
     "routing_cloud_copy", "routing_cloud_copy_hold_words", "routing_cloud_copy_rules",
     "routing_cloud_copy_stale_after", "routing_cloud_copy_debounce",
-    # Routing slice 5 registers the switch; its app control arrives with
-    # the proposals app group (slice 15b).
-    "routing_proposal_text_between_macs",
     # Read once, by phase 1a's import of the standing rules, and never again
     # after it ran: a control for it would do nothing.
     "routing_rules_seed",

@@ -30,6 +30,8 @@ import { inPlansOrder } from "./RoutingCard";
 import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, providerRows, routingOverview, staleAfterSeconds } from "./routingOverview";
 import type { GroupKey, GroupTag, OverviewSettings, Problem, ProviderRow } from "./routingOverview";
 import { checksModel } from "./routingChecks";
+import { endedWords, holdChoiceIds, holdChoiceTargets, proposalsModel } from "./routingProposals";
+import type { ProposalRow } from "./routingProposals";
 import {
   ACCOUNT_FILTERS,
   ACCOUNT_SORTS,
@@ -138,6 +140,9 @@ type Writer = {
     back?: Back,
   ) => Promise<boolean>;
   fail: (id: string, message: string | null) => void;
+  /** The error under `id` as it stands now, readable in the same tick a
+   *  write's promise settles (the state above lands a render later). */
+  errorOf: (id: string) => string | undefined;
 };
 
 function useWriter(reread: () => Promise<unknown>): Writer {
@@ -162,13 +167,17 @@ function useWriter(reread: () => Promise<unknown>): Writer {
     const to = usable(k.from) ? k.from : k.back?.();
     if (usable(to) && to !== at) to.focus();
   });
-  const fail = (id: string, message: string | null) =>
+  const errorsNow = useRef<Record<string, string>>({});
+  const fail = (id: string, message: string | null) => {
+    if (message) errorsNow.current[id] = message;
+    else delete errorsNow.current[id];
     setErrors((prev) => {
       const out = { ...prev };
       if (message) out[id] = message;
       else delete out[id];
       return out;
     });
+  };
   const run: Writer["run"] = (id, command, args, after, back) => {
     const at = document.activeElement;
     const from = at instanceof HTMLElement && at !== document.body ? at : null;
@@ -217,7 +226,7 @@ function useWriter(reread: () => Promise<unknown>): Writer {
     queue.current = job.catch(() => undefined);
     return job;
   };
-  return { isBusy: (id) => pending.includes(id), anyBusy: pending.length > 0, errors, results, run, fail };
+  return { isBusy: (id) => pending.includes(id), anyBusy: pending.length > 0, errors, results, run, fail, errorOf: (id: string) => errorsNow.current[id] };
 }
 
 /** One routing setting's value as `khipu config` reports it now, read just
@@ -305,6 +314,105 @@ function useFocusFirst<T extends HTMLElement>(): RefObject<T | null> {
     ref.current?.focus();
   }, []);
   return ref;
+}
+
+// ---------------------------------------------------------------------------
+// End or keep: a write that names a held or paused account is refused until
+// the owner says, for each one, whether it ends or stays (plan section 2,
+// decision 4). The CLI names the ids in its refusal; this asks and retries
+// the same write with the choices. Khipu never reads a release from prose.
+// ---------------------------------------------------------------------------
+
+type HoldAsk = {
+  ids: string[];
+  retry: (holds: Record<string, "end" | "keep">) => Promise<boolean>;
+};
+
+/** `attempt` runs a write; on the end-or-keep refusal it keeps the retry
+ *  (with the choices merged into the same write's arguments) for the panel
+ *  below. Returns the write's own result. */
+function useEndOrKeep(w: Writer) {
+  const [ask, setAsk] = useState<HoldAsk | null>(null);
+  const attempt = async (
+    id: string,
+    command: string,
+    args: Record<string, unknown>,
+    after?: (() => Promise<unknown>) | null,
+    back?: Back,
+  ): Promise<boolean> => {
+    const ok = await w.run(id, command, args, after, back);
+    if (ok) return true;
+    const ids = holdChoiceIds(w.errorOf(id));
+    if (!ids.length) return false;
+    setAsk({
+      ids,
+      retry: async (holds) => {
+        const done = await w.run(id, command, { ...args, holds }, after, back);
+        if (done) {
+          setAsk(null);
+          return true;
+        }
+        const again = holdChoiceIds(w.errorOf(id));
+        if (again.length) setAsk((cur) => (cur ? { ...cur, ids: again } : cur));
+        return false;
+      },
+    });
+    return false;
+  };
+  return { ask, setAsk, attempt };
+}
+
+function EndOrKeepChoices({
+  view,
+  ask,
+  now,
+  busy,
+  saveLabel,
+  onCancel,
+}: {
+  view: RouteView;
+  ask: HoldAsk;
+  now: Date;
+  busy: boolean;
+  saveLabel: string;
+  onCancel: () => void;
+}) {
+  const [choices, setChoices] = useState<Record<string, "end" | "keep">>({});
+  const targets = holdChoiceTargets(view, ask.ids, now);
+  const ready = targets.every((t) => choices[t.id]);
+  return (
+    <div className="route-choice" role="group" aria-label="End or keep each hold">
+      <p className="set-help">
+        <b>That change wasn't saved yet.</b> It names {targets.length === 1 ? "an account that is held or paused" : "accounts that are held or paused"}.
+        Say for each one whether its hold or pause ends or stays.
+      </p>
+      {targets.map((t) => (
+        <fieldset key={t.id}>
+          <legend>{t.legend}</legend>
+          <label>
+            <input type="radio" name={`hold-choice-${t.id}`} checked={choices[t.id] === "end"}
+              onChange={() => setChoices((c) => ({ ...c, [t.id]: "end" }))} />
+            {t.endLabel}
+          </label>
+          <label>
+            <input type="radio" name={`hold-choice-${t.id}`} checked={choices[t.id] === "keep"}
+              onChange={() => setChoices((c) => ({ ...c, [t.id]: "keep" }))} />
+            {t.keepLabel}
+          </label>
+        </fieldset>
+      ))}
+      <div className="toolbar">
+        <button type="button" className="primary sm" disabled={!ready || busy}
+          onClick={() => void ask.retry(choices)}>
+          <Busy on={busy} />
+          {saveLabel}
+        </button>
+        <button type="button" className="sm link" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -761,11 +869,13 @@ function PriorityEntryForm({
   p,
   i,
   w,
+  attempt,
   onClose,
 }: {
   p: RoutePriority;
   i: number;
   w: Writer;
+  attempt: (id: string, command: string, args: Record<string, unknown>) => Promise<boolean>;
   onClose: () => void;
 }) {
   const e = p.entries[i];
@@ -785,7 +895,7 @@ function PriorityEntryForm({
     }
     const next = priorityItems(p.entries);
     next[i] = { account: e.account, role: role.trim() || null, until: end.iso };
-    if (await w.run(id, "khipu_route_priority", { action: "set", entries: next, until: p.until ?? null, expect: p.version ?? null })) onClose();
+    if (await attempt(id, "khipu_route_priority", { action: "set", entries: next, until: p.until ?? null, expect: p.version ?? null })) onClose();
   }
   return (
     <form className="route-pause" id={formId} aria-label={`Change ${e.label} in your priority`} onSubmit={submit} onKeyDown={escapeCloses(onClose)}>
@@ -812,7 +922,7 @@ function PriorityEntryForm({
   );
 }
 
-function PriorityEndForm({ p, w, onClose }: { p: RoutePriority; w: Writer; onClose: () => void }) {
+function PriorityEndForm({ p, w, attempt, onClose }: { p: RoutePriority; w: Writer; attempt: (id: string, command: string, args: Record<string, unknown>) => Promise<boolean>; onClose: () => void }) {
   const [choice, setChoice] = useState(p.until ? "keep" : "never");
   const [custom, setCustom] = useState("");
   const formId = `prio-end-${useId().replace(/:/g, "")}`;
@@ -824,7 +934,7 @@ function PriorityEndForm({ p, w, onClose }: { p: RoutePriority; w: Writer; onClo
       w.fail(id, end.error);
       return;
     }
-    if (await w.run(id, "khipu_route_priority", { action: "set", entries: priorityItems(p.entries), until: end.iso, expect: p.version ?? null })) onClose();
+    if (await attempt(id, "khipu_route_priority", { action: "set", entries: priorityItems(p.entries), until: end.iso, expect: p.version ?? null })) onClose();
   }
   return (
     <form className="route-pause" aria-label="When your whole priority ends" onSubmit={submit} onKeyDown={escapeCloses(onClose)}>
@@ -871,9 +981,10 @@ function PrioritySection({
   const choice = candidates.some((a) => a.key === adding) ? adding : candidates[0]?.key ?? "";
   // The version of the priority this page loaded, never one fetched at save time.
   const expect = p?.version ?? data.priority_version ?? null;
+  const eok = useEndOrKeep(w);
   const send = (id: string, next: PriorityItem[], back?: Back) =>
     next.length
-      ? w.run(id, "khipu_route_priority", { action: "set", entries: next, until: p?.until ?? null, expect }, null, back)
+      ? eok.attempt(id, "khipu_route_priority", { action: "set", entries: next, until: p?.until ?? null, expect }, null, back)
       : w.run(id, "khipu_route_priority", { action: "clear", expect }, null, back);
   const move = (i: number, by: number) => {
     const next = priorityItems(entries);
@@ -896,7 +1007,7 @@ function PrioritySection({
           <span>
             <b>{priorityPendingWords(p)}</b>
           </span>
-          {p.owner_request ? <span>What it said you asked: “{p.owner_request}”</span> : null}
+          {p.owner_request && !p.proposal_withheld ? <span>What it said you asked: “{p.owner_request}”</span> : null}
           <span>
             It replaced:{" "}
             {p.replaced?.entries.length
@@ -906,7 +1017,7 @@ function PrioritySection({
           </span>
           <div className="toolbar">
             <button type="button" className="sm primary" disabled={w.isBusy("priority:confirm")}
-              onClick={() => void w.run("priority:confirm", "khipu_route_priority", { action: "confirm", expect })}>
+              onClick={() => void eok.attempt("priority:confirm", "khipu_route_priority", { action: "confirm", expect })}>
               <Busy on={w.isBusy("priority:confirm")} />
               Confirm
             </button>
@@ -919,6 +1030,10 @@ function PrioritySection({
           <WriteError w={w} id="priority:confirm" />
           <WriteError w={w} id="priority:undo" />
         </div>
+      ) : null}
+      {eok.ask ? (
+        <EndOrKeepChoices view={data} ask={eok.ask} now={now} busy={w.anyBusy} saveLabel="Save priority"
+          onCancel={() => eok.setAsk(null)} />
       ) : null}
       {entries.length ? (
         <ol className="rows route-priority-list" aria-label="Your priority, first to last">
@@ -952,7 +1067,7 @@ function PrioritySection({
                   Remove
                 </button>
               </span>
-              {editing === i && p ? <PriorityEntryForm p={p} i={i} w={w} onClose={() => setEditing(null)} /> : null}
+              {editing === i && p ? <PriorityEntryForm p={p} i={i} w={w} attempt={eok.attempt} onClose={() => setEditing(null)} /> : null}
             </li>
           ))}
         </ol>
@@ -993,7 +1108,7 @@ function PrioritySection({
         ) : null}
       </div>
       <WriteError w={w} id="priority:add" />
-      {endOpen && p ? <PriorityEndForm p={p} w={w} onClose={() => setEndOpen(false)} /> : null}
+      {endOpen && p ? <PriorityEndForm p={p} w={w} attempt={eok.attempt} onClose={() => setEndOpen(false)} /> : null}
       {clearing && p ? (
         <ConfirmGroup label="Clear your priority?" onClose={() => setClearing(false)} back={() => addSelect.current}>
           <span>Clear your priority? Conversations hear "No priority set" on their next prompt. It stays in Recent changes.</span>
@@ -2045,6 +2160,258 @@ const H = 3600;
 const D = 86400;
 
 // ---------------------------------------------------------------------------
+// Proposals from conversations (routing slice 15b)
+// ---------------------------------------------------------------------------
+
+/** Seven days after a proposal was written: when it ends on its own. */
+function proposalEndsAt(at: string | null | undefined): string | null {
+  if (!at) return null;
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return null;
+  return new Date(d.getTime() + 7 * 24 * 3600 * 1000).toISOString();
+}
+
+function ProposalRowView({
+  row,
+  data,
+  w,
+  attempt,
+  ask,
+  setAsk,
+  now,
+}: {
+  row: ProposalRow;
+  data: RouteView;
+  w: Writer;
+  attempt: (id: string, command: string, args: Record<string, unknown>) => Promise<boolean>;
+  ask: string | null;
+  setAsk: (a: string | null) => void;
+  now: Date;
+}) {
+  const p = row.proposal;
+  const live = p.status === "live";
+  const [draft, setDraft] = useState(row.proposed ?? "");
+  const [editConfirm, setEditConfirm] = useState(false);
+  const confirmId = `proposal:confirm:${p.id}`;
+  const dismissId = `proposal:dismiss:${p.id}`;
+  const editId = `proposal:edit:${p.id}`;
+  const rule = p.kind === "rule" ? (data.rules ?? []).find((r) => r.entity === p.entity) ?? (data.rules ?? []).find((r) => r.n === p.n) : undefined;
+  const expect = data.priority?.version ?? data.priority_version ?? null;
+  const ends = proposalEndsAt(p.at);
+  const close = () => {
+    setAsk(null);
+    setEditConfirm(false);
+  };
+  const ruleMissing = p.kind === "rule" && !rule;
+  const refuse = (id: string) => {
+    w.fail(id, "That rule isn't in this read, so nothing was sent. Read the routing record again, then try again.");
+    return Promise.resolve(false);
+  };
+  const confirm = () =>
+    ruleMissing
+      ? refuse(confirmId)
+      : p.kind === "rule" && rule
+        ? attempt(confirmId, "khipu_route_rule", { action: "confirm", n: rule.n })
+        : attempt(confirmId, "khipu_route_priority", { action: "confirm", expect });
+  const dismiss = () =>
+    ruleMissing
+      ? refuse(dismissId)
+      : p.kind === "rule" && rule
+        ? w.run(dismissId, "khipu_route_rule", { action: "dismiss", n: rule.n })
+        : w.run(dismissId, "khipu_route_priority", { action: "undo", expect });
+  return (
+    <div className="mrow prop" role="listitem" data-route-item={`proposal:${p.id}`} tabIndex={-1}>
+      <span className="name">{row.name}</span>
+      <span>
+        {live ? (
+          <>
+            {row.by}.{" "}
+            {row.withheld
+              ? "Its words stay on the Mac it came from, so confirm it there. It is already in use everywhere."
+              : `In use now${row.owner ? " on top of your words" : ""}${ends ? `; ends ${whenLocal(ends, now)} unless you confirm it` : ""}.`}
+            {p.kind === "priority" && !row.withheld && data.priority?.owner_request ? (
+              <> What it said you asked: “{data.priority.owner_request}”</>
+            ) : null}
+          </>
+        ) : p.status === "crossed" ? (
+          <>{row.by}. It was written against an older version, so it never took effect. Its author was told.</>
+        ) : (
+          <>{row.by}. You replaced it with your own write, so it has ended.</>
+        )}
+      </span>
+      {live && ruleMissing ? (
+        <span>That rule isn't in this read, so this proposal can't be confirmed or dismissed here. Read the routing record again, then try again.</span>
+      ) : null}
+      <span className="end">
+        {live ? <Tag tone="accent" dot>In use</Tag> : p.status === "crossed" ? <Tag tone="warn" dot>Crossed</Tag> : <Tag dot>{endedWords(p.status)}</Tag>}
+      </span>
+      {live && !row.withheld ? (
+        <div className="prop-side">
+          <div>
+            <span className="cap">{row.owner ? "Your words" : "Your words now"}</span>
+            {row.owner ?? "Nothing yet: this adds new words of yours once confirmed."}
+          </div>
+          <div>
+            <span className="cap">Proposed words</span>
+            {row.proposed ?? ""}
+          </div>
+        </div>
+      ) : null}
+      {live && !ruleMissing ? (
+        <div className="acts">
+          {!row.withheld ? (
+            <button type="button" className="sm primary" disabled={w.isBusy(confirmId)}
+              aria-label={`Confirm the proposed ${row.name.toLowerCase()}`} onClick={() => void confirm()}>
+              <Busy on={w.isBusy(confirmId)} />
+              Confirm
+            </button>
+          ) : null}
+          {p.kind === "rule" && !row.withheld ? (
+            <button type="button" className="sm" aria-expanded={ask === "edit"}
+              aria-label={`Edit the proposed ${row.name.toLowerCase()}`} onClick={() => { setDraft(row.proposed ?? ""); setEditConfirm(false); setAsk(ask === "edit" ? null : "edit"); }}>
+              Edit, then confirm
+            </button>
+          ) : null}
+          <button type="button" className="sm" aria-expanded={ask === "dismiss"}
+            aria-label={`Dismiss the proposed ${row.name.toLowerCase()}`} onClick={() => setAsk(ask === "dismiss" ? null : "dismiss")}>
+            Dismiss
+          </button>
+        </div>
+      ) : null}
+      {live && ask === "dismiss" ? (
+        <ConfirmGroup label={`Dismiss the proposed ${row.name.toLowerCase()}?`} onClose={close} back={() => null}>
+          <span>
+            Dismiss this proposal? {row.owner ? "Your words stay as they are." : "Nothing is added."} The conversation
+            that proposed it is told.
+          </span>
+          <WriteError w={w} id={dismissId} />
+          <div className="toolbar">
+            <button type="button" className="sm danger" disabled={w.isBusy(dismissId)}
+              onClick={async () => { if (await dismiss()) close(); }}>
+              <Busy on={w.isBusy(dismissId)} />
+              Dismiss it
+            </button>
+            <button type="button" className="sm link" onClick={close}>
+              Keep it
+            </button>
+          </div>
+        </ConfirmGroup>
+      ) : null}
+      {live && ask === "edit" && rule ? (
+        <form className={editConfirm ? "route-confirm" : "route-pause"} aria-label={`Edit the proposed ${row.name.toLowerCase()}`}
+          onKeyDown={escapeCloses(close)}
+          onSubmit={async (e) => {
+            e.preventDefault();
+            if (!draft.trim()) {
+              w.fail(editId, "Write the words first.");
+              return;
+            }
+            if (!editConfirm) {
+              w.fail(editId, null);
+              setEditConfirm(true);
+              return;
+            }
+            if (await attempt(editId, "khipu_route_rule", { action: "edit", n: rule.n, text: draft })) close();
+          }}>
+          <div className="toolbar">
+            <label htmlFor={editId}>Words</label>
+            <input id={editId} value={draft} autoFocus autoComplete="off" readOnly={editConfirm} onChange={(e) => setDraft(e.target.value)} />
+          </div>
+          {editConfirm ? <span>Make these your words for {row.name.toLowerCase()}? They replace the proposal.</span> : null}
+          <WriteError w={w} id={editId} />
+          <div className="toolbar">
+            <button type="submit" className="primary sm" disabled={w.isBusy(editId)}>
+              <Busy on={w.isBusy(editId)} />
+              {editConfirm ? "Make them mine" : "Save…"}
+            </button>
+            <button type="button" className="sm link" onClick={close}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      ) : null}
+      <WriteError w={w} id={confirmId} />
+    </div>
+  );
+}
+
+function ProposalsSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }) {
+  const model = proposalsModel(data, now);
+  const eok = useEndOrKeep(w);
+  const [ask, setAsk] = useState<{ id: string; kind: string } | null>(null);
+  const [showEnded, setShowEnded] = useState(false);
+  const ended = model.ended;
+  const endedCounts = ended
+    .filter((r) => {
+      const at = r.proposal.ended_at;
+      return at != null && new Date(at).getTime() >= new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    })
+    .reduce<Record<string, number>>((acc, r) => ({ ...acc, [r.proposal.status]: (acc[r.proposal.status] ?? 0) + 1 }), {});
+  const endedToday = model.endedToday;
+  const anyDatedEnd = ended.some((r) => r.proposal.ended_at);
+  const rows = [...model.live, ...model.stale];
+  return (
+    <div className="section-body">
+      <h2 className="sub-title">Proposals from conversations</h2>
+      <p className="set-help">A conversation's change is in use until you confirm or dismiss it.</p>
+      {rows.length ? (
+        <div className="mrows" role="list" aria-label="Proposals">
+          {rows.map((row) => (
+            <ProposalRowView key={row.proposal.id} row={row} data={data} w={w} attempt={eok.attempt} now={now}
+              ask={ask?.id === row.proposal.id ? ask.kind : null}
+              setAsk={(kind) => setAsk(kind ? { id: row.proposal.id, kind } : null)} />
+          ))}
+        </div>
+      ) : (
+        <div className="empty">
+          <b>Nothing waiting for you</b>
+          <span>When a conversation proposes a change to a rule, your note or your priority, it shows here beside your words.</span>
+        </div>
+      )}
+      {eok.ask ? (
+        <EndOrKeepChoices view={data} ask={eok.ask} now={now} busy={w.anyBusy} saveLabel="Save and confirm"
+          onCancel={() => eok.setAsk(null)} />
+      ) : null}
+      {ended.length ? (
+        <p className="set-help">
+          {anyDatedEnd ? (
+            <>
+              Ended today: {endedToday}
+              {Object.keys(endedCounts).length
+                ? ` (${Object.entries(endedCounts).map(([s, n]) => `${n} ${endedWords(s)}`).join(", ")})`
+                : ""}
+              .{" "}
+            </>
+          ) : (
+            <>Ended: {ended.length}. </>
+          )}
+          <button type="button" className="sm" aria-expanded={showEnded} onClick={() => setShowEnded((v) => !v)}>
+            {showEnded ? "Hide" : "Show"}
+          </button>
+        </p>
+      ) : null}
+      {showEnded ? (
+        <div className="mrows" role="list" aria-label="Ended proposals">
+          {ended.map((row) => (
+            <div key={row.proposal.id} className="mrow prop" role="listitem">
+              <span className="name">{row.name}</span>
+              <span>{row.by}. {endedWords(row.proposal.status)}.</span>
+              <span className="end"><Tag>{endedWords(row.proposal.status)}</Tag></span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {model.live.some((r) => r.withheld) ? (
+        <p className="set-help">
+          Proposal words are kept on the Mac they came from because “Share proposal words between your Macs” is off in
+          Telling conversations.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Holds
 // ---------------------------------------------------------------------------
 
@@ -2083,6 +2450,7 @@ function HoldsSection({
 }) {
   const holds = data.holds ?? [];
   const accounts = data.accounts ?? [];
+  const [ending, setEnding] = useState<string | null>(null);
   const [text, setText] = useState("");
   const [about, setAbout] = useState("all");
   const [reason, setReason] = useState("other");
@@ -2126,6 +2494,7 @@ function HoldsSection({
   }
   return (
     <div className="section-body">
+        <h2 className="sub-title">Holds</h2>
         <p className="set-help">Short notes about one account, this Mac or all work. Every hold from a conversation ends on its own.</p>
         {holds.length ? (
           <div className="rows" role="list" aria-label="Holds">
@@ -2146,30 +2515,48 @@ function HoldsSection({
                       type="button"
                       className="sm"
                       aria-label={`End the hold on ${h.scope_label}`}
+                      aria-expanded={ending === h.id}
                       disabled={w.isBusy(id)}
-                      onClick={() => {
-                        // Once this hold ends, focus goes to the next hold's
-                        // End now, else the one before, else Add hold. Worked
-                        // out on the click, from this hold's place, so a long
-                        // list of holds costs nothing to show (Codex review,
-                        // finding 2).
-                        const from = holds;
-                        void w.run(id, "khipu_route_hold_end", { id: h.id }, null, () => {
-                          const usable = (j: number) => {
-                            const b = endBtns.current[from[j].id];
-                            return b?.isConnected ? b : null;
-                          };
-                          for (let j = i + 1; j < from.length; j++) if (usable(j)) return usable(j);
-                          for (let j = i - 1; j >= 0; j--) if (usable(j)) return usable(j);
-                          return addBtn.current;
-                        });
-                      }}
+                      onClick={() => setEnding((v) => (v === h.id ? null : h.id))}
                     >
                       <Busy on={w.isBusy(id)} />
                       End now
                     </button>
                   </span>
-                  {w.errors[id] ? (
+                  {ending === h.id ? (
+                    <ConfirmGroup label={`End the hold on ${h.scope_label}?`} onClose={() => setEnding(null)}
+                      back={() => endBtns.current[h.id] ?? addBtn.current}>
+                      <span>
+                        End the hold on {h.scope_label} now? Conversations stop seeing it on their next prompt. It
+                        stays in Recent changes.
+                      </span>
+                      <WriteError w={w} id={id} />
+                      <div className="toolbar">
+                        <button type="button" className="sm danger" disabled={w.isBusy(id)}
+                          onClick={() => {
+                            // Once this hold ends, focus goes to the next
+                            // hold's End now, else the one before, else Add
+                            // hold (Codex review, finding 2).
+                            const from = holds;
+                            void w.run(id, "khipu_route_hold_end", { id: h.id }, null, () => {
+                              const usable = (j: number) => {
+                                const b = endBtns.current[from[j].id];
+                                return b?.isConnected ? b : null;
+                              };
+                              for (let j = i + 1; j < from.length; j++) if (usable(j)) return usable(j);
+                              for (let j = i - 1; j >= 0; j--) if (usable(j)) return usable(j);
+                              return addBtn.current;
+                            }).then((ok) => { if (ok) setEnding(null); });
+                          }}>
+                          <Busy on={w.isBusy(id)} />
+                          End the hold
+                        </button>
+                        <button type="button" className="sm link" onClick={() => setEnding(null)}>
+                          Keep it
+                        </button>
+                      </div>
+                    </ConfirmGroup>
+                  ) : w.errors[id] ? (
                     <div className="route-pause">
                       <WriteError w={w} id={id} />
                     </div>
@@ -2740,6 +3127,22 @@ function TellingSection({
             {SIZES.map((r) => (
               <LimitRow key={r.name} name={r.name} help={r.help} fields={r.fields} join={r.join} cfg={cfg} w={w} reread={reread} />
             ))}
+          </div>
+          <div className="opt-list">
+            <SwitchRow
+              id="route-proposal-text"
+              label="Share proposal words between your Macs"
+              what="A conversation's proposed words travel between your Macs, so you can confirm them anywhere. Off, they stay on the Mac they came from until you confirm them there. They never go to cloud agents."
+              tag={<Tag>Between your Macs</Tag>}
+              checked={cfg?.routing?.routing_proposal_text_between_macs?.value !== false}
+              disabled={!cfg || w.anyBusy}
+              read={cfgRead}
+              busy={w.isBusy("proposal-text")}
+              onChange={(next) =>
+                void w.run("proposal-text", "khipu_config_set", { key: "routing_proposal_text_between_macs", value: next ? "on" : "off" }, reread)
+              }
+              error={<WriteError w={w} id="proposal-text" />}
+            />
           </div>
         </SubFold>
         {oldSet.length ? (
@@ -4040,7 +4443,12 @@ export function RoutingSettings({
     ) : (
       unread
     ),
-    holds: data ? <HoldsSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} /> : unread,
+    holds: data ? (
+      <>
+        <ProposalsSection data={data} w={w} now={now} />
+        <HoldsSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
+      </>
+    ) : unread,
     checks: data ? (
       <ChecksSection data={data} now={now} folds={folds} />
     ) : route.error ? (

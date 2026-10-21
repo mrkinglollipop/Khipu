@@ -70,6 +70,9 @@ export type RouteAccount = {
 
 export type RouteHold = {
   id: string;
+  entity?: string;
+  revision?: string;
+  scope?: { kind?: string; account?: string };
   scope_label: string;
   reason: string;
   text?: string | null;
@@ -88,6 +91,9 @@ export type RouteRule = {
   entity?: string;
   seeded?: boolean;
   confirmed?: boolean;
+  owner_revision?: string;
+  /** Its live proposal's words are not shared on this Mac. */
+  proposal_withheld?: boolean;
   /** A live conversation request awaiting the owner's reconfirmation. */
   pending?: boolean;
   pending_kind?: "added" | "changed" | null;
@@ -225,6 +231,7 @@ export type RoutePriority = {
   pending?: boolean;
   confirmed?: boolean;
   pending_by?: string | null;
+  proposal_withheld?: boolean;
   owner_request?: string | null;
   replaced?: { entries: RoutePriorityEntry[]; until?: string | null } | null;
   /** The priority as read; a write that carries it is refused once it moved. */
@@ -303,7 +310,25 @@ export type RouteProvider = {
   use?: string;
 };
 
+/** One conversation proposal on an entity (slice 5), as `khipu route
+ *  --json` keeps it: which entity, its standing beside the owner's newest
+ *  revision (`base`), its author, and how it ended when it is not live. */
+export type RouteProposal = {
+  id: string;
+  entity: string;
+  kind: "rule" | "priority" | string;
+  base?: string | null;
+  author?: RouteAuthor;
+  written_by?: RouteAuthor;
+  at?: string | null;
+  n?: number | null;
+  status: "live" | "replaced" | "crossed" | "overtaken" | "dismissed" | "expired" | "confirmed" | "undone" | string;
+  replaced_by?: string | null;
+  ended_at?: string | null;
+};
+
 export type RouteView = {
+  proposals?: Record<string, RouteProposal>;
   definitions?: { providers?: Record<string, RouteProvider>; accounts?: Record<string, unknown> };
   record?: boolean;
   version?: number;

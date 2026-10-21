@@ -816,6 +816,8 @@ describe("Settings -> Routing: holds", () => {
     expect(hold).toHaveTextContent("No new launches while the Mac is busy (load over 75)");
     expect(hold).toHaveTextContent("Machine busy · set by a Claude Code conversation in project-a at 9:40 AM · ends tomorrow 9:40 AM");
     fireEvent.click(screen.getByRole("button", { name: "End the hold on this Mac" }));
+    expect(calls("khipu_route_hold_end")).toEqual([]);
+    fireEvent.click(within(await screen.findByRole("group", { name: "End the hold on this Mac?" })).getByRole("button", { name: "End the hold" }));
     await waitFor(() => expect(calls("khipu_route_hold_end")).toEqual([{ id: "h1" }]));
   });
 
@@ -1549,8 +1551,10 @@ describe("Settings -> Routing: focus after a button removes itself (R2-2)", () =
     const first = await screen.findByRole("button", { name: "End the hold on this Mac" });
     first.focus();
     fireEvent.click(first);
+    fireEvent.click(within(await screen.findByRole("group", { name: "End the hold on this Mac?" })).getByRole("button", { name: "End the hold" }));
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "End the hold on all work" })));
     fireEvent.click(screen.getByRole("button", { name: "End the hold on all work" }));
+    fireEvent.click(within(await screen.findByRole("group", { name: "End the hold on all work?" })).getByRole("button", { name: "End the hold" }));
     await waitFor(() => expect(screen.queryByRole("button", { name: "End the hold on all work" })).toBeNull());
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Add hold" })));
   });
