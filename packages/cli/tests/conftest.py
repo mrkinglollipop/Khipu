@@ -169,6 +169,26 @@ def _forget_hub_unreachable_memo():
 
 
 @pytest.fixture(autouse=True)
+def _reset_read_role_and_query_cache_queue():
+    # The read DSN, its provisioning memo, the in-process query vectors and the
+    # cache-write queue all outlive a test in the shared test data dir.
+    from khipu import query_cache_queue, read_role
+
+    def _clear():
+        query_cache_queue._MEMORY.clear()
+        read_role.invalidate_cache()
+        for where in (query_cache_queue.queue_file, read_role._memo_file):
+            try:
+                where().unlink()
+            except Exception:  # noqa: BLE001
+                pass
+
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_project_for_cwd_cache():
     # Same reason as above: a per-process cache that is right in a one-shot
     # hook and wrong between tests that fake different projects for one path.

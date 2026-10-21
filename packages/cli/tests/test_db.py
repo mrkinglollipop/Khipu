@@ -13,7 +13,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from khipu import db
+from khipu import db, read_role
 
 _CLEAR = {
     "KHIPU_DATABASE_URL": "",
@@ -136,6 +136,7 @@ class ConnectTest(unittest.TestCase):
             "postgres://x",
             autocommit=True,
             connect_timeout=db.CONNECT_TIMEOUT_SECONDS,
+            application_name=read_role.application_name("owner"),
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,

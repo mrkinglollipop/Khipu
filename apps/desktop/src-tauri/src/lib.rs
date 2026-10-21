@@ -920,6 +920,14 @@ const ROUTING_DURATION_KEYS: &[&str] = &[
 /// save of an ordinary setting (no `--from-app`). Mirrors
 /// `offline.SETTINGS` in the CLI.
 const OFFLINE_DURATION_KEYS: &[&str] = &["hub_statement_timeout", "hub_dead_connection_after", "app_cli_timeout"];
+/// The hub's search role (swarm-ready A): whole numbers of 0 or more, an
+/// ordinary save the CLI applies on the hub before storing. Mirrors
+/// `read_role.SETTINGS` in the CLI.
+const READ_ROLE_KEYS: &[&str] = &[
+    "read_role_connection_limit",
+    "read_role_statement_timeout",
+    "read_role_idle_in_transaction_timeout",
+];
 /// Whole numbers of 0 or more.
 const ROUTING_COUNT_KEYS: &[&str] = &[
     "routing_summary_chars",
@@ -1423,6 +1431,7 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
         k if REPLICA_DURATION_KEYS.contains(&k) => Ok(set(k, replica_setting_value(k, value)?)),
         k if OFFLINE_DURATION_KEYS.contains(&k) => Ok(set(k, routing_setting_value(k, value)?)),
+        k if READ_ROLE_KEYS.contains(&k) => Ok(set(k, parse_daily_calls(k, value)?)),
         k if storage_key(k) => Ok(set(k, storage_setting_value(k, value)?)),
         k if work_key(k) => Ok(set(k, work_setting_value(k, value)?)),
         _ => Err(format!("not a settable key: {key:?}")),
@@ -1458,6 +1467,7 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
         && !routing_key(key)
         && !REPLICA_DURATION_KEYS.contains(&key)
         && !OFFLINE_DURATION_KEYS.contains(&key)
+        && !READ_ROLE_KEYS.contains(&key)
         && !storage_key(key)
         && !work_key(key)
         && !by_profile
@@ -6220,6 +6230,25 @@ mod settings_command_tests {
         }
         assert!(!cli_has_no_time_limit(&v(&["owed", "--envelope"])));
         assert!(!cli_has_no_time_limit(&v(&["db", "status"])));
+    }
+
+    #[test]
+    fn the_read_role_settings_are_ordinary_settings() {
+        for key in READ_ROLE_KEYS {
+            assert_eq!(config_set_argv(key, "20").unwrap(), v(&["config", "--set", key, "20"]));
+            assert_eq!(config_set_argv(key, "0").unwrap(), v(&["config", "--set", key, "0"]));
+            assert_eq!(config_unset_argv(key).unwrap(), v(&["config", &format!("--unset={key}")]));
+            assert!(config_set_argv(key, "-1").is_err());
+            assert!(config_set_argv(key, "1.5").is_err());
+            assert!(config_set_argv_expect(key, "5", Some("v1")).is_err());
+        }
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/cli/khipu/read_role.py"),
+        ).unwrap();
+        let settings = src.split("SETTINGS: dict").nth(1).unwrap().split("\n}").next().unwrap();
+        for k in READ_ROLE_KEYS {
+            assert!(settings.contains(&format!("\"{k}\":")), "{k} missing from read_role.SETTINGS");
+        }
     }
 
     #[test]

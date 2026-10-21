@@ -32,7 +32,7 @@ import type { RouteView } from "./routing";
 import { fmtAge, fmtAgo, fmtAgoSince, fmtClock } from "./time";
 import { plural, shortProject, timeOnly } from "./work";
 
-export type HealthRowStatus = "ok" | "err" | "skipped";
+export type HealthRowStatus = "ok" | "warn" | "err" | "skipped";
 
 export type HealthRow = {
   /** The `*_ok` field name this row renders, e.g. "hub_ok". */
@@ -69,6 +69,7 @@ const LABELS: Record<string, string> = {
   recall_probe_ok: "Memory round trip works",
   bundle_seal_ok: "App bundle intact",
   schema_migrations_ok: "Database has every update this version expects",
+  read_role_ok: "Searches keep clear of captures",
   // Phase 6 (honesty): per-nightly-step evidence (D1), instead of trusting
   // only the legacy driver's exit code.
   notes_reconcile_ok: "Notes reconciled by the nightly",
@@ -284,6 +285,12 @@ function detailFor(key: string, parsed: Record<string, unknown>): string | undef
     const ds = parsed.disk_space as { level?: string; message?: string } | undefined;
     return ds?.level === "amber" && ds.message ? ds.message : undefined;
   }
+  if (key === "read_role_ok") {
+    const rr = parsed.read_role as { warnings?: unknown; error?: unknown } | undefined;
+    const words = Array.isArray(rr?.warnings) ? rr!.warnings.filter((w): w is string => typeof w === "string") : [];
+    if (typeof rr?.error === "string") words.push(`Could not check: ${rr.error}`);
+    return words.length ? words.join(" ") : undefined;
+  }
   if (key === "prompt_recall_snapshot_ok") {
     const prs = parsed.prompt_recall_snapshot as { level?: string; message?: string } | undefined;
     return prs?.level === "amber" && prs.message ? prs.message : undefined;
@@ -445,6 +452,9 @@ export function healthRows(
     if (isNotConfigured(key, notConfigured)) {
       return { key, status: "skipped", label, ...extra };
     }
+    if (key === "read_role_ok" && parsed[key] && (parsed.read_role as { level?: unknown } | undefined)?.level === "amber") {
+      return { key, status: "warn", label, ...extra };
+    }
     return { key, status: parsed[key] ? "ok" : "err", label, ...extra };
   });
   const plansRow = plansHealthRow(plans);
@@ -456,8 +466,9 @@ export function healthRows(
 
   const statusRank: Record<HealthRowStatus, number> = {
     err: 0,
-    skipped: 1,
-    ok: 2,
+    warn: 1,
+    skipped: 2,
+    ok: 3,
   };
   const orderIndex = (key: string) => {
     const i = ORDER.indexOf(key);
@@ -538,6 +549,15 @@ export function HealthReportRows({
               <Check size={16} strokeWidth={1.75} aria-hidden className="ok" />
               <span className="row-main">{row.label}</span>
               {text ? <span className="row-meta wrap">{text}</span> : null}
+            </div>
+          );
+        }
+        if (row.status === "warn") {
+          return (
+            <div key={row.key} className="row-item">
+              <TriangleAlert size={16} strokeWidth={1.75} aria-hidden className="warn" />
+              <span className="row-main">{row.label}</span>
+              {row.detail ? <span className="row-meta wrap">{row.detail}</span> : null}
             </div>
           );
         }

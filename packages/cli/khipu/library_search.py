@@ -600,7 +600,8 @@ def get(ident: str) -> dict[str, Any]:
     name, doc, idx = parse_id(ident)
     from khipu.db import connect
 
-    with connect() as conn:
+    from khipu.db import read_connection
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT d.id, d.source, d.rel_path, d.title, d.author, d.tags, d.bytes,"

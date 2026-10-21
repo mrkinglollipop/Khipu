@@ -530,6 +530,13 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                         pass
                 out["replayed"] += 1
                 _log(f"replayed {jp.name} (inserted={stats.get('episode_inserted')})")
+        # Query vectors search queued instead of writing on its read connection.
+        if not out.get("stopped_early"):
+            from khipu import query_cache_queue
+
+            flushed = query_cache_queue.flush_on_owner()
+            if flushed.get("put") or flushed.get("hit") or flushed.get("error"):
+                out["query_cache"] = flushed
         return out
     finally:
         os.close(fd)

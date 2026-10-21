@@ -625,16 +625,28 @@ def _query_cache_available(cur) -> bool:
 
 def _query_vec(cur, conn, profile: str, api_q: str) -> tuple[list[float], str]:
     """Query vector through memory_query_cache. Returns (vec, state) where
-    state is ``hit`` (no API call), ``miss`` (embedded and stored) or ``off``
-    (hub not migrated; embedded, nothing stored). Cache failures never fail
-    the search — they roll back and fall through to the API."""
+    state is ``hit`` (no API call), ``miss`` (embedded and queued for the
+    cache) or ``off`` (hub not migrated; embedded, nothing stored). Cache
+    failures never fail the search — they roll back and fall through to the
+    API.
+
+    Nothing is written on ``conn``: search runs as the read role. A new
+    vector is kept in this process and queued, and a hit queues its usage
+    bump; ``outbox.drain`` writes both on an owner connection
+    (``query_cache_queue``)."""
+    from khipu import query_cache_queue
+
     api_q = _sanitize_provider_text(api_q)
+    qh = _query_hash(profile, api_q)
+    kept = query_cache_queue.remembered(profile, qh)
+    if kept is not None:
+        query_cache_queue.queue_hit(profile, qh)
+        return kept, "hit"
     try:
         have_cache = _query_cache_available(cur)
     except Exception:  # noqa: BLE001
         conn.rollback()
         have_cache = False
-    qh = _query_hash(profile, api_q)
     if have_cache:
         try:
             cur.execute(
@@ -649,12 +661,8 @@ def _query_vec(cur, conn, profile: str, api_q: str) -> tuple[list[float], str]:
                 except (RuntimeError, TypeError, ValueError):
                     _log("query cache row invalid; replacing from provider")
                 else:
-                    cur.execute(
-                        "UPDATE memory_query_cache SET last_used_at = now(), hits = hits + 1"
-                        " WHERE profile = %s AND query_hash = %s",
-                        (profile, qh),
-                    )
-                    conn.commit()
+                    query_cache_queue.remember(profile, qh, cached)
+                    query_cache_queue.queue_hit(profile, qh)
                     return cached, "hit"
         except Exception as exc:  # noqa: BLE001
             conn.rollback()
@@ -667,18 +675,8 @@ def _query_vec(cur, conn, profile: str, api_q: str) -> tuple[list[float], str]:
     )
     if not have_cache:
         return vec, "off"
-    try:
-        cur.execute(
-            "INSERT INTO memory_query_cache (profile, query_hash, embedding)"
-            " VALUES (%s, %s, %s::vector)"
-            " ON CONFLICT (profile, query_hash) DO UPDATE"
-            " SET embedding = EXCLUDED.embedding, last_used_at = now()",
-            (profile, qh, _vec_literal(vec)),
-        )
-        conn.commit()
-    except Exception as exc:  # noqa: BLE001
-        conn.rollback()
-        _log(f"query cache write skipped: {type(exc).__name__}")
+    query_cache_queue.remember(profile, qh, vec)
+    query_cache_queue.queue_put(profile, qh, vec)
     return vec, "miss"
 
 
@@ -2161,7 +2159,8 @@ def _cosine_candidates(
     if not query:
         return []
     fetch = max(1, min(int(limit), 200))
-    with connect() as conn:
+    from khipu.db import read_connection
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             profile = _active_profile(cur)
             # W2.3 fix: metadata filters ride the candidate SQL, so the
@@ -2760,7 +2759,8 @@ class _LibraryLegs:
             from khipu import library_search as _ls
             from khipu.hub_snapshot import try_hub_connect
 
-            with try_hub_connect() as conn:
+            from khipu.db import read_connection
+            with read_connection(try_hub_connect) as conn:
                 self._conn = conn
                 with conn.cursor() as cur:
                     self._result = _ls.library_candidates(
@@ -2959,7 +2959,8 @@ def hybrid_search(
                 degraded = "no-embedding"
             timing["embed_error"] = msg[:120]
 
-    with try_hub_connect() as conn:
+    from khipu.db import read_connection
+    with read_connection(try_hub_connect) as conn:
         with conn.cursor() as cur:
             literal_rows: list[dict[str, Any]] = []
             if mode in ("hybrid", "literal") and kind != LIBRARY_KIND:

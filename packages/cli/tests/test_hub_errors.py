@@ -56,6 +56,7 @@ _WORDS = ("connect", "timeout", "timed out", "refused", "operational", "unreacha
 # Modules allowed a match of their own: module -> why.
 OWN_MATCH = {
     "hub_errors.py": "the rule itself",
+    "read_role.py": "spots a full read role (a hub that answered), which must never read as offline",
     "setup.py": "turns a connection test's error into advice for the owner; classifies nothing as offline",
     "join_pair.py": "the pairing socket between two Macs, not the hub",
     "join.py": "explains a database address that could not be parsed; classifies nothing as offline",

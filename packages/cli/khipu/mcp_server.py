@@ -1233,7 +1233,8 @@ def _tool_graph(args: dict) -> dict:
     )
 
     try:
-        with try_hub_connect() as conn:
+        from khipu.db import read_connection
+        with read_connection(try_hub_connect) as conn:
             with conn.cursor() as cur:
                 return _graph_query(cur, node_id, hops, limit)
     except Exception as exc:
@@ -1270,10 +1271,10 @@ def _tool_status_light(args: dict) -> dict:
 
     def _probe() -> None:
         try:
-            from khipu.db import connect
+            from khipu.db import connect, read_connection
             from khipu.notes import notes_freshness
 
-            with connect() as conn:
+            with read_connection(connect) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
                     cur.fetchone()
@@ -1655,7 +1656,8 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     project = args.get("project") or None
     hub_now = None
     try:
-        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+        from khipu.db import read_connection
+        with read_connection(connect, statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
             with conn.cursor() as cur:
                 rows = commitments.fetch_owed_rows(cur, project=project, status=status)
                 if hub_ages:
@@ -1893,7 +1895,8 @@ def _owed_owners_items(ids: list[int]) -> list[int] | None:
     from khipu.hub_snapshot import hub_connection_failed
 
     try:
-        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+        from khipu.db import read_connection
+        with read_connection(connect, statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
             with conn.cursor() as cur:
                 rows = commitments.owners_of(cur, ids)
     except Exception as exc:  # noqa: BLE001
@@ -2108,7 +2111,8 @@ def _tool_decisions(args: dict) -> dict:
     from khipu.hub_snapshot import hub_connection_failed
 
     try:
-        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+        from khipu.db import read_connection
+        with read_connection(connect, statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
             with conn.cursor() as cur:
                 if status == "conflicts":
                     results = _decisions.list_links(cur, state="candidate", project=project, limit=limit)
@@ -2239,7 +2243,8 @@ def _tool_brief(args: dict) -> dict:
         return {"available": False, "reason": briefs.REASON_SWITCH_OFF}
     from khipu.db import connect
 
-    with connect() as conn:
+    from khipu.db import read_connection
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             return briefs.read_brief(cur, topic)
 

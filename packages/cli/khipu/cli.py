@@ -958,6 +958,18 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         work_block = _work.doctor_block()
     except Exception as e:  # noqa: BLE001  (a failed check must not crash doctor)
         work_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    # The search role (swarm-ready A): whether this Mac searches as
+    # khipu_read, the role's settings, and clients still searching as the
+    # owner. Warns; never gates `ok`.
+    if hub_ok:
+        try:
+            from khipu import read_role as _read_role
+
+            read_role_block = _read_role.doctor_block()
+        except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
+            read_role_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    else:
+        read_role_block = {"warnings": [], "state": "unknown", "error": "the hub is not reachable"}
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -1010,13 +1022,21 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "ledger": ledger_block,
         "schema_migrations": schema,
         "work": work_block,
+        "read_role": read_role_block,
+        # Its own row in the app: red while this Mac cannot use the search role
+        # or another client searches as the owner; amber (true, with the fix)
+        # on a hub that cannot host one. Never gates `ok` or a promotion.
+        **({"read_role_ok": (read_role_block.get("state") in ("read", "cannot_host")
+                             and not read_role_block.get("error")
+                             and not read_role_block.get("owner_searchers"))} if hub_ok else {}),
         "promotion": _promotion_block(),
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
                      + list(owner_direction_block.get("warnings") or [])
                      + list(owner_actions_log_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
-                     + list(schema.get("warnings") or []) + _disk_space_warnings(local)
+                     + list(schema.get("warnings") or []) + list(read_role_block.get("warnings") or [])
+                     + _disk_space_warnings(local)
                      + _replica_schema_warnings(local)),
         "not_configured": not_configured,
         "ok": (
@@ -2136,7 +2156,7 @@ def cmd_graph(args: argparse.Namespace) -> int:
     )
 
     try:
-        with try_hub_connect() as conn:
+        with try_hub_connect(role="read") as conn:
             with conn.cursor() as cur:
                 out = _graph_query(cur, args.id, args.hops, args.limit)
     except Exception as exc:
@@ -2679,7 +2699,9 @@ def cmd_decisions(args: argparse.Namespace) -> int:
         status = "retracted"
     elif getattr(args, "all", False):
         status = "all"
-    with connect() as conn:
+    from khipu.db import read_connection
+
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             rows = _decisions.list_decisions(
                 cur, project=getattr(args, "project", None), since=since_dt,
@@ -3648,6 +3670,19 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps({"ok": True, key: _offline.settings_status()[key], "config_file": str(path)}))
         return 0
+    from khipu import read_role as _read_role
+
+    if (args.set and args.set[0] in _read_role.SETTINGS) or args.unset in _read_role.SETTINGS:
+        # The hub's search role: saved only once the hub took it (ALTER ROLE
+        # through the owner connection); 0 lifts the limit.
+        key = args.set[0] if args.set else args.unset
+        try:
+            path = _read_role.set_setting(key, args.set[1] if args.set else None)
+        except ValueError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        print(json.dumps({"ok": True, key: _read_role.settings_status(read_hub=True)[key], "config_file": str(path)}))
+        return 0
     from khipu import routing as _routing
 
     if isinstance(getattr(args, "answer_request", None), (list, tuple)):
@@ -3836,6 +3871,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "work": _work.settings_status(),
         "work_suggested": _work.suggested_files(),
         "offline": _offline.settings_status(),
+        "read_role": _read_role.settings_status(read_hub=True),
         "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
         "config": load_config(),

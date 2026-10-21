@@ -32,6 +32,11 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
             hub_dead_connection_after: { value: 60, default: 60, kind: "duration", source: "default", words: "How soon a hub connection that went silent (a network change) is given up (0: wait for the system)" },
             app_cli_timeout: { value: 45, default: 60, kind: "duration", source: "file", words: "Longest the app waits for one Khipu answer before it shows the hub as not reachable (0: no limit)" },
           },
+          read_role: {
+            read_role_connection_limit: { value: 20, default: 20, kind: "count", source: "default", words: "Most hub connections searches may hold at once, across every Mac and the gateway (0: no limit)" },
+            read_role_statement_timeout: { value: 30, default: 30, kind: "duration", source: "default", words: "Longest one search statement may run on the hub, in seconds (0: no limit)" },
+            read_role_idle_in_transaction_timeout: { value: 60, default: 60, kind: "duration", source: "default", words: "How soon the hub closes a search connection left idle in a transaction, in seconds (0: no limit)" },
+          },
         };
       case "khipu_usage_status":
       case "khipu_usage_refresh":

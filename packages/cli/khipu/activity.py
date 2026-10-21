@@ -64,7 +64,9 @@ def _recent_rows(cur, limit: int) -> list[dict]:
 
 
 def recent_episodes(*, limit: int = 40) -> list[dict]:
-    with connect() as conn:
+    from khipu.db import read_connection
+
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             return _recent_rows(cur, limit)
 
@@ -75,7 +77,8 @@ def episode_detail(episode_id: int) -> dict | None:
     forgotten episode in full), gated on ``episodes.deleted_at`` being
     present so a pre-migration hub keeps its old behavior instead of every
     lookup failing."""
-    with connect() as conn:
+    from khipu.db import read_connection
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             from khipu.db import has_columns
 
@@ -121,7 +124,8 @@ def topic_detail(slug: str, *, offset: int = 0,
     if not slug:
         return None
     offset, max_bytes = page_args(offset, max_bytes)
-    with connect() as conn:
+    from khipu.db import read_connection
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -158,7 +162,8 @@ def media_detail(asset_id: str) -> dict | None:
     asset_id = (asset_id or "").strip()
     if not asset_id:
         return None
-    with connect() as conn:
+    from khipu.db import read_connection
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT to_regclass('public.media_assets') IS NOT NULL")
             if not cur.fetchone()[0]:
@@ -186,7 +191,9 @@ def media_detail(asset_id: str) -> dict | None:
 
 
 def activity_payload(*, limit: int = 40) -> dict:
-    with connect() as conn:
+    from khipu.db import read_connection
+
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM episodes {_live_where(cur)}")
             n = int(cur.fetchone()[0])
@@ -352,7 +359,9 @@ def project_slice(
     episodes: list[dict[str, Any]] = []
     topics: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
-    with connect() as conn:
+    from khipu.db import read_connection
+
+    with read_connection(connect) as conn:
         with conn.cursor() as cur:
             if project:
                 # O3: a snoozed row (due_after in the future) is parked — it

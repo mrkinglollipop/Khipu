@@ -11,6 +11,7 @@ import {
   HubAwayCard,
   OfflineWaitsCard,
   PathOverridesCard,
+  SearchRoleCard,
   ReplicaCopyCard,
 } from "../SettingsControls";
 
@@ -495,6 +496,52 @@ describe("ReplicaCopyCard", () => {
     fireEvent.submit(every.closest("form")!);
     expect(await screen.findByRole("alert")).toHaveTextContent(/whole number of minutes, 1 or more/);
     expect(calls.some(([cmd]) => cmd === "khipu_config_set")).toBe(false);
+  });
+});
+
+describe("SearchRoleCard", () => {
+  const role = (value: number, def: number, source = "default") => ({
+    value, default: def, kind: "count", source, words: "Most hub connections searches may hold at once",
+  });
+
+  it("renders the three role settings and saves one through khipu_config_set", async () => {
+    config = {
+      ...config,
+      read_role: {
+        read_role_connection_limit: role(12, 20, "file"),
+        read_role_statement_timeout: role(30, 30),
+        read_role_idle_in_transaction_timeout: role(60, 60),
+      },
+    };
+    render(<SearchRoleCard active />);
+    const limit = (await screen.findByLabelText("Most hub connections searches may hold")) as HTMLInputElement;
+    await waitFor(() => expect(limit.value).toBe("12"));
+    expect(screen.getByLabelText("Longest one search may run on the hub (seconds)")).toBeInTheDocument();
+    expect(screen.getByLabelText("Close a search connection left idle after (seconds)")).toBeInTheDocument();
+    fireEvent.change(limit, { target: { value: "0" } });
+    fireEvent.click(limit.closest("form")!.querySelector("button[type=submit]")!);
+    await waitFor(() =>
+      expect(calls).toContainEqual(["khipu_config_set", { key: "read_role_connection_limit", value: "0" }]),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+    await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "read_role_connection_limit" }]));
+  });
+
+  it("says when the hub could not be read and the value is this Mac's saved one", async () => {
+    config = { ...config, read_role: { read_role_connection_limit: { ...role(20, 20), on_hub: false } } };
+    render(<SearchRoleCard active />);
+    expect(await screen.findByText(/The hub could not be read, so this is this Mac's saved value/)).toBeInTheDocument();
+  });
+
+  it("refuses a value that is not a whole number without calling the CLI", async () => {
+    config = { ...config, read_role: { read_role_connection_limit: role(20, 20) } };
+    render(<SearchRoleCard active />);
+    const limit = (await screen.findByLabelText("Most hub connections searches may hold")) as HTMLInputElement;
+    await waitFor(() => expect(limit.value).toBe("20"));
+    fireEvent.change(limit, { target: { value: "-3" } });
+    fireEvent.click(limit.closest("form")!.querySelector("button[type=submit]")!);
+    expect(await screen.findByRole("alert")).toHaveTextContent("whole number of connections");
+    expect(calls.some(([c]) => c === "khipu_config_set")).toBe(false);
   });
 });
 

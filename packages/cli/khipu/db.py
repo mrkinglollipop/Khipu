@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import threading
+from contextvars import ContextVar
 from pathlib import Path
 
 import psycopg
@@ -122,28 +123,141 @@ def _with_statement_timeout(conninfo: str, seconds: float) -> str:
     return make_conninfo(**params)
 
 
-def connect(*, autocommit: bool = False, statement_timeout_s: float | None = None):
+# The role the next connect() takes when its caller names none. Set only for
+# the length of one connect call by ``read_connection``, so nothing opened
+# later in the same block (a write) inherits it.
+_ROLE: ContextVar[str] = ContextVar("khipu_connect_role", default="owner")
+
+
+def current_role() -> str:
+    return _ROLE.get()
+
+
+def read_connection(opener, **kwargs):
+    """``opener(**kwargs)`` (``connect``, or the replica module's hub
+    connect) as the search role. The opener is passed in so a test's stand-in for it
+    still intercepts the call."""
+    token = _ROLE.set("read")
+    try:
+        return opener(**kwargs)
+    finally:
+        _ROLE.reset(token)
+
+
+def connect(*, autocommit: bool = False, statement_timeout_s: float | None = None,
+            role: str | None = None, connect_timeout: float | None = None):
     """Bound connection setup; SQL timeouts belong to the operation's caller
-    (``statement_timeout_s`` is how a caller asks for one)."""
-    conninfo = conninfo_with_local_root_cert(resolve_dsn())
+    (``statement_timeout_s`` is how a caller asks for one).
+
+    ``role="read"`` is for search and the other read tools: it connects as the
+    hub's ``khipu_read`` role (``read_role``) with the password derived from
+    the owner DSN, setting the role up when the hub refuses it. It connects
+    as the owner, labelled ``owner-read``, only on a hub confirmed unable to
+    host a read role. A full role, a refused password that could not be
+    repaired, a failed provisioning or a role with rights beyond search
+    raises (``read_role.ReadRoleUnavailable`` for the last three) and never
+    takes an owner connection. An isolated run never sets the role up: it
+    uses the derived password or fails. Captures and every other
+    write keep the default owner role."""
+    role = role or _ROLE.get()
+    owner_dsn = resolve_dsn()
+    timeout = CONNECT_TIMEOUT_SECONDS if connect_timeout is None else connect_timeout
+    if role == "read":
+        return _connect_read(owner_dsn, autocommit=autocommit, statement_timeout_s=statement_timeout_s,
+                             connect_timeout=timeout)
+    if role != "owner":
+        raise ValueError(f"unknown connection role {role!r}")
+    return _open(owner_dsn, "owner", autocommit=autocommit, statement_timeout_s=statement_timeout_s,
+                 connect_timeout=timeout)
+
+
+def _open(dsn: str, label: str, *, autocommit: bool, statement_timeout_s: float | None,
+          connect_timeout: float):
+    from khipu import hub_reach, read_role
+
+    conninfo = conninfo_with_local_root_cert(dsn)
     if statement_timeout_s is not None and statement_timeout_s > 0:
         conninfo = _with_statement_timeout(conninfo, statement_timeout_s)
-    from khipu import hub_reach
-
     # A failed connect writes the hub-down memo and a success clears it, so the
-    # prompt hook and the search tools skip a connect they know will fail.
+    # prompt hook and the search tools skip a connect they know will fail. A
+    # full read role is a hub that answered, not an outage.
     try:
         conn = psycopg.connect(
             conninfo,
             autocommit=autocommit,
-            connect_timeout=CONNECT_TIMEOUT_SECONDS,
+            connect_timeout=connect_timeout,
+            application_name=read_role.application_name(label),
             **_keepalive_kwargs(),
         )
     except psycopg.OperationalError as exc:
-        hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
+        if not read_role.role_limit_error(exc):
+            hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
         raise
     hub_reach.note_reachable()
     return conn
+
+
+def _connect_read(owner_dsn: str, **kw):
+    import os
+
+    from khipu import read_role
+    from khipu.paths import isolated_dir
+
+    from_env = bool((os.environ.get(read_role.READ_DSN_ENV) or "").strip())
+    if not from_env and read_role.cannot_host(owner_dsn):
+        conn = _open(owner_dsn, "owner-read", **kw)
+        read_role.recheck_capability(conn, owner_dsn)
+        return conn
+    read = read_role.read_conninfo(owner_dsn)
+    try:
+        conn = _open(read, "read", **kw)
+    except psycopg.OperationalError as exc:
+        if not read_role.auth_error(exc):
+            raise
+        refusal: BaseException = exc
+    else:
+        try:
+            if read_role.check_connection(conn, owner_dsn):
+                return conn
+        except BaseException:
+            conn.close()
+            raise
+        conn.close()
+        refusal = read_role.ReadRoleUnavailable(f"{read_role.READ_ROLE} has no grants on this database")
+    read_role.forget_validated(owner_dsn)
+    if from_env:
+        raise read_role.ReadRoleUnavailable(
+            f"the hub refused {read_role.READ_DSN_ENV} ({type(refusal).__name__})") from refusal
+    if isolated_dir() is not None:
+        # Never writes: a confirmed hub without a read role is the one case
+        # that shares the owner's connections.
+        with _open(owner_dsn, "owner", **kw) as probe:
+            if read_role.confirmed_cannot_host(probe):
+                return _open(owner_dsn, "owner-read", **kw)
+        raise read_role.ReadRoleUnavailable(
+            f"the hub refused the search role and an isolated run never sets it up ({type(refusal).__name__})"
+        ) from refusal
+    # Not forced: a provisioning that failed recently answers at once rather
+    # than take an owner connection on every search.
+    if not read_role.provision(owner_dsn=owner_dsn):
+        return _open(owner_dsn, "owner-read", **kw)
+    try:
+        conn = _open(read, "read", **kw)
+    except psycopg.OperationalError as again:
+        if not read_role.auth_error(again):
+            raise
+        read_role.note_failure(owner_dsn, "the hub refused the derived password right after it was set")
+        raise read_role.ReadRoleUnavailable(
+            f"the hub refused the search role's password after it was set ({type(again).__name__})"
+        ) from again
+    try:
+        if read_role.check_connection(conn, owner_dsn):
+            return conn
+    except BaseException:
+        conn.close()
+        raise
+    conn.close()
+    raise read_role.ReadRoleUnavailable(f"{read_role.READ_ROLE} still has no grants on this database after setup")
 
 
 def dsn_configured() -> bool:

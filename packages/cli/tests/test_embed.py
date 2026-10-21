@@ -321,6 +321,7 @@ class SemanticSearchRankFetchWiringTest(unittest.TestCase):
         # AttributeError when the real khipu.db never imported).
         fake_db = ModuleType("khipu.db")
         fake_db.connect = lambda: FakeConn()
+        fake_db.read_connection = lambda opener, **kw: opener(**kw)
         with mock.patch.dict(sys.modules, {"khipu.db": fake_db}), mock.patch.object(
             em, "embed_one", return_value=[0.0] * em.DIM
         ), mock.patch.object(em, "_active_profile", return_value=em.PROFILE_2):
@@ -1499,8 +1500,10 @@ class QueryVectorCacheTest(unittest.TestCase):
         b = em._query_hash("p1", prefix + "gateway budget prompt about the deploy pipeline zulu")
         self.assertNotEqual(a, b)
 
-    def test_hit_skips_the_api_and_bumps_usage(self):
+    def test_hit_skips_the_api_and_queues_the_usage_bump(self):
         from unittest import mock
+
+        from khipu import query_cache_queue
 
         vec = [1.0] + [0.0] * (em.DIM - 1)
         cur = _FakeCur(table=True, cached=json.dumps(vec))
@@ -1509,8 +1512,11 @@ class QueryVectorCacheTest(unittest.TestCase):
             out, state = em._query_vec(cur, conn, em.PROFILE_2, "q")
         self.assertEqual(state, "hit")
         self.assertEqual(out, vec)
-        self.assertTrue(any(s.lstrip().startswith("UPDATE memory_query_cache") for s in cur.executed))
-        self.assertEqual(conn.commits, 1)
+        # Search runs as the read role: the bump is queued, never written here.
+        self.assertFalse(any(s.lstrip().startswith(("UPDATE", "INSERT")) for s in cur.executed))
+        self.assertEqual(conn.commits, 0)
+        queued = [json.loads(line) for line in query_cache_queue.queue_file().read_text().splitlines()]
+        self.assertEqual([q["op"] for q in queued], ["hit"])
 
     def test_miss_embeds_once_and_stores(self):
         from unittest import mock
@@ -1523,7 +1529,15 @@ class QueryVectorCacheTest(unittest.TestCase):
         self.assertEqual(state, "miss")
         self.assertEqual(out, vec)
         m.assert_called_once()
-        self.assertTrue(any(s.lstrip().startswith("INSERT INTO memory_query_cache") for s in cur.executed))
+        from khipu import query_cache_queue
+
+        self.assertFalse(any(s.lstrip().startswith(("UPDATE", "INSERT")) for s in cur.executed))
+        queued = [json.loads(line) for line in query_cache_queue.queue_file().read_text().splitlines()]
+        self.assertEqual([(q["op"], q["vec"]) for q in queued], [("put", vec)])
+        # The next identical query in this process needs neither the hub nor the API.
+        with mock.patch.object(em, "embed_one", side_effect=AssertionError("kept in process")):
+            again, state = em._query_vec(_FakeCur(table=True, cached=None), conn, em.PROFILE_2, "q")
+        self.assertEqual((again, state), (vec, "hit"))
 
     def test_unmigrated_hub_embeds_directly(self):
         from unittest import mock
@@ -1535,21 +1549,21 @@ class QueryVectorCacheTest(unittest.TestCase):
         self.assertEqual(state, "off")
         self.assertFalse(any("memory_query_cache" in s and "to_regclass" not in s for s in cur.executed))
 
-    def test_cache_write_failure_never_fails_the_search(self):
+    def test_a_read_only_connection_never_fails_the_search(self):
         from unittest import mock
 
-        class BrokenWriteCur(_FakeCur):
+        class ReadOnlyCur(_FakeCur):
             def execute(self, sql, params=None):
-                if sql.lstrip().startswith("INSERT"):
-                    raise RuntimeError("permission denied")
+                if sql.lstrip().startswith(("INSERT", "UPDATE")):
+                    raise RuntimeError("cannot execute INSERT in a read-only transaction")
                 super().execute(sql, params)
 
-        cur = BrokenWriteCur(table=True)
+        cur = ReadOnlyCur(table=True)
         conn = _FakeConn()
         with mock.patch.object(em, "embed_one", return_value=[0.1] * em.DIM):
             _out, state = em._query_vec(cur, conn, em.PROFILE_2, "q")
         self.assertEqual(state, "miss")
-        self.assertEqual(conn.rollbacks, 1)
+        self.assertEqual((conn.commits, conn.rollbacks), (0, 0))
 
 
 class SearchConfidenceTest(unittest.TestCase):

@@ -41,7 +41,13 @@ NOT_CAPTURE = {
                      "recall_prompt._session_lock", "routing._lock", "session_capture._beat_lock",
                      "session_capture._capture_now_lock", "session_capture._claim_lock",
                      "usage._open_lock", "discover._try_lock", "config.config_write_lock",
-                     "accounts._declined_lock", "signin._lock", "work._view_lock"), _LOCKS),
+                     "accounts._declined_lock", "signin._lock", "work._view_lock",
+                     "query_cache_queue._locked"), _LOCKS),
+    # The search role (swarm-ready slice 2): query-vector cache rows waiting for the
+    # drain, and this Mac's read DSN and its provisioning memo. No capture text.
+    "query_cache_queue._append": "query-vector cache rows waiting for the drain: profile, md5 of the query, "
+                                 "vector; never query text",
+    "read_role._write_memo": "when the read role was last provisioned or why it failed; no capture text",
     # Account discovery (9A): which login folders exist and when they were checked,
     # and a throwaway folder a status check runs in. Folder names and counts only.
     "identity.observe_checkout": "per checkout key: its root commit; a hash and the key, no capture text",

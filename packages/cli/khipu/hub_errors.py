@@ -23,6 +23,11 @@ _CONNECTION_CLASSES = frozenset({
     "ConnectionResetError", "ConnectionAbortedError", "BrokenPipeError", "TimeoutError", "timeout",
     "gaierror", "herror",
 })
+# The hub answered, but this client's search role cannot be used now
+# (khipu.read_role.ReadRoleUnavailable). Search answers it as it answers an
+# outage, from this Mac's copy, because the alternative, the owner role,
+# would take connections saves need.
+_SEARCH_ROLE_CLASSES = frozenset({"ReadRoleUnavailable"})
 # Words a wrapped connection failure carries in its message.
 _CONNECTION_PHRASES = (
     "could not connect", "connection refused", "connection timed out", "connection timeout",
@@ -44,6 +49,8 @@ def unreachable_text(text: str | None) -> bool:
     words = str(text).partition(":")[0].split()
     name = words[-1] if words else ""
     lowered = str(text).lower()
+    if name in _SEARCH_ROLE_CLASSES:
+        return True
     if any(p in lowered for p in _ANSWERED_PHRASES):
         return False
     return name in _CONNECTION_CLASSES or any(p in lowered for p in _CONNECTION_PHRASES)

@@ -51,7 +51,7 @@ HUB_PROBE_TIMEOUT_S = 3
 GATE_IGNORE_KEY = "promote_gate_ignore"
 OVERRIDE_TTL_S = 24 * 60 * 60
 # Never part of the doctor step's red list (gate_doctor skips them).
-_DOCTOR_NOT_GATED = ("jobs_ok", "synth_provider_ok")
+_DOCTOR_NOT_GATED = ("jobs_ok", "synth_provider_ok", "read_role_ok")
 # launchd starts a job with this PATH and nothing else (no plist sets one).
 LAUNCHD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 RECALL_BUDGET_MS = 1200.0

@@ -2666,7 +2666,8 @@ def _hub_hits_budgeted(
             from khipu.cli import _literal_candidates
             from khipu.search_text import token_hit_count
 
-            with connect() as conn:
+            from khipu.db import read_connection
+            with read_connection(connect) as conn:
                 with conn.cursor() as cur:
                     # fast=True (2026-09-15): index-scan-bounded columns only
                     # (episodes.summary; topics.title/body) and never queries
@@ -2769,7 +2770,8 @@ def _hub_hits_budgeted(
             from khipu.db import connect
             from khipu.decisions import enrich_search_results as _enrich_decisions
 
-            with connect() as conn:
+            from khipu.db import read_connection
+            with read_connection(connect) as conn:
                 with conn.cursor() as cur2:
                     enriched = _enrich_decisions(cur2, fused)
             enriched_episodes = [r for r in enriched if r.get("kind") == "episode"]
@@ -3066,7 +3068,8 @@ def _thread_memory_hits(thread: str, *, progress: dict | None = None) -> list[di
     except Exception:  # noqa: BLE001 — old/missing replicas cannot block the hub leg
         pass
     try:
-        with hub_snapshot.try_hub_connect() as conn:
+        from khipu.db import read_connection
+        with read_connection(hub_snapshot.try_hub_connect) as conn:
             with conn.cursor() as cur:
                 cur.execute("SET TRANSACTION READ ONLY")
                 cur.execute("SET LOCAL statement_timeout = '1000ms'")
@@ -3378,10 +3381,10 @@ def _deliverable_context_line(tokens: list[str], *, cwd: str | None,
 
         if hub_reach.known_unreachable() is not None:
             return ""
-        from khipu.db import connect
+        from khipu.db import connect, read_connection
         from khipu import deliverables as _deliverables
 
-        with connect() as conn:
+        with read_connection(connect) as conn:
             with conn.cursor() as cur:
                 return _deliverables.deliverable_line_for_prompt(
                     cur, tokens, project=project
