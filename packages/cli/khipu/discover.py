@@ -319,6 +319,26 @@ def _load_store() -> dict:
     return data
 
 
+def _load_store_strict() -> dict:
+    """``_load_store`` for a completeness boundary: a store that is there
+    but unreadable, unparseable or malformed raises, rather than reading
+    as an empty store. No store file at all is a legitimate empty store."""
+    if not os.path.lexists(store_file()):
+        return {"version": STORE_VERSION, "candidates": {}}
+    with _data_state() as dfd:
+        text = _read_at(dfd, STORE_NAME)
+    if text is None:
+        raise ValueError("discovery store is unreadable")
+    data = json.loads(text)
+    if not isinstance(data, dict) or data.get("version") != STORE_VERSION:
+        raise ValueError("discovery store has an unknown shape")
+    if not isinstance(data.get("candidates"), dict):
+        raise ValueError("discovery store has no candidate table")
+    if any(not _well_formed(k, v) for k, v in data["candidates"].items()):
+        raise ValueError("discovery store holds a malformed candidate")
+    return data
+
+
 def _well_formed(cid, rec) -> bool:
     """A stored candidate every reader can use as is: a hand-edited or
     half-written entry is dropped, never a crash on the Looking… path."""

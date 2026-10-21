@@ -609,7 +609,6 @@ def test_6_local_routing_errors_are_already_scrubbed(replay):
     assert str(replay.root) not in json.dumps(body)
 
 
-@future("7", "unidentified callers receive untracked delivery and consume no changes")
 def test_6_no_identity_consumes_nothing(replay):
     routing.add_rule("synthetic owner rule", via="app")
     before = routing.events_file().read_bytes()
@@ -622,7 +621,6 @@ def test_6_no_identity_consumes_nothing(replay):
 
 @pytest.mark.parametrize("protocol", ["dropped-response", "duplicate-ack", "foreign-component", "foreign-identity",
                                      "same-component", "cross-component", "provider-switch", "error-result"])
-@future("7", "MCP results need owned batches, ack replay, attachment capability and scrubbed additions")
 def test_6_pull_protocol(replay, monkeypatch, protocol):
     monkeypatch.setenv("CODEX_THREAD_ID", "s1")
     if protocol == "provider-switch":

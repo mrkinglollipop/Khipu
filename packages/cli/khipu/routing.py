@@ -785,12 +785,11 @@ def _cut_paths(words: str) -> str:
 
 
 def _for_agents(value, view: dict | None = None):
-    """``value`` as an agent may read it (``agent_view.scrub``): the owner's
-    note and standing rules in ``view`` pass as he wrote them."""
+    """Project using this view's owner words, with credentials removed."""
     from khipu import agent_view
 
     keys = [a.get("key") for a in (view or {}).get("accounts") or [] if isinstance(a, dict)] if view else None
-    return agent_view.scrub(value, keep=agent_view.keep_owner_words(view), extra_keys=keys)
+    return agent_view.scrub_strict(value, keep=agent_view.keep_owner_words(view), extra_keys=keys)
 
 
 def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime:
@@ -1203,6 +1202,25 @@ def conversation_author(environ: dict | None = None, cwd: str | None = None, nam
 
 def _author_sessions(by: dict) -> set[str]:
     return {by[k] for k in ("session", "provider_session") if by.get(k)}
+
+
+def _session_forms(session: str | None) -> set[str]:
+    """The forms one conversation identity takes across the two slices:
+    the raw harness-native id an author is recorded with, its canonical
+    ``claude:``/``codex:`` form, and a shared id as itself. A pull
+    namespace id is never an author's: authors come from the environment,
+    and a pull caller names its own id. Forms of other conversations are
+    never added."""
+    if not session:
+        return set()
+    forms = {session}
+    if session.startswith("pull\0"):
+        return forms
+    if session.startswith(("claude:", "codex:")):
+        forms.add(session.split(":", 1)[1])
+    else:
+        forms.update(("claude:" + session, "codex:" + session))
+    return forms
 
 
 OWNER = {"kind": "owner"}
@@ -6926,16 +6944,17 @@ def _replacement_notices(view: dict, now: datetime, session: str | None) -> list
         by = item.get("notify") or item.get("author") or {}
         # Only the author's session owes delivery. Missing or departed
         # sessions cannot force work or text into other conversations.
-        if session not in _author_sessions(by):
+        authors = set().union(*(_session_forms(ident) for ident in _author_sessions(by))) if _author_sessions(by) else set()
+        if not (_session_forms(session) & authors):
             continue
         ended = _parse(item.get("ended_at") or item.get("at"))
         if ended is None or now >= ended + timedelta(days=7):
             continue
-        for ident in _author_sessions(by):
+        for ident in authors:
             if ident not in receipts:
                 receipts[ident] = set(recall_prompt.routing_marker(ident).get("notices") or {})
                 receipts[ident].update(routing_delivery.notice_receipts(ident))
-        if any(item["id"] in receipts[ident] for ident in _author_sessions(by)):
+        if any(item["id"] in receipts[ident] for ident in authors):
             continue
         who = author_words(by, push=True)
         if item.get("kind") == "priority":
@@ -7721,7 +7740,8 @@ def _public_proposals(view: dict, *, session: str | None = None) -> list[dict]:
     out = []
     for item in (view.get("proposals") or {}).values():
         told = item.get("notify") or item.get("author")
-        if item.get("status") in ("replaced", "crossed") and (not session or session not in _author_sessions(told or {})):
+        authors = set().union(*(_session_forms(ident) for ident in _author_sessions(told or {}))) if _author_sessions(told or {}) else set()
+        if item.get("status") in ("replaced", "crossed") and (not session or not (_session_forms(session) & authors)):
             continue
         out.append({"id": item.get("id"), "kind": item.get("kind"), "entity": item.get("entity"),
                     "status": item.get("status"), "base": item.get("base"), "at": item.get("at"), "rule": item.get("n"),
@@ -7814,15 +7834,16 @@ def _for_a_conversation():
 
 
 def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
-                      lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+                      lock_wait: float | None = CONVERSATION_LOCK_BUDGET, view: dict | None = None) -> dict:
     """What MCP ``khipu_route`` answers (``_conversation_view``), read
     waiting at most ``lock_wait`` seconds for the routing lock (an unsaved
     fold after that)."""
     with _for_a_conversation(), lock_budget(lock_wait):
-        return _conversation_view(since_version=since_version, account=account, now=now)
+        return _conversation_view(since_version=since_version, account=account, now=now, view=view)
 
 
-def _conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None) -> dict:
+def _conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
+                       view: dict | None = None) -> dict:
     """What MCP ``khipu_route`` answers, built field by field from the view
     (see the note above ``account_id``). With ``since_version`` (V or
     EPOCH:V) the current state of everything that changed after it, as
@@ -7832,7 +7853,7 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     words, each account's evidence line and the name a conversation gave
     itself."""
     now = now or _now()
-    view = read_view(now)
+    view = read_view(now) if view is None else view
     key = None
     if account:
         key = _account_for_a_conversation(account, accounts() + list(view.get("accounts") or []))
@@ -7840,6 +7861,10 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
         version, epoch = _parse_since(since_version)
         out = since(version, view, now=now, epoch=epoch)
         pairs = list(zip(out["entities"], out["lines"]))
+        from khipu import agent_view
+
+        if not agent_view.login_inventory_available():
+            pairs = [(e, line) for e, line in pairs if not e.startswith("lane:")]
         if key is not None:
             mine = {f"account:{key}"} | {f"hold:{i}" for i in _holds_on(key, view)}
             pairs = [(e, line) for e, line in pairs
@@ -7863,9 +7888,12 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     out["holds"] = [_public_hold(h, now) for h in view.get("holds") or []
                     if key is None or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
     if key is None:
-        out["unmatched"] = [dict(_pick(u, _LANE_FIELDS), line=lane_line(u, now),
-                                 candidates=[account_id(k) for k in u.get("candidates") or []])
-                            for u in view.get("unmatched") or []]
+        from khipu import agent_view
+
+        out["unmatched"] = ([dict(_pick(u, _LANE_FIELDS), line=lane_line(u, now),
+                                  candidates=[account_id(k) for k in u.get("candidates") or []])
+                             for u in view.get("unmatched") or []]
+                            if agent_view.login_inventory_available() else [])
         out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
                                if r.get("silent") or r.get("unreadable")]
     out["about"] = ABOUT
