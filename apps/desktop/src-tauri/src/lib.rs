@@ -944,6 +944,7 @@ const ROUTING_SWITCH_KEYS: &[&str] = &[
     "routing_push_delegation",
     "routing_reset_check",
     "routing_pace_order",
+    "routing_proposal_text_between_macs",
 ];
 /// The owner's own dispatch scripts, by file name (phase 6).
 const ROUTING_DISPATCH_SCRIPTS_KEY: &str = "routing_dispatch_scripts";
@@ -1841,11 +1842,35 @@ fn route_operation_argv(mut argv: Vec<String>, op: Option<&str>) -> Result<Vec<S
     Ok(argv)
 }
 
+/// The end-or-keep choices for the holds and pauses a write names, as
+/// `--holds={"id":"end"|"keep"}`: the same checked map the priority command
+/// takes, joined to its flag so no id can become an argument of its own.
+fn checked_holds_arg(holds: &serde_json::Map<String, Value>) -> Result<String, String> {
+    if holds.len() > ROUTE_PRIORITY_MOST || holds.iter().any(|(id, choice)| {
+        id.trim().is_empty() || id.len() > 256 || !matches!(choice.as_str(), Some("end" | "keep"))
+    }) {
+        return Err("holds must map each hold id to end or keep".to_string());
+    }
+    Ok(format!("--holds={}", Value::Object(holds.clone())))
+}
+
 fn route_rule_argv(action: &str, n: Option<u32>, text: Option<&str>) -> Result<Vec<String>, String> {
+    route_rule_argv_holds(action, n, text, None)
+}
+
+fn route_rule_argv_holds(
+    action: &str,
+    n: Option<u32>,
+    text: Option<&str>,
+    holds: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<String>, String> {
     if !ROUTE_RULE_ACTIONS.contains(&action) {
         return Err(format!("not a rule change: {action:?}"));
     }
     let mut argv = route_base("rule");
+    if let Some(holds) = holds {
+        argv.push(checked_holds_arg(holds)?);
+    }
     argv.extend(["--".to_string(), action.to_string()]);
     if action != "add" {
         let n = n.filter(|n| *n >= 1).ok_or_else(|| "name the rule's number".to_string())?;
@@ -1946,12 +1971,7 @@ fn route_priority_argv_expect(
     }
     let mut argv = route_base("priority");
     if let Some(holds) = holds {
-        if holds.len() > ROUTE_PRIORITY_MOST || holds.iter().any(|(id, choice)| {
-            id.trim().is_empty() || id.len() > 256 || !matches!(choice.as_str(), Some("end" | "keep"))
-        }) {
-            return Err("holds must map each hold id to end or keep".to_string());
-        }
-        argv.push(format!("--holds={}", Value::Object(holds.clone())));
+        argv.push(checked_holds_arg(holds)?);
     }
     if action == "set" {
         if entries.is_empty() {
@@ -2516,8 +2536,14 @@ async fn khipu_route_note_end(op: Option<String>) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn khipu_route_rule(action: String, n: Option<u32>, text: Option<String>, op: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(route_operation_argv(route_rule_argv(&action, n, text.as_deref())?, op.as_deref())?).await
+async fn khipu_route_rule(
+    action: String,
+    n: Option<u32>,
+    text: Option<String>,
+    holds: Option<serde_json::Map<String, Value>>,
+    op: Option<String>,
+) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_rule_argv_holds(&action, n, text.as_deref(), holds.as_ref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
@@ -5741,6 +5767,13 @@ mod settings_command_tests {
                 v(&["route", "rule", "--from-app", "--", action, "6"])
             );
         }
+        let holds = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("end")))]);
+        assert_eq!(
+            route_rule_argv_holds("confirm", Some(6), None, Some(&holds)).unwrap(),
+            v(&["route", "rule", "--from-app", "--holds={\"h-grok\":\"end\"}", "--", "confirm", "6"])
+        );
+        let bad = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("drop")))]);
+        assert!(route_rule_argv_holds("confirm", Some(6), None, Some(&bad)).is_err());
         assert_eq!(
             route_hold_add_argv("No new launches", "machine-busy", "machine", None, None).unwrap(),
             v(&["route", "hold", "--from-app", "--reason=machine-busy", "--machine", "--", "No new launches"])
