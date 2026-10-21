@@ -268,6 +268,8 @@ def test_routing_words_without_source_provenance_are_kept_not_incomplete(isolate
         "replication temp": (routing.routing_dir(), ".replication-random"),
         "title pending": (session_capture.state_dir(), "title-pending--synthetic.json"),
         "title cache": (session_capture.state_dir(), "title-cache--synthetic.json"),
+        "title cache temp": (session_capture.state_dir(), ".title-cache--synthetic.json.tmp1"),
+        "title pending temp": (session_capture.state_dir(), ".title-pending--synthetic.json.tmp1"),
     }[store]
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / name
