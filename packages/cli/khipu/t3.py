@@ -63,6 +63,14 @@ def handoff_thread(text: str) -> str | None:
 # table scan. Older rows fall back to the native identity, as a miss did
 # before. When T3 (or a future schema) indexes the native id expression,
 # that index is used instead and the whole table is in reach again.
+#
+# Fallback window (no ``rowid``): on a WITHOUT ROWID table (or any schema
+# where the rowid query errors naming rowid) the lookup retries with the
+# newest ``_LOOKUP_WINDOW`` rows by ``updated_at`` (a plain LIMITed scan of
+# the first ``_LOOKUP_WINDOW`` stored rows when ``updated_at`` is also
+# unavailable). The window is the same size, so a row older than the newest
+# 1024 by that ordering can still miss; the retry exists so a schema
+# without rowid does not silently miss every row inside the window.
 _LOOKUP_WINDOW = 1024
 
 
@@ -82,18 +90,47 @@ def _distinct_threads(rows) -> str | None:
     return threads[0] if threads else None
 
 
-def thread_for_session(sid: str) -> str | None:
-    """A bounded read of T3's provider projection; failures mean no mapping.
+def _fallback_window_rows(con, sid: str):
+    """Bounded lookup for tables with no usable ``rowid``.
 
-    The connection timeout matches T3's WAL contract, but the busy handler
-    and VM deadline are tighter so a locked or large DB cannot stall a hook.
-    The query never evaluates the JSON payload outside a bounded newest
-    window (or an index on the native id, when one exists), and it returns
-    None when the native id names more than one distinct thread.
+    Tries the newest ``_LOOKUP_WINDOW`` rows by ``updated_at`` first, then
+    a plain LIMITed scan of the first ``_LOOKUP_WINDOW`` stored rows when
+    that ordering is unavailable. Raises ``sqlite3.Error`` when neither
+    bounded query can run, so the caller reports a failure, not a miss.
+    """
+    guarded = ("WHERE CASE WHEN json_valid(payload_json) THEN "
+               "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ?")
+    try:
+        return con.execute(
+            "SELECT thread_id FROM ("
+            "SELECT thread_id, payload_json FROM orchestration_v2_projection_provider_threads "
+            f"ORDER BY updated_at DESC LIMIT ?) {guarded}",
+            (_LOOKUP_WINDOW, sid),
+        ).fetchall()
+    except sqlite3.Error:
+        return con.execute(
+            "SELECT thread_id FROM ("
+            "SELECT thread_id, payload_json FROM orchestration_v2_projection_provider_threads "
+            f"LIMIT ?) {guarded}",
+            (_LOOKUP_WINDOW, sid),
+        ).fetchall()
+
+
+def thread_for_session_result(sid: str) -> tuple[str | None, bool]:
+    """``(thread, definitive)`` for a native session id.
+
+    ``definitive`` is True only when a query actually completed: a row was
+    found (``thread`` set, or None when the completed query matched rows
+    naming more than one distinct thread), or a successful query matched
+    zero rows. A missing database, a lock or timeout, an interrupted or
+    otherwise failing query is ``(None, False)`` — a failure, not a miss —
+    so callers must not treat it as a settled negative answer.
     """
     if not sid:
-        return None
+        return None, True
     path = Path(os.environ.get("KHIPU_T3_DB") or Path.home() / ".t3/userdata/statev2.sqlite")
+    if not path.is_file():
+        return None, False
     con = None
     try:
         # With T3 closed there is no -wal file, and even a mode=ro open of a
@@ -119,23 +156,43 @@ def thread_for_session(sid: str) -> str | None:
                     "WHERE json_extract(payload_json, '$.nativeThreadRef.nativeId') = ? "
                     "LIMIT 2", (sid,),
                 ).fetchall()
-                return _distinct_threads(rows)
+                return _distinct_threads(rows), True
             except sqlite3.Error:
                 pass
-        rows = con.execute(
-            "SELECT thread_id FROM ("
-            "SELECT thread_id, payload_json FROM orchestration_v2_projection_provider_threads "
-            "ORDER BY rowid DESC LIMIT ?) "
-            "WHERE CASE WHEN json_valid(payload_json) THEN "
-            "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ?",
-            (_LOOKUP_WINDOW, sid),
-        ).fetchall()
-        return _distinct_threads(rows)
+        try:
+            rows = con.execute(
+                "SELECT thread_id FROM ("
+                "SELECT thread_id, payload_json FROM orchestration_v2_projection_provider_threads "
+                "ORDER BY rowid DESC LIMIT ?) "
+                "WHERE CASE WHEN json_valid(payload_json) THEN "
+                "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ?",
+                (_LOOKUP_WINDOW, sid),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            if "rowid" not in str(exc).lower():
+                raise
+            rows = _fallback_window_rows(con, sid)
+        return _distinct_threads(rows), True
     except (OSError, ValueError, sqlite3.Error):
-        return None
+        return None, False
     finally:
         if con is not None:
             con.close()
+
+
+def thread_for_session(sid: str) -> str | None:
+    """A bounded read of T3's provider projection; failures mean no mapping.
+
+    The connection timeout matches T3's WAL contract, but the busy handler
+    and VM deadline are tighter so a locked or large DB cannot stall a hook.
+    The query never evaluates the JSON payload outside a bounded newest
+    window (or an index on the native id, when one exists), and it returns
+    None when the native id names more than one distinct thread. Callers
+    that must tell a settled miss from a failed lookup (and so must not
+    settle anything on a failure) use ``thread_for_session_result``.
+    """
+    thread, _definitive = thread_for_session_result(sid)
+    return thread
 
 
 def _thread_db_path(home: Path | None = None) -> Path:
@@ -532,9 +589,15 @@ def _is_khipu_hook_command(command: str) -> bool:
             index += 1
         if index < len(tokens) and tokens[index] == "-c":
             return False  # a shell string, not a direct hook exec
-    if index >= len(tokens):
-        return False
-    return Path(tokens[index]).name in _KHIPU_HOOK_NAMES
+    if index < len(tokens) and Path(tokens[index]).name in _KHIPU_HOOK_NAMES:
+        return True
+    # A quoted or unquoted absolute path with spaces, standing alone as the
+    # whole command, tokenizes into pieces above; accept it when the path
+    # itself ends in a Khipu hook name. A mention inside a larger command
+    # (`echo /opt/.../khipu-stop-hook`) is not a hook exec and stays False.
+    trimmed = command.strip().strip("\"'").strip()
+    return any(trimmed == name or trimmed.endswith("/" + name)
+               for name in _KHIPU_HOOK_NAMES) and trimmed.startswith("/")
 
 
 def claude_instances(settings_file: Path) -> list[dict[str, Any]]:

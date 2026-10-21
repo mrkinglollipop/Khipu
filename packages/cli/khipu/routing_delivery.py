@@ -495,46 +495,118 @@ def _t3_pin_path(bare):
 
 _T3_PIN_CACHE: dict = {}
 
+# Pins settle one session's identity, not a permanent record: a pin older
+# than this is dropped and the session is looked up again, and at most this
+# many pin files are kept (oldest first out). A hook on a machine with no
+# T3 database never writes one at all (see ``_t3_root``: a missing database
+# is a lookup failure, and failures are not pinned).
+_T3_PIN_TTL_S = 30 * 24 * 3600
+_T3_PIN_MAX = 128
+
+
+def _pin_timestamp(raw, path):
+    stamps = []
+    if isinstance(raw, dict):
+        for field in ("ts", "created_at", "pinned_at"):
+            value = raw.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                stamps.append(float(value))
+    try:
+        stamps.append(path.stat().st_mtime)
+    except OSError:
+        pass
+    return min(stamps) if stamps else None
+
+
+def _pin_expired(stamp, now=None):
+    return stamp is not None and (time.time() if now is None else now) - stamp > _T3_PIN_TTL_S
+
+
+def _drop_pin(path, key=None):
+    _T3_PIN_CACHE.pop(key if key is not None else str(path), None)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _prune_t3_pins(directory):
+    """Drop expired pin files and keep at most ``_T3_PIN_MAX`` of the rest."""
+    try:
+        paths = list(directory.glob("t3-pin--*.json"))
+    except OSError:
+        return
+    now = time.time()
+    survivors = []
+    for path in paths:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if _pin_expired(mtime, now):
+            _drop_pin(path)
+        else:
+            survivors.append((mtime, path))
+    survivors.sort()
+    while len(survivors) >= _T3_PIN_MAX:
+        _drop_pin(survivors.pop(0)[1])
+
 
 def _pinned_t3_root(bare):
-    """The first T3 answer for this native session, pinned on disk.
+    """The first definitive T3 answer for this native session, pinned on disk.
 
     Returns ``(root, pinned)``: ``root`` is the pinned ``t3:<thread>`` (or
     None for a pinned native identity) and ``pinned`` says whether a pin
     was read. T3 can project its session row after the session's first
     hook fires; without a pin the session would start on its native
     ledger and later flip to the thread ledger, splitting deliveries
-    across both. The first answer therefore wins for the whole session,
-    whichever way it went. A native session id names one session, so a
+    across both. The first definitive answer therefore wins for the whole
+    session, whichever way it went. A native session id names one session, so a
     pin keyed by it cannot leak into a different conversation (a reused
     id that T3 maps to two threads resolves to no mapping at lookup
-    time, and that negative answer is what gets pinned).
+    time, and that negative answer is what gets pinned). An expired pin
+    (see ``_T3_PIN_TTL_S``) is dropped and reported as no pin.
     """
     # Keyed by pin path, not bare id alone: the path lives under the
     # current Khipu state dir, which a new home must not inherit.
-    key = str(_t3_pin_path(bare))
+    path = _t3_pin_path(bare)
+    key = str(path)
     if key in _T3_PIN_CACHE:
-        return _T3_PIN_CACHE[key], True
+        root, stamp = _T3_PIN_CACHE[key]
+        try:
+            stamp = min(stamp, path.stat().st_mtime)
+        except OSError:
+            pass
+        if _pin_expired(stamp):
+            _drop_pin(path, key)
+            return None, False
+        return root, True
     try:
-        raw = json.loads(_t3_pin_path(bare).read_text())
+        raw = json.loads(path.read_text())
     except (OSError, ValueError):
+        return None, False
+    stamp = _pin_timestamp(raw, path)
+    if _pin_expired(stamp):
+        _drop_pin(path, key)
         return None, False
     root = raw.get("root") if isinstance(raw, dict) else None
     root = root if isinstance(root, str) and root.startswith("t3:") else None
-    _T3_PIN_CACHE[key] = root
+    _T3_PIN_CACHE[key] = (root, stamp if stamp is not None else time.time())
     return root, True
 
 
 def _pin_t3_root(bare, root):
-    """Store the first answer; a racing hook's pin wins and is returned."""
+    """Store the first definitive answer; a racing hook's pin wins."""
     try:
         path = _t3_pin_path(bare)
         path.parent.mkdir(parents=True, exist_ok=True)
+        _prune_t3_pins(path.parent)
+        stamp = time.time()
         with open(path, "x", encoding="utf-8") as handle:
-            json.dump({"root": root}, handle)
+            json.dump({"root": root, "ts": stamp}, handle)
         if len(_T3_PIN_CACHE) > 512:
             _T3_PIN_CACHE.clear()
-        _T3_PIN_CACHE[str(path)] = root
+        _T3_PIN_CACHE[str(path)] = (root, stamp)
         return root
     except FileExistsError:
         pinned, found = _pinned_t3_root(bare)
@@ -550,9 +622,9 @@ def _t3_root(native):
     the agent no thread environment variable, so the canonical identity is
     derived from T3's own session-to-thread record. Fail-open and bounded
     (``thread_for_session`` has its own short deadline); a session T3 does
-    not know keeps its native identity. The first answer for a session is
-    pinned (see ``_pinned_t3_root``) so the identity cannot flip
-    mid-session."""
+    not know keeps its native identity. The first definitive answer for a
+    session is pinned (see ``_pinned_t3_root``) so the identity cannot flip
+    mid-session; a failed lookup is never pinned."""
     if not isinstance(native, str):
         return None
     bare = native.strip()
@@ -568,8 +640,13 @@ def _t3_root(native):
     try:
         from khipu import t3
 
-        thread = t3.thread_for_session(bare)
+        thread, definitive = t3.thread_for_session_result(bare)
     except Exception:  # noqa: BLE001 - identity derivation never breaks a hook
+        return None
+    if not definitive:
+        # A failure (DB missing, locked, timed out, query error) settles
+        # nothing: keep the native identity for this hook only and leave
+        # no pin, so a later hook retries the lookup.
         return None
     return _pin_t3_root(bare, f"t3:{thread}" if thread else None)
 

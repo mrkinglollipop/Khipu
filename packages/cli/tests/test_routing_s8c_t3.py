@@ -6,6 +6,7 @@ the brief advisory. Fake T3 database and temp HOME only; no real harness.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 
@@ -275,6 +276,84 @@ def test_first_identity_answer_is_pinned_for_the_session(tmp_path, monkeypatch):
     assert routing_delivery.canonical_identity(mapped_env)["root"] == f"t3:{THREAD}"
 
 
+# ---- fix round 2: N1 definitive vs failure, N2 rowid fallback, N3 pins ----
+
+
+def _pin_files():
+    return list(routing_delivery._t3_pin_path("probe").parent.glob("t3-pin--*.json"))
+
+
+def test_n1_transient_failure_is_not_pinned_and_a_later_hook_retries(tmp_path, monkeypatch):
+    missing = tmp_path / "missing.sqlite"
+    monkeypatch.setenv("KHIPU_T3_DB", str(missing))
+    env = {"CLAUDE_CODE_SESSION_ID": "f1"}
+    # DB unavailable at the first hook: a failure, not a settled miss.
+    assert t3.thread_for_session_result("f1") == (None, False)
+    assert t3.thread_for_session("f1") is None
+    assert routing_delivery.canonical_identity(env)["root"] == "claude:f1"
+    assert _pin_files() == []
+    # The DB is back, with a row: the next hook maps the session instead
+    # of staying stranded on the pin a failure never wrote.
+    _raw_db(tmp_path, monkeypatch, [_row(THREAD, "f1", "2026-10-21")])
+    assert t3.thread_for_session_result("f1") == (THREAD, True)
+    assert routing_delivery.canonical_identity(env)["root"] == f"t3:{THREAD}"
+
+
+def test_n1_query_error_is_a_failure_and_empty_db_is_a_definitive_miss(tmp_path, monkeypatch):
+    _raw_db(tmp_path, monkeypatch, [])
+    assert t3.thread_for_session_result("nobody") == (None, True)
+    broken = tmp_path / "broken.sqlite"
+    with sqlite3.connect(broken) as con:
+        con.execute("CREATE TABLE renamed (id TEXT)")
+    monkeypatch.setenv("KHIPU_T3_DB", str(broken))
+    assert t3.thread_for_session_result("nobody") == (None, False)
+    assert t3.thread_for_session("nobody") is None
+
+
+def test_n2_without_rowid_table_falls_back_to_a_bounded_query(tmp_path, monkeypatch):
+    path = tmp_path / "statev2.sqlite"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE orchestration_v2_projection_provider_threads "
+                "(thread_id TEXT PRIMARY KEY, payload_json TEXT, updated_at TEXT) WITHOUT ROWID")
+    con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?)",
+                _row(THREAD, "r1", "2026-10-21"))
+    con.commit()
+    con.close()
+    monkeypatch.setenv("KHIPU_T3_DB", str(path))
+    assert t3.thread_for_session("r1") == THREAD
+    assert t3.thread_for_session_result("r1") == (THREAD, True)
+    assert t3.thread_for_session_result("absent") == (None, True)
+
+
+def test_n3_no_pin_files_on_a_mac_with_no_t3_database(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(tmp_path / "missing.sqlite"))
+    for i in range(5):
+        identity = routing_delivery.canonical_identity({"CLAUDE_CODE_SESSION_ID": f"no-t3-{i}"})
+        assert identity["root"] == f"claude:no-t3-{i}"
+    assert _pin_files() == []
+
+
+def test_n3_pin_files_are_capped_and_expire(tmp_path, monkeypatch):
+    _raw_db(tmp_path, monkeypatch, [])
+    for i in range(routing_delivery._T3_PIN_MAX + 12):
+        routing_delivery.canonical_identity({"CLAUDE_CODE_SESSION_ID": f"capped-{i}"})
+    pins = _pin_files()
+    assert 0 < len(pins) <= routing_delivery._T3_PIN_MAX
+    # An expired pin no longer settles the session: the row that landed
+    # after the (now stale) native pin is honoured on the next lookup.
+    env = {"CLAUDE_CODE_SESSION_ID": "old-session"}
+    assert routing_delivery.canonical_identity(env)["root"] == "claude:old-session"
+    pin = routing_delivery._t3_pin_path("old-session")
+    assert pin.is_file()
+    stale = time.time() - routing_delivery._T3_PIN_TTL_S - 60
+    os.utime(pin, (stale, stale))
+    path = tmp_path / "statev2.sqlite"
+    with sqlite3.connect(path) as con:
+        con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?)",
+                    _row(THREAD, "old-session", "2026-10-21"))
+    assert routing_delivery.canonical_identity(env)["root"] == f"t3:{THREAD}"
+
+
 def _provider_with_command(tmp_path, command):
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir(parents=True, exist_ok=True)
@@ -286,10 +365,15 @@ def _provider_with_command(tmp_path, command):
 @pytest.mark.parametrize("command,expected", [
     ("echo not-a-khipu-hook", "missing"),
     ("echo khipu-recall-hook", "missing"),
+    ("echo /opt/khipu/bin/khipu-stop-hook", "missing"),
     ("khipu-recall-hook-extra", "missing"),
     ("khipu-recall-hook", "installed"),
     ("/opt/khipu/bin/khipu-prompt-recall", "installed"),
     ("env KHIPU_CAPTURE_QUEUE_ONLY=1 /opt/khipu/bin/khipu-stop-hook", "installed"),
+    # N4: a quoted or unquoted absolute path with spaces, standing alone.
+    ('"/Volumes/Cloud Storage/Code/Khipu/bin/khipu-stop-hook"', "installed"),
+    ("/Volumes/Cloud Storage/Code/Khipu/bin/khipu-stop-hook", "installed"),
+    ("'/Volumes/Cloud Storage/Code/Khipu/bin/khipu-recall-hook'", "installed"),
 ])
 def test_hook_detection_matches_actual_hook_command_names(tmp_path, command, expected):
     assert t3.provider_hooks(_provider_with_command(tmp_path, command), tmp_path) == expected
