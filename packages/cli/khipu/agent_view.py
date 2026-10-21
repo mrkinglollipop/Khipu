@@ -632,7 +632,8 @@ def prepare_routing_table(*, refresh=False) -> None:
             table = _rules(None)
             if _inventory_signature(None, sig[-1]) != inventory:
                 raise InventoryUnavailable()
-            _TABLE.update(helper_table=table, helper_sig=sig, helper_at=time.monotonic(), helper_wall_at=time.time())
+            _TABLE.update(helper_table=table, helper_sig=sig, helper_inventory=inventory,
+                          helper_at=time.monotonic(), helper_wall_at=time.time())
             return table
         finally:
             _FORM_CACHE.current = previous
@@ -658,7 +659,13 @@ def _prompt_table(keys):
     """Use the helper's complete table for at most two seconds.
 
     A completed 5 ms login probe can reject it earlier. An incomplete probe
-    cannot extend its lifetime or prevent use while it is fresh.
+    cannot extend its lifetime or prevent use while it is fresh, but the
+    full signature is not the only guard: it also walks non-login sources
+    that can stall, so the cheap inventory signature recorded with the
+    table is checked too. That check covers every alias input (config,
+    login-shaped home entries, and the stamps of known login paths,
+    symlink targets included), so a login change since the build withholds
+    routing even when the full probe does not finish in its window.
     """
     previous = _TABLE.get("helper_table")
     built_sig = _TABLE.get("helper_sig")
@@ -667,6 +674,14 @@ def _prompt_table(keys):
     sig = _bounded_inventory(lambda: _signature(keys), 0.005)
     if sig is not None and _login_signature(sig) != _login_signature(built_sig):
         raise InventoryUnavailable()
+    built_inventory = _TABLE.get("helper_inventory")
+    if built_inventory is not None:
+        # ~0.2 ms normally; 50 ms leaves room for a loaded Mac inside the
+        # prompt budget. Not finishing means the inputs can't be read, so
+        # withhold rather than trust the table.
+        inventory = _bounded_inventory(lambda: _inventory_signature(keys, built_sig[-1]), 0.05)
+        if inventory is None or inventory != built_inventory:
+            raise InventoryUnavailable()
     if not _helper_table_fresh():
         raise InventoryUnavailable()
     # Never inherit ended owner exemptions from the helper's older routing view.

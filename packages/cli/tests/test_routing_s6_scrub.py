@@ -98,7 +98,12 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
                 agent_view.os.listdir = stalled_volume
             original_write(fd, data)
 
-        if refresh in ("slow-signature", "one-shot", "cold-recovery") or (added and refresh != "fast-signature"):
+        # The fast case's probe takes a fixed 15 ms: past the prompt's 5 ms
+        # full-signature window on every run, not only under load, while the
+        # added login is already in place before the first prompt. Withholding
+        # therefore cannot depend on the full signature finishing in time.
+        if refresh in ("slow-signature", "fast-signature", "one-shot", "cold-recovery") \
+                or (added and refresh != "fast-signature"):
             agent_view._signature = slow_signature
         recall_prompt._write_all = write
         if refresh in ("cold-stalled-volume", "cold-recovery"):
@@ -204,6 +209,18 @@ def test_helper_table_expires_without_a_completed_prompt_signature(replay, monke
     assert agent_view._PROMPT_TABLE_MAX_AGE_S == 2 * recall_prompt._HELPER_TICK_S == 2.0
     built = agent_view._TABLE["helper_at"]
     built_sig = agent_view._TABLE["helper_sig"]
+
+    def stalled(_):
+        time.sleep(0.1)
+        pytest.fail("prompt signature exceeded its deadline")
+
+    # An incomplete probe may use the fresh table while nothing has changed.
+    real_signature = agent_view._signature
+    monkeypatch.setattr(agent_view, "_signature", stalled)
+    monkeypatch.setattr(agent_view.time, "monotonic", lambda: built + 1.99)
+    assert agent_view._prompt_table(()) is not None
+    assert agent_view._TABLE["helper_at"] == built
+    monkeypatch.setattr(agent_view, "_signature", real_signature)
     # A login appears immediately after the helper's last build.
     folder = Path(os.environ["HOME"]) / ".codex-NewLoginXYZ"
     folder.mkdir()
@@ -214,15 +231,12 @@ def test_helper_table_expires_without_a_completed_prompt_signature(replay, monke
     monkeypatch.setattr(agent_view, "_signature", lambda _: changed)
     with pytest.raises(agent_view.InventoryUnavailable):
         agent_view._prompt_table(())
-
-    def stalled(_):
-        time.sleep(0.1)
-        pytest.fail("prompt signature exceeded its deadline")
-
+    # An incomplete full probe cannot hide it either: the inventory
+    # recorded with the table no longer matches.
     monkeypatch.setattr(agent_view, "_signature", stalled)
     monkeypatch.setattr(agent_view.time, "monotonic", lambda: built + 1.99)
-    assert agent_view._prompt_table(()) is not None
-    assert agent_view._TABLE["helper_at"] == built
+    with pytest.raises(agent_view.InventoryUnavailable):
+        agent_view._prompt_table(())
     monkeypatch.setattr(agent_view.time, "monotonic", lambda: built + 2.001)
     with pytest.raises(agent_view.InventoryUnavailable):
         agent_view._prompt_table(())
