@@ -148,6 +148,24 @@ def test_explicit_other_login_is_not_merged_by_label(replay):
     assert {a["key"] for a in routing.accounts()} == {"codex|", "codex|/fake/other-login"}
 
 
+@pytest.mark.parametrize("owner_first", [True, False])
+def test_label_fallback_cannot_take_another_definitions_default_login(replay, owner_first):
+    replay.configure(usage_accounts=[{"harness": "codex", "label": "Codex"}])
+    replay.write({"type": "account_migration", "bindings": {"codex|": "codex:orig"},
+                  "aliases": {}, "written_by": {"kind": "migration"}})
+    definitions = [("codex:orig", "Codex Pro"), ("codex:other", "Codex")]
+    for ident, label in definitions if owner_first else reversed(definitions):
+        routing.set_definition("account", {"id": ident, "label": label, "provider": "codex"}, via="app")
+    assert {(a["key"], a["label"]) for a in routing.accounts()} == {
+        ("codex|", "Codex Pro"), ("codex:other", "Codex")}
+    assert routing._resolve_reported("codex:orig") == "codex|"
+    assert routing._resolve_reported("codex:other") == "codex:other"
+    routing.report(account="codex:orig", state="limited", until="2h", author=AUTHOR)
+    routing.report(account="codex:other", state="open", author=AUTHOR)
+    assert {(a["key"], a["label"], a["state"]) for a in replay.view()["accounts"]} == {
+        ("codex|", "Codex Pro", "limited"), ("codex:other", "Codex", "open")}
+
+
 def test_deepseek_runner_spend_reaches_its_account(replay):
     from tests.test_routing_s17t_telemetry import NOW, runner, spend
 

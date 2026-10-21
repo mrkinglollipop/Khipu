@@ -1009,6 +1009,8 @@ def _definition_accounts(known: list[dict], events: list[dict] | None = None, co
     ordered = ordered if ordered is not None else events if events_ordered else _in_write_order(events)
     ids, forwards, _aliases = account_identity.state(ordered, known)
     out = [dict(a) for a in known]
+    defined_ids = {account_identity.forwarded(ident, forwards) for ident in definitions["accounts"]}
+    assigned = {a["key"]: a.get("definition_id") for a in out}
     for ident, value in definitions["accounts"].items():
         current = account_identity.forwarded(ident, forwards)
         account = next((a for a in out if ids.get(a["key"]) == current), None)
@@ -1018,6 +1020,8 @@ def _definition_accounts(known: list[dict], events: list[dict] | None = None, co
             # providers also need matching names; explicit bindings win.
             matches = [a for a in known if a["harness"] == value["provider"]
                        and a["key"] == f"{value['provider']}|" and not a.get("home")
+                       and (ids.get(a["key"]) not in defined_ids or ids[a["key"]] == current)
+                       and assigned.get(a["key"]) in (None, current)
                        and (a["label"].casefold() == value["label"].casefold()
                             or value["provider"] in usage.NO_FOLDER)]
             definitions_for_login = [v for v in definitions["accounts"].values()
@@ -1037,6 +1041,7 @@ def _definition_accounts(known: list[dict], events: list[dict] | None = None, co
                 account = {"key": key, "home": home}
                 out.append(account)
         account.update(label=value["label"], harness=value["provider"], label_source="owner", definition_id=current)
+        assigned[account["key"]] = current
     if entry_cache is not None:
         entry_cache["overlays"][overlay_key] = tuple(dict(account) for account in out)
     return out
