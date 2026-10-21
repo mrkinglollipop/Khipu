@@ -33,7 +33,7 @@ from pathlib import Path
 
 # The scans forget runs, by the name a store gives.
 FORGET_SCANS = ("native jobs", "outbox", "legacy logs", "replica", "replica temps",
-                "legacy writers", "recall golden", "work view", "owner words")
+                "legacy writers", "recall golden", "work view", "owner words", "routing words")
 
 
 # The scrubs a restored file may go through, by the name an entry gives.
@@ -148,6 +148,13 @@ STORES: tuple[Store, ...] = (
           "each owner action with the owner's quoted words, and widenings waiting for a second turn",
           "owner words",
           _w("owner_direction._append", "owner_direction._log_locked", "owner_direction._write_private")),
+    Store("routing delivery words", "capture home state/recall--*.routing.json and their rewrite temps",
+          "cached routing rules, proposals and notices, including owner words", "routing words",
+          _w("routing_delivery._transaction")),
+    Store("routing replication words", "data folder state/routing/remote.jsonl and .replication-* rewrites",
+          "replicated routing rule, note and proposal text, including owner words; the same writer "
+          "also saves replication cursors and the Mac id", "routing words",
+          _w("routing_replication._atomic")),
     Store("conversation media", "data folder media/conversation_memory/<sha256>.<ext>",
           "images found in transcripts, shared by content hash",
           "kept: images are content-addressed and can belong to several episodes; a known "

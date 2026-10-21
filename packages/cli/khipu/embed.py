@@ -2613,7 +2613,11 @@ def _apply_search_filters(
             "FROM topics WHERE deleted_at IS NULL AND slug = ANY(%s)",
             (topic_ids,),
         )
-        for slug, ts, status, proj, note_type, superseded_by, routing_claim in cur.fetchall():
+        for row in cur.fetchall():
+            slug, ts, status, proj, note_type, superseded_by = row[:6]
+            # The advisory mark is additive; older metadata adapters return
+            # only the six source-validity fields. Absence is not a claim.
+            routing_claim = row[6] if len(row) > 6 else None
             meta[("topic", slug)] = {
                 "ts": ts, "status": status, "project": proj,
                 "type": note_type, "superseded_by": superseded_by,
