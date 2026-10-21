@@ -2357,7 +2357,11 @@ def _route_pull_attachment(routing, routing_delivery, identity, now, *, view=Non
         view, now, routing.settings(), project=project,
         session=identity["session"] if identity else None)
     if identity and identity["session"].startswith("gateway\0"):
-        planned["delivery_plan"].update(gateway=True, copy_checked_at=view.get("checked_at"))
+        # ``checked_at`` moves on every quiet local read.  A gateway copy is
+        # stale only when it trails an actual folded revision.
+        planned["delivery_plan"].update(gateway=True, copy_epoch=view.get("epoch"),
+                                        copy_revision=view.get("version"),
+                                        copy_revision_at=view.get("folded_at"))
     # Only this pull's complete scrub table proves lane alias coverage.
     skip = frozenset(item["entity"] for item in planned["delivery_plan"]["items"] if item.get("withheld"))
     skip |= frozenset() if agent_view.login_inventory_available() else frozenset(
@@ -2506,7 +2510,12 @@ def _tool_route_gateway_projected(args: dict) -> dict:
     # attachment restamped the shared table with the local exemption, so
     # clear it before the final scrub cuts every path, owner words included.
     agent_view._table(keys).owner = []
-    return agent_view.scrub_strict(out, keep=(), extra_keys=keys)
+    result = agent_view.scrub_strict(out, keep=(), extra_keys=keys)
+    if identity is not None:
+        routing_delivery.record_gateway_copy(identity["session"], epoch=view.get("epoch"),
+                                             revision=view.get("version"), revision_at=view.get("folded_at"),
+                                             result=result, now=now)
+    return result
 
 
 @_with_route_receipts
