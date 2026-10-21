@@ -278,12 +278,12 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
         else:
             group = 2
             why = advice["reason"]
-        # Among accounts that may go, one with no fresh reading ranks below
-        # one whose evidence is known; unknown evidence is not a tie-break
-        # over an open account.
-        unknown = 1 if group == 0 and advice["evidence"] == "unknown" else 0
+        # The owner's order comes first. Among accounts the owner did not
+        # rank, one that may go with no fresh reading ranks below one whose
+        # evidence is known.
+        unknown = 1 if group == 0 and advice["evidence"] == "unknown" and entry["key"] not in order else 0
         rows.append({**advice, "why_ranked": why,
-                     "_rank": (group, unknown, order.get(entry["key"], len(order) + 1000))})
+                     "_rank": (group, order.get(entry["key"], len(order) + 1000), unknown)})
     rows.sort(key=lambda r: r["_rank"])
     for i, row in enumerate(rows, 1):
         row["rank"] = i

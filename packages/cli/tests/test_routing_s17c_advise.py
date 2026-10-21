@@ -303,3 +303,16 @@ def test_expired_telemetry_answers_go_with_unknown_evidence(mac):
     later = NOW + timedelta(seconds=200)
     out = routing.advise("Main", purpose="job", now=later)
     assert out["verdict"] == "go" and out["evidence"] == "unknown"
+
+
+def test_an_owner_ranked_account_with_no_report_keeps_its_priority(replay):
+    # The owner's order wins over evidence: an account ranked first with no
+    # usage reading yet stays above a fresh account the owner ranked second.
+    routing.report(account="Claude", state="open", author=AUTHOR)
+    unknown = next(a for a in replay.view()["accounts"] if a["state"] == routing.UNKNOWN)
+    routing.set_priority([{"account": unknown["label"], "role": "first"},
+                          {"account": "Claude", "role": "second"}],
+                         via="app", expect=routing.priority_version())
+    ranked = [r for r in routing.advise(now=replay.now)["ranked"] if r["verdict"] == "go"]
+    assert [r["label"] for r in ranked[:2]] == [unknown["label"], "Claude"]
+    assert ranked[0]["evidence"] == "unknown"
