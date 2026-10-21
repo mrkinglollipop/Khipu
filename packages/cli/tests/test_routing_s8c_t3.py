@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 
 import pytest
 
@@ -16,6 +17,14 @@ from tests.test_routing_s7_fix1 import home, _call, _route  # noqa: F401  (fixtu
 THREAD = "thread-synthetic-1"
 ADVISORY = "This child got no routing: add `khipu route --brief` to its brief."
 BRIEF = "Build the synthetic routing fixture carefully and report back."
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    # Identity pinning writes under Khipu's state dir; keep it in the
+    # test's temp HOME so no real state is touched or leaks between tests.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
 
 
 @pytest.fixture
@@ -175,3 +184,112 @@ def test_delegate_task_with_routing_in_brief_gets_no_advisory(delegation_home):
 def test_delegate_task_to_hooked_t3_provider_gets_no_advisory(delegation_home):
     routing.add_rule("synthetic owner rule", via="app")
     assert ADVISORY not in _delegate(delegation_home, BRIEF, hooked=True)
+
+
+# ---- fix round 1: mapped children, ambiguous ids, lookup shape, pinning -----
+
+
+@pytest.mark.parametrize("prefix", ["claude", "codex"])
+def test_mapped_parent_accepts_native_prefixed_children(t3_db, prefix):
+    env = {"CLAUDE_CODE_SESSION_ID": "claude-one"}
+    child = routing_delivery.canonical_identity(env, explicit=f"{prefix}:claude-one/c")
+    assert child is not None
+    assert child["root"] == child["session"] == f"t3:{THREAD}/c"
+    assert child["child"] is True and child["capability"] == "pull_only"
+    deep = routing_delivery.canonical_identity(env, explicit=f"{prefix}:claude-one/a/b")
+    assert deep["root"] == f"t3:{THREAD}/a/b"
+    assert routing_delivery.hook_session(f"{prefix}:claude-one/c", env) == f"t3:{THREAD}/c"
+    # The mapped spelling still works, and an invalid child still fails closed.
+    assert routing_delivery.canonical_identity(env, explicit=f"t3:{THREAD}/c")["root"] == f"t3:{THREAD}/c"
+    assert routing_delivery.canonical_identity(env, explicit=f"{prefix}:claude-one/../x") is None
+    assert routing_delivery.canonical_identity(env, explicit=f"{prefix}:someone-else/c") is None
+
+
+def test_mapped_child_of_a_bystander_payload_resolves_to_its_own_thread(t3_db):
+    env = {"CLAUDE_CODE_SESSION_ID": "claude-one"}
+    assert routing_delivery.hook_session("codex:codex-two/kid", env) == f"t3:{THREAD}/kid"
+    assert routing_delivery.hook_session("codex:codex-two/kid", {}) == f"t3:{THREAD}/kid"
+    assert routing_delivery.hook_session("claude:absent/kid", {}) == "claude:absent/kid"
+
+
+def _raw_db(tmp_path, monkeypatch, rows):
+    path = tmp_path / "statev2.sqlite"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE orchestration_v2_projection_provider_threads "
+                "(thread_id TEXT, payload_json TEXT, updated_at TEXT)")
+    con.executemany("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?)", rows)
+    con.commit()
+    con.close()
+    monkeypatch.setenv("KHIPU_T3_DB", str(path))
+    return path
+
+
+def _row(thread, sid, at="2026-10-20"):
+    return (thread, json.dumps({"nativeThreadRef": {"nativeId": sid}}), at)
+
+
+def test_native_id_in_two_distinct_threads_resolves_to_none(tmp_path, monkeypatch):
+    _raw_db(tmp_path, monkeypatch, [
+        _row("OLD", "abc", "2026-10-21"), _row("NEW", "abc", "2026-10-20")])
+    assert t3.thread_for_session("abc") is None
+    identity = routing_delivery.canonical_identity({"CLAUDE_CODE_SESSION_ID": "abc"})
+    assert identity["root"] == "claude:abc"
+
+
+def test_native_id_repeated_for_one_thread_still_resolves(tmp_path, monkeypatch):
+    _raw_db(tmp_path, monkeypatch, [
+        _row(THREAD, "abc", "2026-10-20"), _row(THREAD, "abc", "2026-10-21"),
+        _row("other-thread", "xyz", "2026-10-21")])
+    assert t3.thread_for_session("abc") == THREAD
+
+
+def test_lookup_on_a_large_db_finds_the_current_session_within_its_deadline(tmp_path, monkeypatch):
+    blob = "x" * 6000
+    rows = [(f"old-{i}", json.dumps({"nativeThreadRef": {"nativeId": f"n{i}"}, "blob": blob}),
+             "2026-10-07") for i in range(15000)]
+    rows.append(_row(THREAD, "current-session", "2026-10-21"))
+    _raw_db(tmp_path, monkeypatch, rows)
+    start = time.monotonic()
+    assert t3.thread_for_session("current-session") == THREAD
+    assert time.monotonic() - start < 5
+
+
+def test_first_identity_answer_is_pinned_for_the_session(tmp_path, monkeypatch):
+    path = _raw_db(tmp_path, monkeypatch, [])
+    env = {"CLAUDE_CODE_SESSION_ID": "late-row"}
+    assert routing_delivery.canonical_identity(env)["root"] == "claude:late-row"
+    with sqlite3.connect(path) as con:
+        con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?)",
+                    _row(THREAD, "late-row", "2026-10-21"))
+        con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?)",
+                    _row(THREAD, "early-row", "2026-10-21"))
+    # The row landing mid-session must not flip this session's ledger.
+    assert routing_delivery.canonical_identity(env)["root"] == "claude:late-row"
+    assert routing_delivery.hook_session("late-row", env) == "claude:late-row"
+    # ... and a session first seen mapped stays mapped if the row goes away.
+    mapped_env = {"CODEX_THREAD_ID": "early-row"}
+    assert routing_delivery.canonical_identity(mapped_env)["root"] == f"t3:{THREAD}"
+    with sqlite3.connect(path) as con:
+        con.execute("DELETE FROM orchestration_v2_projection_provider_threads "
+                    "WHERE thread_id = ?", (THREAD,))
+    assert routing_delivery.canonical_identity(mapped_env)["root"] == f"t3:{THREAD}"
+
+
+def _provider_with_command(tmp_path, command):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    hooks = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": command}]}]}}
+    (codex_home / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
+    return {"driver": "codex", "home_path": str(codex_home)}
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("echo not-a-khipu-hook", "missing"),
+    ("echo khipu-recall-hook", "missing"),
+    ("khipu-recall-hook-extra", "missing"),
+    ("khipu-recall-hook", "installed"),
+    ("/opt/khipu/bin/khipu-prompt-recall", "installed"),
+    ("env KHIPU_CAPTURE_QUEUE_ONLY=1 /opt/khipu/bin/khipu-stop-hook", "installed"),
+])
+def test_hook_detection_matches_actual_hook_command_names(tmp_path, command, expected):
+    assert t3.provider_hooks(_provider_with_command(tmp_path, command), tmp_path) == expected

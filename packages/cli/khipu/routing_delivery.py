@@ -486,6 +486,63 @@ def refit(session, changes, body_limit):
         _prune_agent_components(data, _clock(), keep=component)
         return answer
 
+def _t3_pin_path(bare):
+    from khipu import recall_prompt
+
+    digest = hashlib.sha256(("t3\0" + bare).encode("utf-8")).hexdigest()
+    return recall_prompt._dedup_path("ledger").parent / f"t3-pin--{digest}.json"
+
+
+_T3_PIN_CACHE: dict = {}
+
+
+def _pinned_t3_root(bare):
+    """The first T3 answer for this native session, pinned on disk.
+
+    Returns ``(root, pinned)``: ``root`` is the pinned ``t3:<thread>`` (or
+    None for a pinned native identity) and ``pinned`` says whether a pin
+    was read. T3 can project its session row after the session's first
+    hook fires; without a pin the session would start on its native
+    ledger and later flip to the thread ledger, splitting deliveries
+    across both. The first answer therefore wins for the whole session,
+    whichever way it went. A native session id names one session, so a
+    pin keyed by it cannot leak into a different conversation (a reused
+    id that T3 maps to two threads resolves to no mapping at lookup
+    time, and that negative answer is what gets pinned).
+    """
+    # Keyed by pin path, not bare id alone: the path lives under the
+    # current Khipu state dir, which a new home must not inherit.
+    key = str(_t3_pin_path(bare))
+    if key in _T3_PIN_CACHE:
+        return _T3_PIN_CACHE[key], True
+    try:
+        raw = json.loads(_t3_pin_path(bare).read_text())
+    except (OSError, ValueError):
+        return None, False
+    root = raw.get("root") if isinstance(raw, dict) else None
+    root = root if isinstance(root, str) and root.startswith("t3:") else None
+    _T3_PIN_CACHE[key] = root
+    return root, True
+
+
+def _pin_t3_root(bare, root):
+    """Store the first answer; a racing hook's pin wins and is returned."""
+    try:
+        path = _t3_pin_path(bare)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "x", encoding="utf-8") as handle:
+            json.dump({"root": root}, handle)
+        if len(_T3_PIN_CACHE) > 512:
+            _T3_PIN_CACHE.clear()
+        _T3_PIN_CACHE[str(path)] = root
+        return root
+    except FileExistsError:
+        pinned, found = _pinned_t3_root(bare)
+        return pinned if found else root
+    except OSError:
+        return root
+
+
 def _t3_root(native):
     """``t3:<thread>`` for a harness-native session id T3 maps to a thread.
 
@@ -493,7 +550,9 @@ def _t3_root(native):
     the agent no thread environment variable, so the canonical identity is
     derived from T3's own session-to-thread record. Fail-open and bounded
     (``thread_for_session`` has its own short deadline); a session T3 does
-    not know keeps its native identity."""
+    not know keeps its native identity. The first answer for a session is
+    pinned (see ``_pinned_t3_root``) so the identity cannot flip
+    mid-session."""
     if not isinstance(native, str):
         return None
     bare = native.strip()
@@ -501,15 +560,56 @@ def _t3_root(native):
         if bare.startswith(prefix):
             bare = bare[len(prefix):]
             break
-    if not bare or bare.startswith("t3:"):
+    if not bare or bare.startswith("t3:") or "/" in bare:
         return None
+    pinned, found = _pinned_t3_root(bare)
+    if found:
+        return pinned
     try:
         from khipu import t3
 
         thread = t3.thread_for_session(bare)
     except Exception:  # noqa: BLE001 - identity derivation never breaks a hook
         return None
-    return f"t3:{thread}" if thread else None
+    return _pin_t3_root(bare, f"t3:{thread}" if thread else None)
+
+
+def _valid_child_suffix(suffix):
+    return bool(suffix) and "\0" not in suffix and all(
+        part not in ("", ".", "..") for part in suffix.split("/"))
+
+
+def _mapped_child(session, root, natives):
+    """Rewrite a native-prefixed child of a T3-mapped root onto that root.
+
+    A child a harness names ``claude:<native>/<path>`` (or ``codex:``)
+    before it knows the session maps to ``t3:<thread>`` is still a child
+    of the mapped conversation; rewriting it keeps slice 7's child-ledger
+    guarantee for mapped parents. Returns None when ``session`` is not
+    such a child (or its path is not a strict descendant)."""
+    if not isinstance(session, str) or not root.startswith("t3:"):
+        return None
+    for native in natives:
+        if not native:
+            continue
+        for prefix in ("claude:", "codex:"):
+            head = prefix + native + "/"
+            if session.startswith(head):
+                suffix = session[len(head):]
+                return root + "/" + suffix if _valid_child_suffix(suffix) else None
+    return None
+
+
+def _t3_child(session):
+    """``t3:<thread>/<path>`` for a native-prefixed child session string,
+    resolving the parent part through T3; None when unmapped or invalid."""
+    if not isinstance(session, str):
+        return None
+    parent, sep, suffix = session.strip().partition("/")
+    if not sep or not _valid_child_suffix(suffix):
+        return None
+    root = _t3_root(parent)
+    return root + "/" + suffix if root else None
 
 
 _HOOKED_HARNESSES = frozenset({"claude_code", "codex"})
@@ -567,9 +667,14 @@ def canonical_identity(environ=None, explicit=None):
         return None
     if shared or claude or codex:
         if explicit and explicit != root:
+            # A child named under the session's native id (either harness
+            # prefix) belongs to the mapped root, not to the native one.
+            rewritten = _mapped_child(explicit, root, (claude, codex))
+            if rewritten is not None:
+                explicit = rewritten
             prefix = root + "/"
             suffix = explicit[len(prefix):] if explicit.startswith(prefix) else ""
-            if not suffix or any(part in ("", ".", "..") for part in suffix.split("/")) or "\0" in suffix:
+            if not _valid_child_suffix(suffix):
                 return None
             root = session = explicit
     if "/" in root:
@@ -616,7 +721,8 @@ def hook_session(session, environ=None):
         canonical = _t3_root(codex) or f"codex:{codex}"
     else:
         if isinstance(session, str) and session.strip():
-            return _t3_root(session.strip()) or session
+            session = session.strip()
+            return _t3_child(session) or _t3_root(session) or session
         return session
     if not isinstance(session, str) or not session.strip():
         return canonical
@@ -627,9 +733,14 @@ def hook_session(session, environ=None):
     own.update(f"{prefix}:{value}" for prefix, value in (("claude", claude), ("codex", codex)) if value)
     if session in own:
         return canonical
-    # A payload naming a different T3-mapped native session is that thread's
-    # own conversation, never this environment's ledger.
-    return _t3_root(session) or session
+    # A child named under this session's native id belongs to the mapped
+    # root, exactly as in canonical_identity.
+    rewritten = _mapped_child(session, canonical, (claude, codex))
+    if rewritten is not None:
+        return rewritten
+    # A payload naming a different T3-mapped native session (or its child)
+    # is that thread's own conversation, never this environment's ledger.
+    return _t3_child(session) or _t3_root(session) or session
 
 
 def untracked_items(out):

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sqlite3
 import tempfile
 import time
@@ -54,11 +55,41 @@ def handoff_thread(text: str) -> str | None:
     return match.group(1) if match else None
 
 
+# How many of the newest provider-thread rows the hook lookup examines.
+# A session's row is written when T3 starts that session, so at hook time it
+# is among the newest rows; examining a bounded newest window (by rowid,
+# which SQLite can walk backwards without sorting or touching older rows)
+# keeps a multi-gigabyte projection from turning every hook into a full
+# table scan. Older rows fall back to the native identity, as a miss did
+# before. When T3 (or a future schema) indexes the native id expression,
+# that index is used instead and the whole table is in reach again.
+_LOOKUP_WINDOW = 1024
+
+
+def _distinct_threads(rows) -> str | None:
+    """One thread id from candidate rows, or None when they disagree.
+
+    A native id reused across two distinct threads must not silently pick
+    one thread's ledger; several rows for the same thread (a provider
+    switch) still resolve to that thread."""
+    threads: list[str] = []
+    for row in rows:
+        thread = row[0] if row else None
+        if isinstance(thread, str) and thread and thread not in threads:
+            threads.append(thread)
+            if len(threads) > 1:
+                return None
+    return threads[0] if threads else None
+
+
 def thread_for_session(sid: str) -> str | None:
     """A bounded read of T3's provider projection; failures mean no mapping.
 
     The connection timeout matches T3's WAL contract, but the busy handler
     and VM deadline are tighter so a locked or large DB cannot stall a hook.
+    The query never evaluates the JSON payload outside a bounded newest
+    window (or an index on the native id, when one exists), and it returns
+    None when the native id names more than one distinct thread.
     """
     if not sid:
         return None
@@ -73,13 +104,33 @@ def thread_for_session(sid: str) -> str | None:
         con.execute("PRAGMA busy_timeout = 2")
         deadline = time.monotonic() + 0.05
         con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
-        row = con.execute(
-            "SELECT thread_id FROM orchestration_v2_projection_provider_threads "
-            "WHERE CASE WHEN json_valid(payload_json) THEN "
-            "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ? "
-            "ORDER BY updated_at DESC LIMIT 1", (sid,),
+        indexed = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND tbl_name = 'orchestration_v2_projection_provider_threads' "
+            "AND sql LIKE '%nativeId%' LIMIT 1"
         ).fetchone()
-        return row[0] if row and isinstance(row[0], str) and row[0] else None
+        if indexed:
+            # The CASE/json_valid guard would defeat the expression index,
+            # so match it exactly; a malformed row errors and falls through
+            # to the guarded window query below.
+            try:
+                rows = con.execute(
+                    "SELECT DISTINCT thread_id FROM orchestration_v2_projection_provider_threads "
+                    "WHERE json_extract(payload_json, '$.nativeThreadRef.nativeId') = ? "
+                    "LIMIT 2", (sid,),
+                ).fetchall()
+                return _distinct_threads(rows)
+            except sqlite3.Error:
+                pass
+        rows = con.execute(
+            "SELECT thread_id FROM ("
+            "SELECT thread_id, payload_json FROM orchestration_v2_projection_provider_threads "
+            "ORDER BY rowid DESC LIMIT ?) "
+            "WHERE CASE WHEN json_valid(payload_json) THEN "
+            "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ?",
+            (_LOOKUP_WINDOW, sid),
+        ).fetchall()
+        return _distinct_threads(rows)
     except (OSError, ValueError, sqlite3.Error):
         return None
     finally:
@@ -449,7 +500,41 @@ def provider_hooks(instance: dict[str, Any], home: Path | None = None) -> str:
                 walk(inner)
 
     walk(data.get("hooks") if isinstance(data, dict) else None)
-    return "installed" if any("khipu-" in command for command in commands) else "missing"
+    return "installed" if any(_is_khipu_hook_command(command) for command in commands) else "missing"
+
+
+# The actual Khipu hook launchers (integrations.LAUNCHER_NAMES minus the
+# MCP server, which is not a hook). A command counts only when its
+# executable's name is exactly one of these; a shell snippet that merely
+# mentions a Khipu-looking word (``echo not-a-khipu-hook``) is not a hook.
+_KHIPU_HOOK_NAMES = frozenset({
+    "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
+    "khipu-aegis-capture", "khipu-delegation-hook",
+})
+_INTERPRETERS = frozenset({"sh", "bash", "zsh", "dash", "python3", "python"})
+
+
+def _is_khipu_hook_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    index = 0
+    # Skip an `env` prefix and variable assignments (`env K=V <hook>`,
+    # `K=V <hook>`) so the executable itself is what gets matched.
+    if tokens and Path(tokens[0]).name == "env":
+        index = 1
+    while index < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
+        index += 1
+    if index < len(tokens) and Path(tokens[index]).name in _INTERPRETERS:
+        index += 1
+        while index < len(tokens) and tokens[index].startswith("-") and tokens[index] != "-c":
+            index += 1
+        if index < len(tokens) and tokens[index] == "-c":
+            return False  # a shell string, not a direct hook exec
+    if index >= len(tokens):
+        return False
+    return Path(tokens[index]).name in _KHIPU_HOOK_NAMES
 
 
 def claude_instances(settings_file: Path) -> list[dict[str, Any]]:
