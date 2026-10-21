@@ -165,6 +165,36 @@ class _QuotaServer:
                     self.send_header("Location", "https://evil.test/steal")
                     self.end_headers()
                     return
+                if server_ref.mode == "slow_status":
+                    # Nothing at all for far longer than the probe timeout:
+                    # the client is stuck waiting for the status line.
+                    time.sleep(10)
+                    try:
+                        body = b'{"windows":[{"used_pct":5,"window_mins":300}]}'
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    except OSError:
+                        pass
+                    return
+                if server_ref.mode == "drip_headers":
+                    # A valid status line, then one header line every 0.25 s.
+                    # Each line arrives well inside any per-read timeout, so
+                    # only an overall deadline can stop this.
+                    try:
+                        self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+                        self.wfile.flush()
+                        for i in range(80):
+                            self.wfile.write(f"X-Drip-{i}: x\r\n".encode())
+                            self.wfile.flush()
+                            time.sleep(0.25)
+                        body = b'{"windows":[{"used_pct":5,"window_mins":300}]}'
+                        self.wfile.write(b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+                        self.wfile.flush()
+                    except OSError:
+                        pass
+                    return
                 if server_ref.mode == "drip":
                     self.send_response(200)
                     self.send_header("Content-Length", "100000")
@@ -276,6 +306,26 @@ def test_slow_drip_hits_the_overall_deadline_and_times_out(quota_server):
     elapsed = time.monotonic() - started
     assert row["error"] == usage.E_TIMEOUT
     assert elapsed < 6
+
+
+def test_slow_drip_headers_hit_the_overall_deadline_and_time_out(quota_server):
+    quota_server.mode = "drip_headers"
+    started = time.monotonic()
+    row = _probe_socket(timeout=2)
+    elapsed = time.monotonic() - started
+    assert row["error"] == usage.E_TIMEOUT
+    assert elapsed < 6
+    assert KEY not in json.dumps(row)
+
+
+def test_slow_status_line_hits_the_overall_deadline_and_times_out(quota_server):
+    quota_server.mode = "slow_status"
+    started = time.monotonic()
+    row = _probe_socket(timeout=2)
+    elapsed = time.monotonic() - started
+    assert row["error"] == usage.E_TIMEOUT
+    assert elapsed < 6
+    assert KEY not in json.dumps(row)
 
 
 @pytest.mark.parametrize("mode", ["neg", "over", "huge_mins"])

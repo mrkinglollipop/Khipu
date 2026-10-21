@@ -1430,29 +1430,38 @@ def probe_glm(*, timeout: float = TIMEOUT_S) -> dict:
 _HTTP_HOST = re.compile(r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\Z")
 
 
+def _find_socket(obj):
+    """The socket under a connection or response, or None."""
+    import socket as socket_module
+
+    for _ in range(8):
+        if obj is None:
+            return None
+        if isinstance(obj, socket_module.socket):
+            return obj
+        obj = getattr(obj, "fp", None) or getattr(obj, "raw", None) or getattr(obj, "_sock", None)
+    return None
+
+
 def _shrink_read_timeout(response, remaining: float) -> None:
     """Best-effort: give the socket under ``response`` only ``remaining``
     seconds, so one slow read cannot outlive the overall deadline."""
-    import socket as socket_module
-
-    obj = response
-    for _ in range(8):
-        if obj is None:
+    sock = _find_socket(response)
+    if sock is not None:
+        try:
+            sock.settimeout(max(0.0, remaining))
+        except OSError:
             return
-        if isinstance(obj, socket_module.socket):
-            try:
-                obj.settimeout(max(0.0, remaining))
-            except OSError:
-                return
-            return
-        obj = getattr(obj, "fp", None) or getattr(obj, "raw", None) or getattr(obj, "_sock", None)
 
 
 def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes]:
     """(HTTP status, bounded body on 200 only) of the quota call. A redirect
     is a ProbeError, and no error body is ever read. Proxies are disabled, so
     only the owner-confirmed host is ever contacted, and ``timeout`` is an
-    overall deadline (connect plus body read), not a per-read budget."""
+    overall deadline (connect through status line, headers and body read),
+    not a per-read budget."""
+    import http.client
+    import socket as socket_module
     import urllib.error
     import urllib.request
 
@@ -1462,17 +1471,70 @@ def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes
     request = urllib.request.Request(f"https://{host}/",
                                      headers={"Authorization": key, "Accept": "application/json"})
     deadline = time.monotonic() + timeout
+
+    # One watchdog deadline covers connect, TLS, the status line, the
+    # response headers and the body. A per-read socket timeout alone cannot
+    # do that: each dripped header line would earn a fresh budget. The
+    # watchdog tracks every socket the request creates and closes it at the
+    # deadline, repeatedly until the request is done, so a socket created
+    # just as the deadline fires is closed too. It never holds the key.
+    fired = threading.Event()
+    done = threading.Event()
+    connections: list = []
+    response_sockets: list = []
+
+    def _close_socket(sock) -> None:
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket_module.SHUT_RDWR)
+        except Exception:  # noqa: BLE001 - already closed or not connected
+            pass
+        try:
+            sock.close()
+        except Exception:  # noqa: BLE001 - closing is best-effort
+            pass
+
+    def _watchdog() -> None:
+        if done.wait(max(0.0, deadline - time.monotonic())):
+            return
+        fired.set()
+        while not done.is_set():
+            for conn in list(connections):
+                _close_socket(getattr(conn, "sock", None))
+            for sock in list(response_sockets):
+                _close_socket(sock)
+            done.wait(0.05)
+
+    class _DeadlineConnection(http.client.HTTPSConnection):
+        def __init__(self, *args, **kwargs):
+            connections.append(self)
+            super().__init__(*args, **kwargs)
+
+    class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_DeadlineConnection, req,
+                                context=self._context, check_hostname=self._check_hostname)
+
+    watchdog = threading.Thread(target=_watchdog, daemon=True)
+    watchdog.start()
     try:
         class _NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *args, **kwargs):  # noqa: ARG002 - refusing is the whole job
                 return None
 
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect(),
+                                             _DeadlineHTTPSHandler())
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ProbeError(E_TIMEOUT)
         response = opener.open(request, timeout=remaining)  # noqa: S310 - owner-confirmed https host
+        sock = _find_socket(response)
+        if sock is not None:
+            response_sockets.append(sock)
         with response:
+            if fired.is_set() or time.monotonic() >= deadline:
+                raise ProbeError(E_TIMEOUT)
             status = getattr(response, "status", None)
             if not isinstance(status, int) or isinstance(status, bool):
                 status = getattr(response, "code", None)
@@ -1483,7 +1545,7 @@ def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes
             chunks, total = [], 0
             while True:
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if fired.is_set() or remaining <= 0:
                     raise ProbeError(E_TIMEOUT)
                 _shrink_read_timeout(response, remaining)
                 # read1 (one raw read) over read: read would wait to fill the
@@ -1491,6 +1553,8 @@ def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes
                 # check between chunks.
                 read_chunk = getattr(response, "read1", response.read)
                 chunk = read_chunk(min(65536, HTTP_QUOTA_MAX_BYTES + 1 - total))
+                if fired.is_set() or time.monotonic() >= deadline:
+                    raise ProbeError(E_TIMEOUT)
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -1503,6 +1567,8 @@ def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes
     except ProbeError:
         raise
     except urllib.error.HTTPError as exc:
+        if fired.is_set():
+            raise ProbeError(E_TIMEOUT) from None
         # With redirects refused, urllib raises for a 3xx; its body (which a
         # hostile endpoint could fill with echoed material) is never read.
         if 300 <= exc.code < 400:
@@ -1511,9 +1577,15 @@ def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes
     except TimeoutError:
         raise ProbeError(E_TIMEOUT) from None
     except urllib.error.URLError as exc:
+        if fired.is_set():
+            raise ProbeError(E_TIMEOUT) from None
         raise ProbeError(E_TIMEOUT if isinstance(exc.reason, TimeoutError) else E_NO_ANSWER) from None
     except Exception:  # noqa: BLE001 - any text could echo the key or the body
+        if fired.is_set():
+            raise ProbeError(E_TIMEOUT) from None
         raise ProbeError(E_NO_ANSWER) from None
+    finally:
+        done.set()
 
 
 def parse_http_quota(status: int, body: bytes) -> dict:
