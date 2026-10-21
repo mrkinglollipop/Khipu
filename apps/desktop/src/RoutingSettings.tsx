@@ -4242,9 +4242,10 @@ function writeFolds(keys: string[]): void {
   }
 }
 
-/** One window's small trend, drawn only from the trailing rate the pace
- *  object carries. The dashed line is the rate that lands on the target and
- *  the cap line is an owner cap, as docs/mockups/2026-10-21-routing draws it. */
+/** One window's small trend: the used line is the current level only (the
+ *  pace object carries no history). The dashed line is the rate that lands
+ *  on the target and the cap line is an owner cap, as
+ *  docs/mockups/2026-10-21-routing draws it. */
 function PaceTrendSvg({ trend }: { trend: PaceTrend }) {
   return (
     <svg className="trend" viewBox="0 0 120 28" role="img" aria-label={trend.label} preserveAspectRatio="none">
@@ -4316,7 +4317,7 @@ export function PaceSection({ data, plans, now, folds }: {
         hour&apos;s for five-hour windows). Khipu&apos;s advice for jobs is advisory; it starts and stops nothing.
       </p>
       <div className="legend" aria-hidden="true">
-        <span><i />used, last 24 h (last hour for five hours)</span>
+        <span><i />used now</span>
         <span><i className="need" />rate that lands on the limit</span>
         <span><i className="cap" />your cap</span>
       </div>

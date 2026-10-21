@@ -22,10 +22,11 @@ export type PaceTag = { text: string; tone: PaceTone };
 export type PaceSayPart = { text: string; bold?: boolean };
 
 /** The small trend under a window, on the mock's 120 x 28 viewBox. The used
- *  line is the trailing rate run backwards over the window (the only history
- *  `route --json` carries); the dashed line is the rate that lands on the
- *  window's headline target, and the cap line is that target when it is an
- *  owner cap. A window with no rate has no trend. */
+ *  line is the current level only: `route --json` carries no history, so no
+ *  past usage is reconstructed from the trailing rate. The dashed line is
+ *  the rate that lands on the window's headline target from the current
+ *  level, and the cap line is that target when it is an owner cap. A window
+ *  with no rate has no trend. */
 export type PaceTrend = {
   used: string;
   need: { y1: number; y2: number } | null;
@@ -210,22 +211,19 @@ function trendOf(pace: Pace, name: string, need: number | null, capPct: number |
   if (pace.why || rate == null || pace.used_pct == null) return null;
   const points = 24;
   const hours = pace.trailing_h ?? 24;
-  const start = pace.used_pct - rate * hours;
   const end = pace.used_pct;
-  const needEnd = need != null ? start + need * hours : null;
-  const values = [start, end, ...(capPct != null ? [capPct] : []), ...(needEnd != null ? [needEnd] : [])];
+  const needEnd = need != null ? end + need * hours : null;
+  const values = [end, ...(capPct != null ? [capPct] : []), ...(needEnd != null ? [needEnd] : [])];
   const lo = Math.min(...values) - 2;
   const hi = Math.max(...values) + 2;
   const span = hi - lo || 1;
   const X = (i: number) => Math.round((i * 120) / points * 10) / 10;
   const Y = (v: number) => Math.round((28 - ((v - lo) * 28) / span) * 10) / 10;
-  const used = Array.from({ length: points + 1 }, (_, i) => `${X(i)},${Y(start + ((end - start) * i) / points)}`).join(" ");
-  const from = Math.round(start);
-  const to = Math.round(end);
+  const used = Array.from({ length: points + 1 }, (_, i) => `${X(i)},${Y(end)}`).join(" ");
   const period = hours === 1 ? "in the last hour" : "over the last 24 hours";
-  let text = from === to || rate < 0.01
+  let text = rate < 0.01
     ? `${name}: no use ${period}`
-    : `${name}: the last ${hours === 1 ? "hour" : "24 hours"} averaged ${rateWords(rate)}% an hour, from ${from}% to ${to}% used`;
+    : `${name}: the last ${hours === 1 ? "hour" : "24 hours"} averaged ${rateWords(rate)}% an hour (trailing average)`;
   if (need != null) {
     const cmp = rate > 1.15 * need ? "faster" : rate < 0.85 * need ? "slower" : "close to";
     text += capPct != null
@@ -235,7 +233,7 @@ function trendOf(pace: Pace, name: string, need: number | null, capPct: number |
   if (capPct != null && need == null) text += `; your ${Math.round(capPct)}% cap line above`;
   return {
     used,
-    need: need != null ? { y1: Y(start), y2: Y(start + need * hours) } : null,
+    need: need != null ? { y1: Y(end), y2: Y(end + need * hours) } : null,
     capY: capPct != null ? Y(capPct) : null,
     label: text,
   };
@@ -422,6 +420,15 @@ function planOutpacing(a: RouteAccount): boolean {
   return (a.pace ?? []).some((p) => p.plan?.verdict === "outpacing");
 }
 
+/** The share cap this account has already reached, if any: the pace object
+ *  for its window first, then its cap status for that same verdict. */
+function reachedShareCap(a: RouteAccount): { window: string | null; pct: number } | null {
+  const pace = (a.pace ?? []).find((p) => p.share_cap?.verdict === "cap_reached");
+  if (pace?.share_cap?.pct != null) return { window: pace.window, pct: pace.share_cap.pct };
+  const status = (a.cap_statuses ?? []).find((s) => s.kind === "share" && s.verdict === "cap_reached");
+  return status?.pct != null ? { window: status.window ?? null, pct: status.pct } : null;
+}
+
 /** The account's tag: the one thing to say about it, in the mock's order. */
 function accountTag(a: RouteAccount): PaceTag {
   const classification = accountClassification(a);
@@ -439,6 +446,8 @@ function accountTag(a: RouteAccount): PaceTag {
   const paces = a.pace ?? [];
   if (paces.length && paces.every((p) => p.why || readingUnknown(p))) return { text: "Can't tell yet", tone: "neutral" };
   if (!paces.length) return { text: "No pace", tone: "neutral" };
+  const reachedShare = reachedShareCap(a);
+  if (reachedShare) return { text: `At your ${Math.round(reachedShare.pct)}%`, tone: "err" };
   const planOut = paces.find((p) => p.plan?.verdict === "outpacing");
   if (planOut) return { text: "Outpacing", tone: "warn" };
   const shareOut = paces.find((p) => p.share_cap?.verdict === "outpacing");
@@ -485,6 +494,11 @@ function sayOf(a: RouteAccount, now: Date): PaceSayPart[] {
       return [{ text: `The spend total can't be told: ${spend.why || "the spend readings are incomplete"}.` }];
     }
     return [{ text: `Khipu doesn't read ${label}'s plan, so there is no pace.` }];
+  }
+
+  const reachedShare = reachedShareCap(a);
+  if (reachedShare) {
+    return [{ text: `At your ${windowAdj(reachedShare.window)} ${Math.round(reachedShare.pct)}% cap.` }];
   }
 
   const crossing = earliestCrossing(a, now);
@@ -549,9 +563,7 @@ function lineOf(a: RouteAccount, now: Date, advice: PaceAdvice | null): { week: 
       ? "Closed to all"
       : advice.word === "Not for jobs"
         ? "Not for jobs"
-        : advice.evid.startsWith("evidence unknown")
-          ? "Jobs: go, unsure"
-          : advice.word === "Hold back" ? "Jobs: hold back" : "Jobs: go"
+        : `${advice.word === "Hold back" ? "Jobs: hold back" : "Jobs: go"}${advice.evid.startsWith("evidence unknown") ? ", unsure" : ""}`
     : "";
   if (classification === "limited") return { week: a.until ? `Back ${whenLocal(a.until, now)}` : "At its limit", advice: adviceWords };
   if (classification === "paused") return { week: "Paused by you", advice: adviceWords };
@@ -561,6 +573,8 @@ function lineOf(a: RouteAccount, now: Date, advice: PaceAdvice | null): { week: 
   if (spend?.verdict === "unknown") return { week: "Spend can't be told", advice: adviceWords };
   if (!paces.length) return { week: "No pace: plan not read", advice: adviceWords };
   if (paces.every((p) => readingUnknown(p))) return { week: "Can't tell yet", advice: adviceWords };
+  const reachedShare = reachedShareCap(a);
+  if (reachedShare) return { week: `At your ${Math.round(reachedShare.pct)}% cap`, advice: adviceWords };
   const crossing = earliestCrossing(a, now);
   if (crossing) {
     const what = crossing.target === "plan"
@@ -635,8 +649,12 @@ function adviceWhy(a: RouteAccount, advice: NonNullable<RouteAccount["advice"]>,
         return `${conc?.jobs ?? "All"} of ${conc?.cap_n ?? "its"} jobs running`;
       }
       case "share cap_reached": {
-        const share = status("share");
-        return `at your ${windowAdj(share?.window)} ${Math.round(share?.pct ?? 0)}%`;
+        const reachedPace = (a.pace ?? []).find((p) => p.share_cap?.verdict === "cap_reached");
+        const shares = (a.cap_statuses ?? []).filter((s) => s.kind === "share");
+        const share = shares.find((s) => s.verdict === "cap_reached" && (!reachedPace || s.window === reachedPace.window))
+          ?? shares.find((s) => reachedPace != null && s.window === reachedPace.window);
+        const pct = share?.pct ?? reachedPace?.share_cap?.pct ?? 0;
+        return `at your ${windowAdj(share?.window ?? reachedPace?.window)} ${Math.round(pct)}%`;
       }
       case "spend over":
       case "spend reached": {
@@ -714,6 +732,7 @@ function adviceOf(a: RouteAccount, now: Date): PaceAdvice | null {
 function openByDefault(a: RouteAccount, now: Date): boolean {
   const classification = accountClassification(a);
   if (classification === "limited" || classification === "paused" || classification === "down") return false;
+  if (reachedShareCap(a)) return true;
   const crossing = earliestCrossing(a, now);
   if (crossing && crossing.hours <= 6) return true;
   return planOutpacing(a);
