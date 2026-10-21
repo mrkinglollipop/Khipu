@@ -1612,10 +1612,11 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
                 "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
                 "harness", "to", "started_at", "model", "family", "transport", "mac", "legacy_mac", "entity", "base",
-                "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id")
+                "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id",
+                "resets_at", "cycle", "revision", "cap_kind")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
-                "witness_at", "expires_at", "reset_at")
-_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order")
+                "witness_at", "expires_at", "reset_at", "resets_at")
+_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "t_err")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
                   "observed", "observed_turn", "session_logs", "silent", "unmatched")
@@ -1762,7 +1763,7 @@ def _checked(data: dict) -> dict | None:
                 return None
     if "written_at" not in out:
         return None  # every line Khipu writes carries its time
-    if "kind" in out and out["kind"] != entry_model.kind(out):
+    if "kind" in out and out["type"] not in ("cap_set",) and out["kind"] != entry_model.kind(out):
         return None
     if "expires_at" in data and data["expires_at"] is None:
         out["expires_at"] = None
@@ -1833,6 +1834,11 @@ def _checked(data: dict) -> dict | None:
         if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
             return None
         out["used_pct"] = used
+    pct = data.get("pct")
+    if pct is not None:
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct):
+            return None
+        out["pct"] = pct
     cuts = data.get("lanes_cut")
     if cuts is not None:
         # An account note's lanes, each [runner, lane]: text pairs only.
@@ -3180,6 +3186,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # author from this, never from the state left after it (fix round 1).
     causes: dict[str, dict] = {}
     owner_changes: list[dict] = []
+    pace_samples: dict[tuple, list[dict]] = {}
+    pace_caps: dict[tuple, dict] = {}
+    cap_proposals: list[dict] = []
     observed = entry_model.observations(events, cfg)
     runner_status = {r["name"]: r for r in (sources or {}).get("runners") or []}
     for event in observed:
@@ -3195,6 +3204,39 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         kind = event.get("type")
         entity = event_identity.entity(event)
         if kind in entry_model.OBSERVATIONS:
+            continue
+        if kind == "usage_sample":
+            from khipu import routing_pace
+
+            window = event.get("window") if event.get("window") in routing_pace.WINDOWS else None
+            witness, reset = _parse(event.get("witness_at")), _parse(event.get("resets_at"))
+            used = event.get("used_pct")
+            if (window and witness and reset and isinstance(event.get("account"), str)
+                    and isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used)):
+                pace_samples.setdefault((event["account"], window), []).append(
+                    {"t": witness, "used": float(used), "reset": reset, "mac": event.get("mac") or "legacy",
+                     "source": event.get("source") or "probe", "cycle": event.get("cycle"),
+                     "t_err": event.get("t_err") if isinstance(event.get("t_err"), int) else 0})
+            continue
+        if kind in ("cap_set", "cap_remove"):
+            from khipu import routing_pace
+
+            window = event.get("window") if event.get("window") in routing_pace.WINDOWS else None
+            account = event.get("account")
+            if window and isinstance(account, str):
+                owner_cap = (event.get("written_by") or {}).get("kind") == "owner"
+                if kind == "cap_remove":
+                    if owner_cap:
+                        pace_caps.pop((account, window, event.get("cap_kind") or event.get("kind")), None)
+                    continue
+                cap = routing_pace.checked_cap({k: event.get(k) for k in ("kind", "pct", "revision")})
+                if cap is not None:
+                    if owner_cap:
+                        pace_caps[(account, window, cap["kind"])] = dict(cap, window=window)
+                    else:
+                        # A conversation's cap is a proposal, never a fact.
+                        cap_proposals.append(dict(cap, account=account, window=window, pending=True,
+                                                  written_by=event.get("written_by")))
             continue
         if kind == "reset_check":
             account, until = event.get("account"), _parse(event.get("reset_until"))
@@ -3563,6 +3605,17 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                     "reason": _reset_reason_words(reset["reason"]), "written_by": _check_author(),
                                     "scope": reset["scope"], "window": reset["window"]}
     entries.sort(key=lambda e: (_STATE_ORDER.get(e["state"], 9), e["label"].casefold()))
+    from khipu import routing_pace as _pace
+
+    for entry in entries:
+        windows = sorted({w for (a, w) in pace_samples if a == entry["key"]}
+                         | {w for (a, w, _k2) in pace_caps if a == entry["key"]})
+        if windows:
+            entry["pace"] = [_pace.compute_pace(pace_samples.get((entry["key"], w), []),
+                                                 [c for (a, ww, _k2), c in pace_caps.items()
+                                                  if a == entry["key"] and ww == w], now, w)
+                              for w in windows]
+            entry["caps"] = [dict(c) for (a, _w, _k2), c in sorted(pace_caps.items()) if a == entry["key"]]
 
     unmatched: dict[tuple, dict] = {}
     for item in unmatched_raw:
@@ -3724,7 +3777,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             effective["definition:" + name] = values
     return {"accounts": entries, "holds": active_holds, "rules": active_rules, "note": note_out,
             "proposals": proposals,
-            "machine_holds": machine_holds,
+            "machine_holds": machine_holds, "cap_proposals": cap_proposals,
             "definitions": definitions,
             "priority": priority_out, "priority_version": priority_version, "priority_ended": priority_ended,
             "priority_owner_revision": priority_owner_revision,
@@ -4599,6 +4652,69 @@ def _runner_source_state(runner: dict) -> str:
     """The durable availability state of a runner, excluding its advancing beat."""
     return json.dumps({"silent": bool(runner.get("silent")), "unreadable": bool(runner.get("unreadable")),
                        "lanes": list(runner.get("lanes") or [])}, sort_keys=True, separators=(",", ":"))
+
+
+def _pace_sample_events(ordered: list[dict], known: list[dict], now: datetime) -> list[dict]:
+    """New pace samples from the usage cache, at each window's cadence.
+
+    A stored reading is only sampled when the pace rules say it adds
+    information; the fold stays pure, so samples enter only here."""
+    from khipu import routing_pace, usage
+
+    try:
+        rows = usage._load_cache()
+    except Exception:  # noqa: BLE001 - an unreadable cache samples nothing
+        return []
+    known_keys = {a["key"] for a in known}
+    existing: dict[tuple, list[dict]] = {}
+    for event in ordered:
+        if event.get("type") == "usage_sample":
+            at = _parse(event.get("witness_at"))
+            if at is not None:
+                existing.setdefault((event.get("account"), event.get("window")), []).append(
+                    {"window": event.get("window"), "t": at, "used": event.get("used_pct"),
+                     "mac": event.get("mac"), "source": event.get("source")})
+    out = []
+    for key, row in sorted(rows.items()):
+        if key not in known_keys or not isinstance(row, dict) or not row.get("ok"):
+            continue
+        costly = key.partition("|")[0] == "grok"
+        for w in row.get("windows") or []:
+            if not isinstance(w, dict) or w.get("name") not in routing_pace.WINDOWS:
+                continue
+            used = w.get("used_pct")
+            if isinstance(used, bool) or not isinstance(used, (int, float)):
+                continue
+            witness = _parse(w.get("observed_at") or row.get("observed_at") or row.get("probed_at"))
+            if witness is None or witness > now:
+                continue
+            candidate = {"window": w["name"], "t": witness, "used": used,
+                         "mac": _local_mac(), "source": "probe"}
+            prior = existing.setdefault((key, w["name"]), [])
+            if not routing_pace.should_sample(prior, candidate, costly=costly):
+                continue
+            event = {"type": "usage_sample", "account": key, "window": w["name"],
+                     "witness_at": _iso(witness), "used_pct": used, "t_err": 60,
+                     "source": "probe", "written_by": {"kind": "probe"}, "via": "probe"}
+            reset = _parse(w.get("resets_at"))
+            if reset is not None:
+                event["resets_at"] = _iso(reset)
+            prior.append(candidate)
+            out.append(event)
+    return out
+
+
+def record_pace_samples(now: datetime | None = None) -> int:
+    """Store new pace samples from the usage cache after a probe refresh.
+
+    Sampling is a write, so it happens here and in the fold's callers that
+    own a write, never in the fold itself: a read must stay a read."""
+    now = now or _now()
+    ordered = _read_all_events(author_check=False)[0]
+    batch = _pace_sample_events(ordered, accounts(), now)
+    if batch:
+        _write_many(batch)
+    return len(batch)
 
 
 def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
@@ -5657,6 +5773,53 @@ def set_definition(definition: str, value: dict, *, via: str) -> dict:
     return _owner_write({"type": "definition_set", "definition": definition, "value": checked}, via)
 
 
+def set_cap(account: str, *, window: str, kind: str, pct, revision: str | None = None, via: str,
+            now: datetime | None = None) -> dict:
+    """Owner-only: confirm a pace cap as a structured fact, never from prose."""
+    from khipu import routing_pace
+
+    if window not in routing_pace.WINDOWS:
+        raise RouteError("window must be weekly or five_hour")
+    cap = routing_pace.checked_cap({"kind": kind, "pct": pct, "revision": revision or "cap"})
+    if cap is None:
+        raise RouteError("a cap takes kind share or per_day, a pct above 0 and at most 100, and a revision")
+    if revision is None:
+        cap["revision"] = f"cap-{event_identity.uuid7()}"
+    key = _resolve_account_key(account)
+    return dict(_owner_write({"type": "cap_set", "account": key, "window": window, **cap}, via), account=key)
+
+
+def remove_cap(account: str, *, window: str, kind: str, via: str, now: datetime | None = None) -> dict:
+    from khipu import routing_pace
+
+    if window not in routing_pace.WINDOWS or kind not in ("share", "per_day"):
+        raise RouteError("window must be weekly or five_hour and kind share or per_day")
+    key = _resolve_account_key(account)
+    return dict(_owner_write({"type": "cap_remove", "account": key, "window": window, "cap_kind": kind}, via),
+                account=key)
+
+
+def request_cap(account: str, *, window: str, kind: str, pct, revision: str, author: dict,
+                via: str = "mcp", now: datetime | None = None) -> dict:
+    """A conversation's cap attempt: stored as a proposal, never a fact."""
+    from khipu import routing_pace
+
+    if window not in routing_pace.WINDOWS:
+        raise RouteError("window must be weekly or five_hour")
+    cap = routing_pace.checked_cap({"kind": kind, "pct": pct, "revision": revision})
+    if cap is None:
+        raise RouteError("a cap takes kind share or per_day, a pct above 0 and at most 100, and a revision")
+    key = _account_for_a_conversation(account, accounts())
+    by = dict(author or {})
+    if by.get("kind") != "conversation":
+        # Like request_rule: a caller-supplied owner author is never trusted;
+        # the cap stays a conversation proposal under the real author.
+        by = conversation_author()
+    written, view = _write({"type": "cap_set", "account": key, "window": window, **cap,
+                            "written_by": by, "via": via})
+    return {"ok": True, "id": written["id"], "pending": True, "account": key, "version": view.get("version")}
+
+
 def _priority_entries(raw, *, now: datetime, conversation: bool) -> list[dict]:
     """The ordered entries a write stores, in the order given: each account
     resolved to its key (a conversation names one by its label or its id),
@@ -6339,6 +6502,30 @@ def plan_facts(view: dict, now: datetime) -> dict[str, dict]:
     return out
 
 
+def headline_pace(entry: dict) -> dict | None:
+    """The pace window that needs attention first for one account."""
+    paces = entry.get("pace") or []
+    if not paces:
+        return None
+
+    def rank(pace):
+        obj = pace.get(pace.get("headline") or "plan") or pace.get("plan") or {}
+        verdict = obj.get("verdict")
+        eta = _parse(obj.get("runs_out_at") or obj.get("reaches_cap_at"))
+        return (0 if verdict in ("limit_reached", "cap_reached", "over") else
+                1 if eta else 2 if verdict == "near" else 3,
+                eta.timestamp() if eta else float("inf"))
+
+    return min(paces, key=rank)
+
+
+def pace_line_for(entry: dict, now: datetime) -> str | None:
+    from khipu import routing_pace
+
+    pace = headline_pace(entry)
+    return routing_pace.pace_line(entry["label"], pace, now) if pace else None
+
+
 def _pace_of(fact: dict | None) -> float:
     """A fact's pace for ordering; one with none (unreadable, or figures
     that may be out of date) goes last."""
@@ -6756,6 +6943,9 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
             fact = facts.get(entry["key"])
             if fact is not None and entry.get("configured", True):
                 line += f"; {pace_words(fact, now)}"
+            pace_text = pace_line_for(entry, now)
+            if pace_text:
+                line += f"; {pace_text}"
             items.append(("open" if entry["state"] == OPEN else "account", line, ""))
         items += [("lane", _clip(lane_line(u, now), width), "") for u in view.get("unmatched") or []]
         items += [("hold", _push_clip(hold_line(h, now, view=view), width, view), h["at"]) for h in view.get("holds") or []]
@@ -7385,6 +7575,7 @@ def _public_account(entry: dict, now: datetime) -> dict:
     out["disagreement"] = _pick(entry.get("disagreement"), _REPORT_FIELDS)
     out["last_seen"] = _pick(entry.get("last_seen"), _LAST_SEEN_FIELDS)
     out["underlying"] = _pick(entry.get("underlying"), ("state", "until", "basis"))
+    out["pace"] = [dict(p) for p in entry.get("pace") or []]
     out["line"] = account_line(entry, now, push=False)
     return out
 
@@ -7800,7 +7991,9 @@ def refresh_plan_figures() -> dict:
 
         if not features.enabled("routing_push"):
             return {"refreshed": 0, "skipped": "routing push off"}
-        return usage.refresh_due()
+        out = usage.refresh_due()
+        record_pace_samples()
+        return out
     except Exception:  # noqa: BLE001 - the drain never fails on this
         return {"refreshed": 0, "skipped": "error"}
 
@@ -7886,7 +8079,7 @@ def prompt_imports() -> None:
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
     from khipu import (  # noqa: F401
-        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_delivery, routing_providers, routing_sources,
+        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_delivery, routing_pace, routing_providers, routing_sources,
         session_capture, usage)
 
 
@@ -8256,10 +8449,42 @@ def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = N
         with agent_view.routing_projection(keys):
             out = _prompt_text(marker, view, now, cfg, session_id=session_id)
             if not out.pop("_reserved", False):
+                out = _pace_push_adjust(out, view, now, session, marker.component)
                 out = routing_delivery.offer(routing_delivery.plan(out, view, now, cfg, session=session),
                                              session=session, component=marker.component)
             return dict(out, _delivery_view=view, _reserved=True)
     return _prompt_text(marker, view, now, cfg, session_id=session_id)
+
+
+def _pace_push_adjust(out: dict, view: dict, now: datetime, session: str, component: str) -> dict:
+    """Offer a pace forecast when it changed enough against the last one
+    this conversation acknowledged, even when nothing else changed."""
+    from khipu import routing_delivery, routing_pace
+
+    forecasts: dict[str, dict] = {}
+    lines: dict[str, str] = {}
+    for entry in view.get("accounts") or []:
+        pace = headline_pace(entry)
+        if pace is None:
+            continue
+        entity = f"pace:{entry['key']}:{pace['window']}"
+        forecasts[entity] = routing_pace.forecast(pace, entry["key"], entry["label"], now)
+        lines[entity] = pace_line_for(entry, now)
+    if not forecasts:
+        return out
+    acked = routing_delivery.snapshot(session, component).get("pace_acked") or {}
+    effective = {e: routing_pace.effective_forecast(acked.get(e), f, now) for e, f in forecasts.items()}
+    pushes = {e: f for e, f in effective.items() if routing_pace.should_push(acked.get(e), f, now)}
+    if out.get("kind") == "full":
+        return dict(out, pace_forecasts=effective)
+    if not pushes:
+        return out
+    out = dict(out, pace_forecasts=pushes)
+    if out.get("kind") == "none":
+        text = CHANGES_HEADING.format(at=_clock(now, now)) + "\n" + "\n".join(lines[e] for e in pushes)
+        out.update(kind="changes", text=_for_agents(text, view), count=len(pushes),
+                   owed_entities=list(pushes), shown_entities=list(pushes))
+    return out
 
 
 def _prompt_text(marker, view, now, cfg, *, session_id=None):
@@ -8827,6 +9052,9 @@ def _route_intent(cmd: str, args) -> dict | None:
         target = value.get("id") or value["runner"] + ":" + value["lane"]
         return owner_direction.intent("route.definition.set", target,
                                       facts={"definition": args.definition, "value": value})
+    if cmd == "cap":
+        return owner_direction.intent(f"route.cap.{args.action}", _resolve_account_key(args.account),
+                                      facts={"window": args.window, "kind": args.kind})
     if cmd in ("pause", "lift", "clear"):
         facts = {"report": args.report} if cmd == "clear" and getattr(args, "report", None) else None
         return owner_direction.intent(f"route.{cmd}", _resolve_account_key(args.account), facts=facts)
@@ -8992,7 +9220,15 @@ def run_cli(args) -> int:
             _print_json({"ok": False, "error": _REFUSED})
             return 2
         now = _now()
-        if cmd == "definition":
+        if cmd == "cap":
+            if args.action == "set":
+                if args.pct is None:
+                    raise RouteError("cap set needs --pct")
+                out = set_cap(args.account, window=args.window, kind=args.kind, pct=args.pct,
+                              revision=args.revision, via=via)
+            else:
+                out = remove_cap(args.account, window=args.window, kind=args.kind, via=via)
+        elif cmd == "definition":
             out = set_definition(args.definition, want["facts"]["value"], via=via)
         elif cmd == "pause":
             out = pause(args.account, until=args.until, via=via, now=now)

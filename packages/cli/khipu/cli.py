@@ -5782,7 +5782,17 @@ def build_parser() -> argparse.ArgumentParser:
     rdef.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rdef)
 
-    for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule, rdef):
+    rcap = rt_sub.add_parser("cap", parents=[rt_json], help="Owner: set or remove a pace cap")
+    rcap.add_argument("action", choices=("set", "remove"))
+    rcap.add_argument("account")
+    rcap.add_argument("--window", required=True, choices=("weekly", "five_hour"))
+    rcap.add_argument("--kind", required=True, choices=("share", "per_day"))
+    rcap.add_argument("--pct", type=float, default=None)
+    rcap.add_argument("--revision", default=None)
+    rcap.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rcap)
+
+    for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule, rdef, rcap):
         writer.add_argument("--op", default=None, help="Retry identity; reuse for the same change")
 
     dec = sub.add_parser(

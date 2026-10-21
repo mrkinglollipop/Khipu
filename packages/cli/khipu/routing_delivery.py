@@ -128,6 +128,11 @@ def plan(out, view, now, cfg, *, session=None):
         if effective is None:
             effective = line
         items.append(dict(entity=entity, effective=effective, text=line, label=label, whole=whole))
+    for entity, fc in (out.get("pace_forecasts") or {}).items():
+        entry = next((a for a in view.get("accounts") or [] if a["key"] == fc["account"]), None)
+        line = r.pace_line_for(entry, now) if entry else None
+        if line:
+            items.append(dict(entity=entity, effective=line, text=line, label=fc["label"], whole=False))
     projected = r._for_agents([(item["text"], item["label"]) for item in items], view) if items else []
     for item, (line, label) in zip(items, projected):
         effective = item.pop("effective")
@@ -151,8 +156,9 @@ def plan(out, view, now, cfg, *, session=None):
                           label="Proposal notice", whole=True, visible=ident in (out.get("notices") or [])))
     removed = {e: r.change_line(e, view, now) for e in view.get("causes", {})
                if e not in view.get("effective", {}) and (e == "note" or e.startswith("rule:"))}
-    return dict(out, delivery_plan={"items": items, "current_entities": list(view.get("effective", {})),
-                                   "removed": removed, "notices": ["notice:" + n[2] for n in notices], "at": r._iso(now),
+    return dict(out, delivery_plan={"items": items, "pace_forecasts": out.get("pace_forecasts") or {},
+                                    "current_entities": list(view.get("effective", {})),
+                                    "removed": removed, "notices": ["notice:" + n[2] for n in notices], "at": r._iso(now),
                                    "limit": cfg["routing_summary_chars"] if full else cfg["routing_prompt_chars"],
                                    "full": full, "page_limit": cfg["routing_prompt_chars"], "text": out.get("text"),
                                    "lease": cfg["routing_delivery_lease"],
@@ -248,7 +254,7 @@ def _render(state, out, now, component):
     if not due:
         # Informational full/stale blocks have no change debt to reserve.
         answer = {k: v for k, v in out.items() if k not in
-                  ("delivery_plan", "delivery_reservation", "routing_changes", "delivery", "_delivery_view", "_reserved")}
+                  ("delivery_plan", "delivery_reservation", "routing_changes", "delivery", "_delivery_view", "_reserved", "pace_forecasts")}
         return answer
     limit = out["delivery_plan"]["limit"]
     # Keep ordinary small offers byte-identical. A preview is never enough
@@ -316,7 +322,7 @@ def _render(state, out, now, component):
             body.append(tail)
         plain = heading + "\n" + "\n".join(body)
     complete = [entity for entity, end in progress.items() if end == len(entries[entity]["text"])]
-    answer = {k: v for k, v in out.items() if k not in ("delivery_plan", "delivery_reservation", "_delivery_view", "_reserved")}
+    answer = {k: v for k, v in out.items() if k not in ("delivery_plan", "delivery_reservation", "_delivery_view", "_reserved", "pace_forecasts")}
     if "notices" in out or out["delivery_plan"].get("notices"):
         answer["notices"] = [entity.removeprefix("notice:") for entity in complete
                              if entity.startswith("notice:")]
@@ -400,6 +406,9 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
             e["restarted"] = False
         batches = state.setdefault("batches", {})
         batches[batch] = True
+        forecasts = (flight.get("plan") or {}).get("pace_forecasts") or {}
+        if forecasts:
+            state["pace_acked"] = {**(state.get("pace_acked") or {}), **forecasts}
         # Idempotence covers recent retries; older ids fail closed.
         for old in list(batches)[:-128]:
             del batches[old]
