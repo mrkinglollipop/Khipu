@@ -173,6 +173,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_dispatch_scripts": ("names", [], "Your own scripts that hand work to another agent, by file name"),
     "routing_delivery_lease": ("duration", 60, "How long an unacknowledged routing batch stays in flight"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
+    "routing_child_chars": ("count", 4000, "Longest routing block for a subagent at its start (0: no limit)"),
     "routing_prompt_budget_ms": ("count", 50, "Time allowed before a prompt, in milliseconds"),
     "routing_start_budget_ms": ("count", 1000, "Time allowed at the start of a conversation, in milliseconds"),
     "routing_resend_after_versions": ("count", 20, "Send everything again after this many changes (0: never)"),
@@ -8561,8 +8562,27 @@ def start_budget() -> float:
     return min(max(0, ms), START_BUDGET_MOST_MS) / 1000.0
 
 
+def child_page_push(session_id: str | None, agent_id: str | None, *,
+                    now: datetime | None = None) -> dict | None:
+    """The next deferred routing page for a subagent's own tool result
+    (slice 8a): one page from its ``agent:<agent_id>`` ledger, or None when
+    nothing is deferred. The parent's ledger is never touched."""
+    if not session_id or not agent_id or push_off("delegation"):
+        return None
+    from khipu import routing_delivery
+
+    now = now or _now()
+    out = light_status(now, start=True, session_id=None)
+    planned = routing_delivery.plan(dict(out, kind="full"), out.view, now, settings(), session=None)
+    session = routing_delivery.hook_session(session_id)
+    page = routing_delivery.child_page(planned, session=session, component=f"agent:{agent_id}",
+                                       now=now, cfg=settings())
+    return dict(page, session=session) if page else None
+
+
 def start_push(budget: float | None = None, moment: str = "start", *,
-               session_id: str | None = None) -> dict | None:
+               session_id: str | None = None, child_component: str | None = None,
+               child_session: str | None = None) -> dict | None:
     """The full summary for the session-start hook (or, with ``moment``
     "delegation", for a subagent at its start), or None when the push is
     off. Folds outside the routing lock and waits for it, to save the view,
@@ -8572,11 +8592,22 @@ def start_push(budget: float | None = None, moment: str = "start", *,
     if push_off(moment):
         return None
     budget = start_budget() if budget is None else budget
-    out = light_status(lock_wait=budget / 2, start=True, session_id=session_id)
+    out = light_status(lock_wait=budget / 2, start=True,
+                       session_id=None if child_component else session_id)
     from khipu import routing_delivery
 
     now = _now()
     view = out.view
+    if child_component:
+        # A subagent receives a snapshot, not its parent conversation's
+        # notices: the plan is built with no session, and the bounded
+        # block is reserved in the child's own per-agent ledger.
+        planned = routing_delivery.plan(dict(out, kind="full"), view, now, settings(), session=None)
+        answer = routing_delivery.child_offer(planned, session=child_session,
+                                              component=child_component, now=now, cfg=settings())
+        answer.update(kind="full", version=out["version"], epoch=out.get("epoch"),
+                      generation=out.get("generation"), notices=[])
+        return answer
     out = routing_delivery.plan(dict(out, kind="full"), view, now, settings(), session=session_id)
     from khipu import recall_rule
 

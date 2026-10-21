@@ -1,9 +1,10 @@
 # Routing received-context acceptance
 
 Read `docs/plans/2026-10-20-routing-first-class.md`, sections 4 and 12, first.
-This is slice 2b's rig. Cases 7a, 7b and 7c remain **strict** expected failures
-owned by slices 8a, 8b and 8c. Codex SubagentStart receipt is a plain passing
-assertion; bounded child blocks and the absent-hook advisory remain slice 8b contracts.
+This is slice 2b's rig. Case 7a is a plain passing assertion (slice 8a);
+cases 7b and 7c remain **strict** expected failures owned by slices 8b
+and 8c. Codex SubagentStart receipt is a plain passing assertion; bounded
+child blocks and the absent-hook advisory remain slice 8b contracts.
 
 ## Run it deliberately
 

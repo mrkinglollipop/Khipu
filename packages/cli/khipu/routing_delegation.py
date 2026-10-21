@@ -12,10 +12,14 @@ Two hooks, both behind ``routing_push`` and ``routing_push_delegation``:
   (``routing_prompt_budget_ms``, ``routing_prompt_chars``) and the same
   seen marker, moved only once the block was written. So a block one push
   delivered is never repeated by the other. A call inside a subagent (its
-  payload carries ``agent_id``) gets nothing: the subagent heard the
-  summary at its start, and the parent's marker is not the subagent's.
-- SubagentStart (Claude Code): the full summary, for the subagent alone. The
-  parent's marker does not move, since the parent never saw it.
+  payload carries ``agent_id``) is not a delegation: it gets the next
+  deferred page from the subagent's own ledger (slice 8a), and the
+  parent's marker is not the subagent's.
+- SubagentStart (Claude Code): a bounded child block, for the subagent
+  alone. The parent's marker does not move, since the parent never saw
+  it; what the block leaves out is owed in the subagent's own
+  ``agent:<agent_id>`` ledger and arrives as pages on its own tool
+  results (its PreToolUse, below).
 
 Neither ever denies, asks or changes a call: the answer carries only
 ``additionalContext``, and the context reaches the model with the tool's
@@ -584,12 +588,42 @@ def _claude_model_brief(command: str | None) -> tuple[str | None, str | None]:
     return model, brief
 
 
+def _agent_tool_use(payload: dict, environ, agent_id: str) -> tuple[dict, dict | None, str | None]:
+    """The next deferred routing page on a subagent's own tool result.
+
+    The subagent's PreToolUse is its delivery point: the page comes from
+    its ``agent:<agent_id>`` ledger, reserved until this hook's caller
+    records it delivered, and the parent's ledger never moves. Context
+    only, never a permission decision."""
+    if _switched_off(environ) or _helper(payload):
+        return {}, None, None
+    session_id = payload.get("session_id") or payload.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        return {}, None, None
+    from khipu import routing
+
+    try:
+        page = routing.child_page_push(session_id, agent_id)
+    except Exception:  # noqa: BLE001 - routing never breaks the hook
+        return {}, None, None
+    if not page or not page.get("routing_changes") or not isinstance(page.get("text"), str):
+        return {}, None, None
+    info = {"status": "changes:1", "pending": {
+        "session": page["session"], "version": page["version"], "epoch": page.get("epoch"),
+        "full": False, "unrefreshed": None, "at": None, "based_on": None,
+        "owed": page.get("owed_entities"), "shown": page.get("shown_entities"),
+        "notices": [], "routing_changes": page["routing_changes"]}}
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                   "additionalContext": page["text"]}}, info, "agent"
+
+
 def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | None]:
     """(what to print, what to record once it is printed, the call's kind)
     for one PreToolUse call. Never a permission decision of any kind. Most
     tool calls end at the first test, which reads nothing."""
-    if payload.get("agent_id") or payload.get("agentId"):
-        return {}, None, None  # inside a subagent: it heard the summary at its start
+    agent_id = payload.get("agent_id") or payload.get("agentId")
+    if agent_id:
+        return _agent_tool_use(payload, environ, str(agent_id))
     if not might_delegate(payload) or _switched_off(environ):
         return {}, None, None
     kind = delegation_kind(payload)
@@ -620,15 +654,36 @@ def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | 
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": ctx}}, info, kind
 
 
-def subagent_start(payload: dict) -> dict:
-    """The full summary for a Claude Code subagent at its start."""
+def _subagent_start(payload: dict) -> tuple[dict, dict | None, str | None]:
+    """The bounded child block for a subagent at its start, plus what to
+    record once it is printed. A subagent receives a snapshot, not its
+    parent conversation's notices: the block is reserved in its own
+    per-agent ledger, and the parent's marker never moves."""
     from khipu import recall_rule
 
-    # A subagent receives a snapshot, not its parent conversation's notices.
-    text = recall_rule._RoutingAtStart(moment="delegation", session_id="").begin().text()
-    if not text or recall_rule._utf16_len(text) > recall_rule._HOOK_CONTEXT_BUDGET:
-        return {}
-    return {"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": text}}
+    session_id = payload.get("session_id") or payload.get("sessionId") or ""
+    agent_id = payload.get("agent_id") or payload.get("agentId") or ""
+    at = recall_rule._RoutingAtStart(moment="delegation", session_id=session_id,
+                                     agent_id=str(agent_id) if agent_id else None,
+                                     child_component=None if agent_id else "agent:unknown").begin()
+    text = at.text()
+    if not text:
+        return {}, None, None
+    out = {"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": text}}
+    stored = at.out if isinstance(at.out, dict) else {}
+    if not stored.get("routing_changes") or not at.session:
+        return out, None, None
+    info = {"status": "full", "pending": {
+        "session": at.session, "version": stored["version"], "epoch": stored.get("epoch"),
+        "full": False, "unrefreshed": None, "at": None, "based_on": None,
+        "owed": stored.get("owed_entities"), "shown": stored.get("shown_entities"),
+        "notices": [], "routing_changes": stored["routing_changes"]}}
+    return out, info, "subagent"
+
+
+def subagent_start(payload: dict) -> dict:
+    """The bounded child block for a Claude Code subagent at its start."""
+    return _subagent_start(payload)[0]
 
 
 def hook_main(raw: str, environ=None) -> tuple[dict, dict | None, str | None]:
@@ -639,7 +694,7 @@ def hook_main(raw: str, environ=None) -> tuple[dict, dict | None, str | None]:
     payload = _payload(raw)
     event = _event(payload)
     if event == "SubagentStart":
-        return ({} if _helper(payload) else subagent_start(payload)), None, None
+        return ({}, None, None) if _helper(payload) else _subagent_start(payload)
     if event and event != "PreToolUse":
         return {}, None, None
     out = pre_tool_use(payload, environ)

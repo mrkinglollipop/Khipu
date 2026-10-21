@@ -14,6 +14,7 @@ import tempfile
 import time
 import hashlib
 import json
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -613,6 +614,176 @@ def _projected_pages(changes):
     for item in changes["items"]:
         item["text"] = RoutingPage(item["text"])
     return changes
+
+
+_CHILD_GROUPS = {"account": 0, "hold": 1, "rule": 2, "note": 3, "priority": 4, "lane": 5}
+
+
+def _child_sorted(entries):
+    indexed = list(enumerate(entries))
+    return [entry for _i, entry in sorted(
+        indexed, key=lambda pair: (_CHILD_GROUPS.get(pair[1]["entity"].split(":", 1)[0]
+                                                    if ":" in pair[1]["entity"] else pair[1]["entity"], 6), pair[0]))]
+
+
+def _child_opening(entry):
+    from khipu import routing as r
+
+    label = {"note": "Owner note", "priority": "Owner priority"}.get(entry["entity"], entry["label"])
+    return f"{label}: \"{r._compact_opening(entry['text'], 64)}\""
+
+
+def _child_header_base(entry):
+    if entry["entity"] == "note":
+        return "Owner note"
+    if entry["entity"] == "priority":
+        return "Owner priority"
+    match = re.match(r"Standing rule (\S+)", entry["label"] or "")
+    return f"Rule {match.group(1)}" if match else entry["label"]
+
+
+def child_offer(planned, *, session=None, component, now=None, cfg=None):
+    """The bounded block a subagent gets at its start (slice 8a).
+
+    Account states and holds first, then each standing rule and the note:
+    whole when it fits under ``routing_child_chars``, otherwise its number,
+    kind, accounts and opening, with the whole text left owed in this
+    component's ledger for its own tool results. Shown entities are
+    reserved as one batch, exactly as a hook offer reserves them; the
+    caller acknowledges it only once the block was printed.
+    """
+    from khipu import routing as r
+
+    cfg = cfg or {}
+    now = now or _parse(planned["delivery_plan"]["at"])
+    limit = cfg.get("routing_child_chars", 4000) or 10 ** 9
+    width = cfg.get("routing_line_chars", 200)
+
+    def build(state):
+        entries = _merge(state, planned)
+        ordered = _child_sorted(entries.values())
+        heading = planned["delivery_plan"]["heading"]
+        lines, shown, deferred = [heading], {}, []
+        used = _size(heading)
+        candidates = [e for e in ordered if e.get("whole")]
+        for entry in ordered:
+            entity = entry["entity"]
+            if not entry.get("whole"):
+                rendered = r._clip(entry["text"], width) if width else entry["text"]
+                if used + _size(rendered) + 1 <= limit:
+                    lines.append(rendered)
+                    shown[entity] = len(entry["text"])
+                    used += _size(rendered) + 1
+                else:
+                    deferred.append(entity)
+                continue
+            opening = _child_opening(entry)
+            at = next((i for i, e in enumerate(candidates) if e is entry), len(candidates))
+            reserve = sum(_size(_child_opening(e)) + 1 for e in candidates[at + 1:])
+            whole = entry["text"]
+            header = _size("Standing rules:") + 1 if entity.startswith("rule:") \
+                and not any(line == "Standing rules:" for line in lines) else 0
+            if (not entry.get("offset") or entry.get("acked")) and \
+                    used + header + _size(whole) + 1 + reserve <= limit:
+                if header:
+                    lines.append("Standing rules:")
+                    used += header
+                lines.append(whole)
+                shown[entity] = len(whole)
+                used += _size(whole) + 1
+            elif used + header + _size(opening) + 1 <= limit:
+                if header:
+                    lines.append("Standing rules:")
+                    used += header
+                lines.append(opening)
+                deferred.append(entity)
+                used += _size(opening) + 1
+            else:
+                deferred.append(entity)
+        answer = {"text": "\n".join(lines), "owed_entities": deferred,
+                  "shown_entities": list(shown)}
+        if session and shown:
+            changes = {"batch": str(uuid.uuid4()), "component": component,
+                       "items": [dict(change=e + "@" + entries[e]["revision"], entity=e,
+                                      revision=entries[e]["revision"]) for e in shown]}
+            answer["routing_changes"] = changes
+            state["flight"] = {"until": _iso(now + timedelta(seconds=planned["delivery_plan"]["lease"])),
+                               "out": {"routing_changes": copy.deepcopy(changes),
+                                       "version": planned.get("version")},
+                               "progress": dict(shown), "plan": copy.deepcopy(planned["delivery_plan"])}
+        return answer
+
+    if not session:
+        return build({})
+    with _transaction(session) as data:
+        return build(data.setdefault(component, {}))
+
+
+def child_page(planned, *, session=None, component, now=None, cfg=None):
+    """The next deferred page for one agent component, or None.
+
+    One whole entity at a time, in child order, one page per delivery
+    point. The page is reserved as a leased batch; acknowledging it (the
+    hook's delivered callback) advances the ledger's offset, so a dropped
+    print re-sends the same page and a revision change restarts it.
+    """
+    cfg = cfg or {}
+    now = now or _parse(planned["delivery_plan"]["at"])
+    if not session:
+        return None
+    with _transaction(session) as data:
+        state = data.setdefault(component, {})
+        entries = _merge(state, planned)
+        flight = state.get("flight")
+        if flight and _parse(flight["until"]) > now:
+            out = flight["out"]
+            if not out.get("text"):
+                return None  # the start block itself is still in flight
+            return {"text": out["text"], "routing_changes": copy.deepcopy(out["routing_changes"]),
+                    "version": out.get("version"), "epoch": planned.get("epoch"),
+                    "owed_entities": [i["entity"] for i in out["routing_changes"]["items"]],
+                    "shown_entities": []}
+        if flight:
+            state["expired"] = state.get("expired", 0) + 1
+            state.pop("flight", None)
+        due = [e for e in _child_sorted(entries.values())
+               if e.get("whole") and not e.get("acked") and e.get("offset", 0) < len(e["text"])]
+        if not due:
+            return None
+        entry = due[0]
+        page_limit = planned["delivery_plan"].get("page_limit") or cfg.get("routing_prompt_chars") or 2000
+        base = _child_header_base(entry)
+        start = entry.get("offset", 0)
+        n = entry.get("pages", 0) + 1
+        m, end = n, start
+        for _ in range(4):
+            header = f"{base} page {n}/{m}"
+            width = max(2, page_limit - _size(header) - 1)
+            end = _cut(entry["text"], start, width)
+            if end == start:
+                return None
+            remaining = _pages_left(entry["text"], end, width)
+            if remaining is None:
+                return None
+            if n + remaining == m:
+                break
+            m = n + remaining
+        header = f"{base} page {n}/{m}"
+        rendered = header + "\n" + entry["text"][start:end]
+        if entry.get("restarted"):
+            rendered = f"{base} changed while being shown.\n" + rendered
+        item = dict(change=entry["entity"] + "@" + entry["revision"], entity=entry["entity"],
+                    revision=entry["revision"], page={"n": n, "m": m})
+        changes = {"batch": str(uuid.uuid4()), "component": component, "items": [item]}
+        state["flight"] = {"until": _iso(now + timedelta(seconds=planned["delivery_plan"]["lease"])),
+                           "out": {"routing_changes": copy.deepcopy(changes),
+                                   "version": planned.get("version"), "text": rendered},
+                           "progress": {entry["entity"]: end},
+                           "plan": copy.deepcopy(planned["delivery_plan"])}
+        return {"text": rendered, "routing_changes": changes, "version": planned.get("version"),
+                "epoch": planned.get("epoch"),
+                "owed_entities": [e["entity"] for e in due],
+                "shown_entities": [entry["entity"]] if end == len(entry["text"]) else []}
 
 
 def _batch_in_state(state, batch):
