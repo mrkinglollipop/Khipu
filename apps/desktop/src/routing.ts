@@ -411,6 +411,10 @@ export type RouteAdvice = {
   label?: string | null;
   purpose?: "job" | string;
   verdict?: "go" | "hold_back" | "closed" | "not_eligible" | string;
+  /** The check cap's qualifiers the generic check advice was computed
+   *  for (`check_advice` only, when its cap is qualified). */
+  tier?: string | null;
+  sensitive?: boolean;
   /** The verdict's cause: semicolon-joined "kind verdict" pairs, a state, a
  *  crossing, or the eligibility sentence in the CLI's words. */
   reason?: string | null;

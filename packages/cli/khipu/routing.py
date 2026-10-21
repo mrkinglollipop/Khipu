@@ -8184,6 +8184,10 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
         return dict(routing_advice.account_advice(view, e, now, purpose=purpose),
                     newest_reading_at=e.get("newest_reading_at"))
 
+    def _check_advice(e):
+        return dict(routing_advice.check_advice(view, e, now),
+                    newest_reading_at=e.get("newest_reading_at"))
+
     def _owner_caps(e):
         statuses = cap_statuses(view, e, now, confirmations=True)
         for status in statuses:
@@ -8202,7 +8206,7 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
                                           cap_statuses=_owner_caps(e),
                                           advice=_advice(e, "job"),
                                           lead_advice=_advice(e, "orchestration"),
-                                          **({"check_advice": _advice(e, "check")}
+                                          **({"check_advice": _check_advice(e)}
                                              if routing_advice.has_check_cap(e) else {})))
                        for e in view["accounts"] if account is None or e["key"] == account]
     out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
@@ -8582,7 +8586,7 @@ def _public_account(entry: dict, now: datetime, view: dict | None = None) -> dic
 
         out["advice"] = routing_advice.account_advice(view, entry, now)
         if routing_advice.has_check_cap(entry):
-            out["check_advice"] = routing_advice.account_advice(view, entry, now, purpose="check")
+            out["check_advice"] = routing_advice.check_advice(view, entry, now)
     out["line"] = account_line(entry, now, push=False)
     return out
 
@@ -9778,12 +9782,13 @@ def _advice_push_adjust(out: dict, view: dict, now: datetime, session: str, comp
             check_id = f"advice:check:{entry['key']}"
             if check_id in acked or any(c.get("kind") == "pace_target" and c.get("purpose") == "check"
                                         for c in entry.get("caps") or []):
-                current[check_id] = routing_advice.account_advice(view, entry, now, purpose="check")
+                current[check_id] = routing_advice.check_advice(view, entry, now)
     if not current:
         return out
 
     def sig(item):
-        return (item.get("verdict"), item.get("reason"), item.get("evidence")) if item else None
+        return (item.get("verdict"), item.get("reason"), item.get("evidence"),
+                item.get("tier"), item.get("sensitive")) if item else None
 
     pushes = {e: a for e, a in current.items() if sig(acked.get(e)) != sig(a)}
     if out.get("kind") == "full":

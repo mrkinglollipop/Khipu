@@ -64,7 +64,7 @@ export type PaceAdvice = {
   why: string;
   evid: string;
   lead: { word: PaceAdvice["word"]; tone: PaceAdvice["tone"]; why: string } | null;
-  checks: { word: "Go" | "Hold back" | "Closed" | "Not for checks"; tone: PaceAdvice["tone"]; why: string } | null;
+  checks: { label: string; word: "Go" | "Hold back" | "Closed" | "Not for checks"; tone: PaceAdvice["tone"]; why: string } | null;
 };
 
 /** One account: its block, or the one line the group keeps closed. */
@@ -802,8 +802,14 @@ function adviceOf(a: RouteAccount, now: Date): PaceAdvice | null {
       ? "evidence stale"
       : `evidence unknown: ${evidenceCause(a)}`;
   const check = a.check_advice;
+  const checkTier = check?.tier ?? null;
+  const checkSensitive = check?.sensitive ?? false;
+  const checkLabel = checkTier || checkSensitive
+    ? `${checkTier ? `${capitalise(checkTier)} checks` : "Checks"}${checkSensitive ? " of sensitive code" : ""}`
+    : "Checks";
   const checks: PaceAdvice["checks"] = check && (a.cap_statuses ?? []).some((s) => s.kind === "pace_target" && s.purpose === "check")
-    ? { word: check.verdict === "go" ? "Go" : check.verdict === "hold_back" ? "Hold back" : check.verdict === "closed" ? "Closed" : "Not for checks",
+    ? { label: checkLabel,
+      word: check.verdict === "go" ? "Go" : check.verdict === "hold_back" ? "Hold back" : check.verdict === "closed" ? "Closed" : "Not for checks",
       tone: check.verdict === "go" ? "go" : check.verdict === "hold_back" ? "hold" : "closed",
       why: adviceWhy(a, check, now) }
     : null;

@@ -4725,7 +4725,7 @@ export function PaceSection({ data, plans, now, folds }: {
                   </div>
                   {row.advice.checks ? (
                     <div className="adv-row">
-                      <span className="who">Checks</span>
+                      <span className="who">{row.advice.checks.label}</span>
                       <span className={`word ${row.advice.checks.tone}`}>{row.advice.checks.word}</span>
                       <span className="why">{row.advice.checks.why}</span>
                     </div>

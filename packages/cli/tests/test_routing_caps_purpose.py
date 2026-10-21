@@ -156,6 +156,76 @@ def test_check_advice_changes_are_pushed_and_acknowledged(replay):
     assert "Advice for checks: Codex: hold back" in context
 
 
+def test_qualified_check_cap_drives_generic_check_advice_row_and_push(replay):
+    routing.report(account="Claude", state="open", author=AUTHOR)
+    replay.write(_sample(replay, used=40,
+                         reset=replay.now + timedelta(seconds=604800 * (1 - .2196))))
+    routing.set_cap("Claude", window="weekly", kind="pace_target", pct=100, slack=5, via="app")
+    routing.set_priority([{"account": "Claude"}], via="app", expect=routing.priority_version())
+    _, _, info = replay.offer()
+    replay.ack(info)
+    routing.set_cap("Claude", window="weekly", kind="pace_target", pct=100, slack=20,
+                    purpose="check", tier="sonnet", sensitive_only=True, via="app")
+    view = replay.view()
+    claude = next(a for a in routing.public_view(view, replay.now)["accounts"] if a["label"] == "Claude")
+    assert claude["check_advice"]["verdict"] == "go"
+    assert claude["check_advice"]["numbers"]["allowance_pct"] == pytest.approx(41.96, abs=.001)
+    assert routing_advice.advice_line(claude["check_advice"]) == (
+        "Advice for Sonnet checks of sensitive code: Claude: go (no provider fact restricts this account)")
+    entry = next(a for a in view["accounts"] if a["label"] == "Claude")
+    assert routing._public_account(entry, replay.now, view=view)["check_advice"]["verdict"] == "go"
+    _, context, _ = replay.offer()
+    assert "Advice for Sonnet checks of sensitive code: Claude: go" in context
+    assert "Advice for checks: Claude: hold back" not in context
+
+
+def test_disagreeing_check_qualifiers_fall_back_with_explicit_unqualified_advice(replay):
+    routing.report(account="Claude", state="open", author=AUTHOR)
+    replay.write(_sample(replay, used=40,
+                         reset=replay.now + timedelta(seconds=604800 * (1 - .2196))))
+    routing.set_cap("Claude", window="weekly", kind="pace_target", pct=100, slack=5, via="app")
+    routing.set_cap("Claude", window="weekly", kind="pace_target", pct=100, slack=20,
+                    purpose="check", tier="sonnet", sensitive_only=True, via="app")
+    routing.set_cap("Claude", window="five_hour", kind="pace_target", pct=100, slack=20,
+                    purpose="check", tier="opus", via="app")
+    view = replay.view()
+    entry = next(a for a in view["accounts"] if a["label"] == "Claude")
+    advice = routing_advice.check_advice(view, entry, replay.now)
+    assert advice["tier"] is None
+    assert advice["sensitive"] is False
+    assert routing_advice.advice_line(advice).startswith("Advice for checks: Claude: ")
+    claude = next(a for a in routing.public_view(view, replay.now)["accounts"] if a["label"] == "Claude")
+    assert claude["check_advice"]["tier"] is None
+    assert claude["check_advice"]["sensitive"] is False
+
+
+def test_rescoping_check_cap_sends_a_new_push_line(replay):
+    routing.report(account="Claude", state="open", author=AUTHOR)
+    replay.write(_sample(replay, used=40,
+                         reset=replay.now + timedelta(seconds=604800 * (1 - .2196))))
+    routing.set_cap("Claude", window="weekly", kind="pace_target", pct=100, slack=5, via="app")
+    routing.set_cap("Claude", window="weekly", kind="pace_target", pct=100, slack=20,
+                    purpose="check", tier="sonnet", sensitive_only=True, via="app")
+    routing.set_priority([{"account": "Claude"}], via="app", expect=routing.priority_version())
+    _, context, info = replay.offer()
+    assert "Advice for Sonnet checks of sensitive code: Claude: go" in context
+    replay.ack(info)
+    routing.set_cap("Claude", window="weekly", kind="pace_target", pct=100, slack=20,
+                    purpose="check", tier="opus", sensitive_only=True, via="app")
+    _, context, _ = replay.offer()
+    assert "Advice for Opus checks of sensitive code: Claude: go" in context
+
+
+@pytest.mark.parametrize("fields,words", [
+    ({"tier": "sonnet"}, "Sonnet checks"),
+    ({"sensitive": True}, "checks of sensitive code"),
+    ({}, "checks"),
+])
+def test_advice_line_names_check_qualifiers(fields, words):
+    advice = {"purpose": "check", "label": "Claude", "verdict": "go", "reason": "ok", **fields}
+    assert routing_advice.advice_line(advice) == f"Advice for {words}: Claude: go (ok)"
+
+
 @pytest.mark.parametrize("used,expected", [(40, "go"), (42, "hold_back")])
 def test_claude_sonnet_check_allowance_uses_twenty_points(replay, used, expected):
     routing.report(account="Claude", state="open", author=AUTHOR)

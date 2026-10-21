@@ -172,6 +172,38 @@ def has_check_cap(entry: dict) -> bool:
                for c in entry.get("caps") or [])
 
 
+def check_cap_qualifiers(entry: dict) -> tuple[str | None, bool] | None:
+    """The qualifier pair an account's qualified check caps share, or None.
+
+    None covers both no qualified check cap and qualified caps that
+    disagree: a single generic check line cannot name two scopes, so it
+    keeps the unqualified computation in both cases.
+    """
+    qualified = {(c.get("tier"), bool(c.get("sensitive_only")))
+                 for c in entry.get("caps") or []
+                 if c.get("kind") == "pace_target" and c.get("purpose") == "check"
+                 and (c.get("tier") is not None or c.get("sensitive_only"))}
+    return qualified.pop() if len(qualified) == 1 else None
+
+
+def check_advice(view: dict, entry: dict, now) -> dict:
+    """The generic check advice for an account: computed for its check
+    cap's qualifiers when it has them, so the row a reader sees is the
+    allowance the owner actually gave those checks. The qualifiers ride
+    on the result so lines can name the scope they were computed for."""
+    qualifiers = check_cap_qualifiers(entry)
+    if qualifiers is None:
+        advice = account_advice(view, entry, now, purpose="check")
+        advice["tier"] = None
+        advice["sensitive"] = False
+        return advice
+    tier, sensitive = qualifiers
+    advice = account_advice(view, entry, now, purpose="check", tier=tier, sensitive=sensitive)
+    advice["tier"] = tier
+    advice["sensitive"] = sensitive
+    return advice
+
+
 def _check_matches(status: dict, tier, sensitive: bool) -> bool:
     return ((status.get("tier") is None or status["tier"] == tier)
             and (not status.get("sensitive_only") or sensitive))
@@ -271,6 +303,10 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
 
 def advice_line(advice: dict) -> str:
     purpose = {"orchestration": "orchestration", "check": "checks"}.get(advice.get("purpose"), "jobs")
+    if advice.get("purpose") == "check" and (advice.get("tier") or advice.get("sensitive")):
+        purpose = f"{str(advice['tier']).capitalize()} checks" if advice.get("tier") else "checks"
+        if advice.get("sensitive"):
+            purpose += " of sensitive code"
     return (f"Advice for {purpose}: {advice['label']}: "
             f"{advice['verdict'].replace('_', ' ')} ({advice['reason']})")
 
