@@ -945,8 +945,12 @@ class RoutingPage(str):
 
 # Every secret shape in redact.py needs one of these markers (a vendor
 # prefix, a credential keyword, "://" for a URL credential, a key block);
-# text holding none of them cannot match, so the full regex scan is
-# skipped. Lowercased markers only ever over-match, never under-match.
+# pure-ASCII text holding none of them cannot match, so the full regex
+# scan is skipped for it. Lowercased markers only ever over-match, never
+# under-match on ASCII. Non-ASCII variants always get the full scan:
+# redact_secrets is case-insensitive, and re.I folds some non-ASCII
+# letters (long s, dotless/dotted i, Kelvin sign) onto ASCII, so a
+# keyword spelled with those can hide from the ASCII markers.
 _SECRET_MARKERS = ("-----begin", "sk-", "xai-", "k_live_", "k_test_", "akia", "asia",
                    "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "xox", "aiza",
                    "ya29.", "eyj", "bearer", "basic", "://", "key", "secret", "token",
@@ -957,6 +961,12 @@ def _has_secret(text: str) -> bool:
     from khipu.redact import redact_secrets
 
     for variant in _decoded_variants(text):
+        # The check is on each decoded variant, not the original text:
+        # an ASCII escape (e.g. \u0131) only becomes non-ASCII on decode.
+        if not variant.isascii():
+            if redact_secrets(variant, force=True)[1]:
+                return True
+            continue
         lowered = variant.lower()
         if not any(marker in lowered for marker in _SECRET_MARKERS):
             continue
