@@ -486,6 +486,32 @@ def refit(session, changes, body_limit):
         _prune_agent_components(data, _clock(), keep=component)
         return answer
 
+def _t3_root(native):
+    """``t3:<thread>`` for a harness-native session id T3 maps to a thread.
+
+    This is where Khipu's T3 integration sets ``KHIPU_SESSION_ID``: T3 gives
+    the agent no thread environment variable, so the canonical identity is
+    derived from T3's own session-to-thread record. Fail-open and bounded
+    (``thread_for_session`` has its own short deadline); a session T3 does
+    not know keeps its native identity."""
+    if not isinstance(native, str):
+        return None
+    bare = native.strip()
+    for prefix in ("claude:", "codex:"):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+    if not bare or bare.startswith("t3:"):
+        return None
+    try:
+        from khipu import t3
+
+        thread = t3.thread_for_session(bare)
+    except Exception:  # noqa: BLE001 - identity derivation never breaks a hook
+        return None
+    return f"t3:{thread}" if thread else None
+
+
 _HOOKED_HARNESSES = frozenset({"claude_code", "codex"})
 _PULL_ONLY_HARNESSES = frozenset({"aegis", "grok", "grok_build", "cursor", "muse", "gateway", "unknown"})
 
@@ -529,9 +555,9 @@ def canonical_identity(environ=None, explicit=None):
     if shared:
         root = session = shared
     elif claude:
-        root = session = f"claude:{claude}"
+        root = session = _t3_root(claude) or f"claude:{claude}"
     elif codex:
-        root = session = f"codex:{codex}"
+        root = session = _t3_root(codex) or f"codex:{codex}"
     elif explicit and not explicit.startswith(("claude:", "codex:", "t3:")):
         root = explicit
         # Environment strings cannot contain NUL. Explicit pull ids thus
@@ -585,10 +611,12 @@ def hook_session(session, environ=None):
     if shared:
         canonical = shared
     elif claude:
-        canonical = f"claude:{claude}"
+        canonical = _t3_root(claude) or f"claude:{claude}"
     elif codex:
-        canonical = f"codex:{codex}"
+        canonical = _t3_root(codex) or f"codex:{codex}"
     else:
+        if isinstance(session, str) and session.strip():
+            return _t3_root(session.strip()) or session
         return session
     if not isinstance(session, str) or not session.strip():
         return canonical
@@ -599,7 +627,9 @@ def hook_session(session, environ=None):
     own.update(f"{prefix}:{value}" for prefix, value in (("claude", claude), ("codex", codex)) if value)
     if session in own:
         return canonical
-    return session
+    # A payload naming a different T3-mapped native session is that thread's
+    # own conversation, never this environment's ledger.
+    return _t3_root(session) or session
 
 
 def untracked_items(out):

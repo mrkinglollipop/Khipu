@@ -229,9 +229,10 @@ def _age_seconds(value: str | None) -> float | None:
 def health(home: Path | None = None) -> dict[str, Any] | None:
     """Read-only T3 health for ``khipu doctor`` and the desktop card.
 
-    A T3 card exists only when its settings file exists.  Settings contents are
-    deliberately not parsed here: they can hold provider credentials and a
-    malformed or newer settings shape must not hide the installed T3 surface.
+    A T3 card exists only when its settings file exists.  Provider instances
+    are read through ``provider_instances``' closed field set (the file can
+    hold provider credentials, and a malformed or newer settings shape must
+    not hide the installed T3 surface).
     """
     if not settings_path(home).is_file():
         return None
@@ -250,8 +251,19 @@ def health(home: Path | None = None) -> dict[str, Any] | None:
         warnings.append(lookup_error or "T3's thread lookup is unavailable")
     if recent_without_capture:
         warnings.append("T3 was used in the last day without a thread-linked capture")
+    providers: list[dict[str, Any]] = []
+    for inst in all_provider_instances(settings_path(home)):
+        if not inst["enabled"]:
+            continue
+        hooks = provider_hooks(inst, home if home is not None else Path.home())
+        providers.append({"id": inst["id"], "driver": inst["driver"], "name": inst["name"], "hooks": hooks})
+        if hooks == "missing":
+            warnings.append(f"T3 provider {inst['name']} ({inst['driver']}) is missing Khipu hooks; "
+                            "sessions on it get no Khipu routing start block, so a brief for its "
+                            "children must carry `khipu route --brief`.")
     return {
         "detected": True,
+        "providers": providers,
         "lookup": {"ok": lookup_ok, "error": lookup_error},
         "used_recently": used_recently,
         "recent_use_error": recent_use_error,
@@ -368,6 +380,76 @@ def provider_instances(settings_file: Path | None, drivers, *, text: str | None 
             "enabled": inst.get("enabled") is not False,
         })
     return out
+
+
+def all_provider_instances(settings_file: Path | None = None, *, text: str | None = None) -> list[dict[str, Any]]:
+    """Every enabled-or-not provider instance, whatever its driver.
+
+    Only the driver names are read to build the allow-list, then
+    ``provider_instances`` extracts its closed field set; no other settings
+    byte leaves this module."""
+    try:
+        if text is None:
+            target = settings_file if settings_file is not None else settings_path()
+            text = target.read_text(encoding="utf-8")
+        data = json.loads(text) if text is not None else None
+    except (OSError, ValueError):
+        return []
+    instances = data.get("providerInstances") if isinstance(data, dict) else None
+    if not isinstance(instances, dict):
+        return []
+    drivers = {inst.get("driver") for inst in instances.values()
+               if isinstance(inst, dict) and isinstance(inst.get("driver"), str) and inst.get("driver")}
+    if not drivers:
+        return []
+    return provider_instances(settings_file, drivers, text=text)
+
+
+def _provider_folder(instance: dict[str, Any], home: Path, default_name: str) -> Path:
+    raw = (instance.get("home_path") or "").strip()
+    if not raw:
+        return home / default_name
+    if raw == "~":
+        return home
+    if raw.startswith("~/"):
+        return home / raw[2:]
+    path = Path(raw)
+    return path if path.is_absolute() else home / path
+
+
+def provider_hooks(instance: dict[str, Any], home: Path | None = None) -> str:
+    """``installed`` when the provider's own config home carries a Khipu
+    hook, else ``missing``. Providers whose driver has no Khipu hook pack
+    (anything but Claude Code and Codex) are always ``missing``: a T3 child
+    on them gets no routing start block. Only hook command names are read;
+    nothing else in those files leaves this function."""
+    home = home if home is not None else Path.home()
+    driver = instance.get("driver")
+    if driver == CLAUDE_DRIVER:
+        target = _provider_folder(instance, home, ".claude") / "settings.json"
+    elif driver == CODEX_DRIVER:
+        target = _provider_folder(instance, home, ".codex") / "hooks.json"
+    else:
+        return "missing"
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "missing"
+    commands: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            command = value.get("command")
+            if isinstance(command, str):
+                commands.append(command)
+            for inner in value.values():
+                walk(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                walk(inner)
+
+    walk(data.get("hooks") if isinstance(data, dict) else None)
+    return "installed" if any("khipu-" in command for command in commands) else "missing"
 
 
 def claude_instances(settings_file: Path) -> list[dict[str, Any]]:
