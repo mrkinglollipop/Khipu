@@ -155,7 +155,8 @@ export const PACE_VIEW: RouteView = {
       state: "open",
       pace: [],
       cap_statuses: [
-        { kind: "spend", revision: "r-deep-spend", window: null, cap_usd: 35, days: 7, usd: null, events: null, verdict: "unknown", why: "project-c has a gap in its spend coverage for this account" },
+        { kind: "spend", revision: "r-deep-spend", window: null, cap_usd: 35, days: 7, usd: null, events: null, verdict: "unknown", why: "project-c has a gap in its spend coverage for this account",
+          reported: { usd: 21.40, events: 4, gaps: [{ runner: "project-c", from: new Date(2026, 9, 20, 3).toISOString(), to: new Date(2026, 9, 20, 6).toISOString(), seconds: 10800 }] } },
       ],
       advice: {
         account: "deepseek", label: "DeepSeek", purpose: "job", verdict: "go",
