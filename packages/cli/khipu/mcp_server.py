@@ -2332,7 +2332,7 @@ def _tool_usage(args: dict) -> dict:
                                             background=True))
 
 
-def _route_pull_attachment(routing, routing_delivery, identity, now, *, view=None):
+def _route_pull_attachment(routing, routing_delivery, identity, now, *, view=None, delivery_point=True):
     """(routing_changes, delivery) for one pull caller, from the current view.
 
     An identified caller reserves its `mcp` component's batch under the
@@ -2356,6 +2356,12 @@ def _route_pull_attachment(routing, routing_delivery, identity, now, *, view=Non
          "owed_entities": [], "shown_entities": []},
         view, now, routing.settings(), project=project,
         session=identity["session"] if identity else None)
+    if identity and identity["session"].startswith("gateway\0"):
+        # ``checked_at`` moves on every quiet local read.  A gateway copy is
+        # stale only when it trails an actual folded revision.
+        planned["delivery_plan"].update(gateway=True, copy_epoch=view.get("epoch"),
+                                        copy_revision=view.get("version"),
+                                        copy_revision_at=view.get("folded_at"))
     # Only this pull's complete scrub table proves lane alias coverage.
     skip = frozenset(item["entity"] for item in planned["delivery_plan"]["items"] if item.get("withheld"))
     skip |= frozenset() if agent_view.login_inventory_available() else frozenset(
@@ -2368,7 +2374,8 @@ def _route_pull_attachment(routing, routing_delivery, identity, now, *, view=Non
     else:
         counting = "main" if identity["capability"] == "hooked" else "mcp"
         changes, delivery = routing_delivery.pull_offer(planned, session=identity["session"], component="mcp",
-                                                        counting_component=counting, now=now, skip_entities=skip)
+                                                        counting_component=counting, now=now, skip_entities=skip,
+                                                        delivery_point=delivery_point, harness=identity.get("harness", "unknown"))
     # Pull items name entities publicly: an account by its stable id, never
     # its key (a login folder the raw ledger entity carries).
     if changes is not None:
@@ -2431,8 +2438,8 @@ def _gateway_route_identity(args: dict):
     if label is None:
         # No token label is its own namespace: it must never share a
         # ledger with a token that happens to be labelled "gateway".
-        return {"session": f"gateway\0unlabeled\0{session}", "capability": "pull_only"}
-    return {"session": f"gateway\0labeled\0{label}\0{session}", "capability": "pull_only"}
+        return {"session": f"gateway\0unlabeled\0{session}", "capability": "pull_only", "harness": "gateway"}
+    return {"session": f"gateway\0labeled\0{label}\0{session}", "capability": "pull_only", "harness": "gateway"}
 
 
 def _tool_route_gateway(args: dict) -> dict:
@@ -2478,7 +2485,7 @@ def _tool_route_gateway_projected(args: dict) -> dict:
         # An unknown or expired batch is answered, never an error (there is
         # nothing to acknowledge); only a batch issued to another identity
         # is refused. With no session_id nothing is consumed for anyone.
-        _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
+        _route_pull_attachment(routing, routing_delivery, identity, now, view=view, delivery_point=False)
         status = routing_delivery.pull_acknowledge(identity["session"], ack, component="mcp", now=now)
         if status == "foreign":
             raise _ToolFailure({"ok": False, "code": "ack_not_yours",
@@ -2503,7 +2510,12 @@ def _tool_route_gateway_projected(args: dict) -> dict:
     # attachment restamped the shared table with the local exemption, so
     # clear it before the final scrub cuts every path, owner words included.
     agent_view._table(keys).owner = []
-    return agent_view.scrub_strict(out, keep=(), extra_keys=keys)
+    result = agent_view.scrub_strict(out, keep=(), extra_keys=keys)
+    if identity is not None:
+        routing_delivery.record_gateway_copy(identity["session"], epoch=view.get("epoch"),
+                                             revision=view.get("version"), revision_at=view.get("folded_at"),
+                                             result=result, now=now)
+    return result
 
 
 @_with_route_receipts
@@ -2553,7 +2565,7 @@ def _tool_route_projected(args: dict) -> dict:
     if ack and identity is not None:
         # Revalidate the complete source and final representation first.
         # A pre-upgrade or newly withheld reservation cannot consume debt.
-        _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
+        _route_pull_attachment(routing, routing_delivery, identity, now, view=view, delivery_point=False)
         status = routing_delivery.pull_acknowledge(identity["session"], ack, component="mcp", now=now)
         if status == "foreign":
             raise _ToolFailure({"ok": False, "code": "ack_not_yours",

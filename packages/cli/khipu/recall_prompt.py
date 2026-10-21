@@ -310,7 +310,24 @@ def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_
             new.pop("notices", None)
         return new
 
-    return _update_routing_marker(session_id, change, wait, component=component)
+    recorded = _update_routing_marker(session_id, change, wait, component=component)
+    if recorded and shown is not None:
+        # The marker is the hook's final-delivery callback.  Its claims only
+        # become delivery-health receipts when the delivery ledger has the
+        # independently captured final rendered payload for them.
+        try:
+            from khipu import routing_delivery
+
+            # The marker write is the public return contract.  Receipt
+            # mismatch is retained for health but does not rewrite a
+            # successful marker write into a delivery failure.
+            routing_delivery.mark_shown(session_id, shown, component=component,
+                                        version=version, epoch=epoch)
+        except OSError:
+            recorded = False
+        except Exception:
+            pass
+    return recorded
 
 
 def _notice_receipts(old, notices) -> dict:

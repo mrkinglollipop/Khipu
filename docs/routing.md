@@ -380,3 +380,47 @@ The closed 11a projection does not yet cover newer pace samples, caps and tier
 facts. Unsupported kinds are reported as `deferred_kinds`, retained locally and
 retried after a projection upgrade; they do not block supported events. No
 live hub, live configuration, hook or launch agent was changed for this slice.
+
+## Delivery health
+
+`khipu doctor --json` exposes `routing_delivery` (also inside `routing`) and
+`routing_delivery_ok`. The check reads existing delivery ledgers, today's stamped
+hook outcomes, replication cursors and gateway delivery rows; it never probes or
+changes routing, owner actions, dispatch policy or the promotion gate. Desktop
+clients can consume the same check; the app delivery view is slice 15a.
+
+For each identity active within `routing_delivery_live_after` (12 hours), the
+current attachment selects `main` for hooked clients and `mcp` for pull-only
+clients. Agent components count separately. Child receipts never clear parent
+debt. Each revision records its first owed delivery point and the ceiling of
+characters ahead plus its own characters divided by the available payload
+budget (page framing and the owed tail consume part of the configured cap). Still owed
+at that bound plus `routing_delivery_slack` (2) further delivery points is red. The
+bound belongs to that revision: a replacement revision starts a new age and budget.
+An entity replaced on every delivery point continually restarts this bound;
+health does not accumulate stall age across its successive revisions.
+Two expired leases for the same revision are also red. An acknowledgement past
+its shown receipt is red; old ledgers without receipt proof are unknown.
+
+Other red reasons are more than 1% of today's recorded prompts skipping routing,
+a cross-Mac caught-up cursor more than 10 minutes behind, a gateway delivered
+projection still behind after `routing_cloud_copy_stale_after` seconds since the
+current local revision's `folded_at`, and a limited lane still
+unmatched for an hour of one continuous unmatched run. UTC timestamps select today's hook outcomes from the
+existing bounded log tail. Copy checks are not applicable when their switches
+are off. Enabled copies without timestamps, unreadable ledgers, absent live
+identities and missing hook outcomes say `unknown` with named missing evidence,
+never green. A gateway identity outside the 12-hour delivery liveness window no
+longer supplies copy evidence. A gateway response carrying the current local
+revision proves recovery; an unchanged record stays fresh while its callers are
+idle. A newly folded revision starts the gateway staleness clock even when a
+client last pulled much earlier. Simply calling health
+cannot refresh evidence.
+
+Each result carries `status`, `reasons`, `missing`, per-component `identities`,
+`prompts`, `replication` and `gateway`. Identity names are ledger hashes; health
+rows carry the attachment's harness name (`unknown` for missing or unrecognized
+names) and each component's `last_delivery_point`, with no session ids, routing
+words or login paths. Green requires affirmative evidence
+for every applicable check. Recovery requires the corresponding receipt, current
+outcome log, caught-up cursor, delivered projection or resolved lane mapping.

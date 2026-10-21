@@ -1340,40 +1340,76 @@ def test_14_scanner_live_claims_and_false_positives(replay, line, flag):
 
 @pytest.mark.parametrize("condition", ["budget-stall", "lease-expired-twice", "ack-unshown", "prompt-skips",
                                       "cross-mac-stale", "gateway-stale", "unmatched-limit"])
-@future("16", "doctor needs routing_delivery health driven by delivery evidence")
 def test_15_health_red_and_recovery(replay, condition):
-    routing.report(account="Codex", state="open", author=AUTHOR)
-    out, _, info = replay.offer()
-    if condition in {"budget-stall", "lease-expired-twice"}:
-        for _ in range(5 if condition == "budget-stall" else 2):
-            replay.advance(61)
-            replay.offer()
-    elif condition == "ack-unshown":
-        assert recall_prompt.mark_routing_seen("s1", version=out["version"], epoch=out["epoch"],
-                                              owed=["not-shown"], shown=["not-shown"])
-    elif condition == "prompt-skips":
+    from khipu import routing_delivery, routing_replication
+
+    def outcomes(skips=0):
         log = recall_prompt._log_path()
         log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text("".join("session=s1 reason=no_hits ms=1 hits=[] legs=[] degraded=None routing=skipped:timeout\n"
-                               for _ in range(2)))
-    elif condition in {"cross-mac-stale", "gateway-stale"}:
-        replay.configure(**{f"routing_{condition.replace('-', '_')}_at": routing._iso(T0 - timedelta(hours=1))})
+        prefix = routing._iso(replay.now) + " [khipu-prompt-recall] "
+        log.write_text("".join(prefix + "session=s1 reason=no_hits ms=1 hits=[] legs=[] degraded=None routing="
+                               + ("skipped:budget" if i < skips else "none") + "\n" for i in range(100)))
+
+    routing.report(account="Codex", state="open", author=AUTHOR)
+    out, _, info = replay.offer()
+    outcomes()
+    if condition == "budget-stall":
+        # Repeated delivery points inside one lease isolate the budget bound.
+        for _ in range(5):
+            replay.offer()
+    elif condition == "lease-expired-twice":
+        for _ in range(2):
+            replay.advance(61)
+            _, _, info = replay.offer()
+    elif condition == "ack-unshown":
+        # An ack is not itself a shown receipt.  This claim names an entity
+        # absent from the final rendered payload and must leave the real one
+        # red until its actual rendered receipt arrives.
+        assert recall_prompt.mark_routing_seen("s1", version=out["version"], epoch=out["epoch"],
+                                               owed=["not-shown"], shown=["not-shown"])
+        assert routing_delivery.acknowledge("s1", info["pending"]["routing_changes"])
     else:
-        replay.write(replay.event("evidence", runner="synthetic-runner", lane="unmapped", state="limited",
-                                  source="runner", until=routing._iso(T0 + timedelta(hours=3))))
-        replay.advance(3601)
-    health = routing.doctor_block(now=replay.now).get("routing_delivery")
-    expect(isinstance(health, dict), True, f"15/{condition}: doctor has no routing_delivery evidence check")
+        replay.ack(info)
+        if condition == "prompt-skips":
+            outcomes(skips=2)
+        elif condition == "cross-mac-stale":
+            replay.configure(routing_replication_live=True)
+            routing_replication._save({"caught_up_at": routing._iso(replay.now - timedelta(hours=1))})
+        elif condition == "gateway-stale":
+            replay.configure(routing_cloud_copy=True)
+            replay.patch.setenv("KHIPU_HARNESS", "gateway")
+            replay.patch.setenv(mcp_server.GATEWAY_ACTIVE_ENV, "1")
+            replay.patch.setattr(mcp_server, "_GATEWAY_ACTIVE", True)
+            replay.pull(session_id="client:health")
+            replay.advance(601)
+            routing.report(account="Codex", state="limited", until="1h", author=AUTHOR)
+            routing.read_view(replay.now)
+            replay.advance(601)
+        else:
+            replay.write(replay.event("evidence", runner="synthetic-runner", lane="unmapped", state="limited",
+                                      source="runner", until=routing._iso(T0 + timedelta(hours=3))))
+            replay.advance(3601)
+    health = routing.doctor_block(now=replay.now)["routing_delivery"]
+    assert condition in health["reasons"], health
     assert health["status"] == "red"
-    # Recovery must cite the corresponding evidence, never a probe result.
-    replay.ack(info)
-    if condition == "unmatched-limit":
+    # Recovery changes the corresponding persisted evidence, never a probe.
+    if condition in {"budget-stall", "lease-expired-twice", "ack-unshown"}:
+        if condition == "ack-unshown":
+            assert recall_prompt.mark_routing_seen("s1", version=out["version"], epoch=out["epoch"],
+                                                   owed=out["owed_entities"], shown=out["shown_entities"])
+        else:
+            replay.ack(info)
+    elif condition == "unmatched-limit":
         replay.configure(routing_lane_map={"synthetic-runner": {"unmapped": "Codex"}})
-    elif condition in {"cross-mac-stale", "gateway-stale"}:
-        replay.configure(**{f"routing_{condition.replace('-', '_')}_at": routing._iso(replay.now)})
-    elif condition == "prompt-skips":
-        log.write_text("".join("session=s1 reason=no_hits ms=1 hits=[] legs=[] degraded=None routing=none\n"
-                               for _ in range(201)))
+    elif condition == "cross-mac-stale":
+        routing_replication._save({"caught_up_at": routing._iso(replay.now)})
+    elif condition == "gateway-stale":
+        # A fresh source check and gateway delivery prove a current copy.
+        body = replay.pull(session_id="client:health")
+        if body.get("routing_changes"):
+            replay.pull(session_id="client:health", ack=body["routing_changes"]["batch"])
+    else:
+        outcomes()
     assert routing.doctor_block(now=replay.now)["routing_delivery"]["status"] == "green"
 
 

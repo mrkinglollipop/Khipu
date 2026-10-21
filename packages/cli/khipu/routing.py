@@ -171,6 +171,8 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_push_prompt": ("switch", True, "Tell conversations before each prompt"),
     "routing_push_delegation": ("switch", True, "Tell conversations before handing work to another agent"),
     "routing_dispatch_scripts": ("names", [], "Your own scripts that hand work to another agent, by file name"),
+    "routing_delivery_live_after": ("duration", 12 * 3600, "How long a delivery identity counts as live"),
+    "routing_delivery_slack": ("count", 2, "Extra delivery points before stalled delivery turns red"),
     "routing_delivery_lease": ("duration", 60, "How long an unacknowledged routing batch stays in flight"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
     "routing_child_chars": ("count", 4000, "Longest routing block for a subagent at its start (0: no limit beyond the hook's own cap)"),
@@ -4146,11 +4148,33 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         slot = (item["runner"], item.get("lane") or "")
         if slot not in unmatched or _k(item) > _k(unmatched[slot]):
             unmatched[slot] = item
+    unmatched_since: dict[tuple, datetime] = {}
+    for slot in unmatched:
+        start, previous_until = None, None
+        history = sorted((item for item in unmatched_raw
+                          if (item["runner"], item.get("lane") or "") == slot), key=_k)
+        for item in history:
+            at, until = item.get("at"), item.get("until")
+            limited = item.get("state") == LIMITED and isinstance(at, datetime) and isinstance(until, datetime)
+            # A clear, an expired gap, or a fresh post-expiry limit starts a
+            # new unmatched run.  Repeated overlapping limits retain its
+            # first witness rather than moving the one-hour health clock.
+            if not limited:
+                start, previous_until = None, None
+            elif start is None or (previous_until is not None and at > previous_until):
+                start, previous_until = at, until
+            else:
+                # The newest report controls the lane's effective expiry;
+                # it may shorten a prior limit as well as extend it.
+                previous_until = until
+        if start is not None:
+            unmatched_since[slot] = start
     lanes = [{"runner": r, "lane": lane, "state": e["state"], "until": _iso(e["until"]), "basis": e["basis"],
-              "at": _iso(e["at"]), "written_by": e["written_by"], "id": e["id"],
+              "at": _iso(e["at"]), "limited_since": _iso(unmatched_since[(r, lane)]),
+              "written_by": e["written_by"], "id": e["id"],
               **{k: e.get("lane_match", {}).get(k) for k in ("candidates", "reason", "field_to_add")}}
              for (r, lane), e in sorted(unmatched.items())
-             if e["state"] == LIMITED and e["until"] and e["until"] > now]
+             if e["state"] == LIMITED and e["until"] and e["until"] > now and (r, lane) in unmatched_since]
 
     reminder = cfg["routing_owner_hold_reminder"]
     active_holds = []
@@ -7829,7 +7853,7 @@ def _current_line(entity: str, view: dict, now: datetime) -> str:
 def doctor_block(now: datetime | None = None) -> dict:
     """What ``khipu doctor`` carries: the version, each account's line and
     the warnings from the scope's doctor list that phase 1a can see. Never
-    gates doctor's ``ok`` and never probes anything."""
+    changes a work gate and never probes anything."""
     now = now or _now()
     view = read_view(now)
     cfg = settings()
@@ -7931,8 +7955,11 @@ def doctor_block(now: datetime | None = None) -> dict:
                         "went without their routing lines until a later prompt. Raise the time allowed before "
                         "a prompt in Settings \u2192 Routing, or see whether the Mac is busy.")
     pending_rules = sum(1 for r in view.get("rules") or [] if r.get("pending"))
+    from khipu import routing_health
+
+    delivery_health = routing_health.doctor_block(view, now, cfg)
     held = view.get("priority")
-    return {"priority": {"set": held is not None, "pending": bool(held and held.get("pending")),
+    return {"routing_delivery": delivery_health, "priority": {"set": held is not None, "pending": bool(held and held.get("pending")),
                          "entries": [e["label"] for e in (held or {}).get("entries") or []],
                          "line": priority_line(held, now, view=view) if held else None},
             "record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),

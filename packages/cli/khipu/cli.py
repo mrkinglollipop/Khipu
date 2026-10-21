@@ -1005,6 +1005,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "decision_links": decision_links_block,
         "plan_usage": plan_usage_block,
         "routing": routing_block,
+        "routing_delivery": routing_block.get("routing_delivery", {"status": "unknown", "missing": ["routing check"]}),
+        "routing_delivery_ok": routing_block.get("routing_delivery", {}).get("status") == "green",
         "owner_direction": owner_direction_block,
         "owner_actions_log": owner_actions_log_block,
         "ledger": ledger_block,
