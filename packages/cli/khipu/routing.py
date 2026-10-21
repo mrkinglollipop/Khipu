@@ -8081,9 +8081,13 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     # are deliberately absent from the app's display rows.
     from khipu import routing_directions
 
+    try:
+        items = routing_directions.owed_items()
+    except Exception:  # noqa: BLE001 - a damaged directions store must not break the route view
+        items = []
     out["unreached_directions"] = [
         {key: item.get(key) for key in ("id", "words", "project", "join", "reason")}
-        for item in routing_directions.owed_items()
+        for item in items if isinstance(item, dict)
     ]
     return out
 

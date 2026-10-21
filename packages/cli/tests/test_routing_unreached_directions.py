@@ -113,3 +113,17 @@ def test_owner_local_directions_never_reach_other_surfaces(directions, monkeypat
                  "DismissedSentinel", "AppliedSentinel")
     for leaf in strings(output):
         assert not any(secret in leaf for secret in forbidden), (surface, leaf)
+
+
+def test_a_damaged_directions_store_never_breaks_the_route_view(replay, monkeypatch):  # noqa: F811
+    from datetime import datetime, timezone
+
+    from khipu import routing, routing_directions
+
+    def broken():
+        raise KeyError("words")
+
+    monkeypatch.setattr(routing_directions, "owed_items", broken)
+    view = routing.read_view()
+    out = routing.public_view(view, datetime.now(timezone.utc))
+    assert out["unreached_directions"] == []
