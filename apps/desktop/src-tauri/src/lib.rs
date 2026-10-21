@@ -945,6 +945,7 @@ const ROUTING_SWITCH_KEYS: &[&str] = &[
     "routing_reset_check",
     "routing_pace_order",
     "routing_proposal_text_between_macs",
+    "routing_replication_live",
 ];
 /// The owner's own dispatch scripts, by file name (phase 6).
 const ROUTING_DISPATCH_SCRIPTS_KEY: &str = "routing_dispatch_scripts";
@@ -5898,6 +5899,11 @@ mod settings_command_tests {
         }
         let many: Vec<String> = (0..17).map(|i| format!("\"s{i}.py\"")).collect();
         assert!(config_set_argv("routing_dispatch_scripts", &format!("[{}]", many.join(","))).is_err());
+        // Replication between Macs is an owner switch from the app.
+        assert_eq!(config_set_argv("routing_replication_live", "on").unwrap(), v(&["config", "--from-app", "--set", "routing_replication_live", "on"]));
+        assert_eq!(config_set_argv("routing_replication_live", "off").unwrap(), v(&["config", "--from-app", "--set", "routing_replication_live", "off"]));
+        assert_eq!(config_unset_argv("routing_replication_live").unwrap(), v(&["config", "--from-app", "--unset=routing_replication_live"]));
+        assert!(config_set_argv("routing_replication_live", "yes").is_err());
         // Phase 7 settings are not offered yet.
         for k in ["routing_cloud_copy", "routing_rules_seed"] {
             assert!(config_set_argv(k, "on").is_err(), "{k}");

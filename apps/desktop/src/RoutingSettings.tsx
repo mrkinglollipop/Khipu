@@ -16,7 +16,8 @@
    `--from-app` (src-tauri/src/lib.rs, `route_*_argv`) or `config --set`,
    then the page re-reads the record: what it shows is what the CLI reports.
    The switch before handing work to another agent (phase 6) and the copy for
-   cloud agents (phase 7) join with their phases. */
+   cloud agents (phase 7) join with their phases. The Mac-to-Mac replication
+   switch sits beside the proposal-text switch in Sizes and times. */
 
 import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent, ReactNode, RefObject } from "react";
@@ -3249,6 +3250,24 @@ function SubFold({ k, name, line, folds, children }: { k: string; name: string; 
   );
 }
 
+/** The replication status line under the Mac-to-Mac copy switch, in the
+ *  words of `khipu route replication status`: caught up, stale, or never
+ *  synced. Off (the doctor block's `not_applicable`) and still loading
+ *  (no block yet) say so instead. The doctor block carries the same
+ *  status; no new read is made. */
+export function replicationStatusWords(
+  freshness: RouteDeliveryFreshness | null | undefined,
+  healthError?: string | null,
+): string {
+  if (healthError) return "can't be checked";
+  if (!freshness) return "checking…";
+  if (freshness.status === "not_applicable") return "off";
+  if (freshness.caught_up_at) return freshness.stale || freshness.status === "red" ? "stale" : "caught up";
+  if (freshness.status === "green") return "caught up";
+  if (freshness.status === "red") return "stale";
+  return "never synced";
+}
+
 function TellingSection({
   data,
   deliveryHealth,
@@ -3431,6 +3450,24 @@ function TellingSection({
               }
               error={<WriteError w={w} id="proposal-text" />}
             />
+            <SwitchRow
+              id="route-replication-live"
+              label="Copy routing between your Macs through the hub"
+              what="Sends your routing record to the hub so your other Macs can pick it up, and brings their routing changes here. This is the Mac-to-Mac copy, separate from the copy for cloud agents."
+              tag={<Tag>Between your Macs</Tag>}
+              checked={cfg?.routing?.routing_replication_live?.value === true}
+              disabled={!cfg || w.anyBusy}
+              read={cfgRead}
+              busy={w.isBusy("replication-live")}
+              onChange={(next) =>
+                void w.run("replication-live", "khipu_config_set", { key: "routing_replication_live", value: next ? "on" : "off" }, reread)
+              }
+              error={<WriteError w={w} id="replication-live" />}
+            />
+            <p className="set-help" role="status">
+              Replication: {replicationStatusWords(deliveryHealth?.replication, deliveryHealthError)}
+              {deliveryAge(deliveryHealth?.replication?.age_seconds) ? ` · ${deliveryAge(deliveryHealth?.replication?.age_seconds)}` : ""}
+            </p>
           </div>
         </SubFold>
 
