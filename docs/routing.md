@@ -110,6 +110,18 @@ Runner identity contract:
   and repair guidance. Stale or contradictory bindings never match. A failed
   or silent heartbeat cannot confirm identity.
 
+Runner budget declarations (slice 19b). A runner's `config.json` may carry a
+`budget` object mapping an account (its key, a `provider|` prefix or a
+label) to a list of cap declarations. Each declaration is the same shape as
+an owner cap fact: `{"kind": "share"|"per_day"|"pace_target", "window":
+"weekly"|"five_hour", "pct", "slack"}`, `{"kind": "spend", "usd", "days"}` or
+`{"kind": "concurrency", "n"}`. Khipu compares each declaration with the
+owner-confirmed cap facts and reports the ones that have no matching fact or
+disagree with the fact they have; a runner value never becomes a fact, and
+the runner's files are never written. A lane's own `cap` is local capacity
+on that Mac, not a quota, and is not compared. `khipu route --json` and
+`khipu doctor` carry the report as `runner_caps`.
+
 Runner telemetry contract (slice 17t). A runner's `state/heartbeat.json` may
 also carry three typed, timestamped records. Khipu reads them through the
 same bounded parser as the rest of the heartbeat: only parsed fields

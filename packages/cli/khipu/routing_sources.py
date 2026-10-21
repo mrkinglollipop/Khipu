@@ -69,6 +69,11 @@ KEEP_LINES = {"LIMITED": 200, "ADDED": 300, "LAUNCH": 300}
 # and the file is already bounded by JSON_MAX; a lane past this is counted
 # (``skipped``) so a rule check says it was not fully checked.
 LANES_MAX = 1024
+# Budget declarations a runner's config may carry (slice 19b): accounts and
+# caps per account. Bounded like the lanes, and a declaration past the bound
+# is counted, never silently dropped.
+BUDGET_ACCOUNTS_MAX = 64
+BUDGET_DECLARATIONS_MAX = 32
 LAUNCH_KEEP = timedelta(days=2)
 # A heartbeat interval longer than this is not a heartbeat (the runners write
 # 20 and 30 seconds); the file is reported as out of range.
@@ -765,6 +770,68 @@ def lane_identity(spec: dict) -> dict:
     return out
 
 
+def _budget_declaration(item) -> dict | None:
+    """One typed budget cap a runner's config declares, or None. The values
+    pass the same check an owner cap does (``routing_pace.checked_cap``),
+    and a field the kind does not use refuses the declaration, never drops
+    it silently. A window belongs only to the window-scoped kinds."""
+    from khipu import routing_pace
+
+    if not isinstance(item, dict):
+        return None
+    kind = item.get("kind")
+    if kind not in routing_pace.CAP_KINDS:
+        return None
+    if set(item) - {"kind", "window", "pct", "slack", "usd", "days", "n"}:
+        return None
+    window = item.get("window")
+    if kind in routing_pace.WINDOW_CAP_KINDS:
+        if window not in routing_pace.WINDOWS:
+            return None
+    elif window is not None:
+        return None
+    fields = {k: item.get(k) for k in ("pct", "slack", "usd", "days", "n") if item.get(k) is not None}
+    cap = routing_pace.checked_cap({"kind": kind, "revision": "declared", **fields})
+    if cap is None:
+        return None
+    out = {k: cap[k] for k in ("kind", "pct", "slack", "usd", "days", "n") if k in cap}
+    if kind in routing_pace.WINDOW_CAP_KINDS:
+        out["window"] = window
+    return out
+
+
+def _parse_budget(value, known: list[dict]) -> tuple[dict, int]:
+    """A runner's ``budget`` object: account key -> a list of cap
+    declarations. Only a known account key, a ``provider|`` prefix, a stable
+    id or a shape-checked name is kept (``_declared_account``); a secret-
+    shaped or unusable account is counted, never repaired. ``(budget,
+    skipped)``."""
+    if value is None:
+        return {}, 0
+    if not isinstance(value, dict):
+        return {}, 1
+    out: dict[str, list[dict]] = {}
+    skipped = 0
+    items = list(value.items())
+    skipped += max(0, len(items) - BUDGET_ACCOUNTS_MAX)
+    for raw_account, declarations in items[:BUDGET_ACCOUNTS_MAX]:
+        account = _declared_account(raw_account, known)
+        if account is None or account == WITHHELD or not isinstance(declarations, list):
+            skipped += 1
+            continue
+        skipped += max(0, len(declarations) - BUDGET_DECLARATIONS_MAX)
+        kept = []
+        for item in declarations[:BUDGET_DECLARATIONS_MAX]:
+            declaration = _budget_declaration(item)
+            if declaration is None:
+                skipped += 1
+                continue
+            kept.append(declaration)
+        if kept:
+            out.setdefault(account, []).extend(kept)
+    return out, skipped
+
+
 def _config_facts(lanes) -> dict:
     """A config read kept by an older view, rebuilt from the allowed fields
     only: names that pass ``safe_name``, the launch facts (any launch list it
@@ -786,11 +853,27 @@ def _config_facts(lanes) -> dict:
     return out
 
 
+def _config_budget(budget) -> dict:
+    """A budget kept by an older view, rebuilt through the same typed check
+    as a fresh read. A declaration that no longer checks is dropped."""
+    rebuilt: dict[str, list[dict]] = {}
+    for account, declarations in (budget.items() if isinstance(budget, dict) else ()):
+        if not isinstance(account, str) or not account or not isinstance(declarations, list):
+            continue
+        kept = [declaration for declaration in
+                (_budget_declaration(item) for item in declarations if isinstance(item, dict))
+                if declaration is not None]
+        if kept:
+            rebuilt[account] = kept
+    return rebuilt
+
+
 def _parse_config(data: bytes) -> dict:
     """Only the named keys: each lane's kind, model and confirm_lane, the
     facts its launch arguments give (``launch_facts``: never the arguments),
-    and defaults.check_lane and defaults.fix_lanes. Nothing else in
-    config.json is kept."""
+    defaults.check_lane and defaults.fix_lanes, and the typed ``budget``
+    declarations (slice 19b: account -> caps). Nothing else in config.json
+    is kept."""
     doc = json.loads(data.decode("utf-8"))
     if not isinstance(doc, dict) or not isinstance(doc.get("lanes"), dict):
         raise ValueError("no lanes")
@@ -819,7 +902,14 @@ def _parse_config(data: bytes) -> dict:
     fix_lanes = [n for n in (safe_name(x) for x in fix) if n] if isinstance(fix, list) else []
     if isinstance(fix, list) and len(fix_lanes) < len(fix):
         skipped["fix_lanes"] = len(fix) - len(fix_lanes)
+    from khipu import routing
+
+    budget, budget_skipped = _parse_budget(doc.get("budget"), routing.accounts())
+    if budget_skipped:
+        skipped["budget"] = budget_skipped
     out = {"lanes": lanes, "check_lane": safe_name(defaults.get("check_lane")), "fix_lanes": fix_lanes}
+    if budget:
+        out["budget"] = budget
     return dict(out, skipped=skipped) if skipped else out
 
 
@@ -1085,7 +1175,13 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
             if last.get("data") is not None:
                 cache[key] = dict(last, since=since)
                 if key == "config" and isinstance(last["data"], dict):
-                    cache[key]["data"] = dict(last["data"], lanes=_config_facts(last["data"].get("lanes")))
+                    rebuilt = dict(last["data"], lanes=_config_facts(last["data"].get("lanes")))
+                    budget = _config_budget(last["data"].get("budget"))
+                    if budget:
+                        rebuilt["budget"] = budget
+                    else:
+                        rebuilt.pop("budget", None)
+                    cache[key]["data"] = rebuilt
             else:
                 cache[key] = {"data": None, "good_at": None, "mtime": None, "since": since}
             files[key] = {"error": _short_error(exc), "good_at": cache[key].get("good_at"), "since": since}
@@ -1114,6 +1210,25 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
                       "coverage": len(cache["telemetry"]["coverage"]), "incomplete": cache["telemetry"]["incomplete"]},
     }
     return status, cache
+
+
+def runner_budget_declarations(cache: dict) -> list[dict]:
+    """Each typed budget declaration the registered runners' configs hold,
+    flattened as ``{runner, account, kind, window, ...}`` for the comparison
+    with Khipu's cap facts (slice 19b). Read-only: it consumes the parsed
+    cache and opens nothing."""
+    out: list[dict] = []
+    runners = cache.get("runners") if isinstance(cache, dict) else None
+    for name, kept in sorted((runners or {}).items()):
+        data = ((kept or {}).get("config") or {}).get("data") if isinstance(kept, dict) else None
+        budget = data.get("budget") if isinstance(data, dict) else None
+        for account, declarations in (budget.items() if isinstance(budget, dict) else ()):
+            if not isinstance(account, str) or not isinstance(declarations, list):
+                continue
+            for declaration in declarations:
+                if isinstance(declaration, dict):
+                    out.append({"runner": name, "account": account, **declaration})
+    return out
 
 
 def _same_until(a: datetime, b: datetime) -> bool:
