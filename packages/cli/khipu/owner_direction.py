@@ -74,7 +74,8 @@ class DirectionRefused(Exception):
 ACTIONS: frozenset[str] = frozenset({
     "route.definition.set", "route.pause", "route.lift", "route.clear", "route.note.set", "route.note.end", "route.rule.add",
     "route.rule.edit", "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo",
-    "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.confirm",
+    "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.cap.set", "route.cap.remove",
+    "route.priority.set", "route.priority.confirm",
     "route.priority.undo", "route.priority.clear", "route.tier_table.set", "route.tier_table.confirm",
     "route.tier_table.clear", "accounts.track", "accounts.rename", "accounts.stop",
     "accounts.move", "accounts.decline", "accounts.offer_again", "accounts.auto_track", "accounts.request.confirm",
@@ -991,6 +992,12 @@ def _before(want: dict):
         else:
             prior = definitions.get("providers" if facts["definition"] == "provider" else "accounts", {}).get(target)
         return {"value": prior}
+    if action in ("route.cap.set", "route.cap.remove"):
+        facts = want.get("facts") or {}
+        entry = _entry(target)
+        prior = next((c for c in entry.get("caps") or []
+                      if c.get("window") == facts.get("window") and c.get("kind") == facts.get("kind")), None)
+        return {"cap": prior}
     if action == "route.pause":
         entry = _entry(target)
         paused = entry.get("state") == routing.PAUSED
@@ -1503,6 +1510,19 @@ def _ledger_undo(verb: str):
     return run
 
 
+def _undo_cap(line: dict, via: str) -> dict:
+    from khipu import routing
+
+    facts = line.get("facts") or {}
+    previous = (line.get("before") or {}).get("cap")
+    if previous is not None:
+        return routing.set_cap(line["target"], window=facts.get("window") or previous.get("window"),
+                               kind=previous["kind"], pct=previous["pct"],
+                               revision=previous.get("revision"), via=via)
+    return routing.remove_cap(line["target"], window=facts.get("window"),
+                              kind=facts.get("kind"), via=via)
+
+
 def _undo_definition(line: dict, via: str) -> dict:
     from khipu import routing
 
@@ -1515,6 +1535,8 @@ def _undo_definition(line: dict, via: str) -> dict:
 
 
 _UNDO = {
+    "route.cap.set": _undo_cap,
+    "route.cap.remove": _undo_cap,
     "route.definition.set": _undo_definition,
     "route.pause": _undo_pause,
     "route.lift": _undo_lift,
