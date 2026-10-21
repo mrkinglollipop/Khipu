@@ -53,6 +53,13 @@ LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis")
 KEPT = ("The hub and each Mac's local replica keep this episode's row and text, marked "
         "forgotten (deleted_at set); search, recall and get skip it. No command purges "
         "it yet, and no command restores it.")
+# Routing words are the owner's, not an episode's: they carry no episode
+# provenance, so a forget keeps them and says how they are removed instead.
+ROUTING_WORDS_KEPT_WHY = (
+        "they are the owner's rules, notes, holds and conversations' proposals, with no episode "
+        "provenance, so forgetting an episode does not remove them; remove them with the routing "
+        "commands that manage them (khipu route rule retire, khipu route note end, "
+        "khipu route hold end, khipu route priority clear) or in Settings → Routing")
 NO_ROOT_WHY = "no memory root is configured, so legacy logs could not be checked"
 GATEWAY_NO_ROOT_WHY = ("this server is the HTTPS gateway, a hub-only server that keeps no "
                        "legacy logs, so there are none to check")
@@ -661,7 +668,7 @@ BACKUP_DIR = ".khipu-forget-backups"
 
 # Worst first: a location reports the worst state any identity pass saw.
 LOCATION_STATES = ("unreadable", "not checked", "copy remains", "unidentified records",
-                   "removed", "clean", "not applicable")
+                   "removed", "clean", "kept", "not applicable")
 # States that leave a forgotten line, or one nobody could look at or identify.
 INCOMPLETE_STATES = frozenset(LOCATION_STATES[:4])
 
@@ -1332,6 +1339,44 @@ def _owner_words_scan(session_id: str | None, *, gateway: bool) -> dict[str, Any
     return {"ok": True, "removed": removed, "locations": [{"place": place, "path": None, "state": state}]}
 
 
+def _routing_words_scan(*, gateway: bool) -> dict[str, Any]:
+    """Report routing copies that cannot be attributed to an episode.
+
+    Replication deliberately drops session provenance, and delivery mixes
+    words from several conversations. Removing either file would discard
+    unrelated instructions without preventing the authoritative record from
+    delivering them again. They are kept, like the other non-attributable
+    stores, and the result says how to remove them; only a routing folder
+    that cannot be listed keeps the forget incomplete.
+    """
+    from khipu import routing, session_capture
+
+    place = "routing words"
+    if gateway:
+        return {"ok": True, "locations": [{"place": place, "path": None,
+                "state": "not applicable", "why": "routing copies are local to each client"}]}
+    locations = []
+    for folder, matches in (
+        (session_capture.state_dir(), lambda name: name.startswith("recall--") and ".routing.json" in name),
+        (routing.routing_dir(), lambda name: name == "remote.jsonl" or name.startswith(".replication-")),
+    ):
+        try:
+            names = _listing(folder)
+        except OSError as exc:
+            locations.append({"place": place, "path": str(folder), "state": "unreadable",
+                              "why": f"routing copies could not be listed ({type(exc).__name__})"})
+            continue
+        for name in names:
+            if matches(name):
+                locations.append({"place": place, "path": str(folder / name), "state": "kept",
+                                  "why": f"routing words in {folder / name} are kept: "
+                                         f"{ROUTING_WORDS_KEPT_WHY}"})
+    if not locations:
+        locations.append({"place": place, "path": None, "state": "clean"})
+    return {"ok": not any(loc["state"] in INCOMPLETE_STATES for loc in locations),
+            "locations": locations}
+
+
 def _scrub_golden_file(path: Path, episode_id: int) -> dict[str, Any]:
     import tempfile
 
@@ -1486,6 +1531,8 @@ def plain_summary(out: dict[str, Any]) -> str:
                                                    f"{loc.get('state')}"))
             outbox_named = outbox_named or (str(loc.get("place")).startswith("outbox")
                                             and bool(loc.get("why")))
+        elif loc.get("state") == "kept" and loc.get("why"):
+            lines.append("- " + loc["why"])
         elif loc.get("state") == "not applicable" and loc.get("why"):
             lines.append(f"- not applicable: {loc['why']}")
     partial = out.get("partial") or []
@@ -1763,12 +1810,16 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
                                            gateway=_is_gateway() if gateway is None else bool(gateway))
     if not out["owner_words"]["ok"]:
         partial.append("owner_words")
+    out["routing_words"] = _routing_words_scan(
+        gateway=_is_gateway() if gateway is None else bool(gateway))
+    if not out["routing_words"]["ok"]:
+        partial.append("routing_words")
     # Every store the inventory says forget scans must be one of the scans
     # above; a store added without its scan keeps the forget open.
     from khipu.capture_stores import STORES
 
     ran = {"native jobs", "outbox", "legacy logs", "replica", "replica temps", "legacy writers",
-           "recall golden", "work view", "owner words"}
+           "recall golden", "work view", "owner words", "routing words"}
     unscanned = [{"place": st.name, "path": None, "state": "not checked",
                   "why": (f"{st.name} ({st.where}) is in the store inventory but forget has no "
                           "scan for it, so the forget stays open")}
@@ -1780,7 +1831,7 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         legacy_locs, *(item.get("inspected", []) for item in out["outboxes"]),
         out["replica_temps"]["locations"], out["native_jobs"]["inspected"],
         writers["locations"], out["recall_golden"]["locations"], out["work_view"]["locations"],
-        out["owner_words"]["locations"], unscanned)
+        out["owner_words"]["locations"], out["routing_words"]["locations"], unscanned)
     out["outbox"] = {"ok": all(item.get("ok") for item in out["outboxes"]),
                      "removed": sum(int(item.get("removed") or 0) for item in out["outboxes"])}
     if not out["outbox"]["ok"]:
@@ -1810,6 +1861,8 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
                       if loc["state"] in INCOMPLETE_STATES],
         "owner_words": [loc.get("why") for loc in out["owner_words"]["locations"]
                         if loc["state"] in INCOMPLETE_STATES],
+        "routing_words": [loc.get("why") for loc in out["routing_words"]["locations"]
+                          if loc["state"] in INCOMPLETE_STATES],
     }
     if out.get("unidentified_sources", 0) > 0:
         out["partial_errors"]["legacy_file"] = [

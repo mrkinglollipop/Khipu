@@ -8103,6 +8103,19 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
                       for c in view.get("changes") or []]
     for key in (*_INTERNAL, "directions"):
         out.pop(key, None)
+    # Owner-local only: the private owed store never enters the fold or any
+    # routing delivery projection. Session, prompt hash, target and paths
+    # are deliberately absent from the app's display rows.
+    from khipu import routing_directions
+
+    try:
+        items = routing_directions.owed_items()
+    except Exception:  # noqa: BLE001 - a damaged directions store must not break the route view
+        items = []
+    out["unreached_directions"] = [
+        {key: item.get(key) for key in ("id", "words", "project", "join", "reason")}
+        for item in items if isinstance(item, dict)
+    ]
     return out
 
 

@@ -448,6 +448,19 @@ entry with the reason it holds no capture data. A new writer therefore cannot sh
 | commitments backup | hygiene backup folder `commitments-<time>/commitments.bin` | a binary copy of the commitments table | kept: closed commitments remain by design |
 | local backup | a backup folder or archive the owner chose | a copy of the data folder | kept: backups are kept for recovery; an import restores only what a store allows, through its scrub |
 
+Routing also has two stores of owner words: the delivery ledgers in capture home
+`state/recall--*.routing.json` (including their rewrite temps), and the replicated routing
+record in data folder `state/routing/remote.jsonl` (including `.replication-*` temps).
+Forget lists each such copy as kept, without making the forget incomplete. Neither format
+retains episode provenance: delivery mixes several conversations, and replication
+deliberately strips session identities. Erasing an unrelated routing instruction would
+lose owner intent, and deleting a cache would not prevent its source from delivering the
+words again. They are removed through the routing commands that manage them
+(`khipu route rule retire`, `khipu route note end`, `khipu route hold end`,
+`khipu route priority clear`) or in Settings → Routing, not by forgetting an episode; a
+routing folder that cannot be listed still keeps the forget incomplete. This is never a
+claim that those words were forgotten. The files remain excluded from backup restore.
+
 Writers that hold no capture data are listed in the test's `NOT_CAPTURE` with what they write. The Work
 view and the account settings added these (2026-10-16): `config._write_config` (settings) and
 `config.config_write_lock` (a lock), the one config write path since every settings writer goes through
