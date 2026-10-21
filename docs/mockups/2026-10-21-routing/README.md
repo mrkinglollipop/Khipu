@@ -66,6 +66,10 @@ PNGs: `png/<screen>-light.png` and `png/<screen>-dark.png`, rendered at 1280 wid
   The rest of the page was checked by eye in the renders, not measured.
 - Visual passes: every screen was looked at in its PNG, at most three passes each.
 
+## Approved
+
+Matt approved these mocks on 2026-10-21 ("Proceed as you rec"), taking every recommendation below, and confirmed Grok's cap at 76%. App slices 15a-15e build from these screens.
+
 ## Open questions for Matt (each with a recommendation)
 
 1. **Where Pace lives.** Today one group is "Priority and pace". *Recommend* splitting it: "Priority" keeps your
