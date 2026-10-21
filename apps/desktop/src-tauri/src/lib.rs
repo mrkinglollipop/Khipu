@@ -924,6 +924,7 @@ const OFFLINE_DURATION_KEYS: &[&str] = &["hub_statement_timeout", "hub_dead_conn
 const ROUTING_COUNT_KEYS: &[&str] = &[
     "routing_summary_chars",
     "routing_prompt_chars",
+    "routing_child_chars",
     "routing_prompt_budget_ms",
     "routing_resend_after_versions",
     "routing_hold_chars",
