@@ -6,7 +6,10 @@ directions in the transcript's owner turns with the deterministic patterns
 below — no model ever sees the prompt text — and opens one owed item naming
 the owner's own words. The words live only in this module's private store
 (the owner-turns folder: 0700, its file 0600, never synced), shown only to
-the owner through the owed item. Everywhere else the direction is its key:
+the owner through the owed item. The pushed memory slice never carries
+the words: in the direction's own project (and never for a dispatched
+job) it carries only a count and the direction ids, pointing at
+``khipu owed``. Everywhere else the direction is its key:
 ``(session, prompt_sha256, occurrence)``, joined to applied owner actions
 whose log lines carry exactly that triple (``owner_direction`` copies it
 from the recorded turn; the turn records are pruned at 24 hours, the
@@ -325,8 +328,58 @@ def owed_items() -> list[dict]:
         out.append({"id": row["id"], "kind": "routing_direction",
                     "text": f"Routing said here, not in Khipu: '{row['words']}'",
                     "words": row["words"], "session": row["session"], "target": row.get("target"),
+                    "project": row.get("project"),
                     "join": row.get("join") or "joined", "reason": row.get("reason")})
     return out
+
+
+def _project_from_cwd(cwd) -> str | None:
+    if not cwd:
+        return None
+    try:
+        from khipu.identity import resolve_repo_root
+
+        return resolve_repo_root(str(cwd)).get("project") or None
+    except Exception:  # noqa: BLE001 - an unresolvable cwd scopes nothing
+        return None
+
+
+def _project_for(session, sha=None) -> str | None:
+    """A direction session's own project, from its recorded turns' cwd.
+    None when the turns are gone or their cwd resolves to no project:
+    the direction then scopes to no slice at all (fail closed)."""
+    try:
+        turns = owner_turns.turns(session)
+    except Exception:  # noqa: BLE001 - no readable turns, no project
+        return None
+    with_cwd = [t for t in turns if t.get("cwd")]
+    if sha:
+        matched = [t for t in with_cwd if t.get("prompt_sha256") == sha]
+        with_cwd = matched or with_cwd
+    for turn in reversed(with_cwd):
+        project = _project_from_cwd(turn.get("cwd"))
+        if project:
+            return project
+    return None
+
+
+def pushed_slice_ids(project, *, job: bool = False) -> list[str]:
+    """The open directions a pushed slice may name for ``project``: ids
+    only, never the words. A dispatched job's slice names none, and a
+    direction names only in its own project's slice."""
+    if job or not project:
+        return []
+    own: dict[str, str | None] = {}
+    ids = []
+    for row in directions():
+        if row.get("status") != "open":
+            continue
+        session = row.get("session")
+        if session not in own:
+            own[session] = row.get("project") or _project_for(session, row.get("prompt_sha256"))
+        if own[session] and own[session] == project:
+            ids.append(row["id"])
+    return ids
 
 
 # ---- correlation with applied owner actions -------------------------------
@@ -521,7 +574,11 @@ def capture_scan(session: str, turns, *, now: float | None = None, actions: list
                 continue
             rows[key] = {"id": key, "session": session, "prompt_sha256": sha,
                          "occurrence": occurrence, "words": found["words"], "target": found["target"],
+                         "project": _project_from_cwd((recorded.get(sha) or {}).get("cwd")),
                          "status": "open", "join": "joined", "at": at}
+    for row in rows.values():
+        if row.get("session") == session and not row.get("project"):
+            row["project"] = _project_from_cwd((recorded.get(row.get("prompt_sha256")) or {}).get("cwd"))
     counter = owner_turns.occurrence_state(session)
     for row in rows.values():
         if row.get("session") != session or row.get("status") in ("dismissed", "closed"):

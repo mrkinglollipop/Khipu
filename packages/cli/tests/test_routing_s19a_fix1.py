@@ -141,9 +141,9 @@ def test_khipu_owed_rows_carry_the_routing_direction(world):
     assert mcp_server._routing_direction_rows("closed", filters) == []
 
 
-def test_the_pushed_session_slice_carries_the_routing_direction(world, monkeypatch):
+def test_the_pushed_session_slice_names_no_direction_words(world, monkeypatch):
     say(GLM)
-    scan([GLM])
+    (row,) = scan([GLM])
     from khipu import activity, identity
 
     monkeypatch.setattr(identity, "resolve_repo_root",
@@ -151,7 +151,8 @@ def test_the_pushed_session_slice_carries_the_routing_direction(world, monkeypat
     monkeypatch.setattr(activity, "project_slice",
                         lambda **kw: {"commitments": [], "episodes": [], "topics": [], "decisions": []})
     text = recall_rule._pushed_memory_slice("/work")
-    assert "Routing said here, not in Khipu" in text and GLM in text
+    assert GLM not in text and "Routing said here" not in text
+    assert f"1 routing direction not yet in Khipu: {row['id']}; khipu owed shows them" in text
 
 
 # ---- P2 (4): a lost counter is marked even after the turns were pruned ------
