@@ -381,6 +381,12 @@ export type CapStatus = {
   days?: number | null;
   usd?: number | null;
   events?: number | null;
+  /** Owner-display evidence only. Never a cap total or an advice input. */
+  reported?: {
+    usd: number;
+    events: number;
+    gaps: { runner: string; from: string; to: string; seconds: number }[];
+  } | null;
   cap_n?: number | null;
   jobs?: number | null;
   verdict?: string;

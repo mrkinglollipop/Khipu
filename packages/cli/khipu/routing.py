@@ -8097,8 +8097,22 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
         return dict(routing_advice.account_advice(view, e, now, purpose=purpose),
                     newest_reading_at=e.get("newest_reading_at"))
 
+    def _owner_caps(e):
+        statuses = cap_statuses(view, e, now, confirmations=True)
+        for status in statuses:
+            if status["kind"] != "spend" or status["verdict"] != "unknown":
+                continue
+            # Partial money evidence belongs only to this owner-facing
+            # projection, after the cap and advice have been judged.
+            try:
+                status["reported"] = routing_sources.spend_report(
+                    _telemetry_streams(view), e["key"], now - timedelta(days=status["days"]), now)
+            except Exception:  # noqa: BLE001 - extra display evidence must not break the route view
+                status["reported"] = None
+        return statuses
+
     out["accounts"] = [_with_authors(dict(e, line=account_line(e, now, push=False),
-                                          cap_statuses=cap_statuses(view, e, now, confirmations=True),
+                                          cap_statuses=_owner_caps(e),
                                           advice=_advice(e, "job"),
                                           lead_advice=_advice(e, "orchestration")))
                        for e in view["accounts"] if account is None or e["key"] == account]
