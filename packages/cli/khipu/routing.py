@@ -3668,6 +3668,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     owner_changes: list[dict] = []
     pace_samples: dict[tuple, list[dict]] = {}
     pace_caps: dict[tuple, dict] = {}
+    # When the owner confirmed each cap fact (the confirming event's
+    # written_at). Kept beside the cap, never inside it, so projections
+    # that copy a cap do not change.
+    pace_cap_at: dict[tuple, str] = {}
     cap_proposals: list[dict] = []
     observed = entry_model.observations(events, cfg)
     runner_status = {r["name"]: r for r in (sources or {}).get("runners") or []}
@@ -3725,12 +3729,18 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 if kind == "cap_remove":
                     if owner_cap:
                         pace_caps.pop((account, slot, cap_kind), None)
+                        pace_cap_at.pop((account, slot, cap_kind), None)
                     continue
                 cap = routing_pace.checked_cap({k: event.get(k) for k in
                                                 ("kind", "pct", "slack", "usd", "days", "n", "revision")})
                 if cap is not None:
                     if owner_cap:
                         pace_caps[(account, slot, cap["kind"])] = dict(cap, window=window if scoped else None)
+                        confirmed = _parse(event.get("written_at"))
+                        if confirmed is not None:
+                            pace_cap_at[(account, slot, cap["kind"])] = _iso(confirmed)
+                        else:
+                            pace_cap_at.pop((account, slot, cap["kind"]), None)
                     else:
                         # A conversation's cap is a proposal, never a fact.
                         cap_proposals.append(dict(cap, account=account,
@@ -4126,6 +4136,12 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 if a == entry["key"]]
         if mine:
             entry["caps"] = [dict(c) for c in mine]
+            entry["cap_confirmed"] = {f"{w or ''}|{k}": at for (a, w, k), at in pace_cap_at.items()
+                                      if a == entry["key"]}
+        readings = [s["t"] for (a, _w), group in pace_samples.items() if a == entry["key"]
+                    for s in group if s["t"] <= now]
+        if readings:
+            entry["newest_reading_at"] = _iso(max(readings))
 
     unmatched: dict[tuple, dict] = {}
     for item in unmatched_raw:
@@ -5581,7 +5597,7 @@ def runner_cap_flags(view: dict, account: str | None = None) -> list[dict]:
         view.get("accounts") or [], account_key=account)
 
 
-def cap_statuses(view: dict, entry: dict, now: datetime) -> list[dict]:
+def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool = False) -> list[dict]:
     """Each owner cap on one account with its verdict at ``now``.
 
     ``pace_target`` reads the window's pace object; ``spend`` and
@@ -5596,6 +5612,9 @@ def cap_statuses(view: dict, entry: dict, now: datetime) -> list[dict]:
     for cap in entry.get("caps") or []:
         kind = cap.get("kind")
         base = {"kind": kind, "revision": cap.get("revision"), "window": cap.get("window")}
+        if confirmations:
+            base["confirmed_at"] = (entry.get("cap_confirmed") or {}).get(
+                f"{cap.get('window') or ''}|{kind}")
         if kind == "pace_target":
             pace = next((p for p in entry.get("pace") or [] if p.get("window") == cap.get("window")), {})
             target = pace.get("pace_target") or {}
@@ -8058,9 +8077,16 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out = dict(view, generated_at=_iso(now))
     from khipu import routing_advice
 
+    # The owner's app shows two advice rows: jobs, and lead conversations.
+    # Both carry the newest usage reading's time (the app words its age).
+    def _advice(e, purpose):
+        return dict(routing_advice.account_advice(view, e, now, purpose=purpose),
+                    newest_reading_at=e.get("newest_reading_at"))
+
     out["accounts"] = [_with_authors(dict(e, line=account_line(e, now, push=False),
-                                          cap_statuses=cap_statuses(view, e, now),
-                                          advice=routing_advice.account_advice(view, e, now)))
+                                          cap_statuses=cap_statuses(view, e, now, confirmations=True),
+                                          advice=_advice(e, "job"),
+                                          lead_advice=_advice(e, "orchestration")))
                        for e in view["accounts"] if account is None or e["key"] == account]
     out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
     # A pending rule's requester as the fold keeps it, for Khipu's own

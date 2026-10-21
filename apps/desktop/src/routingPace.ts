@@ -56,12 +56,14 @@ export type PaceCapRow = {
   tag: PaceTag | null;
 };
 
-/** Khipu's advice for jobs. `route --json` carries the job purpose only. */
+/** Khipu's advice for jobs, and for lead conversations when `route --json`
+ *  carries it. */
 export type PaceAdvice = {
   word: "Go" | "Hold back" | "Closed" | "Not for jobs";
   tone: "go" | "hold" | "closed";
   why: string;
   evid: string;
+  lead: { word: PaceAdvice["word"]; tone: PaceAdvice["tone"]; why: string } | null;
 };
 
 /** One account: its block, or the one line the group keeps closed. */
@@ -74,6 +76,8 @@ export type PaceRow = {
   say: PaceSayPart[];
   windows: PaceWindow[];
   caps: PaceCapRow[];
+  /** "confirmed by you Oct 20": the newest confirm time on the caps. */
+  capsEvid: string;
   advice: PaceAdvice | null;
   /** Open at first look: its plan is outpacing or a cap is less than 6 h away.
    *  This is the approved mock's "only Claude open"; the README's Q3 wording
@@ -716,11 +720,48 @@ function adviceOf(a: RouteAccount, now: Date): PaceAdvice | null {
   const evidence = advice.evidence ?? "unknown";
   const conc = (a.cap_statuses ?? []).find((s) => s.kind === "concurrency" && s.jobs != null);
   const evid = evidence === "fresh"
-    ? !(a.pace ?? []).length && conc ? "running count fresh" : "readings fresh"
+    ? !(a.pace ?? []).length && conc ? "running count fresh" : `readings fresh${readingAge(advice.newest_reading_at, now)}`
     : evidence === "stale"
       ? "evidence stale"
       : `evidence unknown: ${evidenceCause(a)}`;
-  return { word, tone, why: adviceWhy(a, advice, now), evid };
+  return { word, tone, why: adviceWhy(a, advice, now), evid, lead: leadOf(a, now) };
+}
+
+/** ", 3 min ago": how old the newest reading is, when the CLI says. */
+function readingAge(iso: string | null | undefined, now: Date): string {
+  if (!iso) return "";
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return "";
+  return `, ${shortSpan(Math.max(0, (now.getTime() - t) / 1000))} ago`;
+}
+
+/** "confirmed by you Oct 20": the newest time the CLI carries for a cap. */
+function capsEvidOf(a: RouteAccount): string {
+  const times = (a.cap_statuses ?? []).map((s) => (s.confirmed_at ? new Date(s.confirmed_at).getTime() : NaN)).filter((t) => !Number.isNaN(t));
+  if (!times.length) return "confirmed by you";
+  const day = new Date(Math.max(...times)).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return `confirmed by you ${day}`;
+}
+
+const CAP_APPLIES_WORDS: Record<string, string> = { pace_target: "even pace", per_day: "daily cap" };
+
+/** The lead-conversation row: orchestration advice, with the caps that only
+ *  hold jobs named so a "go" is not a surprise. */
+function leadOf(a: RouteAccount, now: Date): PaceAdvice["lead"] {
+  const lead = a.lead_advice;
+  if (!lead) return null;
+  const verdict = lead.verdict ?? "go";
+  const word = verdict === "go" ? "Go" : verdict === "hold_back" ? "Hold back" : verdict === "closed" ? "Closed" : "Not for jobs";
+  const tone = verdict === "go" ? "go" : verdict === "hold_back" ? "hold" : "closed";
+  if (verdict !== "go") return { word: word === "Not for jobs" ? "Not for jobs" : word, tone, why: adviceWhy(a, lead, now) };
+  const caps = lead.caps ?? [];
+  const jobOnly = caps.filter((c) => c.applies === false && CAP_APPLIES_WORDS[c.kind]).map((c) => CAP_APPLIES_WORDS[c.kind]);
+  const unique = [...new Set(jobOnly)];
+  const shares = caps.filter((c) => c.applies !== false && c.kind === "share" && c.pct != null).map((c) => `${Math.round(c.pct as number)}%`);
+  const parts: string[] = [];
+  if (unique.length) parts.push(`Your ${unique.join(" and ")} ${unique.length === 1 ? "applies" : "apply"} only to jobs.`);
+  if (shares.length) parts.push(`Under ${shares.join(" and ")}.`);
+  return { word, tone, why: parts.join(" ") || "No cap holds lead conversations." };
 }
 
 /** Whether the group opens the account at first look. The approved mock
@@ -756,6 +797,7 @@ export function paceModel(view: RouteView, plans: UsageReport | null | undefined
       say: sayOf(a, now),
       windows: (a.pace ?? []).map((p) => windowRow(p, a.label, now)),
       caps: (a.cap_statuses ?? []).map((s) => ({ key: `${s.kind}:${s.window ?? ""}:${s.revision ?? ""}`, name: capName(s), ...capState(a, s, now) })),
+      capsEvid: capsEvidOf(a),
       advice,
       open: openByDefault(a, now),
       planOutpacing: planOutpacing(a),
