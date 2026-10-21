@@ -53,6 +53,13 @@ LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis")
 KEPT = ("The hub and each Mac's local replica keep this episode's row and text, marked "
         "forgotten (deleted_at set); search, recall and get skip it. No command purges "
         "it yet, and no command restores it.")
+# Routing words are the owner's, not an episode's: they carry no episode
+# provenance, so a forget keeps them and says how they are removed instead.
+ROUTING_WORDS_KEPT_WHY = (
+        "they are the owner's rules, notes, holds and conversations' proposals, with no episode "
+        "provenance, so forgetting an episode does not remove them; remove them with the routing "
+        "commands that manage them (khipu route rule retire, khipu route note end, "
+        "khipu route hold end, khipu route priority clear) or in Settings → Routing")
 NO_ROOT_WHY = "no memory root is configured, so legacy logs could not be checked"
 GATEWAY_NO_ROOT_WHY = ("this server is the HTTPS gateway, a hub-only server that keeps no "
                        "legacy logs, so there are none to check")
@@ -661,7 +668,7 @@ BACKUP_DIR = ".khipu-forget-backups"
 
 # Worst first: a location reports the worst state any identity pass saw.
 LOCATION_STATES = ("unreadable", "not checked", "copy remains", "unidentified records",
-                   "removed", "clean", "not applicable")
+                   "removed", "clean", "kept", "not applicable")
 # States that leave a forgotten line, or one nobody could look at or identify.
 INCOMPLETE_STATES = frozenset(LOCATION_STATES[:4])
 
@@ -1338,7 +1345,9 @@ def _routing_words_scan(*, gateway: bool) -> dict[str, Any]:
     Replication deliberately drops session provenance, and delivery mixes
     words from several conversations. Removing either file would discard
     unrelated instructions without preventing the authoritative record from
-    delivering them again. Their presence must keep forget partial.
+    delivering them again. They are kept, like the other non-attributable
+    stores, and the result says how to remove them; only a routing folder
+    that cannot be listed keeps the forget incomplete.
     """
     from khipu import routing, session_capture
 
@@ -1359,9 +1368,9 @@ def _routing_words_scan(*, gateway: bool) -> dict[str, Any]:
             continue
         for name in names:
             if matches(name):
-                locations.append({"place": place, "path": str(folder / name), "state": "not checked",
-                                  "why": "routing words have no episode provenance; a copy may remain, "
-                                         "so the forget stays open"})
+                locations.append({"place": place, "path": str(folder / name), "state": "kept",
+                                  "why": f"routing words in {folder / name} are kept: "
+                                         f"{ROUTING_WORDS_KEPT_WHY}"})
     if not locations:
         locations.append({"place": place, "path": None, "state": "clean"})
     return {"ok": not any(loc["state"] in INCOMPLETE_STATES for loc in locations),
@@ -1522,6 +1531,8 @@ def plain_summary(out: dict[str, Any]) -> str:
                                                    f"{loc.get('state')}"))
             outbox_named = outbox_named or (str(loc.get("place")).startswith("outbox")
                                             and bool(loc.get("why")))
+        elif loc.get("state") == "kept" and loc.get("why"):
+            lines.append("- " + loc["why"])
         elif loc.get("state") == "not applicable" and loc.get("why"):
             lines.append(f"- not applicable: {loc['why']}")
     partial = out.get("partial") or []

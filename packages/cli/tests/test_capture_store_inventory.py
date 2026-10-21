@@ -257,7 +257,7 @@ def test_a_store_without_a_forget_scan_keeps_the_forget_open(isolated, tmp_path,
 
 
 @pytest.mark.parametrize("store", ["delivery", "delivery temp", "replication", "replication temp"])
-def test_routing_words_without_source_provenance_keep_forget_open(isolated, tmp_path, monkeypatch, store):
+def test_routing_words_without_source_provenance_are_kept_not_incomplete(isolated, tmp_path, monkeypatch, store):
     from khipu import routing, session_capture
 
     folder, name = {
@@ -279,11 +279,25 @@ def test_routing_words_without_source_provenance_keep_forget_open(isolated, tmp_
 
     result = forget.forget_everywhere(1, memory_root=root)
 
-    assert not result["complete"]
-    assert "routing_words" in result["partial"]
-    assert any(loc["path"] == str(path) and loc["state"] == "not checked"
-               for loc in result["locations"])
+    assert result["complete"], result
+    assert "routing_words" not in result["partial"]
+    kept = [loc for loc in result["locations"] if loc["path"] == str(path)]
+    assert kept and kept[0]["state"] == "kept", result["locations"]
+    assert "no episode provenance" in kept[0]["why"]
+    assert "Settings → Routing" in kept[0]["why"]
+    assert "khipu route" in kept[0]["why"]
     assert path.read_text() == text
+    assert "not completely forgotten yet" not in result["message"]
+    assert "a copy may remain, so the forget stays open" not in result["message"]
+    assert kept[0]["why"] in result["message"]
+
+
+def test_routing_word_stores_are_classified_kept():
+    for name in ("routing delivery words", "routing replication words"):
+        store = capture_stores.store(name)
+        assert store.forget.startswith("kept: "), store
+        assert "no episode provenance" in store.forget
+        assert "Settings → Routing" in store.forget
 
 
 def test_unreadable_routing_folder_is_not_a_clean_scan(isolated, monkeypatch):
