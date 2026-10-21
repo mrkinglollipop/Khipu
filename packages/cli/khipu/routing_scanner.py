@@ -378,7 +378,7 @@ def _facts_for(account: dict, kind: str, window, purpose: str = "job") -> list[d
 
 
 def _declared_values(declaration: dict) -> dict:
-    out = {k: declaration[k] for k in ("kind", "window", "purpose") if declaration.get(k) is not None}
+    out = {k: declaration[k] for k in ("kind", "window", "purpose", "tier", "sensitive_only") if declaration.get(k) is not None}
     for field in _CAP_VALUES[declaration["kind"]]:
         if declaration.get(field) is not None:
             out[field] = declaration[field]
@@ -389,6 +389,7 @@ def _fact_values(fact: dict, kind: str) -> dict:
     out = {"kind": kind}
     if fact.get("purpose", "job") != "job":
         out["purpose"] = fact["purpose"]
+    out.update({k: fact[k] for k in ("tier", "sensitive_only") if k in fact})
     if fact.get("window") is not None:
         out["window"] = fact["window"]
     for field in _CAP_VALUES[kind]:
@@ -400,6 +401,8 @@ def _fact_values(fact: dict, kind: str) -> dict:
 
 
 def _same_cap(kind: str, declaration: dict, fact: dict) -> bool:
+    if declaration.get("tier") != fact.get("tier") or bool(declaration.get("sensitive_only")) != bool(fact.get("sensitive_only")):
+        return False
     for field in _CAP_VALUES[kind]:
         if declaration.get(field) != fact.get(field):
             return False

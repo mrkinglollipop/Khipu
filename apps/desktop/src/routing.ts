@@ -373,6 +373,8 @@ export type Pace = {
 export type CapStatus = {
   kind: "share" | "per_day" | "pace_target" | "spend" | "concurrency" | string;
   purpose?: "job" | "check";
+  tier?: "opus" | "sonnet" | "haiku";
+  sensitive_only?: boolean;
   /** The fact's opaque revision, as you confirmed it. */
   revision?: string | null;
   /** When you confirmed this cap (`route --json` only; absent elsewhere). */

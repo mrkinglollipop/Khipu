@@ -2211,6 +2211,17 @@ def _checked(data: dict) -> dict | None:
         if data["purpose"] not in ("job", "check"):
             return None
         out["purpose"] = data["purpose"]
+    if out["type"] in ("cap_set", "cap_remove"):
+        from khipu.routing_pace import cap_scope_error
+
+        if cap_scope_error(data.get("cap_kind") or data.get("kind"), data.get("purpose", "job"),
+                           tier=data.get("tier"), sensitive_only=data.get("sensitive_only")):
+            return None
+        for field in ("tier", "sensitive_only"):
+            if field in data:
+                if data[field] is None:
+                    return None
+                out[field] = data[field]
     for field in _TEXT_FIELDS:
         value = data.get(field)
         if value is None:
@@ -3739,7 +3750,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             account = event.get("account")
             cap_kind = event.get("cap_kind") or event.get("kind")
             purpose = event.get("purpose", "job")
-            if purpose not in routing_pace.CAP_PURPOSES:
+            if routing_pace.cap_scope_error(cap_kind, purpose):
                 continue
             # Window caps need their window; spend and concurrency are
             # account facts and carry none.
@@ -3753,7 +3764,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                         pace_cap_at.pop((account, slot, cap_kind, purpose), None)
                     continue
                 cap = routing_pace.checked_cap({k: event.get(k) for k in
-                                                ("kind", "pct", "slack", "usd", "days", "n", "revision", "purpose")
+                                                ("kind", "pct", "slack", "usd", "days", "n", "revision", "purpose", "tier", "sensitive_only")
                                                 if k in event})
                 if cap is not None:
                     if owner_cap:
@@ -5635,7 +5646,8 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
     for cap in entry.get("caps") or []:
         kind = cap.get("kind")
         purpose = cap.get("purpose", "job")
-        base = {"kind": kind, "revision": cap.get("revision"), "window": cap.get("window"), "purpose": purpose}
+        base = {"kind": kind, "revision": cap.get("revision"), "window": cap.get("window"), "purpose": purpose,
+                **{k: cap[k] for k in ("tier", "sensitive_only") if k in cap}}
         if confirmations:
             base["confirmed_at"] = (entry.get("cap_confirmed") or {}).get(
                 f"{cap.get('window') or ''}|{kind}" + ("|check" if purpose == "check" else ""))
@@ -5710,7 +5722,7 @@ def _lane_account_key(lane: str, view: dict) -> str:
 
 
 def advise(account: str | None = None, *, lane: str | None = None, tier: str | None = None,
-           kind: str | None = None, privacy: bool = False, purpose: str = "job",
+           kind: str | None = None, privacy: bool = False, purpose: str = "job", sensitive: bool = False,
            now: datetime | None = None, view: dict | None = None, environ: dict | None = None) -> dict:
     """Launch advice (slice 17c): ``go``, ``hold_back``, ``not_eligible`` or
     ``closed`` per account, ranked in the owner's priority order. Advisory
@@ -5724,6 +5736,8 @@ def advise(account: str | None = None, *, lane: str | None = None, tier: str | N
         raise RouteError("kind must be build, fix or check")
     if purpose not in routing_advice.PURPOSES:
         raise RouteError("purpose must be job, check or orchestration")
+    if not isinstance(sensitive, bool):
+        raise RouteError("sensitive must be true or false")
     now = now or _now()
     view = read_view(now) if view is None else view
     dispatched = routing_advice.is_dispatched(environ)
@@ -5734,9 +5748,9 @@ def advise(account: str | None = None, *, lane: str | None = None, tier: str | N
     elif lane:
         target = _lane_account_key(lane, view)
     ranked = routing_advice.rank(view, now, purpose=effective, tier=tier, kind=kind,
-                                 privacy=privacy, target_key=target)
+                                 privacy=privacy, sensitive=sensitive, target_key=target)
     out: dict = {"purpose": effective, "requested_purpose": purpose, "dispatched": dispatched,
-                 "tier": tier, "kind": kind, "privacy": bool(privacy), "ranked": ranked,
+                 "tier": tier, "kind": kind, "privacy": bool(privacy), "sensitive": sensitive, "ranked": ranked,
                  "about": ABOUT, "advisory": True}
     if target is not None and ranked:
         out.update({k: ranked[0][k] for k in
@@ -6523,8 +6537,10 @@ def _checked_cap_or_raise(kind, fields: dict, revision, *, window):
 
     if kind in routing_pace.WINDOW_CAP_KINDS and window not in routing_pace.WINDOWS:
         raise RouteError("window must be weekly or five_hour")
-    if fields.get("purpose", "job") not in routing_pace.CAP_PURPOSES:
-        raise RouteError("cap purpose must be job or check")
+    error = routing_pace.cap_scope_error(kind, fields.get("purpose", "job"),
+                                         tier=fields.get("tier"), sensitive_only=fields.get("sensitive_only"))
+    if error:
+        raise RouteError(error)
     cap = routing_pace.checked_cap({"kind": kind, "revision": revision or "cap",
                                     **{k: v for k, v in fields.items() if v is not None}})
     if cap is None:
@@ -6536,10 +6552,11 @@ def _checked_cap_or_raise(kind, fields: dict, revision, *, window):
 
 def set_cap(account: str, *, window: str | None = None, kind: str, pct=None, slack=None, usd=None,
             days=None, n=None, revision: str | None = None, via: str,
-            purpose: str = "job", now: datetime | None = None) -> dict:
+            purpose: str = "job", tier=None, sensitive_only=None, now: datetime | None = None) -> dict:
     """Owner-only: confirm a cap as a structured fact, never from prose.
     A runner's numbers are never read here; they only judge the cap later."""
-    cap = _checked_cap_or_raise(kind, {"pct": pct, "slack": slack, "usd": usd, "days": days, "n": n, "purpose": purpose},
+    cap = _checked_cap_or_raise(kind, {"pct": pct, "slack": slack, "usd": usd, "days": days, "n": n, "purpose": purpose,
+                                    "tier": tier, "sensitive_only": sensitive_only},
                                 revision, window=window)
     key = _resolve_account_key(account)
     event = {"type": "cap_set", "account": key, **cap}
@@ -6554,8 +6571,9 @@ def remove_cap(account: str, *, window: str | None = None, kind: str, via: str, 
 
     if kind not in routing_pace.CAP_KINDS:
         raise RouteError(_CAP_WORDS)
-    if purpose not in routing_pace.CAP_PURPOSES:
-        raise RouteError("cap purpose must be job or check")
+    error = routing_pace.cap_scope_error(kind, purpose)
+    if error:
+        raise RouteError(error)
     if kind in routing_pace.WINDOW_CAP_KINDS and window not in routing_pace.WINDOWS:
         raise RouteError("window must be weekly or five_hour")
     key = _resolve_account_key(account)
@@ -6567,9 +6585,10 @@ def remove_cap(account: str, *, window: str | None = None, kind: str, via: str, 
 
 def request_cap(account: str, *, window: str | None = None, kind: str, pct=None, slack=None, usd=None,
                 days=None, n=None, revision: str, author: dict,
-                via: str = "mcp", purpose: str = "job", now: datetime | None = None) -> dict:
+                via: str = "mcp", purpose: str = "job", tier=None, sensitive_only=None, now: datetime | None = None) -> dict:
     """A conversation's cap attempt: stored as a proposal, never a fact."""
-    cap = _checked_cap_or_raise(kind, {"pct": pct, "slack": slack, "usd": usd, "days": days, "n": n, "purpose": purpose},
+    cap = _checked_cap_or_raise(kind, {"pct": pct, "slack": slack, "usd": usd, "days": days, "n": n, "purpose": purpose,
+                                    "tier": tier, "sensitive_only": sensitive_only},
                                 revision, window=window)
     key = _account_for_a_conversation(account, accounts())
     by = dict(author or {})
@@ -8107,8 +8126,7 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out = dict(view, generated_at=_iso(now))
     from khipu import routing_advice
 
-    # The owner's app shows two advice rows: jobs, and lead conversations.
-    # Both carry the newest usage reading's time (the app words its age).
+    # Only accounts with a check allowance need a separate check advice row.
     def _advice(e, purpose):
         return dict(routing_advice.account_advice(view, e, now, purpose=purpose),
                     newest_reading_at=e.get("newest_reading_at"))
@@ -8130,8 +8148,9 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["accounts"] = [_with_authors(dict(e, line=account_line(e, now, push=False),
                                           cap_statuses=_owner_caps(e),
                                           advice=_advice(e, "job"),
-                                          check_advice=_advice(e, "check"),
-                                          lead_advice=_advice(e, "orchestration")))
+                                          lead_advice=_advice(e, "orchestration"),
+                                          **({"check_advice": _advice(e, "check")}
+                                             if routing_advice.has_check_cap(e) else {})))
                        for e in view["accounts"] if account is None or e["key"] == account]
     out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
     # A pending rule's requester as the fold keeps it, for Khipu's own
@@ -8505,7 +8524,8 @@ def _public_account(entry: dict, now: datetime, view: dict | None = None) -> dic
         from khipu import routing_advice
 
         out["advice"] = routing_advice.account_advice(view, entry, now)
-        out["check_advice"] = routing_advice.account_advice(view, entry, now, purpose="check")
+        if routing_advice.has_check_cap(entry):
+            out["check_advice"] = routing_advice.account_advice(view, entry, now, purpose="check")
     out["line"] = account_line(entry, now, push=False)
     return out
 
@@ -10370,7 +10390,7 @@ def _route_intent(cmd: str, args) -> dict | None:
                                       facts={"definition": args.definition, "value": value})
     if cmd == "cap":
         facts = {"window": args.window, "kind": args.kind,
-                 **{k: getattr(args, k) for k in ("pct", "slack", "usd", "days", "n")
+                 **{k: getattr(args, k) for k in ("pct", "slack", "usd", "days", "n", "tier", "sensitive_only")
                     if getattr(args, k, None) is not None}}
         if getattr(args, "purpose", "job") != "job":
             facts["purpose"] = args.purpose
@@ -10493,7 +10513,8 @@ def run_cli(args) -> int:
         if cmd == "advise":
             out = advise(args.account, lane=getattr(args, "lane", None), tier=getattr(args, "tier", None),
                          kind=getattr(args, "kind", None), privacy=bool(getattr(args, "privacy", False)),
-                         purpose=getattr(args, "purpose", "job") or "job", now=now)
+                         purpose=getattr(args, "purpose", "job") or "job",
+                         sensitive=bool(getattr(args, "sensitive", False)), now=now)
             if getattr(args, "json", False):
                 _print_json(out)
             else:
@@ -10579,7 +10600,8 @@ def run_cli(args) -> int:
                 out = set_cap(args.account, window=args.window, kind=args.kind, pct=args.pct,
                               slack=getattr(args, "slack", None), usd=getattr(args, "usd", None),
                               days=getattr(args, "days", None), n=getattr(args, "n", None),
-                              revision=args.revision, purpose=args.purpose, via=via)
+                              revision=args.revision, purpose=args.purpose, tier=args.tier,
+                              sensitive_only=args.sensitive_only, via=via)
             else:
                 out = remove_cap(args.account, window=args.window, kind=args.kind, purpose=args.purpose, via=via)
         elif cmd == "definition":

@@ -123,40 +123,52 @@ on that Mac, not a quota, and is not compared. `khipu route --json` and
 `khipu doctor` carry the report as `runner_caps`.
 
 Caps by purpose. A cap fact may carry `purpose: "job"` (the default for
-old facts too) or `purpose: "check"`. A check `pace_target` is a separate
+old facts too) or `purpose: "check"`. Only `pace_target` accepts check purpose; share,
+per-day, spend and concurrency caps reject it. A check `pace_target` is a separate
 allowance for that account and window. Without one, checks use the job
 pace target. Setting, removing and undoing a check cap leave the job cap
 alone. The existing owner direction, app and typed-terminal gates apply.
 `khipu route --json` includes the purpose on every `cap_statuses` row and
-separate `advice`, `check_advice` and `lead_advice` objects. Settings shows
-the check allowance beside the job allowance.
+separate `advice` and `lead_advice` objects, plus `check_advice` only when a
+check cap exists. Settings shows the check allowance beside the job allowance,
+with its window and qualifiers.
 
 The owner's check exceptions can be written with these commands (a terminal
 asks for typed confirmation):
 
 ```sh
 khipu route cap set Codex --window weekly --kind pace_target --pct 100 --slack 5 --purpose check
-khipu route cap set Claude --window weekly --kind pace_target --pct 100 --slack 20 --purpose check
+khipu route cap set Claude --window weekly --kind pace_target --pct 100 --slack 20 --purpose check --tier sonnet --sensitive-only
 ```
 
 These add check allowances to the existing job caps; they do not set job
 caps or share ceilings. Codex's job cap is even weekly pace with zero
 slack and a 95% share ceiling. Main Claude's job cap is even plus 5 with
 a 91% share ceiling. The Claude check allowance is for Sonnet checks of
-sensitive code; the caller names that work explicitly:
+sensitive code. Check caps accept optional `tier` (`opus`, `sonnet` or `haiku`)
+and `sensitive_only` (boolean). A qualified allowance applies only when the
+call matches every qualifier; otherwise checks use the job cap for that window.
+An unqualified check cap, such as Codex's, applies to checks on any code.
+`--sensitive` is declared by the caller, not detected or verified by Khipu;
+it is separate from `--privacy`, which retains its account-eligibility meaning.
+The caller names that work explicitly:
 
 ```sh
 khipu route advise --lane codex-check --purpose check --kind check --json
-khipu route advise Claude --purpose check --kind check --tier sonnet --privacy --json
+khipu route advise Claude --purpose check --kind check --tier sonnet --sensitive --privacy --json
 khipu route cap remove Codex --window weekly --kind pace_target --purpose check
 ```
 
 Runners use the same `purpose: "check"` on `khipu_route_advise` and their
-budget declarations. Purpose selects the pace allowance; it does not grant
-model or privacy eligibility. Share, spend and concurrency ceilings apply
-to every purpose. At a share ceiling, advice is `closed`, including for
-orchestration. Spend and concurrency still answer `hold_back` when reached;
-orchestration is exempt only from pace and daily pacing. Advice lines and
+budget declarations. MCP advice also takes caller-declared `tier` and
+`sensitive`; runner budget declarations carry the cap's optional `tier` and
+`sensitive_only`. A tier inferred from the task table does not count as a caller
+declaration for a qualified check allowance. Purpose selects the pace allowance;
+it does not grant model or privacy eligibility. Share ceilings close every
+purpose at the ceiling. A reached spend ceiling closes orchestration and holds
+jobs and checks back. Full concurrency holds jobs and checks back; orchestration
+never pauses for pace, daily pacing or concurrency. Owner holds, account pauses
+and provider limits still close an account. Advice lines and
 pushes identify their purpose, for example `Advice for checks: Codex: go`.
 
 Runner telemetry contract (slice 17t). A runner's `state/heartbeat.json` may

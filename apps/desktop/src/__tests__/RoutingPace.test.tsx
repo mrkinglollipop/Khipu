@@ -19,11 +19,11 @@ it("shows check allowance beside jobs without changing the job summary", () => {
   codex.check_advice = { ...codex.advice, purpose: "check", verdict: "go", reason: "provider facts allow this work",
     caps: codex.cap_statuses!.map((c) => ({ ...c, applies: c.purpose === "check" })) };
   const row = paceModel(view, PACE_PLANS, PACE_NOW).rows.find((a) => a.label === "Codex")!;
-  expect(row.caps.map((c) => c.name)).toContain("Checks: up to 5 over even");
+  expect(row.caps.map((c) => c.name)).toContain("Week: Checks: up to 5 over even");
   expect(row.line.week).toContain("1.7 points ahead");
   render(<PaceSection data={view} plans={PACE_PLANS} now={PACE_NOW} folds={{ ...folds, isOpen: () => true }} />);
   fireEvent.click(screen.getByRole("button", { name: /^Codex/ }));
-  expect(screen.getByText("Checks: up to 5 over even")).toBeVisible();
+  expect(screen.getByText("Week: Checks: up to 5 over even")).toBeVisible();
   expect(screen.getByText("Checks")).toBeVisible();
   expect(row.advice?.checks?.word).toBe("Go");
 });
@@ -273,4 +273,19 @@ describe("Owner-only partial spend display", () => {
     fireEvent.click(screen.getByRole("button", { name: /DeepSeek/ }));
     expect(screen.getByText(new RegExp(`${amount.replace("$", "\\$")} reported · gap`))).toBeTruthy();
   });
+});
+
+
+it("names qualified check windows and says Not for checks", () => {
+  const view = structuredClone(PACE_VIEW);
+  const claude = view.accounts!.find((a) => a.label === "Claude")!;
+  claude.cap_statuses!.push({ kind: "pace_target", purpose: "check", window: "weekly",
+    revision: "checks", pct: 100, slack: 20, tier: "sonnet", sensitive_only: true, verdict: "within" });
+  claude.check_advice = { ...claude.advice, purpose: "check", verdict: "not_eligible", reason: "tier not allowed" };
+  const row = paceModel(view, PACE_PLANS, PACE_NOW).rows.find((a) => a.label === "Claude")!;
+  expect(row.caps.map((c) => c.name)).toContain("Week: Sonnet checks of sensitive code: up to 20 over even");
+  expect(row.advice?.checks?.word).toBe("Not for checks");
+  render(<PaceSection data={view} plans={PACE_PLANS} now={PACE_NOW} folds={{ ...folds, isOpen: () => true }} />);
+  expect(screen.getByText("Week: Sonnet checks of sensitive code: up to 20 over even")).toBeVisible();
+  expect(screen.getByText("Not for checks")).toBeVisible();
 });

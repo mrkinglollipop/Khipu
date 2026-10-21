@@ -64,7 +64,7 @@ export type PaceAdvice = {
   why: string;
   evid: string;
   lead: { word: PaceAdvice["word"]; tone: PaceAdvice["tone"]; why: string } | null;
-  checks: { word: PaceAdvice["word"]; tone: PaceAdvice["tone"]; why: string } | null;
+  checks: { word: "Go" | "Hold back" | "Closed" | "Not for checks"; tone: PaceAdvice["tone"]; why: string } | null;
 };
 
 /** One account: its block, or the one line the group keeps closed. */
@@ -316,9 +316,13 @@ function capName(s: CapStatus): string {
     case "per_day":
       return `Jobs: at most ${Math.round(s.pct ?? 0)}% a day`;
     case "pace_target":
-      if (s.purpose === "check") return (s.pct ?? 0) >= 100
-        ? `Checks: up to ${num1(s.slack ?? 0)} over even`
-        : `Checks: even pace to ${Math.round(s.pct ?? 0)}%, ${num1(s.slack ?? 0)} points slack`;
+      if (s.purpose === "check") {
+        const who = s.tier ? `${s.tier[0].toUpperCase()}${s.tier.slice(1)} checks` : "Checks";
+        const scope = `${windowName(s.window)}: ${who}${s.sensitive_only ? " of sensitive code" : ""}`;
+        return (s.pct ?? 0) >= 100
+          ? `${scope}: up to ${num1(s.slack ?? 0)} over even`
+          : `${scope}: even pace to ${Math.round(s.pct ?? 0)}%, ${num1(s.slack ?? 0)} points slack`;
+      }
       return (s.pct ?? 0) >= 100
         ? `${windowName(s.window)}: no more than ${num1(s.slack ?? 0)} points ahead of even`
         : `${windowName(s.window)}: even pace to ${Math.round(s.pct ?? 0)}%, ${num1(s.slack ?? 0)} points slack`;
@@ -767,7 +771,7 @@ function adviceOf(a: RouteAccount, now: Date): PaceAdvice | null {
       : `evidence unknown: ${evidenceCause(a)}`;
   const check = a.check_advice;
   const checks: PaceAdvice["checks"] = check && (a.cap_statuses ?? []).some((s) => s.kind === "pace_target" && s.purpose === "check")
-    ? { word: check.verdict === "go" ? "Go" : check.verdict === "hold_back" ? "Hold back" : check.verdict === "closed" ? "Closed" : "Not for jobs",
+    ? { word: check.verdict === "go" ? "Go" : check.verdict === "hold_back" ? "Hold back" : check.verdict === "closed" ? "Closed" : "Not for checks",
       tone: check.verdict === "go" ? "go" : check.verdict === "hold_back" ? "hold" : "closed",
       why: adviceWhy(a, check, now) }
     : null;

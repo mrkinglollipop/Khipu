@@ -14,12 +14,11 @@ PURPOSES = ("job", "check", "orchestration")
 TIERS = ("opus", "sonnet", "haiku")
 KINDS = ("build", "fix", "check")
 _KIND_CLASS = {"build": "build", "fix": "fix-round", "check": "tests"}
-# Pace and daily pacing do not hold orchestration; resource ceilings
-# remain applicable to every purpose.
+# Pace and concurrency do not hold orchestration; share and spend ceilings do.
 _APPLIES = {
     "pace_target": {"job", "check"},
     "per_day": {"job", "check"},
-    "concurrency": set(PURPOSES),
+    "concurrency": {"job", "check"},
     "share": set(PURPOSES),
     "spend": set(PURPOSES),
 }
@@ -168,26 +167,41 @@ def _without_figures(status: dict) -> dict:
     return {k: (None if k in _FIGURE_FIELDS else v) for k, v in status.items()}
 
 
-def _applies(status: dict, purpose: str, statuses: list[dict]) -> bool:
+def has_check_cap(entry: dict) -> bool:
+    return any(c.get("kind") == "pace_target" and c.get("purpose") == "check"
+               for c in entry.get("caps") or [])
+
+
+def _check_matches(status: dict, tier, sensitive: bool) -> bool:
+    return ((status.get("tier") is None or status["tier"] == tier)
+            and (not status.get("sensitive_only") or sensitive))
+
+
+_DECLARED_TIER = object()
+
+
+def _applies(status: dict, purpose: str, statuses: list[dict], *, tier=None, sensitive=False) -> bool:
     if purpose not in _APPLIES.get(status.get("kind"), set()):
         return False
     if status.get("kind") != "pace_target":
         return True
     target = "check" if purpose == "check" and any(
         s.get("kind") == "pace_target" and s.get("purpose", "job") == "check"
-        and s.get("window") == status.get("window") for s in statuses) else "job"
+        and s.get("window") == status.get("window") and _check_matches(s, tier, sensitive)
+        for s in statuses) else "job"
     return status.get("purpose", "job") == target
 
 
 def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
-                   tier=None, kind=None, privacy: bool = False,
-                   explicit: bool = False) -> dict:
+                   tier=None, kind=None, privacy: bool = False, sensitive: bool = False,
+                   explicit: bool = False, declared_tier=_DECLARED_TIER) -> dict:
     """One account's advice at ``now``. Never a permission decision."""
     from khipu import routing
 
     statuses = routing.cap_statuses(view, entry, now)
+    check_tier = tier if declared_tier is _DECLARED_TIER else declared_tier
     figures_purpose = "job" if purpose == "orchestration" else purpose
-    applicable = [s for s in statuses if _applies(s, figures_purpose, statuses)]
+    applicable = [s for s in statuses if _applies(s, figures_purpose, statuses, tier=check_tier, sensitive=sensitive)]
     evidence = _evidence(view, entry, now, applicable)
     # An unplaceable pace reading has no figures: never show a number the
     # reading cannot support. Other readings (spend, concurrency) keep
@@ -199,7 +213,7 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
                 else status for status in statuses]
     numbers: dict = {}
     for status in statuses:
-        if not _applies(status, figures_purpose, statuses):
+        if not _applies(status, figures_purpose, statuses, tier=check_tier, sensitive=sensitive):
             continue
         if status["kind"] == "pace_target":
             numbers.update(allowance_pct=status.get("allowance_pct"),
@@ -230,12 +244,15 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         verdict, reason = "closed", "plan limit reached"
     elif any(s.get("kind") == "share" and s.get("verdict") == "cap_reached" for s in statuses):
         verdict, reason = "closed", "share cap_reached"
+    elif purpose == "orchestration" and any(
+            s.get("kind") == "spend" and s.get("verdict") in ("reached", "over") for s in statuses):
+        verdict, reason = "closed", "spend ceiling reached"
     elif not eligible:
         # Facts do not allow this work for this account: never a ``go``.
         verdict, reason = "not_eligible", why_eligible
     else:
         holding = [s for s in statuses
-                   if _applies(s, purpose, statuses)
+                   if _applies(s, purpose, statuses, tier=check_tier, sensitive=sensitive)
                    and s.get("verdict") in _HOLD_VERDICTS.get(s.get("kind"), set())]
         crossing = _crosses_within_hour(entry, now) if purpose in ("job", "check") else []
         if holding:
@@ -247,7 +264,7 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
     return {"account": routing.account_id(entry["key"]), "label": entry.get("label"),
             "purpose": purpose, "verdict": verdict, "reason": reason,
             "evidence": evidence, "numbers": numbers,
-            "caps": [{**s, "applies": _applies(s, purpose, statuses)}
+            "caps": [{**s, "applies": _applies(s, purpose, statuses, tier=check_tier, sensitive=sensitive)}
                      for s in statuses],
             "eligible": eligible, "why_eligible": why_eligible, "advisory": True}
 
@@ -259,7 +276,7 @@ def advice_line(advice: dict) -> str:
 
 
 def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
-         privacy: bool = False, target_key: str | None = None) -> list[dict]:
+         privacy: bool = False, sensitive: bool = False, target_key: str | None = None) -> list[dict]:
     """Every account's advice, ranked for work of this kind.
 
     Eligible ``go`` accounts come first in the owner's priority order
@@ -268,6 +285,7 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
     then accounts the facts do not allow for this tier or kind. Each row
     says why it stands where it does.
     """
+    declared_tier = tier
     if tier is None and kind is not None:
         table = view.get("tier_table") or {}
         tiers = table.get("tiers") if table.get("confirmed") is True else None
@@ -280,7 +298,8 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
                if target_key is None or e["key"] == target_key]
     for entry in entries:
         advice = account_advice(view, entry, now, purpose=purpose, tier=tier, kind=kind,
-                                privacy=privacy, explicit=target_key is not None)
+                                privacy=privacy, sensitive=sensitive, explicit=target_key is not None,
+                                declared_tier=declared_tier)
         if not advice["eligible"]:
             group = 3
             why = advice["why_eligible"]

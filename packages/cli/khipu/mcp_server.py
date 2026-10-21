@@ -856,6 +856,7 @@ TOOLS: list[dict] = [
                 "tier": {"type": "string", "enum": ["opus", "sonnet", "haiku"]},
                 "kind": {"type": "string", "enum": ["build", "fix", "check"]},
                 "privacy": {"type": "boolean", "description": "The work is privacy-sensitive"},
+                "sensitive": {"type": "boolean", "description": "Caller declares the code being checked is sensitive; default false"},
                 "purpose": {"type": "string", "enum": ["job", "check", "orchestration"], "description": "Default job; check uses the check pace allowance, falling back to job"},
             },
         },
@@ -2562,16 +2563,19 @@ def _tool_route_advise(args: dict) -> dict:
     _ensure_path()
     from khipu import routing
 
-    if not isinstance(args, dict) or set(args) - {"account", "lane", "tier", "kind", "privacy", "purpose"}:
-        raise ValueError("khipu_route_advise takes account, lane, tier, kind, privacy and purpose")
+    if not isinstance(args, dict) or set(args) - {"account", "lane", "tier", "kind", "privacy", "purpose", "sensitive"}:
+        raise ValueError("khipu_route_advise takes account, lane, tier, kind, privacy, purpose and sensitive")
     for key in ("account", "lane", "tier", "kind", "purpose"):
         if args.get(key) is not None and not isinstance(args[key], str):
             raise ValueError(f"{key} must be text")
     if args.get("privacy") is not None and not isinstance(args["privacy"], bool):
         raise ValueError("privacy must be true or false")
+    if args.get("sensitive") is not None and not isinstance(args["sensitive"], bool):
+        raise ValueError("sensitive must be true or false")
     return routing.advise(args.get("account") or None, lane=args.get("lane") or None,
                           tier=args.get("tier") or None, kind=args.get("kind") or None,
-                          privacy=bool(args.get("privacy")), purpose=args.get("purpose") or "job")
+                          privacy=bool(args.get("privacy")), purpose=args.get("purpose") or "job",
+                          sensitive=bool(args.get("sensitive")))
 
 
 def _tool_route_report(args: dict) -> dict:

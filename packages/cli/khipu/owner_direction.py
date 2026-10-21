@@ -1535,7 +1535,8 @@ def _undo_cap(line: dict, via: str) -> dict:
         return routing.set_cap(line["target"], window=facts.get("window") or previous.get("window"),
                                kind=previous["kind"], pct=previous.get("pct"), slack=previous.get("slack"),
                                usd=previous.get("usd"), days=previous.get("days"), n=previous.get("n"),
-                               revision=previous.get("revision"), purpose=previous.get("purpose", "job"), via=via)
+                               revision=previous.get("revision"), purpose=previous.get("purpose", "job"),
+                               tier=previous.get("tier"), sensitive_only=previous.get("sensitive_only"), via=via)
     return routing.remove_cap(line["target"], window=facts.get("window"),
                               kind=facts.get("kind"), purpose=facts.get("purpose", "job"), via=via)
 

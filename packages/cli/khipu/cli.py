@@ -5874,6 +5874,9 @@ def build_parser() -> argparse.ArgumentParser:
     rcap.add_argument("--n", type=int, default=None)
     rcap.add_argument("--revision", default=None)
     rcap.add_argument("--purpose", default="job", choices=("job", "check"))
+    rcap.add_argument("--tier", default=None, choices=("opus", "sonnet", "haiku"), help="Check allowance: this tier only")
+    rcap.add_argument("--sensitive-only", action=argparse.BooleanOptionalAction, default=None,
+                      help="Check allowance: only caller-declared sensitive code")
     rcap.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rcap)
     radv = rt_sub.add_parser("advise", parents=[rt_json],
@@ -5883,6 +5886,7 @@ def build_parser() -> argparse.ArgumentParser:
     radv.add_argument("--tier", default=None, choices=("opus", "sonnet", "haiku"))
     radv.add_argument("--kind", default=None, choices=("build", "fix", "check"))
     radv.add_argument("--privacy", action="store_true", help="The work is privacy-sensitive")
+    radv.add_argument("--sensitive", action="store_true", help="Caller declares the code being checked is sensitive")
     radv.add_argument("--purpose", default="job", choices=("job", "check", "orchestration"))
 
     for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule, rdef, rtier, rcap):

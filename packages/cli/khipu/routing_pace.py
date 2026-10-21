@@ -47,20 +47,38 @@ _CAP_FIELDS = {"share": {"pct"}, "per_day": {"pct"}, "pace_target": {"pct", "sla
                "spend": {"usd", "days"}, "concurrency": {"n"}}
 
 
+def cap_scope_error(kind, purpose="job", *, tier=None, sensitive_only=None):
+    """The scope shared by owner writes, proposals and stored facts."""
+    if purpose not in CAP_PURPOSES:
+        return "cap purpose must be job or check"
+    if purpose == "check" and kind != "pace_target":
+        return "check purpose is only supported for pace_target caps"
+    if (tier is not None or sensitive_only is not None) and (kind != "pace_target" or purpose != "check"):
+        return "cap qualifiers are only supported for check pace_target caps"
+    if tier is not None and tier not in ("opus", "sonnet", "haiku"):
+        return "cap tier must be opus, sonnet or haiku"
+    if sensitive_only is not None and not isinstance(sensitive_only, bool):
+        return "sensitive_only must be true or false"
+    return None
+
+
 def checked_cap(value):
     """One owner cap fact, checked by kind. Runner numbers never enter
     here: a cap holds only what the owner confirmed. A field the kind
     does not use refuses the cap, never drops silently."""
-    if not isinstance(value, dict) or set(value) - {"kind", "pct", "slack", "usd", "days", "n", "revision", "purpose"}:
+    if not isinstance(value, dict) or set(value) - {"kind", "pct", "slack", "usd", "days", "n", "revision", "purpose", "tier", "sensitive_only"}:
         return None
-    if "purpose" in value and value["purpose"] not in CAP_PURPOSES:
+    if any(k in value and value[k] is None for k in ("purpose", "tier", "sensitive_only")):
         return None
-    scope = {"purpose": value["purpose"]} if "purpose" in value else {}
+    if cap_scope_error(value.get("kind"), value.get("purpose", "job"),
+                       tier=value.get("tier"), sensitive_only=value.get("sensitive_only")):
+        return None
+    scope = {k: value[k] for k in ("purpose", "tier", "sensitive_only") if k in value}
     kind = value.get("kind")
     revision = value.get("revision")
     if kind not in CAP_KINDS or not isinstance(revision, str) or not revision.strip():
         return None
-    if {k for k, v in value.items() if v is not None} - {"kind", "revision", "purpose"} - _CAP_FIELDS[kind]:
+    if {k for k, v in value.items() if v is not None} - {"kind", "revision", "purpose", "tier", "sensitive_only"} - _CAP_FIELDS[kind]:
         return None
     revision = revision.strip()
     if kind in ("share", "per_day"):

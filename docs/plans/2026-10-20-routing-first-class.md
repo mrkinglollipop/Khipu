@@ -751,20 +751,25 @@ read from prose.
 The window share (91% of the week, 60% of the five hours) is section 2a's `share`.
 
 **2026-10-21 note: caps by purpose.** Cap facts accept optional `purpose: job|check`,
-defaulting to `job` for existing facts. A check `pace_target` replaces the job
-pace allowance for checks in that account/window only; without one, checks
-use the job cap. Codex: weekly target 100, job slack 0, check slack 5,
-share ceiling 95%. Main Claude: weekly target 100, job slack 5, Sonnet
-sensitive-check slack 20, share ceiling 91%. The caller requests check
-advice explicitly; purpose does not grant model/privacy eligibility.
-Owner direction, app and typed-terminal confirmation, removal and undo all
-preserve purpose. `cap_statuses` exposes it and the app shows both allowances.
-Share ceilings close every purpose at the ceiling; spend and concurrency
-hold every purpose back. Orchestration remains exempt from pace/daily pacing.
+defaulting to `job` for existing facts. Only `pace_target` accepts check purpose.
+A check allowance replaces the job allowance in that account/window only when
+the request matches its optional `tier` and `sensitive_only` qualifiers;
+otherwise checks use the job cap. Codex: weekly target 100, job slack 0,
+unqualified check slack 5, share ceiling 95%. Main Claude: weekly target 100,
+job slack 5, check slack 20 with `tier: sonnet` and `sensitive_only: true`,
+share ceiling 91%. The caller explicitly declares the check's `--tier` and
+`--sensitive`; Khipu does not detect or verify sensitive code, and task-table
+inference does not satisfy the tier qualifier. Purpose grants no model/privacy
+eligibility. Owner direction, app and typed-terminal confirmation, removal and
+undo preserve the scope. `cap_statuses` exposes it; the app names its window
+and qualifiers. `check_advice` is omitted when no check cap exists. Share
+ceilings close every purpose. Spend ceilings close orchestration and hold jobs
+and checks back. Orchestration never pauses for pace, daily pacing or concurrency;
+owner holds, account pauses and provider limits still close it.
 This supersedes case 17b's original share/concurrency expectations.
 
 *Advice* (slice 17c). `khipu route advise` and an `advice` object per account in `khipu_route`.
-- **The request** names a lane, an account, or a tier and kind: `--tier opus|sonnet|haiku`, `--privacy`,
+- **The request** names a lane, an account, or a tier and kind: `--tier opus|sonnet|haiku`, `--privacy`, `--sensitive`,
   `--kind build|fix|check`, and `--purpose job|check|orchestration`.
   - `purpose` defaults to `job`.
   - `orchestration` is accepted only from an attachment that is not a dispatched job. Capture lineage
@@ -777,9 +782,10 @@ This supersedes case 17b's original share/concurrency expectations.
 
     | Cap | `job` | `check` | `orchestration` |
     |---|---|---|---|
-    | `pace_target` | job cap | check cap, else job cap | exempt |
+    | `pace_target` | job cap | matching check cap, else job cap | exempt |
     | `per_day` | applies | applies | exempt |
-    | `concurrency`, `spend` | applies | applies | applies |
+    | `concurrency` | applies | applies | exempt |
+    | `spend` | applies | applies | closes at ceiling |
     | `share` | closes at ceiling | closes at ceiling | closes at ceiling |
 
     It also applies to `job` and `check` when any cap crosses within the hour at the trailing average.

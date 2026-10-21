@@ -278,22 +278,22 @@ def _coverage():
             "from": (NOW - timedelta(days=7)).timestamp(), "to": NOW.timestamp()}
 
 
-def test_spend_over_holds_every_purpose(mac):
+def test_spend_ceiling_closes_orchestration_and_holds_jobs_and_checks(mac):
     _runner(mac, {"spend": [_spend("e1", 35.10, NOW - timedelta(hours=1))],
                   "spend_coverage": [_coverage()]})
     routing.set_cap("Main", kind="spend", usd=35, days=7, revision="s1", via="app")
     for purpose in ("job", "check", "orchestration"):
         out = routing.advise("Main", purpose=purpose, now=NOW)
-        assert out["verdict"] == "hold_back", purpose
+        assert out["verdict"] == ("closed" if purpose == "orchestration" else "hold_back"), purpose
         assert out["numbers"]["spend_usd"] == pytest.approx(35.10)
 
 
-def test_concurrency_full_holds_every_purpose(mac):
+def test_concurrency_full_holds_jobs_and_checks_only(mac):
     _runner(mac, {"active": [{"lane": "main-lane", "account": MAIN, "jobs": 1,
                               "unit": "job", "at": NOW.timestamp()}]})
     routing.set_cap("Main", kind="concurrency", n=1, revision="c1", via="app")
     for purpose in ("job", "check", "orchestration"):
-        assert routing.advise("Main", purpose=purpose, now=NOW)["verdict"] == "hold_back"
+        assert routing.advise("Main", purpose=purpose, now=NOW)["verdict"] == ("go" if purpose == "orchestration" else "hold_back")
 
 
 def test_expired_telemetry_answers_go_with_unknown_evidence(mac):
