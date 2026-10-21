@@ -113,7 +113,18 @@ export type RouteRunner = {
   files?: Record<string, RouteRunnerFile>;
   lanes?: string[];
   unmatched_lanes?: string[];
-  lane_matches?: Record<string, { account: string | null; matched_by: string | null; candidates: string[] }>;
+  /** What the CLI's shared resolver says (routing.py `resolve_lane`): the
+   *  account label it matched, how, the candidates when it couldn't, and why a
+   *  declaration was refused (`reason`, e.g. "launcher evidence contradicts
+   *  the declaration"). */
+  lane_matches?: Record<string, {
+    account: string | null;
+    matched_by: string | null;
+    candidates: string[];
+    identity_state?: string | null;
+    reason?: string | null;
+    field_to_add?: string | null;
+  }>;
 };
 
 export type RouteLane = { runner: string; lane: string; until?: string | null };

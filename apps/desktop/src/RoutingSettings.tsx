@@ -7,8 +7,9 @@
    Every option phases 1a to 3c built, each usable here and each limit
    raisable or removable on the spot: the accounts (Mark paused until, Lift,
    Clear, Dismiss one report), the owner's note, the standing rules, holds,
-   telling conversations, job runner folders, which account each job lane
-   uses, the routing table file and recent changes.
+   telling conversations, the providers and lanes group with the job runner
+   folders folded under it (routing slice 15c), the routing table file and
+   recent changes.
 
    Khipu reports; it never routes. Nothing here sends, stops or reorders
    work. Every write goes through one fixed-argv Tauri command that passes
@@ -26,8 +27,8 @@ import type { FeaturesShape } from "./settingsCli";
 import { PlanBlock, RefreshButton, UsageAccountsField, planPauses, planStatus } from "./PlansCard";
 import type { PlanUsageState, UsageAccount } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
-import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, routingOverview, staleAfterSeconds } from "./routingOverview";
-import type { GroupKey, GroupTag, OverviewSettings, Problem } from "./routingOverview";
+import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, providerRows, routingOverview, staleAfterSeconds } from "./routingOverview";
+import type { GroupKey, GroupTag, OverviewSettings, Problem, ProviderRow } from "./routingOverview";
 import {
   ACCOUNT_FILTERS,
   ACCOUNT_SORTS,
@@ -1026,7 +1027,7 @@ function PrioritySection({
 }
 
 /** Which groups, account lines and inner folds are open, by key. */
-type Folds = { isOpen: (key: string) => boolean; toggle: (key: string) => void };
+type Folds = { isOpen: (key: string) => boolean; toggle: (key: string) => void; openKeys: (keys: string[]) => void };
 
 /** One account as a line that folds: name, state in words with its dot, the
  *  week and pace, and its problem tags; open, what today's row showed and its
@@ -2833,7 +2834,66 @@ function RecordReadLine({ read, what }: { read: Exclude<RecordRead, "ready">; wh
   );
 }
 
-function FoldersSection({
+// ---------------------------------------------------------------------------
+// Providers and lanes (routing slice 15c; mocks
+// docs/mockups/2026-10-21-routing/lanes-light.html and lanes-states-light.html):
+// the providers Khipu knows, every lane with the account it uses, and the job
+// runner folders under a fold of their own. The group only reports: the writes
+// it keeps (adding or removing a folder, mapping a lane) are the ones the page
+// already had.
+// ---------------------------------------------------------------------------
+
+/** How a provider's plan is read, in the mock's words. */
+const PROBE_WORDS: Record<string, string> = {
+  claude: "plan read with the Claude command line",
+  codex: "plan read with the Codex command line",
+  grok: "plan read with Grok's command line; it starts an agent, so every 30 min",
+  "http-quota": "plan read from a usage address you gave",
+  none: "plan not read; job runner lines and reports only",
+};
+
+/** Muse's harness sends no job runner lines of its own: reports only. */
+const MUSE_PLAN_WORDS = "plan not read; reports only";
+
+function providerPlanWords(p: ProviderRow): string {
+  if (p.id === "muse") return MUSE_PLAN_WORDS;
+  return PROBE_WORDS[p.probe ?? "none"] ?? PROBE_WORDS.none;
+}
+
+/** A short list in words: "glm-5.3 and glm-5.3-flash". */
+function listWords(items: string[]): string {
+  return items.length <= 1 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+function ProvidersList({ view }: { view: RouteView }) {
+  const rows = providerRows(view);
+  if (!rows.length) return <p className="set-help">No providers yet. Add an account and its provider shows here.</p>;
+  return (
+    <div className="mrows" role="list" aria-label="Providers">
+      {rows.map((p) => (
+        <div key={p.id} className="mrow prov" role="listitem">
+          <span className="name">{p.label}</span>
+          <span>
+            {[p.family, providerPlanWords(p)].filter(Boolean).join(" · ")}
+            <br />
+            <span className="src">
+              {!p.accounts.length
+                ? "No accounts yet"
+                : p.accounts.length === 1
+                  ? "1 account"
+                  : `${p.accounts.length} accounts: ${p.accounts.join(", ")}`}
+              {p.models_allowed?.length ? ` · only ${listWords(p.models_allowed)}` : ""}
+              {p.models_never?.length ? ` · never ${listWords(p.models_never)}` : ""}
+            </span>
+          </span>
+          <span className="end">{p.use === "on_request" ? <Tag>On request</Tag> : null}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ProvidersLanesSection({
   data,
   cfg,
   lists,
@@ -2841,6 +2901,7 @@ function FoldersSection({
   w,
   now,
   reread,
+  folds,
 }: {
   data: RouteView | null;
   cfg: RouteConfig | null;
@@ -2849,6 +2910,7 @@ function FoldersSection({
   w: Writer;
   now: Date;
   reread: () => Promise<unknown>;
+  folds: Folds;
 }) {
   const raw = cfg?.routing?.routing_sources?.value;
   const entries: SourceEntry[] = Array.isArray(raw) ? (raw as SourceEntry[]) : [];
@@ -2912,271 +2974,322 @@ function FoldersSection({
   const accounts = data?.accounts ?? [];
   const lanesOf = (name: string) =>
     [...new Set([...(runners.find((x) => x.name === name)?.lanes ?? []), ...Object.keys(map[name] ?? {})])].sort();
-  // Lanes of a runner the folders don't name still show, after the folders.
+  // Lanes of a runner the folders don't name still show, after the folders'.
   const others = [...new Set([...runners.map((r) => r.name), ...refused, ...Object.keys(map)])].filter(
     (name) => !entries.some((e) => e.name === name),
   );
   const unmatchedLimits = data?.unmatched ?? [];
-  // Searching lanes: by lane, runner and mapped account; folders always stay.
-  const laneGroups = [...entries.map((e) => e.name), ...others].map((name) => ({ name, lanes: lanesOf(name) }));
-  const totalLanes = laneGroups.reduce((n, g) => n + g.lanes.length, 0);
+  // Every lane once: folder order, then lanes of runners no folder names.
+  const laneEntries = [...entries.map((e) => e.name), ...others].flatMap((name) =>
+    lanesOf(name).map((lane) => ({ runner: name, lane })),
+  );
+  const totalLanes = laneEntries.length;
+  // Searching lanes: by lane, runner and mapped account.
   const searchLanes = recordRead === "ready" && totalLanes > SEARCH_OVER;
   const query = searchLanes ? lists.laneQuery.trim() : "";
   const laneSearchId = `lane-search-${base}`;
   const laneSearch = useRef<HTMLInputElement>(null);
   const laneMatches = (name: string, lane: string) => !query || matchesQuery(query, lane, name, map[name]?.[lane], runners.find((r) => r.name === name)?.lane_matches?.[lane]?.account ?? undefined);
-  const matchingLanes = laneGroups.reduce((n, g) => n + g.lanes.filter((l) => laneMatches(g.name, l)).length, 0);
+  const shownLanes = laneEntries.filter(({ runner, lane }) => laneMatches(runner, lane));
   const hiddenNoAccount = data
     ? lanesWithoutAccount(data, { routing: cfg?.routing ?? null, push: null }).filter(
         (x) => lanesOf(x.runner).includes(x.lane) && !laneMatches(x.runner, x.lane),
       ).length
     : 0;
-  const lanesList = (name: string, lanes: string[]) => {
-    const shownLanes = lanes.filter((lane) => laneMatches(name, lane));
-    if (!shownLanes.length) return null;
-    return (
-      <div className="lane-sub" role="list" aria-label={`${name} lanes`}>
-        {shownLanes.map((lane) => (
-          <LaneRow key={lane} runner={name} lane={lane} target={map[name]?.[lane]}
-            match={runners.find((r) => r.name === name)?.lane_matches?.[lane]}
-            accounts={accounts} w={w} reread={reread} />
-        ))}
-      </div>
-    );
-  };
+  // What the Job runner folders fold says closed: every folder, then any
+  // problem with one, or that all of them are reporting.
+  const folderProblems = entries.map((entry): string | null => {
+    const r = runners.find((x) => x.name === entry.name);
+    if (refused.includes(entry.name)) return "refused";
+    if (r?.unreadable) return "can't be read";
+    if (r?.silent) return "stopped reporting";
+    return null;
+  }).filter((x): x is string => !!x);
+  const foldersLine = !entries.length
+    ? "No folders added"
+    : `${plural(entries.length, "folder", "folders")}, ${
+        folderProblems.length === 0
+          ? entries.length === 2
+            ? "both reporting"
+            : "all reporting"
+          : folderProblems.length === 1
+            ? `1 ${folderProblems[0]}`
+            : `${plural(folderProblems.length, "folder", "folders")} need a look`
+      }`;
   return (
-    <div className="section-body">
-        {searchLanes ? (
-          <>
-            <div className="search-row">
-              <label className="sr-only" htmlFor={laneSearchId}>
-                Search job runner lanes
-              </label>
-              <input id={laneSearchId} ref={laneSearch} className="filter-input" type="search" placeholder={`Search the ${totalLanes} lanes`}
-                autoComplete="off" value={lists.laneQuery} onChange={(e) => lists.setLaneQuery(e.target.value)} />
-            </div>
-            {query ? (
-              <p className="set-help" role="status">
-                {matchingLanes
-                  ? `${matchingLanes} of ${totalLanes} lanes match.`
-                  : `No lanes match “${query}”.`}
-                {hiddenNoAccount
-                  ? ` ${plural(hiddenNoAccount, "lane without an account is", "lanes without an account are")} hidden by this search.`
-                  : ""}{" "}
-                <button type="button" className="sm link" onClick={() => {
-                  lists.setLaneQuery("");
-                  focusAfter(() => laneSearch.current);
-                }}>
-                  Clear search
-                </button>
-              </p>
-            ) : null}
-          </>
-        ) : null}
-        {entries.length ? (
-          <div className="rows" role="list" aria-label="Job runner folders">
-            {entries.map((entry) => {
-              const r = runners.find((x) => x.name === entry.name);
-              const st = refused.includes(entry.name)
-                ? { text: "Refused: it is inside a private folder", tone: "err" as const }
-                : runnerState(r, now);
-              const id = `folder-remove:${entry.name}`;
-              return (
-                <div key={entry.name} className="row-item route-acct" role="listitem" data-route-item={`runner:${entry.name}`}
-                  tabIndex={-1}>
-                  <span className="route-name">{entry.name}</span>
-                  <span className="route-what">
-                    <span className="route-state">
-                      <span className={st.tone ? `hdot ${st.tone}` : "hdot"} aria-hidden />
-                      {st.text}
-                    </span>
-                    <span className="route-src">{runnerDetail(entry, r, now)}</span>
-                  </span>
-                  <span className="route-acts">
-                    <button
-                      ref={(el) => {
-                        removeBtns.current[entry.name] = el;
-                      }}
-                      type="button"
-                      className="sm"
-                      aria-label={`Remove the ${entry.name} folder`}
-                      aria-expanded={removing === entry.name}
-                      onClick={() => setRemoving(removing === entry.name ? null : entry.name)}
-                    >
-                      Remove
-                    </button>
-                  </span>
-                  {removing === entry.name ? (
-                    <ConfirmGroup
-                      label={`Remove the ${entry.name} folder?`}
-                      onClose={() => setRemoving(null)}
-                      back={() => removeBtns.current[entry.name] ?? addBtn.current}
-                    >
-                      <span>
-                        Stop reading {entry.name}? Its limits and heartbeat stop counting; the folder itself is not
-                        touched.
-                      </span>
-                      <WriteError w={w} id={id} />
-                      <div className="toolbar">
-                        <button
-                          type="button"
-                          className="sm danger"
-                          disabled={w.isBusy(id)}
-                          onClick={async () => {
-                            if (await write((now) => now.filter((x) => x.name !== entry.name), id)) setRemoving(null);
-                          }}
-                        >
-                          <Busy on={w.isBusy(id)} />
-                          Remove {entry.name}
-                        </button>
-                        <button type="button" className="sm link" onClick={() => setRemoving(null)}>
-                          Keep it
-                        </button>
-                      </div>
-                    </ConfirmGroup>
-                  ) : null}
-                  {recordRead === "ready" && lanesOf(entry.name).length ? lanesList(entry.name, lanesOf(entry.name)) : null}
-                </div>
-              );
-            })}
-          </div>
-        ) : recordRead !== "ready" ? (
-          <RecordReadLine read={recordRead} what="job runner folders" />
+    <>
+      <div className="section-body">
+        <h2 className="sub-title">Providers</h2>
+        {data ? (
+          <ProvidersList view={data} />
         ) : (
-          <p className="set-help">No job runner folders yet. Add one to let Khipu read a runner's limits and heartbeat.</p>
+          <RecordReadLine read={recordRead === "failed" ? "failed" : "reading"} what="the providers" />
         )}
+      </div>
+      <div className="section-body">
+        <h2 className="sub-title">
+          Lanes{" "}
+          {totalLanes ? (
+            <span className="meta">
+              {plural(totalLanes, "lane", "lanes")}
+              {entries.length ? ` in ${plural(entries.length, "job runner folder", "job runner folders")}` : ""}
+            </span>
+          ) : null}
+        </h2>
         {recordRead !== "ready" ? (
           // Before the lane map is read every lane would look unmatched.
           <RecordReadLine read={recordRead} what="job runner lanes" />
-        ) : others.length ? (
-          others.map((name) => {
-            const lanes = lanesOf(name);
-            const r = runners.find((x) => x.name === name);
-            const isRefused = refused.includes(name);
-            // A runner Khipu reports on that isn't in your folders list: its
-            // state still shows, so a problem with it has a place here.
-            const st = isRefused ? { text: "Refused: it is inside a private folder", tone: "err" as const } : r ? runnerState(r, now) : null;
-            return (
-              <div key={name} className="rows">
-                <h2 className="rows-head route-day">{name}</h2>
-                {st ? (
-                  <div className="row-item route-acct" data-route-item={`runner:${name}`} tabIndex={-1}>
-                    <span className="route-name">{name}</span>
+        ) : totalLanes ? (
+          <>
+            {searchLanes ? (
+              <>
+                <div className="search-row">
+                  <label className="sr-only" htmlFor={laneSearchId}>
+                    Search job runner lanes
+                  </label>
+                  <input id={laneSearchId} ref={laneSearch} className="filter-input" type="search" placeholder={`Search the ${totalLanes} lanes`}
+                    autoComplete="off" value={lists.laneQuery} onChange={(e) => lists.setLaneQuery(e.target.value)} />
+                </div>
+                {query ? (
+                  <p className="set-help" role="status">
+                    {shownLanes.length
+                      ? `${shownLanes.length} of ${totalLanes} lanes match.`
+                      : `No lanes match “${query}”.`}
+                    {hiddenNoAccount
+                      ? ` ${plural(hiddenNoAccount, "lane without an account is", "lanes without an account are")} hidden by this search.`
+                      : ""}{" "}
+                    <button type="button" className="sm link" onClick={() => {
+                      lists.setLaneQuery("");
+                      focusAfter(() => laneSearch.current);
+                    }}>
+                      Clear search
+                    </button>
+                  </p>
+                ) : null}
+              </>
+            ) : null}
+            {shownLanes.length ? (
+              <div className="mrows" role="list" aria-label="Lanes">
+                {shownLanes.map(({ runner, lane }) => (
+                  <LaneRow key={`${runner}/${lane}`} runner={runner} lane={lane} target={map[runner]?.[lane]}
+                    match={runners.find((r) => r.name === runner)?.lane_matches?.[lane]}
+                    accounts={accounts} w={w} reread={reread} />
+                ))}
+              </div>
+            ) : null}
+            <p className="set-help">A lane without an account still runs; its limits just count toward no account.</p>
+          </>
+        ) : (
+          <div className="empty">
+            <b>No job runners yet</b>
+            <span>Add a job runner folder and its lanes show here with the account each one uses.</span>
+            <div className="toolbar">
+              <button
+                type="button"
+                className="sm primary"
+                disabled={!cfg}
+                onClick={() => {
+                  folds.openKeys(["sub:folders"]);
+                  setAdding(true);
+                }}
+              >
+                Add a folder…
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+      <div className="section-body">
+        <SubFold k="sub:folders" name="Job runner folders" line={foldersLine} folds={folds}>
+          {entries.length ? (
+            <div className="rows" role="list" aria-label="Job runner folders">
+              {entries.map((entry) => {
+                const r = runners.find((x) => x.name === entry.name);
+                const st = refused.includes(entry.name)
+                  ? { text: "Refused: it is inside a private folder", tone: "err" as const }
+                  : runnerState(r, now);
+                const id = `folder-remove:${entry.name}`;
+                return (
+                  <div key={entry.name} className="row-item route-acct" role="listitem" data-route-item={`runner:${entry.name}`}
+                    tabIndex={-1}>
+                    <span className="route-name">{entry.name}</span>
                     <span className="route-what">
                       <span className="route-state">
                         <span className={st.tone ? `hdot ${st.tone}` : "hdot"} aria-hidden />
                         {st.text}
                       </span>
-                      <span className="route-src">
-                        Not in your job runner folders{r?.path ? ` · ${r.path}` : ""}
-                      </span>
+                      <span className="route-src">{runnerDetail(entry, r, now)}</span>
                     </span>
+                    <span className="route-acts">
+                      <button
+                        ref={(el) => {
+                          removeBtns.current[entry.name] = el;
+                        }}
+                        type="button"
+                        className="sm"
+                        aria-label={`Remove the ${entry.name} folder`}
+                        aria-expanded={removing === entry.name}
+                        onClick={() => setRemoving(removing === entry.name ? null : entry.name)}
+                      >
+                        Remove
+                      </button>
+                    </span>
+                    {removing === entry.name ? (
+                      <ConfirmGroup
+                        label={`Remove the ${entry.name} folder?`}
+                        onClose={() => setRemoving(null)}
+                        back={() => removeBtns.current[entry.name] ?? addBtn.current}
+                      >
+                        <span>
+                          Stop reading {entry.name}? Its limits and heartbeat stop counting; the folder itself is not
+                          touched.
+                        </span>
+                        <WriteError w={w} id={id} />
+                        <div className="toolbar">
+                          <button
+                            type="button"
+                            className="sm danger"
+                            disabled={w.isBusy(id)}
+                            onClick={async () => {
+                              if (await write((now) => now.filter((x) => x.name !== entry.name), id)) setRemoving(null);
+                            }}
+                          >
+                            <Busy on={w.isBusy(id)} />
+                            Remove {entry.name}
+                          </button>
+                          <button type="button" className="sm link" onClick={() => setRemoving(null)}>
+                            Keep it
+                          </button>
+                        </div>
+                      </ConfirmGroup>
+                    ) : null}
                   </div>
-                ) : null}
-                {lanes.length ? (
-                  lanesList(name, lanes)
-                ) : (
-                  <p className="set-help route-lanes-none">Khipu hasn't read any lanes from this runner's settings yet.</p>
-                )}
+                );
+              })}
+            </div>
+          ) : recordRead !== "ready" ? (
+            <RecordReadLine read={recordRead} what="job runner folders" />
+          ) : (
+            <p className="set-help">No job runner folders yet. Add one to let Khipu read a runner's limits and heartbeat.</p>
+          )}
+          {others.map((name) => {
+            const r = runners.find((x) => x.name === name);
+            const isRefused = refused.includes(name);
+            // A runner Khipu reports on that isn't in your folders list: its
+            // state still shows, so a problem with it has a place here.
+            const st = isRefused ? { text: "Refused: it is inside a private folder", tone: "err" as const } : r ? runnerState(r, now) : null;
+            return st ? (
+              <div key={name} className="rows">
+                <div className="row-item route-acct" data-route-item={`runner:${name}`} tabIndex={-1}>
+                  <span className="route-name">{name}</span>
+                  <span className="route-what">
+                    <span className="route-state">
+                      <span className={st.tone ? `hdot ${st.tone}` : "hdot"} aria-hidden />
+                      {st.text}
+                    </span>
+                    <span className="route-src">
+                      Not in your job runner folders{r?.path ? ` · ${r.path}` : ""}
+                    </span>
+                  </span>
+                </div>
               </div>
-            );
-          })
-        ) : !entries.length ? (
-          <p className="set-help">Lanes show here once a job runner folder is added and read.</p>
-        ) : null}
-        {unmatchedLimits.length ? (
-          <p className="set-help" role="status">
-            {unmatchedLimits.length === 1 ? "A limit came" : `${unmatchedLimits.length} limits came`} from a lane that
-            isn't matched to an account. Match it above and the limit counts for that account.
+            ) : null;
+          })}
+          {unmatchedLimits.length ? (
+            <p className="set-help" role="status">
+              {unmatchedLimits.length === 1 ? "A limit came" : `${unmatchedLimits.length} limits came`} from a lane that
+              isn't matched to an account. Match it above and the limit counts for that account.
+            </p>
+          ) : null}
+          <div className="toolbar">
+            <button ref={addBtn} type="button" className="sm" aria-expanded={adding} disabled={!cfg} onClick={() => setAdding((v) => !v)}>
+              Add a folder…
+            </button>
+          </div>
+          {adding ? (
+            <form className="route-pause route-folder-form" aria-label="Add a job runner folder" onSubmit={add} onKeyDown={escapeCloses(closeAdd)}>
+              <div className="toolbar">
+                <label htmlFor={`${base}-name`}>Name</label>
+                <input id={`${base}-name`} value={name} autoFocus autoComplete="off" placeholder="Project A…" onChange={(e) => setName(e.target.value)} />
+              </div>
+              <div className="toolbar">
+                <label htmlFor={`${base}-path`}>Folder</label>
+                <input
+                  id={`${base}-path`}
+                  className="mono"
+                  value={path}
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="/path/to/the/runner's state folder…"
+                  onChange={(e) => setPath(e.target.value)}
+                />
+              </div>
+              <WriteError w={w} id="folder-add" />
+              <div className="toolbar">
+                <button type="submit" className="primary sm" disabled={w.isBusy("folder-add")}>
+                  <Busy on={w.isBusy("folder-add")} />
+                  Add folder
+                </button>
+                <button type="button" className="sm link" onClick={closeAdd}>
+                  Cancel
+                </button>
+              </div>
+            </form>
+          ) : null}
+          <div className="rows">
+            <LimitRow
+              name="Say a job runner stopped reporting after"
+              help="Counted in the runner's own heartbeat intervals."
+              fields={[{ key: "routing_runner_silent_intervals", label: "Stopped after", unit: "intervals", options: [2, 3, 5, 10, 20, 0], zero: "Never" }]}
+              cfg={cfg}
+              w={w}
+              reread={reread}
+            />
+            <LimitRow
+              name="How much of the end of a runner's events.log is read"
+              help="Older lines are left unread."
+              fields={[
+                {
+                  key: "routing_runner_tail_bytes",
+                  label: "Read the last",
+                  unit: "bytes",
+                  options: [128 * 1024, 512 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024, 0],
+                  zero: "All of it",
+                },
+              ]}
+              cfg={cfg}
+              w={w}
+              reread={reread}
+            />
+            <LimitRow
+              name="Newest limit lines kept from each runner"
+              help="The runner's lines that say a lane reached a limit."
+              fields={[{ key: "routing_runner_limited_lines", label: "Keep", unit: "lines", options: [50, 100, 200, 500, 1000, 0], zero: "No limit" }]}
+              cfg={cfg}
+              w={w}
+              reread={reread}
+            />
+            <LimitRow
+              name="Look at the folders and the routing table every"
+              help="Off: Khipu still updates when a limit or a hold runs out, and whenever it is asked."
+              fields={[{ key: "routing_poll_interval", label: "Look every", unit: "time", options: [5, 10, 30, 60, 5 * M, 0], zero: "Off" }]}
+              cfg={cfg}
+              w={w}
+              reread={reread}
+            />
+          </div>
+          <p className="set-help">
+            Khipu only reads these folders. It never writes to them, never changes a runner's settings, and reads only
+            its limits, its job starts, its heartbeat and the few lane settings it needs to watch your rules. Every line
+            it keeps is checked for secrets first. A folder inside API Keys, My Portfolio or any sign-in file is refused.
           </p>
-        ) : null}
-        <div className="toolbar">
-          <button ref={addBtn} type="button" className="sm" aria-expanded={adding} disabled={!cfg} onClick={() => setAdding((v) => !v)}>
-            Add a folder…
-          </button>
-        </div>
-        {adding ? (
-          <form className="route-pause route-folder-form" aria-label="Add a job runner folder" onSubmit={add} onKeyDown={escapeCloses(closeAdd)}>
-            <div className="toolbar">
-              <label htmlFor={`${base}-name`}>Name</label>
-              <input id={`${base}-name`} value={name} autoFocus autoComplete="off" placeholder="Project A…" onChange={(e) => setName(e.target.value)} />
-            </div>
-            <div className="toolbar">
-              <label htmlFor={`${base}-path`}>Folder</label>
-              <input
-                id={`${base}-path`}
-                className="mono"
-                value={path}
-                autoComplete="off"
-                spellCheck={false}
-                placeholder="/path/to/the/runner's state folder…"
-                onChange={(e) => setPath(e.target.value)}
-              />
-            </div>
-            <WriteError w={w} id="folder-add" />
-            <div className="toolbar">
-              <button type="submit" className="primary sm" disabled={w.isBusy("folder-add")}>
-                <Busy on={w.isBusy("folder-add")} />
-                Add folder
-              </button>
-              <button type="button" className="sm link" onClick={closeAdd}>
-                Cancel
-              </button>
-            </div>
-          </form>
-        ) : null}
-        <div className="rows">
-          <LimitRow
-            name="Say a job runner stopped reporting after"
-            help="Counted in the runner's own heartbeat intervals."
-            fields={[{ key: "routing_runner_silent_intervals", label: "Stopped after", unit: "intervals", options: [2, 3, 5, 10, 20, 0], zero: "Never" }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="How much of the end of a runner's events.log is read"
-            help="Older lines are left unread."
-            fields={[
-              {
-                key: "routing_runner_tail_bytes",
-                label: "Read the last",
-                unit: "bytes",
-                options: [128 * 1024, 512 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024, 0],
-                zero: "All of it",
-              },
-            ]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Newest limit lines kept from each runner"
-            help="The runner's lines that say a lane reached a limit."
-            fields={[{ key: "routing_runner_limited_lines", label: "Keep", unit: "lines", options: [50, 100, 200, 500, 1000, 0], zero: "No limit" }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Look at the folders and the routing table every"
-            help="Off: Khipu still updates when a limit or a hold runs out, and whenever it is asked."
-            fields={[{ key: "routing_poll_interval", label: "Look every", unit: "time", options: [5, 10, 30, 60, 5 * M, 0], zero: "Off" }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-        </div>
-        <p className="set-help">
-          Khipu only reads these folders. It never writes to them, never changes a runner's settings, and reads only
-          its limits, its job starts, its heartbeat and the few lane settings it needs to watch your rules. Every line
-          it keeps is checked for secrets first. A folder inside API Keys, My Portfolio or any sign-in file is refused.
-        </p>
-        <p className="set-help">
-          A limit on one lane closes every lane on the same account. A lane that isn't matched is never guessed;
-          conversations are told a limit came from an unmatched lane.
-        </p>
-    </div>
+          <p className="set-help">
+            A limit on one lane closes every lane on the same account. A lane that isn't matched is never guessed;
+            conversations are told a limit came from an unmatched lane.
+          </p>
+        </SubFold>
+      </div>
+    </>
   );
 }
 
@@ -3185,6 +3298,59 @@ function FoldersSection({
 // ---------------------------------------------------------------------------
 
 type LaneMap = Record<string, Record<string, string>>;
+
+/** What the CLI's resolver says about one lane, as `khipu route --json`
+ *  reports it (routing.ts, `RouteRunner.lane_matches`). */
+type LaneMatch = NonNullable<RouteRunner["lane_matches"]>[string];
+
+/** The resolver's refusal reasons, in plain words (routing.py `resolve_lane`). */
+const LANE_REASON_WORDS: Record<string, string> = {
+  "launcher evidence contradicts the declaration": "the runner's settings and its login name different accounts",
+  "invalid or stale login binding": "the runner's login binding is invalid or stale",
+  "explicit provider conflicts with model provider": "the runner names a provider its model isn't from",
+  "model family has no unique provider": "the model's family has no unique provider",
+  "login binding conflicts with model or provider": "the runner's login conflicts with its model or provider",
+  "provider has no unique account": "the provider has no unique account",
+  "account, provider or login binding conflict": "the runner's account, provider and login conflict",
+  "override has no unique current binding": "the account you mapped it to has no unique binding",
+};
+
+const LANE_MAP_HELP = "Add an account line for this lane in the runner's settings, or map it here.";
+
+/** The how-matched line, the tag beside it and the candidates row under a
+ *  lane, in the mock's words. `undefined` tag: none. */
+function laneMatchWords(target: string | undefined, match: LaneMatch | undefined): {
+  how: string;
+  tag: { text: string; tone?: "ok" | "warn" } | null;
+  cands: string | null;
+} {
+  if (target) return { how: "you mapped it", tag: { text: "Yours" }, cands: null };
+  if (match?.account) {
+    if (match.matched_by === "declaration") {
+      return match.identity_state === "confirmed"
+        ? { how: `the runner says so; a job from it used ${match.account}'s login`, tag: { text: "Confirmed", tone: "ok" }, cands: null }
+        : { how: "the runner says so; no job has proved it yet", tag: { text: "Claimed" }, cands: null };
+    }
+    if (match.matched_by === "name") return { how: "matched by name", tag: { text: "By name" }, cands: null };
+    if (match.matched_by === "login_home") return { how: "the runner's login names it", tag: { text: "By login" }, cands: null };
+    if (match.matched_by === "provider") return { how: "the runner names the provider; it has one account", tag: { text: "By provider" }, cands: null };
+    return { how: `matched by ${match.matched_by}`, tag: null, cands: null };
+  }
+  const reason = match?.reason ?? "";
+  const n = match?.candidates.length ?? 0;
+  // A declaration its launcher contradicts: the candidates say who, but not
+  // which side the runner named, so the row says it that way.
+  if (reason === "launcher evidence contradicts the declaration") {
+    return { how: LANE_REASON_WORDS[reason], tag: { text: "Conflict", tone: "warn" },
+      cands: "Fix the runner's settings, or pick the account here." };
+  }
+  if (n >= 2) {
+    return { how: `${n === 2 ? "two" : n} accounts match the name`, tag: { text: "Pick one", tone: "warn" },
+      cands: `Could be: ${match!.candidates.join(", ")}` };
+  }
+  if (reason) return { how: LANE_REASON_WORDS[reason] ?? reason, tag: { text: "No account", tone: "warn" }, cands: LANE_MAP_HELP };
+  return { how: "no name match and nothing declared", tag: { text: "No account", tone: "warn" }, cands: LANE_MAP_HELP };
+}
 
 function LaneRow({
   runner,
@@ -3198,17 +3364,20 @@ function LaneRow({
   runner: string;
   lane: string;
   target: string | undefined;
-  match?: { account: string | null; matched_by: string | null; candidates: string[] };
+  match?: LaneMatch;
   accounts: RouteAccount[];
   w: Writer;
   reread: () => Promise<unknown>;
 }) {
   const resolved = target || match?.account;
   const known = resolved ? accounts.find((a) => a.label === resolved || a.key === resolved) : undefined;
-  const [open, setOpen] = useState(!resolved);
+  // Closed, as the mock draws it: the row says how the lane matched, and
+  // Change… opens the map form (no lane opens one on its own).
+  const [open, setOpen] = useState(false);
   const [choice, setChoice] = useState(known?.label ?? "");
   const selId = `lane-${useId().replace(/:/g, "")}`;
   const id = `lane:${runner}/${lane}`;
+  const words = laneMatchWords(target, match);
   async function save(e: FormEvent) {
     e.preventDefault();
     // The change is made to the lane map as Khipu has it just before the
@@ -3234,18 +3403,22 @@ function LaneRow({
     if (ok && choice) setOpen(false);
   }
   return (
-    <div className="row-item route-lane" role="listitem" data-route-item={`lane:${runner}/${lane}`} tabIndex={-1}>
-      <span className="mono">{lane}</span>
-      <span aria-hidden>→</span>
+    <div className="mrow lane" role="listitem" data-route-item={`lane:${runner}/${lane}`} tabIndex={-1}>
+      <span>
+        <span className="mono">{lane}</span>
+        <br />
+        <span className="src">{runner} runner</span>
+      </span>
+      <span className="arrow" aria-hidden>→</span>
       {open ? (
-        <form className="toolbar" aria-label={`Account for ${runner}'s ${lane} lane`} onSubmit={save}>
-          {!resolved ? <Tag tone="warn">Not matched</Tag> : null}
-          {!resolved && !!match?.candidates.length ? <span>Candidates: {match.candidates.join(", ")}</span> : null}
+        <form className="lane-form" aria-label={`Account for ${runner}'s ${lane} lane`} onSubmit={save}>
+          {!resolved ? <Tag tone="warn">No account</Tag> : null}
+          {!resolved && !!match?.candidates.length ? <span>Could be: {match.candidates.join(", ")}</span> : null}
           <label className="sr-only" htmlFor={selId}>
             Account for {lane}
           </label>
           <select id={selId} value={choice} onChange={(e) => setChoice(e.target.value)}>
-            <option value="">{target ? "Not matched" : "Choose an account…"}</option>
+            <option value="">{target ? "No account" : "Choose an account…"}</option>
             {accounts.map((a) => (
               <option key={a.key} value={a.label}>
                 {a.label}
@@ -3263,34 +3436,38 @@ function LaneRow({
           ) : null}
         </form>
       ) : (
-        <span>
-          {known?.label ?? resolved}
-          {!target && match?.matched_by ? <span className="t2"> · matched by {match.matched_by}</span> : null}
-          {!known ? (
-            <>
-              {" "}
-              <Tag tone="warn">Not an account Khipu knows</Tag>
-            </>
-          ) : null}
-        </span>
+        <>
+          <span>
+            {resolved ?? "No account"}
+            {!known && resolved ? (
+              <>
+                {" "}
+                <Tag tone="warn">Not an account Khipu knows</Tag>
+              </>
+            ) : null}
+          </span>
+          <span className="src">{words.how}</span>
+          <span className="end">
+            {words.tag ? (
+              <Tag tone={words.tag.tone} dot>
+                {words.tag.text}
+              </Tag>
+            ) : null}
+            <button
+              type="button"
+              className="sm"
+              aria-label={`Change the account for ${runner}'s ${lane} lane`}
+              onClick={() => {
+                setChoice(known?.label ?? "");
+                setOpen(true);
+              }}
+            >
+              Change…
+            </button>
+          </span>
+        </>
       )}
-      {!open ? (
-        <span className="route-acts">
-          <button
-            type="button"
-            className="sm"
-            aria-label={`Change the account for ${runner}'s ${lane} lane`}
-            onClick={() => {
-              setChoice(known?.label ?? "");
-              setOpen(true);
-            }}
-          >
-            Change…
-          </button>
-        </span>
-      ) : (
-        <span />
-      )}
+      {!open && words.cands ? <div className="cands">{words.cands}</div> : null}
       {w.errors[id] ? (
         <div className="route-pause">
           <WriteError w={w} id={id} />
@@ -3299,6 +3476,7 @@ function LaneRow({
     </div>
   );
 }
+
 
 // ---------------------------------------------------------------------------
 // The routing table file and recent changes
@@ -3767,7 +3945,8 @@ export function RoutingSettings({
   const show = (p: Problem) => {
     // Clear whatever filter or search could hide the item Show points at.
     lists.reveal(p.group);
-    folds.openKeys([p.group, ...(p.item?.startsWith("account:") ? [p.item] : [])]);
+    // A job runner's line lives inside the Providers and lanes group's fold.
+    folds.openKeys([p.group, ...(p.item?.startsWith("account:") ? [p.item] : []), ...(p.item?.startsWith("runner:") ? ["sub:folders"] : [])]);
     setFocusItem({ item: p.item ?? null, group: p.group });
   };
 
@@ -3811,7 +3990,7 @@ export function RoutingSettings({
       />
     ),
     resets: <ResetChecksSection data={data} cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} />,
-    runners: <FoldersSection data={data} cfg={config.data} lists={lists} recordRead={recordRead} w={w} now={now} reread={rereadConfig} />,
+    runners: <ProvidersLanesSection data={data} cfg={config.data} lists={lists} recordRead={recordRead} w={w} now={now} reread={rereadConfig} folds={folds} />,
     table: <TableSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />,
     changes: data ? <ChangesSection data={data} lists={lists} w={w} now={now} /> : unread,
   };
