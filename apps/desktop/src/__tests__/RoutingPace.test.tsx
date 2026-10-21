@@ -73,7 +73,7 @@ describe("Pace, caps and advice: the model", () => {
   it("keeps an unknown reading unknown and a closed account closed", () => {
     const model = paceModel(PACE_VIEW, PACE_PLANS, PACE_NOW);
     const deepseek = model.rows.find((r) => r.label === "DeepSeek");
-    expect(deepseek?.line).toEqual({ week: "Spend can't be told", advice: "Jobs: go, unsure" });
+    expect(deepseek?.line).toEqual({ week: "$21.40 reported; a 3 h gap", advice: "Jobs: go, unsure" });
     expect(deepseek?.advice?.evid).toBe("evidence unknown: spend gap");
     const muse = model.rows.find((r) => r.label === "Muse");
     expect(muse?.line).toEqual({ week: "Back Mon 12:00 AM", advice: "Closed to all" });
@@ -272,6 +272,39 @@ describe("Owner-only partial spend display", () => {
     render(<PaceSection data={data} plans={PACE_PLANS} now={PACE_NOW} folds={{ ...folds, isOpen: () => true }} />);
     fireEvent.click(screen.getByRole("button", { name: /DeepSeek/ }));
     expect(screen.getByText(new RegExp(`${amount.replace("$", "\\$")} reported · gap`))).toBeTruthy();
+  });
+
+  it("caps the gap list to the three largest and counts the rest", () => {
+    const data = structuredClone(PACE_VIEW);
+    const account = data.accounts!.find((a) => a.label === "DeepSeek")!;
+    const gap = (day: number, hours: number) => ({
+      runner: `runner-${day}`, from: new Date(2026, 9, day, 1).toISOString(),
+      to: new Date(2026, 9, day, 1 + hours).toISOString(), seconds: hours * 3600,
+    });
+    Object.assign(account.cap_statuses![0], { reported: { usd: 21.40, events: 1,
+      gaps: [gap(14, 1), gap(15, 6), gap(16, 2), gap(17, 5), gap(18, 3), gap(19, 4)] } });
+    const row = paceModel(data, PACE_PLANS, PACE_NOW).rows.find((r) => r.label === "DeepSeek")!;
+    expect(row.line.week).toBe("$21.40 reported; 6 gaps, largest 6 h");
+    expect(row.caps[0].state).toContain("and 3 more");
+    expect(row.caps[0].state).not.toContain("runner-");
+    expect((row.caps[0].state.match(/gap /g) ?? []).length).toBe(3);
+    const say = row.say.map((p) => p.text).join("");
+    expect(say).toContain("and 3 more gaps");
+    expect((say.match(/runner has a/g) ?? []).length).toBe(3);
+  });
+
+  it("counts gaps the CLI already folded into gaps_more", () => {
+    const data = structuredClone(PACE_VIEW);
+    const account = data.accounts!.find((a) => a.label === "DeepSeek")!;
+    const gap = (day: number, hours: number) => ({
+      runner: `runner-${day}`, from: new Date(2026, 9, day, 1).toISOString(),
+      to: new Date(2026, 9, day, 1 + hours).toISOString(), seconds: hours * 3600,
+    });
+    Object.assign(account.cap_statuses![0], { reported: { usd: 21.40, events: 1, gaps_more: 4,
+      gaps: [gap(15, 6), gap(17, 5), gap(19, 4)] } });
+    const row = paceModel(data, PACE_PLANS, PACE_NOW).rows.find((r) => r.label === "DeepSeek")!;
+    expect(row.line.week).toBe("$21.40 reported; 7 gaps, largest 6 h");
+    expect(row.caps[0].state).toContain("and 4 more");
   });
 });
 
