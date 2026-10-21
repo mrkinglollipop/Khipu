@@ -45,10 +45,14 @@ def runner(mac, name, telemetry=None, lanes=None, events=""):
     (folder / "config.json").write_text(json.dumps({"lanes": lanes or {}}))
     (folder / "state" / "global.json").write_text('{"limited": {}}')
     (folder / "events.log").write_text(events)
-    beat(folder, telemetry)
+    beat(folder, None, at=NOW - timedelta(days=8))
     cfg = json.loads(config.config_file().read_text())
     cfg.setdefault("routing_sources", []).append({"name": name, "kind": "lanes", "path": str(folder)})
     config.config_file().write_text(json.dumps(cfg))
+    # Khipu has been accumulating this runner's telemetry since before the
+    # periods these tests ask about (fix round 2, N1).
+    routing.read_view(now=NOW - timedelta(days=8))
+    beat(folder, telemetry)
     return folder
 
 
@@ -277,12 +281,12 @@ def test_a_future_dated_active_at_is_bounded_to_arrival_and_cannot_wedge_the_lan
     assert routing.telemetry_active(MAIN, now=NOW) == {"jobs": 1, "status": "known"}
 
 
-def test_an_orphan_correction_does_not_count(mac):
+def test_an_orphan_correction_marks_the_total_unknown(mac):
     at = NOW - timedelta(hours=1)
     runner(mac, "a", {"spend": [spend("e1", 10.0, at), spend("e2", -5.0, at, corrects="missing-1")],
                       "spend_coverage": [coverage()]})
     total = week_total()
-    assert total["status"] == "known" and total["usd"] == 10.0
+    assert total["status"] == "unknown" and total["usd"] is None
 
 
 def test_a_plain_negative_without_corrects_is_dropped_and_marks_incomplete(mac):
@@ -293,23 +297,23 @@ def test_a_plain_negative_without_corrects_is_dropped_and_marks_incomplete(mac):
     assert total["status"] == "unknown" and total["usd"] is None
 
 
-def test_a_correction_of_an_out_of_period_target_does_not_count(mac):
+def test_a_correction_of_an_out_of_period_target_marks_the_total_unknown(mac):
     runner(mac, "a", {"spend": [spend("e1", 30.0, NOW - timedelta(days=8)),
                                 spend("e2", 1.0, NOW - timedelta(days=2)),
                                 spend("e3", -0.10, NOW - timedelta(days=1), corrects="e1")],
                       "spend_coverage": [coverage(start=NOW - timedelta(days=14))]})
     total = week_total()
-    assert total["status"] == "known" and total["usd"] == 1.0
+    assert total["status"] == "unknown" and total["usd"] is None
 
 
-def test_a_correction_of_another_accounts_target_does_not_count(mac):
+def test_a_correction_of_another_accounts_target_marks_the_totals_unknown(mac):
     _home, _data, second = mac
     at = NOW - timedelta(hours=1)
     runner(mac, "a", {"spend": [spend("e1", 10.0, at), spend("e2", 30.0, at, account=second),
                                 spend("e3", -5.0, at, corrects="e2")],
                       "spend_coverage": [coverage(), coverage(account=second)]})
-    assert week_total()["usd"] == 10.0
-    assert week_total(second)["usd"] == 30.0
+    assert week_total()["status"] == "unknown" and week_total()["usd"] is None
+    assert week_total(second)["status"] == "unknown" and week_total(second)["usd"] is None
 
 
 def test_absurd_or_non_finite_usd_is_dropped_and_marks_incomplete(mac):
@@ -383,6 +387,71 @@ def test_participation_starts_at_the_first_coverage_interval(mac):
                       "spend_coverage": [coverage(start=NOW - timedelta(days=3), end=NOW - timedelta(days=2)),
                                          coverage(start=NOW - timedelta(hours=2))]})
     assert week_total()["status"] == "unknown"
+
+
+# ---- fix round 2: accumulation start, dropped corrections, bare heartbeats (N1-N3) -----
+
+
+def test_the_accumulation_start_is_persisted_and_bounds_known_periods(mac):
+    at = NOW - timedelta(hours=1)
+    runner(mac, "a", {"spend": [spend("e1", 10.0, at)], "spend_coverage": [coverage()]})
+    view = routing.read_view(now=NOW)
+    tele = view["source_cache"]["runners"]["a"]["telemetry"]
+    assert tele["since"] == (NOW - timedelta(days=8)).timestamp()
+    assert week_total()["status"] == "known"
+    earlier = routing.telemetry_spend(MAIN, start=NOW - timedelta(days=9), end=NOW, now=NOW)
+    assert earlier["status"] == "unknown" and earlier["usd"] is None
+
+
+def test_a_lost_view_resets_the_accumulation_start_and_reads_unknown(mac):
+    folder = runner(mac, "a", {"spend": [spend("e1", 50.0, NOW - timedelta(days=3))],
+                               "spend_coverage": [coverage()]})
+    assert week_total()["usd"] == 50.0
+    beat(folder, {"spend": [spend("e2", 2.0, NOW - timedelta(hours=1))],
+                  "spend_coverage": [coverage()]})
+    assert week_total()["usd"] == 52.0
+    routing.view_file().unlink()
+    total = week_total()
+    assert total["status"] == "unknown" and total["usd"] is None
+
+
+def test_a_discarded_cache_resets_the_accumulation_start_and_reads_unknown(mac):
+    folder = runner(mac, "a", {"spend": [spend("e1", 50.0, NOW - timedelta(days=3))],
+                               "spend_coverage": [coverage()]})
+    assert week_total()["usd"] == 50.0
+    beat(folder, {"spend": [spend("e2", 2.0, NOW - timedelta(hours=1))],
+                  "spend_coverage": [coverage()]})
+    assert week_total()["usd"] == 52.0
+    view = json.loads(routing.view_file().read_text())
+    view["source_cache"]["redaction"] = routing_sources.REDACTION - 1
+    view["digest"] = routing._digest(view)
+    routing.view_file().write_text(json.dumps(view))
+    beat(folder, {"spend": [spend("e2", 2.0, NOW - timedelta(hours=1))],
+                  "spend_coverage": [coverage()]})
+    total = week_total()
+    assert total["status"] == "unknown" and total["usd"] is None
+
+
+def test_a_correction_with_no_account_targeting_an_account_event_marks_it_unknown(mac):
+    at = NOW - timedelta(hours=1)
+    runner(mac, "b", {"spend": [spend("b1", 8.0, at),
+                                spend("c1", -3.0, at, account=None, corrects="b1")],
+                      "spend_coverage": [coverage()]})
+    total = week_total()
+    assert total["status"] == "unknown" and total["usd"] is None
+    assert routing.telemetry_spend(days=7, now=NOW)["unattributed"]["spend_status"] == "unknown"
+
+
+def test_a_heartbeat_with_no_telemetry_keys_expires_the_active_snapshot(mac):
+    folder = runner(mac, "a", {"active": [_active("main-lane", 3)]})
+    assert routing.telemetry_active(MAIN, now=NOW) == {"jobs": 3, "status": "known"}
+    beat(folder, None)
+    assert routing.telemetry_active(MAIN, now=NOW) == {"jobs": None, "status": "unknown"}
+
+
+def test_idle_is_known_zero_only_when_the_runner_sends_jobs_zero_for_the_lane(mac):
+    runner(mac, "a", {"active": [_active("main-lane", 0)]})
+    assert routing.telemetry_active(MAIN, now=NOW) == {"jobs": 0, "status": "known"}
 
 
 def test_the_4096_event_runner_persists_aggregates_not_every_event(mac):

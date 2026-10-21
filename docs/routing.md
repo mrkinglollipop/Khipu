@@ -101,6 +101,10 @@ kept.
   `unit` is `job` today: a GLM job's requests go in turn, so one job is one
   request at a time. The newest snapshot for a `(runner, lane)` replaces the
   earlier one, and every snapshot expires at the runner's silent deadline.
+  A heartbeat with none of the telemetry keys also expires the snapshot.
+  When a lane is idle the runner sends `jobs: 0` for that lane: idle reads
+  as a known zero only from such a record, never from a missing one, so a
+  lane the runner stops mentioning reads unknown, not zero.
 - `spend`: a list of increments, never a running total:
   `{"event", "job", "attempt", "provider", "account", "usd", "at"}`.
   `event` is a uuid the runner mints; records are deduplicated on it, so a
@@ -111,6 +115,14 @@ kept.
   accumulation incomplete).
 - `spend_coverage`: a list of `{"account", "from", "to"}`: the interval for
   which this runner vouches it reported every spend for that account.
+  Khipu records when it started accumulating each runner's telemetry;
+  that start is kept in the saved view and resets whenever the kept
+  accumulation is discarded or the view is lost, and a period that starts
+  before it reads unknown, never a known understated total. A correction
+  whose target Khipu cannot find in the same stream and period (it names
+  no account, or its target lies outside the period) is dropped from the
+  figure and marks the affected stream, or the unattributed bucket,
+  incomplete, so the total reads unknown instead of silently omitting it.
 
 Each record is attributed to an account through the same lane resolver as
 limits and reports. A record no resolution can name is unattributed, never

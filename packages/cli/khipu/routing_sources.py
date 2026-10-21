@@ -413,6 +413,10 @@ def _parse_heartbeat(data: bytes) -> dict:
                             for lane, spec in list(lanes.items())[:LANES_MAX]
                             if safe_name(lane) == lane and isinstance(spec, dict)}
         out["telemetry"] = _parse_telemetry(doc, known)
+    else:
+        # Every heartbeat is a telemetry occasion: one with none of the
+        # telemetry keys still replaces (expires) the active snapshot.
+        out["telemetry"] = _parse_telemetry(doc, [])
     return out
 
 
@@ -574,22 +578,32 @@ def _telemetry_event_count(tele: dict) -> int:
             + len([c for c in tele.get("corrections") or [] if isinstance(c, dict)]))
 
 
-def merge_telemetry(prev, parsed) -> dict:
+def merge_telemetry(prev, parsed, now: datetime | None = None) -> dict:
     """One runner's accumulated telemetry, in the form persisted in the
     view: plain spend aggregated into one bucket per (account declaration,
     provider, second) holding the summed usd, the event count and the
     hashed event ids (so dedup and correction targets survive a reload
     without persisting every event); corrections kept individually, since
     each counts only against its own target; the current ``active``
-    snapshot, which each telemetry heartbeat replaces whole (an empty or
-    missing snapshot means idle, known, never the old jobs); and every
+    snapshot, which each heartbeat replaces whole (an empty or missing
+    snapshot expires the old jobs, never keeps them); and every
     coverage interval vouched so far. Deduplication is per runner, on the
     hashed event id: the first seen wins, so a heartbeat that republishes
     its recent spend never double-counts, and two runners minting the same
     id never merge. Spend dropped for any reason (malformed, truncated,
-    past the keep) marks the accumulation incomplete."""
+    past the keep) marks the accumulation incomplete.
+
+    ``since`` is when Khipu started accumulating this runner (the first
+    merge with no kept accumulation, dated by the fold's clock): it is
+    kept across merges and reset whenever the kept accumulation is gone
+    (a cache discarded at ``collect`` or a lost view.json both reach this
+    merge with no ``prev``), so a period that starts before it can never
+    read as a known, understated total."""
     prev = prev if isinstance(prev, dict) else {}
     parsed = parsed if isinstance(parsed, dict) else {}
+    since = _number(prev.get("since"))
+    if _epoch(since) is None:
+        since = now.timestamp() if now is not None else None
     buckets: dict[tuple, dict] = {}
     for item in prev.get("buckets") or []:
         if isinstance(item, dict) and _epoch(item.get("at")) is not None:
@@ -664,7 +678,8 @@ def merge_telemetry(prev, parsed) -> dict:
                    for b in sorted(buckets.values(), key=lambda b: b["at"] or 0)]
     return {"buckets": out_buckets,
             "corrections": sorted(corrections.values(), key=lambda c: c.get("at") or 0),
-            "dropped_spend": dropped, "active": active, "coverage": coverage, "incomplete": incomplete}
+            "dropped_spend": dropped, "active": active, "coverage": coverage, "incomplete": incomplete,
+            "since": since}
 
 
 _SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".rb", ".pl")
@@ -1061,7 +1076,7 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
             cache[key] = {"data": stored, "good_at": _iso(now), "seen_at": last["seen_at"] if same else _iso(now),
                           "mtime": mtime, "since": None}
             if key == "heartbeat":
-                cache["telemetry"] = merge_telemetry(prev.get("telemetry"), telemetry_parsed)
+                cache["telemetry"] = merge_telemetry(prev.get("telemetry"), telemetry_parsed, now)
             if key == "events":
                 cache[key]["scan"] = scan_events(path, last.get("scan"), now)
             files[key] = {"error": None, "good_at": _iso(now), "since": None}
@@ -1075,7 +1090,7 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
                 cache[key] = {"data": None, "good_at": None, "mtime": None, "since": since}
             files[key] = {"error": _short_error(exc), "good_at": cache[key].get("good_at"), "since": since}
     if "telemetry" not in cache:
-        cache["telemetry"] = merge_telemetry(prev.get("telemetry"), None)
+        cache["telemetry"] = merge_telemetry(prev.get("telemetry"), None, now)
     cache["sightings"] = _sightings(cache, prev.get("sightings"))
     from khipu.routing import _after
 
@@ -1262,7 +1277,8 @@ def telemetry_streams(cache: dict, *, known: list[dict], lane_map: dict, provide
             return streams.setdefault((runner, key), {
                 "runner": runner, "account": key, "silent": bool(silent.get(runner)),
                 "incomplete": bool(tele.get("incomplete")), "buckets": [], "corrections": [], "dropped": [],
-                "coverage": [], "active": [], "launches": []})
+                "coverage": [], "active": [], "launches": [],
+                "accumulating_since": _epoch(tele.get("since"))})
 
         for item in tele.get("buckets") or []:
             if isinstance(item, dict) and _epoch(item.get("at")) is not None:
@@ -1357,6 +1373,40 @@ def _stream_spend(stream: dict, start: datetime, end: datetime) -> tuple[float, 
     return total, count
 
 
+def _dropped_correction_taint(streams: list[dict], start: datetime, end: datetime) -> set[tuple[str, str | None]]:
+    """The (runner, account) streams a correction in the period taints.
+    A correction counts only against a target in its own stream with its
+    own time in the same period; one dropped for lack of such a target
+    (no target in its stream, a cross-period target, or a target in
+    another of the same runner's streams, as when the correction names
+    no account) marks its own stream incomplete for the period, and the
+    target's stream too when the target lives in one, so no total reads
+    known with the correction silently missing from it."""
+    targets: list[tuple[dict, dict[str, datetime]]] = []
+    for stream in streams:
+        found: dict[str, datetime] = {}
+        for bucket in stream["buckets"]:
+            for token in bucket["ids"]:
+                found[token] = bucket["at"]
+        for correction in stream["corrections"]:
+            found.setdefault(correction["event"], correction["at"])
+        targets.append((stream, found))
+    tainted: set[tuple[str, str | None]] = set()
+    for stream, found in targets:
+        for correction in stream["corrections"]:
+            if not start <= correction["at"] <= end:
+                continue
+            target_at = found.get(correction["corrects"])
+            if target_at is not None and start <= target_at <= end:
+                continue  # the correction counted
+            tainted.add((stream["runner"], stream["account"]))
+            for other, other_found in targets:
+                if other is not stream and other["runner"] == stream["runner"] \
+                        and correction["corrects"] in other_found:
+                    tainted.add((other["runner"], other["account"]))
+    return tainted
+
+
 def spend_total(streams: list[dict], account: str, start: datetime, end: datetime) -> dict:
     """One account's spend over [start, end] from its streams. Known only
     when every stream that took part covers its own participation interval;
@@ -1372,6 +1422,7 @@ def spend_total(streams: list[dict], account: str, start: datetime, end: datetim
             participating.append((stream, part))
     if not participating:
         return {**base, "status": "unknown", "usd": None, "reason": "no spend reported for this period"}
+    tainted = _dropped_correction_taint(streams, start, end)
     for stream, (begin, finish) in participating:
         if stream["silent"]:
             return {**base, "status": "unknown", "usd": None,
@@ -1379,6 +1430,14 @@ def spend_total(streams: list[dict], account: str, start: datetime, end: datetim
         if stream["incomplete"]:
             return {**base, "status": "unknown", "usd": None,
                     "reason": f"some of {stream['runner']}'s spend records were not kept"}
+        since = stream.get("accumulating_since")
+        if since is not None and start < since:
+            return {**base, "status": "unknown", "usd": None,
+                    "reason": f"{stream['runner']}'s telemetry is only accumulated from {_iso(since)}; "
+                              "this period starts before that"}
+        if (stream["runner"], stream["account"]) in tainted:
+            return {**base, "status": "unknown", "usd": None,
+                    "reason": f"a correction from {stream['runner']} could not be applied for this account"}
         if not _coverage_covers(stream["coverage"], begin, finish):
             return {**base, "status": "unknown", "usd": None,
                     "reason": f"{stream['runner']} has a gap in its spend coverage for this account"}
@@ -1419,12 +1478,16 @@ def unattributed_summary(streams: list[dict], start: datetime | None = None, end
     mine = [s for s in streams if s["account"] is None]
     total, count, unknown = 0.0, 0, False
     participating = False
+    tainted = _dropped_correction_taint(streams, start, end)
     for stream in sorted(mine, key=lambda s: s["runner"]):
         part = _participation(stream, start, end)
         if part is None:
             continue
         participating = True
-        if stream["silent"] or stream["incomplete"] or not _coverage_covers(stream["coverage"], part[0], part[1]):
+        since = stream.get("accumulating_since")
+        if stream["silent"] or stream["incomplete"] or not _coverage_covers(stream["coverage"], part[0], part[1]) \
+                or (since is not None and start < since) \
+                or (stream["runner"], stream["account"]) in tainted:
             unknown = True
         usd, events = _stream_spend(stream, start, end)
         total += usd
