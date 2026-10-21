@@ -1606,3 +1606,44 @@ def test_auto_track_default_only_for_a_genuinely_new_install(mac):
     assert stored[config.AUTO_TRACK_KEY] is False and stored.get(config.AUTO_TRACK_MIGRATION_KEY) is True
     cf.write_text('{"usage_auto_track": true}')
     assert config.auto_track() is True
+
+
+# ---- slice 9c fix round 2 ----
+
+def test_a_recheck_reporting_no_id_splits_previously_merged_homes(mac):
+    marker = mac.tmp / "claude-noid"
+    body = textwrap.dedent(f"""\
+        case "$*" in
+          "auth status --json")
+            if [ -z "$CLAUDE_CONFIG_DIR" ]; then echo '{{"loggedIn": false}}'; exit 1; fi
+            if [ -f "{marker}" ]; then echo '{{"loggedIn": true}}'; else echo '{{"loggedIn": true, "userId": "U1-shared"}}'; fi
+            exit 0;;
+          "--version") echo "2.1.296 (Claude Code)"; exit 0;;
+          -p*) cat "{FIXTURES / 'claude.jsonl'}"; exit 0;;
+        esac
+        exit 64
+    """)
+    mac.install("claude", body)
+    one = mac.folder(".claude-one")
+    two = mac.folder(".claude-two")
+    mac.session("claude_code", "one", login_home=str(one))
+    mac.session("claude_code", "two", login_home=str(two))
+    out = discover.discover(at=NOW)
+    merged = [c for c in out["candidates"] if c.get("merged")]
+    assert len(merged) == 1 and set(merged[0]["homes"]) == {"~/.claude-one", "~/.claude-two"}
+    marker.write_text("no id")
+    out = discover.discover(now=True, at=NOW + 60)
+    rows = _by_path(out)
+    assert rows["~/.claude-one"]["state"] == "signed_in" and rows["~/.claude-one"]["merged"] is False
+    assert rows["~/.claude-two"]["state"] == "signed_in" and rows["~/.claude-two"]["merged"] is False
+
+
+def test_bounded_settings_does_not_follow_a_symlinked_settings_file(mac):
+    folder = mac.folder(".claude-linked")
+    outside = mac.tmp / "outside-settings.json"
+    outside.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+                                            "ANTHROPIC_AUTH_TOKEN": TOKEN_SENTINEL}}))
+    (folder / "settings.json").symlink_to(outside)
+    got = discover.bounded_settings(folder)
+    assert got == {"host": None, "provider": None, "has_token": False, "unreadable": True}
+    assert TOKEN_SENTINEL not in json.dumps(got)

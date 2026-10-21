@@ -460,8 +460,10 @@ def bounded_settings(path) -> dict:
     # The stat above is only an existence pre-check; the opened descriptor
     # is re-validated with fstat, so a file swapped in between (a FIFO, an
     # oversize file) is still refused, and O_NONBLOCK never waits on one.
+    # O_NOFOLLOW refuses a settings file that is itself a symlink, so a
+    # link inside the home cannot redirect this one read outside it.
     try:
-        fd = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
+        fd = os.open(target, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except FileNotFoundError:
         return out
     except OSError:
@@ -917,6 +919,10 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
     status check timed out only because the run's deadline cut its time."""
     cli = rec["cli"]
     home = None if rec.get("default") else rec.get("abs")
+    # A fresh check replaces any stored subscription key: only an id this
+    # check itself reports can (re)merge homes. A key restored from the
+    # store survives only on homes this run does not re-check.
+    rec.pop("subscription", None)
     clipped = [False]
 
     def left() -> float:
