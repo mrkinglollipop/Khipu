@@ -1372,6 +1372,9 @@ def _glm_request(key: str, timeout: float) -> tuple[int, bytes]:
         raise ProbeError(E_NO_ANSWER) from None
 
 
+_GLM_QUOTA_TYPES = frozenset({"TOKENS_LIMIT", "CREDIT_LIMIT"})
+
+
 def _glm_pct(limit: dict):
     """Used percent of one limit: z.ai's own ``percentage``, else used / limit."""
     pct = limit.get("percentage")
@@ -1412,9 +1415,10 @@ def parse_glm(status: int, body: bytes) -> dict:
         unit = limit.get("unit")
         if isinstance(unit, bool) or unit not in _GLM_UNITS:
             continue
-        # unit 3 / 6 are the token windows; a same-unit request-count limit
-        # (type TIME_LIMIT) must not stand in for one.
-        if isinstance(limit.get("type"), str) and limit["type"] != "TOKENS_LIMIT":
+        # unit 3 / 6 are the quota windows; a same-unit request-count limit
+        # (type TIME_LIMIT) must not stand in for one. z.ai renamed the quota
+        # type TOKENS_LIMIT to CREDIT_LIMIT in October 2026.
+        if isinstance(limit.get("type"), str) and limit["type"] not in _GLM_QUOTA_TYPES:
             continue
         name, mins = _GLM_UNITS[unit]
         if any(w["name"] == name for w in windows):
@@ -1651,7 +1655,7 @@ def parse_http_quota(status: int, body: bytes) -> dict:
             unit = limit.get("unit")
             if isinstance(unit, bool) or unit not in _GLM_UNITS:
                 continue
-            if isinstance(limit.get("type"), str) and limit["type"] != "TOKENS_LIMIT":
+            if isinstance(limit.get("type"), str) and limit["type"] not in _GLM_QUOTA_TYPES:
                 continue
             name, mins = _GLM_UNITS[unit]
             if any(w["name"] == name for w in windows):
