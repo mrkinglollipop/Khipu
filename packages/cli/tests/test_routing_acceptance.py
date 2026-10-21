@@ -1238,7 +1238,9 @@ def test_13_gateway_projection(replay, monkeypatch, contract):
     elif contract == "foreign-delivery":
         assert "s2" not in json.dumps(body.get("delivery"))
     elif contract == "foreign-ack":
-        error, body = replay.call(session_id="synthetic-client:s2", ack="synthetic-other-batch")
+        error, issued = replay.call(session_id="synthetic-client:s1")
+        assert not error and issued["routing_changes"]["batch"]
+        error, body = replay.call(session_id="synthetic-client:s2", ack=issued["routing_changes"]["batch"])
         assert error and body["code"] == "ack_not_yours"
     else:
         error, body = replay.call("khipu_owner_act", action="routing.pause", args={"account": "Codex"})

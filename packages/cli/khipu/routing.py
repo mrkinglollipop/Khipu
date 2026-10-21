@@ -8331,13 +8331,15 @@ def account_id(key: str) -> str:
     return _legacy_account_id(key)
 
 
-def _pick(item, fields: tuple) -> dict | None:
+def _pick(item, fields: tuple, *, author: bool = True) -> dict | None:
     """The named fields of ``item`` and nothing else; a ``written_by`` among
-    them as ``_public_author`` gives it."""
+    them as ``_public_author`` gives it. The gateway projection passes
+    ``author=False``: a ``written_by`` (and with it any project or session
+    name) must never be copied there, whatever fields are named."""
     if not isinstance(item, dict):
         return None
     out = {k: item[k] for k in fields if k in item}
-    if "written_by" in item:
+    if author and "written_by" in item:
         by = item["written_by"]
         out["written_by"] = {k: by[k] for k in _AUTHOR_PUBLIC if k in by} if isinstance(by, dict) else None
     return out
@@ -8583,11 +8585,11 @@ _GATEWAY_DAY_FIELDS = ("revision", "pct", "verdict", "used_24h_pct", "observed_p
 
 
 def _gateway_pace(pace: dict) -> dict:
-    out = _pick(pace, _GATEWAY_PACE_FIELDS)
+    out = _pick(pace, _GATEWAY_PACE_FIELDS, author=False)
     for kind, fields in (("plan", _GATEWAY_PLAN_FIELDS), ("share_cap", _GATEWAY_SHARE_FIELDS),
                          ("day_cap", _GATEWAY_DAY_FIELDS)):
         if isinstance(pace.get(kind), dict):
-            out[kind] = _pick(pace[kind], fields)
+            out[kind] = _pick(pace[kind], fields, author=False)
     return out
 
 
@@ -8622,6 +8624,9 @@ def gateway_projection(view: dict | None = None, *, now: datetime | None = None,
             continue
         pub = _public_account(entry, now, view)
         row = {k: pub[k] for k in ("id", "label", "state", "basis", "until", "line") if k in pub}
+        # The gateway line is rendered as a push renders it: the setter's
+        # project and session never leave through the gateway.
+        row["line"] = account_line(entry, now, push=True)
         witness = pub.get("witness") or {}
         row["witness"] = {k: witness[k] for k in ("source", "at") if witness.get(k) is not None}
         row["models"] = [{k: m[k] for k in ("model", "basis", "until", "at") if k in m}
@@ -8630,33 +8635,65 @@ def gateway_projection(view: dict | None = None, *, now: datetime | None = None,
         rows.append(row)
     out["accounts"] = rows
     holds = []
+    hold_words = bool(cfg.get("routing_cloud_copy_hold_words"))
     for hold in view.get("holds") or []:
         pub = _public_hold(hold, now)
         if key is not None and pub["scope"] != {"kind": "account", "account": account_id(key)}:
             continue
-        row = {k: pub[k] for k in ("id", "scope", "reason", "until", "owner", "at", "line") if k in pub}
-        if cfg.get("routing_cloud_copy_hold_words") and pub.get("text"):
+        row = {k: pub[k] for k in ("id", "scope", "reason", "until", "owner", "at") if k in pub}
+        # As for accounts: the push form of the line (no project, no
+        # session), and hold words in it only under their own switch.
+        row["line"] = hold_line(hold if hold_words else {**hold, "text": ""}, now, push=True)
+        if hold_words and hold.get("owner") and pub.get("text"):
             row["text"] = pub["text"]
         holds.append(row)
     out["holds"] = holds
     if cfg.get("routing_cloud_copy_rules"):
-        out["rules"] = [{"id": r["entity"], "n": r.get("n"), "text": r.get("text"),
-                         "pending": False, "confirmed": bool(r.get("confirmed")),
-                         "revision": r.get("revision")}
-                        for r in view.get("rules") or []
-                        if not r.get("pending") and not r.get("proposal_withheld")]
+        rules = []
+        for r in view.get("rules") or []:
+            if r.get("pending"):
+                # A pending proposal never appears; the owner's last
+                # confirmed revision underneath it still does.
+                if r.get("pending_kind") == "changed" and isinstance(r.get("prior_text"), str):
+                    rules.append({"id": r["entity"], "n": r.get("n"), "text": r["prior_text"],
+                                  "pending": False,
+                                  "confirmed": bool(r["prior_confirmed"])
+                                  if isinstance(r.get("prior_confirmed"), bool) else not r.get("seeded"),
+                                  "revision": r.get("owner_revision")})
+                continue
+            if r.get("proposal_withheld"):
+                continue
+            rules.append({"id": r["entity"], "n": r.get("n"), "text": r.get("text"),
+                          "pending": False, "confirmed": bool(r.get("confirmed")),
+                          "revision": r.get("revision")})
+        out["rules"] = rules
         if view.get("note"):
             out["note"] = {"text": view["note"]["text"], "at": view["note"].get("at")}
         priority = _public_priority(view, now, facts)
-        if priority and not priority.get("pending") and not priority.get("proposal_withheld"):
-            entries = []
-            for entry in priority.get("entries") or []:
+
+        def entry_rows(rows: list[dict]) -> list[dict]:
+            out_rows = []
+            for entry in rows:
                 row = {"account": entry.get("id"), "label": entry.get("label"),
                        "role": entry.get("role"), "until": entry.get("until")}
                 if isinstance(entry.get("level"), dict):
-                    row["level"] = _pick(entry["level"], ("claim", "as_of", "until"))
-                entries.append(row)
-            out["priority"] = {"entries": entries, "until": priority.get("until"), "pending": False,
+                    row["level"] = _pick(entry["level"], ("claim", "as_of", "until"), author=False)
+                out_rows.append(row)
+            return out_rows
+
+        if priority and priority.get("pending"):
+            replaced = priority.get("replaced")
+            if replaced:
+                raw = (view.get("priority") or {}).get("replaced") or {}
+                line = priority_line({"entries": raw.get("entries") or [], "until": raw.get("until"),
+                                      "pending": False}, now, view=view, facts=facts)
+                out["priority"] = {"entries": entry_rows(replaced.get("entries") or []),
+                                   "until": replaced.get("until"), "pending": False,
+                                   "revision": priority.get("owner_revision") or priority.get("version"),
+                                   "line": line}
+        elif priority and not priority.get("proposal_withheld"):
+            out["priority"] = {"entries": entry_rows(priority.get("entries") or []),
+                               "until": priority.get("until"), "pending": False,
                                "revision": priority.get("owner_revision") or priority.get("version"),
                                "line": priority.get("line")}
     return out

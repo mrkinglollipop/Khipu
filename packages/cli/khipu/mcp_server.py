@@ -2398,8 +2398,12 @@ def _gateway_route_identity(args: dict):
     session = (args.get("session_id") or "").strip()
     if not session:
         return None
-    label = gateway_label() or "gateway"
-    return {"session": f"gateway\0{label}\0{session}", "capability": "pull_only"}
+    label = gateway_label()
+    if label is None:
+        # No token label is its own namespace: it must never share a
+        # ledger with a token that happens to be labelled "gateway".
+        return {"session": f"gateway\0unlabeled\0{session}", "capability": "pull_only"}
+    return {"session": f"gateway\0labeled\0{label}\0{session}", "capability": "pull_only"}
 
 
 def _tool_route_gateway(args: dict) -> dict:
@@ -2439,16 +2443,15 @@ def _tool_route_gateway_projected(args: dict) -> dict:
     if out is None:
         return {"available": False, "reason": GATEWAY_COPY_OFF_REASON}
     ack = (args.get("ack") or "").strip()
-    if ack:
-        if identity is None:
-            raise _ToolFailure({"ok": False, "code": "ack_not_yours",
-                                "error": "That routing batch was not issued to this conversation; "
-                                         "the batch stays where it was."})
+    if ack and identity is not None:
         # Revalidate the complete source and final representation first,
         # exactly as the local pull does, then move only this identity's batch.
+        # An unknown or expired batch is answered, never an error (there is
+        # nothing to acknowledge); only a batch issued to another identity
+        # is refused. With no session_id nothing is consumed for anyone.
         _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
         status = routing_delivery.pull_acknowledge(identity["session"], ack, component="mcp", now=now)
-        if status not in ("acked", "duplicate"):
+        if status == "foreign":
             raise _ToolFailure({"ok": False, "code": "ack_not_yours",
                                 "error": "That routing batch was not issued to this conversation; "
                                          "the batch stays where it was."})

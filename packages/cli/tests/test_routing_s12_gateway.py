@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import itertools
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -101,6 +101,18 @@ def leaves(value):
             yield from leaves(inner)
 
 
+def string_leaves(value):
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            yield str(key)
+            yield from string_leaves(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            yield from string_leaves(inner)
+    elif isinstance(value, str):
+        yield value
+
+
 def test_gateway_projection_is_closed_path_free_and_switch_gated(gw):
     private = seed(gw)
     error, body = call(gw, session_id="client-a:s1", label="tok-a")
@@ -172,9 +184,10 @@ def test_gateway_delivery_is_identity_owned(gw):
     # The same session id under a different token label is another identity.
     error, refused = call(gw, session_id="client-a:s1", ack=alice_batch, label="tok-b")
     assert error and refused["code"] == "ack_not_yours"
-    # An entirely unknown batch is refused through the gateway too.
-    error, refused = call(gw, session_id="client-a:s1", ack="synthetic-other-batch", label="tok-a")
-    assert error and refused["code"] == "ack_not_yours"
+    # An entirely unknown batch is answered, never refused: nothing was
+    # issued under that name, so there is nothing to acknowledge.
+    error, answered = call(gw, session_id="client-a:s1", ack="synthetic-other-batch", label="tok-a")
+    assert not error and answered["available"] is True
 
     # The owner of the batch acks it, then acks each following page/batch
     # until the ledger is acked through the current version.
@@ -191,6 +204,104 @@ def test_gateway_delivery_is_identity_owned(gw):
     # A duplicate ack is a no-op, not an error.
     error, again = call(gw, session_id="client-a:s1", ack=batch, label="tok-a")
     assert not error, again
+
+
+CONV_AUTHOR = {"kind": "conversation", "harness": "codex", "project": "projSECRETPROJ",
+               "session": "claude:s"}
+
+
+def seed_planted(gw):
+    routing.add_rule("A confirmed owner rule", via="app")
+    routing.set_priority([{"account": "Codex", "role": "builds"},
+                          {"account": "Claude", "role": "reviews"}],
+                         via="app", expect=routing.priority_version())
+    routing.add_hold("OWNERHOLDWORDS maintenance", reason="other", scope="all", owner=True, via="app")
+    routing.add_hold("CONVHOLDWORDS secret plan", reason="other", scope="all",
+                     author=dict(CONV_AUTHOR), via="mcp")
+    routing.report(state="limited", account="Codex", until="1h", author=dict(CONV_AUTHOR))
+
+
+@pytest.mark.parametrize("hold_words", [True, False])
+def test_gateway_string_leaves_hide_project_session_and_gate_hold_words(gw, hold_words):
+    seed_planted(gw)
+    configure(gw, routing_cloud_copy_hold_words=hold_words)
+    error, body = call(gw, session_id="client-a:s1", label="tok-a")
+    assert not error, body
+    assert_gateway_fields(body)
+    strings = list(string_leaves(body))
+    for sentinel in ("projSECRETPROJ", "claude:s", "CONVHOLDWORDS"):
+        assert not any(sentinel in text for text in strings), (sentinel, hold_words)
+    if hold_words:
+        assert any("OWNERHOLDWORDS" in text for text in strings)
+    else:
+        assert not any("OWNERHOLDWORDS" in text for text in strings)
+    conversation_hold = next(h for h in body["holds"] if not h["owner"])
+    assert "text" not in conversation_hold
+
+
+def test_gateway_pending_proposal_shows_last_confirmed_rule_and_priority(gw):
+    routing.add_rule("CONFIRMEDTEXT rule", via="app")
+    routing.set_priority([{"account": "Codex", "role": "OWNERROLE"}],
+                         via="app", expect=routing.priority_version())
+    gw["patch"].setenv("KHIPU_SESSION_ID", "seed-conv")
+    shown = routing.conversation_view()
+    routing.request_rule("PROPOSALTEXT rule", n=1, author=dict(CONV_AUTHOR),
+                         base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Claude", "role": "PROPOSALROLE"}],
+                             owner_request="PROPOSALREQUEST", author=dict(CONV_AUTHOR),
+                             expect=routing.priority_version(), base=shown["priority_owner_revision"])
+    error, body = call(gw, session_id="client-a:s1", label="tok-a")
+    assert not error, body
+    assert_gateway_fields(body)
+    assert [r["text"] for r in body["rules"]] == ["CONFIRMEDTEXT rule"]
+    assert body["rules"][0]["pending"] is False
+    assert [(e["label"], e["role"]) for e in body["priority"]["entries"]] == [("Codex", "OWNERROLE")]
+    assert body["priority"]["pending"] is False
+    serialized = json.dumps(body)
+    for sentinel in ("PROPOSALTEXT", "PROPOSALROLE", "PROPOSALREQUEST", "projSECRETPROJ", "claude:s"):
+        assert sentinel not in serialized
+
+
+def test_gateway_unknown_expired_and_no_session_acks_are_answered(gw):
+    seed(gw)
+    error, body = call(gw, session_id="client-a:s1", ack="never-issued-batch", label="tok-a")
+    assert not error and body["available"] is True
+    error, body = call(gw, ack="never-issued-batch", label="tok-a")
+    assert not error and body["delivery"] == "untracked: pass session_id"
+    error, alice = call(gw, session_id="client-a:s1", label="tok-a")
+    assert not error, alice
+    batch = alice["routing_changes"]["batch"]
+    assert batch
+    routing._now.now += timedelta(seconds=61)
+    error, body = call(gw, session_id="client-a:s1", ack=batch, label="tok-a")
+    assert not error and body["available"] is True
+
+
+def test_gateway_no_label_does_not_share_the_gateway_labels_ledger(gw):
+    seed(gw)
+    error, anon = call(gw, session_id="client-a:s1")
+    assert not error, anon
+    error, labelled = call(gw, session_id="client-a:s1", label="gateway")
+    assert not error, labelled
+    anon_batch, labelled_batch = anon["routing_changes"]["batch"], labelled["routing_changes"]["batch"]
+    assert anon_batch and labelled_batch and anon_batch != labelled_batch
+    error, refused = call(gw, session_id="client-a:s1", ack=anon_batch, label="gateway")
+    assert error and refused["code"] == "ack_not_yours"
+
+
+def test_gateway_pace_pick_never_copies_written_by(gw):
+    seed(gw)
+    view = routing.read_view()
+    planted = {"kind": "conversation", "harness": "codex", "project": "PPROJ", "session": "PSESS"}
+    view["accounts"][0]["pace"] = [{"window": "weekly", "headline": "plan", "written_by": dict(planted),
+                                    "project": "PPROJ", "session": "PSESS",
+                                    "plan": {"verdict": "on_pace", "written_by": dict(planted)}}]
+    body = routing.gateway_projection(view, now=routing._now())
+    assert body is not None
+    assert not ({key for key, _ in leaves(body)} & {"written_by", "project", "session"})
+    serialized = json.dumps(body)
+    assert "PPROJ" not in serialized and "PSESS" not in serialized
 
 
 def test_gateway_owner_writes_are_refused_and_write_nothing(gw):
