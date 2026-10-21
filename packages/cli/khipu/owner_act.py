@@ -35,8 +35,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.rule.dismiss": (("rule",), ()),
     "route.hold.add": (("text", "reason", "scope"), ("account", "until")),
     "route.hold.end": (("hold",), ()),
-    "route.cap.set": (("account", "kind"), ("window", "pct", "slack", "usd", "days", "n", "revision")),
-    "route.cap.remove": (("account", "kind"), ("window",)),
+    "route.cap.set": (("account", "kind"), ("window", "pct", "slack", "usd", "days", "n", "revision", "purpose")),
+    "route.cap.remove": (("account", "kind"), ("window", "purpose")),
     "route.priority.set": (("entries",), ("until", "expect", "holds")),
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
@@ -186,6 +186,8 @@ def _values(action: str, args) -> dict:
                 raise _bad("n must be a whole number at least 1")
         elif action.startswith("route.cap.") and key == "window" and value not in ("weekly", "five_hour"):
             raise _bad("window must be weekly or five_hour")
+        elif action.startswith("route.cap.") and key == "purpose" and value not in ("job", "check"):
+            raise _bad("cap purpose must be job or check")
         elif action.startswith("route.cap.") and key == "kind" \
                 and value not in ("share", "per_day", "pace_target", "spend", "concurrency"):
             raise _bad("kind must be share, per_day, pace_target, spend or concurrency")
@@ -280,7 +282,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["route", "hold"], ["end", v["hold"]]
     if action.startswith("route.cap."):
         return ["route", "cap", verb, *_opts(v, "window", "kind", "pct", "slack", "usd", "days", "n",
-                                             "revision")], [v["account"]]
+                                             "revision", "purpose")], [v["account"]]
     if action.startswith("route.priority."):
         return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
     if action == "route.tier_table.set":

@@ -10,19 +10,18 @@ from __future__ import annotations
 import os
 from datetime import timedelta
 
-PURPOSES = ("job", "orchestration")
+PURPOSES = ("job", "check", "orchestration")
 TIERS = ("opus", "sonnet", "haiku")
 KINDS = ("build", "fix", "check")
 _KIND_CLASS = {"build": "build", "fix": "fix-round", "check": "tests"}
-# Cap kinds that hold a job back, by purpose. Orchestration is not a
-# runner job, so pace and concurrency caps do not hold it; share and
-# spend caps hold every purpose.
+# Pace and daily pacing do not hold orchestration; resource ceilings
+# remain applicable to every purpose.
 _APPLIES = {
-    "pace_target": {"job"},
-    "per_day": {"job"},
-    "concurrency": {"job"},
-    "share": {"job", "orchestration"},
-    "spend": {"job", "orchestration"},
+    "pace_target": {"job", "check"},
+    "per_day": {"job", "check"},
+    "concurrency": set(PURPOSES),
+    "share": set(PURPOSES),
+    "spend": set(PURPOSES),
 }
 _HOLD_VERDICTS = {
     "pace_target": {"ahead", "recovering"},
@@ -61,7 +60,7 @@ def is_dispatched(environ=None) -> bool:
 
 def effective_purpose(purpose, dispatched: bool) -> str:
     if purpose not in PURPOSES:
-        raise ValueError("purpose must be job or orchestration")
+        raise ValueError("purpose must be job, check or orchestration")
     return "job" if dispatched and purpose == "orchestration" else purpose
 
 
@@ -169,6 +168,17 @@ def _without_figures(status: dict) -> dict:
     return {k: (None if k in _FIGURE_FIELDS else v) for k, v in status.items()}
 
 
+def _applies(status: dict, purpose: str, statuses: list[dict]) -> bool:
+    if purpose not in _APPLIES.get(status.get("kind"), set()):
+        return False
+    if status.get("kind") != "pace_target":
+        return True
+    target = "check" if purpose == "check" and any(
+        s.get("kind") == "pace_target" and s.get("purpose", "job") == "check"
+        and s.get("window") == status.get("window") for s in statuses) else "job"
+    return status.get("purpose", "job") == target
+
+
 def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
                    tier=None, kind=None, privacy: bool = False,
                    explicit: bool = False) -> dict:
@@ -176,7 +186,9 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
     from khipu import routing
 
     statuses = routing.cap_statuses(view, entry, now)
-    evidence = _evidence(view, entry, now, statuses)
+    figures_purpose = "job" if purpose == "orchestration" else purpose
+    applicable = [s for s in statuses if _applies(s, figures_purpose, statuses)]
+    evidence = _evidence(view, entry, now, applicable)
     # An unplaceable pace reading has no figures: never show a number the
     # reading cannot support. Other readings (spend, concurrency) keep
     # their own figures; their status is already unknown without one.
@@ -187,6 +199,8 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
                 else status for status in statuses]
     numbers: dict = {}
     for status in statuses:
+        if not _applies(status, figures_purpose, statuses):
+            continue
         if status["kind"] == "pace_target":
             numbers.update(allowance_pct=status.get("allowance_pct"),
                            used_pct=status.get("used_pct"))
@@ -214,14 +228,16 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         verdict, reason = "closed", "down"
     elif pace_plan_closed:
         verdict, reason = "closed", "plan limit reached"
+    elif any(s.get("kind") == "share" and s.get("verdict") == "cap_reached" for s in statuses):
+        verdict, reason = "closed", "share cap_reached"
     elif not eligible:
         # Facts do not allow this work for this account: never a ``go``.
         verdict, reason = "not_eligible", why_eligible
     else:
         holding = [s for s in statuses
-                   if purpose in _APPLIES.get(s.get("kind"), set())
+                   if _applies(s, purpose, statuses)
                    and s.get("verdict") in _HOLD_VERDICTS.get(s.get("kind"), set())]
-        crossing = _crosses_within_hour(entry, now) if purpose == "job" else []
+        crossing = _crosses_within_hour(entry, now) if purpose in ("job", "check") else []
         if holding:
             verdict = "hold_back"
             reason = "; ".join(f"{s['kind']} {s['verdict']}" for s in holding)
@@ -231,13 +247,13 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
     return {"account": routing.account_id(entry["key"]), "label": entry.get("label"),
             "purpose": purpose, "verdict": verdict, "reason": reason,
             "evidence": evidence, "numbers": numbers,
-            "caps": [{**s, "applies": purpose in _APPLIES.get(s.get("kind"), set())}
+            "caps": [{**s, "applies": _applies(s, purpose, statuses)}
                      for s in statuses],
             "eligible": eligible, "why_eligible": why_eligible, "advisory": True}
 
 
 def advice_line(advice: dict) -> str:
-    purpose = "orchestration" if advice.get("purpose") == "orchestration" else "jobs"
+    purpose = {"orchestration": "orchestration", "check": "checks"}.get(advice.get("purpose"), "jobs")
     return (f"Advice for {purpose}: {advice['label']}: "
             f"{advice['verdict'].replace('_', ' ')} ({advice['reason']})")
 

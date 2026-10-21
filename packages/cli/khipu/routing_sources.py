@@ -782,7 +782,7 @@ def _budget_declaration(item) -> dict | None:
     kind = item.get("kind")
     if kind not in routing_pace.CAP_KINDS:
         return None
-    if set(item) - {"kind", "window", "pct", "slack", "usd", "days", "n"}:
+    if set(item) - {"kind", "window", "pct", "slack", "usd", "days", "n", "purpose"}:
         return None
     window = item.get("window")
     if kind in routing_pace.WINDOW_CAP_KINDS:
@@ -791,10 +791,12 @@ def _budget_declaration(item) -> dict | None:
     elif window is not None:
         return None
     fields = {k: item.get(k) for k in ("pct", "slack", "usd", "days", "n") if item.get(k) is not None}
+    if "purpose" in item:
+        fields["purpose"] = item["purpose"]
     cap = routing_pace.checked_cap({"kind": kind, "revision": "declared", **fields})
     if cap is None:
         return None
-    out = {k: cap[k] for k in ("kind", "pct", "slack", "usd", "days", "n") if k in cap}
+    out = {k: cap[k] for k in ("kind", "pct", "slack", "usd", "days", "n", "purpose") if k in cap}
     if kind in routing_pace.WINDOW_CAP_KINDS:
         out["window"] = window
     return out

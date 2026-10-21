@@ -122,6 +122,43 @@ the runner's files are never written. A lane's own `cap` is local capacity
 on that Mac, not a quota, and is not compared. `khipu route --json` and
 `khipu doctor` carry the report as `runner_caps`.
 
+Caps by purpose. A cap fact may carry `purpose: "job"` (the default for
+old facts too) or `purpose: "check"`. A check `pace_target` is a separate
+allowance for that account and window. Without one, checks use the job
+pace target. Setting, removing and undoing a check cap leave the job cap
+alone. The existing owner direction, app and typed-terminal gates apply.
+`khipu route --json` includes the purpose on every `cap_statuses` row and
+separate `advice`, `check_advice` and `lead_advice` objects. Settings shows
+the check allowance beside the job allowance.
+
+The owner's check exceptions can be written with these commands (a terminal
+asks for typed confirmation):
+
+```sh
+khipu route cap set Codex --window weekly --kind pace_target --pct 100 --slack 5 --purpose check
+khipu route cap set Claude --window weekly --kind pace_target --pct 100 --slack 20 --purpose check
+```
+
+These add check allowances to the existing job caps; they do not set job
+caps or share ceilings. Codex's job cap is even weekly pace with zero
+slack and a 95% share ceiling. Main Claude's job cap is even plus 5 with
+a 91% share ceiling. The Claude check allowance is for Sonnet checks of
+sensitive code; the caller names that work explicitly:
+
+```sh
+khipu route advise --lane codex-check --purpose check --kind check --json
+khipu route advise Claude --purpose check --kind check --tier sonnet --privacy --json
+khipu route cap remove Codex --window weekly --kind pace_target --purpose check
+```
+
+Runners use the same `purpose: "check"` on `khipu_route_advise` and their
+budget declarations. Purpose selects the pace allowance; it does not grant
+model or privacy eligibility. Share, spend and concurrency ceilings apply
+to every purpose. At a share ceiling, advice is `closed`, including for
+orchestration. Spend and concurrency still answer `hold_back` when reached;
+orchestration is exempt only from pace and daily pacing. Advice lines and
+pushes identify their purpose, for example `Advice for checks: Codex: go`.
+
 Runner telemetry contract (slice 17t). A runner's `state/heartbeat.json` may
 also carry three typed, timestamped records. Khipu reads them through the
 same bounded parser as the rest of the heartbeat: only parsed fields

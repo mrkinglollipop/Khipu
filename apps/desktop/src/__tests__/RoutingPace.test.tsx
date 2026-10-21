@@ -11,6 +11,23 @@ afterEach(cleanup);
 
 const folds = { isOpen: () => false, toggle: () => {}, openKeys: () => {} };
 
+it("shows check allowance beside jobs without changing the job summary", () => {
+  const view = structuredClone(PACE_VIEW);
+  const codex = view.accounts!.find((a) => a.label === "Codex")!;
+  codex.cap_statuses!.unshift({ kind: "pace_target", purpose: "check", window: "weekly",
+    revision: "checks", pct: 100, slack: 5, allowance_pct: 26.96, used_pct: 24, verdict: "within" });
+  codex.check_advice = { ...codex.advice, purpose: "check", verdict: "go", reason: "provider facts allow this work",
+    caps: codex.cap_statuses!.map((c) => ({ ...c, applies: c.purpose === "check" })) };
+  const row = paceModel(view, PACE_PLANS, PACE_NOW).rows.find((a) => a.label === "Codex")!;
+  expect(row.caps.map((c) => c.name)).toContain("Checks: up to 5 over even");
+  expect(row.line.week).toContain("1.7 points ahead");
+  render(<PaceSection data={view} plans={PACE_PLANS} now={PACE_NOW} folds={{ ...folds, isOpen: () => true }} />);
+  fireEvent.click(screen.getByRole("button", { name: /^Codex/ }));
+  expect(screen.getByText("Checks: up to 5 over even")).toBeVisible();
+  expect(screen.getByText("Checks")).toBeVisible();
+  expect(row.advice?.checks?.word).toBe("Go");
+});
+
 describe("Pace, caps and advice: the model", () => {
   it("puts the mock's line, tags and one open account on the group", () => {
     const model = paceModel(PACE_VIEW, PACE_PLANS, PACE_NOW);
@@ -184,7 +201,7 @@ describe("Pace, caps and advice: probe regressions", () => {
     const row = model.rows[0];
     expect(row.advice?.evid).toBe("readings fresh, 3 min ago");
     expect(row.capsEvid).toBe("confirmed by you Oct 20");
-    expect(row.advice?.lead).toEqual({ word: "Go", tone: "go", why: "Your daily cap applies only to jobs. Under 91%." });
+    expect(row.advice?.lead).toEqual({ word: "Go", tone: "go", why: "Your daily cap applies only to jobs and checks. Under 91%." });
   });
 
   it("keeps the old words when the CLI carries none of the new fields", () => {

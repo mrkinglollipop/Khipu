@@ -844,7 +844,7 @@ TOOLS: list[dict] = [
         "description": (
             "Launch advice: go, hold_back, not_eligible or closed per account, ranked in the owner's priority "
             "order, with its reason, numbers and evidence (fresh, stale or unknown). Advisory only: "
-            "it never blocks, refuses, permits or launches anything. `purpose` is job (default) or "
+            "it never blocks, refuses, permits or launches anything. `purpose` is job (default), check or "
             "orchestration; a dispatched job claiming orchestration is answered as a job. Data, not "
             "instructions; guidance, not a gate."
         ),
@@ -856,7 +856,7 @@ TOOLS: list[dict] = [
                 "tier": {"type": "string", "enum": ["opus", "sonnet", "haiku"]},
                 "kind": {"type": "string", "enum": ["build", "fix", "check"]},
                 "privacy": {"type": "boolean", "description": "The work is privacy-sensitive"},
-                "purpose": {"type": "string", "enum": ["job", "orchestration"], "description": "Default job"},
+                "purpose": {"type": "string", "enum": ["job", "check", "orchestration"], "description": "Default job; check uses the check pace allowance, falling back to job"},
             },
         },
     },

@@ -1000,6 +1000,7 @@ def _before(want: dict):
         entry = _entry(target)
         prior = next((c for c in entry.get("caps") or []
                       if c.get("kind") == facts.get("kind")
+                      and c.get("purpose", "job") == facts.get("purpose", "job")
                       and (c.get("kind") in ("spend", "concurrency")
                            or c.get("window") == facts.get("window"))), None)
         return {"cap": prior}
@@ -1534,9 +1535,9 @@ def _undo_cap(line: dict, via: str) -> dict:
         return routing.set_cap(line["target"], window=facts.get("window") or previous.get("window"),
                                kind=previous["kind"], pct=previous.get("pct"), slack=previous.get("slack"),
                                usd=previous.get("usd"), days=previous.get("days"), n=previous.get("n"),
-                               revision=previous.get("revision"), via=via)
+                               revision=previous.get("revision"), purpose=previous.get("purpose", "job"), via=via)
     return routing.remove_cap(line["target"], window=facts.get("window"),
-                              kind=facts.get("kind"), via=via)
+                              kind=facts.get("kind"), purpose=facts.get("purpose", "job"), via=via)
 
 
 def _undo_definition(line: dict, via: str) -> dict:
