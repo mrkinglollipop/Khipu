@@ -6,7 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { RoutingSettings } from "../RoutingSettings";
+import { RoutingSettings, replicationStatusWords } from "../RoutingSettings";
 import { endedWords, holdChoiceIds, holdChoiceTargets, proposalsModel } from "../routingProposals";
 import type { RouteView } from "../routing";
 
@@ -71,6 +71,7 @@ function config() {
       routing_owner_hold_reminder: setting(7776000),
       routing_hold_chars: setting(300),
       routing_proposal_text_between_macs: setting(true),
+      routing_replication_live: setting(false),
       routing_push_start: setting(true),
       routing_push_prompt: setting(true),
       routing_push_delegation: setting(true),
@@ -297,6 +298,28 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     expect(sw).toBeChecked();
     fireEvent.click(sw);
     await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_proposal_text_between_macs", value: "off" }));
+  });
+
+  it("shows the replication switch off by default, beside the proposal-text switch, with its status", async () => {
+    await page();
+    const sw = screen.getByRole("switch", { name: /Copy routing between your Macs through the hub/ });
+    expect(sw).not.toBeChecked();
+    expect(screen.getByText(/Mac-to-Mac copy, separate from the copy for cloud agents/)).toBeInTheDocument();
+    expect(screen.getByText(/Replication: checking…/)).toBeInTheDocument();
+    fireEvent.click(sw);
+    await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_replication_live", value: "on" }));
+  });
+
+  it("words replication status as caught up, stale or never synced", () => {
+    expect(replicationStatusWords({ status: "green", caught_up_at: "2026-10-14T15:00:00Z", stale: false })).toBe("caught up");
+    expect(replicationStatusWords({ status: "red", caught_up_at: "2026-10-14T15:00:00Z", stale: true })).toBe("stale");
+    expect(replicationStatusWords({ status: "unknown", age_seconds: null, caught_up_at: null })).toBe("never synced");
+  });
+
+  it("words replication status as off when not applicable and checking while loading", () => {
+    expect(replicationStatusWords({ status: "not_applicable" })).toBe("off");
+    expect(replicationStatusWords(undefined)).toBe("checking…");
+    expect(replicationStatusWords(null)).toBe("checking…");
   });
 });
 

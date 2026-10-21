@@ -462,9 +462,21 @@ The Home screen has a Routing card with one row per account, holds, your note, a
 
 ## Replication between Macs (slice 11b)
 
-`routing_replication_live` must be the JSON boolean `true` to enable network
-replication; it defaults off and is not an app setting yet. The hub needs migration
-0042 and 0043. Enabling it or deploying a running build is a separate operational step.
+`routing_replication_live` is the owner's switch for network replication
+between Macs. It defaults off. Turn it on or off in the app at
+Settings → Routing, beside the other Mac-to-Mac switch ("Copy routing
+between your Macs through the hub"), or with
+`khipu config --set routing_replication_live on --owner-direction` (or
+`--from-app` from the app, or a typed `yes` on a terminal). Like the other
+routing switches it goes only through that owner gate and is recorded as
+an owner action; a conversation's change at the owner's request waits for
+him to confirm or undo it. Do not hand-edit `config.json` for it. The app
+stores the JSON boolean, and the live check still requires that boolean:
+a hand-edited string or number in the file never turns replication on.
+The switch's status line in the app ("Replication: caught up", "stale", or
+"never synced") comes from `khipu route replication status` (below). The
+hub needs migration 0042 and 0043. Enabling it or deploying a running
+build is a separate operational step.
 
 - `khipu route replication status` reads local cursors, caught-up time, age,
   source rows and deferred event kinds. More than ten minutes old is stale.

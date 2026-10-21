@@ -201,6 +201,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_cloud_copy_hold_words": ("switch", False, "Include hold words in the copy"),
     "routing_cloud_copy_rules": ("switch", False, "Include the rules and the note in the copy"),
     "routing_proposal_text_between_macs": ("switch", True, "Proposal text between your Macs"),
+    "routing_replication_live": ("switch", False, "Copy routing between your Macs through the hub"),
     "routing_cloud_copy_stale_after": ("duration", 600, "The copy counts as out of date after"),
     "routing_cloud_copy_debounce": ("duration", 30, "Wait for a burst of changes to end before copying"),
     # Owner-local delivery labels (survey rows 8-11): names the owner gave
@@ -485,7 +486,14 @@ def settings_status() -> dict[str, dict]:
             except (ValueError, TypeError):
                 source = "invalid"
         waiting = requests.get(key)
-        out[key] = {"value": values[key], "default": default, "kind": kind, "source": source, "words": words,
+        value = values[key]
+        if key == "routing_replication_live":
+            # Same strict test as _replication_live: a hand-edited word or
+            # number never shows the switch on (or counts as a stored form).
+            value = config.get(key) is True
+            if config.get(key) is not None and not isinstance(config.get(key), bool):
+                source = "invalid"
+        out[key] = {"value": value, "default": default, "kind": kind, "source": source, "words": words,
                     "request": {"request": waiting.get("request"), "by": waiting.get("by"), "at": waiting.get("at"),
                                 "by_words": author_words(waiting.get("by") if isinstance(waiting.get("by"), dict)
                                                          else None, push=True),
@@ -984,8 +992,10 @@ def _entry_definitions(events_stat: list | None = None, mac: str | None = None) 
 
 
 def _definition_accounts(known: list[dict], events: list[dict] | None = None, config: dict | None = None,
-                         definitions: dict | None = None, entry_cache: dict | None = None) -> list[dict]:
+                         definitions: dict | None = None, entry_cache: dict | None = None,
+                         events_ordered: bool = False) -> list[dict]:
     """New definitions live in facts; legacy config remains a read fallback."""
+    from khipu import usage
     from khipu.config import load_config
 
     if definitions is None and events is None:
@@ -1004,20 +1014,42 @@ def _definition_accounts(known: list[dict], events: list[dict] | None = None, co
     if events is None:
         cache = entry_cache or _entry_cache()
         events, ordered = cache["events"], cache["ordered"]
-    ids, forwards, _aliases = account_identity.state(ordered if ordered is not None else _in_write_order(events), known)
+    ordered = ordered if ordered is not None else events if events_ordered else _in_write_order(events)
+    ids, forwards, _aliases = account_identity.state(ordered, known)
     out = [dict(a) for a in known]
+    defined_ids = {account_identity.forwarded(ident, forwards) for ident in definitions["accounts"]}
+    assigned = {a["key"]: a.get("definition_id") for a in out}
     for ident, value in definitions["accounts"].items():
         current = account_identity.forwarded(ident, forwards)
         account = next((a for a in out if ids.get(a["key"]) == current), None)
+        if account is None and current not in bindings:
+            # A definition can predate the default login's permanent id.
+            # A single-login provider can only bind its one default. Folder
+            # providers also need matching names; explicit bindings win.
+            matches = [a for a in known if a["harness"] == value["provider"]
+                       and a["key"] == f"{value['provider']}|" and not a.get("home")
+                       and (ids.get(a["key"]) not in defined_ids or ids[a["key"]] == current)
+                       and assigned.get(a["key"]) in (None, current)
+                       and (a["label"].casefold() == value["label"].casefold()
+                            or value["provider"] in usage.NO_FOLDER)]
+            definitions_for_login = [v for v in definitions["accounts"].values()
+                                     if v["provider"] == value["provider"]
+                                     and (v["label"].casefold() == value["label"].casefold()
+                                          or value["provider"] in usage.NO_FOLDER)]
+            if len(matches) == len(definitions_for_login) == 1:
+                account = next(a for a in out if a["key"] == matches[0]["key"])
         if account is None:
             binding = bindings.get(current) or {}
             if binding.get("harness", value["provider"]) != value["provider"]:
                 binding = {}
             home = binding.get("home")
             key = f"{value['provider']}|{home or ''}" if binding else current
-            account = {"key": key, "home": home}
-            out.append(account)
+            account = next((a for a in out if a["key"] == key), None)
+            if account is None:
+                account = {"key": key, "home": home}
+                out.append(account)
         account.update(label=value["label"], harness=value["provider"], label_source="owner", definition_id=current)
+        assigned[account["key"]] = current
     if entry_cache is not None:
         entry_cache["overlays"][overlay_key] = tuple(dict(account) for account in out)
     return out
@@ -1079,7 +1111,8 @@ def _resolve_account_key(name: str, known: list[dict] | None = None, *, conversa
     if account_identity.LEGACY.fullmatch(raw) or account_identity.STABLE.fullmatch(raw):
         stable = _resolve_identity(raw, known)
         key_ids, _forward, _aliases = _identity_snapshot(known)[0]
-        candidates = [a["key"] for a in known if key_ids.get(a["key"]) == stable]
+        candidates = [a["key"] for a in known if key_ids.get(a["key"]) == stable
+                      or a.get("definition_id") == stable]
         if not candidates:
             candidates = [key for key, ident in key_ids.items() if ident == stable]
         if len(set(candidates)) == 1:
@@ -1542,9 +1575,17 @@ def _hub_configured() -> bool:
 
 def _replication_live() -> bool:
     # Slice 11 enables this only once hub acceptance can assign numbers.
+    # Registered as a switch in SETTINGS (the owner sets it from the app,
+    # which stores a JSON boolean), but the live check stays strict: a
+    # hand-edited string or number in the file never turns replication on.
+    # A conversation's change at the owner's request is not live either
+    # until he confirms it; undoing it restores the value it replaced.
     from khipu.config import load_config
 
-    return load_config().get("routing_replication_live", False) is True
+    config = load_config()
+    if config.get("routing_replication_live", False) is not True:
+        return False
+    return "routing_replication_live" not in _setting_requests(config)
 
 
 def _pending_numbering() -> bool:
@@ -2662,7 +2703,7 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     cfg["_mac"] = mac
     from khipu import routing_replication
 
-    fingerprint = {"replication": routing_replication.fingerprint(), "entry_model": 1, "account_identity": 2, "payer_identity": 3, "events": events_stat, "config": config_stat,
+    fingerprint = {"replication": routing_replication.fingerprint(), "entry_model": 1, "account_identity": 3, "payer_identity": 3, "events": events_stat, "config": config_stat,
                    "seed": _stat(Path(seed)) if seed else None,
                    "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
     return fingerprint, cfg, known
@@ -3303,6 +3344,8 @@ def _effective_account(entry: dict) -> dict:
     reset = entry.get("reset_check") or {}
     # The owner's latest track, rename or stop of it: a change of its own.
     extra = {"note": entry["note"]} if entry.get("note") else {}
+    if entry.get("usage_setup"):
+        extra["usage_setup"] = entry["usage_setup"]
     return {**extra, "label": entry["label"], "state": entry["state"], "until": entry["until"], "basis": entry["basis"],
             "scope": entry["scope"], "reason": entry["reason"],
             "models": [[m["model"], m["until"], m["basis"],
@@ -3575,6 +3618,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # A pure replay may name its Mac; unstamped logs retain their local meaning.
     mac = mac or cfg.get("_mac")
     definitions = entry_model.definitions(events, mac)
+    known = _definition_accounts(known, events=events, config={}, definitions=definitions, events_ordered=True)
     lane_map = {r: dict(lanes) for r, lanes in lane_map.items()}
     for runner, lanes in definitions["lane_maps"].items():
         lane_map.setdefault(runner, {}).update(lanes)
@@ -3586,7 +3630,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     known = [dict(a) for a in known]
     for ident, value in definitions["accounts"].items():
         ident = account_identity.forwarded(ident, stable_forwards)
-        key = stable_keys.get(ident, ident)
+        defined = next((a for a in known if a.get("definition_id") == ident), None)
+        key = defined["key"] if defined else stable_keys.get(ident, ident)
+        stable_keys[ident] = key
         account = next((a for a in known if a["key"] == key), None)
         if account is None:
             known.append({"key": key, "label": value["label"], "harness": value["provider"],
@@ -4131,12 +4177,17 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # Settings -> Models while limited) gets no reset check and no Check now.
     # With "Read no accounts" no default login is read either.
     none = bool(cfg.get("_accounts_none"))
+    from khipu.routing_providers import usage_setup
+
     for entry in entries:
         origin = by_key[entry["key"]]
         if origin.get("matched_by"):
             entry["matched_by"] = origin["matched_by"]
         entry["configured"] = (entry["key"] in known_keys if known_keys else not entry.get("home") and not none) \
             and "|" in entry["key"]
+        setup = usage_setup(entry["harness"], definitions["providers"].get(entry["harness"], {}))
+        if setup:
+            entry["usage_setup"] = setup
         marked = notes.get(entry["key"])
         if marked is not None:
             entry["note"] = [marked["state"], _iso(marked["at"])]
@@ -6936,6 +6987,8 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
             text = f"{label}: unknown: last cleared by you{age(_parse(last['at']))}"
         elif last:
             text = f"{label}: unknown: last seen {_state_words(last['state'])}{age(_parse(last['at']))}"
+        elif entry.get("usage_setup"):
+            text = f"{label}: {entry['usage_setup']}"
         elif (entry.get("note") or [None])[0] == "tracked":
             text = f"{label}: newly tracked, not read yet"
         else:
@@ -8276,7 +8329,7 @@ _VIEW_FIELDS = ("schema", "epoch", "version", "folded_at", "checked_at", "record
                 "valid_until", "outside_app", "unchecked", "seed_error", "priority_owner_revision")
 _AUTHOR_PUBLIC = ("kind", "harness", "project", "session", "name")
 _ACCOUNT_FIELDS = ("label", "harness", "state", "until", "basis", "scope", "reason", "checkable", "confirmed_at",
-                   "since", "silent", "configured", "matched_by")
+                   "since", "silent", "configured", "matched_by", "usage_setup")
 _WITNESS_FIELDS = ("id", "source", "at", "evidence", "message_time", "cleared", "observed", "turn",
                    "until_default", "model", "family", "transport")
 _REPORT_FIELDS = ("id", "state", "source", "at", "since", "until")
@@ -8316,7 +8369,7 @@ def _identity_snapshot(known: list[dict], *, events: list[dict] | None = None,
                        events_ordered: bool = False) -> tuple:
     """One identity/log walk per input revision, never per public row."""
     revision = (_identity_revision(), tuple((a["key"], a["label"], a["harness"], a.get("home"),
-                                              a.get("label_source")) for a in known))
+                                              a.get("label_source"), a.get("definition_id")) for a in known))
     cached = _IDENTITY_CACHE.get(revision)
     if cached is not None:
         return cached
@@ -8455,7 +8508,11 @@ def _resolve_identity(raw: str, known: list[dict]) -> str:
             message = f"this account id expired on {expiry.date().isoformat()}; use {stable}"
             raise RouteError(message, public=message)
         return stable
-    return account_identity.forwarded(raw, forwards)
+    stable = account_identity.forwarded(raw, forwards)
+    matches = [a for a in known if a.get("definition_id") == stable and a["key"] in _keys]
+    if len(matches) == 1:
+        return _keys[matches[0]["key"]]
+    return stable
 
 
 def resolve_account(name: str, known: list[dict] | None = None, *, conversation: bool = False) -> str:

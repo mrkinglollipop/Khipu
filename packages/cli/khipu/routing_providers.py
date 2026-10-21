@@ -63,3 +63,14 @@ def line(provider: dict) -> str:
     if provider.get("use") == "on_request":
         parts.append("use: on_request")
     return f"Provider {provider.get('label') or provider['id']}: " + "; ".join(parts) if parts else ""
+
+
+def usage_setup(harness: str, provider: dict) -> str | None:
+    """A missing reader is setup debt, never evidence of available quota."""
+    from khipu import usage
+
+    if provider.get("probe") == "http-quota" and provider.get("host"):
+        return None
+    if harness not in usage.HARNESSES:
+        return "no usage reader set up; confirm its quota host in Settings → Accounts"
+    return None
