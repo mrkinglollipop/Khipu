@@ -9730,7 +9730,8 @@ def _advice_push_adjust(out: dict, view: dict, now: datetime, session: str, comp
         return out
 
     def sig(item):
-        return (item.get("verdict"), item.get("reason"), item.get("evidence")) if item else None
+        return (item.get("verdict"), item.get("reason"), item.get("evidence"),
+                item.get("tier"), item.get("sensitive")) if item else None
 
     pushes = {e: a for e, a in current.items() if sig(acked.get(e)) != sig(a)}
     if out.get("kind") == "full":

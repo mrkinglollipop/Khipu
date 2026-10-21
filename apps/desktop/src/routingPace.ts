@@ -770,10 +770,8 @@ function adviceOf(a: RouteAccount, now: Date): PaceAdvice | null {
       ? "evidence stale"
       : `evidence unknown: ${evidenceCause(a)}`;
   const check = a.check_advice;
-  const qualifiedCap = (a.cap_statuses ?? []).find((s) => s.kind === "pace_target" && s.purpose === "check"
-    && (s.tier || s.sensitive_only));
-  const checkTier = check?.tier ?? qualifiedCap?.tier ?? null;
-  const checkSensitive = check?.sensitive ?? qualifiedCap?.sensitive_only ?? false;
+  const checkTier = check?.tier ?? null;
+  const checkSensitive = check?.sensitive ?? false;
   const checkLabel = checkTier || checkSensitive
     ? `${checkTier ? `${capitalise(checkTier)} checks` : "Checks"}${checkSensitive ? " of sensitive code" : ""}`
     : "Checks";

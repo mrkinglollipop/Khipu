@@ -282,7 +282,8 @@ it("names qualified check windows and says Not for checks", () => {
   const claude = view.accounts!.find((a) => a.label === "Claude")!;
   claude.cap_statuses!.push({ kind: "pace_target", purpose: "check", window: "weekly",
     revision: "checks", pct: 100, slack: 20, tier: "sonnet", sensitive_only: true, verdict: "within" });
-  claude.check_advice = { ...claude.advice, purpose: "check", verdict: "not_eligible", reason: "tier not allowed" };
+  claude.check_advice = { ...claude.advice, purpose: "check", verdict: "not_eligible", reason: "tier not allowed",
+    tier: "sonnet", sensitive: true };
   const row = paceModel(view, PACE_PLANS, PACE_NOW).rows.find((a) => a.label === "Claude")!;
   expect(row.caps.map((c) => c.name)).toContain("Week: Sonnet checks of sensitive code: up to 20 over even");
   expect(row.advice?.checks?.label).toBe("Sonnet checks of sensitive code");
@@ -291,4 +292,18 @@ it("names qualified check windows and says Not for checks", () => {
   expect(screen.getByText("Week: Sonnet checks of sensitive code: up to 20 over even")).toBeVisible();
   expect(screen.getByText("Sonnet checks of sensitive code")).toBeVisible();
   expect(screen.getByText("Not for checks")).toBeVisible();
+});
+
+it("uses plain Checks when check advice carries no tier", () => {
+  const view = structuredClone(PACE_VIEW);
+  const claude = view.accounts!.find((a) => a.label === "Claude")!;
+  claude.cap_statuses!.push({ kind: "pace_target", purpose: "check", window: "weekly",
+    revision: "checks", pct: 100, slack: 20, tier: "sonnet", sensitive_only: true, verdict: "within" });
+  claude.cap_statuses!.push({ kind: "pace_target", purpose: "check", window: "five_hour",
+    revision: "checks-5h", pct: 100, slack: 20, tier: "opus", sensitive_only: false, verdict: "within" });
+  claude.check_advice = { ...claude.advice, purpose: "check", verdict: "hold_back", reason: "pace_target within",
+    tier: null, sensitive: false };
+  const row = paceModel(view, PACE_PLANS, PACE_NOW).rows.find((a) => a.label === "Claude")!;
+  expect(row.advice?.checks?.label).toBe("Checks");
+  expect(row.advice?.checks?.word).toBe("Hold back");
 });

@@ -193,7 +193,10 @@ def check_advice(view: dict, entry: dict, now) -> dict:
     on the result so lines can name the scope they were computed for."""
     qualifiers = check_cap_qualifiers(entry)
     if qualifiers is None:
-        return account_advice(view, entry, now, purpose="check")
+        advice = account_advice(view, entry, now, purpose="check")
+        advice["tier"] = None
+        advice["sensitive"] = False
+        return advice
     tier, sensitive = qualifiers
     advice = account_advice(view, entry, now, purpose="check", tier=tier, sensitive=sensitive)
     advice["tier"] = tier
