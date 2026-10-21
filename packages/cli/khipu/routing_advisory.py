@@ -512,9 +512,10 @@ def format_line(task: str, expected: str, actual: str, guessed: bool) -> str:
             f"this dispatch is {actual.title()}. Say why if intended.")
 
 
-def dispatch_line(model: str | None, brief: str | None) -> str | None:
-    """The one rule 12 line for this dispatch, or None when it matches or no
-    confirmed table governs. Never a permission decision."""
+def mismatch(model: str | None, brief: str | None) -> dict | None:
+    """The rule 12 mismatch of this dispatch (work class, the tier the
+    confirmed table asks for, the tier used, whether the class was guessed),
+    or None when it matches or no confirmed table governs."""
     from khipu import routing
 
     table = (routing.read_view().get("tier_table") or {})
@@ -526,7 +527,14 @@ def dispatch_line(model: str | None, brief: str | None) -> str | None:
     expected = tiers.get(task) if task else None
     if task is None or actual is None or expected is None or actual == expected:
         return None
-    return format_line(task, expected, actual, guessed)
+    return {"task": task, "expected": expected, "actual": actual, "guessed": guessed}
+
+
+def dispatch_line(model: str | None, brief: str | None) -> str | None:
+    """The one rule 12 line for this dispatch, or None when it matches or no
+    confirmed table governs. Never a permission decision."""
+    found = mismatch(model, brief)
+    return format_line(found["task"], found["expected"], found["actual"], found["guessed"]) if found else None
 
 
 def settings_model(home: str) -> str | None:
