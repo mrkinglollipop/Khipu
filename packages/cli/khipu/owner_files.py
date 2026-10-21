@@ -32,6 +32,9 @@ PATTERNS: tuple[tuple[str, str, str], ...] = (
     ("temp", "turns", ".*.tmp"),
     ("briefs", "turns", "briefs.jsonl"),
     ("settings", "turns", "settings.json"),
+    ("temp", "turns", "occurrences/.*.tmp"),
+    ("occurrences", "turns", "occurrences/*.json"),
+    ("directions", "turns", "routing-directions.json"),
     ("turns", "turns", "*.jsonl"),
     ("temp", "data", ".owner-*.tmp"),
     ("lock", "data", ".owner-*.lock"),
@@ -53,7 +56,11 @@ def _roots() -> dict[str, Path]:
 def kind_of(path: Path) -> str | None:
     roots = _roots()
     for kind, root, pattern in PATTERNS:
-        if path.parent == roots[root] and fnmatch.fnmatchcase(path.name, pattern):
+        try:
+            relative = path.relative_to(roots[root]).as_posix()
+        except ValueError:
+            continue
+        if fnmatch.fnmatchcase(relative, pattern):
             return kind
     return None
 
@@ -71,6 +78,12 @@ def listed() -> list[Path]:
             path = root / entry
             if any(r == name and fnmatch.fnmatchcase(entry, p) for _k, r, p in PATTERNS):
                 out.append(path)
+        sub = root / "occurrences"
+        if name == "turns" and sub.exists():
+            with os.scandir(sub) as entries:
+                out += [sub / e.name for e in sorted(entries, key=lambda e: e.name)
+                        if e.is_file(follow_symlinks=False)
+                        and (fnmatch.fnmatchcase(e.name, "*.json") or fnmatch.fnmatchcase(e.name, ".*.tmp"))]
     return out
 
 

@@ -444,8 +444,35 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
             # repeat live DB work through the cwd and recents fallbacks.
             _ = exc
             return ""
-        if slice_data and (slice_data.get("commitments") or slice_data.get("episodes")):
-            return _render_project_slice(project or host or "unknown", slice_data)
+        # Routing directions (slice 19a) never carry the owner's words
+        # into a slice: a job's slice names none at all, and another
+        # project's slice names none either. This project's own slice
+        # gets only a count and the ids; `khipu owed` shows the words.
+        direction_ids: list[str] = []
+        if not job and project:
+            try:
+                from khipu import routing_directions
+
+                direction_ids = routing_directions.pushed_slice_ids(project)
+            except Exception:  # noqa: BLE001 - directions never break the pushed slice
+                direction_ids = []
+        if slice_data and (slice_data.get("commitments") or slice_data.get("episodes")
+                           or direction_ids):
+            rendered = _render_project_slice(project or host or "unknown", slice_data)
+            if direction_ids:
+                noun = "direction" if len(direction_ids) == 1 else "directions"
+                note = [f"### Routing directions",
+                        f"- {len(direction_ids)} routing {noun} not yet in Khipu: "
+                        f"{', '.join(direction_ids)}; khipu owed shows them"]
+                lines = rendered.split("\n")
+                for at, line in enumerate(lines):
+                    if line.startswith("Loaded for this session"):
+                        lines[at:at] = note
+                        break
+                else:
+                    lines.extend(note)
+                rendered = "\n".join(lines)
+            return rendered
 
     rows: list[dict] = []
     term = cwd_search_term(cwd)
