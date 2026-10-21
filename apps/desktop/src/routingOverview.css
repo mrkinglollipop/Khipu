@@ -108,6 +108,18 @@
 .route-settings .mrow .end { justify-self: end; display: inline-flex; gap: var(--s2); align-items: center; flex-wrap: wrap; justify-content: flex-end; }
 .route-settings .mrow .name { font-weight: 600; min-width: 0; }
 .route-settings .mrow .route-pause { grid-column: 1 / -1; }
+/* Delivery evidence has a deliberately smaller schema than the approved mock:
+   identities and components are available, friendly project/Mac names and
+   last-prompt times are not. Keep the raw identity readable rather than
+   manufacturing context. */
+.route-settings .delivery-section { display: flex; flex-direction: column; gap: var(--s3); }
+.route-settings .delivery-section > .section-body { padding: 0; }
+.route-settings .mrow.delivery { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); }
+.route-settings .delivery-state { display: flex; flex-direction: column; align-items: flex-end; text-align: right; gap: var(--s1); min-width: 0; }
+.route-settings .delivery-state .src { overflow-wrap: anywhere; }
+.route-settings .mrow.delivery-change { grid-template-columns: 4rem minmax(0, 1fr) auto; }
+.route-settings .mrow.delivery-freshness { grid-template-columns: minmax(0, 1fr) auto; }
+.route-settings .mrow.delivery .mono { overflow-wrap: anywhere; }
 /* Providers: name, what Khipu knows, the On request tag. */
 .route-settings .mrow.prov { grid-template-columns: 6.5rem minmax(0, 1fr) auto; }
 /* Lanes: the lane and its runner, an arrow, the account, how it matched, the tag. */
@@ -165,6 +177,7 @@
 @media (max-width: 1100px) {
   .needs ul { grid-template-columns: 1fr; }
   .needs li { flex-wrap: wrap; }
+  .route-settings .mrow.delivery-change { grid-template-columns: 5.5rem minmax(0, 1fr) auto; }
 }
 
 /* Sorting, filtering and searching the lists (settings clarity phase 4). */

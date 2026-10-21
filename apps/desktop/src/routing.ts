@@ -442,6 +442,34 @@ export type RouteProposal = {
   ended_at?: string | null;
 };
 
+/** Read-only delivery evidence from the `routing_delivery` block in `khipu
+ * doctor`. `khipu route --json` deliberately does not carry this ledger. */
+export type RouteDeliveryIdentity = {
+  /** Opaque canonical identity. The health read has no friendly project or Mac label. */
+  identity: string;
+  /** The component whose receipt is current: main, mcp, or agent:<id>. */
+  component: string;
+  status: "green" | "red" | "unknown" | string;
+  reasons?: string[];
+  missing?: string[];
+  owed?: number;
+};
+
+export type RouteDeliveryFreshness = {
+  status?: "green" | "red" | "unknown" | "not_applicable" | string;
+  age_seconds?: number | null;
+};
+
+export type RouteDeliveryHealth = {
+  status: "green" | "red" | "unknown" | string;
+  reasons?: string[];
+  missing?: string[];
+  identities?: RouteDeliveryIdentity[];
+  prompts?: { status?: string; reasons?: string[]; missing?: string[]; count?: number; skipped?: number; rate_pct?: number };
+  replication?: RouteDeliveryFreshness;
+  gateway?: RouteDeliveryFreshness;
+};
+
 export type RouteView = {
   proposals?: Record<string, RouteProposal>;
   definitions?: { providers?: Record<string, RouteProvider>; accounts?: Record<string, unknown> };
@@ -1213,4 +1241,74 @@ export function paceWords(fact: PlanFact | null | undefined, now: Date): string 
   const head = `${fact.left_pct}% of its ${fact.window} left, resets ${whenLocal(fact.resets_at, now)}`;
   if (!fact.left_pct || fact.left_pct <= 0) return `${head}: nothing left to use until then`;
   return `${head}: about ${rateWords(fact.pace_pct_per_hour ?? 0)}% an hour to use it all (${fact.words})`;
+}
+
+export function deliveryReason(reason: string): string {
+  const words: Record<string, string> = {
+    "ack-unshown": "a change was acknowledged before it was shown",
+    "budget-stall": "a change is still owed past its delivery budget",
+    "lease-expired-twice": "a change's delivery lease expired twice",
+    "prompt-skips": "too many prompts skipped routing",
+    "cross-mac-stale": "the cross-Mac copy is behind",
+    "gateway-stale": "the cloud copy is behind",
+    "unmatched-limit": "an unmatched lane has a limit for over an hour",
+  };
+  return words[reason] ?? reason.replace(/-/g, " ");
+}
+
+const DELIVERY_HARNESS_WORDS: ReadonlyArray<readonly [string, string]> = [
+  ["claude_code", "Claude"],
+  ["claude-code", "Claude"],
+  ["claude", "Claude"],
+  ["codex", "Codex"],
+  ["grok", "Grok"],
+  ["cursor", "Cursor"],
+  ["glm", "GLM"],
+  ["muse", "Muse"],
+  ["deepseek", "DeepSeek"],
+  ["aegis", "Aegis"],
+  ["antigravity", "Antigravity"],
+  ["gemini", "Gemini"],
+];
+
+function deliveryHarness(identity: string): string | null {
+  const lower = identity.toLowerCase();
+  for (const [prefix, word] of DELIVERY_HARNESS_WORDS) {
+    if (lower === prefix) return word;
+    if (lower.startsWith(prefix) && ":_-/.".includes(lower.charAt(prefix.length))) return word;
+  }
+  return null;
+}
+
+export type DeliveryConversationLabel = {
+  conversation: string;
+  harness: string | null;
+  component: string;
+};
+
+/** Owner-facing labels for delivery rows. Raw identities and component ids
+ * can hold session ids, so they are never rendered: a conversation is named
+ * by its stable first-appearance order, its harness, and a generic component
+ * word only. */
+export function deliveryConversationLabels(
+  rows: ReadonlyArray<{ identity?: unknown; component?: unknown }> | null | undefined,
+): DeliveryConversationLabel[] {
+  const numbers = new Map<string, number>();
+  return (rows ?? []).map((row) => {
+    const identity = typeof row?.identity === "string" ? row.identity : "";
+    if (!numbers.has(identity)) numbers.set(identity, numbers.size + 1);
+    const component = typeof row?.component === "string" ? row.component : "";
+    return {
+      conversation: `Conversation ${numbers.get(identity)}`,
+      harness: identity ? deliveryHarness(identity) : null,
+      component:
+        component === "main"
+          ? "main"
+          : component === "mcp"
+            ? "MCP helper"
+            : component === "agent" || component.startsWith("agent:")
+              ? "a helper agent"
+              : "another component",
+    };
+  });
 }

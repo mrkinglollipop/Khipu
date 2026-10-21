@@ -6,8 +6,8 @@
    the closed lines' tags and Home's attention items read the same sources
    (`brokenRules`, `quietRunners` in routing.ts). */
 
-import { accountClassification, brokenRules, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
-import type { PlanFact, RouteProvider, RouteView } from "./routing";
+import { accountClassification, brokenRules, deliveryConversationLabels, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
+import type { PlanFact, RouteDeliveryHealth, RouteProvider, RouteView } from "./routing";
 import { proposalsModel } from "./routingProposals";
 import { checksLine, checksModel } from "./routingChecks";
 import { paceModel } from "./routingPace";
@@ -59,6 +59,9 @@ export type OverviewSettings = {
   /** routing_push as `khipu features` reports it; null: not read yet. */
   push: { enabled?: boolean } | null;
   pushError?: string | null;
+  /** Read-only `khipu doctor` evidence. Route JSON does not include it. */
+  delivery?: RouteDeliveryHealth | null;
+  deliveryError?: string | null;
 };
 
 export type Overview = {
@@ -320,7 +323,35 @@ const TAG_WORDS: Record<string, (n: number) => string> = {
   table: () => "Can't read the file",
   contradiction: (n) => plural(n, "contradiction", "contradictions"),
   crossing: (n) => plural(n, "cap crossing", "cap crossings"),
+  "delivery-behind": (n) => `${n} delivery ${n === 1 ? "problem" : "problems"}`,
+  "delivery-copy": (n) => `${n} ${n === 1 ? "copy" : "copies"} behind`,
+  "delivery-read": () => "Couldn't read delivery",
 };
+
+/** Delivery remains visible even when the separate routing-record read fails. */
+function deliveryProblems(s: OverviewSettings): Problem[] {
+  const out: Problem[] = [];
+  const add = (key: string, kind: string, needs: string) => out.push({ key, kind, needs, group: "telling", tone: "err", show: "routing delivery" });
+  if (s.deliveryError) {
+    out.push({ key: "delivery-read", kind: "delivery-read", needs: "Routing delivery couldn't be read", group: "telling", tone: "warn", show: "routing delivery" });
+    return out;
+  }
+  const health = s.delivery;
+  if (!health) return out;
+  const identities = Array.isArray(health.identities) ? health.identities : [];
+  const labels = deliveryConversationLabels(identities);
+  identities.forEach((row, index) => {
+    if (row?.status !== "red") return;
+    const label = labels[index];
+    const owed = Number.isInteger(row.owed) && (row.owed ?? -1) >= 0 ? `: ${row.owed} changes owed` : "";
+    const where = label.harness ? ` (${label.harness}, ${label.component})` : ` (${label.component})`;
+    add(`delivery:${index}`, "delivery-behind", `${label.conversation}${where} has a delivery problem${owed}`);
+  });
+  if (health.replication?.status === "red") add("delivery-macs", "delivery-copy", "Other Macs' routing copy is behind");
+  if (health.gateway?.status === "red") add("delivery-cloud", "delivery-copy", "The cloud routing copy is behind");
+  if (health.status === "red" && !out.length) add("delivery-health", "delivery-behind", "Routing delivery needs attention");
+  return out;
+}
 
 /** A group's problem tags: one per kind, counted. */
 export function groupTags(problems: Problem[], group: GroupKey): GroupTag[] {
@@ -389,6 +420,19 @@ function holdsLine(view: RouteView, now: Date): string {
 }
 
 function tellingLine(s: OverviewSettings): string {
+  if (s.push && s.push.enabled !== true) return "Off";
+  if (s.deliveryError) return "Couldn't read delivery";
+  if (s.delivery) {
+    const identities = Array.isArray(s.delivery.identities) ? s.delivery.identities : [];
+    if (!identities.length && Array.isArray(s.delivery.identities) && !s.delivery.missing?.length && s.delivery.status === "green") return "No live conversations";
+    if (!identities.length) return "No live conversations can be checked";
+    const bad = identities.filter((row) => row.status === "red").length;
+    const unknown = identities.filter((row) => row.status === "unknown").length;
+    const parts = [`${plural(identities.length, "live conversation", "live conversations")}`];
+    if (bad) parts.push(`${bad} behind`);
+    if (unknown) parts.push(`${unknown} can't be checked`);
+    return parts.join("; ");
+  }
   if (s.pushError || s.routingError) return "Couldn't read its settings";
   if (!s.push || !s.routing) return "Reading…";
   if (s.push.enabled !== true) return "Off";
@@ -460,7 +504,7 @@ export function routingOverview(
   s: OverviewSettings,
   now: Date,
 ): Overview {
-  const problems = view ? routingProblems(view, plans, plansError, s, now) : [];
+  const problems = [...(view ? routingProblems(view, plans, plansError, s, now) : []), ...deliveryProblems(s)];
   const pace = view ? paceModel(view, plans, now) : null;
   const lines = {} as Record<GroupKey, string>;
   const tags = {} as Record<GroupKey, GroupTag[]>;
