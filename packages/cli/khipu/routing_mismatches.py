@@ -145,6 +145,17 @@ def _rows(now: datetime, *, expire: bool = False) -> list[dict]:
             names = sorted(e.name for e in entries if e.name.startswith(PREFIX) and e.name.endswith(".json"))
     except OSError:
         return []
+    if expire:
+        # Expiry covers the whole store, not only the newest files shown.
+        for name in names[:-MOST_FILES]:
+            path = owner_turns.folder() / name
+            data = _read(path)
+            at = _parse(data.get("at")) if data else None
+            if (at is not None and at <= now - KEEP) or (at is None and _stale(path, now)):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
     for name in names[-MOST_FILES:]:
         path = owner_turns.folder() / name
         data = _read(path)

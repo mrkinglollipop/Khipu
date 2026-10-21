@@ -132,6 +132,16 @@ def test_only_today_is_shown_and_rows_expire_on_read_and_in_the_sweep(mismatched
     assert out["ok"] and out["mismatches"] == 1 and len(events()) == 2
 
 
+def test_expiry_reaches_files_beyond_the_display_limit(mismatched, monkeypatch):
+    monkeypatch.setattr(routing_mismatches, "MOST_FILES", 5)
+    base = mismatched.now
+    routing_mismatches.record(dict(FOUND), now=base - timedelta(days=8))
+    for minutes in range(5):
+        routing_mismatches.record(dict(FOUND), now=base - timedelta(minutes=minutes))
+    assert len(events()) == 6
+    assert routing_mismatches.sweep(now=base) == 1 and len(events()) == 5
+
+
 def test_a_damaged_store_reads_empty_and_never_breaks_the_view(mismatched):
     folder = owner_turns._ensure_folder()
     (folder / (routing_mismatches.PREFIX + "bad.json")).write_text("{not json")
