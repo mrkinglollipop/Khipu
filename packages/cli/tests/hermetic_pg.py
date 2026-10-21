@@ -94,6 +94,22 @@ def _watch_cluster(root: Path, pg_ctl: str, options: str) -> None:
         _stop_orphan(root, pg_ctl)
 
 
+def _sweep_orphans(temp_root: Path, pg_ctl: str) -> None:
+    """Stop clusters left by earlier runs whose owner is gone (a supervisor
+    that was itself killed, or a run from before supervised startup)."""
+    candidates = list(temp_root.glob("khipu-hermetic-pg-*"))
+    candidates.extend(temp_root.glob("kt-*/khipu-hermetic-pg-*"))
+    for root in candidates:
+        if root.is_symlink() or root.parent.is_symlink() or not root.is_dir():
+            continue
+        owner = _read_owner(root)
+        if owner is not None and not _owner_alive(owner):
+            try:
+                _stop_orphan(root, pg_ctl)
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                pass
+
+
 def _system_temp() -> Path:
     root = Path(tempfile.gettempdir())
     while root.name.startswith("kt-"):
@@ -298,6 +314,7 @@ def pg_cluster(request):
             return
     # conftest deletes kt-* at exit; PGDATA must outlive that cleanup when a
     # nested pytest dies before its supervisor finishes stopping PostgreSQL.
+    _sweep_orphans(_system_temp(), PG_CTL)
     root = Path(tempfile.mkdtemp(prefix="khipu-hermetic-pg-", dir=_system_temp()))
     cluster = Cluster(root, _free_port())
     shared = False
