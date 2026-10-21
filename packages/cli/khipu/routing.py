@@ -1967,7 +1967,7 @@ def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = No
         if entity and not row.get("pending"):
             revisions[entity] = event_identity.revision(row)
         if row.get("type") == "rule_add":
-            rule_ids[row.get("hub_order", row.get("n"))] = entity
+            rule_ids.setdefault(_rule_number(row), set()).add(entity)
     for event in events:
         event.setdefault("id", _new_id("e"))
         event.setdefault("mac", mac)
@@ -1989,9 +1989,14 @@ def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = No
                     event.setdefault("local_order", event.get("n"))
                 else:
                     event["number_pending"] = True
-                rule_ids[event.get("n")] = event["entity"]
+                rule_ids.setdefault(_rule_number(event), set()).add(event["entity"])
         elif kind in event_identity.RULE_CHANGES:
-            entity = event.get("target") or event.get("entity") or rule_ids.get(event.get("n"))
+            entity = event.get("target") or event.get("entity")
+            if not entity:
+                candidates = rule_ids.get(event.get("n"), set())
+                if len(candidates) > 1:
+                    raise RouteError("ambiguous rule number; use its uuid: " + ", ".join(sorted(candidates)))
+                entity = next(iter(candidates), None)
             if not entity:
                 raise RouteError("a rule change needs an existing rule uuid")
             event.update(entity=entity, target=entity)
@@ -2054,7 +2059,7 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "resets_at", "cycle", "revision", "cap_kind")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
                 "witness_at", "expires_at", "reset_at", "resets_at")
-_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "t_err")
+_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
                   "observed", "observed_turn", "session_logs", "silent", "unmatched")
@@ -2113,9 +2118,8 @@ def _next_rules(events: list[dict], count: int) -> int | None:
     """Reserve this Mac's display numbers until replication assigns hub numbers."""
     if _pending_numbering():
         return None
-    mac = _mac_locked()
-    taken = {e["n"] for e in events if e.get("type") == "rule_add" and isinstance(e.get("n"), int)
-             and e.get("mac") in (None, mac)}
+    taken = {_rule_number(e) for e in events if e.get("type") == "rule_add"
+             and _rule_number(e) is not None}
     first = _next_after(taken, count, 1)
     if not any(first + i in taken for i in range(count)):
         return first
@@ -3857,8 +3861,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                  "component": _rule_add_component(event),
                                  "revision": event_identity.revision(event),
                                  "owner_revision": "0" if pending else event_identity.revision(event),
-                                 "number_pending": bool(event.get("number_pending") or
-                                     (event.get("mac") and event.get("entity") and _rule_number(event) is None)),
+                                 "number_pending": _rule_number(event) is None,
                                  "proposal_withheld": bool(event.get("proposal_withheld")),
                                  "provisional_n": event.get("n"),
                                  "n": _rule_number(event), "text": event["text"], "source": event.get("source") or "",
@@ -4791,13 +4794,15 @@ def _rule_component(rule: dict) -> str:
 
 
 def _rule_number(event: dict) -> int | None:
+    if isinstance(event.get("local_order"), int):
+        return event["local_order"]
+    # Old pending rows may have a provisional n that was never displayed.
     if event.get("number_pending"):
-        return None
-    if isinstance(event.get("hub_order"), int):
-        return event["hub_order"]
-    if event.get("mac") and event.get("entity"):
-        return event.get("local_order")
-    return event.get("n")
+        return event.get("rule_number")
+    for field in ("n", "rule_number"):
+        if isinstance(event.get(field), int):
+            return event[field]
+    return None
 
 
 def _rule_add_component(event: dict) -> str:
@@ -6089,7 +6094,10 @@ def _rule(n, now) -> dict:
         number = int(n)
     except (TypeError, ValueError):
         raise RouteError(f"{n!r} is not a rule number or uuid") from None
-    rule = next((r for r in rules if r["n"] == number), None)
+    # Resolve against history too: retiring one duplicate cannot redirect an
+    # old numeric reference to an unrelated surviving rule.
+    entity, _ = rule_reference(number)
+    rule = next((r for r in rules if r["entity"] == entity), None)
     if rule is None:
         provisional = [r["entity"] for r in rules if r.get("number_pending") and
                        r.get("provisional_n") in (None, number)]
@@ -6214,12 +6222,13 @@ def rule_reference(n) -> tuple[str, int | None]:
     except (TypeError, ValueError):
         raise RouteError(f"{n!r} is not a rule number or uuid") from None
     matches = [e for e in additions if _rule_number(e) == number]
-    settled = [e for e in matches if not e.get("number_pending") and
-               _rule_number(e) is not None]
-    if settled:
-        return event_identity.entity(settled[-1]), number
-    provisional = [e for e in additions if (e in matches or e.get("n") is None) and
-                   (e.get("number_pending") or (e.get("entity") and _rule_number(e) is None))]
+    entities = sorted({event_identity.entity(e) for e in matches})
+    if len(entities) > 1:
+        raise RouteError("ambiguous rule number; use its uuid: " + ", ".join(entities))
+    if entities:
+        return entities[0], number
+    provisional = [e for e in additions if _rule_number(e) is None and
+                   e.get("n") in (None, number)]
     if provisional:
         raise RouteError("new rule (number pending); use its uuid: " +
                          ", ".join(event_identity.entity(e) for e in provisional))

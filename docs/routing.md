@@ -329,7 +329,7 @@ The Home screen has a Routing card with one row per account, holds, your note, a
 
 `routing_replication_live` must be the JSON boolean `true` to enable network
 replication; it defaults off and is not an app setting yet. The hub needs migration
-0042. Enabling it or deploying a running build is a separate operational step.
+0042 and 0043. Enabling it or deploying a running build is a separate operational step.
 
 - `khipu route replication status` reads local cursors, caught-up time, age,
   source rows and deferred event kinds. More than ten minutes old is stale.
@@ -340,6 +340,7 @@ replication; it defaults off and is not an app setting yet. The hub needs migrat
   does not connect. The next enabled sync rebuilds the downloaded set; old local
   event IDs are retried idempotently. Run this after restoring a copied routing
   folder to another Mac; a fresh install creates its own identity automatically.
+  If a sync holds the lock, restore returns `busy` without changing files.
 
 The daemon's existing routing poll uploads in local sequence order, then pulls
 hub-timestamp pages with the snapshot overlap. Polls are capped at 30 seconds
@@ -348,8 +349,15 @@ while the routing helper is running. A stopped helper needs an explicit sync.
 The local routing lock is never held over a network operation. Durable receipts
 precede upload cursor advancement; durable pages precede download cursor
 advancement. Only a completed pull through its snapshot can mark caught-up.
-The hub's acceptance sequence supplies rule numbers; offline additions keep
-UUID targets and show “new rule (number pending)”.
+Existing `n`/`local_order` display numbers never change. Previously unnumbered
+rules receive the next rule number in hub acceptance order, independent of gaps
+or other event kinds in `hub_order`. Assignments persist in receipts and survive
+retries and restore. Offline additions keep UUID targets and show “new rule
+(number pending)”. Each Mac reserves its existing number range before uploading,
+including a numeric high-water mark for id-less legacy rules; those rows never
+upload. A Mac's private numbers cannot be known elsewhere before its first sync.
+Conflicting historical numbers are preserved, and ambiguous numeric operations
+refuse with the matching UUIDs so the owner can target the intended rule.
 
 Unconfirmed words omitted by `routing_proposal_text_between_macs` become a
 placeholder on the other Mac. Confirm on the source Mac, where the words are

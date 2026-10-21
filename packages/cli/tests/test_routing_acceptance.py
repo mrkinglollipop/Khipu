@@ -1000,7 +1000,7 @@ def test_11a_slug_collisions_are_refused_even_on_an_unchanged_stored_list(replay
 
 
 def test_11b_two_macs_keep_both_rules_until_hub_numbering(replay):
-    rows = [replay.event("rule_add", i, n=1, text=word, mac=f"m{i}", entity=f"rule-{i}",
+    rows = [replay.event("rule_add", i, n=1, number_pending=True, text=word, mac=f"m{i}", entity=f"rule-{i}",
                          hlc={"wall": 1, "counter": 0, "mac": f"m{i}"}) for i, word in [(1, "first"), (2, "second")]]
     view = replay.fold(rows)
     expect(sorted(r["text"] for r in view["rules"]), ["first", "second"], "11b: concurrent numeric rule keys overwrite one rule")

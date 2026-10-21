@@ -96,13 +96,15 @@ def remote_events():
 
 
 def merge(local):
-    """Private local fields win; only the hub assigns display numbers."""
+    """Keep existing numbers; receipts number previously unnumbered rules."""
     rows = {r["id"]: dict(r, remote=True) for r in remote_events()}
     for row in local:
         receipt = rows.get(row.get("id"), {})
         merged = dict(row)
         if isinstance(receipt.get("hub_order"), int):
-            merged.update(hub_order=receipt["hub_order"], number_pending=False)
+            merged["hub_order"] = receipt["hub_order"]
+            if receipt.get("rule_number") is not None:
+                merged["rule_number"] = receipt["rule_number"]
         rows[row.get("id") or ("local", len(rows))] = merged
     return list(rows.values())
 
@@ -122,14 +124,18 @@ def _store_locked(receipts):
                 or payload["id"] != receipt["event_id"]
                 or not isinstance(order, int) or isinstance(order, bool) or order <= 0):
             raise ValueError("invalid hub receipt")
-        checked = routing._checked(dict(payload, hub_order=order, number_pending=False))
+        number = receipt.get("rule_number")
+        if number is not None and (type(number) is not int or not 0 < number <= routing._WHOLE_MOST):
+            raise ValueError("invalid rule number")
+        checked = routing._checked(dict(payload, hub_order=order,
+                                        **({"rule_number": number} if number is not None else {})))
         if checked is None:
             raise ValueError("invalid hub event")
         if payload["id"] not in rows:
             rows[payload["id"]] = checked
             changed = True
         elif "hub_order" not in rows[payload["id"]]:
-            rows[payload["id"]].update(hub_order=order, number_pending=False)
+            rows[payload["id"]].update(checked)
             changed = True
     if changed:
         _atomic(_path("remote.jsonl"), "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows.values()))
@@ -142,17 +148,44 @@ class PostgresHub:
     BIGSERIAL is not a uniqueness constraint and is never a conflict target.
     Pull pagination uses (hub timestamp, primary key), not a unique hub_order.
     """
+    def reserve_numbers(self, mac, floor):
+        """Only a numeric high-water mark leaves id-less local history."""
+        from khipu import db
+
+        with db.connect(statement_timeout_s=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(1263030864)")
+                cur.execute("INSERT INTO routing_sources(mac, rule_number_floor) VALUES (%s, %s) "
+                            "ON CONFLICT (mac) DO UPDATE SET rule_number_floor = "
+                            "greatest(routing_sources.rule_number_floor, EXCLUDED.rule_number_floor)",
+                            (mac, floor))
+
     def upload(self, mac, payload):
         from khipu import db
 
         with db.connect(statement_timeout_s=5) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT pg_advisory_xact_lock(1263030864)")
-                cur.execute("INSERT INTO routing_events(event_id, sender_mac, payload, received_at) "
-                            "VALUES (%s, %s, %s::jsonb, clock_timestamp()) "
+                # The same transaction lock orders both numbering and inserts.
+                # Retrying an id returns its original receipt without allocating.
+                cur.execute("SELECT event_id, hub_order, payload, received_at, rule_number "
+                            "FROM routing_events WHERE event_id = %s", (payload["id"],))
+                existing = cur.fetchone()
+                if existing is not None:
+                    return self._receipt(existing)
+                number = routing._rule_number(payload) if payload["type"] == "rule_add" else None
+                if payload["type"] == "rule_add" and number is None:
+                    cur.execute("SELECT greatest("
+                                "coalesce((SELECT max(rule_number_floor) FROM routing_sources), 0), "
+                                "coalesce((SELECT max(rule_number) FROM routing_events), 0))")
+                    number = cur.fetchone()[0] + 1
+                    if number > routing._WHOLE_MOST:
+                        raise ValueError("rule numbers exhausted")
+                cur.execute("INSERT INTO routing_events(event_id, sender_mac, payload, received_at, rule_number) "
+                            "VALUES (%s, %s, %s::jsonb, clock_timestamp(), %s) "
                             "ON CONFLICT (event_id) DO NOTHING",
-                            (payload["id"], mac, json.dumps(payload)))
-                cur.execute("SELECT event_id, hub_order, payload, received_at FROM routing_events WHERE event_id = %s",
+                            (payload["id"], mac, json.dumps(payload), number))
+                cur.execute("SELECT event_id, hub_order, payload, received_at, rule_number FROM routing_events WHERE event_id = %s",
                             (payload["id"],))
                 row = cur.fetchone()
                 cur.execute("INSERT INTO routing_sources(mac, last_hub_order, last_event_id, event_count, last_seen_at) "
@@ -165,7 +198,7 @@ class PostgresHub:
 
     @staticmethod
     def _receipt(row):
-        return dict(event_id=row[0], hub_order=row[1], payload=row[2], received_at=_stamp(row[3]))
+        return dict(event_id=row[0], hub_order=row[1], payload=row[2], received_at=_stamp(row[3]), rule_number=row[4])
 
     def pull(self, after, until, limit):
         from khipu import db
@@ -175,7 +208,7 @@ class PostgresHub:
                 cur.execute("SELECT clock_timestamp()")
                 now = _stamp(cur.fetchone()[0])
                 upper = until or now
-                cur.execute("SELECT event_id, hub_order, payload, received_at FROM routing_events "
+                cur.execute("SELECT event_id, hub_order, payload, received_at, rule_number FROM routing_events "
                             "WHERE (received_at, event_id) > (%s::timestamptz, %s) "
                             "AND received_at <= %s::timestamptz ORDER BY received_at, event_id LIMIT %s",
                             (*after, upper, limit + 1))
@@ -213,6 +246,11 @@ def sync(*, hub=None, limit=500, max_pages=20):
             if state.get("mac") != mac:
                 state = {"mac": mac}
             hub = hub if hub is not None else PostgresHub()
+            # Reserve even when this Mac has only id-less history and no upload.
+            # Reserve all local numbers before sending a pending rule, regardless
+            # of the log's order. Never transmit those legacy rows themselves.
+            numbers = [routing._rule_number(e) for e in merge(local) if e.get("type") == "rule_add"]
+            hub.reserve_numbers(mac, max((n for n in numbers if n is not None), default=0))
             uploaded = state.setdefault("uploaded", {})
             deferred = state.setdefault("deferred", {})
             skipped = 0
@@ -272,12 +310,15 @@ def sync(*, hub=None, limit=500, max_pages=20):
 
 def restore():
     """Explicit local recovery: a fresh sender, with the old log left intact."""
-    with _sync_lock(), routing._lock():
-        mac = secrets.token_hex(16)
-        _atomic(_path("mac-id"), mac + "\n")
-        _atomic(_path("remote.jsonl"), "")
-        _save({"mac": mac})
-    return {"mac": mac}
+    try:
+        with _sync_lock(), routing._lock():
+            mac = secrets.token_hex(16)
+            _atomic(_path("mac-id"), mac + "\n")
+            _atomic(_path("remote.jsonl"), "")
+            _save({"mac": mac})
+        return {"mac": mac}
+    except BlockingIOError:
+        return {"ok": False, "error": "busy"}
 
 
 def status(now=None):

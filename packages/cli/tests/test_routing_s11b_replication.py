@@ -16,15 +16,26 @@ class Hub:
         self.calls = []
         self.fail_upload = False
         self.offline = False
+        self.number_floor = 0
+
+    def reserve_numbers(self, mac, floor):
+        if self.offline:
+            raise OSError("SENTINEL-PRIVATE-CONNECTION")
+        self.number_floor = max(self.number_floor, floor)
 
     def upload(self, mac, payload):
         self.calls.append(copy.deepcopy(payload))
         if self.offline:
             raise OSError("SENTINEL-PRIVATE-CONNECTION")
         if payload["id"] not in self.rows:
+            number = None
+            if payload["type"] == "rule_add":
+                number = routing._rule_number(payload)
+                if number is None:
+                    number = max([self.number_floor] + [r.get("rule_number") or 0 for r in self.rows.values()]) + 1
             self.rows[payload["id"]] = dict(payload=copy.deepcopy(payload),
                 event_id=payload["id"], hub_order=len(self.rows) * 3 + 1,
-                received_at=routing._iso(self.now))
+                received_at=routing._iso(self.now), rule_number=number)
         if self.fail_upload:
             self.fail_upload = False
             raise OSError("committed, response lost")
@@ -76,8 +87,9 @@ def test_12_hub_order_numbers_converge_and_local_history_is_unchanged(pair, reve
     order = (b, a) if reverse else (a, b)
     for mac in (*order, *order):
         assert sync(mac, hub)["ok"]
-    expected = {r["payload"]["entity"]: r["hub_order"] for r in hub.rows.values()
-                if r["payload"]["type"] == "rule_add"}
+    expected = {r["payload"]["entity"]: i for i, r in enumerate(
+        sorted(hub.rows.values(), key=lambda r: r["hub_order"]), 1)}
+    assert set(expected.values()) == {1, 2}
     for mac, original in zip((a, b), before):
         mac.activate()
         rules = mac.view()["rules"]
@@ -410,6 +422,7 @@ def test_postgres_transport_uses_primary_key_and_preserves_microsecond_cursor(pa
     stamp = T0.replace(microsecond=123456)
     statements = []
     committed = []
+    stored = []
 
     class Cursor:
         def __enter__(self):
@@ -419,13 +432,17 @@ def test_postgres_transport_uses_primary_key_and_preserves_microsecond_cursor(pa
         def execute(self, sql, params=()):
             statements.append((sql, params))
             self.sql = sql
+            if sql.startswith("INSERT INTO routing_events"):
+                stored.append((payload["id"], 19, json.loads(params[2]), stamp, params[3]))
         def fetchone(self):
             if self.sql == "SELECT clock_timestamp()":
                 return (stamp,)
-            return (payload["id"], 19, payload, stamp)
+            if self.sql.startswith("SELECT greatest"):
+                return (3,)
+            return stored[0] if stored else None
         def fetchall(self):
             if "FROM routing_events" in self.sql:
-                return [(payload["id"], 19, payload, stamp)]
+                return list(stored)
             return [("synthetic", 0, None, 0, stamp)]
 
     class Connection:
@@ -438,9 +455,17 @@ def test_postgres_transport_uses_primary_key_and_preserves_microsecond_cursor(pa
 
     monkeypatch.setattr(db, "connect", lambda **kw: Connection())
     hub = replication.PostgresHub()
+    hub.reserve_numbers("restored", 3)
+    assert committed == [True]
+    committed.clear()
     receipt = hub.upload("restored", payload)
     assert committed == [True]
     assert receipt["received_at"].endswith(".123456Z")
+    assert receipt["rule_number"] == 4
+    assert receipt["payload"] == payload
+    assert hub.upload("restored", payload) == receipt
+    assert len(stored) == 1
+    assert any("greatest(routing_sources.rule_number_floor" in sql for sql, _ in statements)
     assert any("ON CONFLICT (event_id) DO NOTHING" in sql for sql, _ in statements)
     assert any("coalesce(max(hub_order), 0)" in sql for sql, _ in statements)
     assert not any("ON CONFLICT (hub_order)" in sql for sql, _ in statements)
