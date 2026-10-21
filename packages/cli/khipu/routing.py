@@ -8076,6 +8076,15 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
                       for c in view.get("changes") or []]
     for key in (*_INTERNAL, "directions"):
         out.pop(key, None)
+    # Owner-local only: the private owed store never enters the fold or any
+    # routing delivery projection. Session, prompt hash, target and paths
+    # are deliberately absent from the app's display rows.
+    from khipu import routing_directions
+
+    out["unreached_directions"] = [
+        {key: item.get(key) for key in ("id", "words", "project", "join", "reason")}
+        for item in routing_directions.owed_items()
+    ]
     return out
 
 

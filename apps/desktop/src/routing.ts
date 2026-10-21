@@ -478,6 +478,14 @@ export type RouteView = {
    *  soon as the clock passes it. */
   contradictions?: RouteContradiction[];
   rule_hygiene?: RouteHygiene[];
+  /** Open owed directions, projected for this Mac's owner only (slice 19a). */
+  unreached_directions?: {
+    id: string;
+    words: string;
+    project?: string | null;
+    join: string;
+    reason?: string | null;
+  }[];
 };
 
 export type Tone = "ok" | "warn" | "err" | null;
