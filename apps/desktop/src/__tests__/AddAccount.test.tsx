@@ -332,7 +332,12 @@ describe("Add an account: step 2, which login", () => {
 
 describe("Add an account: step 3, check and save", () => {
   it("Live: read just now, with the plan row", () => {
-    render(<Dialog start={{ candidate: CLIENT, read: { ok: true, row: liveRow() } }} />);
+    // A read is live only while its window is still in force: Khipu gives no
+    // figures for a window whose reset time has passed (PlansCard.liveWindows).
+    // Keep this fake read's reset ahead of the clock the dialog reads.
+    const resets_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    const row = liveRow({ windows: [{ name: "weekly", used_pct: 18, resets_at, window_mins: 10080 }] });
+    render(<Dialog start={{ candidate: CLIENT, read: { ok: true, row } }} />);
     expect(screen.getByRole("heading", { name: /Step 3 of 3\s*Check and save/ })).toBeInTheDocument();
     expect(screen.getByLabelText("Name")).toHaveValue("Claude client");
     expect(screen.getByText("Live: read just now")).toBeInTheDocument();
