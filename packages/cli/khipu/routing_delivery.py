@@ -544,25 +544,51 @@ def _render(state, out, now, component, *, delivery_point=True):
         state["flight"]["out"] = copy.deepcopy(answer)
     return answer
 
+def _queue_title_resolution(root):
+    """Queue a T3 title lookup for the read path; never reads T3 here.
+
+    Per-prompt delivery must not touch T3's database (a locked database
+    would stall every prompt and retry on each one), so delivery only
+    leaves a pending marker beside the ledger. ``routing_delivery_rows``
+    resolves pending markers into a title cache on the ``route --json``
+    read path."""
+    try:
+        ledger = _path(root)
+        digest = ledger.name.removesuffix(".routing.json").removeprefix("recall--")
+        folder = ledger.parent
+        if (folder / f"title-cache--{digest}.json").exists() \
+                or (folder / f"title-pending--{digest}.json").exists():
+            return
+        folder.mkdir(parents=True, exist_ok=True)
+        with open(folder / f"title-pending--{digest}.json", "x", encoding="utf-8") as handle:
+            json.dump({"root": root}, handle)
+    except Exception:  # noqa: BLE001 - queueing a title never breaks delivery
+        pass
+
+
 def _friendly_name(session, existing=None):
     """The conversation name Khipu already knows for this ledger, if any.
 
-    Only a T3 thread title (read through ``t3``'s read-only path) is
-    resolved here; anything else keeps a name already stored on the
-    ledger. Fail-open: no title is never a delivery failure."""
-    if isinstance(existing, str) and existing.strip():
-        return existing.strip()
+    Only a T3 thread title is a title source, and it is never read on
+    this per-prompt path: a title already stored on the ledger is kept
+    (identity-shaped values are dropped), and a missing one is queued
+    for resolution on the ``route --json`` read path. Fail-open: no
+    title is never a delivery failure."""
     if not isinstance(session, str):
         return None
     root = session.split("/", 1)[0]
-    if not root.startswith("t3:"):
-        return None
-    try:
-        from khipu import t3
+    if isinstance(existing, str) and existing.strip():
+        try:
+            from khipu.routing_delivery_rows import _clean_name
 
-        return t3.thread_title(root[3:])
-    except Exception:  # noqa: BLE001 - a title lookup never breaks delivery
-        return None
+            cleaned = _clean_name(existing, forbidden={session, root})
+        except Exception:  # noqa: BLE001 - a bad stored name reads as no name
+            cleaned = None
+        if cleaned:
+            return cleaned
+    if root.startswith("t3:"):
+        _queue_title_resolution(root)
+    return None
 
 
 def _attachment(data, session, component, now, harness, *, gateway=False):

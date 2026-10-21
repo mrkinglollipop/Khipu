@@ -194,6 +194,7 @@ export type RouteDeliveryMac = {
   label: string;
   age_seconds?: number | null;
   behind?: boolean;
+  freshness?: string;
 };
 
 export type RuleCheck = {

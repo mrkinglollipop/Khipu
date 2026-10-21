@@ -53,7 +53,7 @@ def test_public_view_carries_live_rows_with_last_prompt_and_this_mac(replay):  #
     rows = public["delivery_rows"]
     assert len(rows) == 1
     row = rows[0]
-    assert row["label"] == "Conversation 1"
+    assert row["label"] == "Conversation 1 · unknown"
     assert row["harness"] == "unknown"
     assert row["mac"] == "This Mac"
     assert row["last_prompt_at"] == routing._iso(replay.now)
@@ -69,7 +69,7 @@ def test_stored_friendly_name_is_the_row_label(replay):  # noqa: F811
     assert public["delivery_rows"][0]["label"] == FRIENDLY
 
 
-def test_t3_thread_title_is_stored_at_delivery_time(replay, tmp_path, monkeypatch):  # noqa: F811
+def test_t3_thread_title_reaches_the_label_via_the_read_path(replay, tmp_path, monkeypatch):  # noqa: F811
     db = tmp_path / "statev2.sqlite"
     con = sqlite3.connect(db)
     con.execute("CREATE TABLE orchestration_v2_projection_threads "
@@ -94,7 +94,7 @@ def test_mac_names_setting_names_this_and_other_macs(replay, monkeypatch):  # no
     public = routing.public_view(replay.view(), replay.now)
     assert public["delivery_rows"][0]["mac"] == MAC_NAME
     assert public["delivery_macs"] == [
-        {"label": OTHER_MAC_NAME, "age_seconds": 300, "behind": False}]
+        {"label": OTHER_MAC_NAME, "age_seconds": None, "behind": False, "freshness": "unknown"}]
 
 
 def test_other_mac_is_plain_another_mac_until_named(replay, monkeypatch):  # noqa: F811
@@ -102,7 +102,8 @@ def test_other_mac_is_plain_another_mac_until_named(replay, monkeypatch):  # noq
         "sources": [{"mac": OTHER_MAC, "last_seen_at": routing._iso(replay.now - timedelta(hours=2))}]})
     public = routing.public_view(replay.view(), replay.now)
     assert public["delivery_macs"][0]["label"] == "another Mac"
-    assert public["delivery_macs"][0]["behind"] is True
+    assert public["delivery_macs"][0]["age_seconds"] is None
+    assert public["delivery_macs"][0]["behind"] is False
     assert not any(OTHER_MAC in s for s in strings(public["delivery_macs"]))
 
 
@@ -118,6 +119,7 @@ def test_per_change_recipients_count_and_name_who_has_it(replay):  # noqa: F811
     view = replay.view()
     change = view["changes"][-1]
     out = planned()
+    out["epoch"] = view["epoch"]
     out["delivery_plan"]["items"] = [dict(entity=e, revision="r1", text="abc",
                                           label="Standing rule", whole=True, visible=True)
                                      for e in change["entities"]]
@@ -133,6 +135,112 @@ def test_per_change_recipients_count_and_name_who_has_it(replay):  # noqa: F811
     assert recipients["have"] == [FRIENDLY]
     assert len(recipients["waiting"]) == 1
     assert recipients["waiting"][0].startswith("Conversation ")
+
+
+@pytest.mark.parametrize("shaped", [
+    "claude_code_0123abcd", "codex_0123abcd", "Explore-abcdef", "t3:thread-synthetic",
+    "claude:synthetic-delivery-session", "agent:synthetic-component",
+    "0123abcd-0123-abcd-0123-abcd0123abcd", "0123456789abcdef0123",
+])
+def test_identity_shaped_friendly_names_are_never_labels(replay, shaped):  # noqa: F811
+    routing_delivery.offer(planned(), session="synthetic-one")
+    set_friendly("synthetic-one", shaped)
+    public = routing.public_view(replay.view(), replay.now)
+    label = public["delivery_rows"][0]["label"]
+    assert shaped not in label
+    assert label.startswith("Conversation 1 · ")
+
+
+def test_own_session_id_is_never_a_label(replay):  # noqa: F811
+    routing_delivery.offer(planned(), session="synthetic-one")
+    set_friendly("synthetic-one", "synthetic-one")
+    public = routing.public_view(replay.view(), replay.now)
+    assert public["delivery_rows"][0]["label"].startswith("Conversation 1 · ")
+
+
+def test_conversation_authored_name_field_is_not_a_label(replay):  # noqa: F811
+    from khipu import routing_delivery_rows
+
+    routing_delivery.offer(planned(), session="synthetic-one")
+    view = dict(replay.view())
+    view["authored"] = {"name": "AuthoredSentinelName", "session": "synthetic-one"}
+    data = routing_delivery_rows.delivery_data(view, replay.now, routing.settings())
+    assert data["rows"][0]["label"].startswith("Conversation 1 · ")
+    assert not any("AuthoredSentinelName" in s for s in strings(data["rows"]))
+
+
+def test_recipient_needs_evidence_for_the_changes_revision_and_epoch(replay):  # noqa: F811
+    from khipu import routing_delivery_rows
+
+    routing.add_rule("Synthetic ordinary rule for recipients", via="app")
+    view = replay.view()
+    change = view["changes"][-1]
+    out = planned()
+    out["epoch"] = view["epoch"]
+    out["version"] = change["version"]
+    out["delivery_plan"]["items"] = [dict(entity=e, revision="r1", text="abc",
+                                          label="Standing rule", whole=True, visible=True)
+                                     for e in change["entities"]]
+    out["delivery_plan"]["current_entities"] = list(change["entities"])
+    answer = routing_delivery.offer(out, session="synthetic-one")
+    assert routing_delivery.acknowledge("synthetic-one", answer["routing_changes"], now=replay.now)
+    data = routing_delivery_rows.delivery_data(replay.view(), replay.now, routing.settings())
+    assert data["recipients"][change["version"]]["have_count"] == 1
+    # The same version under another epoch is not evidence for this epoch.
+    other = dict(replay.view(), epoch="another-epoch")
+    data = routing_delivery_rows.delivery_data(other, replay.now, routing.settings())
+    assert data["recipients"][change["version"]]["have_count"] == 0
+    # Editing the rule makes a new version whose revision was never delivered.
+    rule = replay.view()["rules"][-1]
+    routing.edit_rule(rule["n"], "Synthetic edited rule for recipients", via="app")
+    view2 = replay.view()
+    change2 = view2["changes"][-1]
+    assert change2["version"] != change["version"]
+    assert set(change["entities"]) & set(change2["entities"])
+    data = routing_delivery_rows.delivery_data(view2, replay.now, routing.settings())
+    assert data["recipients"][change2["version"]]["have_count"] == 0
+
+
+def test_t3_title_is_resolved_at_route_read_not_on_delivery(replay, tmp_path, monkeypatch):  # noqa: F811
+    from khipu import t3
+
+    db = tmp_path / "statev2.sqlite"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE orchestration_v2_projection_threads "
+                "(thread_id TEXT, payload_json TEXT, updated_at TEXT)")
+    con.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?)",
+                ("thread-synthetic", json.dumps({"title": FRIENDLY}), "2026-10-20"))
+    con.commit()
+    con.close()
+    monkeypatch.setenv("KHIPU_T3_DB", str(db))
+    calls = []
+    real_title = t3.thread_title
+    monkeypatch.setattr(t3, "thread_title", lambda tid: calls.append(tid) or real_title(tid))
+    routing_delivery.offer(planned(), session="t3:thread-synthetic")
+    assert calls == []
+    public = routing.public_view(replay.view(), replay.now)
+    assert public["delivery_rows"][0]["label"] == FRIENDLY
+    assert calls == ["thread-synthetic"]
+    public = routing.public_view(replay.view(), replay.now)
+    assert public["delivery_rows"][0]["label"] == FRIENDLY
+    assert calls == ["thread-synthetic"]
+
+
+def test_other_mac_freshness_is_unknown_without_a_catch_up_receipt(replay, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(routing_replication, "status", lambda now=None: {
+        "sources": [{"mac": OTHER_MAC, "last_seen_at": routing._iso(replay.now)}]})
+    public = routing.public_view(replay.view(), replay.now)
+    assert public["delivery_macs"][0]["age_seconds"] is None
+    assert public["delivery_macs"][0]["behind"] is False
+
+
+def test_other_mac_freshness_uses_its_catch_up_receipt(replay, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(routing_replication, "status", lambda now=None: {
+        "sources": [{"mac": OTHER_MAC, "last_seen_at": routing._iso(replay.now),
+                     "caught_up_at": routing._iso(replay.now - timedelta(hours=2))}]})
+    public = routing.public_view(replay.view(), replay.now)
+    assert public["delivery_macs"][0]["age_seconds"] == 7200
+    assert public["delivery_macs"][0]["behind"] is True
 
 
 def test_empty_and_damaged_ledgers_read_as_empty_rows(replay, tmp_path):  # noqa: F811
