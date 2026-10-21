@@ -1207,14 +1207,16 @@ def _author_sessions(by: dict) -> set[str]:
 def _session_forms(session: str | None) -> set[str]:
     """The forms one conversation identity takes across the two slices:
     the raw harness-native id an author is recorded with, its canonical
-    ``claude:``/``codex:`` form, a shared id as itself, and the pull
-    namespace's root. Forms of other conversations are never added."""
+    ``claude:``/``codex:`` form, and a shared id as itself. A pull
+    namespace id is never an author's: authors come from the environment,
+    and a pull caller names its own id. Forms of other conversations are
+    never added."""
     if not session:
         return set()
     forms = {session}
     if session.startswith("pull\0"):
-        forms.add(session[len("pull\0"):])
-    elif session.startswith(("claude:", "codex:")):
+        return forms
+    if session.startswith(("claude:", "codex:")):
         forms.add(session.split(":", 1)[1])
     else:
         forms.update(("claude:" + session, "codex:" + session))

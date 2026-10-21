@@ -94,12 +94,7 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
 - `khipu_reflect` answers one question from memory with each claim cited, or
   abstains. It calls a model: ask it for a synthesis, not a lookup.
 - `khipu_route` reads which accounts are open, limited, paused or down,
-  the owner's rules, note, priority; read before delegating. Its answer
-  carries `routing_changes` for this conversation: pass `ack` with that
-  batch, and only your own batch, once read. With no session in your
-  environment pass your own `session_id` (a child: `<parent>/<child>`;
-  clients sharing one gateway token: `<client>:<stable id>`, unique among
-  them); with no identity the answer is untracked and consumes nothing.
+  the owner's rules, note, priority; read before delegating.
   `khipu_route_report` logs a limit you hit; `khipu_route_rule` and
   `khipu_route_priority` write an owner-requested rule or account
   order (pending until confirmed). Khipu reports; you route.
