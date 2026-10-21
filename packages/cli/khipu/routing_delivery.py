@@ -406,7 +406,11 @@ def canonical_identity(environ=None, explicit=None):
             if not suffix or any(part in ("", ".", "..") for part in suffix.split("/")) or "\0" in suffix:
                 return None
             root = session = explicit
-    if harness in _HOOKED_HARNESSES:
+    if "/" in root:
+        # A child has no hook of its own; its pulls count on the mcp
+        # component, never on a parent's main ledger that will not move.
+        capability = "pull_only"
+    elif harness in _HOOKED_HARNESSES:
         capability = "hooked"
     elif harness in _PULL_ONLY_HARNESSES:
         capability = "pull_only"

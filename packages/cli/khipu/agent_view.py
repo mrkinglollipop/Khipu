@@ -159,7 +159,8 @@ def _homes(extra_keys: Iterable[str] | None, view: dict, *, local_only=False, re
         # in the home folder now, so a folder is scrubbed before any run.
         from khipu import discover
 
-        for rec in discover._load_store()["candidates"].values():
+        store = discover._load_store_strict() if require_complete else discover._load_store()
+        for rec in store["candidates"].values():
             if rec["cli"] in _DEFAULT_FOLDERS and rec.get("abs") and not rec.get("default"):
                 out.append((rec["cli"], rec["abs"]))
         for cli, folder in (() if local_only else discover._source_names()):
@@ -942,18 +943,39 @@ class RoutingPage(str):
     """
 
 
+# Every secret shape in redact.py needs one of these markers (a vendor
+# prefix, a credential keyword, "://" for a URL credential, a key block);
+# text holding none of them cannot match, so the full regex scan is
+# skipped. Lowercased markers only ever over-match, never under-match.
+_SECRET_MARKERS = ("-----begin", "sk-", "xai-", "k_live_", "k_test_", "akia", "asia",
+                   "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "xox", "aiza",
+                   "ya29.", "eyj", "bearer", "basic", "://", "key", "secret", "token",
+                   "passw", "pwd", "dsn", "connection", "private")
+
+
 def _has_secret(text: str) -> bool:
     from khipu.redact import redact_secrets
 
-    return any(redact_secrets(variant, force=True)[1] for variant in _decoded_variants(text))
+    for variant in _decoded_variants(text):
+        lowered = variant.lower()
+        if not any(marker in lowered for marker in _SECRET_MARKERS):
+            continue
+        if redact_secrets(variant, force=True)[1]:
+            return True
+    return False
 
 
-def _strict_text(text: str, table: _Table, keep: list[str]) -> str:
+def _strict_text(text: str, table: _Table, keep: list[str], *, _secret_known: bool | None = None) -> str:
     # An exemption must never split a credential into undetectable pieces.
-    if _has_secret(text):
+    if _secret_known is None:
+        if _has_secret(text):
+            return WITHHELD
+    elif _secret_known:
         return WITHHELD
     held = [w for w in keep if w and w in text]
     for variant in _decoded_variants(text):
+        if "|" not in variant:
+            continue
         matches = list(_ANY_ACCOUNT_KEY.finditer(variant))
         if not matches:
             continue
@@ -965,9 +987,16 @@ def _strict_text(text: str, table: _Table, keep: list[str]) -> str:
     return text
 
 
+_OWNER_REPLACEMENTS: dict[tuple, list] = {}
+
+
 def _owner_token_replacements(words):
     from khipu.redact import MASK, redact_secrets
 
+    cache_key = tuple(words)
+    cached = _OWNER_REPLACEMENTS.get(cache_key)
+    if cached is not None:
+        return cached
     replacements = []
     for word in words:
         if not _has_secret(word):
@@ -979,6 +1008,9 @@ def _owner_token_replacements(words):
         # pending credential and leave its otherwise unrecognizable suffix.
         pattern = re.compile(r"(?<![A-Za-z0-9_./%&;=+-])" + re.escape(word) + r"(?![A-Za-z0-9_./%&;=+-])")
         replacements.append((word, cleaned, pattern))
+    if len(_OWNER_REPLACEMENTS) >= 8:
+        _OWNER_REPLACEMENTS.clear()
+    _OWNER_REPLACEMENTS[cache_key] = replacements
     return replacements
 
 
@@ -1010,8 +1042,13 @@ def scrub_strict(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] |
             # Scan the source before any path/name or owner-word masking.
             if _has_secret(item):
                 return WITHHELD
-            item = _strict_text(item, table, words)
-            return _strict_text(_scrub_text(item, table, words), table, words)
+            item = _strict_text(item, table, words, _secret_known=False)
+            if item == WITHHELD:
+                return item
+            scrubbed = _scrub_text(item, table, words)
+            # An unchanged value already passed this exact scan; only a
+            # scrubbed value can have joined fragments into a new shape.
+            return scrubbed if scrubbed == item else _strict_text(scrubbed, table, words)
         if isinstance(item, dict):
             return {(walk(k) if isinstance(k, str) else k): walk(v) for k, v in item.items()}
         if isinstance(item, list):
