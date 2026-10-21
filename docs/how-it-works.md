@@ -352,7 +352,7 @@ Five integration packs exist (`claude_code`, `cursor`, `codex`, `aegis`, `grok_b
 
 Claude accounts run inside T3 Code are wired by the Claude Code install, one set of hooks per Claude home. Search can filter by T3 thread. Stock Grok Build has no pack of its own.
 
-Khipu never opens the database to the internet itself; keep it on a private network. The gateway is the only part meant to face the internet, and it enforces a bearer token, a request body cap, rate limits per address and per token, an auth-failure throttle, a JSON-RPC batch cap, and refusal of browser origins unless allowed. Over the gateway, `khipu_capture` writes immediately (there is no hook), and usage and routing answer "not available".
+Khipu never opens the database to the internet itself; keep it on a private network. The gateway is the only part meant to face the internet, and it enforces a bearer token, a request body cap, rate limits per address and per token, an auth-failure throttle, a JSON-RPC batch cap, and refusal of browser origins unless allowed. Over the gateway, `khipu_capture` writes immediately (there is no hook), usage answers "not available", and `khipu_route` answers only its closed projection when the owner has turned on the cloud routing copy.
 
 Install and check a harness with `khipu integrations install <harness>` and `khipu integrations verify <harness>`. Verify exercises the integration. It does not just check that a file exists.
 

@@ -1221,7 +1221,6 @@ def test_12_not_installed_on_mac_b_leaves_mac_a_open(replay):
 
 
 @pytest.mark.parametrize("contract", ["projection", "foreign-delivery", "foreign-ack", "owner-write"])
-@future("12", "gateway routing must implement a closed projection and caller-owned delivery")
 def test_13_gateway_projection(replay, monkeypatch, contract):
     replay.configure(routing_cloud_copy=True, routing_cloud_copy_rules=True, routing_cloud_copy_hold_words=True)
     routing.add_rule("owner words at " + str(replay.root / "private-login"), via="app")

@@ -8574,6 +8574,94 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     return result
 
 
+_GATEWAY_PACE_FIELDS = ("window", "cycle_resets_at", "trailing_h", "buckets", "valid_pct", "observed_pct",
+                        "gappy", "rate_pct_per_h", "why", "headline")
+_GATEWAY_PLAN_FIELDS = ("verdict", "needed_pct_per_h", "runs_out_at", "before_reset_s", "unused_at_reset_pct")
+_GATEWAY_SHARE_FIELDS = ("revision", "pct", *_GATEWAY_PLAN_FIELDS)
+_GATEWAY_DAY_FIELDS = ("revision", "pct", "verdict", "used_24h_pct", "observed_pct", "settles_at_pct",
+                       "peak_pct", "peak_at", "reaches_cap_at")
+
+
+def _gateway_pace(pace: dict) -> dict:
+    out = _pick(pace, _GATEWAY_PACE_FIELDS)
+    for kind, fields in (("plan", _GATEWAY_PLAN_FIELDS), ("share_cap", _GATEWAY_SHARE_FIELDS),
+                         ("day_cap", _GATEWAY_DAY_FIELDS)):
+        if isinstance(pace.get(kind), dict):
+            out[kind] = _pick(pace[kind], fields)
+    return out
+
+
+def gateway_projection(view: dict | None = None, *, now: datetime | None = None,
+                       account: str | None = None) -> dict | None:
+    """The closed gateway projection of the routing record (slice 12).
+
+    Only the fields named here leave through the gateway: account labels,
+    states with their times and basis, structured holds, and — under their
+    own switches — owner hold words, the confirmed rules and note, and the
+    confirmed priority. Pending proposals (rules, priority) never appear:
+    proposal text does not go to the gateway. No account key, login folder,
+    Mac id, author, history or internal fold field is copied. Paths inside
+    owner words are cut by the caller's strict scrub, which for a gateway
+    answer keeps no owner-word exemption. Returns None when the cloud copy
+    switch is off."""
+    now = now or _now()
+    view = read_view(now) if view is None else view
+    cfg = settings()
+    if not cfg.get("routing_cloud_copy"):
+        return None
+    key = None
+    if account:
+        key = _account_for_a_conversation(account, accounts() + list(view.get("accounts") or []))
+    facts = plan_facts(view, now)
+    out: dict[str, Any] = {"available": True, "about": ABOUT, "record": view.get("record"),
+                           "version": view.get("version"), "epoch": view.get("epoch"),
+                           "folded_at": view.get("folded_at"), "valid_until": view.get("valid_until")}
+    rows = []
+    for entry in view.get("accounts") or []:
+        if key is not None and entry["key"] != key:
+            continue
+        pub = _public_account(entry, now, view)
+        row = {k: pub[k] for k in ("id", "label", "state", "basis", "until", "line") if k in pub}
+        witness = pub.get("witness") or {}
+        row["witness"] = {k: witness[k] for k in ("source", "at") if witness.get(k) is not None}
+        row["models"] = [{k: m[k] for k in ("model", "basis", "until", "at") if k in m}
+                         for m in pub.get("models") or []]
+        row["pace"] = [_gateway_pace(p) for p in entry.get("pace") or [] if isinstance(p, dict)]
+        rows.append(row)
+    out["accounts"] = rows
+    holds = []
+    for hold in view.get("holds") or []:
+        pub = _public_hold(hold, now)
+        if key is not None and pub["scope"] != {"kind": "account", "account": account_id(key)}:
+            continue
+        row = {k: pub[k] for k in ("id", "scope", "reason", "until", "owner", "at", "line") if k in pub}
+        if cfg.get("routing_cloud_copy_hold_words") and pub.get("text"):
+            row["text"] = pub["text"]
+        holds.append(row)
+    out["holds"] = holds
+    if cfg.get("routing_cloud_copy_rules"):
+        out["rules"] = [{"id": r["entity"], "n": r.get("n"), "text": r.get("text"),
+                         "pending": False, "confirmed": bool(r.get("confirmed")),
+                         "revision": r.get("revision")}
+                        for r in view.get("rules") or []
+                        if not r.get("pending") and not r.get("proposal_withheld")]
+        if view.get("note"):
+            out["note"] = {"text": view["note"]["text"], "at": view["note"].get("at")}
+        priority = _public_priority(view, now, facts)
+        if priority and not priority.get("pending") and not priority.get("proposal_withheld"):
+            entries = []
+            for entry in priority.get("entries") or []:
+                row = {"account": entry.get("id"), "label": entry.get("label"),
+                       "role": entry.get("role"), "until": entry.get("until")}
+                if isinstance(entry.get("level"), dict):
+                    row["level"] = _pick(entry["level"], ("claim", "as_of", "until"))
+                entries.append(row)
+            out["priority"] = {"entries": entries, "until": priority.get("until"), "pending": False,
+                               "revision": priority.get("owner_revision") or priority.get("version"),
+                               "line": priority.get("line")}
+    return out
+
+
 # What a conversation may write through MCP, and what it may not. The owner's
 # changes are refused whatever the arguments say: "owner only" is a
 # convention (Khipu holds no credential), and a tool call is never the owner.
