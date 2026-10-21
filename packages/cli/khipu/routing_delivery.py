@@ -544,6 +544,72 @@ def _render(state, out, now, component, *, delivery_point=True):
         state["flight"]["out"] = copy.deepcopy(answer)
     return answer
 
+def _queue_title_resolution(root):
+    """Queue a T3 title lookup for the read path; never reads T3 here.
+
+    Per-prompt delivery must not touch T3's database (a locked database
+    would stall every prompt and retry on each one), so delivery only
+    leaves a pending marker beside the ledger. ``routing_delivery_rows``
+    resolves pending markers into a title cache on the ``route --json``
+    read path."""
+    try:
+        from khipu.routing_delivery_rows import _write_private_file
+
+        ledger = _path(root)
+        digest = ledger.name.removesuffix(".routing.json").removeprefix("recall--")
+        folder = ledger.parent
+        if (folder / f"title-cache--{digest}.json").exists() \
+                or (folder / f"title-pending--{digest}.json").exists():
+            return
+        # Only the identity's digest is queued (the ledger file name is
+        # already that digest), never the raw canonical identity; the
+        # read path recovers the thread from the digest in memory.
+        _write_private_file(folder / f"title-pending--{digest}.json",
+                            json.dumps({"digest": digest}))
+    except Exception:  # noqa: BLE001 - queueing a title never breaks delivery
+        pass
+
+
+def _friendly_name(session, existing=None):
+    """The conversation name Khipu already knows for this ledger, if any.
+
+    Only a T3 thread title is a title source, and it is never read on
+    this per-prompt path: a title already stored on the ledger is kept
+    (identity-shaped values are dropped), and a missing one is queued
+    for resolution on the ``route --json`` read path. Fail-open: no
+    title is never a delivery failure."""
+    if not isinstance(session, str):
+        return None
+    root = session.split("/", 1)[0]
+    if isinstance(existing, str) and existing.strip():
+        try:
+            from khipu.routing_delivery_rows import _clean_name
+
+            cleaned = _clean_name(existing, forbidden={session, root})
+        except Exception:  # noqa: BLE001 - a bad stored name reads as no name
+            cleaned = None
+        if cleaned:
+            return cleaned
+    if root.startswith("t3:"):
+        _queue_title_resolution(root)
+    return None
+
+
+def _attachment(data, session, component, now, harness, *, gateway=False):
+    prior = data.get("attachment") if isinstance(data.get("attachment"), dict) else {}
+    attachment = {"component": component, "at": _iso(now), "harness": health_harness(harness)}
+    if gateway or prior.get("gateway"):
+        attachment["gateway"] = True
+        for key in ("copy_epoch", "copy_revision", "copy_revision_at"):
+            if key in prior:
+                attachment[key] = prior[key]
+    friendly = _friendly_name(session, prior.get("friendly_name"))
+    if friendly:
+        attachment["friendly_name"] = friendly
+    data["attachment"] = attachment
+    return attachment
+
+
 def offer(out, *, session=None, component="main"):
     """Reserve one component's batch under its independent delivery lock."""
     now = _parse(out["delivery_plan"]["at"])
@@ -557,8 +623,7 @@ def offer(out, *, session=None, component="main"):
         return answer
     with _transaction(session) as data:
         if component == "main":
-            data["attachment"] = {"component": "main", "at": _iso(now),
-                                  "harness": health_harness(out["delivery_plan"].get("harness"))}
+            _attachment(data, session, "main", now, out["delivery_plan"].get("harness"))
         state = data.setdefault(component, {})
         answer = _render(state, out, now, component)
         _prune_agent_components(data, now, keep=component)
@@ -977,8 +1042,7 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
     with _transaction(session) as data:
         state = data.setdefault(component, {})
         entries = _merge(state, out)
-        data["attachment"] = {"component": counting_component, "at": _iso(now),
-                              "harness": health_harness(harness)}
+        _attachment(data, session, counting_component, now, harness)
         if delivery_point:
             _delivery_point(state, out, now)
         _prune_agent_components(data, now, keep=component)
@@ -1373,8 +1437,7 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
         if reservation is not None and not state:
             state.update(copy.deepcopy(reservation))
             if component == "main":
-                data["attachment"] = {"component": "main", "at": _iso(now),
-                                      "harness": health_harness(state.get("harness"))}
+                _attachment(data, session, "main", now, state.get("harness"))
         if batch in state.get("batches", {}):
             return True
         flight = state.get("flight")
