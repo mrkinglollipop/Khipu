@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import time
 from contextlib import redirect_stdout
 
 from khipu import recall_prompt, recall_rule, routing, routing_delegation, routing_delivery
@@ -143,6 +144,108 @@ def test_child_start_without_agent_id_is_bounded_and_reserves_nowhere(replay, mo
     assert text and recall_rule._utf16_len(text) <= 4000
     assert routing_delivery.snapshot("s1", "main") == {}
     assert routing_delivery.snapshot("s1", "agent:unknown") == {}
+
+
+def _planned(replay):  # noqa: F811
+    out = routing.light_status(replay.now, start=True, session_id=None)
+    return routing_delivery.plan(dict(out, kind="full"), out.view, replay.now,
+                                 routing.settings(), session=None)
+
+
+def test_per_agent_ledgers_stay_bounded_finished_and_stale(replay):  # noqa: F811
+    replay.configure(routing_prompt_chars=2000)
+    routing.add_rule("small synthetic rule", via="app")
+    planned = _planned(replay)
+    stale = routing_delivery.child_offer(planned, session="s1", component="agent:old",
+                                         now=replay.now, cfg=routing.settings())
+    assert routing_delivery.acknowledge("s1", stale["routing_changes"])
+    replay.advance(8 * 86400)
+    fresh = routing_delivery.child_offer(planned, session="s1", component="agent:fresh",
+                                         now=replay.now, cfg=routing.settings())
+    assert routing_delivery.acknowledge("s1", fresh["routing_changes"])
+    # A finished component older than the stale age is dropped outright.
+    assert routing_delivery.snapshot("s1", "agent:old") == {}
+    for i in range(150):
+        answer = routing_delivery.child_offer(planned, session="s1", component=f"agent:a{i}",
+                                              now=replay.now, cfg=routing.settings())
+        if answer.get("routing_changes"):
+            assert routing_delivery.acknowledge("s1", answer["routing_changes"])
+    path = routing_delivery._path("s1")
+    assert path.stat().st_size < 1_048_576
+    data = json.loads(path.read_text())
+    agents = {name: state for name, state in data.items() if name.startswith("agent:")}
+    assert len(agents) <= routing_delivery._AGENT_MAX_COMPONENTS
+    # Finished agents keep only revision proof, never the delivered words.
+    assert "small synthetic rule" not in json.dumps(agents)
+    assert all(not state.get("entries") for state in agents.values())
+
+
+def test_child_page_read_has_the_parent_prompt_deadline(replay, monkeypatch):  # noqa: F811
+    replay.configure(routing_prompt_chars=2000, routing_prompt_budget_ms=50)
+    _seed_rules(replay)
+    _run(_start(), monkeypatch)
+    original = routing._start_view
+
+    def slow(now):
+        time.sleep(2)
+        return original(now)
+
+    monkeypatch.setattr(routing, "_start_view", slow)
+    began = time.monotonic()
+    out = _run(_tool(), monkeypatch)
+    assert time.monotonic() - began < 1.0
+    assert _ctx(out) == ""
+
+
+def test_hook_context_cap_applies_whatever_child_chars_says(replay, monkeypatch):  # noqa: F811
+    replay.configure(routing_prompt_chars=2000)
+    _seed_rules(replay)
+    for setting in (0, 100000):
+        replay.configure(routing_child_chars=setting)
+        text = _ctx(_run(_start(f"cap{setting}", f"s-cap{setting}"), monkeypatch))
+        assert text
+        assert recall_rule._utf16_len(text) <= recall_rule._HOOK_CONTEXT_BUDGET
+
+
+def test_tiny_child_limits_never_exceed_the_bound(replay, monkeypatch):  # noqa: F811
+    _seed_rules(replay)
+    for limit in (50, 120):
+        replay.configure(routing_child_chars=limit)
+        text = _ctx(_run(_start(f"tiny{limit}", f"s-tiny{limit}"), monkeypatch))
+        assert recall_rule._utf16_len(text) <= limit
+    replay.configure(routing_child_chars=50)
+    assert _ctx(_run(_start("tiny-none", "s-tiny-none"), monkeypatch)) == ""
+
+
+def test_dropped_account_and_hold_lines_are_paged_later(replay, monkeypatch):  # noqa: F811
+    replay.configure(routing_prompt_chars=2000, routing_child_chars=150)
+    routing.report(account="Codex", state="limited", until="1h", author=AUTHOR)
+    routing.add_hold("wait for the child fixture", scope="account", account="Codex",
+                     reason="keep", author=AUTHOR)
+    _seed_rules(replay)
+    opening = _ctx(_run(_start(), monkeypatch))
+    assert "Codex:" not in opening and "Hold on Codex" not in opening
+    pages = []
+    for _ in range(4):
+        page = _ctx(_run(_tool(), monkeypatch))
+        if page:
+            pages.append(page)
+    assert any("Codex:" in page for page in pages)
+    assert any("Hold on Codex" in page for page in pages)
+
+
+def test_parallel_tool_calls_do_not_print_the_same_page_twice(replay, monkeypatch):  # noqa: F811
+    replay.configure(routing_prompt_chars=2000)
+    _seed_rules(replay)
+    _run(_start(), monkeypatch)
+    first = routing.child_page_push("s1", "a1")
+    assert first and first["text"]
+    # The page is leased before printing: a second call before its ack
+    # gets nothing, not the same page and batch again.
+    assert routing.child_page_push("s1", "a1") is None
+    assert routing_delivery.acknowledge(first["session"], first["routing_changes"])
+    third = routing.child_page_push("s1", "a1")
+    assert third and third["routing_changes"]["batch"] != first["routing_changes"]["batch"]
 
 
 def test_no_agent_identity_means_no_per_agent_pages(replay, monkeypatch):  # noqa: F811

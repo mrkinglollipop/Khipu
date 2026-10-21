@@ -669,6 +669,8 @@ def _subagent_start(payload: dict) -> tuple[dict, dict | None, str | None]:
     text = at.text()
     if not text:
         return {}, None, None
+    if recall_rule._utf16_len(text) > recall_rule._HOOK_CONTEXT_BUDGET:
+        return {}, None, None  # the hook cap wins over any child setting
     out = {"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": text}}
     stored = at.out if isinstance(at.out, dict) else {}
     if not stored.get("routing_changes") or not at.session:

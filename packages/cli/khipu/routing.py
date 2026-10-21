@@ -173,7 +173,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_dispatch_scripts": ("names", [], "Your own scripts that hand work to another agent, by file name"),
     "routing_delivery_lease": ("duration", 60, "How long an unacknowledged routing batch stays in flight"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
-    "routing_child_chars": ("count", 4000, "Longest routing block for a subagent at its start (0: no limit)"),
+    "routing_child_chars": ("count", 4000, "Longest routing block for a subagent at its start (0: no limit beyond the hook's own cap)"),
     "routing_prompt_budget_ms": ("count", 50, "Time allowed before a prompt, in milliseconds"),
     "routing_start_budget_ms": ("count", 1000, "Time allowed at the start of a conversation, in milliseconds"),
     "routing_resend_after_versions": ("count", 20, "Send everything again after this many changes (0: never)"),
@@ -8562,12 +8562,9 @@ def start_budget() -> float:
     return min(max(0, ms), START_BUDGET_MOST_MS) / 1000.0
 
 
-def child_page_push(session_id: str | None, agent_id: str | None, *,
-                    now: datetime | None = None) -> dict | None:
-    """The next deferred routing page for a subagent's own tool result
-    (slice 8a): one page from its ``agent:<agent_id>`` ledger, or None when
-    nothing is deferred. The parent's ledger is never touched."""
-    if not session_id or not agent_id or push_off("delegation"):
+def _child_page_push_inline(session_id: str, agent_id: str,
+                            now: datetime | None = None) -> dict | None:
+    if push_off("delegation"):
         return None
     from khipu import routing_delivery
 
@@ -8578,6 +8575,98 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
     page = routing_delivery.child_page(planned, session=session, component=f"agent:{agent_id}",
                                        now=now, cfg=settings())
     return dict(page, session=session) if page else None
+
+
+def child_page_push(session_id: str | None, agent_id: str | None, *,
+                    now: datetime | None = None) -> dict | None:
+    """The next deferred routing page for a subagent's own tool result
+    (slice 8a): one page from its ``agent:<agent_id>`` ledger, or None when
+    nothing is deferred. The parent's ledger is never touched.
+
+    Like the parent's per-prompt push, the record read runs in a forked
+    child under ``routing_prompt_budget_ms``: a slow read returns nothing
+    on time instead of blocking the subagent's tool call."""
+    if not session_id or not agent_id or push_off("delegation"):
+        return None
+    budget = prompt_budget()
+    if budget <= 0 or not hasattr(os, "fork"):
+        return None
+    deadline = time.monotonic() + budget
+    read_fd = write_fd = None
+    pid = None
+    try:
+        import warnings
+
+        read_fd, write_fd = os.pipe()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads
+            pid = os.fork()
+        if pid == 0:  # the child: read, write the page's JSON, exit
+            code = 1
+            try:
+                import signal
+
+                os.close(read_fd)
+                os.setsid()
+                null = os.open(os.devnull, os.O_RDWR)
+                for fd in (0, 1, 2):
+                    os.dup2(null, fd)
+
+                def on_alarm(_sig, _frame):
+                    if finishing_view():
+                        signal.signal(signal.SIGALRM, lambda *_: os._exit(1))
+                        signal.setitimer(signal.ITIMER_REAL, 60.0)
+                        return
+                    os._exit(1)
+
+                signal.signal(signal.SIGALRM, on_alarm)
+                signal.setitimer(signal.ITIMER_REAL,
+                                 max(0.0, deadline - time.monotonic()) + 0.05)
+                page = _child_page_push_inline(session_id, agent_id, now)
+                if page:
+                    data = memoryview(json.dumps(page).encode("utf-8"))
+                    while data:
+                        data = data[os.write(write_fd, data):]
+                code = 0
+            except BaseException:  # noqa: BLE001 - nothing for routing
+                code = 1
+            finally:
+                os._exit(code)
+        os.close(write_fd)
+        write_fd = None
+        import select
+
+        chunks: list[bytes] = []
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None  # late: the child exits on its alarm
+            ready, _, _ = select.select([read_fd], [], [], left)
+            if not ready:
+                return None
+            chunk = os.read(read_fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        page = json.loads(b"".join(chunks).decode("utf-8")) if chunks else None
+        return page if isinstance(page, dict) and page else None
+    except Exception:  # noqa: BLE001 - routing never breaks the hook
+        return None
+    finally:
+        for fd in (read_fd, write_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if pid:
+            def reap() -> None:
+                try:
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
+
+            threading.Thread(target=reap, name="khipu-routing-page-reap", daemon=True).start()
 
 
 def start_push(budget: float | None = None, moment: str = "start", *,
