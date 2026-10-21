@@ -201,6 +201,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_cloud_copy_hold_words": ("switch", False, "Include hold words in the copy"),
     "routing_cloud_copy_rules": ("switch", False, "Include the rules and the note in the copy"),
     "routing_proposal_text_between_macs": ("switch", True, "Proposal text between your Macs"),
+    "routing_replication_live": ("switch", False, "Copy routing between your Macs through the hub"),
     "routing_cloud_copy_stale_after": ("duration", 600, "The copy counts as out of date after"),
     "routing_cloud_copy_debounce": ("duration", 30, "Wait for a burst of changes to end before copying"),
     # Owner-local delivery labels (survey rows 8-11): names the owner gave
@@ -485,7 +486,14 @@ def settings_status() -> dict[str, dict]:
             except (ValueError, TypeError):
                 source = "invalid"
         waiting = requests.get(key)
-        out[key] = {"value": values[key], "default": default, "kind": kind, "source": source, "words": words,
+        value = values[key]
+        if key == "routing_replication_live":
+            # Same strict test as _replication_live: a hand-edited word or
+            # number never shows the switch on (or counts as a stored form).
+            value = config.get(key) is True
+            if config.get(key) is not None and not isinstance(config.get(key), bool):
+                source = "invalid"
+        out[key] = {"value": value, "default": default, "kind": kind, "source": source, "words": words,
                     "request": {"request": waiting.get("request"), "by": waiting.get("by"), "at": waiting.get("at"),
                                 "by_words": author_words(waiting.get("by") if isinstance(waiting.get("by"), dict)
                                                          else None, push=True),
@@ -1542,9 +1550,17 @@ def _hub_configured() -> bool:
 
 def _replication_live() -> bool:
     # Slice 11 enables this only once hub acceptance can assign numbers.
+    # Registered as a switch in SETTINGS (the owner sets it from the app,
+    # which stores a JSON boolean), but the live check stays strict: a
+    # hand-edited string or number in the file never turns replication on.
+    # A conversation's change at the owner's request is not live either
+    # until he confirms it; undoing it restores the value it replaced.
     from khipu.config import load_config
 
-    return load_config().get("routing_replication_live", False) is True
+    config = load_config()
+    if config.get("routing_replication_live", False) is not True:
+        return False
+    return "routing_replication_live" not in _setting_requests(config)
 
 
 def _pending_numbering() -> bool:
