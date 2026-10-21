@@ -236,8 +236,35 @@ def test_10_structured_contradictions_reference_account_and_source(replay, surfa
     matching = [f for f in found if f.get("account") == "codex:main" and f.get("state") == state
                 and f.get("source") == source]
     expect(len(matching), 1, f"10: {source}/{state} contradiction is not structured on {surface}")
-    assert changed["id"] in matching[0]["entities"]
+    if source == "rule":
+        # A rule flag names the rule's public entity, never its private
+        # origin event id, so a reader can turn the flag into a rule number.
+        assert matching[0]["entities"] == [changed["entity"]]
+        assert changed["id"] not in matching[0]["entities"]
+    else:
+        assert changed["id"] in matching[0]["entities"]
     assert matching[0]["text"] and matching[0]["advisory"] is True
+
+
+def test_10_rule_contradiction_entities_are_public_rule_ids(replay):
+    """A rule-sourced contradiction's entities match a rule in the public view.
+
+    ``khipu route --json`` keeps each rule's ``entity`` (its stable public id)
+    and leaves ``origin_id`` private. A consumer needs that same id on the
+    flag to show "Rule N names X" instead of a duplicate generic line.
+    """
+    rule = routing.add_rule("Use Codex for synthetic builds.", via="app")
+    routing.pause("Codex", via="app")
+    public = replay.pull()
+    assert all("origin_id" not in r for r in public["rules"]), "origin ids must stay private"
+    public_entities = {r["entity"] for r in public["rules"]}
+    matching = [f for f in public["contradictions"]
+                if f.get("source") == "rule" and f.get("state") == "paused"]
+    expect(len(matching), 1, "10: the rule/pause contradiction is not on the public view")
+    expect(matching[0]["entities"], [rule["entity"]],
+           "10: a rule contradiction must carry the rule's public entity")
+    assert set(matching[0]["entities"]) <= public_entities
+    assert rule["id"] not in matching[0]["entities"]
 
 
 def test_10_opposite_structured_directions_do_not_guess_from_prose(replay):

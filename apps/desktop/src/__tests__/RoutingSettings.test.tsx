@@ -157,7 +157,7 @@ let answers: Record<string, Answer>;
 // Settings clarity phase 3 folds the page into groups; these tests read
 // every group open, every account line open and Telling's inner folds open.
 const ALL_OPEN = [
-  "accounts", "priority", "rules", "holds", "telling", "resets", "runners", "table", "changes", "sub:hears", "sub:sizes",
+  "accounts", "priority", "rules", "holds", "checks", "telling", "resets", "runners", "table", "changes", "sub:hears", "sub:sizes",
   "sub:folders",
   ...KEYS.map((k) => `account:${k}`),
 ];
@@ -1255,6 +1255,170 @@ describe("Settings -> Routing: providers and lanes", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add a folder…" }));
     expect(foldersFold).toHaveAttribute("aria-expanded", "true");
     expect(await screen.findByRole("form", { name: "Add a job runner folder" })).toBeInTheDocument();
+  });
+});
+
+// Routing slice 15d: the Checks and copies group (mocks
+// docs/mockups/2026-10-21-routing/checks-light.html and checks-states-light.html).
+// The advisory flags `khipu route --json` carries (slice 10's contradictions
+// and rule upkeep) and rule 12's confirmed model table, all display only.
+describe("Settings -> Routing: checks and copies", () => {
+  const TIERS = {
+    scope: "opus", mock: "opus", ruling: "opus", "hard-security": "opus", "failed-fix": "opus",
+    build: "sonnet", "fix-round": "sonnet", tests: "sonnet", docs: "sonnet", synthesis: "sonnet",
+    mechanical: "haiku",
+  };
+
+  /** The mock's checks screen on this file's fixture: one paused account the
+   *  priority names, one untracked entry, a dated rule, two rules on one
+   *  topic, and an edit that has waited 35 h. */
+  function checksView(): RouteView {
+    const v = view();
+    v.priority = {
+      entries: [
+        { account: "codex|", label: "Codex", role: "Builds and tests." },
+        { account: "grok|", label: "Grok Build", role: "Reviews." },
+        { account: "antigravity|", label: "Antigravity", in_settings: false },
+      ],
+      confirmed: true,
+      version: "p1",
+    };
+    v.rules = [
+      { n: 3, entity: "rule-3", text: "Grok Build handles fast models.", date: "2026-10-13" },
+      { n: 6, entity: "rule-6", text: "Use Grok Build for fast models.", date: "2026-10-13" },
+      { n: 9, entity: "rule-9", text: "Use Grok Build until Friday.", date: "2026-10-13" },
+      { n: 7, entity: "rule-7", text: "Khipu's record is guidance.", pending: true, at: "2026-10-13T04:40:00Z" },
+    ];
+    v.contradictions = [
+      { kind: "account_state", account: "grok:main", source: "priority", state: "paused", entities: ["priority-1"],
+        text: "The priority names Grok Build, which is paused.", advisory: true },
+      { kind: "account_state", account: "antigravity:main", source: "priority", state: "untracked", entities: ["priority-2"],
+        text: "The priority names Antigravity, which is untracked.", advisory: true },
+    ];
+    v.rule_hygiene = [
+      { kind: "move_to_role", account: "grok:main", entities: ["rule-9"], advisory: true,
+        text: "Move this into the account's priority role with an until." },
+      { kind: "overlap", account: "grok:main", entities: ["rule-3", "rule-6"], advisory: true,
+        text: "Two standing rules name the same account and topic." },
+      { kind: "long_pending", entities: ["rule-7"], advisory: true,
+        text: "This edit has been waiting on the owner for more than 24 hours.",
+        owner_direction: { confirm: "Confirm rule 7", drop: "Undo the pending edit of rule 7" } },
+    ];
+    v.tier_table = { confirmed: true, tiers: TIERS };
+    return v;
+  }
+
+  it("words every contradiction and upkeep flag, and Needs you carries the contradictions", async () => {
+    answers.khipu_route_view = checksView();
+    await page();
+    const group = screen.getByRole("region", { name: "Checks and copies" });
+    const closed = document.querySelector('[data-settings-group="checks"]')!;
+    expect(closed).toHaveTextContent("2 contradictions · 3 rules to look at");
+    expect(closed.querySelector(".tag.warn")).toHaveTextContent("2 contradictions");
+    expect(within(group).getByText("Khipu flags these so you can fix them. None of them stops any work.")).toBeInTheDocument();
+
+    expect(row("Contradictions and out-of-date words", "Priority 2 names Grok Build, which you paused until Fri 9:00 AM"))
+      .toHaveTextContent("Your priority and your pause can't both hold.");
+    expect(row("Contradictions and out-of-date words", "Priority 3 names Antigravity, which Khipu doesn't track"))
+      .toHaveTextContent("It can never be open or limited here.");
+    expect(within(row("Contradictions and out-of-date words", "Priority 2 names Grok Build"))
+      .getByText("Contradiction")).toBeInTheDocument();
+
+    expect(row("Rule upkeep", "Rule 9 says “until Friday”"))
+      .toHaveTextContent("A dated limit belongs on the account's priority, with an end date.");
+    expect(row("Rule upkeep", "Rules 3 and 6 both cover Grok Build"))
+      .toHaveTextContent("Two rules on one account and topic.");
+    expect(row("Rule upkeep", "A conversation's edit to rule 7 has waited 35 h"))
+      .toHaveTextContent("It is in use until you confirm or drop it.");
+
+    // Display only: no row carries an owner action (the mock's fixes are
+    // owner actions and stay in the groups that own the words).
+    for (const name of ["Contradictions and out-of-date words", "Rule upkeep"]) {
+      expect(within(screen.getByRole("list", { name })).queryAllByRole("button")).toHaveLength(0);
+    }
+    // Neither the table nor any flag offers Confirm, Compare, Dismiss or Set a level.
+    expect(within(group).queryByRole("button", { name: /Confirm|Compare|Dismiss|Set a level|Make it a cap/ })).toBeNull();
+
+    const needs = screen.getByRole("region", { name: "Needs you" });
+    expect(within(needs).getByText("Priority 2 names Grok Build, which you paused until Fri 9:00 AM")).toBeInTheDocument();
+    expect(within(needs).getByText("Priority 3 names Antigravity, which Khipu doesn't track")).toBeInTheDocument();
+    expect(within(needs).queryByText(/Rule 9|Rules 3 and 6|edit to rule 7/)).toBeNull();
+    fireEvent.click(within(needs).getByRole("button", { name: "Show Priority 2 names Grok Build, which you paused until Fri 9:00 AM" }));
+    const target = document.querySelector<HTMLElement>('[data-route-item="check:account_state:grok:main:priority-1:0"]')!;
+    await waitFor(() => expect(document.activeElement).toBe(target));
+  });
+
+  it("names the rule a rule-sourced contradiction comes from, by its public id", async () => {
+    // The ids are the shapes `khipu route --json` carries: a rule's public
+    // entity ("rule-" and a uuid) in `rules[].entity`, and the private origin
+    // event id the flag must not name. Before the CLI fix a flag carried the
+    // origin id, so no row could map it to a rule and every one read
+    // "A standing rule names…".
+    const v = checksView();
+    const entity = "rule-019a15c9f-4534-7a2e-9c1d-2b3e4f5a6b7c";
+    v.rules = [{ n: 12, entity, text: "Use Grok Build for fast models.", date: "2026-10-13" }];
+    v.contradictions = [{
+      kind: "account_state", account: "grok:main", source: "rule", state: "paused", entities: [entity],
+      text: "A standing rule names Grok Build, which is paused.", advisory: true,
+    }];
+    answers.khipu_route_view = v;
+    await page();
+    const titled = row("Contradictions and out-of-date words", "Rule 12 names Grok Build");
+    expect(titled).toHaveTextContent("Rule 12 names Grok Build, which you paused until Fri 9:00 AM");
+    expect(titled).toHaveTextContent("Your rule names an account you paused.");
+    expect(within(screen.getByRole("region", { name: "Needs you" }))
+      .getByText("Rule 12 names Grok Build, which you paused until Fri 9:00 AM")).toBeInTheDocument();
+  });
+
+  it("folds the confirmed model table with all eleven kinds of work", async () => {
+    answers.khipu_route_view = checksView();
+    await page();
+    const fold = screen.getByRole("button", { name: /Your model table/ });
+    expect(fold).toHaveTextContent("11 kinds of work · confirmed by you");
+    expect(fold).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(fold);
+    expect(fold).toHaveAttribute("aria-expanded", "true");
+    const table = screen.getByRole("region", { name: "Your model table" });
+    expect([...table.querySelectorAll("dt")].map((d) => d.textContent)).toEqual([
+      "Scopes and designs", "Mocks", "Rulings", "Hardest security code", "A fix that already failed",
+      "Builds", "Fix rounds", "Tests", "Docs", "Reports and summaries", "Searches and lookups",
+    ]);
+    expect([...table.querySelectorAll("dd")].map((d) => d.textContent)).toEqual([
+      "Opus", "Opus", "Opus", "Opus", "Opus", "Sonnet", "Sonnet", "Sonnet", "Sonnet", "Sonnet", "Haiku",
+    ]);
+  });
+
+  it("says nothing is flagged, and says so only for what it read", async () => {
+    const v = checksView();
+    v.contradictions = [];
+    v.rule_hygiene = [];
+    delete v.tier_table;
+    answers.khipu_route_view = v;
+    await page();
+    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("Nothing flagged in Khipu's record");
+    expect(screen.getByText("Nothing to fix")).toBeInTheDocument();
+    expect(screen.getByText("No priority, rule or direction disagrees with an account.")).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Contradictions and out-of-date words" })).toBeNull();
+    expect(screen.queryByRole("list", { name: "Rule upkeep" })).toBeNull();
+  });
+
+  it("keeps a failed read apart from nothing found", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_route_view") throw new Error("khipu route: exited 1");
+      const a = answers[cmd] ?? { ok: true };
+      const out = typeof a === "function" ? await a(undefined) : a;
+      return typeof out === "string" ? out : JSON.stringify(out);
+    });
+    render(<RoutingSettings active />);
+    await screen.findByText(
+      "Couldn't read the checks: Khipu's routing command failed. That is not the same as nothing found.",
+    );
+    const group = screen.getByRole("region", { name: "Checks and copies" });
+    expect(within(group).getByText(
+      "Couldn't read the checks: Khipu's routing command failed. That is not the same as nothing found.",
+    )).toBeInTheDocument();
+    expect(within(group).queryByText("Nothing to fix")).toBeNull();
+    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("Not read");
   });
 });
 
