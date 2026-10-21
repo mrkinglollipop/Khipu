@@ -105,7 +105,25 @@ def display_path(path: Path, home: Path | None = None,
     """``path`` shown relative to its root: the repo name for a
     per-project file, ``~`` for home, never a stripped absolute path."""
     home = Path.home() if home is None else home
+    try:
+        path.relative_to(home)
+        under_home = True
+    except ValueError:
+        under_home = False
     for root in project_roots:
+        if root == home:
+            # Home itself as a project root must not rename ~/… paths
+            # after the home folder (which can be a username).
+            continue
+        if under_home:
+            try:
+                home.relative_to(root)
+            except ValueError:
+                pass
+            else:
+                # An ancestor of home as a project root must not rename
+                # ~/… paths after the home folder (which can be a username).
+                continue
         try:
             rel = path.relative_to(root)
         except ValueError:

@@ -265,12 +265,51 @@ def _failed(state, now):
     return {"ok": False, "error": "copy_publish_failed"}
 
 
+_HUB_CONFIGURED_TTL_SECONDS = 300
+_CLEANUP_MAX_FAILURES = 6
+_hub_configured_cache = None
+
+
+def _hub_configured_cached(now):
+    """``routing._hub_configured()`` (two Keychain lookups) at most once
+    per TTL window; the checker identity is part of the key so a replaced
+    checker is never served a stale answer."""
+    global _hub_configured_cache
+    checker = routing._hub_configured
+    if _hub_configured_cache is not None:
+        cached_checker, checked_at, value = _hub_configured_cache
+        if cached_checker is checker and checked_at <= now \
+                and (now - checked_at).total_seconds() < _HUB_CONFIGURED_TTL_SECONDS:
+            return value
+    value = bool(checker())
+    _hub_configured_cache = (checker, now, value)
+    return value
+
+
 def _disabled_skip(state, now, *, force):
     known = _publishers(state)
     if not known:
-        # A recomputable id is not evidence this Mac ever published. Unknown
-        # state gets at most one configured-hub cleanup, never recurring retries.
-        if state.get("cleanup_attempted") is True or not routing._hub_configured():
+        # A recomputable id is not evidence this Mac ever published. A
+        # cleanup that never ran (or whose outcome was lost) is not
+        # retried, but one that failed against a configured hub is:
+        # otherwise a row published before both local files were lost
+        # would stay on the hub forever.
+        if state.get("cleanup_attempted") is True:
+            if state.get("disabled") is True or not state.get("error"):
+                return {"ok": True, "disabled": True}
+            failures = state.get("failures")
+            if isinstance(failures, int) and not isinstance(failures, bool) \
+                    and failures >= _CLEANUP_MAX_FAILURES:
+                return {"ok": False, "error": state["error"]}
+            if not _hub_configured_cached(now):
+                return {"ok": True, "disabled": True}
+            retry = routing._parse(state.get("retry_at"))
+            if not force and retry and retry > now:
+                return {"ok": False, "error": "copy_retry_pending"}
+            if _publisher(create=False) is None:
+                return {"ok": True, "disabled": True}
+            return None
+        if not _hub_configured_cached(now):
             return {"ok": True, "disabled": True}
         if _publisher(create=False) is None:
             return {"ok": True, "disabled": True}
@@ -305,11 +344,15 @@ def publish(*, force=False, now=None, hub=None):
             known = _publishers(state)
             if not enabled and not known:
                 # Commit the attempt marker before remote I/O. If the outcome
-                # is lost, an idle Mac cannot retry this speculative deletion.
+                # is lost, an idle Mac cannot retry this speculative deletion;
+                # a recorded failure instead retries on its bounded backoff.
+                failures = state.get("failures")
                 state = dict(cleanup_attempted=True, cleanup_publisher=publisher)
+                if isinstance(failures, int) and not isinstance(failures, bool) and failures > 0:
+                    state["failures"] = failures
                 _save(state)
                 (hub or PostgresHub()).delete(publisher)
-                state["disabled"] = True
+                state = dict(cleanup_attempted=True, cleanup_publisher=publisher, disabled=True)
                 _save(state)
                 return {"ok": True, "disabled": True, "deleted": True}
             if publisher:

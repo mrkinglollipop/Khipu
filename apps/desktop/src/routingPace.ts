@@ -348,6 +348,19 @@ function spendGaps(s: CapStatus): NonNullable<CapStatus["reported"]>["gaps"] {
     Date.parse(gap.to) > Date.parse(gap.from));
 }
 
+const GAP_DISPLAY_LIMIT = 3;
+
+/** The largest few gaps for display, and how many more there are: the
+ *  CLI's own folded count plus any this list still has to drop. */
+function cappedGaps(s: CapStatus): { shown: NonNullable<CapStatus["reported"]>["gaps"]; more: number; total: number } {
+  const sorted = [...spendGaps(s)].sort((x, y) => y.seconds - x.seconds || Date.parse(x.from) - Date.parse(y.from));
+  const shown = sorted.slice(0, GAP_DISPLAY_LIMIT);
+  const folded = reportedSpend(s)?.gaps_more;
+  const more = (Number.isFinite(folded) ? Math.max(0, Math.floor(folded as number)) : 0)
+    + Math.max(0, sorted.length - shown.length);
+  return { shown, more, total: shown.length + more };
+}
+
 function gapWhen(iso: string, now: Date): string {
   const day = new Date(iso).toLocaleDateString(undefined, { weekday: "short" });
   return whenLocal(iso, now).replace(/^yesterday\b/, day);
@@ -395,7 +408,9 @@ function capState(a: RouteAccount, s: CapStatus, now: Date): { state: string; ta
       if (s.verdict === "unknown") {
         const reported = reportedSpend(s);
         if (reported) {
-          const gaps = spendGaps(s).map((g) => `gap ${gapWhen(g.from, now)} to ${gapWhen(g.to, now)} (${g.runner})`);
+          const { shown, more } = cappedGaps(s);
+          const gaps = shown.map((g) => `gap ${gapWhen(g.from, now)} to ${gapWhen(g.to, now)}`);
+          if (more) gaps.push(`and ${more} more`);
           return { state: `${usdWords(reported.usd)} reported · ${gaps.join("; ") || `total unknown: ${s.why || "incomplete readings"}`}`, tag: null };
         }
         return { state: `The total can't be told: ${s.why || "the spend reading is incomplete"}`, tag: null };
@@ -532,11 +547,17 @@ function sayOf(a: RouteAccount, now: Date): PaceSayPart[] {
     if (spend?.verdict === "unknown") {
       const reported = reportedSpend(spend);
       if (reported) {
-        const gaps = spendGaps(spend).map((g) => {
+        const { shown, more } = cappedGaps(spend);
+        const gaps = shown.map((g) => {
           const day = new Date(g.from).toLocaleDateString(undefined, { weekday: "short" });
           return `The ${g.runner} runner has a ${shortSpan(g.seconds)} gap on ${day}`;
         });
-        const why = gaps.length ? `${gaps.join(". ")}, so the total isn't known.` : `The total can't be told: ${spend.why || "the spend readings are incomplete"}.`;
+        const moreWords = more ? `and ${plural(more, "more gap", "more gaps")}` : "";
+        const why = gaps.length
+          ? `${gaps.join(". ")}${moreWords ? `, ${moreWords}` : ""}, so the total isn't known.`
+          : more
+            ? `${capitalise(moreWords)}, so the total isn't known.`
+            : `The total can't be told: ${spend.why || "the spend readings are incomplete"}.`;
         return [{ text: `${usdWords(reported.usd)} reported in the last ${spend.days} days. ${why}` }];
       }
       return [{ text: `The spend total can't be told: ${spend.why || "the spend readings are incomplete"}.` }];
@@ -618,7 +639,18 @@ function lineOf(a: RouteAccount, now: Date, advice: PaceAdvice | null): { week: 
   if (classification === "down") return { week: "Down", advice: adviceWords };
   const paces = a.pace ?? [];
   const spend = (a.cap_statuses ?? []).find((s) => s.kind === "spend");
-  if (spend?.verdict === "unknown") return { week: "Spend can't be told", advice: adviceWords };
+  if (spend?.verdict === "unknown") {
+    const reported = reportedSpend(spend);
+    if (reported) {
+      const { shown, more, total } = cappedGaps(spend);
+      const amount = usdWords(reported.usd);
+      if (total === 1 && shown[0]) return { week: `${amount} reported; a ${shortSpan(shown[0].seconds)} gap`, advice: adviceWords };
+      if (total > 1 && shown[0]) return { week: `${amount} reported; ${total} gaps, largest ${shortSpan(shown[0].seconds)}`, advice: adviceWords };
+      if (more) return { week: `${amount} reported; ${plural(more, "more gap", "more gaps")}`, advice: adviceWords };
+      return { week: `${amount} reported`, advice: adviceWords };
+    }
+    return { week: "Spend can't be told", advice: adviceWords };
+  }
   if (!paces.length) return { week: "No pace: plan not read", advice: adviceWords };
   if (paces.every((p) => readingUnknown(p))) return { week: "Can't tell yet", advice: adviceWords };
   const reachedShare = reachedShareCap(a);

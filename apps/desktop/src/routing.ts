@@ -394,6 +394,8 @@ export type CapStatus = {
     usd: number;
     events: number;
     gaps: { runner: string; from: string; to: string; seconds: number }[];
+    /** Gaps the CLI folded away beyond the largest few it lists. */
+    gaps_more?: number;
   } | null;
   cap_n?: number | null;
   jobs?: number | null;
