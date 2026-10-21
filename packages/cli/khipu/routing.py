@@ -1890,6 +1890,25 @@ def _checked(data: dict) -> dict | None:
                     if not isinstance(scope["mac"], str) or not scope["mac"]:
                         return None
                     out["scope"]["mac"] = scope["mac"]
+    if out["type"] == "tier_table_set":
+        # Kept as written so a later confirmed table can be told from one
+        # that is not. An unknown tier stays in the line and is not adopted.
+        confirmed = data.get("confirmed")
+        tiers = data.get("tiers")
+        if not isinstance(confirmed, bool) or not isinstance(tiers, dict) or not tiers:
+            return None
+        if not all(isinstance(key, str) and isinstance(value, str) for key, value in tiers.items()):
+            return None
+        out["confirmed"] = confirmed
+        out["tiers"] = {_no_surrogates(key): _no_surrogates(value) for key, value in tiers.items()}
+    if out["type"] == "direction_set":
+        for field in ("topic", "value"):
+            raw = data.get(field)
+            if not isinstance(raw, str):
+                return None
+            out[field] = _no_surrogates(raw)
+        if not out.get("account") or not out.get("id"):
+            return None
     return out
 
 
@@ -3027,12 +3046,15 @@ def _fold_priority(priority: dict | None, now: datetime, labels: dict, in_settin
             replaced = {"entries": held, "until": _iso(priority["prior"]["until"])}
     by = priority["written_by"]
     pending = priority["pending"]
-    return {"entries": active, "until": _iso(priority["until"]), "at": _iso(priority["at"]), "written_by": by,
-            "via": priority["via"], "pending": pending, "confirmed": not pending,
-            "owner_revision": priority.get("_owner_revision"),
-            "pending_by": author_words(by, push=True) if pending else None,
-            "pending_author": by if pending else None, "owner_request": priority.get("owner_request"),
-            "replaced": replaced, "confirmed_at": _iso(priority.get("confirmed_at"))}, ended
+    shown = {"entries": active, "until": _iso(priority["until"]), "at": _iso(priority["at"]), "written_by": by,
+             "via": priority["via"], "pending": pending, "confirmed": not pending,
+             "owner_revision": priority.get("_owner_revision"),
+             "pending_by": author_words(by, push=True) if pending else None,
+             "pending_author": by if pending else None, "owner_request": priority.get("owner_request"),
+             "replaced": replaced, "confirmed_at": _iso(priority.get("confirmed_at"))}
+    if priority.get("_event_id"):
+        shown["event_id"] = priority["_event_id"]
+    return shown, ended
 
 
 def _effective_priority(priority: dict) -> dict:
@@ -3345,7 +3367,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                  "prior_text": None, "prior_confirmed": None,
                                  "pending_by": author_words(info["written_by"], push=True) if pending else None,
                                  "pending_author": info["written_by"] if pending else None,
-                                 "written_by": info["written_by"], "via": info["via"], "at": info["at"]}
+                                 "written_by": info["written_by"], "via": info["via"], "at": info["at"],
+                                 "origin_id": event.get("id")}
         elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_unconfirm",
                       "rule_dismiss") and entity in rules and not proposal_crossed:
             rule = rules[entity]
@@ -3421,7 +3444,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             new = {"entries": event["entries"], "until": info["until"], "at": info["at"],
                    "written_by": info["written_by"], "via": info["via"], "pending": pending,
                    "owner_request": event.get("owner_request") if pending else None, "prior": None,
-                   "_owner_revision": priority_owner_revision}
+                   "_owner_revision": priority_owner_revision,
+                   "_event_id": event.get("id")}
             if pending:
                 # Undo brings back what the owner last had: a second request
                 # before he answers keeps the priority the first replaced.
@@ -3602,7 +3626,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                      "n": r["n"], "text": r["text"], "source": r["source"], "date": r["date"], "seeded": r["seeded"],
                      "confirmed": r["confirmed"], "pending": r.get("pending"), "pending_kind": r.get("pending_kind"),
                      "pending_by": r.get("pending_by"), "prior_text": r.get("prior_text"),
-                     "pending_author": r.get("pending_author"),
+                     "pending_author": r.get("pending_author"), "origin_id": r.get("origin_id"),
                      "written_by": r["written_by"], "via": r["via"], "at": _iso(r["at"])}
                     for r in sorted(rules.values(), key=lambda r: (r["n"] is None, r["n"] or 0, r["entity"]))
                     if not r["retired"]]
@@ -3722,8 +3746,13 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     for name, values in definitions.items():
         if values:
             effective["definition:" + name] = values
+    from khipu.routing_advisory import fold_facts
+
+    tier_table, directions = fold_facts(events)
     return {"accounts": entries, "holds": active_holds, "rules": active_rules, "note": note_out,
             "proposals": proposals,
+            **({"tier_table": tier_table} if tier_table else {}),
+            **({"directions": directions} if directions else {}),
             "machine_holds": machine_holds,
             "definitions": definitions,
             "priority": priority_out, "priority_version": priority_version, "priority_ended": priority_ended,
@@ -4807,14 +4836,14 @@ def read_view(now: datetime | None = None) -> dict:
     fingerprint, cfg, known = _inputs()
     prev = _load_view()
     if _fresh(prev, fingerprint, now):
-        return dict(prev, checked_at=_iso(now))
+        return _with_advisory(dict(prev, checked_at=_iso(now)), now)
     from khipu import routing_sources
 
     if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
             and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
         body = fold([], now=now, cfg=cfg, known=known)
         body["seed_error"] = None
-        return _assemble(None, body, now, 0, fingerprint, record=False)
+        return _with_advisory(_assemble(None, body, now, 0, fingerprint, record=False), now)
     try:
         # Its turn to fold first (a running fold, the daemon's poll say, is
         # waited for and its saved view answered), then the routing lock.
@@ -4825,12 +4854,20 @@ def read_view(now: datetime | None = None) -> dict:
             inputs = _inputs()
             prev = _load_view()
             if _fresh(prev, inputs[0], now):
-                return dict(prev, checked_at=_iso(now))
-            return _refold_locked(now, inputs)
+                return _with_advisory(dict(prev, checked_at=_iso(now)), now)
+            return _with_advisory(_refold_locked(now, inputs), now)
     except OSError:
         # A read-only data dir, or a lock held past this thread's budget,
         # costs the saved view, never the answer.
-        return _unsaved_view(now)
+        return _with_advisory(_unsaved_view(now), now)
+
+
+def _with_advisory(view: dict, now: datetime) -> dict:
+    """Contradiction and hygiene flags for this read. Not part of the
+    effective view, so they never move the version or rewrite a log line."""
+    from khipu.routing_advisory import attach
+
+    return attach(view, now)
 
 
 _OP = contextvars.ContextVar("routing_operation", default=None)
@@ -6911,7 +6948,9 @@ def doctor_block(now: datetime | None = None) -> dict:
             "note": view.get("note") is not None, "outside_app": view.get("outside_app") or [],
             "unchecked": view.get("unchecked") or [],
             "seed_error": view.get("seed_error"), "bad_lines": view.get("bad_lines", 0),
-            "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings}
+            "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings,
+            "contradictions": list(view.get("contradictions") or []),
+            "rule_hygiene": list(view.get("rule_hygiene") or [])}
 
 
 def _priority_warnings(view: dict, now: datetime, cfg: dict) -> list[str]:
@@ -7012,11 +7051,11 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
     # A pending rule's requester as the fold keeps it, for Khipu's own
     # same-conversation check; ``pending_by`` is its words.
-    out["rules"] = [{k: v for k, v in r.items() if k not in ("pending_author", "component", "provisional_n")} for r in view.get("rules") or []]
+    out["rules"] = [{k: v for k, v in r.items() if k not in ("pending_author", "component", "provisional_n", "origin_id")} for r in view.get("rules") or []]
     # The owner's priority and each account's plan facts (phase 4b); the app
     # words them itself, in local times.
     if view.get("priority"):
-        out["priority"] = {k: v for k, v in view["priority"].items() if k != "pending_author"}
+        out["priority"] = {k: v for k, v in view["priority"].items() if k not in ("pending_author", "event_id")}
     out["plan_facts"] = plan_facts(view, now)
     out["pace_order"] = cfg["routing_pace_order"]
     # What the app's Routing card and attention items need beside the view
@@ -7045,7 +7084,7 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["changes"] = [dict(c, items=[dict(i, by=author_words(i.get("written_by"), push=False)
                                           if i.get("written_by") else None) for i in c.get("items") or []])
                       for c in view.get("changes") or []]
-    for key in _INTERNAL:
+    for key in (*_INTERNAL, "directions"):
         out.pop(key, None)
     return out
 
@@ -7512,6 +7551,10 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
         out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
                                if r.get("silent") or r.get("unreadable")]
     out["about"] = ABOUT
+    if view.get("tier_table"):
+        out["tier_table"] = view["tier_table"]
+    out["contradictions"] = list(view.get("contradictions") or [])
+    out["rule_hygiene"] = list(view.get("rule_hygiene") or [])
     result = _for_agents(out, view)
     _record_read(view, rules=True, priority=True)
     session = conversation_author().get("session")
@@ -7824,7 +7867,7 @@ def prompt_imports() -> None:
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
     from khipu import (  # noqa: F401
-        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_delivery, routing_providers, routing_sources,
+        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_advisory, routing_delivery, routing_providers, routing_sources,
         session_capture, usage)
 
 

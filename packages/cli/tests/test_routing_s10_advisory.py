@@ -16,7 +16,7 @@ import shlex
 import pytest
 
 from khipu import routing, routing_delegation
-from tests.test_routing_acceptance import AUTHOR, expect, future
+from tests.test_routing_acceptance import AUTHOR, expect
 
 pytest_plugins = ("tests.test_routing_acceptance",)
 
@@ -58,7 +58,6 @@ def dispatch_lines(text):
     return [line for line in text.splitlines() if line.startswith("Rule 12:")]
 
 
-@future("10", "confirmed structured task-to-tier table is absent")
 def test_10_confirmed_tier_table_round_trips_all_classes(replay):
     table(replay)
     for body in (replay.view(), replay.pull()):
@@ -67,7 +66,6 @@ def test_10_confirmed_tier_table_round_trips_all_classes(replay):
         assert actual["confirmed"] is True
 
 
-@future("10", "confirmed table is not retained independently of owner prose")
 def test_10_table_confirmation_survives_reads_and_does_not_reparse_words(replay):
     rule = routing.add_rule("Fix rounds use Opus in this quoted historical example.", via="app")
     table(replay)
@@ -78,7 +76,6 @@ def test_10_table_confirmation_survives_reads_and_does_not_reparse_words(replay)
         expect(dispatch_lines(hook(payload())), [LINE], "10: confirmed table did not govern dispatch")
 
 
-@future("10", "owner-confirmed table values do not govern the check")
 def test_10_owner_confirmed_table_is_authority_not_a_hardcoded_default(replay):
     custom = dict(TIERS, **{"fix-round": "opus"})
     table(replay, tiers=custom)
@@ -94,7 +91,6 @@ def test_10_owner_confirmed_table_is_authority_not_a_hardcoded_default(replay):
     {"confirmed": False}, {"written_by": AUTHOR},
     {"tiers": {"fix-round": "invented-tier"}},
 ], ids=["unconfirmed", "conversation", "invalid-tier"])
-@future("10", "untrusted replacement must retain the confirmed tier table")
 def test_10_untrusted_table_cannot_replace_confirmed_owner_table(replay, replacement):
     table(replay)
     replay.write({"type": "tier_table_set", "tiers": dict(TIERS, **{"fix-round": "opus"}),
@@ -112,14 +108,12 @@ def test_10_untrusted_table_cannot_replace_confirmed_owner_table(replay, replace
     dict(payload(), tool_name="Bash", tool_input={"command": "claude -m opus -p 'task: fix-round\nRepair it.'"}),
     dict(payload(), tool_name="Bash", tool_input={"command": "claude --model=opus -p 'task: fix-round\nRepair it.'"}),
 ], ids=["Agent", "Task", "native-child", "long-model", "short-model", "equals-model"])
-@future("10", "Opus fix-round dispatch lacks exact rule 12 result line")
 def test_10_opus_fix_round_advisory_on_each_dispatch_shape(replay, call):
     table(replay)
     expect(dispatch_lines(hook(call)), [LINE], "10: Opus fix-round result lacks the exact rule 12 line")
 
 
 @pytest.mark.parametrize("task,tier", list(TIERS.items()))
-@future("10", "task classes are not compared with the structured tier table")
 def test_10_each_task_class_checks_the_expected_tier(replay, task, tier):
     table(replay)
     wrong = "sonnet" if tier == "opus" else "opus"
@@ -137,13 +131,11 @@ def test_10_matching_tier_gets_no_dispatch_advisory(replay, task, tier):
 
 
 @pytest.mark.parametrize("model", ["opus", "claude-opus-4-6", "claude-opus-4-6-20260101"])
-@future("10", "Opus model ids are not resolved to their tier")
 def test_10_model_id_resolves_to_tier(replay, model):
     table(replay)
     expect(dispatch_lines(hook(payload(model))), [LINE], "10: Opus model id has no fix-round advisory")
 
 
-@future("10", "local Claude settings model is not checked at dispatch")
 def test_10_model_from_fake_config_home_without_credentials(replay):
     table(replay)
     home = replay.root / "fake-opus-home"
@@ -157,7 +149,6 @@ def test_10_model_from_fake_config_home_without_credentials(replay):
     assert dispatch_lines(hook(call)) == []
 
 
-@future("10", "task line does not override keyword guesses")
 def test_10_explicit_task_class_wins_over_misleading_keywords(replay):
     table(replay)
     expect(dispatch_lines(hook(payload(brief="task: fix-round\nScope, design, ruling, mock: repair their tests."))),
@@ -165,7 +156,6 @@ def test_10_explicit_task_class_wins_over_misleading_keywords(replay):
     assert dispatch_lines(hook(payload(brief="task: scope\nPlan the fix-round tests."))) == []
 
 
-@future("10", "keyword fallback has no marked guess")
 def test_10_keyword_fallback_is_explicitly_marked_as_guess(replay):
     table(replay)
     lines = dispatch_lines(hook(payload(brief="Fix round: repair the broken synthetic fixture.")))
@@ -220,7 +210,6 @@ def flags(replay, field, surface):
 @pytest.mark.parametrize("source,state", [("priority", "held"), ("rule", "held"),
                                           ("priority", "paused"), ("rule", "paused"),
                                           ("priority", "down"), ("priority", "untracked")])
-@future("10", "structured account contradictions are absent")
 def test_10_structured_contradictions_reference_account_and_source(replay, surface, source, state):
     if source == "priority":
         changed = routing.set_priority([{"account": "Codex", "role": "Use Codex for synthetic builds."}],
@@ -251,7 +240,6 @@ def test_10_structured_contradictions_reference_account_and_source(replay, surfa
     assert matching[0]["text"] and matching[0]["advisory"] is True
 
 
-@future("10", "opposite structured directions are not flagged")
 def test_10_opposite_structured_directions_do_not_guess_from_prose(replay):
     replay.write(*[{"type": "direction_set", "id": f"direction-{value}", "account": "codex:main",
                     "topic": "dispatch", "value": value, "written_by": {"kind": "owner"}}
@@ -273,7 +261,6 @@ def test_10_directions_need_same_account_topic_and_opposite_values(replay):
     assert not any(f.get("kind") == "opposite_directions" for f in flags(replay, "contradictions", "mcp"))
 
 
-@future("10", "ending a hold must remove its derived contradiction")
 def test_10_ending_hold_clears_contradiction_without_changing_rule(replay):
     words = "Use Codex for synthetic builds."
     rule = routing.add_rule(words, via="app")
@@ -290,7 +277,6 @@ def test_10_ending_hold_clears_contradiction_without_changing_rule(replay):
 @pytest.mark.parametrize("surface", ["view", "mcp", "doctor"])
 @pytest.mark.parametrize("words", ["Use Codex until Saturday.", "Use Codex this week.",
                                    "Use Codex on Friday.", "Use Codex until 2026-10-24."])
-@future("10", "time-worded standing rules have no move-to-role flag")
 def test_10_time_wording_suggests_priority_role_with_until(replay, surface, words):
     rule = routing.add_rule(words, via="app")
     found = flags(replay, "rule_hygiene", surface)
@@ -302,7 +288,6 @@ def test_10_time_wording_suggests_priority_role_with_until(replay, surface, word
 
 
 @pytest.mark.parametrize("words", ["Use Codex until 2026-10-19.", "Use Codex until Monday."])
-@future("10", "passed date or named deadline has no expired flag")
 def test_10_passed_rule_deadline_is_expired(replay, words):
     # Written before Monday; checked on Tuesday. A bare weekday is therefore
     # the already-passed deadline, not next week's freshly inferred deadline.
@@ -324,7 +309,6 @@ def test_10_future_deadline_is_not_expired_and_retired_rules_are_not_flagged(rep
         assert not any(f.get("kind") == "expired" and future_rule["entity"] in f.get("entities", []) for f in found)
 
 
-@future("10", "named reset expiry is not checked")
 def test_10_named_reset_expiry_uses_account_reset(replay):
     replay.usage(reset=replay.now.replace(hour=15))
     rule = routing.add_rule("Use Codex until its weekly reset.", via="app")
@@ -334,7 +318,6 @@ def test_10_named_reset_expiry_uses_account_reset(replay):
            True, "10: passed named weekly reset has no expired flag")
 
 
-@future("10", "same account/topic rules lack overlap flag")
 def test_10_rule_overlap_names_both_rules_and_excludes_other_topics(replay):
     a = routing.add_rule("Codex handles synthetic test writing.", via="app")
     b = routing.add_rule("Use Codex for writing synthetic tests.", via="app")
@@ -345,7 +328,6 @@ def test_10_rule_overlap_names_both_rules_and_excludes_other_topics(replay):
     assert all(other["entity"] not in pair for pair in pairs)
 
 
-@future("10", "priority role restating a standing rule is not flagged")
 def test_10_priority_role_restatement_names_rule_and_role(replay):
     words = "Codex handles synthetic test writing."
     rule = routing.add_rule(words, via="app")
@@ -358,7 +340,6 @@ def test_10_priority_role_restatement_names_rule_and_role(replay):
 
 
 @pytest.mark.parametrize("age", [24 * 3600 + 1, 25 * 3600], ids=["just-over-24h", "25h"])
-@future("10", "long-pending edits lack actionable owner directions")
 def test_10_old_pending_edit_lists_owner_confirmation_and_drop_directions(replay, age):
     rule = routing.add_rule("Codex handles synthetic tests.", via="app")
     routing.request_rule("Codex handles synthetic docs.", n=rule["n"], author=AUTHOR,
@@ -385,7 +366,6 @@ def test_10_pending_edit_not_old_until_strictly_over_24_hours(replay, age):
     assert not any(f.get("kind") == "long_pending" for f in flags(replay, "rule_hygiene", "mcp"))
 
 
-@future("10", "long-pending flags must clear after owner confirmation")
 def test_10_confirming_old_edit_clears_only_its_long_pending_flag(replay):
     rule = routing.add_rule("Codex handles synthetic tests.", via="app")
     routing.request_rule("Codex handles synthetic docs.", n=rule["n"], author=AUTHOR,
