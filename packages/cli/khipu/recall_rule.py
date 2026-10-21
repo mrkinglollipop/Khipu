@@ -444,6 +444,16 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
             # repeat live DB work through the cwd and recents fallbacks.
             _ = exc
             return ""
+        try:
+            from khipu import routing_directions
+
+            directions = [{"id": item["id"], "kind": "routing_direction", "text": item["text"],
+                           "owner": "user"} for item in routing_directions.owed_items()]
+            if directions and slice_data is not None:
+                slice_data = {**slice_data,
+                              "commitments": directions + list(slice_data.get("commitments") or [])}
+        except Exception:  # noqa: BLE001 - directions never break the pushed slice
+            pass
         if slice_data and (slice_data.get("commitments") or slice_data.get("episodes")):
             return _render_project_slice(project or host or "unknown", slice_data)
 

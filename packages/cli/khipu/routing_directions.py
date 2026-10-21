@@ -52,8 +52,25 @@ _QUESTION_START = re.compile(
     r"^(what|why|how|when|where|which|who|should|would|could|can|do|does|did|is|are|was|were)\b", re.I)
 _HYPOTHETICAL = re.compile(r"^(if|suppose|imagine|hypothetically|what\s+if)\b", re.I)
 _REPORTING = re.compile(r"\b(said|says|asked\s+whether|wrote|quoted|discuss\w*|thinking\s+about|wondering)\b", re.I)
-_SENTENCE = re.compile(r"[^.!?\n]+(?:[.!?]+|$)")
 _QUOTES = (('"', '"'), ("“", "”"), ("‘", "’"))
+
+
+def _sentences(text: str):
+    """(offset, span) per sentence. A dot between two digits (a version
+    such as 3.11) never ends a sentence."""
+    start = 0
+    for i, char in enumerate(text):
+        if char == "\n":
+            if text[start:i].strip():
+                yield start, text[start:i]
+            start = i + 1
+        elif char in ".!?" and not (
+                char == "." and 0 < i < len(text) - 1
+                and text[i - 1].isdigit() and text[i + 1].isdigit()):
+            yield start, text[start:i + 1]
+            start = i + 1
+    if text[start:].strip():
+        yield start, text[start:]
 
 
 def _num(word: str):
@@ -81,44 +98,154 @@ def _quoted_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _target(span: str) -> dict | None:
+def _norm_entity(name) -> str:
+    text = unicodedata.normalize("NFC", str(name or "")).lower()
+    text = re.sub(r"[_:\-|/]+", " ", text)
+    return " ".join(re.sub(r"[^a-z0-9. ]+", " ", text).split())
+
+
+def known_entities() -> dict:
+    """The names a direction may name, from Khipu's routing record:
+    ``{"all": {norm: canonical}, "accounts": {norm: canonical}}`` where
+    accounts also holds providers and lanes (the entities a structured
+    target may name) and all also holds provider model ids. Nothing here
+    is a static list: with no record, nothing is known and extract
+    abstains. Fail-open to empty — a broken record opens no items."""
+    all_names: dict[str, str] = {}
+    accounts: dict[str, str] = {}
+
+    def add(name, *, account: bool = False, canonical: str | None = None) -> None:
+        norm = _norm_entity(name)
+        if not norm:
+            return
+        shown = canonical or _entity(str(name))
+        all_names.setdefault(norm, shown)
+        if account:
+            accounts.setdefault(norm, shown)
+
+    try:
+        from khipu import routing
+
+        for acct in routing.accounts():
+            label = acct.get("label")
+            if label:
+                add(label, account=True)
+            ident = acct.get("id")
+            if ident:
+                add(ident, account=True, canonical=label or _entity(str(ident).replace(":", " ")))
+            if acct.get("provider"):
+                add(acct["provider"], account=True)
+        try:
+            definitions, _cache = routing._entry_definitions()
+        except Exception:  # noqa: BLE001 - definitions are one source among several
+            definitions = {}
+        for provider in (definitions.get("providers") or {}).values():
+            if not isinstance(provider, dict):
+                continue
+            label = provider.get("label") or provider.get("id")
+            if provider.get("id"):
+                add(provider["id"], account=True, canonical=label)
+            if label:
+                add(label, account=True)
+            for lane in provider.get("lane_names") or []:
+                add(lane, account=True)
+            for model in (provider.get("models_allowed") or []) + (provider.get("models_never") or []):
+                add(model)
+        for acct in (definitions.get("accounts") or {}).values():
+            if not isinstance(acct, dict):
+                continue
+            label = acct.get("label") or acct.get("id")
+            if label:
+                add(label, account=True)
+            if acct.get("id"):
+                add(acct["id"], account=True, canonical=label)
+            if acct.get("provider"):
+                add(acct["provider"], account=True)
+        for lanes in (definitions.get("lane_maps") or {}).values():
+            if isinstance(lanes, dict):
+                for lane in lanes:
+                    add(lane, account=True)
+    except Exception:  # noqa: BLE001 - no readable record, no known names
+        return {"all": {}, "accounts": {}}
+    return {"all": all_names, "accounts": accounts}
+
+
+def _coerce_known(entities) -> dict:
+    if isinstance(entities, dict) and "all" in entities:
+        return entities
+    if entities is None:
+        return known_entities()
+    names = {}
+    for name in entities:
+        norm = _norm_entity(name)
+        if norm:
+            names[norm] = _entity(str(name))
+    return {"all": dict(names), "accounts": dict(names)}
+
+
+def _find_known(text: str, names: dict) -> str | None:
+    """The canonical known name in ``text``: earliest, then longest.
+    Whole-phrase matching on the normalized text, never a substring of
+    a longer name ('Claude' does not match inside 'Claude second')."""
+    norm = _norm_entity(text)
+    best = None
+    for key, canonical in names.items():
+        m = re.search(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", norm)
+        if m and (best is None or m.start() < best[0] or (m.start() == best[0] and len(key) > len(best[1]))):
+            best = (m.start(), key, canonical)
+    return best[2] if best else None
+
+
+def _target(span: str, known: dict) -> dict | None:
+    accounts = known["accounts"]
     for pattern in _CONCURRENCY:
         m = pattern.search(span)
         if m:
-            return {"entity": _entity(m.group(1)), "kind": "concurrency", "value": _num(m.group(2))}
+            canonical = accounts.get(_norm_entity(m.group(1)))
+            return {"entity": canonical, "kind": "concurrency", "value": _num(m.group(2))} if canonical else None
     m = _SHARE.search(span)
     if m:
+        canonical = _find_known(span, accounts)
+        if not canonical:
+            return None
         value = float(m.group(2))
-        return {"entity": _entity(m.group(1)), "kind": "share",
+        return {"entity": canonical, "kind": "share",
                 "value": int(value) if value == int(value) else value}
     m = _SPEND.search(span)
     if m and re.search(r"\b(week|day|month|rolling|budget|spend|cost)\b", span, re.I):
+        # A spend target needs a real account entity from the record;
+        # words before the $ that name none open nothing.
+        canonical = _find_known(span, accounts)
+        if not canonical:
+            return None
         value = float(m.group(2))
-        return {"entity": _entity(m.group(1)), "kind": "spend",
+        return {"entity": canonical, "kind": "spend",
                 "value": int(value) if value == int(value) else value}
-    m = re.match(r"(?i)(?:use|never\s+use|don'?t\s+use|do\s+not\s+use|pause|prefer|avoid)\s+(.+)", span.strip())
-    if m:
-        words = _entity(m.group(1)).split()
-        entity = " ".join(words[:2]) if len(words) > 1 and words[1][:1].isupper() else (words[0] if words else "")
-        return {"entity": entity, "kind": None, "value": None} if entity else None
-    return None
+    canonical = _find_known(span, known["all"])
+    return {"entity": canonical, "kind": None, "value": None} if canonical else None
 
 
-def extract(text: str) -> list[dict]:
+def extract(text: str, entities=None) -> list[dict]:
     """The routing directions in one owner turn: ``[{words, target}]``.
 
-    Abstains on questions, quotations, hypotheticals and reported speech.
-    A span's words are a byte-identical slice of the turn as typed."""
+    A direction must name a known account, provider, lane or model from
+    the routing record (``entities`` overrides that set, for tests), so
+    ordinary prompts that happen to start with a routing verb open
+    nothing. Abstains on questions, quotations, hypotheticals and
+    reported speech. A span's words are a byte-identical slice of the
+    turn as typed."""
     if not text or is_machine(text, anywhere=True):
+        return []
+    known = _coerce_known(entities)
+    if not known["all"]:
         return []
     quoted = _quoted_spans(text)
     out = []
-    for match in _SENTENCE.finditer(text):
-        span = match.group(0)
+    for start0, span in _sentences(text):
         words = span.strip()
         if not words:
             continue
-        start = match.start() + (len(span) - len(span.lstrip()))
+        start = start0 + (len(span) - len(span.lstrip()))
         if any(q[0] <= start < q[1] for q in quoted) or words[:1] in {'"', "“", "‘", ">", "'"}:
             continue
         if span.rstrip().endswith("?") or _QUESTION_START.match(words) or _HYPOTHETICAL.match(words):
@@ -129,8 +256,8 @@ def extract(text: str) -> list[dict]:
             or (_SPEND.search(words) and re.search(r"\b(week|day|month|rolling|budget|spend|cost)\b", words, re.I))
         if not structured and not _IMPERATIVE.match(words):
             continue
-        target = _target(words)
-        if structured and target is None:
+        target = _target(words, known)
+        if target is None:
             continue
         out.append({"words": words, "target": target})
     return out
@@ -219,7 +346,25 @@ def _action_target(line: dict) -> dict | None:
     return None
 
 
-def _matches(direction: dict, line: dict) -> bool:
+def _entity_key(name, known: dict | None = None) -> str:
+    """One entity's comparison key: exact after normalization and after
+    resolving a stable id or key to its known name, so 'Claude' and
+    'Claude second' are different keys in both directions."""
+    norm = _norm_entity(name)
+    if known:
+        accounts = known.get("accounts") or {}
+        if norm in accounts:
+            return norm
+        # A stable id (claude:second) or a usage key (claude|home) names
+        # the account its parts name, when the record knows that name.
+        for variant in (norm.replace(" ", " "), norm.split(" ")[0],
+                        " ".join(norm.split(" ")[1:])):
+            if variant in accounts:
+                return variant
+    return norm
+
+
+def _matches(direction: dict, line: dict, known: dict | None = None) -> bool:
     facts = line.get("facts") if isinstance(line.get("facts"), dict) else {}
     if facts.get("direction") == direction["id"]:
         return True
@@ -234,9 +379,8 @@ def _matches(direction: dict, line: dict) -> bool:
             return False
     except (TypeError, ValueError):
         return False
-    want = unicodedata.normalize("NFC", target["entity"]).lower()
-    have = unicodedata.normalize("NFC", got["entity"]).lower()
-    return want in have or have in want
+    known = known if known is not None else known_entities()
+    return _entity_key(target["entity"], known) == _entity_key(got["entity"], known)
 
 
 def _applied_actions(actions: list[dict] | None) -> list[dict]:
@@ -247,20 +391,49 @@ def _applied_actions(actions: list[dict] | None) -> list[dict]:
     return [a for a in owner_direction.actions() if a.get("state") == "applied"]
 
 
+def _join_reason(row: dict, counter: dict | None) -> str | None:
+    """Why this direction cannot be joined, or None when it can. Recomputed
+    on every capture and refresh, never sticky: a turn record that simply
+    arrives after a capture clears the reason on the next pass."""
+    if counter is None:
+        return "the occurrence counter is gone, so this direction cannot be joined"
+    if counter.get("lost"):
+        recreated = counter.get("recreated_at")
+        at = row.get("at")
+        if not isinstance(at, (int, float)) or recreated is None or at < recreated:
+            return "the occurrence counter was lost, so this direction cannot be joined"
+    counted = int((counter.get("counts") or {}).get(row.get("prompt_sha256")) or 0)
+    if counted < int(row.get("occurrence") or 0):
+        return "the recorder and the transcript count this prompt differently"
+    return None
+
+
 def refresh(actions: list[dict] | None = None) -> list[dict]:
     """Re-join every stored direction against the applied owner actions."""
     applied = _applied_actions(actions)
+    known = None  # loaded on the first structured match candidate
+    counters: dict[str, dict | None] = {}
     data = _load()
     for row in data["directions"].values():
         if row.get("status") in ("dismissed", "closed"):
             continue
         row["status"] = "open"
-        if row.get("join") == "unjoined":
-            continue  # the count disagreement stands until a capture agrees
+        session = row.get("session")
+        if session not in counters:
+            counters[session] = owner_turns.occurrence_state(session)
+        reason = _join_reason(row, counters[session])
+        if reason is not None:
+            row["join"] = "unjoined"
+            row["reason"] = reason
+            continue
+        row["join"] = "joined"
+        row.pop("reason", None)
         joined = [a for a in applied if a.get("session") == row["session"]
                   and a.get("prompt_sha256") == row["prompt_sha256"]
                   and a.get("occurrence") == row["occurrence"]]
-        match = next((a for a in joined if _matches(row, a)), None)
+        if joined and known is None:
+            known = known_entities()
+        match = next((a for a in joined if _matches(row, a, known)), None)
         if match is not None:
             row["status"] = "closed"
             row["closed_by"] = match.get("id")
@@ -288,52 +461,78 @@ def capture_scan(session: str, turns, *, now: float | None = None, actions: list
     now = time.time() if now is None else now
     data = _load()
     rows = data["directions"]
-    recorded = {}
+    recorded: dict[str, dict] = {}
+    recorded_occs: dict[str, list[int]] = {}
     for turn in owner_turns.turns(session, now):
         if isinstance(turn.get("prompt_sha256"), str):
             recorded.setdefault(turn["prompt_sha256"], turn)
-    counter = owner_turns.occurrence_state(session)
-    counts: dict[str, int] = {}
-    totals: dict[str, int] = {}
+            if isinstance(turn.get("occurrence"), int):
+                recorded_occs.setdefault(turn["prompt_sha256"], []).append(turn["occurrence"])
+    known = known_entities()
+    # First pass: the eligible typed turns in this scanned window, in
+    # order. Occurrences come from the owner turn record (the durable
+    # per-session counter the recorder numbered), never from counting
+    # within this window alone: a window holding only the second typing
+    # of a prompt takes the recorder's occurrence 2, so it opens the
+    # second direction and only its own action can close it. A scan
+    # holding k typings takes the recorder's last k occurrences; when
+    # the record holds fewer (a missed hook, pruned turn records),
+    # transcript numbering is the placeholder and the join check below
+    # marks the direction unjoined until the record agrees.
+    typed_turns: list[tuple[str, float | None, str]] = []
     for raw in turns:
         text, at = _turn_parts(raw)
         typed = owner_text(text)
         if typed is None or not typed.strip() or is_machine(typed, anywhere=True):
             continue
         sha = owner_turns.prompt_sha256(typed)
-        known = recorded.get(sha)
-        if (known is not None and (known.get("delegated") or known.get("machine"))) \
+        seen = recorded.get(sha)
+        if (seen is not None and (seen.get("delegated") or seen.get("machine"))) \
                 or owner_turns.brief_for(typed) is not None:
             continue  # a dispatched job's prompt is never the owner's direction
+        typed_turns.append((typed, at, sha))
+    totals: dict[str, int] = {}
+    for _typed, _at, sha in typed_turns:
+        totals[sha] = totals.get(sha, 0) + 1
+    assigned: dict[str, list[int]] = {}
+    for sha, total in totals.items():
+        occs = sorted(recorded_occs.get(sha) or [])
+        assigned[sha] = occs[-total:] if len(occs) >= total else list(range(1, total + 1))
+    counts: dict[str, int] = {}
+    for typed, at, sha in typed_turns:
         counts[sha] = counts.get(sha, 0) + 1
-        totals[sha] = counts[sha]
-        for found in extract(typed):
-            key = _direction_id(session, sha, counts[sha], found["words"])
+        occurrence = assigned[sha][counts[sha] - 1]
+        for found in extract(typed, known):
+            key = _direction_id(session, sha, occurrence, found["words"])
             if key in rows:
                 continue  # a dismissal (or a close) survives the next capture
+            stale = next((k for k, r in list(rows.items())
+                          if r.get("session") == session and r.get("prompt_sha256") == sha
+                          and r.get("words") == found["words"] and r.get("status") == "open"
+                          and r.get("join") == "unjoined" and r.get("occurrence") != occurrence
+                          and len(recorded_occs.get(sha) or []) >= totals[sha]), None)
+            if stale is not None:
+                # The turn record arrived after an earlier capture had
+                # numbered this direction from the window alone: re-key
+                # it to the recorder's occurrence so it can join.
+                row = rows.pop(stale)
+                row.update({"id": key, "occurrence": occurrence})
+                rows[key] = row
+                continue
             rows[key] = {"id": key, "session": session, "prompt_sha256": sha,
-                         "occurrence": counts[sha], "words": found["words"], "target": found["target"],
+                         "occurrence": occurrence, "words": found["words"], "target": found["target"],
                          "status": "open", "join": "joined", "at": at}
+    counter = owner_turns.occurrence_state(session)
     for row in rows.values():
         if row.get("session") != session or row.get("status") in ("dismissed", "closed"):
             continue
-        sha = row["prompt_sha256"]
-        reason = None
-        if counter is None:
-            if recorded or any(r.get("session") == session for r in rows.values()):
-                reason = "the occurrence counter is gone, so this direction cannot be joined"
-        elif counter.get("lost"):
-            recreated = counter.get("recreated_at")
-            at = row.get("at")
-            if not isinstance(at, (int, float)) or recreated is None or at < recreated:
-                reason = "the occurrence counter was lost, so this direction cannot be joined"
-        if reason is None and counter is not None and not counter.get("lost"):
-            counted = int((counter.get("counts") or {}).get(sha) or 0)
-            if sha in totals and counted != totals[sha]:
-                reason = "the recorder and the transcript count this prompt differently"
+        reason = _join_reason(row, counter)
         if reason is not None:
             row["join"] = "unjoined"
             row["reason"] = reason
+        else:
+            row["join"] = "joined"
+            row.pop("reason", None)
     _save(data)
     refresh(actions)
     return [r for r in directions() if r.get("session") == session]

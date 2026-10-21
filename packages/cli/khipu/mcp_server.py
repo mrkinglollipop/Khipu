@@ -572,7 +572,7 @@ TOOLS: list[dict] = [
                     "description": "open (default) | closed | stale",
                 },
                 "owner": {"type": "string", "description": "user | assistant | agent | all (default)"},
-                "kind": {"type": "string", "description": "followup | blocker | question | promise"},
+                "kind": {"type": "string", "description": "followup | blocker | question | promise | routing_direction"},
                 "origin": {"type": "string", "description": "conversation | job"},
                 "query": {"type": "string", "description": "Words that must all be in the text"},
                 "pr": {"type": "integer", "description": "Only items naming this pull request number"},
@@ -1661,7 +1661,47 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
         commitments.add_hub_ages(page["results"], hub_now or datetime.now(timezone.utc))
     out = {"status": status, "project": project, **page, "limit": limit,
            **({"limit_note": note} if note else {}), **stale}
+    directions = _routing_direction_rows(status, filters)
+    if directions:
+        out["results"] = directions + out["results"]
+        out["total"] = int(out.get("total") or 0) + len(directions)
+        counts = out.setdefault("counts", {})
+        counts.setdefault("owner", {})["user"] = counts.get("owner", {}).get("user", 0) + len(directions)
+        counts.setdefault("kind", {})["routing_direction"] = \
+            counts.get("kind", {}).get("routing_direction", 0) + len(directions)
     out.update(owner_writes.annotate(out["results"], "owed_update"))
+    return out
+
+
+def _routing_direction_rows(status: str, filters: dict) -> list[dict]:
+    """Open routing directions (slice 19a) in the owed list the owner
+    reads. They live in the local routing-directions store, not the
+    commitments table; the words in ``text`` come from that store and
+    are shown only through this owner-facing list. Fail-open: a broken
+    store never breaks the owed list. Dismiss one with
+    ``khipu owed --close <id>`` (the app's owed close control)."""
+    if status != "open" or filters.get("pr") is not None or filters.get("origin") \
+            or filters.get("looks_done"):
+        return []
+    if filters.get("owner") not in (None, "user"):
+        return []
+    kind = filters.get("kind")
+    if kind and kind != "routing_direction":
+        return []
+    try:
+        from khipu import routing_directions
+
+        items = routing_directions.owed_items()
+    except Exception:  # noqa: BLE001 - the owed list must not fail on the directions store
+        return []
+    words = [w for w in (filters.get("query") or "").lower().split() if w]
+    out = []
+    for item in items:
+        if words and not all(w in (item.get("text") or "").lower() for w in words):
+            continue
+        out.append({"id": item["id"], "kind": "routing_direction", "text": item["text"],
+                    "owner": "user", "session": item.get("session"), "target": item.get("target"),
+                    "join": item.get("join"), "reason": item.get("reason")})
     return out
 
 
@@ -1674,8 +1714,8 @@ def owed_filters(args: dict) -> dict:
     if owner not in (*commitments.OWNERS, "all"):
         raise ValueError("owner must be 'user', 'assistant', 'agent' or 'all'")
     kind = (args.get("kind") or "").strip().lower() or None
-    if kind and kind not in commitments.VALID_KINDS:
-        raise ValueError(f"kind must be one of {', '.join(commitments.VALID_KINDS)}")
+    if kind and kind != "routing_direction" and kind not in commitments.VALID_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(commitments.VALID_KINDS)} or routing_direction")
     origin = (args.get("origin") or "").strip().lower() or None
     if origin and origin not in commitments.ORIGINS:
         raise ValueError("origin must be 'conversation' or 'job'")

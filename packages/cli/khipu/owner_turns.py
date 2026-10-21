@@ -213,6 +213,24 @@ def occurrence_file(session: str) -> Path:
     return occurrences_folder() / f"{_SAFE.sub('_', session)[:128]}.json"
 
 
+def _high_water_file(session: str) -> Path:
+    return occurrences_folder() / f"{_SAFE.sub('_', session)[:128]}.hw.json"
+
+
+def _high_water(session: str) -> dict:
+    """The durable high-water counts kept beside (not in) the counter
+    file, so a counter deleted after its turn records were pruned is
+    still known to have existed: recreating it is a lost counter, and
+    its numbers are never reused."""
+    try:
+        data = json.loads(_high_water_file(session).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    counts = data.get("counts") if isinstance(data, dict) else None
+    return {k: int(v) for k, v in counts.items() if isinstance(v, int) and v > 0} \
+        if isinstance(counts, dict) else {}
+
+
 def occurrence_state(session: str) -> dict | None:
     """The session's durable occurrence counter, or None when it is gone.
     It never expires (section 13 E): it is kept apart from the 24-hour turn
@@ -232,9 +250,12 @@ def _next_occurrence(session: str, sha: str, now: float) -> int:
     rather than be matched on a reused number."""
     state = occurrence_state(session)
     if state is None:
-        earlier = any(isinstance(t.get("prompt_sha256"), str)
-                      for t in _read_lines(session_file(session)))
-        state = {"counts": {}, "lost": bool(earlier), "recreated_at": now if earlier else None}
+        high = _high_water(session)
+        earlier = bool(high) or any(isinstance(t.get("prompt_sha256"), str)
+                                     for t in _read_lines(session_file(session)))
+        # A lost counter restarts from its high-water counts, so a
+        # retyped prompt never reuses an occurrence from before the loss.
+        state = {"counts": dict(high), "lost": bool(earlier), "recreated_at": now if earlier else None}
     counts = state["counts"]
     counts[sha] = int(counts.get(sha) or 0) + 1
     d = occurrences_folder()
@@ -242,6 +263,7 @@ def _next_occurrence(session: str, sha: str, now: float) -> int:
     os.chmod(folder(), 0o700)
     os.chmod(d, 0o700)
     _write_private(occurrence_file(session), json.dumps(state) + "\n")
+    _write_private(_high_water_file(session), json.dumps({"counts": counts}) + "\n")
     return counts[sha]
 
 
@@ -704,6 +726,7 @@ def forget_sessions(sessions) -> dict:
         # The occurrence counter and any routing directions go with the
         # session's episodes: only forget-for-good removes them.
         occurrence_file(name).unlink(missing_ok=True)
+        _high_water_file(name).unlink(missing_ok=True)
     try:
         from khipu import routing_directions
 
