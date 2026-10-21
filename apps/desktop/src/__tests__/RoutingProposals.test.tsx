@@ -324,6 +324,22 @@ describe("Proposals and holds: the pure model", () => {
     expect(model.live[0].proposed).toBe("Use at most 76% of the xAI week.");
   });
 
+  it("moves a crossed proposal to the ended once it is older than 48 hours by its written time", () => {
+    const older = new Date(MORNING.getTime() - 49 * 3600 * 1000).toISOString();
+    const edge = new Date(MORNING.getTime() - 48 * 3600 * 1000).toISOString();
+    const v = view({
+      proposals: {
+        "prop-old": { id: "prop-old", entity: "rule-b", kind: "rule", n: 6, status: "crossed", at: older,
+          author: { kind: "conversation", harness: "grok_build", project: "project-d" } },
+        "prop-edge": { id: "prop-edge", entity: "rule-e", kind: "rule", n: 7, status: "crossed", at: edge,
+          author: { kind: "conversation", harness: "grok_build", project: "project-d" } },
+      },
+    });
+    const model = proposalsModel(v, MORNING);
+    expect(model.stale.map((r) => r.proposal.id)).toEqual(["prop-edge"]);
+    expect(model.ended.map((r) => r.proposal.id)).toEqual(["prop-old"]);
+  });
+
   it("counts overtaken as ended, with a label that says the owner replaced it", () => {
     const v = view({
       proposals: {
