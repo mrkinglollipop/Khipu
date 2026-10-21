@@ -8,7 +8,7 @@ The tool list is returned verbatim by the server's `tools/list`. This page group
 
 - **Locally (stdio).** The launcher is `packages/cli/bin/khipu-mcp`. `khipu integrations install` writes it into each harness's MCP config. See [Integrations](integrations.md).
 - **Over HTTPS (the gateway).** The gateway serves the same tool list. A few tools answer differently there:
-  - The five routing tools (`khipu_usage`, `khipu_route`, `khipu_route_report`, `khipu_route_rule`, `khipu_route_priority`) and the `routing` field of `khipu_status` reply `{available: false, reason}`. They are local only.
+  - `khipu_usage`, `khipu_route_report`, `khipu_route_rule`, `khipu_route_priority` and the `routing` field of `khipu_status` reply `{available: false, reason}`. `khipu_route` replies with the closed gateway projection when the owner has turned on the cloud routing copy (`routing_cloud_copy`); otherwise it too replies `{available: false, reason}`.
   - `khipu_forget` refuses only episodes whose session id starts with a local harness name (`claude_code`, `cursor`, `codex` or `aegis`); any other episode, including one with no session id, can be forgotten through it, because the gateway does not check that the episode came from a cloud harness. A stricter check is planned.
   - `khipu_capture` writes immediately (see below).
   - `khipu_owner_act` is not listed and refuses every call: owner direction needs the owner's typed turns, which only a prompt hook on the owner's Mac records.
@@ -194,8 +194,10 @@ The routing record: which accounts are open, limited (with the end time and whet
 
 | Parameter | Meaning |
 | --- | --- |
-| `since` | A version from an earlier answer. Returns only what changed after it. |
+| `since` | A version from an earlier answer. Returns only what changed after it. Not available through the gateway. |
 | `account` | Narrow to one account, by label or id. |
+| `session_id` | This conversation's own session id, for pull delivery. Through the gateway, clients sharing one token use ids unique among them, of the form `<client>:<stable id>`. |
+| `ack` | A routing batch issued to this caller, read and now acknowledged. Through the gateway an ack for another identity's batch is refused (`ack_not_yours`). |
 
 Routing write tools (`khipu_route_report`, `khipu_route_rule`, and `khipu_route_priority`) accept an optional `op` string (1–256 characters). Reuse it when retrying the same operation; use a fresh value for a new change. Without `op`, the server derives a private, salted identity from the MCP request id, tool arguments, and conversation identity. Retries keep the first event; reusing an explicit `op` with a different body is refused. `op` never changes who the server records as the author.
 
