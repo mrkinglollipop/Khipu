@@ -10,20 +10,29 @@ and an environment cleared of every harness variable, so the author Khipu
 sets comes only from what the test gives the server. Nothing here starts a
 process or reaches the hub.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import json
 import itertools
 import re
 from datetime import datetime, timedelta, timezone
 from unittest import mock
-
 import pytest
-
+from tests import routing_gateway_fixture as gateway_fixtures
 from khipu import mcp_server as ms
 from khipu import routing
 from khipu import usage as usage_mod
 from khipu.mcp_server import handle_message
+
+gateway_hub = gateway_fixtures.gateway_hub
+hub = gateway_fixtures.hub
+pg_cluster = gateway_fixtures.pg_cluster
+
+
+
+
+
+
 
 T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
 ACCOUNTS = [{"label": "Claude", "harness": "claude"},
@@ -310,7 +319,7 @@ def test_khipu_route_takes_the_same_privacy_path_as_the_cli(home, capsys):
 # ---- the gateway answers available: false until phase 7 ---------------------------------------------
 
 
-def test_the_gateway_answers_available_false(home, monkeypatch):
+def test_the_gateway_answers_available_false(home, monkeypatch, gateway_hub):
     monkeypatch.setenv(ms.GATEWAY_ACTIVE_ENV, "1")
     # No cloud routing copy is configured in this home, so the gateway
     # projection fails closed instead of answering.

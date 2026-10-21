@@ -5749,6 +5749,8 @@ def build_parser() -> argparse.ArgumentParser:
     rt_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                          help="Print JSON (writes always do)")
     rt_sub = rt.add_subparsers(dest="route_cmd")
+    copy = rt_sub.add_parser("copy", parents=[rt_json], help="Publish the closed routing copy to the hub")
+    copy.add_argument("action", choices=("publish",))
     replication = rt_sub.add_parser("replication", parents=[rt_json],
                                    help="Routing sync status, a bounded sync, or local restore with a new Mac id")
     replication.add_argument("action", choices=("status", "sync", "restore"), default="status", nargs="?")

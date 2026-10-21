@@ -72,6 +72,19 @@ Grok Bot reaches Khipu only through the HTTPS gateway, as server `khipu-cloud`, 
 
 Through the gateway there is no hook, so `khipu_capture` writes immediately and is the only way the session is remembered. A few tools are unavailable there (usage, the routing write tools, and forgetting episodes from local harnesses); `khipu_route` answers the closed gateway projection described in [Routing](routing.md) when the owner has turned on the cloud routing copy. See [MCP tools](mcp-tools.md).
 
+Cloud routing requires hub migration `0044_routing_gateway_copy.sql`, an updated
+Mac daemon with `routing_cloud_copy` enabled and a hub connection, and a gateway
+deploy. `khipu route copy publish` manually publishes the Mac's scrubbed closed
+projection. The container's own routing configuration is irrelevant. Responses
+carry the hub `as_of` and a stale mark after the publishing Mac's stale bound;
+no published row means unavailable. Give every conversation a stable, unique
+`session_id`; token labels separate clients that reuse session ids. Pull batches
+and acknowledgements persist in the hub's `routing_gateway_delivery` table, so
+container replacement retains them. A failed database/receipt transaction fails
+closed with `available: false`; no ephemeral in-container fallback accepts acks.
+Migration apply and gateway deploy remain separate operator steps.
+
+
 ## What each hook does
 
 | Hook | Event | What it does |

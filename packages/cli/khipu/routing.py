@@ -9809,6 +9809,14 @@ def poll_interval(cfg: dict | None = None) -> float | None:
 
 
 def poll_refold(now: datetime | None = None, *, on_fold=None) -> dict:
+    from khipu import routing_gateway_copy
+
+    out = _poll_refold(now, on_fold=on_fold)
+    out["gateway_copy"] = routing_gateway_copy.publish(now=now)
+    return out
+
+
+def _poll_refold(now: datetime | None = None, *, on_fold=None) -> dict:
     """One poll of the record: refold and save the view when a source or the
     log changed or ``valid_until`` has passed, else nothing. Answers
     ``{"folded", "saved", "busy", "version", "valid_until", "interval"}``:
@@ -10400,6 +10408,12 @@ def run_cli(args) -> int:
     auth = _OWNER_AUTH.set(None)
     operation_token = _OP.set(getattr(args, "op", None))
     try:
+        if cmd == "copy":
+            from khipu import routing_gateway_copy
+
+            out = routing_gateway_copy.publish(force=True, now=now)
+            _print_json(out)
+            return 0 if out["ok"] else 1
         if cmd == "replication":
             from khipu import routing_replication
 

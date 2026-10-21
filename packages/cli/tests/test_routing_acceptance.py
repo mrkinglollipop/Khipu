@@ -9,8 +9,8 @@ The tests contain no implementation of future routing behavior.
 received Claude child context, native Codex child context/parent advisory,
 and a real T3 provider switch/provider-hook doctor check.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import copy
 import io
 import itertools
@@ -23,11 +23,20 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
 import pytest
-
+from tests import routing_gateway_fixture as gateway_fixtures
 from khipu import agent_view, mcp_server, recall_prompt, recall_rule, routing, routing_delegation
 from scripts.routing_fixture_sanitize import FixtureError, load_pace, load_replay, main, sanitize
+
+gateway_hub = gateway_fixtures.gateway_hub
+hub = gateway_fixtures.hub
+pg_cluster = gateway_fixtures.pg_cluster
+
+
+
+
+
+
 
 
 T0 = datetime(2026, 10, 20, 14, tzinfo=timezone.utc)
@@ -134,7 +143,10 @@ class Replay:
 
 
 @pytest.fixture
-def replay(tmp_path, monkeypatch):
+def replay(tmp_path, monkeypatch, request):
+    disposable_gateway = "gateway_hub" in request.fixturenames
+    if disposable_gateway:
+        request.getfixturevalue("gateway_hub")
     for name in ("KHIPU_ISOLATED_DIR", "ROUTING_NOW_OFF", "KHIPU_SESSION_ID", "KHIPU_HARNESS",
                  "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_HOME",
                  "CLAUDE_CONFIG_DIR", "KHIPU_DATABASE_URL", "ALZY_DATABASE_URL", "GEMINI_API_KEY",
@@ -154,7 +166,8 @@ def replay(tmp_path, monkeypatch):
     monkeypatch.setattr(socket, "create_connection", forbidden)
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     from khipu import db
-    monkeypatch.setattr(db, "connect", forbidden)
+    if not disposable_gateway:
+        monkeypatch.setattr(db, "connect", forbidden)
     yield Replay(tmp_path / "mac-a", monkeypatch)
     assert not attempted, "a production fail-open handler swallowed a forbidden connection/process attempt"
 
@@ -1221,10 +1234,12 @@ def test_12_not_installed_on_mac_b_leaves_mac_a_open(replay):
 
 
 @pytest.mark.parametrize("contract", ["projection", "foreign-delivery", "foreign-ack", "owner-write"])
-def test_13_gateway_projection(replay, monkeypatch, contract):
+def test_13_gateway_projection(replay, monkeypatch, contract, gateway_hub):
     replay.configure(routing_cloud_copy=True, routing_cloud_copy_rules=True, routing_cloud_copy_hold_words=True)
     routing.add_rule("owner words at " + str(replay.root / "private-login"), via="app")
     routing.set_note("owner note", via="app")
+    from khipu import routing_gateway_copy
+    assert routing_gateway_copy.publish(force=True)["ok"]
     monkeypatch.setenv(mcp_server.GATEWAY_ACTIVE_ENV, "1")
     error, body = replay.call()
     assert not error
@@ -1259,7 +1274,7 @@ def leaves(value):
 
 GATEWAY_FIELDS = {
     "root": {"available", "about", "record", "version", "epoch", "accounts", "holds", "rules", "note", "priority",
-             "delivery", "routing_changes", "folded_at", "valid_until"},
+             "delivery", "routing_changes", "folded_at", "valid_until", "as_of", "stale", "stale_message"},
     "accounts": {"id", "label", "state", "basis", "until", "at", "line", "witness", "models", "pace"},
     "witness": {"source", "state", "basis", "at", "until", "window", "used_pct"},
     "models": {"model", "state", "basis", "until", "at", "line", "witness"},
@@ -1340,7 +1355,7 @@ def test_14_scanner_live_claims_and_false_positives(replay, line, flag):
 
 @pytest.mark.parametrize("condition", ["budget-stall", "lease-expired-twice", "ack-unshown", "prompt-skips",
                                       "cross-mac-stale", "gateway-stale", "unmatched-limit"])
-def test_15_health_red_and_recovery(replay, condition):
+def test_15_health_red_and_recovery(replay, condition, gateway_hub):
     from khipu import routing_delivery, routing_replication
 
     def outcomes(skips=0):
@@ -1377,6 +1392,8 @@ def test_15_health_red_and_recovery(replay, condition):
             routing_replication._save({"caught_up_at": routing._iso(replay.now - timedelta(hours=1))})
         elif condition == "gateway-stale":
             replay.configure(routing_cloud_copy=True)
+            from khipu import routing_gateway_copy
+            assert routing_gateway_copy.publish(force=True)["ok"]
             replay.patch.setenv("KHIPU_HARNESS", "gateway")
             replay.patch.setenv(mcp_server.GATEWAY_ACTIVE_ENV, "1")
             replay.patch.setattr(mcp_server, "_GATEWAY_ACTIVE", True)
@@ -1404,10 +1421,13 @@ def test_15_health_red_and_recovery(replay, condition):
     elif condition == "cross-mac-stale":
         routing_replication._save({"caught_up_at": routing._iso(replay.now)})
     elif condition == "gateway-stale":
-        # A fresh source check and gateway delivery prove a current copy.
+        # Publication precedes the gateway read; it never refolds on the gateway.
+        from khipu import routing_gateway_copy
+        assert routing_gateway_copy.publish(force=True)["ok"]
         body = replay.pull(session_id="client:health")
         if body.get("routing_changes"):
             replay.pull(session_id="client:health", ack=body["routing_changes"]["batch"])
+        assert routing_gateway_copy.publish(force=True)["ok"]  # fetch closed receipt metadata
     else:
         outcomes()
     assert routing.doctor_block(now=replay.now)["routing_delivery"]["status"] == "green"

@@ -177,6 +177,11 @@ STORES: tuple[Store, ...] = (
           "khipu route priority clear) or in Settings → Routing, not by forgetting an episode; "
           "forget lists each copy as kept and an unreadable routing folder keeps the forget open",
           _w("routing_replication._atomic")),
+    Store("routing gateway publisher state", "data folder state/routing/gateway-copy.json, gateway-publishers.json and .gateway-copy-* rewrites",
+          "current and historical salted publisher ids, projection hashes, revision times, retry counters "
+          "and bounded gateway health metadata; no words",
+          "none: publication bookkeeping holds no capture text",
+          _w("routing_gateway_copy._save")),
     Store("routing scan report", "data folder state/routing/scan-report.json, written atomically "
           "through a unique temp file in the same folder",
           "routing copies found in files: file paths shown relative to home or their repo root, "

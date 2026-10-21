@@ -247,6 +247,80 @@ Settings > Routing has a switch for this and a **Check now** button per account.
 
 Five tools. Locally all five work as below. Through the HTTPS gateway, `khipu_route` answers only the closed gateway projection (account labels and states, structured holds, and — under their switches — owner hold words, the confirmed rules and note, and the confirmed priority; paths are cut even inside owner words, and pending proposals never appear), and only when the owner has turned on `routing_cloud_copy`. The other routing tools and `khipu_owner_act` answer `available: false` there, and every owner write is refused. A gateway caller's identity is its token label plus its `session_id`: it sees only its own delivery state, and an ack for another identity's batch is refused (`ack_not_yours`). `since` is not available through the gateway. See [MCP tools](mcp-tools.md) for the full list.
 
+The cloud copy is **published by the Mac**, not folded in the gateway container.
+Migration `0044_routing_gateway_copy.sql` adds `routing_gateway_copies`, one
+current row per salted publisher identity, plus `routing_gateway_delivery` for
+receipts. Apply the migration to the hub before deploying the gateway. This
+change does not apply a migration or deploy anything itself. The Mac must also
+run the updated daemon and have its hub connection configured.
+
+With `routing_cloud_copy` on, each daemon routing poll considers publication,
+including polls that do not refold. Changes use a trailing
+`routing_cloud_copy_debounce` (30 seconds by default); failures retry with
+bounded exponential backoff. An unchanged copy gets a heartbeat at most every
+60 seconds (or half the stale bound when shorter). `khipu route copy publish`
+forces an immediate attempt, bypassing debounce/backoff. Lock contention skips
+that tick without changing health or starting backoff; actual publication and
+revocation failures remain retryable errors.
+
+A salted publisher id change (including Mac-id restore) first deletes all
+retired ids known to this Mac before adopting the replacement. The full set of
+used ids is kept in both publication state and an independent durable
+`gateway-publishers.json` journal. Turning the switch off deletes every recorded
+id plus the id recomputed from the persisted salt and Mac id, even if
+`gateway-copy.json` is missing or corrupt. Deletion failures preserve the ids
+for retry; another Mac's row is never included. Completed revocations retain
+the history and skip redundant daemon deletes. A Mac without a persisted
+routing identity or recorded publisher stays offline when the switch is off;
+an existing identity with lost publication state gets one speculative cleanup
+only when a hub is configured. Its attempt marker is saved before the delete;
+a failure is recorded but never retried on idle ticks, even after its retry time.
+These ticks write no files and contact no hub. Publishing again clears the
+speculative-cleanup marker. In contrast, recorded publisher ids remain pending
+until revocation succeeds, and delete retries honor `retry_at` before taking a
+lock or rewriting state. A forced manual publish bypasses that backoff for
+recorded publishers. Without a configured hub, recomputed-id cleanup does not
+create files or contact the hub.
+
+Only `gateway_projection` computed with the **Mac's** switches and then strictly
+scrubbed is uploaded. `routing_cloud_copy_rules` controls confirmed rules, note
+and priority; `routing_cloud_copy_hold_words` controls owner hold words.
+Conversation hold words, proposals, login paths, session/project names, raw Mac
+ids and private history never enter that payload. The hub receives a salted
+publisher hash as bookkeeping; it is never returned through the gateway.
+
+The gateway reads the newest hub row (hub publication time, then publisher hash
+for ties), never its local routing log or switches. It returns `as_of` from the
+hub publication time, plus `stale: true` and a last-report message once that time
+exceeds the publishing Mac's `routing_cloud_copy_stale_after`. No row returns
+`available: false` with the existing cloud-copy reason. The hub copy is a
+snapshot: a disconnected Mac cannot update time-driven account changes, so
+clients must honor its stale mark.
+
+Pull delivery persists in `routing_gateway_delivery` in the hub, keyed by a
+hash of the authenticated token label and session id. No receipt depends on a
+container filesystem or volume. One batch covers the full selected projection;
+its digest includes the published epoch/revision, contents and account filter.
+A resend keeps the batch id until acknowledged or its 60-second lease expires.
+Foreign acknowledgements are refused; duplicates are harmless; unknown/expired
+acks consume nothing. Receipt changes commit before a response reports them.
+A missing table, database outage or failed receipt commit returns
+`available: false` with a fixed durable-ledger-unavailable reason. It never
+accepts an ack in memory and silently loses it on restart. Owner writes remain
+refused. Receipt rows inactive for more than seven days are pruned in batches
+of at most 1,000 during gateway delivery and health refreshes. A live in-flight
+lease is retained. At the retention boundary receipts remain; after pruning,
+an old ack is unknown and consumes nothing, and the full current copy is offered
+again.
+
+The Mac refreshes receipt health at most once a minute during normal publishing;
+a forced manual publish refreshes it immediately. SQL returns health fields
+only, restricted to the configured live-delivery window (at most seven days)
+and at most 512 rows. A probe for one additional row detects truncation, which
+makes health unknown with a named missing-evidence reason. Batch and ack history
+never travel back to the Mac. Health display itself never contacts the hub.
+
+
 | Tool | What it does |
 | --- | --- |
 | `khipu_route` | Reads the record: account states, rules, holds. Takes `since` (only what changed after a version) and `account`. Read-only. |
@@ -412,8 +486,9 @@ are off. Enabled copies without timestamps, unreadable ledgers, absent live
 identities and missing hook outcomes say `unknown` with named missing evidence,
 never green. A gateway identity outside the 12-hour delivery liveness window no
 longer supplies copy evidence. A gateway response carrying the current local
-revision proves recovery; an unchanged record stays fresh while its callers are
-idle. A newly folded revision starts the gateway staleness clock even when a
+revision proves delivery recovery. An unchanged record stays fresh while its
+Mac keeps publishing heartbeats, even if callers are idle. Publication age
+past the stale bound is independently red, including when clients are inactive. A newly folded revision starts the gateway staleness clock even when a
 client last pulled much earlier. Simply calling health
 cannot refresh evidence.
 
