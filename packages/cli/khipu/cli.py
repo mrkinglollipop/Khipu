@@ -5830,6 +5830,14 @@ def build_parser() -> argparse.ArgumentParser:
     rcap.add_argument("--revision", default=None)
     rcap.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rcap)
+    radv = rt_sub.add_parser("advise", parents=[rt_json],
+                             help="Launch advice per account (advisory only; it never blocks anything)")
+    radv.add_argument("account", nargs="?", default=None, help="One account (its label or its id)")
+    radv.add_argument("--lane", default=None, help="One job runner lane")
+    radv.add_argument("--tier", default=None, choices=("opus", "sonnet", "haiku"))
+    radv.add_argument("--kind", default=None, choices=("build", "fix", "check"))
+    radv.add_argument("--privacy", action="store_true", help="The work is privacy-sensitive")
+    radv.add_argument("--purpose", default="job", choices=("job", "orchestration"))
 
     for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule, rdef, rtier, rcap):
         writer.add_argument("--op", default=None, help="Retry identity; reuse for the same change")

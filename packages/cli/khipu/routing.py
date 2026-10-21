@@ -5554,6 +5554,70 @@ def cap_line_for(view: dict, entry: dict, now: datetime) -> str | None:
     return None
 
 
+def _lane_account_key(lane: str, view: dict) -> str:
+    """The account key a lane name resolves to, or a refusal naming its
+    candidates. A lane is never guessed: an ambiguous name stays unmatched."""
+    raw = str(lane or "").strip()
+    entries = list(view.get("accounts") or [])
+    by_label = [e for e in entries if e.get("label", "").casefold() == raw.casefold()]
+    if len(by_label) == 1:
+        return by_label[0]["key"]
+    candidates: list[str] = []
+    for item in view.get("unmatched") or []:
+        if item.get("lane") == raw:
+            candidates += [c for c in item.get("candidates") or []]
+    providers = (view.get("definitions") or {}).get("providers") or {}
+    rows = providers.values() if isinstance(providers, dict) else providers
+    for provider in rows:
+        if isinstance(provider, dict) and (provider.get("id") == raw.lower()
+                                           or raw in (provider.get("lane_names") or [])):
+            candidates += [account_id(e["key"]) for e in entries if e.get("harness") == provider.get("id")]
+    keys = []
+    for candidate in dict.fromkeys(candidates):
+        keys += [e["key"] for e in entries if account_id(e["key"]) == candidate]
+    if len(keys) == 1:
+        return keys[0]
+    if keys:
+        raise RouteError(f"lane {raw!r} matches more than one account; name the account instead")
+    raise RouteError(f"Khipu doesn't know the lane you named ({raw}); name an account or a matched lane")
+
+
+def advise(account: str | None = None, *, lane: str | None = None, tier: str | None = None,
+           kind: str | None = None, privacy: bool = False, purpose: str = "job",
+           now: datetime | None = None, view: dict | None = None, environ: dict | None = None) -> dict:
+    """Launch advice (slice 17c): ``go``, ``hold_back``, ``not_eligible`` or
+    ``closed`` per account, ranked in the owner's priority order. Advisory
+    only — this never blocks, refuses, permits or launches anything. A
+    dispatched job claiming ``orchestration`` is answered as a job."""
+    from khipu import routing_advice
+
+    if tier is not None and tier not in routing_advice.TIERS:
+        raise RouteError("tier must be opus, sonnet or haiku")
+    if kind is not None and kind not in routing_advice.KINDS:
+        raise RouteError("kind must be build, fix or check")
+    if purpose not in routing_advice.PURPOSES:
+        raise RouteError("purpose must be job or orchestration")
+    now = now or _now()
+    view = read_view(now) if view is None else view
+    dispatched = routing_advice.is_dispatched(environ)
+    effective = routing_advice.effective_purpose(purpose, dispatched)
+    target = None
+    if account:
+        target = _account_for_a_conversation(account, accounts() + list(view.get("accounts") or []))
+    elif lane:
+        target = _lane_account_key(lane, view)
+    ranked = routing_advice.rank(view, now, purpose=effective, tier=tier, kind=kind,
+                                 privacy=privacy, target_key=target)
+    out: dict = {"purpose": effective, "requested_purpose": purpose, "dispatched": dispatched,
+                 "tier": tier, "kind": kind, "privacy": bool(privacy), "ranked": ranked,
+                 "about": ABOUT, "advisory": True}
+    if target is not None and ranked:
+        out.update({k: ranked[0][k] for k in
+                    ("account", "label", "verdict", "reason", "evidence", "numbers", "caps",
+                     "eligible", "why_eligible")})
+    return out
+
+
 _OP = contextvars.ContextVar("routing_operation", default=None)
 
 
@@ -7894,8 +7958,11 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
 
     cfg = settings()
     out = dict(view, generated_at=_iso(now))
+    from khipu import routing_advice
+
     out["accounts"] = [_with_authors(dict(e, line=account_line(e, now, push=False),
-                                          cap_statuses=cap_statuses(view, e, now)))
+                                          cap_statuses=cap_statuses(view, e, now),
+                                          advice=routing_advice.account_advice(view, e, now)))
                        for e in view["accounts"] if account is None or e["key"] == account]
     out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
     # A pending rule's requester as the fold keeps it, for Khipu's own
@@ -8218,6 +8285,10 @@ def _public_account(entry: dict, now: datetime, view: dict | None = None) -> dic
     out["last_seen"] = _pick(entry.get("last_seen"), _LAST_SEEN_FIELDS)
     out["underlying"] = _pick(entry.get("underlying"), ("state", "until", "basis"))
     out["pace"] = [dict(p) for p in entry.get("pace") or []]
+    if view is not None:
+        from khipu import routing_advice
+
+        out["advice"] = routing_advice.account_advice(view, entry, now)
     out["line"] = account_line(entry, now, push=False)
     return out
 
@@ -8856,7 +8927,7 @@ def prompt_imports() -> None:
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
     from khipu import (  # noqa: F401
-        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_advisory, routing_delivery, routing_pace, routing_providers, routing_sources,
+        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_advice, routing_advisory, routing_delivery, routing_pace, routing_providers, routing_sources,
         session_capture, usage)
 
 
@@ -9227,6 +9298,7 @@ def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = N
             out = _prompt_text(marker, view, now, cfg, session_id=session_id)
             if not out.pop("_reserved", False):
                 out = _pace_push_adjust(out, view, now, session, marker.component)
+                out = _advice_push_adjust(out, view, now, session, marker.component)
                 out = routing_delivery.offer(routing_delivery.plan(out, view, now, cfg, session=session),
                                              session=session, component=marker.component)
             return dict(out, _delivery_view=view, _reserved=True)
@@ -9261,6 +9333,44 @@ def _pace_push_adjust(out: dict, view: dict, now: datetime, session: str, compon
         text = CHANGES_HEADING.format(at=_clock(now, now)) + "\n" + "\n".join(lines[e] for e in pushes)
         out.update(kind="changes", text=_for_agents(text, view), count=len(pushes),
                    owed_entities=list(pushes), shown_entities=list(pushes))
+    return out
+
+
+def _advice_push_adjust(out: dict, view: dict, now: datetime, session: str, component: str) -> dict:
+    """Offer an advice line when the advice for an account in this
+    conversation's priority changed since the last acknowledged advice,
+    under the same acknowledged-forecast discipline as pace pushes."""
+    from khipu import routing_advice, routing_delivery
+
+    priority_keys = {e.get("account") for e in (view.get("priority") or {}).get("entries") or []}
+    if not priority_keys:
+        return out
+    current: dict[str, dict] = {}
+    for entry in view.get("accounts") or []:
+        if entry["key"] in priority_keys:
+            current[f"advice:{entry['key']}"] = routing_advice.account_advice(view, entry, now)
+    if not current:
+        return out
+    acked = routing_delivery.snapshot(session, component).get("advice_acked") or {}
+
+    def sig(item):
+        return (item.get("verdict"), item.get("reason"), item.get("evidence")) if item else None
+
+    pushes = {e: a for e, a in current.items() if sig(acked.get(e)) != sig(a)}
+    if out.get("kind") == "full":
+        return dict(out, advice_forecasts=current)
+    if not pushes:
+        return out
+    lines = [routing_advice.advice_line(pushes[e]) for e in pushes]
+    out = dict(out, advice_forecasts=pushes)
+    if out.get("kind") == "none":
+        text = CHANGES_HEADING.format(at=_clock(now, now)) + "\n" + "\n".join(lines)
+        out.update(kind="changes", text=_for_agents(text, view), count=len(pushes),
+                   owed_entities=list(pushes), shown_entities=list(pushes))
+    elif out.get("kind") == "changes" and out.get("text"):
+        out.update(text=out["text"] + "\n" + "\n".join(lines),
+                   shown_entities=list(dict.fromkeys([*(out.get("shown_entities") or []), *pushes])),
+                   owed_entities=list(dict.fromkeys([*(out.get("owed_entities") or []), *pushes])))
     return out
 
 
@@ -9982,6 +10092,18 @@ def run_cli(args) -> int:
             return 0
         if cmd == "check":
             _print_json(check_account(args.account, now=now))
+            return 0
+        if cmd == "advise":
+            out = advise(args.account, lane=getattr(args, "lane", None), tier=getattr(args, "tier", None),
+                         kind=getattr(args, "kind", None), privacy=bool(getattr(args, "privacy", False)),
+                         purpose=getattr(args, "purpose", "job") or "job", now=now)
+            if getattr(args, "json", False):
+                _print_json(out)
+            else:
+                for row in out["ranked"]:
+                    print(f"{row['rank']}. {row['label']}: {row['verdict'].replace('_', ' ')} "
+                          f"({row['reason']}; evidence {row['evidence']}; {row['why_ranked']})")
+                print(ABOUT)
             return 0
         if cmd == "wait":
             timeout = None
