@@ -119,6 +119,25 @@
   font-size: var(--t-sm); color: var(--text-2); }
 .route-settings .lane-form { grid-column: 3 / -1; display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
 
+/* Proposals and holds (routing slice 15b): a proposal's words beside the
+   owner's, its actions under it, and the end-or-keep choices.
+   docs/mockups/2026-10-21-routing/mock.css ".prop", ".side" and ".choice". */
+.route-settings .mrow.prop { grid-template-columns: 7.5rem minmax(0, 1fr) auto; }
+.route-settings .mrow.prop .acts { grid-column: 2 / -1; display: flex; gap: var(--s2); flex-wrap: wrap; margin-top: var(--s1); }
+.route-settings .mrow.prop .route-confirm,
+.route-settings .mrow.prop .route-pause { grid-column: 1 / -1; }
+.route-settings .prop-side { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s2); margin-top: var(--s1); grid-column: 2 / -1; }
+.route-settings .prop-side > div { border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s2) var(--s3); background: var(--surface-2); font-size: var(--t-sm); line-height: 1.5; color: var(--text); white-space: pre-line; }
+.route-settings .prop-side .cap { display: block; font-size: var(--t-xs); color: var(--muted); font-weight: 600; margin-bottom: 2px; }
+.route-settings .route-choice { margin-top: var(--s2); padding: var(--s3); border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); border-radius: var(--r-sm); background: var(--warn-soft); display: flex; flex-direction: column; gap: var(--s2); }
+.route-settings .route-choice fieldset { border: 0; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--s1); }
+.route-settings .route-choice legend { padding: 0; margin-bottom: var(--s1); font-weight: 600; color: var(--text); font-size: var(--t-sm); }
+.route-settings .route-choice label { display: flex; gap: var(--s2); align-items: baseline; font-size: var(--t-sm); color: var(--text); }
+.route-settings .route-choice input[type="radio"] { width: auto; height: auto; margin: 0; flex: none; transform: translateY(2px); }
+@media (max-width: 1100px) {
+  .route-settings .prop-side { grid-template-columns: 1fr; }
+}
+
 /* Checks and copies (routing slice 15d): an advisory row is its sentence and,
    at the right, at most one tag; its explanation takes the line below.
    docs/mockups/2026-10-21-routing/mock.css ".adv" and ".tiers". */

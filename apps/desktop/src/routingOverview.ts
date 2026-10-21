@@ -8,6 +8,7 @@
 
 import { accountClassification, brokenRules, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
 import type { PlanFact, RouteProvider, RouteView } from "./routing";
+import { proposalsModel } from "./routingProposals";
 import { checksLine, checksModel } from "./routingChecks";
 import { keptWindow, passingGapHeld, planStatus } from "./PlansCard";
 import type { UsageAccount, UsageReport } from "./PlansCard";
@@ -21,7 +22,7 @@ export const GROUPS: ReadonlyArray<{ key: GroupKey; name: string; record: boolea
   { key: "accounts", name: "Accounts", record: true },
   { key: "priority", name: "Priority and pace", record: true },
   { key: "rules", name: "Your note and standing rules", record: true },
-  { key: "holds", name: "Holds", record: true },
+  { key: "holds", name: "Proposals and holds", record: true },
   { key: "checks", name: "Checks and copies", record: true },
   { key: "telling", name: "Telling conversations", record: false },
   { key: "resets", name: "Checking for resets", record: false },
@@ -213,18 +214,29 @@ export function routingProblems(
     });
   }
   if (plansError && !plans) out.push({ key: "plans-read", group: "accounts", kind: "plans-read", tone: "warn" });
+  // Live proposals (slice 15b) already give every pending rule and the
+  // pending priority one Needs you line below; a pending thing a live
+  // proposal covers must not be counted again under its own group.
+  const proposals = proposalsModel(view, now);
+  const coveredPriority = proposals.live.some((r) => r.proposal.kind === "priority");
+  const coveredRule = (n: number, entity?: string) =>
+    proposals.live.some((r) => r.proposal.kind === "rule" && (r.proposal.entity === entity || r.proposal.n === n));
   if (view.priority?.pending) {
     out.push({ key: "priority", group: "priority", kind: "priority", tone: "warn",
-      needs: "A conversation changed your priority: confirm or undo it", show: "the priority to confirm", item: "priority:pending" });
+      ...(coveredPriority
+        ? {}
+        : { needs: "A conversation changed your priority: confirm or undo it", show: "the priority to confirm" }),
+      item: "priority:pending" });
   }
   const toConfirm = (view.rules ?? []).filter((r) => r.pending || (r.seeded && !r.confirmed));
   for (const r of toConfirm) out.push({ key: `confirm:${r.n}`, group: "rules", kind: "confirm", tone: "warn" });
-  if (toConfirm.length) {
-    // One Needs you line for all of them, pointing at the first.
-    const first = out.find((p) => p.kind === "confirm")!;
-    first.needs = toConfirm.length === 1 ? "1 standing rule to confirm" : `${toConfirm.length} standing rules to confirm`;
-    first.show = toConfirm.length === 1 ? "the standing rule to confirm" : "the standing rules to confirm";
-    first.item = `rule:${toConfirm[0].n}`;
+  const uncovered = toConfirm.filter((r) => !coveredRule(r.n, r.entity));
+  if (uncovered.length) {
+    // One Needs you line for the uncovered ones only, pointing at the first.
+    const first = out.find((p) => p.key === `confirm:${uncovered[0].n}`)!;
+    first.needs = uncovered.length === 1 ? "1 standing rule to confirm" : `${uncovered.length} standing rules to confirm`;
+    first.show = uncovered.length === 1 ? "the standing rule to confirm" : "the standing rules to confirm";
+    first.item = `rule:${uncovered[0].n}`;
   }
   for (const { rule, checks } of brokenRules(view)) {
     const said = (checks[0]?.text ?? "").replace(/^A standing rule may be broken: /, "").replace(/\.$/, "");
@@ -233,6 +245,13 @@ export function routingProblems(
       needs: `Standing rule ${rule} may be broken${said ? `: ${said}` : r ? `: it says ${ruleWords(r.text)}` : ""}`,
       show: `standing rule ${rule}`, item: `rule:${rule}` });
   }
+  proposals.live.forEach((row, i) => {
+    out.push({ key: `proposal:${row.proposal.id}`, group: "holds", kind: "proposal", tone: "warn",
+      ...(i === 0
+        ? { needs: proposals.live.length === 1 ? "1 proposal from a conversation to confirm" : `${proposals.live.length} proposals from conversations to confirm`,
+            show: "the proposals from conversations", item: `proposal:${row.proposal.id}` }
+        : { item: `proposal:${row.proposal.id}` }) });
+  });
   for (const h of view.holds ?? []) {
     if (h.remind) {
       out.push({ key: `hold:${h.id}`, group: "holds", kind: "remind", tone: "warn",
@@ -284,6 +303,7 @@ const TAG_WORDS: Record<string, (n: number) => string> = {
   priority: () => "To confirm",
   confirm: (n) => `${n} to confirm`,
   broken: (n) => `${n} may be broken`,
+  proposal: (n) => (n === 1 ? "1 to confirm" : `${n} to confirm`),
   remind: (n) => plural(n, "hold to look at", "holds to look at"),
   silent: (n) => `${n} stopped reporting`,
   unreadable: (n) => `${n} can't be read`,
@@ -345,14 +365,19 @@ function rulesLine(view: RouteView): string {
 
 function holdsLine(view: RouteView, now: Date): string {
   const holds = view.holds ?? [];
-  if (!holds.length) return "None";
-  const next = holds
-    .map((h) => h.until)
-    .filter((u): u is string => !!u && !Number.isNaN(new Date(u).getTime()))
-    .sort((a, b) => new Date(a).getTime() - new Date(b).getTime())[0];
-  const head = plural(holds.length, "hold", "holds");
-  if (!next) return `${head}, each until you clear it`;
-  return `${head}, the ${holds.length === 1 ? "hold" : "next"} ends ${whenLocal(next, now)}`;
+  const proposals = proposalsModel(view, now);
+  const parts: string[] = [];
+  if (proposals.live.length) parts.push(`${plural(proposals.live.length, "proposal", "proposals")} in use`);
+  const crossed = proposals.stale.filter((r) => r.proposal.status === "crossed").length;
+  if (crossed) parts.push(`${crossed} crossed`);
+  if (holds.length) {
+    const next = holds
+      .map((h) => h.until)
+      .filter((u): u is string => !!u && !Number.isNaN(new Date(u).getTime()))
+      .sort((a, b) => new Date(a).getTime() - new Date(b).getTime())[0];
+    parts.push(next ? `${plural(holds.length, "hold", "holds")}, the next ends ${whenLocal(next, now)}` : `${plural(holds.length, "hold", "holds")}, each until you clear it`);
+  }
+  return parts.length ? parts.join(" · ") : "No proposals · no holds";
 }
 
 function tellingLine(s: OverviewSettings): string {
