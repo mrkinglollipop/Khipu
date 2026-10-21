@@ -182,6 +182,16 @@ def test_delegate_task_with_routing_in_brief_gets_no_advisory(delegation_home):
     assert ADVISORY not in _delegate(delegation_home, brief)
 
 
+@pytest.mark.parametrize("brief", [
+    "Routing at the edge of the network, the build host moves first. " + BRIEF,
+    "## Routing table for this job\n" + BRIEF,
+    "Before starting, see Khipu's routing record docs for background. " + BRIEF,
+])
+def test_delegate_task_with_prose_mentioning_routing_still_gets_advisory(delegation_home, brief):
+    routing.add_rule("synthetic owner rule", via="app")
+    assert ADVISORY in _delegate(delegation_home, brief)
+
+
 def test_delegate_task_to_hooked_t3_provider_gets_no_advisory(delegation_home):
     routing.add_rule("synthetic owner rule", via="app")
     assert ADVISORY not in _delegate(delegation_home, BRIEF, hooked=True)

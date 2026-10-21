@@ -206,6 +206,12 @@ def test_changed_log_prompt_with_source_append_reads_and_orders_once(replay, mon
 
     # The helper's preparation is outside the prompt's measured read boundary.
     agent_view.prepare_routing_table(refresh=True)
+    # ...but preparation may itself read the log (a definition makes the
+    # inventory ask for the record's definitions) and leave the parsed events
+    # in ``_ENTRY_INPUTS``. Whether it gets that far depends on its own 250 ms
+    # deadline, so start the measured prompt from a cold entry cache: the one
+    # read and one ordering counted below must be the prompt's own.
+    monkeypatch.setattr(routing, "_ENTRY_INPUTS", {})
     monkeypatch.setattr(routing, "_read_event_lines", counted_read)
     monkeypatch.setattr(routing, "_in_write_order", counted_order)
     replay.advance(1)

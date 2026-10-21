@@ -119,6 +119,21 @@
   font-size: var(--t-sm); color: var(--text-2); }
 .route-settings .lane-form { grid-column: 3 / -1; display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
 
+/* Checks and copies (routing slice 15d): an advisory row is its sentence and,
+   at the right, at most one tag; its explanation takes the line below.
+   docs/mockups/2026-10-21-routing/mock.css ".adv" and ".tiers". */
+.route-settings .mrow .sub { grid-column: 2 / -1; color: var(--text-2); font-size: var(--t-sm); }
+.route-settings .mrow.adv { grid-template-columns: minmax(0, 1fr) auto; }
+.route-settings .mrow.adv .sub { grid-column: 1 / -1; }
+.route-settings .tiers {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 var(--s5); margin: 0;
+  padding: var(--s2) var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface); font-size: var(--t-sm);
+}
+.route-settings .tiers > div { display: flex; justify-content: space-between; gap: var(--s3); padding: 3px 0; border-bottom: 1px dotted var(--border); }
+.route-settings .tiers dt { color: var(--text-2); }
+.route-settings .tiers dd { margin: 0; color: var(--text); font-weight: 600; }
+
 /* Headings moved up a level so none is skipped; the look stays the same. */
 .route-settings h2.sub-title { margin: var(--s3) 0 var(--s1); font-size: var(--t-sm); font-weight: 600; color: var(--text-2); letter-spacing: 0; text-transform: none; line-height: 1.4; }
 .route-settings .section-body > h2.sub-title:first-child { margin-top: 0; }

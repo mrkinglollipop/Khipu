@@ -35,8 +35,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.rule.dismiss": (("rule",), ()),
     "route.hold.add": (("text", "reason", "scope"), ("account", "until")),
     "route.hold.end": (("hold",), ()),
-    "route.cap.set": (("account", "window", "kind", "pct"), ("revision",)),
-    "route.cap.remove": (("account", "window", "kind"), ()),
+    "route.cap.set": (("account", "kind"), ("window", "pct", "slack", "usd", "days", "n", "revision")),
+    "route.cap.remove": (("account", "kind"), ("window",)),
     "route.priority.set": (("entries",), ("until", "expect", "holds")),
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
@@ -164,10 +164,26 @@ def _values(action: str, args) -> dict:
                     raise _bad("pct must be a number above 0 and at most 100") from None
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 100:
                 raise _bad("pct must be a number above 0 and at most 100")
+        elif action.startswith("route.cap.") and key in ("slack", "usd", "days"):
+            if isinstance(value, str):
+                try:
+                    value = float(value)
+                except ValueError:
+                    raise _bad(f"{key} must be a number") from None
+            low = 0 if key == "slack" else 0
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not low <= value or (key == "slack" and value > 100) or (key != "slack" and value <= 0):
+                raise _bad(f"{key} is out of range for a cap")
+        elif action.startswith("route.cap.") and key == "n":
+            if isinstance(value, str) and value.strip().isdigit():
+                value = int(value.strip())
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise _bad("n must be a whole number at least 1")
         elif action.startswith("route.cap.") and key == "window" and value not in ("weekly", "five_hour"):
             raise _bad("window must be weekly or five_hour")
-        elif action.startswith("route.cap.") and key == "kind" and value not in ("share", "per_day"):
-            raise _bad("kind must be share or per_day")
+        elif action.startswith("route.cap.") and key == "kind" \
+                and value not in ("share", "per_day", "pace_target", "spend", "concurrency"):
+            raise _bad("kind must be share, per_day, pace_target, spend or concurrency")
         elif key in _FLAGS:
             if not isinstance(value, bool):
                 raise _bad(f"{key} must be true or false")
@@ -181,6 +197,13 @@ def _values(action: str, args) -> dict:
         if choices and value not in choices:
             raise _bad(f"{key} must be one of: {', '.join(choices)}")
         out[key] = value
+    if action == "route.cap.set":
+        from khipu.routing_pace import _CAP_FIELDS
+
+        used = _CAP_FIELDS.get(out.get("kind")) or set()
+        extra = sorted(set(out) & {"pct", "slack", "usd", "days", "n"} - used)
+        if extra:
+            raise _bad(f"a {out.get('kind')} cap does not take {', '.join(extra)}")
     return out
 
 
@@ -251,7 +274,8 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     if action == "route.hold.end":
         return ["route", "hold"], ["end", v["hold"]]
     if action.startswith("route.cap."):
-        return ["route", "cap", verb, *_opts(v, "window", "kind", "pct", "revision")], [v["account"]]
+        return ["route", "cap", verb, *_opts(v, "window", "kind", "pct", "slack", "usd", "days", "n",
+                                             "revision")], [v["account"]]
     if action.startswith("route.priority."):
         return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
     if action == "route.tier_table.set":
