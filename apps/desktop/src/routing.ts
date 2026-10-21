@@ -524,6 +524,9 @@ export type RouteView = {
     scanned_at?: string | null;
     files_checked: number;
     hits: { file: string; line: number; quote: string; superseded: boolean }[];
+    hits_total?: number;
+    more_not_shown?: number;
+    too_large?: string[];
   };
   /** Open owed directions, projected for this Mac's owner only (slice 19a). */
   unreached_directions?: {

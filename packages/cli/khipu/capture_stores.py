@@ -165,9 +165,10 @@ STORES: tuple[Store, ...] = (
           "khipu route priority clear) or in Settings → Routing, not by forgetting an episode; "
           "forget lists each copy as kept and an unreadable routing folder keeps the forget open",
           _w("routing_replication._atomic")),
-    Store("routing scan report", "data folder state/routing/scan-report.json and its .json.tmp rewrite",
-          "routing copies found in files: file paths shown from home, line numbers and clipped "
-          "quoted owner words",
+    Store("routing scan report", "data folder state/routing/scan-report.json, written atomically "
+          "through a unique temp file in the same folder",
+          "routing copies found in files: file paths shown relative to home or their repo root, "
+          "line numbers and clipped quoted owner words, plus hit counts and too-large file names",
           "kept: routing copies have no episode provenance; they are the scanner's report of "
           "words in the owner's own files, replaced on the next scan and removed by deleting "
           "state/routing/scan-report.json, not by forgetting an episode",

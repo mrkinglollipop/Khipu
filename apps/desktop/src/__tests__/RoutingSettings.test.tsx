@@ -1307,6 +1307,22 @@ describe("Settings -> Routing: checks and copies", () => {
     expect(screen.queryByText("Nothing to fix")).toBeNull();
   });
 
+  it("shows the total count and how many copies are not shown, not every row", async () => {
+    const v = view();
+    Object.assign(v, { routing_file_copies: {
+      status: "checked", scanned_at: "2026-10-21T18:10:00Z", files_checked: 3,
+      hits: [{ file: "RepoA/CLAUDE.md", line: 1, quote: "Prefer Codex first", superseded: true }],
+      hits_total: 501, more_not_shown: 500, too_large: ["~/big.md"],
+    } });
+    answers.khipu_route_view = v;
+    await page();
+    const list = screen.getByRole("list", { name: "Copies of routing found in files" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(1);
+    expect(screen.getByText("500 more not shown.")).toBeInTheDocument();
+    expect(screen.getByText(/Too large to read: ~\/big\.md\./)).toBeInTheDocument();
+    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("501 copies in files");
+  });
+
   it("keeps files never looked at apart from nothing found, with no action", async () => {
     const v = view();
     Object.assign(v, { routing_file_copies: { status: "not_checked", scanned_at: null, files_checked: 0, hits: [] } });

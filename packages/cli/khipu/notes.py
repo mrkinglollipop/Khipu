@@ -670,8 +670,12 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
                 "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
                 "files": dict((state or {}).get("files", {})),
             })
+        _refresh_scan_report()
         return out
 
+    # The scan report refreshes before the hub write, not after it, so a
+    # reconcile with no hub reachable still refreshes it.
+    _refresh_scan_report()
     from khipu.db import connect
     from khipu.mirror import _upsert_topic
 
@@ -726,12 +730,7 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
         "files": new_files_state,
     })
-    try:
-        from khipu import routing_scan_report
-
-        routing_scan_report.refresh()
-    except Exception as exc:  # noqa: BLE001 — the scan report must never break reconcile
-        _log(f"routing scan report failed: {type(exc).__name__}")
+    _refresh_scan_report()
     try:
         from khipu import organise
 
@@ -742,6 +741,17 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         out["organise"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         _log(f"organise.after_reconcile failed: {exc}")
     return out
+
+
+def _refresh_scan_report() -> None:
+    """Refresh the owner-local routing scan report; never fatal, and the
+    log line carries only the exception type, never file words."""
+    try:
+        from khipu import routing_scan_report
+
+        routing_scan_report.refresh()
+    except Exception as exc:  # noqa: BLE001 — the scan report must never break reconcile
+        _log(f"routing scan report failed: {type(exc).__name__}")
 
 
 def notes_freshness(cur) -> dict[str, Any]:

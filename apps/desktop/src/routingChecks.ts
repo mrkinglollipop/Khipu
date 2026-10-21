@@ -23,6 +23,9 @@ export type FileCopiesModel = {
   scanned_at: string | null;
   files_checked: number;
   hits: { file: string; line: number; quote: string; superseded: boolean }[];
+  hits_total: number;
+  more_not_shown: number;
+  too_large: string[];
 };
 
 export type ChecksModel = {
@@ -260,7 +263,10 @@ export function checksModel(view: RouteView | null, now: Date): ChecksModel {
   const copies = view.routing_file_copies;
   const fileCopies: FileCopiesModel | null = copies
     ? { status: copies.status, scanned_at: copies.scanned_at ?? null,
-        files_checked: copies.files_checked ?? 0, hits: copies.hits ?? [] }
+        files_checked: copies.files_checked ?? 0, hits: copies.hits ?? [],
+        hits_total: copies.hits_total ?? copies.hits?.length ?? 0,
+        more_not_shown: copies.more_not_shown ?? 0,
+        too_large: copies.too_large ?? [] }
     : null;
   let table: ChecksModel["table"] = null;
   const tiers = view.tier_table?.tiers;
@@ -283,7 +289,7 @@ export function checksLine(view: RouteView | null, now: Date): string {
   if (model.contradictions.length) parts.push(plural(model.contradictions.length, "contradiction", "contradictions"));
   if (model.upkeep.length) parts.push(`${plural(model.upkeep.length, "rule", "rules")} to look at`);
   if (model.unreached.length) parts.push(`${plural(model.unreached.length, "direction", "directions")} not in Khipu`);
-  if (model.fileCopies?.hits.length) parts.push(`${plural(model.fileCopies.hits.length, "copy", "copies")} in files`);
+  if (model.fileCopies?.hits_total) parts.push(`${plural(model.fileCopies.hits_total, "copy", "copies")} in files`);
   if (parts.length) return parts.join(" · ");
   if (model.fileCopies && model.fileCopies.status !== "checked") return "Files not looked at yet";
   if (model.table) return "Your model table · nothing flagged";

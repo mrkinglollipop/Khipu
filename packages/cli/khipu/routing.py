@@ -8164,7 +8164,8 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
         out["routing_file_copies"] = routing_scan_report.report()
     except Exception:  # noqa: BLE001 - a damaged scan report must not break the route view
         out["routing_file_copies"] = {"status": "not_checked", "scanned_at": None,
-                                      "files_checked": 0, "hits": []}
+                                      "files_checked": 0, "hits": [], "hits_total": 0,
+                                      "more_not_shown": 0, "too_large": []}
     return out
 
 

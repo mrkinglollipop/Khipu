@@ -3571,7 +3571,7 @@ function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds
       ) : null}
       {model.fileCopies ? (
         <div className="section-body">
-          <h2 className="sub-title">Routing written in files{model.fileCopies.status === "checked" ? <span className="meta">{model.fileCopies.hits.length} found</span> : null}</h2>
+          <h2 className="sub-title">Routing written in files{model.fileCopies.status === "checked" ? <span className="meta">{model.fileCopies.hits_total} found</span> : null}</h2>
           {model.fileCopies.status !== "checked" ? (
             <div className="empty">
               <b>Khipu hasn't looked at your files yet</b>
@@ -3587,10 +3587,17 @@ function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds
                   sub: `“${h.quote}”`,
                 }))}
               </div>
+              {model.fileCopies.more_not_shown ? (
+                <p className="set-help">{model.fileCopies.more_not_shown} more not shown.</p>
+              ) : null}
+              {model.fileCopies.too_large.length ? (
+                <p className="set-help">Too large to read: {model.fileCopies.too_large.join(", ")}.</p>
+              ) : null}
             </>
           ) : (
             <p className="set-help">
               Files last looked at{model.fileCopies.scanned_at ? ` ${whenLocal(model.fileCopies.scanned_at, now)}` : ""}: {model.fileCopies.files_checked} files, 0 copies.
+              {model.fileCopies.too_large.length ? ` Too large to read: ${model.fileCopies.too_large.join(", ")}.` : ""}
             </p>
           )}
         </div>

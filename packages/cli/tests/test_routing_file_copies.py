@@ -47,17 +47,31 @@ def scanned(replay, monkeypatch):
     project_root.mkdir(parents=True, exist_ok=True)
     (project_root / "AGENTS.md").write_text("Delegation order: second Claude account first\n",
                                            encoding="utf-8")
-    monkeypatch.setattr(notes, "resolve_claude_project_path",
-                        lambda slug, **kw: project_root)
-    # A file the scanner never reads must stay out, however loud it is.
+    (project_root / "CLAUDE.md").write_text("Prefer Codex first ProjectClaudeSentinel\n",
+                                           encoding="utf-8")
+    for rel in (".claude/AGENTS.md", ".codex/AGENTS.md", "AGENTS.md"):
+        extra = home / rel
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_text("Prefer Claude for dispatch. GlobalExtraSentinel\n", encoding="utf-8")
+    monkeypatch.setattr(routing_scan_report, "known_project_roots",
+                        lambda: [project_root])
+    # Files the approved set never reads must stay out, however loud they are.
     (home / "unread.md").write_text(f"{WORDS}\n", encoding="utf-8")
+    for rel in (".codex/CLAUDE.md", "CLAUDE.md"):
+        decoy = home / rel
+        decoy.parent.mkdir(parents=True, exist_ok=True)
+        decoy.write_text(f"{WORDS} DecoySentinel\n", encoding="utf-8")
+    stranger = home / "Projects" / "StrangerRepo"
+    stranger.mkdir(parents=True, exist_ok=True)
+    (stranger / "AGENTS.md").write_text(f"{WORDS} StrangerSentinel\n", encoding="utf-8")
     return replay
 
 
 def test_not_looked_at_yet_is_an_explicit_state(scanned):
     public = routing.public_view(scanned.view(), scanned.now)
     assert public[FIELD] == {"status": "not_checked", "scanned_at": None,
-                             "files_checked": 0, "hits": []}
+                             "files_checked": 0, "hits": [], "hits_total": 0,
+                             "more_not_shown": 0, "too_large": []}
 
 
 def test_refresh_reports_each_hit_owner_locally(scanned, capsys):
@@ -149,3 +163,98 @@ def test_owner_local_file_copies_never_reach_other_surfaces(scanned, monkeypatch
                  str(scanned.root / ".claude" / "projects"))
     for leaf in strings(output):
         assert not any(secret in leaf for secret in forbidden), (surface, leaf)
+
+
+def test_scan_reads_exactly_the_approved_set(scanned, monkeypatch):
+    import sys
+
+    home = scanned.root
+    expected = {
+        home / ".claude" / "CLAUDE.md", home / ".claude" / "AGENTS.md",
+        home / ".codex" / "AGENTS.md", home / "AGENTS.md",
+        home / "Projects" / PROJECT_FILE / "CLAUDE.md",
+        home / "Projects" / PROJECT_FILE / "AGENTS.md",
+        home / ".claude" / "projects" / "synthetic-slug" / "memory" / "note.md",
+    }
+    assert set(routing_scan_report.candidate_files()) == expected
+    opened = []
+
+    def hook(event, args):
+        if event == "open" and args and isinstance(args[0], str) and args[0].endswith(".md"):
+            opened.append(args[0])
+
+    sys.addaudithook(hook)
+    try:
+        routing_scan_report.refresh(now=scanned.now)
+    finally:
+        pass
+    assert {p for p in opened if p.endswith(".md")} == {str(p) for p in expected}
+    files = {h["file"] for h in routing_scan_report.report()["hits"]}
+    assert f"{PROJECT_FILE}/AGENTS.md" in files
+    assert f"{PROJECT_FILE}/CLAUDE.md" in files
+    assert not any(f.startswith("/") for f in files)
+    assert not any("DecoySentinel" in h["quote"] or "StrangerSentinel" in h["quote"]
+                   for h in routing_scan_report.report()["hits"])
+
+
+def test_report_refreshes_on_read_when_a_scanned_file_changes(scanned):
+    routing_scan_report.refresh(now=scanned.now)
+    assert routing_scan_report.report()["hits"]
+    (scanned.root / ".claude" / "CLAUDE.md").write_text("# Global\nclean now\n",
+                                                        encoding="utf-8")
+    report = routing_scan_report.report()
+    assert report["status"] == "checked"
+    assert not any(h["file"] == "~/.claude/CLAUDE.md" for h in report["hits"])
+
+
+def test_reconcile_without_hub_still_refreshes_the_report(scanned):
+    routing_scan_report.refresh(now=scanned.now)
+    (scanned.root / ".claude" / "CLAUDE.md").write_text("# Global\nclean now\n",
+                                                        encoding="utf-8")
+    plan = notes._build_plan()
+    notes._write_state({"last_reconcile_at": None, "files": {
+        item["path"]: {**item["signature"], "slug": item["parsed"]["slug"],
+                       "base_slug": item["parsed"]["slug"]} for item in plan}})
+    out = notes.reconcile(changed_only=True)
+    assert out["candidates"] == 0
+    assert not any(h["file"] == "~/.claude/CLAUDE.md"
+                   for h in routing_scan_report.report()["hits"])
+
+
+def test_limits_cap_file_size_and_hit_counts(scanned):
+    note = (scanned.root / ".claude" / "projects" / "synthetic-slug"
+            / "memory" / "note.md")
+    note.write_text("---\nname: Synthetic\n---\n"
+                    + "Prefer Codex first LimitSentinel\n" * 600, encoding="utf-8")
+    big = note.parent / "big.md"
+    big.write_text("---\nname: big\n---\n" + "x" * (routing_scan_report.MAX_FILE_BYTES + 10),
+                   encoding="utf-8")
+    report = routing_scan_report.refresh(now=scanned.now)
+    assert len(report["hits"]) <= routing_scan_report.MAX_HITS_TOTAL
+    assert report["hits_total"] > len(report["hits"])
+    assert report["more_not_shown"] == report["hits_total"] - len(report["hits"])
+    assert any(h["file"].endswith("memory/note.md") for h in report["hits"])
+    assert sum(1 for h in report["hits"] if h["file"].endswith("memory/note.md")) \
+        <= routing_scan_report.MAX_HITS_PER_FILE
+    assert any(t.endswith("memory/big.md") for t in report["too_large"])
+    assert "LimitSentinel" not in json.dumps(report["too_large"])
+
+
+def test_bool_line_in_a_damaged_report_is_rejected(scanned):
+    routing_scan_report.refresh(now=scanned.now)
+    path = routing_scan_report.store_path()
+    path.write_text(json.dumps({"status": "checked", "scanned_at": "x",
+                                "files_checked": 1,
+                                "hits": [{"file": "x", "line": True, "quote": "q"}]}),
+                    encoding="utf-8")
+    # A damaged report reads as not checked; staleness refresh only
+    # replaces a valid report, never resurrects a damaged one.
+    assert routing_scan_report.report()["status"] == "not_checked"
+
+
+def test_report_write_is_atomic_with_owner_only_modes(scanned):
+    routing_scan_report.refresh(now=scanned.now)
+    path = routing_scan_report.store_path()
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert not list(path.parent.glob("*.tmp"))
