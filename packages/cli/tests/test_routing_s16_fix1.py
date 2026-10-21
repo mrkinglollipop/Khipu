@@ -78,6 +78,9 @@ def test_gateway_health_tracks_revision_not_caller_idleness(replay):
     routing.report(account="Codex", state="limited", until="1h", author=AUTHOR)
     routing.read_view(replay.now)
     changed = routing.doctor_block(now=replay.now)["routing_delivery"]
+    assert changed["gateway"]["status"] == "green"
+    replay.advance(601)
+    changed = routing.doctor_block(now=replay.now)["routing_delivery"]
     assert changed["gateway"]["status"] == "red"
     assert "gateway-stale" in changed["reasons"]
 

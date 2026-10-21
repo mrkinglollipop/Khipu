@@ -164,7 +164,11 @@ def doctor_block(view, now, cfg):
                 # identity, it no longer supplies gateway evidence at all.
                 gateways.append(attachment)
             health = component_health(state, now, slack=cfg["routing_delivery_slack"])
-            rows.append(dict(identity=path.stem.removeprefix("recall--"), component=component, **health))
+            rows.append(dict(identity=path.name.removesuffix(".routing.json").removeprefix("recall--"),
+                             component=component,
+                             harness=routing_delivery.health_harness(
+                                 state.get("harness") if component.startswith("agent:") else attachment.get("harness")),
+                             last_delivery_point=state["last_delivery_point"], **health))
             reasons += health["reasons"]
             missing += health["missing"]
     if not rows:
@@ -199,8 +203,9 @@ def doctor_block(view, now, cfg):
         else:
             behind = [(epoch, revision, stamp) for epoch, revision, stamp in gateway_rows
                       if (epoch, revision) != (current_epoch, current_revision)]
-            ages = [max(0.0, (current_at - stamp).total_seconds()) for _epoch, _revision, stamp in behind]
-            age = max(ages, default=0.0)
+            # A client becomes behind when this revision is folded, not
+            # when it last pulled an older revision during a quiet period.
+            age = max(0.0, (now - current_at).total_seconds()) if behind else 0.0
             stale = bool(behind and cfg["routing_cloud_copy_stale_after"]
                          and age > cfg["routing_cloud_copy_stale_after"])
             gateway = dict(status="red" if stale else "green", age_seconds=age)

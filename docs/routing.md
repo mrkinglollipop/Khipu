@@ -404,7 +404,8 @@ its shown receipt is red; old ledgers without receipt proof are unknown.
 
 Other red reasons are more than 1% of today's recorded prompts skipping routing,
 a cross-Mac caught-up cursor more than 10 minutes behind, a gateway delivered
-projection behind the current local revision by more than `routing_cloud_copy_stale_after`, and a limited lane still
+projection still behind after `routing_cloud_copy_stale_after` seconds since the
+current local revision's `folded_at`, and a limited lane still
 unmatched for an hour of one continuous unmatched run. UTC timestamps select today's hook outcomes from the
 existing bounded log tail. Copy checks are not applicable when their switches
 are off. Enabled copies without timestamps, unreadable ledgers, absent live
@@ -412,11 +413,14 @@ identities and missing hook outcomes say `unknown` with named missing evidence,
 never green. A gateway identity outside the 12-hour delivery liveness window no
 longer supplies copy evidence. A gateway response carrying the current local
 revision proves recovery; an unchanged record stays fresh while its callers are
-idle. Simply calling health
+idle. A newly folded revision starts the gateway staleness clock even when a
+client last pulled much earlier. Simply calling health
 cannot refresh evidence.
 
 Each result carries `status`, `reasons`, `missing`, per-component `identities`,
 `prompts`, `replication` and `gateway`. Identity names are ledger hashes; health
-rows contain no routing words or login paths. Green requires affirmative evidence
+rows carry the attachment's harness name (`unknown` for missing or unrecognized
+names) and each component's `last_delivery_point`, with no session ids, routing
+words or login paths. Green requires affirmative evidence
 for every applicable check. Recovery requires the corresponding receipt, current
 outcome log, caught-up cursor, delivered projection or resolved lane mapping.

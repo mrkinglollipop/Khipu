@@ -1384,6 +1384,7 @@ def test_15_health_red_and_recovery(replay, condition):
             replay.advance(601)
             routing.report(account="Codex", state="limited", until="1h", author=AUTHOR)
             routing.read_view(replay.now)
+            replay.advance(601)
         else:
             replay.write(replay.event("evidence", runner="synthetic-runner", lane="unmapped", state="limited",
                                       source="runner", until=routing._iso(T0 + timedelta(hours=3))))

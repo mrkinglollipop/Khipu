@@ -314,6 +314,7 @@ def plan(out, view, now, cfg, *, session=None, project=None):
     return dict(out, delivery_plan={"items": items, "pace_forecasts": out.get("pace_forecasts") or {},
                                     "advice_forecasts": out.get("advice_forecasts") or {},
                                     "current_entities": list(view.get("effective", {})),
+                                    "harness": health_harness(_current_harness()),
                                     "removed": removed, "notices": ["notice:" + n[2] for n in notices], "at": r._iso(now),
                                    "limit": cfg["routing_summary_chars"] if full else cfg["routing_prompt_chars"],
                                    "full": full, "page_limit": cfg["routing_prompt_chars"], "text": out.get("text"),
@@ -393,6 +394,7 @@ def _delivery_point(state, out, now):
     point = state["delivery_points"] = state.get("delivery_points", 0) + 1
     state["last_delivery_point"] = _iso(now)
     plan = out["delivery_plan"]
+    state["harness"] = health_harness(plan.get("harness"))
     state["slack"] = plan.get("slack", 2)
     budget = plan.get("page_limit") or plan.get("limit") or 8000
     ahead = 0
@@ -555,7 +557,8 @@ def offer(out, *, session=None, component="main"):
         return answer
     with _transaction(session) as data:
         if component == "main":
-            data["attachment"] = {"component": "main", "at": _iso(now)}
+            data["attachment"] = {"component": "main", "at": _iso(now),
+                                  "harness": health_harness(out["delivery_plan"].get("harness"))}
         state = data.setdefault(component, {})
         answer = _render(state, out, now, component)
         _prune_agent_components(data, now, keep=component)
@@ -788,6 +791,28 @@ _HOOKED_HARNESSES = frozenset({"claude_code", "codex"})
 _PULL_ONLY_HARNESSES = frozenset({"aegis", "grok", "grok_build", "cursor", "muse", "gateway", "unknown"})
 
 
+def _current_harness(environ=None):
+    """Read attachment hints without resolving a conversation or consulting T3."""
+    env = os.environ if environ is None else environ
+    value = env.get("KHIPU_HARNESS")
+    harness = value.strip().lower() if isinstance(value, str) else ""
+    if not harness:
+        if env.get("GROK_HOOK_NAME") or env.get("GROK_HOOK_EVENT"):
+            harness = "aegis"
+        elif env.get("CLAUDECODE") or env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_CODE_ENTRYPOINT"):
+            harness = "claude_code"
+        elif env.get("CODEX_THREAD_ID") or env.get("CODEX_SANDBOX") or env.get("CODEX_HOME"):
+            harness = "codex"
+        else:
+            harness = "unknown"
+    return harness
+
+
+def health_harness(value):
+    """Health metadata admits harness names only, never arbitrary caller words."""
+    return value if isinstance(value, str) and value in _HOOKED_HARNESSES | _PULL_ONLY_HARNESSES else "unknown"
+
+
 def canonical_identity(environ=None, explicit=None):
     """The one conversation identity for hooks and pull (MCP) delivery.
 
@@ -810,16 +835,7 @@ def canonical_identity(environ=None, explicit=None):
     def _clean(value):
         return value.strip() if isinstance(value, str) else ""
 
-    harness = _clean(env.get("KHIPU_HARNESS")).lower()
-    if not harness:
-        if env.get("GROK_HOOK_NAME") or env.get("GROK_HOOK_EVENT"):
-            harness = "aegis"
-        elif env.get("CLAUDECODE") or env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_CODE_ENTRYPOINT"):
-            harness = "claude_code"
-        elif env.get("CODEX_THREAD_ID") or env.get("CODEX_SANDBOX") or env.get("CODEX_HOME"):
-            harness = "codex"
-        else:
-            harness = "unknown"
+    harness = _current_harness(env)
     explicit = _clean(explicit)
     shared = _clean(env.get("KHIPU_SESSION_ID"))
     claude = _clean(env.get("CLAUDE_CODE_SESSION_ID"))
@@ -946,7 +962,7 @@ def _delivery_summary(data, component, state, changes, now, counting_component):
             "duplicates_across_components": duplicates, "health": health}
 
 
-def pull_offer(out, *, session, component="mcp", counting_component=None, now=None, skip_entities=frozenset(), delivery_point=True):
+def pull_offer(out, *, session, component="mcp", counting_component=None, now=None, skip_entities=frozenset(), delivery_point=True, harness="unknown"):
     """Reserve (or re-send) one pull component's batch under its own lock.
 
     A live in-flight batch is re-sent byte-identically, so a dropped
@@ -961,7 +977,8 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
     with _transaction(session) as data:
         state = data.setdefault(component, {})
         entries = _merge(state, out)
-        data["attachment"] = {"component": counting_component, "at": _iso(now)}
+        data["attachment"] = {"component": counting_component, "at": _iso(now),
+                              "harness": health_harness(harness)}
         if delivery_point:
             _delivery_point(state, out, now)
         _prune_agent_components(data, now, keep=component)
@@ -1356,7 +1373,8 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
         if reservation is not None and not state:
             state.update(copy.deepcopy(reservation))
             if component == "main":
-                data["attachment"] = {"component": "main", "at": _iso(now)}
+                data["attachment"] = {"component": "main", "at": _iso(now),
+                                      "harness": health_harness(state.get("harness"))}
         if batch in state.get("batches", {}):
             return True
         flight = state.get("flight")
@@ -1415,11 +1433,10 @@ def mark_shown(session, shown, *, component="main", version=None, epoch=None):
         if epoch != state.get("epoch") or (isinstance(version, int) and isinstance(state.get("acked_through"), int)
                                             and version < state["acked_through"]):
             return True
-        receipts = state.get("shown_receipts")
         entries = state.get("entries")
         if not isinstance(entries, dict):
             return False
-        candidates = list(receipts.values()) if isinstance(receipts, dict) else []
+        candidates = []
         flight = state.get("flight")
         if isinstance(flight, dict):
             items = ((flight.get("out") or {}).get("routing_changes") or {}).get("items") or []
@@ -1513,7 +1530,7 @@ def record_gateway_copy(session, *, epoch, revision, revision_at, result, now=No
                         visible[entity] = row["text"]
             flight["shown"] = _rendered_receipt(entries, flight.get("progress"), rendered, visible=visible)
         attachment = data.get("attachment") if isinstance(data.get("attachment"), dict) else {}
-        attachment.update(component="mcp", at=_iso(now), gateway=True,
+        attachment.update(component="mcp", at=_iso(now), gateway=True, harness="gateway",
                           copy_epoch=epoch, copy_revision=revision, copy_revision_at=revision_at)
         data["attachment"] = attachment
         return True

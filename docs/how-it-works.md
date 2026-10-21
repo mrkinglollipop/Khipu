@@ -405,7 +405,9 @@ Routing delivery has its own `routing_delivery` health check. It reports stalled
 budgeted pages, twice-expired leases, acknowledgements beyond shown receipts,
 today's routing skips, stale cross-Mac/gateway revisions and unmatched limits
 that remain limited for an hour of one continuous run. A replacement revision
-starts a new delivery-age bound. It reads recorded evidence only. Missing evidence is explicitly unknown;
+starts a new delivery-age bound. A behind gateway copy ages from the current
+local revision's fold time; time spent idle before that change does not count.
+Delivery rows show a safe harness name and last delivery point. It reads recorded evidence only. Missing evidence is explicitly unknown;
 child and MCP receipts cannot satisfy a hooked parent's debt. This health row
 changes no routing or promotion gate. See [Delivery health](routing.md#delivery-health).
 

@@ -2375,7 +2375,7 @@ def _route_pull_attachment(routing, routing_delivery, identity, now, *, view=Non
         counting = "main" if identity["capability"] == "hooked" else "mcp"
         changes, delivery = routing_delivery.pull_offer(planned, session=identity["session"], component="mcp",
                                                         counting_component=counting, now=now, skip_entities=skip,
-                                                        delivery_point=delivery_point)
+                                                        delivery_point=delivery_point, harness=identity.get("harness", "unknown"))
     # Pull items name entities publicly: an account by its stable id, never
     # its key (a login folder the raw ledger entity carries).
     if changes is not None:
@@ -2438,8 +2438,8 @@ def _gateway_route_identity(args: dict):
     if label is None:
         # No token label is its own namespace: it must never share a
         # ledger with a token that happens to be labelled "gateway".
-        return {"session": f"gateway\0unlabeled\0{session}", "capability": "pull_only"}
-    return {"session": f"gateway\0labeled\0{label}\0{session}", "capability": "pull_only"}
+        return {"session": f"gateway\0unlabeled\0{session}", "capability": "pull_only", "harness": "gateway"}
+    return {"session": f"gateway\0labeled\0{label}\0{session}", "capability": "pull_only", "harness": "gateway"}
 
 
 def _tool_route_gateway(args: dict) -> dict:
