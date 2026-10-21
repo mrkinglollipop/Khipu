@@ -4,6 +4,7 @@
 import { StrictMode, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
+import { ChevronRight } from "lucide-react";
 import "../src/App.css";
 import "../src/routingOverview.css";
 import "../src/accounts.css";
@@ -33,7 +34,13 @@ import { OfflineBanner, SavedOnThisMac, WaitingToSync } from "../src/OfflineBann
 import { OfflineWaitsCard } from "../src/SettingsControls";
 import { SetupAccountsStep } from "../src/SetupAccounts";
 import { PlanBlock } from "../src/PlansCard";
+import { ProjectsSettings } from "../src/ProjectsSettings";
+import type { ProjectsList } from "../src/ProjectsSettings";
+import { useCliState } from "../src/settingsCli";
 import type { UsageAccount } from "../src/PlansCard";
+import { PaceSection } from "../src/RoutingSettings";
+import { paceModel } from "../src/routingPace";
+import { PACE_NOW, PACE_PLANS, PACE_VIEW } from "./paceFake";
 import type { DiscoverResult, Support } from "../src/accountsApi";
 import {
   CLIENT,
@@ -131,7 +138,81 @@ function OfflineOwedStates() {
   );
 }
 
-/** Settings -> Accounts and routing with only Proposals and holds open
+/** The Pace group's body inside the page's own group card, with the dev
+ *  fixture shaped like `khipu route --json`. Screenshots only. */
+function PaceGroup() {
+  const model = paceModel(PACE_VIEW, PACE_PLANS, PACE_NOW);
+  const folds = { isOpen: () => false, toggle: () => {}, openKeys: () => {} };
+  return (
+    <div className="route-settings">
+      <div className="fold disclose route-group" data-open="true">
+        <button type="button" className="disclosure fold-btn" aria-expanded="true" data-settings-group="pace">
+          <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
+          <span className="gname">Pace, caps and advice</span>
+          <span className="gline">{model.line}</span>
+          <span className="gtags">
+            {model.tags.map((t) => (
+              <span key={t.text} className={["tag", t.tone === "neutral" ? "" : t.tone].filter(Boolean).join(" ")}>
+                <span className="dot" aria-hidden />{t.text}
+              </span>
+            ))}
+          </span>
+        </button>
+        <div className="fold-body">
+          <div className="disclose-body">
+            <PaceSection data={PACE_VIEW} plans={PACE_PLANS} now={PACE_NOW} folds={folds} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const PN = (name: string, role: "canonical" | "alias", extra: object = {}) => ({ name, role, open_commitments: 0, standing_decisions: 0, episodes: 0, ...extra });
+const PROJECTS_FIXTURE = {
+  groups: [
+    { canonical: "mrkinglollipop/olivewood", totals: { open_commitments: 9, standing_decisions: 31, episodes: 412 }, names: [
+      PN("mrkinglollipop/olivewood", "canonical", { episodes: 14 }),
+      PN("mrkinglollipop/church-harness", "alias", { source: "github", created_at: new Date().toISOString(), episodes: 398 }),
+    ] },
+    { canonical: "field-notes", totals: { open_commitments: 2, standing_decisions: 4, episodes: 57 }, names: [
+      PN("field-notes", "canonical", { episodes: 50 }),
+      PN("notes-scratch", "alias", { source: "checkout", created_at: "2026-10-12T17:40:00Z", episodes: 7 }),
+    ] },
+  ],
+  pairs: [
+    { a: "lollipop-labs/olivewood", b: "mrkinglollipop/olivewood", state: "asked", created_at: new Date().toISOString() },
+    { a: "mrkinglollipop/khipu-site", b: "mrkinglollipop/site-2025", state: "kept_separate", decided_at: "2026-10-03T16:00:00Z" },
+  ],
+  pair_counts: {
+    "mrkinglollipop/olivewood": { open_commitments: 9, episodes: 412, last_used: new Date().toISOString() },
+    "lollipop-labs/olivewood": { open_commitments: 1, episodes: 14, last_used: "2026-10-17T16:00:00Z" },
+  },
+  sweep: { at: new Date().toISOString(), result: "ok" },
+};
+
+function ProjectsHost({ withQuestion = true }: { withQuestion?: boolean }) {
+  const state = useCliState<ProjectsList>("khipu_projects_list", true);
+  const waiting = withQuestion ? 1 : 0;
+  const tabs = ["Database", "Capture & models", "Accounts and routing", "Owner actions", "Work", "Projects", "Optional features", "Embeddings"];
+  return (
+    <div className="settings-body" style={{ maxWidth: "none" }}>
+      <div className="settings-split">
+        <div className="subnav" role="tablist" aria-label="Settings sections">
+          {tabs.map((t) => (
+            <button key={t} type="button" role="tab" aria-selected={t === "Projects"} className={t === "Projects" ? "on" : undefined}>
+              {t}
+              {t === "Projects" && waiting ? <span className="nav-count">{waiting}</span> : null}
+            </button>
+          ))}
+        </div>
+        <div className="settings-pane"><ProjectsSettings active state={state} /></div>
+      </div>
+    </div>
+  );
+}
+
+ /** Settings -> Accounts and routing with only Proposals and holds open
  *  (slice 15b), against the fictional record in fakeTauri. */
 function RoutingProposals() {
   useState(() => {
@@ -149,6 +230,9 @@ function RoutingProposals() {
 }
 
 const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNode }> = {
+  pace: { title: "Pace, caps and advice (fictional mock data)", render: () => <PaceGroup /> },
+  "projects": { title: "Settings: Projects", fake: { projects: PROJECTS_FIXTURE }, render: () => <ProjectsHost /> },
+  "projects-empty": { title: "Settings: Projects, none", fake: { projects: { groups: [], pairs: [], sweep: { result: null } } }, render: () => <ProjectsHost withQuestion={false} /> },
   "routing-proposals": { title: "Proposals and holds (slice 15b)", fake: { route15b: true }, render: () => <RoutingProposals /> },
   "offline-owed": { title: "Owed with the hub away: the banners and a waiting row", render: () => <OfflineOwedStates /> },
   "offline-settings": { title: "Settings: When the hub is away", render: () => <div className="route-settings"><OfflineWaitsCard active /></div> },
@@ -266,7 +350,9 @@ function Page() {
     );
   }
   return (
-    <main style={{ padding: 24, maxWidth: 960 }} data-state={hash}>
+    // The pace group is screenshotted at the Settings pane's own 720px width,
+    // so it wraps where the approved mock does rather than across a wider page.
+    <main style={{ padding: 24, maxWidth: hash === "pace" ? 744 : hash.startsWith("projects") ? "none" : 960 }} data-state={hash}>
       <h1 style={{ fontSize: 14, color: "var(--muted)" }}>{st.title}</h1>
       {st.render()}
     </main>

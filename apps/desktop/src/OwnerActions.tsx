@@ -46,6 +46,7 @@ export type OwnerAction = {
   no_undo?: string;
   after?: Record<string, unknown> | null;
   facts?: Record<string, unknown> | null;
+  result?: Record<string, unknown> | null;
 };
 
 const HARNESS: Record<string, string> = { claude_code: "Claude Code", codex: "Codex", aegis: "Aegis" };

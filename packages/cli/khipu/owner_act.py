@@ -75,6 +75,11 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     # The clean-up: ``plan`` (a file from ``khipu owed tidy --plan-out``, shown
     # to the owner first) to apply, or ``batch`` to undo; one, not both.
     "owed.tidy": (("project",), ("plan", "batch")),
+    "project.alias_add": (("alias", "canonical"), ()),
+    "project.alias_remove": (("alias",), ()),
+    "project.merge": (("a", "b", "show_as"), ()),
+    "project.keep_separate": (("a", "b"), ()),
+    "project.separate": (("name",), ()),
     "direction.off": ((), ()),
     "direction.on": ((), ()),
     "direction.acknowledge": ((), ()),
@@ -332,6 +337,23 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
                 else f"--undo={v['batch']}"], []
     if action in ("work.same", "work.not_same"):
         return ["work", verb.replace("_", "-")], [v["row"], v["commitment"]]
+    if action.startswith("project."):
+        # Names are checked here as the CLI checks them: a refusal before the gate.
+        from khipu import project_group
+
+        why = project_group.check_names([v[k] for k in ("alias", "canonical", "a", "b", "name", "show_as") if k in v])
+        if why:
+            raise _bad(why)
+    if action == "project.alias_add":
+        return ["project", "alias", "add"], [v["alias"], v["canonical"]]
+    if action == "project.alias_remove":
+        return ["project", "alias", "remove"], [v["alias"]]
+    if action == "project.merge":
+        return ["project", "merge", *_opts(v, "show_as")], [v["a"], v["b"]]
+    if action == "project.keep_separate":
+        return ["project", "keep-separate"], [v["a"], v["b"]]
+    if action == "project.separate":
+        return ["project", "separate"], [v["name"]]
     if action in ("direction.off", "direction.on", "direction.acknowledge"):
         return ["owner-direction", action.partition(".")[2]], []
     if action == "direction.set":

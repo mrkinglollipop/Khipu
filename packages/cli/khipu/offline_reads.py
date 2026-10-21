@@ -39,6 +39,21 @@ def owed(project: str | None, status: str, limit: int) -> dict[str, Any] | None:
     return {"status": status, "project": project or None, "results": results, **hub_snapshot.stale_fields()}
 
 
+def owed_canonical(project: str | None) -> str | None:
+    """The canonical name the replica reads ``project`` as (``project`` itself
+    with no alias, or when the alias table is missing). The same resolution
+    :func:`owed_rows` labels its rows with, for the listing's top-level field."""
+    if not project:
+        return project
+    con = _open()
+    if con is None:
+        return project
+    try:
+        return hub_snapshot.snapshot_project_group(con, project)[0] or project
+    finally:
+        con.close()
+
+
 def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
     """The replica's raw commitment rows of one scope (owners not yet
     resolved), for ``owed`` and the paged read (``commitments.page_owed``)."""

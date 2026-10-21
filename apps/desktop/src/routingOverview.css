@@ -175,3 +175,68 @@
 button.chip[aria-pressed="true"] {
   border-color: color-mix(in srgb, var(--accent) 50%, transparent); color: var(--accent-text); background: var(--accent-soft);
 }
+
+/* Pace, caps and advice (routing slice 15e), from
+   docs/mockups/2026-10-21-routing/mock.css "Pace: one block per account", on
+   the app's own tokens. One block for each account the approved rule opens,
+   one line for the rest. */
+.route-settings .pace-blocks { display: flex; flex-direction: column; gap: var(--s2); }
+.route-settings .pace-block .plan-block-head { align-items: center; }
+.route-settings .pace-block .plan-block-head .spacer { flex: 1; }
+.route-settings .pace-fold {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 24px; height: 24px; margin: 0 0 0 2px; padding: 0; border: 0; border-radius: var(--r-sm);
+  background: transparent; box-shadow: none; color: var(--muted); cursor: pointer;
+}
+.route-settings .pace-fold:hover { background: var(--surface-2); color: var(--text); }
+.route-settings .pace-fold:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--ring); }
+.route-settings .pace-fold .disclosure-chevron { transform: rotate(90deg); }
+.route-settings .pace-say { margin: 0; font-size: var(--t-sm); color: var(--text); line-height: 1.45; }
+.route-settings .pace-wins { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--s2); }
+.route-settings .pace-win {
+  display: grid; grid-template-columns: 5.5rem minmax(3rem, 7rem) 2.75rem minmax(0, 1fr) 7.5rem;
+  column-gap: var(--s3); align-items: center; font-size: var(--t-sm);
+}
+.route-settings .pace-win .wname { color: var(--text-2); }
+.route-settings .pace-rate { display: flex; flex-direction: column; gap: 0; line-height: 1.35; min-width: 0; }
+.route-settings .pace-rate .r1 { color: var(--text); display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
+.route-settings .pace-rate .r1 .tag { white-space: nowrap; }
+.route-settings .pace-rate .r2 { color: var(--muted); font-size: var(--t-xs); }
+.route-settings .trend { display: block; width: 7.5rem; height: 28px; }
+.route-settings .trend .used { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+.route-settings .trend .need { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+.route-settings .trend .cap { fill: none; stroke: var(--warn); stroke-width: 1; }
+.route-settings .trend-none { font-size: var(--t-xs); color: var(--muted); }
+.route-settings .pace-sec {
+  border-top: 1px solid var(--border); padding-top: var(--s2); display: flex; flex-direction: column; gap: var(--s1);
+}
+.route-settings .pace-sec h4 { margin: 0; font-size: var(--t-xs); font-weight: 600; color: var(--muted); }
+.route-settings .cap-row {
+  display: grid; grid-template-columns: minmax(0, 11rem) minmax(0, 1fr) auto;
+  column-gap: var(--s3); align-items: baseline; font-size: var(--t-sm); line-height: 1.45;
+}
+.route-settings .cap-row .cname { color: var(--text-2); }
+.route-settings .cap-row .cstate { color: var(--text); }
+.route-settings .cap-row .end { display: inline-flex; gap: var(--s2); align-items: center; justify-content: flex-end; }
+.route-settings .adv-row {
+  display: grid; grid-template-columns: 9.5rem 5.5rem minmax(0, 1fr);
+  column-gap: var(--s3); align-items: baseline; font-size: var(--t-sm); line-height: 1.45;
+}
+.route-settings .adv-row .who,
+.route-settings .adv-row .why { color: var(--text-2); }
+.route-settings .word { font-weight: 600; }
+.route-settings .word.go { color: var(--ok); }
+.route-settings .word.hold { color: var(--warn); }
+.route-settings .word.closed { color: var(--err); }
+.route-settings .evid { font-size: var(--t-xs); color: var(--muted); }
+.route-settings .legend { display: flex; gap: var(--s4); flex-wrap: wrap; font-size: var(--t-xs); color: var(--muted); align-items: center; }
+.route-settings .legend i { display: inline-block; width: 16px; height: 0; border-top: 1.5px solid var(--accent); vertical-align: middle; margin-right: 4px; }
+.route-settings .legend i.need { border-top: 1px dashed var(--muted); }
+.route-settings .legend i.cap { border-top: 1px solid var(--warn); }
+
+@media (max-width: 1100px) {
+  .route-settings .pace-win { grid-template-columns: 5rem minmax(3rem, 1fr) 2.75rem minmax(0, 1fr); }
+  .route-settings .pace-win .trend,
+  .route-settings .pace-win .trend-none { grid-column: 2 / -1; }
+  .route-settings .adv-row { grid-template-columns: 8rem 5rem minmax(0, 1fr); }
+}

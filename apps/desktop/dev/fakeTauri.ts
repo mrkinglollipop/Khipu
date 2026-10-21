@@ -4,7 +4,7 @@
 import { CLIENT, TRACKED, discovery, liveRow, status9B } from "../src/__tests__/accountsFixtures";
 import type { DiscoverResult } from "../src/accountsApi";
 
-export type Fake = { nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15b?: boolean };
+export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15b?: boolean };
 
 /** Fictional routing record for the Proposals and holds group (slice 15b),
  *  shaped as `khipu route --json` prints it. */
@@ -84,6 +84,8 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
         return f.usage ?? { accounts: [{ harness: "claude", account: "Claude Code", home: null, ok: true, plan: "max", windows: [] }] };
       case "khipu_features_show":
         return { features: { routing_push: { enabled: true, source: "default" } } };
+      case "khipu_projects_list":
+        return { ok: true, ...(f.projects as object) };
       case "khipu_route_view":
         if (f.route15b) return route15b().view;
         return { accounts: [], priority: null };

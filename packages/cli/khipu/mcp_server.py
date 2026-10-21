@@ -979,6 +979,25 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "khipu_project",
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "description": (
+            "Is this one project? For any name of a project, its canonical "
+            "name, every name grouped with it (owner, same checkout or GitHub) "
+            "with the evidence and date, what each name holds (open "
+            "commitments, standing decisions, episodes) and in total, and the "
+            "'same project?' pairs the owner is asked about or kept separate. "
+            "The same answer whichever name is passed; paste it as proof. A "
+            "pair that is asked is the owner's to answer: ask them, then call "
+            "khipu_owner_act with project.merge or project.keep_separate."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Any name of the project, e.g. owner/repo"}},
+            "required": ["name"],
+        },
+    },
+    {
         "name": "khipu_owner_act",
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
         "description": (
@@ -1675,10 +1694,18 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     filters = owed_filters(args)
     limit, note = owed_page_limit(args.get("limit"))
     project = args.get("project") or None
+    # The alias the caller named reads as -- and is reported as -- its
+    # canonical project, the same labels the rows carry; `asked` keeps the
+    # name they typed (``project_group.show``'s asked/canonical pair).
+    canonical = project
     hub_now = None
     try:
         with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
             with conn.cursor() as cur:
+                if project:
+                    from khipu import identity
+
+                    canonical = identity.project_canonical_group(cur, project)[0] or project
                 rows = commitments.fetch_owed_rows(cur, project=project, status=status)
                 if hub_ages:
                     # A Mac clock ahead of or behind the hub can't make an age negative.
@@ -1691,13 +1718,15 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
         rows = offline_reads.owed_rows(project, status)
         if rows is None:
             raise
+        canonical = offline_reads.owed_canonical(project) if project else project
         stale = stale_fields()
     page = commitments.page_owed(rows, **filters, limit=limit)
     if hub_ages:
         from datetime import datetime, timezone
 
         commitments.add_hub_ages(page["results"], hub_now or datetime.now(timezone.utc))
-    out = {"status": status, "project": project, **page, "limit": limit,
+    out = {"status": status, "project": canonical, **page, "limit": limit,
+           **({"asked": project} if project and canonical != project else {}),
            **({"limit_note": note} if note else {}), **stale}
     directions = _routing_direction_rows(status, filters)
     if directions:
@@ -2664,6 +2693,21 @@ def _tool_owner_act(args: dict) -> dict:
     return out
 
 
+def _tool_project(args: dict) -> dict:
+    """``khipu_project``: one project's names, evidence, counts and pairs
+    (``project_group.show``). Read-only."""
+    name = str((args or {}).get("name") or "").strip()
+    if not name:
+        raise _ToolFailure({"ok": False, "code": "bad_args", "error": "khipu_project needs a name"})
+    _ensure_path()
+    from khipu import project_group
+    from khipu.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            return project_group.show(cur, name)
+
+
 _LEDGER_VERBS = ("add", "set", "get", "list", "loose-ends", "needs-owner", "needs-matt", "render", "check",
                  "remove", "removed")
 _LEDGER_TEXT = ("project", "id", "title", "kind", "parent", "state", "evidence", "owner", "note", "link", "if_state",
@@ -2799,6 +2843,7 @@ TOOL_FUNCS = {
     "khipu_route_priority": _tool_route_priority,
     "khipu_ledger": _tool_ledger,
     "khipu_owner_act": _tool_owner_act,
+    "khipu_project": _tool_project,
 }
 
 # Tools the HTTPS gateway neither lists nor runs: owner direction needs the

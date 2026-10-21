@@ -66,6 +66,12 @@ export type RouteAccount = {
   silent?: boolean;
   next_check?: string | null;
   reset_check?: { checks?: number; busy_tries?: number; status?: string; next_at?: string | null; reason?: string | null } | null;
+  /** One pace object per window Khipu reads (slice 4Pb), five-hour first. */
+  pace?: Pace[];
+  /** Each owner cap on this account with its verdict at this read (slice 17a). */
+  cap_statuses?: CapStatus[];
+  /** Khipu's launch advice for jobs (slice 17c). Advisory, never a gate. */
+  advice?: RouteAdvice | null;
 };
 
 export type RouteHold = {
@@ -256,6 +262,109 @@ export type PlanFact = {
   figures_at?: string | null;
   /** Its longest window's reset time passed since it was read. */
   reset_passed?: boolean;
+};
+
+/** One window's pace (`routing_pace.compute_pace`, slice 4Pb): the trailing
+ *  rate Khipu read, its verdict against the plan limit and each window-scoped
+ *  cap, and `why` the rate cannot be told. */
+export type PaceLimit = {
+  verdict?: "unknown" | "limit_reached" | "cap_reached" | "outpacing" | "underpacing" | "on_pace" | string;
+  needed_pct_per_h?: number | null;
+  runs_out_at?: string | null;
+  /** How long before the window's reset it runs out, in seconds. */
+  before_reset_s?: number | null;
+  unused_at_reset_pct?: number | null;
+  revision?: string | null;
+  pct?: number | null;
+};
+
+/** A per-day cap's own arithmetic: what the rolling day gained, where it
+ *  peaks and when it reaches the cap. */
+export type PaceDayCap = {
+  revision?: string | null;
+  pct?: number;
+  verdict?: "over" | "near" | "under" | "unknown" | string;
+  used_24h_pct?: number | null;
+  observed_pct?: number | null;
+  settles_at_pct?: number | null;
+  peak_pct?: number | null;
+  peak_at?: string | null;
+  reaches_cap_at?: string | null;
+  why?: string | null;
+};
+
+/** An even-pace cap (`pace_target`): how much the account may have used by
+ *  now and where it stands against that allowance. */
+export type PaceTarget = {
+  revision?: string | null;
+  pct?: number;
+  slack?: number;
+  allowance_pct?: number | null;
+  used_pct?: number | null;
+  verdict?: "ahead" | "within" | "recovering" | "unknown" | string;
+  why?: string | null;
+};
+
+export type Pace = {
+  window: "five_hour" | "weekly" | string;
+  cycle_resets_at?: string | null;
+  /** The trailing span the rate covers: 1 or 24. */
+  trailing_h?: number;
+  buckets?: number;
+  valid_pct?: number;
+  observed_pct?: number;
+  gappy?: boolean;
+  rate_pct_per_h?: number | null;
+  /** Why no rate can be given, in the CLI's own words. */
+  why?: string | null;
+  used_pct?: number | null;
+  plan?: PaceLimit;
+  share_cap?: PaceLimit | null;
+  day_cap?: PaceDayCap | null;
+  pace_target?: PaceTarget | null;
+  /** Which target the window's verdict speaks: plan, share_cap or day_cap. */
+  headline?: "plan" | "share_cap" | "day_cap" | string;
+};
+
+/** One owner cap with its verdict at this read (`routing.py cap_statuses`,
+ *  slice 17a/17t): the fact as you confirmed it, plus the figures that
+ *  judged it. A cap Khipu cannot read says `unknown` with no figure. */
+export type CapStatus = {
+  kind: "share" | "per_day" | "pace_target" | "spend" | "concurrency" | string;
+  /** The fact's opaque revision, as you confirmed it (no date is carried). */
+  revision?: string | null;
+  window?: "five_hour" | "weekly" | null;
+  pct?: number | null;
+  slack?: number | null;
+  allowance_pct?: number | null;
+  used_pct?: number | null;
+  cap_usd?: number | null;
+  days?: number | null;
+  usd?: number | null;
+  events?: number | null;
+  cap_n?: number | null;
+  jobs?: number | null;
+  verdict?: string;
+  why?: string | null;
+};
+
+/** One account's launch advice (`routing_advice.account_advice`, slice 17c).
+ *  `route --json` carries the job purpose only; orchestration advice is the
+ *  CLI's own `route advise`. Advisory: it never blocks, permits or launches. */
+export type RouteAdvice = {
+  account?: string;
+  label?: string | null;
+  purpose?: "job" | string;
+  verdict?: "go" | "hold_back" | "closed" | "not_eligible" | string;
+  /** The verdict's cause: semicolon-joined "kind verdict" pairs, a state, a
+ *  crossing, or the eligibility sentence in the CLI's words. */
+  reason?: string | null;
+  evidence?: "fresh" | "stale" | "unknown" | string;
+  numbers?: Record<string, number>;
+  caps?: (CapStatus & { applies?: boolean })[];
+  eligible?: boolean;
+  why_eligible?: string | null;
+  advisory?: boolean;
 };
 
 /** Rule 12's model table, once the owner has confirmed it (slice 10). Only a

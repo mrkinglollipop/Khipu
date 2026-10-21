@@ -84,7 +84,7 @@ def test_a_runner_cap_with_no_khipu_fact_is_flagged(mac):
     flag = flags[0]
     assert flag["runner"] == "runner a"
     assert (flag["account"], flag["kind"], flag["window"], flag["status"]) == (
-        MAIN, "share", "weekly", "no_fact")
+        "Main", "share", "weekly", "no_fact")
     assert flag["declared"] == {"kind": "share", "window": "weekly", "pct": 91.0}
     assert flag["fact"] is None
     assert "runner a" in flag["text"] and "Main" in flag["text"]
@@ -143,7 +143,7 @@ def test_account_scoped_caps_need_no_window_and_different_accounts_stay_apart(ma
     _cap("Main", "concurrency", n=1)
     _runner(mac, {"DeepSeek": [{"kind": "concurrency", "n": 1}]})
     (flag,) = _flags()
-    assert flag["account"] == DEEPSEEK and flag["status"] == "no_fact"
+    assert flag["account"] == "DeepSeek" and flag["status"] == "no_fact"
     assert flag["window"] is None
 
 
@@ -162,7 +162,9 @@ def test_an_unknown_account_is_flagged_and_never_guessed(mac):
     _runner(mac, {"Ghost": [{"kind": "share", "window": "weekly", "pct": 91}]})
     (flag,) = _flags()
     assert flag["status"] == "no_account" and flag["account"] is None
-    assert "Ghost" in flag["text"] and "isn't a Khipu account" in flag["text"]
+    assert "Ghost" not in json.dumps(flag)
+    assert "an unnamed account" in flag["text"] and "isn't a Khipu account" in flag["text"]
+    assert flag["account_words"] == "an unnamed account"
 
 
 def test_a_secret_shaped_account_is_counted_and_never_shown(mac):
@@ -226,6 +228,46 @@ def test_two_runners_are_reported_separately(mac):
     _runner(mac, {"Main": [{"kind": "share", "window": "weekly", "pct": 76}]}, name="runner b")
     (flag,) = _flags()
     assert flag["runner"] == "runner b" and flag["status"] == "disagrees"
+
+
+def test_public_view_runner_caps_follow_the_account_filter(mac):
+    _runner(mac, {"Main": [{"kind": "share", "window": "weekly", "pct": 91}],
+                  "DeepSeek": [{"kind": "share", "window": "weekly", "pct": 80}]})
+    view = routing.read_view(now=NOW)
+    public = routing.public_view(view, NOW, account=MAIN)
+    assert [e["key"] for e in public["accounts"]] == [MAIN]
+    assert [(f["account"], f["status"]) for f in public["runner_caps"]] == [("Main", "no_fact")]
+    public = routing.public_view(view, NOW, account=DEEPSEEK)
+    assert [(f["account"], f["status"]) for f in public["runner_caps"]] == [("DeepSeek", "no_fact")]
+    assert len(routing.public_view(view, NOW)["runner_caps"]) == 2
+
+
+def test_a_login_key_never_appears_in_a_runner_cap_flag(mac):
+    _runner(mac, {"DeepSeek": [{"kind": "share", "window": "weekly", "pct": 91}]})
+    (flag,) = _flags()
+    assert flag["account"] == "DeepSeek" and flag["account_words"] == "DeepSeek"
+    assert DEEPSEEK not in json.dumps(flag) and "/logins/" not in json.dumps(flag)
+    view = routing.read_view(now=NOW)
+    assert DEEPSEEK not in json.dumps(routing.public_view(view, NOW)["runner_caps"])
+    assert DEEPSEEK not in json.dumps(routing.doctor_block(now=NOW)["runner_caps"])
+
+
+def test_a_login_key_shaped_label_is_never_echoed():
+    accounts = [{"key": DEEPSEEK, "label": DEEPSEEK, "caps": []}]
+    declared = [{"runner": "r", "account": DEEPSEEK, "kind": "share", "window": "weekly", "pct": 91.0}]
+    (flag,) = routing_scanner.compare_runner_caps(declared, accounts)
+    assert DEEPSEEK not in json.dumps(flag) and "/logins/" not in json.dumps(flag)
+
+
+def test_an_unknown_letters_only_name_is_never_echoed():
+    accounts = [{"key": MAIN, "label": "Main", "caps": []}]
+    declared = [{"runner": "r", "account": "LettersOnlySecretName", "kind": "share",
+                 "window": "weekly", "pct": 91.0}]
+    (flag,) = routing_scanner.compare_runner_caps(declared, accounts)
+    assert flag["status"] == "no_account" and flag["account"] is None
+    assert "LettersOnlySecretName" not in json.dumps(flag)
+    assert flag["account_words"] == "an unnamed account"
+    assert "an unnamed account" in flag["text"]
 
 
 # ---- the pure comparison and the parser used on their own ------------------

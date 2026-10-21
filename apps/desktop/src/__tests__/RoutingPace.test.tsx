@@ -1,0 +1,196 @@
+// Routing slice 15e (docs/plans/2026-10-20-routing-first-class.md, 2a and
+// 13): the Pace, caps and advice group. The fixture is the approved mock's
+// fictional data, shaped as `khipu route --json` (docs/mockups/2026-10-21-routing).
+import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { PaceSection } from "../RoutingSettings";
+import { paceModel } from "../routingPace";
+import { PACE_NOW, PACE_PLANS, PACE_VIEW } from "../../dev/paceFake";
+
+afterEach(cleanup);
+
+const folds = { isOpen: () => false, toggle: () => {}, openKeys: () => {} };
+
+describe("Pace, caps and advice: the model", () => {
+  it("puts the mock's line, tags and one open account on the group", () => {
+    const model = paceModel(PACE_VIEW, PACE_PLANS, PACE_NOW);
+    expect(model.line).toBe("Claude reaches a cap at 4:40 PM; Muse closed");
+    expect(model.tags.map((t) => t.text)).toEqual(["Claude outpacing", "3 hold back for jobs"]);
+    expect(model.rows.map((r) => r.label)).toEqual(["Claude", "Codex", "Grok", "Claude second", "GLM", "DeepSeek", "Muse"]);
+    expect(model.rows.filter((r) => r.open).map((r) => r.label)).toEqual(["Claude"]);
+    expect(model.crossings.map((c) => c.show)).toEqual(["Claude's pace"]);
+  });
+
+  it("words rates to two decimals and the reset the rate lands on", () => {
+    const claude = paceModel(PACE_VIEW, PACE_PLANS, PACE_NOW).rows[0];
+    expect(claude.windows.map((w) => w.rate)).toEqual(["9% an hour", "0.82% an hour"]);
+    expect(claude.windows[0].rateTag?.text).toBe("Outpacing your 60%");
+    expect(claude.windows[1].rateTag?.text).toBe("Outpacing");
+    expect(claude.windows[0].r2).toBe("7.2% an hour lands on 60% at the 5:10 PM reset");
+    expect(claude.windows[1].r2).toBe("0.59% an hour lands on 100% at the reset Mon 11:00 AM");
+    const say = claude.say.map((p) => p.text).join("");
+    expect(say).toContain("At the week's rate it would run out Sun 2:46 AM");
+    expect(say).toContain(", 1 d 8 h before the reset.");
+  });
+
+  it("shows only the advice the CLI gives, and only a whole-limit target clears", () => {
+    const model = paceModel(PACE_VIEW, PACE_PLANS, PACE_NOW);
+    const claude = model.rows[0];
+    expect(claude.caps.map((c) => c.name)).toEqual([
+      "Five hours: at most 60%",
+      "Week: at most 91%",
+      "Week: even pace to 65%, 5 points slack",
+      "Jobs: at most 13% a day",
+    ]);
+    expect(claude.advice).toMatchObject({
+      word: "Hold back",
+      tone: "hold",
+      evid: "readings fresh",
+      why: "6 points ahead of your even pace to 65%; near its 13% a day.",
+    });
+    // A 65% even-pace target is not a target usage closes on its own.
+    expect(claude.advice?.why).not.toContain("Clears when");
+    expect(model.rows[1].advice?.why).toContain("Clears when the allowance reaches 47%, about 4.5 h from now if no more is used.");
+  });
+
+  it("keeps an unknown reading unknown and a closed account closed", () => {
+    const model = paceModel(PACE_VIEW, PACE_PLANS, PACE_NOW);
+    const deepseek = model.rows.find((r) => r.label === "DeepSeek");
+    expect(deepseek?.line).toEqual({ week: "Spend can't be told", advice: "Jobs: go, unsure" });
+    expect(deepseek?.advice?.evid).toBe("evidence unknown: spend gap");
+    const muse = model.rows.find((r) => r.label === "Muse");
+    expect(muse?.line).toEqual({ week: "Back Mon 12:00 AM", advice: "Closed to all" });
+    expect(muse?.open).toBe(false);
+  });
+
+  it("is empty only when no account has a pace or a cap", () => {
+    expect(paceModel({ record: true, priority: null, accounts: [] }, null, PACE_NOW)).toMatchObject({
+      rows: [], tags: [], crossings: [], line: "No accounts yet", empty: true,
+    });
+  });
+});
+
+// The four probe shapes from the cross-family review: real Python-computed
+// values (not the preview fixture) that the first tests missed.
+describe("Pace, caps and advice: probe regressions", () => {
+  const NOW = new Date(2026, 9, 21, 14, 40);
+  const at = (day: number, hour: number, minute = 0) => new Date(2026, 9, day, hour, minute).toISOString();
+  const pace = (over: Record<string, unknown>) => ({
+    window: "weekly", cycle_resets_at: at(26, 11), trailing_h: 24, buckets: 48,
+    valid_pct: 97.9, observed_pct: 97.9, gappy: false, rate_pct_per_h: 1, why: null, used_pct: 12,
+    plan: { verdict: "underpacing", needed_pct_per_h: 0.5, runs_out_at: null, before_reset_s: null, unused_at_reset_pct: 25 },
+    share_cap: null, day_cap: null, pace_target: null, headline: "plan", ...over,
+  });
+  const view = (accounts: unknown[]) => ({ record: true, priority: null, accounts } as never);
+  const acct = (over: Record<string, unknown>) => ({
+    key: "probe|", label: "Probe", harness: "claude", state: "open", pace: [], cap_statuses: [], ...over,
+  });
+
+  it("keeps a hold_back verdict when its evidence is unknown", () => {
+    const reached = pace({
+      used_pct: 95,
+      share_cap: { revision: "r-w", pct: 91, verdict: "cap_reached", needed_pct_per_h: null, runs_out_at: null, before_reset_s: null, unused_at_reset_pct: null },
+      headline: "share_cap",
+    });
+    const model = paceModel(view([acct({
+      pace: [reached],
+      cap_statuses: [{ kind: "share", revision: "r-w", window: "weekly", pct: 91, verdict: "cap_reached" }],
+      advice: { account: "probe", label: "Probe", purpose: "job", verdict: "hold_back", reason: "share cap_reached", evidence: "unknown", numbers: {}, eligible: true, why_eligible: "provider facts allow this work", advisory: true },
+    })]), null, NOW);
+    expect(model.rows[0].advice?.word).toBe("Hold back");
+    expect(model.rows[0].advice?.evid).toMatch(/^evidence unknown:/);
+    expect(model.rows[0].line.advice).toBe("Jobs: hold back, unsure");
+  });
+
+  it("keeps a closed verdict when its evidence is unknown", () => {
+    const model = paceModel(view([acct({
+      pace: [pace({})],
+      advice: { account: "probe", label: "Probe", purpose: "job", verdict: "closed", reason: "limited", evidence: "unknown", numbers: {}, eligible: true, why_eligible: "provider facts allow this work", advisory: true },
+    })]), null, NOW);
+    expect(model.rows[0].advice?.word).toBe("Closed");
+    expect(model.rows[0].line.advice).not.toContain("go");
+  });
+
+  it("shows only the trailing average rate, never a reconstructed past", () => {
+    const model = paceModel(view([acct({
+      pace: [pace({
+        used_pct: 12, rate_pct_per_h: 1, trailing_h: 24,
+        plan: { verdict: "outpacing", needed_pct_per_h: 0.5, runs_out_at: at(25, 6, 40), before_reset_s: null, unused_at_reset_pct: null },
+      })],
+    })]), null, NOW);
+    const trend = model.rows[0].windows[0].trend;
+    expect(trend?.label).toContain("averaged 1% an hour");
+    expect(trend?.label).toContain("trailing average");
+    expect(trend?.label).not.toContain("from");
+    expect(trend?.label).not.toContain("-12%");
+    const ys = (trend?.used ?? "").split(" ").map((p) => p.split(",")[1]);
+    expect(new Set(ys).size).toBe(1);
+  });
+
+  it("lets a reached share cap win the badge, summary and default opening", () => {
+    const model = paceModel(view([acct({
+      pace: [pace({
+        used_pct: 65,
+        share_cap: { revision: "r-w", pct: 60, verdict: "cap_reached", needed_pct_per_h: null, runs_out_at: null, before_reset_s: null, unused_at_reset_pct: null },
+        headline: "share_cap",
+      })],
+      cap_statuses: [{ kind: "share", revision: "r-w", window: "weekly", pct: 60, verdict: "cap_reached" }],
+      advice: { account: "probe", label: "Probe", purpose: "job", verdict: "hold_back", reason: "share cap_reached", evidence: "fresh", numbers: {}, eligible: true, why_eligible: "provider facts allow this work", advisory: true },
+    })]), null, NOW);
+    const row = model.rows[0];
+    expect(row.tag).toEqual({ text: "At your 60%", tone: "err" });
+    expect(row.say.map((p) => p.text).join("")).toContain("60%");
+    expect(row.say.map((p) => p.text).join("")).not.toContain("will go unused");
+    expect(row.line.week).toContain("60%");
+    expect(row.line.week).not.toContain("unused");
+    expect(row.open).toBe(true);
+  });
+
+  it("names the share cap that caused the hold, not the first share cap", () => {
+    const five = pace({
+      window: "five_hour", cycle_resets_at: at(21, 17, 10), trailing_h: 1, buckets: 12, used_pct: 10,
+      share_cap: { revision: "r-5h", pct: 60, verdict: "underpacing", needed_pct_per_h: 25, runs_out_at: null, before_reset_s: null, unused_at_reset_pct: null },
+      headline: "share_cap",
+    });
+    const week = pace({
+      used_pct: 95,
+      share_cap: { revision: "r-w", pct: 91, verdict: "cap_reached", needed_pct_per_h: null, runs_out_at: null, before_reset_s: null, unused_at_reset_pct: null },
+      headline: "share_cap",
+    });
+    const model = paceModel(view([acct({
+      pace: [five, week],
+      cap_statuses: [
+        { kind: "share", revision: "r-5h", window: "five_hour", pct: 60, verdict: "underpacing" },
+        { kind: "share", revision: "r-w", window: "weekly", pct: 91, verdict: "cap_reached" },
+      ],
+      advice: { account: "probe", label: "Probe", purpose: "job", verdict: "hold_back", reason: "share cap_reached", evidence: "fresh", numbers: {}, eligible: true, why_eligible: "provider facts allow this work", advisory: true },
+    })]), null, NOW);
+    expect(model.rows[0].advice?.why).toBe("At your week 91%.");
+  });
+});
+
+describe("Pace, caps and advice: the group", () => {
+  it("renders the open block, the closed lines and the push sub-fold", () => {
+    render(<PaceSection data={PACE_VIEW} plans={PACE_PLANS} now={PACE_NOW} folds={folds} />);
+    expect(screen.getByRole("group", { name: "Claude pace" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /Your caps/ })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /Khipu's advice/ })).toBeTruthy();
+    expect(screen.getAllByText("6 points ahead").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Jobs: hold back").length).toBeGreaterThan(0);
+    expect(screen.getByText("Closed to all")).toBeTruthy();
+    expect(screen.getByText("When pace changes are sent to conversations")).toBeTruthy();
+    // The CLI carries jobs advice only; a lead-conversation verdict would be invented.
+    expect(screen.queryByText("Lead conversations")).toBeNull();
+  });
+
+  it("offers no owner action: no cap setting, confirming or removing", () => {
+    render(<PaceSection data={PACE_VIEW} plans={PACE_PLANS} now={PACE_NOW} folds={folds} />);
+    expect(screen.queryByRole("button", { name: /add a cap|set a cap|confirm|remove/i })).toBeNull();
+    expect(screen.queryByRole("textbox")).toBeNull();
+  });
+
+  it("says when no account has a reading", () => {
+    render(<PaceSection data={{ record: true, priority: null, accounts: [] }} plans={null} now={PACE_NOW} folds={folds} />);
+    expect(screen.getByText("No usage readings yet")).toBeTruthy();
+  });
+});

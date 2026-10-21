@@ -2442,6 +2442,84 @@ async fn khipu_owner_direction_set(key: String, value: String) -> Result<String,
     run_khipu_cli_async(owner_direction_set_argv(&key, &value)?).await
 }
 
+/// A project name as the app sends it, held to the safe shape the CLI holds
+/// it to (`identity.safe_project_name`): a remote's `owner/repo`
+/// (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,100}`) or a folder name
+/// (`[A-Za-z0-9._][A-Za-z0-9._ -]{0,99}`). Anything else (a `|`, a newline,
+/// a backtick, a leading dash) is refused here, before the CLI is run.
+fn checked_project_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
+    let slug = match name.split_once('/') {
+        Some((owner, repo)) => {
+            let n = owner.chars().count();
+            let r = repo.chars().count();
+            owner.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+                && n <= 100
+                && owner.chars().all(word)
+                && (1..=100).contains(&r)
+                && repo.chars().all(word)
+        }
+        None => false,
+    };
+    let folder = name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+        && name.chars().count() <= 100
+        && name.chars().all(|c| word(c) || c == ' ');
+    if !(slug || folder) {
+        return Err("that is not a project name Khipu uses (letters, digits, dots, dashes and underscores, \
+                    with one owner/repo slash at most)"
+            .to_string());
+    }
+    Ok(name.to_string())
+}
+
+const PROJECTS_LIST_ARGV: &[&str] = &["project", "list", "--json"];
+
+fn project_owner_argv(verb: &[&str], flags: &[(&str, &str)], names: &[&str]) -> Result<Vec<String>, String> {
+    let mut argv: Vec<String> = vec!["project".to_string()];
+    argv.extend(verb.iter().map(|s| s.to_string()));
+    argv.push("--from-app".to_string());
+    for (flag, value) in flags {
+        argv.push(flag.to_string());
+        argv.push(checked_project_name(value)?);
+    }
+    argv.push("--".to_string());
+    for n in names {
+        argv.push(checked_project_name(n)?);
+    }
+    Ok(argv)
+}
+
+#[tauri::command]
+async fn khipu_projects_list() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(PROJECTS_LIST_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_project_name_add(older: String, current: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["alias", "add"], &[], &[&older, &current])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_name_remove(older: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["alias", "remove"], &[], &[&older])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_separate(name: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["separate"], &[], &[&name])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_merge(a: String, b: String, show_as: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["merge"], &[("--show-as", &show_as)], &[&a, &b])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_keep_separate(a: String, b: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["keep-separate"], &[], &[&a, &b])?).await
+}
+
 #[tauri::command]
 async fn khipu_route_clear(account: String, report: Option<String>, op: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(route_operation_argv(route_clear_argv(&account, report.as_deref())?, op.as_deref())?).await
@@ -4977,6 +5055,12 @@ pub fn run() {
             khipu_owner_direction_acknowledge,
             khipu_owner_direction_switch,
             khipu_owner_direction_set,
+            khipu_projects_list,
+            khipu_project_name_add,
+            khipu_project_name_remove,
+            khipu_project_separate,
+            khipu_project_merge,
+            khipu_project_keep_separate,
             khipu_route_clear,
             khipu_route_note_set,
             khipu_route_note_end,
@@ -5556,6 +5640,39 @@ mod settings_command_tests {
             assert!(!argv.iter().any(|a| a.starts_with("--max-age")));
         }
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"usage"));
+    }
+
+    #[test]
+    fn project_commands_are_fixed_verbs_marked_from_the_app() {
+        assert_eq!(fixed_argv(PROJECTS_LIST_ARGV), v(&["project", "list", "--json"]));
+        assert_eq!(
+            project_owner_argv(&["alias", "add"], &[], &["o/old", "o/new"]).unwrap(),
+            v(&["project", "alias", "add", "--from-app", "--", "o/old", "o/new"])
+        );
+        assert_eq!(
+            project_owner_argv(&["merge"], &[("--show-as", "o/b")], &["o/a", "o/b"]).unwrap(),
+            v(&["project", "merge", "--from-app", "--show-as", "o/b", "--", "o/a", "o/b"])
+        );
+        assert_eq!(
+            project_owner_argv(&["separate"], &[], &["o/old"]).unwrap(),
+            v(&["project", "separate", "--from-app", "--", "o/old"])
+        );
+        assert!(project_owner_argv(&["alias", "remove"], &[], &[""]).is_err());
+        assert!(project_owner_argv(&["alias", "remove"], &[], &["a\nb"]).is_err());
+    }
+
+    #[test]
+    fn project_names_are_held_to_the_safe_shape_before_the_cli_runs() {
+        for ok in ["o/old", "my-folder", "my folder.v2", "_x", "a.b/c_d-e", "  o/padded  "] {
+            assert!(checked_project_name(ok).is_ok(), "{ok:?} should pass");
+        }
+        let long_owner = format!("{}/r", "a".repeat(101));
+        let long_folder = "a".repeat(101);
+        for bad in ["", "o/a|o/b", "a|b", "o/a\no/b", "o/a`x`", "--x", "-x", "o/", "/r", "a/b/c", "o /r", "o/a b", "é/x", &long_owner, &long_folder] {
+            assert!(checked_project_name(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert!(project_owner_argv(&["keep-separate"], &[], &["--x", "o/b"]).is_err());
+        assert!(project_owner_argv(&["merge"], &[("--show-as", "o/a|o/b")], &["o/a", "o/b"]).is_err());
     }
 
     #[test]

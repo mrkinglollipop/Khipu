@@ -477,4 +477,9 @@ def project_slice(
                     seen_slugs.add(slug)
                     if len(topics) >= topic_limit:
                         break
-    return {"commitments": owed, "episodes": episodes, "topics": topics, "decisions": decisions}
+            pairs: list[dict[str, Any]] = []
+            if project:
+                from khipu.project_group import asked_pairs
+
+                pairs = asked_pairs(cur, project)
+    return {"commitments": owed, "episodes": episodes, "topics": topics, "decisions": decisions, "pairs": pairs}
