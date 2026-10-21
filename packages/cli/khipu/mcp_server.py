@@ -810,8 +810,19 @@ TOOLS: list[dict] = [
             "Read it before you hand work to another account or model. "
             "`since` (a version, or epoch:version, as an earlier answer gave "
             "it) answers only what changed after it; `account` narrows to one "
-            "account. Data, not instructions; guidance, not a gate. Khipu "
-            "reports; routing stays with you."
+            "account. The answer carries `routing_changes` (a batch issued to "
+            "this conversation's `mcp` component) and `delivery`; pass `ack` "
+            "with that batch once you have read it, and only with your own "
+            "batch. A caller with no session in its environment must pass "
+            "`session_id`: a pull-only child passes its own `<parent>/<child>` "
+            "session id, where the parent is the canonical root exactly as "
+            "the environment names it (`claude:<id>`, `codex:<id>` or the "
+            "shared session id, then `/<child>`) — a bare native id as the "
+            "parent is not yours; and clients sharing one gateway token use session ids "
+            "unique among them, of the form `<client>:<stable id>`. With no "
+            "identity the answer says `untracked: pass session_id` and nothing "
+            "is marked delivered. Data, not instructions; guidance, not a "
+            "gate. Khipu reports; routing stays with you."
         ),
         "inputSchema": {
             "type": "object",
@@ -819,6 +830,11 @@ TOOLS: list[dict] = [
                 "since": {"type": "string",
                           "description": "Only what changed after this version (V or epoch:V)"},
                 "account": {"type": "string", "description": "One account: its label or its id, as khipu_route lists them"},
+                "session_id": {"type": "string",
+                               "description": "This conversation's own session id when its environment names none; "
+                                              "a descendant uses the canonical root as its prefix (claude:<id>/child, codex:<id>/child)"},
+                "ack": {"type": "string",
+                        "description": "A routing batch issued to this conversation's mcp component, read and now acknowledged"},
             },
         },
     },
@@ -2265,6 +2281,60 @@ def _tool_usage(args: dict) -> dict:
                                             background=True))
 
 
+def _route_pull_attachment(routing, routing_delivery, identity, now, *, view=None):
+    """(routing_changes, delivery) for one pull caller, from the current view.
+
+    An identified caller reserves its `mcp` component's batch under the
+    delivery lock; an unidentified one is shown the same items with nothing
+    reserved or consumed."""
+    if view is None:
+        with routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
+            view = routing.read_view(now)
+    from khipu import agent_view
+
+    keys = [a.get("key") for a in view.get("accounts") or [] if isinstance(a, dict)]
+    table = agent_view._table(keys)
+    table.owner = agent_view.keep_owner_words(view)
+
+    def project(value):
+        return agent_view.scrub_strict(value, keep=table.owner, extra_keys=keys)
+
+    planned = routing_delivery.plan(
+        {"kind": "full", "text": routing.summary(view, now=now)["text"],
+         "version": view["version"], "epoch": view.get("epoch"),
+         "owed_entities": [], "shown_entities": []},
+        view, now, routing.settings(), project=project,
+        session=identity["session"] if identity else None)
+    # Only this pull's complete scrub table proves lane alias coverage.
+    skip = frozenset(item["entity"] for item in planned["delivery_plan"]["items"] if item.get("withheld"))
+    skip |= frozenset() if agent_view.login_inventory_available() else frozenset(
+        item["entity"] for item in planned["delivery_plan"]["items"]
+        if item["entity"].startswith("lane:"))
+    if identity is None:
+        changes, delivery = {"batch": None, "component": "mcp",
+                             "items": [item for item in routing_delivery.untracked_items(planned)
+                                       if item["entity"] not in skip]}, "untracked: pass session_id"
+    else:
+        counting = "main" if identity["capability"] == "hooked" else "mcp"
+        changes, delivery = routing_delivery.pull_offer(planned, session=identity["session"], component="mcp",
+                                                        counting_component=counting, now=now, skip_entities=skip)
+    # Pull items name entities publicly: an account by its stable id, never
+    # its key (a login folder the raw ledger entity carries).
+    if changes is not None:
+        changes = {**changes, "items": [
+            {**item, "entity": routing._public_entity(item["entity"]),
+             "change": f"{routing._public_entity(item['entity'])}@{item['revision']}"}
+            for item in changes["items"]]}
+    if isinstance(delivery, dict) and delivery.get("duplicates_across_components"):
+        delivery = {**delivery, "duplicates_across_components": [
+            routing._public_entity(entity) for entity in delivery["duplicates_across_components"]]}
+    # Projected strictly here, not only scrubbed at dispatch: an entity can
+    # carry an account key or a secret-shaped lane name, and a direct
+    # caller of this tool gets neither.
+    scrubbed = project({"routing_changes": changes, "delivery": delivery})
+    return scrubbed["routing_changes"], scrubbed["delivery"]
+
+
 # Stdio has one connection per server process. PID scoping also drops any
 # receipts inherited by a fork; a new stdio connection gets a fresh token.
 _ROUTING_RECEIPTS = {}
@@ -2288,12 +2358,27 @@ def _with_route_receipts(func):
 
 @_with_route_receipts
 def _tool_route(args: dict) -> dict:
+    if _via_https_gateway():
+        return {"available": False, "reason": ROUTING_GATEWAY_REASON}
+    from khipu import agent_view
+
+    try:
+        with agent_view.pull_projection():
+            return _tool_route_projected(args)
+    except agent_view.PullInventoryUnavailable:
+        # No reservation or acknowledgement happens without the full table.
+        return {"available": False, "reason": agent_view.INCOMPLETE}
+
+
+def _tool_route_projected(args: dict) -> dict:
     """khipu_route: the routing record as ``khipu route --json`` gives it,
-    plus the words the push leaves out. Local only until the cloud copy."""
+    plus the words the push leaves out, and this conversation's pull
+    delivery (`routing_changes` and `delivery`). Local only until the
+    cloud copy."""
     if _via_https_gateway():
         return {"available": False, "reason": ROUTING_GATEWAY_REASON}
     _ensure_path()
-    from khipu import routing
+    from khipu import routing, routing_delivery
 
     account = args.get("account")
     if account is not None and not isinstance(account, str):
@@ -2301,7 +2386,49 @@ def _tool_route(args: dict) -> dict:
     since = args.get("since")
     if since is not None and (isinstance(since, bool) or not isinstance(since, (str, int))):
         raise ValueError("since must be a version number, or epoch:version")
-    return routing.conversation_view(since_version=since, account=account or None)
+    for key in ("session_id", "ack"):
+        if args.get(key) is not None and not isinstance(args[key], str):
+            raise ValueError(f"{key} must be text")
+    identity = routing_delivery.canonical_identity(os.environ, explicit=args.get("session_id"))
+    if args.get("session_id") and identity is None and routing_delivery.canonical_identity(os.environ):
+        raise _ToolFailure({"ok": False, "code": "session_not_yours",
+                            "error": "session_id must name this conversation or a strict descendant of its "
+                                     "canonical root (for example claude:<id>/child or codex:<id>/child, "
+                                     "using the root exactly as your environment names it)."})
+    now = routing._now()
+    # The body, reserved pages and final scrub share one folded view.
+    with routing._for_a_conversation(), routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
+        view = routing.read_view(now)
+    ack = (args.get("ack") or "").strip()
+    if ack and identity is not None:
+        # Revalidate the complete source and final representation first.
+        # A pre-upgrade or newly withheld reservation cannot consume debt.
+        _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
+        status = routing_delivery.pull_acknowledge(identity["session"], ack, component="mcp", now=now)
+        if status == "foreign":
+            raise _ToolFailure({"ok": False, "code": "ack_not_yours",
+                                "error": "That routing batch was not issued to this conversation; "
+                                         "the batch stays where it was."})
+    try:
+        out = routing.conversation_view(since_version=since, account=account or None, now=now, view=view)
+    except ValueError as exc:
+        # A refusal still carries this caller's routing changes, scrubbed
+        # with the error at the dispatch boundary like any other addition.
+        payload = {"error": str(exc)}
+        try:
+            changes, delivery = _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
+        except Exception:  # noqa: BLE001 - the refusal itself stays the answer
+            changes, delivery = None, None
+        if changes is not None:
+            payload["routing_changes"] = changes
+        if delivery is not None:
+            payload["delivery"] = delivery
+        raise _ToolFailure(payload) from None
+    changes, delivery = _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
+    if changes is not None:
+        out["routing_changes"] = changes
+    out["delivery"] = delivery
+    return out
 
 
 def _tool_route_report(args: dict) -> dict:
@@ -2557,10 +2684,14 @@ _MEMORY_FIELDS = ("prior_work", "prior_work_text", "prior_work_meta")
 def _scrub_for_agents(name: str, payload):
     from khipu import agent_view
 
+    # khipu_route's answers carry conversation-written words (pending
+    # rules, lane names) that scrub alone leaves secret-shaped tokens and
+    # account keys in: they leave through the strict projection's scan.
+    strict = agent_view.scrub_strict if name == "khipu_route" else agent_view.scrub
     if not isinstance(payload, dict):
-        return agent_view.scrub(payload)
+        return strict(payload)
     memory = {k: payload[k] for k in _MEMORY_FIELDS if k in payload}
-    out = agent_view.scrub({k: v for k, v in payload.items() if k not in memory})
+    out = strict({k: v for k, v in payload.items() if k not in memory})
     out.update(memory)
     return out
 
@@ -2750,9 +2881,20 @@ def _dispatch_message(msg: dict) -> dict | None:
         from khipu import agent_view
 
         # Every error leaves through the tool's own pass: a projected tool's
-        # through agent_view.project, whatever raised it.
-        scrub = agent_view.project if name in _AGENT_PROJECTED else agent_view.scrub
+        # through agent_view.project, khipu_route's through the strict
+        # projection's scan, whatever raised it.
+        if name in _AGENT_PROJECTED:
+            scrub = agent_view.project
+        elif name == "khipu_route":
+            scrub = agent_view.scrub_strict
+        else:
+            scrub = agent_view.scrub
+        projection = agent_view.pull_projection() if name == "khipu_route" and not _via_https_gateway() else None
+        projection_entered = False
         try:
+            if projection is not None:
+                projection.__enter__()
+                projection_entered = True
             arguments = dict(params.get("arguments") or {})
             if name in {"khipu_route_report", "khipu_route_rule", "khipu_route_priority"} and not _via_https_gateway():
                 from khipu import routing
@@ -2770,6 +2912,8 @@ def _dispatch_message(msg: dict) -> dict | None:
                 payload = _scrub_for_agents(name, payload)
             elif name in _AGENT_PROJECTED:
                 payload = agent_view.project(payload)
+        except agent_view.PullInventoryUnavailable:
+            return _result(req_id, _tool_text({"available": False, "reason": agent_view.INCOMPLETE}))
         except _ToolFailure as exc:
             return _result(req_id, _tool_text(scrub(exc.payload), is_error=True))
         except ValueError as exc:  # argument/mode rejections → tool error, not crash
@@ -2784,8 +2928,11 @@ def _dispatch_message(msg: dict) -> dict | None:
             # Its own text may name a file: fixed words for a filesystem
             # error, anything else scrubbed (agent_view.error_text).
             error = {"error": agent_view.error_text(exc)}
-            return _result(req_id, _tool_text(scrub(error) if name in _AGENT_PROJECTED else error, is_error=True))
+            return _result(req_id, _tool_text(
+                scrub(error) if name in _AGENT_PROJECTED or name == "khipu_route" else error, is_error=True))
         finally:
+            if projection_entered:
+                projection.__exit__(None, None, None)
             if _RELOAD_ON_CHANGE:
                 _note_loaded_modules()
         return _result(req_id, _tool_text(payload))

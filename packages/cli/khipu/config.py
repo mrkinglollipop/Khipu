@@ -738,12 +738,31 @@ def check_accounts_version(data: dict, expect: "str | None") -> None:
 
 
 AUTO_TRACK_KEY = "usage_auto_track"
+AUTO_TRACK_MIGRATION_KEY = "usage_auto_track_default_migrated"
 
 
 def auto_track() -> bool:
     """Whether found accounts a conversation used are tracked without asking
-    (settings clarity phase 9; per Mac, off by default)."""
-    return load_config().get(AUTO_TRACK_KEY) is True
+    (settings clarity phase 9; per Mac). On by default only for a genuinely
+    new install — no config file at all (decision 15). An install that
+    already had a config file when this default arrived, with no stored
+    key, may have turned it off under the old delete-the-key behaviour:
+    the migration below stores an explicit ``false`` plus its marker once,
+    so it stays off. Any stored value other than literal ``true`` — false,
+    null, 0, a string, a malformed document — reads as off."""
+    data = load_config()
+    if AUTO_TRACK_KEY in data:
+        return data[AUTO_TRACK_KEY] is True
+    if not config_file().is_file():
+        return True
+    try:
+        with mutate_config() as stored:
+            if AUTO_TRACK_KEY not in stored:
+                stored[AUTO_TRACK_KEY] = False
+                stored[AUTO_TRACK_MIGRATION_KEY] = True
+    except Exception:  # noqa: BLE001 — a malformed document reads as off, never on
+        return False
+    return False
 
 
 # ---------------------------------------------------------------------------

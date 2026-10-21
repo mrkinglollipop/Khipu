@@ -2261,8 +2261,9 @@ def cmd_usage(args: argparse.Namespace) -> int:
         out = discover.discover(now=bool(getattr(args, "now", False)), check=getattr(args, "check", None))
         if getattr(args, "check", None) is None:
             out["clis"] = discover.cli_states()
-        # The owner's automatic-tracking switch (off by default): what Home
-        # would offer is tracked through the one save path.
+        # The owner's automatic-tracking switch (on by default for a new
+        # install; an explicit off persists): what Home would offer is
+        # tracked through the one save path.
         from khipu import accounts
 
         out["auto_tracked"] = accounts.auto_track(out)
@@ -6347,6 +6348,10 @@ def build_parser() -> argparse.ArgumentParser:
     aauto = acc_sub.add_parser("auto-track", parents=[acc_owner],
                                help="Track found logins a conversation used without asking (on this Mac)")
     aauto.add_argument("state", choices=("on", "off"))
+    amerge = acc_sub.add_parser("merge", parents=[acc_owner],
+                                help="Same subscription: offer these found logins as one account")
+    amerge.add_argument("--candidate", action="append", required=True, metavar="ID",
+                        help="A discovery candidate id; repeat for each login of the subscription")
     areq = acc_sub.add_parser("request", parents=[acc_owner, acc_cas],
                               help="Answer a conversation's change to the account list")
     areq.add_argument("action", choices=("confirm", "undo"))

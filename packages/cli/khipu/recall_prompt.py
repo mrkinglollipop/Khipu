@@ -208,13 +208,16 @@ def _save_recent_batches(session_id: str, batches: list[tuple[str, ...]]) -> Non
 # that session's existing per-prompt state, not in a new file per session").
 
 
-def routing_marker(session_id: str, component: str = "main") -> dict:
+def routing_marker(session_id: str, component: str = "main", *, canonical=False) -> dict:
     """{"version", "epoch", "full_at"} as last recorded, or {}."""
     if not session_id:
         return {}
+    from khipu.routing_delivery import Marker, hook_session
+
+    if not canonical:
+        session_id = hook_session(session_id)
     data = _load_session_state(session_id)
     marker = data.get("routing") if component == "main" else data.get("routing_component_markers", {}).get(component)
-    from khipu.routing_delivery import Marker
 
     return Marker(marker if isinstance(marker, dict) else {}, session=session_id, component=component)
 
@@ -347,6 +350,9 @@ def _update_routing_marker(session_id: str, change, wait: float, *, component: s
     write records nothing and is never raised."""
     if not session_id or fcntl is None:
         return False
+    from khipu.routing_delivery import hook_session
+
+    session_id = hook_session(session_id)
     try:
         with _session_lock(session_id, wait) as taken:
             if not taken:
@@ -518,7 +524,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
                 signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 
             try:
-                marker = routing_marker(session_id)
+                marker = routing_marker(session_id, canonical=True)
                 out = routing.prompt_push(marker, budget=budget, on_fold=fold_started, session_id=session_id)
                 answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed",
                                                    "owed_entities", "shown_entities", "generation", "notices", "routing_changes")}
@@ -1568,14 +1574,16 @@ class _RoutingAtPrompt:
             # The budget is the read's: it starts when the child is ready to
             # read (``collect``), not before the child imported routing (most
             # of 50 ms in a fresh interpreter).
-            self.session = session_id if isinstance(session_id, str) else None
+            from khipu.routing_delivery import hook_session
+
+            self.session = hook_session(session_id, env) if isinstance(session_id, str) and session_id else None
             self.forked = time.monotonic()
             self.cap = self.forked + _ROUTING_WAIT_MOST
             read_fd, write_fd = os.pipe()
             if forkserver is not None:
                 self.fd = read_fd
                 try:
-                    forkserver.start(write_fd, session_id, self.cap)
+                    forkserver.start(write_fd, self.session, self.cap)
                 except RoutingHelperStarting:
                     self.status = "skipped:starting"  # never waits for the helper
                     self._close()
@@ -1598,7 +1606,7 @@ class _RoutingAtPrompt:
                 os.close(write_fd)
                 raise
             if pid == 0:
-                _prompt_routing_child(write_fd, session_id, environ, self.cap, decided, moment)
+                _prompt_routing_child(write_fd, self.session, environ, self.cap, decided, moment)
             os.close(write_fd)
             self.pid, self.fd = pid, read_fd
             self.status = "skipped:budget"  # until an answer arrives in time
