@@ -69,8 +69,15 @@ afterEach(() => {
   invokeMock.mockReset();
 });
 
+// Routing writes carry a per-operation id (`op`, routing slice 3b) so a
+// retried write is recognised as the same change. These tests read the
+// arguments that say what the owner asked for; RoutingSettings.test.tsx
+// covers the ids themselves.
 function calls(cmd: string) {
-  return invokeMock.mock.calls.filter((c) => c[0] === cmd).map((c) => c[1]);
+  return invokeMock.mock.calls.filter((c) => c[0] === cmd).map((c) => {
+    const { op: _op, ...args } = (c[1] ?? {}) as Record<string, unknown>;
+    return args;
+  });
 }
 
 // ---------------------------------------------------------------------------
