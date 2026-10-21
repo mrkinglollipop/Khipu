@@ -1794,7 +1794,7 @@ def _checked(data: dict) -> dict | None:
         refs = data.get("accounts", [])
         if checked is None or not isinstance(refs, list) or any(
                 not isinstance(a, str) or not account_identity.STABLE.fullmatch(a)
-                or a.partition(":")[0] != checked["id"] for a in refs):
+                or not entry_model.provider_set_ref_allowed(checked, a) for a in refs):
             return None
         out.update(checked, accounts=list(refs))
     if "observation_scope" in data:
@@ -1896,6 +1896,25 @@ def _checked(data: dict) -> dict | None:
                     if not isinstance(scope["mac"], str) or not scope["mac"]:
                         return None
                     out["scope"]["mac"] = scope["mac"]
+    if out["type"] == "tier_table_set":
+        # Kept as written so a later confirmed table can be told from one
+        # that is not. An unknown tier stays in the line and is not adopted.
+        confirmed = data.get("confirmed")
+        tiers = data.get("tiers")
+        if not isinstance(confirmed, bool) or not isinstance(tiers, dict) or not tiers:
+            return None
+        if not all(isinstance(key, str) and isinstance(value, str) for key, value in tiers.items()):
+            return None
+        out["confirmed"] = confirmed
+        out["tiers"] = {_no_surrogates(key): _no_surrogates(value) for key, value in tiers.items()}
+    if out["type"] == "direction_set":
+        for field in ("topic", "value"):
+            raw = data.get(field)
+            if not isinstance(raw, str):
+                return None
+            out[field] = _no_surrogates(raw)
+        if not out.get("account") or not out.get("id"):
+            return None
     return out
 
 
@@ -3033,12 +3052,15 @@ def _fold_priority(priority: dict | None, now: datetime, labels: dict, in_settin
             replaced = {"entries": held, "until": _iso(priority["prior"]["until"])}
     by = priority["written_by"]
     pending = priority["pending"]
-    return {"entries": active, "until": _iso(priority["until"]), "at": _iso(priority["at"]), "written_by": by,
-            "via": priority["via"], "pending": pending, "confirmed": not pending,
-            "owner_revision": priority.get("_owner_revision"),
-            "pending_by": author_words(by, push=True) if pending else None,
-            "pending_author": by if pending else None, "owner_request": priority.get("owner_request"),
-            "replaced": replaced, "confirmed_at": _iso(priority.get("confirmed_at"))}, ended
+    shown = {"entries": active, "until": _iso(priority["until"]), "at": _iso(priority["at"]), "written_by": by,
+             "via": priority["via"], "pending": pending, "confirmed": not pending,
+             "owner_revision": priority.get("_owner_revision"),
+             "pending_by": author_words(by, push=True) if pending else None,
+             "pending_author": by if pending else None, "owner_request": priority.get("owner_request"),
+             "replaced": replaced, "confirmed_at": _iso(priority.get("confirmed_at"))}
+    if priority.get("_event_id"):
+        shown["event_id"] = priority["_event_id"]
+    return shown, ended
 
 
 def _effective_priority(priority: dict) -> dict:
@@ -3387,7 +3409,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                  "prior_text": None, "prior_confirmed": None,
                                  "pending_by": author_words(info["written_by"], push=True) if pending else None,
                                  "pending_author": info["written_by"] if pending else None,
-                                 "written_by": info["written_by"], "via": info["via"], "at": info["at"]}
+                                 "written_by": info["written_by"], "via": info["via"], "at": info["at"],
+                                 "origin_id": event.get("id")}
         elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_unconfirm",
                       "rule_dismiss") and entity in rules and not proposal_crossed:
             rule = rules[entity]
@@ -3463,7 +3486,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             new = {"entries": event["entries"], "until": info["until"], "at": info["at"],
                    "written_by": info["written_by"], "via": info["via"], "pending": pending,
                    "owner_request": event.get("owner_request") if pending else None, "prior": None,
-                   "_owner_revision": priority_owner_revision}
+                   "_owner_revision": priority_owner_revision,
+                   "_event_id": event.get("id")}
             if pending:
                 # Undo brings back what the owner last had: a second request
                 # before he answers keeps the priority the first replaced.
@@ -3655,7 +3679,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                      "n": r["n"], "text": r["text"], "source": r["source"], "date": r["date"], "seeded": r["seeded"],
                      "confirmed": r["confirmed"], "pending": r.get("pending"), "pending_kind": r.get("pending_kind"),
                      "pending_by": r.get("pending_by"), "prior_text": r.get("prior_text"),
-                     "pending_author": r.get("pending_author"),
+                     "pending_author": r.get("pending_author"), "origin_id": r.get("origin_id"),
                      "written_by": r["written_by"], "via": r["via"], "at": _iso(r["at"])}
                     for r in sorted(rules.values(), key=lambda r: (r["n"] is None, r["n"] or 0, r["entity"]))
                     if not r["retired"]]
@@ -3775,8 +3799,13 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     for name, values in definitions.items():
         if values:
             effective["definition:" + name] = values
+    from khipu.routing_advisory import fold_facts
+
+    tier_table, directions = fold_facts(events)
     return {"accounts": entries, "holds": active_holds, "rules": active_rules, "note": note_out,
             "proposals": proposals,
+            **({"tier_table": tier_table} if tier_table else {}),
+            **({"directions": directions} if directions else {}),
             "machine_holds": machine_holds, "cap_proposals": cap_proposals,
             "definitions": definitions,
             "priority": priority_out, "priority_version": priority_version, "priority_ended": priority_ended,
@@ -4923,14 +4952,14 @@ def read_view(now: datetime | None = None) -> dict:
     fingerprint, cfg, known = _inputs()
     prev = _load_view()
     if _fresh(prev, fingerprint, now):
-        return dict(prev, checked_at=_iso(now))
+        return _with_advisory(dict(prev, checked_at=_iso(now)), now)
     from khipu import routing_sources
 
     if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
             and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
         body = fold([], now=now, cfg=cfg, known=known)
         body["seed_error"] = None
-        return _assemble(None, body, now, 0, fingerprint, record=False)
+        return _with_advisory(_assemble(None, body, now, 0, fingerprint, record=False), now)
     try:
         # Its turn to fold first (a running fold, the daemon's poll say, is
         # waited for and its saved view answered), then the routing lock.
@@ -4941,12 +4970,20 @@ def read_view(now: datetime | None = None) -> dict:
             inputs = _inputs()
             prev = _load_view()
             if _fresh(prev, inputs[0], now):
-                return dict(prev, checked_at=_iso(now))
-            return _refold_locked(now, inputs)
+                return _with_advisory(dict(prev, checked_at=_iso(now)), now)
+            return _with_advisory(_refold_locked(now, inputs), now)
     except OSError:
         # A read-only data dir, or a lock held past this thread's budget,
         # costs the saved view, never the answer.
-        return _unsaved_view(now)
+        return _with_advisory(_unsaved_view(now), now)
+
+
+def _with_advisory(view: dict, now: datetime) -> dict:
+    """Contradiction and hygiene flags for this read. Not part of the
+    effective view, so they never move the version or rewrite a log line."""
+    from khipu.routing_advisory import attach
+
+    return attach(view, now)
 
 
 def _telemetry_streams(view: dict) -> list[dict]:
@@ -5995,6 +6032,71 @@ def clear_priority(*, via: str, now: datetime | None = None, expect=None) -> dic
         _check_priority(expect, now)
         _held_priority(now)
         return _owner_write({"type": "priority_clear"}, via)
+
+
+# ---- the rule 12 tier table (slice 10) ---------------------------------------------------
+#
+# A structured fact the owner confirms once, like a pace cap: only a
+# confirmed, owner-written table governs the dispatch check. A conversation's
+# table stays a proposal until the owner confirms or replaces it.
+
+
+def _checked_tiers(tiers) -> dict:
+    from khipu.routing_advisory import valid_tiers
+
+    if not valid_tiers(tiers):
+        raise RouteError("a tier table names every task class (scope, mock, ruling, hard-security, "
+                         "failed-fix, build, fix-round, tests, docs, synthesis, mechanical) with a tier: "
+                         "opus, sonnet or haiku")
+    return dict(tiers)
+
+
+def set_tier_table(tiers, *, via: str, now: datetime | None = None) -> dict:
+    """The owner's tier table, confirmed as written."""
+    rows = _checked_tiers(tiers)
+    return dict(_owner_write({"type": "tier_table_set", "tiers": rows, "confirmed": True}, via),
+                tiers=rows)
+
+
+def request_tier_table(tiers, *, owner_request: str, author: dict | None = None, via: str = "mcp",
+                       now: datetime | None = None) -> dict:
+    """A conversation's proposed tier table: recorded, never governing until
+    the owner confirms it (``confirm_tier_table`` or his own set)."""
+    rows = _checked_tiers(tiers)
+    request_words = _one_line(owner_request)
+    if not request_words:
+        raise RouteError("describe the owner's request in one line")
+    by = dict(author or conversation_author())
+    if by.get("kind") != "conversation":
+        by = conversation_author()
+    written, view = _write({"type": "tier_table_set", "tiers": rows, "confirmed": False,
+                            "pending": True, "owner_request": _clean(request_words, 0),
+                            "written_by": by, "via": via})
+    return dict(_done(written, view), tiers=rows, pending=True)
+
+
+def _proposed_tiers() -> dict | None:
+    proposed = None
+    for event in _in_write_order(read_events()[0]):
+        if event.get("type") == "tier_table_set" and event.get("confirmed") is not True:
+            from khipu.routing_advisory import valid_tiers
+
+            if valid_tiers(event.get("tiers")):
+                proposed = dict(event["tiers"])
+    return proposed
+
+
+def confirm_tier_table(*, via: str, now: datetime | None = None) -> dict:
+    """Confirm the latest proposed tier table, as the owner wrote it."""
+    proposed = _proposed_tiers()
+    if proposed is None:
+        raise RouteError("there is no proposed tier table to confirm")
+    return set_tier_table(proposed, via=via, now=now)
+
+
+def clear_tier_table(*, via: str, now: datetime | None = None) -> dict:
+    """Remove the tier table, so no table governs the dispatch check."""
+    return _owner_write({"type": "tier_table_clear"}, via)
 
 
 # ---- words ----------------------------------------------------------------------------
@@ -7163,7 +7265,9 @@ def doctor_block(now: datetime | None = None) -> dict:
             "note": view.get("note") is not None, "outside_app": view.get("outside_app") or [],
             "unchecked": view.get("unchecked") or [],
             "seed_error": view.get("seed_error"), "bad_lines": view.get("bad_lines", 0),
-            "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings}
+            "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings,
+            "contradictions": list(view.get("contradictions") or []),
+            "rule_hygiene": list(view.get("rule_hygiene") or [])}
 
 
 def _priority_warnings(view: dict, now: datetime, cfg: dict) -> list[str]:
@@ -7264,11 +7368,11 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
     # A pending rule's requester as the fold keeps it, for Khipu's own
     # same-conversation check; ``pending_by`` is its words.
-    out["rules"] = [{k: v for k, v in r.items() if k not in ("pending_author", "component", "provisional_n")} for r in view.get("rules") or []]
+    out["rules"] = [{k: v for k, v in r.items() if k not in ("pending_author", "component", "provisional_n", "origin_id")} for r in view.get("rules") or []]
     # The owner's priority and each account's plan facts (phase 4b); the app
     # words them itself, in local times.
     if view.get("priority"):
-        out["priority"] = {k: v for k, v in view["priority"].items() if k != "pending_author"}
+        out["priority"] = {k: v for k, v in view["priority"].items() if k not in ("pending_author", "event_id")}
     out["plan_facts"] = plan_facts(view, now)
     out["pace_order"] = cfg["routing_pace_order"]
     # What the app's Routing card and attention items need beside the view
@@ -7297,7 +7401,7 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["changes"] = [dict(c, items=[dict(i, by=author_words(i.get("written_by"), push=False)
                                           if i.get("written_by") else None) for i in c.get("items") or []])
                       for c in view.get("changes") or []]
-    for key in _INTERNAL:
+    for key in (*_INTERNAL, "directions"):
         out.pop(key, None)
     return out
 
@@ -7765,6 +7869,10 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
         out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
                                if r.get("silent") or r.get("unreadable")]
     out["about"] = ABOUT
+    if view.get("tier_table"):
+        out["tier_table"] = view["tier_table"]
+    out["contradictions"] = list(view.get("contradictions") or [])
+    out["rule_hygiene"] = list(view.get("rule_hygiene") or [])
     result = _for_agents(out, view)
     _record_read(view, rules=True, priority=True)
     session = conversation_author().get("session")
@@ -7787,7 +7895,10 @@ OWNER_ACTIONS = {"pause": "Pausing an account", "lift": "Lifting a pause", "clea
                  "confirm_rule": "A standing rule", "undo_rule": "A standing rule",
                  "dismiss_rule": "A standing rule", "priority": "The owner's priority",
                  "set_priority": "The owner's priority", "confirm_priority": "The owner's priority",
-                 "undo_priority": "The owner's priority", "clear_priority": "The owner's priority"}
+                 "undo_priority": "The owner's priority", "clear_priority": "The owner's priority",
+                 "tier_table": "The tier table", "set_tier_table": "The tier table",
+                 "tier_table_set": "The tier table", "confirm_tier_table": "The tier table",
+                 "clear_tier_table": "The tier table"}
 OWNER_REFUSAL = ("{what} is the owner's to change: in the app (Settings \u2192 Routing) or on a terminal with "
                  "`khipu route`, which asks for a typed confirmation. A conversation can report what it "
                  "learned about an account and add or end its holds.")
@@ -8079,7 +8190,7 @@ def prompt_imports() -> None:
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
     from khipu import (  # noqa: F401
-        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_delivery, routing_pace, routing_providers, routing_sources,
+        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_advisory, routing_delivery, routing_pace, routing_providers, routing_sources,
         session_capture, usage)
 
 
@@ -9002,6 +9113,57 @@ def _priority_cli(args, now: datetime) -> int:
     return 0
 
 
+def _tier_table_arg(args) -> dict:
+    raw = getattr(args, "tiers", None)
+    if raw is None:
+        raise RouteError('--tiers must be JSON: {"scope": "opus", "mock": "opus", ...}')
+    try:
+        tiers = _loads(raw)
+    except ValueError:
+        raise RouteError('--tiers must be JSON: {"scope": "opus", "mock": "opus", ...}') from None
+    if not isinstance(tiers, dict):
+        raise RouteError("--tiers must be a JSON object naming each task class's tier")
+    return tiers
+
+
+def _tier_table_cli(args, now: datetime) -> int:
+    """``khipu route tier-table``: show it; a conversation proposes one at the
+    owner's request (``--at-owner-request``, never governing); or the owner's
+    set, confirm and clear, after a typed yes or from the app."""
+    action = args.action or "show"
+    if action == "show":
+        view = read_view(now)
+        _print_json({"tier_table": view.get("tier_table")})
+        return 0
+    if getattr(args, "at_owner_request", None) is not None:
+        if action != "set":
+            raise RouteError("--at-owner-request is only for tier-table set: confirming and clearing are "
+                             "the owner's")
+        _print_json(request_tier_table(_tier_table_arg(args), owner_request=args.at_owner_request,
+                                       author=conversation_author(), via="cli", now=now))
+        return 0
+    via = _owner_via(args, _intent_or_none(_tier_table_intent, args, action))
+    if via is None:
+        _print_json({"ok": False, "error": _REFUSED})
+        return 2
+    now = _now()
+    if action == "set":
+        out = set_tier_table(_tier_table_arg(args), via=via, now=now)
+    elif action == "confirm":
+        out = confirm_tier_table(via=via, now=now)
+    else:
+        out = clear_tier_table(via=via, now=now)
+    _print_json(_finish_owner(out))
+    return 0
+
+
+def _tier_table_intent(args, action: str) -> dict | None:
+    from khipu import owner_direction
+
+    facts = {"tiers": _tier_table_arg(args)} if action == "set" else None
+    return owner_direction.intent(f"route.tier_table.{action}", "tier_table", facts=facts)
+
+
 def _finish_owner(out: dict) -> dict:
     from khipu import owner_direction
 
@@ -9198,6 +9360,8 @@ def run_cli(args) -> int:
             return 0
         if cmd == "priority":
             return _priority_cli(args, now)
+        if cmd == "tier-table":
+            return _tier_table_cli(args, now)
         if cmd == "rule" and getattr(args, "at_owner_request", None) is not None:
             # The rule's words are the positional words, as for the owner's
             # add and edit; the flag carries the owner's request.
