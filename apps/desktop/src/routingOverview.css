@@ -97,11 +97,27 @@
 .acct-foot { border-top: 1px solid var(--border); padding-top: var(--s2); display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; font-size: var(--t-sm); color: var(--text-2); }
 .acct-foot .spacer { flex: 1; }
 
-/* Job runners and lanes: each folder's lanes under it. */
-.row-item.route-acct > .lane-sub { grid-column: 1 / -1; }
-.lane-sub { display: flex; flex-direction: column; margin-top: var(--s2); border-top: 1px solid var(--border); }
-.lane-sub .route-lane { padding-left: 0; }
-.lane-sub .route-src { text-align: left; }
+/* Providers and lanes (routing slice 15c): the bordered row lists inside the
+   group, as docs/mockups/2026-10-21-routing/mock.css draws them, on the app's
+   own tokens. */
+.route-settings .mrows { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); }
+.route-settings .mrow { display: grid; column-gap: var(--s3); row-gap: 2px; align-items: baseline; padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--border); font-size: var(--t-sm); color: var(--text); line-height: 1.45; }
+.route-settings .mrow:last-child { border-bottom: 0; }
+.route-settings .mrow .src { color: var(--muted); font-size: var(--t-xs); }
+.route-settings .mrow .end { justify-self: end; display: inline-flex; gap: var(--s2); align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.route-settings .mrow .name { font-weight: 600; min-width: 0; }
+.route-settings .mrow .route-pause { grid-column: 1 / -1; }
+/* Providers: name, what Khipu knows, the On request tag. */
+.route-settings .mrow.prov { grid-template-columns: 6.5rem minmax(0, 1fr) auto; }
+/* Lanes: the lane and its runner, an arrow, the account, how it matched, the tag. */
+.route-settings .mrow.lane { grid-template-columns: minmax(0, 9rem) 1.1em minmax(0, 7.5rem) minmax(0, 1fr) auto; align-items: center; }
+.route-settings .mrow.lane > .arrow { color: var(--muted); }
+.route-settings .mrow.lane .mono { font-family: var(--mono); font-size: var(--t-sm); }
+/* The candidates row under a lane, and the map form that takes the row's width. */
+.route-settings .cands { grid-column: 1 / -1; display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; margin-top: var(--s1);
+  font-size: var(--t-sm); color: var(--text-2); }
+.route-settings .lane-form { grid-column: 3 / -1; display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
 
 /* Headings moved up a level so none is skipped; the look stays the same. */
 .route-settings h2.sub-title { margin: var(--s3) 0 var(--s1); font-size: var(--t-sm); font-weight: 600; color: var(--text-2); letter-spacing: 0; text-transform: none; line-height: 1.4; }

@@ -2374,9 +2374,6 @@ def test_recent_changes_name_the_owner_in_settings_for_every_change_made_in_the_
 NOT_IN_THE_APP_YET = {
     # First-class routing slice 14 owns the delivery and health controls.
     "routing_delivery_lease",
-    # Slice 8b registers the child-block bound; its app control arrives
-    # with the delivery app group (slice 15a).
-    "routing_child_chars",
     # Phase 7: the copy for cloud agents.
     "routing_cloud_copy", "routing_cloud_copy_hold_words", "routing_cloud_copy_rules",
     "routing_cloud_copy_stale_after", "routing_cloud_copy_debounce",

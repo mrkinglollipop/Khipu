@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from khipu import recall_prompt, routing, routing_delegation
+from khipu import recall_prompt, routing, routing_delegation, routing_delivery
 
 T0 = datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc)
 ACCOUNTS = [{"label": "Claude", "harness": "claude"}, {"label": "Codex", "harness": "codex"}]
@@ -90,6 +90,13 @@ def _ctx(out):
     return out["hookSpecificOutput"]["additionalContext"] if out else ""
 
 
+def _child_text(agent="child-1", session=SESSION, environ=None):
+    """The unified child block, through the SubagentStart hook."""
+    out, _info, _kind = routing_delegation.hook_main(json.dumps(
+        {"hook_event_name": "SubagentStart", "session_id": session, "agent_id": agent}), environ)
+    return _ctx(out)
+
+
 # ---- the bounded child block -------------------------------------------------
 
 
@@ -97,7 +104,7 @@ def test_child_block_orders_accounts_holds_rules_note_and_fits_small_case(home):
     routing.add_rule("Codex does the builds.", via="app")
     routing.set_note("Owner note words.", via="app")
     routing.add_hold("keep it for the audit", reason="keep", scope="machine", owner=True, via="app")
-    block = routing.child_block()
+    block = _child_text()
     assert block.startswith("## Routing at ")
     lines = block.splitlines()
     account_at = next(i for i, line in enumerate(lines) if line.startswith("Codex:"))
@@ -110,7 +117,7 @@ def test_child_block_orders_accounts_holds_rules_note_and_fits_small_case(home):
 
 def test_child_block_bounds_oversized_rules_to_openings(home):
     _oversized_rules()
-    block = routing.child_block()
+    block = _child_text()
     assert _utf16(block) <= 4000
     # Accounts come before any rule.
     assert block.index("Codex:") < block.index("SYNTHETIC-ROUTING-OPENING-0")
@@ -125,7 +132,7 @@ def test_child_block_bounds_oversized_rules_to_openings(home):
 def test_child_block_respects_the_configured_bound(home):
     _set(home, routing_child_chars=500)
     _oversized_rules(1)
-    block = routing.child_block()
+    block = _child_text()
     assert 0 < _utf16(block) <= 500
     assert "Standing rule 1" in block
 
@@ -142,6 +149,41 @@ def test_subagent_start_returns_bounded_block_not_nothing_when_oversized(home, m
     assert "SYNTHETIC-ROUTING-OPENING-0" in text
     assert "SYNTHETIC-ROUTING-END-0" in text  # the first fitting rule is whole, not a page
     assert recall_prompt.routing_marker(SESSION) == before  # the parent never saw it
+
+
+def test_codex_subagent_start_is_a_snapshot_and_defers_to_its_own_pull(home, monkeypatch):
+    _oversized_rules(2)
+    monkeypatch.setenv("CODEX_THREAD_ID", "codex-child-1")
+    before = recall_prompt.routing_marker(SESSION)
+    out, info, kind = routing_delegation.hook_main(json.dumps(
+        {"hook_event_name": "SubagentStart", "session_id": SESSION, "agent_id": "child-1"}),
+        {**os.environ})
+    text = _ctx(out)
+    assert text.startswith("## Routing at ")
+    assert _utf16(text) <= 4000
+    assert "SYNTHETIC-ROUTING-OPENING-0" in text
+    assert "SYNTHETIC-ROUTING-END-0" in text
+    # Its own conversation: nothing reserved under the parent, no ack to record.
+    assert (info, kind) == (None, None)
+    assert routing_delivery.snapshot(SESSION, "agent:child-1") == {}
+    assert routing_delivery.snapshot(SESSION, "main") == {}
+    assert recall_prompt.routing_marker(SESSION) == before
+    # No deferred page on its own (non-Khipu) tool results either: pull only.
+    page_out, page_info, page_kind = routing_delegation.pre_tool_use(
+        {"hook_event_name": "PreToolUse", "session_id": "codex-child-session", "agent_id": "child-1",
+         "tool_name": "Bash", "tool_input": {"command": "cat probe.txt"}}, environ={**os.environ})
+    assert (page_out, page_info, page_kind) == ({}, None, None)
+    # Deferred routing arrives on the child's own Khipu pull, under its
+    # own CODEX_THREAD_ID identity, with the deferred rule named.
+    from khipu.mcp_server import handle_message
+
+    result = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                             "params": {"name": "khipu_route", "arguments": {}}})["result"]
+    assert not result["isError"], result
+    body = json.loads(result["content"][0]["text"])
+    entities = [item["entity"] for item in body["routing_changes"]["items"]]
+    assert any(entity.startswith("rule:") for entity in entities), body["routing_changes"]
+    assert routing_delivery.snapshot("codex:codex-child-1", "agent:child-1") == {}
 
 
 def test_subagent_start_still_off_when_delegation_push_off(home):

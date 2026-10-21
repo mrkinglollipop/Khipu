@@ -2359,6 +2359,28 @@ def cmd_owed(args: argparse.Namespace) -> int:
                           **({"waiting_to_sync": True} if res.get("waiting_to_sync") else {})}))
         return 0
 
+    dismiss_raw = getattr(args, "dismiss", None)
+    close_raw = getattr(args, "close", None)
+    if dismiss_raw or (isinstance(close_raw, str) and "rd-" in close_raw):
+        # A routing direction (slice 19a) is dismissed, not closed: the
+        # same owed close control the app already has, routed to the
+        # directions store. Several ids are comma-separated, like --close.
+        from khipu import routing_directions
+
+        raw = dismiss_raw or close_raw
+        results = []
+        for part in str(raw).split(","):
+            direction_id = part.strip()
+            if not direction_id:
+                continue
+            row = routing_directions.dismiss(direction_id)
+            results.append({"id": direction_id, "ok": row is not None,
+                            **({"status": "dismissed"} if row is not None
+                               else {"error": "no such routing direction"})})
+        ok = bool(results) and all(r["ok"] for r in results)
+        print(json.dumps({"ok": ok, "dismissed": results}))
+        return 0 if ok else 1
+
     close_id = getattr(args, "close", None)
     reopen_id = getattr(args, "reopen", None)
     reassign_ids = getattr(args, "reassign", None)
@@ -5567,7 +5589,7 @@ def build_parser() -> argparse.ArgumentParser:
     owed.add_argument("--limit", type=int, default=50)
     owed.add_argument("--owner", default=None, choices=("user", "assistant", "agent", "all"),
                       help="Only items this owner owes (pages the list, like khipu_owed)")
-    owed.add_argument("--kind", default=None, choices=("followup", "blocker", "question", "promise"))
+    owed.add_argument("--kind", default=None, choices=("followup", "blocker", "question", "promise", "routing_direction"))
     owed.add_argument("--origin", default=None, choices=("conversation", "job"))
     owed.add_argument("--query", default=None, help="Only items whose text holds all these words")
     owed.add_argument("--pr", type=int, default=None, help="Only items naming this pull request number")
@@ -5575,6 +5597,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Only the owner's items a rule found done, for him to close")
     owed.add_argument("--cursor", default=None, help="next_cursor from the previous page")
     owed.add_argument("--close", metavar="ID[,ID...]", default=None, help="Close commitment ID, or several")
+    owed.add_argument("--dismiss", metavar="ID[,ID...]", default=None,
+                      help="Dismiss routing direction ID (rd-...), or several")
     owed.add_argument("--reopen", metavar="ID[,ID...]", default=None, help="Reopen commitment ID, or several")
     owed.add_argument("--reassign", metavar="ID[,ID...]", default=None,
                       help="Give commitment ID, or several, to another owner (needs --to)")

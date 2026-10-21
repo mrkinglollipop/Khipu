@@ -444,8 +444,35 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
             # repeat live DB work through the cwd and recents fallbacks.
             _ = exc
             return ""
-        if slice_data and (slice_data.get("commitments") or slice_data.get("episodes")):
-            return _render_project_slice(project or host or "unknown", slice_data)
+        # Routing directions (slice 19a) never carry the owner's words
+        # into a slice: a job's slice names none at all, and another
+        # project's slice names none either. This project's own slice
+        # gets only a count and the ids; `khipu owed` shows the words.
+        direction_ids: list[str] = []
+        if not job and project:
+            try:
+                from khipu import routing_directions
+
+                direction_ids = routing_directions.pushed_slice_ids(project)
+            except Exception:  # noqa: BLE001 - directions never break the pushed slice
+                direction_ids = []
+        if slice_data and (slice_data.get("commitments") or slice_data.get("episodes")
+                           or direction_ids):
+            rendered = _render_project_slice(project or host or "unknown", slice_data)
+            if direction_ids:
+                noun = "direction" if len(direction_ids) == 1 else "directions"
+                note = [f"### Routing directions",
+                        f"- {len(direction_ids)} routing {noun} not yet in Khipu: "
+                        f"{', '.join(direction_ids)}; khipu owed shows them"]
+                lines = rendered.split("\n")
+                for at, line in enumerate(lines):
+                    if line.startswith("Loaded for this session"):
+                        lines[at:at] = note
+                        break
+                else:
+                    lines.extend(note)
+                rendered = "\n".join(lines)
+            return rendered
 
     rows: list[dict] = []
     term = cwd_search_term(cwd)
@@ -606,7 +633,8 @@ _ROUTING_CHILD_GRACE = 0.05
 
 
 def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, moment: str = "start",
-                   session_id: str | None = None) -> None:
+                   session_id: str | None = None, child_component: str | None = None,
+                   child_session: str | None = None) -> None:
     """The forked child: write the summary's JSON to ``write_fd`` and exit.
     Never returns, and never touches the hook's stdin, stdout or stderr."""
     code = 1
@@ -630,7 +658,8 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
 
         signal.signal(signal.SIGALRM, on_alarm)
         signal.setitimer(signal.ITIMER_REAL, max(0.0, deadline - time.monotonic()) + _ROUTING_CHILD_GRACE)
-        out = routing.start_push(budget, moment, session_id=session_id)
+        out = routing.start_push(budget, moment, session_id=session_id,
+                                 child_component=child_component, child_session=child_session)
         if isinstance(out, dict):
             data = memoryview(json.dumps({k: out.get(k) for k in (
                 "kind", "text", "version", "epoch", "generation", "owed_entities", "shown_entities",
@@ -647,9 +676,14 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
 
 
 class _RoutingAtStart:
-    def __init__(self, moment: str = "start", *, session_id: str | None = None) -> None:
+    def __init__(self, moment: str = "start", *, session_id: str | None = None,
+                 agent_id: str | None = None, child_component: str | None = None) -> None:
         # "start", or "delegation" for a subagent's start (routing_delegation).
         self.moment = moment
+        # Only an identified agent gets a ledger; an unidentified child
+        # still gets the bounded block, reserved nowhere.
+        self.child_component = child_component or (f"agent:{agent_id}" if agent_id else None)
+        self._child_ledger = bool(agent_id)
         from khipu.routing_delivery import hook_session
 
         self.session = hook_session(session_id) if session_id else None
@@ -688,7 +722,9 @@ class _RoutingAtStart:
                 os.close(write_fd)
                 raise
             if pid == 0:
-                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment, self.child_session)
+                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment, self.child_session,
+                               child_component=self.child_component,
+                               child_session=self.session if self._child_ledger else None)
             os.close(write_fd)
             self.pid, self.fd = pid, read_fd
         except Exception:
@@ -723,7 +759,7 @@ class _RoutingAtStart:
 
             if not recall_prompt._routing_generation_current(out.get("generation")):
                 return None  # the record changed since the child read it
-            if self.session and out.get("delivery_plan"):
+            if self.session and not self.child_component and out.get("delivery_plan"):
                 from khipu.routing_delivery import offer
 
                 out = offer(out, session=self.session)

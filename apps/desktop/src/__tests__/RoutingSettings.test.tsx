@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { RoutingSettings } from "../RoutingSettings";
 import { brokenRules, ruleResultLine } from "../routing";
-import type { RouteAccount, RouteView } from "../routing";
+import type { RouteAccount, RouteRunner, RouteView } from "../routing";
 import { changeDays, chosenEnd, durationWords, endChoices, isoLocal, limitWords, ruleOrigin, settingWords, tableErrorWords } from "../routingWords";
 // The stylesheet as written, for the headless Chrome layout check (vitest
 // hands CSS imports over empty). The app has no @types/node.
@@ -158,6 +158,7 @@ let answers: Record<string, Answer>;
 // every group open, every account line open and Telling's inner folds open.
 const ALL_OPEN = [
   "accounts", "priority", "rules", "holds", "telling", "resets", "runners", "table", "changes", "sub:hears", "sub:sizes",
+  "sub:folders",
   ...KEYS.map((k) => `account:${k}`),
 ];
 
@@ -1092,9 +1093,10 @@ describe("Settings -> Routing: job runner folders, lanes, the table and changes"
 
   it("matches an unmatched lane to an account", async () => {
     await page();
-    const list = await screen.findByRole("list", { name: "Project B lanes" });
+    const list = await screen.findByRole("list", { name: "Lanes" });
     const lane = within(list).getAllByRole("listitem").find((r) => r.textContent?.startsWith("opus-batch"))!;
-    expect(lane).toHaveTextContent("Not matched");
+    expect(lane).toHaveTextContent("No account");
+    fireEvent.click(within(lane).getByRole("button", { name: "Change the account for Project B's opus-batch lane" }));
     fireEvent.change(within(lane).getByLabelText("Account for opus-batch"), { target: { value: "Claude main" } });
     fireEvent.click(within(lane).getByRole("button", { name: "Save" }));
     await waitFor(() => expect(calls("khipu_config_set")).toHaveLength(1));
@@ -1114,6 +1116,145 @@ describe("Settings -> Routing: job runner folders, lanes, the table and changes"
     expect(screen.queryByRole("list", { name: "Yesterday" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Show earlier days" }));
     expect(screen.getByRole("list", { name: "Yesterday" })).toHaveTextContent("Grok Build paused by you");
+  });
+});
+
+// Routing slice 15c: the Providers and lanes group (mocks
+// docs/mockups/2026-10-21-routing/lanes-light.html and lanes-states-light.html).
+// Every way a lane can match, and the provider facts the owner wrote.
+describe("Settings -> Routing: providers and lanes", () => {
+  /** The mock's lanes screen, on this file's fixture: two runner folders, one
+   *  lane of every match kind, two providers defined and Muse on request. */
+  function lanesView(): RouteView {
+    const v = view();
+    v.accounts = [...v.accounts!, acct("Muse", "muse", {}), { ...acct("GLM", "glm", {}), key: "glm:main" }];
+    v.definitions = {
+      providers: {
+        glm: { id: "glm", label: "GLM", family: "Zhipu", login: "none", probe: "none", lane_names: ["glm"],
+          models_allowed: ["glm-5.3", "glm-5.3-flash"] },
+        muse: { id: "muse", label: "Muse", family: "Meta", login: "none", probe: "none", lane_names: ["muse"],
+          models_allowed: ["muse-wonder-full-1.0"], use: "on_request" },
+      },
+    };
+    const match = (account: string | null, matched_by: string | null, extra: Partial<NonNullable<RouteRunner["lane_matches"]>[string]> = {}) =>
+      ({ account, matched_by, candidates: [] as string[], identity_state: null, reason: null, field_to_add: null, ...extra });
+    v.sources!.runners = [
+      { name: "project-a", path: "/runners/a", heartbeat_at: "2026-10-14T15:39:40Z", interval: 20, silent: false, unreadable: false,
+        lanes: ["claude", "grok-review", "review-2"], unmatched_lanes: [], files: {},
+        lane_matches: {
+          claude: match(null, null, { candidates: ["Claude main", "Claude second"], field_to_add: "budget_account" }),
+          "grok-review": match("Grok Build", null),
+          "review-2": match(null, null, { field_to_add: "budget_account" }),
+        } },
+      { name: "project-c", path: "/runners/c", heartbeat_at: "2026-10-14T15:39:00Z", interval: 20, silent: false, unreadable: false,
+        lanes: ["codex", "glm", "main-opus", "main-sonnet", "secondary-haiku"], unmatched_lanes: [], files: {},
+        lane_matches: {
+          codex: match("Codex", "name"),
+          glm: match("GLM", "name"),
+          "main-opus": match(null, null, { candidates: ["Claude main", "Claude second"],
+            reason: "launcher evidence contradicts the declaration", field_to_add: "budget_account" }),
+          "main-sonnet": match("Claude main", "declaration", { identity_state: "confirmed" }),
+          "secondary-haiku": match("Claude second", "declaration", { identity_state: "claimed" }),
+        } },
+    ];
+    return v;
+  }
+
+  function lanesConfig() {
+    return config({
+      routing_sources: setting([
+        { name: "project-a", kind: "lanes", path: "/runners/a" },
+        { name: "project-c", kind: "lanes", path: "/runners/c" },
+      ], []),
+      routing_lane_map: setting({ "project-a": { "grok-review": "Grok Build" } }, {}),
+    });
+  }
+
+  it("lists the providers with how Khipu reads each plan, and the owner's model facts", async () => {
+    answers.khipu_route_view = lanesView();
+    answers.khipu_config_show = lanesConfig();
+    await page();
+    const group = screen.getByRole("region", { name: "Providers and lanes" });
+    expect(document.querySelector('[data-settings-group="runners"]')).toHaveTextContent("5 providers · 2 folders, 8 lanes");
+    const rows = within(group).getAllByRole("list", { name: "Providers" })[0]!;
+    expect(within(rows).getAllByRole("listitem").map((r) => r.querySelector(".name")?.textContent)).toEqual([
+      "Claude", "Codex", "Grok", "GLM", "Muse",
+    ]);
+    expect(row("Providers", "Claude")).toHaveTextContent("Anthropic · plan read with the Claude command line");
+    expect(row("Providers", "Claude")).toHaveTextContent("2 accounts: Claude main, Claude second");
+    expect(row("Providers", "Grok")).toHaveTextContent("plan read with Grok's command line; it starts an agent, so every 30 min");
+    expect(row("Providers", "GLM")).toHaveTextContent("Zhipu · plan not read; job runner lines and reports only");
+    expect(row("Providers", "GLM")).toHaveTextContent("1 account · only glm-5.3 and glm-5.3-flash");
+    expect(row("Providers", "Muse")).toHaveTextContent("Meta · plan not read; reports only");
+    expect(row("Providers", "Muse")).toHaveTextContent("only muse-wonder-full-1.0");
+    expect(within(row("Providers", "Muse")).getByText("On request")).toBeInTheDocument();
+  });
+
+  it("words every way a lane can match, and its candidates row", async () => {
+    answers.khipu_route_view = lanesView();
+    answers.khipu_config_show = lanesConfig();
+    await page();
+    expect(row("Lanes", "claude")).toHaveTextContent("project-a runner");
+    expect(row("Lanes", "claude")).toHaveTextContent("No account");
+    expect(row("Lanes", "claude")).toHaveTextContent("two accounts match the name");
+    expect(within(row("Lanes", "claude")).getByText("Pick one")).toBeInTheDocument();
+    expect(row("Lanes", "claude")).toHaveTextContent("Could be: Claude main, Claude second");
+    expect(row("Lanes", "grok-review")).toHaveTextContent("Grok Build");
+    expect(row("Lanes", "grok-review")).toHaveTextContent("you mapped it");
+    expect(within(row("Lanes", "grok-review")).getByText("Yours")).toBeInTheDocument();
+    expect(row("Lanes", "review-2")).toHaveTextContent("no name match and nothing declared");
+    // The account column and the warn tag both say it.
+    expect(within(row("Lanes", "review-2")).getAllByText("No account")).toHaveLength(2);
+    expect(row("Lanes", "review-2")).toHaveTextContent(
+      "Add an account line for this lane in the runner's settings, or map it here.",
+    );
+    expect(row("Lanes", "main-sonnet")).toHaveTextContent("the runner says so; a job from it used Claude main's login");
+    expect(within(row("Lanes", "main-sonnet")).getByText("Confirmed")).toBeInTheDocument();
+    expect(row("Lanes", "secondary-haiku")).toHaveTextContent("the runner says so; no job has proved it yet");
+    expect(within(row("Lanes", "secondary-haiku")).getByText("Claimed")).toBeInTheDocument();
+    expect(row("Lanes", "codex")).toHaveTextContent("matched by name");
+    expect(within(row("Lanes", "codex")).getByText("By name")).toBeInTheDocument();
+    // A declaration its launcher contradicts: its own tag, never Needs you.
+    expect(row("Lanes", "main-opus")).toHaveTextContent("the runner's settings and its login name different accounts");
+    expect(within(row("Lanes", "main-opus")).getByText("Conflict")).toBeInTheDocument();
+    expect(row("Lanes", "main-opus")).toHaveTextContent("Fix the runner's settings, or pick the account here.");
+    const needs = screen.getByRole("region", { name: "Needs you" });
+    expect(within(needs).getByText("Lane claude in project-a matches two accounts")).toBeInTheDocument();
+    expect(within(needs).getByText("Lane review-2 in project-a has no account")).toBeInTheDocument();
+    expect(within(needs).queryByText(/main-opus/)).toBeNull();
+    expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("2 lanes without an account");
+    expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("1 lane conflicts");
+  });
+
+  it("folds the job runner folders under the lanes, saying how each is doing", async () => {
+    answers.khipu_route_view = lanesView();
+    answers.khipu_config_show = lanesConfig();
+    await page();
+    const fold = screen.getByRole("button", { name: /Job runner folders/ });
+    expect(fold).toHaveTextContent("2 folders, both reporting");
+    expect(fold).toHaveAttribute("aria-expanded", "true");
+    expect(row("Job runner folders", "project-a")).toHaveTextContent("Read just now · 3 lanes");
+    expect(within(row("Lanes", "claude")).queryByRole("button", { name: "Remove" })).toBeNull();
+  });
+
+  it("says No job runners yet, and its Add a folder opens the folders fold", async () => {
+    answers.khipu_route_view = { ...lanesView(), sources: { runners: [], table: { stamped_at: null, changed_at: null } } };
+    answers.khipu_config_show = config({
+      routing_sources: setting([], []),
+      routing_lane_map: setting({}, {}),
+    });
+    await page();
+    expect(document.querySelector('[data-settings-group="runners"]')).toHaveTextContent("No job runner folders");
+    expect(screen.getByText("No job runners yet")).toBeInTheDocument();
+    expect(screen.getByText("Add a job runner folder and its lanes show here with the account each one uses.")).toBeInTheDocument();
+    const foldersFold = screen.getByRole("button", { name: /Job runner folders/ });
+    // The page opens every fold for these tests; close this one so the empty
+    // state's own Add a folder… is the one button.
+    fireEvent.click(foldersFold);
+    expect(foldersFold).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Add a folder…" }));
+    expect(foldersFold).toHaveAttribute("aria-expanded", "true");
+    expect(await screen.findByRole("form", { name: "Add a job runner folder" })).toBeInTheDocument();
   });
 });
 
@@ -1418,13 +1559,13 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
   it("keeps both lane changes made before the first one's re-read (finding 1)", async () => {
     const cli = heldConfig();
     await page();
-    const b = await screen.findByRole("list", { name: "Project B lanes" });
-    const opus = within(b).getAllByRole("listitem").find((r) => r.textContent?.startsWith("opus-batch"))!;
+    const lanes = await screen.findByRole("list", { name: "Lanes" });
+    const opus = within(lanes).getAllByRole("listitem").find((r) => r.textContent?.startsWith("opus-batch"))!;
+    fireEvent.click(within(opus).getByRole("button", { name: "Change the account for Project B's opus-batch lane" }));
     fireEvent.change(within(opus).getByLabelText("Account for opus-batch"), { target: { value: "Claude main" } });
     fireEvent.click(within(opus).getByRole("button", { name: "Save" }));
     fireEvent.click(screen.getByRole("button", { name: "Change the account for Project A's codex lane" }));
-    const a = screen.getByRole("list", { name: "Project A lanes" });
-    const codex = within(a).getAllByRole("listitem").find((r) => r.textContent?.startsWith("codex"))!;
+    const codex = within(lanes).getAllByRole("listitem").find((r) => r.textContent?.startsWith("codex"))!;
     fireEvent.change(within(codex).getByLabelText("Account for codex"), { target: { value: "Claude second" } });
     fireEvent.click(within(codex).getByRole("button", { name: "Save" }));
     cli.release();
@@ -1708,9 +1849,10 @@ it("shows a Cursor lane matched to Grok without writing a lane override", async 
     lane_matches: { "cursor-grok": { account: "Grok", matched_by: "declaration", candidates: ["Grok"] } } }];
   answers.khipu_route_view = v;
   await page();
-  const lanes = await screen.findByRole("list", { name: "Project A lanes" });
-  expect(lanes).toHaveTextContent("Grok · matched by declaration");
-  expect(within(lanes).queryByText("Not matched")).toBeNull();
+  const lanes = await screen.findByRole("list", { name: "Lanes" });
+  expect(lanes).toHaveTextContent("cursor-grok");
+  expect(lanes).toHaveTextContent("the runner says so; no job has proved it yet");
+  expect(within(lanes).queryByText("No account")).toBeNull();
   expect(calls("khipu_config_set")).toEqual([]);
 });
 

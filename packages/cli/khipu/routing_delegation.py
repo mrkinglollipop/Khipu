@@ -12,15 +12,24 @@ Two hooks, both behind ``routing_push`` and ``routing_push_delegation``:
   (``routing_prompt_budget_ms``, ``routing_prompt_chars``) and the same
   seen marker, moved only once the block was written. So a block one push
   delivered is never repeated by the other. A call inside a subagent (its
-  payload carries ``agent_id``) gets nothing: the subagent heard the
-  summary at its start, and the parent's marker is not the subagent's.
-- SubagentStart: the bounded child block (``routing.child_block``), for the
-  subagent alone — a Codex native child records it as a developer message
-  before its first call. The parent's marker does not move, since the
-  parent never saw it. When Codex's SubagentStart hook is absent and a
-  ``spawn_agent`` brief carries no routing, the parent's PreToolUse result
-  carries one advisory line naming ``khipu route --brief``; nothing is
-  added to the brief itself.
+  payload carries ``agent_id``) is not a delegation: it gets the next
+  deferred page from the subagent's own ledger (slice 8a), and the
+  parent's marker is not the subagent's.
+- SubagentStart: the one bounded child block
+  (``routing_delivery.child_offer``, slice 8a), for the child alone. The
+  parent's marker does not move, since the parent never saw it. A Claude
+  Code child keeps what the block leaves out owed in its own
+  ``agent:<agent_id>`` ledger, arriving as pages on its own tool results
+  (its PreToolUse, below). A Codex native child records the same block
+  as a developer message before its first call; it is its own
+  conversation, so nothing is reserved in the parent's ledger and its
+  deferred routing reaches it only on its own Khipu tool calls, under
+  its own ``CODEX_THREAD_ID`` identity (slice 7 pull delivery). When
+  Codex's SubagentStart hook is absent and a ``spawn_agent`` brief
+  carries no routing, the parent's PreToolUse result carries one
+  advisory line naming ``khipu route --brief``; nothing is added to the
+  brief itself. A T3 ``delegate_task`` child whose provider has no hooks
+  gets the same advisory line by its own check (slice 8c).
 
 Neither ever denies, asks or changes a call: the answer carries only
 ``additionalContext``, and the context reaches the model with the tool's
@@ -517,6 +526,36 @@ def provider_advisory(payload: dict) -> list[str]:
     return list(dict.fromkeys(warnings))
 
 
+CHILD_NO_ROUTING_ADVISORY = "This child got no routing: add `khipu route --brief` to its brief."
+
+
+def _t3_child_advisory(payload: dict) -> str | None:
+    """The advisory line for a T3 ``delegate_task`` child whose provider has
+    no Khipu hooks: it will get no start block, so a brief without routing
+    leaves it with nothing. Nothing is added to the brief itself."""
+    name = _tool_name(payload)
+    if name is None or not (name == "delegate_task" or name.endswith("__delegate_task")):
+        return None
+    data = payload.get("tool_input") or payload.get("toolInput")
+    if not isinstance(data, dict):
+        return None
+    target = data.get("target") if isinstance(data.get("target"), dict) else {}
+    instance_id = target.get("providerInstanceId") or target.get("provider_instance_id") \
+        or data.get("providerInstanceId")
+    if not isinstance(instance_id, str) or not instance_id:
+        return None
+    briefs = briefs_of(payload)
+    if not briefs or any(_brief_has_routing(brief) for brief in briefs):
+        return None
+    from khipu import t3
+
+    instance = next((inst for inst in t3.all_provider_instances(t3.settings_path())
+                     if inst["id"] == instance_id and inst["enabled"]), None)
+    if instance is None or t3.provider_hooks(instance) != "missing":
+        return None
+    return CHILD_NO_ROUTING_ADVISORY
+
+
 def _rule12_line(payload: dict) -> str | None:
     """The rule 12 tier line for this dispatch, or None. Context only."""
     from khipu.routing_advisory import dispatch_line
@@ -589,14 +628,16 @@ def _claude_model_brief(command: str | None) -> tuple[str | None, str | None]:
     return model, brief
 
 
-ADVISORY = "This child got no routing: add `khipu route --brief` to its brief."
+# The one advisory line both child checks (Codex ``spawn_agent``, slice
+# 8b, and T3 ``delegate_task``, slice 8c) put on the parent's result.
+ADVISORY = CHILD_NO_ROUTING_ADVISORY
 
 
 def _brief_has_routing(brief: str) -> bool:
     """Whether a brief already carries a routing block (the heading
     ``khipu route --brief`` / the pushes print), as opposed to merely
     mentioning routing in prose."""
-    return "## Routing" in brief or "Routing at " in brief
+    return "## Routing" in brief or "Routing at " in brief or "Khipu's routing record" in brief
 
 
 def _codex_subagent_hook_installed(environ=None) -> bool:
@@ -631,12 +672,62 @@ def _spawn_advisory(payload: dict, environ=None) -> str | None:
     return None if _codex_subagent_hook_installed(environ) else ADVISORY
 
 
+def _is_codex_child(environ=None) -> bool:
+    """Whether this SubagentStart fires for a Codex native child: the
+    hook process carries Codex's environment and no Claude Code one.
+    A Codex child is its own conversation (section 5), so its start
+    block is a snapshot and its deferred routing comes only through
+    pull delivery under its own ``CODEX_THREAD_ID`` identity."""
+    env = os.environ if environ is None else environ
+    harness = (env.get("KHIPU_HARNESS") or "").strip().lower()
+    if harness:
+        return harness == "codex"
+    if env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDECODE") or env.get("CLAUDE_CODE_ENTRYPOINT"):
+        return False
+    return bool(env.get("CODEX_THREAD_ID") or env.get("CODEX_SANDBOX"))
+
+
+def _agent_tool_use(payload: dict, environ, agent_id: str) -> tuple[dict, dict | None, str | None]:
+    """The next deferred routing page on a subagent's own tool result.
+
+    The subagent's PreToolUse is its delivery point: the page comes from
+    its ``agent:<agent_id>`` ledger, reserved until this hook's caller
+    records it delivered, and the parent's ledger never moves. Context
+    only, never a permission decision."""
+    if _switched_off(environ) or _helper(payload):
+        return {}, None, None
+    if _is_codex_child(environ):
+        # A Codex native child is its own conversation: no page from a
+        # per-agent ledger. Its deferred routing comes only through
+        # pull delivery on its own Khipu tool calls (slice 7).
+        return {}, None, None
+    session_id = payload.get("session_id") or payload.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        return {}, None, None
+    from khipu import routing
+
+    try:
+        page = routing.child_page_push(session_id, agent_id)
+    except Exception:  # noqa: BLE001 - routing never breaks the hook
+        return {}, None, None
+    if not page or not page.get("routing_changes") or not isinstance(page.get("text"), str):
+        return {}, None, None
+    info = {"status": "changes:1", "pending": {
+        "session": page["session"], "version": page["version"], "epoch": page.get("epoch"),
+        "full": False, "unrefreshed": None, "at": None, "based_on": None,
+        "owed": page.get("owed_entities"), "shown": page.get("shown_entities"),
+        "notices": [], "routing_changes": page["routing_changes"]}}
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                   "additionalContext": page["text"]}}, info, "agent"
+
+
 def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | None]:
     """(what to print, what to record once it is printed, the call's kind)
     for one PreToolUse call. Never a permission decision of any kind. Most
     tool calls end at the first test, which reads nothing."""
-    if payload.get("agent_id") or payload.get("agentId"):
-        return {}, None, None  # inside a subagent: it heard the summary at its start
+    agent_id = payload.get("agent_id") or payload.get("agentId")
+    if agent_id:
+        return _agent_tool_use(payload, environ, str(agent_id))
     if not might_delegate(payload) or _switched_off(environ):
         return {}, None, None
     kind = delegation_kind(payload)
@@ -663,6 +754,12 @@ def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | 
     if line:
         ctx += ("\n" if ctx else "") + line
     try:
+        advisory = _t3_child_advisory(payload)
+    except Exception:  # noqa: BLE001 - an advisory never fails a dispatch
+        advisory = None
+    if advisory:
+        ctx += ("\n" if ctx else "") + advisory
+    try:
         advisory = _spawn_advisory(payload, environ)
     except Exception:  # noqa: BLE001 - an advisory never fails a dispatch
         advisory = None
@@ -673,27 +770,57 @@ def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | 
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": ctx}}, info, kind
 
 
-def subagent_start(payload: dict) -> dict:
-    """The bounded child block for a subagent at its start (slice 8b).
+def _subagent_start(payload: dict, environ=None) -> tuple[dict, dict | None, str | None]:
+    """The bounded child block for a child at its start, plus what to
+    record once it is printed. One block for every harness, built by
+    ``routing_delivery.child_offer`` through ``routing.start_push``:
+    accounts and holds first, then each standing rule and the note whole
+    if they fit, otherwise their openings, bounded by
+    ``routing_child_chars`` and the hook-context cap. A child receives a
+    snapshot, not its parent conversation's notices, and the parent's
+    marker never moves.
 
-    The same block whichever harness fires SubagentStart (a Claude Code
-    subagent, a Codex native child): accounts and holds first, then the
-    rules and note whole if they fit, otherwise their openings, bounded
-    by ``routing_child_chars``. A snapshot, not its parent
-    conversation's notices: no marker or ledger moves. Deferred routing
-    reaches a Codex child only on its own Khipu tool calls, under its
-    own ``CODEX_THREAD_ID`` identity (slice 7's pull delivery)."""
-    from khipu import routing
+    A Claude Code subagent's remainder is owed in its own
+    ``agent:<agent_id>`` ledger and arrives as pages on its own tool
+    results. A Codex native child is its own conversation: the block is
+    reserved nowhere in the parent, and its deferred routing reaches it
+    only on its own Khipu tool calls, under its own ``CODEX_THREAD_ID``
+    identity (slice 7 pull delivery)."""
+    from khipu import recall_rule
 
-    try:
-        if routing.push_off("delegation"):
-            return {}
-        text = routing.child_block()
-    except Exception:  # noqa: BLE001 - routing never breaks the hook
-        return {}
-    if not text or not text.strip():
-        return {}
-    return {"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": text}}
+    session_id = payload.get("session_id") or payload.get("sessionId") or ""
+    agent_id = payload.get("agent_id") or payload.get("agentId") or ""
+    if _is_codex_child(environ):
+        # Snapshot only: no per-agent ledger under the parent. The
+        # unidentified-child component reserves nowhere (see
+        # ``_RoutingAtStart``); the child's own pull identity is
+        # separate and will be offered what this block left out.
+        at = recall_rule._RoutingAtStart(moment="delegation", session_id=session_id,
+                                         agent_id=None, child_component="agent:unknown").begin()
+    else:
+        at = recall_rule._RoutingAtStart(moment="delegation", session_id=session_id,
+                                         agent_id=str(agent_id) if agent_id else None,
+                                         child_component=None if agent_id else "agent:unknown").begin()
+    text = at.text()
+    if not text:
+        return {}, None, None
+    if recall_rule._utf16_len(text) > recall_rule._HOOK_CONTEXT_BUDGET:
+        return {}, None, None  # the hook cap wins over any child setting
+    out = {"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": text}}
+    stored = at.out if isinstance(at.out, dict) else {}
+    if not stored.get("routing_changes") or not at.session:
+        return out, None, None
+    info = {"status": "full", "pending": {
+        "session": at.session, "version": stored["version"], "epoch": stored.get("epoch"),
+        "full": False, "unrefreshed": None, "at": None, "based_on": None,
+        "owed": stored.get("owed_entities"), "shown": stored.get("shown_entities"),
+        "notices": [], "routing_changes": stored["routing_changes"]}}
+    return out, info, "subagent"
+
+
+def subagent_start(payload: dict, environ=None) -> dict:
+    """The bounded child block for a child agent at its start."""
+    return _subagent_start(payload, environ)[0]
 
 
 def hook_main(raw: str, environ=None) -> tuple[dict, dict | None, str | None]:
@@ -704,7 +831,7 @@ def hook_main(raw: str, environ=None) -> tuple[dict, dict | None, str | None]:
     payload = _payload(raw)
     event = _event(payload)
     if event == "SubagentStart":
-        return ({} if _helper(payload) else subagent_start(payload)), None, None
+        return ({}, None, None) if _helper(payload) else _subagent_start(payload, env)
     if event and event != "PreToolUse":
         return {}, None, None
     out = pre_tool_use(payload, environ)

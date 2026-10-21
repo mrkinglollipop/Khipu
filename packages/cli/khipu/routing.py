@@ -172,8 +172,8 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_push_delegation": ("switch", True, "Tell conversations before handing work to another agent"),
     "routing_dispatch_scripts": ("names", [], "Your own scripts that hand work to another agent, by file name"),
     "routing_delivery_lease": ("duration", 60, "How long an unacknowledged routing batch stays in flight"),
-    "routing_child_chars": ("count", 4000, "Longest routing block for a child agent at its start (0: no limit)"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
+    "routing_child_chars": ("count", 4000, "Longest routing block for a subagent at its start (0: no limit beyond the hook's own cap)"),
     "routing_prompt_budget_ms": ("count", 50, "Time allowed before a prompt, in milliseconds"),
     "routing_start_budget_ms": ("count", 1000, "Time allowed at the start of a conversation, in milliseconds"),
     "routing_resend_after_versions": ("count", 20, "Send everything again after this many changes (0: never)"),
@@ -1529,6 +1529,410 @@ def _replication_live() -> bool:
 
 def _pending_numbering() -> bool:
     return _replication_live() and _hub_configured()
+
+
+# The replication payload (plan section 6) is a closed per-kind field map,
+# never a deny-list: a kind the map does not name is dropped entirely, and a
+# field reaches the hub only when the kind's entry names it with its shape.
+# Every account reference is rewritten through the caller's local bindings
+# to its stable id; an account-like value that maps to no stable id drops
+# its field. Scrubbing never depends on the bindings: any string holding a
+# path separator, a ``<harness>|`` key, a home-like path or a secret shape
+# drops, whatever the bindings say, unless the field is an owner-words field
+# (rule and note text, an owner hold's words, priority role words, and a
+# proposal's text, ``prior_text`` and ``owner_request`` under their switch),
+# which travels byte-identical.
+_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}\Z")
+_TIME_SHAPE = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?)?\Z")
+_HOME_LIKE = re.compile(
+    r"(?:^|[\s\"'(=])~(?:/|$)|/(?:Users|home|private|root)/|^[A-Za-z]:[\\/]")
+_VIA_CODES = frozenset({"cli", "app", "mcp", "direction", "check", "seed",
+                        "migration", "runner", "auto", "terminal"})
+_STATE_CODES = frozenset({LIMITED, OPEN, DOWN})
+_KIND_CODES = frozenset({"observation", "owner_rule", "fact"})
+_DEFINITION_CODES = frozenset({"provider", "account", "lane_map"})
+_WINDOW_CODES = frozenset({"five_hour", "five-hour", "weekly", "daily"})
+_REASON_CODES = frozenset(set(HOLD_REASONS) | set(DOWN_REASONS)
+                          | {"signin", "not-installed"})
+_AUTHOR_KINDS = frozenset({"owner", "conversation", "check", "seed",
+                           "migration", "runner"})
+_PROVIDER_LOGINS = frozenset({"folder", "none"})
+_PROVIDER_USES = frozenset({"normal", "on_request"})
+_DECLINE_WHY = frozenset({"you stopped tracking it"})
+
+# Field shapes: "id" a safe identifier, "time" an ISO time or date,
+# "account" a login key mapped through the bindings (or already a stable
+# id), "model" a CLI model name, "name" the safe-name rule, "label" short
+# owner-facing words (danger-checked only), "int"/"bool"/"float" as named,
+# and a frozenset value a closed code set. The structured shapes ("scope",
+# "entries", ...) are projected by name below.
+_COMMON_FIELDS: dict[str, Any] = {
+    "id": "id", "mac": "id", "legacy_mac": "id", "entity": "id",
+    "base": "id", "proposal": "id", "op": "id", "revision": "id",
+    "written_at": "time", "via": "via", "kind": _KIND_CODES,
+    "expires_at": "time",
+}
+_OBSERVATION_FIELDS: dict[str, Any] = {
+    "account": "account", "runner": "name", "lane": "name",
+    "source": frozenset(SOURCES), "state": _STATE_CODES,
+    "basis": frozenset(BASES), "window": _WINDOW_CODES, "model": "model",
+    "family": "name", "transport": "name", "reason": _REASON_CODES,
+    "until": "time", "witness_at": "time", "reset_at": "time",
+    "used_pct": "float", "message_time": "bool", "until_default": "bool",
+    "observed": "bool", "observed_turn": "bool", "session_logs": "bool",
+    "silent": "bool", "unmatched": "bool",
+}
+_RULE_TARGET_FIELDS: dict[str, Any] = {"n": "int", "target": "id"}
+_REPLICATION_FIELDS: dict[str, dict[str, Any]] = {
+    "evidence": {**_OBSERVATION_FIELDS, "scope": "scope_text"},
+    "observation": {**_OBSERVATION_FIELDS, "scope": "scope_text"},
+    "observation_renew": {"target": "id", "witness_at": "time",
+                          "used_pct": "float"},
+    "source_seen": {"runner": "name", "status": "source_status",
+                    "witness_at": "time"},
+    "hold": {"scope": "hold_scope", "reason": frozenset(HOLD_REASONS),
+             "until": "time", "owner": "bool"},
+    "hold_end": {"target": "id"},
+    "rule_add": {"n": "int", "source": frozenset(SOURCES), "date": "time",
+                 "seeded": "bool", "pending": "bool", "local_order": "int",
+                 "number_pending": "bool"},
+    "rule_edit": {**_RULE_TARGET_FIELDS, "pending": "bool",
+                  "prior_confirmed": "bool"},
+    "rule_retire": dict(_RULE_TARGET_FIELDS),
+    "rule_restore": {**_RULE_TARGET_FIELDS},
+    "rule_confirm": dict(_RULE_TARGET_FIELDS),
+    "rule_unconfirm": dict(_RULE_TARGET_FIELDS),
+    "rule_undo": dict(_RULE_TARGET_FIELDS),
+    "rule_dismiss": dict(_RULE_TARGET_FIELDS),
+    "note_set": {},
+    "note_end": {},
+    "priority_set": {"until": "time", "pending": "bool"},
+    "priority_confirm": {},
+    "priority_undo": {},
+    "priority_clear": {},
+    "priority_drop": {"account": "account"},
+    "pause": {"account": "account", "until": "time"},
+    "lift": {"account": "account"},
+    "clear": {"account": "account"},
+    "clear_undo": {"account": "account", "target": "id"},
+    "dismiss": {"account": "account", "target": "id"},
+    "undismiss": {"account": "account", "target": "id"},
+    "definition_set": {"definition": _DEFINITION_CODES},
+    "definition_remove": {"definition": _DEFINITION_CODES},
+    "provider_set": {"label": "label", "family": "label",
+                     "login": _PROVIDER_LOGINS, "probe": "probe",
+                     "host": "host", "use": _PROVIDER_USES,
+                     "lane_names": "names", "models_allowed": "names",
+                     "models_never": "names"},
+    "account_migration": {"started_at": "time"},
+    "account_binding": {"account": "account", "to": "account",
+                        "state": frozenset({"tracked", "bound"})},
+    "account_rename": {"account": "account", "to": "account"},
+    "account_move": {"account": "account", "target": "account"},
+    "account_note": {"account": "account",
+                     "state": frozenset({"renamed", "untracked", "tracked"})},
+    "account_txn": {"state": frozenset({"begin", "done", "abort"}),
+                    "target": "id", "txn": "id"},
+    "seed_import": {"count": "int"},
+    "reset_check": {"account": "account", "scope": "scope_text",
+                    "checks": "int", "busy_tries": "int", "lock_tries": "int",
+                    "status": "reset_status", "reason": "reset_reason",
+                    "counted": "bool", "reset_until": "time",
+                    "next_at": "time", "reset_moved_to": "time",
+                    "state_id": "id", "schedule_id": "id"},
+    "owner_change": {"target": "id", "auth": "owner_auth",
+                     "harness": "name"},
+}
+# Kinds whose "text" is owner words; a hold's text is owner words only when
+# the hold is the owner's, and priority "role" words follow the same switch
+# as proposal text on a pending priority.
+_TEXT_KINDS = frozenset({"rule_add", "rule_edit", "note_set", "owner_change"})
+_HOLDS_KINDS = frozenset({"priority_set", "priority_confirm", "rule_add",
+                          "rule_edit", "rule_confirm", "rule_restore"})
+
+
+def _dangerous(value: str) -> bool:
+    """A path separator, a login key, a home-like path or a secret shape."""
+    if "/" in value or "\\" in value or "|" in value or _HOME_LIKE.search(value):
+        return True
+    from khipu.redact import redact_secrets
+    from khipu.routing_sources import _key_like
+
+    return bool(_key_like(value) or redact_secrets(value, force=True)[1])
+
+
+def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = None,
+                        bindings: dict) -> list[dict]:
+    """The closed Mac-to-hub projection of local routing events.
+
+    Only the fields named in ``_REPLICATION_FIELDS`` for the event's kind
+    are copied, each in its named shape; an unknown kind is dropped
+    entirely. The local ``source_id``, evidence text, ``op_body``,
+    ``auth_chain``, seed file names and hashes, account-list digests
+    (``list_before``/``list_after``) and login bindings never leave the
+    Mac. ``written_by`` is reduced to ``{kind, harness, mac}``; project and
+    session names are dropped, never hashed into the payload. Owner rule
+    and note words travel as written (paths included) once confirmed; a
+    pending proposal's ``text`` and ``owner_request`` travel only when
+    ``proposal_text`` is on, and a conversation hold's words never travel
+    (an owner's hold words do). ``bindings`` is the caller's local
+    login-key-to-stable-id map and is required: scrubbing does not depend
+    on it, but an account reference that it does not map (and that is not
+    already a stable id) drops its field rather than travel. The input
+    events are not mutated.
+    """
+    if proposal_text is None:
+        proposal_text = bool(settings().get("routing_proposal_text_between_macs", True))
+    bindings = dict(bindings)
+
+    def mapped(value):
+        if not isinstance(value, str) or not value:
+            return None
+        target = bindings.get(value, value)
+        return target if account_identity.STABLE.fullmatch(target) else None
+
+    def shaped(shape, value):
+        if shape == "account":
+            return mapped(value)
+        if not isinstance(value, str) or not value or _dangerous(value):
+            return None
+        if shape == "id":
+            return value if _SAFE_ID.fullmatch(value) else None
+        if shape == "time":
+            return value if _TIME_SHAPE.fullmatch(value) else None
+        if shape == "via":
+            base = value.removesuffix("-unchecked")
+            return value if base in _VIA_CODES and (
+                value == base or value.endswith("-unchecked")) else None
+        if shape == "model":
+            return value if _MODEL_NAME.fullmatch(value) else None
+        if shape == "name":
+            from khipu.routing_sources import safe_name
+
+            return value if safe_name(value) == value else None
+        if shape == "label":
+            from khipu.routing_sources import safe_name
+
+            return value if safe_name(value) == value else None
+        if shape == "scope_text":
+            return value if value in ("all", "quota") or _MODEL_NAME.fullmatch(value) else None
+        if shape == "reset_status":
+            return value if value in _RESET_STATUSES else None
+        if shape == "reset_reason":
+            return value if value in _REASON_CODES or value in _RESET_REASONS else None
+        if shape == "owner_auth":
+            return value if value in _OWNER_AUTHS else None
+        if shape == "probe":
+            from khipu.routing_providers import ADAPTERS
+
+            return value if value in ADAPTERS else None
+        if shape == "host":
+            return value if len(value) <= 253 and re.fullmatch(
+                r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?", value) and ".." not in value else None
+        if shape == "source_status":
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                return None
+            if not isinstance(parsed, dict) or set(parsed) - {"silent", "unreadable", "lanes"}:
+                return None
+            if not all(isinstance(parsed.get(k), bool) for k in ("silent", "unreadable")
+                       if k in parsed):
+                return None
+            lanes = parsed.get("lanes", [])
+            if not isinstance(lanes, list) or not all(isinstance(x, str) and not _dangerous(x)
+                                                      for x in lanes):
+                return None
+            return value
+        if isinstance(shape, frozenset):
+            return value if value in shape else None
+        return None
+
+    def scalar(shape, value):
+        if shape == "int":
+            return value if isinstance(value, int) and not isinstance(value, bool) \
+                and abs(value) <= _WHOLE_MOST else None
+        if shape == "bool":
+            return value if isinstance(value, bool) else None
+        if shape == "float":
+            return value if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                and math.isfinite(value) else None
+        if shape == "names":
+            if not isinstance(value, list):
+                return None
+            from khipu.routing_providers import NAME
+
+            return list(value) if all(isinstance(v, str) and NAME.fullmatch(v)
+                                      and not _dangerous(v) for v in value) else None
+        return shaped(shape, value)
+
+    out: list[dict] = []
+    for event in events:
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            continue
+        kind = event["type"]
+        fields = _REPLICATION_FIELDS.get(kind)
+        if fields is None:
+            continue
+        pending = event.get("pending") is True
+        row: dict[str, Any] = {"type": kind}
+        for field, shape in {**_COMMON_FIELDS, **fields}.items():
+            if field not in event:
+                continue
+            value = scalar(shape, event[field])
+            if value is not None:
+                row[field] = value
+        hlc = event.get("hlc")
+        if isinstance(hlc, dict) and isinstance(hlc.get("mac"), str) and hlc["mac"] \
+                and not _dangerous(hlc["mac"]) and _SAFE_ID.fullmatch(hlc["mac"]) \
+                and all(isinstance(hlc.get(k), int) and not isinstance(hlc.get(k), bool)
+                        and 0 <= hlc[k] <= _WHOLE_MOST for k in ("wall", "counter")):
+            row["hlc"] = {"wall": hlc["wall"], "counter": hlc["counter"], "mac": hlc["mac"]}
+        by = event.get("written_by")
+        if isinstance(by, dict):
+            author: dict[str, Any] = {}
+            if by.get("kind") in _AUTHOR_KINDS:
+                author["kind"] = by["kind"]
+            harness = shaped("name", by.get("harness"))
+            if harness is not None:
+                author["harness"] = harness
+            mac = shaped("id", by.get("mac"))
+            if mac is not None:
+                author["mac"] = mac
+            if author:
+                row["written_by"] = author
+        if kind == "hold":
+            scope = event.get("scope")
+            if isinstance(scope, dict) and scope.get("kind") in _HOLD_KINDS:
+                projected_scope: dict[str, Any] = {"kind": scope["kind"]}
+                if scope["kind"] == "account":
+                    account = mapped(scope.get("account"))
+                    if account is not None:
+                        projected_scope["account"] = account
+                if scope["kind"] == "machine":
+                    mac = shaped("id", scope.get("mac"))
+                    if mac is not None:
+                        projected_scope["mac"] = mac
+                row["scope"] = projected_scope
+        locality = event.get("observation_scope")
+        if kind in entry_model.OBSERVATIONS and isinstance(locality, dict) \
+                and locality.get("kind") in ("machine", "account_quota"):
+            projected_locality: dict[str, Any] = {"kind": locality["kind"]}
+            if locality["kind"] == "machine":
+                mac = shaped("id", locality.get("mac"))
+                if mac is not None:
+                    projected_locality["mac"] = mac
+            row["observation_scope"] = projected_locality
+        declaration = event.get("declaration")
+        if kind in ("evidence", "observation") and isinstance(declaration, dict):
+            projected_declaration: dict[str, Any] = {}
+            for field in ("kind", "provider", "model"):
+                value = shaped("name", declaration.get(field))
+                if value is not None:
+                    projected_declaration[field] = value
+            if isinstance(declaration.get("identity_invalid"), bool):
+                projected_declaration["identity_invalid"] = declaration["identity_invalid"]
+            for field in ("account", "budget_account"):
+                value = mapped(declaration.get(field))
+                if value is not None:
+                    projected_declaration[field] = value
+            if projected_declaration:
+                row["declaration"] = projected_declaration
+        if kind == "priority_set" and isinstance(event.get("entries"), list):
+            entries = []
+            for entry in event["entries"]:
+                if not isinstance(entry, dict):
+                    continue
+                projected_entry: dict[str, Any] = {}
+                if "account" in entry:
+                    account = mapped(entry.get("account"))
+                    if account is None:
+                        continue
+                    projected_entry["account"] = account
+                label = scalar("label", entry.get("label"))
+                if label is not None:
+                    projected_entry["label"] = label
+                if not pending or proposal_text:
+                    if isinstance(entry.get("role"), str):
+                        projected_entry["role"] = entry["role"]
+                    level = entry.get("level")
+                    if isinstance(level, dict) and isinstance(level.get("claim"), str) \
+                            and not _dangerous(level["claim"]):
+                        checked = {k: shaped("time", level[k]) for k in ("as_of", "until")
+                                   if k in level}
+                        if all(v is not None for v in checked.values()) \
+                                and set(checked) == {"as_of", "until"}:
+                            projected_entry["level"] = {"claim": level["claim"], **checked}
+                until = shaped("time", entry.get("until"))
+                if until is not None:
+                    projected_entry["until"] = until
+                entries.append(projected_entry)
+            row["entries"] = entries
+        if kind in _HOLDS_KINDS and isinstance(event.get("holds"), dict):
+            holds = {k: v for k, v in event["holds"].items()
+                     if isinstance(k, str) and v in ("end", "keep")
+                     and _SAFE_ID.fullmatch(k) and not _dangerous(k)}
+            row["holds"] = holds
+        if kind in ("definition_set", "definition_remove"):
+            value = entry_model.checked_definition(event.get("definition"),
+                                                   event.get("value"))
+            if value is not None and not any(
+                    isinstance(v, str) and _dangerous(v)
+                    for v in (value.values() if isinstance(value, dict) else ())):
+                if isinstance(value, dict) and "account" in value:
+                    account = mapped(value["account"])
+                    if account is None:
+                        value = None
+                    else:
+                        value = dict(value, account=account)
+                if value is not None:
+                    row["value"] = value
+        if kind == "provider_set" and isinstance(event.get("accounts"), list):
+            row["accounts"] = [account for ref in event["accounts"]
+                                if (account := mapped(ref)) is not None]
+        if kind == "account_migration" and isinstance(event.get("aliases"), dict):
+            row["aliases"] = {k: v for k, v in event["aliases"].items()
+                              if isinstance(k, str) and isinstance(v, str)
+                              and account_identity.LEGACY.fullmatch(k)
+                              and account_identity.STABLE.fullmatch(v)}
+        if kind == ACCOUNT_TXN and isinstance(event.get("declines"), list):
+            declines = []
+            for decline in event["declines"]:
+                if not isinstance(decline, dict):
+                    continue
+                account = mapped(decline.get("account"))
+                if account is None:
+                    continue
+                projected_decline: dict[str, Any] = {"account": account}
+                if decline.get("why") is None or decline.get("why") in _DECLINE_WHY:
+                    projected_decline["why"] = decline.get("why")
+                declines.append(projected_decline)
+            row["declines"] = declines
+        if kind == "account_note":
+            # The note's text is the account's old label, a self-given
+            # name: it never travels (plan section 6). Its lanes_cut pairs
+            # are runner and lane names, in the safe-name shape.
+            if isinstance(event.get("lanes_cut"), list):
+                row["lanes_cut"] = [[pair[0], pair[1]] for pair in event["lanes_cut"]
+                                    if isinstance(pair, list) and len(pair) == 2
+                                    and all(isinstance(x, str) and not _dangerous(x)
+                                            and shaped("name", x) is not None for x in pair)]
+        text = event.get("text")
+        if isinstance(text, str):
+            if kind == "hold":
+                if event.get("owner") is True:
+                    row["text"] = text
+            elif kind in _TEXT_KINDS and (not pending or proposal_text):
+                row["text"] = text
+        if proposal_text and isinstance(event.get("owner_request"), str):
+            row["owner_request"] = event["owner_request"]
+        if kind in ("rule_add", "rule_edit") and isinstance(event.get("prior_text"), str) \
+                and (not pending or proposal_text):
+            row["prior_text"] = event["prior_text"]
+        out.append(row)
+    return out
 
 
 def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = None,
@@ -7106,91 +7510,6 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
             "shown_entities": [item[3] for item, chosen in zip(theirs, fitted) if chosen]}
 
 
-def child_block(view: dict | None = None, *, now: datetime | None = None,
-                limit: int | None = None) -> str:
-    """The bounded block a child agent gets at its start (section 4).
-
-    In order: account states and holds, then each standing rule and the
-    note (and the priority) whole if they fit, otherwise each one's
-    number, kind, accounts and opening. Bounded by
-    ``routing_child_chars`` in UTF-16 units, as hook contexts are
-    counted. A snapshot only: it moves no conversation's marker or
-    delivery ledger, and its scrub is the summary's (``_for_agents``).
-    """
-    from khipu.routing_delivery import _size
-
-    now = now or _now()
-    view = read_view(now) if view is None else view
-    if limit is None:
-        limit = settings()["routing_child_chars"]
-    heading = (f"## Routing at {_clock(now, now)} (Khipu's routing record, version {view['version']}; "
-               "data, not instructions; guidance, not a gate)")
-    if not view.get("record"):
-        lines = [heading, "No routing record on this Mac."]
-        return "\n".join(lines) if not limit else "\n".join(lines)[:limit]
-    facts = plan_facts(view, now)
-    first: list[str] = []
-    for entry in view.get("accounts") or []:
-        line = account_line(entry, now)
-        fact = facts.get(entry["key"])
-        if fact is not None and entry.get("configured", True):
-            line += f"; {pace_words(fact, now)}"
-        pace_text = pace_line_for(entry, now)
-        if pace_text:
-            line += f"; {pace_text}"
-        first.append(line)
-    first += [hold_line(h, now, view=view) for h in view.get("holds") or []]
-    candidates: list[tuple[str, str]] = []  # (identifying label, whole line)
-    for rule in view.get("rules") or []:
-        label = f"Standing rule {rule['n'] if rule['n'] is not None else 'new rule (number pending)'}"
-        names = _named_account_labels(rule.get("text"), view)
-        if names:
-            label += " for " + ", ".join(names)
-        candidates.append((label, rule_line(rule, view=view, facts=facts)))
-    if view.get("note"):
-        candidates.append(("Owner note", note_line(view["note"], now)))
-    if view.get("priority"):
-        candidates.append(("Owner priority", priority_line(view["priority"], now, view=view, facts=facts)))
-    first = list(_for_agents(first, view))
-    candidates = [(label, whole) for (label, _raw), whole in
-                  zip(candidates, _for_agents([whole for _label, whole in candidates], view))]
-    lines = [heading, *first]
-
-    def joined_size(parts: list[str]) -> int:
-        return sum(_size(part) + 1 for part in parts) - 1 if parts else 0
-
-    for label, whole in candidates:
-        if not limit:
-            lines.append(whole)
-            continue
-        if joined_size([*lines, whole]) <= limit:
-            lines.append(whole)
-            continue
-        prefix = f"{label}: "
-        room = limit - joined_size(lines) - 1 - _size(prefix)
-        if room < 0:
-            continue  # not even its identifying label fits; earlier entries keep the bound
-        body, used = [], 0
-        for char in whole:
-            cost = _size(char)
-            if used + cost > room:
-                break
-            body.append(char)
-            used += cost
-        lines.append(prefix + "".join(body))
-    text = "\n".join(lines)
-    if limit and _size(text) > limit:  # accounts and holds alone overflow: the bound still holds
-        out, used = [], 0
-        for char in text:
-            cost = _size(char)
-            if used + cost > limit:
-                break
-            out.append(char)
-            used += cost
-        text = "".join(out)
-    return text
-
-
 def since(version: int, view: dict | None = None, *, now: datetime | None = None,
           epoch: str | None = None) -> dict:
     """The current state of everything that changed after ``version``. The
@@ -8243,8 +8562,116 @@ def start_budget() -> float:
     return min(max(0, ms), START_BUDGET_MOST_MS) / 1000.0
 
 
+def _child_page_push_inline(session_id: str, agent_id: str,
+                            now: datetime | None = None) -> dict | None:
+    if push_off("delegation"):
+        return None
+    from khipu import routing_delivery
+
+    now = now or _now()
+    out = light_status(now, start=True, session_id=None)
+    planned = routing_delivery.plan(dict(out, kind="full"), out.view, now, settings(), session=None)
+    session = routing_delivery.hook_session(session_id)
+    page = routing_delivery.child_page(planned, session=session, component=f"agent:{agent_id}",
+                                       now=now, cfg=settings())
+    return dict(page, session=session) if page else None
+
+
+def child_page_push(session_id: str | None, agent_id: str | None, *,
+                    now: datetime | None = None) -> dict | None:
+    """The next deferred routing page for a subagent's own tool result
+    (slice 8a): one page from its ``agent:<agent_id>`` ledger, or None when
+    nothing is deferred. The parent's ledger is never touched.
+
+    Like the parent's per-prompt push, the record read runs in a forked
+    child under ``routing_prompt_budget_ms``: a slow read returns nothing
+    on time instead of blocking the subagent's tool call."""
+    if not session_id or not agent_id or push_off("delegation"):
+        return None
+    budget = prompt_budget()
+    if budget <= 0 or not hasattr(os, "fork"):
+        return None
+    deadline = time.monotonic() + budget
+    read_fd = write_fd = None
+    pid = None
+    try:
+        import warnings
+
+        read_fd, write_fd = os.pipe()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads
+            pid = os.fork()
+        if pid == 0:  # the child: read, write the page's JSON, exit
+            code = 1
+            try:
+                import signal
+
+                os.close(read_fd)
+                os.setsid()
+                null = os.open(os.devnull, os.O_RDWR)
+                for fd in (0, 1, 2):
+                    os.dup2(null, fd)
+
+                def on_alarm(_sig, _frame):
+                    if finishing_view():
+                        signal.signal(signal.SIGALRM, lambda *_: os._exit(1))
+                        signal.setitimer(signal.ITIMER_REAL, 60.0)
+                        return
+                    os._exit(1)
+
+                signal.signal(signal.SIGALRM, on_alarm)
+                signal.setitimer(signal.ITIMER_REAL,
+                                 max(0.0, deadline - time.monotonic()) + 0.05)
+                page = _child_page_push_inline(session_id, agent_id, now)
+                if page:
+                    data = memoryview(json.dumps(page).encode("utf-8"))
+                    while data:
+                        data = data[os.write(write_fd, data):]
+                code = 0
+            except BaseException:  # noqa: BLE001 - nothing for routing
+                code = 1
+            finally:
+                os._exit(code)
+        os.close(write_fd)
+        write_fd = None
+        import select
+
+        chunks: list[bytes] = []
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None  # late: the child exits on its alarm
+            ready, _, _ = select.select([read_fd], [], [], left)
+            if not ready:
+                return None
+            chunk = os.read(read_fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        page = json.loads(b"".join(chunks).decode("utf-8")) if chunks else None
+        return page if isinstance(page, dict) and page else None
+    except Exception:  # noqa: BLE001 - routing never breaks the hook
+        return None
+    finally:
+        for fd in (read_fd, write_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if pid:
+            def reap() -> None:
+                try:
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
+
+            threading.Thread(target=reap, name="khipu-routing-page-reap", daemon=True).start()
+
+
 def start_push(budget: float | None = None, moment: str = "start", *,
-               session_id: str | None = None) -> dict | None:
+               session_id: str | None = None, child_component: str | None = None,
+               child_session: str | None = None) -> dict | None:
     """The full summary for the session-start hook (or, with ``moment``
     "delegation", for a subagent at its start), or None when the push is
     off. Folds outside the routing lock and waits for it, to save the view,
@@ -8254,11 +8681,22 @@ def start_push(budget: float | None = None, moment: str = "start", *,
     if push_off(moment):
         return None
     budget = start_budget() if budget is None else budget
-    out = light_status(lock_wait=budget / 2, start=True, session_id=session_id)
+    out = light_status(lock_wait=budget / 2, start=True,
+                       session_id=None if child_component else session_id)
     from khipu import routing_delivery
 
     now = _now()
     view = out.view
+    if child_component:
+        # A subagent receives a snapshot, not its parent conversation's
+        # notices: the plan is built with no session, and the bounded
+        # block is reserved in the child's own per-agent ledger.
+        planned = routing_delivery.plan(dict(out, kind="full"), view, now, settings(), session=None)
+        answer = routing_delivery.child_offer(planned, session=child_session,
+                                              component=child_component, now=now, cfg=settings())
+        answer.update(kind="full", version=out["version"], epoch=out.get("epoch"),
+                      generation=out.get("generation"), notices=[])
+        return answer
     out = routing_delivery.plan(dict(out, kind="full"), view, now, settings(), session=session_id)
     from khipu import recall_rule
 

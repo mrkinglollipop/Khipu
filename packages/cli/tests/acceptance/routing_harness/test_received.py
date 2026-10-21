@@ -22,7 +22,6 @@ def test_rig_reads_known_received_sentinels(received, harness):
         assert child.inputs
 
 
-@future("8a", "7a: bounded oversized child block before its first step, remainder on its own tool results")
 def test_7a_claude_child_oversized_block_and_deferred_pages(received):
     scenario = received("claude")
     child, = scenario.children
