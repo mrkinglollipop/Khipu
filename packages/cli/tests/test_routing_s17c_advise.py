@@ -134,12 +134,12 @@ def test_pause_is_closed_for_both_purposes(replay):
         assert out["verdict"] == "closed", purpose
 
 
-def test_share_cap_holds_orchestration_too(replay):
+def test_share_cap_closes_every_purpose(replay):
     routing.report(account="Claude", state="open", author=AUTHOR)
     replay.write(_sample(replay, used=95))
     routing.set_cap("Claude", window="weekly", kind="share", pct=91, revision="sh1", via="app")
-    assert routing.advise("Claude", purpose="orchestration", now=replay.now)["verdict"] == "hold_back"
-    assert routing.advise("Claude", purpose="job", now=replay.now)["verdict"] == "hold_back"
+    for purpose in ("job", "check", "orchestration"):
+        assert routing.advise("Claude", purpose=purpose, now=replay.now)["verdict"] == "closed"
 
 
 def test_an_old_reading_is_unknown_evidence_with_no_figures(replay):
@@ -278,22 +278,22 @@ def _coverage():
             "from": (NOW - timedelta(days=7)).timestamp(), "to": NOW.timestamp()}
 
 
-def test_spend_over_holds_both_purposes(mac):
+def test_spend_ceiling_closes_orchestration_and_holds_jobs_and_checks(mac):
     _runner(mac, {"spend": [_spend("e1", 35.10, NOW - timedelta(hours=1))],
                   "spend_coverage": [_coverage()]})
     routing.set_cap("Main", kind="spend", usd=35, days=7, revision="s1", via="app")
-    for purpose in ("job", "orchestration"):
+    for purpose in ("job", "check", "orchestration"):
         out = routing.advise("Main", purpose=purpose, now=NOW)
-        assert out["verdict"] == "hold_back", purpose
+        assert out["verdict"] == ("closed" if purpose == "orchestration" else "hold_back"), purpose
         assert out["numbers"]["spend_usd"] == pytest.approx(35.10)
 
 
-def test_concurrency_full_holds_job_but_not_orchestration(mac):
+def test_concurrency_full_holds_jobs_and_checks_only(mac):
     _runner(mac, {"active": [{"lane": "main-lane", "account": MAIN, "jobs": 1,
                               "unit": "job", "at": NOW.timestamp()}]})
     routing.set_cap("Main", kind="concurrency", n=1, revision="c1", via="app")
-    assert routing.advise("Main", purpose="job", now=NOW)["verdict"] == "hold_back"
-    assert routing.advise("Main", purpose="orchestration", now=NOW)["verdict"] == "go"
+    for purpose in ("job", "check", "orchestration"):
+        assert routing.advise("Main", purpose=purpose, now=NOW)["verdict"] == ("go" if purpose == "orchestration" else "hold_back")
 
 
 def test_expired_telemetry_answers_go_with_unknown_evidence(mac):

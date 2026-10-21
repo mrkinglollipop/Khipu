@@ -72,6 +72,8 @@ export type RouteAccount = {
   cap_statuses?: CapStatus[];
   /** Khipu's launch advice for jobs (slice 17c). Advisory, never a gate. */
   advice?: RouteAdvice | null;
+  /** Check advice uses its own pace allowance, or the job allowance. */
+  check_advice?: RouteAdvice | null;
   /** The same advice for lead conversations (orchestration purpose). */
   lead_advice?: RouteAdvice | null;
 };
@@ -360,6 +362,7 @@ export type Pace = {
   share_cap?: PaceLimit | null;
   day_cap?: PaceDayCap | null;
   pace_target?: PaceTarget | null;
+  check_pace_target?: PaceTarget | null;
   /** Which target the window's verdict speaks: plan, share_cap or day_cap. */
   headline?: "plan" | "share_cap" | "day_cap" | string;
 };
@@ -369,6 +372,9 @@ export type Pace = {
  *  judged it. A cap Khipu cannot read says `unknown` with no figure. */
 export type CapStatus = {
   kind: "share" | "per_day" | "pace_target" | "spend" | "concurrency" | string;
+  purpose?: "job" | "check";
+  tier?: "opus" | "sonnet" | "haiku";
+  sensitive_only?: boolean;
   /** The fact's opaque revision, as you confirmed it. */
   revision?: string | null;
   /** When you confirmed this cap (`route --json` only; absent elsewhere). */
