@@ -19,6 +19,7 @@ WINDOWS = {
 # Cap kinds scoped to a usage window; the rest are account-scoped facts.
 WINDOW_CAP_KINDS = ("share", "per_day", "pace_target")
 CAP_KINDS = WINDOW_CAP_KINDS + ("spend", "concurrency")
+CAP_PURPOSES = ("job", "check")
 _REUSABLE_CYCLES = {"weekly", "five_hour", "five-hour", "five hour", "daily", "day"}
 
 
@@ -46,38 +47,59 @@ _CAP_FIELDS = {"share": {"pct"}, "per_day": {"pct"}, "pace_target": {"pct", "sla
                "spend": {"usd", "days"}, "concurrency": {"n"}}
 
 
+def cap_scope_error(kind, purpose="job", *, tier=None, sensitive_only=None):
+    """The scope shared by owner writes, proposals and stored facts."""
+    if purpose not in CAP_PURPOSES:
+        return "cap purpose must be job or check"
+    if purpose == "check" and kind != "pace_target":
+        return "check purpose is only supported for pace_target caps"
+    if (tier is not None or sensitive_only is not None) and (kind != "pace_target" or purpose != "check"):
+        return "cap qualifiers are only supported for check pace_target caps"
+    if tier is not None and tier not in ("opus", "sonnet", "haiku"):
+        return "cap tier must be opus, sonnet or haiku"
+    if sensitive_only is not None and not isinstance(sensitive_only, bool):
+        return "sensitive_only must be true or false"
+    return None
+
+
 def checked_cap(value):
     """One owner cap fact, checked by kind. Runner numbers never enter
     here: a cap holds only what the owner confirmed. A field the kind
     does not use refuses the cap, never drops silently."""
-    if not isinstance(value, dict) or set(value) - {"kind", "pct", "slack", "usd", "days", "n", "revision"}:
+    if not isinstance(value, dict) or set(value) - {"kind", "pct", "slack", "usd", "days", "n", "revision", "purpose", "tier", "sensitive_only"}:
         return None
+    if any(k in value and value[k] is None for k in ("purpose", "tier", "sensitive_only")):
+        return None
+    if cap_scope_error(value.get("kind"), value.get("purpose", "job"),
+                       tier=value.get("tier"), sensitive_only=value.get("sensitive_only")):
+        return None
+    scope = {k: value[k] for k in ("purpose", "tier", "sensitive_only") if k in value}
     kind = value.get("kind")
     revision = value.get("revision")
     if kind not in CAP_KINDS or not isinstance(revision, str) or not revision.strip():
         return None
-    if {k for k, v in value.items() if v is not None} - {"kind", "revision"} - _CAP_FIELDS[kind]:
+    if {k for k, v in value.items() if v is not None} - {"kind", "revision", "purpose", "tier", "sensitive_only"} - _CAP_FIELDS[kind]:
         return None
     revision = revision.strip()
     if kind in ("share", "per_day"):
         pct = _num(value.get("pct"))
         if pct is None or not 0 < pct <= 100:
             return None
-        return {"kind": kind, "pct": pct, "revision": revision}
+        return {"kind": kind, "pct": pct, "revision": revision, **scope}
     if kind == "pace_target":
         pct, slack = _num(value.get("pct")), _num(value.get("slack"))
         if pct is None or not 0 < pct <= 100 or slack is None or not 0 <= slack <= 100:
             return None
-        return {"kind": kind, "pct": pct, "slack": slack, "revision": revision}
+        return {"kind": kind, "pct": pct, "slack": slack, "revision": revision, **scope}
     if kind == "spend":
         usd, days = _num(value.get("usd")), _num(value.get("days"))
         if usd is None or not 0 < usd <= 1e9 or days is None or not 0 < days <= 366:
             return None
-        return {"kind": kind, "usd": usd, "days": days, "revision": revision}
+        return {"kind": kind, "usd": usd, "days": days, "revision": revision, **scope}
     n = value.get("n")
     if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 100000:
         return None
-    return {"kind": kind, "n": n, "revision": revision}
+    return {"kind": kind, "n": n, "revision": revision, **scope}
 
 
 def spend_verdict(total: dict, usd) -> str:
@@ -197,9 +219,10 @@ def compute_pace(samples, caps, now, window):
                      "before_reset_s": None, "unused_at_reset_pct": None},
             "share_cap": None, "day_cap": None, "pace_target": None, "headline": "plan"}
     samples = [s for s in samples if s.get("reset") is not None and _num(s.get("used")) is not None]
-    target_cap = next((c for c in caps if c.get("kind") == "pace_target"), None)
-    if target_cap:
-        pace["pace_target"] = {"revision": target_cap["revision"], "pct": target_cap["pct"],
+    targets = {("check_pace_target" if c.get("purpose", "job") == "check" else "pace_target"): c
+               for c in caps if c.get("kind") == "pace_target"}
+    for field, target_cap in targets.items():
+        pace[field] = {"revision": target_cap["revision"], "pct": target_cap["pct"],
                                "slack": target_cap["slack"], "allowance_pct": None, "used_pct": None,
                                "verdict": "unknown", "why": "no reading"}
     if not samples:
@@ -379,7 +402,7 @@ def compute_pace(samples, caps, now, window):
             pace["plan"].update(verdict="limit_reached", needed_pct_per_h=needed)
         elif allowed:
             pace["plan"] = target(100 - used)
-    share = next((c for c in caps if c["kind"] == "share"), None)
+    share = min((c for c in caps if c["kind"] == "share"), key=lambda c: c["pct"], default=None)
     if share:
         sc = target(share["pct"] - used, share["pct"]) if used is not None else {"verdict": "unknown"}
         sc["revision"], sc["pct"] = share["revision"], share["pct"]
@@ -387,7 +410,7 @@ def compute_pace(samples, caps, now, window):
         pace["share_cap"] = {"revision": sc["revision"], "pct": sc["pct"], "verdict": sc["verdict"],
                              "needed_pct_per_h": sc.get("needed_pct_per_h"), "runs_out_at": sc.get("runs_out_at"),
                              "before_reset_s": sc.get("before_reset_s"), "unused_at_reset_pct": sc.get("unused_at_reset_pct")}
-    day = next((c for c in caps if c["kind"] == "per_day"), None)
+    day = min((c for c in caps if c["kind"] == "per_day"), key=lambda c: c["pct"], default=None)
     if day:
         day_start = now - timedelta(hours=24)
         dgain, ddur, dgap, _ddis = clipped(day_start, now)
@@ -451,9 +474,25 @@ def compute_pace(samples, caps, now, window):
                            "used_24h_pct": dgain, "observed_pct": dobs, "settles_at_pct": settles,
                            "peak_pct": peak, "peak_at": peak_at, "reaches_cap_at": reaches,
                            "why": day_why}
+    if any(c.get("purpose") == "check" and c["kind"] in ("share", "per_day") for c in caps):
+        # The headline uses the strictest ceiling, but each fact retains
+        # its own verdict even when another purpose has a lower ceiling.
+        ceiling_verdicts = []
+        for cap in caps:
+            if cap["kind"] == "share":
+                verdict = target(cap["pct"] - used, cap["pct"])["verdict"] if used is not None else "unknown"
+            elif cap["kind"] == "per_day":
+                daily = pace["day_cap"] or {}
+                gain = daily.get("used_24h_pct")
+                verdict = ("unknown" if daily.get("verdict") == "unknown" or gain is None else
+                           "over" if gain > cap["pct"] else "near" if gain >= .85 * cap["pct"] else "under")
+            else:
+                continue
+            ceiling_verdicts.append({"kind": cap["kind"], "purpose": cap.get("purpose", "job"),
+                                     "verdict": verdict})
+        pace["ceiling_verdicts"] = ceiling_verdicts
     pace["used_pct"] = used
-    target_cap = next((c for c in caps if c["kind"] == "pace_target"), None)
-    if target_cap:
+    for field, target_cap in targets.items():
         # Ahead of an even pace toward the target, apart from the forecast:
         # allowance grows linearly with the elapsed share of the window.
         target = {"revision": target_cap["revision"], "pct": target_cap["pct"],
@@ -477,7 +516,7 @@ def compute_pace(samples, caps, now, window):
                 for b in blist if b["segment"][0] == current_key)
             target["verdict"] = ("ahead" if used > allowance else
                                  "within" if used <= allowance - 1 or not was_ahead else "recovering")
-        pace["pace_target"] = target
+        pace[field] = target
     # Headline: reached/over, then earliest crossing, then near, then plan.
     ranked = []
     if pace["plan"]["verdict"] in ("limit_reached",):

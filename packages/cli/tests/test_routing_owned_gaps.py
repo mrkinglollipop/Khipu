@@ -80,4 +80,4 @@ def test_push_and_gateway_projections_do_not_carry_the_additions(replay):
     for row in routing.conversation_view(now=replay.now)["accounts"]:
         assert all("confirmed_at" not in c for c in row.get("cap_statuses") or [])
     assert routing.cap_statuses(view, _claude(view), replay.now)[0].keys() == \
-        {"kind", "revision", "window", "pct", "slack", "allowance_pct", "used_pct", "verdict", "why"}
+        {"kind", "purpose", "revision", "window", "pct", "slack", "allowance_pct", "used_pct", "verdict", "why"}

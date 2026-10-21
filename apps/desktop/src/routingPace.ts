@@ -64,6 +64,7 @@ export type PaceAdvice = {
   why: string;
   evid: string;
   lead: { word: PaceAdvice["word"]; tone: PaceAdvice["tone"]; why: string } | null;
+  checks: { word: "Go" | "Hold back" | "Closed" | "Not for checks"; tone: PaceAdvice["tone"]; why: string } | null;
 };
 
 /** One account: its block, or the one line the group keeps closed. */
@@ -315,6 +316,13 @@ function capName(s: CapStatus): string {
     case "per_day":
       return `Jobs: at most ${Math.round(s.pct ?? 0)}% a day`;
     case "pace_target":
+      if (s.purpose === "check") {
+        const who = s.tier ? `${s.tier[0].toUpperCase()}${s.tier.slice(1)} checks` : "Checks";
+        const scope = `${windowName(s.window)}: ${who}${s.sensitive_only ? " of sensitive code" : ""}`;
+        return (s.pct ?? 0) >= 100
+          ? `${scope}: up to ${num1(s.slack ?? 0)} over even`
+          : `${scope}: even pace to ${Math.round(s.pct ?? 0)}%, ${num1(s.slack ?? 0)} points slack`;
+      }
       return (s.pct ?? 0) >= 100
         ? `${windowName(s.window)}: no more than ${num1(s.slack ?? 0)} points ahead of even`
         : `${windowName(s.window)}: even pace to ${Math.round(s.pct ?? 0)}%, ${num1(s.slack ?? 0)} points slack`;
@@ -353,21 +361,23 @@ function capState(a: RouteAccount, s: CapStatus, now: Date): { state: string; ta
       const pace = paceOf(a, s.window);
       const cap = pace.share_cap;
       const used = pace.used_pct;
-      if (!cap || cap.verdict === "unknown") return { state: "Not known yet", tag: null };
-      if (cap.verdict === "cap_reached") {
+      const verdict = s.verdict ?? cap?.verdict;
+      if (!cap || verdict === "unknown") return { state: "Not known yet", tag: null };
+      if (verdict === "cap_reached") {
         return { state: `${used != null ? `${Math.round(used)}% now` : "At it"} · reached`, tag: { text: "Reached", tone: "err" } };
       }
-      if (cap.runs_out_at) {
+      if (cap.runs_out_at && cap.pct === s.pct) {
         return { state: `${used != null ? `${Math.round(used)}% now` : "Used"} · reaches it ${whenLocal(cap.runs_out_at, now)}`, tag: null };
       }
       return { state: used != null ? `${Math.round(used)}% now` : "Not known yet", tag: null };
     }
     case "per_day": {
       const day = paceOf(a, s.window).day_cap;
-      if (!day || day.verdict === "unknown") return { state: day?.why ? `Not known: ${day.why}` : "Not known yet", tag: null };
+      const verdict = s.verdict ?? day?.verdict;
+      if (!day || verdict === "unknown") return { state: day?.why ? `Not known: ${day.why}` : "Not known yet", tag: null };
       const used = day.used_24h_pct != null ? `${num1(day.used_24h_pct)}% in the last 24 h` : "";
-      if (day.verdict === "over") return { state: `${used} · over it`, tag: { text: "Over", tone: "err" } };
-      if (day.reaches_cap_at) {
+      if (verdict === "over") return { state: `${used} · over it`, tag: { text: "Over", tone: "err" } };
+      if (day.reaches_cap_at && day.pct === s.pct) {
         return { state: `${used} · reaches ${Math.round(day.pct ?? 0)}% at ${whenLocal(day.reaches_cap_at, now)}`, tag: null };
       }
       return { state: used || "Not known yet", tag: null };
@@ -483,7 +493,7 @@ function accountTag(a: RouteAccount): PaceTag {
   if (shareOut) return { text: `Outpacing your ${Math.round(shareOut.share_cap?.pct ?? 0)}%`, tone: "warn" };
   const dayOut = paces.find((p) => p.day_cap?.verdict === "over" || p.day_cap?.verdict === "near");
   if (dayOut) return { text: `${dayOut.day_cap?.verdict === "over" ? "Over" : "Near"} your ${Math.round(dayOut.day_cap?.pct ?? 0)}% a day`, tone: "warn" };
-  const target = statuses.find((s) => s.kind === "pace_target");
+  const target = statuses.find((s) => s.kind === "pace_target" && s.purpose !== "check");
   if (target?.verdict === "ahead") return { text: "Ahead of your pace", tone: "warn" };
   if (target?.verdict === "recovering") return { text: "Coming back to your pace", tone: "warn" };
   if (paces.some((p) => p.plan?.verdict === "underpacing")) return { text: "Underpacing", tone: "neutral" };
@@ -572,7 +582,7 @@ function sayOf(a: RouteAccount, now: Date): PaceSayPart[] {
     return parts;
   }
 
-  const target = (a.cap_statuses ?? []).find((s) => s.kind === "pace_target");
+  const target = (a.cap_statuses ?? []).find((s) => s.kind === "pace_target" && s.purpose !== "check");
   if (target?.verdict === "ahead" && target.used_pct != null && target.allowance_pct != null) {
     const week = paceOf(a, "weekly");
     const planVerdict = week.plan?.verdict ?? "unknown";
@@ -622,7 +632,7 @@ function lineOf(a: RouteAccount, now: Date, advice: PaceAdvice | null): { week: 
         : `Reaches ${Math.round(crossing.pct ?? 0)}%`;
     return { week: `${what} ${crossing.when}`, advice: adviceWords };
   }
-  const target = (a.cap_statuses ?? []).find((s) => s.kind === "pace_target");
+  const target = (a.cap_statuses ?? []).find((s) => s.kind === "pace_target" && s.purpose !== "check");
   if (target?.verdict === "ahead" && target.used_pct != null && target.allowance_pct != null) {
     return { week: `${num1(Math.max(0, target.used_pct - target.allowance_pct))} points ahead of your even pace`, advice: adviceWords };
   }
@@ -653,7 +663,8 @@ function clearsAt(s: CapStatus): string | null {
  *  state, then the one figure that makes it actionable. */
 function adviceWhy(a: RouteAccount, advice: NonNullable<RouteAccount["advice"]>, now: Date): string {
   const reason = (advice.reason ?? "").replace(/\.$/, "");
-  const status = (kind: string) => (a.cap_statuses ?? []).find((s) => s.kind === kind);
+  const status = (kind: string) => (advice.caps ?? a.cap_statuses ?? []).find((s) => s.kind === kind
+    && (kind !== "pace_target" || ("applies" in s ? s.applies !== false : s.purpose !== "check")));
   const target = status("pace_target");
   const parts = reason.split("; ").filter(Boolean).map((part) => {
     switch (part) {
@@ -758,7 +769,13 @@ function adviceOf(a: RouteAccount, now: Date): PaceAdvice | null {
     : evidence === "stale"
       ? "evidence stale"
       : `evidence unknown: ${evidenceCause(a)}`;
-  return { word, tone, why: adviceWhy(a, advice, now), evid, lead: leadOf(a, now) };
+  const check = a.check_advice;
+  const checks: PaceAdvice["checks"] = check && (a.cap_statuses ?? []).some((s) => s.kind === "pace_target" && s.purpose === "check")
+    ? { word: check.verdict === "go" ? "Go" : check.verdict === "hold_back" ? "Hold back" : check.verdict === "closed" ? "Closed" : "Not for checks",
+      tone: check.verdict === "go" ? "go" : check.verdict === "hold_back" ? "hold" : "closed",
+      why: adviceWhy(a, check, now) }
+    : null;
+  return { word, tone, why: adviceWhy(a, advice, now), evid, lead: leadOf(a, now), checks };
 }
 
 /** ", 3 min ago": how old the newest reading is, when the CLI says. */
@@ -793,7 +810,7 @@ function leadOf(a: RouteAccount, now: Date): PaceAdvice["lead"] {
   const unique = [...new Set(jobOnly)];
   const shares = caps.filter((c) => c.applies !== false && c.kind === "share" && c.pct != null).map((c) => `${Math.round(c.pct as number)}%`);
   const parts: string[] = [];
-  if (unique.length) parts.push(`Your ${unique.join(" and ")} ${unique.length === 1 ? "applies" : "apply"} only to jobs.`);
+  if (unique.length) parts.push(`Your ${unique.join(" and ")} ${unique.length === 1 ? "applies" : "apply"} only to jobs and checks.`);
   if (shares.length) parts.push(`Under ${shares.join(" and ")}.`);
   return { word, tone, why: parts.join(" ") || "No cap holds lead conversations." };
 }
@@ -830,7 +847,7 @@ export function paceModel(view: RouteView, plans: UsageReport | null | undefined
       tag: accountTag(a),
       say: sayOf(a, now),
       windows: (a.pace ?? []).map((p) => windowRow(p, a.label, now)),
-      caps: (a.cap_statuses ?? []).map((s) => ({ key: `${s.kind}:${s.window ?? ""}:${s.revision ?? ""}`, name: capName(s), ...capState(a, s, now) })),
+      caps: (a.cap_statuses ?? []).map((s) => ({ key: `${s.kind}:${s.window ?? ""}:${s.purpose ?? "job"}:${s.revision ?? ""}`, name: capName(s), ...capState(a, s, now) })),
       capsEvid: capsEvidOf(a),
       advice,
       open: openByDefault(a, now),

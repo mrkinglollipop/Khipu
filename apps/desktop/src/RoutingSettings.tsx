@@ -4686,6 +4686,13 @@ export function PaceSection({ data, plans, now, folds }: {
                     <span className={`word ${row.advice.tone}`}>{row.advice.word}</span>
                     <span className="why">{row.advice.why}</span>
                   </div>
+                  {row.advice.checks ? (
+                    <div className="adv-row">
+                      <span className="who">Checks</span>
+                      <span className={`word ${row.advice.checks.tone}`}>{row.advice.checks.word}</span>
+                      <span className="why">{row.advice.checks.why}</span>
+                    </div>
+                  ) : null}
                   {row.advice.lead ? (
                     <div className="adv-row">
                       <span className="who">Lead conversations</span>

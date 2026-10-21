@@ -750,31 +750,51 @@ read from prose.
 
 The window share (91% of the week, 60% of the five hours) is section 2a's `share`.
 
+**2026-10-21 note: caps by purpose.** Cap facts accept optional `purpose: job|check`,
+defaulting to `job` for existing facts. Only `pace_target` accepts check purpose.
+A check allowance replaces the job allowance in that account/window only when
+the request matches its optional `tier` and `sensitive_only` qualifiers;
+otherwise checks use the job cap. Codex: weekly target 100, job slack 0,
+unqualified check slack 5, share ceiling 95%. Main Claude: weekly target 100,
+job slack 5, check slack 20 with `tier: sonnet` and `sensitive_only: true`,
+share ceiling 91%. The caller explicitly declares the check's `--tier` and
+`--sensitive`; Khipu does not detect or verify sensitive code, and task-table
+inference does not satisfy the tier qualifier. Purpose grants no model/privacy
+eligibility. Owner direction, app and typed-terminal confirmation, removal and
+undo preserve the scope. `cap_statuses` exposes it; the app names its window
+and qualifiers. `check_advice` is omitted when no check cap exists. Share
+ceilings close every purpose. Spend ceilings close orchestration and hold jobs
+and checks back. Orchestration never pauses for pace, daily pacing or concurrency;
+owner holds, account pauses and provider limits still close it.
+This supersedes case 17b's original share/concurrency expectations.
+
 *Advice* (slice 17c). `khipu route advise` and an `advice` object per account in `khipu_route`.
-- **The request** names a lane, an account, or a tier and kind: `--tier opus|sonnet|haiku`, `--privacy`,
-  `--kind build|fix|check`, and `--purpose job|orchestration`.
+- **The request** names a lane, an account, or a tier and kind: `--tier opus|sonnet|haiku`, `--privacy`, `--sensitive`,
+  `--kind build|fix|check`, and `--purpose job|check|orchestration`.
   - `purpose` defaults to `job`.
   - `orchestration` is accepted only from an attachment that is not a dispatched job. Capture lineage
     already marks dispatched jobs (`CLAUDE_DISPATCHED_LANE`, the delegation hooks' child identities), and a
     job that claims `orchestration` is answered as a `job`.
 - **The answer:** `go`, `hold_back` or `closed`, each with its reason, its numbers, and an `evidence` field
   (`fresh`, `stale`, `unknown`).
-  - **`closed`:** a limit, a pause or a hold, for every purpose.
+  - **`closed`:** a limit, a pause, a hold or a reached share ceiling, for every purpose.
   - **`hold_back`**, per cap kind and purpose:
 
-    | Cap | `job` | `orchestration` |
-    |---|---|---|
-    | `pace_target`, `per_day` | applies | exempt |
-    | `concurrency` | applies | exempt, because orchestration is not a runner job |
-    | `share`, `spend` | applies | applies |
+    | Cap | `job` | `check` | `orchestration` |
+    |---|---|---|---|
+    | `pace_target` | job cap | matching check cap, else job cap | exempt |
+    | `per_day` | applies | applies | exempt |
+    | `concurrency` | applies | applies | exempt |
+    | `spend` | applies | applies | closes at ceiling |
+    | `share` | closes at ceiling | closes at ceiling | closes at ceiling |
 
-    It also applies to `job` when any cap crosses within the hour at the trailing average.
+    It also applies to `job` and `check` when any cap crosses within the hour at the trailing average.
   - **Unknown evidence:** the answer is `go` with that evidence status, so the consumer can apply its own
     policy.
 - **Ranking:** `advise` ranks what is open in the owner's priority order and says why. It replaces section
   2a's "Khipu still returns no pick" with advice that nothing is obliged to follow.
 - **Pushes:** a change of advice for an account in the conversation's priority is pushed under section 2a's
-  push rules.
+  push rules. Lines identify jobs or checks; changed check advice gets its own acknowledged push.
 
 *The Church Harness runner* (slice 17b, in church-harness, with Matt's go). Its numbers are converted, not
 copied:
