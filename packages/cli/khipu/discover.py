@@ -120,6 +120,8 @@ _VERSION_RE = re.compile(rb"(\d+\.\d+(?:\.\d+)*)")
 # whether a token is present. Every other byte is dropped in that function.
 SETTINGS_NAME = "settings.json"
 SETTINGS_MAX = 64 * 1024
+SETTINGS_MAX_DEPTH = 48
+SETTINGS_MAX_ITEMS = 4096
 PROVIDER_HOSTS = MappingProxyType({"api.z.ai": "glm", "api.deepseek.com": "deepseek",
                                    "api.anthropic.com": "claude"})
 AUTH_FILES = MappingProxyType({"claude": (".credentials.json", ".claude.json"),
@@ -401,6 +403,40 @@ def zai_home(path) -> bool:
     return path is not None and bool(ZAI_FOLDER.match(Path(path).name))
 
 
+def _settings_shape_ok(raw: bytes) -> bool:
+    """Depth and count limits checked without building the document, so a
+    deeply nested or sprawling file is refused before the JSON parser can
+    recurse on it. String contents never count as structure."""
+    depth = items = 0
+    in_string = escaped = False
+    for byte in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+            items += 1
+        elif byte in (0x5B, 0x7B):
+            depth += 1
+            items += 1
+            if depth > SETTINGS_MAX_DEPTH:
+                return False
+        elif byte in (0x5D, 0x7D):
+            depth -= 1
+            if depth < 0:
+                return False
+        elif byte in (0x2C, 0x3A):
+            items += 1
+        if items > SETTINGS_MAX_ITEMS:
+            return False
+    return True
+
+
 def bounded_settings(path) -> dict:
     """The bounded settings parser: the only read inside a login home.
 
@@ -421,18 +457,38 @@ def bounded_settings(path) -> dict:
     if not stat.S_ISREG(info.st_mode) or info.st_size > SETTINGS_MAX:
         out["unreadable"] = True
         return out
+    # The stat above is only an existence pre-check; the opened descriptor
+    # is re-validated with fstat, so a file swapped in between (a FIFO, an
+    # oversize file) is still refused, and O_NONBLOCK never waits on one.
     try:
-        with open(target, "rb") as handle:
-            raw = handle.read(SETTINGS_MAX + 1)
+        fd = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return out
     except OSError:
         out["unreadable"] = True
         return out
-    if len(raw) > SETTINGS_MAX:
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > SETTINGS_MAX:
+            out["unreadable"] = True
+            return out
+        raw = b""
+        while len(raw) <= SETTINGS_MAX:
+            chunk = os.read(fd, SETTINGS_MAX + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        out["unreadable"] = True
+        return out
+    finally:
+        os.close(fd)
+    if len(raw) > SETTINGS_MAX or not _settings_shape_ok(raw):
         out["unreadable"] = True
         return out
     try:
         data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError, MemoryError):
         out["unreadable"] = True
         return out
     if not isinstance(data, dict):
@@ -446,9 +502,11 @@ def bounded_settings(path) -> dict:
         try:
             parts = urlsplit(url.strip())
             host = parts.hostname.lower().rstrip(".") if parts.hostname else None
+            port = parts.port
         except ValueError:
-            host = None
-        if host and parts.username is None and parts.password is None and host in PROVIDER_HOSTS:
+            host, port = None, None
+        if host and parts.scheme.lower() == "https" and port in (None, 443) \
+                and parts.username is None and parts.password is None and host in PROVIDER_HOSTS:
             out["host"] = host
             out["provider"] = PROVIDER_HOSTS[host]
     out["has_token"] = any(isinstance(env.get(k), str) and bool(env[k].strip())
@@ -489,7 +547,10 @@ def _login_evidence(cli: str, path, settings: dict | None = None) -> list[str]:
 
 def _worktree_container(cli: str, path, settings: dict | None = None) -> bool:
     """A folder holding only a ``worktrees`` folder is a worktree container,
-    not a login: it has a worktrees folder (by stat) and no login marker."""
+    not a login. Any known marker of a real home beside it — an auth file,
+    settings, a projects folder, a history file, sessions — means it is a
+    real home that also holds worktrees. Stat-only, like every other check
+    here: nothing inside the folder is listed or read."""
     if path is None or cli not in FOLDER_CLIS:
         return False
     try:
@@ -499,11 +560,13 @@ def _worktree_container(cli: str, path, settings: dict | None = None) -> bool:
         return False
     if _auth_present(cli, path):
         return False
-    try:
-        os.stat(Path(path) / SETTINGS_NAME)
-        return False
-    except OSError:
-        return True
+    for name in (SETTINGS_NAME, "projects", "history.jsonl", "sessions", ".claude.json"):
+        try:
+            os.stat(Path(path) / name)
+            return False
+        except OSError:
+            continue
+    return True
 
 
 def _subscription_key(cli: str, account_id) -> str | None:
@@ -670,6 +733,7 @@ def _gather(now_ts: float) -> tuple[dict, set, set]:
                 and _worktree_container(cli, path, settings):
             return  # a folder holding only worktrees is not offered
         evidence_home = path
+        provider_pointed = bool(settings and settings["host"]) or zai_home(path)
         if cli == "claude" and (zai_home(path) or (settings and settings["provider"] == GLM)):
             cli, path = GLM, None  # one GLM login, whatever folder ran it
         ident = identity(path) if path is not None else MUSE_IDENTITY
@@ -701,6 +765,8 @@ def _gather(now_ts: float) -> tuple[dict, set, set]:
                     rec["settings"] = R_UNREADABLE
             if found_evidence:
                 rec["login_evidence"] = sorted(set(rec.get("login_evidence") or ()) | set(found_evidence))
+            if settings is not None and provider_pointed:
+                rec["provider_pointed"] = True
 
     for cli, path in _source_names():
         add(cli, path, "name")
@@ -864,9 +930,10 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
             raise _CutOff
         return state, reason, plan
 
-    if "settings_token" in (rec.get("login_evidence") or ()):
+    if "settings_token" in (rec.get("login_evidence") or ()) and rec.get("provider_pointed"):
         # A provider-pointed home whose settings hold a token is a login on
         # that token's presence alone; the token itself is never read out.
+        # Any other home is asked through its CLI instead.
         return settle(SIGNED_IN, None)
     if cli == GLM:
         return settle(*_from_probe(usage.probe_glm(timeout=left())))
@@ -889,7 +956,9 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
     if cli in ("grok", "muse"):
         data = usage.probe_grok(home, timeout=left()) if cli == "grok" else \
             usage.probe_muse(timeout=left(), turn=False)
-        subscription = _subscription_key(cli, data.get("account_id"))
+        digest = data.get("account_digest")
+        subscription = digest if isinstance(digest, str) and digest \
+            else _subscription_key(cli, data.get("account_id"))
         if subscription:
             rec["subscription"] = subscription
         return settle(*_from_probe(data))
@@ -1012,6 +1081,16 @@ def _collapse(found: dict, groups: list | None = None) -> dict:
             primary["sources"] = sorted({s for r in recs for s in (r.get("sources") or ())})
             primary["homes"] = [r.get("path") for r in recs]
             primary["merged"] = True
+            # Every collapsed home keeps its own check state, so the next
+            # run restores it instead of re-checking homes it already knows.
+            checks = {}
+            for r in recs:
+                for cid, state in (r.get("home_checks") or {}).items():
+                    checks[cid] = state
+                checks[r["id"]] = {k: r[k] for k in
+                                   ("last_checked", "state", "reason", "plan", "subscription", "first_seen")
+                                   if r.get(k) is not None}
+            primary["home_checks"] = checks
             primary["conversations_7d"] = min(COUNT_CAP, sum(r.get("conversations_7d") or 0 for r in recs)) or None
             if any(r.get("state") == SIGNED_IN for r in recs):
                 primary["state"] = SIGNED_IN
@@ -1043,8 +1122,40 @@ def merge_same_subscription(candidate_ids) -> dict:
     store["subscription_groups"] = groups
     _save_store(store)
     merged = _collapse(cands, groups)
-    return {"ok": True, "group": group, "candidate": public(merged[chosen[0]["id"]])
-            if chosen[0]["id"] in merged else None}
+    primary = next((r for r in merged.values() if r.get("merged")), None) \
+        or merged.get(chosen[0]["id"])
+    _reconcile_slice3a_bindings(chosen, primary)
+    return {"ok": True, "group": group, "candidate": public(primary) if primary else None}
+
+
+def _reconcile_slice3a_bindings(chosen: list, primary: dict | None) -> None:
+    """Reconcile slice 3a's local bindings with an owner merge: a stable id
+    bound to a merged home binds through the primary home only, so the
+    collapsed homes cannot spawn separate accounts from their bindings.
+    Untracked candidates have no bindings and nothing is created for them."""
+    if primary is None or not primary.get("abs"):
+        return
+    homes = {r.get("abs") for r in chosen if r.get("abs")}
+    if not homes:
+        return
+    from khipu import config as _config
+    from khipu import routing_identity
+
+    with _config.mutate_config() as data:
+        bindings = data.get(routing_identity.BINDINGS)
+        if not isinstance(bindings, dict):
+            return
+        matched = [key for key, value in bindings.items()
+                   if isinstance(value, dict) and value.get("harness") == primary["cli"]
+                   and value.get("home") in homes]
+        if not matched:
+            return
+        keep = next((key for key in matched if bindings[key].get("home") == primary["abs"]),
+                    matched[0])
+        for key in matched:
+            if key != keep:
+                del bindings[key]
+        bindings[keep] = {"harness": primary["cli"], "home": primary["abs"]}
 
 
 def public(rec: dict) -> dict:
@@ -1068,7 +1179,8 @@ def public(rec: dict) -> dict:
         # Home's Found card lists only signed-in finds a conversation used,
         # or a provider-pointed home whose settings token is its evidence.
         "offer_on_home": state == SIGNED_IN and ("conversation" in sources
-                                                 or "settings_token" in (rec.get("login_evidence") or ())),
+                                                 or ("settings_token" in (rec.get("login_evidence") or ())
+                                                     and rec.get("provider_pointed"))),
     }
 
 
@@ -1163,8 +1275,13 @@ def discover(*, now: bool = False, check: str | None = None, at: float | None = 
                     and identity(old["abs"]) == old.get("identity") and key not in tracked and key not in declined:
                 found[cid] = {k: old.get(k) for k in ("id", "cli", "identity", "default", "abs", "path", "name")}
                 found[cid].update(sources=["owner"], conversations_7d=None)
+        restored = dict(previous)
+        for old in previous.values():
+            for cid, state in (old.get("home_checks") or {}).items():
+                if cid not in restored and isinstance(state, dict):
+                    restored[cid] = dict(state)
         for cid, rec in found.items():
-            old = previous.get(cid) or {}
+            old = restored.get(cid) or {}
             first = old.get("first_seen")
             rec["first_seen"] = first if isinstance(first, (int, float)) else now_ts
             if old.get("owner_checked"):

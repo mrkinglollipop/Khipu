@@ -1603,6 +1603,21 @@ def test_every_code_a_probe_can_return_has_a_plain_note():
     assert usage._note("bad_reply", "claude") == "Claude Code answered in a way Khipu can't read"
 
 
+def test_a_grok_usage_row_keeps_only_a_digest_of_the_account_id(fake, monkeypatch):
+    monkeypatch.setattr(usage, "probe_grok",
+                        lambda home, timeout=None: {"ok": True, "plan": "SuperGrok", "windows": [],
+                                                    "account_id": "ACCT-SENTINEL-99"})
+    row = usage.probe_account({"label": "Grok", "harness": "grok", "home": None})
+    assert "ACCT-SENTINEL-99" not in json.dumps(row)
+    assert "account_id" not in row and row.get("account_digest")
+    frames = [{"id": 1, "result": {"_meta": {"agentVersion": "1.0.52"}}},
+              {"id": 2, "result": {"subscription_tier": "SuperGrok", "account_id": "ACCT-SENTINEL-99",
+                                   "config": {"currentPeriod": {"type": "usage_period_type_weekly"}}}}]
+    parsed = usage.parse_grok(frames)
+    assert "ACCT-SENTINEL-99" not in json.dumps(parsed) and "account_id" not in parsed
+    assert parsed.get("account_digest")
+
+
 def test_a_failed_probe_row_carries_the_plain_note_for_its_account(fake):
     (Path.home() / ".grok-work").mkdir(exist_ok=True)  # a missing folder is its own note (9B)
     row = usage.probe_account({"label": "Grok work", "harness": "grok", "home": "~/.grok-work"})

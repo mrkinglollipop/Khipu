@@ -1081,6 +1081,7 @@ def move(key, folder, *, expect=None, via: str = "app") -> dict:
 def set_auto_track(on: bool) -> dict:
     with config.mutate_config() as data:
         data[config.AUTO_TRACK_KEY] = bool(on)
+        data[config.AUTO_TRACK_MIGRATION_KEY] = True
         config.save_config(data)
     return {"ok": True, "auto_track": bool(on)}
 
