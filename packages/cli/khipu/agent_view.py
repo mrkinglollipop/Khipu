@@ -676,8 +676,11 @@ def _prompt_table(keys):
         raise InventoryUnavailable()
     built_inventory = _TABLE.get("helper_inventory")
     if built_inventory is not None:
-        inventory = _bounded_inventory(lambda: _inventory_signature(keys, built_sig[-1]), 0.005)
-        if inventory is not None and inventory != built_inventory:
+        # ~0.2 ms normally; 50 ms leaves room for a loaded Mac inside the
+        # prompt budget. Not finishing means the inputs can't be read, so
+        # withhold rather than trust the table.
+        inventory = _bounded_inventory(lambda: _inventory_signature(keys, built_sig[-1]), 0.05)
+        if inventory is None or inventory != built_inventory:
             raise InventoryUnavailable()
     if not _helper_table_fresh():
         raise InventoryUnavailable()
