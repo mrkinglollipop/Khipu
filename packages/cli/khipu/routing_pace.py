@@ -42,14 +42,21 @@ def _num(value):
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
 
 
+_CAP_FIELDS = {"share": {"pct"}, "per_day": {"pct"}, "pace_target": {"pct", "slack"},
+               "spend": {"usd", "days"}, "concurrency": {"n"}}
+
+
 def checked_cap(value):
     """One owner cap fact, checked by kind. Runner numbers never enter
-    here: a cap holds only what the owner confirmed."""
+    here: a cap holds only what the owner confirmed. A field the kind
+    does not use refuses the cap, never drops silently."""
     if not isinstance(value, dict) or set(value) - {"kind", "pct", "slack", "usd", "days", "n", "revision"}:
         return None
     kind = value.get("kind")
     revision = value.get("revision")
     if kind not in CAP_KINDS or not isinstance(revision, str) or not revision.strip():
+        return None
+    if {k for k, v in value.items() if v is not None} - {"kind", "revision"} - _CAP_FIELDS[kind]:
         return None
     revision = revision.strip()
     if kind in ("share", "per_day"):
@@ -68,7 +75,7 @@ def checked_cap(value):
             return None
         return {"kind": kind, "usd": usd, "days": days, "revision": revision}
     n = value.get("n")
-    if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 100000:
+    if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 100000:
         return None
     return {"kind": kind, "n": n, "revision": revision}
 
@@ -80,6 +87,8 @@ def spend_verdict(total: dict, usd) -> str:
         return "unknown"
     if total["usd"] > usd:
         return "over"
+    if total["usd"] >= usd:
+        return "reached"
     return "near" if total["usd"] >= 0.85 * usd else "under"
 
 
@@ -458,10 +467,16 @@ def compute_pace(samples, caps, now, window):
             elapsed = min(max(params["window_s"] - secs_to_reset, 0.0), float(params["window_s"]))
             allowance = target_cap["pct"] * elapsed / params["window_s"] + target_cap["slack"]
             target["allowance_pct"] = allowance
-            # Recovery needs a full point under the allowance (hysteresis):
-            # the band between reads "recovering", not yet "within".
+            # Recovery needs a full point under the allowance (hysteresis),
+            # and only after the account was ahead in this cycle: the band
+            # between reads "recovering" then, never for one never ahead.
+            was_ahead = any(
+                b["value"] > target_cap["pct"] * min(max(
+                    params["window_s"] - (representative - b["time"]).total_seconds(), 0.0),
+                    float(params["window_s"])) / params["window_s"] + target_cap["slack"]
+                for b in blist if b["segment"][0] == current_key)
             target["verdict"] = ("ahead" if used > allowance else
-                                 "within" if used <= allowance - 1 else "recovering")
+                                 "within" if used <= allowance - 1 or not was_ahead else "recovering")
         pace["pace_target"] = target
     # Headline: reached/over, then earliest crossing, then near, then plan.
     ranked = []
@@ -492,15 +507,15 @@ def pace_line(label, pace, now):
     obj = pace.get(headline) or pace["plan"]
     verdict = obj.get("verdict", "unknown")
     target = pace.get("pace_target") or {}
+    if verdict in ("limit_reached", "cap_reached"):
+        return f"{label} {word}: {verdict.replace('_', ' ')} at the trailing average ({rate_text})"
     if target.get("verdict") in ("ahead", "recovering"):
         allowance = target.get("allowance_pct")
-        allowance_text = f"{allowance:g}%" if isinstance(allowance, (int, float)) else "its allowance"
+        allowance_text = f"{allowance:.2f}%" if isinstance(allowance, (int, float)) else "its allowance"
         return (f"{label} {word}: {target['verdict']} of its pace target "
                 f"({target.get('used_pct'):g}% used against a {allowance_text} allowance)")[:160]
     if verdict == "unknown" or pace.get("why"):
         return f"{label} {word}: pace unknown at the trailing average: {pace.get('why') or 'not enough readings'}"
-    if verdict in ("limit_reached", "cap_reached"):
-        return f"{label} {word}: {verdict.replace('_', ' ')} at the trailing average ({rate_text})"
     needed = obj.get("needed_pct_per_h")
     needed_text = f"{_rate_words(needed)}%/h" if needed is not None else "no rate"
     lands = f"{needed_text} lands on {obj.get('pct') or 100:g}%" if isinstance(obj.get('pct') or 100, (int, float)) \

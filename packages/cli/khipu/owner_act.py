@@ -177,8 +177,8 @@ def _values(action: str, args) -> dict:
         elif action.startswith("route.cap.") and key == "n":
             if isinstance(value, str) and value.strip().isdigit():
                 value = int(value.strip())
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise _bad("n must be a whole number at least 0")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise _bad("n must be a whole number at least 1")
         elif action.startswith("route.cap.") and key == "window" and value not in ("weekly", "five_hour"):
             raise _bad("window must be weekly or five_hour")
         elif action.startswith("route.cap.") and key == "kind" \
@@ -197,6 +197,13 @@ def _values(action: str, args) -> dict:
         if choices and value not in choices:
             raise _bad(f"{key} must be one of: {', '.join(choices)}")
         out[key] = value
+    if action == "route.cap.set":
+        from khipu.routing_pace import _CAP_FIELDS
+
+        used = _CAP_FIELDS.get(out.get("kind")) or set()
+        extra = sorted(set(out) & {"pct", "slack", "usd", "days", "n"} - used)
+        if extra:
+            raise _bad(f"a {out.get('kind')} cap does not take {', '.join(extra)}")
     return out
 
 

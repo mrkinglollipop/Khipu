@@ -42,8 +42,15 @@ def test_checked_cap_accepts_the_new_kinds():
     {"kind": "spend", "usd": 35, "days": 0, "revision": "r"},
     {"kind": "spend", "usd": "35", "days": 7, "revision": "r"},
     {"kind": "concurrency", "n": -1, "revision": "r"},
+    {"kind": "concurrency", "n": 0, "revision": "r"},
     {"kind": "concurrency", "n": 1.5, "revision": "r"},
     {"kind": "concurrency", "n": True, "revision": "r"},
+    # A field the kind does not use refuses, never drops silently.
+    {"kind": "share", "pct": 50, "usd": 5, "revision": "r"},
+    {"kind": "per_day", "pct": 50, "slack": 5, "revision": "r"},
+    {"kind": "pace_target", "pct": 65, "slack": 5, "usd": 5, "revision": "r"},
+    {"kind": "spend", "usd": 35, "days": 7, "pct": 50, "revision": "r"},
+    {"kind": "concurrency", "n": 1, "days": 7, "revision": "r"},
 ])
 def test_checked_cap_rejects_bad_new_caps(bad):
     assert routing_pace.checked_cap(bad) is None
@@ -69,9 +76,25 @@ def test_pace_target_ahead_at_18_used_11h_in():
 
 def test_pace_target_within_and_recovering_band():
     assert _week_pace(5)["pace_target"]["verdict"] == "within"
-    # Inside the 1-point recovery band: no longer ahead, not yet recovered.
-    assert _week_pace(8.8)["pace_target"]["verdict"] == "recovering"
+    # Inside the 1-point band but never ahead in this cycle: still within.
+    assert _week_pace(8.8)["pace_target"]["verdict"] == "within"
     assert _week_pace(8.0)["pace_target"]["verdict"] == "within"
+
+
+def test_pace_target_recovering_only_after_a_prior_ahead():
+    now = T0 + timedelta(hours=11)
+    reset = T0 + timedelta(hours=168)
+    cap = {"kind": "pace_target", "pct": 65.0, "slack": 5.0, "revision": "r1"}
+    samples = [samp(T0 + timedelta(hours=5), 10, reset=reset), samp(now, 8.8, reset=reset)]
+    target = routing_pace.compute_pace(samples, [cap], now, "weekly")["pace_target"]
+    assert target["verdict"] == "recovering"
+
+
+def test_pace_target_never_ahead_at_window_start_is_within():
+    cap = {"kind": "pace_target", "pct": 100.0, "slack": 0.0, "revision": "r1"}
+    reset = T0 + timedelta(hours=168)
+    pace = routing_pace.compute_pace([samp(T0, 0, reset=reset)], [cap], T0, "weekly")
+    assert pace["pace_target"]["verdict"] == "within"
 
 
 def test_pace_target_unknown_without_a_reading():
@@ -83,7 +106,29 @@ def test_pace_target_unknown_without_a_reading():
 def test_pace_target_line_names_ahead_within_160_chars():
     pace = _week_pace(18)
     line = routing_pace.pace_line("Claude", pace, T0 + timedelta(hours=11))
-    assert "ahead" in line and len(line) <= 160
+    assert "ahead" in line and "9.26%" in line and len(line) <= 160
+
+
+def _pace_with_caps(used, caps, *, at_h=11):
+    now = T0 + timedelta(hours=at_h)
+    reset = T0 + timedelta(hours=168)
+    return routing_pace.compute_pace([samp(now, used, reset=reset)], caps, now, "weekly"), now
+
+
+def test_pace_line_limit_reached_wins_over_pace_target():
+    pace, now = _pace_with_caps(100, [{"kind": "pace_target", "pct": 65.0, "slack": 5.0, "revision": "r1"}])
+    assert pace["plan"]["verdict"] == "limit_reached"
+    line = routing_pace.pace_line("Claude", pace, now)
+    assert "limit reached" in line and "pace target" not in line
+
+
+def test_pace_line_share_cap_reached_wins_over_pace_target():
+    caps = [{"kind": "pace_target", "pct": 65.0, "slack": 5.0, "revision": "r1"},
+            {"kind": "share", "pct": 91.0, "revision": "r2"}]
+    pace, now = _pace_with_caps(95, caps)
+    assert pace["share_cap"]["verdict"] == "cap_reached"
+    line = routing_pace.pace_line("Claude", pace, now)
+    assert "cap reached" in line and "pace target" not in line
 
 
 # ---- owner confirm vs conversation proposal (world fixture) ----------------
@@ -133,6 +178,24 @@ def test_owner_remove_new_cap_kinds(world):  # noqa: F811
     routing.remove_cap("Claude", kind="concurrency", via="app")
     account, _ = _caps()
     assert not [c for c in account.get("caps") or [] if c["kind"] == "concurrency"]
+
+
+def test_cap_with_a_field_the_kind_does_not_use_is_refused_through_cli_and_owner_direction(world, khipu_app):  # noqa: F811
+    from khipu import cli
+    from tests.test_owner_direction_e2e import _act, _hook
+
+    routing.report(account="Claude", state="open", author=CONV)
+    with pytest.raises(routing.RouteError):
+        routing.set_cap("Claude", window="weekly", kind="share", pct=50, usd=5, via="app")
+    khipu_app.as_app()
+    assert cli.main(["route", "cap", "set", "Claude", "--window", "weekly", "--kind", "share",
+                     "--pct", "50", "--usd", "5", "--from-app"]) == 2
+    _hook("set Claude weekly share cap 50 with 5 dollars")
+    err, out = _act("route.cap.set", {"account": "Claude", "window": "weekly", "kind": "share",
+                                      "pct": 50, "usd": 5, "revision": "bad1"})
+    assert err and out.get("ok") is False
+    account, _ = _caps()
+    assert not account.get("caps")
 
 
 def test_set_cap_rejects_a_spend_cap_without_usd(world):  # noqa: F811
@@ -202,6 +265,14 @@ def test_spend_cap_over_at_35_10_against_35(mac):
     status = _statuses()["spend"]
     assert status["verdict"] == "over" and status["usd"] == pytest.approx(35.10)
     assert status["cap_usd"] == 35
+
+
+def test_spend_cap_exactly_at_the_cap_reads_reached(mac):
+    _runner(mac, {"spend": [_spend("e1", 35.0, NOW - timedelta(hours=1))],
+                  "spend_coverage": [_coverage()]})
+    routing.set_cap("Main", kind="spend", usd=35, days=7, revision="s1", via="app")
+    assert _statuses()["spend"]["verdict"] == "reached"
+    assert routing_pace.spend_verdict({"status": "known", "usd": 35.0}, 35) == "reached"
 
 
 def test_spend_cap_unknown_when_the_period_is_not_covered(mac):

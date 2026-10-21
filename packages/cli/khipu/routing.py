@@ -5534,7 +5534,7 @@ def cap_statuses(view: dict, entry: dict, now: datetime) -> list[dict]:
 def cap_line_for(view: dict, entry: dict, now: datetime) -> str | None:
     """One short push line for a cap that needs attention, or None."""
     for status in cap_statuses(view, entry, now):
-        if status["kind"] == "spend" and status["verdict"] in ("over", "near"):
+        if status["kind"] == "spend" and status["verdict"] in ("over", "reached", "near"):
             return (f"{entry['label']} spend: ${status['usd']:g} of ${status['cap_usd']:g} "
                     f"in {status['days']:g} d ({status['verdict']})")
         if status["kind"] == "concurrency" and status["verdict"] == "full":
