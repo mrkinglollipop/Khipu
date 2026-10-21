@@ -8,10 +8,11 @@
 
 import { accountClassification, brokenRules, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
 import type { PlanFact, RouteProvider, RouteView } from "./routing";
+import { checksLine, checksModel } from "./routingChecks";
 import { keptWindow, passingGapHeld, planStatus } from "./PlansCard";
 import type { UsageAccount, UsageReport } from "./PlansCard";
 
-export type GroupKey = "accounts" | "priority" | "rules" | "holds" | "telling" | "resets" | "runners" | "table" | "changes";
+export type GroupKey = "accounts" | "priority" | "rules" | "holds" | "checks" | "telling" | "resets" | "runners" | "table" | "changes";
 
 /** The groups in page order. A link from elsewhere names one by its key
  *  (`data-settings-group`); the what's-new items use accounts, priority and
@@ -21,6 +22,7 @@ export const GROUPS: ReadonlyArray<{ key: GroupKey; name: string; record: boolea
   { key: "priority", name: "Priority and pace", record: true },
   { key: "rules", name: "Your note and standing rules", record: true },
   { key: "holds", name: "Holds", record: true },
+  { key: "checks", name: "Checks and copies", record: true },
   { key: "telling", name: "Telling conversations", record: false },
   { key: "resets", name: "Checking for resets", record: false },
   { key: "runners", name: "Providers and lanes", record: true },
@@ -262,6 +264,12 @@ export function routingProblems(
       show: `lane ${lane}`, item: `lane:${runner}/${lane}` });
   }
   if (view.sources?.table?.error) out.push({ key: "table", group: "table", kind: "table", tone: "warn" });
+  // Advisory contradictions need the owner to choose which line holds, so
+  // each gets its own Needs you line; rule upkeep is an advisory mark only.
+  for (const row of checksModel(view, now).contradictions) {
+    out.push({ key: `check:${row.key}`, group: "checks", kind: "contradiction", tone: "warn",
+      needs: row.title, show: row.title, item: `check:${row.key}` });
+  }
   return out;
 }
 
@@ -283,6 +291,7 @@ const TAG_WORDS: Record<string, (n: number) => string> = {
   lane: (n) => plural(n, "lane without an account", "lanes without an account"),
   conflict: (n) => plural(n, "lane conflicts", "lanes conflict"),
   table: () => "Can't read the file",
+  contradiction: (n) => plural(n, "contradiction", "contradictions"),
 };
 
 /** A group's problem tags: one per kind, counted. */
@@ -427,6 +436,7 @@ export function routingOverview(
   lines.priority = view ? priorityLine(view, s) : unread;
   lines.rules = view ? rulesLine(view) : unread;
   lines.holds = view ? holdsLine(view, now) : unread;
+  lines.checks = view ? checksLine(view, now) : unread;
   lines.telling = tellingLine(s);
   lines.resets = resetsLine(s);
   lines.runners = view ? runnersLine(view, s) : unread;

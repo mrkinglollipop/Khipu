@@ -29,6 +29,7 @@ import type { PlanUsageState, UsageAccount } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
 import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, providerRows, routingOverview, staleAfterSeconds } from "./routingOverview";
 import type { GroupKey, GroupTag, OverviewSettings, Problem, ProviderRow } from "./routingOverview";
+import { checksModel } from "./routingChecks";
 import {
   ACCOUNT_FILTERS,
   ACCOUNT_SORTS,
@@ -2898,6 +2899,65 @@ function ProvidersList({ view }: { view: RouteView }) {
   );
 }
 
+/** Checks and copies (routing slice 15d; mocks
+ *  docs/mockups/2026-10-21-routing/checks-light.html and checks-states-*.html):
+ *  the advisory flags `khipu route --json` carries, and rule 12's confirmed
+ *  model table. Display only: a row states what disagrees; the owner's fix
+ *  stays in the group that owns the words, and nothing here sends, stops or
+ *  refuses work. The checks `route --json` does not carry yet (model
+ *  mismatches, stale level words, copies in files, directions that never
+ *  reached Khipu) are left out rather than guessed. */
+function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds: Folds }) {
+  const model = checksModel(data, now);
+  const row = (r: { key: string; title: string; sub: string }, tag?: ReactNode) => (
+    <div key={r.key} className="mrow adv" role="listitem" data-route-item={`check:${r.key}`} tabIndex={-1}>
+      <span>{r.title}</span>
+      {tag ? <span className="end">{tag}</span> : null}
+      {r.sub ? <span className="sub">{r.sub}</span> : null}
+    </div>
+  );
+  return (
+    <>
+      <p className="set-help">Khipu flags these so you can fix them. None of them stops any work.</p>
+      {model.table ? (
+        <div className="section-body">
+          <SubFold k="sub:model-table" name="Your model table" line={model.table.line} folds={folds}>
+            <dl className="tiers">
+              {model.table.rows.map((t) => (
+                <div key={t.label}>
+                  <dt>{t.label}</dt>
+                  <dd>{t.tier}</dd>
+                </div>
+              ))}
+            </dl>
+          </SubFold>
+        </div>
+      ) : null}
+      {model.contradictions.length ? (
+        <div className="section-body">
+          <h2 className="sub-title">Contradictions and out-of-date words</h2>
+          <div className="mrows" role="list" aria-label="Contradictions and out-of-date words">
+            {model.contradictions.map((r) => row(r, <Tag tone="warn" dot>Contradiction</Tag>))}
+          </div>
+        </div>
+      ) : null}
+      {model.upkeep.length ? (
+        <div className="section-body">
+          <h2 className="sub-title">Rule upkeep</h2>
+          <div className="mrows" role="list" aria-label="Rule upkeep">
+            {model.upkeep.map((r) => row(r))}
+          </div>
+        </div>
+      ) : null}
+      {!model.table && !model.contradictions.length && !model.upkeep.length ? (
+        <div className="section-body">
+          <EmptyState title="Nothing to fix" hint="No priority, rule or direction disagrees with an account." />
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 function ProvidersLanesSection({
   data,
   cfg,
@@ -3981,6 +4041,17 @@ export function RoutingSettings({
       unread
     ),
     holds: data ? <HoldsSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} /> : unread,
+    checks: data ? (
+      <ChecksSection data={data} now={now} folds={folds} />
+    ) : route.error ? (
+      <p className="set-error">
+        Couldn't read the checks: {recordCause(route.error)}. That is not the same as nothing found.
+      </p>
+    ) : (
+      <p className="set-help" role="status">
+        Reading the checks…
+      </p>
+    ),
     telling: (
       <TellingSection
         data={data}
