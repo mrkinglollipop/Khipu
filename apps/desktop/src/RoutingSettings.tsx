@@ -25,10 +25,12 @@ import { EmptyState, Tag } from "./ui";
 import { callCli, useCliState } from "./settingsCli";
 import type { FeaturesShape } from "./settingsCli";
 import { PlanBlock, RefreshButton, UsageAccountsField, planPauses, planStatus } from "./PlansCard";
-import type { PlanUsageState, UsageAccount } from "./PlansCard";
+import type { PlanUsageState, UsageAccount, UsageReport } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
 import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, providerRows, routingOverview, staleAfterSeconds } from "./routingOverview";
 import type { GroupKey, GroupTag, OverviewSettings, Problem, ProviderRow } from "./routingOverview";
+import { paceModel } from "./routingPace";
+import type { PaceTrend, PaceWindow } from "./routingPace";
 import { checksModel } from "./routingChecks";
 import {
   ACCOUNT_FILTERS,
@@ -3837,6 +3839,171 @@ function writeFolds(keys: string[]): void {
   }
 }
 
+/** One window's small trend, drawn only from the trailing rate the pace
+ *  object carries. The dashed line is the rate that lands on the target and
+ *  the cap line is an owner cap, as docs/mockups/2026-10-21-routing draws it. */
+function PaceTrendSvg({ trend }: { trend: PaceTrend }) {
+  return (
+    <svg className="trend" viewBox="0 0 120 28" role="img" aria-label={trend.label} preserveAspectRatio="none">
+      {trend.capY != null ? <line className="cap" x1={0} x2={120} y1={trend.capY} y2={trend.capY} /> : null}
+      {trend.need ? <line className="need" x1={0} y1={trend.need.y1} x2={120} y2={trend.need.y2} /> : null}
+      <polyline className="used" points={trend.used} />
+    </svg>
+  );
+}
+
+/** A window row: its use, rate, the rate that lands on the limit or cap, and
+ *  the trend. A reading that can't be placed says so and draws no trend. */
+function PaceWindowRow({ w }: { w: PaceWindow }) {
+  const tone = w.meterTone;
+  return (
+    <li className="pace-win">
+      <span className="wname">{w.name}</span>
+      {w.usedPct != null ? (
+        <>
+          <span className={["plan-meter", tone].filter(Boolean).join(" ")} role="progressbar"
+            aria-label={`${w.name} used`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={w.usedPct}>
+            <i style={{ width: `${Math.min(100, Math.max(0, w.usedPct))}%` }} />
+          </span>
+          <span className={["plan-pct", tone].filter(Boolean).join(" ")}>{w.usedPct}%</span>
+        </>
+      ) : (
+        <>
+          <span />
+          <span />
+        </>
+      )}
+      <span className="pace-rate">
+        <span className="r1">
+          {w.rateTag ? (
+            <>
+              {`${w.rate ?? "Can't tell"} · `}
+              <Tag tone={w.rateTag.tone} dot={false}>{w.rateTag.text}</Tag>
+            </>
+          ) : (
+            `${w.rate ?? "Can't tell"}${w.ratePlain ? ` · ${w.ratePlain}` : ""}`
+          )}
+        </span>
+        <span className="r2">{w.r2}</span>
+      </span>
+      {w.trend ? <PaceTrendSvg trend={w.trend} /> : <span className="trend-none">no trend</span>}
+    </li>
+  );
+}
+
+/** Pace, caps and advice: one block for each account the approved mock opens
+ *  (its plan outpacing or a cap within 6 h), then one line for the rest. Display
+ *  only: caps are facts the owner confirmed in the CLI, so no control here
+ *  adds, confirms or removes one, and advice is advisory. */
+export function PaceSection({ data, plans, now, folds }: {
+  data: RouteView;
+  plans?: UsageReport | null;
+  now: Date;
+  folds: Folds;
+}) {
+  const model = paceModel(data, plans, now);
+  const [openRows, setOpenRows] = useState<string[]>(() => model.rows.filter((r) => r.open).map((r) => r.key));
+  const toggle = (key: string) => setOpenRows((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+  const open = model.rows.filter((r) => openRows.includes(r.key));
+  const closed = model.rows.filter((r) => !openRows.includes(r.key));
+  return (
+    <div className="section-body pace-section">
+      <p className="set-help">
+        How fast each account is being used against its limit and your caps, at the last 24 hours&apos; rate (the last
+        hour&apos;s for five-hour windows). Khipu&apos;s advice for jobs is advisory; it starts and stops nothing.
+      </p>
+      <div className="legend" aria-hidden="true">
+        <span><i />used, last 24 h (last hour for five hours)</span>
+        <span><i className="need" />rate that lands on the limit</span>
+        <span><i className="cap" />your cap</span>
+      </div>
+      {model.empty ? (
+        <EmptyState
+          title="No usage readings yet"
+          hint="Pace needs at least 3 readings in a day. Khipu reads plans every 30 min for a week, every 10 min for five hours."
+        />
+      ) : null}
+      {open.length ? (
+        <div className="pace-blocks">
+          {open.map((row) => (
+            <div key={row.key} className={`plan-block pace-block${row.tag.tone === "warn" || row.tag.tone === "err" ? " warn" : ""}`}
+              role="group" aria-label={`${row.label} pace`} data-route-item={`pace:${row.key}`} tabIndex={-1}>
+              <h3 className="plan-block-head">
+                {row.label}
+                {row.planLabel ? <span className="meta">{row.planLabel}</span> : null}
+                <span className="spacer" />
+                <Tag tone={row.tag.tone} dot>{row.tag.text}</Tag>
+                <button type="button" className="pace-fold" aria-expanded="true" aria-label={`Close ${row.label} pace`}
+                  onClick={() => toggle(row.key)}>
+                  <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
+                </button>
+              </h3>
+              <p className="pace-say">
+                {row.say.map((part, i) => part.bold ? <b key={i}>{part.text}</b> : <span key={i}>{part.text}</span>)}
+              </p>
+              {row.windows.length ? (
+                <ul className="pace-wins" aria-label={`${row.label} windows`}>
+                  {row.windows.map((w) => <PaceWindowRow key={w.key} w={w} />)}
+                </ul>
+              ) : null}
+              {row.caps.length ? (
+                <div className="pace-sec">
+                  <h4>Your caps <span className="evid">· confirmed by you</span></h4>
+                  {row.caps.map((cap) => (
+                    <div className="cap-row" key={cap.key}>
+                      <span className="cname">{cap.name}</span>
+                      <span className="cstate">
+                        {cap.state}
+                        {cap.tag ? <> · <Tag tone={cap.tag.tone} dot>{cap.tag.text}</Tag></> : null}
+                      </span>
+                      <span className="end" />
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {row.advice ? (
+                <div className="pace-sec">
+                  <h4>Khipu&apos;s advice <span className="evid">· {row.advice.evid}</span></h4>
+                  <div className="adv-row">
+                    <span className="who">Jobs</span>
+                    <span className={`word ${row.advice.tone}`}>{row.advice.word}</span>
+                    <span className="why">{row.advice.why}</span>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {closed.length ? (
+        <div className="route-alist" role="list" aria-label="Other accounts">
+          {closed.map((row) => (
+            <div key={row.key} role="listitem">
+              <div className="fold route-aline" data-open="false">
+                <button type="button" className="fold-btn" aria-expanded="false" data-route-item={`pace:${row.key}`}
+                  onClick={() => toggle(row.key)}>
+                  <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
+                  <span className="an">{row.label}</span>
+                  <span className="as"><Tag tone={row.tag.tone} dot>{row.tag.text}</Tag></span>
+                  <span className="ap"><span className="ap-week">{row.line.week}</span></span>
+                  <span className="at"><span className="ap-pace">{row.line.advice}</span></span>
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <SubFold k="sub:pace-push" name="When pace changes are sent to conversations"
+        line="At a verdict change, and 24 h, 6 h, 1 h and 15 min before a limit" folds={folds}>
+        <p className="set-help">
+          A conversation hears when a window&apos;s verdict changes, and when its forecast crosses 24 hours, 6 hours,
+          1 hour or 15 minutes. It hears each forecast once, and the advice never stops a job.
+        </p>
+      </SubFold>
+    </div>
+  );
+}
+
 function useFolds() {
   const [open, setOpen] = useState<string[]>(() => readFolds() ?? ["accounts"]);
   const change = (edit: (prev: string[]) => string[]) =>
@@ -4031,6 +4198,7 @@ export function RoutingSettings({
     ) : (
       unread
     ),
+    pace: data ? <PaceSection data={data} plans={plansState?.data ?? null} now={now} folds={folds} /> : unread,
     priority: data ? <PrioritySection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} /> : unread,
     rules: data ? (
       <>

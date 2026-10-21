@@ -157,7 +157,7 @@ let answers: Record<string, Answer>;
 // Settings clarity phase 3 folds the page into groups; these tests read
 // every group open, every account line open and Telling's inner folds open.
 const ALL_OPEN = [
-  "accounts", "priority", "rules", "holds", "checks", "telling", "resets", "runners", "table", "changes", "sub:hears", "sub:sizes",
+  "accounts", "pace", "priority", "rules", "holds", "checks", "telling", "resets", "runners", "table", "changes", "sub:hears", "sub:sizes",
   "sub:folders",
   ...KEYS.map((k) => `account:${k}`),
 ];

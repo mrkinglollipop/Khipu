@@ -9,17 +9,19 @@
 import { accountClassification, brokenRules, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
 import type { PlanFact, RouteProvider, RouteView } from "./routing";
 import { checksLine, checksModel } from "./routingChecks";
+import { paceModel } from "./routingPace";
 import { keptWindow, passingGapHeld, planStatus } from "./PlansCard";
 import type { UsageAccount, UsageReport } from "./PlansCard";
 
-export type GroupKey = "accounts" | "priority" | "rules" | "holds" | "checks" | "telling" | "resets" | "runners" | "table" | "changes";
+export type GroupKey = "accounts" | "pace" | "priority" | "rules" | "holds" | "checks" | "telling" | "resets" | "runners" | "table" | "changes";
 
 /** The groups in page order. A link from elsewhere names one by its key
  *  (`data-settings-group`); the what's-new items use accounts, priority and
  *  rules. `record`: the group needs the routing record. */
 export const GROUPS: ReadonlyArray<{ key: GroupKey; name: string; record: boolean }> = [
   { key: "accounts", name: "Accounts", record: true },
-  { key: "priority", name: "Priority and pace", record: true },
+  { key: "pace", name: "Pace, caps and advice", record: true },
+  { key: "priority", name: "Priority", record: true },
   { key: "rules", name: "Your note and standing rules", record: true },
   { key: "holds", name: "Holds", record: true },
   { key: "checks", name: "Checks and copies", record: true },
@@ -46,7 +48,7 @@ export type Problem = {
   item?: string;
 };
 
-export type GroupTag = { text: string; tone: Tone };
+export type GroupTag = { text: string; tone: Tone | "neutral" };
 
 /** The settings the closed lines need, from `khipu config --show` and `khipu features`. */
 export type OverviewSettings = {
@@ -270,6 +272,11 @@ export function routingProblems(
     out.push({ key: `check:${row.key}`, group: "checks", kind: "contradiction", tone: "warn",
       needs: row.title, show: row.title, item: `check:${row.key}` });
   }
+  // Pace crossings under 6 h: the same rows the Pace group opens by itself.
+  for (const crossing of paceModel(view, plans, now).crossings) {
+    out.push({ key: crossing.key, group: "pace", kind: "crossing", tone: "warn",
+      needs: crossing.needs, show: crossing.show, item: crossing.item });
+  }
   return out;
 }
 
@@ -292,6 +299,7 @@ const TAG_WORDS: Record<string, (n: number) => string> = {
   conflict: (n) => plural(n, "lane conflicts", "lanes conflict"),
   table: () => "Can't read the file",
   contradiction: (n) => plural(n, "contradiction", "contradictions"),
+  crossing: (n) => plural(n, "cap crossing", "cap crossings"),
 };
 
 /** A group's problem tags: one per kind, counted. */
@@ -428,11 +436,13 @@ export function routingOverview(
   now: Date,
 ): Overview {
   const problems = view ? routingProblems(view, plans, plansError, s, now) : [];
+  const pace = view ? paceModel(view, plans, now) : null;
   const lines = {} as Record<GroupKey, string>;
   const tags = {} as Record<GroupKey, GroupTag[]>;
   for (const g of GROUPS) tags[g.key] = groupTags(problems, g.key);
   const unread = recordError ? "Not read" : "Reading…";
   lines.accounts = view ? accountsLine(view) : unread;
+  lines.pace = view ? (pace?.empty ? "No readings yet" : pace?.line ?? "No readings yet") : unread;
   lines.priority = view ? priorityLine(view, s) : unread;
   lines.rules = view ? rulesLine(view) : unread;
   lines.holds = view ? holdsLine(view, now) : unread;
@@ -442,6 +452,9 @@ export function routingOverview(
   lines.runners = view ? runnersLine(view, s) : unread;
   lines.table = tableLine(s);
   lines.changes = view ? changesLine(view, now) : unread;
+  // The Pace group's tags say what it holds, not how many rows have a
+  // crossing: outpacing, jobs held back, and what can't be told (the mock).
+  if (pace) tags.pace = pace.tags.map((t) => ({ text: t.text, tone: t.tone }));
   for (const g of GROUPS) {
     if (!view && recordError && g.record) tags[g.key] = [{ text: "Couldn't read", tone: "err" }];
   }
