@@ -9,12 +9,25 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from khipu import config, routing, usage
+from khipu import config, routing, routing_advice, usage
 from tests.test_routing_acceptance import AUTHOR  # noqa: F401
 
 pytest_plugins = ("tests.test_routing_acceptance",)
 
 T0 = datetime(2026, 10, 20, 14, tzinfo=timezone.utc)
+
+
+_DISPATCH_MARKERS = ("KHIPU_JOB", "KHIPU_PARENT_SESSION", "CLAUDE_DISPATCHED_LANE",
+                     "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_HOST_SESSION_ID",
+                     "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
+
+
+@pytest.fixture(autouse=True)
+def _outside_a_job(monkeypatch):
+    """These cases exercise orchestration advice too, so clear every
+    dispatch marker: the suite must pass inside a dispatched shell."""
+    for name in _DISPATCH_MARKERS:
+        monkeypatch.delenv(name, raising=False)
 
 
 _SAMPLE_N = [0]
@@ -57,6 +70,40 @@ def test_dispatched_job_claiming_orchestration_gets_job_advice(replay, monkeypat
     assert out["dispatched"] is True
 
 
+# Each environment the review listed, plus the matching-ids control.
+_DISPATCHED_ENVS = [
+    {"CLAUDE_CODE_HOST_SESSION_ID": "host-1"},
+    {"CLAUDE_CODE_HOST_SESSION_ID": "host-1", "CLAUDE_CODE_CHILD_SESSION": "1"},
+    {"CLAUDE_CODE_CHILD_SESSION": "1"},
+    {"KHIPU_JOB": "1"},
+    {"KHIPU_PARENT_SESSION": "claude_code:parent"},
+    {"CLAUDE_DISPATCHED_LANE": "lane-a"},
+]
+
+
+@pytest.mark.parametrize("environ", _DISPATCHED_ENVS)
+def test_dispatched_detection_fails_closed(environ):
+    assert routing_advice.is_dispatched(environ) is True
+
+
+@pytest.mark.parametrize("environ", [
+    {},
+    {"CODEX_THREAD_ID": "own-thread"},
+    {"CLAUDE_CODE_SESSION_ID": "same", "CLAUDE_CODE_HOST_SESSION_ID": "same"},
+])
+def test_dispatched_detection_is_false_without_lineage(environ):
+    assert routing_advice.is_dispatched(environ) is False
+
+
+@pytest.mark.parametrize("environ", _DISPATCHED_ENVS)
+def test_incomplete_lineage_never_gets_orchestration_advice(replay, environ):
+    _pace_target(replay, used=18)
+    out = routing.advise("Claude", purpose="orchestration", now=replay.now, environ=environ)
+    assert out["dispatched"] is True
+    assert out["purpose"] == "job" and out["requested_purpose"] == "orchestration"
+    assert out["verdict"] == "hold_back"
+
+
 def test_zero_burn_is_still_hold_back_while_ahead(replay):
     _pace_target(replay, used=18)
     out = routing.advise("Claude", purpose="job", now=replay.now)
@@ -93,6 +140,47 @@ def test_share_cap_holds_orchestration_too(replay):
     routing.set_cap("Claude", window="weekly", kind="share", pct=91, revision="sh1", via="app")
     assert routing.advise("Claude", purpose="orchestration", now=replay.now)["verdict"] == "hold_back"
     assert routing.advise("Claude", purpose="job", now=replay.now)["verdict"] == "hold_back"
+
+
+def test_an_old_reading_is_unknown_evidence_with_no_figures(replay):
+    routing.report(account="Claude", state="open", author=AUTHOR)
+    # The report is fresh; the usage reading is three days old, so the pace
+    # object covers none of the last 24 h. Evidence is the reading's, not
+    # the report's.
+    replay.write(_sample(replay, used=18, at=replay.now - timedelta(days=3)))
+    routing.set_cap("Claude", window="weekly", kind="pace_target", pct=65, slack=5,
+                    revision="pt1", via="app")
+    out = routing.advise("Claude", purpose="job", now=replay.now)
+    assert out["evidence"] == "unknown"
+    assert out["numbers"] == {}
+    caps = [c for c in out["caps"] if c["kind"] == "pace_target"]
+    assert caps and all(c.get("allowance_pct") is None and c.get("used_pct") is None
+                        for c in caps)
+
+
+def test_ineligible_account_is_never_go(replay):
+    _pace_target(replay, used=18)
+    view = replay.view()
+    view["definitions"] = {"providers": {
+        "claude": {"id": "claude", "models_allowed": ["haiku"]}}}
+    out = routing.advise("Claude", tier="sonnet", now=replay.now, view=view)
+    assert out["eligible"] is False
+    assert out["verdict"] == "not_eligible"
+    assert out["reason"] and out["reason"] != "provider facts allow this work"
+
+
+def test_an_account_with_no_report_ranks_below_a_fresh_open_one(replay):
+    routing.report(account="Claude", state="open", author=AUTHOR)
+    view = replay.view()
+    claude = next(a for a in view["accounts"] if a["label"] == "Claude")
+    unknown = next(a for a in view["accounts"] if a["state"] == routing.UNKNOWN)
+    # Neither is in the owner's priority; the unknown account is first in
+    # the record's order, and must still rank below the fresh open one.
+    view["accounts"] = [unknown, claude]
+    ranked = routing.advise(now=replay.now, view=view)["ranked"]
+    assert ranked[0]["label"] == "Claude" and ranked[0]["evidence"] == "fresh"
+    assert ranked[1]["label"] == unknown["label"]
+    assert ranked[1]["evidence"] == "unknown"
 
 
 def test_advice_field_is_on_each_khipu_route_account(replay):
@@ -137,6 +225,9 @@ def test_advice_change_for_a_priority_account_pushes(replay):
     out, context, info = replay.offer()
     assert out["kind"] != "none"
     assert "hold_back" in context or "hold back" in context
+    # The push carries job advice; it says so rather than posing as the
+    # orchestrator's own advice.
+    assert "Advice for jobs" in context
 
 
 # ---- spend and concurrency (fake runner telemetry, as in 17a) --------------

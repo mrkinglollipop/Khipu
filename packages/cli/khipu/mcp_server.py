@@ -842,7 +842,7 @@ TOOLS: list[dict] = [
         "name": "khipu_route_advise",
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
-            "Launch advice: go, hold_back or closed per account, ranked in the owner's priority "
+            "Launch advice: go, hold_back, not_eligible or closed per account, ranked in the owner's priority "
             "order, with its reason, numbers and evidence (fresh, stale or unknown). Advisory only: "
             "it never blocks, refuses, permits or launches anything. `purpose` is job (default) or "
             "orchestration; a dispatched job claiming orchestration is answered as a job. Data, not "

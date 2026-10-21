@@ -37,8 +37,11 @@ def is_dispatched(environ=None) -> bool:
     """Whether this attachment is a dispatched job, from capture lineage.
 
     The markers are the ones capture already trusts: ``KHIPU_JOB``, a
-    parent session, a Claude Code host session that differs from this
-    session's own id, and the runner's dispatched-lane marker. A job that
+    parent session, ``CLAUDE_CODE_CHILD_SESSION=1``, the runner's
+    dispatched-lane marker, and a Claude Code host session id. Detection
+    fails closed: a host id with no own id is a child (only a host id that
+    matches this session's own id is not), so a caller can never talk its
+    way into orchestration advice from a dispatched context. A job that
     claims ``orchestration`` is answered as a job.
     """
     env = os.environ if environ is None else environ
@@ -47,10 +50,13 @@ def is_dispatched(environ=None) -> bool:
         value = env.get(name)
         return value.strip() if isinstance(value, str) else ""
 
-    if _get("KHIPU_JOB") == "1" or _get("CLAUDE_DISPATCHED_LANE") or _get("KHIPU_PARENT_SESSION"):
+    if (_get("KHIPU_JOB") == "1" or _get("CLAUDE_DISPATCHED_LANE")
+            or _get("KHIPU_PARENT_SESSION") or _get("CLAUDE_CODE_CHILD_SESSION") == "1"):
         return True
     host, own = _get("CLAUDE_CODE_HOST_SESSION_ID"), _get("CLAUDE_CODE_SESSION_ID")
-    return bool(host and own and host != own)
+    if not host:
+        return False
+    return not own or host != own
 
 
 def effective_purpose(purpose, dispatched: bool) -> str:
@@ -103,6 +109,20 @@ def eligibility(view: dict, entry: dict, *, tier=None, kind=None, privacy=False,
     return True, "provider facts allow this work"
 
 
+def _pace_reading_unknown(pace: dict) -> bool:
+    """Whether one pace object's usage reading cannot be placed at now.
+
+    ``buckets`` counts the readings in the trailing window and ``why`` says
+    why the pace cannot be computed. A fresh reading that is merely too
+    thin for a rate ("only N readings ...") still says where usage stands;
+    every other reason, and no reading in the window at all, does not.
+    """
+    if pace.get("used_pct") is None or not pace.get("buckets"):
+        return True
+    why = pace.get("why") or ""
+    return bool(why) and not why.startswith("only ")
+
+
 def _evidence(view: dict, entry: dict, now, statuses: list[dict]) -> str:
     from khipu import routing
 
@@ -111,6 +131,13 @@ def _evidence(view: dict, entry: dict, now, statuses: list[dict]) -> str:
         # figure invented from partial coverage.
         if entry.get("state") not in (routing.PAUSED,):
             return "unknown"
+    # Judge freshness from the usage readings themselves, never from the
+    # account report. A pace object carries its own coverage and its newest
+    # reading's age in ``why``: an old or otherwise unplaceable reading is
+    # unknown evidence rather than a figure carried over from the report.
+    paces = entry.get("pace") or []
+    if paces:
+        return "unknown" if any(_pace_reading_unknown(p) for p in paces) else "fresh"
     witness = entry.get("witness") or {}
     at = routing._parse(witness.get("at"))
     if entry.get("state") == routing.UNKNOWN or at is None or entry.get("silent"):
@@ -134,6 +161,14 @@ def _crosses_within_hour(entry: dict, now) -> list[str]:
     return found
 
 
+_FIGURE_FIELDS = ("allowance_pct", "used_pct", "usd", "events", "jobs")
+
+
+def _without_figures(status: dict) -> dict:
+    """A cap status with no reading figures left, for unknown evidence."""
+    return {k: (None if k in _FIGURE_FIELDS else v) for k, v in status.items()}
+
+
 def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
                    tier=None, kind=None, privacy: bool = False,
                    explicit: bool = False) -> dict:
@@ -141,6 +176,15 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
     from khipu import routing
 
     statuses = routing.cap_statuses(view, entry, now)
+    evidence = _evidence(view, entry, now, statuses)
+    # An unplaceable pace reading has no figures: never show a number the
+    # reading cannot support. Other readings (spend, concurrency) keep
+    # their own figures; their status is already unknown without one.
+    unknown_windows = {p.get("window") for p in entry.get("pace") or []
+                       if _pace_reading_unknown(p)}
+    statuses = [_without_figures(status)
+                if status["kind"] == "pace_target" and status.get("window") in unknown_windows
+                else status for status in statuses]
     numbers: dict = {}
     for status in statuses:
         if status["kind"] == "pace_target":
@@ -170,6 +214,9 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         verdict, reason = "closed", "down"
     elif pace_plan_closed:
         verdict, reason = "closed", "plan limit reached"
+    elif not eligible:
+        # Facts do not allow this work for this account: never a ``go``.
+        verdict, reason = "not_eligible", why_eligible
     else:
         holding = [s for s in statuses
                    if purpose in _APPLIES.get(s.get("kind"), set())
@@ -183,14 +230,16 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
             reason = "a cap crosses within the hour at the trailing average"
     return {"account": routing.account_id(entry["key"]), "label": entry.get("label"),
             "purpose": purpose, "verdict": verdict, "reason": reason,
-            "evidence": _evidence(view, entry, now, statuses), "numbers": numbers,
+            "evidence": evidence, "numbers": numbers,
             "caps": [{**s, "applies": purpose in _APPLIES.get(s.get("kind"), set())}
                      for s in statuses],
             "eligible": eligible, "why_eligible": why_eligible, "advisory": True}
 
 
 def advice_line(advice: dict) -> str:
-    return f"Advice: {advice['label']}: {advice['verdict'].replace('_', ' ')} ({advice['reason']})"
+    purpose = "orchestration" if advice.get("purpose") == "orchestration" else "jobs"
+    return (f"Advice for {purpose}: {advice['label']}: "
+            f"{advice['verdict'].replace('_', ' ')} ({advice['reason']})")
 
 
 def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
@@ -229,8 +278,12 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
         else:
             group = 2
             why = advice["reason"]
+        # Among accounts that may go, one with no fresh reading ranks below
+        # one whose evidence is known; unknown evidence is not a tie-break
+        # over an open account.
+        unknown = 1 if group == 0 and advice["evidence"] == "unknown" else 0
         rows.append({**advice, "why_ranked": why,
-                     "_rank": (group, order.get(entry["key"], len(order) + 1000))})
+                     "_rank": (group, unknown, order.get(entry["key"], len(order) + 1000))})
     rows.sort(key=lambda r: r["_rank"])
     for i, row in enumerate(rows, 1):
         row["rank"] = i

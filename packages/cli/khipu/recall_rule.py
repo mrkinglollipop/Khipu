@@ -94,7 +94,7 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
 - `khipu_reflect` answers one question from memory with each claim cited, or
   abstains. It calls a model: ask it for a synthesis, not a lookup.
 - `khipu_route` reads which accounts are open or down; rules, note, priority.
-  `khipu_route_advise` advises go, hold_back or closed.
+  `khipu_route_advise` says go, hold_back, not_eligible or closed.
   `khipu_route_report` logs a limit you hit; `khipu_route_rule` and
   `khipu_route_priority` write an owner-requested rule or account
   order (pending until confirmed). Khipu reports; you route.

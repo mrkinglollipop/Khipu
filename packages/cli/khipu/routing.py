@@ -5585,10 +5585,10 @@ def _lane_account_key(lane: str, view: dict) -> str:
 def advise(account: str | None = None, *, lane: str | None = None, tier: str | None = None,
            kind: str | None = None, privacy: bool = False, purpose: str = "job",
            now: datetime | None = None, view: dict | None = None, environ: dict | None = None) -> dict:
-    """Launch advice (slice 17c): ``go``, ``hold_back`` or ``closed`` per
-    account, ranked in the owner's priority order. Advisory only — this
-    never blocks, refuses, permits or launches anything. A dispatched job
-    claiming ``orchestration`` is answered as a job."""
+    """Launch advice (slice 17c): ``go``, ``hold_back``, ``not_eligible`` or
+    ``closed`` per account, ranked in the owner's priority order. Advisory
+    only — this never blocks, refuses, permits or launches anything. A
+    dispatched job claiming ``orchestration`` is answered as a job."""
     from khipu import routing_advice
 
     if tier is not None and tier not in routing_advice.TIERS:
