@@ -32,6 +32,7 @@ import re
 import secrets
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -191,6 +192,57 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
             return "t3"
         return origin or "unknown"
     return "unknown"
+
+
+def canonical_prompt(text: str) -> str:
+    """The one canonical form of a prompt's text, shared by the recorder and
+    capture (routing plan section 13 E): Unicode NFC, trimmed, whitespace
+    collapsed. Only its hash is ever stored."""
+    return " ".join(unicodedata.normalize("NFC", text or "").split())
+
+
+def prompt_sha256(text: str) -> str:
+    return hashlib.sha256(canonical_prompt(text).encode("utf-8")).hexdigest()
+
+
+def occurrences_folder() -> Path:
+    return folder() / "occurrences"
+
+
+def occurrence_file(session: str) -> Path:
+    return occurrences_folder() / f"{_SAFE.sub('_', session)[:128]}.json"
+
+
+def occurrence_state(session: str) -> dict | None:
+    """The session's durable occurrence counter, or None when it is gone.
+    It never expires (section 13 E): it is kept apart from the 24-hour turn
+    records and removed only when the session is forgotten for good."""
+    try:
+        data = json.loads(occurrence_file(session).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and isinstance(data.get("counts"), dict) else None
+
+
+def _next_occurrence(session: str, sha: str, now: float) -> int:
+    """Number this hash in this session: first typing 1, identical later 2.
+
+    A counter file lost from disk is recreated with a ``lost`` marker (and
+    the time), so directions from before the marker can stay ``unjoined``
+    rather than be matched on a reused number."""
+    state = occurrence_state(session)
+    if state is None:
+        earlier = any(isinstance(t.get("prompt_sha256"), str)
+                      for t in _read_lines(session_file(session)))
+        state = {"counts": {}, "lost": bool(earlier), "recreated_at": now if earlier else None}
+    counts = state["counts"]
+    counts[sha] = int(counts.get(sha) or 0) + 1
+    d = occurrences_folder()
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(folder(), 0o700)
+    os.chmod(d, 0o700)
+    _write_private(occurrence_file(session), json.dumps(state) + "\n")
+    return counts[sha]
 
 
 def _norm(text: str) -> str:
@@ -486,6 +538,11 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
     if brief is not None:
         turn["parent"] = brief.get("parent")
         turn["brief"] = brief.get("sha")
+    if text.strip() and not machine and brief is None:
+        # Section 13 E: the hash and its durable occurrence, never the text.
+        sha = prompt_sha256(text)
+        turn["prompt_sha256"] = sha
+        turn["occurrence"] = _next_occurrence(session, sha, now)
     ok, why = eligible(turn, conf)
     turn["eligible"] = ok
     if why:
@@ -643,6 +700,16 @@ def forget_sessions(sessions) -> dict:
         else:
             path.unlink()
             out["files"] += 1
+    for name in names:
+        # The occurrence counter and any routing directions go with the
+        # session's episodes: only forget-for-good removes them.
+        occurrence_file(name).unlink(missing_ok=True)
+    try:
+        from khipu import routing_directions
+
+        routing_directions.forget_sessions(names)
+    except Exception:  # noqa: BLE001 - the turn files above are the scan's core
+        pass
     briefs = d / "briefs.jsonl"
     rows = _read_lines(briefs)
     kept = [b for b in rows if b.get("parent") not in names and b.get("sha") not in texts]

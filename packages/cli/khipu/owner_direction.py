@@ -140,6 +140,7 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
     turn = _recent_turn(session, conf, now)
     _from_the_hook(turn)
     return {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
+            "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
             "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook"}
 
 
@@ -824,7 +825,8 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
             line.update(runs_at=_iso(runs_at), runs_at_ts=runs_at)
         if want.get("facts"):
             line["facts"] = want["facts"]
-    for key in ("words", "harness", "session", "via_session", "turn", "binding", "auth_chain"):
+    for key in ("words", "harness", "session", "via_session", "turn", "prompt_sha256", "occurrence",
+                "binding", "auth_chain"):
         if stamp.get(key) is not None:
             line[key] = stamp[key]
     line["state"] = "pending"
