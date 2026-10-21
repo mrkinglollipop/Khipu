@@ -8,7 +8,7 @@
    the CLI, so this model words facts and never offers one. Advice is
    advisory: nothing here ranks, picks, refuses or stops work. A figure the
    readings cannot support is never invented: an unknown cap says why, and a
-   total that is not known is not shown from partial coverage. */
+   incomplete total stays unknown while its reported portion is labelled. */
 
 import { accountClassification, capitalise, whenLocal, windowWords } from "./routing";
 import type { CapStatus, Pace, RouteAccount, RouteView } from "./routing";
@@ -327,6 +327,24 @@ function capName(s: CapStatus): string {
   }
 }
 
+/** An owner's reported portion is display evidence, separate from `usd`. */
+function reportedSpend(s: CapStatus): CapStatus["reported"] {
+  const reported = s.reported;
+  return reported && Number.isFinite(reported.usd) && reported.events > 0 ? reported : null;
+}
+
+function spendGaps(s: CapStatus): NonNullable<CapStatus["reported"]>["gaps"] {
+  return (reportedSpend(s)?.gaps ?? []).filter((gap) =>
+    gap.runner && Number.isFinite(gap.seconds) && gap.seconds > 0 &&
+    Number.isFinite(Date.parse(gap.from)) && Number.isFinite(Date.parse(gap.to)) &&
+    Date.parse(gap.to) > Date.parse(gap.from));
+}
+
+function gapWhen(iso: string, now: Date): string {
+  const day = new Date(iso).toLocaleDateString(undefined, { weekday: "short" });
+  return whenLocal(iso, now).replace(/^yesterday\b/, day);
+}
+
 /** A cap row's state, from the figures that judged it; never a number the
  *  reading cannot support. */
 function capState(a: RouteAccount, s: CapStatus, now: Date): { state: string; tag: PaceTag | null } {
@@ -364,7 +382,14 @@ function capState(a: RouteAccount, s: CapStatus, now: Date): { state: string; ta
       return { state, tag: null };
     }
     case "spend": {
-      if (s.verdict === "unknown") return { state: `The total can't be told: ${s.why || "the spend reading is incomplete"}`, tag: null };
+      if (s.verdict === "unknown") {
+        const reported = reportedSpend(s);
+        if (reported) {
+          const gaps = spendGaps(s).map((g) => `gap ${gapWhen(g.from, now)} to ${gapWhen(g.to, now)} (${g.runner})`);
+          return { state: `${usdWords(reported.usd)} reported · ${gaps.join("; ") || `total unknown: ${s.why || "incomplete readings"}`}`, tag: null };
+        }
+        return { state: `The total can't be told: ${s.why || "the spend reading is incomplete"}`, tag: null };
+      }
       if (s.usd == null) return { state: "Not known yet", tag: null };
       const usd = `${usdWords(s.usd)} reported`;
       if (s.verdict === "over") return { state: usd, tag: { text: "Over", tone: "err" } };
@@ -490,11 +515,20 @@ function sayOf(a: RouteAccount, now: Date): PaceSayPart[] {
 
   if (!paces.length) {
     // Caps without a plan read: a concurrency count still says what Khipu
-    // knows, and an unread spend total says why instead of a partial figure.
+    // knows; partial spend is labelled separately from the unknown total.
     const spend = (a.cap_statuses ?? []).find((s) => s.kind === "spend");
     const conc = (a.cap_statuses ?? []).find((s) => s.kind === "concurrency");
     if (conc) return [{ text: `Khipu doesn't read ${label}'s plan, so there is no pace. It counts the jobs its runners report.` }];
     if (spend?.verdict === "unknown") {
+      const reported = reportedSpend(spend);
+      if (reported) {
+        const gaps = spendGaps(spend).map((g) => {
+          const day = new Date(g.from).toLocaleDateString(undefined, { weekday: "short" });
+          return `The ${g.runner} runner has a ${shortSpan(g.seconds)} gap on ${day}`;
+        });
+        const why = gaps.length ? `${gaps.join(". ")}, so the total isn't known.` : `The total can't be told: ${spend.why || "the spend readings are incomplete"}.`;
+        return [{ text: `${usdWords(reported.usd)} reported in the last ${spend.days} days. ${why}` }];
+      }
       return [{ text: `The spend total can't be told: ${spend.why || "the spend readings are incomplete"}.` }];
     }
     return [{ text: `Khipu doesn't read ${label}'s plan, so there is no pace.` }];

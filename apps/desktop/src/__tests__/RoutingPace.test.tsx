@@ -2,7 +2,7 @@
 // 13): the Pace, caps and advice group. The fixture is the approved mock's
 // fictional data, shaped as `khipu route --json` (docs/mockups/2026-10-21-routing).
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { PaceSection } from "../RoutingSettings";
 import { paceModel } from "../routingPace";
 import { PACE_NOW, PACE_PLANS, PACE_VIEW } from "../../dev/paceFake";
@@ -230,5 +230,30 @@ describe("Pace, caps and advice: the group", () => {
   it("says when no account has a reading", () => {
     render(<PaceSection data={{ record: true, priority: null, accounts: [] }} plans={null} now={PACE_NOW} folds={folds} />);
     expect(screen.getByText("No usage readings yet")).toBeTruthy();
+  });
+});
+
+describe("Owner-only partial spend display", () => {
+  it.each([0, 21.40, 35, 35000])("shows $%s as reported without judging the cap or changing advice", (usd) => {
+    const data = structuredClone(PACE_VIEW);
+    const account = data.accounts!.find((a) => a.label === "DeepSeek")!;
+    const cap = account.cap_statuses![0];
+    Object.assign(cap, { reported: { usd, events: 1, gaps: [{
+      runner: "project-c", from: "2026-10-20T07:00:00Z", to: "2026-10-20T10:00:00Z", seconds: 10800,
+    }] } });
+    const before = paceModel(PACE_VIEW, PACE_PLANS, PACE_NOW).rows.find((r) => r.label === "DeepSeek")!;
+    const after = paceModel(data, PACE_PLANS, PACE_NOW).rows.find((r) => r.label === "DeepSeek")!;
+    const amount = Number.isInteger(usd) ? `$${usd}` : `$${usd.toFixed(2)}`;
+    expect(after.say.map((p) => p.text).join("")).toContain(`${amount} reported`);
+    expect(after.say.map((p) => p.text).join("")).toContain("project-c runner has a 3 h gap");
+    expect(after.caps[0].state).toContain(`${amount} reported`);
+    expect(after.caps[0].state).toContain("gap Tue");
+    expect(after.caps[0].tag).toBeNull();
+    expect(after.advice).toEqual(before.advice);
+    expect(after.tag).toEqual(before.tag);
+    expect(after.crossing).toBeNull();
+    render(<PaceSection data={data} plans={PACE_PLANS} now={PACE_NOW} folds={{ ...folds, isOpen: () => true }} />);
+    fireEvent.click(screen.getByRole("button", { name: /DeepSeek/ }));
+    expect(screen.getByText(new RegExp(`${amount.replace("$", "\\$")} reported · gap`))).toBeTruthy();
   });
 });
