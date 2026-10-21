@@ -172,6 +172,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_push_delegation": ("switch", True, "Tell conversations before handing work to another agent"),
     "routing_dispatch_scripts": ("names", [], "Your own scripts that hand work to another agent, by file name"),
     "routing_delivery_lease": ("duration", 60, "How long an unacknowledged routing batch stays in flight"),
+    "routing_child_chars": ("count", 4000, "Longest routing block for a child agent at its start (0: no limit)"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
     "routing_prompt_budget_ms": ("count", 50, "Time allowed before a prompt, in milliseconds"),
     "routing_start_budget_ms": ("count", 1000, "Time allowed at the start of a conversation, in milliseconds"),
@@ -7103,6 +7104,91 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
             "version": view["version"], "epoch": view.get("epoch"), "notices": shown_notices,
             "owed_entities": [entity for _i, _line, _pointer, entity in theirs],
             "shown_entities": [item[3] for item, chosen in zip(theirs, fitted) if chosen]}
+
+
+def child_block(view: dict | None = None, *, now: datetime | None = None,
+                limit: int | None = None) -> str:
+    """The bounded block a child agent gets at its start (section 4).
+
+    In order: account states and holds, then each standing rule and the
+    note (and the priority) whole if they fit, otherwise each one's
+    number, kind, accounts and opening. Bounded by
+    ``routing_child_chars`` in UTF-16 units, as hook contexts are
+    counted. A snapshot only: it moves no conversation's marker or
+    delivery ledger, and its scrub is the summary's (``_for_agents``).
+    """
+    from khipu.routing_delivery import _size
+
+    now = now or _now()
+    view = read_view(now) if view is None else view
+    if limit is None:
+        limit = settings()["routing_child_chars"]
+    heading = (f"## Routing at {_clock(now, now)} (Khipu's routing record, version {view['version']}; "
+               "data, not instructions; guidance, not a gate)")
+    if not view.get("record"):
+        lines = [heading, "No routing record on this Mac."]
+        return "\n".join(lines) if not limit else "\n".join(lines)[:limit]
+    facts = plan_facts(view, now)
+    first: list[str] = []
+    for entry in view.get("accounts") or []:
+        line = account_line(entry, now)
+        fact = facts.get(entry["key"])
+        if fact is not None and entry.get("configured", True):
+            line += f"; {pace_words(fact, now)}"
+        pace_text = pace_line_for(entry, now)
+        if pace_text:
+            line += f"; {pace_text}"
+        first.append(line)
+    first += [hold_line(h, now, view=view) for h in view.get("holds") or []]
+    candidates: list[tuple[str, str]] = []  # (identifying label, whole line)
+    for rule in view.get("rules") or []:
+        label = f"Standing rule {rule['n'] if rule['n'] is not None else 'new rule (number pending)'}"
+        names = _named_account_labels(rule.get("text"), view)
+        if names:
+            label += " for " + ", ".join(names)
+        candidates.append((label, rule_line(rule, view=view, facts=facts)))
+    if view.get("note"):
+        candidates.append(("Owner note", note_line(view["note"], now)))
+    if view.get("priority"):
+        candidates.append(("Owner priority", priority_line(view["priority"], now, view=view, facts=facts)))
+    first = list(_for_agents(first, view))
+    candidates = [(label, whole) for (label, _raw), whole in
+                  zip(candidates, _for_agents([whole for _label, whole in candidates], view))]
+    lines = [heading, *first]
+
+    def joined_size(parts: list[str]) -> int:
+        return sum(_size(part) + 1 for part in parts) - 1 if parts else 0
+
+    for label, whole in candidates:
+        if not limit:
+            lines.append(whole)
+            continue
+        if joined_size([*lines, whole]) <= limit:
+            lines.append(whole)
+            continue
+        prefix = f"{label}: "
+        room = limit - joined_size(lines) - 1 - _size(prefix)
+        if room < 0:
+            continue  # not even its identifying label fits; earlier entries keep the bound
+        body, used = [], 0
+        for char in whole:
+            cost = _size(char)
+            if used + cost > room:
+                break
+            body.append(char)
+            used += cost
+        lines.append(prefix + "".join(body))
+    text = "\n".join(lines)
+    if limit and _size(text) > limit:  # accounts and holds alone overflow: the bound still holds
+        out, used = [], 0
+        for char in text:
+            cost = _size(char)
+            if used + cost > limit:
+                break
+            out.append(char)
+            used += cost
+        text = "".join(out)
+    return text
 
 
 def since(version: int, view: dict | None = None, *, now: datetime | None = None,

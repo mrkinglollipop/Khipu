@@ -51,7 +51,6 @@ def test_codex_child_receives_subagent_start_routing(received):
     assert not leaked, "parent SessionStart context leaked into child"
 
 
-@future("8b", "7b: bounded child block and missing-hook routing-free brief advisory")
 def test_7b_codex_missing_brief_advisory(received):
     scenario = received("codex")
     child = scenario.children[0]
