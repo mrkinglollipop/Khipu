@@ -268,6 +268,9 @@ describe("Home Routing card, the other states", () => {
       witness: { source: "runner", written_by: { kind: "runner", name: "Project A" }, at: "2026-10-14T13:10:00Z" },
     }, "Down: out of service", "Seen by your Project A job runner at 9:10 AM"],
     ["unknown with no report", {}, "Unknown: no report yet", ""],
+    ["missing usage reader", {
+      harness: "deepseek", usage_setup: "no usage reader set up; confirm its quota host in Settings → Accounts",
+    }, "No usage reader set up; confirm its quota host in Settings → Accounts", ""],
     ["unknown, last seen open", {
       last_seen: { state: "open", source: "probe", at: "2026-10-14T05:02:00Z" },
     }, "Unknown: last seen open 14 h ago", "Read from Claude at 1:02 AM"],
@@ -310,6 +313,16 @@ describe("Home Routing card, the other states", () => {
     const a = acct("Account", (extra.harness as string) ?? "claude", extra);
     expect(accountState(a, AFTERNOON).text).toBe(stateText);
     expect(accountSource(a, AFTERNOON)).toBe(sourceText);
+  });
+
+  it("renders the missing DeepSeek quota setup on its account card", () => {
+    const v = mainView();
+    v.accounts = [acct("DeepSeek", "deepseek", {
+      usage_setup: "no usage reader set up; confirm its quota host in Settings → Accounts",
+    })];
+    render(<RoutingCard state={stateOf(v)} />);
+    expect(screen.getByText("No usage reader set up; confirm its quota host in Settings → Accounts")).toBeInTheDocument();
+    expect(screen.queryByText("Unknown: no report yet")).not.toBeInTheDocument();
   });
 
   it("says when Khipu's record has not been refreshed, and keeps the last view", () => {

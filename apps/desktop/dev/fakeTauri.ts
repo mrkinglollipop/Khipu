@@ -5,7 +5,7 @@ import { CLIENT, TRACKED, discovery, liveRow, status9B } from "../src/__tests__/
 import type { DiscoverResult } from "../src/accountsApi";
 import { DELIVERY_VIEW } from "./deliveryFake";
 
-export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean };
+export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeReplication?: boolean };
 
 /** Fictional routing record for the Proposals and holds group (slice 15b),
  *  shaped as `khipu route --json` prints it. */
@@ -46,7 +46,22 @@ function route15b() {
         routing_conversation_hold: setting(86400), routing_conversation_hold_max: setting(604800),
         routing_owner_hold_reminder: setting(7776000), routing_hold_chars: setting(300),
         routing_proposal_text_between_macs: setting(true),
+        routing_replication_live: setting(false),
         routing_push_start: setting(true), routing_push_prompt: setting(true), routing_push_delegation: setting(true),
+      },
+    },
+  };
+}
+
+/** Fictional routing record with the Mac-to-Mac replication switch on. */
+function routeReplication() {
+  const base = route15b();
+  return {
+    view: base.view,
+    config: {
+      routing: {
+        ...base.config.routing,
+        routing_replication_live: { value: true, default: false, kind: "switch", source: "file" },
       },
     },
   };
@@ -86,6 +101,7 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
       case "khipu_accounts_try":
         return { ok: true, default: false, row: liveRow({ account: String(args?.harness ?? "claude") }) };
       case "khipu_config_show":
+        if (f.routeReplication) return routeReplication().config;
         if (f.route15a) return route15a().config;
         if (f.route15b) return route15b().config;
         return {
@@ -105,6 +121,7 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
       case "khipu_projects_list":
         return { ok: true, ...(f.projects as object) };
       case "khipu_route_view":
+        if (f.routeReplication) return routeReplication().view;
         if (f.route15a) return route15a().view;
         if (f.route15b) return route15b().view;
         return { accounts: [], priority: null };

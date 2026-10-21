@@ -265,7 +265,8 @@ def plan(out, view, now, cfg, *, session=None, project=None):
         effective = view.get("effective", {}).get(entity)
         if effective is None:
             effective = line
-        items.append(dict(entity=entity, effective=effective, text=line, label=label, whole=whole))
+        items.append(dict(entity=entity, effective=effective, text=line, label=label, whole=whole,
+                          removed=entity not in view.get("effective", {})))
     for entity, fc in (out.get("pace_forecasts") or {}).items():
         entry = next((a for a in view.get("accounts") or [] if a["key"] == fc["account"]), None)
         line = r.pace_line_for(entry, now) if entry else None
@@ -309,8 +310,12 @@ def plan(out, view, now, cfg, *, session=None, project=None):
         line = r._for_agents(raw, view)
         items.append(dict(entity="notice:" + ident, revision=ident, text=line,
                           label="Proposal notice", whole=True, visible=ident in (out.get("notices") or [])))
-    removed = {e: r.change_line(e, view, now) for e in view.get("causes", {})
-               if e not in view.get("effective", {}) and (e == "note" or e.startswith("rule:"))}
+    historical = {e for change in view.get("changes", []) for e in change.get("entities", [])}
+    removed = {e: r._current_line(e, view, now) for e in historical | set(view.get("causes", {}))
+               if e not in view.get("effective", {})}
+    removed_lines = list(removed.values())
+    removed_lines = project(removed_lines) if project else r._for_agents(removed_lines, view)
+    removed = dict(zip(removed, removed_lines))
     return dict(out, delivery_plan={"items": items, "pace_forecasts": out.get("pace_forecasts") or {},
                                     "advice_forecasts": out.get("advice_forecasts") or {},
                                     "current_entities": list(view.get("effective", {})),
@@ -365,7 +370,8 @@ def _merge(state, out):
             line = plan.get("removed", {}).get(entity, fallback)
             fingerprint = [line, line, old["label"]] if entity.startswith("rule:") or entity in ("note", "priority") else line
             revision = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
-            items.append(dict(entity=entity, revision=revision, text=line, label=old["label"], whole=True, visible=False))
+            items.append(dict(entity=entity, revision=revision, text=line, label=old["label"], whole=True,
+                              visible=False, removed=True))
     done = state.get("done") if isinstance(state.get("done"), dict) else {}
     for item in items:
         entity = item["entity"]
@@ -438,17 +444,34 @@ def _render(state, out, now, component, *, delivery_point=True):
         _expire(state, flight)
         state.pop("flight", None)
     # A receipt can arrive after the plan was rendered, through another
-    # hook or identity. Suppress only the notice lines already acknowledged.
+    # hook or identity. Completed removals can also remain in a stale offer;
+    # their matching receipt takes precedence over that old omission.
     heard = [ident for ident in out.get("notices", []) if entries.get("notice:" + ident, {}).get("acked")]
-    if heard and isinstance(out.get("text"), str):
+    removed = [item for item in out["delivery_plan"]["items"] if item.get("removed") and
+               ((entries.get(item["entity"], {}).get("acked") and
+                 entries[item["entity"]].get("revision") == item["revision"]) or
+                (state.get("done") or {}).get(item["entity"]) == item["revision"])]
+    if (heard or removed) and isinstance(out.get("text"), str):
         lines = out["text"].split("\n")
         for ident in heard:
             line = entries["notice:" + ident]["text"]
             if line in lines:
                 lines.remove(line)
+        for item in removed:
+            for line in list(lines):
+                prefix = line.removesuffix("…").removesuffix("...").rstrip()
+                if line == item["text"] or (prefix and line != prefix and item["text"].startswith(prefix)):
+                    lines.remove(line)
         plain = "\n".join(lines)
         out = dict(out, text=plain, delivery_plan=dict(out["delivery_plan"], text=plain))
-        out["notices"] = [ident for ident in out.get("notices", []) if ident not in heard]
+        if heard:
+            out["notices"] = [ident for ident in out.get("notices", []) if ident not in heard]
+        if removed:
+            completed = {item["entity"] for item in removed}
+            for field in ("owed_entities", "shown_entities"):
+                out[field] = [e for e in out.get(field, []) if e not in completed]
+            if len(lines) <= 1 and out.get("kind") == "changes":
+                out.update(kind="none", text=None, count=0)
     due = [e for e in entries.values() if not e.get("acked")]
     # A new hold must precede the remaining pages of an older, long rule.
     due.sort(key=lambda e: not e["entity"].startswith("hold:"))

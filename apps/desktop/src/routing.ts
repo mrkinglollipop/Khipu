@@ -59,6 +59,7 @@ export type RouteAccount = {
   /** False when plan usage no longer reads the account (removed in
    *  Settings -> Models while limited): no reset check and no Check now. */
   configured?: boolean;
+  usage_setup?: string;
   witness?: RouteWitness | null;
   disagreement?: RouteReport | null;
   last_seen?: RouteReport | null;
@@ -72,6 +73,8 @@ export type RouteAccount = {
   cap_statuses?: CapStatus[];
   /** Khipu's launch advice for jobs (slice 17c). Advisory, never a gate. */
   advice?: RouteAdvice | null;
+  /** Check advice uses its own pace allowance, or the job allowance. */
+  check_advice?: RouteAdvice | null;
   /** The same advice for lead conversations (orchestration purpose). */
   lead_advice?: RouteAdvice | null;
 };
@@ -360,6 +363,7 @@ export type Pace = {
   share_cap?: PaceLimit | null;
   day_cap?: PaceDayCap | null;
   pace_target?: PaceTarget | null;
+  check_pace_target?: PaceTarget | null;
   /** Which target the window's verdict speaks: plan, share_cap or day_cap. */
   headline?: "plan" | "share_cap" | "day_cap" | string;
 };
@@ -369,6 +373,9 @@ export type Pace = {
  *  judged it. A cap Khipu cannot read says `unknown` with no figure. */
 export type CapStatus = {
   kind: "share" | "per_day" | "pace_target" | "spend" | "concurrency" | string;
+  purpose?: "job" | "check";
+  tier?: "opus" | "sonnet" | "haiku";
+  sensitive_only?: boolean;
   /** The fact's opaque revision, as you confirmed it. */
   revision?: string | null;
   /** When you confirmed this cap (`route --json` only; absent elsewhere). */
@@ -502,6 +509,10 @@ export type RouteDeliveryIdentity = {
 export type RouteDeliveryFreshness = {
   status?: "green" | "red" | "unknown" | "not_applicable" | string;
   age_seconds?: number | null;
+  /** From `khipu route replication status` (via the doctor block): when the
+   *  last completed Mac-to-Mac copy finished, and whether it is now stale. */
+  caught_up_at?: string | null;
+  stale?: boolean;
 };
 
 export type RouteDeliveryHealth = {
@@ -769,6 +780,7 @@ export function accountState(a: RouteAccount, now: Date): { text: string; tone: 
       if (a.silent) text = "Unknown: its only reporter stopped";
       else if (a.last_seen?.cleared) text = `Unknown: last cleared by you ${ageWords(a.last_seen.at, now)}`;
       else if (a.last_seen) text = `Unknown: last seen ${stateWord(a.last_seen.state)} ${ageWords(a.last_seen.at, now)}`;
+      else if (a.usage_setup) text = a.usage_setup[0].toUpperCase() + a.usage_setup.slice(1);
       else text = "Unknown: no report yet";
   }
   if (models.length) text += `; ${models.join("; ")}`;
