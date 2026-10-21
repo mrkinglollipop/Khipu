@@ -1147,7 +1147,6 @@ def test_12_two_home_replication_recovery(replay, scenario):
 
 
 @pytest.mark.parametrize("proposal_text", [False, True], ids=["proposal-text-off", "proposal-text-on"])
-@future("11a", "replication needs the closed payload projector, independently of local agent scrubbing")
 def test_12_replication_payload_checks_every_nested_field(replay, proposal_text):
     # This named seam pins the projector contract without substituting a
     # test-written projector. Slice 11a may bind its implementation here.

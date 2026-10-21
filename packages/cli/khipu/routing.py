@@ -1512,6 +1512,228 @@ def _pending_numbering() -> bool:
     return _replication_live() and _hub_configured()
 
 
+# The replication payload (plan section 6) is an explicit allow-list, never a
+# deny-list: a field reaches the hub only when it is named here, and every
+# account reference is rewritten through the caller's local bindings to its
+# stable id. A login key with no binding drops its field rather than travel.
+_REPLICATION_TEXT_TYPES = frozenset({"rule_add", "rule_edit", "note_set", "owner_change"})
+_REPLICATION_SCALARS = (
+    "id", "entity", "proposal", "op", "txn", "mac", "legacy_mac", "via", "kind",
+    "definition", "state", "basis", "source", "status", "reason", "window",
+    "harness", "model", "family", "transport", "auth", "reset_id", "state_id",
+    "schedule_id", "revision", "date", "written_at", "until", "clock_at",
+    "reset_until", "next_at", "reset_moved_to", "started_at", "witness_at",
+    "expires_at", "reset_at",
+)
+_REPLICATION_WHOLE = ("n", "count", "checks", "busy_tries", "lock_tries", "hub_order", "local_order")
+_REPLICATION_SWITCHES = (
+    "message_time", "owner", "seeded", "until_default", "counted", "pending",
+    "prior_confirmed", "number_pending", "observed", "observed_turn",
+    "session_logs", "silent", "unmatched",
+)
+_REPLICATION_PROVIDER_FIELDS = (
+    "label", "family", "login", "probe", "host", "use",
+    "lane_names", "models_allowed", "models_never",
+)
+
+
+def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = None,
+                        bindings: dict | None = None) -> list[dict]:
+    """The closed Mac-to-hub projection of local routing events.
+
+    Only the fields named in this function are copied. The local
+    ``source_id``, evidence text, ``op_body``, ``auth_chain``, seed file
+    names and hashes, account-list digests (``list_before``/``list_after``)
+    and login bindings never leave the Mac. ``written_by`` is reduced to
+    ``{kind, harness, mac}``; project and session names are dropped, never
+    hashed into the payload. Owner rule and note words travel as written
+    (paths included) once confirmed; a pending proposal's ``text`` and
+    ``owner_request`` travel only when ``proposal_text`` is on, and a
+    conversation hold's words never travel (an owner's hold words do).
+    The input events are not mutated.
+    """
+    if proposal_text is None:
+        proposal_text = bool(settings().get("routing_proposal_text_between_macs", True))
+    bindings = dict(bindings or {})
+    homes = [key.partition("|")[2] for key in bindings
+             if isinstance(key, str) and key.partition("|")[2]]
+
+    def mapped(value):
+        if not isinstance(value, str) or not value:
+            return None
+        if value in bindings:
+            return bindings[value]
+        if "|" in value:
+            return value if not value.partition("|")[2] else None
+        return value
+
+    def clean(field, value):
+        if field in ("text", "prior_text", "owner_request", "role"):
+            return value
+        if any("|" + home in value or home in value for home in homes):
+            return None
+        return value
+
+    def text_field(field, value):
+        value = value if isinstance(value, str) else None
+        return value if value is None else clean(field, value)
+
+    out: list[dict] = []
+    for event in events:
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            continue
+        kind = event["type"]
+        pending = event.get("pending") is True
+        row: dict[str, Any] = {"type": kind}
+        for field in _REPLICATION_SCALARS:
+            value = text_field(field, event.get(field))
+            if value is not None:
+                row[field] = value
+        for field in ("account", "target", "to"):
+            value = mapped(event.get(field))
+            if value is not None:
+                value = clean(field, value)
+            if value is not None:
+                row[field] = value
+        for field in _REPLICATION_WHOLE:
+            value = event.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and abs(value) <= _WHOLE_MOST:
+                row[field] = value
+        for field in _REPLICATION_SWITCHES:
+            if isinstance(event.get(field), bool):
+                row[field] = event[field]
+        used = event.get("used_pct")
+        if isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used):
+            row["used_pct"] = used
+        hlc = event.get("hlc")
+        if isinstance(hlc, dict) and isinstance(hlc.get("mac"), str) and hlc["mac"] \
+                and all(isinstance(hlc.get(k), int) and not isinstance(hlc.get(k), bool)
+                        and 0 <= hlc[k] <= _WHOLE_MOST for k in ("wall", "counter")):
+            row["hlc"] = {"wall": hlc["wall"], "counter": hlc["counter"], "mac": hlc["mac"]}
+        by = event.get("written_by")
+        if isinstance(by, dict):
+            author = {k: by[k] for k in ("kind", "harness", "mac")
+                      if isinstance(by.get(k), str) and clean(k, by[k]) is not None}
+            if author:
+                row["written_by"] = author
+        scope = event.get("scope")
+        if isinstance(scope, dict) and scope.get("kind") in _HOLD_KINDS:
+            projected_scope: dict[str, Any] = {"kind": scope["kind"]}
+            if scope["kind"] == "account":
+                account = mapped(scope.get("account"))
+                if account is not None:
+                    projected_scope["account"] = account
+            if scope["kind"] == "machine" and isinstance(scope.get("mac"), str) and scope["mac"]:
+                projected_scope["mac"] = scope["mac"]
+            row["scope"] = projected_scope
+        elif isinstance(scope, str):
+            value = text_field("scope", scope)
+            if value is not None:
+                row["scope"] = value
+        locality = event.get("observation_scope")
+        if kind in ("evidence", "observation", "source_seen") and isinstance(locality, dict) \
+                and locality.get("kind") in ("machine", "account_quota"):
+            projected_locality: dict[str, Any] = {"kind": locality["kind"]}
+            if locality["kind"] == "machine" and isinstance(locality.get("mac"), str) and locality["mac"]:
+                projected_locality["mac"] = locality["mac"]
+            row["observation_scope"] = projected_locality
+        declaration = event.get("declaration")
+        if kind in ("evidence", "observation") and isinstance(declaration, dict):
+            projected_declaration = {}
+            for field in ("kind", "provider", "model", "identity_invalid"):
+                if field in declaration:
+                    projected_declaration[field] = declaration[field]
+            for field in ("account", "budget_account"):
+                value = mapped(declaration.get(field))
+                if value is not None:
+                    projected_declaration[field] = value
+            row["declaration"] = projected_declaration
+        if kind == "priority_set" and isinstance(event.get("entries"), list):
+            entries = []
+            for entry in event["entries"]:
+                if not isinstance(entry, dict):
+                    continue
+                projected_entry: dict[str, Any] = {}
+                if "account" in entry:
+                    account = mapped(entry.get("account"))
+                    if account is None:
+                        continue
+                    projected_entry["account"] = account
+                if isinstance(entry.get("label"), str) and clean("label", entry["label"]) is not None:
+                    projected_entry["label"] = entry["label"]
+                if not pending or proposal_text:
+                    if isinstance(entry.get("role"), str):
+                        projected_entry["role"] = entry["role"]
+                    level = entry.get("level")
+                    if isinstance(level, dict):
+                        projected_entry["level"] = {k: level[k] for k in ("claim", "as_of", "until")
+                                                    if isinstance(level.get(k), str)}
+                if isinstance(entry.get("until"), str):
+                    projected_entry["until"] = entry["until"]
+                entries.append(projected_entry)
+            row["entries"] = entries
+        if kind in ("priority_set", "priority_confirm", "rule_add", "rule_edit",
+                    "rule_confirm", "rule_restore") and isinstance(event.get("holds"), dict):
+            row["holds"] = {k: v for k, v in event["holds"].items()
+                            if isinstance(k, str) and v in ("end", "keep")
+                            and all(("|" + home) not in k for home in homes)}
+        if kind in ("definition_set", "definition_remove"):
+            value = entry_model.checked_definition(event.get("definition"), event.get("value"))
+            if value is not None:
+                if "account" in value:
+                    account = mapped(value["account"])
+                    if account is None:
+                        value = None
+                    else:
+                        value = dict(value, account=account)
+                if value is not None:
+                    row["value"] = value
+        if kind == "provider_set":
+            for field in _REPLICATION_PROVIDER_FIELDS:
+                value = event.get(field)
+                if isinstance(value, str) and clean(field, value) is not None:
+                    row[field] = value
+                elif isinstance(value, list) and all(isinstance(v, str) for v in value):
+                    row[field] = list(value)
+            if isinstance(event.get("accounts"), list):
+                row["accounts"] = [account for ref in event["accounts"]
+                                    if (account := mapped(ref)) is not None]
+        if kind == "account_migration" and isinstance(event.get("aliases"), dict):
+            row["aliases"] = {k: v for k, v in event["aliases"].items()
+                              if isinstance(k, str) and isinstance(v, str) and "|" not in v}
+        if kind == ACCOUNT_TXN and isinstance(event.get("declines"), list):
+            declines = []
+            for decline in event["declines"]:
+                if not isinstance(decline, dict):
+                    continue
+                account = mapped(decline.get("account"))
+                if account is None:
+                    continue
+                projected_decline: dict[str, Any] = {"account": account}
+                if decline.get("why") is None or isinstance(decline.get("why"), str):
+                    projected_decline["why"] = decline.get("why")
+                declines.append(projected_decline)
+            row["declines"] = declines
+        if kind == "account_note" and isinstance(event.get("lanes_cut"), list):
+            row["lanes_cut"] = [[pair[0], pair[1]] for pair in event["lanes_cut"]
+                                 if isinstance(pair, list) and len(pair) == 2
+                                 and all(isinstance(x, str) for x in pair)]
+        text = event.get("text")
+        if isinstance(text, str):
+            if kind == "hold":
+                if event.get("owner") is True:
+                    row["text"] = text
+            elif kind in _REPLICATION_TEXT_TYPES and (not pending or proposal_text):
+                row["text"] = text
+        if proposal_text and isinstance(event.get("owner_request"), str):
+            row["owner_request"] = event["owner_request"]
+        if kind in ("rule_add", "rule_edit") and isinstance(event.get("prior_text"), str) \
+                and (not pending or proposal_text):
+            row["prior_text"] = event["prior_text"]
+        out.append(row)
+    return out
+
+
 def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = None,
                      ordered: list[dict] | None = None) -> None:
     """Enrich new lines only. All append paths, including seeds and account
