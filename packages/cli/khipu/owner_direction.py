@@ -998,7 +998,9 @@ def _before(want: dict):
         facts = want.get("facts") or {}
         entry = _entry(target)
         prior = next((c for c in entry.get("caps") or []
-                      if c.get("window") == facts.get("window") and c.get("kind") == facts.get("kind")), None)
+                      if c.get("kind") == facts.get("kind")
+                      and (c.get("kind") in ("spend", "concurrency")
+                           or c.get("window") == facts.get("window"))), None)
         return {"cap": prior}
     if action == "route.pause":
         entry = _entry(target)
@@ -1519,7 +1521,8 @@ def _undo_cap(line: dict, via: str) -> dict:
     previous = (line.get("before") or {}).get("cap")
     if previous is not None:
         return routing.set_cap(line["target"], window=facts.get("window") or previous.get("window"),
-                               kind=previous["kind"], pct=previous["pct"],
+                               kind=previous["kind"], pct=previous.get("pct"), slack=previous.get("slack"),
+                               usd=previous.get("usd"), days=previous.get("days"), n=previous.get("n"),
                                revision=previous.get("revision"), via=via)
     return routing.remove_cap(line["target"], window=facts.get("window"),
                               kind=facts.get("kind"), via=via)
