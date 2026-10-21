@@ -1694,10 +1694,18 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     filters = owed_filters(args)
     limit, note = owed_page_limit(args.get("limit"))
     project = args.get("project") or None
+    # The alias the caller named reads as -- and is reported as -- its
+    # canonical project, the same labels the rows carry; `asked` keeps the
+    # name they typed (``project_group.show``'s asked/canonical pair).
+    canonical = project
     hub_now = None
     try:
         with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
             with conn.cursor() as cur:
+                if project:
+                    from khipu import identity
+
+                    canonical = identity.project_canonical_group(cur, project)[0] or project
                 rows = commitments.fetch_owed_rows(cur, project=project, status=status)
                 if hub_ages:
                     # A Mac clock ahead of or behind the hub can't make an age negative.
@@ -1710,13 +1718,15 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
         rows = offline_reads.owed_rows(project, status)
         if rows is None:
             raise
+        canonical = offline_reads.owed_canonical(project) if project else project
         stale = stale_fields()
     page = commitments.page_owed(rows, **filters, limit=limit)
     if hub_ages:
         from datetime import datetime, timezone
 
         commitments.add_hub_ages(page["results"], hub_now or datetime.now(timezone.utc))
-    out = {"status": status, "project": project, **page, "limit": limit,
+    out = {"status": status, "project": canonical, **page, "limit": limit,
+           **({"asked": project} if project and canonical != project else {}),
            **({"limit_note": note} if note else {}), **stale}
     directions = _routing_direction_rows(status, filters)
     if directions:
