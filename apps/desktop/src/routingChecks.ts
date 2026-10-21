@@ -18,10 +18,18 @@ export type ChecksRow = {
 
 export type TierRow = { label: string; tier: string };
 
+export type FileCopiesModel = {
+  status: string;
+  scanned_at: string | null;
+  files_checked: number;
+  hits: { file: string; line: number; quote: string; superseded: boolean }[];
+};
+
 export type ChecksModel = {
   contradictions: ChecksRow[];
   upkeep: ChecksRow[];
   unreached: ChecksRow[];
+  fileCopies: FileCopiesModel | null;
   /** The confirmed model table, or null: `route --json` carries only a
    *  confirmed one, so an absent table can mean none or one still waiting. */
   table: { rows: TierRow[]; line: string } | null;
@@ -236,7 +244,7 @@ function upkeepRow(h: RouteHygiene, i: number, view: RouteView, rules: Map<strin
 
 /** Every advisory row and the model table, in the group's order. */
 export function checksModel(view: RouteView | null, now: Date): ChecksModel {
-  if (!view) return { contradictions: [], upkeep: [], unreached: [], table: null };
+  if (!view) return { contradictions: [], upkeep: [], unreached: [], fileCopies: null, table: null };
   const rules = ruleByEntity(view);
   const contradictions = (view.contradictions ?? []).map((c, i) => contradictionRow(c, i, view, rules, now));
   const upkeep = (view.rule_hygiene ?? []).map((h, i) => upkeepRow(h, i, view, rules, now));
@@ -249,6 +257,11 @@ export function checksModel(view: RouteView | null, now: Date): ChecksModel {
         ? `The owner turn could not be matched${d.reason ? `: ${d.reason}` : ""}.`
         : "Nothing in Khipu matches it."),
   }));
+  const copies = view.routing_file_copies;
+  const fileCopies: FileCopiesModel | null = copies
+    ? { status: copies.status, scanned_at: copies.scanned_at ?? null,
+        files_checked: copies.files_checked ?? 0, hits: copies.hits ?? [] }
+    : null;
   let table: ChecksModel["table"] = null;
   const tiers = view.tier_table?.tiers;
   if (tiers && Object.keys(tiers).length && view.tier_table?.confirmed !== false) {
@@ -260,7 +273,7 @@ export function checksModel(view: RouteView | null, now: Date): ChecksModel {
     const rows = [...known, ...extra];
     table = { rows, line: `${plural(rows.length, "kind", "kinds")} of work · confirmed by you` };
   }
-  return { contradictions, upkeep, unreached, table };
+  return { contradictions, upkeep, unreached, fileCopies, table };
 }
 
 /** The group's closed line: what is flagged, in the parts Khipu can see. */
@@ -270,7 +283,9 @@ export function checksLine(view: RouteView | null, now: Date): string {
   if (model.contradictions.length) parts.push(plural(model.contradictions.length, "contradiction", "contradictions"));
   if (model.upkeep.length) parts.push(`${plural(model.upkeep.length, "rule", "rules")} to look at`);
   if (model.unreached.length) parts.push(`${plural(model.unreached.length, "direction", "directions")} not in Khipu`);
+  if (model.fileCopies?.hits.length) parts.push(`${plural(model.fileCopies.hits.length, "copy", "copies")} in files`);
   if (parts.length) return parts.join(" · ");
+  if (model.fileCopies && model.fileCopies.status !== "checked") return "Files not looked at yet";
   if (model.table) return "Your model table · nothing flagged";
   return "Nothing flagged in Khipu's record";
 }

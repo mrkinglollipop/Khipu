@@ -727,6 +727,12 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         "files": new_files_state,
     })
     try:
+        from khipu import routing_scan_report
+
+        routing_scan_report.refresh()
+    except Exception as exc:  # noqa: BLE001 — the scan report must never break reconcile
+        _log(f"routing scan report failed: {type(exc).__name__}")
+    try:
         from khipu import organise
 
         out["organise"] = organise.after_reconcile(

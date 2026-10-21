@@ -3516,8 +3516,9 @@ function ProvidersList({ view }: { view: RouteView }) {
  *  model table. Display only: a row states what disagrees; the owner's fix
  *  stays in the group that owns the words, and nothing here sends, stops or
  *  refuses work. The checks `route --json` does not carry yet (model
- *  mismatches, stale level words, copies in files) are left out rather
- *  than guessed. Open owed directions stay local to the owner's Mac. */
+ *  mismatches, stale level words) are left out rather than guessed.
+ *  Open owed directions and routing copies found in files
+ *  stay local to the owner's Mac. */
 function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds: Folds }) {
   const model = checksModel(data, now);
   const row = (r: { key: string; title: string; sub: string }, tag?: ReactNode) => (
@@ -3568,7 +3569,34 @@ function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds
           </div>
         </div>
       ) : null}
-      {!model.table && !model.contradictions.length && !model.upkeep.length && !model.unreached.length ? (
+      {model.fileCopies ? (
+        <div className="section-body">
+          <h2 className="sub-title">Routing written in files{model.fileCopies.status === "checked" ? <span className="meta">{model.fileCopies.hits.length} found</span> : null}</h2>
+          {model.fileCopies.status !== "checked" ? (
+            <div className="empty">
+              <b>Khipu hasn't looked at your files yet</b>
+              <span>Nothing is known about copies until the first look. It reads only, and never edits a file.</span>
+            </div>
+          ) : model.fileCopies.hits.length ? (
+            <>
+              <p className="set-help">Conversations are told Khipu's record wins over these.</p>
+              <div className="mrows" role="list" aria-label="Copies of routing found in files">
+                {model.fileCopies.hits.map((h) => row({
+                  key: `copy:${h.file}:${h.line}`,
+                  title: `${h.file} line ${h.line}`,
+                  sub: `“${h.quote}”`,
+                }))}
+              </div>
+            </>
+          ) : (
+            <p className="set-help">
+              Files last looked at{model.fileCopies.scanned_at ? ` ${whenLocal(model.fileCopies.scanned_at, now)}` : ""}: {model.fileCopies.files_checked} files, 0 copies.
+            </p>
+          )}
+        </div>
+      ) : null}
+      {!model.table && !model.contradictions.length && !model.upkeep.length && !model.unreached.length
+        && !model.fileCopies?.hits.length && !(model.fileCopies && model.fileCopies.status !== "checked") ? (
         <div className="section-body">
           <EmptyState title="Nothing to fix" hint="No priority, rule or direction disagrees with an account." />
         </div>
