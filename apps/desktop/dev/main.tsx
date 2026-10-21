@@ -231,6 +231,26 @@ function ProjectsHost({ withQuestion = true }: { withQuestion?: boolean }) {
   );
 }
 
+/** Settings -> Accounts and routing with Telling conversations open, so the
+ *  Mac-to-Mac replication switch and its caught-up status line show. */
+function RoutingReplication() {
+  useState(() => {
+    try {
+      window.localStorage.setItem("khipu.routing.open", JSON.stringify(["telling", "sub:sizes"]));
+    } catch {
+      // The group can be opened by hand.
+    }
+  });
+  return (
+    <div className="settings-pane" style={{ width: 1184, maxWidth: "none", margin: "0 auto" }}>
+      <RoutingSettings
+        active
+        deliveryHealth={{ status: "green", identities: [], replication: { status: "green", age_seconds: 120, caught_up_at: "2026-10-21T18:38:00Z", stale: false }, gateway: { status: "not_applicable" } }}
+      />
+    </div>
+  );
+}
+
  /** Settings -> Accounts and routing with only Proposals and holds open
  *  (slice 15b), against the fictional record in fakeTauri. */
 function RoutingProposals() {
@@ -256,6 +276,7 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   "projects": { title: "Settings: Projects", fake: { projects: PROJECTS_FIXTURE }, render: () => <ProjectsHost /> },
   "projects-empty": { title: "Settings: Projects, none", fake: { projects: { groups: [], pairs: [], sweep: { result: null } } }, render: () => <ProjectsHost withQuestion={false} /> },
   "routing-proposals": { title: "Proposals and holds (slice 15b)", fake: { route15b: true }, render: () => <RoutingProposals /> },
+  "routing-replication": { title: "Copy routing between your Macs (replication on, caught up)", fake: { routeReplication: true }, render: () => <RoutingReplication /> },
   "offline-owed": { title: "Owed with the hub away: the banners and a waiting row", render: () => <OfflineOwedStates /> },
   "offline-settings": { title: "Settings: When the hub is away", render: () => <div className="route-settings"><OfflineWaitsCard active /></div> },
   "dialog-step1": { title: "Dialog, step 1: choose the service", render: () => <Dlg /> },
@@ -362,7 +383,7 @@ function Page() {
       </main>
     );
   }
-  if (hash === "routing-proposals") {
+  if (hash === "routing-proposals" || hash === "routing-replication") {
     // The Settings pane at its app width, uncapped by the 960 state frame.
     return (
       <main style={{ padding: 24 }} data-state={hash}>

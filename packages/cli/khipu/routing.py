@@ -201,6 +201,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_cloud_copy_hold_words": ("switch", False, "Include hold words in the copy"),
     "routing_cloud_copy_rules": ("switch", False, "Include the rules and the note in the copy"),
     "routing_proposal_text_between_macs": ("switch", True, "Proposal text between your Macs"),
+    "routing_replication_live": ("switch", False, "Copy routing between your Macs through the hub"),
     "routing_cloud_copy_stale_after": ("duration", 600, "The copy counts as out of date after"),
     "routing_cloud_copy_debounce": ("duration", 30, "Wait for a burst of changes to end before copying"),
     # Owner-local delivery labels (survey rows 8-11): names the owner gave
@@ -1542,6 +1543,9 @@ def _hub_configured() -> bool:
 
 def _replication_live() -> bool:
     # Slice 11 enables this only once hub acceptance can assign numbers.
+    # Registered as a switch in SETTINGS (the owner sets it from the app,
+    # which stores a JSON boolean), but the live check stays strict: a
+    # hand-edited string or number in the file never turns replication on.
     from khipu.config import load_config
 
     return load_config().get("routing_replication_live", False) is True

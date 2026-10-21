@@ -500,6 +500,10 @@ export type RouteDeliveryIdentity = {
 export type RouteDeliveryFreshness = {
   status?: "green" | "red" | "unknown" | "not_applicable" | string;
   age_seconds?: number | null;
+  /** From `khipu route replication status` (via the doctor block): when the
+   *  last completed Mac-to-Mac copy finished, and whether it is now stale. */
+  caught_up_at?: string | null;
+  stale?: boolean;
 };
 
 export type RouteDeliveryHealth = {
