@@ -1553,6 +1553,23 @@ def result_vectors():
     yield "boundary-gain-12-not-15", clipped, day, {"day_cap.used_24h_pct": 12, "day_cap.observed_pct": 0,
                                                   "day_cap.verdict": "unknown"}
     yield "half-hour-total", steady(), day, {"day_cap.used_24h_pct": 12, "observed_pct": 100, "rate_pct_per_h": 0.5}
+    yield "day-cap-under", steady(0.25), day, {"day_cap.verdict": "under", "day_cap.used_24h_pct": 6,
+                                               "day_cap.settles_at_pct": 6, "day_cap.why": None}
+    yield "day-cap-20h-floor-met", steady(start=14400), day, {"day_cap.verdict": "under",
+                                                              "day_cap.used_24h_pct": 10, "day_cap.why": None}
+    yield "day-cap-below-20h-floor", steady(start=21600), day, {
+        "day_cap.verdict": "unknown", "day_cap.why": "the last 24 h are covered for only 18 h"}
+    yield "plan-outpacing-values", steady(reset=900000), (), {
+        "plan.runs_out_at": routing._iso(T0 + timedelta(seconds=720000)), "plan.before_reset_s": 180000,
+        "plan.needed_pct_per_h": pytest.approx(88 / 226)}
+    yield "plan-underpacing-values", steady(reset=200000), (), {
+        "plan.verdict": "underpacing", "plan.runs_out_at": None,
+        "plan.unused_at_reset_pct": pytest.approx(88 - 0.5 * 113600 / 3600)}
+    aging_invalid = steady()
+    aging_invalid[24]["used"] = aging_invalid[23]["used"] - 1
+    yield "day-aging-across-invalid-interval", aging_invalid, day, {
+        "day_cap.used_24h_pct": 11.5, "day_cap.peak_pct": 12,
+        "day_cap.peak_at": routing._iso(T0 + timedelta(seconds=86400 + 45000))}
     yield "steady-near-no-crossing", steady(), day, {"day_cap.verdict": "near", "day_cap.reaches_cap_at": None,
                                                      "day_cap.settles_at_pct": 12}
     # Phase the trailing window ten minutes past the epoch bucket edge.
@@ -1613,7 +1630,6 @@ RESULTS = list(result_vectors())
 
 
 @pytest.mark.parametrize("name,samples,caps,expected", RESULTS, ids=[row[0] for row in RESULTS])
-@future("4Pb", "the pure pace calculation must satisfy the numerical vector named in this case")
 def test_16b_pace_results(replay, name, samples, caps, expected):
     pace = pace_view(replay, samples, caps=caps, now=87000 if name == "exact-aging-crossing" else 86400)
     for key, wanted in expected.items():
@@ -1630,10 +1646,12 @@ def test_16b_pace_results(replay, name, samples, caps, expected):
     ([0, 240, 480], False), ([899, 1799, 1801], False),
     ([0, 3000, 6000], True),
 ], ids=["no-middle", "45m02-span", "four-minute-chain", "jitter-chain", "over-hour-span"])
-@future("4Pb", "single-linkage reset components must be transitive and order-independent")
 def test_16b_cycle_grouping_in_every_arrival_order(replay, offsets, ambiguous):
     samples = steady(reset=604800 + min(offsets))
-    samples += [sample(86400, 12, reset=604800 + offset, mac=f"m{i + 2}") for i, offset in enumerate(offsets)]
+    # Distinct disputed values: identical readings from another Mac would be
+    # duplicates of the history's last reading and never reach grouping.
+    samples += [sample(86400, 12 + 0.001 * (i + 1), reset=604800 + offset, mac=f"m{i + 2}")
+                for i, offset in enumerate(offsets)]
     # Permute the disputed readings while retaining enough real history for
     # a known forecast. A false split gives newest-bucket disagreement.
     history, disputed = samples[:-len(offsets)], samples[-len(offsets):]
@@ -1651,7 +1669,6 @@ def test_16b_cycle_grouping_in_every_arrival_order(replay, offsets, ambiguous):
 
 @pytest.mark.parametrize("kind", ["two-real-resets", "reusable-weekly-id", "unique-cycle-id", "mixed-cycle-ids",
                                   "idless-outside-component", "newest-witness-disagrees"])
-@future("4Pb", "cycle identity follows reset components and unique provider cycle ids")
 def test_16b_cycle_identity(replay, kind):
     samples = steady()
     for s in samples[24:]:
@@ -1683,7 +1700,6 @@ def test_16b_cycle_identity(replay, kind):
             assert pace["rate_pct_per_h"] == pytest.approx(0.5)
 
 
-@future("4Pb", "synthetic history verdicts allow for each sample's t_err")
 def test_16b_synthetic_history_with_uncertainty(replay):
     rows = load_pace(json.loads(PACE.read_text()))
     samples = [sample(row["t"], row["used"], reset=row["reset"], error=row["t_err"]) for row in rows]
@@ -1769,3 +1785,57 @@ def test_16c_pace_pushes(replay, scenario):
             count += 1
             replay.ack(info)
     assert count == wanted
+
+
+def test_4pa_cost_20000_events_with_18000_samples_stays_under_budget(replay):
+    import time as _time
+
+    from tests.routing_s4_cost_workload import build
+
+    path = routing.events_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [r for r in build(20_000, routing) if r["type"] != "rule_add"]
+    count = 0
+    for account in ("codex|", "grok|", "claude|"):
+        for window, step in (("weekly", 1800), ("five_hour", 600)):
+            for i in range(3000):
+                at = T0 - timedelta(seconds=(3000 - i) * step)
+                rows.append({"type": "usage_sample", "id": f"s{count}", "account": account,
+                             "window": window, "witness_at": routing._iso(at),
+                             "used_pct": (i * 0.25) % 90,
+                             "resets_at": routing._iso(T0 + timedelta(days=3)), "mac": "m1",
+                             "source": "probe", "t_err": 60,
+                             "written_at": routing._iso(at), "written_by": {"kind": "probe"},
+                             "via": "probe"})
+                count += 1
+    assert count == 18_000
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    view = replay.view()
+    # Samples are trimmed to what each window reads: no window keeps more
+    # buckets than its trailing window can hold.
+    for entry in view["accounts"]:
+        for pace in entry.get("pace") or []:
+            limit = 97 if pace["window"] == "weekly" else 13
+            assert pace["buckets"] <= limit, (entry["key"], pace["window"], pace["buckets"])
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "evidence", "id": "changed", "account": "grok|",
+                                 "state": "open", "source": "report",
+                                 "written_at": routing._iso(replay.now),
+                                 "written_by": {"kind": "conversation", "harness": "codex",
+                                                "project": "p", "session": "z"}, "via": "mcp"}) + "\n")
+    replay.usage(witness=replay.now, reset=T0 + timedelta(days=6))
+    replay.advance(1)
+    # The helper's table preparation is outside the measured push, as in
+    # the slice cost workload; the push itself has the one-second budget.
+    out, elapsed = None, None
+    for _attempt in range(20):
+        agent_view.prepare_routing_table(refresh=True)
+        started = _time.perf_counter()
+        try:
+            out = routing.prompt_push(recall_prompt.routing_marker("s1"), budget=1.0, now=replay.now)
+        except agent_view.InventoryUnavailable:
+            continue
+        elapsed = _time.perf_counter() - started
+        break
+    assert out is not None and out["kind"] in {"changes", "full"}
+    assert elapsed < 1.0, f"changed push took {elapsed:.3f}s at the 20,000-event/18,000-sample workload"

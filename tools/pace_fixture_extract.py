@@ -2,11 +2,13 @@
 """Extract pace_fixture_v1 rows from real routing blocks in a transcript.
 
 Deterministic and local: reads one Claude Code transcript JSONL, takes only
-user-message text blocks (tool arguments and tool results never supply a
-reading, even when they embed a decoy block), and prints the readings as
-``pace_fixture_v1`` JSON on stdout. Times are seconds relative to each
-routing block's own heading time. A malformed transcript is rejected with a
-fixed error on stderr and nothing on stdout; input is never echoed.
+user-message text (including a string content) and ``attachment`` /
+``hook_additional_context`` rows (tool arguments and tool results never
+supply a reading, even when they embed a decoy block), and prints the
+readings as ``pace_fixture_v1`` JSON on stdout. Times are seconds relative
+to the first routing block's heading time, so blocks minutes apart keep a
+real time axis. A malformed transcript is rejected with a fixed error on
+stderr, exit 2 and nothing on stdout; input is never echoed.
 """
 from __future__ import annotations
 
@@ -30,19 +32,29 @@ MONTHS = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
 WINDOWS = {"week": "weekly", "five-hour": "five_hour"}
 
 
+class Malformed(Exception):
+    pass
+
+
 def _reset_at(clock: str, origin: datetime) -> datetime | None:
     """The instant a rendered reset clock names, next after ``origin``."""
     match = re.fullmatch(r"(\d{2}):(\d{2})Z", clock)
     if match:
+        if int(match[1]) > 23 or int(match[2]) > 59:
+            raise Malformed
         at = origin.replace(hour=int(match[1]), minute=int(match[2]), second=0, microsecond=0)
         return at if at > origin else at + timedelta(days=1)
     match = re.fullmatch(r"([A-Z][a-z]{2}) (\d{2}):(\d{2})Z", clock)
     if match and match[1] in WEEKDAYS:
+        if int(match[2]) > 23 or int(match[3]) > 59:
+            raise Malformed
         at = origin.replace(hour=int(match[2]), minute=int(match[3]), second=0, microsecond=0)
         at += timedelta(days=(WEEKDAYS[match[1]] - origin.weekday()) % 7)
         return at if at > origin else at + timedelta(days=7)
     match = re.fullmatch(r"([A-Z][a-z]{2}) (\d{2}) (\d{2}):(\d{2})Z", clock)
     if match and match[1] in MONTHS:
+        if int(match[3]) > 23 or int(match[4]) > 59:
+            raise Malformed
         try:
             at = origin.replace(month=MONTHS[match[1]], day=int(match[2]), hour=int(match[3]),
                                 minute=int(match[4]), second=0, microsecond=0)
@@ -52,15 +64,28 @@ def _reset_at(clock: str, origin: datetime) -> datetime | None:
     return None
 
 
-def _readings(text: str, stamp: str | None) -> list[dict]:
-    heading = HEADING.search(text)
-    if not heading or not stamp:
-        return []
+def _stamp(row: dict) -> datetime:
+    stamp = row.get("timestamp")
+    if not isinstance(stamp, str) or not stamp:
+        raise Malformed
     try:
-        day = datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(timezone.utc)
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(timezone.utc)
     except ValueError:
-        return []
-    origin = day.replace(hour=int(heading[1]), minute=int(heading[2]), second=0, microsecond=0)
+        raise Malformed from None
+
+
+def _readings(text: str, stamp: datetime, epoch: datetime | None) -> tuple[list[dict], datetime | None]:
+    heading = HEADING.search(text)
+    if not heading:
+        return [], epoch
+    if int(heading[1]) > 23 or int(heading[2]) > 59:
+        raise Malformed
+    try:
+        origin = stamp.replace(hour=int(heading[1]), minute=int(heading[2]), second=0, microsecond=0)
+    except ValueError:
+        raise Malformed from None
+    if epoch is None:
+        epoch = origin
     out = []
     for line in text.splitlines():
         match = READING.search(line)
@@ -71,10 +96,49 @@ def _readings(text: str, stamp: str | None) -> list[dict]:
             continue
         age = int(match[1] or 0) * 3600 + int(match[2]) * 60
         label = line.split(":", 1)[0].strip()
-        out.append({"label": label, "window": WINDOWS[match[4]], "t": -age, "t_err": T_ERR,
-                    "used": 100.0 - float(match[3]),
-                    "reset": int((reset - origin).total_seconds())})
-    return out
+        out.append({"label": label, "window": WINDOWS[match[4]],
+                    "t": int((origin - timedelta(seconds=age) - epoch).total_seconds()),
+                    "t_err": T_ERR, "used": 100.0 - float(match[3]),
+                    "reset": int((reset - epoch).total_seconds())})
+    return out, epoch
+
+
+def _texts(row) -> list[str]:
+    """The reading-bearing texts of one transcript row, or Malformed."""
+    if not isinstance(row, dict):
+        raise Malformed
+    kind = row.get("type")
+    if kind == "attachment":
+        attachment = row.get("attachment")
+        if not isinstance(attachment, dict):
+            raise Malformed
+        if attachment.get("type") != "hook_additional_context":
+            return []
+        content = attachment.get("content")
+        if isinstance(content, str):
+            return [content]
+        if isinstance(content, list) and all(isinstance(part, str) for part in content):
+            return list(content)
+        raise Malformed
+    if kind != "user":
+        return []
+    message = row.get("message")
+    if not isinstance(message, dict):
+        raise Malformed
+    content = message.get("content")
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        raise Malformed
+    texts = []
+    for block in content:
+        if not isinstance(block, dict):
+            raise Malformed
+        if block.get("type") == "text":
+            if not isinstance(block.get("text"), str):
+                raise Malformed
+            texts.append(block["text"])
+    return texts
 
 
 def main(argv: list[str]) -> int:
@@ -84,19 +148,22 @@ def main(argv: list[str]) -> int:
     try:
         lines = open(argv[1], encoding="utf-8").read().splitlines()
         rows = [json.loads(line) for line in lines if line.strip()]
-    except (OSError, ValueError):
+        found: list[dict] = []
+        epoch = None
+        for row in rows:
+            texts = _texts(row)
+            if not texts:
+                continue
+            stamp = None
+            for text in texts:
+                if HEADING.search(text):
+                    if stamp is None:
+                        stamp = _stamp(row)
+                    readings, epoch = _readings(text, stamp, epoch)
+                    found.extend(readings)
+    except (OSError, ValueError, Malformed):
         print(ERROR, file=sys.stderr)
         return 2
-    found: list[dict] = []
-    for row in rows:
-        if not isinstance(row, dict) or row.get("type") != "user":
-            continue
-        content = (row.get("message") or {}).get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
-                found.extend(_readings(block["text"], row.get("timestamp")))
     accounts: dict[str, str] = {}
     windows: dict[str, str] = {}
     out, seen = [], set()

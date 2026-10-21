@@ -5810,8 +5810,13 @@ def request_cap(account: str, *, window: str, kind: str, pct, revision: str, aut
     if cap is None:
         raise RouteError("a cap takes kind share or per_day, a pct above 0 and at most 100, and a revision")
     key = _account_for_a_conversation(account, accounts())
+    by = dict(author or {})
+    if by.get("kind") != "conversation":
+        # Like request_rule: a caller-supplied owner author is never trusted;
+        # the cap stays a conversation proposal under the real author.
+        by = conversation_author()
     written, view = _write({"type": "cap_set", "account": key, "window": window, **cap,
-                            "written_by": dict(author or {}), "via": via})
+                            "written_by": by, "via": via})
     return {"ok": True, "id": written["id"], "pending": True, "account": key, "version": view.get("version")}
 
 

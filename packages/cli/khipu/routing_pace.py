@@ -84,17 +84,22 @@ def _hours(value):
 
 
 def _filter(samples, params):
-    out, last_by = [], {}
+    out, last_by, last_identical = [], {}, {}
     for s in sorted(samples, key=lambda x: (x["t"], x.get("mac") or "", x.get("source") or "", x["used"])):
         if s.get("t_err", 0) > params["sample_s"]:
             continue
         key = (s.get("mac"), s.get("source"))
         if key in last_by and s["t"] <= last_by[key]:
             continue
-        if any(k["used"] == s["used"] and 0 <= (s["t"] - k["t"]).total_seconds() <= s.get("t_err", 0) for k in out):
+        # Only an identical reading from the same Mac and source, carrying
+        # the same reset, is a duplicate; a disagreeing witness is evidence.
+        ident = (s.get("mac"), s.get("source"), s.get("reset"), s["used"])
+        kept_at = last_identical.get(ident)
+        if kept_at is not None and 0 <= (s["t"] - kept_at).total_seconds() <= s.get("t_err", 0):
             continue
         out.append(dict(s))
         last_by[key] = s["t"]
+        last_identical[ident] = s["t"]
     return out
 
 
@@ -153,6 +158,18 @@ def compute_pace(samples, caps, now, window):
         pace["why"] = "this account can't be probed"
         return pace
     _cycles(samples, window)
+    # Only the windows the calculations read can matter: the trailing window
+    # (a rolling day for a per-day cap), plus the newest reading before it
+    # per witness and cycle, which anchors the interval straddling its start.
+    horizon = 86400 if any(c.get("kind") == "per_day" for c in caps) else trailing
+    horizon_start = now - timedelta(seconds=horizon)
+    before: dict = {}
+    for s in samples:
+        if s["t"] < horizon_start:
+            ident = (s.get("mac"), s.get("source"), s["_cycle_key"])
+            if ident not in before or s["t"] > before[ident]["t"]:
+                before[ident] = s
+    samples = [s for s in samples if s["t"] >= horizon_start] + list(before.values())
     # Raw possible resets, judged before any bucket maximum can hide them.
     ordered = sorted(samples, key=lambda x: (x["t"], x.get("mac") or "", x.get("source") or "", x["used"]))
     for i, s in enumerate(ordered):
@@ -162,26 +179,32 @@ def compute_pace(samples, caps, now, window):
     segments = {}
     for key in {s["_cycle_key"] for s in ordered}:
         group = [s for s in ordered if s["_cycle_key"] == key]
+        # The highest later reading in this same cycle, for refute checks.
+        suffix_high: list = [None] * (len(group) + 1)
+        for pos in range(len(group) - 1, -1, -1):
+            suffix_high[pos] = group[pos]["used"] if suffix_high[pos + 1] is None \
+                else max(suffix_high[pos + 1], group[pos]["used"])
         high, seg = None, 0
         for pos, s in enumerate(group):
             s["_segment"] = (key, seg)
             if high is None or s["used"] >= high:
                 high = s["used"] if high is None else max(high, s["used"])
                 continue
+            if suffix_high[pos + 1] is not None and suffix_high[pos + 1] >= high:
+                # A later reading in this cycle returns to the high: the
+                # whole dip is a correction, rebound included.
+                s["_correction"] = True
+                continue
             if s["used"] < high - 5:
-                later = ordered[s["_i"] + 1:]
-                if any(x["used"] >= high for x in later):
-                    s["_correction"] = True
-                    continue
-                nxt = later[:2]
-                if (later and later[0]["_cycle_key"] != key) or (len(nxt) == 2 and all(x["used"] < high - 5 for x in nxt)):
+                nxt = ordered[s["_i"] + 1:s["_i"] + 3]
+                if (nxt and nxt[0]["_cycle_key"] != key) or (len(nxt) == 2 and all(x["used"] < high - 5 for x in nxt)):
                     seg += 1
                     s["_segment"] = (key, seg)
                     high = s["used"]
                     continue
                 pending = True
-            # A smaller drop is a correction only in bucket intervals; the
-            # raw point stays, and negative bucket gains are excluded below.
+            # A smaller unrecovered drop stays a raw point; negative bucket
+            # gains are excluded below.
         segments[key] = seg
     newest = max(samples, key=lambda x: x["t"])
     bucket_no = int(newest["t"].timestamp() // params["bucket_s"])
@@ -209,13 +232,8 @@ def compute_pace(samples, caps, now, window):
     pace["buckets"] = len(in_window)
 
     def clipped(intervals_start, intervals_end):
-        gains = durations = gap = 0.0
+        gains = durations = gap = disagree = 0.0
         for a, b in zip(blist, blist[1:]):
-            if a["segment"] != b["segment"] or b["correction"]:
-                continue
-            gain = b["value"] - a["value"]
-            if gain < 0:
-                continue
             dur = (b["time"] - a["time"]).total_seconds()
             if dur <= 0:
                 continue
@@ -223,13 +241,21 @@ def compute_pace(samples, caps, now, window):
             inside = (hi - lo).total_seconds()
             if inside <= 0:
                 continue
+            if a["segment"] != b["segment"]:
+                disagree += inside
+                continue
+            if a["correction"] or b["correction"]:
+                continue
+            gain = b["value"] - a["value"]
+            if gain < 0:
+                continue
             gains += gain * inside / dur
             durations += inside
             if dur > params["gap_s"]:
                 gap += inside
-        return gains, durations, gap
+        return gains, durations, gap, disagree
 
-    gains, valid_dur, gap_time = clipped(start, now)
+    gains, valid_dur, gap_time, disagree_time = clipped(start, now)
     rate = gains / (valid_dur / 3600) if valid_dur > 0 else None
     pace["rate_pct_per_h"] = rate
     pace["valid_pct"] = valid_dur / trailing * 100
@@ -253,7 +279,10 @@ def compute_pace(samples, caps, now, window):
     elif len(in_window) < 3:
         why = f"only {len(in_window)} readings in the last {params['trailing_h']} h"
     elif pace["valid_pct"] < 50 or pace["observed_pct"] < 50:
-        why = f"readings cover only {_hours(max(0.0, (valid_dur - gap_time) / 3600))} of the last {params['trailing_h']} h"
+        if disagree_time > 0:
+            why = f"readings disagree for {_hours(disagree_time / 3600)} of the last {params['trailing_h']} h"
+        else:
+            why = f"readings cover only {_hours(max(0.0, (valid_dur - gap_time) / 3600))} of the last {params['trailing_h']} h"
     elif blist and (now - blist[-1]["time"]).total_seconds() > 2 * params["sample_s"]:
         age_h = (now - blist[-1]["time"]).total_seconds() / 3600
         why = f"last reading {_hours(age_h)} h old"
@@ -305,52 +334,67 @@ def compute_pace(samples, caps, now, window):
     day = next((c for c in caps if c["kind"] == "per_day"), None)
     if day:
         day_start = now - timedelta(hours=24)
-        dgain, ddur, dgap = clipped(day_start, now)
+        dgain, ddur, dgap, _ddis = clipped(day_start, now)
         dobs = max(0.0, (ddur - dgap) / 86400 * 100)
         verdict = "unknown"
+        day_why = None
+        if ddur < 20 * 3600 or dobs < 50:
+            day_why = f"the last 24 h are covered for only {_hours(max(0.0, (ddur - dgap) / 3600))} h"
         reaches = peak = peak_at = None
         settles = 24 * rate if rate is not None else None
-        if ddur >= 20 * 3600 and dobs >= 50:
+        if day_why is None:
             verdict = "over" if dgain > day["pct"] else "near" if dgain >= 0.85 * day["pct"] else "under"
             # Exact walk of S(delta) = G + r*delta - A(delta), breakpoints at
-            # each bucket time's age-out moment.
+            # each bucket time's age-out moment. A is swept once: every valid
+            # interval adds its gain rate to A's slope between the moments
+            # its start and its end age out, so the walk is linear.
             points = sorted({b["time"] for b in blist if day_start <= b["time"] <= now})
             breaks = sorted({0.0, 86400.0, *[(t - day_start).total_seconds() for t in points]})
             breaks = [b for b in breaks if 0 <= b <= 86400]
+            slope_at: dict[float, float] = {}
+            for a, b in zip(blist, blist[1:]):
+                if a["segment"] != b["segment"] or a["correction"] or b["correction"] or b["value"] < a["value"]:
+                    continue
+                dur = (b["time"] - a["time"]).total_seconds()
+                if dur <= 0:
+                    continue
+                start_age = max(0.0, (max(a["time"], day_start) - day_start).total_seconds())
+                end_age = min(86400.0, (b["time"] - day_start).total_seconds())
+                if end_age <= start_age:
+                    continue
+                per_s = (b["value"] - a["value"]) / dur
+                slope_at[start_age] = slope_at.get(start_age, 0.0) + per_s
+                slope_at[end_age] = slope_at.get(end_age, 0.0) - per_s
 
-            def aged(delta):
-                lo = day_start + timedelta(seconds=delta)
-                total = 0.0
-                for a, b in zip(blist, blist[1:]):
-                    if a["segment"] != b["segment"] or b["correction"] or b["value"] < a["value"]:
-                        continue
-                    dur = (b["time"] - a["time"]).total_seconds()
-                    inside = (min(b["time"], lo) - max(a["time"], day_start)).total_seconds()
-                    if dur > 0 and inside > 0:
-                        total += (b["value"] - a["value"]) * inside / dur
-                return total
+            aged, slope = 0.0, slope_at.get(0.0, 0.0)
 
-            def s_of(delta):
-                return dgain + (rate or 0) * delta / 3600 - aged(delta)
+            def s_of(delta, aged_value):
+                return dgain + (rate or 0) * delta / 3600 - aged_value
 
-            peak, peak_delta = s_of(0), 0.0
+            peak, peak_delta = s_of(0.0, 0.0), 0.0
+            reaches = None
             for a, b in zip(breaks, breaks[1:]):
-                for d in (a, b):
-                    if s_of(d) > peak:
-                        peak, peak_delta = s_of(d), d
+                sa = s_of(a, aged)
+                aged_b = aged + slope * (b - a)
+                sb = s_of(b, aged_b)
+                for d, value in ((a, sa), (b, sb)):
+                    if value > peak:
+                        peak, peak_delta = value, d
                 if verdict != "over" and reaches is None:
-                    sa, sb = s_of(a), s_of(b)
                     if sa >= day["pct"]:
                         reaches = a
                     elif sa < day["pct"] <= sb and sb > sa:
                         reaches = a + (day["pct"] - sa) / (sb - sa) * (b - a)
+                aged = aged_b
+                slope += slope_at.get(b, 0.0)
             peak_at = iso(now + timedelta(seconds=peak_delta))
             if verdict == "over":
                 reaches = 0.0
             reaches = iso(now + timedelta(seconds=reaches)) if reaches is not None else None
         pace["day_cap"] = {"revision": day["revision"], "pct": day["pct"], "verdict": verdict,
                            "used_24h_pct": dgain, "observed_pct": dobs, "settles_at_pct": settles,
-                           "peak_pct": peak, "peak_at": peak_at, "reaches_cap_at": reaches}
+                           "peak_pct": peak, "peak_at": peak_at, "reaches_cap_at": reaches,
+                           "why": day_why}
     # Headline: reached/over, then earliest crossing, then near, then plan.
     ranked = []
     if pace["plan"]["verdict"] in ("limit_reached",):
@@ -385,19 +429,30 @@ def pace_line(label, pace, now):
         return f"{label} {word}: {verdict.replace('_', ' ')} at the trailing average ({rate_text})"
     needed = obj.get("needed_pct_per_h")
     needed_text = f"{_rate_words(needed)}%/h" if needed is not None else "no rate"
+    lands = f"{needed_text} lands on {obj.get('pct') or 100:g}%" if isinstance(obj.get('pct') or 100, (int, float)) \
+        else f"{needed_text} lands on 100%"
+    gappy = " (gappy readings)" if pace.get("gappy") else ""
+    lines = []
     if obj.get("runs_out_at"):
         runs = parse(obj["runs_out_at"])
         before = obj.get("before_reset_s")
         tail = f", {_span(before)} before reset" if before is not None else ""
-        return (f"{label} {word}: {verdict} at the trailing average ({rate_text}); runs out "
-                f"{_clock(runs, now)}{tail}; {needed_text} lands on the limit")
-    if obj.get("reaches_cap_at"):
-        return (f"{label} {word}: {verdict} at the trailing average ({rate_text}); reaches its cap "
-                f"{_clock(parse(obj['reaches_cap_at']), now)}; {needed_text} lands on the limit")
-    if verdict == "underpacing" and obj.get("unused_at_reset_pct") is not None:
-        return (f"{label} {word}: underpacing at the trailing average ({rate_text}); about "
-                f"{obj['unused_at_reset_pct']:g}% unused at the reset; {needed_text} lands on the limit")
-    return f"{label} {word}: {verdict} at the trailing average ({rate_text}); {needed_text} lands on the limit"
+        lines.append(f"{label} {word}: {verdict} at the trailing average ({rate_text}); runs out "
+                     f"{_clock(runs, now)}{tail}; {lands}{gappy}")
+        lines.append(f"{label} {word}: {verdict} at the trailing average ({rate_text}); runs out "
+                     f"{_clock(runs, now)}; {lands}{gappy}")
+    elif obj.get("reaches_cap_at"):
+        lines.append(f"{label} {word}: {verdict} at the trailing average ({rate_text}); reaches its cap "
+                     f"{_clock(parse(obj['reaches_cap_at']), now)}; {lands}{gappy}")
+    elif verdict == "underpacing" and obj.get("unused_at_reset_pct") is not None:
+        lines.append(f"{label} {word}: underpacing at the trailing average ({rate_text}); about "
+                     f"{obj['unused_at_reset_pct']:g}% unused at the reset; {lands}{gappy}")
+    lines.append(f"{label} {word}: {verdict} at the trailing average ({rate_text}); {lands}{gappy}")
+    lines.append(f"{label} {word}: {verdict} ({rate_text}); {lands}{gappy}")
+    for line in lines:
+        if len(line) <= 160:
+            return line
+    return lines[-1][:160]
 
 
 def forecast(pace, account, label, now=None):
@@ -448,8 +503,9 @@ def should_push(acked, current, now):
     if (old_eta is None) != (new_eta is None):
         return True
     if old_eta and new_eta:
-        # Bands and movement compare each forecast's remaining time as it
-        # stood when it was made, not a value that decays with the clock.
+        # Bands compare remaining time, but movement compares the absolute
+        # projected run-out times: a forecast that has not moved does not
+        # push merely because the clock advanced.
         old_s = acked.get("eta_s")
         new_s = current.get("eta_s")
         if old_s is None:
@@ -459,7 +515,8 @@ def should_push(acked, current, now):
         for band in (86400, 21600, 3600, 900):
             if old_s >= band > new_s:
                 return True
-        if abs(new_s - old_s) > max(900, 0.25 * abs(old_s)):
+        moved_s = abs((parse(new_eta) - parse(old_eta)).total_seconds())
+        if moved_s > max(900, 0.25 * abs(old_s)):
             return True
     return False
 
@@ -476,6 +533,12 @@ def should_sample(existing, candidate, *, costly=False):
     age = (candidate["t"] - last["t"]).total_seconds()
     if age <= 0:
         return False
-    if age >= interval or age >= 3600:
+    if age >= 3600:
         return True
-    return abs(candidate["used"] - last["used"]) >= 0.5 and age >= 120
+    if abs(candidate["used"] - last["used"]) >= 0.5 and age >= 120:
+        return True
+    # The fast cadence applies only while usage moved in the last hour;
+    # an idle window is sampled hourly (the age check above).
+    recent = [s for s in prior if (candidate["t"] - s["t"]).total_seconds() <= 3600]
+    moved_recently = len(recent) > 1 and max(s["used"] for s in recent) > min(s["used"] for s in recent)
+    return moved_recently and age >= interval
