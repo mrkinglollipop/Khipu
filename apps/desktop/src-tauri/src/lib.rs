@@ -944,6 +944,7 @@ const ROUTING_SWITCH_KEYS: &[&str] = &[
     "routing_push_delegation",
     "routing_reset_check",
     "routing_pace_order",
+    "routing_proposal_text_between_macs",
 ];
 /// The owner's own dispatch scripts, by file name (phase 6).
 const ROUTING_DISPATCH_SCRIPTS_KEY: &str = "routing_dispatch_scripts";
@@ -1841,11 +1842,35 @@ fn route_operation_argv(mut argv: Vec<String>, op: Option<&str>) -> Result<Vec<S
     Ok(argv)
 }
 
+/// The end-or-keep choices for the holds and pauses a write names, as
+/// `--holds={"id":"end"|"keep"}`: the same checked map the priority command
+/// takes, joined to its flag so no id can become an argument of its own.
+fn checked_holds_arg(holds: &serde_json::Map<String, Value>) -> Result<String, String> {
+    if holds.len() > ROUTE_PRIORITY_MOST || holds.iter().any(|(id, choice)| {
+        id.trim().is_empty() || id.len() > 256 || !matches!(choice.as_str(), Some("end" | "keep"))
+    }) {
+        return Err("holds must map each hold id to end or keep".to_string());
+    }
+    Ok(format!("--holds={}", Value::Object(holds.clone())))
+}
+
 fn route_rule_argv(action: &str, n: Option<u32>, text: Option<&str>) -> Result<Vec<String>, String> {
+    route_rule_argv_holds(action, n, text, None)
+}
+
+fn route_rule_argv_holds(
+    action: &str,
+    n: Option<u32>,
+    text: Option<&str>,
+    holds: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<String>, String> {
     if !ROUTE_RULE_ACTIONS.contains(&action) {
         return Err(format!("not a rule change: {action:?}"));
     }
     let mut argv = route_base("rule");
+    if let Some(holds) = holds {
+        argv.push(checked_holds_arg(holds)?);
+    }
     argv.extend(["--".to_string(), action.to_string()]);
     if action != "add" {
         let n = n.filter(|n| *n >= 1).ok_or_else(|| "name the rule's number".to_string())?;
@@ -1946,12 +1971,7 @@ fn route_priority_argv_expect(
     }
     let mut argv = route_base("priority");
     if let Some(holds) = holds {
-        if holds.len() > ROUTE_PRIORITY_MOST || holds.iter().any(|(id, choice)| {
-            id.trim().is_empty() || id.len() > 256 || !matches!(choice.as_str(), Some("end" | "keep"))
-        }) {
-            return Err("holds must map each hold id to end or keep".to_string());
-        }
-        argv.push(format!("--holds={}", Value::Object(holds.clone())));
+        argv.push(checked_holds_arg(holds)?);
     }
     if action == "set" {
         if entries.is_empty() {
@@ -2422,6 +2442,84 @@ async fn khipu_owner_direction_set(key: String, value: String) -> Result<String,
     run_khipu_cli_async(owner_direction_set_argv(&key, &value)?).await
 }
 
+/// A project name as the app sends it, held to the safe shape the CLI holds
+/// it to (`identity.safe_project_name`): a remote's `owner/repo`
+/// (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,100}`) or a folder name
+/// (`[A-Za-z0-9._][A-Za-z0-9._ -]{0,99}`). Anything else (a `|`, a newline,
+/// a backtick, a leading dash) is refused here, before the CLI is run.
+fn checked_project_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
+    let slug = match name.split_once('/') {
+        Some((owner, repo)) => {
+            let n = owner.chars().count();
+            let r = repo.chars().count();
+            owner.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+                && n <= 100
+                && owner.chars().all(word)
+                && (1..=100).contains(&r)
+                && repo.chars().all(word)
+        }
+        None => false,
+    };
+    let folder = name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+        && name.chars().count() <= 100
+        && name.chars().all(|c| word(c) || c == ' ');
+    if !(slug || folder) {
+        return Err("that is not a project name Khipu uses (letters, digits, dots, dashes and underscores, \
+                    with one owner/repo slash at most)"
+            .to_string());
+    }
+    Ok(name.to_string())
+}
+
+const PROJECTS_LIST_ARGV: &[&str] = &["project", "list", "--json"];
+
+fn project_owner_argv(verb: &[&str], flags: &[(&str, &str)], names: &[&str]) -> Result<Vec<String>, String> {
+    let mut argv: Vec<String> = vec!["project".to_string()];
+    argv.extend(verb.iter().map(|s| s.to_string()));
+    argv.push("--from-app".to_string());
+    for (flag, value) in flags {
+        argv.push(flag.to_string());
+        argv.push(checked_project_name(value)?);
+    }
+    argv.push("--".to_string());
+    for n in names {
+        argv.push(checked_project_name(n)?);
+    }
+    Ok(argv)
+}
+
+#[tauri::command]
+async fn khipu_projects_list() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(PROJECTS_LIST_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_project_name_add(older: String, current: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["alias", "add"], &[], &[&older, &current])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_name_remove(older: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["alias", "remove"], &[], &[&older])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_separate(name: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["separate"], &[], &[&name])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_merge(a: String, b: String, show_as: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["merge"], &[("--show-as", &show_as)], &[&a, &b])?).await
+}
+
+#[tauri::command]
+async fn khipu_project_keep_separate(a: String, b: String) -> Result<String, String> {
+    run_khipu_cli_async(project_owner_argv(&["keep-separate"], &[], &[&a, &b])?).await
+}
+
 #[tauri::command]
 async fn khipu_route_clear(account: String, report: Option<String>, op: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(route_operation_argv(route_clear_argv(&account, report.as_deref())?, op.as_deref())?).await
@@ -2438,8 +2536,14 @@ async fn khipu_route_note_end(op: Option<String>) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn khipu_route_rule(action: String, n: Option<u32>, text: Option<String>, op: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(route_operation_argv(route_rule_argv(&action, n, text.as_deref())?, op.as_deref())?).await
+async fn khipu_route_rule(
+    action: String,
+    n: Option<u32>,
+    text: Option<String>,
+    holds: Option<serde_json::Map<String, Value>>,
+    op: Option<String>,
+) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_rule_argv_holds(&action, n, text.as_deref(), holds.as_ref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
@@ -4951,6 +5055,12 @@ pub fn run() {
             khipu_owner_direction_acknowledge,
             khipu_owner_direction_switch,
             khipu_owner_direction_set,
+            khipu_projects_list,
+            khipu_project_name_add,
+            khipu_project_name_remove,
+            khipu_project_separate,
+            khipu_project_merge,
+            khipu_project_keep_separate,
             khipu_route_clear,
             khipu_route_note_set,
             khipu_route_note_end,
@@ -5533,6 +5643,39 @@ mod settings_command_tests {
     }
 
     #[test]
+    fn project_commands_are_fixed_verbs_marked_from_the_app() {
+        assert_eq!(fixed_argv(PROJECTS_LIST_ARGV), v(&["project", "list", "--json"]));
+        assert_eq!(
+            project_owner_argv(&["alias", "add"], &[], &["o/old", "o/new"]).unwrap(),
+            v(&["project", "alias", "add", "--from-app", "--", "o/old", "o/new"])
+        );
+        assert_eq!(
+            project_owner_argv(&["merge"], &[("--show-as", "o/b")], &["o/a", "o/b"]).unwrap(),
+            v(&["project", "merge", "--from-app", "--show-as", "o/b", "--", "o/a", "o/b"])
+        );
+        assert_eq!(
+            project_owner_argv(&["separate"], &[], &["o/old"]).unwrap(),
+            v(&["project", "separate", "--from-app", "--", "o/old"])
+        );
+        assert!(project_owner_argv(&["alias", "remove"], &[], &[""]).is_err());
+        assert!(project_owner_argv(&["alias", "remove"], &[], &["a\nb"]).is_err());
+    }
+
+    #[test]
+    fn project_names_are_held_to_the_safe_shape_before_the_cli_runs() {
+        for ok in ["o/old", "my-folder", "my folder.v2", "_x", "a.b/c_d-e", "  o/padded  "] {
+            assert!(checked_project_name(ok).is_ok(), "{ok:?} should pass");
+        }
+        let long_owner = format!("{}/r", "a".repeat(101));
+        let long_folder = "a".repeat(101);
+        for bad in ["", "o/a|o/b", "a|b", "o/a\no/b", "o/a`x`", "--x", "-x", "o/", "/r", "a/b/c", "o /r", "o/a b", "é/x", &long_owner, &long_folder] {
+            assert!(checked_project_name(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert!(project_owner_argv(&["keep-separate"], &[], &["--x", "o/b"]).is_err());
+        assert!(project_owner_argv(&["merge"], &[("--show-as", "o/a|o/b")], &["o/a", "o/b"]).is_err());
+    }
+
+    #[test]
     fn owner_direction_commands_are_fixed_verbs_marked_from_the_app() {
         assert_eq!(fixed_argv(OWNER_DIRECTION_SHOW_ARGV), v(&["owner-direction", "show"]));
         assert_eq!(fixed_argv(OWNER_DIRECTION_ACTIONS_ARGV), v(&["owner-direction", "actions", "--json"]));
@@ -5624,6 +5767,13 @@ mod settings_command_tests {
                 v(&["route", "rule", "--from-app", "--", action, "6"])
             );
         }
+        let holds = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("end")))]);
+        assert_eq!(
+            route_rule_argv_holds("confirm", Some(6), None, Some(&holds)).unwrap(),
+            v(&["route", "rule", "--from-app", "--holds={\"h-grok\":\"end\"}", "--", "confirm", "6"])
+        );
+        let bad = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("drop")))]);
+        assert!(route_rule_argv_holds("confirm", Some(6), None, Some(&bad)).is_err());
         assert_eq!(
             route_hold_add_argv("No new launches", "machine-busy", "machine", None, None).unwrap(),
             v(&["route", "hold", "--from-app", "--reason=machine-busy", "--machine", "--", "No new launches"])

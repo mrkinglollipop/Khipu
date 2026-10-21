@@ -2881,6 +2881,19 @@ def cmd_project(args: argparse.Namespace) -> int:
     """K6: `khipu project backfill [--dry-run|--apply] [--limit N]` — resolve
     a project for episodes that have none, from the session's other episodes
     or a known repo_root. Never from a session id or free-text scope."""
+    if getattr(args, "project_cmd", None) == "show":
+        from khipu import project_group
+
+        return project_group.cmd_show(args)
+    if getattr(args, "project_cmd", None) == "list":
+        from khipu import project_group
+
+        return project_group.cmd_list(args)
+    if getattr(args, "project_cmd", None) in ("merge", "keep-separate", "separate") or (
+            getattr(args, "project_cmd", None) == "alias" and getattr(args, "alias_cmd", None) in ("add", "remove")):
+        from khipu import project_group
+
+        return project_group.cmd_owner(args)
     if getattr(args, "project_cmd", None) == "alias":
         return cmd_project_alias(args)
     if getattr(args, "project_cmd", None) == "renames":
@@ -5041,6 +5054,31 @@ class _Parser(argparse.ArgumentParser):
     """Usage errors quote what was typed; a key-shaped value is masked first.
     Subparsers inherit the class."""
 
+    def _match_arguments_partial(self, actions, arg_strings_pattern):
+        counts = super()._match_arguments_partial(actions, arg_strings_pattern)
+        # Keep an empty optional/variadic positional available for the explicit
+        # `--` tail. Otherwise argparse can finish it before intervening flags
+        # (e.g. `rule add --from-app -- words`) and reject the literal words.
+        # With no remaining separator, retain argparse's existing behaviour.
+        if "-" in arg_strings_pattern[sum(counts):]:
+            while counts and counts[-1] == 0:
+                counts.pop()
+        offset = 0
+        self._positional_separators = {}
+        for action, count in zip(actions, counts):
+            self._positional_separators[action] = "-" in arg_strings_pattern[offset:offset + count]
+            offset += count
+        return counts
+
+    def _get_values(self, action, arg_strings):
+        # argparse strips a `--` from each positional, even when that token
+        # was literal text after a separator consumed by an earlier positional.
+        # Supply the marker it expects to strip, preserving the actual value.
+        if (not action.option_strings and action.nargs not in (argparse.PARSER, argparse.REMAINDER)
+                and "--" in arg_strings and not self._positional_separators.get(action, True)):
+            arg_strings = ["--", *arg_strings]
+        return super()._get_values(action, arg_strings)
+
     def error(self, message: str):
         from khipu.redact import redact_secrets
 
@@ -5923,6 +5961,8 @@ def build_parser() -> argparse.ArgumentParser:
     bf_identity.add_argument("--limit", type=int, default=None)
     bf.set_defaults(func=cmd_backfill)
 
+    from khipu import owner_direction
+
     proj = sub.add_parser("project", help="Project identity maintenance (K6)")
     proj_sub = proj.add_subparsers(dest="project_cmd", required=True)
     proj_bf = proj_sub.add_parser(
@@ -5940,10 +5980,32 @@ def build_parser() -> argparse.ArgumentParser:
     al_add = alias_sub.add_parser("add", help="Make ALIAS another key for CANONICAL")
     al_add.add_argument("alias")
     al_add.add_argument("canonical")
+    owner_direction.add_owner_flags(al_add)
+    al_add.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     al_list = alias_sub.add_parser("list", help="List the aliases")
     al_list.add_argument("--json", action="store_true")
     al_rm = alias_sub.add_parser("remove", help="Remove an alias")
     al_rm.add_argument("alias")
+    owner_direction.add_owner_flags(al_rm)
+    al_rm.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
+    proj_show = proj_sub.add_parser("show", help="Is NAME one project? Its names, evidence, counts and pairs")
+    proj_show.add_argument("name")
+    proj_show.add_argument("--json", action="store_true")
+    proj_list = proj_sub.add_parser("list", help="Every project with more than one name, every pair, the last GitHub check")
+    proj_list.add_argument("--json", action="store_true", help="(always JSON)")
+    proj_merge = proj_sub.add_parser("merge", help="Merge an asked pair: both read as one project (owner)")
+    proj_merge.add_argument("a")
+    proj_merge.add_argument("b")
+    proj_merge.add_argument("--show-as", dest="show_as", required=True, help="The name to keep (A or B)")
+    proj_keep = proj_sub.add_parser("keep-separate", help="Keep an asked pair as two projects (owner)")
+    proj_keep.add_argument("a")
+    proj_keep.add_argument("b")
+    proj_sep = proj_sub.add_parser("separate", help="NAME is not its canonical's project: remove it as an older "
+                                   "name and never link them again (owner)")
+    proj_sep.add_argument("name")
+    for _p in (proj_merge, proj_keep, proj_sep):
+        owner_direction.add_owner_flags(_p)
+        _p.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     proj_ren = proj_sub.add_parser("renames", help="GitHub rename detection")
     ren_sub = proj_ren.add_subparsers(dest="renames_cmd", required=True)
     ren_check = ren_sub.add_parser("check", help="Ask GitHub what recent projects are called now; record renames")

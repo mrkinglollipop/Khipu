@@ -65,6 +65,9 @@ import { OwedChangeDialog, OwedSelectionBar, OwedTidyDialog, owedChange } from "
 import type { OwedOwner } from "./OwedBulk";
 import { OptionalFeatures } from "./OptionalFeatures";
 import { OwnerActions } from "./OwnerActions";
+import { ProjectsSettings, askedCount } from "./ProjectsSettings";
+import { useCliState } from "./settingsCli";
+import type { ProjectsList } from "./ProjectsSettings";
 import { EmbeddingsPanel } from "./EmbeddingsPanel";
 import { fmtAgo, fmtAgoFromRead, fmtClock } from "./time";
 import {
@@ -577,6 +580,7 @@ type SettingsSection =
   | "routing"
   | "owner"
   | "work"
+  | "projects"
   | "features"
   | "index"
   | "data"
@@ -591,6 +595,7 @@ const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["routing", "Accounts and routing"],
   ["owner", "Owner actions"],
   ["work", "Work"],
+  ["projects", "Projects"],
   ["features", "Optional features"],
   ["index", "Embeddings"],
   ["data", "Data & backups"],
@@ -2726,6 +2731,9 @@ export default function App() {
     ipv4?: string;
   } | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("database");
+  // Read once at start, so the count beside Projects shows before it is opened.
+  const projects = useCliState<ProjectsList>("khipu_projects_list", true);
+  const projectsWaiting = askedCount(projects.data);
   // Plan usage (docs/plans/2026-10-14-plan-usage.md, phase 2). Doctor carries
   // only the cached figures; the app reads `khipu usage --json` itself (it can
   // probe on demand) and adds one attention item when any window still in
@@ -5856,6 +5864,11 @@ export default function App() {
                     onClick={() => setSettingsSection(id)}
                   >
                     {label}
+                    {id === "projects" && projectsWaiting > 0 ? (
+                      <span className="nav-count" aria-label={`${projectsWaiting} waiting for your answer`}>
+                        {projectsWaiting}
+                      </span>
+                    ) : null}
                   </button>
                 ))}
               </div>
@@ -6032,6 +6045,10 @@ export default function App() {
                       />
                     }
                   />
+                ) : null}
+
+                {settingsSection === "projects" ? (
+                  <ProjectsSettings active={tab === "settings" && settingsSection === "projects"} state={projects} />
                 ) : null}
 
                 {settingsSection === "features" ? (

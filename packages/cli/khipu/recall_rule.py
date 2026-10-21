@@ -98,6 +98,9 @@ pages, and a knowledge graph, searchable through the `khipu` MCP tools.
   `khipu_route_report` logs a limit you hit; `khipu_route_rule` and
   `khipu_route_priority` write an owner-requested rule or account
   order (pending until confirmed). Khipu reports; you route.
+- `khipu_project` shows whether names are one project (aliases, evidence,
+  counts); the owner merges or separates a pair via `khipu_owner_act`
+  `project.merge` / `project.keep_separate`, and `project.alias_add` / `_remove`.
 - Capture writes: on a local Mac with a Khipu capture hook (`khipu-stop-hook`
   or `khipu-aegis-capture`) the hook is the writer, not you — but `khipu_capture`
   works there too: call it (or `khipu capture now` in a shell) when you
@@ -261,10 +264,16 @@ def _commitment_age_days(c: dict) -> int | None:
         return None
 
 
+def _pair_lines(slice_data: dict) -> list[str]:
+    from khipu.project_group import slice_lines
+
+    return slice_lines(slice_data.get("pairs") or [])
+
+
 def _render_project_slice(label: str, slice_data: dict) -> str:
     from khipu.snippets import clip_snippet
 
-    lines = ["## Pushed slice", f"project: `{label}`"]
+    lines = ["## Pushed slice", f"project: `{label}`", *_pair_lines(slice_data)]
     owed = slice_data.get("commitments") or []
     if owed:
         lines.append("### Open commitments")
@@ -457,7 +466,7 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
             except Exception:  # noqa: BLE001 - directions never break the pushed slice
                 direction_ids = []
         if slice_data and (slice_data.get("commitments") or slice_data.get("episodes")
-                           or direction_ids):
+                           or slice_data.get("pairs") or direction_ids):
             rendered = _render_project_slice(project or host or "unknown", slice_data)
             if direction_ids:
                 noun = "direction" if len(direction_ids) == 1 else "directions"

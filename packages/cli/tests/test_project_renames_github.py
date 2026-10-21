@@ -11,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from khipu import cli, identity, jobs, project_renames as pr
+from khipu import cli, identity, jobs, project_group, project_renames as pr
 from tests.hermetic_pg import MIGRATIONS, hub, pg_cluster  # noqa: F401
 
 OLD, NEW = "o/church", "o/olive"
@@ -190,3 +190,35 @@ def test_doctor_block_skipped_recently_is_ok_then_yellow_after_three_days(conn):
     assert pr.doctor_block(conn.cursor())["severity"] == "yellow"
     pr._write_last({"result": "ok"})
     assert pr.doctor_block(conn.cursor())["severity"] == "ok"
+
+
+def test_a_kept_separate_pair_is_never_linked_by_the_sweep(conn):
+    _episode(conn, OLD)
+    conn.execute("INSERT INTO project_pairs (a, b, state, decided_at) VALUES (%s, %s, 'kept_separate', now())",
+                 tuple(sorted((OLD, NEW))))
+    conn.commit()
+    out = pr.sweep(conn, _answers({OLD: (NEW, None)}))
+    assert out["result"] == "ok" and out["renamed"] == []
+    assert out["skipped_by_owner"] == [{"old": OLD, "new": NEW}]
+    assert _rows(conn, "SELECT alias FROM project_aliases") == []
+    assert _rows(conn, "SELECT state FROM project_pairs") == [("kept_separate",)]
+
+
+def test_a_name_kept_separate_from_a_project_stays_separate_after_that_project_is_renamed(conn):
+    """Separate B from C, rename C to D, then GitHub says B is now D: B and
+    C would share D's group, so the sweep links nothing."""
+    b, c, d = "o/bee", "o/cee", "o/dee"
+    conn.execute("INSERT INTO project_aliases (alias, project, source) VALUES (%s, %s, 'github')", (b, c))
+    conn.commit()
+    with conn.cursor() as cur:
+        assert project_group.apply(cur, project_group.ACTION_SEPARATE, [b])["ok"]
+    conn.commit()
+    with conn.cursor() as cur:
+        assert identity.record_rename(cur, c, d, source="github")["ok"]
+    conn.commit()
+    _episode(conn, b)
+    out = pr.sweep(conn, _answers({b: (d, None)}))
+    assert out["result"] == "ok" and out["renamed"] == [], out
+    assert out["skipped_by_owner"] == [{"old": b, "new": d}]
+    assert dict(_rows(conn, "SELECT alias, project FROM project_aliases")) == {c: d}
+    assert _rows(conn, "SELECT a, b, state FROM project_pairs") == [(b, c, "kept_separate")]

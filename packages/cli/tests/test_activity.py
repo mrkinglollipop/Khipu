@@ -180,7 +180,10 @@ class ProjectSliceTest(unittest.TestCase):
 
     def _run(self, results, **kw):
         cur = FakeCursor(results)
-        with mock.patch.object(activity, "connect", return_value=FakeConn(cur)):
+        # The "same project?" pairs are read by their own queries
+        # (tests/test_project_group.py); these tests count the slice's others.
+        with mock.patch.object(activity, "connect", return_value=FakeConn(cur)), \
+             mock.patch("khipu.project_group.asked_pairs", return_value=[]):
             out = activity.project_slice(**kw)
         return out, cur
 
@@ -335,7 +338,10 @@ class TopicSlugOverFetchTest(unittest.TestCase):
 
     def _run(self, results, **kw):
         cur = FakeCursor(results)
-        with mock.patch.object(activity, "connect", return_value=FakeConn(cur)):
+        # The "same project?" pairs are read by their own queries
+        # (tests/test_project_group.py); these tests count the slice's others.
+        with mock.patch.object(activity, "connect", return_value=FakeConn(cur)), \
+             mock.patch("khipu.project_group.asked_pairs", return_value=[]):
             out = activity.project_slice(**kw)
         return out, cur
 
