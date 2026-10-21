@@ -516,6 +516,36 @@ def provider_advisory(payload: dict) -> list[str]:
     return list(dict.fromkeys(warnings))
 
 
+CHILD_NO_ROUTING_ADVISORY = "This child got no routing: add `khipu route --brief` to its brief."
+
+
+def _t3_child_advisory(payload: dict) -> str | None:
+    """The advisory line for a T3 ``delegate_task`` child whose provider has
+    no Khipu hooks: it will get no start block, so a brief without routing
+    leaves it with nothing. Nothing is added to the brief itself."""
+    name = _tool_name(payload)
+    if name is None or not (name == "delegate_task" or name.endswith("__delegate_task")):
+        return None
+    data = payload.get("tool_input") or payload.get("toolInput")
+    if not isinstance(data, dict):
+        return None
+    target = data.get("target") if isinstance(data.get("target"), dict) else {}
+    instance_id = target.get("providerInstanceId") or target.get("provider_instance_id") \
+        or data.get("providerInstanceId")
+    if not isinstance(instance_id, str) or not instance_id:
+        return None
+    briefs = briefs_of(payload)
+    if not briefs or any("Khipu's routing record" in brief or "## Routing at" in brief for brief in briefs):
+        return None
+    from khipu import t3
+
+    instance = next((inst for inst in t3.all_provider_instances(t3.settings_path())
+                     if inst["id"] == instance_id and inst["enabled"]), None)
+    if instance is None or t3.provider_hooks(instance) != "missing":
+        return None
+    return CHILD_NO_ROUTING_ADVISORY
+
+
 def _rule12_line(payload: dict) -> str | None:
     """The rule 12 tier line for this dispatch, or None. Context only."""
     from khipu.routing_advisory import dispatch_line
@@ -649,6 +679,12 @@ def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | 
         line = None
     if line:
         ctx += ("\n" if ctx else "") + line
+    try:
+        advisory = _t3_child_advisory(payload)
+    except Exception:  # noqa: BLE001 - an advisory never fails a dispatch
+        advisory = None
+    if advisory:
+        ctx += ("\n" if ctx else "") + advisory
     if not ctx:
         return {}, info, kind
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": ctx}}, info, kind
