@@ -35,6 +35,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import fcntl
+import hashlib
 import heapq
 import json
 import math
@@ -937,6 +938,14 @@ def probe_codex(home: str | None = None, *, timeout: float = TIMEOUT_S, rollout:
 # ---- Grok --------------------------------------------------------------------
 
 
+def _account_digest(harness: str, account_id) -> str | None:
+    """Only a digest of a CLI-reported account id is ever kept: equality is
+    all a subscription grouping needs, so the raw id is dropped here."""
+    if not isinstance(account_id, str) or not account_id.strip():
+        return None
+    return "sub:" + hashlib.sha256(f"{harness}:{account_id.strip()}".encode()).hexdigest()[:24]
+
+
 def parse_grok(frames: list[dict]) -> dict:
     if not any(frame.get("id") == 2 for frame in frames):
         _answer(frames, 1)  # a failed initialize is the probe's error
@@ -955,8 +964,20 @@ def parse_grok(frames: list[dict]) -> dict:
                      period.get("end") or config.get("billingPeriodEnd"))
     balance = _number(_dict(config, "prepaidBalance").get("val"))
     credits = {"prepaid_balance": balance} if balance is not None else None
-    return {"ok": True, "plan": _text(result.get("subscription_tier")), "windows": [window] if window else [],
-            "credits": credits, "version": version, "source": "live"}
+    account_id = None
+    for source in (result, config):
+        for key in ("account_id", "accountId", "user_id", "userId"):
+            if isinstance(source.get(key), str) and source[key].strip():
+                account_id = source[key].strip()
+                break
+        if account_id:
+            break
+    out = {"ok": True, "plan": _text(result.get("subscription_tier")), "windows": [window] if window else [],
+           "credits": credits, "version": version, "source": "live"}
+    digest = _account_digest("grok", account_id)
+    if digest:
+        out["account_digest"] = digest
+    return out
 
 
 def _grok_budget(timeout: float) -> float:
@@ -1743,7 +1764,7 @@ def _entry_problem(harness: str, home: str | None) -> tuple[str, str, str] | Non
     if harness == "claude" and path is not None:
         from khipu import discover
 
-        if discover.zai_home(path):
+        if discover.provider_home(path) == "glm":
             return "zai_home", "home", ("This login folder runs Claude Code against z.ai, so it is the GLM "
                                         "account; track GLM instead of reading it as Claude")
     return None
@@ -2088,6 +2109,15 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
             data = probe_glm(timeout=timeout)
         else:
             data = {"ok": False, "error": E_INVALID}
+        data = dict(data)
+        raw_account_id = None
+        for key in ("account_id", "accountId", "user_id", "userId"):
+            raw_account_id = data.pop(key, None) or raw_account_id
+        digest = data.get("account_digest") or _account_digest(harness, raw_account_id)
+        if digest:
+            data["account_digest"] = digest
+        else:
+            data.pop("account_digest", None)
         row = _blank_row(account)
         row.update(data)
         row.update({"probed_at": _iso(_now().timestamp()), "ms": int((time.monotonic() - started) * 1000)})
