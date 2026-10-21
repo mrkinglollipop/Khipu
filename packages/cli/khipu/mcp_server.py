@@ -2402,6 +2402,8 @@ _ROUTING_RECEIPTS_LOCK = threading.RLock()
 def _with_route_receipts(func):
     @functools.wraps(func)
     def call(args):
+        if _via_https_gateway():
+            return func(args)
         from khipu import routing
 
         with _ROUTING_RECEIPTS_LOCK:
@@ -2446,76 +2448,36 @@ def _tool_route_gateway(args: dict) -> dict:
     """khipu_route through the HTTPS gateway (slice 12): only the closed
     gateway projection, only the caller's own delivery state, and no owner
     words exemption — paths are cut even inside owner words. Fails closed:
-    no cloud copy, no complete login inventory, or a `since` request all
+    no published cloud copy, unavailable durable receipts, or a `since` request all
     answer available: false instead of widening what the caller sees."""
-    from khipu import agent_view
-
-    try:
-        with agent_view.pull_projection():
-            return _tool_route_gateway_projected(args)
-    except agent_view.PullInventoryUnavailable:
-        return {"available": False, "reason": agent_view.INCOMPLETE}
+    return _tool_route_gateway_projected(args)
 
 
 def _tool_route_gateway_projected(args: dict) -> dict:
-    from khipu import agent_view, routing, routing_delivery
+    from khipu import routing_gateway_copy
 
-    account = args.get("account")
-    if account is not None and not isinstance(account, str):
-        raise ValueError("account must be text")
-    for key in ("session_id", "ack"):
+    for key in ("account", "session_id", "ack"):
         if args.get(key) is not None and not isinstance(args[key], str):
             raise ValueError(f"{key} must be text")
     if args.get("since") is not None:
         return {"available": False, "reason": GATEWAY_SINCE_REASON}
-    session = (args.get("session_id") or "").strip()
-    if "\0" in session:
+    if "\0" in (args.get("session_id") or ""):
         raise ValueError("session_id must be text")
     identity = _gateway_route_identity(args)
-    now = routing._now()
-    with routing._for_a_conversation(), routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
-        view = routing.read_view(now)
-    out = routing.gateway_projection(view, now=now, account=account or None)
+    try:
+        out = routing_gateway_copy.answer(identity=identity["session"] if identity else None,
+                                          account=args.get("account") or None,
+                                          ack=(args.get("ack") or "").strip())
+    except ValueError:
+        raise ValueError("invalid gateway copy or account") from None
+    except Exception:
+        return {"available": False, "reason": routing_gateway_copy.UNAVAILABLE}
     if out is None:
         return {"available": False, "reason": GATEWAY_COPY_OFF_REASON}
-    ack = (args.get("ack") or "").strip()
-    if ack and identity is not None:
-        # Revalidate the complete source and final representation first,
-        # exactly as the local pull does, then move only this identity's batch.
-        # An unknown or expired batch is answered, never an error (there is
-        # nothing to acknowledge); only a batch issued to another identity
-        # is refused. With no session_id nothing is consumed for anyone.
-        _route_pull_attachment(routing, routing_delivery, identity, now, view=view, delivery_point=False)
-        status = routing_delivery.pull_acknowledge(identity["session"], ack, component="mcp", now=now)
-        if status == "foreign":
-            raise _ToolFailure({"ok": False, "code": "ack_not_yours",
-                                "error": "That routing batch was not issued to this conversation; "
-                                         "the batch stays where it was."})
-    changes, delivery = _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
-    if changes is not None:
-        items = []
-        for item in changes.get("items") or []:
-            row = {k: item[k] for k in ("change", "entity", "revision") if k in item}
-            if isinstance(item.get("page"), dict):
-                row["page"] = {k: item["page"][k] for k in ("n", "m") if k in item["page"]}
-            items.append(row)
-        out["routing_changes"] = {"batch": changes.get("batch"),
-                                  "component": changes.get("component"), "items": items}
-    if isinstance(delivery, dict):
-        out["delivery"] = {k: delivery[k] for k in ("owed", "in_flight", "acked_through") if k in delivery}
-    else:
-        out["delivery"] = delivery
-    keys = [a.get("key") for a in view.get("accounts") or [] if isinstance(a, dict)]
-    # No owner-word exemption on this side of the gateway: the pull
-    # attachment restamped the shared table with the local exemption, so
-    # clear it before the final scrub cuts every path, owner words included.
-    agent_view._table(keys).owner = []
-    result = agent_view.scrub_strict(out, keep=(), extra_keys=keys)
-    if identity is not None:
-        routing_delivery.record_gateway_copy(identity["session"], epoch=view.get("epoch"),
-                                             revision=view.get("version"), revision_at=view.get("folded_at"),
-                                             result=result, now=now)
-    return result
+    if out.get("foreign_ack"):
+        raise _ToolFailure({"ok": False, "code": "ack_not_yours",
+                            "error": "That routing batch was not issued to this conversation; the batch stays where it was."})
+    return out
 
 
 @_with_route_receipts
@@ -2880,6 +2842,8 @@ _MEMORY_FIELDS = ("prior_work", "prior_work_text", "prior_work_meta")
 
 
 def _scrub_for_agents(name: str, payload):
+    if name == "khipu_route" and _via_https_gateway():
+        return payload  # Mac-scrubbed and closed-schema validated before any receipt.
     from khipu import agent_view
 
     # khipu_route's answers carry conversation-written words (pending

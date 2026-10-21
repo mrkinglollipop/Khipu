@@ -171,8 +171,6 @@ def doctor_block(view, now, cfg):
                              last_delivery_point=state["last_delivery_point"], **health))
             reasons += health["reasons"]
             missing += health["missing"]
-    if not rows:
-        missing.append("live delivery identities")
     prompts = prompt_health(now)
     reasons += prompts["reasons"]
     missing += prompts["missing"]
@@ -191,6 +189,20 @@ def doctor_block(view, now, cfg):
                 reasons.append("cross-mac-stale")
     gateway = {"status": "not_applicable"}
     if cfg["routing_cloud_copy"]:
+        from khipu import routing_gateway_copy
+
+        publication = routing_gateway_copy.status()
+        for row in publication.get("gateway_rows") or []:
+            seen = _time(row.get("at"))
+            if seen and seen <= now and (not cfg["routing_delivery_live_after"] or
+                    (now - seen).total_seconds() <= cfg["routing_delivery_live_after"]):
+                gateways.append(row)
+                if "status" in row:
+                    rows.append(dict(identity=row.get("identity"), component="mcp", harness="gateway",
+                                     copy_epoch=row.get("copy_epoch"), copy_revision=row.get("copy_revision"),
+                                     copy_revision_at=row.get("copy_revision_at"), last_delivery_point=row["at"],
+                                     status=row["status"], reasons=row.get("reasons", []), missing=[]))
+                    reasons += row.get("reasons", [])
         current_epoch, current_revision = view.get("epoch"), view.get("version")
         current_at = _time(view.get("folded_at"))
         gateway_rows = [(row.get("copy_epoch"), row.get("copy_revision"), _time(row.get("copy_revision_at")))
@@ -208,9 +220,28 @@ def doctor_block(view, now, cfg):
             age = max(0.0, (now - current_at).total_seconds()) if behind else 0.0
             stale = bool(behind and cfg["routing_cloud_copy_stale_after"]
                          and age > cfg["routing_cloud_copy_stale_after"])
-            gateway = dict(status="red" if stale else "green", age_seconds=age)
+            gateway = dict(status="red" if stale else "green", age_seconds=age,
+                           copies=[dict(epoch=e, revision=r, revision_at=stamp.isoformat())
+                                   for e, r, stamp in gateway_rows])
             if stale:
                 reasons.append("gateway-stale")
+        if publication.get("error"):
+            missing.append("gateway publication failed; retry pending")
+            gateway["publication_error"] = publication["error"]
+            if gateway["status"] == "green":
+                gateway["status"] = "unknown"
+        if publication.get("published_at"):
+            published_at = _time(publication["published_at"])
+            age = max(0, (now - published_at).total_seconds()) if published_at else None
+            gateway["published_at"] = publication["published_at"]
+            gateway["published_epoch"] = publication.get("epoch")
+            gateway["published_revision"] = publication.get("revision")
+            gateway["published_revision_at"] = publication.get("folded_at")
+            if age is not None and cfg["routing_cloud_copy_stale_after"] and age > cfg["routing_cloud_copy_stale_after"]:
+                gateway["status"] = "red"
+                reasons.append("gateway-stale")
+    if not rows:
+        missing.append("live delivery identities")
     for lane in view.get("unmatched") or []:
         stamp = _time(lane.get("limited_since"))
         if stamp is None:

@@ -247,6 +247,53 @@ Settings > Routing has a switch for this and a **Check now** button per account.
 
 Five tools. Locally all five work as below. Through the HTTPS gateway, `khipu_route` answers only the closed gateway projection (account labels and states, structured holds, and — under their switches — owner hold words, the confirmed rules and note, and the confirmed priority; paths are cut even inside owner words, and pending proposals never appear), and only when the owner has turned on `routing_cloud_copy`. The other routing tools and `khipu_owner_act` answer `available: false` there, and every owner write is refused. A gateway caller's identity is its token label plus its `session_id`: it sees only its own delivery state, and an ack for another identity's batch is refused (`ack_not_yours`). `since` is not available through the gateway. See [MCP tools](mcp-tools.md) for the full list.
 
+The cloud copy is **published by the Mac**, not folded in the gateway container.
+Migration `0044_routing_gateway_copy.sql` adds `routing_gateway_copies`, one
+current row per salted publisher identity, plus `routing_gateway_delivery` for
+receipts. Apply the migration to the hub before deploying the gateway. This
+change does not apply a migration or deploy anything itself. The Mac must also
+run the updated daemon and have its hub connection configured.
+
+With `routing_cloud_copy` on, each daemon routing poll considers publication,
+including polls that do not refold. Changes use a trailing
+`routing_cloud_copy_debounce` (30 seconds by default); failures retry with
+bounded exponential backoff. An unchanged copy gets a heartbeat at most every
+60 seconds (or half the stale bound when shorter). `khipu route copy publish`
+forces an immediate attempt, bypassing debounce/backoff. Turning the switch off
+removes only this Mac's row on the next poll/manual publish; if the hub is down,
+the deletion remains pending and health reports the failure. Other Macs' rows
+are independent. With no previous publication and the switch off, no hub
+connection is attempted.
+
+Only `gateway_projection` computed with the **Mac's** switches and then strictly
+scrubbed is uploaded. `routing_cloud_copy_rules` controls confirmed rules, note
+and priority; `routing_cloud_copy_hold_words` controls owner hold words.
+Conversation hold words, proposals, login paths, session/project names, raw Mac
+ids and private history never enter that payload. The hub receives a salted
+publisher hash as bookkeeping; it is never returned through the gateway.
+
+The gateway reads the newest hub row (hub publication time, then publisher hash
+for ties), never its local routing log or switches. It returns `as_of` from the
+hub publication time, plus `stale: true` and a last-report message once that time
+exceeds the publishing Mac's `routing_cloud_copy_stale_after`. No row returns
+`available: false` with the existing cloud-copy reason. The hub copy is a
+snapshot: a disconnected Mac cannot update time-driven account changes, so
+clients must honor its stale mark.
+
+Pull delivery persists in `routing_gateway_delivery` in the hub, keyed by a
+hash of the authenticated token label and session id. No receipt depends on a
+container filesystem or volume. One batch covers the full selected projection;
+its digest includes the published epoch/revision, contents and account filter.
+A resend keeps the batch id until acknowledged or its 60-second lease expires.
+Foreign acknowledgements are refused; duplicates are harmless; unknown/expired
+acks consume nothing. Receipt changes commit before a response reports them.
+A missing table, database outage or failed receipt commit returns
+`available: false` with a fixed durable-ledger-unavailable reason. It never
+accepts an ack in memory and silently loses it on restart. Owner writes remain
+refused. Receipt metadata is fetched by the Mac publisher for delivery health;
+health itself never contacts the hub.
+
+
 | Tool | What it does |
 | --- | --- |
 | `khipu_route` | Reads the record: account states, rules, holds. Takes `since` (only what changed after a version) and `account`. Read-only. |
@@ -412,8 +459,9 @@ are off. Enabled copies without timestamps, unreadable ledgers, absent live
 identities and missing hook outcomes say `unknown` with named missing evidence,
 never green. A gateway identity outside the 12-hour delivery liveness window no
 longer supplies copy evidence. A gateway response carrying the current local
-revision proves recovery; an unchanged record stays fresh while its callers are
-idle. A newly folded revision starts the gateway staleness clock even when a
+revision proves delivery recovery. An unchanged record stays fresh while its
+Mac keeps publishing heartbeats, even if callers are idle. Publication age
+past the stale bound is independently red, including when clients are inactive. A newly folded revision starts the gateway staleness clock even when a
 client last pulled much earlier. Simply calling health
 cannot refresh evidence.
 

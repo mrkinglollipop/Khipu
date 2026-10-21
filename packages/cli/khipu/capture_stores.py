@@ -165,6 +165,10 @@ STORES: tuple[Store, ...] = (
           "khipu route priority clear) or in Settings → Routing, not by forgetting an episode; "
           "forget lists each copy as kept and an unreadable routing folder keeps the forget open",
           _w("routing_replication._atomic")),
+    Store("routing gateway publisher state", "data folder state/routing/gateway-copy.json and .gateway-copy-* rewrites",
+          "salted publisher id, projection hashes, revision times, retry counters and gateway health metadata; no words",
+          "none: publication bookkeeping holds no capture text",
+          _w("routing_gateway_copy._save")),
     Store("conversation media", "data folder media/conversation_memory/<sha256>.<ext>",
           "images found in transcripts, shared by content hash",
           "kept: images are content-addressed and can belong to several episodes; a known "

@@ -3,20 +3,28 @@
 Hermetic: a fake gateway only. The gateway is simulated by setting
 KHIPU_GATEWAY_ACTIVE and presenting a token label through
 ``request_context.gateway_request`` around ``handle_message`` — no socket,
-no live gateway, no hub. Every write before the gateway is activated is
+no live gateway; a disposable PostgreSQL hub. Every write before the gateway is activated is
 local test seeding in a temp HOME.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import itertools
 import json
 from datetime import datetime, timedelta, timezone
-
 import pytest
-
 from khipu import mcp_server as ms
 from khipu import request_context, routing
 from tests.test_routing_acceptance import assert_gateway_fields
+from tests import routing_gateway_fixture as gateway_fixtures
+
+gateway_hub = gateway_fixtures.gateway_hub
+hub = gateway_fixtures.hub
+pg_cluster = gateway_fixtures.pg_cluster
+
+
+
+
+
 
 T0 = datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)
 ACCOUNTS = [{"label": "Claude", "harness": "claude"},
@@ -37,7 +45,7 @@ class Clock:
 
 
 @pytest.fixture
-def gw(tmp_path, monkeypatch):
+def gw(tmp_path, monkeypatch, gateway_hub):
     data = tmp_path / "data"
     data.mkdir()
     config = {"usage_accounts": ACCOUNTS, "routing_cloud_copy": True,
@@ -74,6 +82,10 @@ def seed(gw):
 
 
 def call(gw, name="khipu_route", label=None, **args):
+    if gw.get("autopublish", True):
+        from khipu import routing_gateway_copy
+        gw["patch"].delenv(ms.GATEWAY_ACTIVE_ENV, raising=False)
+        assert routing_gateway_copy.publish(force=True)["ok"]
     gw["patch"].setenv(ms.GATEWAY_ACTIVE_ENV, "1")
 
     def run():
@@ -306,6 +318,11 @@ def test_gateway_pace_pick_never_copies_written_by(gw):
 
 def test_gateway_owner_writes_are_refused_and_write_nothing(gw):
     seed(gw)
+    # Materialize any local account migration during the Mac publication;
+    # the gateway write-refusal assertions then cover only gateway actions.
+    from khipu import routing_gateway_copy
+    assert routing_gateway_copy.publish(force=True)["ok"]
+    gw["autopublish"] = False
     before = routing.events_file().read_bytes()
     error, body = call(gw, "khipu_owner_act", action="routing.pause", args={"account": "Codex"}, label="tok-a")
     assert error and body["code"] == "not_on_gateway" and not body.get("ok")

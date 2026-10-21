@@ -1,9 +1,17 @@
 """S16 review fixes: delivery evidence must describe what was rendered."""
-from datetime import timedelta
 
+from datetime import timedelta
 from khipu import mcp_server, recall_prompt, routing, routing_delivery
 from khipu import routing_health
 from tests import test_routing_acceptance as acceptance
+from tests import routing_gateway_fixture as gateway_fixtures
+
+gateway_hub = gateway_fixtures.gateway_hub
+hub = gateway_fixtures.hub
+pg_cluster = gateway_fixtures.pg_cluster
+
+
+
 
 
 T0 = acceptance.T0
@@ -20,6 +28,8 @@ def _outcomes(replay, n=100):
 
 
 def _gateway_on(replay):
+    from khipu import routing_gateway_copy
+    assert routing_gateway_copy.publish(force=True)["ok"]
     replay.patch.setenv("KHIPU_HARNESS", "gateway")
     replay.patch.setenv(mcp_server.GATEWAY_ACTIVE_ENV, "1")
     replay.patch.setattr(mcp_server, "_GATEWAY_ACTIVE", True)
@@ -29,6 +39,8 @@ def _gateway_off(replay):
     replay.patch.delenv("KHIPU_HARNESS")
     replay.patch.delenv(mcp_server.GATEWAY_ACTIVE_ENV)
     replay.patch.setattr(mcp_server, "_GATEWAY_ACTIVE", False)
+    from khipu import routing_gateway_copy
+    assert routing_gateway_copy.publish(force=True)["ok"]
 
 
 def test_hook_receipt_only_accepts_the_final_rendered_entities(replay):
@@ -57,7 +69,7 @@ def test_hook_receipt_only_accepts_the_final_rendered_entities(replay):
     assert "ack-unshown" in routing.doctor_block(now=replay.now)["routing_delivery"]["reasons"]
 
 
-def test_gateway_health_tracks_revision_not_caller_idleness(replay):
+def test_gateway_health_tracks_revision_not_caller_idleness(replay, gateway_hub):
     routing.report(account="Codex", state="open", author=AUTHOR)
     out, _context, info = replay.offer()
     replay.ack(info)
@@ -70,6 +82,8 @@ def test_gateway_health_tracks_revision_not_caller_idleness(replay):
     _gateway_off(replay)
     replay.advance(601)
     routing.read_view(replay.now)  # a local read changes checked_at only
+    from khipu import routing_gateway_copy
+    assert routing_gateway_copy.publish(force=True)["ok"]  # quiet Mac heartbeat
     out, _context, info = replay.offer()
     replay.ack(info)
     _outcomes(replay)
@@ -93,8 +107,10 @@ def test_gateway_health_tracks_revision_not_caller_idleness(replay):
 
     replay.advance(13 * 3600)
     dropped = routing.doctor_block(now=replay.now)["routing_delivery"]
-    assert dropped["gateway"]["status"] == "unknown"
-    assert "gateway-stale" not in dropped["reasons"]
+    # Inactive clients are excluded, while a Mac that stopped publishing
+    # still has a stale hub copy under the new publication evidence path.
+    assert dropped["gateway"]["status"] == "red"
+    assert "gateway-stale" in dropped["reasons"]
 
 
 def test_unmatched_limit_age_starts_with_the_current_continuous_run(replay):
@@ -168,7 +184,7 @@ def test_completed_child_marker_keeps_pruned_render_proof(replay):
     assert routing_health.component_health(routing_delivery.snapshot("s1", "agent:c"), replay.now)["status"] == "green"
 
 
-def test_gateway_receipts_use_decoded_final_projection_text(replay):
+def test_gateway_receipts_use_decoded_final_projection_text(replay, gateway_hub):
     routing.report(account="Codex", state="open", author=AUTHOR)
     routing.add_rule('Synthetic rule says "quoted words".\nThen another line.', via="app")
     replay.configure(routing_cloud_copy=True, routing_cloud_copy_rules=True)
@@ -182,5 +198,6 @@ def test_gateway_receipts_use_decoded_final_projection_text(replay):
         body = replay.pull(session_id="client:quoted", ack=changes["batch"])
     else:
         raise AssertionError("gateway did not finish its rendered rule")
+    _gateway_off(replay)  # the Mac fetches only receipt metadata from the hub
     result = routing.doctor_block(now=replay.now)["routing_delivery"]
     assert result["status"] == "green", result
