@@ -2524,6 +2524,11 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
     fields: [{ key: "routing_prompt_chars", label: "Longest update", unit: "chars", options: [200, 400, 800, 1600, 0], zero: "No limit" }],
   },
   {
+    name: "Longest routing block for a subagent at its start",
+    help: "Account states and holds come first, then your rules and your note whole where they fit; the rest arrives on the subagent's own tool results.",
+    fields: [{ key: "routing_child_chars", label: "Longest child block", unit: "chars", options: [1000, 2000, 4000, 8000, 0], zero: "No limit" }],
+  },
+  {
     name: "Longest line",
     help: "Each line about an account, a hold or a lane. Rules and your note are never cut.",
     fields: [{ key: "routing_line_chars", label: "Longest line", unit: "chars", options: [100, 200, 400, 800, 0], zero: "No limit" }],

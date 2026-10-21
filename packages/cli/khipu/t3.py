@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sqlite3
 import tempfile
 import time
@@ -54,15 +55,82 @@ def handoff_thread(text: str) -> str | None:
     return match.group(1) if match else None
 
 
-def thread_for_session(sid: str) -> str | None:
-    """A bounded read of T3's provider projection; failures mean no mapping.
+# How many of the newest provider-thread rows the hook lookup examines.
+# A session's row is written when T3 starts that session, so at hook time it
+# is among the newest rows; examining a bounded newest window (by rowid,
+# which SQLite can walk backwards without sorting or touching older rows)
+# keeps a multi-gigabyte projection from turning every hook into a full
+# table scan. Older rows fall back to the native identity, as a miss did
+# before. When T3 (or a future schema) indexes the native id expression,
+# that index is used instead and the whole table is in reach again.
+#
+# Fallback window (no ``rowid``): on a WITHOUT ROWID table (or any schema
+# where the rowid query errors naming rowid) the lookup retries with the
+# newest ``_LOOKUP_WINDOW`` rows by ``updated_at`` (a plain LIMITed scan of
+# the first ``_LOOKUP_WINDOW`` stored rows when ``updated_at`` is also
+# unavailable). The window is the same size, so a row older than the newest
+# 1024 by that ordering can still miss; the retry exists so a schema
+# without rowid does not silently miss every row inside the window.
+_LOOKUP_WINDOW = 1024
 
-    The connection timeout matches T3's WAL contract, but the busy handler
-    and VM deadline are tighter so a locked or large DB cannot stall a hook.
+
+def _distinct_threads(rows) -> str | None:
+    """One thread id from candidate rows, or None when they disagree.
+
+    A native id reused across two distinct threads must not silently pick
+    one thread's ledger; several rows for the same thread (a provider
+    switch) still resolve to that thread."""
+    threads: list[str] = []
+    for row in rows:
+        thread = row[0] if row else None
+        if isinstance(thread, str) and thread and thread not in threads:
+            threads.append(thread)
+            if len(threads) > 1:
+                return None
+    return threads[0] if threads else None
+
+
+def _fallback_window_rows(con, sid: str):
+    """Bounded lookup for tables with no usable ``rowid``.
+
+    Tries the newest ``_LOOKUP_WINDOW`` rows by ``updated_at`` first, then
+    a plain LIMITed scan of the first ``_LOOKUP_WINDOW`` stored rows when
+    that ordering is unavailable. Raises ``sqlite3.Error`` when neither
+    bounded query can run, so the caller reports a failure, not a miss.
+    """
+    guarded = ("WHERE CASE WHEN json_valid(payload_json) THEN "
+               "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ?")
+    try:
+        return con.execute(
+            "SELECT thread_id FROM ("
+            "SELECT thread_id, payload_json FROM orchestration_v2_projection_provider_threads "
+            f"ORDER BY updated_at DESC LIMIT ?) {guarded}",
+            (_LOOKUP_WINDOW, sid),
+        ).fetchall()
+    except sqlite3.Error:
+        return con.execute(
+            "SELECT thread_id FROM ("
+            "SELECT thread_id, payload_json FROM orchestration_v2_projection_provider_threads "
+            f"LIMIT ?) {guarded}",
+            (_LOOKUP_WINDOW, sid),
+        ).fetchall()
+
+
+def thread_for_session_result(sid: str) -> tuple[str | None, bool]:
+    """``(thread, definitive)`` for a native session id.
+
+    ``definitive`` is True only when a query actually completed: a row was
+    found (``thread`` set, or None when the completed query matched rows
+    naming more than one distinct thread), or a successful query matched
+    zero rows. A missing database, a lock or timeout, an interrupted or
+    otherwise failing query is ``(None, False)`` — a failure, not a miss —
+    so callers must not treat it as a settled negative answer.
     """
     if not sid:
-        return None
+        return None, True
     path = Path(os.environ.get("KHIPU_T3_DB") or Path.home() / ".t3/userdata/statev2.sqlite")
+    if not path.is_file():
+        return None, False
     con = None
     try:
         # With T3 closed there is no -wal file, and even a mode=ro open of a
@@ -73,18 +141,58 @@ def thread_for_session(sid: str) -> str | None:
         con.execute("PRAGMA busy_timeout = 2")
         deadline = time.monotonic() + 0.05
         con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
-        row = con.execute(
-            "SELECT thread_id FROM orchestration_v2_projection_provider_threads "
-            "WHERE CASE WHEN json_valid(payload_json) THEN "
-            "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ? "
-            "ORDER BY updated_at DESC LIMIT 1", (sid,),
+        indexed = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND tbl_name = 'orchestration_v2_projection_provider_threads' "
+            "AND sql LIKE '%nativeId%' LIMIT 1"
         ).fetchone()
-        return row[0] if row and isinstance(row[0], str) and row[0] else None
+        if indexed:
+            # The CASE/json_valid guard would defeat the expression index,
+            # so match it exactly; a malformed row errors and falls through
+            # to the guarded window query below.
+            try:
+                rows = con.execute(
+                    "SELECT DISTINCT thread_id FROM orchestration_v2_projection_provider_threads "
+                    "WHERE json_extract(payload_json, '$.nativeThreadRef.nativeId') = ? "
+                    "LIMIT 2", (sid,),
+                ).fetchall()
+                return _distinct_threads(rows), True
+            except sqlite3.Error:
+                pass
+        try:
+            rows = con.execute(
+                "SELECT thread_id FROM ("
+                "SELECT thread_id, payload_json FROM orchestration_v2_projection_provider_threads "
+                "ORDER BY rowid DESC LIMIT ?) "
+                "WHERE CASE WHEN json_valid(payload_json) THEN "
+                "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ?",
+                (_LOOKUP_WINDOW, sid),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            if "rowid" not in str(exc).lower():
+                raise
+            rows = _fallback_window_rows(con, sid)
+        return _distinct_threads(rows), True
     except (OSError, ValueError, sqlite3.Error):
-        return None
+        return None, False
     finally:
         if con is not None:
             con.close()
+
+
+def thread_for_session(sid: str) -> str | None:
+    """A bounded read of T3's provider projection; failures mean no mapping.
+
+    The connection timeout matches T3's WAL contract, but the busy handler
+    and VM deadline are tighter so a locked or large DB cannot stall a hook.
+    The query never evaluates the JSON payload outside a bounded newest
+    window (or an index on the native id, when one exists), and it returns
+    None when the native id names more than one distinct thread. Callers
+    that must tell a settled miss from a failed lookup (and so must not
+    settle anything on a failure) use ``thread_for_session_result``.
+    """
+    thread, _definitive = thread_for_session_result(sid)
+    return thread
 
 
 def _thread_db_path(home: Path | None = None) -> Path:
@@ -229,9 +337,10 @@ def _age_seconds(value: str | None) -> float | None:
 def health(home: Path | None = None) -> dict[str, Any] | None:
     """Read-only T3 health for ``khipu doctor`` and the desktop card.
 
-    A T3 card exists only when its settings file exists.  Settings contents are
-    deliberately not parsed here: they can hold provider credentials and a
-    malformed or newer settings shape must not hide the installed T3 surface.
+    A T3 card exists only when its settings file exists.  Provider instances
+    are read through ``provider_instances``' closed field set (the file can
+    hold provider credentials, and a malformed or newer settings shape must
+    not hide the installed T3 surface).
     """
     if not settings_path(home).is_file():
         return None
@@ -250,8 +359,19 @@ def health(home: Path | None = None) -> dict[str, Any] | None:
         warnings.append(lookup_error or "T3's thread lookup is unavailable")
     if recent_without_capture:
         warnings.append("T3 was used in the last day without a thread-linked capture")
+    providers: list[dict[str, Any]] = []
+    for inst in all_provider_instances(settings_path(home)):
+        if not inst["enabled"]:
+            continue
+        hooks = provider_hooks(inst, home if home is not None else Path.home())
+        providers.append({"id": inst["id"], "driver": inst["driver"], "name": inst["name"], "hooks": hooks})
+        if hooks == "missing":
+            warnings.append(f"T3 provider {inst['name']} ({inst['driver']}) is missing Khipu hooks; "
+                            "sessions on it get no Khipu routing start block, so a brief for its "
+                            "children must carry `khipu route --brief`.")
     return {
         "detected": True,
+        "providers": providers,
         "lookup": {"ok": lookup_ok, "error": lookup_error},
         "used_recently": used_recently,
         "recent_use_error": recent_use_error,
@@ -368,6 +488,116 @@ def provider_instances(settings_file: Path | None, drivers, *, text: str | None 
             "enabled": inst.get("enabled") is not False,
         })
     return out
+
+
+def all_provider_instances(settings_file: Path | None = None, *, text: str | None = None) -> list[dict[str, Any]]:
+    """Every enabled-or-not provider instance, whatever its driver.
+
+    Only the driver names are read to build the allow-list, then
+    ``provider_instances`` extracts its closed field set; no other settings
+    byte leaves this module."""
+    try:
+        if text is None:
+            target = settings_file if settings_file is not None else settings_path()
+            text = target.read_text(encoding="utf-8")
+        data = json.loads(text) if text is not None else None
+    except (OSError, ValueError):
+        return []
+    instances = data.get("providerInstances") if isinstance(data, dict) else None
+    if not isinstance(instances, dict):
+        return []
+    drivers = {inst.get("driver") for inst in instances.values()
+               if isinstance(inst, dict) and isinstance(inst.get("driver"), str) and inst.get("driver")}
+    if not drivers:
+        return []
+    return provider_instances(settings_file, drivers, text=text)
+
+
+def _provider_folder(instance: dict[str, Any], home: Path, default_name: str) -> Path:
+    raw = (instance.get("home_path") or "").strip()
+    if not raw:
+        return home / default_name
+    if raw == "~":
+        return home
+    if raw.startswith("~/"):
+        return home / raw[2:]
+    path = Path(raw)
+    return path if path.is_absolute() else home / path
+
+
+def provider_hooks(instance: dict[str, Any], home: Path | None = None) -> str:
+    """``installed`` when the provider's own config home carries a Khipu
+    hook, else ``missing``. Providers whose driver has no Khipu hook pack
+    (anything but Claude Code and Codex) are always ``missing``: a T3 child
+    on them gets no routing start block. Only hook command names are read;
+    nothing else in those files leaves this function."""
+    home = home if home is not None else Path.home()
+    driver = instance.get("driver")
+    if driver == CLAUDE_DRIVER:
+        target = _provider_folder(instance, home, ".claude") / "settings.json"
+    elif driver == CODEX_DRIVER:
+        target = _provider_folder(instance, home, ".codex") / "hooks.json"
+    else:
+        return "missing"
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "missing"
+    commands: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            command = value.get("command")
+            if isinstance(command, str):
+                commands.append(command)
+            for inner in value.values():
+                walk(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                walk(inner)
+
+    walk(data.get("hooks") if isinstance(data, dict) else None)
+    return "installed" if any(_is_khipu_hook_command(command) for command in commands) else "missing"
+
+
+# The actual Khipu hook launchers (integrations.LAUNCHER_NAMES minus the
+# MCP server, which is not a hook). A command counts only when its
+# executable's name is exactly one of these; a shell snippet that merely
+# mentions a Khipu-looking word (``echo not-a-khipu-hook``) is not a hook.
+_KHIPU_HOOK_NAMES = frozenset({
+    "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
+    "khipu-aegis-capture", "khipu-delegation-hook",
+})
+_INTERPRETERS = frozenset({"sh", "bash", "zsh", "dash", "python3", "python"})
+
+
+def _is_khipu_hook_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    index = 0
+    # Skip an `env` prefix and variable assignments (`env K=V <hook>`,
+    # `K=V <hook>`) so the executable itself is what gets matched.
+    if tokens and Path(tokens[0]).name == "env":
+        index = 1
+    while index < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
+        index += 1
+    if index < len(tokens) and Path(tokens[index]).name in _INTERPRETERS:
+        index += 1
+        while index < len(tokens) and tokens[index].startswith("-") and tokens[index] != "-c":
+            index += 1
+        if index < len(tokens) and tokens[index] == "-c":
+            return False  # a shell string, not a direct hook exec
+    if index < len(tokens) and Path(tokens[index]).name in _KHIPU_HOOK_NAMES:
+        return True
+    # A quoted or unquoted absolute path with spaces, standing alone as the
+    # whole command, tokenizes into pieces above; accept it when the path
+    # itself ends in a Khipu hook name. A mention inside a larger command
+    # (`echo /opt/.../khipu-stop-hook`) is not a hook exec and stays False.
+    trimmed = command.strip().strip("\"'").strip()
+    return any(trimmed == name or trimmed.endswith("/" + name)
+               for name in _KHIPU_HOOK_NAMES) and trimmed.startswith("/")
 
 
 def claude_instances(settings_file: Path) -> list[dict[str, Any]]:
