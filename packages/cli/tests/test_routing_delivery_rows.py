@@ -141,6 +141,14 @@ def test_per_change_recipients_count_and_name_who_has_it(replay):  # noqa: F811
     "claude_code_0123abcd", "codex_0123abcd", "Explore-abcdef", "t3:thread-synthetic",
     "claude:synthetic-delivery-session", "agent:synthetic-component",
     "0123abcd-0123-abcd-0123-abcd0123abcd", "0123456789abcdef0123",
+    "Investigate t3:private-thread-synthetic today",
+    "Investigate claude_code_0123abcd today",
+    "Investigate codex_0123abcd today",
+    "Investigate agent:/Explore-abcdef today",
+    "Investigate Explore-abcdef today",
+    "Investigate 0123abcd-0123-abcd-0123-abcd0123abcd today",
+    "Investigate deadbeefcafe1234 today",
+    "Investigate synthetic-one today",
 ])
 def test_identity_shaped_friendly_names_are_never_labels(replay, shaped):  # noqa: F811
     routing_delivery.offer(planned(), session="synthetic-one")
@@ -224,6 +232,39 @@ def test_t3_title_is_resolved_at_route_read_not_on_delivery(replay, tmp_path, mo
     public = routing.public_view(replay.view(), replay.now)
     assert public["delivery_rows"][0]["label"] == FRIENDLY
     assert calls == ["thread-synthetic"]
+
+
+def test_title_pending_holds_only_a_digest_and_title_files_are_private(replay, tmp_path, monkeypatch):  # noqa: F811
+    import os
+    import stat
+
+    from khipu import recall_prompt
+
+    db = tmp_path / "statev2.sqlite"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE orchestration_v2_projection_threads "
+                "(thread_id TEXT, payload_json TEXT, updated_at TEXT)")
+    con.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?)",
+                ("thread-synthetic", json.dumps({"title": FRIENDLY}), "2026-10-20"))
+    con.commit()
+    con.close()
+    monkeypatch.setenv("KHIPU_T3_DB", str(db))
+    routing_delivery.offer(planned(), session="t3:thread-synthetic")
+    folder = recall_prompt._dedup_path("ledger").parent
+    pending = list(folder.glob("title-pending--*.json"))
+    assert len(pending) == 1
+    assert "thread-synthetic" not in pending[0].read_text()
+    assert "t3:" not in pending[0].read_text()
+    assert stat.S_IMODE(pending[0].stat().st_mode) == 0o600
+    assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+    public = routing.public_view(replay.view(), replay.now)
+    assert public["delivery_rows"][0]["label"] == FRIENDLY
+    cache = list(folder.glob("title-cache--*.json"))
+    assert len(cache) == 1
+    assert stat.S_IMODE(cache[0].stat().st_mode) == 0o600
+    assert "thread-synthetic" not in cache[0].read_text()
+    assert not list(folder.glob("title-pending--*.json"))
+    assert os.name == "posix"
 
 
 def test_other_mac_freshness_is_unknown_without_a_catch_up_receipt(replay, monkeypatch):  # noqa: F811

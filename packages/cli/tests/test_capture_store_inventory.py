@@ -256,7 +256,8 @@ def test_a_store_without_a_forget_scan_keeps_the_forget_open(isolated, tmp_path,
                for loc in result["locations"])
 
 
-@pytest.mark.parametrize("store", ["delivery", "delivery temp", "replication", "replication temp"])
+@pytest.mark.parametrize("store", ["delivery", "delivery temp", "replication", "replication temp",
+                                   "title pending", "title cache"])
 def test_routing_words_without_source_provenance_are_kept_not_incomplete(isolated, tmp_path, monkeypatch, store):
     from khipu import routing, session_capture
 
@@ -265,6 +266,8 @@ def test_routing_words_without_source_provenance_are_kept_not_incomplete(isolate
         "delivery temp": (session_capture.state_dir(), "recall--synthetic.routing.json-random"),
         "replication": (routing.routing_dir(), "remote.jsonl"),
         "replication temp": (routing.routing_dir(), ".replication-random"),
+        "title pending": (session_capture.state_dir(), "title-pending--synthetic.json"),
+        "title cache": (session_capture.state_dir(), "title-cache--synthetic.json"),
     }[store]
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / name

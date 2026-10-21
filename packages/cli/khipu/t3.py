@@ -17,6 +17,7 @@ a missing file, bad JSON or a changed shape is "nothing found", never an error.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -248,6 +249,50 @@ def thread_title(thread_id: str) -> str | None:
     finally:
         if con is not None:
             con.close()
+
+
+def thread_title_for_digest(digest: str) -> str | None:
+    """The title of the T3 thread whose ``t3:<thread_id>`` identity hashes
+    to ``digest`` (a sha256 hex digest), or None.
+
+    Callers that must not persist a raw thread identity queue only this
+    digest; the matching thread id is recovered here, in memory, by
+    hashing each projected thread id until one matches, and is never
+    written back by this function."""
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return None
+    path = _thread_db_path()
+    if not path.is_file():
+        return None
+    con = None
+    match = None
+    try:
+        con = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=0.5)
+        con.execute("PRAGMA busy_timeout = 50")
+        deadline = time.monotonic() + 0.5
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        tables = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        for table in ("orchestration_v2_projection_threads",
+                      "orchestration_v2_projection_provider_threads"):
+            if table not in tables or match is not None:
+                continue
+            cols = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+            if "thread_id" not in cols:
+                continue
+            rows = con.execute(
+                f"SELECT DISTINCT thread_id FROM {table} LIMIT 10000").fetchall()
+            for (thread_id,) in rows:
+                if isinstance(thread_id, str) and thread_id and \
+                        hashlib.sha256(f"t3:{thread_id}".encode("utf-8")).hexdigest() == digest:
+                    match = thread_id
+                    break
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    finally:
+        if con is not None:
+            con.close()
+    return thread_title(match) if match is not None else None
 
 
 def _clean_title(value) -> str | None:

@@ -553,15 +553,19 @@ def _queue_title_resolution(root):
     resolves pending markers into a title cache on the ``route --json``
     read path."""
     try:
+        from khipu.routing_delivery_rows import _write_private_file
+
         ledger = _path(root)
         digest = ledger.name.removesuffix(".routing.json").removeprefix("recall--")
         folder = ledger.parent
         if (folder / f"title-cache--{digest}.json").exists() \
                 or (folder / f"title-pending--{digest}.json").exists():
             return
-        folder.mkdir(parents=True, exist_ok=True)
-        with open(folder / f"title-pending--{digest}.json", "x", encoding="utf-8") as handle:
-            json.dump({"root": root}, handle)
+        # Only the identity's digest is queued (the ledger file name is
+        # already that digest), never the raw canonical identity; the
+        # read path recovers the thread from the digest in memory.
+        _write_private_file(folder / f"title-pending--{digest}.json",
+                            json.dumps({"digest": digest}))
     except Exception:  # noqa: BLE001 - queueing a title never breaks delivery
         pass
 

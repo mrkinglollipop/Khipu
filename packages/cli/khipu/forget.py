@@ -1357,7 +1357,8 @@ def _routing_words_scan(*, gateway: bool) -> dict[str, Any]:
                 "state": "not applicable", "why": "routing copies are local to each client"}]}
     locations = []
     for folder, matches in (
-        (session_capture.state_dir(), lambda name: name.startswith("recall--") and ".routing.json" in name),
+        (session_capture.state_dir(), lambda name: (name.startswith("recall--") and ".routing.json" in name)
+         or name.startswith(("title-pending--", "title-cache--"))),
         (routing.routing_dir(), lambda name: name == "remote.jsonl" or name.startswith(".replication-")),
     ):
         try:

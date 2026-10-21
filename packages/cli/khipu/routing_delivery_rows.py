@@ -10,9 +10,12 @@ projection. Every read failure reads as empty, never as an error.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import re
+import tempfile
 import time
 
 _SESSION_SHAPED = re.compile(
@@ -27,8 +30,21 @@ _SESSION_SHAPED = re.compile(
 _HARNESS_PREFIX = re.compile(
     r"^(?:claude_code|claude-code|codex|claude|cursor|grok_build|grok-build|"
     r"grok|aegis|muse|gateway|t3|agent|main|mcp)(?:[:/_.\-]|$)", re.IGNORECASE)
+# The same harness prefixes anywhere in a title, not only at its start:
+# ``Investigate t3:… today`` and ``Investigate claude_code_… today`` are
+# identifiers with surrounding words, not titles.
+_HARNESS_ANYWHERE = re.compile(
+    r"(?:^|[^A-Za-z0-9])(?:claude_code|claude-code|codex|claude|cursor|"
+    r"grok_build|grok-build|grok|aegis|muse|gateway|t3|agent|main|mcp)"
+    r"(?:[:/_.\-])\S*", re.IGNORECASE)
 _COMPONENT_ID = re.compile(r"^[A-Za-z][A-Za-z0-9]*-[0-9a-fA-F]{4,}(?:-[0-9a-fA-F]+)*$")
+_COMPONENT_ANYWHERE = re.compile(
+    r"[A-Za-z][A-Za-z0-9]*-[0-9a-fA-F]{4,}(?:-[0-9a-fA-F]+)*")
+_COLON_ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]*:[A-Za-z0-9][^\s]*")
 _HEX_TOKEN = re.compile(r"\b(?=[0-9a-fA-F]*[a-fA-F])(?=[0-9a-fA-F]*\d)[0-9a-fA-F]{8,}\b")
+# A hex run of 8+ anywhere, even glued to a prefix by ``_``/``:``/``-``
+# (where a word boundary would hide it from ``_HEX_TOKEN``).
+_HEX_RUN = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{8,}(?![0-9a-fA-F])", re.IGNORECASE)
 # How long another Mac's copy may lag before its row reads as behind; the
 # same bound ``routing_replication.status`` uses for its stale verdict.
 _MAC_STALE_SECONDS = 600
@@ -45,19 +61,62 @@ def _identity_forms(name):
 
 
 def _is_identity_shaped(name, forbidden=(), ledger_hash=None):
-    lowered = {value.lower() for value in forbidden if isinstance(value, str)}
+    lowered = {value.lower() for value in forbidden if isinstance(value, str) and len(value) >= 3}
     if name.lower() in lowered:
         return True
-    if _SESSION_SHAPED.search(name) or _HEX_TOKEN.search(name):
+    # An identifier embedded in surrounding words is still an identifier.
+    if any(value in name.lower() for value in lowered):
         return True
-    if _HARNESS_PREFIX.match(name):
+    if _SESSION_SHAPED.search(name) or _HEX_TOKEN.search(name) or _HEX_RUN.search(name):
+        return True
+    if _HARNESS_PREFIX.match(name) or _HARNESS_ANYWHERE.search(name):
+        return True
+    if _COMPONENT_ANYWHERE.search(name) or _COLON_ID.search(name):
         return True
     if " " not in name and (":" in name or _COMPONENT_ID.match(name)):
         return True
-    if ledger_hash and any(hashlib.sha256(form.encode("utf-8")).hexdigest() == ledger_hash
-                            for form in _identity_forms(name)):
-        return True
+    if ledger_hash:
+        # The whole name, and every token in it, in each of its identity
+        # forms: an embedded own session id hashes to the ledger hash.
+        candidates = {name}
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9:/_.\-]*", name):
+            candidates.add(token)
+            candidates.update(part for part in re.split(r"[\s:/_.\-]+", token) if part)
+        if any(hashlib.sha256(form.encode("utf-8")).hexdigest() == ledger_hash
+               for candidate in candidates for form in _identity_forms(candidate)):
+            return True
     return False
+
+
+def _write_private_file(path, text):
+    """Write ``text`` to ``path`` privately and atomically.
+
+    The folder is made 0700 and the file 0600, through a same-folder
+    temporary replaced with ``os.replace`` (like
+    ``routing_replication._atomic``), so a reader never sees a partial
+    file and another local user never reads an identity or a title."""
+    folder = path.parent
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        os.chmod(folder, 0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=folder)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+        directory = os.open(folder, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
 
 
 def _clean_name(value, *, forbidden=(), ledger_hash=None):
@@ -92,9 +151,21 @@ def _resolve_pending_titles(folder):
             continue
         if not isinstance(raw, dict):
             continue
+        # Pending files hold only the identity's digest (in the file name
+        # and in ``digest``), never the raw canonical identity. A legacy
+        # file that still carries ``root`` is rewritten digest-only below
+        # before any lookup, and its raw value is used only to check that
+        # it belongs to this digest.
         root = raw.get("root")
         digest = path.name.removeprefix("title-pending--").removesuffix(".json")
-        if not isinstance(root, str) or not root.startswith("t3:") or not digest:
+        stored = raw.get("digest")
+        if isinstance(root, str) and root.startswith("t3:"):
+            if hashlib.sha256(root.encode("utf-8")).hexdigest() != digest:
+                root = None
+        elif root is not None:
+            root = None
+        if not digest or (stored is not None and stored != digest) or (root is None and stored is None
+                                                                      and "root" in raw):
             try:
                 path.unlink()
             except OSError:
@@ -104,17 +175,24 @@ def _resolve_pending_titles(folder):
         if isinstance(attempted, (int, float)) and time.time() - attempted < _TITLE_RETRY_SECONDS:
             continue
         try:
-            path.write_text(json.dumps({**raw, "attempted_at": time.time()}))
+            _write_private_file(path, json.dumps({"digest": digest, "attempted_at": time.time()}))
         except OSError:
             continue
         try:
-            title = _clean_name(t3.thread_title(root[3:]), forbidden={root, root[3:]})
+            found = t3.thread_title_for_digest(digest)
+            if found is None and isinstance(root, str):
+                # A legacy pending file whose thread the digest scan
+                # cannot see (for example a mocked title reader).
+                found = t3.thread_title(root[3:])
+            forbidden = {root, root[3:]} if isinstance(root, str) else set()
+            title = _clean_name(found, forbidden=forbidden, ledger_hash=digest)
         except Exception:  # noqa: BLE001 - a failed lookup stays queued for a later read
             continue
         if not title:
             continue
         try:
-            (folder / f"title-cache--{digest}.json").write_text(json.dumps({"name": title}))
+            _write_private_file(folder / f"title-cache--{digest}.json",
+                                json.dumps({"name": title}))
             path.unlink()
         except OSError:
             continue
