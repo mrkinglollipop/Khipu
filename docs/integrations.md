@@ -70,7 +70,7 @@ Grok Bot reaches Khipu only through the HTTPS gateway, as server `khipu-cloud`, 
 - With `--project DIR` it instead writes `DIR/.cursor/mcp.json` and `DIR/.cursor/rules/khipu.mdc` for that one repo.
 - `verify` does an MCP handshake and checks that a wrong token is refused.
 
-Through the gateway there is no hook, so `khipu_capture` writes immediately and is the only way the session is remembered. A few tools are unavailable there (usage, routing, and forgetting episodes from local harnesses). See [MCP tools](mcp-tools.md).
+Through the gateway there is no hook, so `khipu_capture` writes immediately and is the only way the session is remembered. A few tools are unavailable there (usage, the routing write tools, and forgetting episodes from local harnesses); `khipu_route` answers the closed gateway projection described in [Routing](routing.md) when the owner has turned on the cloud routing copy. See [MCP tools](mcp-tools.md).
 
 ## What each hook does
 

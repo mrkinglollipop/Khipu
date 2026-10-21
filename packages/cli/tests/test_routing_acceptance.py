@@ -1221,7 +1221,6 @@ def test_12_not_installed_on_mac_b_leaves_mac_a_open(replay):
 
 
 @pytest.mark.parametrize("contract", ["projection", "foreign-delivery", "foreign-ack", "owner-write"])
-@future("12", "gateway routing must implement a closed projection and caller-owned delivery")
 def test_13_gateway_projection(replay, monkeypatch, contract):
     replay.configure(routing_cloud_copy=True, routing_cloud_copy_rules=True, routing_cloud_copy_hold_words=True)
     routing.add_rule("owner words at " + str(replay.root / "private-login"), via="app")
@@ -1239,7 +1238,9 @@ def test_13_gateway_projection(replay, monkeypatch, contract):
     elif contract == "foreign-delivery":
         assert "s2" not in json.dumps(body.get("delivery"))
     elif contract == "foreign-ack":
-        error, body = replay.call(session_id="synthetic-client:s2", ack="synthetic-other-batch")
+        error, issued = replay.call(session_id="synthetic-client:s1")
+        assert not error and issued["routing_changes"]["batch"]
+        error, body = replay.call(session_id="synthetic-client:s2", ack=issued["routing_changes"]["batch"])
         assert error and body["code"] == "ack_not_yours"
     else:
         error, body = replay.call("khipu_owner_act", action="routing.pause", args={"account": "Codex"})

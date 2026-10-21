@@ -5054,6 +5054,31 @@ class _Parser(argparse.ArgumentParser):
     """Usage errors quote what was typed; a key-shaped value is masked first.
     Subparsers inherit the class."""
 
+    def _match_arguments_partial(self, actions, arg_strings_pattern):
+        counts = super()._match_arguments_partial(actions, arg_strings_pattern)
+        # Keep an empty optional/variadic positional available for the explicit
+        # `--` tail. Otherwise argparse can finish it before intervening flags
+        # (e.g. `rule add --from-app -- words`) and reject the literal words.
+        # With no remaining separator, retain argparse's existing behaviour.
+        if "-" in arg_strings_pattern[sum(counts):]:
+            while counts and counts[-1] == 0:
+                counts.pop()
+        offset = 0
+        self._positional_separators = {}
+        for action, count in zip(actions, counts):
+            self._positional_separators[action] = "-" in arg_strings_pattern[offset:offset + count]
+            offset += count
+        return counts
+
+    def _get_values(self, action, arg_strings):
+        # argparse strips a `--` from each positional, even when that token
+        # was literal text after a separator consumed by an earlier positional.
+        # Supply the marker it expects to strip, preserving the actual value.
+        if (not action.option_strings and action.nargs not in (argparse.PARSER, argparse.REMAINDER)
+                and "--" in arg_strings and not self._positional_separators.get(action, True)):
+            arg_strings = ["--", *arg_strings]
+        return super()._get_values(action, arg_strings)
+
     def error(self, message: str):
         from khipu.redact import redact_secrets
 

@@ -2397,10 +2397,109 @@ def _with_route_receipts(func):
     return call
 
 
+GATEWAY_COPY_OFF_REASON = (
+    "the owner has not turned on the routing copy for cloud agents on the Mac that runs the accounts. "
+    "Use the local khipu MCP server or `khipu route`."
+)
+GATEWAY_SINCE_REASON = (
+    "since is not available through the gateway; read the full gateway projection instead."
+)
+
+
+def _gateway_route_identity(args: dict):
+    """(ledger session, capability) for one gateway caller, or None.
+
+    The gateway identity is (token label, session_id): the label comes from
+    the gateway request, never from the arguments, and the ledger key is
+    namespaced so it can never collide with a local conversation's."""
+    from khipu.request_context import gateway_label
+
+    session = (args.get("session_id") or "").strip()
+    if not session:
+        return None
+    label = gateway_label()
+    if label is None:
+        # No token label is its own namespace: it must never share a
+        # ledger with a token that happens to be labelled "gateway".
+        return {"session": f"gateway\0unlabeled\0{session}", "capability": "pull_only"}
+    return {"session": f"gateway\0labeled\0{label}\0{session}", "capability": "pull_only"}
+
+
+def _tool_route_gateway(args: dict) -> dict:
+    """khipu_route through the HTTPS gateway (slice 12): only the closed
+    gateway projection, only the caller's own delivery state, and no owner
+    words exemption — paths are cut even inside owner words. Fails closed:
+    no cloud copy, no complete login inventory, or a `since` request all
+    answer available: false instead of widening what the caller sees."""
+    from khipu import agent_view
+
+    try:
+        with agent_view.pull_projection():
+            return _tool_route_gateway_projected(args)
+    except agent_view.PullInventoryUnavailable:
+        return {"available": False, "reason": agent_view.INCOMPLETE}
+
+
+def _tool_route_gateway_projected(args: dict) -> dict:
+    from khipu import agent_view, routing, routing_delivery
+
+    account = args.get("account")
+    if account is not None and not isinstance(account, str):
+        raise ValueError("account must be text")
+    for key in ("session_id", "ack"):
+        if args.get(key) is not None and not isinstance(args[key], str):
+            raise ValueError(f"{key} must be text")
+    if args.get("since") is not None:
+        return {"available": False, "reason": GATEWAY_SINCE_REASON}
+    session = (args.get("session_id") or "").strip()
+    if "\0" in session:
+        raise ValueError("session_id must be text")
+    identity = _gateway_route_identity(args)
+    now = routing._now()
+    with routing._for_a_conversation(), routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
+        view = routing.read_view(now)
+    out = routing.gateway_projection(view, now=now, account=account or None)
+    if out is None:
+        return {"available": False, "reason": GATEWAY_COPY_OFF_REASON}
+    ack = (args.get("ack") or "").strip()
+    if ack and identity is not None:
+        # Revalidate the complete source and final representation first,
+        # exactly as the local pull does, then move only this identity's batch.
+        # An unknown or expired batch is answered, never an error (there is
+        # nothing to acknowledge); only a batch issued to another identity
+        # is refused. With no session_id nothing is consumed for anyone.
+        _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
+        status = routing_delivery.pull_acknowledge(identity["session"], ack, component="mcp", now=now)
+        if status == "foreign":
+            raise _ToolFailure({"ok": False, "code": "ack_not_yours",
+                                "error": "That routing batch was not issued to this conversation; "
+                                         "the batch stays where it was."})
+    changes, delivery = _route_pull_attachment(routing, routing_delivery, identity, now, view=view)
+    if changes is not None:
+        items = []
+        for item in changes.get("items") or []:
+            row = {k: item[k] for k in ("change", "entity", "revision") if k in item}
+            if isinstance(item.get("page"), dict):
+                row["page"] = {k: item["page"][k] for k in ("n", "m") if k in item["page"]}
+            items.append(row)
+        out["routing_changes"] = {"batch": changes.get("batch"),
+                                  "component": changes.get("component"), "items": items}
+    if isinstance(delivery, dict):
+        out["delivery"] = {k: delivery[k] for k in ("owed", "in_flight", "acked_through") if k in delivery}
+    else:
+        out["delivery"] = delivery
+    keys = [a.get("key") for a in view.get("accounts") or [] if isinstance(a, dict)]
+    # No owner-word exemption on this side of the gateway: the pull
+    # attachment restamped the shared table with the local exemption, so
+    # clear it before the final scrub cuts every path, owner words included.
+    agent_view._table(keys).owner = []
+    return agent_view.scrub_strict(out, keep=(), extra_keys=keys)
+
+
 @_with_route_receipts
 def _tool_route(args: dict) -> dict:
     if _via_https_gateway():
-        return {"available": False, "reason": ROUTING_GATEWAY_REASON}
+        return _tool_route_gateway(args)
     from khipu import agent_view
 
     try:
