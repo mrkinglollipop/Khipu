@@ -5487,6 +5487,18 @@ def telemetry_active(account: str | None = None, *, now: datetime | None = None)
     return totals.get(key, {"jobs": None, "status": "unknown"})
 
 
+def runner_cap_flags(view: dict) -> list[dict]:
+    """Where a registered job runner's own budget caps have no matching
+    Khipu cap fact, or disagree with the fact they have (slice 19b). A
+    report only: the runner's files are read through routing_sources'
+    registration, never written, and no runner number becomes a fact."""
+    from khipu import routing_scanner, routing_sources
+
+    return routing_scanner.compare_runner_caps(
+        routing_sources.runner_budget_declarations(view.get("source_cache") or {}),
+        view.get("accounts") or [])
+
+
 def cap_statuses(view: dict, entry: dict, now: datetime) -> list[dict]:
     """Each owner cap on one account with its verdict at ``now``.
 
@@ -7755,6 +7767,8 @@ def doctor_block(now: datetime | None = None) -> dict:
         lane_map.setdefault(runner, {}).update(lanes)
     checks += routing_sources.provider_checks(cache, definitions.get("providers", {}), accounts(), lane_map)
     warnings += [c["text"] for c in checks if c["status"] == "broken"]
+    runner_caps = runner_cap_flags(view)
+    warnings += [flag["text"] for flag in runner_caps]
     warnings += _launch_warnings(view, routing_sources.launches(cache), cfg, now)
     budget = prompt_budget_block(cfg)
     if budget.get("warn"):
@@ -7781,7 +7795,8 @@ def doctor_block(now: datetime | None = None) -> dict:
             "note": view.get("note") is not None, "outside_app": view.get("outside_app") or [],
             "unchecked": view.get("unchecked") or [],
             "seed_error": view.get("seed_error"), "bad_lines": view.get("bad_lines", 0),
-            "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings,
+            "sources": _sources_brief(sources), "rule_checks": checks, "runner_caps": runner_caps,
+            "warnings": warnings,
             "contradictions": list(view.get("contradictions") or []),
             "rule_hygiene": list(view.get("rule_hygiene") or [])}
 
@@ -7892,6 +7907,9 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
         out["priority"] = {k: v for k, v in view["priority"].items() if k not in ("pending_author", "event_id")}
     out["plan_facts"] = plan_facts(view, now)
     out["pace_order"] = cfg["routing_pace_order"]
+    # Where a registered runner's own budget caps have no Khipu fact, or
+    # disagree with one (slice 19b). Numbers and Khipu's words only.
+    out["runner_caps"] = runner_cap_flags(view)
     # What the app's Routing card and attention items need beside the view
     # (phase 4): each watched rule's check, as doctor carries it, and the
     # two times the app words its warnings by.
