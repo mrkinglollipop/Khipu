@@ -11,9 +11,14 @@ import math
 from datetime import datetime, timedelta, timezone
 
 WINDOWS = {
-    "weekly": {"trailing_s": 86400, "bucket_s": 900, "sample_s": 1800, "gap_s": 7200, "trailing_h": 24},
-    "five_hour": {"trailing_s": 3600, "bucket_s": 300, "sample_s": 600, "gap_s": 900, "trailing_h": 1},
+    "weekly": {"trailing_s": 86400, "bucket_s": 900, "sample_s": 1800, "gap_s": 7200, "trailing_h": 24,
+               "window_s": 604800},
+    "five_hour": {"trailing_s": 3600, "bucket_s": 300, "sample_s": 600, "gap_s": 900, "trailing_h": 1,
+                  "window_s": 18000},
 }
+# Cap kinds scoped to a usage window; the rest are account-scoped facts.
+WINDOW_CAP_KINDS = ("share", "per_day", "pace_target")
+CAP_KINDS = WINDOW_CAP_KINDS + ("spend", "concurrency")
 _REUSABLE_CYCLES = {"weekly", "five_hour", "five-hour", "five hour", "daily", "day"}
 
 
@@ -38,15 +43,52 @@ def _num(value):
 
 
 def checked_cap(value):
-    if not isinstance(value, dict) or set(value) - {"kind", "pct", "revision"}:
+    """One owner cap fact, checked by kind. Runner numbers never enter
+    here: a cap holds only what the owner confirmed."""
+    if not isinstance(value, dict) or set(value) - {"kind", "pct", "slack", "usd", "days", "n", "revision"}:
         return None
-    if value.get("kind") not in ("share", "per_day"):
-        return None
-    pct = _num(value.get("pct"))
+    kind = value.get("kind")
     revision = value.get("revision")
-    if pct is None or not 0 < pct <= 100 or not isinstance(revision, str) or not revision.strip():
+    if kind not in CAP_KINDS or not isinstance(revision, str) or not revision.strip():
         return None
-    return {"kind": value["kind"], "pct": pct, "revision": revision.strip()}
+    revision = revision.strip()
+    if kind in ("share", "per_day"):
+        pct = _num(value.get("pct"))
+        if pct is None or not 0 < pct <= 100:
+            return None
+        return {"kind": kind, "pct": pct, "revision": revision}
+    if kind == "pace_target":
+        pct, slack = _num(value.get("pct")), _num(value.get("slack"))
+        if pct is None or not 0 < pct <= 100 or slack is None or not 0 <= slack <= 100:
+            return None
+        return {"kind": kind, "pct": pct, "slack": slack, "revision": revision}
+    if kind == "spend":
+        usd, days = _num(value.get("usd")), _num(value.get("days"))
+        if usd is None or not 0 < usd <= 1e9 or days is None or not 0 < days <= 366:
+            return None
+        return {"kind": kind, "usd": usd, "days": days, "revision": revision}
+    n = value.get("n")
+    if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 100000:
+        return None
+    return {"kind": kind, "n": n, "revision": revision}
+
+
+def spend_verdict(total: dict, usd) -> str:
+    """A spend cap's verdict from a 17t total: unknown stays unknown,
+    never a figure invented from partial coverage."""
+    if not isinstance(total, dict) or total.get("status") != "known" or total.get("usd") is None:
+        return "unknown"
+    if total["usd"] > usd:
+        return "over"
+    return "near" if total["usd"] >= 0.85 * usd else "under"
+
+
+def concurrency_verdict(active: dict, n) -> str:
+    """A concurrency cap's verdict from a 17t active snapshot: an expired
+    record is unknown, never zero jobs."""
+    if not isinstance(active, dict) or active.get("status") != "known" or active.get("jobs") is None:
+        return "unknown"
+    return "full" if active["jobs"] >= n else "under"
 
 
 def _clock(dt, now):
@@ -144,8 +186,13 @@ def compute_pace(samples, caps, now, window):
             "valid_pct": 0.0, "observed_pct": 0.0, "gappy": False, "rate_pct_per_h": None, "why": None,
             "plan": {"verdict": "unknown", "needed_pct_per_h": None, "runs_out_at": None,
                      "before_reset_s": None, "unused_at_reset_pct": None},
-            "share_cap": None, "day_cap": None, "headline": "plan"}
+            "share_cap": None, "day_cap": None, "pace_target": None, "headline": "plan"}
     samples = [s for s in samples if s.get("reset") is not None and _num(s.get("used")) is not None]
+    target_cap = next((c for c in caps if c.get("kind") == "pace_target"), None)
+    if target_cap:
+        pace["pace_target"] = {"revision": target_cap["revision"], "pct": target_cap["pct"],
+                               "slack": target_cap["slack"], "allowance_pct": None, "used_pct": None,
+                               "verdict": "unknown", "why": "no reading"}
     if not samples:
         pace["why"] = "this account can't be probed"
         return pace
@@ -395,6 +442,27 @@ def compute_pace(samples, caps, now, window):
                            "used_24h_pct": dgain, "observed_pct": dobs, "settles_at_pct": settles,
                            "peak_pct": peak, "peak_at": peak_at, "reaches_cap_at": reaches,
                            "why": day_why}
+    pace["used_pct"] = used
+    target_cap = next((c for c in caps if c["kind"] == "pace_target"), None)
+    if target_cap:
+        # Ahead of an even pace toward the target, apart from the forecast:
+        # allowance grows linearly with the elapsed share of the window.
+        target = {"revision": target_cap["revision"], "pct": target_cap["pct"],
+                  "slack": target_cap["slack"], "allowance_pct": None, "used_pct": used,
+                  "verdict": "unknown", "why": None}
+        if used is None:
+            target["why"] = "no reading"
+        elif secs_to_reset is None or secs_to_reset <= 0:
+            target["why"] = "no reset time"
+        else:
+            elapsed = min(max(params["window_s"] - secs_to_reset, 0.0), float(params["window_s"]))
+            allowance = target_cap["pct"] * elapsed / params["window_s"] + target_cap["slack"]
+            target["allowance_pct"] = allowance
+            # Recovery needs a full point under the allowance (hysteresis):
+            # the band between reads "recovering", not yet "within".
+            target["verdict"] = ("ahead" if used > allowance else
+                                 "within" if used <= allowance - 1 else "recovering")
+        pace["pace_target"] = target
     # Headline: reached/over, then earliest crossing, then near, then plan.
     ranked = []
     if pace["plan"]["verdict"] in ("limit_reached",):
@@ -423,6 +491,12 @@ def pace_line(label, pace, now):
     headline = pace.get("headline") or "plan"
     obj = pace.get(headline) or pace["plan"]
     verdict = obj.get("verdict", "unknown")
+    target = pace.get("pace_target") or {}
+    if target.get("verdict") in ("ahead", "recovering"):
+        allowance = target.get("allowance_pct")
+        allowance_text = f"{allowance:g}%" if isinstance(allowance, (int, float)) else "its allowance"
+        return (f"{label} {word}: {target['verdict']} of its pace target "
+                f"({target.get('used_pct'):g}% used against a {allowance_text} allowance)")[:160]
     if verdict == "unknown" or pace.get("why"):
         return f"{label} {word}: pace unknown at the trailing average: {pace.get('why') or 'not enough readings'}"
     if verdict in ("limit_reached", "cap_reached"):
