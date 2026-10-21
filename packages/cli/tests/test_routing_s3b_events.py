@@ -131,11 +131,14 @@ def test_hlc_survives_same_clock_and_restart_and_records_base(mac):
     assert re.fullmatch(r"[0-9a-f]{32}", (routing.routing_dir() / "mac-id").read_text().strip())
 
 
-def test_proposal_base_is_the_owner_revision(mac):
+def test_proposal_base_is_the_owner_revision(mac, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     owner = routing.add_rule("owner words", via="app")
     author = {"kind": "conversation", "harness": "codex", "session": "one"}
-    routing.request_rule("first proposal", n=1, author=author)
-    routing.request_rule("second proposal", n=1, author=author)
+    shown = routing.conversation_view()
+    routing.request_rule("first proposal", n=1, author=author, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
+    shown = routing.conversation_view()
+    routing.request_rule("second proposal", n=1, author=author, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
     rows = routing.read_events()[0]
     assert rows[1]["base"] == rows[2]["base"] == owner["id"]
     assert rows[1]["proposal"] != rows[2]["proposal"]

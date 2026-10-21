@@ -979,8 +979,8 @@ def _stop_events(view: dict, keys: list[str], *, keep_priority: bool, keep_pause
         if keep_priority:
             done["priority"] = "kept"
         elif held.get("pending"):
-            # A conversation's request stays the owner's to confirm or undo,
-            # without the account, and so does the priority it replaced.
+            # Dropping an account advances the owner base and ends any
+            # pending overlay before removing it from the owner's priority.
             events += [{"type": "priority_drop", "account": key} for key in keys]
             done["priority"] = "removed"
         else:

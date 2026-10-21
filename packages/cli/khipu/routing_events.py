@@ -32,6 +32,8 @@ def derived(kind: str, key) -> str:
 def revision(event: dict, *, operations_salt: bytes | None = None) -> str:
     if event.get("_revision"):
         return event["_revision"]
+    if isinstance(event.get("revision"), str) and event["revision"]:
+        return event["revision"]
     if event.get("mac") and event.get("id"):
         return event["id"]
     from khipu.routing import _id_salt

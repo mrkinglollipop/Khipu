@@ -5760,6 +5760,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="A conversation: the owner's request, in one line (set only; stays unconfirmed)")
     rprio.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rprio)
+    rprio.add_argument("--base", default=None, help="Owner revision read when preparing a priority request")
     rprio.add_argument("--expect", default=None, metavar="V",
                        help="The priority's version as read; refused if it changed since")
     rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire, restore or confirm a standing rule", parents=[rt_json])
@@ -5770,6 +5771,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help='Explicit choices for held or paused accounts: {"id": "end" or "keep"}')
     rrule.add_argument("--at-owner-request", default=None, metavar="REQUEST",
                        help="A conversation: the owner's request, in one line (rule add or edit; stays unconfirmed)")
+    rrule.add_argument("--base", default=None, help="Owner revision read when preparing a rule edit request")
     rrule.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rrule)
 

@@ -515,35 +515,38 @@ def proposals(replay):
             replay.event("rule_edit", 3, n=1, text="second", pending=True, base="r1", written_by=OTHER)]
 
 
-@future("5", "two conversations can replace a proposal without the pending-author lock")
-def test_4_two_conversations_take_turns_without_refusal(replay):
+def test_4_two_conversations_take_turns_without_refusal(replay, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     routing.add_rule("owner", via="app")
-    routing.request_rule("first", n=1, author=AUTHOR)
+    shown = routing.conversation_view()
+    routing.request_rule("first", n=1, author=AUTHOR, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
     refused = None
     try:
-        routing.request_rule("second", n=1, author=OTHER)
+        shown = routing.conversation_view()
+        routing.request_rule("second", n=1, author=OTHER, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
     except routing.RouteError as error:
         refused = str(error)
     expect(refused, None, "4: the second conversation is refused by the pending-author lock")
     assert replay.view()["rules"][0]["text"] == "second"
 
 
-@future("5", "priority proposals from two conversations replace rather than lock")
-def test_4_priority_conversations_take_turns_without_refusal(replay):
+def test_4_priority_conversations_take_turns_without_refusal(replay, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     routing.set_priority([{"account": "Codex", "role": "owner"}], via="app", expect=routing.priority_version())
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": "first"}], owner_request="synthetic request",
-                             author=AUTHOR, expect=routing.priority_version())
+                             author=AUTHOR, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     refused = None
     try:
+        shown = routing.conversation_view()
         routing.request_priority([{"account": "Codex", "role": "second"}], owner_request="synthetic request",
-                                 author=OTHER, expect=routing.priority_version())
+                                 author=OTHER, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     except routing.RouteError as error:
         refused = str(error)
     expect(refused, None, "4: a pending priority refuses another conversation's replacement")
     assert replay.view()["priority"]["entries"][0]["role"] == "second"
 
 
-@future("5", "replaced proposals retain terminal status and notify their original author")
 def test_4_first_author_is_told_the_proposal_was_replaced(replay):
     view = replay.fold(proposals(replay))
     assert view["rules"][0]["text"] == "second"
@@ -552,7 +555,6 @@ def test_4_first_author_is_told_the_proposal_was_replaced(replay):
     assert view["proposals"]["e2"]["notify"] == AUTHOR
 
 
-@future("5", "a delayed proposal based on an old owner revision is crossed")
 def test_4_delayed_retry_cannot_override_new_owner_revision(replay):
     rows = proposals(replay)[:2]
     rows += [replay.event("rule_edit", 3, n=1, text="new owner", revision="r2"),
@@ -562,11 +564,7 @@ def test_4_delayed_retry_cannot_override_new_owner_revision(replay):
     assert view["proposals"]["e4"]["status"] == "crossed"
 
 
-@pytest.mark.parametrize("ending", [
-    pytest.param("expiry", marks=future("5", "proposal expiry must restore the owner revision")),
-    "undo",
-    pytest.param("dismiss", marks=future("5", "Dismiss must restore the owner revision")),
-])
+@pytest.mark.parametrize("ending", ["expiry", "undo", "dismiss"])
 def test_4_overlay_end_never_revives_replaced_proposal(replay, ending):
     rows = proposals(replay)
     if ending == "expiry":

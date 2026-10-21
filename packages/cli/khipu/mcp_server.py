@@ -49,6 +49,7 @@ Manual harness wiring (Install packs remain P3 — do not auto-edit configs):
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import re
@@ -887,9 +888,14 @@ TOOLS: list[dict] = [
                          "description": "Existing standing rule number to change; omit to add"},
                 "holds": {"type": "object", "additionalProperties": {"type": "string", "enum": ["end", "keep"]},
                           "description": "Explicit end-or-keep choices for held or paused accounts"},
+                "base": {"type": "string", "minLength": 1, "maxLength": 256,
+                         "description": "A rule owner revision this conversation was shown by khipu_route "
+                                        "when this request was prepared; a request delivered after the owner "
+                                        "changed the rule is recorded as crossed, never made live"},
                 "owner_request": {"type": "string", "description": "This conversation's one-line words describing the owner's request"},
             },
             "required": ["text", "owner_request"],
+            "allOf": [{"if": {"required": ["rule"]}, "then": {"required": ["base"]}}],
         },
     },
     {
@@ -924,10 +930,14 @@ TOOLS: list[dict] = [
                     },
                 },
                 "until": {"type": "string", "description": "When the whole priority ends (a time, or 3d)"},
+                "base": {"type": "string", "minLength": 1, "maxLength": 256,
+                         "description": "The priority's owner revision (owner_revision, as khipu_route lists "
+                                        "it) when this request was prepared; a request delivered after the "
+                                        "owner changed the priority is recorded as crossed, never made live"},
                 "owner_request": {"type": "string",
                                   "description": "This conversation's one-line words describing the owner's request"},
             },
-            "required": ["entries", "owner_request"],
+            "required": ["entries", "owner_request", "base"],
         },
     },
     {
@@ -1303,7 +1313,9 @@ def _routing_light() -> dict:
         _ensure_path()
         from khipu import routing
 
-        return routing.light_status()
+        # Status is optional and may finish after its caller has returned.
+        # Notices belong to the delivery-aware route and hook responses.
+        return routing.light_status(session_id="")
     except Exception:  # noqa: BLE001 - an optional field must never break khipu_status
         return {}
 
@@ -2212,6 +2224,28 @@ def _tool_usage(args: dict) -> dict:
                                             background=True))
 
 
+# Stdio has one connection per server process. PID scoping also drops any
+# receipts inherited by a fork; a new stdio connection gets a fresh token.
+_ROUTING_RECEIPTS = {}
+_ROUTING_RECEIPTS_LOCK = threading.RLock()
+
+
+def _with_route_receipts(func):
+    @functools.wraps(func)
+    def call(args):
+        from khipu import routing
+
+        with _ROUTING_RECEIPTS_LOCK:
+            key = (os.getpid(), _ROUTING_SESSION, str(routing.routing_dir()))
+            if _ROUTING_RECEIPTS.get("key") != key:
+                _ROUTING_RECEIPTS.clear()
+                _ROUTING_RECEIPTS.update(key=key, reads={})
+            with routing.mcp_read_receipts(_ROUTING_RECEIPTS["reads"]):
+                return func(args)
+    return call
+
+
+@_with_route_receipts
 def _tool_route(args: dict) -> dict:
     """khipu_route: the routing record as ``khipu route --json`` gives it,
     plus the words the push leaves out. Local only until the cloud copy."""
@@ -2244,6 +2278,7 @@ def _tool_route_report(args: dict) -> dict:
     return routing.conversation_write(args, author=routing.conversation_author())
 
 
+@_with_route_receipts
 def _tool_route_rule(args: dict) -> dict:
     """Record a conversation's owner-requested rule through the trusted
     report author path; this tool never lets it speak as the owner."""
@@ -2252,11 +2287,14 @@ def _tool_route_rule(args: dict) -> dict:
     _ensure_path()
     from khipu import routing
 
-    if not isinstance(args, dict) or set(args) - {"text", "rule", "holds", "owner_request"}:
+    if not isinstance(args, dict) or set(args) - {"text", "rule", "holds", "owner_request", "base"}:
         raise ValueError("khipu_route_rule takes text, owner_request and optional rule and holds")
     text = args.get("text")
     if not isinstance(text, str):
         raise ValueError("text must be text")
+    base = args.get("base")
+    if (args.get("rule") is not None or base is not None) and (not isinstance(base, str) or not base.strip()):
+        raise routing.RouteError("base must be the owner revision the request was prepared against")
     owner_request = args.get("owner_request")
     if not isinstance(owner_request, str) or not owner_request.strip() or "\n" in owner_request or "\r" in owner_request:
         raise ValueError("owner_request must be one line of text")
@@ -2268,9 +2306,10 @@ def _tool_route_rule(args: dict) -> dict:
                                                                       for hold, choice in holds.items())):
         raise ValueError('holds must map each hold id to "end" or "keep"')
     return routing.request_rule(text, n=number, owner_request=owner_request,
-                                author=routing.conversation_author(), via="mcp", holds=holds)
+                                author=routing.conversation_author(), via="mcp", holds=holds, base=base)
 
 
+@_with_route_receipts
 def _tool_route_priority(args: dict) -> dict:
     """Record the owner's priority at his request through the conversation
     author path; it never speaks as the owner, and its answer names each
@@ -2280,8 +2319,11 @@ def _tool_route_priority(args: dict) -> dict:
     _ensure_path()
     from khipu import routing
 
-    if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request"}:
+    if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request", "base"}:
         raise ValueError("khipu_route_priority takes entries, owner_request and optional until")
+    base = args.get("base")
+    if not isinstance(base, str) or not base.strip():
+        raise routing.RouteError("base must be the owner revision the request was prepared against")
     entries = args.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError("entries must be the owner's accounts, in his order")
@@ -2291,11 +2333,8 @@ def _tool_route_priority(args: dict) -> dict:
     until = args.get("until")
     if until is not None and not isinstance(until, str):
         raise ValueError("until must be text")
-    # The version as of building this request, read inside the call's lock
-    # budget: one that moves before the write lands refuses it, and the
-    # request still waits for the owner.
     return routing.conversation_priority(entries, until=until, owner_request=owner_request,
-                                         author=routing.conversation_author(), expect_current=True)
+                                         author=routing.conversation_author(), base=base)
 
 
 def _tool_owner_act(args: dict) -> dict:
@@ -2715,7 +2754,8 @@ def _dispatch_message(msg: dict) -> dict | None:
 
 
 def main() -> int:
-    global _RELOAD_ON_CHANGE
+    global _RELOAD_ON_CHANGE, _ROUTING_SESSION
+    _ROUTING_SESSION = secrets.token_hex(16)
     _RELOAD_ON_CHANGE = True
     _note_loaded_modules()
     print(f"[khipu-mcp] ready (pid {os.getpid()})", file=sys.stderr, flush=True)
