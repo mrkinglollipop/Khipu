@@ -3,7 +3,8 @@
 # (routing truth, phase 6). PreToolUse: for a delegation call only, prints
 # hookSpecificOutput.additionalContext with what changed in the routing
 # record since the conversation last heard (the per-prompt push's read,
-# budget and seen marker). SubagentStart: the full summary for the subagent.
+# budget and seen marker). SubagentStart: the bounded child block for the
+# subagent, with the rest owed to its own tool results.
 # Never denies or changes a call, and never fails one: any error -> {}.
 # Aegis's runner env means Aegis is calling, and Aegis gets no push by ANY
 # route. Refuse on GROK runner vars AND on the pack's KHIPU_HARNESS=aegis
