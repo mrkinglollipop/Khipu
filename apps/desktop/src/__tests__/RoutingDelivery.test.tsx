@@ -8,16 +8,48 @@ import { DELIVERY_HEALTH, DELIVERY_NOW, DELIVERY_VIEW } from "../../dev/delivery
 
 afterEach(cleanup);
 
+const SESSION_ID_SHAPED = [
+  /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+  /[0-9a-f]{16,}/i,
+  /[0-9a-f]{8,}/i,
+  /claude_code_/,
+  /\.routing\b/,
+  /Explore-abcdef/,
+  /fixture-/,
+];
+
 describe("Telling conversations: delivery and health", () => {
-  it("shows only the identity and component doctor actually provides", () => {
-    render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+  it("shows generic conversation labels, never raw identities or component ids", () => {
+    const { container } = render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
     const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
     expect(rows).toHaveLength(3);
-    expect(rows[0]).toHaveTextContent("claude:fixture-a");
-    expect(rows[0]).toHaveTextContent("Current component: main");
+    expect(rows[0]).toHaveTextContent("Conversation 1");
+    expect(rows[0]).toHaveTextContent("Claude");
+    expect(rows[0]).toHaveTextContent("main");
+    expect(rows[1]).toHaveTextContent("Conversation 2");
+    expect(rows[1]).toHaveTextContent("Codex");
     expect(rows[1]).toHaveTextContent("2 changes owed");
+    expect(rows[2]).toHaveTextContent("Conversation 1");
+    expect(rows[2]).toHaveTextContent("a helper agent");
     expect(rows[2]).toHaveTextContent("Can't check: delivery point history");
     expect(screen.queryByText(/project-a|last prompt/i)).toBeNull();
+    for (const pattern of SESSION_ID_SHAPED) expect(container.textContent).not.toMatch(pattern);
+  });
+
+  it("shows when the cached health report was read", () => {
+    render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} healthReadAt={DELIVERY_NOW} now={DELIVERY_NOW} />);
+    expect(screen.getByText(/health report read at/i)).toHaveTextContent("40");
+  });
+
+  it("does not call a conversation up to date while telling is off", () => {
+    render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} tellingOff now={DELIVERY_NOW} />);
+    expect(screen.queryByText("No changes owed")).toBeNull();
+    expect(screen.getByRole("list", { name: "Live conversations" })).toHaveTextContent("Not being told");
+  });
+
+  it("shows Off before any delivery summary when the push is off", () => {
+    const model = routingOverview(null, null, null, null, { routing: {}, push: { enabled: false }, delivery: DELIVERY_HEALTH }, DELIVERY_NOW);
+    expect(model.lines.telling).toBe("Off");
   });
 
   it("keeps has-it information unknown until the doctor exposes it", () => {
@@ -58,7 +90,11 @@ describe("Telling conversations: delivery and health", () => {
   it("surfaces delivery failures in Needs you even when the routing record failed", () => {
     const model = routingOverview(null, "route failed", null, null, { routing: null, push: null, delivery: DELIVERY_HEALTH }, DELIVERY_NOW);
     expect(model.problems.filter((item) => item.group === "telling")).toHaveLength(2);
-    expect(model.problems.map((item) => item.needs).join(" ")).toContain("2 changes owed");
+    const needs = model.problems.map((item) => item.needs).join(" ");
+    expect(needs).toContain("Conversation 2");
+    expect(needs).toContain("Codex");
+    expect(needs).toContain("2 changes owed");
+    for (const pattern of SESSION_ID_SHAPED) expect(needs).not.toMatch(pattern);
     expect(model.tags.telling.every((tag) => tag.tone === "err")).toBe(true);
   });
 

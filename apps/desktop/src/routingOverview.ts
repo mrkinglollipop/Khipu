@@ -6,7 +6,7 @@
    the closed lines' tags and Home's attention items read the same sources
    (`brokenRules`, `quietRunners` in routing.ts). */
 
-import { accountClassification, brokenRules, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
+import { accountClassification, brokenRules, deliveryConversationLabels, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
 import type { PlanFact, RouteDeliveryHealth, RouteProvider, RouteView } from "./routing";
 import { proposalsModel } from "./routingProposals";
 import { checksLine, checksModel } from "./routingChecks";
@@ -338,11 +338,15 @@ function deliveryProblems(s: OverviewSettings): Problem[] {
   }
   const health = s.delivery;
   if (!health) return out;
-  for (const row of Array.isArray(health.identities) ? health.identities : []) {
-    if (row?.status !== "red") continue;
+  const identities = Array.isArray(health.identities) ? health.identities : [];
+  const labels = deliveryConversationLabels(identities);
+  identities.forEach((row, index) => {
+    if (row?.status !== "red") return;
+    const label = labels[index];
     const owed = Number.isInteger(row.owed) && (row.owed ?? -1) >= 0 ? `: ${row.owed} changes owed` : "";
-    add(`delivery:${row.identity}:${row.component}`, "delivery-behind", `${row.identity} (${row.component}) has a delivery problem${owed}`);
-  }
+    const where = label.harness ? ` (${label.harness}, ${label.component})` : ` (${label.component})`;
+    add(`delivery:${index}`, "delivery-behind", `${label.conversation}${where} has a delivery problem${owed}`);
+  });
   if (health.replication?.status === "red") add("delivery-macs", "delivery-copy", "Other Macs' routing copy is behind");
   if (health.gateway?.status === "red") add("delivery-cloud", "delivery-copy", "The cloud routing copy is behind");
   if (health.status === "red" && !out.length) add("delivery-health", "delivery-behind", "Routing delivery needs attention");
@@ -416,6 +420,7 @@ function holdsLine(view: RouteView, now: Date): string {
 }
 
 function tellingLine(s: OverviewSettings): string {
+  if (s.push && s.push.enabled !== true) return "Off";
   if (s.deliveryError) return "Couldn't read delivery";
   if (s.delivery) {
     const identities = Array.isArray(s.delivery.identities) ? s.delivery.identities : [];

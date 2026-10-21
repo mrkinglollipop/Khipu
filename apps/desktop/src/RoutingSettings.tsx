@@ -56,6 +56,7 @@ import {
   accountState,
   capitalise,
   disagreementWords,
+  deliveryConversationLabels,
   deliveryReason,
   holdWords,
   modelDisagreementWords,
@@ -2691,8 +2692,10 @@ function HoldsSection({
 // ---------------------------------------------------------------------------
 
 /** `routing_delivery` is intentionally an evidence report, not a routing
- * decision. Keep its raw identity and component: doctor does not carry a
- * friendly conversation, project, Mac, or last-prompt label for these rows. */
+ * decision. Its raw identity and component can hold session ids, so they are
+ * never rendered: rows use the generic labels from
+ * `deliveryConversationLabels` (doctor carries no friendly conversation,
+ * project, Mac, or last-prompt label for these rows). */
 
 function deliveryStrings(value: unknown): string[] | null {
   return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : null;
@@ -2727,9 +2730,10 @@ function freshnessWords(label: string, freshness: RouteDeliveryFreshness | undef
   return { label, text: "Can't be checked", tone: undefined };
 }
 
-function identityWords(row: RouteDeliveryIdentity): { text: string; detail?: string; tone: "ok" | "warn" | "err" | undefined } {
+function identityWords(row: RouteDeliveryIdentity, tellingOff = false): { text: string; detail?: string; tone: "ok" | "warn" | "err" | undefined } {
   const owed = typeof row.owed === "number" && Number.isFinite(row.owed) && row.owed >= 0 ? row.owed : null;
   const owedWords = owed == null ? null : `${owed} ${owed === 1 ? "change" : "changes"} owed`;
+  if (tellingOff && row.status === "green" && owed === 0 && !(row.missing?.length)) return { text: "Not being told", tone: undefined };
   if (row.status === "green" && owed != null && !(row.missing?.length)) return { text: owed ? owedWords! : "No changes owed", tone: owed ? undefined : "ok" };
   if (row.status === "red") {
     const reason = (deliveryStrings(row.reasons) ?? []).map(deliveryReason).join("; ");
@@ -2751,10 +2755,14 @@ function deliveryStatus(health: RouteDeliveryHealth): "green" | "red" | "unknown
 /** Delivery and health (routing slice 15a): presentation only. The route view
  * supplies recent changes; `khipu doctor` supplies receipt evidence. Nothing
  * here acknowledges delivery, changes settings, or decides where work goes. */
-export function DeliverySection({ data, health, healthError, now, liveAfterSeconds, onRetry }: {
+export function DeliverySection({ data, health, healthError, healthReadAt, tellingOff, now, liveAfterSeconds, onRetry }: {
   data: RouteView | null;
   health?: RouteDeliveryHealth | null;
   healthError?: string | null;
+  /** When the (possibly cached) doctor report behind `health` was read. */
+  healthReadAt?: Date | number | null;
+  /** The routing push is off, so no conversation is being told anything. */
+  tellingOff?: boolean;
   now: Date;
   liveAfterSeconds?: number;
   onRetry?: () => Promise<unknown>;
@@ -2769,6 +2777,11 @@ export function DeliverySection({ data, health, healthError, now, liveAfterSecon
     readHealth.replication?.status === "not_applicable" ? null : freshnessWords("Other Macs", readHealth.replication) ?? { label: "Other Macs", text: "Can't be checked", tone: undefined },
     readHealth.gateway?.status === "not_applicable" ? null : freshnessWords("Cloud copy", readHealth.gateway) ?? { label: "Cloud copy", text: "Can't be checked", tone: undefined },
   ].filter((row): row is NonNullable<typeof row> => row != null) : [];
+  const labels = deliveryConversationLabels(identities);
+  const readAt = healthReadAt == null ? null : healthReadAt instanceof Date ? healthReadAt : new Date(healthReadAt);
+  const readAtWords = readAt && !Number.isNaN(readAt.getTime())
+    ? readAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    : null;
   const healthReasons = (deliveryStrings(readHealth?.reasons) ?? []).map(deliveryReason);
   const liveLabel = liveAfterSeconds == null
     ? "recent delivery points"
@@ -2802,15 +2815,20 @@ export function DeliverySection({ data, health, healthError, now, liveAfterSecon
         </div>
       ) : null}
 
+      {readHealth && readAtWords ? (
+        <p className="set-help">Delivery health from the health report read at {readAtWords}.</p>
+      ) : null}
+
       <div className="section-body">
         <h2 className="sub-title">Live conversations <span className="meta">{liveLabel}</span></h2>
         {identities.length ? (
           <div className="mrows" role="list" aria-label="Live conversations">
-            {identities.map((row) => {
-              const state = identityWords(row);
+            {identities.map((row, index) => {
+              const state = identityWords(row, tellingOff);
+              const label = labels[index];
               return (
-                <div key={`${row.identity}:${row.component}`} className="mrow delivery" role="listitem">
-                  <span><span className="name mono">{row.identity}</span><br /><span className="src">Current component: {row.component}</span></span>
+                <div key={`delivery-${index}`} className="mrow delivery" role="listitem">
+                  <span><span className="name">{label.conversation}</span><br /><span className="src">{[label.harness, label.component].filter(Boolean).join(" · ")}</span></span>
                   <span className="delivery-state"><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
                 </div>
               );
@@ -3179,6 +3197,7 @@ function TellingSection({
   data,
   deliveryHealth,
   deliveryHealthError,
+  deliveryHealthReadAt,
   deliveryLiveAfterSeconds,
   onRetryDelivery,
   now,
@@ -3194,6 +3213,7 @@ function TellingSection({
   data: RouteView | null;
   deliveryHealth?: RouteDeliveryHealth | null;
   deliveryHealthError?: string | null;
+  deliveryHealthReadAt?: number | null;
   deliveryLiveAfterSeconds?: number;
   onRetryDelivery?: () => Promise<unknown>;
   now: Date;
@@ -3225,7 +3245,7 @@ function TellingSection({
   const oldSet = [old.env ? "env" : null, old.file ? "file" : null].filter(Boolean);
   return (
     <div className="section-body">
-      <DeliverySection data={data} health={deliveryHealth} healthError={deliveryHealthError} now={now} liveAfterSeconds={deliveryLiveAfterSeconds} onRetry={onRetryDelivery} />
+      <DeliverySection data={data} health={deliveryHealth} healthError={deliveryHealthError} healthReadAt={deliveryHealthReadAt} tellingOff={master != null && master.enabled !== true} now={now} liveAfterSeconds={deliveryLiveAfterSeconds} onRetry={onRetryDelivery} />
       <SubFold k="sub:hears" name="What each kind of conversation hears" line={`${HEARS.length} kinds`} folds={folds}>
       <p className="opt-group-note">
         A running conversation hears a change as soon as its app allows. Any conversation can also ask Khipu.
@@ -4677,6 +4697,7 @@ export function RoutingSettings({
   onSetUpAccounts,
   deliveryHealth,
   deliveryHealthError,
+  deliveryHealthReadAt,
   onRetryDelivery,
 }: {
   active: boolean;
@@ -4685,6 +4706,8 @@ export function RoutingSettings({
   /** The current app-wide `khipu doctor` delivery block, if it has been read. */
   deliveryHealth?: RouteDeliveryHealth | null;
   deliveryHealthError?: string | null;
+  /** When that doctor report was read (ms epoch); it may be a cached report. */
+  deliveryHealthReadAt?: number | null;
   /** Re-reads the existing app-wide doctor report; it changes no routing state. */
   onRetryDelivery?: () => Promise<unknown>;
 }) {
@@ -4834,6 +4857,7 @@ export function RoutingSettings({
         data={data}
         deliveryHealth={deliveryHealth}
         deliveryHealthError={deliveryHealthError}
+        deliveryHealthReadAt={deliveryHealthReadAt}
         deliveryLiveAfterSeconds={deliveryLiveAfterSeconds}
         onRetryDelivery={onRetryDelivery}
         now={now}

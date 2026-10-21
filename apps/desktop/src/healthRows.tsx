@@ -457,7 +457,11 @@ export function healthRows(
     // Delivery's top-level boolean is false for both a confirmed delivery
     // problem and an unreadable report. Keep the latter grey so Home never
     // claims a failure without the doctor's evidence.
-    if (key === "routing_delivery_ok" && (parsed.routing_delivery as { status?: unknown } | undefined)?.status === "unknown") {
+    const deliveryBlock = parsed.routing_delivery;
+    if (
+      key === "routing_delivery_ok" &&
+      (!deliveryBlock || typeof deliveryBlock !== "object" || (deliveryBlock as { status?: unknown }).status === "unknown")
+    ) {
       return { key, status: "skipped", label, ...extra };
     }
     return { key, status: parsed[key] ? "ok" : "err", label, ...extra };

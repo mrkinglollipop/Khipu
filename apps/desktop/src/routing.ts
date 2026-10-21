@@ -1241,3 +1241,60 @@ export function deliveryReason(reason: string): string {
   };
   return words[reason] ?? reason.replace(/-/g, " ");
 }
+
+const DELIVERY_HARNESS_WORDS: ReadonlyArray<readonly [string, string]> = [
+  ["claude_code", "Claude"],
+  ["claude-code", "Claude"],
+  ["claude", "Claude"],
+  ["codex", "Codex"],
+  ["grok", "Grok"],
+  ["cursor", "Cursor"],
+  ["glm", "GLM"],
+  ["muse", "Muse"],
+  ["deepseek", "DeepSeek"],
+  ["aegis", "Aegis"],
+  ["antigravity", "Antigravity"],
+  ["gemini", "Gemini"],
+];
+
+function deliveryHarness(identity: string): string | null {
+  const lower = identity.toLowerCase();
+  for (const [prefix, word] of DELIVERY_HARNESS_WORDS) {
+    if (lower === prefix) return word;
+    if (lower.startsWith(prefix) && ":_-/.".includes(lower.charAt(prefix.length))) return word;
+  }
+  return null;
+}
+
+export type DeliveryConversationLabel = {
+  conversation: string;
+  harness: string | null;
+  component: string;
+};
+
+/** Owner-facing labels for delivery rows. Raw identities and component ids
+ * can hold session ids, so they are never rendered: a conversation is named
+ * by its stable first-appearance order, its harness, and a generic component
+ * word only. */
+export function deliveryConversationLabels(
+  rows: ReadonlyArray<{ identity?: unknown; component?: unknown }> | null | undefined,
+): DeliveryConversationLabel[] {
+  const numbers = new Map<string, number>();
+  return (rows ?? []).map((row) => {
+    const identity = typeof row?.identity === "string" ? row.identity : "";
+    if (!numbers.has(identity)) numbers.set(identity, numbers.size + 1);
+    const component = typeof row?.component === "string" ? row.component : "";
+    return {
+      conversation: `Conversation ${numbers.get(identity)}`,
+      harness: identity ? deliveryHarness(identity) : null,
+      component:
+        component === "main"
+          ? "main"
+          : component === "mcp"
+            ? "MCP helper"
+            : component === "agent" || component.startsWith("agent:")
+              ? "a helper agent"
+              : "another component",
+    };
+  });
+}

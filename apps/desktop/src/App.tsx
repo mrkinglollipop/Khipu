@@ -6035,6 +6035,7 @@ export default function App() {
                     onSetUpAccounts={openAccountsStepInFirstRun}
                     deliveryHealth={(doctorParsed as { routing_delivery?: RouteDeliveryHealth } | null)?.routing_delivery ?? null}
                     deliveryHealthError={doctorReadError}
+                    deliveryHealthReadAt={doctorLastOkAt}
                     onRetryDelivery={() => loadDoctor(true)}
                   />
                 ) : null}

@@ -32,9 +32,9 @@ export const DELIVERY_HEALTH: RouteDeliveryHealth = {
   reasons: ["budget-stall", "cross-mac-stale"],
   missing: [],
   identities: [
-    { identity: "claude:fixture-a", component: "main", status: "green", owed: 0, reasons: [], missing: [] },
-    { identity: "codex:fixture-b", component: "mcp", status: "red", owed: 2, reasons: ["budget-stall"], missing: [] },
-    { identity: "claude:fixture-a", component: "agent:helper-1", status: "unknown", reasons: [], missing: ["delivery point history"] },
+    { identity: "claude_code_0a1b2c3d-1111-2222-3333-444455556666.routing", component: "main", status: "green", owed: 0, reasons: [], missing: [] },
+    { identity: "codex_9f8e7d6c-aaaa-bbbb-cccc-ddddeeeeffff.routing", component: "mcp", status: "red", owed: 2, reasons: ["budget-stall"], missing: [] },
+    { identity: "claude_code_0a1b2c3d-1111-2222-3333-444455556666.routing", component: "agent:Explore-abcdef12", status: "unknown", reasons: [], missing: ["delivery point history"] },
   ],
   prompts: { status: "green", count: 38, skipped: 0, rate_pct: 0 },
   replication: { status: "red", age_seconds: 8040 },
