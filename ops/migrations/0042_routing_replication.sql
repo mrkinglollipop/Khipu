@@ -17,16 +17,17 @@
 -- routing_sources is the per-Mac source status row: how fresh each sending
 -- Mac's stream is, by the hub's own clock.
 --
--- Additive and safe to run twice. Reverse with DROP TABLE routing_sources,
--- routing_events, and deleting the 0042 row from schema_migrations.
+-- Additive and safe to run twice. Reverse: DROP INDEX IF EXISTS
+-- idx_routing_events_received, idx_routing_events_sender; DROP TABLE
+-- routing_sources, routing_events; and delete the
+-- '0042_routing_replication' row from schema_migrations.
 
 CREATE TABLE IF NOT EXISTS routing_events (
     hub_order   BIGSERIAL,
     event_id    TEXT PRIMARY KEY,
     sender_mac  TEXT NOT NULL,
     payload     JSONB NOT NULL,
-    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (hub_order)
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_routing_events_sender
