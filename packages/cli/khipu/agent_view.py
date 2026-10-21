@@ -128,38 +128,39 @@ def _saved_view() -> dict:
     return {}
 
 
-def _homes(extra_keys: Iterable[str] | None, view: dict, *, local_only=False) -> list[tuple[str, str | None]]:
+def _homes(extra_keys: Iterable[str] | None, view: dict, *, local_only=False, require_complete=False) -> list[tuple[str, str | None]]:
     """Every (harness, login folder) Khipu knows: configured (invalid entries
     included), discovered Claude homes, the routing record's accounts, the
     caller's ``extra_keys`` ("harness|home"), each default login and each
     one set for this process through a harness's own variable
     (``CODEX_HOME``, ``GROK_HOME``, ``CLAUDE_CONFIG_DIR``)."""
     out: list[tuple[str, str | None]] = [(h, None) for h in _DEFAULT_FOLDERS]
-    with contextlib.suppress(Exception):
+    with (contextlib.nullcontext() if require_complete else contextlib.suppress(Exception)):
         from khipu.usage import _HOME_VARS
 
         for harness, var in _HOME_VARS.items():
             value = (os.environ.get(var) or "").strip()
             if value:
                 out.append((harness, value))
-    with contextlib.suppress(Exception):
+    with (contextlib.nullcontext() if require_complete else contextlib.suppress(Exception)):
         from khipu.config import load_config
 
         for entry in load_config().get("usage_accounts") or []:
             if isinstance(entry, dict) and isinstance(entry.get("home"), str) and entry["home"].strip():
                 out.append((str(entry.get("harness") or "").strip().lower(), entry["home"].strip()))
-    with contextlib.suppress(Exception):
+    with (contextlib.nullcontext() if require_complete else contextlib.suppress(Exception)):
         from khipu import claude_homes
 
         for found in (() if local_only else claude_homes.discover()):
             out.append(("claude", None if found.is_default else str(found.path)))
-    with contextlib.suppress(Exception):
+    with (contextlib.nullcontext() if require_complete else contextlib.suppress(Exception)):
         # Account discovery's finds (settings clarity phase 9): its last
         # stored run, which carries every source, and the login-shaped names
         # in the home folder now, so a folder is scrubbed before any run.
         from khipu import discover
 
-        for rec in discover._load_store()["candidates"].values():
+        store = discover._load_store_strict() if require_complete else discover._load_store()
+        for rec in store["candidates"].values():
             if rec["cli"] in _DEFAULT_FOLDERS and rec.get("abs") and not rec.get("default"):
                 out.append((rec["cli"], rec["abs"]))
         for cli, folder in (() if local_only else discover._source_names()):
@@ -379,7 +380,7 @@ def _other_paths(*, local_only=False) -> list[str]:
     return others
 
 
-def _rules(extra_keys: Iterable[str] | None = None, *, local_only=False) -> _Table:
+def _rules(extra_keys: Iterable[str] | None = None, *, local_only=False, require_complete=False) -> _Table:
     view = _saved_view()
     home = _home_dir()
     root_to: dict[str, object] = {}  # folded path -> an _Id or a word
@@ -394,7 +395,7 @@ def _rules(extra_keys: Iterable[str] | None = None, *, local_only=False) -> _Tab
         if not plain:
             token_names.add(_fold(form))
 
-    for harness, raw in _homes(extra_keys, view, local_only=local_only):
+    for harness, raw in _homes(extra_keys, view, local_only=local_only, require_complete=require_complete):
         ident = _Id(harness, raw)
         default = raw is None
         if raw is None:
@@ -694,8 +695,23 @@ def _table(extra_keys) -> _Table:
     """The cached table, rebuilt on any source change or TTL expiry."""
     extra_keys = tuple(extra_keys) if extra_keys is not None else None
     current = getattr(_PROJECTION, "current", None)
-    if current is not None and current[0] == extra_keys:
-        return current[1]
+    if current is not None:
+        if current[0] is None:
+            keys = getattr(_PROJECTION, "pull_keys", ())
+            if set(extra_keys or ()) - set(keys):
+                keys = tuple(dict.fromkeys((*keys, *extra_keys)))
+                try:
+                    table = _rules(keys, require_complete=True)
+                except Exception:
+                    raise PullInventoryUnavailable() from None
+                # Owner provenance comes from the view being projected,
+                # never from a saved view preceding this pull's fold.
+                table.owner = []
+                _PROJECTION.current = (None, table)
+                _PROJECTION.pull_keys = keys
+            return _PROJECTION.current[1]
+        if current[0] == extra_keys:
+            return current[1]
     previous = getattr(_FORM_CACHE, "current", None)
     _FORM_CACHE.current = {}
     try:
@@ -767,6 +783,8 @@ def _scrub_text(text: str, table: _Table, keep: list[str]) -> str:
 
 
 def _walk(value, table, keep):
+    if isinstance(value, RoutingPage):
+        return value
     if isinstance(value, str):
         return _scrub_text(value, table, keep)
     if isinstance(value, dict):
@@ -915,6 +933,198 @@ def _withhold_names(value, fixed=None, names=None):
     if isinstance(value, (list, tuple)):
         return type(value)(_withhold_names(v, fixed, names) for v in value)
     return value
+
+
+class RoutingPage(str):
+    """An internal fragment of a fully projected routing entry.
+
+    JSON callers cannot supply this provenance. Only delivery may create it,
+    after scanning the complete source and before cutting a page.
+    """
+
+
+# Every secret shape in redact.py needs one of these markers (a vendor
+# prefix, a credential keyword, "://" for a URL credential, a key block);
+# pure-ASCII text holding none of them cannot match, so the full regex
+# scan is skipped for it. Lowercased markers only ever over-match, never
+# under-match on ASCII. Non-ASCII variants always get the full scan:
+# redact_secrets is case-insensitive, and re.I folds some non-ASCII
+# letters (long s, dotless/dotted i, Kelvin sign) onto ASCII, so a
+# keyword spelled with those can hide from the ASCII markers.
+_SECRET_MARKERS = ("-----begin", "sk-", "xai-", "k_live_", "k_test_", "akia", "asia",
+                   "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "xox", "aiza",
+                   "ya29.", "eyj", "bearer", "basic", "://", "key", "secret", "token",
+                   "passw", "pwd", "dsn", "connection", "private")
+
+
+def _has_secret(text: str) -> bool:
+    from khipu.redact import redact_secrets
+
+    for variant in _decoded_variants(text):
+        # The check is on each decoded variant, not the original text:
+        # an ASCII escape (e.g. \u0131) only becomes non-ASCII on decode.
+        if not variant.isascii():
+            if redact_secrets(variant, force=True)[1]:
+                return True
+            continue
+        lowered = variant.lower()
+        if not any(marker in lowered for marker in _SECRET_MARKERS):
+            continue
+        if redact_secrets(variant, force=True)[1]:
+            return True
+    return False
+
+
+def _strict_text(text: str, table: _Table, keep: list[str], *, _secret_known: bool | None = None) -> str:
+    # An exemption must never split a credential into undetectable pieces.
+    if _secret_known is None:
+        if _has_secret(text):
+            return WITHHELD
+    elif _secret_known:
+        return WITHHELD
+    held = [w for w in keep if w and w in text]
+    for variant in _decoded_variants(text):
+        if "|" not in variant:
+            continue
+        matches = list(_ANY_ACCOUNT_KEY.finditer(variant))
+        if not matches:
+            continue
+        spans = [(m.start(), m.end()) for word in held
+                 for m in re.finditer(re.escape(word), variant)]
+        if any(not any(start <= match.start() and match.end() <= end for start, end in spans)
+               for match in matches):
+            return WITHHELD
+    return text
+
+
+_OWNER_REPLACEMENTS: dict[tuple, list] = {}
+
+
+def _owner_token_replacements(words):
+    from khipu.redact import MASK, redact_secrets
+
+    cache_key = tuple(words)
+    cached = _OWNER_REPLACEMENTS.get(cache_key)
+    if cached is not None:
+        return cached
+    replacements = []
+    for word in words:
+        if not _has_secret(word):
+            continue
+        cleaned = redact_secrets(word, force=True)[0]
+        # Encoded credentials must be removed before owner-word masking too.
+        cleaned = re.sub(r"\S+", lambda m: MASK if _has_secret(m.group()) else m.group(), cleaned)
+        # A whole owner credential must not mask only the prefix of a longer
+        # pending credential and leave its otherwise unrecognizable suffix.
+        pattern = re.compile(r"(?<![A-Za-z0-9_./%&;=+-])" + re.escape(word) + r"(?![A-Za-z0-9_./%&;=+-])")
+        replacements.append((word, cleaned, pattern))
+    if len(_OWNER_REPLACEMENTS) >= 8:
+        _OWNER_REPLACEMENTS.clear()
+    _OWNER_REPLACEMENTS[cache_key] = replacements
+    return replacements
+
+
+def redact_owner_tokens(text: str, words: Iterable[str]) -> str:
+    """Remove credentials only inside complete, current owner phrases."""
+    for _word, cleaned, pattern in _owner_token_replacements(sorted(words, key=len, reverse=True)):
+        text = pattern.sub(lambda _m: cleaned, text)
+    return text
+
+
+def scrub_strict(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] | None = None):
+    """``scrub``, then the strict projection's final scan: any string still
+    holding an account key (``harness|``) or a secret-shaped token is
+    withheld whole. Current owner phrases preserve their words while
+    secret tokens inside them are removed before any exemption is applied."""
+    table = _table(extra_keys)
+    words = sorted({w for w in [*keep, *table.owner] if isinstance(w, str) and w}, key=len, reverse=True)
+    # Only a complete owner phrase may authorize token-level redaction.
+    # A pending credential containing a short owner word still fails closed.
+    replacements = _owner_token_replacements(words)
+    clean_words = {word: cleaned for word, cleaned, _pattern in replacements}
+    words = sorted({clean_words.get(word, word) for word in words}, key=len, reverse=True)
+    def walk(item):
+        if isinstance(item, RoutingPage):
+            return item
+        if isinstance(item, str):
+            for _word, cleaned, pattern in replacements:
+                item = pattern.sub(lambda _m: cleaned, item)
+            # Scan the source before any path/name or owner-word masking.
+            if _has_secret(item):
+                return WITHHELD
+            item = _strict_text(item, table, words, _secret_known=False)
+            if item == WITHHELD:
+                return item
+            scrubbed = _scrub_text(item, table, words)
+            # An unchanged value already passed this exact scan; only a
+            # scrubbed value can have joined fragments into a new shape.
+            return scrubbed if scrubbed == item else _strict_text(scrubbed, table, words)
+        if isinstance(item, dict):
+            return {(walk(k) if isinstance(k, str) else k): walk(v) for k, v in item.items()}
+        if isinstance(item, list):
+            return [walk(v) for v in item]
+        if isinstance(item, tuple):
+            return tuple(walk(v) for v in item)
+        return item
+
+    return walk(value)
+
+
+class PullInventoryUnavailable(RuntimeError):
+    """The pull cannot be projected with a complete login table."""
+
+
+@contextlib.contextmanager
+def pull_projection():
+    """Use one complete login table for a pull, or withhold the answer.
+
+    Unlike the bounded hook projection, a pull must not use a local-only
+    fallback. The full inventory and its resolved aliases must finish.
+    """
+    current = getattr(_PROJECTION, "current", None)
+    if current is not None and current[0] is None:
+        yield
+        return
+    try:
+        _config_whole()
+        # Discovery intentionally tolerates unreadable directories. That is
+        # not evidence of completeness at this privacy boundary.
+        from khipu import discover
+
+        with os.scandir(_home_dir()) as entries:
+            for entry in entries:
+                if discover.name_match(entry.name):
+                    entry.is_dir(follow_symlinks=True)
+        # The existing routing read supplies fresh account keys through
+        # _table. Another read here would add a third lock wait and would
+        # misclassify routing-read failures as inventory failures.
+        keys = ()
+        table = _rules(keys, require_complete=True)
+        table.owner = []
+    except Exception:
+        raise PullInventoryUnavailable() from None
+    previous = getattr(_PROJECTION, "current", None)
+    previous_keys = getattr(_PROJECTION, "pull_keys", ())
+    _PROJECTION.current = (None, table)
+    _PROJECTION.pull_keys = keys
+    try:
+        yield
+    finally:
+        _PROJECTION.current = previous
+        _PROJECTION.pull_keys = previous_keys
+
+
+def login_inventory_available() -> bool:
+    """Only the complete table prepared for this pull can cover lane aliases.
+
+    A successful complete pull inventory proves coverage even when no
+    private login exists. Hook tables retain their helper freshness gate;
+    a general cached table alone never grants pull coverage.
+    """
+    current = getattr(_PROJECTION, "current", None)
+    if current is None or current[0] is not None or current[1].previous is not None:
+        return False
+    return True
 
 
 def _projected(value):

@@ -444,8 +444,35 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
             # repeat live DB work through the cwd and recents fallbacks.
             _ = exc
             return ""
-        if slice_data and (slice_data.get("commitments") or slice_data.get("episodes")):
-            return _render_project_slice(project or host or "unknown", slice_data)
+        # Routing directions (slice 19a) never carry the owner's words
+        # into a slice: a job's slice names none at all, and another
+        # project's slice names none either. This project's own slice
+        # gets only a count and the ids; `khipu owed` shows the words.
+        direction_ids: list[str] = []
+        if not job and project:
+            try:
+                from khipu import routing_directions
+
+                direction_ids = routing_directions.pushed_slice_ids(project)
+            except Exception:  # noqa: BLE001 - directions never break the pushed slice
+                direction_ids = []
+        if slice_data and (slice_data.get("commitments") or slice_data.get("episodes")
+                           or direction_ids):
+            rendered = _render_project_slice(project or host or "unknown", slice_data)
+            if direction_ids:
+                noun = "direction" if len(direction_ids) == 1 else "directions"
+                note = [f"### Routing directions",
+                        f"- {len(direction_ids)} routing {noun} not yet in Khipu: "
+                        f"{', '.join(direction_ids)}; khipu owed shows them"]
+                lines = rendered.split("\n")
+                for at, line in enumerate(lines):
+                    if line.startswith("Loaded for this session"):
+                        lines[at:at] = note
+                        break
+                else:
+                    lines.extend(note)
+                rendered = "\n".join(lines)
+            return rendered
 
     rows: list[dict] = []
     term = cwd_search_term(cwd)
@@ -650,7 +677,14 @@ class _RoutingAtStart:
     def __init__(self, moment: str = "start", *, session_id: str | None = None) -> None:
         # "start", or "delegation" for a subagent's start (routing_delegation).
         self.moment = moment
-        self.session = session_id
+        from khipu.routing_delivery import hook_session
+
+        self.session = hook_session(session_id) if session_id else None
+        # An explicitly empty payload session is an unidentified receiver:
+        # its child must not fall back to the environment's author, whose
+        # notices are not this receiver's to see. No argument at all keeps
+        # the child's environment fallback.
+        self.child_session = self.session if session_id else ("" if session_id == "" else None)
         self.out: dict | None = None
         self.deadline = time.monotonic()
         self.pid: int | None = None
@@ -681,7 +715,7 @@ class _RoutingAtStart:
                 os.close(write_fd)
                 raise
             if pid == 0:
-                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment, self.session)
+                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment, self.child_session)
             os.close(write_fd)
             self.pid, self.fd = pid, read_fd
         except Exception:
@@ -750,12 +784,18 @@ class _RoutingAtStart:
         """Reset the session's last-seen version to the one just printed and
         record the time of this full summary."""
         out = self.out
-        if self.session is not None and session_id != self.session:
-            return
         if not isinstance(session_id, str) or not session_id or not isinstance(out, dict):
             return
+        if self.session is not None:
+            from khipu.routing_delivery import hook_session
+
+            if hook_session(session_id) != self.session:
+                return
         try:
             from khipu import recall_prompt, routing
+            from khipu.routing_delivery import hook_session
+
+            session_id = self.session or hook_session(session_id)
 
             if out.get("notices") and not out.get("routing_changes"):
                 return

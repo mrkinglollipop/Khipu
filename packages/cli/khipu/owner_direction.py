@@ -74,8 +74,10 @@ class DirectionRefused(Exception):
 ACTIONS: frozenset[str] = frozenset({
     "route.definition.set", "route.pause", "route.lift", "route.clear", "route.note.set", "route.note.end", "route.rule.add",
     "route.rule.edit", "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo",
-    "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.confirm",
-    "route.priority.undo", "route.priority.clear", "accounts.track", "accounts.rename", "accounts.stop",
+    "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.cap.set", "route.cap.remove",
+    "route.priority.set", "route.priority.confirm",
+    "route.priority.undo", "route.priority.clear", "route.tier_table.set", "route.tier_table.confirm",
+    "route.tier_table.clear", "accounts.track", "accounts.rename", "accounts.stop",
     "accounts.move", "accounts.decline", "accounts.offer_again", "accounts.auto_track", "accounts.request.confirm",
     "accounts.request.undo", "config.usage_accounts", "config.routing_setting", "config.answer_request.confirm",
     "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel", "ledger.import",
@@ -138,6 +140,7 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
     turn = _recent_turn(session, conf, now)
     _from_the_hook(turn)
     return {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
+            "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
             "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook"}
 
 
@@ -822,7 +825,8 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
             line.update(runs_at=_iso(runs_at), runs_at_ts=runs_at)
         if want.get("facts"):
             line["facts"] = want["facts"]
-    for key in ("words", "harness", "session", "via_session", "turn", "binding", "auth_chain"):
+    for key in ("words", "harness", "session", "via_session", "turn", "prompt_sha256", "occurrence",
+                "binding", "auth_chain"):
         if stamp.get(key) is not None:
             line[key] = stamp[key]
     line["state"] = "pending"
@@ -990,6 +994,12 @@ def _before(want: dict):
         else:
             prior = definitions.get("providers" if facts["definition"] == "provider" else "accounts", {}).get(target)
         return {"value": prior}
+    if action in ("route.cap.set", "route.cap.remove"):
+        facts = want.get("facts") or {}
+        entry = _entry(target)
+        prior = next((c for c in entry.get("caps") or []
+                      if c.get("window") == facts.get("window") and c.get("kind") == facts.get("kind")), None)
+        return {"cap": prior}
     if action == "route.pause":
         entry = _entry(target)
         paused = entry.get("state") == routing.PAUSED
@@ -1027,6 +1037,9 @@ def _before(want: dict):
             replaced = (held or {}).get("replaced")
             return {"entries": _priority_rows(replaced), "until": (replaced or {}).get("until")}
         return {"entries": _priority_rows(held), "until": (held or {}).get("until")}
+    if action.startswith("route.tier_table."):
+        held = routing.read_view().get("tier_table")
+        return {"tiers": dict(held["tiers"]) if held else None}
     if action == "accounts.rename":
         return {"label": next((a["label"] for a in routing.accounts() if a["key"] == target), None)}
     if action == "accounts.stop":
@@ -1138,7 +1151,7 @@ def _before(want: dict):
 def _after(want: dict, result) -> Any:
     if not isinstance(result, dict):
         return None
-    keep = ("id", "entity", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts")
+    keep = ("id", "entity", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts", "tiers")
     return {k: result[k] for k in keep if k in result} or None
 
 
@@ -1412,6 +1425,15 @@ def _undo_priority(line, via, holds=None):
                               _undo_default_holds=True)
 
 
+def _undo_tier_table(line, via):
+    from khipu import routing
+
+    tiers = _b(line).get("tiers")
+    if tiers:
+        return routing.set_tier_table(tiers, via=via)
+    return routing.clear_tier_table(via=via)
+
+
 def _undo_decline(line, via):
     from khipu import accounts
 
@@ -1490,6 +1512,19 @@ def _ledger_undo(verb: str):
     return run
 
 
+def _undo_cap(line: dict, via: str) -> dict:
+    from khipu import routing
+
+    facts = line.get("facts") or {}
+    previous = (line.get("before") or {}).get("cap")
+    if previous is not None:
+        return routing.set_cap(line["target"], window=facts.get("window") or previous.get("window"),
+                               kind=previous["kind"], pct=previous["pct"],
+                               revision=previous.get("revision"), via=via)
+    return routing.remove_cap(line["target"], window=facts.get("window"),
+                              kind=facts.get("kind"), via=via)
+
+
 def _undo_definition(line: dict, via: str) -> dict:
     from khipu import routing
 
@@ -1502,6 +1537,8 @@ def _undo_definition(line: dict, via: str) -> dict:
 
 
 _UNDO = {
+    "route.cap.set": _undo_cap,
+    "route.cap.remove": _undo_cap,
     "route.definition.set": _undo_definition,
     "route.pause": _undo_pause,
     "route.lift": _undo_lift,
@@ -1521,6 +1558,9 @@ _UNDO = {
     "route.priority.confirm": _undo_priority,
     "route.priority.undo": _undo_priority,
     "route.priority.clear": _undo_priority,
+    "route.tier_table.set": _undo_tier_table,
+    "route.tier_table.confirm": _undo_tier_table,
+    "route.tier_table.clear": _undo_tier_table,
     "accounts.track": _undo_track,
     "accounts.rename": _undo_rename,
     "accounts.stop": _undo_stop,

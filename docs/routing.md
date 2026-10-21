@@ -55,8 +55,27 @@ DeepSeek provider facts and an account; existing provider restrictions are kept.
 `label`, `family`, `login` (`folder` or `none`), `probe` (`claude`, `codex`,
 `grok`, `muse`, `glm`, `http-quota`, or `none`), optional hostname `host`,
 `lane_names`, optional exact model ids in `models_allowed` and `models_never`,
-and `use` (`normal` or `on_request`). `http-quota` is reserved for slice 9b.
+and `use` (`normal` or `on_request`). With `probe: http-quota` and a `host`,
+the periodic usage refresh reads `https://<host>/` for each account of the
+provider: HTTPS only to that confirmed host, redirects refused, and the key
+stored as `<provider>_api_key` read from the Keychain only at request time
+and sent only in the request header. Only the parsed quota windows are
+kept; failures carry a fixed code (a redirect is `redirect_refused`), never
+a response body or header.
 Account definitions name the provider; login folders remain local bindings.
+
+The rule 12 tier table is a structured fact (`tier_table_set`, `tiers` naming
+every task class: `scope`, `mock`, `ruling`, `hard-security`, `failed-fix`,
+`build`, `fix-round`, `tests`, `docs`, `synthesis`, `mechanical`, each with a
+tier of `opus`, `sonnet` or `haiku`), written with
+`khipu route tier-table set --tiers='<JSON>'` (terminal confirmation),
+`--owner-direction` in an eligible owner conversation, the app's owner path
+(`--from-app`), or `khipu_owner_act` action `route.tier_table.set` with
+`{"tiers": {...}}`. `khipu route tier-table confirm` confirms a table a
+conversation proposed (`set --at-owner-request '...'` writes a proposal that
+never governs on its own), and `clear` removes the table. Only a confirmed,
+owner-written table governs the advisory dispatch check. Each owner write is
+logged, and Undo restores the prior table (or clears it when there was none).
 No adapter or provider fact launches a probe by itself. Model and use checks
 are advisory. DeepSeek's rule 13 model restriction is `models_allowed: [deepseek-flash]`,
 not merely a ban on one Pro model. Spend and concurrency remain with slices
@@ -295,6 +314,8 @@ The Home screen has a Routing card with one row per account, holds, your note, a
 | `khipu route priority show\|set\|confirm\|undo\|clear` | Manage the priority order. |
 
 `khipu route sources` lists each job runner folder with its last good read and any error. Run `khipu route --help` and each subcommand's `--help` for every flag. See the [CLI reference](cli.md).
+
+**Directions said in a conversation.** If you type a routing direction in a conversation ("use GLM only one job at a time") and no matching owner change reaches Khipu, capture opens an owed item, "Routing said here, not in Khipu", quoting your words; only you see that quote. A direction counts only when it names an account, provider, lane or model Khipu's record knows; ordinary prompts that merely start with a word like "use" or "keep" open nothing. The item appears in `khipu_owed` (kind `routing_direction`), in `khipu owed` on the command line, and in the pushed slice at session start. It closes when the matching owner change is made from that same prompt (setting the cap to a different value leaves it open), when an owner change cites it, or when you dismiss it with `khipu owed --close <id>` (the owed list's close control, also `khipu owed --dismiss <id>`); a dismissal survives later captures. Questions, quotations and job prompts open nothing. If the prompt recorder missed the turn, the item stays open marked unjoined rather than being matched by guesswork.
 
 ## Limits of this feature
 

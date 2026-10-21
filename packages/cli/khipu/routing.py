@@ -785,12 +785,11 @@ def _cut_paths(words: str) -> str:
 
 
 def _for_agents(value, view: dict | None = None):
-    """``value`` as an agent may read it (``agent_view.scrub``): the owner's
-    note and standing rules in ``view`` pass as he wrote them."""
+    """Project using this view's owner words, with credentials removed."""
     from khipu import agent_view
 
     keys = [a.get("key") for a in (view or {}).get("accounts") or [] if isinstance(a, dict)] if view else None
-    return agent_view.scrub(value, keep=agent_view.keep_owner_words(view), extra_keys=keys)
+    return agent_view.scrub_strict(value, keep=agent_view.keep_owner_words(view), extra_keys=keys)
 
 
 def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime:
@@ -1203,6 +1202,25 @@ def conversation_author(environ: dict | None = None, cwd: str | None = None, nam
 
 def _author_sessions(by: dict) -> set[str]:
     return {by[k] for k in ("session", "provider_session") if by.get(k)}
+
+
+def _session_forms(session: str | None) -> set[str]:
+    """The forms one conversation identity takes across the two slices:
+    the raw harness-native id an author is recorded with, its canonical
+    ``claude:``/``codex:`` form, and a shared id as itself. A pull
+    namespace id is never an author's: authors come from the environment,
+    and a pull caller names its own id. Forms of other conversations are
+    never added."""
+    if not session:
+        return set()
+    forms = {session}
+    if session.startswith("pull\0"):
+        return forms
+    if session.startswith(("claude:", "codex:")):
+        forms.add(session.split(":", 1)[1])
+    else:
+        forms.update(("claude:" + session, "codex:" + session))
+    return forms
 
 
 OWNER = {"kind": "owner"}
@@ -2016,10 +2034,11 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "status", "reset_id", "reset_until", "next_at", "state_id", "reset_moved_to", "schedule_id",
                 "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
                 "harness", "to", "started_at", "model", "family", "transport", "mac", "legacy_mac", "entity", "base",
-                "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id")
+                "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id",
+                "resets_at", "cycle", "revision", "cap_kind")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
-                "witness_at", "expires_at", "reset_at")
-_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order")
+                "witness_at", "expires_at", "reset_at", "resets_at")
+_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "t_err")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
                   "observed", "observed_turn", "session_logs", "silent", "unmatched")
@@ -2166,7 +2185,7 @@ def _checked(data: dict) -> dict | None:
                 return None
     if "written_at" not in out:
         return None  # every line Khipu writes carries its time
-    if "kind" in out and out["kind"] != entry_model.kind(out):
+    if "kind" in out and out["type"] not in ("cap_set",) and out["kind"] != entry_model.kind(out):
         return None
     if "expires_at" in data and data["expires_at"] is None:
         out["expires_at"] = None
@@ -2197,7 +2216,7 @@ def _checked(data: dict) -> dict | None:
         refs = data.get("accounts", [])
         if checked is None or not isinstance(refs, list) or any(
                 not isinstance(a, str) or not account_identity.STABLE.fullmatch(a)
-                or a.partition(":")[0] != checked["id"] for a in refs):
+                or not entry_model.provider_set_ref_allowed(checked, a) for a in refs):
             return None
         out.update(checked, accounts=list(refs))
     if "observation_scope" in data:
@@ -2237,6 +2256,11 @@ def _checked(data: dict) -> dict | None:
         if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
             return None
         out["used_pct"] = used
+    pct = data.get("pct")
+    if pct is not None:
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct):
+            return None
+        out["pct"] = pct
     cuts = data.get("lanes_cut")
     if cuts is not None:
         # An account note's lanes, each [runner, lane]: text pairs only.
@@ -2294,6 +2318,25 @@ def _checked(data: dict) -> dict | None:
                     if not isinstance(scope["mac"], str) or not scope["mac"]:
                         return None
                     out["scope"]["mac"] = scope["mac"]
+    if out["type"] == "tier_table_set":
+        # Kept as written so a later confirmed table can be told from one
+        # that is not. An unknown tier stays in the line and is not adopted.
+        confirmed = data.get("confirmed")
+        tiers = data.get("tiers")
+        if not isinstance(confirmed, bool) or not isinstance(tiers, dict) or not tiers:
+            return None
+        if not all(isinstance(key, str) and isinstance(value, str) for key, value in tiers.items()):
+            return None
+        out["confirmed"] = confirmed
+        out["tiers"] = {_no_surrogates(key): _no_surrogates(value) for key, value in tiers.items()}
+    if out["type"] == "direction_set":
+        for field in ("topic", "value"):
+            raw = data.get(field)
+            if not isinstance(raw, str):
+                return None
+            out[field] = _no_surrogates(raw)
+        if not out.get("account") or not out.get("id"):
+            return None
     return out
 
 
@@ -3431,12 +3474,15 @@ def _fold_priority(priority: dict | None, now: datetime, labels: dict, in_settin
             replaced = {"entries": held, "until": _iso(priority["prior"]["until"])}
     by = priority["written_by"]
     pending = priority["pending"]
-    return {"entries": active, "until": _iso(priority["until"]), "at": _iso(priority["at"]), "written_by": by,
-            "via": priority["via"], "pending": pending, "confirmed": not pending,
-            "owner_revision": priority.get("_owner_revision"),
-            "pending_by": author_words(by, push=True) if pending else None,
-            "pending_author": by if pending else None, "owner_request": priority.get("owner_request"),
-            "replaced": replaced, "confirmed_at": _iso(priority.get("confirmed_at"))}, ended
+    shown = {"entries": active, "until": _iso(priority["until"]), "at": _iso(priority["at"]), "written_by": by,
+             "via": priority["via"], "pending": pending, "confirmed": not pending,
+             "owner_revision": priority.get("_owner_revision"),
+             "pending_by": author_words(by, push=True) if pending else None,
+             "pending_author": by if pending else None, "owner_request": priority.get("owner_request"),
+             "replaced": replaced, "confirmed_at": _iso(priority.get("confirmed_at"))}
+    if priority.get("_event_id"):
+        shown["event_id"] = priority["_event_id"]
+    return shown, ended
 
 
 def _effective_priority(priority: dict) -> dict:
@@ -3584,6 +3630,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # author from this, never from the state left after it (fix round 1).
     causes: dict[str, dict] = {}
     owner_changes: list[dict] = []
+    pace_samples: dict[tuple, list[dict]] = {}
+    pace_caps: dict[tuple, dict] = {}
+    cap_proposals: list[dict] = []
     observed = entry_model.observations(events, cfg)
     runner_status = {r["name"]: r for r in (sources or {}).get("runners") or []}
     for event in observed:
@@ -3599,6 +3648,39 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         kind = event.get("type")
         entity = event_identity.entity(event)
         if kind in entry_model.OBSERVATIONS:
+            continue
+        if kind == "usage_sample":
+            from khipu import routing_pace
+
+            window = event.get("window") if event.get("window") in routing_pace.WINDOWS else None
+            witness, reset = _parse(event.get("witness_at")), _parse(event.get("resets_at"))
+            used = event.get("used_pct")
+            if (window and witness and reset and isinstance(event.get("account"), str)
+                    and isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used)):
+                pace_samples.setdefault((event["account"], window), []).append(
+                    {"t": witness, "used": float(used), "reset": reset, "mac": event.get("mac") or "legacy",
+                     "source": event.get("source") or "probe", "cycle": event.get("cycle"),
+                     "t_err": event.get("t_err") if isinstance(event.get("t_err"), int) else 0})
+            continue
+        if kind in ("cap_set", "cap_remove"):
+            from khipu import routing_pace
+
+            window = event.get("window") if event.get("window") in routing_pace.WINDOWS else None
+            account = event.get("account")
+            if window and isinstance(account, str):
+                owner_cap = (event.get("written_by") or {}).get("kind") == "owner"
+                if kind == "cap_remove":
+                    if owner_cap:
+                        pace_caps.pop((account, window, event.get("cap_kind") or event.get("kind")), None)
+                    continue
+                cap = routing_pace.checked_cap({k: event.get(k) for k in ("kind", "pct", "revision")})
+                if cap is not None:
+                    if owner_cap:
+                        pace_caps[(account, window, cap["kind"])] = dict(cap, window=window)
+                    else:
+                        # A conversation's cap is a proposal, never a fact.
+                        cap_proposals.append(dict(cap, account=account, window=window, pending=True,
+                                                  written_by=event.get("written_by")))
             continue
         if kind == "reset_check":
             account, until = event.get("account"), _parse(event.get("reset_until"))
@@ -3749,7 +3831,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                  "prior_text": None, "prior_confirmed": None,
                                  "pending_by": author_words(info["written_by"], push=True) if pending else None,
                                  "pending_author": info["written_by"] if pending else None,
-                                 "written_by": info["written_by"], "via": info["via"], "at": info["at"]}
+                                 "written_by": info["written_by"], "via": info["via"], "at": info["at"],
+                                 "origin_id": event.get("id")}
         elif kind in ("rule_edit", "rule_retire", "rule_restore", "rule_confirm", "rule_undo", "rule_unconfirm",
                       "rule_dismiss") and entity in rules and not proposal_crossed:
             rule = rules[entity]
@@ -3825,7 +3908,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             new = {"entries": event["entries"], "until": info["until"], "at": info["at"],
                    "written_by": info["written_by"], "via": info["via"], "pending": pending,
                    "owner_request": event.get("owner_request") if pending else None, "prior": None,
-                   "_owner_revision": priority_owner_revision}
+                   "_owner_revision": priority_owner_revision,
+                   "_event_id": event.get("id")}
             if pending:
                 # Undo brings back what the owner last had: a second request
                 # before he answers keeps the priority the first replaced.
@@ -3967,6 +4051,17 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                     "reason": _reset_reason_words(reset["reason"]), "written_by": _check_author(),
                                     "scope": reset["scope"], "window": reset["window"]}
     entries.sort(key=lambda e: (_STATE_ORDER.get(e["state"], 9), e["label"].casefold()))
+    from khipu import routing_pace as _pace
+
+    for entry in entries:
+        windows = sorted({w for (a, w) in pace_samples if a == entry["key"]}
+                         | {w for (a, w, _k2) in pace_caps if a == entry["key"]})
+        if windows:
+            entry["pace"] = [_pace.compute_pace(pace_samples.get((entry["key"], w), []),
+                                                 [c for (a, ww, _k2), c in pace_caps.items()
+                                                  if a == entry["key"] and ww == w], now, w)
+                              for w in windows]
+            entry["caps"] = [dict(c) for (a, _w, _k2), c in sorted(pace_caps.items()) if a == entry["key"]]
 
     unmatched: dict[tuple, dict] = {}
     for item in unmatched_raw:
@@ -4006,7 +4101,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                      "n": r["n"], "text": r["text"], "source": r["source"], "date": r["date"], "seeded": r["seeded"],
                      "confirmed": r["confirmed"], "pending": r.get("pending"), "pending_kind": r.get("pending_kind"),
                      "pending_by": r.get("pending_by"), "prior_text": r.get("prior_text"),
-                     "pending_author": r.get("pending_author"),
+                     "pending_author": r.get("pending_author"), "origin_id": r.get("origin_id"),
                      "written_by": r["written_by"], "via": r["via"], "at": _iso(r["at"])}
                     for r in sorted(rules.values(), key=lambda r: (r["n"] is None, r["n"] or 0, r["entity"]))
                     if not r["retired"]]
@@ -4126,9 +4221,14 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     for name, values in definitions.items():
         if values:
             effective["definition:" + name] = values
+    from khipu.routing_advisory import fold_facts
+
+    tier_table, directions = fold_facts(events)
     return {"accounts": entries, "holds": active_holds, "rules": active_rules, "note": note_out,
             "proposals": proposals,
-            "machine_holds": machine_holds,
+            **({"tier_table": tier_table} if tier_table else {}),
+            **({"directions": directions} if directions else {}),
+            "machine_holds": machine_holds, "cap_proposals": cap_proposals,
             "definitions": definitions,
             "priority": priority_out, "priority_version": priority_version, "priority_ended": priority_ended,
             "priority_owner_revision": priority_owner_revision,
@@ -5005,6 +5105,69 @@ def _runner_source_state(runner: dict) -> str:
                        "lanes": list(runner.get("lanes") or [])}, sort_keys=True, separators=(",", ":"))
 
 
+def _pace_sample_events(ordered: list[dict], known: list[dict], now: datetime) -> list[dict]:
+    """New pace samples from the usage cache, at each window's cadence.
+
+    A stored reading is only sampled when the pace rules say it adds
+    information; the fold stays pure, so samples enter only here."""
+    from khipu import routing_pace, usage
+
+    try:
+        rows = usage._load_cache()
+    except Exception:  # noqa: BLE001 - an unreadable cache samples nothing
+        return []
+    known_keys = {a["key"] for a in known}
+    existing: dict[tuple, list[dict]] = {}
+    for event in ordered:
+        if event.get("type") == "usage_sample":
+            at = _parse(event.get("witness_at"))
+            if at is not None:
+                existing.setdefault((event.get("account"), event.get("window")), []).append(
+                    {"window": event.get("window"), "t": at, "used": event.get("used_pct"),
+                     "mac": event.get("mac"), "source": event.get("source")})
+    out = []
+    for key, row in sorted(rows.items()):
+        if key not in known_keys or not isinstance(row, dict) or not row.get("ok"):
+            continue
+        costly = key.partition("|")[0] == "grok"
+        for w in row.get("windows") or []:
+            if not isinstance(w, dict) or w.get("name") not in routing_pace.WINDOWS:
+                continue
+            used = w.get("used_pct")
+            if isinstance(used, bool) or not isinstance(used, (int, float)):
+                continue
+            witness = _parse(w.get("observed_at") or row.get("observed_at") or row.get("probed_at"))
+            if witness is None or witness > now:
+                continue
+            candidate = {"window": w["name"], "t": witness, "used": used,
+                         "mac": _local_mac(), "source": "probe"}
+            prior = existing.setdefault((key, w["name"]), [])
+            if not routing_pace.should_sample(prior, candidate, costly=costly):
+                continue
+            event = {"type": "usage_sample", "account": key, "window": w["name"],
+                     "witness_at": _iso(witness), "used_pct": used, "t_err": 60,
+                     "source": "probe", "written_by": {"kind": "probe"}, "via": "probe"}
+            reset = _parse(w.get("resets_at"))
+            if reset is not None:
+                event["resets_at"] = _iso(reset)
+            prior.append(candidate)
+            out.append(event)
+    return out
+
+
+def record_pace_samples(now: datetime | None = None) -> int:
+    """Store new pace samples from the usage cache after a probe refresh.
+
+    Sampling is a write, so it happens here and in the fold's callers that
+    own a write, never in the fold itself: a read must stay a read."""
+    now = now or _now()
+    ordered = _read_all_events(author_check=False)[0]
+    batch = _pace_sample_events(ordered, accounts(), now)
+    if batch:
+        _write_many(batch)
+    return len(batch)
+
+
 def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
     """Refold and save the view; the caller holds the lock."""
     fingerprint, cfg, known = inputs or _inputs()
@@ -5211,14 +5374,14 @@ def read_view(now: datetime | None = None) -> dict:
     fingerprint, cfg, known = _inputs()
     prev = _load_view()
     if _fresh(prev, fingerprint, now):
-        return dict(prev, checked_at=_iso(now))
+        return _with_advisory(dict(prev, checked_at=_iso(now)), now)
     from khipu import routing_sources
 
     if fingerprint["events"] is None and not cfg.get("routing_rules_seed") \
             and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
         body = fold([], now=now, cfg=cfg, known=known)
         body["seed_error"] = None
-        return _assemble(None, body, now, 0, fingerprint, record=False)
+        return _with_advisory(_assemble(None, body, now, 0, fingerprint, record=False), now)
     try:
         # Its turn to fold first (a running fold, the daemon's poll say, is
         # waited for and its saved view answered), then the routing lock.
@@ -5229,12 +5392,20 @@ def read_view(now: datetime | None = None) -> dict:
             inputs = _inputs()
             prev = _load_view()
             if _fresh(prev, inputs[0], now):
-                return dict(prev, checked_at=_iso(now))
-            return _refold_locked(now, inputs)
+                return _with_advisory(dict(prev, checked_at=_iso(now)), now)
+            return _with_advisory(_refold_locked(now, inputs), now)
     except OSError:
         # A read-only data dir, or a lock held past this thread's budget,
         # costs the saved view, never the answer.
-        return _unsaved_view(now)
+        return _with_advisory(_unsaved_view(now), now)
+
+
+def _with_advisory(view: dict, now: datetime) -> dict:
+    """Contradiction and hygiene flags for this read. Not part of the
+    effective view, so they never move the version or rewrite a log line."""
+    from khipu.routing_advisory import attach
+
+    return attach(view, now)
 
 
 def _telemetry_streams(view: dict) -> list[dict]:
@@ -6061,6 +6232,53 @@ def set_definition(definition: str, value: dict, *, via: str) -> dict:
     return _owner_write({"type": "definition_set", "definition": definition, "value": checked}, via)
 
 
+def set_cap(account: str, *, window: str, kind: str, pct, revision: str | None = None, via: str,
+            now: datetime | None = None) -> dict:
+    """Owner-only: confirm a pace cap as a structured fact, never from prose."""
+    from khipu import routing_pace
+
+    if window not in routing_pace.WINDOWS:
+        raise RouteError("window must be weekly or five_hour")
+    cap = routing_pace.checked_cap({"kind": kind, "pct": pct, "revision": revision or "cap"})
+    if cap is None:
+        raise RouteError("a cap takes kind share or per_day, a pct above 0 and at most 100, and a revision")
+    if revision is None:
+        cap["revision"] = f"cap-{event_identity.uuid7()}"
+    key = _resolve_account_key(account)
+    return dict(_owner_write({"type": "cap_set", "account": key, "window": window, **cap}, via), account=key)
+
+
+def remove_cap(account: str, *, window: str, kind: str, via: str, now: datetime | None = None) -> dict:
+    from khipu import routing_pace
+
+    if window not in routing_pace.WINDOWS or kind not in ("share", "per_day"):
+        raise RouteError("window must be weekly or five_hour and kind share or per_day")
+    key = _resolve_account_key(account)
+    return dict(_owner_write({"type": "cap_remove", "account": key, "window": window, "cap_kind": kind}, via),
+                account=key)
+
+
+def request_cap(account: str, *, window: str, kind: str, pct, revision: str, author: dict,
+                via: str = "mcp", now: datetime | None = None) -> dict:
+    """A conversation's cap attempt: stored as a proposal, never a fact."""
+    from khipu import routing_pace
+
+    if window not in routing_pace.WINDOWS:
+        raise RouteError("window must be weekly or five_hour")
+    cap = routing_pace.checked_cap({"kind": kind, "pct": pct, "revision": revision})
+    if cap is None:
+        raise RouteError("a cap takes kind share or per_day, a pct above 0 and at most 100, and a revision")
+    key = _account_for_a_conversation(account, accounts())
+    by = dict(author or {})
+    if by.get("kind") != "conversation":
+        # Like request_rule: a caller-supplied owner author is never trusted;
+        # the cap stays a conversation proposal under the real author.
+        by = conversation_author()
+    written, view = _write({"type": "cap_set", "account": key, "window": window, **cap,
+                            "written_by": by, "via": via})
+    return {"ok": True, "id": written["id"], "pending": True, "account": key, "version": view.get("version")}
+
+
 def _priority_entries(raw, *, now: datetime, conversation: bool) -> list[dict]:
     """The ordered entries a write stores, in the order given: each account
     resolved to its key (a conversation names one by its label or its id),
@@ -6236,6 +6454,71 @@ def clear_priority(*, via: str, now: datetime | None = None, expect=None) -> dic
         _check_priority(expect, now)
         _held_priority(now)
         return _owner_write({"type": "priority_clear"}, via)
+
+
+# ---- the rule 12 tier table (slice 10) ---------------------------------------------------
+#
+# A structured fact the owner confirms once, like a pace cap: only a
+# confirmed, owner-written table governs the dispatch check. A conversation's
+# table stays a proposal until the owner confirms or replaces it.
+
+
+def _checked_tiers(tiers) -> dict:
+    from khipu.routing_advisory import valid_tiers
+
+    if not valid_tiers(tiers):
+        raise RouteError("a tier table names every task class (scope, mock, ruling, hard-security, "
+                         "failed-fix, build, fix-round, tests, docs, synthesis, mechanical) with a tier: "
+                         "opus, sonnet or haiku")
+    return dict(tiers)
+
+
+def set_tier_table(tiers, *, via: str, now: datetime | None = None) -> dict:
+    """The owner's tier table, confirmed as written."""
+    rows = _checked_tiers(tiers)
+    return dict(_owner_write({"type": "tier_table_set", "tiers": rows, "confirmed": True}, via),
+                tiers=rows)
+
+
+def request_tier_table(tiers, *, owner_request: str, author: dict | None = None, via: str = "mcp",
+                       now: datetime | None = None) -> dict:
+    """A conversation's proposed tier table: recorded, never governing until
+    the owner confirms it (``confirm_tier_table`` or his own set)."""
+    rows = _checked_tiers(tiers)
+    request_words = _one_line(owner_request)
+    if not request_words:
+        raise RouteError("describe the owner's request in one line")
+    by = dict(author or conversation_author())
+    if by.get("kind") != "conversation":
+        by = conversation_author()
+    written, view = _write({"type": "tier_table_set", "tiers": rows, "confirmed": False,
+                            "pending": True, "owner_request": _clean(request_words, 0),
+                            "written_by": by, "via": via})
+    return dict(_done(written, view), tiers=rows, pending=True)
+
+
+def _proposed_tiers() -> dict | None:
+    proposed = None
+    for event in _in_write_order(read_events()[0]):
+        if event.get("type") == "tier_table_set" and event.get("confirmed") is not True:
+            from khipu.routing_advisory import valid_tiers
+
+            if valid_tiers(event.get("tiers")):
+                proposed = dict(event["tiers"])
+    return proposed
+
+
+def confirm_tier_table(*, via: str, now: datetime | None = None) -> dict:
+    """Confirm the latest proposed tier table, as the owner wrote it."""
+    proposed = _proposed_tiers()
+    if proposed is None:
+        raise RouteError("there is no proposed tier table to confirm")
+    return set_tier_table(proposed, via=via, now=now)
+
+
+def clear_tier_table(*, via: str, now: datetime | None = None) -> dict:
+    """Remove the tier table, so no table governs the dispatch check."""
+    return _owner_write({"type": "tier_table_clear"}, via)
 
 
 # ---- words ----------------------------------------------------------------------------
@@ -6743,6 +7026,30 @@ def plan_facts(view: dict, now: datetime) -> dict[str, dict]:
     return out
 
 
+def headline_pace(entry: dict) -> dict | None:
+    """The pace window that needs attention first for one account."""
+    paces = entry.get("pace") or []
+    if not paces:
+        return None
+
+    def rank(pace):
+        obj = pace.get(pace.get("headline") or "plan") or pace.get("plan") or {}
+        verdict = obj.get("verdict")
+        eta = _parse(obj.get("runs_out_at") or obj.get("reaches_cap_at"))
+        return (0 if verdict in ("limit_reached", "cap_reached", "over") else
+                1 if eta else 2 if verdict == "near" else 3,
+                eta.timestamp() if eta else float("inf"))
+
+    return min(paces, key=rank)
+
+
+def pace_line_for(entry: dict, now: datetime) -> str | None:
+    from khipu import routing_pace
+
+    pace = headline_pace(entry)
+    return routing_pace.pace_line(entry["label"], pace, now) if pace else None
+
+
 def _pace_of(fact: dict | None) -> float:
     """A fact's pace for ordering; one with none (unreadable, or figures
     that may be out of date) goes last."""
@@ -7041,16 +7348,17 @@ def _replacement_notices(view: dict, now: datetime, session: str | None) -> list
         by = item.get("notify") or item.get("author") or {}
         # Only the author's session owes delivery. Missing or departed
         # sessions cannot force work or text into other conversations.
-        if session not in _author_sessions(by):
+        authors = set().union(*(_session_forms(ident) for ident in _author_sessions(by))) if _author_sessions(by) else set()
+        if not (_session_forms(session) & authors):
             continue
         ended = _parse(item.get("ended_at") or item.get("at"))
         if ended is None or now >= ended + timedelta(days=7):
             continue
-        for ident in _author_sessions(by):
+        for ident in authors:
             if ident not in receipts:
                 receipts[ident] = set(recall_prompt.routing_marker(ident).get("notices") or {})
                 receipts[ident].update(routing_delivery.notice_receipts(ident))
-        if any(item["id"] in receipts[ident] for ident in _author_sessions(by)):
+        if any(item["id"] in receipts[ident] for ident in authors):
             continue
         who = author_words(by, push=True)
         if item.get("kind") == "priority":
@@ -7160,6 +7468,9 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
             fact = facts.get(entry["key"])
             if fact is not None and entry.get("configured", True):
                 line += f"; {pace_words(fact, now)}"
+            pace_text = pace_line_for(entry, now)
+            if pace_text:
+                line += f"; {pace_text}"
             items.append(("open" if entry["state"] == OPEN else "account", line, ""))
         items += [("lane", _clip(lane_line(u, now), width), "") for u in view.get("unmatched") or []]
         items += [("hold", _push_clip(hold_line(h, now, view=view), width, view), h["at"]) for h in view.get("holds") or []]
@@ -7377,7 +7688,9 @@ def doctor_block(now: datetime | None = None) -> dict:
             "note": view.get("note") is not None, "outside_app": view.get("outside_app") or [],
             "unchecked": view.get("unchecked") or [],
             "seed_error": view.get("seed_error"), "bad_lines": view.get("bad_lines", 0),
-            "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings}
+            "sources": _sources_brief(sources), "rule_checks": checks, "warnings": warnings,
+            "contradictions": list(view.get("contradictions") or []),
+            "rule_hygiene": list(view.get("rule_hygiene") or [])}
 
 
 def _priority_warnings(view: dict, now: datetime, cfg: dict) -> list[str]:
@@ -7478,11 +7791,11 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
     # A pending rule's requester as the fold keeps it, for Khipu's own
     # same-conversation check; ``pending_by`` is its words.
-    out["rules"] = [{k: v for k, v in r.items() if k not in ("pending_author", "component", "provisional_n")} for r in view.get("rules") or []]
+    out["rules"] = [{k: v for k, v in r.items() if k not in ("pending_author", "component", "provisional_n", "origin_id")} for r in view.get("rules") or []]
     # The owner's priority and each account's plan facts (phase 4b); the app
     # words them itself, in local times.
     if view.get("priority"):
-        out["priority"] = {k: v for k, v in view["priority"].items() if k != "pending_author"}
+        out["priority"] = {k: v for k, v in view["priority"].items() if k not in ("pending_author", "event_id")}
     out["plan_facts"] = plan_facts(view, now)
     out["pace_order"] = cfg["routing_pace_order"]
     # What the app's Routing card and attention items need beside the view
@@ -7511,7 +7824,7 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["changes"] = [dict(c, items=[dict(i, by=author_words(i.get("written_by"), push=False)
                                           if i.get("written_by") else None) for i in c.get("items") or []])
                       for c in view.get("changes") or []]
-    for key in _INTERNAL:
+    for key in (*_INTERNAL, "directions"):
         out.pop(key, None)
     return out
 
@@ -7789,6 +8102,7 @@ def _public_account(entry: dict, now: datetime) -> dict:
     out["disagreement"] = _pick(entry.get("disagreement"), _REPORT_FIELDS)
     out["last_seen"] = _pick(entry.get("last_seen"), _LAST_SEEN_FIELDS)
     out["underlying"] = _pick(entry.get("underlying"), ("state", "until", "basis"))
+    out["pace"] = [dict(p) for p in entry.get("pace") or []]
     out["line"] = account_line(entry, now, push=False)
     return out
 
@@ -7830,7 +8144,8 @@ def _public_proposals(view: dict, *, session: str | None = None) -> list[dict]:
     out = []
     for item in (view.get("proposals") or {}).values():
         told = item.get("notify") or item.get("author")
-        if item.get("status") in ("replaced", "crossed") and (not session or session not in _author_sessions(told or {})):
+        authors = set().union(*(_session_forms(ident) for ident in _author_sessions(told or {}))) if _author_sessions(told or {}) else set()
+        if item.get("status") in ("replaced", "crossed") and (not session or not (_session_forms(session) & authors)):
             continue
         out.append({"id": item.get("id"), "kind": item.get("kind"), "entity": item.get("entity"),
                     "status": item.get("status"), "base": item.get("base"), "at": item.get("at"), "rule": item.get("n"),
@@ -7923,15 +8238,16 @@ def _for_a_conversation():
 
 
 def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
-                      lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+                      lock_wait: float | None = CONVERSATION_LOCK_BUDGET, view: dict | None = None) -> dict:
     """What MCP ``khipu_route`` answers (``_conversation_view``), read
     waiting at most ``lock_wait`` seconds for the routing lock (an unsaved
     fold after that)."""
     with _for_a_conversation(), lock_budget(lock_wait):
-        return _conversation_view(since_version=since_version, account=account, now=now)
+        return _conversation_view(since_version=since_version, account=account, now=now, view=view)
 
 
-def _conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None) -> dict:
+def _conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
+                       view: dict | None = None) -> dict:
     """What MCP ``khipu_route`` answers, built field by field from the view
     (see the note above ``account_id``). With ``since_version`` (V or
     EPOCH:V) the current state of everything that changed after it, as
@@ -7941,7 +8257,7 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     words, each account's evidence line and the name a conversation gave
     itself."""
     now = now or _now()
-    view = read_view(now)
+    view = read_view(now) if view is None else view
     key = None
     if account:
         key = _account_for_a_conversation(account, accounts() + list(view.get("accounts") or []))
@@ -7949,6 +8265,10 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
         version, epoch = _parse_since(since_version)
         out = since(version, view, now=now, epoch=epoch)
         pairs = list(zip(out["entities"], out["lines"]))
+        from khipu import agent_view
+
+        if not agent_view.login_inventory_available():
+            pairs = [(e, line) for e, line in pairs if not e.startswith("lane:")]
         if key is not None:
             mine = {f"account:{key}"} | {f"hold:{i}" for i in _holds_on(key, view)}
             pairs = [(e, line) for e, line in pairs
@@ -7972,12 +8292,19 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     out["holds"] = [_public_hold(h, now) for h in view.get("holds") or []
                     if key is None or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
     if key is None:
-        out["unmatched"] = [dict(_pick(u, _LANE_FIELDS), line=lane_line(u, now),
-                                 candidates=[account_id(k) for k in u.get("candidates") or []])
-                            for u in view.get("unmatched") or []]
+        from khipu import agent_view
+
+        out["unmatched"] = ([dict(_pick(u, _LANE_FIELDS), line=lane_line(u, now),
+                                  candidates=[account_id(k) for k in u.get("candidates") or []])
+                             for u in view.get("unmatched") or []]
+                            if agent_view.login_inventory_available() else [])
         out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
                                if r.get("silent") or r.get("unreadable")]
     out["about"] = ABOUT
+    if view.get("tier_table"):
+        out["tier_table"] = view["tier_table"]
+    out["contradictions"] = list(view.get("contradictions") or [])
+    out["rule_hygiene"] = list(view.get("rule_hygiene") or [])
     result = _for_agents(out, view)
     _record_read(view, rules=True, priority=True)
     session = conversation_author().get("session")
@@ -8000,7 +8327,10 @@ OWNER_ACTIONS = {"pause": "Pausing an account", "lift": "Lifting a pause", "clea
                  "confirm_rule": "A standing rule", "undo_rule": "A standing rule",
                  "dismiss_rule": "A standing rule", "priority": "The owner's priority",
                  "set_priority": "The owner's priority", "confirm_priority": "The owner's priority",
-                 "undo_priority": "The owner's priority", "clear_priority": "The owner's priority"}
+                 "undo_priority": "The owner's priority", "clear_priority": "The owner's priority",
+                 "tier_table": "The tier table", "set_tier_table": "The tier table",
+                 "tier_table_set": "The tier table", "confirm_tier_table": "The tier table",
+                 "clear_tier_table": "The tier table"}
 OWNER_REFUSAL = ("{what} is the owner's to change: in the app (Settings \u2192 Routing) or on a terminal with "
                  "`khipu route`, which asks for a typed confirmation. A conversation can report what it "
                  "learned about an account and add or end its holds.")
@@ -8204,7 +8534,9 @@ def refresh_plan_figures() -> dict:
 
         if not features.enabled("routing_push"):
             return {"refreshed": 0, "skipped": "routing push off"}
-        return usage.refresh_due()
+        out = usage.refresh_due()
+        record_pace_samples()
+        return out
     except Exception:  # noqa: BLE001 - the drain never fails on this
         return {"refreshed": 0, "skipped": "error"}
 
@@ -8290,7 +8622,7 @@ def prompt_imports() -> None:
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
     from khipu import (  # noqa: F401
-        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_delivery, routing_providers, routing_sources,
+        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_advisory, routing_delivery, routing_pace, routing_providers, routing_sources,
         session_capture, usage)
 
 
@@ -8660,10 +8992,42 @@ def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = N
         with agent_view.routing_projection(keys):
             out = _prompt_text(marker, view, now, cfg, session_id=session_id)
             if not out.pop("_reserved", False):
+                out = _pace_push_adjust(out, view, now, session, marker.component)
                 out = routing_delivery.offer(routing_delivery.plan(out, view, now, cfg, session=session),
                                              session=session, component=marker.component)
             return dict(out, _delivery_view=view, _reserved=True)
     return _prompt_text(marker, view, now, cfg, session_id=session_id)
+
+
+def _pace_push_adjust(out: dict, view: dict, now: datetime, session: str, component: str) -> dict:
+    """Offer a pace forecast when it changed enough against the last one
+    this conversation acknowledged, even when nothing else changed."""
+    from khipu import routing_delivery, routing_pace
+
+    forecasts: dict[str, dict] = {}
+    lines: dict[str, str] = {}
+    for entry in view.get("accounts") or []:
+        pace = headline_pace(entry)
+        if pace is None:
+            continue
+        entity = f"pace:{entry['key']}:{pace['window']}"
+        forecasts[entity] = routing_pace.forecast(pace, entry["key"], entry["label"], now)
+        lines[entity] = pace_line_for(entry, now)
+    if not forecasts:
+        return out
+    acked = routing_delivery.snapshot(session, component).get("pace_acked") or {}
+    effective = {e: routing_pace.effective_forecast(acked.get(e), f, now) for e, f in forecasts.items()}
+    pushes = {e: f for e, f in effective.items() if routing_pace.should_push(acked.get(e), f, now)}
+    if out.get("kind") == "full":
+        return dict(out, pace_forecasts=effective)
+    if not pushes:
+        return out
+    out = dict(out, pace_forecasts=pushes)
+    if out.get("kind") == "none":
+        text = CHANGES_HEADING.format(at=_clock(now, now)) + "\n" + "\n".join(lines[e] for e in pushes)
+        out.update(kind="changes", text=_for_agents(text, view), count=len(pushes),
+                   owed_entities=list(pushes), shown_entities=list(pushes))
+    return out
 
 
 def _prompt_text(marker, view, now, cfg, *, session_id=None):
@@ -9181,6 +9545,57 @@ def _priority_cli(args, now: datetime) -> int:
     return 0
 
 
+def _tier_table_arg(args) -> dict:
+    raw = getattr(args, "tiers", None)
+    if raw is None:
+        raise RouteError('--tiers must be JSON: {"scope": "opus", "mock": "opus", ...}')
+    try:
+        tiers = _loads(raw)
+    except ValueError:
+        raise RouteError('--tiers must be JSON: {"scope": "opus", "mock": "opus", ...}') from None
+    if not isinstance(tiers, dict):
+        raise RouteError("--tiers must be a JSON object naming each task class's tier")
+    return tiers
+
+
+def _tier_table_cli(args, now: datetime) -> int:
+    """``khipu route tier-table``: show it; a conversation proposes one at the
+    owner's request (``--at-owner-request``, never governing); or the owner's
+    set, confirm and clear, after a typed yes or from the app."""
+    action = args.action or "show"
+    if action == "show":
+        view = read_view(now)
+        _print_json({"tier_table": view.get("tier_table")})
+        return 0
+    if getattr(args, "at_owner_request", None) is not None:
+        if action != "set":
+            raise RouteError("--at-owner-request is only for tier-table set: confirming and clearing are "
+                             "the owner's")
+        _print_json(request_tier_table(_tier_table_arg(args), owner_request=args.at_owner_request,
+                                       author=conversation_author(), via="cli", now=now))
+        return 0
+    via = _owner_via(args, _intent_or_none(_tier_table_intent, args, action))
+    if via is None:
+        _print_json({"ok": False, "error": _REFUSED})
+        return 2
+    now = _now()
+    if action == "set":
+        out = set_tier_table(_tier_table_arg(args), via=via, now=now)
+    elif action == "confirm":
+        out = confirm_tier_table(via=via, now=now)
+    else:
+        out = clear_tier_table(via=via, now=now)
+    _print_json(_finish_owner(out))
+    return 0
+
+
+def _tier_table_intent(args, action: str) -> dict | None:
+    from khipu import owner_direction
+
+    facts = {"tiers": _tier_table_arg(args)} if action == "set" else None
+    return owner_direction.intent(f"route.tier_table.{action}", "tier_table", facts=facts)
+
+
 def _finish_owner(out: dict) -> dict:
     from khipu import owner_direction
 
@@ -9231,6 +9646,9 @@ def _route_intent(cmd: str, args) -> dict | None:
         target = value.get("id") or value["runner"] + ":" + value["lane"]
         return owner_direction.intent("route.definition.set", target,
                                       facts={"definition": args.definition, "value": value})
+    if cmd == "cap":
+        return owner_direction.intent(f"route.cap.{args.action}", _resolve_account_key(args.account),
+                                      facts={"window": args.window, "kind": args.kind})
     if cmd in ("pause", "lift", "clear"):
         facts = {"report": args.report} if cmd == "clear" and getattr(args, "report", None) else None
         return owner_direction.intent(f"route.{cmd}", _resolve_account_key(args.account), facts=facts)
@@ -9374,6 +9792,8 @@ def run_cli(args) -> int:
             return 0
         if cmd == "priority":
             return _priority_cli(args, now)
+        if cmd == "tier-table":
+            return _tier_table_cli(args, now)
         if cmd == "rule" and getattr(args, "at_owner_request", None) is not None:
             # The rule's words are the positional words, as for the owner's
             # add and edit; the flag carries the owner's request.
@@ -9396,7 +9816,15 @@ def run_cli(args) -> int:
             _print_json({"ok": False, "error": _REFUSED})
             return 2
         now = _now()
-        if cmd == "definition":
+        if cmd == "cap":
+            if args.action == "set":
+                if args.pct is None:
+                    raise RouteError("cap set needs --pct")
+                out = set_cap(args.account, window=args.window, kind=args.kind, pct=args.pct,
+                              revision=args.revision, via=via)
+            else:
+                out = remove_cap(args.account, window=args.window, kind=args.kind, via=via)
+        elif cmd == "definition":
             out = set_definition(args.definition, want["facts"]["value"], via=via)
         elif cmd == "pause":
             out = pause(args.account, until=args.until, via=via, now=now)

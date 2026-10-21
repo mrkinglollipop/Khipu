@@ -35,10 +35,15 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.rule.dismiss": (("rule",), ()),
     "route.hold.add": (("text", "reason", "scope"), ("account", "until")),
     "route.hold.end": (("hold",), ()),
+    "route.cap.set": (("account", "window", "kind", "pct"), ("revision",)),
+    "route.cap.remove": (("account", "window", "kind"), ()),
     "route.priority.set": (("entries",), ("until", "expect", "holds")),
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
+    "route.tier_table.set": (("tiers",), ()),
+    "route.tier_table.confirm": ((), ()),
+    "route.tier_table.clear": ((), ()),
     "accounts.track": (("entries",), ("expect",)),
     "accounts.rename": (("account", "name"), ("expect",)),
     "accounts.stop": (("account",), ("expect",)),
@@ -120,7 +125,13 @@ def _values(action: str, args) -> dict:
     for key, value in args.items():
         if value is None:
             continue
-        if action == "route.definition.set" and key == "value":
+        if action == "route.tier_table.set" and key == "tiers":
+            from khipu.routing_advisory import valid_tiers
+
+            if not valid_tiers(value):
+                raise _bad("tiers must name every task class with a tier of opus, sonnet or haiku")
+            value = dict(value)
+        elif action == "route.definition.set" and key == "value":
             from khipu import routing_entries
 
             value = routing_entries.checked_definition(args.get("definition"), value)
@@ -145,6 +156,18 @@ def _values(action: str, args) -> dict:
                 value = int(value.strip())
             if type(value) is not int or value < 1:
                 raise _bad(f"{key} must be a whole number above 0")
+        elif key == "pct":
+            if isinstance(value, str):
+                try:
+                    value = float(value)
+                except ValueError:
+                    raise _bad("pct must be a number above 0 and at most 100") from None
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 100:
+                raise _bad("pct must be a number above 0 and at most 100")
+        elif action.startswith("route.cap.") and key == "window" and value not in ("weekly", "five_hour"):
+            raise _bad("window must be weekly or five_hour")
+        elif action.startswith("route.cap.") and key == "kind" and value not in ("share", "per_day"):
+            raise _bad("kind must be share or per_day")
         elif key in _FLAGS:
             if not isinstance(value, bool):
                 raise _bad(f"{key} must be true or false")
@@ -227,8 +250,14 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["route", "hold", *_opts(v, "reason", "until"), *where], [v["text"]]
     if action == "route.hold.end":
         return ["route", "hold"], ["end", v["hold"]]
+    if action.startswith("route.cap."):
+        return ["route", "cap", verb, *_opts(v, "window", "kind", "pct", "revision")], [v["account"]]
     if action.startswith("route.priority."):
         return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
+    if action == "route.tier_table.set":
+        return ["route", "tier-table", "set", "--tiers=" + json.dumps(v["tiers"])], []
+    if action.startswith("route.tier_table."):
+        return ["route", "tier-table", verb], []
     if action == "accounts.track":
         return ["accounts", "track", *_opts(v, "entries", "expect")], []
     if action in ("accounts.rename", "accounts.stop", "accounts.move"):

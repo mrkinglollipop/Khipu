@@ -484,10 +484,22 @@ def _found(monkeypatch):
 
 
 def test_the_switch_off_tracks_nothing(mac, capsys, monkeypatch):
+    rc, out = _cli(["accounts", "auto-track", "--from-app", "off"], capsys)
+    assert rc == 0 and accounts.status()["auto_track"] is False
     _found(monkeypatch)
     rc, out = _cli(["usage", "--discover", "--json"], capsys)
     assert rc == 0 and out["auto_tracked"] == [] and _stored() is None
-    assert not config.config_file().exists()
+
+
+def test_auto_track_is_on_for_a_new_install_and_an_explicit_off_persists(mac, capsys):
+    assert config.auto_track() is True, "a new install with no setting tracks by default (decision 15)"
+    assert accounts.status()["auto_track"] is True
+    rc, out = _cli(["accounts", "auto-track", "--from-app", "off"], capsys)
+    assert rc == 0 and out["auto_track"] is False
+    assert json.loads(config.config_file().read_text())[config.AUTO_TRACK_KEY] is False
+    assert config.auto_track() is False, "an explicit off survives a restart (the setting is re-read)"
+    rc, out = _cli(["accounts", "auto-track", "--from-app", "on"], capsys)
+    assert rc == 0 and config.auto_track() is True
 
 
 def test_the_switch_on_tracks_only_what_home_would_offer(mac, capsys, monkeypatch):

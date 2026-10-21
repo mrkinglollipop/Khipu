@@ -2261,8 +2261,9 @@ def cmd_usage(args: argparse.Namespace) -> int:
         out = discover.discover(now=bool(getattr(args, "now", False)), check=getattr(args, "check", None))
         if getattr(args, "check", None) is None:
             out["clis"] = discover.cli_states()
-        # The owner's automatic-tracking switch (off by default): what Home
-        # would offer is tracked through the one save path.
+        # The owner's automatic-tracking switch (on by default for a new
+        # install; an explicit off persists): what Home would offer is
+        # tracked through the one save path.
         from khipu import accounts
 
         out["auto_tracked"] = accounts.auto_track(out)
@@ -2357,6 +2358,28 @@ def cmd_owed(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": True, "id": cid, "until": until,
                           **({"waiting_to_sync": True} if res.get("waiting_to_sync") else {})}))
         return 0
+
+    dismiss_raw = getattr(args, "dismiss", None)
+    close_raw = getattr(args, "close", None)
+    if dismiss_raw or (isinstance(close_raw, str) and "rd-" in close_raw):
+        # A routing direction (slice 19a) is dismissed, not closed: the
+        # same owed close control the app already has, routed to the
+        # directions store. Several ids are comma-separated, like --close.
+        from khipu import routing_directions
+
+        raw = dismiss_raw or close_raw
+        results = []
+        for part in str(raw).split(","):
+            direction_id = part.strip()
+            if not direction_id:
+                continue
+            row = routing_directions.dismiss(direction_id)
+            results.append({"id": direction_id, "ok": row is not None,
+                            **({"status": "dismissed"} if row is not None
+                               else {"error": "no such routing direction"})})
+        ok = bool(results) and all(r["ok"] for r in results)
+        print(json.dumps({"ok": ok, "dismissed": results}))
+        return 0 if ok else 1
 
     close_id = getattr(args, "close", None)
     reopen_id = getattr(args, "reopen", None)
@@ -5566,7 +5589,7 @@ def build_parser() -> argparse.ArgumentParser:
     owed.add_argument("--limit", type=int, default=50)
     owed.add_argument("--owner", default=None, choices=("user", "assistant", "agent", "all"),
                       help="Only items this owner owes (pages the list, like khipu_owed)")
-    owed.add_argument("--kind", default=None, choices=("followup", "blocker", "question", "promise"))
+    owed.add_argument("--kind", default=None, choices=("followup", "blocker", "question", "promise", "routing_direction"))
     owed.add_argument("--origin", default=None, choices=("conversation", "job"))
     owed.add_argument("--query", default=None, help="Only items whose text holds all these words")
     owed.add_argument("--pr", type=int, default=None, help="Only items naming this pull request number")
@@ -5574,6 +5597,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Only the owner's items a rule found done, for him to close")
     owed.add_argument("--cursor", default=None, help="next_cursor from the previous page")
     owed.add_argument("--close", metavar="ID[,ID...]", default=None, help="Close commitment ID, or several")
+    owed.add_argument("--dismiss", metavar="ID[,ID...]", default=None,
+                      help="Dismiss routing direction ID (rd-...), or several")
     owed.add_argument("--reopen", metavar="ID[,ID...]", default=None, help="Reopen commitment ID, or several")
     owed.add_argument("--reassign", metavar="ID[,ID...]", default=None,
                       help="Give commitment ID, or several, to another owner (needs --to)")
@@ -5781,8 +5806,28 @@ def build_parser() -> argparse.ArgumentParser:
     rdef.add_argument("--value", required=True, metavar="JSON")
     rdef.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rdef)
+    rtier = rt_sub.add_parser(
+        "tier-table", parents=[rt_json],
+        help="The rule 12 tier table: show it; set, confirm or clear it (asks for a typed confirmation)")
+    rtier.add_argument("action", nargs="?", default="show", choices=("show", "set", "confirm", "clear"))
+    rtier.add_argument("--tiers", "--value", dest="tiers", default=None, metavar="JSON",
+                       help='set: {"scope": "opus", "mock": "opus", ...} naming every task class')
+    rtier.add_argument("--at-owner-request", default=None, metavar="REQUEST",
+                       help="A conversation: the owner's request, in one line (set only; stays a proposal)")
+    rtier.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rtier)
 
-    for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule, rdef):
+    rcap = rt_sub.add_parser("cap", parents=[rt_json], help="Owner: set or remove a pace cap")
+    rcap.add_argument("action", choices=("set", "remove"))
+    rcap.add_argument("account")
+    rcap.add_argument("--window", required=True, choices=("weekly", "five_hour"))
+    rcap.add_argument("--kind", required=True, choices=("share", "per_day"))
+    rcap.add_argument("--pct", type=float, default=None)
+    rcap.add_argument("--revision", default=None)
+    rcap.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rcap)
+
+    for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule, rdef, rtier, rcap):
         writer.add_argument("--op", default=None, help="Retry identity; reuse for the same change")
 
     dec = sub.add_parser(
@@ -6303,6 +6348,10 @@ def build_parser() -> argparse.ArgumentParser:
     aauto = acc_sub.add_parser("auto-track", parents=[acc_owner],
                                help="Track found logins a conversation used without asking (on this Mac)")
     aauto.add_argument("state", choices=("on", "off"))
+    amerge = acc_sub.add_parser("merge", parents=[acc_owner],
+                                help="Same subscription: offer these found logins as one account")
+    amerge.add_argument("--candidate", action="append", required=True, metavar="ID",
+                        help="A discovery candidate id; repeat for each login of the subscription")
     areq = acc_sub.add_parser("request", parents=[acc_owner, acc_cas],
                               help="Answer a conversation's change to the account list")
     areq.add_argument("action", choices=("confirm", "undo"))

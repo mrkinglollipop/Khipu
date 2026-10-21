@@ -44,7 +44,11 @@ def _size(text):
 def _path(session):
     from khipu import recall_prompt
 
-    return recall_prompt._dedup_path(session).with_suffix(".routing.json")
+    session = hook_session(session)
+    # A collision-resistant name for the complete canonical identity:
+    # sanitizing or truncating it made distinct identities share a file.
+    digest = hashlib.sha256(session.encode("utf-8")).hexdigest()
+    return recall_prompt._dedup_path("ledger").parent / f"recall--{digest}.routing.json"
 
 
 @contextlib.contextmanager
@@ -94,7 +98,7 @@ def notice_receipts(session):
             if entity.startswith("notice:") and entry.get("acked")}
 
 
-def plan(out, view, now, cfg, *, session=None):
+def plan(out, view, now, cfg, *, session=None, project=None):
     """Attach current, scrubbed entity revisions to a hook's rendered offer."""
     from khipu import routing as r
 
@@ -128,12 +132,29 @@ def plan(out, view, now, cfg, *, session=None):
         if effective is None:
             effective = line
         items.append(dict(entity=entity, effective=effective, text=line, label=label, whole=whole))
-    projected = r._for_agents([(item["text"], item["label"]) for item in items], view) if items else []
+    for entity, fc in (out.get("pace_forecasts") or {}).items():
+        entry = next((a for a in view.get("accounts") or [] if a["key"] == fc["account"]), None)
+        line = r.pace_line_for(entry, now) if entry else None
+        if line:
+            items.append(dict(entity=entity, effective=line, text=line, label=fc["label"], whole=False))
+    raw = [(item["text"], item["label"]) for item in items]
+    projected = (project(raw) if project else r._for_agents(raw, view)) if items else []
     for item, (line, label) in zip(items, projected):
         effective = item.pop("effective")
-        # Relative account ages are presentation, not a new change. Rules
-        # and priority also depend on the rendered hold and level suffixes.
-        fingerprint = [effective, line, label] if item["entity"].startswith("rule:") or item["entity"] == "priority" else effective
+        if project:
+            # A projection is not evidence that the source characters were
+            # delivered. Withheld/changed entries stay owed at offset zero.
+            from khipu import agent_view
+
+            # A token removed from current owner words is safe to deliver;
+            # all other projection changes remain unacknowledgeable.
+            words = agent_view.keep_owner_words(view)
+            expected = tuple(agent_view.redact_owner_tokens(value, words)
+                             for value in (item["text"], item["label"]))
+            item["withheld"] = (line, label) != expected
+        # Relative account ages are presentation, not a new change. Whole
+        # entries also depend on their safe text and rendered suffixes.
+        fingerprint = [effective, line, label] if item["entity"].startswith("rule:") or item["entity"] in ("note", "priority") else effective
         revision = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
         item.update(text=line, label=label, revision=revision)
         # Rules and notes require their complete words. Accounts and holds
@@ -151,8 +172,9 @@ def plan(out, view, now, cfg, *, session=None):
                           label="Proposal notice", whole=True, visible=ident in (out.get("notices") or [])))
     removed = {e: r.change_line(e, view, now) for e in view.get("causes", {})
                if e not in view.get("effective", {}) and (e == "note" or e.startswith("rule:"))}
-    return dict(out, delivery_plan={"items": items, "current_entities": list(view.get("effective", {})),
-                                   "removed": removed, "notices": ["notice:" + n[2] for n in notices], "at": r._iso(now),
+    return dict(out, delivery_plan={"items": items, "pace_forecasts": out.get("pace_forecasts") or {},
+                                    "current_entities": list(view.get("effective", {})),
+                                    "removed": removed, "notices": ["notice:" + n[2] for n in notices], "at": r._iso(now),
                                    "limit": cfg["routing_summary_chars"] if full else cfg["routing_prompt_chars"],
                                    "full": full, "page_limit": cfg["routing_prompt_chars"], "text": out.get("text"),
                                    "lease": cfg["routing_delivery_lease"],
@@ -200,7 +222,7 @@ def _merge(state, out):
             fallback = ("The owner's note ended" if entity == "note" else
                         old["label"] + (" retired" if entity.startswith("rule:") else " is no longer current"))
             line = plan.get("removed", {}).get(entity, fallback)
-            fingerprint = [line, line, old["label"]] if entity.startswith("rule:") or entity == "priority" else line
+            fingerprint = [line, line, old["label"]] if entity.startswith("rule:") or entity in ("note", "priority") else line
             revision = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
             items.append(dict(entity=entity, revision=revision, text=line, label=old["label"], whole=True, visible=False))
     for item in items:
@@ -248,7 +270,7 @@ def _render(state, out, now, component):
     if not due:
         # Informational full/stale blocks have no change debt to reserve.
         answer = {k: v for k, v in out.items() if k not in
-                  ("delivery_plan", "delivery_reservation", "routing_changes", "delivery", "_delivery_view", "_reserved")}
+                  ("delivery_plan", "delivery_reservation", "routing_changes", "delivery", "_delivery_view", "_reserved", "pace_forecasts")}
         return answer
     limit = out["delivery_plan"]["limit"]
     # Keep ordinary small offers byte-identical. A preview is never enough
@@ -316,7 +338,7 @@ def _render(state, out, now, component):
             body.append(tail)
         plain = heading + "\n" + "\n".join(body)
     complete = [entity for entity, end in progress.items() if end == len(entries[entity]["text"])]
-    answer = {k: v for k, v in out.items() if k not in ("delivery_plan", "delivery_reservation", "_delivery_view", "_reserved")}
+    answer = {k: v for k, v in out.items() if k not in ("delivery_plan", "delivery_reservation", "_delivery_view", "_reserved", "pace_forecasts")}
     if "notices" in out or out["delivery_plan"].get("notices"):
         answer["notices"] = [entity.removeprefix("notice:") for entity in complete
                              if entity.startswith("notice:")]
@@ -368,6 +390,317 @@ def refit(session, changes, body_limit):
         state.pop("flight")
         return _render(state, out, _clock(), component)
 
+_HOOKED_HARNESSES = frozenset({"claude_code", "codex"})
+_PULL_ONLY_HARNESSES = frozenset({"aegis", "grok", "grok_build", "cursor", "muse", "gateway", "unknown"})
+
+
+def canonical_identity(environ=None, explicit=None):
+    """The one conversation identity for hooks and pull (MCP) delivery.
+
+    Returns {"root", "session", "harness", "capability", "child"} or None
+    when the caller's environment and arguments name no session. An
+    identity the environment itself knows (``KHIPU_SESSION_ID``, then a
+    harness-native id) cannot be replaced with an unrelated explicit id.
+    Native and T3 roots cannot be supplied by
+    an unidentified caller. An identified caller may extend its own root
+    with a strict, nonempty descendant path for an isolated child ledger.
+    Other explicit ids use an isolated pull
+    namespace, so they cannot borrow custom environment-owned roots.
+    ``root`` is the conversation name and ``session`` its ledger key. A root
+    containing "/" is a pull-only child:
+    its own ledger, never its parent's. Capability comes from the
+    current attachment's harness alone.
+    """
+    env = os.environ if environ is None else environ
+
+    def _clean(value):
+        return value.strip() if isinstance(value, str) else ""
+
+    harness = _clean(env.get("KHIPU_HARNESS")).lower()
+    if not harness:
+        if env.get("GROK_HOOK_NAME") or env.get("GROK_HOOK_EVENT"):
+            harness = "aegis"
+        elif env.get("CLAUDECODE") or env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_CODE_ENTRYPOINT"):
+            harness = "claude_code"
+        elif env.get("CODEX_THREAD_ID") or env.get("CODEX_SANDBOX") or env.get("CODEX_HOME"):
+            harness = "codex"
+        else:
+            harness = "unknown"
+    explicit = _clean(explicit)
+    shared = _clean(env.get("KHIPU_SESSION_ID"))
+    claude = _clean(env.get("CLAUDE_CODE_SESSION_ID"))
+    codex = _clean(env.get("CODEX_THREAD_ID"))
+    if shared:
+        root = session = shared
+    elif claude:
+        root = session = f"claude:{claude}"
+    elif codex:
+        root = session = f"codex:{codex}"
+    elif explicit and not explicit.startswith(("claude:", "codex:", "t3:")):
+        root = explicit
+        # Environment strings cannot contain NUL. Explicit pull ids thus
+        # cannot borrow even a custom environment-owned root's ledger.
+        session = "pull\0" + explicit
+    else:
+        return None
+    if shared or claude or codex:
+        if explicit and explicit != root:
+            prefix = root + "/"
+            suffix = explicit[len(prefix):] if explicit.startswith(prefix) else ""
+            if not suffix or any(part in ("", ".", "..") for part in suffix.split("/")) or "\0" in suffix:
+                return None
+            root = session = explicit
+    if "/" in root:
+        # A child has no hook of its own; its pulls count on the mcp
+        # component, never on a parent's main ledger that will not move.
+        capability = "pull_only"
+    elif harness in _HOOKED_HARNESSES:
+        capability = "hooked"
+    elif harness in _PULL_ONLY_HARNESSES:
+        capability = "pull_only"
+    elif root.startswith(("claude:", "codex:")):
+        capability = "hooked"
+    else:
+        capability = "pull_only"
+    return {"root": root, "session": session, "harness": harness,
+            "capability": capability, "child": "/" in root}
+
+
+def hook_session(session, environ=None):
+    """Resolve a trusted hook payload once, before helper IPC or a writer.
+
+    Payload-only harness hooks historically use bare ids. The caller's
+    environment supplies the shared root or native namespace when present.
+    Only a payload that names the environment's own conversation (its
+    shared id, its harness-native id, or either's canonical form) resolves
+    to that conversation's canonical session; any other payload is a
+    different conversation and keeps its own identity, so one identity is
+    used end to end without borrowing another conversation's ledger or
+    marker. An empty payload falls back to the environment's identity.
+    """
+    env = os.environ if environ is None else environ
+
+    def _clean(value):
+        return value.strip() if isinstance(value, str) else ""
+
+    shared = _clean(env.get("KHIPU_SESSION_ID"))
+    claude = _clean(env.get("CLAUDE_CODE_SESSION_ID"))
+    codex = _clean(env.get("CODEX_THREAD_ID"))
+    if shared:
+        canonical = shared
+    elif claude:
+        canonical = f"claude:{claude}"
+    elif codex:
+        canonical = f"codex:{codex}"
+    else:
+        return session
+    if not isinstance(session, str) or not session.strip():
+        return canonical
+    session = session.strip()
+    if session == canonical or session.startswith(canonical + "/"):
+        return session
+    own = {value for value in (shared, claude, codex) if value}
+    own.update(f"{prefix}:{value}" for prefix, value in (("claude", claude), ("codex", codex)) if value)
+    if session in own:
+        return canonical
+    return session
+
+
+def untracked_items(out):
+    """Change items for an unidentified caller: named, never reserved."""
+    items = []
+    for item in out["delivery_plan"]["items"]:
+        items.append(dict(change=item["entity"] + "@" + item["revision"],
+                          entity=item["entity"], revision=item["revision"]))
+    return items
+
+
+def _delivery_summary(data, component, state, changes, now, counting_component):
+    entries = state.get("entries", {}) if isinstance(state, dict) else {}
+    in_flight = {item["entity"] for item in changes["items"]} if changes else set()
+    duplicates = []
+    if component == "mcp":
+        other = data.get("main")
+        if isinstance(other, dict) and other.get("entries"):
+            duplicates = [entity for entity in in_flight
+                          if entity in other["entries"] and not other["entries"][entity].get("acked")]
+        elif changes:
+            # No main ledger yet: the same changes are still owed there.
+            duplicates = [item["entity"] for item in changes["items"]]
+    counting = data.get(counting_component) if counting_component else state
+    health = "green"
+    if isinstance(counting, dict):
+        expired = counting.get("expired", 0) or 0
+        flight = counting.get("flight")
+        if flight and _parse(flight["until"]) <= now:
+            expired += 1
+        if expired >= 2 and any(not e.get("acked") for e in (counting.get("entries") or {}).values()):
+            health = "red"
+    return {"owed": sum(1 for e in entries.values() if not e.get("acked") and e["entity"] not in in_flight),
+            "in_flight": len(in_flight), "acked_through": state.get("acked_through"),
+            "duplicates_across_components": duplicates, "health": health}
+
+
+def pull_offer(out, *, session, component="mcp", counting_component=None, now=None, skip_entities=frozenset()):
+    """Reserve (or re-send) one pull component's batch under its own lock.
+
+    A live in-flight batch is re-sent byte-identically, so a dropped
+    response loses nothing. Every item carries the exact text it reserves
+    (``text``: the whole line, or the one page being shown), so a batch
+    never reserves content the response did not return. Entities in
+    ``skip_entities`` are neither reserved nor sent. Returns
+    (routing_changes or None, delivery).
+    """
+    now = now or _parse(out["delivery_plan"]["at"])
+    counting_component = counting_component or component
+    with _transaction(session) as data:
+        state = data.setdefault(component, {})
+        entries = _merge(state, out)
+        skip_entities = skip_entities | frozenset(e["entity"] for e in entries.values() if e.get("withheld"))
+        flight = state.get("flight")
+        if flight and any(item["entity"] in skip_entities
+                          for item in flight["out"]["routing_changes"]["items"]):
+            state.pop("flight", None)  # withdrawn, not expired: it may not be shown at all now
+            flight = None
+        if flight and _parse(flight["until"]) > now:
+            changes = copy.deepcopy(flight["out"]["routing_changes"])
+            return _projected_pages(changes), _delivery_summary(data, component, state, changes, now, counting_component)
+        if flight:
+            state["expired"] = state.get("expired", 0) + 1
+            state.pop("flight", None)
+        due = [e for e in entries.values() if not e.get("acked") and e["entity"] not in skip_entities]
+        if not due:
+            return None, _delivery_summary(data, component, state, None, now, counting_component)
+        plan_data = out["delivery_plan"]
+        page_limit = plan_data.get("page_limit") or plan_data.get("limit") or 4000
+        items, progress = [], {}
+        for entry in due:
+            start, value = entry.get("offset", 0), entry["text"]
+            if not entry["whole"] or (not start and len(value) <= page_limit):
+                items.append(dict(change=entry["entity"] + "@" + entry["revision"],
+                                  entity=entry["entity"], revision=entry["revision"], text=value))
+                progress[entry["entity"]] = len(value)
+                continue
+            width = entry.get("width") or max(2, page_limit - _size(entry["label"]) - 44)
+            entry.setdefault("width", width)
+            end = _cut(value, start, width)
+            if end == start:
+                break
+            remaining = _pages_left(value, end, width)
+            if remaining is None:
+                break
+            n = entry.get("pages", 0) + 1
+            items.append(dict(change=entry["entity"] + "@" + entry["revision"],
+                              entity=entry["entity"], revision=entry["revision"],
+                              page={"n": n, "m": n + remaining}, text=value[start:end]))
+            progress[entry["entity"]] = end
+            break
+        if not items:
+            return None, _delivery_summary(data, component, state, None, now, counting_component)
+        changes = {"batch": str(uuid.uuid4()), "component": component, "items": items}
+        state["flight"] = {"until": _iso(now + timedelta(seconds=plan_data["lease"])),
+                           "out": {"routing_changes": copy.deepcopy(changes),
+                                   "version": out.get("version")},
+                           "progress": progress, "plan": copy.deepcopy(plan_data)}
+        return _projected_pages(changes), _delivery_summary(data, component, state, changes, now, counting_component)
+
+
+def _projected_pages(changes):
+    from khipu.agent_view import RoutingPage
+
+    # The full entry was projected before reservation. Retain that fact
+    # across disk retransmission so a fragment keeps its owner exemption.
+    for item in changes["items"]:
+        item["text"] = RoutingPage(item["text"])
+    return changes
+
+
+def _batch_in_state(state, batch):
+    if not isinstance(state, dict):
+        return False
+    if batch in (state.get("batches") or {}):
+        return True
+    flight = state.get("flight")
+    return bool(flight and flight["out"]["routing_changes"].get("batch") == batch)
+
+
+def _batch_owned_elsewhere(session, batch):
+    """Best-effort foreign classification; never consume another ledger.
+
+    Unknown acknowledgements have a fixed work budget regardless of the
+    number of sessions. Beyond it, "unknown" is equally non-consuming.
+    Read candidate ledgers only while holding their shared delivery lock.
+    """
+    from itertools import islice
+
+    own = _path(session)
+    deadline = time.monotonic() + 0.05
+    reads = 0
+    try:
+        with os.scandir(own.parent) as entries:
+            for entry in islice(entries, 32):
+                if time.monotonic() >= deadline or reads >= 8:
+                    break
+                path = own.parent / entry.name
+                if path == own or not entry.name.endswith(".routing.json"):
+                    continue
+                reads += 1
+                try:
+                    with path.with_suffix(".lock").open("a") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        if path.stat().st_size > 1_048_576:
+                            continue
+                        data = json.loads(path.read_text())
+                        if isinstance(data, dict) and any(_batch_in_state(state, batch) for state in data.values()):
+                            return True
+                except (OSError, ValueError, TypeError, KeyError):
+                    continue
+    except OSError:
+        pass
+    return False
+
+
+def pull_acknowledge(session, batch, *, component="mcp", now=None):
+    """Ack one pull batch. Returns acked, duplicate, foreign or unknown.
+
+    Only the issuing component of this identity may move a batch. A batch
+    issued to another component or identity is "foreign" and stays put; a
+    duplicate is a no-op; an unknown or expired batch is answered, never
+    an error, and consumes nothing.
+    """
+    now = now or _clock()
+    with _transaction(session) as data:
+        state = data.get(component) or {}
+        if batch in (state.get("batches") or {}):
+            return "duplicate"
+        flight = state.get("flight")
+        if flight and flight["out"]["routing_changes"].get("batch") == batch:
+            if _parse(flight["until"]) <= now:
+                return "unknown"
+            changes = flight["out"]["routing_changes"]
+            for item in changes["items"]:
+                entry = state["entries"].get(item["entity"])
+                if entry is None or entry["revision"] != item["revision"]:
+                    return "unknown"
+            for item in changes["items"]:
+                entry = state["entries"][item["entity"]]
+                entry["offset"] = flight["progress"][item["entity"]]
+                entry["acked"] = entry["offset"] == len(entry["text"])
+                entry["pages"] = item.get("page", {}).get("n", 0)
+                entry["restarted"] = False
+            batches = state.setdefault("batches", {})
+            batches[batch] = True
+            for old in list(batches)[:-128]:
+                del batches[old]
+            state.pop("flight", None)
+            if all(e.get("acked") for e in state["entries"].values()):
+                state["acked_through"] = flight["out"].get("version")
+            return "acked"
+        if any(comp != component and _batch_in_state(other, batch) for comp, other in data.items()):
+            return "foreign"
+    return "foreign" if _batch_owned_elsewhere(session, batch) else "unknown"
+
+
 def acknowledge(session, changes, *, reservation=None, now=None):
     """Only an issued batch can ack; failed persistence leaves it retryable."""
     try:
@@ -400,6 +733,9 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
             e["restarted"] = False
         batches = state.setdefault("batches", {})
         batches[batch] = True
+        forecasts = (flight.get("plan") or {}).get("pace_forecasts") or {}
+        if forecasts:
+            state["pace_acked"] = {**(state.get("pace_acked") or {}), **forecasts}
         # Idempotence covers recent retries; older ids fail closed.
         for old in list(batches)[:-128]:
             del batches[old]
