@@ -39,23 +39,53 @@ def test_never_on_unconfigured_poll_ticks_do_not_connect_or_write(gw, monkeypatc
     assert local_files() == before
 
 
-def test_never_on_configured_cleanup_attempts_once_then_stops_writing(gw, monkeypatch):
+def test_never_on_configured_cleanup_retries_with_backoff_then_deletes(gw, gateway_hub, monkeypatch):
     never_published(gw)
     monkeypatch.setattr(routing, "_hub_configured", lambda: True)
     calls = []
+    good = db.connect
     def down(**kwargs):
         calls.append(True)
         raise OSError("configured hub offline")
     monkeypatch.setattr(db, "connect", down)
     assert gc.publish() == {"ok": False, "error": "copy_publish_failed"}
     assert gc.status().get("cleanup_attempted") is True
-    after_attempt = local_files()
-    for _ in range(4):
+    first_retry = routing._parse(gc.status()["retry_at"])
+    routing._now.now = first_retry - timedelta(seconds=1)
+    assert gc.publish() == {"ok": False, "error": "copy_retry_pending"}
+    assert calls == [True]
+    routing._now.now = first_retry + timedelta(seconds=1)
+    assert gc.publish() == {"ok": False, "error": "copy_publish_failed"}
+    assert calls == [True, True]
+    assert gc.status()["failures"] == 2
+    second_retry = routing._parse(gc.status()["retry_at"])
+    assert second_retry > first_retry + timedelta(seconds=1)
+    monkeypatch.setattr(db, "connect", good)
+    routing._now.now = second_retry + timedelta(seconds=1)
+    assert gc.publish() == {"ok": True, "disabled": True, "deleted": True}
+    after_delete = local_files()
+    for _ in range(3):
         routing._now.now += timedelta(seconds=400)
         assert gc.publish() == {"ok": True, "disabled": True}
-    assert gc.publish(force=True) == {"ok": True, "disabled": True}
+    assert local_files() == after_delete
+
+
+def test_unconfigured_hub_check_is_cached_for_a_bounded_time(gw, monkeypatch):
+    never_published(gw)
+    calls = []
+    def check():
+        calls.append(True)
+        return False
+    monkeypatch.setattr(routing, "_hub_configured", check)
+    before = local_files()
+    for _ in range(4):
+        assert gc.publish() == {"ok": True, "disabled": True}
+        routing._now.now += timedelta(seconds=60)
     assert calls == [True]
-    assert local_files() == after_attempt
+    assert local_files() == before
+    routing._now.now += timedelta(seconds=600)
+    assert gc.publish() == {"ok": True, "disabled": True}
+    assert calls == [True, True]
 
 
 def test_known_publisher_delete_honours_retry_without_file_churn(gw, gateway_hub, monkeypatch):
@@ -93,7 +123,7 @@ def test_real_publication_resets_one_off_cleanup_marker(gw, monkeypatch):
     assert not gc.publish()["ok"]
     monkeypatch.setattr(db, "connect", good)
     routing._now.now += timedelta(seconds=400)
-    assert gc.publish() == {"ok": True, "disabled": True}
+    assert gc.publish() == {"ok": True, "disabled": True, "deleted": True}
     gateway_tests.configure(gw, routing_cloud_copy=True)
     gateway_tests.seed(gw)
     assert gc.publish(force=True)["published"]

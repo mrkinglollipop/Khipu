@@ -67,6 +67,22 @@ def test_gaps_are_clipped_merged_and_keep_each_runner_label(replay):
     assert routing_sources.spend_report([a, b], "claude|", start, now) is None
 
 
+def test_spend_report_caps_gaps_to_the_three_largest_with_a_more_count(replay):
+    now, start = replay.now, replay.now - timedelta(days=7)
+    row = stream(now)
+    marks = [start, start + timedelta(hours=1), start + timedelta(hours=2),
+             start + timedelta(hours=3), start + timedelta(hours=5),
+             start + timedelta(hours=6), start + timedelta(hours=9),
+             start + timedelta(hours=10), start + timedelta(hours=14),
+             start + timedelta(hours=15), start + timedelta(hours=20), now]
+    row["coverage"] = list(zip(marks[::2], marks[1::2]))
+    report = routing_sources.spend_report([row], "codex|", start, now)
+    assert [gap["seconds"] for gap in report["gaps"]] == [18000, 14400, 10800]
+    assert report["gaps_more"] == 2
+    small = routing_sources.spend_report([stream(now)], "codex|", start, now)
+    assert len(small["gaps"]) == 1 and "gaps_more" not in small
+
+
 def test_complete_and_no_records_do_not_invent_partial_numbers(replay):
     now, start = replay.now, replay.now - timedelta(days=7)
     row = stream(now)

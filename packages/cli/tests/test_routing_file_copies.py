@@ -67,6 +67,18 @@ def scanned(replay, monkeypatch):
     return replay
 
 
+def test_display_path_home_itself_a_project_root_still_uses_tilde(tmp_path):
+    home = tmp_path / "someuser"
+    home.mkdir()
+    shown = routing_scan_report.display_path(home / ".claude" / "CLAUDE.md", home, [home])
+    assert shown == "~/.claude/CLAUDE.md"
+    assert routing_scan_report.display_path(home, home, [home]) == "~"
+    assert home.name not in shown
+    project = home / "Projects" / "Foo"
+    assert routing_scan_report.display_path(
+        project / "CLAUDE.md", home, [home, project]) == "Foo/CLAUDE.md"
+
+
 def test_not_looked_at_yet_is_an_explicit_state(scanned):
     public = routing.public_view(scanned.view(), scanned.now)
     assert public[FIELD] == {"status": "not_checked", "scanned_at": None,

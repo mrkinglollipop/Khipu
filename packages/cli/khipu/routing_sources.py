@@ -1564,6 +1564,9 @@ def spend_total(streams: list[dict], account: str, start: datetime, end: datetim
     return {**base, "status": "known", "usd": round(total, 2), "events": count, "reason": None}
 
 
+_GAP_DISPLAY_LIMIT = 3
+
+
 def spend_report(streams: list[dict], account: str, start: datetime, end: datetime) -> dict | None:
     """Owner-display evidence for an unknown total; never a verdict input.
 
@@ -1597,7 +1600,15 @@ def spend_report(streams: list[dict], account: str, start: datetime, end: dateti
         if cursor < finish:
             gaps.append({"runner": stream["runner"], "from": _iso(cursor), "to": _iso(finish),
                          "seconds": (finish - cursor).total_seconds()})
-    return {"usd": round(total, 2), "events": count, "gaps": gaps} if count else None
+    if not count:
+        return None
+    report = {"usd": round(total, 2), "events": count, "gaps": gaps}
+    if len(gaps) > _GAP_DISPLAY_LIMIT:
+        # Owner display only: keep the largest gaps and count the rest,
+        # so a badly broken stream cannot flood the report.
+        report["gaps"] = sorted(gaps, key=lambda g: (-g["seconds"], g["from"], g["runner"]))[:_GAP_DISPLAY_LIMIT]
+        report["gaps_more"] = len(gaps) - _GAP_DISPLAY_LIMIT
+    return report
 
 
 def active_totals(streams: list[dict]) -> dict:

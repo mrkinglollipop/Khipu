@@ -106,6 +106,10 @@ def display_path(path: Path, home: Path | None = None,
     per-project file, ``~`` for home, never a stripped absolute path."""
     home = Path.home() if home is None else home
     for root in project_roots:
+        if root == home:
+            # Home itself as a project root must not rename ~/… paths
+            # after the home folder (which can be a username).
+            continue
         try:
             rel = path.relative_to(root)
         except ValueError:
