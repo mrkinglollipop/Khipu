@@ -1348,6 +1348,28 @@ describe("Settings -> Routing: checks and copies", () => {
     await waitFor(() => expect(document.activeElement).toBe(target));
   });
 
+  it("names the rule a rule-sourced contradiction comes from, by its public id", async () => {
+    // The ids are the shapes `khipu route --json` carries: a rule's public
+    // entity ("rule-" and a uuid) in `rules[].entity`, and the private origin
+    // event id the flag must not name. Before the CLI fix a flag carried the
+    // origin id, so no row could map it to a rule and every one read
+    // "A standing rule names…".
+    const v = checksView();
+    const entity = "rule-019a15c9f-4534-7a2e-9c1d-2b3e4f5a6b7c";
+    v.rules = [{ n: 12, entity, text: "Use Grok Build for fast models.", date: "2026-10-13" }];
+    v.contradictions = [{
+      kind: "account_state", account: "grok:main", source: "rule", state: "paused", entities: [entity],
+      text: "A standing rule names Grok Build, which is paused.", advisory: true,
+    }];
+    answers.khipu_route_view = v;
+    await page();
+    const titled = row("Contradictions and out-of-date words", "Rule 12 names Grok Build");
+    expect(titled).toHaveTextContent("Rule 12 names Grok Build, which you paused until Fri 9:00 AM");
+    expect(titled).toHaveTextContent("Your rule names an account you paused.");
+    expect(within(screen.getByRole("region", { name: "Needs you" }))
+      .getByText("Rule 12 names Grok Build, which you paused until Fri 9:00 AM")).toBeInTheDocument();
+  });
+
   it("folds the confirmed model table with all eleven kinds of work", async () => {
     answers.khipu_route_view = checksView();
     await page();

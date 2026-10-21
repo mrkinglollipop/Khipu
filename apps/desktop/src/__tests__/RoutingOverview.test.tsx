@@ -706,10 +706,12 @@ describe.skipIf(!CHROME)("Accounts and routing laid out at 1280 wide", () => {
     ]);
 
   // Routing slice 15d adds the approved Checks and copies group (mock
-  // checks-light.html): one more closed row (44 px) and the page's gap
-  // (12 px). The budget moves with the approved group, so every group can
-  // still be shut on one screen.
-  it("is under 1,560 px with Accounts open, and fits one screen with every group closed", async () => {
+  // checks-light.html): 56 px (one more closed row, 44 px, and the page's
+  // gap, 12 px) on top of the 46 px the page already carried over its old
+  // 1,400 px budget from slice 15c (it measured 1,446 px at 9e894c8).
+  // 1,400 + 46 + 56 = 1,502, so 1,510 keeps the 15c overage visible instead
+  // of excusing it, and every group can still be shut on one screen.
+  it("is under 1,510 px with Accounts open, and fits one screen with every group closed", async () => {
     answers.khipu_route_view = five();
     const { container } = render(<RoutingSettings active plansState={plans()} />);
     await settled();
@@ -722,7 +724,7 @@ describe.skipIf(!CHROME)("Accounts and routing laid out at 1280 wide", () => {
     await settled();
     const shut = heightInChrome(closed.container.innerHTML);
     console.log(`Accounts and routing at 1280 wide: ${open} px with Accounts open, ${shut} px with every group closed`);
-    expect(open).toBeLessThan(1560);
+    expect(open).toBeLessThan(1510);
     expect(shut).toBeLessThan(760);
   }, 180000);
 });

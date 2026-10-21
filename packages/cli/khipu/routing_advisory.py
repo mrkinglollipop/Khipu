@@ -136,13 +136,15 @@ def _contradictions(view: dict) -> list[dict]:
     for rule in view.get("rules") or []:
         if not isinstance(rule, dict) or not isinstance(rule.get("text"), str):
             continue
-        origin = rule.get("origin_id") or rule.get("entity")
+        # The public rule entity, the one the rules list shows; the origin
+        # event id stays private to the fold.
+        entity = rule.get("entity")
         for record in _named(rule["text"], by_key, by_label):
             state = _rule_state(record, held)
-            if state is None or not origin:
+            if state is None or not entity:
                 continue
             flags.append(_flag(
-                "account_state", record["id"], [origin],
+                "account_state", record["id"], [entity],
                 f"A standing rule names {record.get('label') or record['id']}, which is {state}.",
                 state=state, source="rule"))
     flags += _opposite(view.get("directions") or [], by_key)
