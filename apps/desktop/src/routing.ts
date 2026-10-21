@@ -558,6 +558,16 @@ export type RouteView = {
    *  for this Mac's owner only (survey rows 8-11). */
   delivery_rows?: RouteDeliveryRow[];
   delivery_macs?: RouteDeliveryMac[];
+  /** Routing copies found in files, for this Mac's owner only (slice 13/15d). */
+  routing_file_copies?: {
+    status: string;
+    scanned_at?: string | null;
+    files_checked: number;
+    hits: { file: string; line: number; quote: string; superseded: boolean }[];
+    hits_total?: number;
+    more_not_shown?: number;
+    too_large?: string[];
+  };
   /** Open owed directions, projected for this Mac's owner only (slice 19a). */
   unreached_directions?: {
     id: string;

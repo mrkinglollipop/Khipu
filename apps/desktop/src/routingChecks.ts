@@ -20,11 +20,22 @@ export type ChecksRow = {
 
 export type TierRow = { label: string; tier: string };
 
+export type FileCopiesModel = {
+  status: string;
+  scanned_at: string | null;
+  files_checked: number;
+  hits: { file: string; line: number; quote: string; superseded: boolean }[];
+  hits_total: number;
+  more_not_shown: number;
+  too_large: string[];
+};
+
 export type ChecksModel = {
+  mismatches: ChecksRow[];
   contradictions: ChecksRow[];
   upkeep: ChecksRow[];
+  fileCopies: FileCopiesModel | null;
   unreached: ChecksRow[];
-  mismatches: ChecksRow[];
   /** The confirmed model table, or null: `route --json` carries only a
    *  confirmed one, so an absent table can mean none or one still waiting. */
   table: { rows: TierRow[]; line: string } | null;
@@ -246,7 +257,7 @@ function upkeepRow(h: RouteHygiene, i: number, view: RouteView, rules: Map<strin
 
 /** Every advisory row and the model table, in the group's order. */
 export function checksModel(view: RouteView | null, now: Date): ChecksModel {
-  if (!view) return { contradictions: [], upkeep: [], unreached: [], mismatches: [], table: null };
+  if (!view) return { mismatches: [], contradictions: [], upkeep: [], fileCopies: null, unreached: [], table: null };
   const rules = ruleByEntity(view);
   const contradictions = (view.contradictions ?? []).map((c, i) => contradictionRow(c, i, view, rules, now));
   const upkeep = (view.rule_hygiene ?? []).map((h, i) => upkeepRow(h, i, view, rules, now));
@@ -271,6 +282,14 @@ export function checksModel(view: RouteView | null, now: Date): ChecksModel {
         (m.guessed ? "guessed from the brief's words" : "the brief named the kind of work"),
     };
   });
+  const copies = view.routing_file_copies;
+  const fileCopies: FileCopiesModel | null = copies
+    ? { status: copies.status, scanned_at: copies.scanned_at ?? null,
+        files_checked: copies.files_checked ?? 0, hits: copies.hits ?? [],
+        hits_total: copies.hits_total ?? copies.hits?.length ?? 0,
+        more_not_shown: copies.more_not_shown ?? 0,
+        too_large: copies.too_large ?? [] }
+    : null;
   let table: ChecksModel["table"] = null;
   const tiers = view.tier_table?.tiers;
   if (tiers && Object.keys(tiers).length && view.tier_table?.confirmed !== false) {
@@ -282,7 +301,7 @@ export function checksModel(view: RouteView | null, now: Date): ChecksModel {
     const rows = [...known, ...extra];
     table = { rows, line: `${plural(rows.length, "kind", "kinds")} of work · confirmed by you` };
   }
-  return { contradictions, upkeep, unreached, mismatches, table };
+  return { mismatches, contradictions, upkeep, fileCopies, unreached, table };
 }
 
 /** The group's closed line: what is flagged, in the parts Khipu can see. */
@@ -292,8 +311,10 @@ export function checksLine(view: RouteView | null, now: Date): string {
   if (model.mismatches.length) parts.push(`${plural(model.mismatches.length, "model mismatch", "model mismatches")} today`);
   if (model.contradictions.length) parts.push(plural(model.contradictions.length, "contradiction", "contradictions"));
   if (model.upkeep.length) parts.push(`${plural(model.upkeep.length, "rule", "rules")} to look at`);
+  if (model.fileCopies?.hits_total) parts.push(`${plural(model.fileCopies.hits_total, "copy", "copies")} in files`);
   if (model.unreached.length) parts.push(`${plural(model.unreached.length, "direction", "directions")} not in Khipu`);
   if (parts.length) return parts.join(" · ");
+  if (model.fileCopies && model.fileCopies.status !== "checked") return "Files not looked at yet";
   if (model.table) return "Your model table · nothing flagged";
   return "Nothing flagged in Khipu's record";
 }
