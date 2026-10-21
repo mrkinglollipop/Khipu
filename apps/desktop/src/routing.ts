@@ -159,7 +159,43 @@ export type RouteChangeItem = {
   n?: number | null;
 };
 
-export type RouteChange = { version: number; at: string; entities: string[]; items?: RouteChangeItem[] };
+export type RouteChangeRecipients = {
+  have_count: number;
+  live_count: number;
+  have: string[];
+  waiting: string[];
+};
+
+export type RouteChange = {
+  version: number;
+  at: string;
+  entities: string[];
+  items?: RouteChangeItem[];
+  /** Owner-local only (survey rows 8-11): who has this change, by the same
+   *  friendly label the live rows use. Null when Khipu can't tell. */
+  recipients?: RouteChangeRecipients | null;
+};
+
+/** One live delivery row from `route --json` (owner-local; never a session
+ *  id, a Mac id or a path). */
+export type RouteDeliveryRow = {
+  label: string;
+  harness?: string | null;
+  component?: string | null;
+  mac?: string | null;
+  last_prompt_at?: string | null;
+  status?: string;
+  owed?: number | null;
+  reasons?: string[];
+  missing?: string[];
+};
+
+export type RouteDeliveryMac = {
+  label: string;
+  age_seconds?: number | null;
+  behind?: boolean;
+  freshness?: string;
+};
 
 export type RuleCheck = {
   rule: number;
@@ -518,6 +554,20 @@ export type RouteView = {
    *  soon as the clock passes it. */
   contradictions?: RouteContradiction[];
   rule_hygiene?: RouteHygiene[];
+  /** Live delivery rows, other Macs and per-change recipients, projected
+   *  for this Mac's owner only (survey rows 8-11). */
+  delivery_rows?: RouteDeliveryRow[];
+  delivery_macs?: RouteDeliveryMac[];
+  /** Routing copies found in files, for this Mac's owner only (slice 13/15d). */
+  routing_file_copies?: {
+    status: string;
+    scanned_at?: string | null;
+    files_checked: number;
+    hits: { file: string; line: number; quote: string; superseded: boolean }[];
+    hits_total?: number;
+    more_not_shown?: number;
+    too_large?: string[];
+  };
   /** Open owed directions, projected for this Mac's owner only (slice 19a). */
   unreached_directions?: {
     id: string;
@@ -1296,6 +1346,11 @@ function deliveryHarness(identity: string): string | null {
     if (lower.startsWith(prefix) && ":_-/.".includes(lower.charAt(prefix.length))) return word;
   }
   return null;
+}
+
+/** A harness code (`claude_code`, `codex`, ...) in owner words, or null. */
+export function deliveryHarnessName(harness: string | null | undefined): string | null {
+  return harness ? deliveryHarness(harness) : null;
 }
 
 export type DeliveryConversationLabel = {

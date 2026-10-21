@@ -150,13 +150,24 @@ STORES: tuple[Store, ...] = (
           "owner words",
           _w("owner_direction._append", "owner_direction._log_locked", "owner_direction._write_private")),
     Store("routing delivery words", "capture home state/recall--*.routing.json and their rewrite temps",
-          "cached routing rules, proposals and notices, including owner words",
+          "cached routing rules, proposals and notices, including owner words and a "
+          "conversation's friendly name (a T3 thread title) when Khipu knows one",
           "kept: routing words have no episode provenance; they are the owner's rules, notes, holds "
           "and conversations' proposals, removed through the routing commands that manage them "
           "(khipu route rule retire, khipu route note end, khipu route hold end, "
           "khipu route priority clear) or in Settings → Routing, not by forgetting an episode; "
           "forget lists each copy as kept and an unreadable routing folder keeps the forget open",
           _w("routing_delivery._transaction")),
+    Store("routing delivery titles", "capture home state/title-pending--*.json and "
+          "title-cache--*.json beside the delivery ledgers, and their private-write temps",
+          "a queued T3 title lookup holding only the conversation identity's digest (never "
+          "the raw canonical identity), and a resolved T3 thread title",
+          "kept: routing words have no episode provenance; they are the owner's rules, notes, holds "
+          "and conversations' proposals, removed through the routing commands that manage them "
+          "(khipu route rule retire, khipu route note end, khipu route hold end, "
+          "khipu route priority clear) or in Settings → Routing, not by forgetting an episode; "
+          "forget lists each copy as kept and an unreadable routing folder keeps the forget open",
+          _w("routing_delivery_rows._write_private_file")),
     Store("routing replication words", "data folder state/routing/remote.jsonl and .replication-* rewrites",
           "replicated routing rule, note and proposal text, including owner words; the same writer "
           "also saves replication cursors and the Mac id",
@@ -171,6 +182,14 @@ STORES: tuple[Store, ...] = (
           "and bounded gateway health metadata; no words",
           "none: publication bookkeeping holds no capture text",
           _w("routing_gateway_copy._save")),
+    Store("routing scan report", "data folder state/routing/scan-report.json, written atomically "
+          "through a unique temp file in the same folder",
+          "routing copies found in files: file paths shown relative to home or their repo root, "
+          "line numbers and clipped quoted owner words, plus hit counts and too-large file names",
+          "kept: routing copies have no episode provenance; they are the scanner's report of "
+          "words in the owner's own files, replaced on the next scan and removed by deleting "
+          "state/routing/scan-report.json, not by forgetting an episode",
+          _w("routing_scan_report._write_report")),
     Store("conversation media", "data folder media/conversation_memory/<sha256>.<ext>",
           "images found in transcripts, shared by content hash",
           "kept: images are content-addressed and can belong to several episodes; a known "

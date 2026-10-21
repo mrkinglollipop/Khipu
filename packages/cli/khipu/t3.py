@@ -17,6 +17,7 @@ a missing file, bad JSON or a changed shape is "nothing found", never an error.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -193,6 +194,114 @@ def thread_for_session(sid: str) -> str | None:
     """
     thread, _definitive = thread_for_session_result(sid)
     return thread
+
+
+def thread_title(thread_id: str) -> str | None:
+    """A T3 thread's own title, read read-only from its thread projection.
+
+    Fail-open like every T3 read here: a missing database, a changed shape
+    or a locked file is "no title known", never an error. Only a short
+    one-line title leaves this function; no payload text is returned."""
+    if not isinstance(thread_id, str) or not thread_id:
+        return None
+    path = _thread_db_path()
+    if not path.is_file():
+        return None
+    con = None
+    try:
+        con = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=0.5)
+        con.execute("PRAGMA busy_timeout = 50")
+        deadline = time.monotonic() + 0.5
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        tables = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        for table in ("orchestration_v2_projection_threads",
+                      "orchestration_v2_projection_provider_threads"):
+            if table not in tables:
+                continue
+            cols = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+            if "thread_id" not in cols:
+                continue
+            if "title" in cols:
+                row = con.execute(
+                    f"SELECT title FROM {table} WHERE thread_id = ? LIMIT 1",
+                    (thread_id,)).fetchone()
+                title = _clean_title(row[0] if row else None)
+                if title:
+                    return title
+            if "payload_json" in cols:
+                row = con.execute(
+                    f"SELECT payload_json FROM {table} WHERE thread_id = ? LIMIT 1",
+                    (thread_id,)).fetchone()
+                if row and isinstance(row[0], str):
+                    try:
+                        payload = json.loads(row[0])
+                    except ValueError:
+                        payload = None
+                    if isinstance(payload, dict):
+                        for key in ("title", "name", "customTitle", "displayTitle", "threadTitle"):
+                            title = _clean_title(payload.get(key))
+                            if title:
+                                return title
+        return None
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    finally:
+        if con is not None:
+            con.close()
+
+
+def thread_title_for_digest(digest: str) -> str | None:
+    """The title of the T3 thread whose ``t3:<thread_id>`` identity hashes
+    to ``digest`` (a sha256 hex digest), or None.
+
+    Callers that must not persist a raw thread identity queue only this
+    digest; the matching thread id is recovered here, in memory, by
+    hashing each projected thread id until one matches, and is never
+    written back by this function."""
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return None
+    path = _thread_db_path()
+    if not path.is_file():
+        return None
+    con = None
+    match = None
+    try:
+        con = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=0.5)
+        con.execute("PRAGMA busy_timeout = 50")
+        deadline = time.monotonic() + 0.5
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        tables = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        for table in ("orchestration_v2_projection_threads",
+                      "orchestration_v2_projection_provider_threads"):
+            if table not in tables or match is not None:
+                continue
+            cols = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+            if "thread_id" not in cols:
+                continue
+            rows = con.execute(
+                f"SELECT DISTINCT thread_id FROM {table} LIMIT 10000").fetchall()
+            for (thread_id,) in rows:
+                if isinstance(thread_id, str) and thread_id and \
+                        hashlib.sha256(f"t3:{thread_id}".encode("utf-8")).hexdigest() == digest:
+                    match = thread_id
+                    break
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    finally:
+        if con is not None:
+            con.close()
+    return thread_title(match) if match is not None else None
+
+
+def _clean_title(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    title = " ".join(value.split()).strip()
+    if not title or len(title) > 120 or "/" in title or "\\" in title:
+        return None
+    return title
 
 
 def _thread_db_path(home: Path | None = None) -> Path:

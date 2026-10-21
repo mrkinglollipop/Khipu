@@ -570,8 +570,17 @@ Routing state lives only in Khipu's record. Files point at it.
 
 - **May stay in files:** durable capability notes (the global CLAUDE.md model table) and how each lane is
   reached. **May not:** whether an account is open, limited, paused, held or "tight", priorities and levels.
-- **The scanner** (slice 13) reads global and per-project CLAUDE.md and AGENTS.md files and the memory notes
-  Khipu imports. It flags a routing-state claim with its file and line. A line is a claim when it names an
+- **The scanner** (slice 13) reads exactly this set and nothing else: the global `~/.claude/CLAUDE.md`,
+  `~/.claude/AGENTS.md`, `~/.codex/AGENTS.md` and `~/AGENTS.md` when present; the CLAUDE.md and AGENTS.md
+  at the root of each repo Khipu already knows as a project, resolved from Khipu's own project/repo
+  records (the `repo_root` values recorded on its episodes, read from the local hub snapshot — never by
+  walking the filesystem); and the memory notes Khipu imports. A test traces the files the scan opens
+  and asserts that exact set. Reads are bounded: a file over 1 MB is marked too large to read rather
+  than opened whole, hits are capped at 50 per file and 500 in total with the rest counted as not
+  shown, and paths are shown relative to their root (`~` for home, the repo name for a per-project
+  file). The owner-local report of copies found in files refreshes when any scanned file's mtime or
+  size has changed since the last report (a cheap stat on the `route --json` read, off the per-prompt
+  path) and from the notes reconcile, with or without a hub. It flags a routing-state claim with its file and line. A line is a claim when it names an
   account, provider or lane, and either:
   - pairs it with a state word (open, limited, paused, held, tight, low, down) plus a date or a level; or
   - makes a **priority or ordering claim** about it, with or without a date or level: "first", "second",

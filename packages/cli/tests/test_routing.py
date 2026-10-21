@@ -2380,6 +2380,9 @@ NOT_IN_THE_APP_YET = {
     # Read once, by phase 1a's import of the standing rules, and never again
     # after it ran: a control for it would do nothing.
     "routing_rules_seed",
+    # Owner-local Mac names (survey rows 8-11): set only through the
+    # owner-gated `khipu config` path; the delivery group is display only.
+    "routing_mac_names",
 }
 
 

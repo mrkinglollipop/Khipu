@@ -36,6 +36,43 @@ describe("Telling conversations: delivery and health", () => {
     for (const pattern of SESSION_ID_SHAPED) expect(container.textContent).not.toMatch(pattern);
   });
 
+  it("shows friendly names, Macs, last prompts and who has each change, with no owner action", () => {
+    const view = {
+      ...DELIVERY_VIEW,
+      delivery_rows: [
+        { label: "Fix the flaky build", harness: "claude_code", component: "main", mac: "This Mac", last_prompt_at: "2026-10-21T18:38:00Z", status: "green", owed: 0 },
+        { label: "Conversation 2", harness: "codex", component: "mcp", mac: "Studio Mac", last_prompt_at: "2026-10-21T17:40:00Z", status: "red", owed: 2, reasons: ["budget-stall"] },
+      ],
+      delivery_macs: [{ label: "MacBook Air", age_seconds: 8040, behind: true }],
+      changes: DELIVERY_VIEW.changes?.map((change, i) => ({
+        ...change,
+        recipients: i === 0
+          ? { have_count: 1, live_count: 2, have: ["Fix the flaky build"], waiting: ["Conversation 2"] }
+          : { have_count: 2, live_count: 2, have: [], waiting: [] },
+      })),
+    } as typeof DELIVERY_VIEW;
+    const { container } = render(<DeliverySection data={view} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent("Fix the flaky build");
+    expect(rows[0]).toHaveTextContent("This Mac");
+    expect(rows[0]).toHaveTextContent("2 min ago");
+    expect(rows[0]).toHaveTextContent("No changes owed");
+    expect(rows[1]).toHaveTextContent("Conversation 2");
+    expect(rows[1]).toHaveTextContent("Studio Mac");
+    expect(rows[1]).toHaveTextContent("1 h ago");
+    const changes = within(screen.getByRole("list", { name: "Recent changes and who has them" }));
+    expect(changes.getByText("1 of 2 have it")).toBeTruthy();
+    expect(changes.getByText(/Waiting: Conversation 2/)).toBeTruthy();
+    expect(changes.getByText("2 of 2 have it")).toBeTruthy();
+    const macs = screen.getByRole("list", { name: "Other Macs and the cloud" });
+    expect(macs).toHaveTextContent("MacBook Air");
+    expect(macs).toHaveTextContent("Behind");
+    expect(screen.queryByText("Who has it isn't available")).toBeNull();
+    expect(within(screen.getByRole("list", { name: "Live conversations" })).queryAllByRole("button")).toHaveLength(0);
+    for (const pattern of SESSION_ID_SHAPED) expect(container.textContent).not.toMatch(pattern);
+  });
+
   it("shows when the cached health report was read", () => {
     render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} healthReadAt={DELIVERY_NOW} now={DELIVERY_NOW} />);
     expect(screen.getByText(/health report read at/i)).toHaveTextContent("40");

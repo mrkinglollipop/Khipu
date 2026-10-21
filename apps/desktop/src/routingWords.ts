@@ -191,6 +191,8 @@ export type ChangeRow = {
   about: ChangeAbout;
   /** A removed rule the page can bring back. */
   restore?: number;
+  /** Who has this change (owner-local delivery data), or null. */
+  recipients?: import("./routing").RouteChangeRecipients | null;
 };
 
 export type ChangeBy = "you" | "conversations" | "runners" | "khipu";
@@ -255,7 +257,7 @@ function sideSaid(raw: unknown): { who: string; state: string } | null {
 }
 
 function itemRow(change: RouteChange, item: RouteChangeItem, i: number, now: Date): ChangeRow {
-  const base = { key: `${change.version}-${i}`, at: change.at, who: whoWords(item), by: changeBy(item), about: changeAbout(item.entity) };
+  const base = { key: `${change.version}-${i}`, at: change.at, who: whoWords(item), by: changeBy(item), about: changeAbout(item.entity), recipients: change.recipients ?? null };
   const [kind, ...rest] = item.entity.split(":");
   const ident = rest.join(":");
   const cur = item.now ?? null;
@@ -375,7 +377,7 @@ function itemRow(change: RouteChange, item: RouteChangeItem, i: number, now: Dat
 function legacyRow(change: RouteChange, entity: string, i: number, view: RouteView): ChangeRow {
   const [kind, ...rest] = entity.split(":");
   const ident = rest.join(":");
-  const base = { key: `${change.version}-${i}`, at: change.at, who: "Khipu", by: "khipu" as const, about: changeAbout(entity), text: "changed" };
+  const base = { key: `${change.version}-${i}`, at: change.at, who: "Khipu", by: "khipu" as const, about: changeAbout(entity), text: "changed", recipients: change.recipients ?? null };
   if (kind === "account") {
     const label = (view.accounts ?? []).find((a) => a.key === ident)?.label ?? "An account";
     return { ...base, subject: label };
