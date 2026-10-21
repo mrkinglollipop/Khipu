@@ -56,6 +56,7 @@ import {
   accountState,
   capitalise,
   disagreementWords,
+  deliveryReason,
   holdWords,
   modelDisagreementWords,
   paceWords,
@@ -70,6 +71,9 @@ import {
 import type {
   PlanFact,
   RouteAccount,
+  RouteDeliveryFreshness,
+  RouteDeliveryHealth,
+  RouteDeliveryIdentity,
   RouteHold,
   RouteModel,
   RoutePriority,
@@ -2686,13 +2690,183 @@ function HoldsSection({
 // Telling conversations
 // ---------------------------------------------------------------------------
 
+/** `routing_delivery` is intentionally an evidence report, not a routing
+ * decision. Keep its raw identity and component: doctor does not carry a
+ * friendly conversation, project, Mac, or last-prompt label for these rows. */
+
+function deliveryStrings(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : null;
+}
+
+function deliveryIdentities(value: unknown): RouteDeliveryIdentity[] | null {
+  if (!Array.isArray(value)) return null;
+  return value.every((row) => {
+    if (!row || typeof row !== "object") return false;
+    const identity = row as RouteDeliveryIdentity;
+    return typeof identity.identity === "string" && typeof identity.component === "string" && typeof identity.status === "string"
+      && (identity.reasons == null || deliveryStrings(identity.reasons) != null)
+      && (identity.missing == null || deliveryStrings(identity.missing) != null)
+      && (identity.owed == null || (typeof identity.owed === "number" && Number.isFinite(identity.owed) && identity.owed >= 0));
+  }) ? value as RouteDeliveryIdentity[] : null;
+}
+
+function deliveryAge(seconds: number | null | undefined): string | null {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return null;
+  if (seconds < 60) return `${Math.round(seconds)} s old`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min old`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 48 ? `${hours} h${minutes % 60 ? ` ${minutes % 60} min` : ""} old` : `${Math.round(hours / 24)} days old`;
+}
+
+function freshnessWords(label: string, freshness: RouteDeliveryFreshness | undefined): { label: string; text: string; tone: "ok" | "warn" | "err" | undefined } | null {
+  if (!freshness || freshness.status === "not_applicable") return null;
+  const age = deliveryAge(freshness.age_seconds);
+  if (freshness.status === "green" && age) return { label, text: `Current · ${age}`, tone: "ok" };
+  if (freshness.status === "red") return { label, text: age ? `Behind · ${age}` : "Behind", tone: "err" };
+  return { label, text: "Can't be checked", tone: undefined };
+}
+
+function identityWords(row: RouteDeliveryIdentity): { text: string; detail?: string; tone: "ok" | "warn" | "err" | undefined } {
+  const owed = typeof row.owed === "number" && Number.isFinite(row.owed) && row.owed >= 0 ? row.owed : null;
+  const owedWords = owed == null ? null : `${owed} ${owed === 1 ? "change" : "changes"} owed`;
+  if (row.status === "green" && owed != null && !(row.missing?.length)) return { text: owed ? owedWords! : "No changes owed", tone: owed ? undefined : "ok" };
+  if (row.status === "red") {
+    const reason = (deliveryStrings(row.reasons) ?? []).map(deliveryReason).join("; ");
+    return { text: owedWords ?? "Delivery needs attention", detail: reason || undefined, tone: "err" };
+  }
+  const missing = deliveryStrings(row.missing);
+  return { text: "Can't be checked", detail: missing?.length ? `Can't check: ${missing.join(", ")}` : undefined, tone: undefined };
+}
+
+function deliveryStatus(health: RouteDeliveryHealth): "green" | "red" | "unknown" {
+  if (health.status !== "green" && health.status !== "red" && health.status !== "unknown") return "unknown";
+  const missing = health.missing == null ? [] : deliveryStrings(health.missing);
+  const identities = deliveryIdentities(health.identities);
+  return health.status === "green" && (missing == null || missing.length > 0 || identities == null || identities.some((row) => row.status !== "green"))
+    ? "unknown"
+    : health.status;
+}
+
+/** Delivery and health (routing slice 15a): presentation only. The route view
+ * supplies recent changes; `khipu doctor` supplies receipt evidence. Nothing
+ * here acknowledges delivery, changes settings, or decides where work goes. */
+export function DeliverySection({ data, health, healthError, now, liveAfterSeconds, onRetry }: {
+  data: RouteView | null;
+  health?: RouteDeliveryHealth | null;
+  healthError?: string | null;
+  now: Date;
+  liveAfterSeconds?: number;
+  onRetry?: () => Promise<unknown>;
+}) {
+  // A failed doctor read must never leave last-good delivery evidence looking
+  // current. The routing record can still show its own recent changes.
+  const readHealth = healthError ? null : health;
+  const status = readHealth ? deliveryStatus(readHealth) : "unknown";
+  const identities = deliveryIdentities(readHealth?.identities) ?? [];
+  const changes = data ? changeDays(data, now).flatMap((day) => day.rows).slice(0, 3) : [];
+  const freshness = readHealth ? [
+    readHealth.replication?.status === "not_applicable" ? null : freshnessWords("Other Macs", readHealth.replication) ?? { label: "Other Macs", text: "Can't be checked", tone: undefined },
+    readHealth.gateway?.status === "not_applicable" ? null : freshnessWords("Cloud copy", readHealth.gateway) ?? { label: "Cloud copy", text: "Can't be checked", tone: undefined },
+  ].filter((row): row is NonNullable<typeof row> => row != null) : [];
+  const healthReasons = (deliveryStrings(readHealth?.reasons) ?? []).map(deliveryReason);
+  const liveLabel = liveAfterSeconds == null
+    ? "recent delivery points"
+    : liveAfterSeconds === 0 ? "delivery points without an expiry" : `delivery points in the last ${limitWords(liveAfterSeconds, "time")}`;
+  const [retrying, setRetrying] = useState(false);
+  return (
+    <div className="delivery-section">
+      {healthError ? (
+        <div className="set-error" role="alert">
+          Couldn&apos;t read delivery health: {healthError}. Nothing below is a guess.
+          {onRetry ? <button type="button" className="sm" disabled={retrying} onClick={async () => { setRetrying(true); try { await onRetry(); } finally { setRetrying(false); } }}><Busy on={retrying} />Try again</button> : null}
+        </div>
+      ) : !readHealth ? (
+        <div className="empty" role="status">
+          <b>Delivery health hasn&apos;t been reported yet</b>
+          <span>Khipu cannot tell which conversations have been told what until its doctor report includes delivery evidence.</span>
+        </div>
+      ) : status === "red" ? (
+        <div className="callout err" role="alert">
+          <div className="txt">
+            <b>Some routing changes have not reached conversations</b>
+            <span>{healthReasons.map(capitalise).join(". ") + (healthReasons.length ? "." : "") || "Khipu has delivery evidence that needs attention."} Nothing is stopped.</span>
+          </div>
+        </div>
+      ) : status === "unknown" ? (
+        <div className="callout" role="status">
+          <div className="txt">
+            <b>Some delivery evidence can&apos;t be checked</b>
+            <span>{(deliveryStrings(readHealth.missing) ?? []).join(", ") || "Khipu did not return enough evidence to say what conversations have."}</span>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="section-body">
+        <h2 className="sub-title">Live conversations <span className="meta">{liveLabel}</span></h2>
+        {identities.length ? (
+          <div className="mrows" role="list" aria-label="Live conversations">
+            {identities.map((row) => {
+              const state = identityWords(row);
+              return (
+                <div key={`${row.identity}:${row.component}`} className="mrow delivery" role="listitem">
+                  <span><span className="name mono">{row.identity}</span><br /><span className="src">Current component: {row.component}</span></span>
+                  <span className="delivery-state"><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
+                </div>
+              );
+            })}
+          </div>
+        ) : readHealth ? (
+          <div className="empty">
+            <b>{status === "green" ? "No live conversations" : "No live conversations can be confirmed"}</b>
+            <span>{status === "green" ? "No delivery identity has a recent delivery point." : "Khipu did not return enough delivery evidence to prove that no conversation is live."}</span>
+          </div>
+        ) : null}
+      </div>
+
+      <div className="section-body">
+        <h2 className="sub-title">Recent changes and who has them</h2>
+        {!data ? (
+          <p className="set-help">The routing record is still being read.</p>
+        ) : !changes.length ? (
+          <p className="set-help">No routing changes yet.</p>
+        ) : (
+          <div className="mrows" role="list" aria-label="Recent changes and who has them">
+            {changes.map((change, index) => (
+              <div key={`${change.subject}:${change.text}:${index}`} className="mrow delivery-change" role="listitem">
+                <span className="when">{whenLocal(change.at, now)}</span>
+                <span>{change.subject} {change.text}<br /><span className="src">{change.who}</span></span>
+                <span className="end"><Tag>Who has it isn&apos;t available</Tag></span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {freshness.length ? (
+        <div className="section-body">
+          <h2 className="sub-title">Other Macs and the cloud</h2>
+          <div className="mrows" role="list" aria-label="Other Macs and the cloud">
+            {freshness.map((row) => (
+              <div key={row.label} className="mrow delivery-freshness" role="listitem">
+                <span className="name">{row.label}</span>
+                <span className="end"><Tag tone={row.tone} dot>{row.text}</Tag></span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 const HEARS: [string, string][] = [
-  ["Claude Code", "At the start, before each prompt and before handing work to another agent, on every Claude account. A subagent hears the summary when it starts."],
-  ["Codex", "At the start, before each prompt and before handing work to another agent, once you approve Khipu's hooks in Codex."],
+  ["Claude Code", "At the start and before each prompt. During a turn, routing arrives with the tool result after the call has run. A subagent hears the summary when it starts."],
+  ["Codex", "At the start and before each prompt, once you approve Khipu's hooks in Codex. During a turn, routing arrives with the tool result after the call has run."],
   ["Cursor", "At the start only; Cursor has no step before each prompt."],
-  ["Grok Build", "When it asks Khipu."],
-  ["Aegis", "When its own client asks Khipu."],
-  ["Cloud agents", "Not yet: they will hear it from a copy for cloud agents, in a later release."],
+  ["Grok Build", "On its next Khipu tool call; hook output is discarded."],
+  ["Aegis", "On its next Khipu tool call."],
+  ["Cloud agents", "On their next Khipu tool call from the hub copy."],
 ];
 
 /** Where a switch's value stands: read, still being read, or not readable.
@@ -3003,6 +3177,11 @@ function SubFold({ k, name, line, folds, children }: { k: string; name: string; 
 
 function TellingSection({
   data,
+  deliveryHealth,
+  deliveryHealthError,
+  deliveryLiveAfterSeconds,
+  onRetryDelivery,
+  now,
   cfg,
   features,
   featuresError,
@@ -3013,6 +3192,11 @@ function TellingSection({
   folds,
 }: {
   data: RouteView | null;
+  deliveryHealth?: RouteDeliveryHealth | null;
+  deliveryHealthError?: string | null;
+  deliveryLiveAfterSeconds?: number;
+  onRetryDelivery?: () => Promise<unknown>;
+  now: Date;
   cfg: RouteConfig | null;
   features: FeaturesShape | null;
   featuresError?: string | null;
@@ -3041,6 +3225,8 @@ function TellingSection({
   const oldSet = [old.env ? "env" : null, old.file ? "file" : null].filter(Boolean);
   return (
     <div className="section-body">
+      <DeliverySection data={data} health={deliveryHealth} healthError={deliveryHealthError} now={now} liveAfterSeconds={deliveryLiveAfterSeconds} onRetry={onRetryDelivery} />
+      <SubFold k="sub:hears" name="What each kind of conversation hears" line={`${HEARS.length} kinds`} folds={folds}>
       <p className="opt-group-note">
         A running conversation hears a change as soon as its app allows. Any conversation can also ask Khipu.
         Switching these off stops only the telling.
@@ -3114,7 +3300,6 @@ function TellingSection({
       <div className="rows">
         <DispatchScriptsRow cfg={cfg} w={w} reread={reread} />
       </div>
-        <SubFold k="sub:hears" name="What each kind of conversation hears" line={`${HEARS.length} kinds`} folds={folds}>
           <div className="rows" role="list" aria-label="What each kind of conversation hears">
             {HEARS.map(([name, words]) => (
               <div key={name} className="row-item route-hear" role="listitem">
@@ -3123,30 +3308,6 @@ function TellingSection({
               </div>
             ))}
           </div>
-        </SubFold>
-        <SubFold k="sub:sizes" name="Sizes and times" line={sizesLine(cfg, cfgError)} folds={folds}>
-          <div className="rows">
-            {SIZES.map((r) => (
-              <LimitRow key={r.name} name={r.name} help={r.help} fields={r.fields} join={r.join} cfg={cfg} w={w} reread={reread} />
-            ))}
-          </div>
-          <div className="opt-list">
-            <SwitchRow
-              id="route-proposal-text"
-              label="Share proposal words between your Macs"
-              what="A conversation's proposed words travel between your Macs, so you can confirm them anywhere. Off, they stay on the Mac they came from until you confirm them there. They never go to cloud agents."
-              tag={<Tag>Between your Macs</Tag>}
-              checked={cfg?.routing?.routing_proposal_text_between_macs?.value !== false}
-              disabled={!cfg || w.anyBusy}
-              read={cfgRead}
-              busy={w.isBusy("proposal-text")}
-              onChange={(next) =>
-                void w.run("proposal-text", "khipu_config_set", { key: "routing_proposal_text_between_macs", value: next ? "on" : "off" }, reread)
-              }
-              error={<WriteError w={w} id="proposal-text" />}
-            />
-          </div>
-        </SubFold>
         {oldSet.length ? (
           <p className="set-help" role="status">
             <b>Your old "routing off" switch is set, so nothing is told.</b>{" "}
@@ -3172,6 +3333,31 @@ function TellingSection({
             conversations started from that shell are told nothing. Setting either one turns the telling off.
           </p>
         )}
+        </SubFold>
+        <SubFold k="sub:sizes" name="Sizes and times" line={sizesLine(cfg, cfgError)} folds={folds}>
+          <div className="rows">
+            {SIZES.map((r) => (
+              <LimitRow key={r.name} name={r.name} help={r.help} fields={r.fields} join={r.join} cfg={cfg} w={w} reread={reread} />
+            ))}
+          </div>
+          <div className="opt-list">
+            <SwitchRow
+              id="route-proposal-text"
+              label="Share proposal words between your Macs"
+              what="A conversation's proposed words travel between your Macs, so you can confirm them anywhere. Off, they stay on the Mac they came from until you confirm them there. They never go to cloud agents."
+              tag={<Tag>Between your Macs</Tag>}
+              checked={cfg?.routing?.routing_proposal_text_between_macs?.value !== false}
+              disabled={!cfg || w.anyBusy}
+              read={cfgRead}
+              busy={w.isBusy("proposal-text")}
+              onChange={(next) =>
+                void w.run("proposal-text", "khipu_config_set", { key: "routing_proposal_text_between_macs", value: next ? "on" : "off" }, reread)
+              }
+              error={<WriteError w={w} id="proposal-text" />}
+            />
+          </div>
+        </SubFold>
+
     </div>
   );
 }
@@ -4489,10 +4675,18 @@ export function RoutingSettings({
   active,
   plansState,
   onSetUpAccounts,
+  deliveryHealth,
+  deliveryHealthError,
+  onRetryDelivery,
 }: {
   active: boolean;
   plansState?: PlanUsageState | null;
   onSetUpAccounts?: () => void;
+  /** The current app-wide `khipu doctor` delivery block, if it has been read. */
+  deliveryHealth?: RouteDeliveryHealth | null;
+  deliveryHealthError?: string | null;
+  /** Re-reads the existing app-wide doctor report; it changes no routing state. */
+  onRetryDelivery?: () => Promise<unknown>;
 }) {
   const route = useRouting(active);
   const config = useCliState<RouteConfig>("khipu_config_show", active);
@@ -4529,6 +4723,10 @@ export function RoutingSettings({
   const [retrying, setRetrying] = useState(false);
   const now = new Date();
   const data = route.data;
+  const deliveryLiveAfter = config.data?.routing?.routing_delivery_live_after?.value;
+  const deliveryLiveAfterSeconds = typeof deliveryLiveAfter === "number" && Number.isFinite(deliveryLiveAfter) && deliveryLiveAfter >= 0
+    ? deliveryLiveAfter
+    : undefined;
   // Folders and lanes come from both the routing record and the settings;
   // until both are read they say so, never "none yet".
   const recordRead: RecordRead =
@@ -4539,6 +4737,8 @@ export function RoutingSettings({
     routingError: config.data ? null : config.error,
     push,
     pushError: features.error ?? (features.data && !push ? "Khipu's features list has no routing switch" : null),
+    delivery: deliveryHealth ?? null,
+    deliveryError: deliveryHealthError,
   };
   const recordError = data ? null : route.error;
   const overview = routingOverview(data, recordError, plansState?.data, plansState?.error, settings, now);
@@ -4632,6 +4832,11 @@ export function RoutingSettings({
     telling: (
       <TellingSection
         data={data}
+        deliveryHealth={deliveryHealth}
+        deliveryHealthError={deliveryHealthError}
+        deliveryLiveAfterSeconds={deliveryLiveAfterSeconds}
+        onRetryDelivery={onRetryDelivery}
+        now={now}
         cfg={config.data}
         features={features.data}
         featuresError={features.error}

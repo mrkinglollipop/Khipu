@@ -41,6 +41,8 @@ import type { UsageAccount } from "../src/PlansCard";
 import { PaceSection } from "../src/RoutingSettings";
 import { paceModel } from "../src/routingPace";
 import { PACE_NOW, PACE_PLANS, PACE_VIEW } from "./paceFake";
+import { DELIVERY_HEALTH } from "./deliveryFake";
+import type { RouteDeliveryHealth } from "../src/routing";
 import type { DiscoverResult, Support } from "../src/accountsApi";
 import {
   CLIENT,
@@ -168,6 +170,23 @@ function PaceGroup() {
   );
 }
 
+/** The delivery preview renders the real Settings composition: fake route and
+ * config reads, plus the fictional doctor block App passes as a prop. */
+function RoutingDelivery({ health = DELIVERY_HEALTH, error }: { health?: RouteDeliveryHealth | null; error?: string }) {
+  useState(() => {
+    try {
+      window.localStorage.setItem("khipu.routing.open", JSON.stringify(["telling"]));
+    } catch {
+      // The group can be opened by hand.
+    }
+  });
+  return (
+    <div className="settings-pane" style={{ width: 720, maxWidth: "100%" }}>
+      <RoutingSettings active deliveryHealth={health} deliveryHealthError={error} />
+    </div>
+  );
+}
+
 const PN = (name: string, role: "canonical" | "alias", extra: object = {}) => ({ name, role, open_commitments: 0, standing_decisions: 0, episodes: 0, ...extra });
 const PROJECTS_FIXTURE = {
   groups: [
@@ -231,6 +250,9 @@ function RoutingProposals() {
 
 const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNode }> = {
   pace: { title: "Pace, caps and advice (fictional mock data)", render: () => <PaceGroup /> },
+  delivery: { title: "Telling conversations (fictional delivery evidence)", fake: { route15a: true }, render: () => <RoutingDelivery /> },
+  "delivery-unknown": { title: "Telling conversations (missing evidence)", fake: { route15a: true }, render: () => <RoutingDelivery health={{ status: "unknown", identities: [], missing: ["live delivery identities"], replication: { status: "unknown" }, gateway: { status: "unknown" } }} /> },
+  "delivery-error": { title: "Telling conversations (failed delivery read)", fake: { route15a: true }, render: () => <RoutingDelivery error="The delivery report could not be read" /> },
   "projects": { title: "Settings: Projects", fake: { projects: PROJECTS_FIXTURE }, render: () => <ProjectsHost /> },
   "projects-empty": { title: "Settings: Projects, none", fake: { projects: { groups: [], pairs: [], sweep: { result: null } } }, render: () => <ProjectsHost withQuestion={false} /> },
   "routing-proposals": { title: "Proposals and holds (slice 15b)", fake: { route15b: true }, render: () => <RoutingProposals /> },
@@ -352,7 +374,7 @@ function Page() {
   return (
     // The pace group is screenshotted at the Settings pane's own 720px width,
     // so it wraps where the approved mock does rather than across a wider page.
-    <main style={{ padding: 24, maxWidth: hash === "pace" ? 744 : hash.startsWith("projects") ? "none" : 960 }} data-state={hash}>
+    <main style={{ padding: 24, maxWidth: hash === "pace" ? 744 : hash.startsWith("delivery") ? 768 : hash.startsWith("projects") ? "none" : 960 }} data-state={hash}>
       <h1 style={{ fontSize: 14, color: "var(--muted)" }}>{st.title}</h1>
       {st.render()}
     </main>

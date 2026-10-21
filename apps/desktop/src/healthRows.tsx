@@ -27,7 +27,7 @@ import {
   unreadAccounts,
 } from "./PlansCard";
 import type { UsageReport } from "./PlansCard";
-import { brokenChecks, lastChangeWords, quietRunners, runnerWords, whenLocal } from "./routing";
+import { deliveryReason, brokenChecks, lastChangeWords, quietRunners, runnerWords, whenLocal } from "./routing";
 import type { RouteView } from "./routing";
 import { fmtAge, fmtAgo, fmtAgoSince, fmtClock } from "./time";
 import { plural, shortProject, timeOnly } from "./work";
@@ -86,6 +86,7 @@ const LABELS: Record<string, string> = {
   plans: "Plans",
   // Not a doctor field: read from `khipu route --json` (routingHealthRow).
   routing: "Routing",
+  routing_delivery_ok: "Routing delivery",
   // Not a `*_ok` field: doctor's `ledger` and `work` blocks (workHealthRow).
   work: "Work",
 };
@@ -274,6 +275,14 @@ export function ledgerCopyDetail(block: LedgerCopyBlock | undefined): string | u
 }
 
 function detailFor(key: string, parsed: Record<string, unknown>): string | undefined {
+  if (key === "routing_delivery_ok") {
+    const delivery = parsed.routing_delivery as { status?: unknown; reasons?: unknown; missing?: unknown } | undefined;
+    if (!delivery || typeof delivery !== "object") return "delivery evidence was not reported";
+    const values = delivery.status === "unknown" ? delivery.missing : delivery.reasons;
+    return Array.isArray(values) && values.every((value) => typeof value === "string") && values.length
+      ? values.map((value) => deliveryReason(value)).join("; ")
+      : delivery.status === "unknown" ? "delivery evidence could not be checked" : undefined;
+  }
   if (key === "ledger_copy_ok") return ledgerCopyDetail(parsed.ledger_copy as LedgerCopyBlock | undefined);
   if (key === "hub_snapshot_ok") return hubSnapshotDetail(parsed.hub_snapshot as HubSnapshotBlock | undefined);
   if (key === "synth_provider_ok") return synthProviderDetail(parsed.synth_provider as DoctorSynthProvider | undefined);
@@ -445,6 +454,12 @@ export function healthRows(
     if (isNotConfigured(key, notConfigured)) {
       return { key, status: "skipped", label, ...extra };
     }
+    // Delivery's top-level boolean is false for both a confirmed delivery
+    // problem and an unreadable report. Keep the latter grey so Home never
+    // claims a failure without the doctor's evidence.
+    if (key === "routing_delivery_ok" && (parsed.routing_delivery as { status?: unknown } | undefined)?.status === "unknown") {
+      return { key, status: "skipped", label, ...extra };
+    }
     return { key, status: parsed[key] ? "ok" : "err", label, ...extra };
   });
   const plansRow = plansHealthRow(plans);
@@ -551,7 +566,7 @@ export function HealthReportRows({
                 className="muted"
               />
               <span className="row-main">{row.label}</span>
-              <span className="row-meta">not set up</span>
+              <span className="row-meta">{row.key === "routing_delivery_ok" ? `can't be checked${row.detail ? `: ${row.detail}` : ""}` : "not set up"}</span>
             </div>
           );
         }

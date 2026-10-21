@@ -436,6 +436,34 @@ export type RouteProposal = {
   ended_at?: string | null;
 };
 
+/** Read-only delivery evidence from the `routing_delivery` block in `khipu
+ * doctor`. `khipu route --json` deliberately does not carry this ledger. */
+export type RouteDeliveryIdentity = {
+  /** Opaque canonical identity. The health read has no friendly project or Mac label. */
+  identity: string;
+  /** The component whose receipt is current: main, mcp, or agent:<id>. */
+  component: string;
+  status: "green" | "red" | "unknown" | string;
+  reasons?: string[];
+  missing?: string[];
+  owed?: number;
+};
+
+export type RouteDeliveryFreshness = {
+  status?: "green" | "red" | "unknown" | "not_applicable" | string;
+  age_seconds?: number | null;
+};
+
+export type RouteDeliveryHealth = {
+  status: "green" | "red" | "unknown" | string;
+  reasons?: string[];
+  missing?: string[];
+  identities?: RouteDeliveryIdentity[];
+  prompts?: { status?: string; reasons?: string[]; missing?: string[]; count?: number; skipped?: number; rate_pct?: number };
+  replication?: RouteDeliveryFreshness;
+  gateway?: RouteDeliveryFreshness;
+};
+
 export type RouteView = {
   proposals?: Record<string, RouteProposal>;
   definitions?: { providers?: Record<string, RouteProvider>; accounts?: Record<string, unknown> };
@@ -1199,4 +1227,17 @@ export function paceWords(fact: PlanFact | null | undefined, now: Date): string 
   const head = `${fact.left_pct}% of its ${fact.window} left, resets ${whenLocal(fact.resets_at, now)}`;
   if (!fact.left_pct || fact.left_pct <= 0) return `${head}: nothing left to use until then`;
   return `${head}: about ${rateWords(fact.pace_pct_per_hour ?? 0)}% an hour to use it all (${fact.words})`;
+}
+
+export function deliveryReason(reason: string): string {
+  const words: Record<string, string> = {
+    "ack-unshown": "a change was acknowledged before it was shown",
+    "budget-stall": "a change is still owed past its delivery budget",
+    "lease-expired-twice": "a change's delivery lease expired twice",
+    "prompt-skips": "too many prompts skipped routing",
+    "cross-mac-stale": "the cross-Mac copy is behind",
+    "gateway-stale": "the cloud copy is behind",
+    "unmatched-limit": "an unmatched lane has a limit for over an hour",
+  };
+  return words[reason] ?? reason.replace(/-/g, " ");
 }

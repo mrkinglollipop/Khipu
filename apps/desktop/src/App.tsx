@@ -52,6 +52,7 @@ import { RoutingCard } from "./RoutingCard";
 import { RoutingSettings } from "./RoutingSettings";
 import { WorkSettings } from "./WorkSettings";
 import { useRouting } from "./routing";
+import type { RouteDeliveryHealth } from "./routing";
 import { WorkView } from "./WorkView";
 import { WORK_LEDE, badgeLabel, shortProject, useWork } from "./work";
 import { LedgerImport } from "./LedgerImport";
@@ -2731,6 +2732,11 @@ export default function App() {
     ipv4?: string;
   } | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("database");
+  // Routing delivery is part of doctor, not `khipu route --json`; read the
+  // existing cached report whenever this Settings group becomes active.
+  useEffect(() => {
+    if (dsnOk && tab === "settings" && settingsSection === "routing") void loadDoctor(false);
+  }, [dsnOk, tab, settingsSection, loadDoctor]);
   // Read once at start, so the count beside Projects shows before it is opened.
   const projects = useCliState<ProjectsList>("khipu_projects_list", true);
   const projectsWaiting = askedCount(projects.data);
@@ -6027,6 +6033,9 @@ export default function App() {
                     active={tab === "settings" && settingsSection === "routing"}
                     plansState={plans}
                     onSetUpAccounts={openAccountsStepInFirstRun}
+                    deliveryHealth={(doctorParsed as { routing_delivery?: RouteDeliveryHealth } | null)?.routing_delivery ?? null}
+                    deliveryHealthError={doctorReadError}
+                    onRetryDelivery={() => loadDoctor(true)}
                   />
                 ) : null}
 

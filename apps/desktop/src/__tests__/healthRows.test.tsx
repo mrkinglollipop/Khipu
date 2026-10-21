@@ -66,6 +66,15 @@ describe("healthRows (pure)", () => {
     expect(row?.status).toBe("skipped");
   });
 
+  it("keeps unknown routing delivery grey even when its aggregate boolean is false", () => {
+    const row = healthRows(fixture({ routing_delivery_ok: false, routing_delivery: { status: "unknown", missing: ["receipt ledger"] } }))
+      .find((item) => item.key === "routing_delivery_ok");
+    expect(row).toMatchObject({ label: "Routing delivery", status: "skipped", detail: "receipt ledger" });
+    render(<HealthReportRows parsed={{ routing_delivery_ok: false, routing_delivery: { status: "unknown", missing: ["receipt ledger"] } }} attention={[]} />);
+    expect(screen.getByText("can't be checked: receipt ledger")).toBeInTheDocument();
+    expect(screen.queryByText("not set up")).toBeNull();
+  });
+
   it("a nightly step never recorded yet (Phase 6) is grey skipped, not red — false red on a fresh install/update", () => {
     const rows = healthRows(
       fixture({

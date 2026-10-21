@@ -3,8 +3,9 @@
 // variant (9B here or not, what discovery found).
 import { CLIENT, TRACKED, discovery, liveRow, status9B } from "../src/__tests__/accountsFixtures";
 import type { DiscoverResult } from "../src/accountsApi";
+import { DELIVERY_VIEW } from "./deliveryFake";
 
-export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15b?: boolean };
+export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean };
 
 /** Fictional routing record for the Proposals and holds group (slice 15b),
  *  shaped as `khipu route --json` prints it. */
@@ -51,6 +52,22 @@ function route15b() {
   };
 }
 
+/** Fictional route/config reads for the delivery Settings preview. Doctor
+ * evidence remains a component prop because production doctor data is read
+ * by App, not by the route command. */
+function route15a() {
+  const setting = (value: unknown) => ({ value, default: value, kind: "x", source: "default" });
+  return {
+    view: DELIVERY_VIEW,
+    config: {
+      routing: {
+        routing_push_start: setting(true), routing_push_prompt: setting(true), routing_push_delegation: setting(true),
+        routing_delivery_live_after: setting(43200),
+      },
+    },
+  };
+}
+
 function fake(): Fake {
   return ((window as unknown as { __khipuFake?: Fake }).__khipuFake ?? {}) as Fake;
 }
@@ -69,6 +86,7 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
       case "khipu_accounts_try":
         return { ok: true, default: false, row: liveRow({ account: String(args?.harness ?? "claude") }) };
       case "khipu_config_show":
+        if (f.route15a) return route15a().config;
         if (f.route15b) return route15b().config;
         return {
           usage_accounts: { source: "default", accounts: TRACKED, user_home: "/home/someone" },
@@ -87,6 +105,7 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
       case "khipu_projects_list":
         return { ok: true, ...(f.projects as object) };
       case "khipu_route_view":
+        if (f.route15a) return route15a().view;
         if (f.route15b) return route15b().view;
         return { accounts: [], priority: null };
       case "khipu_account_sign_in":
