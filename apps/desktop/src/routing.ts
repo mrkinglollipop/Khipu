@@ -566,6 +566,18 @@ export type RouteView = {
     join: string;
     reason?: string | null;
   }[];
+  /** Today's rule 12 model mismatches, kept on this Mac only (labels, never
+   *  brief text, session ids or paths). */
+  model_mismatches?: {
+    at: string;
+    task: string | null;
+    expected: string | null;
+    actual: string | null;
+    guessed: boolean;
+    account: string | null;
+    model: string | null;
+    project: string | null;
+  }[];
 };
 
 export type Tone = "ok" | "warn" | "err" | null;

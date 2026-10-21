@@ -3572,8 +3572,8 @@ function ProvidersList({ view }: { view: RouteView }) {
  *  model table. Display only: a row states what disagrees; the owner's fix
  *  stays in the group that owns the words, and nothing here sends, stops or
  *  refuses work. The checks `route --json` does not carry yet (model
- *  mismatches, stale level words, copies in files) are left out rather
- *  than guessed. Open owed directions stay local to the owner's Mac. */
+ *  stale level words, copies in files) are left out rather than guessed.
+ *  Today's model mismatches stay local to the owner's Mac. Open owed directions stay local to the owner's Mac. */
 function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds: Folds }) {
   const model = checksModel(data, now);
   const row = (r: { key: string; title: string; sub: string }, tag?: ReactNode) => (
@@ -3586,6 +3586,14 @@ function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds
   return (
     <>
       <p className="set-help">Khipu flags these so you can fix them. None of them stops any work.</p>
+      {model.mismatches.length ? (
+        <div className="section-body">
+          <h2 className="sub-title">Model mismatches today <span className="meta">{model.mismatches.length}</span></h2>
+          <div className="mrows" role="list" aria-label="Model mismatches today">
+            {model.mismatches.map((r) => row(r, <Tag>{r.guessed ? "Guess" : "From the brief"}</Tag>))}
+          </div>
+        </div>
+      ) : null}
       {model.table ? (
         <div className="section-body">
           <SubFold k="sub:model-table" name="Your model table" line={model.table.line} folds={folds}>
@@ -3624,7 +3632,7 @@ function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds
           </div>
         </div>
       ) : null}
-      {!model.table && !model.contradictions.length && !model.upkeep.length && !model.unreached.length ? (
+      {!model.table && !model.mismatches.length && !model.contradictions.length && !model.upkeep.length && !model.unreached.length ? (
         <div className="section-body">
           <EmptyState title="Nothing to fix" hint="No priority, rule or direction disagrees with an account." />
         </div>

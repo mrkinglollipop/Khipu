@@ -8185,6 +8185,11 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     recipients = delivery["recipients"]
     out["changes"] = [dict(change, recipients=recipients.get(change.get("version")))
                        for change in out["changes"]]
+    # Owner-local only, like the directions above: today's rule 12 model
+    # mismatches (labels, never brief text, session ids or paths).
+    from khipu import routing_mismatches
+
+    out["model_mismatches"] = routing_mismatches.today(now)
     return out
 
 
