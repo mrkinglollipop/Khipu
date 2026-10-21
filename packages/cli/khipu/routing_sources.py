@@ -1564,6 +1564,42 @@ def spend_total(streams: list[dict], account: str, start: datetime, end: datetim
     return {**base, "status": "known", "usd": round(total, 2), "events": count, "reason": None}
 
 
+def spend_report(streams: list[dict], account: str, start: datetime, end: datetime) -> dict | None:
+    """Owner-display evidence for an unknown total; never a verdict input.
+
+    Reuse the accumulated, attributed and deduplicated records, including
+    applicable corrections. Gaps are the uncovered parts of each runner's
+    participation interval, not an estimate of missing spend. With no
+    reported events there is no figure, even if a runner was active.
+    """
+    if spend_total(streams, account, start, end)["status"] == "known":
+        return None
+    total, count = 0.0, 0
+    gaps = []
+    for stream in sorted(streams, key=lambda s: s["runner"]):
+        if stream["account"] != account:
+            continue
+        part = _participation(stream, start, end)
+        if part is None:
+            continue
+        usd, events = _stream_spend(stream, start, end)
+        total += usd
+        count += events
+        cursor, finish = part
+        for begin, stop in sorted(stream["coverage"]):
+            begin, stop = max(begin, part[0]), min(stop, finish)
+            if stop < cursor or begin > finish:
+                continue
+            if begin > cursor:
+                gaps.append({"runner": stream["runner"], "from": _iso(cursor), "to": _iso(begin),
+                             "seconds": (begin - cursor).total_seconds()})
+            cursor = max(cursor, stop)
+        if cursor < finish:
+            gaps.append({"runner": stream["runner"], "from": _iso(cursor), "to": _iso(finish),
+                         "seconds": (finish - cursor).total_seconds()})
+    return {"usd": round(total, 2), "events": count, "gaps": gaps} if count else None
+
+
 def active_totals(streams: list[dict]) -> dict:
     """Current active jobs per account: each (runner, lane) snapshot counts
     once, runners sum, and a silent runner that held a snapshot for the
