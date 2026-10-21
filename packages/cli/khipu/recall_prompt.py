@@ -243,19 +243,21 @@ def _session_lock(session_id: str, wait: float):
 
 
 def mark_routing_full(session_id: str, *, version: int, epoch: str | None, at: str,
-                      owed: list[str] | None = None, shown: list[str] | None = None) -> bool:
+                      owed: list[str] | None = None, shown: list[str] | None = None,
+                      notices: list[str] | None = None) -> bool:
     """Record that the full summary at ``version`` was delivered at ``at``:
     the session's last-seen version starts again from it. Takes the
     session's lock without waiting; a busy lock or a failed write records
     nothing (the next prompt then sends the full summary again) and is never
     raised."""
     return mark_routing_seen(session_id, version=version, epoch=epoch, full_at=at,
-                             owed=owed, shown=shown, wait=0.0)
+                             owed=owed, shown=shown, notices=notices, wait=0.0)
 
 
 def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_at: str | None = None,
                       unrefreshed: str | None = None, based_on=None, owed: list[str] | None = None,
-                      shown: list[str] | None = None, wait: float = 0.05, component: str = "main") -> bool:
+                      shown: list[str] | None = None, wait: float = 0.05, component: str = "main",
+                      notices: list[str] | None = None) -> bool:
     """Move the session's last-seen routing version to ``version`` once a
     block was delivered (routing truth, phases 3a and 3b). With ``full_at``
     the marker starts again from a full summary; otherwise only the version
@@ -301,9 +303,27 @@ def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_
             new["owed"] = old["owed"]
         if unrefreshed is not None:
             new["unrefreshed"] = unrefreshed
+        receipts = _notice_receipts(old.get("notices"), notices)
+        if receipts:
+            new["notices"] = receipts
+        else:
+            new.pop("notices", None)
         return new
 
     return _update_routing_marker(session_id, change, wait, component=component)
+
+
+def _notice_receipts(old, notices) -> dict:
+    now = time.time()
+    kept = {key: at for key, at in (old or {}).items()
+            if isinstance(at, (int, float)) and now - at < 7 * 86400}
+    kept.update({key: now for key in notices or [] if isinstance(key, str)})
+    return kept
+
+
+def mark_routing_notices(session_id: str, notices: list[str]) -> bool:
+    return _update_routing_marker(
+        session_id, lambda old: dict(old, notices=_notice_receipts(old.get("notices"), notices)), 0.05)
 
 
 def _later(a, b) -> bool:
@@ -502,11 +522,12 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
 
             try:
                 marker = routing_marker(session_id, canonical=True)
-                out = routing.prompt_push(marker, budget=budget, on_fold=fold_started)
+                out = routing.prompt_push(marker, budget=budget, on_fold=fold_started, session_id=session_id)
                 answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed",
-                                                   "owed_entities", "shown_entities", "generation", "routing_changes")}
+                                                   "owed_entities", "shown_entities", "generation", "notices", "routing_changes")}
                 if isinstance(answer["text"], str) and len(answer["text"]) > _ROUTING_TEXT_MOST:
                     answer["text"] = answer["text"][:_ROUTING_TEXT_MOST]
+                    answer["notices"] = []
                 answer["seen"] = marker.get("version")  # what the marker was when this answer was read
                 answer["pointer_said"] = marker.get("pointer") == {"version": out.get("version"),
                                                                    "epoch": out.get("epoch")}
@@ -1723,7 +1744,7 @@ class _RoutingAtPrompt:
                        "full": out["kind"] == "full", "unrefreshed": out.get("unrefreshed"),
                        "at": out.get("at"), "based_on": out.get("seen"),
                        "owed": out.get("owed_entities"), "shown": out.get("shown_entities"),
-                       "routing_changes": out.get("routing_changes")}
+                       "notices": out.get("notices"), "routing_changes": out.get("routing_changes")}
             return combined, {"status": label, "pending": pending}
         # Too long to go with this prompt. The block is not delivered, so the
         # session's last-seen version does not move and a later prompt with
@@ -1752,6 +1773,8 @@ def _routing_delivered(info: dict | None, delivered: bool) -> str:
                 status = f"{status}:unmarked"
         else:
             changes = pending.get("routing_changes")
+            if pending.get("notices") and not changes:
+                return f" routing={status}:unmarked"
             if changes:
                 from khipu.routing_delivery import acknowledge
 
@@ -1763,7 +1786,7 @@ def _routing_delivered(info: dict | None, delivered: bool) -> str:
                                      full_at=full_at, unrefreshed=pending.get("unrefreshed"),
                                      based_on=pending.get("based_on") if pending["full"] else None,
                                      owed=pending.get("owed"), shown=pending.get("shown"),
-                                     component=(changes or {}).get("component", "main")):
+                                     notices=pending.get("notices"), component=(changes or {}).get("component", "main")):
                 status = f"{status}:unmarked"
     return f" routing={status}"
 

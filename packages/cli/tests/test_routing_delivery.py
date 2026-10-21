@@ -77,10 +77,12 @@ def test_a_compact_rule_change_names_kind_account_and_opening(home):
     assert "Standing rule 1 added" in text and "Grok" in text and "Grok builder may" in text
 
 
-def test_b_priority_and_hold_name_their_contradiction_and_end_route(home):
+def test_b_priority_and_hold_name_their_contradiction_and_end_route(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     held = routing.add_hold("do not launch", reason="keep", scope="account", account="Grok", author=ME)
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": "Grok builder"}],
-                             owner_request="make Grok builder", author=ME, expect=routing.priority_version())
+                             owner_request="make Grok builder", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     text = routing.summary(now=home["clock"].now)["text"]
     assert "Grok" in text and "contradicts active hold" in text
     assert f"end_hold hold_id={held['id']}" in text
@@ -116,7 +118,8 @@ def test_c_omitted_changes_stay_behind_the_real_delivery_watermark(home):
     assert all(len(out["text"].split("\n", 1)[1]) <= 400 for out in (first, second))
 
 
-def test_c_same_version_debt_precedes_newer_priority(home):
+def test_c_same_version_debt_precedes_newer_priority(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     _set(home, routing_line_chars=55)
     key = lambda i: f"codex|/logins/synthetic-login-{i}"
     routing.report(account="Grok", state="open", author=ME)
@@ -131,8 +134,9 @@ def test_c_same_version_debt_precedes_newer_priority(home):
     _deliver(first)
     owed = recall_prompt.routing_marker(SESSION)["owed"]
     assert owed
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": "newer priority"}], owner_request="use Grok",
-                             author=ME, expect=routing.priority_version())
+                             author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     agent_view.prepare_routing_table(refresh=True)
     second = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
     first_owed = next(f"A{i}" for i in range(8) if f"account:{key(i)}" in owed)
@@ -150,20 +154,27 @@ def test_c_identical_rendered_lines_only_acknowledge_the_selected_entity(home):
     assert changed["shown_entities"] == ["account:one"]
 
 
-def test_d_collision_names_author_age_version_and_replacement_routes(home):
+def test_d_replacement_takes_effect_and_names_the_replaced_author(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Grok"}], owner_request="use Grok", author=ME,
-                             expect=routing.priority_version())
-    with pytest.raises(routing.RouteError,
-                       match=r"Claude Code conversation.*just now.*current version.*owner direction.*Settings.*terminal"):
-        routing.request_priority([{"account": "Codex"}], owner_request="replace it", author=OTHER,
-                                 expect=routing.priority_version())
+                             expect=routing.priority_version(), base=shown["priority_owner_revision"])
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Codex"}], owner_request="replace it", author=OTHER,
+                             expect=routing.priority_version(), base=shown["priority_owner_revision"])
+    view = routing.read_view()
+    assert [e["label"] for e in view["priority"]["entries"]] == ["Codex"]
+    replaced = [p for p in view["proposals"].values() if p["status"] == "replaced"]
+    assert len(replaced) == 1 and replaced[0]["notify"] == ME
 
 
-def test_e_stale_level_claim_is_marked_beside_fresh_usage_without_editing_words(home):
+def test_e_stale_level_claim_is_marked_beside_fresh_usage_without_editing_words(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     _usage(home)
     role = "Grok is low: 2% left"
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": role}], owner_request="use Grok", author=ME,
-                             expect=routing.priority_version())
+                             expect=routing.priority_version(), base=shown["priority_owner_revision"])
     text = routing.summary(now=home["clock"].now)["text"]
     assert role in text and "stale level claim; Khipu read 96% left" in text
     view = routing.read_view()
@@ -225,20 +236,25 @@ def test_acceptance_real_replay_has_grok_priority_and_hold_contradiction(
     assert routing.read_view()["holds"][0]["id"] == "h-synthetic-grok"
 
 
-def test_d_rule_collision_lists_the_existing_author_and_all_replacement_routes(home):
+def test_d_rule_replacement_takes_effect_and_names_the_replaced_author(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     routing.request_rule("Grok builds.", author=ME)
-    with pytest.raises(routing.RouteError) as error:
-        routing.request_rule("Grok reviews.", n=1, author=OTHER)
-    text = str(error.value)
-    assert all(word in text for word in ("Claude Code conversation", "just now", "current version",
-                                         "owner direction", "Settings", "terminal"))
+    shown = routing.conversation_view()
+    routing.request_rule("Grok reviews.", n=1, author=OTHER, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
+    view = routing.read_view()
+    assert view["rules"][0]["text"] == "Grok reviews."
+    assert view["rules"][0]["pending_by"] == "a Codex conversation"
+    replaced = [p for p in view["proposals"].values() if p["status"] == "replaced"]
+    assert len(replaced) == 1 and replaced[0]["notify"] == ME
 
 
-def test_f_owner_hold_names_only_the_owner_route_and_never_ends_from_prose(home):
+def test_f_owner_hold_names_only_the_owner_route_and_never_ends_from_prose(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     held = routing.add_hold("Wait for the owner.", reason="keep", scope="account", account="Grok",
                             owner=True, via="app")
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": "Regular builder"}], owner_request="use Grok",
-                             author=ME, expect=routing.priority_version())
+                             author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     view = routing.read_view()
     line = routing.hold_line(view["holds"][0], T0, view=view)
     assert "only the owner" in line and "Settings" in line and "--owner" in line
@@ -288,12 +304,14 @@ def test_f_conversation_route_lists_the_actual_end_hold_action(home):
 
 @pytest.mark.parametrize("path", ["start", "full_prompt", "changes"])
 def test_review_omitted_pending_changes_are_counted_and_delivered_later(home, monkeypatch, path):
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
     before = routing.read_view()
     for i in range(12):
         routing.request_rule(f"pending {i} " + "x" * 500, author=ME)
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Grok", "role": "builder " * 150}],
-                             owner_request="use Grok", author=ME, expect=routing.priority_version())
+                             owner_request="use Grok", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     if path == "start":
         monkeypatch.setattr(routing, "kick_plan_refresh", lambda: None)
         at = recall_rule._RoutingAtStart(session_id=SESSION).begin()

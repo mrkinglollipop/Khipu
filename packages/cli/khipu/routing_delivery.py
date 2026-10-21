@@ -86,7 +86,18 @@ def snapshot(session, component="main"):
         return {}
     return data.get(component, {})
 
-def plan(out, view, now, cfg, *, project=None):
+def notice_receipts(session):
+    """Completed notice deliveries through any component of this conversation."""
+    try:
+        data = json.loads(_path(session).read_text())
+    except (OSError, ValueError):
+        return set()
+    return {entity.removeprefix("notice:") for state in data.values() if isinstance(state, dict)
+            for entity, entry in state.get("entries", {}).items()
+            if entity.startswith("notice:") and entry.get("acked")}
+
+
+def plan(out, view, now, cfg, *, session=None, project=None):
     """Attach current, scrubbed entity revisions to a hook's rendered offer."""
     from khipu import routing as r
 
@@ -120,6 +131,11 @@ def plan(out, view, now, cfg, *, project=None):
         if effective is None:
             effective = line
         items.append(dict(entity=entity, effective=effective, text=line, label=label, whole=whole))
+    for entity, fc in (out.get("pace_forecasts") or {}).items():
+        entry = next((a for a in view.get("accounts") or [] if a["key"] == fc["account"]), None)
+        line = r.pace_line_for(entry, now) if entry else None
+        if line:
+            items.append(dict(entity=entity, effective=line, text=line, label=fc["label"], whole=False))
     raw = [(item["text"], item["label"]) for item in items]
     projected = (project(raw) if project else r._for_agents(raw, view)) if items else []
     for item, (line, label) in zip(items, projected):
@@ -148,10 +164,16 @@ def plan(out, view, now, cfg, *, project=None):
             clipped = line[:max(0, width - 3)].rstrip() + "." * min(width, 3) if width and len(line) > width else line
             visible = bool(line and (line in text or clipped in text or r._clip(line, width) in text))
         item["visible"] = visible
+    notices = r._replacement_notices(view, now, session)
+    for _kind, raw, ident in notices:
+        line = r._for_agents(raw, view)
+        items.append(dict(entity="notice:" + ident, revision=ident, text=line,
+                          label="Proposal notice", whole=True, visible=ident in (out.get("notices") or [])))
     removed = {e: r.change_line(e, view, now) for e in view.get("causes", {})
                if e not in view.get("effective", {}) and (e == "note" or e.startswith("rule:"))}
-    return dict(out, delivery_plan={"items": items, "current_entities": list(view.get("effective", {})),
-                                   "removed": removed, "at": r._iso(now),
+    return dict(out, delivery_plan={"items": items, "pace_forecasts": out.get("pace_forecasts") or {},
+                                    "current_entities": list(view.get("effective", {})),
+                                    "removed": removed, "notices": ["notice:" + n[2] for n in notices], "at": r._iso(now),
                                    "limit": cfg["routing_summary_chars"] if full else cfg["routing_prompt_chars"],
                                    "full": full, "page_limit": cfg["routing_prompt_chars"], "text": out.get("text"),
                                    "lease": cfg["routing_delivery_lease"],
@@ -186,6 +208,12 @@ def _merge(state, out):
     items = list(plan["items"])
     planned = {i["entity"] for i in items}
     current = set(plan.get("current_entities", entries))
+    # Notice debt ends with its seven-day window or a receipt through an
+    # alternate identity. It has no removal message to deliver.
+    for entity in list(entries):
+        if entity.startswith("notice:") and not entries[entity].get("acked") and entity not in plan.get("notices", []):
+            del entries[entity]
+            replaced.add(entity)
     # SessionStart's parent has only the scrubbed plan, not the routing view.
     # Missing saved debt needs a removal message, never its former words.
     for entity, old in entries.items():
@@ -223,13 +251,25 @@ def _render(state, out, now, component):
     if flight:
         state["expired"] = state.get("expired", 0) + 1
         state.pop("flight", None)
+    # A receipt can arrive after the plan was rendered, through another
+    # hook or identity. Suppress only the notice lines already acknowledged.
+    heard = [ident for ident in out.get("notices", []) if entries.get("notice:" + ident, {}).get("acked")]
+    if heard and isinstance(out.get("text"), str):
+        lines = out["text"].split("\n")
+        for ident in heard:
+            line = entries["notice:" + ident]["text"]
+            if line in lines:
+                lines.remove(line)
+        plain = "\n".join(lines)
+        out = dict(out, text=plain, delivery_plan=dict(out["delivery_plan"], text=plain))
+        out["notices"] = [ident for ident in out.get("notices", []) if ident not in heard]
     due = [e for e in entries.values() if not e.get("acked")]
     # A new hold must precede the remaining pages of an older, long rule.
     due.sort(key=lambda e: not e["entity"].startswith("hold:"))
     if not due:
         # Informational full/stale blocks have no change debt to reserve.
         answer = {k: v for k, v in out.items() if k not in
-                  ("delivery_plan", "delivery_reservation", "routing_changes", "delivery", "_delivery_view", "_reserved")}
+                  ("delivery_plan", "delivery_reservation", "routing_changes", "delivery", "_delivery_view", "_reserved", "pace_forecasts")}
         return answer
     limit = out["delivery_plan"]["limit"]
     # Keep ordinary small offers byte-identical. A preview is never enough
@@ -297,7 +337,10 @@ def _render(state, out, now, component):
             body.append(tail)
         plain = heading + "\n" + "\n".join(body)
     complete = [entity for entity, end in progress.items() if end == len(entries[entity]["text"])]
-    answer = {k: v for k, v in out.items() if k not in ("delivery_plan", "delivery_reservation", "_delivery_view", "_reserved")}
+    answer = {k: v for k, v in out.items() if k not in ("delivery_plan", "delivery_reservation", "_delivery_view", "_reserved", "pace_forecasts")}
+    if "notices" in out or out["delivery_plan"].get("notices"):
+        answer["notices"] = [entity.removeprefix("notice:") for entity in complete
+                             if entity.startswith("notice:")]
     answer.update(kind=out.get("kind") if out.get("kind") != "none" else "changes", text=plain,
                   owed_entities=[e["entity"] for e in due], shown_entities=complete,
                   routing_changes={"batch": str(uuid.uuid4()), "component": component, "items": selected})
@@ -660,6 +703,9 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
             e["restarted"] = False
         batches = state.setdefault("batches", {})
         batches[batch] = True
+        forecasts = (flight.get("plan") or {}).get("pace_forecasts") or {}
+        if forecasts:
+            state["pace_acked"] = {**(state.get("pace_acked") or {}), **forecasts}
         # Idempotence covers recent retries; older ids fail closed.
         for old in list(batches)[:-128]:
             del batches[old]

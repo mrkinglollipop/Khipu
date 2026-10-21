@@ -73,6 +73,18 @@ LAUNCH_KEEP = timedelta(days=2)
 # A heartbeat interval longer than this is not a heartbeat (the runners write
 # 20 and 30 seconds); the file is reported as out of range.
 INTERVAL_MAX = 24 * 3600
+# Runner telemetry (slice 17t): how much of one heartbeat's records is kept,
+# and how many spend events one runner's accumulation keeps. Spend past the
+# keep is dropped and marked incomplete, so a total that needs it reads
+# unknown, never a smaller invented figure.
+TELEMETRY_ACTIVE_MAX = 256
+TELEMETRY_SPEND_MAX = 4096
+TELEMETRY_COVERAGE_MAX = 512
+TELEMETRY_SPEND_KEEP = 4096
+TELEMETRY_COVERAGE_KEEP = 1024
+TELEMETRY_USD_MAX = 1_000_000_000.0
+_EVENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_UUID_FULL = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 _STAMPED = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s")
 _LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+(\S+)\s+(ADDED|LIMITED|LAUNCH|HOLD|ERROR|FAILED|FAIL)\b[ \t]*(.*)$")
@@ -144,7 +156,8 @@ _SECRET_FLAG_ONLY = re.compile(r"(?i)^--?[a-z0-9_-]*" + _FLAG_WORDS + r"[a-z0-9_
 # by a view saved under an older version is dropped, never carried forward,
 # so text that older rules let through cannot outlive the fix. 3: no free
 # text at all, only parsed fields and names that pass ``safe_name``.
-REDACTION = 5
+# 6: telemetry spend persisted as aggregates, event ids only as hashes.
+REDACTION = 6
 
 
 def _redacted(text, limit: int = LINE_MAX) -> str:
@@ -391,14 +404,282 @@ def _parse_heartbeat(data: bytes) -> dict:
         raise OutOfRange("interval out of range")
     out = {"time": _number(doc["time"]), "interval": interval}
     lanes = doc.get("lanes")
-    if isinstance(lanes, dict):
+    if isinstance(lanes, dict) or any(k in doc for k in ("active", "spend", "spend_coverage")):
         from khipu import routing
 
         known = routing.accounts()
-        out["lanes"] = {lane: routing.login_binding(spec, known)
-                        for lane, spec in list(lanes.items())[:LANES_MAX]
-                        if safe_name(lane) == lane and isinstance(spec, dict)}
+        if isinstance(lanes, dict):
+            out["lanes"] = {lane: routing.login_binding(spec, known)
+                            for lane, spec in list(lanes.items())[:LANES_MAX]
+                            if safe_name(lane) == lane and isinstance(spec, dict)}
+        out["telemetry"] = _parse_telemetry(doc, known)
+    else:
+        # Every heartbeat is a telemetry occasion: one with none of the
+        # telemetry keys still replaces (expires) the active snapshot.
+        out["telemetry"] = _parse_telemetry(doc, [])
     return out
+
+
+def _declared_account(value, known: list[dict]):
+    """A telemetry record's account declaration, kept only in a form the
+    lane resolver can name: a known account key, a ``provider|`` prefix, a
+    stable ``provider:label`` id, or a name that passes ``safe_name``.
+    Anything else (a login path that is no known key, free text) becomes
+    ``WITHHELD``, which resolves to no account and stays unattributed."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    if value in {a["key"] for a in known}:
+        return value
+    if value.endswith("|") and safe_name(value[:-1]) not in (None, WITHHELD):
+        return value
+    if value.count(":") == 1 and all(safe_name(p) not in (None, WITHHELD) for p in value.split(":")):
+        return value
+    return safe_name(value) or WITHHELD
+
+
+def _telemetry_provider(value):
+    name = safe_name(value)
+    return name if name not in (None, WITHHELD) else None
+
+
+def _event_id(value) -> str | None:
+    """A spend event id kept only in a safe shape: a uuid, or a short
+    name-shaped id that does not look like a key (the same withholding
+    ``safe_name`` applies to other fields, uuids allowed because the
+    contract mints them). Anything else is dropped, never repaired."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if _UUID_FULL.match(text):
+        return text
+    if not _EVENT_ID.match(text) or _KEY_PREFIX.search(text) or _UUID.search(text):
+        return None
+    if any(re.search(r"[A-Za-z]", run) and re.search(r"[0-9]", run) for run in _KEY_RUN.findall(text)):
+        return None
+    return text
+
+
+def _event_token(event: str) -> str:
+    """The persisted form of an event id: a hash, so a raw id (which may
+    be key-shaped in a hostile heartbeat) never reaches view.json, while
+    equality (dedup, correction targets) still works."""
+    return hashlib.sha256(event.encode("utf-8")).hexdigest()[:24]
+
+
+def _parse_telemetry(doc: dict, known: list[dict]) -> dict:
+    """The heartbeat's telemetry records, typed and bounded. Only parsed
+    fields survive: names through ``safe_name``, account declarations
+    through ``_declared_account``, money through ``_number`` and bounded
+    by ``TELEMETRY_USD_MAX``, event ids through ``_event_id`` and kept
+    only as hashes. A record that fails its shape is dropped and counted,
+    never repaired; a dropped spend record is remembered (its account and
+    time, when parseable) so the runner's stream reads incomplete.
+    Record times are bounded to the heartbeat's own time (arrival), so a
+    future-dated record cannot wedge a lane or extend coverage."""
+    beat_at = _epoch(doc.get("time"))
+    out: dict[str, Any] = {"active": [], "spend": [], "coverage": [], "dropped": 0, "truncated": False,
+                           "snapshot": True, "spend_dropped": 0, "spend_dropped_records": []}
+
+    def bounded(at: datetime | None) -> datetime | None:
+        return min(at, beat_at) if at is not None and beat_at is not None else at
+
+    # Account and provider declarations repeat across a heartbeat's
+    # records; each distinct value is resolved once per heartbeat.
+    account_cache: dict[str, Any] = {}
+    provider_cache: dict[str, Any] = {}
+
+    def account_of(value):
+        if isinstance(value, str) and value in account_cache:
+            return account_cache[value]
+        resolved = _declared_account(value, known)
+        if isinstance(value, str):
+            account_cache[value] = resolved
+        return resolved
+
+    def provider_of(value):
+        if isinstance(value, str) and value in provider_cache:
+            return provider_cache[value]
+        resolved = _telemetry_provider(value)
+        if isinstance(value, str):
+            provider_cache[value] = resolved
+        return resolved
+
+    def drop_spend(item) -> None:
+        out["dropped"] += 1
+        out["spend_dropped"] += 1
+        if isinstance(item, dict):
+            at = bounded(_epoch(item.get("at")))
+            out["spend_dropped_records"].append(
+                {"account": account_of(item.get("account")),
+                 "provider": provider_of(item.get("provider")),
+                 "at": at.timestamp() if at is not None else None})
+
+    active = doc.get("active")
+    if isinstance(active, list):
+        out["dropped"] += max(0, len(active) - TELEMETRY_ACTIVE_MAX)
+        for item in active[:TELEMETRY_ACTIVE_MAX]:
+            lane = safe_name(item.get("lane")) if isinstance(item, dict) else None
+            jobs = item.get("jobs") if isinstance(item, dict) else None
+            at = bounded(_epoch(item.get("at"))) if isinstance(item, dict) else None
+            if (lane is None or at is None or isinstance(jobs, bool) or not isinstance(jobs, int)
+                    or not 0 <= jobs <= 100000 or item.get("unit", "job") != "job"):
+                out["dropped"] += 1
+                continue
+            out["active"].append({"lane": lane, "account": account_of(item.get("account")),
+                                  "provider": provider_of(item.get("provider")),
+                                  "jobs": jobs, "unit": "job", "at": at.timestamp()})
+    spend = doc.get("spend")
+    if isinstance(spend, list):
+        records: list[dict] = []
+        for item in spend:
+            event = _event_id(item.get("event")) if isinstance(item, dict) else None
+            usd = _number(item.get("usd")) if isinstance(item, dict) else None
+            at = bounded(_epoch(item.get("at"))) if isinstance(item, dict) else None
+            raw_corrects = item.get("corrects") if isinstance(item, dict) else None
+            corrects = _event_id(raw_corrects) if raw_corrects is not None else None
+            if (event is None or usd is None or abs(usd) > TELEMETRY_USD_MAX or at is None
+                    or (raw_corrects is not None and corrects is None)
+                    or (usd < 0 and corrects is None)):
+                drop_spend(item)
+                continue
+            records.append({
+                "event": _event_token(event),
+                "provider": provider_of(item.get("provider")),
+                "account": account_of(item.get("account")),
+                "usd": usd, "at": at.timestamp(),
+                "corrects": _event_token(corrects) if corrects is not None else None})
+        if len(records) > TELEMETRY_SPEND_MAX:
+            records.sort(key=lambda r: (r["at"], r["event"]))
+            for record in records[:-TELEMETRY_SPEND_MAX]:
+                drop_spend({"account": record["account"], "provider": record["provider"], "at": record["at"]})
+            out["truncated"] = True
+            records = records[-TELEMETRY_SPEND_MAX:]
+        out["spend"] = records
+    coverage = doc.get("spend_coverage")
+    if isinstance(coverage, list):
+        out["dropped"] += max(0, len(coverage) - TELEMETRY_COVERAGE_MAX)
+        for item in coverage[:TELEMETRY_COVERAGE_MAX]:
+            start = _epoch(item.get("from")) if isinstance(item, dict) else None
+            end = bounded(_epoch(item.get("to"))) if isinstance(item, dict) else None
+            if start is None or end is None or start > end:
+                out["dropped"] += 1
+                continue
+            out["coverage"].append({"account": account_of(item.get("account")),
+                                    "provider": provider_of(item.get("provider")),
+                                    "from": start.timestamp(), "to": end.timestamp()})
+    return out
+
+
+def _telemetry_event_count(tele: dict) -> int:
+    """Accumulated spend events: aggregated plain events plus corrections."""
+    tele = tele if isinstance(tele, dict) else {}
+    return (sum(b.get("n") or 0 for b in tele.get("buckets") or [] if isinstance(b, dict))
+            + len([c for c in tele.get("corrections") or [] if isinstance(c, dict)]))
+
+
+def merge_telemetry(prev, parsed, now: datetime | None = None) -> dict:
+    """One runner's accumulated telemetry, in the form persisted in the
+    view: plain spend aggregated into one bucket per (account declaration,
+    provider, second) holding the summed usd, the event count and the
+    hashed event ids (so dedup and correction targets survive a reload
+    without persisting every event); corrections kept individually, since
+    each counts only against its own target; the current ``active``
+    snapshot, which each heartbeat replaces whole (an empty or missing
+    snapshot expires the old jobs, never keeps them); and every
+    coverage interval vouched so far. Deduplication is per runner, on the
+    hashed event id: the first seen wins, so a heartbeat that republishes
+    its recent spend never double-counts, and two runners minting the same
+    id never merge. Spend dropped for any reason (malformed, truncated,
+    past the keep) marks the accumulation incomplete.
+
+    ``since`` is when Khipu started accumulating this runner (the first
+    merge with no kept accumulation, dated by the fold's clock): it is
+    kept across merges and reset whenever the kept accumulation is gone
+    (a cache discarded at ``collect`` or a lost view.json both reach this
+    merge with no ``prev``), so a period that starts before it can never
+    read as a known, understated total."""
+    prev = prev if isinstance(prev, dict) else {}
+    parsed = parsed if isinstance(parsed, dict) else {}
+    since = _number(prev.get("since"))
+    if _epoch(since) is None:
+        since = now.timestamp() if now is not None else None
+    buckets: dict[tuple, dict] = {}
+    for item in prev.get("buckets") or []:
+        if isinstance(item, dict) and _epoch(item.get("at")) is not None:
+            key = (item.get("a"), item.get("p"), _number(item.get("at")))
+            bucket = buckets.setdefault(key, {"a": item.get("a"), "p": item.get("p"), "at": _number(item.get("at")),
+                                              "usd": 0.0, "n": 0, "ids": set()})
+            bucket["usd"] += _number(item.get("usd")) or 0.0
+            bucket["n"] += item.get("n") if isinstance(item.get("n"), int) else 0
+            bucket["ids"] |= {t for t in str(item.get("ids") or "").split(",") if t}
+    corrections: dict[str, dict] = {}
+    for item in prev.get("corrections") or []:
+        if isinstance(item, dict) and isinstance(item.get("event"), str) and _epoch(item.get("at")) is not None:
+            corrections[item["event"]] = item
+    dropped = [d for d in prev.get("dropped_spend") or [] if isinstance(d, dict)]
+    active: dict[str, dict] = {}
+    if isinstance(prev.get("active"), dict):
+        active = {k: v for k, v in prev["active"].items() if isinstance(v, dict) and isinstance(k, str)}
+    coverage = [c for c in prev.get("coverage") or [] if isinstance(c, dict)]
+    incomplete = bool(prev.get("incomplete"))
+    if parsed:
+        incomplete = incomplete or bool(parsed.get("truncated")) or (parsed.get("spend_dropped") or 0) > 0
+        dropped += [d for d in parsed.get("spend_dropped_records") or [] if isinstance(d, dict)]
+        seen = set(corrections) | {t for b in buckets.values() for t in b["ids"]}
+        for record in parsed.get("spend") or []:
+            if not isinstance(record, dict) or not isinstance(record.get("event"), str):
+                continue
+            token, usd, at = record["event"], _number(record.get("usd")), _number(record.get("at"))
+            if token in seen or usd is None or at is None:
+                continue
+            seen.add(token)
+            if record.get("corrects"):
+                corrections[token] = {"event": token, "corrects": record["corrects"],
+                                      "account": record.get("account"), "provider": record.get("provider"),
+                                      "usd": usd, "at": at}
+            else:
+                key = (record.get("account"), record.get("provider"), at)
+                bucket = buckets.setdefault(key, {"a": key[0], "p": key[1], "at": at,
+                                                  "usd": 0.0, "n": 0, "ids": set()})
+                bucket["usd"] += usd
+                bucket["n"] += 1
+                bucket["ids"].add(token)
+        if sum(b["n"] for b in buckets.values()) > TELEMETRY_SPEND_KEEP:
+            for key in sorted(buckets, key=lambda k: k[2] or 0):
+                if sum(b["n"] for b in buckets.values()) <= TELEMETRY_SPEND_KEEP:
+                    break
+                buckets.pop(key, None)
+            incomplete = True
+        if len(corrections) > TELEMETRY_SPEND_KEEP:
+            for token in sorted(corrections, key=lambda t: corrections[t].get("at") or 0)[
+                    :len(corrections) - TELEMETRY_SPEND_KEEP]:
+                corrections.pop(token, None)
+            incomplete = True
+        if len(dropped) > 128:
+            dropped = sorted(dropped, key=lambda d: _number(d.get("at")) or 0)[-128:]
+        if parsed.get("snapshot") or "active" in parsed:
+            active = {}
+            for record in parsed.get("active") or []:
+                if isinstance(record, dict) and isinstance(record.get("lane"), str):
+                    active[record["lane"]] = record
+        seen_marks = {(c.get("account"), c.get("provider"), c.get("from"), c.get("to")) for c in coverage}
+        for record in parsed.get("coverage") or []:
+            if isinstance(record, dict):
+                mark = (record.get("account"), record.get("provider"), record.get("from"), record.get("to"))
+                if mark not in seen_marks:
+                    seen_marks.add(mark)
+                    coverage.append(record)
+        if len(coverage) > TELEMETRY_COVERAGE_KEEP:
+            coverage = sorted(coverage, key=lambda c: _number(c.get("to")) or 0)[-TELEMETRY_COVERAGE_KEEP:]
+            incomplete = True
+    out_buckets = [{"a": b["a"], "p": b["p"], "at": b["at"], "usd": b["usd"], "n": b["n"],
+                    "ids": ",".join(sorted(b["ids"]))}
+                   for b in sorted(buckets.values(), key=lambda b: b["at"] or 0)]
+    return {"buckets": out_buckets,
+            "corrections": sorted(corrections.values(), key=lambda c: c.get("at") or 0),
+            "dropped_spend": dropped, "active": active, "coverage": coverage, "incomplete": incomplete,
+            "since": since}
 
 
 _SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".rb", ".pl")
@@ -779,13 +1060,23 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
             else:
                 data, mtime = read_only(path)
                 parsed = _PARSERS[key](data)
+            # The heartbeat's telemetry is kept once, accumulated, in
+            # ``cache["telemetry"]``: the heartbeat read itself keeps only
+            # its time, interval and lanes, so no spend record (or event
+            # id) is persisted twice in view.json.
+            stored, telemetry_parsed = parsed, None
+            if key == "heartbeat" and isinstance(parsed, dict):
+                telemetry_parsed = parsed.get("telemetry")
+                stored = {k: v for k, v in parsed.items() if k != "telemetry"}
             # ``seen_at``: when Khipu first read the file as it reads now. A
             # re-read that finds the same content keeps it, so a check judged
             # on the file (``rule_checks``) is dated by when Khipu first saw
             # what it judges, not by the latest refresh.
-            same = last.get("data") is not None and last.get("data") == parsed and last.get("seen_at")
-            cache[key] = {"data": parsed, "good_at": _iso(now), "seen_at": last["seen_at"] if same else _iso(now),
+            same = last.get("data") is not None and last.get("data") == stored and last.get("seen_at")
+            cache[key] = {"data": stored, "good_at": _iso(now), "seen_at": last["seen_at"] if same else _iso(now),
                           "mtime": mtime, "since": None}
+            if key == "heartbeat":
+                cache["telemetry"] = merge_telemetry(prev.get("telemetry"), telemetry_parsed, now)
             if key == "events":
                 cache[key]["scan"] = scan_events(path, last.get("scan"), now)
             files[key] = {"error": None, "good_at": _iso(now), "since": None}
@@ -798,6 +1089,8 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
             else:
                 cache[key] = {"data": None, "good_at": None, "mtime": None, "since": since}
             files[key] = {"error": _short_error(exc), "good_at": cache[key].get("good_at"), "since": since}
+    if "telemetry" not in cache:
+        cache["telemetry"] = merge_telemetry(prev.get("telemetry"), None, now)
     cache["sightings"] = _sightings(cache, prev.get("sightings"))
     from khipu.routing import _after
 
@@ -816,6 +1109,9 @@ def read_runner(entry: dict, now: datetime, prev: dict | None, silent_intervals:
         "silent": silent, "silent_deadline": None if silent else _iso(deadline),
         "unreadable": bool(errors), "unreadable_since": min((f["since"] for f in errors), default=None),
         "lanes": sorted((cache["config"].get("data") or {}).get("lanes", {})),
+        "telemetry": {"spend_events": _telemetry_event_count(cache["telemetry"]),
+                      "active_lanes": len(cache["telemetry"]["active"]),
+                      "coverage": len(cache["telemetry"]["coverage"]), "incomplete": cache["telemetry"]["incomplete"]},
     }
     return status, cache
 
@@ -944,6 +1240,264 @@ def runner_evidence(status: dict, cache: dict) -> list[dict]:
         item.update(declaration=lane_identity(spec), model=spec.get("model"), family=model_family(spec.get("model")),
                     transport="cursor" if spec.get("kind") == "cursor" or spec.get("provider") == "cursor" else None)
     return out
+
+
+# ---- runner telemetry totals (slice 17t) ---------------------------------------------
+#
+# Spend is money data: a total is known only on complete coverage, and a
+# missing or partial stream reads unknown, never zero. Accounts never pool:
+# every record is attributed to exactly one account through the lane
+# resolver, or to no account (unattributed, never guessed).
+
+
+def _telemetry_key(runner: str, lane, record: dict, lane_map: dict, known: list[dict],
+                   providers: dict | None, specs: dict) -> str | None:
+    from khipu import routing
+
+    spec = dict(specs.get(lane) or {}) if lane else {}
+    if record.get("account") is not None:
+        spec["account"] = record["account"]
+    if record.get("provider"):
+        spec["provider"] = record["provider"]
+    return routing.resolve_lane(runner, lane or "", lane_map, known, spec, providers)["key"]
+
+
+def telemetry_streams(cache: dict, *, known: list[dict], lane_map: dict, providers: dict | None,
+                      silent: dict[str, bool]) -> list[dict]:
+    """Accumulated telemetry grouped into one stream per (runner, account):
+    that runner's spend, coverage and current active snapshots for the
+    account. ``account`` is None for records no lane resolution can name."""
+    streams: dict[tuple[str, str | None], dict] = {}
+    for runner, kept in sorted(((cache or {}).get("runners") or {}).items()):
+        kept = kept if isinstance(kept, dict) else {}
+        tele = kept.get("telemetry") if isinstance(kept.get("telemetry"), dict) else {}
+        specs = ((kept.get("config") or {}).get("data") or {}).get("lanes") or {}
+
+        def stream(key):
+            return streams.setdefault((runner, key), {
+                "runner": runner, "account": key, "silent": bool(silent.get(runner)),
+                "incomplete": bool(tele.get("incomplete")), "buckets": [], "corrections": [], "dropped": [],
+                "coverage": [], "active": [], "launches": [],
+                "accumulating_since": _epoch(tele.get("since"))})
+
+        for item in tele.get("buckets") or []:
+            if isinstance(item, dict) and _epoch(item.get("at")) is not None:
+                record = {"account": item.get("a"), "provider": item.get("p")}
+                stream(_telemetry_key(runner, None, record, lane_map, known, providers, specs))["buckets"].append(
+                    {"at": _epoch(item.get("at")), "usd": _number(item.get("usd")) or 0.0,
+                     "n": item.get("n") if isinstance(item.get("n"), int) else 0,
+                     "ids": [t for t in str(item.get("ids") or "").split(",") if t]})
+        for item in tele.get("corrections") or []:
+            if isinstance(item, dict) and _epoch(item.get("at")) is not None:
+                stream(_telemetry_key(runner, None, item, lane_map, known, providers, specs))["corrections"].append(
+                    {"event": item.get("event"), "corrects": item.get("corrects"),
+                     "usd": _number(item.get("usd")) or 0.0, "at": _epoch(item.get("at"))})
+        for item in tele.get("dropped_spend") or []:
+            if isinstance(item, dict):
+                stream(_telemetry_key(runner, None, item, lane_map, known, providers, specs))["dropped"].append(
+                    {"at": _epoch(item.get("at"))})
+        for record in tele.get("coverage") or []:
+            if isinstance(record, dict):
+                start, end = _epoch(record.get("from")), _epoch(record.get("to"))
+                if start is not None and end is not None:
+                    stream(_telemetry_key(runner, None, record, lane_map, known, providers, specs))[
+                        "coverage"].append((start, end))
+        for lane, record in (tele.get("active") or {}).items():
+            if isinstance(record, dict):
+                stream(_telemetry_key(runner, lane, record, lane_map, known, providers, specs))["active"].append(
+                    {"lane": lane, "jobs": record.get("jobs"), "at": _epoch(record.get("at"))})
+        events = (kept.get("events") or {}).get("data") or {}
+        for item in events.get("launches") or []:
+            if isinstance(item, dict) and item.get("lane"):
+                at = _parse(item.get("at"))
+                if at is not None:
+                    stream(_telemetry_key(runner, item["lane"], {}, lane_map, known, providers, specs))[
+                        "launches"].append(at)
+    return sorted(streams.values(), key=lambda s: (s["runner"], s["account"] or ""))
+
+
+def _coverage_covers(intervals: list[tuple[datetime, datetime]], start: datetime, end: datetime) -> bool:
+    """Whether the union of coverage intervals holds one unbroken interval
+    covering [start, end]."""
+    merged: list[list[datetime]] = []
+    for begin, finish in sorted(intervals):
+        if merged and begin <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], finish)
+        else:
+            merged.append([begin, finish])
+    return any(begin <= start and finish >= end for begin, finish in merged)
+
+
+def _participation(stream: dict, start: datetime, end: datetime) -> tuple[datetime, datetime] | None:
+    """One stream's participation interval inside [start, end], or None
+    when it took no part. Participation starts at the runner's first
+    evidence in the period (its first spend, correction, dropped record,
+    active snapshot, LAUNCH, or the start of a coverage interval that
+    overlaps the period), not at its first spend event alone, and ends at
+    its last such evidence."""
+    core = [b["at"] for b in stream["buckets"] if start <= b["at"] <= end]
+    core += [c["at"] for c in stream["corrections"] if start <= c["at"] <= end]
+    core += [d["at"] for d in stream["dropped"] if d["at"] is not None and start <= d["at"] <= end]
+    core += [a["at"] for a in stream["active"] if a["at"] is not None and start <= a["at"] <= end]
+    core += [at for at in stream["launches"] if start <= at <= end]
+    if not core:
+        return None
+    times = list(core)
+    for begin, finish in stream["coverage"]:
+        if finish >= start and begin <= end:
+            times += [max(begin, start), min(finish, end)]
+    return min(times), max(times)
+
+
+def _stream_spend(stream: dict, start: datetime, end: datetime) -> tuple[float, int]:
+    """One stream's (usd, events) inside the period. Dedup already ran
+    per runner at accumulation. A correction counts only when its target
+    exists in this same stream (same runner, same resolved account) with
+    its own time inside the same period; an orphan, cross-account or
+    cross-period correction counts nothing."""
+    total, count = 0.0, 0
+    targets: dict[str, datetime] = {}
+    for bucket in stream["buckets"]:
+        for token in bucket["ids"]:
+            targets[token] = bucket["at"]
+        if start <= bucket["at"] <= end:
+            total += bucket["usd"]
+            count += bucket["n"]
+    for correction in stream["corrections"]:
+        targets.setdefault(correction["event"], correction["at"])
+    for correction in stream["corrections"]:
+        target_at = targets.get(correction["corrects"])
+        if start <= correction["at"] <= end and target_at is not None and start <= target_at <= end:
+            total += correction["usd"]
+            count += 1
+    return total, count
+
+
+def _dropped_correction_taint(streams: list[dict], start: datetime, end: datetime) -> set[tuple[str, str | None]]:
+    """The (runner, account) streams a correction in the period taints.
+    A correction counts only against a target in its own stream with its
+    own time in the same period; one dropped for lack of such a target
+    (no target in its stream, a cross-period target, or a target in
+    another of the same runner's streams, as when the correction names
+    no account) marks its own stream incomplete for the period, and the
+    target's stream too when the target lives in one, so no total reads
+    known with the correction silently missing from it."""
+    targets: list[tuple[dict, dict[str, datetime]]] = []
+    for stream in streams:
+        found: dict[str, datetime] = {}
+        for bucket in stream["buckets"]:
+            for token in bucket["ids"]:
+                found[token] = bucket["at"]
+        for correction in stream["corrections"]:
+            found.setdefault(correction["event"], correction["at"])
+        targets.append((stream, found))
+    tainted: set[tuple[str, str | None]] = set()
+    for stream, found in targets:
+        for correction in stream["corrections"]:
+            if not start <= correction["at"] <= end:
+                continue
+            target_at = found.get(correction["corrects"])
+            if target_at is not None and start <= target_at <= end:
+                continue  # the correction counted
+            tainted.add((stream["runner"], stream["account"]))
+            for other, other_found in targets:
+                if other is not stream and other["runner"] == stream["runner"] \
+                        and correction["corrects"] in other_found:
+                    tainted.add((other["runner"], other["account"]))
+    return tainted
+
+
+def spend_total(streams: list[dict], account: str, start: datetime, end: datetime) -> dict:
+    """One account's spend over [start, end] from its streams. Known only
+    when every stream that took part covers its own participation interval;
+    a silent or incomplete stream (any spend record dropped, for any
+    reason), or no stream at all, reads unknown with no figure."""
+    base = {"account": account, "from": _iso(start), "to": _iso(end)}
+    participating = []
+    for stream in streams:
+        if stream["account"] != account:
+            continue
+        part = _participation(stream, start, end)
+        if part is not None:
+            participating.append((stream, part))
+    if not participating:
+        return {**base, "status": "unknown", "usd": None, "reason": "no spend reported for this period"}
+    tainted = _dropped_correction_taint(streams, start, end)
+    for stream, (begin, finish) in participating:
+        if stream["silent"]:
+            return {**base, "status": "unknown", "usd": None,
+                    "reason": f"{stream['runner']} stopped reporting; its spend is unknown"}
+        if stream["incomplete"]:
+            return {**base, "status": "unknown", "usd": None,
+                    "reason": f"some of {stream['runner']}'s spend records were not kept"}
+        since = stream.get("accumulating_since")
+        if since is not None and start < since:
+            return {**base, "status": "unknown", "usd": None,
+                    "reason": f"{stream['runner']}'s telemetry is only accumulated from {_iso(since)}; "
+                              "this period starts before that"}
+        if (stream["runner"], stream["account"]) in tainted:
+            return {**base, "status": "unknown", "usd": None,
+                    "reason": f"a correction from {stream['runner']} could not be applied for this account"}
+        if not _coverage_covers(stream["coverage"], begin, finish):
+            return {**base, "status": "unknown", "usd": None,
+                    "reason": f"{stream['runner']} has a gap in its spend coverage for this account"}
+    total, count = 0.0, 0
+    for stream, _part in sorted(participating, key=lambda p: p[0]["runner"]):
+        usd, events = _stream_spend(stream, start, end)
+        total += usd
+        count += events
+    return {**base, "status": "known", "usd": round(total, 2), "events": count, "reason": None}
+
+
+def active_totals(streams: list[dict]) -> dict:
+    """Current active jobs per account: each (runner, lane) snapshot counts
+    once, runners sum, and a silent runner that held a snapshot for the
+    account makes the account's count unknown rather than partial."""
+    out: dict[str, dict] = {}
+    for key in sorted({s["account"] for s in streams if s["account"] is not None}):
+        mine = [s for s in streams if s["account"] == key and s["active"]]
+        if not mine:
+            continue
+        if any(s["silent"] for s in mine):
+            out[key] = {"jobs": None, "status": "unknown"}
+        else:
+            out[key] = {"jobs": sum(a["jobs"] for s in mine for a in s["active"] if isinstance(a["jobs"], int)),
+                        "status": "known"}
+    return out
+
+
+def unattributed_summary(streams: list[dict], start: datetime | None = None, end: datetime | None = None) -> dict:
+    """Spend and active records no account could be resolved for, kept
+    apart under their own label and never added to any account. The same
+    honesty as an account total: only the given period counts, and a
+    participating stream that is silent, incomplete or has a coverage gap
+    makes the figure unknown (``spend_usd`` None), never zero; with no
+    active snapshot at all, ``active_jobs`` is None, never zero."""
+    start = start or datetime.min.replace(tzinfo=timezone.utc)
+    end = end or datetime.max.replace(tzinfo=timezone.utc)
+    mine = [s for s in streams if s["account"] is None]
+    total, count, unknown = 0.0, 0, False
+    participating = False
+    tainted = _dropped_correction_taint(streams, start, end)
+    for stream in sorted(mine, key=lambda s: s["runner"]):
+        part = _participation(stream, start, end)
+        if part is None:
+            continue
+        participating = True
+        since = stream.get("accumulating_since")
+        if stream["silent"] or stream["incomplete"] or not _coverage_covers(stream["coverage"], part[0], part[1]) \
+                or (since is not None and start < since) \
+                or (stream["runner"], stream["account"]) in tainted:
+            unknown = True
+        usd, events = _stream_spend(stream, start, end)
+        total += usd
+        count += events
+    active = [s for s in mine if s["active"]]
+    jobs = None if not active or any(s["silent"] for s in active) else sum(
+        a["jobs"] for s in active for a in s["active"] if isinstance(a["jobs"], int))
+    return {"spend_events": count, "spend_usd": round(total, 2) if participating and not unknown and count else None,
+            "spend_status": "known" if participating and not unknown else "unknown",
+            "active_jobs": jobs}
 
 
 # ---- the usage cache ----------------------------------------------------------------
@@ -1173,8 +1727,13 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
             evidence.append(item)
     usage_items, usage_status = usage_evidence(configured_keys(config))
     evidence += usage_items
+    streams = telemetry_streams(cache, known=known, lane_map=lane_map, providers=cfg.get("_providers"),
+                                silent={s["name"]: bool(s["silent"]) for s in runners})
     status = {"runners": runners, "refused": refused, "invalid": invalid, "usage": usage_status,
-              "table": read_table(cfg.get("routing_table"))}
+              "table": read_table(cfg.get("routing_table")),
+              "telemetry": {"accounts": {key: {"active_jobs": value["jobs"], "active_status": value["status"]}
+                                         for key, value in active_totals(streams).items()},
+                            "unattributed": unattributed_summary(streams, now - timedelta(days=7), now)}}
     return evidence, status, cache
 
 

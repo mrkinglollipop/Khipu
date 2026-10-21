@@ -91,6 +91,63 @@ Runner identity contract:
   and repair guidance. Stale or contradictory bindings never match. A failed
   or silent heartbeat cannot confirm identity.
 
+Runner telemetry contract (slice 17t). A runner's `state/heartbeat.json` may
+also carry three typed, timestamped records. Khipu reads them through the
+same bounded parser as the rest of the heartbeat: only parsed fields
+survive, names pass the same shape check, and no other byte of the file is
+kept.
+
+- `active`: a snapshot list of `{"lane", "account", "jobs", "unit", "at"}`.
+  `unit` is `job` today: a GLM job's requests go in turn, so one job is one
+  request at a time. The newest snapshot for a `(runner, lane)` replaces the
+  earlier one, and every snapshot expires at the runner's silent deadline.
+  A heartbeat with none of the telemetry keys also expires the snapshot.
+  When a lane is idle the runner sends `jobs: 0` for that lane: idle reads
+  as a known zero only from such a record, never from a missing one, so a
+  lane the runner stops mentioning reads unknown, not zero.
+- `spend`: a list of increments, never a running total:
+  `{"event", "job", "attempt", "provider", "account", "usd", "at"}`.
+  `event` is a uuid the runner mints; records are deduplicated on it, so a
+  heartbeat may republish its recent spend. Each retry is its own `attempt`
+  and its own event, so retries count. A correction is a new event with
+  `corrects: <event>` and the signed difference. Khipu accumulates the
+  events across heartbeats (bounded; what it cannot keep marks the
+  accumulation incomplete).
+- `spend_coverage`: a list of `{"account", "from", "to"}`: the interval for
+  which this runner vouches it reported every spend for that account.
+  Khipu records when it started accumulating each runner's telemetry;
+  that start is kept in the saved view and resets whenever the kept
+  accumulation is discarded or the view is lost, and a period that starts
+  before it reads unknown, never a known understated total. A correction
+  whose target Khipu cannot find in the same stream and period (it names
+  no account, or its target lies outside the period) is dropped from the
+  figure and marks the affected stream, or the unattributed bucket,
+  incomplete, so the total reads unknown instead of silently omitting it.
+
+Each record is attributed to an account through the same lane resolver as
+limits and reports. A record no resolution can name is unattributed, never
+guessed. An account's spend total for a period is known only when every
+runner that took part in the period covers its own participation interval;
+one runner's gap makes the total unknown even when another covers the whole
+period, two accounts on one provider never pool, and a silent runner's
+records expire to unknown. Missing or partial coverage is unknown, never
+zero. Reference emitter (the runner's side, kept minimal):
+
+```python
+import json, time, uuid
+
+def heartbeat(path, active, spend, coverage, interval=20):
+    doc = {"time": time.time(), "interval": interval,
+           "active": [{"lane": lane, "account": account, "jobs": jobs,
+                       "unit": "job", "at": time.time()} for lane, account, jobs in active],
+           "spend": [{"event": str(uuid.uuid4()), "job": job, "attempt": attempt,
+                      "provider": provider, "account": account, "usd": usd,
+                      "at": time.time()} for job, attempt, provider, account, usd in spend],
+           "spend_coverage": [{"account": account, "from": start, "to": time.time()}
+                              for account, start in coverage]}
+    path.write_text(json.dumps(doc))
+```
+
 A runner's lane maps to an account through the lane map (`routing_lane_map`). A lane with no match is shown and pushed as one line. Khipu does not guess.
 
 ### Holds
@@ -113,6 +170,10 @@ These are yours:
 - **Clear.** Clear an account's state, or dismiss one report.
 
 A conversation can record a rule or a priority only when you asked it to. Khipu keeps it pending until you confirm it in the app. A conversation cannot confirm, retire, dismiss or undo anything.
+
+Rule edits and priority requests must carry `base`, the owner revision returned by the conversation's earlier `khipu_route` read. A missing or unread base is refused; later reads never fill it in. The CLI takes the same revision as `--base` with `--at-owner-request`. Replacement notices name the rule number or priority and go only to their author's session, once delivered; undelivered notices expire after seven days.
+
+Sessionless CLI reads, including the app's polling command, create no receipt file and take no routing lock to record a receipt. Sessionless MCP callers can propose against revisions read on the same connection: receipts stay in that server process's memory and never pass to another connection or process. Replacement notices match either the recorded canonical session id (including `t3:<thread>`) or its provider session id.
 
 ### Priority and pace
 

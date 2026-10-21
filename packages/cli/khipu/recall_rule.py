@@ -610,7 +610,8 @@ _ROUTING_CHILD_MOST = 60.0
 _ROUTING_CHILD_GRACE = 0.05
 
 
-def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, moment: str = "start") -> None:
+def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, moment: str = "start",
+                   session_id: str | None = None) -> None:
     """The forked child: write the summary's JSON to ``write_fd`` and exit.
     Never returns, and never touches the hook's stdin, stdout or stderr."""
     code = 1
@@ -634,11 +635,11 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
 
         signal.signal(signal.SIGALRM, on_alarm)
         signal.setitimer(signal.ITIMER_REAL, max(0.0, deadline - time.monotonic()) + _ROUTING_CHILD_GRACE)
-        out = routing.start_push(budget, moment)
+        out = routing.start_push(budget, moment, session_id=session_id)
         if isinstance(out, dict):
             data = memoryview(json.dumps({k: out.get(k) for k in (
                 "kind", "text", "version", "epoch", "generation", "owed_entities", "shown_entities",
-                "routing_changes", "delivery_reservation", "delivery_plan")}).encode("utf-8"))
+                "notices", "routing_changes", "delivery_reservation", "delivery_plan")}).encode("utf-8"))
             while data:
                 data = data[os.write(write_fd, data):]
             os.close(write_fd)  # the hook has its answer; nothing below delays it
@@ -651,7 +652,7 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
 
 
 class _RoutingAtStart:
-    def __init__(self, moment: str = "start", *, session_id=None) -> None:
+    def __init__(self, moment: str = "start", *, session_id: str | None = None) -> None:
         # "start", or "delegation" for a subagent's start (routing_delegation).
         self.moment = moment
         from khipu.routing_delivery import hook_session
@@ -687,7 +688,7 @@ class _RoutingAtStart:
                 os.close(write_fd)
                 raise
             if pid == 0:
-                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment)
+                _routing_child(write_fd, read_fd, budget, self.deadline, self.moment, self.session)
             os.close(write_fd)
             self.pid, self.fd = pid, read_fd
         except Exception:
@@ -756,6 +757,8 @@ class _RoutingAtStart:
         """Reset the session's last-seen version to the one just printed and
         record the time of this full summary."""
         out = self.out
+        if self.session is not None and session_id != self.session:
+            return
         if not isinstance(session_id, str) or not session_id or not isinstance(out, dict):
             return
         try:
@@ -764,6 +767,8 @@ class _RoutingAtStart:
 
             session_id = self.session or hook_session(session_id)
 
+            if out.get("notices") and not out.get("routing_changes"):
+                return
             if out.get("routing_changes"):
                 from khipu.routing_delivery import acknowledge
 
@@ -771,7 +776,8 @@ class _RoutingAtStart:
                     return
             recall_prompt.mark_routing_full(session_id, version=out["version"], epoch=out.get("epoch"),
                                             at=routing._iso(routing._now()),
-                                            owed=out.get("owed_entities"), shown=out.get("shown_entities"))
+                                            owed=out.get("owed_entities"), shown=out.get("shown_entities"),
+                                            notices=out.get("notices"))
         except Exception:
             pass
 
@@ -798,7 +804,7 @@ def session_start_main(*, shape: str | None = None) -> None:
         if is_helper_session(cwd):
             print("{}")  # T3's thread-title helper: no recall
             return
-        routing = _RoutingAtStart(session_id=payload.get("session_id") or payload.get("sessionId")).begin()
+        routing = _RoutingAtStart(session_id=payload.get("session_id") or payload.get("sessionId") or "").begin()
         token = _START_IS_JOB.set(_session_is_job(payload))
         try:
             memory = session_start_context(cwd)

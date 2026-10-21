@@ -545,7 +545,8 @@ def subagent_start(payload: dict) -> dict:
     """The full summary for a Claude Code subagent at its start."""
     from khipu import recall_rule
 
-    text = recall_rule._RoutingAtStart(moment="delegation").begin().text()
+    # A subagent receives a snapshot, not its parent conversation's notices.
+    text = recall_rule._RoutingAtStart(moment="delegation", session_id="").begin().text()
     if not text or recall_rule._utf16_len(text) > recall_rule._HOOK_CONTEXT_BUDGET:
         return {}
     return {"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": text}}
