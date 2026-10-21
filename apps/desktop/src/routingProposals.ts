@@ -80,14 +80,26 @@ function rowFor(view: RouteView, p: RouteProposal, now: Date): ProposalRow {
 
 export type ProposalsModel = {
   live: ProposalRow[];
-  /** Crossed only, still shown beside the live ones. An overtaken proposal
-   *  has ended: the owner wrote over it, so it belongs with the ended. */
+  /** Crossed only, still shown beside the live ones; a crossed proposal moves
+   *  to the ended once it is older than two days. An overtaken proposal has
+   *  ended: the owner wrote over it, so it belongs with the ended. */
   stale: ProposalRow[];
-  /** Everything that has ended (crossed apart, in the main list), newest
-   *  last as the record keeps it. */
+  /** Everything that has ended (crossed apart until it is two days old),
+   *  newest last as the record keeps it. */
   ended: ProposalRow[];
   endedToday: number;
 };
+
+/** How long a crossed proposal stays beside the live ones. Two Macs writing
+ *  at once is worth seeing for a while; after two days it is history. */
+const CROSSED_MAIN_MS = 48 * 60 * 60 * 1000;
+
+/** Whether a crossed proposal's written time puts it past that window. A
+ *  proposal with no readable written time stays where it is. */
+function crossedEnded(r: ProposalRow, now: Date): boolean {
+  const t = r.proposal.at ? new Date(r.proposal.at).getTime() : NaN;
+  return !Number.isNaN(t) && now.getTime() - t > CROSSED_MAIN_MS;
+}
 
 const ENDED_WORDS: Record<string, string> = {
   replaced: "replaced by a newer proposal",
@@ -106,7 +118,8 @@ export function endedWords(status: string): string {
 export function proposalsModel(view: RouteView, now: Date): ProposalsModel {
   const all = Object.values(view.proposals ?? {}).map((p) => rowFor(view, p, now));
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const ended = all.filter((r) => r.proposal.status !== "live" && r.proposal.status !== "crossed");
+  const crossed = all.filter((r) => r.proposal.status === "crossed");
+  const ended = all.filter((r) => r.proposal.status !== "live" && (r.proposal.status !== "crossed" || crossedEnded(r, now)));
   // Only a recorded ended time says when a proposal ended; the CLI does not
   // set one for every ending, and the write time is not the ending.
   const endedToday = ended.filter((r) => {
@@ -115,7 +128,7 @@ export function proposalsModel(view: RouteView, now: Date): ProposalsModel {
   }).length;
   return {
     live: all.filter((r) => r.proposal.status === "live"),
-    stale: all.filter((r) => r.proposal.status === "crossed"),
+    stale: crossed.filter((r) => !crossedEnded(r, now)),
     ended,
     endedToday,
   };
