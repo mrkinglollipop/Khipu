@@ -62,7 +62,9 @@ def _slim_agent_state(state):
     done = state.get("done") if isinstance(state.get("done"), dict) else {}
     for entity, entry in list(entries.items()):
         text = entry.get("text") or ""
-        if entry.get("acked") and entry.get("offset", 0) >= len(text):
+        if (entry.get("acked") and entry.get("offset", 0) >= len(text)
+                and entry.get("shown_offset") == len(text)):
+            state.setdefault("done_shown", {})[entity] = entry.get("revision")
             done[entity] = entry.get("revision")
             del entries[entity]
     if done:
@@ -339,16 +341,54 @@ def _merge(state, out):
         state.pop("flight", None)
     return entries
 
-def _render(state, out, now, component):
-    entries = _merge(state, out)
+def _delivery_point(state, out, now):
+    """Budget debt when its revision first becomes owed; progress never resets its age."""
+    import math
+
+    point = state["delivery_points"] = state.get("delivery_points", 0) + 1
     state["last_delivery_point"] = _iso(now)
+    plan = out["delivery_plan"]
+    state["slack"] = plan.get("slack", 2)
+    budget = plan.get("page_limit") or plan.get("limit") or 8000
+    ahead = 0
+    entries = list(state.get("entries", {}).values())
+    entries.sort(key=lambda e: not e["entity"].startswith("hold:"))
+    for entry in entries:
+        if entry.get("acked"):
+            continue
+        ahead += _size(entry["text"][entry.get("offset", 0):])
+        if "owed_point" not in entry:
+            entry["owed_point"] = point
+            entry["owed_chars"] = ahead
+            # The page header and owed tail consume the same cap as the words.
+            prefix = f"{entry['label']}; revision {entry['revision'][:8]}; page "
+            payload = budget - _size("More routing owed.") - 2 - _size(prefix) - 24
+            entry["budget"] = min(max(0, payload), entry.get("width") or max(0, payload))
+            entry["bound"] = max(1, math.ceil(ahead / entry["budget"])) if entry["budget"] else None
+        elif entry.get("width") and entry["width"] < entry.get("budget", budget):
+            entry["budget"] = entry["width"]
+            entry["bound"] = max(1, math.ceil(entry.get("owed_chars", ahead) / entry["budget"]))
+
+
+def _expire(state, flight):
+    state["expired"] = state.get("expired", 0) + 1
+    for item in flight["out"]["routing_changes"]["items"]:
+        entry = state.get("entries", {}).get(item["entity"])
+        if entry and entry.get("revision") == item.get("revision"):
+            entry["expired"] = entry.get("expired", 0) + 1
+
+
+def _render(state, out, now, component, *, delivery_point=True):
+    entries = _merge(state, out)
+    if delivery_point:
+        _delivery_point(state, out, now)
     flight = state.get("flight")
     if flight and _parse(flight["until"]) > now:
         answer = copy.deepcopy(flight["out"])
         answer["generation"] = out.get("generation")
         return answer
     if flight:
-        state["expired"] = state.get("expired", 0) + 1
+        _expire(state, flight)
         state.pop("flight", None)
     # A receipt can arrive after the plan was rendered, through another
     # hook or identity. Suppress only the notice lines already acknowledged.
@@ -467,6 +507,8 @@ def offer(out, *, session=None, component="main"):
         answer["delivery_plan"] = out["delivery_plan"]
         return answer
     with _transaction(session) as data:
+        if component == "main":
+            data["attachment"] = {"component": "main", "at": _iso(now)}
         state = data.setdefault(component, {})
         answer = _render(state, out, now, component)
         _prune_agent_components(data, now, keep=component)
@@ -488,7 +530,7 @@ def refit(session, changes, body_limit):
         plan["force_pages"] = True
         out = dict(flight["out"], delivery_plan=plan)
         state.pop("flight")
-        answer = _render(state, out, _clock(), component)
+        answer = _render(state, out, _clock(), component, delivery_point=False)
         _prune_agent_components(data, _clock(), keep=component)
         return answer
 
@@ -847,21 +889,17 @@ def _delivery_summary(data, component, state, changes, now, counting_component):
         elif changes:
             # No main ledger yet: the same changes are still owed there.
             duplicates = [item["entity"] for item in changes["items"]]
+    from khipu.routing_health import component_health
+
     counting = data.get(counting_component) if counting_component else state
-    health = "green"
-    if isinstance(counting, dict):
-        expired = counting.get("expired", 0) or 0
-        flight = counting.get("flight")
-        if flight and _parse(flight["until"]) <= now:
-            expired += 1
-        if expired >= 2 and any(not e.get("acked") for e in (counting.get("entries") or {}).values()):
-            health = "red"
+    slack = counting.get("slack", 2) if isinstance(counting, dict) else 2
+    health = component_health(counting, now, slack=slack)["status"]
     return {"owed": sum(1 for e in entries.values() if not e.get("acked") and e["entity"] not in in_flight),
             "in_flight": len(in_flight), "acked_through": state.get("acked_through"),
             "duplicates_across_components": duplicates, "health": health}
 
 
-def pull_offer(out, *, session, component="mcp", counting_component=None, now=None, skip_entities=frozenset()):
+def pull_offer(out, *, session, component="mcp", counting_component=None, now=None, skip_entities=frozenset(), delivery_point=True):
     """Reserve (or re-send) one pull component's batch under its own lock.
 
     A live in-flight batch is re-sent byte-identically, so a dropped
@@ -876,6 +914,12 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
     with _transaction(session) as data:
         state = data.setdefault(component, {})
         entries = _merge(state, out)
+        data["attachment"] = {"component": counting_component, "at": _iso(now)}
+        if delivery_point:
+            _delivery_point(state, out, now)
+        if out["delivery_plan"].get("gateway"):
+            data["attachment"]["gateway"] = True
+            data["attachment"]["copy_checked_at"] = out["delivery_plan"].get("copy_checked_at")
         _prune_agent_components(data, now, keep=component)
         entries = state.get("entries", {})
         skip_entities = skip_entities | frozenset(e["entity"] for e in entries.values() if e.get("withheld"))
@@ -888,7 +932,7 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
             changes = copy.deepcopy(flight["out"]["routing_changes"])
             return _projected_pages(changes), _delivery_summary(data, component, state, changes, now, counting_component)
         if flight:
-            state["expired"] = state.get("expired", 0) + 1
+            _expire(state, flight)
             state.pop("flight", None)
         due = [e for e in entries.values() if not e.get("acked") and e["entity"] not in skip_entities]
         if not due:
@@ -986,6 +1030,7 @@ def child_offer(planned, *, session=None, component, now=None, cfg=None):
     def build(state):
         entries = _merge(state, planned)
         state["touched"] = _iso(now)
+        _delivery_point(state, planned, now)
         ordered = _child_sorted(entries.values())
         heading = planned["delivery_plan"]["heading"]
         if _size(heading) > limit:
@@ -1075,6 +1120,7 @@ def child_page(planned, *, session=None, component, now=None, cfg=None):
         state = data.setdefault(component, {})
         entries = _merge(state, planned)
         state["touched"] = _iso(now)
+        _delivery_point(state, planned, now)
         flight = state.get("flight")
         if flight and _parse(flight["until"]) > now:
             # Leased to a call that has not recorded delivery yet (the
@@ -1082,7 +1128,7 @@ def child_page(planned, *, session=None, component, now=None, cfg=None):
             _prune_agent_components(data, now, keep=component)
             return None
         if flight:
-            state["expired"] = state.get("expired", 0) + 1
+            _expire(state, flight)
             state.pop("flight", None)
         due = [e for e in _child_sorted(entries.values())
                if not e.get("acked") and e.get("offset", 0) < len(e["text"])
@@ -1217,6 +1263,7 @@ def pull_acknowledge(session, batch, *, component="mcp", now=None):
                 entry = state["entries"][item["entity"]]
                 entry["offset"] = flight["progress"][item["entity"]]
                 entry["acked"] = entry["offset"] == len(entry["text"])
+                entry["shown_offset"] = entry["offset"]
                 entry["pages"] = item.get("page", {}).get("n", 0)
                 entry["restarted"] = False
             batches = state.setdefault("batches", {})
@@ -1248,6 +1295,8 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
         state = data.setdefault(component, {})
         if reservation is not None and not state:
             state.update(copy.deepcopy(reservation))
+            if component == "main":
+                data["attachment"] = {"component": "main", "at": _iso(now)}
         if batch in state.get("batches", {}):
             return True
         flight = state.get("flight")
@@ -1261,6 +1310,7 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
                 return False
             e["offset"] = flight["progress"][item["entity"]]
             e["acked"] = e["offset"] == len(e["text"])
+            e["shown_offset"] = e["offset"]
             e["pages"] = item.get("page", {}).get("n", 0)
             e["restarted"] = False
         batches = state.setdefault("batches", {})

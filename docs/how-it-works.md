@@ -401,4 +401,12 @@ During the migration, memory exists as files and as database rows, so they can d
 
 `khipu doctor --quick` runs all the local health checks (imports, config, outbox, capture liveness, jobs, backups, launchers and more) and leaves out the hub, network and probe checks. `khipu doctor --probe` runs a fresh end-to-end recall test.
 
+Routing delivery has its own `routing_delivery` health check. It reports stalled
+budgeted pages, twice-expired leases, acknowledgements beyond shown receipts,
+today's routing skips, stale cross-Mac/gateway copies and hour-old unmatched
+limits. It reads recorded evidence only. Missing evidence is explicitly unknown;
+child and MCP receipts cannot satisfy a hooked parent's debt. This health row
+changes no routing or promotion gate. See [Delivery health](routing.md#delivery-health).
+
+
 For the full list of checks, backups and the promotion gate, see [operations.md](operations.md). For common questions see [faq.md](faq.md).
