@@ -33,7 +33,7 @@ from pathlib import Path
 
 # The scans forget runs, by the name a store gives.
 FORGET_SCANS = ("native jobs", "outbox", "legacy logs", "replica", "replica temps",
-                "legacy writers", "recall golden", "work view", "owner words", "routing words")
+                "legacy writers", "recall golden", "work view", "owner words")
 
 
 # The scrubs a restored file may go through, by the name an entry gives.
@@ -149,11 +149,21 @@ STORES: tuple[Store, ...] = (
           "owner words",
           _w("owner_direction._append", "owner_direction._log_locked", "owner_direction._write_private")),
     Store("routing delivery words", "capture home state/recall--*.routing.json and their rewrite temps",
-          "cached routing rules, proposals and notices, including owner words", "routing words",
+          "cached routing rules, proposals and notices, including owner words",
+          "kept: routing words have no episode provenance; they are the owner's rules, notes, holds "
+          "and conversations' proposals, removed through the routing commands that manage them "
+          "(khipu route rule retire, khipu route note end, khipu route hold end, "
+          "khipu route priority clear) or in Settings → Routing, not by forgetting an episode; "
+          "forget lists each copy as kept and an unreadable routing folder keeps the forget open",
           _w("routing_delivery._transaction")),
     Store("routing replication words", "data folder state/routing/remote.jsonl and .replication-* rewrites",
           "replicated routing rule, note and proposal text, including owner words; the same writer "
-          "also saves replication cursors and the Mac id", "routing words",
+          "also saves replication cursors and the Mac id",
+          "kept: routing words have no episode provenance; they are the owner's rules, notes, holds "
+          "and conversations' proposals, removed through the routing commands that manage them "
+          "(khipu route rule retire, khipu route note end, khipu route hold end, "
+          "khipu route priority clear) or in Settings → Routing, not by forgetting an episode; "
+          "forget lists each copy as kept and an unreadable routing folder keeps the forget open",
           _w("routing_replication._atomic")),
     Store("conversation media", "data folder media/conversation_memory/<sha256>.<ext>",
           "images found in transcripts, shared by content hash",
