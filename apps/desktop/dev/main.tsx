@@ -4,6 +4,7 @@
 import { StrictMode, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
+import { ChevronRight } from "lucide-react";
 import "../src/App.css";
 import "../src/routingOverview.css";
 import "../src/accounts.css";
@@ -37,6 +38,9 @@ import { ProjectsSettings } from "../src/ProjectsSettings";
 import type { ProjectsList } from "../src/ProjectsSettings";
 import { useCliState } from "../src/settingsCli";
 import type { UsageAccount } from "../src/PlansCard";
+import { PaceSection } from "../src/RoutingSettings";
+import { paceModel } from "../src/routingPace";
+import { PACE_NOW, PACE_PLANS, PACE_VIEW } from "./paceFake";
 import type { DiscoverResult, Support } from "../src/accountsApi";
 import {
   CLIENT,
@@ -134,6 +138,36 @@ function OfflineOwedStates() {
   );
 }
 
+/** The Pace group's body inside the page's own group card, with the dev
+ *  fixture shaped like `khipu route --json`. Screenshots only. */
+function PaceGroup() {
+  const model = paceModel(PACE_VIEW, PACE_PLANS, PACE_NOW);
+  const folds = { isOpen: () => false, toggle: () => {}, openKeys: () => {} };
+  return (
+    <div className="route-settings">
+      <div className="fold disclose route-group" data-open="true">
+        <button type="button" className="disclosure fold-btn" aria-expanded="true" data-settings-group="pace">
+          <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
+          <span className="gname">Pace, caps and advice</span>
+          <span className="gline">{model.line}</span>
+          <span className="gtags">
+            {model.tags.map((t) => (
+              <span key={t.text} className={["tag", t.tone === "neutral" ? "" : t.tone].filter(Boolean).join(" ")}>
+                <span className="dot" aria-hidden />{t.text}
+              </span>
+            ))}
+          </span>
+        </button>
+        <div className="fold-body">
+          <div className="disclose-body">
+            <PaceSection data={PACE_VIEW} plans={PACE_PLANS} now={PACE_NOW} folds={folds} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const PN = (name: string, role: "canonical" | "alias", extra: object = {}) => ({ name, role, open_commitments: 0, standing_decisions: 0, episodes: 0, ...extra });
 const PROJECTS_FIXTURE = {
   groups: [
@@ -178,7 +212,7 @@ function ProjectsHost({ withQuestion = true }: { withQuestion?: boolean }) {
   );
 }
 
-/** Settings -> Accounts and routing with only Proposals and holds open
+ /** Settings -> Accounts and routing with only Proposals and holds open
  *  (slice 15b), against the fictional record in fakeTauri. */
 function RoutingProposals() {
   useState(() => {
@@ -196,6 +230,7 @@ function RoutingProposals() {
 }
 
 const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNode }> = {
+  pace: { title: "Pace, caps and advice (fictional mock data)", render: () => <PaceGroup /> },
   "projects": { title: "Settings: Projects", fake: { projects: PROJECTS_FIXTURE }, render: () => <ProjectsHost /> },
   "projects-empty": { title: "Settings: Projects, none", fake: { projects: { groups: [], pairs: [], sweep: { result: null } } }, render: () => <ProjectsHost withQuestion={false} /> },
   "routing-proposals": { title: "Proposals and holds (slice 15b)", fake: { route15b: true }, render: () => <RoutingProposals /> },
@@ -315,7 +350,9 @@ function Page() {
     );
   }
   return (
-    <main style={{ padding: 24, maxWidth: hash.startsWith("projects") ? "none" : 960 }} data-state={hash}>
+    // The pace group is screenshotted at the Settings pane's own 720px width,
+    // so it wraps where the approved mock does rather than across a wider page.
+    <main style={{ padding: 24, maxWidth: hash === "pace" ? 744 : hash.startsWith("projects") ? "none" : 960 }} data-state={hash}>
       <h1 style={{ fontSize: 14, color: "var(--muted)" }}>{st.title}</h1>
       {st.render()}
     </main>
