@@ -1265,6 +1265,27 @@ describe("Settings -> Routing: providers and lanes", () => {
 // The advisory flags `khipu route --json` carries (slice 10's contradictions
 // and rule upkeep) and rule 12's confirmed model table, all display only.
 describe("Settings -> Routing: checks and copies", () => {
+  it("shows unreached owner directions and their count without offering an owner action", async () => {
+    const v = view();
+    Object.assign(v, { unreached_directions: [
+      { id: "rd-one", words: "Use GLM only one job at a time", project: "project-c", join: "joined", reason: null },
+      { id: "rd-two", words: "Keep Codex for builds", project: null, join: "unjoined", reason: "occurrence mismatch" },
+    ] });
+    answers.khipu_route_view = v;
+    await page();
+    const list = screen.getByRole("list", { name: "Said in a conversation, not in Khipu" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    expect(list).toHaveTextContent("“Use GLM only one job at a time”");
+    expect(list).toHaveTextContent("You said this in a conversation in project-c. Nothing in Khipu matches it.");
+    expect(list).toHaveTextContent("“Keep Codex for builds”");
+    expect(list).toHaveTextContent("The owner turn could not be matched: occurrence mismatch.");
+    expect(list).not.toHaveTextContent("null");
+    expect(within(list).queryAllByRole("button")).toHaveLength(0);
+    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("2 directions not in Khipu");
+    expect(screen.queryByText("Nothing to fix")).toBeNull();
+    expect(invokeMock.mock.calls.filter(([cmd]) => /dismiss|owner_act/.test(String(cmd)))).toHaveLength(0);
+  });
+
   const TIERS = {
     scope: "opus", mock: "opus", ruling: "opus", "hard-security": "opus", "failed-fix": "opus",
     build: "sonnet", "fix-round": "sonnet", tests: "sonnet", docs: "sonnet", synthesis: "sonnet",
