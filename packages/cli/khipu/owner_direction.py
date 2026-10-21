@@ -75,7 +75,8 @@ ACTIONS: frozenset[str] = frozenset({
     "route.definition.set", "route.pause", "route.lift", "route.clear", "route.note.set", "route.note.end", "route.rule.add",
     "route.rule.edit", "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo",
     "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.confirm",
-    "route.priority.undo", "route.priority.clear", "accounts.track", "accounts.rename", "accounts.stop",
+    "route.priority.undo", "route.priority.clear", "route.tier_table.set", "route.tier_table.confirm",
+    "route.tier_table.clear", "accounts.track", "accounts.rename", "accounts.stop",
     "accounts.move", "accounts.decline", "accounts.offer_again", "accounts.auto_track", "accounts.request.confirm",
     "accounts.request.undo", "config.usage_accounts", "config.routing_setting", "config.answer_request.confirm",
     "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel", "ledger.import",
@@ -1027,6 +1028,9 @@ def _before(want: dict):
             replaced = (held or {}).get("replaced")
             return {"entries": _priority_rows(replaced), "until": (replaced or {}).get("until")}
         return {"entries": _priority_rows(held), "until": (held or {}).get("until")}
+    if action.startswith("route.tier_table."):
+        held = routing.read_view().get("tier_table")
+        return {"tiers": dict(held["tiers"]) if held else None}
     if action == "accounts.rename":
         return {"label": next((a["label"] for a in routing.accounts() if a["key"] == target), None)}
     if action == "accounts.stop":
@@ -1138,7 +1142,7 @@ def _before(want: dict):
 def _after(want: dict, result) -> Any:
     if not isinstance(result, dict):
         return None
-    keep = ("id", "entity", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts")
+    keep = ("id", "entity", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts", "tiers")
     return {k: result[k] for k in keep if k in result} or None
 
 
@@ -1412,6 +1416,15 @@ def _undo_priority(line, via, holds=None):
                               _undo_default_holds=True)
 
 
+def _undo_tier_table(line, via):
+    from khipu import routing
+
+    tiers = _b(line).get("tiers")
+    if tiers:
+        return routing.set_tier_table(tiers, via=via)
+    return routing.clear_tier_table(via=via)
+
+
 def _undo_decline(line, via):
     from khipu import accounts
 
@@ -1521,6 +1534,9 @@ _UNDO = {
     "route.priority.confirm": _undo_priority,
     "route.priority.undo": _undo_priority,
     "route.priority.clear": _undo_priority,
+    "route.tier_table.set": _undo_tier_table,
+    "route.tier_table.confirm": _undo_tier_table,
+    "route.tier_table.clear": _undo_tier_table,
     "accounts.track": _undo_track,
     "accounts.rename": _undo_rename,
     "accounts.stop": _undo_stop,

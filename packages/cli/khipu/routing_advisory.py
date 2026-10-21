@@ -20,14 +20,17 @@ TIER_NAMES = frozenset({"opus", "sonnet", "haiku"})
 FIX_ROUND_OPUS = "Rule 12: fix rounds go to Sonnet; this dispatch is Opus. Say why if intended."
 _PENDING_AFTER = 24 * 3600
 _TASK_LINE = re.compile(r"(?im)^\s*task:\s*([a-z0-9-]+)\s*$")
-_TIME_WORD = re.compile(
-    r"\b(?:until|this week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
-    r"|\b\d{4}-\d{2}-\d{2}\b",
-    re.IGNORECASE,
-)
-_ISO_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
-_WEEKLY_RESET = re.compile(r"\bweekly reset\b", re.IGNORECASE)
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+# A date, weekday or reset sets a deadline only after one of these words; a
+# date anywhere else (a provenance note such as "(Matt 2026-10-12)") and the
+# bare word "until" followed by anything else are not deadlines.
+_PREP = r"(?:until|through|by|expires(?:\s+on)?)"
+_DATE_DEADLINE = re.compile(rf"\b{_PREP}\s+(?:on\s+)?(\d{{4}}-\d{{2}}-\d{{2}})\b", re.IGNORECASE)
+_WEEKDAY_DEADLINE = re.compile(
+    rf"\b{_PREP}\s+(?:on\s+)?({'|'.join(_WEEKDAYS)})\b", re.IGNORECASE)
+_WEEKDAY_ON_END = re.compile(
+    rf"\bon\s+(?:{'|'.join(_WEEKDAYS)})\b(?=\s*(?:[.!?;]|$))", re.IGNORECASE)
+_THIS_WEEK = re.compile(r"\bthis week\b", re.IGNORECASE)
 _STOP = frozenset(
     "a an the use for to of and or on in its this week until may handles handle "
     "with from by at be is are that it their your into".split()
@@ -71,7 +74,9 @@ def fold_facts(events: list[dict]) -> tuple[dict | None, list[dict]]:
     table = None
     directions: dict[str, dict] = {}
     for event in events:
-        if event.get("type") == "tier_table_set" and _authority(event):
+        if event.get("type") == "tier_table_clear" and _owner_written(event):
+            table = None
+        elif event.get("type") == "tier_table_set" and _authority(event):
             table = {"tiers": dict(event["tiers"]), "confirmed": True}
         elif event.get("type") == "direction_set" and _direction(event):
             directions[event["id"]] = {
@@ -81,9 +86,13 @@ def fold_facts(events: list[dict]) -> tuple[dict | None, list[dict]]:
     return table, list(directions.values())
 
 
-def _authority(event: dict) -> bool:
+def _owner_written(event: dict) -> bool:
     author = event.get("written_by") if isinstance(event.get("written_by"), dict) else {}
-    return (event.get("confirmed") is True and author.get("kind") == "owner"
+    return author.get("kind") == "owner"
+
+
+def _authority(event: dict) -> bool:
+    return (event.get("confirmed") is True and _owner_written(event)
             and valid_tiers(event.get("tiers")))
 
 
@@ -175,18 +184,19 @@ def _published_account(account, by_key: dict) -> str | None:
 def _hygiene(view: dict, now: datetime) -> list[dict]:
     rules = [rule for rule in (view.get("rules") or []) if isinstance(rule, dict)]
     by_key, by_label = _accounts(view)
-    resets = _weekly_resets(rules)
+    resets = _named_resets(rules)
     flags = []
     for rule in rules:
         text = rule.get("text") if isinstance(rule.get("text"), str) else ""
         named = _named(text, by_key, by_label)
         record = named[0] if named else None
-        if text and _TIME_WORD.search(text) and record and record.get("id"):
+        scoped = resets.get(record.get("key")) if record else None
+        if text and record and record.get("id") and _deadline_worded(text, scoped):
             flags.append(_flag(
                 "move_to_role", record["id"], [rule.get("entity")],
                 "Move this into the account's priority role with an until."))
         written = _parse(rule.get("at"))
-        if text and record and _expired(text, written, now, resets.get(record.get("key"))):
+        if text and record and _expired(text, written, now, scoped):
             flags.append(_flag(
                 "expired", record.get("id"), [rule.get("entity")],
                 "This standing rule's date or named reset has passed."))
@@ -261,21 +271,37 @@ def _pending(rules: list[dict], now: datetime) -> list[dict]:
     return flags
 
 
-def _expired(text: str, written: datetime | None, now: datetime, reset: datetime | None) -> bool:
-    for match in _ISO_DATE.finditer(text):
+def _reset_deadline(text: str, phrase: str) -> bool:
+    """A named reset sets a deadline after until/through/by/expires."""
+    return bool(re.search(
+        rf"\b{_PREP}\b[^.;]*?\b{re.escape(phrase)}\b", text, re.IGNORECASE))
+
+
+def _deadline_worded(text: str, scoped: list | None) -> bool:
+    """Time wording that belongs in a role: a deadline date, weekday or
+    named reset, "this week", or a weekday the rule is worded for ("on
+    Friday" at the end of its clause)."""
+    if _DATE_DEADLINE.search(text) or _WEEKDAY_DEADLINE.search(text) or _THIS_WEEK.search(text):
+        return True
+    if _WEEKDAY_ON_END.search(text):
+        return True
+    return any(_reset_deadline(text, phrase) for phrase, _at in scoped or [])
+
+
+def _expired(text: str, written: datetime | None, now: datetime, scoped: list | None) -> bool:
+    for match in _DATE_DEADLINE.finditer(text):
         if now >= _day_end(match.group(1)):
             return True
-    if written is not None:
-        low = text.casefold()
-        for index, name in enumerate(_WEEKDAYS):
-            if re.search(rf"\b{name}\b", low):
-                ahead = (index - written.weekday()) % 7
-                day = written.date() + timedelta(days=ahead)
-                end = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(days=1)
-                if now >= end:
-                    return True
-                break
-    return bool(_WEEKLY_RESET.search(text) and reset is not None and now >= reset)
+    match = _WEEKDAY_DEADLINE.search(text)
+    if match is not None and written is not None:
+        index = _WEEKDAYS.index(match.group(1).casefold())
+        ahead = (index - written.weekday()) % 7
+        day = written.date() + timedelta(days=ahead)
+        end = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(days=1)
+        if now >= end:
+            return True
+    return any(at is not None and now >= at and _reset_deadline(text, phrase)
+               for phrase, at in scoped or [])
 
 
 def _day_end(iso_day: str) -> datetime:
@@ -291,8 +317,24 @@ def _tokens(text: str, labels: list[str]) -> set[str]:
             if word not in banned and len(word) > 2}
 
 
-def _weekly_resets(rules: list[dict]) -> dict:
-    if not any(_WEEKLY_RESET.search(rule.get("text") or "") for rule in rules):
+def _reset_phrases(name: str) -> set[str]:
+    """The phrases a rule may name one window's reset by, from its name."""
+    spaced = name.replace("_", " ")
+    words = {"five_hour": "five-hour", "weekly": "week", "daily": "day"}.get(name)
+    if words is None and name.startswith("weekly_"):
+        words = f"{name.removeprefix('weekly_').replace('_', ' ')} week"
+    if words is None:
+        mins = re.fullmatch(r"(\d+)_min", name)
+        words = f"{mins.group(1)} min" if mins else spaced
+    candidates = {spaced, spaced.replace(" ", "-"), words, name}
+    return {f"{candidate} reset" for candidate in candidates if candidate}
+
+
+def _named_resets(rules: list[dict]) -> dict:
+    """Each account's windows as (reset phrase, time), plus ("reset", the
+    earliest) for a rule that names no window. Only that account's phrases
+    match its rules."""
+    if not any(re.search(r"\breset\b", rule.get("text") or "", re.IGNORECASE) for rule in rules):
         return {}
     from khipu import usage
 
@@ -300,19 +342,21 @@ def _weekly_resets(rules: list[dict]) -> dict:
         rows = usage._load_cache()
     except (OSError, ValueError, TypeError):
         return {}
-    found = {}
+    found: dict[str, list] = {}
     for key, row in (rows or {}).items():
         if not isinstance(row, dict):
             continue
+        scoped = []
         for window in row.get("windows") or []:
             if not isinstance(window, dict):
                 continue
-            name = str(window.get("name") or "")
-            if name != "weekly" and not name.startswith("weekly"):
-                continue
             at = _parse(window.get("resets_at"))
-            if at is not None:
-                found[key] = at
+            if at is None:
+                continue
+            scoped += [(phrase, at) for phrase in _reset_phrases(str(window.get("name") or ""))]
+        if scoped:
+            scoped.append(("reset", min(at for _phrase, at in scoped)))
+            found[key] = scoped
     return found
 
 
@@ -452,7 +496,7 @@ def task_class(brief: str | None) -> tuple[str | None, bool]:
         return match.group(1), False
     low = (brief or "").casefold()
     for name, phrases in _GUESSES:
-        if any(phrase in low for phrase in phrases):
+        if any(re.search(rf"(?<![a-z0-9-]){re.escape(phrase)}(?![a-z0-9-])", low) for phrase in phrases):
             return name, True
     return None, False
 

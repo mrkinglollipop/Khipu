@@ -340,10 +340,13 @@ def test_10_priority_role_restatement_names_rule_and_role(replay):
 
 
 @pytest.mark.parametrize("age", [24 * 3600 + 1, 25 * 3600], ids=["just-over-24h", "25h"])
-def test_10_old_pending_edit_lists_owner_confirmation_and_drop_directions(replay, age):
+def test_10_old_pending_edit_lists_owner_confirmation_and_drop_directions(replay, age, monkeypatch):
     rule = routing.add_rule("Codex handles synthetic tests.", via="app")
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s1")
+    shown = routing.conversation_view()
     routing.request_rule("Codex handles synthetic docs.", n=rule["n"], author=AUTHOR,
-                         owner_request="Change this synthetic rule.")
+                         owner_request="Change this synthetic rule.",
+                         base=shown["rules"][0]["owner_revision"])
     replay.advance(age)
     found = flags(replay, "rule_hygiene", "mcp")
     matching = [f for f in found if f.get("kind") == "long_pending" and rule["entity"] in f.get("entities", [])]
@@ -358,18 +361,24 @@ def test_10_old_pending_edit_lists_owner_confirmation_and_drop_directions(replay
 
 
 @pytest.mark.parametrize("age", [0, 24 * 3600])
-def test_10_pending_edit_not_old_until_strictly_over_24_hours(replay, age):
+def test_10_pending_edit_not_old_until_strictly_over_24_hours(replay, age, monkeypatch):
     rule = routing.add_rule("Codex handles synthetic tests.", via="app")
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s1")
+    shown = routing.conversation_view()
     routing.request_rule("Codex handles synthetic docs.", n=rule["n"], author=AUTHOR,
-                         owner_request="Change this synthetic rule.")
+                         owner_request="Change this synthetic rule.",
+                         base=shown["rules"][0]["owner_revision"])
     replay.advance(age)
     assert not any(f.get("kind") == "long_pending" for f in flags(replay, "rule_hygiene", "mcp"))
 
 
-def test_10_confirming_old_edit_clears_only_its_long_pending_flag(replay):
+def test_10_confirming_old_edit_clears_only_its_long_pending_flag(replay, monkeypatch):
     rule = routing.add_rule("Codex handles synthetic tests.", via="app")
+    monkeypatch.setenv("KHIPU_SESSION_ID", "s1")
+    shown = routing.conversation_view()
     routing.request_rule("Codex handles synthetic docs.", n=rule["n"], author=AUTHOR,
-                         owner_request="Change this synthetic rule.")
+                         owner_request="Change this synthetic rule.",
+                         base=shown["rules"][0]["owner_revision"])
     replay.advance(25 * 3600)
     expect(any(f.get("kind") == "long_pending" for f in flags(replay, "rule_hygiene", "mcp")),
            True, "10: old edit has no pending flag before confirmation")

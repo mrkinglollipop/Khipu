@@ -5809,6 +5809,71 @@ def clear_priority(*, via: str, now: datetime | None = None, expect=None) -> dic
         return _owner_write({"type": "priority_clear"}, via)
 
 
+# ---- the rule 12 tier table (slice 10) ---------------------------------------------------
+#
+# A structured fact the owner confirms once, like a pace cap: only a
+# confirmed, owner-written table governs the dispatch check. A conversation's
+# table stays a proposal until the owner confirms or replaces it.
+
+
+def _checked_tiers(tiers) -> dict:
+    from khipu.routing_advisory import valid_tiers
+
+    if not valid_tiers(tiers):
+        raise RouteError("a tier table names every task class (scope, mock, ruling, hard-security, "
+                         "failed-fix, build, fix-round, tests, docs, synthesis, mechanical) with a tier: "
+                         "opus, sonnet or haiku")
+    return dict(tiers)
+
+
+def set_tier_table(tiers, *, via: str, now: datetime | None = None) -> dict:
+    """The owner's tier table, confirmed as written."""
+    rows = _checked_tiers(tiers)
+    return dict(_owner_write({"type": "tier_table_set", "tiers": rows, "confirmed": True}, via),
+                tiers=rows)
+
+
+def request_tier_table(tiers, *, owner_request: str, author: dict | None = None, via: str = "mcp",
+                       now: datetime | None = None) -> dict:
+    """A conversation's proposed tier table: recorded, never governing until
+    the owner confirms it (``confirm_tier_table`` or his own set)."""
+    rows = _checked_tiers(tiers)
+    request_words = _one_line(owner_request)
+    if not request_words:
+        raise RouteError("describe the owner's request in one line")
+    by = dict(author or conversation_author())
+    if by.get("kind") != "conversation":
+        by = conversation_author()
+    written, view = _write({"type": "tier_table_set", "tiers": rows, "confirmed": False,
+                            "pending": True, "owner_request": _clean(request_words, 0),
+                            "written_by": by, "via": via})
+    return dict(_done(written, view), tiers=rows, pending=True)
+
+
+def _proposed_tiers() -> dict | None:
+    proposed = None
+    for event in _in_write_order(read_events()[0]):
+        if event.get("type") == "tier_table_set" and event.get("confirmed") is not True:
+            from khipu.routing_advisory import valid_tiers
+
+            if valid_tiers(event.get("tiers")):
+                proposed = dict(event["tiers"])
+    return proposed
+
+
+def confirm_tier_table(*, via: str, now: datetime | None = None) -> dict:
+    """Confirm the latest proposed tier table, as the owner wrote it."""
+    proposed = _proposed_tiers()
+    if proposed is None:
+        raise RouteError("there is no proposed tier table to confirm")
+    return set_tier_table(proposed, via=via, now=now)
+
+
+def clear_tier_table(*, via: str, now: datetime | None = None) -> dict:
+    """Remove the tier table, so no table governs the dispatch check."""
+    return _owner_write({"type": "tier_table_clear"}, via)
+
+
 # ---- words ----------------------------------------------------------------------------
 
 
@@ -7577,7 +7642,10 @@ OWNER_ACTIONS = {"pause": "Pausing an account", "lift": "Lifting a pause", "clea
                  "confirm_rule": "A standing rule", "undo_rule": "A standing rule",
                  "dismiss_rule": "A standing rule", "priority": "The owner's priority",
                  "set_priority": "The owner's priority", "confirm_priority": "The owner's priority",
-                 "undo_priority": "The owner's priority", "clear_priority": "The owner's priority"}
+                 "undo_priority": "The owner's priority", "clear_priority": "The owner's priority",
+                 "tier_table": "The tier table", "set_tier_table": "The tier table",
+                 "tier_table_set": "The tier table", "confirm_tier_table": "The tier table",
+                 "clear_tier_table": "The tier table"}
 OWNER_REFUSAL = ("{what} is the owner's to change: in the app (Settings \u2192 Routing) or on a terminal with "
                  "`khipu route`, which asks for a typed confirmation. A conversation can report what it "
                  "learned about an account and add or end its holds.")
@@ -8758,6 +8826,57 @@ def _priority_cli(args, now: datetime) -> int:
     return 0
 
 
+def _tier_table_arg(args) -> dict:
+    raw = getattr(args, "tiers", None)
+    if raw is None:
+        raise RouteError('--tiers must be JSON: {"scope": "opus", "mock": "opus", ...}')
+    try:
+        tiers = _loads(raw)
+    except ValueError:
+        raise RouteError('--tiers must be JSON: {"scope": "opus", "mock": "opus", ...}') from None
+    if not isinstance(tiers, dict):
+        raise RouteError("--tiers must be a JSON object naming each task class's tier")
+    return tiers
+
+
+def _tier_table_cli(args, now: datetime) -> int:
+    """``khipu route tier-table``: show it; a conversation proposes one at the
+    owner's request (``--at-owner-request``, never governing); or the owner's
+    set, confirm and clear, after a typed yes or from the app."""
+    action = args.action or "show"
+    if action == "show":
+        view = read_view(now)
+        _print_json({"tier_table": view.get("tier_table")})
+        return 0
+    if getattr(args, "at_owner_request", None) is not None:
+        if action != "set":
+            raise RouteError("--at-owner-request is only for tier-table set: confirming and clearing are "
+                             "the owner's")
+        _print_json(request_tier_table(_tier_table_arg(args), owner_request=args.at_owner_request,
+                                       author=conversation_author(), via="cli", now=now))
+        return 0
+    via = _owner_via(args, _intent_or_none(_tier_table_intent, args, action))
+    if via is None:
+        _print_json({"ok": False, "error": _REFUSED})
+        return 2
+    now = _now()
+    if action == "set":
+        out = set_tier_table(_tier_table_arg(args), via=via, now=now)
+    elif action == "confirm":
+        out = confirm_tier_table(via=via, now=now)
+    else:
+        out = clear_tier_table(via=via, now=now)
+    _print_json(_finish_owner(out))
+    return 0
+
+
+def _tier_table_intent(args, action: str) -> dict | None:
+    from khipu import owner_direction
+
+    facts = {"tiers": _tier_table_arg(args)} if action == "set" else None
+    return owner_direction.intent(f"route.tier_table.{action}", "tier_table", facts=facts)
+
+
 def _finish_owner(out: dict) -> dict:
     from khipu import owner_direction
 
@@ -8951,6 +9070,8 @@ def run_cli(args) -> int:
             return 0
         if cmd == "priority":
             return _priority_cli(args, now)
+        if cmd == "tier-table":
+            return _tier_table_cli(args, now)
         if cmd == "rule" and getattr(args, "at_owner_request", None) is not None:
             # The rule's words are the positional words, as for the owner's
             # add and edit; the flag carries the owner's request.

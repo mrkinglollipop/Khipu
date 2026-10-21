@@ -5781,8 +5781,18 @@ def build_parser() -> argparse.ArgumentParser:
     rdef.add_argument("--value", required=True, metavar="JSON")
     rdef.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rdef)
+    rtier = rt_sub.add_parser(
+        "tier-table", parents=[rt_json],
+        help="The rule 12 tier table: show it; set, confirm or clear it (asks for a typed confirmation)")
+    rtier.add_argument("action", nargs="?", default="show", choices=("show", "set", "confirm", "clear"))
+    rtier.add_argument("--tiers", "--value", dest="tiers", default=None, metavar="JSON",
+                       help='set: {"scope": "opus", "mock": "opus", ...} naming every task class')
+    rtier.add_argument("--at-owner-request", default=None, metavar="REQUEST",
+                       help="A conversation: the owner's request, in one line (set only; stays a proposal)")
+    rtier.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rtier)
 
-    for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule, rdef):
+    for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule, rdef, rtier):
         writer.add_argument("--op", default=None, help="Retry identity; reuse for the same change")
 
     dec = sub.add_parser(

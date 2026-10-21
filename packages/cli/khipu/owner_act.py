@@ -39,6 +39,9 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
+    "route.tier_table.set": (("tiers",), ()),
+    "route.tier_table.confirm": ((), ()),
+    "route.tier_table.clear": ((), ()),
     "accounts.track": (("entries",), ("expect",)),
     "accounts.rename": (("account", "name"), ("expect",)),
     "accounts.stop": (("account",), ("expect",)),
@@ -120,7 +123,13 @@ def _values(action: str, args) -> dict:
     for key, value in args.items():
         if value is None:
             continue
-        if action == "route.definition.set" and key == "value":
+        if action == "route.tier_table.set" and key == "tiers":
+            from khipu.routing_advisory import valid_tiers
+
+            if not valid_tiers(value):
+                raise _bad("tiers must name every task class with a tier of opus, sonnet or haiku")
+            value = dict(value)
+        elif action == "route.definition.set" and key == "value":
             from khipu import routing_entries
 
             value = routing_entries.checked_definition(args.get("definition"), value)
@@ -229,6 +238,10 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["route", "hold"], ["end", v["hold"]]
     if action.startswith("route.priority."):
         return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
+    if action == "route.tier_table.set":
+        return ["route", "tier-table", "set", "--tiers=" + json.dumps(v["tiers"])], []
+    if action.startswith("route.tier_table."):
+        return ["route", "tier-table", verb], []
     if action == "accounts.track":
         return ["accounts", "track", *_opts(v, "entries", "expect")], []
     if action in ("accounts.rename", "accounts.stop", "accounts.move"):
