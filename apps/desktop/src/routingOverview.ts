@@ -214,18 +214,29 @@ export function routingProblems(
     });
   }
   if (plansError && !plans) out.push({ key: "plans-read", group: "accounts", kind: "plans-read", tone: "warn" });
+  // Live proposals (slice 15b) already give every pending rule and the
+  // pending priority one Needs you line below; a pending thing a live
+  // proposal covers must not be counted again under its own group.
+  const proposals = proposalsModel(view, now);
+  const coveredPriority = proposals.live.some((r) => r.proposal.kind === "priority");
+  const coveredRule = (n: number, entity?: string) =>
+    proposals.live.some((r) => r.proposal.kind === "rule" && (r.proposal.entity === entity || r.proposal.n === n));
   if (view.priority?.pending) {
     out.push({ key: "priority", group: "priority", kind: "priority", tone: "warn",
-      needs: "A conversation changed your priority: confirm or undo it", show: "the priority to confirm", item: "priority:pending" });
+      ...(coveredPriority
+        ? {}
+        : { needs: "A conversation changed your priority: confirm or undo it", show: "the priority to confirm" }),
+      item: "priority:pending" });
   }
   const toConfirm = (view.rules ?? []).filter((r) => r.pending || (r.seeded && !r.confirmed));
   for (const r of toConfirm) out.push({ key: `confirm:${r.n}`, group: "rules", kind: "confirm", tone: "warn" });
-  if (toConfirm.length) {
-    // One Needs you line for all of them, pointing at the first.
-    const first = out.find((p) => p.kind === "confirm")!;
-    first.needs = toConfirm.length === 1 ? "1 standing rule to confirm" : `${toConfirm.length} standing rules to confirm`;
-    first.show = toConfirm.length === 1 ? "the standing rule to confirm" : "the standing rules to confirm";
-    first.item = `rule:${toConfirm[0].n}`;
+  const uncovered = toConfirm.filter((r) => !coveredRule(r.n, r.entity));
+  if (uncovered.length) {
+    // One Needs you line for the uncovered ones only, pointing at the first.
+    const first = out.find((p) => p.key === `confirm:${uncovered[0].n}`)!;
+    first.needs = uncovered.length === 1 ? "1 standing rule to confirm" : `${uncovered.length} standing rules to confirm`;
+    first.show = uncovered.length === 1 ? "the standing rule to confirm" : "the standing rules to confirm";
+    first.item = `rule:${uncovered[0].n}`;
   }
   for (const { rule, checks } of brokenRules(view)) {
     const said = (checks[0]?.text ?? "").replace(/^A standing rule may be broken: /, "").replace(/\.$/, "");
@@ -234,7 +245,6 @@ export function routingProblems(
       needs: `Standing rule ${rule} may be broken${said ? `: ${said}` : r ? `: it says ${ruleWords(r.text)}` : ""}`,
       show: `standing rule ${rule}`, item: `rule:${rule}` });
   }
-  const proposals = proposalsModel(view, now);
   proposals.live.forEach((row, i) => {
     out.push({ key: `proposal:${row.proposal.id}`, group: "holds", kind: "proposal", tone: "warn",
       ...(i === 0

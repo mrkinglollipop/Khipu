@@ -80,9 +80,11 @@ function rowFor(view: RouteView, p: RouteProposal, now: Date): ProposalRow {
 
 export type ProposalsModel = {
   live: ProposalRow[];
-  /** Crossed or overtaken, still shown beside the live ones. */
+  /** Crossed only, still shown beside the live ones. An overtaken proposal
+   *  has ended: the owner wrote over it, so it belongs with the ended. */
   stale: ProposalRow[];
-  /** Everything that has ended, newest last as the record keeps it. */
+  /** Everything that has ended (crossed apart, in the main list), newest
+   *  last as the record keeps it. */
   ended: ProposalRow[];
   endedToday: number;
 };
@@ -93,7 +95,7 @@ const ENDED_WORDS: Record<string, string> = {
   expired: "ended after 7 days",
   confirmed: "confirmed",
   undone: "undone",
-  overtaken: "overtaken by a newer write",
+  overtaken: "replaced by you",
   crossed: "crossed",
 };
 
@@ -104,15 +106,17 @@ export function endedWords(status: string): string {
 export function proposalsModel(view: RouteView, now: Date): ProposalsModel {
   const all = Object.values(view.proposals ?? {}).map((p) => rowFor(view, p, now));
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const endedToday = all.filter((r) => {
-    const at = r.proposal.ended_at ?? r.proposal.at;
-    const t = at ? new Date(at).getTime() : NaN;
-    return r.proposal.status !== "live" && !Number.isNaN(t) && t >= today;
+  const ended = all.filter((r) => r.proposal.status !== "live" && r.proposal.status !== "crossed");
+  // Only a recorded ended time says when a proposal ended; the CLI does not
+  // set one for every ending, and the write time is not the ending.
+  const endedToday = ended.filter((r) => {
+    const t = r.proposal.ended_at ? new Date(r.proposal.ended_at).getTime() : NaN;
+    return !Number.isNaN(t) && t >= today;
   }).length;
   return {
     live: all.filter((r) => r.proposal.status === "live"),
-    stale: all.filter((r) => r.proposal.status === "crossed" || r.proposal.status === "overtaken"),
-    ended: all.filter((r) => r.proposal.status !== "live"),
+    stale: all.filter((r) => r.proposal.status === "crossed"),
+    ended,
     endedToday,
   };
 }

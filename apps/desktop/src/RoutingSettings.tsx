@@ -1007,7 +1007,7 @@ function PrioritySection({
           <span>
             <b>{priorityPendingWords(p)}</b>
           </span>
-          {p.owner_request ? <span>What it said you asked: “{p.owner_request}”</span> : null}
+          {p.owner_request && !p.proposal_withheld ? <span>What it said you asked: “{p.owner_request}”</span> : null}
           <span>
             It replaced:{" "}
             {p.replaced?.entries.length
@@ -2202,14 +2202,23 @@ function ProposalRowView({
     setAsk(null);
     setEditConfirm(false);
   };
+  const ruleMissing = p.kind === "rule" && !rule;
+  const refuse = (id: string) => {
+    w.fail(id, "That rule isn't in this read, so nothing was sent. Read the routing record again, then try again.");
+    return Promise.resolve(false);
+  };
   const confirm = () =>
-    p.kind === "rule" && rule
-      ? attempt(confirmId, "khipu_route_rule", { action: "confirm", n: rule.n })
-      : attempt(confirmId, "khipu_route_priority", { action: "confirm", expect });
+    ruleMissing
+      ? refuse(confirmId)
+      : p.kind === "rule" && rule
+        ? attempt(confirmId, "khipu_route_rule", { action: "confirm", n: rule.n })
+        : attempt(confirmId, "khipu_route_priority", { action: "confirm", expect });
   const dismiss = () =>
-    p.kind === "rule" && rule
-      ? w.run(dismissId, "khipu_route_rule", { action: "dismiss", n: rule.n })
-      : w.run(dismissId, "khipu_route_priority", { action: "undo", expect });
+    ruleMissing
+      ? refuse(dismissId)
+      : p.kind === "rule" && rule
+        ? w.run(dismissId, "khipu_route_rule", { action: "dismiss", n: rule.n })
+        : w.run(dismissId, "khipu_route_priority", { action: "undo", expect });
   return (
     <div className="mrow prop" role="listitem" data-route-item={`proposal:${p.id}`} tabIndex={-1}>
       <span className="name">{row.name}</span>
@@ -2220,18 +2229,21 @@ function ProposalRowView({
             {row.withheld
               ? "Its words stay on the Mac it came from, so confirm it there. It is already in use everywhere."
               : `In use now${row.owner ? " on top of your words" : ""}${ends ? `; ends ${whenLocal(ends, now)} unless you confirm it` : ""}.`}
-            {p.kind === "priority" && data.priority?.owner_request ? (
+            {p.kind === "priority" && !row.withheld && data.priority?.owner_request ? (
               <> What it said you asked: “{data.priority.owner_request}”</>
             ) : null}
           </>
         ) : p.status === "crossed" ? (
           <>{row.by}. It was written against an older version, so it never took effect. Its author was told.</>
         ) : (
-          <>{row.by}. A newer write took its place, so it is no longer in use.</>
+          <>{row.by}. You replaced it with your own write, so it has ended.</>
         )}
       </span>
+      {live && ruleMissing ? (
+        <span>That rule isn't in this read, so this proposal can't be confirmed or dismissed here. Read the routing record again, then try again.</span>
+      ) : null}
       <span className="end">
-        {live ? <Tag tone="accent" dot>In use</Tag> : p.status === "crossed" ? <Tag tone="warn" dot>Crossed</Tag> : <Tag dot>Overtaken</Tag>}
+        {live ? <Tag tone="accent" dot>In use</Tag> : p.status === "crossed" ? <Tag tone="warn" dot>Crossed</Tag> : <Tag dot>{endedWords(p.status)}</Tag>}
       </span>
       {live && !row.withheld ? (
         <div className="prop-side">
@@ -2245,7 +2257,7 @@ function ProposalRowView({
           </div>
         </div>
       ) : null}
-      {live ? (
+      {live && !ruleMissing ? (
         <div className="acts">
           {!row.withheld ? (
             <button type="button" className="sm primary" disabled={w.isBusy(confirmId)}
@@ -2328,14 +2340,15 @@ function ProposalsSection({ data, w, now }: { data: RouteView; w: Writer; now: D
   const eok = useEndOrKeep(w);
   const [ask, setAsk] = useState<{ id: string; kind: string } | null>(null);
   const [showEnded, setShowEnded] = useState(false);
-  const ended = model.ended.filter((r) => r.proposal.status !== "crossed" && r.proposal.status !== "overtaken");
+  const ended = model.ended;
   const endedCounts = ended
     .filter((r) => {
-      const at = r.proposal.ended_at ?? r.proposal.at;
+      const at = r.proposal.ended_at;
       return at != null && new Date(at).getTime() >= new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
     })
     .reduce<Record<string, number>>((acc, r) => ({ ...acc, [r.proposal.status]: (acc[r.proposal.status] ?? 0) + 1 }), {});
-  const endedToday = Object.values(endedCounts).reduce((a, b) => a + b, 0);
+  const endedToday = model.endedToday;
+  const anyDatedEnd = ended.some((r) => r.proposal.ended_at);
   const rows = [...model.live, ...model.stale];
   return (
     <div className="section-body">
@@ -2361,11 +2374,17 @@ function ProposalsSection({ data, w, now }: { data: RouteView; w: Writer; now: D
       ) : null}
       {ended.length ? (
         <p className="set-help">
-          Ended today: {endedToday}
-          {Object.keys(endedCounts).length
-            ? ` (${Object.entries(endedCounts).map(([s, n]) => `${n} ${endedWords(s)}`).join(", ")})`
-            : ""}
-          .{" "}
+          {anyDatedEnd ? (
+            <>
+              Ended today: {endedToday}
+              {Object.keys(endedCounts).length
+                ? ` (${Object.entries(endedCounts).map(([s, n]) => `${n} ${endedWords(s)}`).join(", ")})`
+                : ""}
+              .{" "}
+            </>
+          ) : (
+            <>Ended: {ended.length}. </>
+          )}
           <button type="button" className="sm" aria-expanded={showEnded} onClick={() => setShowEnded((v) => !v)}>
             {showEnded ? "Hide" : "Show"}
           </button>

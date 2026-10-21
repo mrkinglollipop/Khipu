@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { RoutingSettings } from "../RoutingSettings";
-import { holdChoiceIds, holdChoiceTargets, proposalsModel } from "../routingProposals";
+import { endedWords, holdChoiceIds, holdChoiceTargets, proposalsModel } from "../routingProposals";
 import type { RouteView } from "../routing";
 
 const invokeMock = vi.fn();
@@ -215,6 +215,82 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     ]));
   });
 
+  it("never shows the owner-request words of a withheld priority proposal, in either priority section", async () => {
+    answers.khipu_route_view = view({
+      priority: {
+        entries: [{ account: "codex|", label: "Codex", role: "Paced: at most 15 points ahead of an even pace" }],
+        pending: true, pending_by: "a Codex conversation in project-b", proposal_withheld: true,
+        owner_request: "SECRET OWNER WORDS",
+        replaced: { entries: [{ account: "codex|", label: "Codex", role: "Paced: at most 10 points ahead of an even pace" }], until: null },
+        version: "p3",
+      },
+    });
+    await page();
+    expect(document.body.textContent).not.toContain("SECRET OWNER WORDS");
+    expect(document.body.textContent).not.toContain("What it said you asked");
+    const list = screen.getByRole("list", { name: "Proposals" });
+    const prio = within(list).getByText("Your priority").closest(".mrow")!;
+    expect(prio).toHaveTextContent("Its words stay on the Mac it came from");
+  });
+
+  it("puts an overtaken proposal in the ended group, labelled as replaced by the owner, not in the main list", async () => {
+    answers.khipu_route_view = view({
+      proposals: {
+        "prop-crossed": { id: "prop-crossed", entity: "rule-b", kind: "rule", n: 6, status: "crossed", at: "2026-10-14T12:00:00Z",
+          author: { kind: "conversation", harness: "grok_build", project: "project-d" } },
+        "prop-overtaken": { id: "prop-overtaken", entity: "rule-z", kind: "rule", n: 8, status: "overtaken", at: "2026-10-13T12:00:00Z",
+          author: { kind: "conversation", harness: "codex", project: "project-b" } },
+      },
+    });
+    await page();
+    const list = screen.getByRole("list", { name: "Proposals" });
+    expect(within(list).getByText("Rule 6")).toBeInTheDocument();
+    expect(within(list).queryByText("Rule 8")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show" }));
+    const ended = await screen.findByRole("list", { name: "Ended proposals" });
+    const row = within(ended).getByText("Rule 8").closest(".mrow")!;
+    expect(row).toHaveTextContent(/replaced by you/i);
+  });
+
+  it("refuses a rule proposal whose rule is not in this read, and never sends the priority command", async () => {
+    answers.khipu_route_view = view({
+      proposals: {
+        "prop-missing": { id: "prop-missing", entity: "rule-missing", kind: "rule", n: 4, status: "live", at: "2026-10-14T15:15:00Z",
+          author: { kind: "conversation", harness: "claude_code", project: "project-a" } },
+      },
+    });
+    await page();
+    const list = screen.getByRole("list", { name: "Proposals" });
+    const row = within(list).getByText("Rule 4").closest(".mrow")! as HTMLElement;
+    expect(row).toHaveTextContent(/isn't in this read/);
+    expect(within(row).queryByRole("button", { name: "Confirm the proposed rule 4" })).toBeNull();
+    expect(within(row).queryByRole("button", { name: "Dismiss the proposed rule 4" })).toBeNull();
+    expect(calls("khipu_route_priority")).toEqual([]);
+    expect(calls("khipu_route_rule")).toEqual([]);
+  });
+
+  it("lists each thing to confirm once in Needs you, under the proposals line alone", async () => {
+    await page();
+    const needs = screen.getByRole("region", { name: "Needs you" });
+    const lines = within(needs).getAllByRole("listitem").map((li) => li.querySelector("span")!.textContent);
+    expect(lines).toEqual(["2 proposals from conversations to confirm"]);
+  });
+
+  it("does not call an ended proposal 'today' when it has no ended time, however recent its write time", async () => {
+    answers.khipu_route_view = view({
+      proposals: {
+        "prop-undated": { id: "prop-undated", entity: "rule-c", kind: "rule", n: 9, status: "dismissed", at: "2026-10-14T09:00:00Z",
+          author: { kind: "conversation", harness: "codex", project: "project-b" } },
+      },
+    });
+    render(<RoutingSettings active />);
+    const show = await screen.findByRole("button", { name: "Show" });
+    expect(screen.queryByText(/Ended today/)).toBeNull();
+    fireEvent.click(show);
+    const ended = await screen.findByRole("list", { name: "Ended proposals" });
+    expect(ended).toHaveTextContent("Rule 9");
+  });
+
   it("shows the proposal-text switch in Telling conversations, on by default", async () => {
     await page();
     const sw = screen.getByRole("switch", { name: /Share proposal words between your Macs/ });
@@ -243,8 +319,39 @@ describe("Proposals and holds: the pure model", () => {
     const model = proposalsModel(view(), MORNING);
     expect(model.live.map((r) => r.name)).toEqual(["Rule 1", "Your priority"]);
     expect(model.stale.map((r) => r.proposal.status)).toEqual(["crossed"]);
-    expect(model.ended.map((r) => r.proposal.status)).toEqual(["crossed", "dismissed"]);
+    expect(model.ended.map((r) => r.proposal.status)).toEqual(["dismissed"]);
     expect(model.live[0].owner).toBe("Use at most 80% of the xAI week.");
     expect(model.live[0].proposed).toBe("Use at most 76% of the xAI week.");
+  });
+
+  it("counts overtaken as ended, with a label that says the owner replaced it", () => {
+    const v = view({
+      proposals: {
+        "prop-overtaken": { id: "prop-overtaken", entity: "rule-z", kind: "rule", n: 8, status: "overtaken", at: "2026-10-13T12:00:00Z",
+          author: { kind: "conversation", harness: "codex", project: "project-b" } },
+      },
+    });
+    const model = proposalsModel(v, MORNING);
+    expect(model.live).toEqual([]);
+    expect(model.stale).toEqual([]);
+    expect(model.ended.map((r) => r.proposal.status)).toEqual(["overtaken"]);
+    expect(endedWords("overtaken")).toMatch(/replaced by you/i);
+  });
+
+  it("counts Ended today only from an ended time, never from the write time", () => {
+    const undated = view({
+      proposals: {
+        "prop-undated": { id: "prop-undated", entity: "rule-c", kind: "rule", n: 9, status: "dismissed", at: "2026-10-14T09:00:00Z",
+          author: { kind: "conversation", harness: "codex", project: "project-b" } },
+      },
+    });
+    expect(proposalsModel(undated, MORNING).endedToday).toBe(0);
+    const dated = view({
+      proposals: {
+        "prop-dated": { id: "prop-dated", entity: "rule-c", kind: "rule", n: 9, status: "dismissed", at: "2026-10-13T09:00:00Z",
+          ended_at: "2026-10-14T09:00:00Z", author: { kind: "conversation", harness: "codex", project: "project-b" } },
+      },
+    });
+    expect(proposalsModel(dated, MORNING).endedToday).toBe(1);
   });
 });
