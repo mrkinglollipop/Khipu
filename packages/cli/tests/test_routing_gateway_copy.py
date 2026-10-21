@@ -155,7 +155,7 @@ def test_debounce_last_change_retry_and_switch_off(gw):
             return routing._iso(routing._now())
         def delete(self, publisher):
             self.calls.append("deleted")
-        def health_rows(self):
+        def health_rows(self, **kwargs):
             return []
     hub = Hub()
     assert gc.publish(hub=hub)["pending"]

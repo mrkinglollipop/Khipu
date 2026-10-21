@@ -225,6 +225,10 @@ def doctor_block(view, now, cfg):
                                    for e, r, stamp in gateway_rows])
             if stale:
                 reasons.append("gateway-stale")
+        if publication.get("gateway_rows_truncated"):
+            missing.append("gateway delivery snapshot truncated")
+            if gateway["status"] == "green":
+                gateway["status"] = "unknown"
         if publication.get("error"):
             missing.append("gateway publication failed; retry pending")
             gateway["publication_error"] = publication["error"]

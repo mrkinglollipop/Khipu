@@ -6,12 +6,18 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import tempfile
 import contextlib
 import uuid
 from datetime import timedelta
 
 from khipu import routing
+
+DELIVERY_RETENTION_SECONDS = 7 * 24 * 3600
+DELIVERY_PRUNE_LIMIT = 1000
+HEALTH_ROW_LIMIT = 512
+HEALTH_REFRESH_SECONDS = 60
 
 UNAVAILABLE = "routing copy hub or durable delivery ledger unavailable; acknowledgement not confirmed; retry the same batch"
 
@@ -89,20 +95,43 @@ class PostgresHub:
                 row = cur.fetchone()
         return dict(projection=row[0], published_at=routing._iso(row[1]), stale_after=row[2]) if row else None
 
-    def health_rows(self):
+    @staticmethod
+    def _prune_delivery(cur, now):
+        # A live lease wins over the age bound. SKIP LOCKED avoids waiting
+        # behind a receipt transaction refreshing an otherwise old identity.
+        cur.execute("DELETE FROM routing_gateway_delivery WHERE identity IN ("
+                    "SELECT identity FROM routing_gateway_delivery "
+                    "WHERE coalesce(state->>'last_delivery_point', '') < %s "
+                    "AND coalesce(state->'flight'->>'until', '') <= %s "
+                    "ORDER BY state->>'last_delivery_point', identity LIMIT %s FOR UPDATE SKIP LOCKED)",
+                    (routing._iso(now - timedelta(seconds=DELIVERY_RETENTION_SECONDS)),
+                     routing._iso(now), DELIVERY_PRUNE_LIMIT))
+
+    def health_rows(self, *, now=None, live_after=None):
         from khipu import db
+        now = now or routing._now()
+        live_after = routing.settings()["routing_delivery_live_after"] if live_after is None else live_after
+        window = min(live_after or DELIVERY_RETENTION_SECONDS, DELIVERY_RETENTION_SECONDS)
         with db.connect(statement_timeout_s=5) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT identity, state FROM routing_gateway_delivery")
+                self._prune_delivery(cur, now)
+                # Transfer health fields only, never ack history or batch state.
+                # One extra row lets the caller report truncation honestly.
+                cur.execute("SELECT identity, state->>'copy_epoch', state->'copy_revision', "
+                            "state->>'copy_revision_at', state->>'last_delivery_point', "
+                            "state->'pending_points', state->'expired' FROM routing_gateway_delivery "
+                            "WHERE state->>'last_delivery_point' >= %s AND state->>'last_delivery_point' <= %s "
+                            "ORDER BY state->>'last_delivery_point' DESC, identity LIMIT %s",
+                            (routing._iso(now - timedelta(seconds=window)), routing._iso(now), HEALTH_ROW_LIMIT + 1))
                 rows = []
-                for identity, state in cur.fetchall():
+                for identity, epoch, revision, revision_at, at, pending, expired in cur.fetchall():
                     reasons = []
-                    if state.get("pending_points", 0) >= 3:
+                    if (pending or 0) >= 3:
                         reasons.append("budget-stall")
-                    if state.get("expired", 0) >= 2:
+                    if (expired or 0) >= 2:
                         reasons.append("lease-expired-twice")
-                    rows.append(dict(identity=identity, copy_epoch=state.get("copy_epoch"), copy_revision=state.get("copy_revision"),
-                                     copy_revision_at=state.get("copy_revision_at"), at=state.get("last_delivery_point"),
+                    rows.append(dict(identity=identity, copy_epoch=epoch, copy_revision=revision,
+                                     copy_revision_at=revision_at, at=at,
                                      status="red" if reasons else "green", reasons=reasons, missing=[]))
                 return rows
 
@@ -117,6 +146,7 @@ class PostgresHub:
         revision = _digest({k: v for k, v in body.items() if k not in {"as_of", "stale", "stale_message"}})
         with db.connect(statement_timeout_s=5) as conn:
             with conn.cursor() as cur:
+                self._prune_delivery(cur, now)
                 # Serialize first insert as well as subsequent row updates.
                 cur.execute("SELECT pg_advisory_xact_lock(%s)", (int(identity[:15], 16),))
                 cur.execute("SELECT state FROM routing_gateway_delivery WHERE identity=%s FOR UPDATE", (identity,))
@@ -170,8 +200,8 @@ def status():
         return {}
 
 
-def _save(state):
-    path = _path()
+def _save(state, *, path=None):
+    path = path or _path()
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".gateway-copy-", dir=path.parent)
     try:
@@ -190,34 +220,95 @@ def _save(state):
             os.unlink(temporary)
 
 
+def _publisher(*, create):
+    if create:
+        with routing._lock():
+            salt, mac = routing._id_salt(), routing._mac_locked()
+    else:
+        # Revocation must reconstruct the id without minting a new identity.
+        mac = routing._local_mac()
+        try:
+            salt = (routing.routing_dir() / "id-salt").read_bytes()
+        except FileNotFoundError:
+            return None
+        if mac is None or len(salt) < 16:
+            return None
+    return hmac.new(salt, ("gateway-copy:" + mac).encode(), hashlib.sha256).hexdigest()
+
+
+def _publishers_path():
+    return routing.routing_dir() / "gateway-publishers.json"
+
+
+def _publishers(state):
+    try:
+        journal = json.loads(_publishers_path().read_text())
+    except (OSError, ValueError):
+        journal = []
+    candidates = [state.get("publisher")]
+    for values in (journal, state.get("publishers")):
+        if isinstance(values, list):
+            candidates.extend(values)
+    return {value for value in candidates if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)}
+
+
+def _failed(state, now):
+    # Exceptions can contain DSNs or local paths; expose fixed codes only.
+    if state is not None:
+        state["error"] = "copy_publish_failed"
+        state["failures"] = min(6, state.get("failures", 0) + 1)
+        state["retry_at"] = routing._iso(now + timedelta(seconds=min(300, 5 * 2 ** state["failures"])))
+        try:
+            _save(state)
+        except OSError:
+            pass
+    return {"ok": False, "error": "copy_publish_failed"}
+
+
 def publish(*, force=False, now=None, hub=None):
     """Trailing debounce and bounded retry, polled independently of refolding."""
     now = now or routing._now()
-    state = None
+    state, acquired, attempting_lock = None, False, False
     try:
-        # A separate process lock protects manual pushes versus daemon ticks;
-        # no network call holds the routing fold lock.
         from khipu.routing_replication import _sync_lock
-        # A disabled, never-published record must not create even a lock file.
         state = status()
-        if not routing.settings()["routing_cloud_copy"] and not state.get("publisher"):
+        if (not routing.settings()["routing_cloud_copy"] and not _publishers(state)
+                and _publisher(create=False) is None):
             return {"ok": True, "disabled": True}
+        attempting_lock = True
         with _sync_lock():
+            acquired, attempting_lock = True, False
             state = status()
             cfg = routing.settings()
             enabled = cfg["routing_cloud_copy"]
-            if not enabled and not state.get("publisher"):
+            publisher = _publisher(create=enabled)
+            known = _publishers(state)
+            if publisher:
+                known.add(publisher)
+            if not known:
                 return {"ok": True, "disabled": True}
+            used = sorted(known)
+            if (not enabled and not force and state.get("disabled") and not state.get("error")
+                    and state.get("publisher") == publisher and state.get("publishers") == used):
+                return {"ok": True, "disabled": True}
+            # Keep the journal independently of replaceable publication state.
+            # Both ids are durable before a delete or upload can commit remotely.
+            _save(used, path=_publishers_path())
+            state["publishers"] = used
+            _save(state)
             hub = hub or PostgresHub()
             if not enabled:
-                hub.delete(state["publisher"])
-                _save({})
+                for previous in used:
+                    hub.delete(previous)
+                _save(dict(publisher=publisher, publishers=used, disabled=True))
                 return {"ok": True, "disabled": True, "deleted": True}
-            with routing._lock():
-                publisher = hmac.new(
-                    routing._id_salt(), ("gateway-copy:" + routing._mac_locked()).encode(), hashlib.sha256).hexdigest()
             if state.get("publisher") != publisher:
-                state = {"publisher": publisher}
+                for previous in used:
+                    if previous != publisher:
+                        hub.delete(previous)
+                state = dict(publisher=publisher, publishers=used)
+                _save(state)
+            state.pop("disabled", None)
             from khipu import agent_view
             with agent_view.pull_projection():
                 view = routing.read_view(now)
@@ -244,20 +335,20 @@ def publish(*, force=False, now=None, hub=None):
             state.update(digest=digest, published_at=published_at, epoch=projection["epoch"],
                          revision=projection["version"], folded_at=projection["folded_at"], error=None,
                          retry_at=None, failures=0)
-            state["gateway_rows"] = hub.health_rows()
+            refreshed = routing._parse(state.get("health_refreshed_at"))
+            if force or refreshed is None or (now - refreshed).total_seconds() >= HEALTH_REFRESH_SECONDS:
+                rows = hub.health_rows(now=now, live_after=cfg["routing_delivery_live_after"])
+                state["gateway_rows"] = rows[:HEALTH_ROW_LIMIT]
+                state["gateway_rows_truncated"] = len(rows) > HEALTH_ROW_LIMIT
+                state["health_refreshed_at"] = routing._iso(now)
             _save(state)
             return {"ok": True, "published": True, "epoch": state["epoch"], "revision": state["revision"]}
+    except BlockingIOError:
+        if attempting_lock and not acquired:
+            return {"ok": True, "skipped": "busy"}
+        return _failed(state, now)
     except Exception:
-        # Exceptions can contain DSNs or local paths; expose fixed codes only.
-        if state is not None:
-            state["error"] = "copy_publish_failed"
-            state["failures"] = min(6, state.get("failures", 0) + 1)
-            state["retry_at"] = routing._iso(now + timedelta(seconds=min(300, 5 * 2 ** state["failures"])))
-            try:
-                _save(state)
-            except OSError:
-                pass
-        return {"ok": False, "error": "copy_publish_failed"}
+        return _failed(state, now)
 
 
 def answer(*, identity, account=None, ack="", now=None, hub=None):

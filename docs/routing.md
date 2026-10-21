@@ -259,11 +259,20 @@ including polls that do not refold. Changes use a trailing
 `routing_cloud_copy_debounce` (30 seconds by default); failures retry with
 bounded exponential backoff. An unchanged copy gets a heartbeat at most every
 60 seconds (or half the stale bound when shorter). `khipu route copy publish`
-forces an immediate attempt, bypassing debounce/backoff. Turning the switch off
-removes only this Mac's row on the next poll/manual publish; if the hub is down,
-the deletion remains pending and health reports the failure. Other Macs' rows
-are independent. With no previous publication and the switch off, no hub
-connection is attempted.
+forces an immediate attempt, bypassing debounce/backoff. Lock contention skips
+that tick without changing health or starting backoff; actual publication and
+revocation failures remain retryable errors.
+
+A salted publisher id change (including Mac-id restore) first deletes all
+retired ids known to this Mac before adopting the replacement. The full set of
+used ids is kept in both publication state and an independent durable
+`gateway-publishers.json` journal. Turning the switch off deletes every recorded
+id plus the id recomputed from the persisted salt and Mac id, even if
+`gateway-copy.json` is missing or corrupt. Deletion failures preserve the ids
+for retry; another Mac's row is never included. Completed revocations retain
+the history and skip redundant daemon deletes. A Mac without a persisted
+routing identity or recorded publisher stays offline when the switch is off;
+an existing identity with lost publication state requires a hub cleanup attempt.
 
 Only `gateway_projection` computed with the **Mac's** switches and then strictly
 scrubbed is uploaded. `routing_cloud_copy_rules` controls confirmed rules, note
@@ -290,8 +299,18 @@ acks consume nothing. Receipt changes commit before a response reports them.
 A missing table, database outage or failed receipt commit returns
 `available: false` with a fixed durable-ledger-unavailable reason. It never
 accepts an ack in memory and silently loses it on restart. Owner writes remain
-refused. Receipt metadata is fetched by the Mac publisher for delivery health;
-health itself never contacts the hub.
+refused. Receipt rows inactive for more than seven days are pruned in batches
+of at most 1,000 during gateway delivery and health refreshes. A live in-flight
+lease is retained. At the retention boundary receipts remain; after pruning,
+an old ack is unknown and consumes nothing, and the full current copy is offered
+again.
+
+The Mac refreshes receipt health at most once a minute during normal publishing;
+a forced manual publish refreshes it immediately. SQL returns health fields
+only, restricted to the configured live-delivery window (at most seven days)
+and at most 512 rows. A probe for one additional row detects truncation, which
+makes health unknown with a named missing-evidence reason. Batch and ack history
+never travel back to the Mac. Health display itself never contacts the hub.
 
 
 | Tool | What it does |
