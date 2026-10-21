@@ -55,7 +55,13 @@ DeepSeek provider facts and an account; existing provider restrictions are kept.
 `label`, `family`, `login` (`folder` or `none`), `probe` (`claude`, `codex`,
 `grok`, `muse`, `glm`, `http-quota`, or `none`), optional hostname `host`,
 `lane_names`, optional exact model ids in `models_allowed` and `models_never`,
-and `use` (`normal` or `on_request`). `http-quota` is reserved for slice 9b.
+and `use` (`normal` or `on_request`). With `probe: http-quota` and a `host`,
+the periodic usage refresh reads `https://<host>/` for each account of the
+provider: HTTPS only to that confirmed host, redirects refused, and the key
+stored as `<provider>_api_key` read from the Keychain only at request time
+and sent only in the request header. Only the parsed quota windows are
+kept; failures carry a fixed code (a redirect is `redirect_refused`), never
+a response body or header.
 Account definitions name the provider; login folders remain local bindings.
 No adapter or provider fact launches a probe by itself. Model and use checks
 are advisory. DeepSeek's rule 13 model restriction is `models_allowed: [deepseek-flash]`,
