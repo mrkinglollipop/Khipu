@@ -77,7 +77,9 @@ mkdir -p "$LOG_DIR" 2>/dev/null
 # broke the code signature and made Gatekeeper report "Khipu is damaged" (0.3.15,
 # withdrawn). mkdir failure is fail-open: PYTHONPYCACHEPREFIX to a missing dir
 # just disables caching, never blocks the hook.
-PYTHONPYCACHEPREFIX="${HOME}/Library/Caches/Khipu/pycache"
+if [ -z "${PYTHONPYCACHEPREFIX:-}" ]; then
+  PYTHONPYCACHEPREFIX="${HOME}/Library/Caches/Khipu/pycache"
+fi
 mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null
 export PYTHONPYCACHEPREFIX
 PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"

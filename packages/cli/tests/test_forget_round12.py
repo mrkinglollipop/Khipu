@@ -317,6 +317,7 @@ INJECT = {
     "recall golden": lambda mp, tmp: recall_eval.default_golden_path().mkdir(parents=True),
     "work view": lambda mp, tmp: _deny_listing(mp, lambda: work.view_file().parent),
     "owner words": lambda mp, tmp: (owner_turns._ensure_folder(), _deny_listing(mp, owner_turns.folder)),
+    "routing words": lambda mp, tmp: _deny_listing(mp, sc.state_dir),
 }
 
 

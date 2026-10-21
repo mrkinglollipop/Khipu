@@ -317,7 +317,7 @@ def test_every_writer_of_the_override_goes_through_the_owner_gate():
     body = inspect.getsource(cli._config_gate_override)
     assert body.index("_owner_only(") < body.index("set_gate_ignore(")
     body = inspect.getsource(owner_direction.run_cli)
-    assert body.index("routing._owner_via(args, want)") < body.index("out = undo(args.id, via)")
+    assert body.index("routing._owner_via(args, want)") < body.index("out = undo(args.id, via,")
 
 
 # ---- the hub steps and the queue ---------------------------------------------
