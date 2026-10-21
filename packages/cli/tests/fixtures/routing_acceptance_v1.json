@@ -1,0 +1,92 @@
+{
+  "schema": "routing_replay_v1",
+  "events": [
+    {
+      "type": "evidence",
+      "id": "e1",
+      "written_at": 0,
+      "via": "mcp",
+      "written_by": {
+        "kind": "conversation",
+        "harness": "codex",
+        "project": "p1",
+        "session": "s1"
+      },
+      "account": "a1",
+      "state": "open",
+      "source": "report"
+    },
+    {
+      "type": "hold",
+      "id": "e2",
+      "written_at": 3600,
+      "via": "mcp",
+      "written_by": {
+        "kind": "conversation",
+        "harness": "codex",
+        "project": "p1",
+        "session": "s1"
+      },
+      "scope": {
+        "kind": "account",
+        "account": "a1"
+      },
+      "reason": "keep",
+      "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "until": 604800,
+      "owner": false
+    },
+    {
+      "type": "evidence",
+      "id": "e3",
+      "written_at": 172800,
+      "via": "mcp",
+      "written_by": {
+        "kind": "conversation",
+        "harness": "claude_code",
+        "project": "p1",
+        "session": "s2"
+      },
+      "account": "a2",
+      "state": "limited",
+      "source": "report",
+      "until": 259200
+    },
+    {
+      "type": "evidence",
+      "id": "e4",
+      "written_at": 432000,
+      "via": "mcp",
+      "written_by": {
+        "kind": "conversation",
+        "harness": "claude_code",
+        "project": "p1",
+        "session": "s2"
+      },
+      "account": "a2",
+      "state": "open",
+      "source": "report"
+    },
+    {
+      "type": "priority_set",
+      "id": "e5",
+      "written_at": 435600,
+      "via": "mcp",
+      "written_by": {
+        "kind": "conversation",
+        "harness": "claude_code",
+        "project": "p1",
+        "session": "s2"
+      },
+      "pending": true,
+      "entries": [
+        {
+          "account": "a1",
+          "label": "a1",
+          "role": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      ],
+      "owner_request": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    }
+  ]
+}

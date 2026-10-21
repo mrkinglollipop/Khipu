@@ -47,6 +47,8 @@ IMPORTED_HASH_PREFIX = "imported:"
 MASS_REBUILD_MIN_DOCS = 20
 MASS_REBUILD_MAX_FRACTION = 0.10
 NIGHTLY_LIBRARY_CHUNKS = int(os.environ.get("KHIPU_LIBRARY_NIGHTLY_CHUNKS", "500"))
+NIGHTLY_CONNECT_ATTEMPTS = 3
+NIGHTLY_CONNECT_DELAY_S = 1.0
 SCAN_COMMIT_EVERY = 25          # documents per commit
 IMPORT_BATCH = 500              # rows per executemany + commit
 STATUS_SAMPLE = 10
@@ -715,6 +717,7 @@ def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False,
                         _log(f"{name}: stopping: {exc}")
                         break
                     stats["failed"] += len(batch)
+                    stats["last_provider_failure"] = embed.provider_failure(exc)
                     if "API key not found" in str(exc) and not stats.get("embed_provider"):
                         stats["embed_provider"] = "missing key"
                     _log(f"{name}: batch failed ({type(exc).__name__}): {exc}; continuing")
@@ -789,6 +792,8 @@ def backfill_all(conn) -> dict[str, Any]:
                 ok=sc["ok"] and bf_ok,
                 status=bf["status"] if sc["ok"] else "partial",
             )
+            if bf.get("last_provider_failure"):
+                item["last_provider_failure"] = bf["last_provider_failure"]
             if not sc["ok"]:
                 item["scan"] = sc
             if not item["ok"]:
@@ -811,11 +816,38 @@ def backfill_all(conn) -> dict[str, Any]:
 
 
 def nightly() -> dict[str, Any]:
-    """``backfill_all`` over one short connection (the job's entry point)."""
-    from khipu.db import connect
+    """``backfill_all`` over one short connection (the job's entry point).
 
-    with connect() as conn:
-        return backfill_all(conn)
+    Only acquiring the connection is retried (the hub_errors rule: the
+    connect timed out, was refused, or dropped), a bounded number of times
+    with doubling backoff — one transient timeout must not leave every
+    library unswept until tomorrow. Once a connection is open, any failure
+    from ``backfill_all`` or from closing the connection raises at once:
+    the sweep commits per batch, so re-running it after such a failure
+    could replay committed work. An error from a hub that answered also
+    raises at once.
+    """
+    from khipu.db import connect
+    from khipu.hub_errors import unreachable_error
+
+    delay = NIGHTLY_CONNECT_DELAY_S
+    for attempt in range(1, NIGHTLY_CONNECT_ATTEMPTS + 1):
+        try:
+            conn = connect()
+            break
+        except Exception as exc:  # noqa: BLE001 — re-raised unless a retryable hub failure
+            if attempt >= NIGHTLY_CONNECT_ATTEMPTS or not unreachable_error(exc):
+                raise
+            _log(
+                f"nightly: {type(exc).__name__}: {exc}; "
+                f"retry {attempt + 1}/{NIGHTLY_CONNECT_ATTEMPTS} in {delay:.0f}s"
+            )
+            time.sleep(delay)
+            delay *= 2
+    else:
+        raise AssertionError("nightly retry loop exhausted")
+    with conn as opened:
+        return backfill_all(opened)
 
 
 # ---- doctor ---------------------------------------------------------------------

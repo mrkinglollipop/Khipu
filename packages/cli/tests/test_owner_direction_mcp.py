@@ -254,21 +254,39 @@ def test_a_pending_rule_is_not_confirmed_with_no_owner_turn(world):
     assert routing.read_view()["rules"][0]["pending"] is True
 
 
-def _pending_priority() -> str:
+def _pending_priority(world) -> str:
+    world.server("proposal-author")
+    shown = routing.conversation_view()
     out = routing.request_priority([{"account": "Codex"}, {"account": "Claude"}], owner_request="the owner asked",
                                    author={"harness": "grok_bot", "session": "bot-1"}, via="mcp",
-                                   expect=routing.priority_version())
+                                   expect=routing.priority_version(), base=shown["priority_owner_revision"])
     assert out["ok"] is True
     return routing.priority_version()
 
 
 def test_a_pending_priority_confirmed_by_direction(world):
-    version = _pending_priority()
+    version = _pending_priority(world)
     world.say("yes confirm it", session="s-1")
     world.server("s-1")
     is_error, out = _act("route.priority.confirm", {"expect": version})
     assert not is_error and out["ok"] is True, out
     assert routing.read_view()["priority"]["pending"] is False
+
+
+def test_owner_act_accepts_hold_choices_for_priority_and_rule_add(world):
+    hold = routing.add_hold("wait for Grok", scope="account", account="Grok", reason="keep", owner=True, via="app")
+    choices = {hold["id"]: "keep"}
+    world.say("set Grok's priority", session="s-priority")
+    world.server("s-priority")
+    is_error, out = _act("route.priority.set", {"entries": [{"account": "Grok", "role": "build"}],
+                                                  "expect": routing.priority_version(), "holds": choices})
+    assert not is_error and out["ok"] is True, out
+    world.say("add Grok's rule", session="s-rule")
+    world.server("s-rule")
+    is_error, out = _act("route.rule.add", {"text": "Grok builds", "holds": choices})
+    assert not is_error and out["ok"] is True, out
+    actions = _log()
+    assert [line["facts"]["holds"] for line in actions[-2:]] == [choices, choices]
 
 
 def _pending_setting(world) -> None:

@@ -13,6 +13,9 @@ import { fmtAgoSince } from "./time";
 export type RouteAuthor = { kind?: string; harness?: string; project?: string; session?: string; name?: string };
 
 export type RouteWitness = {
+  model?: string | null;
+  family?: string | null;
+  transport?: string | null;
   id?: string;
   source?: string;
   written_by?: RouteAuthor;
@@ -81,6 +84,8 @@ export type RouteHold = {
 export type RouteRule = {
   n: number;
   text: string;
+  /** The rule's stable id, as the advisory flags name it (`routing_advisory`). */
+  entity?: string;
   seeded?: boolean;
   confirmed?: boolean;
   /** A live conversation request awaiting the owner's reconfirmation. */
@@ -110,6 +115,18 @@ export type RouteRunner = {
   files?: Record<string, RouteRunnerFile>;
   lanes?: string[];
   unmatched_lanes?: string[];
+  /** What the CLI's shared resolver says (routing.py `resolve_lane`): the
+   *  account label it matched, how, the candidates when it couldn't, and why a
+   *  declaration was refused (`reason`, e.g. "launcher evidence contradicts
+   *  the declaration"). */
+  lane_matches?: Record<string, {
+    account: string | null;
+    matched_by: string | null;
+    candidates: string[];
+    identity_state?: string | null;
+    reason?: string | null;
+    field_to_add?: string | null;
+  }>;
 };
 
 export type RouteLane = { runner: string; lane: string; until?: string | null };
@@ -192,6 +209,10 @@ export type RoutePriorityEntry = {
   until?: string | null;
   /** False when the account is no longer in Settings -> Models. */
   in_settings?: boolean;
+  /** A level the owner worded into the role, while it lasts (`routing.py`
+   *  keeps `level` beside the entry; the CLI marks stale words in its own
+   *  lines). */
+  level?: { claim: string; as_of?: string | null; until?: string | null } | null;
 };
 
 /** The owner's priority: his order of accounts, never Khipu's. A pending one
@@ -230,7 +251,60 @@ export type PlanFact = {
   reset_passed?: boolean;
 };
 
+/** Rule 12's model table, once the owner has confirmed it (slice 10). Only a
+ *  confirmed table reaches `route --json`; a proposal waiting for the owner
+ *  stays in the event log. */
+export type RouteTierTable = {
+  tiers: Record<string, "opus" | "sonnet" | "haiku" | string>;
+  confirmed: boolean;
+};
+
+/** One advisory contradiction (`routing_advisory._contradictions`): a priority
+ *  or rule naming a held or paused account, a down or untracked priority entry,
+ *  or two structured directions that disagree. Never a gate. */
+export type RouteContradiction = {
+  kind: "account_state" | "opposite_directions" | string;
+  /** The account's stable id. */
+  account?: string;
+  /** The ids of the lines that disagree (a rule's or priority's entity, or
+   *  the two directions). */
+  entities: string[];
+  /** Khipu's own sentence; the app words the row itself where it can. */
+  text: string;
+  advisory: true;
+  state?: string;
+  source?: "priority" | "rule" | string;
+};
+
+/** One rule-upkeep flag (`routing_advisory._hygiene`): a dated rule, a passed
+ *  date, two rules on one topic, a role restating a rule, or an edit a
+ *  conversation made that has waited on the owner. */
+export type RouteHygiene = {
+  kind: "move_to_role" | "expired" | "overlap" | "role_restates_rule" | "long_pending" | string;
+  /** The account's stable id, when the flag names one. */
+  account?: string;
+  /** The rule's `entity` (and, for an overlap or a restated role, the second
+   *  rule or the priority's entity). */
+  entities: string[];
+  text: string;
+  advisory: true;
+  owner_direction?: { confirm?: string; drop?: string };
+};
+
+export type RouteProvider = {
+  id: string;
+  label: string;
+  family: string;
+  login?: string;
+  probe?: string;
+  lane_names?: string[];
+  models_allowed?: string[];
+  models_never?: string[];
+  use?: string;
+};
+
 export type RouteView = {
+  definitions?: { providers?: Record<string, RouteProvider>; accounts?: Record<string, unknown> };
   record?: boolean;
   version?: number;
   /** The priority's version, also when none is set (`version_moved` guard). */
@@ -263,6 +337,13 @@ export type RouteView = {
   plan_facts?: Record<string, PlanFact>;
   /** Whether conversations hear accounts in pace order when no priority is set. */
   pace_order?: boolean;
+  /** Rule 12's table, only once the owner has confirmed it (slice 10). */
+  tier_table?: RouteTierTable | null;
+  /** Advisory contradictions and rule upkeep for this read (slice 10). Each
+   *  is derived on every read, so a passed date or a long wait appears as
+   *  soon as the clock passes it. */
+  contradictions?: RouteContradiction[];
+  rule_hygiene?: RouteHygiene[];
 };
 
 export type Tone = "ok" | "warn" | "err" | null;
@@ -378,7 +459,7 @@ export function midSentence(reason: string): string {
   return reason;
 }
 
-const CLI_NAMES: Record<string, string> = { claude: "Claude", codex: "Codex", grok: "Grok", muse: "Muse" };
+const CLI_NAMES: Record<string, string> = { claude: "Claude", codex: "Codex", grok: "Grok", muse: "Muse", glm: "GLM", cursor: "Cursor" };
 
 function cliName(harness: string): string {
   return CLI_NAMES[harness] ?? harness;

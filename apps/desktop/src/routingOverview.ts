@@ -7,11 +7,12 @@
    (`brokenRules`, `quietRunners` in routing.ts). */
 
 import { accountClassification, brokenRules, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
-import type { PlanFact, RouteView } from "./routing";
+import type { PlanFact, RouteProvider, RouteView } from "./routing";
+import { checksLine, checksModel } from "./routingChecks";
 import { keptWindow, passingGapHeld, planStatus } from "./PlansCard";
 import type { UsageAccount, UsageReport } from "./PlansCard";
 
-export type GroupKey = "accounts" | "priority" | "rules" | "holds" | "telling" | "resets" | "runners" | "table" | "changes";
+export type GroupKey = "accounts" | "priority" | "rules" | "holds" | "checks" | "telling" | "resets" | "runners" | "table" | "changes";
 
 /** The groups in page order. A link from elsewhere names one by its key
  *  (`data-settings-group`); the what's-new items use accounts, priority and
@@ -21,9 +22,10 @@ export const GROUPS: ReadonlyArray<{ key: GroupKey; name: string; record: boolea
   { key: "priority", name: "Priority and pace", record: true },
   { key: "rules", name: "Your note and standing rules", record: true },
   { key: "holds", name: "Holds", record: true },
+  { key: "checks", name: "Checks and copies", record: true },
   { key: "telling", name: "Telling conversations", record: false },
   { key: "resets", name: "Checking for resets", record: false },
-  { key: "runners", name: "Job runners and lanes", record: true },
+  { key: "runners", name: "Providers and lanes", record: true },
   { key: "table", name: "Old routing table file", record: false },
   { key: "changes", name: "Recent changes", record: true },
 ];
@@ -88,7 +90,7 @@ export function lanesWithoutAccount(view: RouteView, s: OverviewSettings): { run
     if (!out.some((x) => x.runner === runner && x.lane === lane)) out.push({ runner, lane });
   };
   if (s.routing) {
-    for (const r of view.sources?.runners ?? []) for (const lane of r.lanes ?? []) if (!map[r.name]?.[lane]) add(r.name, lane);
+    for (const r of view.sources?.runners ?? []) for (const lane of r.lanes ?? []) if (!map[r.name]?.[lane] && !r.lane_matches?.[lane]?.account) add(r.name, lane);
     // Matched to a name Khipu doesn't know: the lane row says so in warn.
     const known = (t: string) => (view.accounts ?? []).some((a) => a.label === t || a.key === t);
     for (const [runner, lanes] of Object.entries(map)) {
@@ -97,6 +99,68 @@ export function lanesWithoutAccount(view: RouteView, s: OverviewSettings): { run
   }
   for (const u of view.unmatched ?? []) add(u.runner, u.lane);
   return out;
+}
+
+/** One provider in the Providers and lanes group: the owner's facts (slice
+ *  9a) over the built-in ones an account's harness names. */
+export type ProviderRow = {
+  id: string;
+  label: string;
+  family: string;
+  /** The adapter that reads its plan: a definition's `probe`, or the
+   *  built-in's; null when Khipu knows neither. */
+  probe: string | null;
+  models_allowed?: string[];
+  models_never?: string[];
+  use?: string;
+  /** The account labels Khipu knows on this provider. */
+  accounts: string[];
+};
+
+/** The built-ins, as the app words them. A provider with a definition takes
+ *  its label, family and probe from there instead. */
+const BUILTIN_PROVIDERS: Record<string, { label: string; family: string; probe: string }> = {
+  claude: { label: "Claude", family: "Anthropic", probe: "claude" },
+  codex: { label: "Codex", family: "OpenAI", probe: "codex" },
+  grok: { label: "Grok", family: "xAI", probe: "grok" },
+  glm: { label: "GLM", family: "Zhipu", probe: "none" },
+  muse: { label: "Muse", family: "Meta", probe: "none" },
+};
+
+/** The mock's order (docs/mockups/2026-10-21-routing/lanes-light.html);
+ *  providers it doesn't name come after, by label. */
+const PROVIDER_ORDER = ["claude", "codex", "grok", "glm", "deepseek", "muse", "antigravity"];
+
+/** Every provider Khipu can say something about: one row per id, whether the
+ *  owner defined it or only an account's harness names it. */
+export function providerRows(view: RouteView): ProviderRow[] {
+  const rows: ProviderRow[] = [];
+  const add = (id: string, def?: RouteProvider) => {
+    const builtin = BUILTIN_PROVIDERS[id];
+    const accounts = (view.accounts ?? [])
+      .filter((a) => a.harness === id || a.key.startsWith(`${id}:`))
+      .map((a) => a.label);
+    if (!def && !builtin && !accounts.length) return;
+    if (rows.some((r) => r.id === id)) return;
+    rows.push({
+      id,
+      label: def?.label ?? builtin?.label ?? id,
+      family: def?.family ?? builtin?.family ?? "",
+      probe: def?.probe ?? builtin?.probe ?? null,
+      models_allowed: def?.models_allowed,
+      models_never: def?.models_never,
+      use: def?.use,
+      accounts,
+    });
+  };
+  const definitions = view.definitions?.providers ?? {};
+  for (const id of Object.keys(definitions)) add(id, definitions[id]);
+  for (const a of view.accounts ?? []) if (a.harness) add(a.harness);
+  const rank = (r: ProviderRow) => {
+    const at = PROVIDER_ORDER.indexOf(r.id);
+    return at === -1 ? PROVIDER_ORDER.length : at;
+  };
+  return rows.sort((a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label));
 }
 
 /** Every problem on the page (scope rule 1), each from one source. */
@@ -184,10 +248,28 @@ export function routingProblems(
       needs: `Khipu refused the ${name} folder: it is inside a private folder`, show: `the ${name} folder`, item: `runner:${name}` });
   }
   for (const { runner, lane } of lanesWithoutAccount(view, s)) {
+    const match = (view.sources?.runners ?? []).find((r) => r.name === runner)?.lane_matches?.[lane];
+    // A lane whose declared account its launcher contradicts: the lane row
+    // says how, so it counts under its own tag, not Needs you.
+    if (match?.reason === "launcher evidence contradicts the declaration") {
+      out.push({ key: `lane-conflict:${runner}/${lane}`, group: "runners", kind: "conflict", tone: "warn",
+        item: `lane:${runner}/${lane}` });
+      continue;
+    }
+    const n = match?.candidates.length ?? 0;
     out.push({ key: `lane:${runner}/${lane}`, group: "runners", kind: "lane", tone: "warn",
-      needs: `Lane ${lane} in ${runner} has no account`, show: `lane ${lane}`, item: `lane:${runner}/${lane}` });
+      needs: n >= 2
+        ? `Lane ${lane} in ${runner} matches ${n === 2 ? "two accounts" : `${n} accounts`}`
+        : `Lane ${lane} in ${runner} has no account`,
+      show: `lane ${lane}`, item: `lane:${runner}/${lane}` });
   }
   if (view.sources?.table?.error) out.push({ key: "table", group: "table", kind: "table", tone: "warn" });
+  // Advisory contradictions need the owner to choose which line holds, so
+  // each gets its own Needs you line; rule upkeep is an advisory mark only.
+  for (const row of checksModel(view, now).contradictions) {
+    out.push({ key: `check:${row.key}`, group: "checks", kind: "contradiction", tone: "warn",
+      needs: row.title, show: row.title, item: `check:${row.key}` });
+  }
   return out;
 }
 
@@ -207,7 +289,9 @@ const TAG_WORDS: Record<string, (n: number) => string> = {
   unreadable: (n) => `${n} can't be read`,
   refused: (n) => `${n} refused`,
   lane: (n) => plural(n, "lane without an account", "lanes without an account"),
+  conflict: (n) => plural(n, "lane conflicts", "lanes conflict"),
   table: () => "Can't read the file",
+  contradiction: (n) => plural(n, "contradiction", "contradictions"),
 };
 
 /** A group's problem tags: one per kind, counted. */
@@ -300,7 +384,6 @@ function runnersLine(view: RouteView, s: OverviewSettings): string {
   if (!s.routing) return "Reading…";
   const raw = s.routing.routing_sources?.value;
   const folders = Array.isArray(raw) ? raw.length : 0;
-  if (!folders) return "No folders added";
   const map = laneMap(s);
   let lanes = 0;
   const names = new Set([...(view.sources?.runners ?? []).map((r) => r.name), ...Object.keys(map)]);
@@ -308,7 +391,8 @@ function runnersLine(view: RouteView, s: OverviewSettings): string {
     const r = (view.sources?.runners ?? []).find((x) => x.name === name);
     lanes += new Set([...(r?.lanes ?? []), ...Object.keys(map[name] ?? {})]).size;
   }
-  return `${plural(folders, "folder", "folders")}, ${plural(lanes, "lane", "lanes")}`;
+  if (!folders && !lanes) return "No job runner folders";
+  return `${plural(providerRows(view).length, "provider", "providers")} · ${plural(folders, "folder", "folders")}, ${plural(lanes, "lane", "lanes")}`;
 }
 
 function tableLine(s: OverviewSettings): string {
@@ -352,6 +436,7 @@ export function routingOverview(
   lines.priority = view ? priorityLine(view, s) : unread;
   lines.rules = view ? rulesLine(view) : unread;
   lines.holds = view ? holdsLine(view, now) : unread;
+  lines.checks = view ? checksLine(view, now) : unread;
   lines.telling = tellingLine(s);
   lines.resets = resetsLine(s);
   lines.runners = view ? runnersLine(view, s) : unread;

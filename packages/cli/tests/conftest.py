@@ -75,7 +75,8 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     # and a suite launched from a Claude session on a second account inherits the
     # real one. Left set, any install test would write into a live Claude home.
     for _name in ("GEMINI_API_KEY", "VOYAGE_API_KEY", "GROK_HOOK_NAME", "GROK_HOOK_EVENT",
-                  "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CONFIG_DIR"):
+                  "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CONFIG_DIR",
+                  "CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_THREAD_ID"):
         os.environ.pop(_name, None)
     for _name in ("CODEX_HOME", "CODEX_SANDBOX", "CLAUDE_PROJECT_DIR"):
         os.environ.pop(_name, None)
@@ -112,6 +113,14 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     # where this Mac's real one may be.
     os.environ["KHIPU_GH_CLI"] = _gh
     os.environ["PATH"] = _SHIM_DIR + os.pathsep + os.environ.get("PATH", "")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_routing_inventory(monkeypatch):
+    """Each hermetic runtime needs its own process-local helper inventory."""
+    from khipu import agent_view
+
+    monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
 
 
 @pytest.fixture(autouse=True)
@@ -257,3 +266,32 @@ class FakeCallers:
 @pytest.fixture
 def khipu_app(tmp_path, monkeypatch):
     return FakeCallers(tmp_path / "apps", monkeypatch)
+
+
+def pytest_addoption(parser):
+    group = parser.getgroup("routing received context")
+    group.addoption("--run-routing-harness", action="store_true", help="Opt in to bounded subscription model runs")
+    group.addoption("--routing-auth-root", help="Credential-only input: codex/auth.json, claude/.credentials.json")
+    group.addoption("--routing-evidence", help="Private evidence directory (outside the checkout)")
+    group.addoption("--routing-replay-evidence", help="Read a saved native run without spending model tokens")
+    for harness in ("t3", "grok", "aegis"):
+        group.addoption(f"--routing-{harness}-adapter", help="Reviewed local native-client headless driver")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "routing_received: opt-in headless received-context acceptance (costs tokens)")
+    # The controller creates this once; xdist workers and nested pytest
+    # invocations inherit it even though their own TMPDIR changes above.
+    shared = os.environ.get("ROUTING_RIG_SESSION_CACHE")
+    if not shared:
+        shared = str(Path(TEMP_ROOT) / "routing-run-cache")
+        os.environ["ROUTING_RIG_SESSION_CACHE"] = shared
+    config._routing_run_cache = Path(shared)
+
+
+def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--run-routing-harness"):
+        skip = pytest.mark.skip(reason="received context is opt-in: --run-routing-harness (costs tokens)")
+        for item in items:
+            if "routing_received" in item.keywords:
+                item.add_marker(skip)

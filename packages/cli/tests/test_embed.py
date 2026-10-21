@@ -468,7 +468,7 @@ class CosineCandidatesExcludesCommitmentsTest(unittest.TestCase):
         # Two execute() calls happen (media_assets check, then the main
         # SELECT) — the fake cursor only remembers the last, which is the
         # one that matters here.
-        self.assertIn("m.kind != 'commitment'", cur.sql)
+        self.assertIn("m.kind NOT IN ('episode', 'topic', 'commitment')", cur.sql)
 
 
 class ApplySearchFiltersHarnessTest(unittest.TestCase):
@@ -769,6 +769,52 @@ class BackfillPerChunkIsolationTest(unittest.TestCase):
         self.assertEqual(stats["embed_provider"], "missing key")
         self.assertEqual(stats["failed_chunks"], 3)
         self.assertEqual(stats["embedded"], 0)
+
+    def test_a_real_429_after_retries_is_the_last_provider_failure(self):
+        """Drive the real batch path: the fake provider raises HTTP 429 on
+        every attempt, embed_batch exhausts its retries, and the receipt
+        keeps only the structured status/kind — never the provider body —
+        for doctor's fix to read."""
+        import io
+        import urllib.error
+        from unittest import mock
+
+        from khipu import jobs, profiles
+        from khipu.profiles import ProfileSpec
+
+        profiles.register_spec(ProfileSpec("prof-1", "voyage", "voyage-t", 4))
+        self.addCleanup(profiles.clear_learned)
+        rows = self._rows(3)
+        cur = _BackfillCursor(rows)
+        conn = _BackfillConn(cur)
+        calls = {"n": 0}
+
+        def transport(url, data, headers, timeout):  # noqa: ARG001
+            calls["n"] += 1
+            raise urllib.error.HTTPError(
+                "https://x", 429, "err", {},
+                io.BytesIO(b"quota exceeded for vk-secret-body"),
+            )
+
+        em.set_transport(transport)
+        self.addCleanup(em.set_transport, None)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_budget_take"), \
+                mock.patch.object(em, "_voyage_key", return_value="vk-secret"), \
+                mock.patch.object(em.time, "sleep", lambda s: None):
+            stats = em.backfill(kind="topic")
+        self.assertEqual(calls["n"], em.BACKFILL_RETRIES + 1)
+        self.assertEqual(stats["failed_chunks"], 3)
+        self.assertEqual(stats["embedded"], 0)
+        self.assertEqual(
+            stats["last_provider_failure"],
+            {"http_status": 429, "kind": "rate_limited"},
+        )
+        self.assertNotIn("vk-secret", json.dumps(stats))
+        fix = jobs._embed_backfill_fix({"counts": stats})
+        self.assertIn("embedding provider", fix)
+        self.assertTrue("quota" in fix or "spending cap" in fix)
+        self.assertIn("429", fix)
 
     def test_budget_exhausted_still_stops_the_sweep(self):
         """The pre-existing behaviour: budget exhaustion is deliberate and
@@ -1190,7 +1236,7 @@ class SearchRowMetadataTest(unittest.TestCase):
             def fetchall(self):
                 # P5 R6/G5: the topic metadata SELECT also reads
                 # frontmatter->>'type' and superseded_by now.
-                return [("khipu", ts, "active", None, None, None)]
+                return [("khipu", ts, "active", None, None, None, None)]
 
         cur = FakeCur()
         rows = [{"kind": "topic", "id": "khipu", "score": 0.5}]
@@ -1218,7 +1264,7 @@ class SearchRowMetadataTest(unittest.TestCase):
                 self.sql = " ".join(sql.split())
 
             def fetchall(self):
-                return [("note:old", ts, "superseded", None, "feedback", "note:new")]
+                return [("note:old", ts, "superseded", None, "feedback", "note:new", None)]
 
         cur = FakeCur()
         rows = [{"kind": "topic", "id": "note:old", "score": 0.5}]

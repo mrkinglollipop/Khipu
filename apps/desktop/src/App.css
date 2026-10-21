@@ -3392,14 +3392,6 @@ input.switch:disabled {
 .route-retries > .set-error { grid-column: 1 / -1; }
 .row-item.route-hear { display: grid; grid-template-columns: 9rem minmax(0, 1fr); column-gap: var(--s3); align-items: baseline; }
 .route-hear .route-name { font-weight: 600; color: var(--text); }
-.row-item.route-lane {
-  display: grid;
-  grid-template-columns: minmax(0, 10rem) 1.2em minmax(0, 1fr) auto;
-  column-gap: var(--s2);
-  align-items: center;
-}
-.route-lane .mono { font-family: var(--mono); font-size: var(--t-sm); }
-.route-lane .route-pause { grid-column: 1 / -1; }
 .row-item.route-event {
   display: grid;
   grid-template-columns: 4.75rem minmax(0, 1fr) minmax(0, 13rem);
@@ -3427,8 +3419,6 @@ input.switch:disabled {
   .row-item.route-limit { grid-template-columns: minmax(0, 1fr) auto; }
   .route-limit > button { grid-column: 1 / -1; justify-self: start; }
   .row-item.route-hear { grid-template-columns: 1fr; }
-  .row-item.route-lane { grid-template-columns: minmax(0, 1fr) 1.2em minmax(0, 1fr); }
-  .route-lane .route-acts { grid-column: 1 / -1; justify-content: flex-start; }
 }
 .route-settings .sr-only {
   position: absolute;

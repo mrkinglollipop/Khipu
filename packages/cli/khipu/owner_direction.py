@@ -72,10 +72,12 @@ class DirectionRefused(Exception):
 # its log line is ``_UNDO``.
 
 ACTIONS: frozenset[str] = frozenset({
-    "route.pause", "route.lift", "route.clear", "route.note.set", "route.note.end", "route.rule.add",
+    "route.definition.set", "route.pause", "route.lift", "route.clear", "route.note.set", "route.note.end", "route.rule.add",
     "route.rule.edit", "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo",
-    "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.confirm",
-    "route.priority.undo", "route.priority.clear", "accounts.track", "accounts.rename", "accounts.stop",
+    "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.cap.set", "route.cap.remove",
+    "route.priority.set", "route.priority.confirm",
+    "route.priority.undo", "route.priority.clear", "route.tier_table.set", "route.tier_table.confirm",
+    "route.tier_table.clear", "accounts.track", "accounts.rename", "accounts.stop",
     "accounts.move", "accounts.decline", "accounts.offer_again", "accounts.auto_track", "accounts.request.confirm",
     "accounts.request.undo", "config.usage_accounts", "config.routing_setting", "config.answer_request.confirm",
     "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel", "ledger.import",
@@ -139,6 +141,7 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
     turn = _recent_turn(session, conf, now)
     _from_the_hook(turn)
     return {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
+            "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
             "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook"}
 
 
@@ -682,6 +685,20 @@ def _find(line_id: str) -> dict | None:
 _PENDING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_owner_action", default=None)
 
 
+def operation_id(event: dict) -> str | None:
+    """Only the intended write inherits the written-ahead action's identity."""
+    pend = _PENDING.get()
+    if not pend:
+        return None
+    via = {"direction": "direction", "app": "app", "terminal": "cli"}.get(pend["stamp"].get("auth"))
+    if event.get("via") != via:
+        return None
+    action = pend["intent"]["action"]
+    if action in {"route.rule.add", "route.hold.add"} and event.get("id") != planned_id(action):
+        return None
+    return (pend.get("line") or {}).get("id")
+
+
 def planned_id(action: str) -> str | None:
     """The id the owner action being written chose for the line it adds
     (a rule or a hold), so the writer uses it; None for any other write."""
@@ -789,10 +806,16 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
         undone = _find(want["target"]) or {}
         line = {"kind": "undo", "id": _new_id(), "at": _iso(_clock()), "undoes": want["target"],
                 "action": undone.get("action"), "target": undone.get("target"), "auth": stamp.get("auth")}
+        if want.get("facts"):
+            line["facts"] = want["facts"]
     else:
         line = {"kind": "action", "id": _new_id(), "at": _iso(_clock()), "action": want["action"],
                 "target": want["target"], "before": None if before in (_NO_UNDO, _UNREADABLE) else before,
                 "auth": stamp.get("auth")}
+        if want["action"].startswith("route.rule.") and want["action"] != "route.rule.add":
+            from khipu import routing
+
+            line["target"] = routing.rule_reference(want["target"])[0]
         why = _no_undo(want["action"], before)
         if why:
             line.update(undo=None, no_undo=why)
@@ -803,7 +826,8 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
             line.update(runs_at=_iso(runs_at), runs_at_ts=runs_at)
         if want.get("facts"):
             line["facts"] = want["facts"]
-    for key in ("words", "harness", "session", "via_session", "turn", "binding", "auth_chain"):
+    for key in ("words", "harness", "session", "via_session", "turn", "prompt_sha256", "occurrence",
+                "binding", "auth_chain"):
         if stamp.get(key) is not None:
             line[key] = stamp[key]
     line["state"] = "pending"
@@ -945,13 +969,14 @@ def _entry(key: str) -> dict:
 def _rule_now(n) -> dict:
     from khipu import routing
 
-    return next((r for r in routing.read_view()["rules"] if str(r["n"]) == str(n)), {}) or {}
+    return next((r for r in routing.read_view()["rules"] if (str(r["n"]) == str(n) or r.get("entity") == str(n))), {}) or {}
 
 
 def _priority_rows(held: dict | None) -> list[dict] | None:
     if not held:
         return None
-    return [{"account": e["account"], "role": e.get("role"), "until": e.get("until")} for e in held["entries"]]
+    return [{"account": e["account"], "role": e.get("role"), "until": e.get("until"),
+             **({"level": dict(e["level"])} if e.get("level") else {})} for e in held["entries"]]
 
 
 def _before(want: dict):
@@ -960,6 +985,24 @@ def _before(want: dict):
     from khipu import routing
 
     action, target = want["action"], want["target"]
+    if action == "route.definition.set":
+        facts = want["facts"]
+        value = facts["value"]
+        definitions = routing.read_view().get("definitions") or {}
+        if facts["definition"] == "lane_map":
+            account = (definitions.get("lane_maps", {}).get(value["runner"]) or {}).get(value["lane"])
+            prior = dict(value, account=account) if account else None
+        else:
+            prior = definitions.get("providers" if facts["definition"] == "provider" else "accounts", {}).get(target)
+        return {"value": prior}
+    if action in ("route.cap.set", "route.cap.remove"):
+        facts = want.get("facts") or {}
+        entry = _entry(target)
+        prior = next((c for c in entry.get("caps") or []
+                      if c.get("kind") == facts.get("kind")
+                      and (c.get("kind") in ("spend", "concurrency")
+                           or c.get("window") == facts.get("window"))), None)
+        return {"cap": prior}
     if action == "route.pause":
         entry = _entry(target)
         paused = entry.get("state") == routing.PAUSED
@@ -997,6 +1040,9 @@ def _before(want: dict):
             replaced = (held or {}).get("replaced")
             return {"entries": _priority_rows(replaced), "until": (replaced or {}).get("until")}
         return {"entries": _priority_rows(held), "until": (held or {}).get("until")}
+    if action.startswith("route.tier_table."):
+        held = routing.read_view().get("tier_table")
+        return {"tiers": dict(held["tiers"]) if held else None}
     if action == "accounts.rename":
         return {"label": next((a["label"] for a in routing.accounts() if a["key"] == target), None)}
     if action == "accounts.stop":
@@ -1112,7 +1158,7 @@ def _before(want: dict):
 def _after(want: dict, result) -> Any:
     if not isinstance(result, dict):
         return None
-    keep = ("id", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts")
+    keep = ("id", "entity", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts", "tiers")
     return {k: result[k] for k in keep if k in result} or None
 
 
@@ -1133,12 +1179,13 @@ def _restore_setting(key: str, value, was_set: bool) -> None:
             data.pop(routing.SETTINGS_REQUEST_KEY, None)
 
 
-def _set_priority_back(before: dict, via: str) -> dict:
+def _set_priority_back(before: dict, via: str, holds: dict | None = None, *, _undo_default_holds: bool = False) -> dict:
     from khipu import routing
 
     if before.get("entries"):
         return routing.set_priority(before["entries"], until=before.get("until"), via=via,
-                                    expect=routing.priority_version())
+                                    expect=routing.priority_version(), holds=holds,
+                                    _undo_default_holds=_undo_default_holds)
     if routing.read_view().get("priority"):
         return routing.clear_priority(via=via, expect=routing.priority_version())
     return {"ok": True}
@@ -1237,14 +1284,16 @@ def _undo_link(line, via):
     return {"ok": True}
 
 
-def _undo_rule_confirm(line, via):
+def _undo_rule_confirm(line, via, holds=None):
     from khipu import routing
 
     before = line.get("before") or {}
+    holds = _undo_holds(line, holds)
     if before.get("seeded"):
         return routing.unconfirm_rule(line["target"], via=via)
     if before.get("pending_kind") == "changed" and isinstance(before.get("prior_text"), str):
-        return routing.edit_rule(line["target"], before["prior_text"], via=via)
+        return routing.edit_rule(line["target"], before["prior_text"], via=via, holds=holds,
+                                 _undo_default_holds=True)
     return routing.retire_rule(line["target"], via=via)
 
 
@@ -1270,6 +1319,20 @@ def _undo_acknowledge(line, via):
 
 def _b(line: dict) -> dict:
     return line.get("before") or {}
+
+
+def _undo_holds(line: dict, explicit: dict | None) -> dict:
+    """Choices for an inverse write.
+
+    Keep the original action's recorded choices, then let this Undo's
+    explicit choices replace them.  The routing write adds current missing
+    choices while it holds the log lock, so a hold that arrives after this
+    direction log entry cannot turn the inverse into a new refusal.
+    """
+    choices = dict((line.get("facts") or {}).get("holds") or {})
+    if explicit:
+        choices.update(explicit)
+    return choices
 
 
 def _undo_clear(line, via):
@@ -1310,10 +1373,12 @@ def _undo_note_end(line, via):
     return routing.set_note(_b(line).get("text") or "", via=via)
 
 
-def _undo_rule_words(line, via):
+def _undo_rule_words(line, via, holds=None):
     from khipu import routing
 
-    return routing.edit_rule(line["target"], _b(line).get("text") or "", via=via)
+    words = _b(line).get("text") or ""
+    return routing.edit_rule(line["target"], words, via=via, holds=_undo_holds(line, holds),
+                             _undo_default_holds=True)
 
 
 def _retire_rule(n_of):
@@ -1324,10 +1389,11 @@ def _retire_rule(n_of):
     return run
 
 
-def _undo_restore_rule(line, via):
+def _undo_restore_rule(line, via, holds=None):
     from khipu import routing
 
-    return routing.restore_rule(line["target"], via=via)
+    return routing.restore_rule(line["target"], via=via, holds=_undo_holds(line, holds),
+                                _undo_default_holds=True)
 
 
 def _undo_hold_add(line, via):
@@ -1345,23 +1411,34 @@ def _undo_hold_add(line, via):
     return routing.end_hold(hold_id, owner=True, via=via)
 
 
-def _added_rule(line) -> int:
+def _added_rule(line) -> str | int:
     from khipu import routing
 
-    n = (line.get("after") or {}).get("n")
+    n = (line.get("after") or {}).get("entity") or (line.get("after") or {}).get("n")
     if n is None:
         # Unconfirmed: the rule written under the id this action chose.
         planned = _b(line).get("event")
         events, _bad = routing.read_events()
-        n = next((e["n"] for e in events if planned and e.get("type") == "rule_add" and e.get("id") == planned
-                  and isinstance(e.get("n"), int)), None)
+        n = next((e.get("entity") or e.get("n") for e in events if planned and e.get("type") == "rule_add"
+                  and e.get("id") == planned), None)
     if n is None:
         raise ValueError("Khipu can't tell which rule this added, so it can't undo it")
     return n
 
 
-def _undo_priority(line, via):
-    return _set_priority_back(_b(line), via)
+def _undo_priority(line, via, holds=None):
+    before = _b(line)
+    return _set_priority_back(before, via, _undo_holds(line, holds),
+                              _undo_default_holds=True)
+
+
+def _undo_tier_table(line, via):
+    from khipu import routing
+
+    tiers = _b(line).get("tiers")
+    if tiers:
+        return routing.set_tier_table(tiers, via=via)
+    return routing.clear_tier_table(via=via)
 
 
 def _undo_decline(line, via):
@@ -1448,7 +1525,35 @@ def _ledger_undo(verb: str):
     return run
 
 
+def _undo_cap(line: dict, via: str) -> dict:
+    from khipu import routing
+
+    facts = line.get("facts") or {}
+    previous = (line.get("before") or {}).get("cap")
+    if previous is not None:
+        return routing.set_cap(line["target"], window=facts.get("window") or previous.get("window"),
+                               kind=previous["kind"], pct=previous.get("pct"), slack=previous.get("slack"),
+                               usd=previous.get("usd"), days=previous.get("days"), n=previous.get("n"),
+                               revision=previous.get("revision"), via=via)
+    return routing.remove_cap(line["target"], window=facts.get("window"),
+                              kind=facts.get("kind"), via=via)
+
+
+def _undo_definition(line: dict, via: str) -> dict:
+    from khipu import routing
+
+    facts = line["facts"]
+    previous = line["before"]["value"]
+    if previous is not None:
+        return routing.set_definition(facts["definition"], previous, via=via)
+    return routing._owner_write({"type": "definition_remove", "definition": facts["definition"],
+                                 "value": facts["value"]}, via)
+
+
 _UNDO = {
+    "route.cap.set": _undo_cap,
+    "route.cap.remove": _undo_cap,
+    "route.definition.set": _undo_definition,
     "route.pause": _undo_pause,
     "route.lift": _undo_lift,
     "route.clear": _undo_clear,
@@ -1467,6 +1572,9 @@ _UNDO = {
     "route.priority.confirm": _undo_priority,
     "route.priority.undo": _undo_priority,
     "route.priority.clear": _undo_priority,
+    "route.tier_table.set": _undo_tier_table,
+    "route.tier_table.confirm": _undo_tier_table,
+    "route.tier_table.clear": _undo_tier_table,
     "accounts.track": _undo_track,
     "accounts.rename": _undo_rename,
     "accounts.stop": _undo_stop,
@@ -1609,7 +1717,7 @@ def _undo_refusal(line: dict | None, line_id: str) -> str | None:
     return None
 
 
-def undo(line_id: str, via: str) -> dict:
+def undo(line_id: str, via: str, *, holds: dict | None = None) -> dict:
     """Apply the inverse of a logged action. Its ``undo`` line is written
     ahead by the owner gate (``gate``/``noted``) and completed by
     ``finish``."""
@@ -1620,7 +1728,13 @@ def undo(line_id: str, via: str) -> dict:
     if line["action"] == "ledger.purge":
         _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line_id, "state": "cancelled"})
         return {"ok": True, "undid": line_id, "state": "cancelled"}
-    out = _UNDO[line["action"]](line, via)
+    inverse = _UNDO[line["action"]]
+    if line["action"] in {"route.rule.confirm", "route.rule.edit", "route.rule.retire",
+                           "route.rule.undo", "route.rule.dismiss", "route.priority.set", "route.priority.confirm",
+                           "route.priority.undo", "route.priority.clear"}:
+        out = inverse(line, via, holds)
+    else:
+        out = inverse(line, via)
     result = dict(out) if isinstance(out, dict) else {"ok": True}
     result.update(ok=True, undid=line_id)
     return result
@@ -1692,12 +1806,13 @@ def run_cli(args) -> int:
                     else "refused"
                 _print({"ok": False, "error": why, "code": code})
                 return 2
-            want = intent("direction.undo", args.id)
+            choices = routing._holds_arg(args)
+            want = intent("direction.undo", args.id, facts={"holds": choices} if choices is not None else None)
             via = routing._owner_via(args, want)
             if via is None:
                 _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
                 return 2
-            out = undo(args.id, via)
+            out = undo(args.id, via, holds=choices)
             _print(finish(out) or out)
             return 0
         if cmd == "on":
@@ -1792,5 +1907,7 @@ def add_parser(sub) -> None:
     add_owner_flags(st)
     un = verbs.add_parser("undo", help="Undo one owner action by its id")
     un.add_argument("id")
+    un.add_argument("--holds", default=None, metavar="JSON",
+                    help='Explicit choices for held or paused accounts: {"id": "end" or "keep"}')
     un.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     add_owner_flags(un)

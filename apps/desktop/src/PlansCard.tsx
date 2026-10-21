@@ -78,6 +78,10 @@ const ERROR_PHRASE: Record<string, string> = {
   not_installed: "not installed",
   bad_reply: "answered in a way Khipu can't read",
   no_plan_limits: "no plan limits reported",
+  no_key: "no GLM key stored",
+  key_rejected: "key not accepted by z.ai",
+  redirect_refused: "quota endpoint tried to redirect to another host",
+  no_plan: "no GLM Coding Plan on this key",
   no_plan_figures: "didn't send its plan figures",
   invalid_account: "not a valid account entry",
   no_answer: "didn't answer",
@@ -430,7 +434,7 @@ export function liveWords(row: UsageAccount): { text: string; live: boolean; che
 /** The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
  *  each opens the browser and asks nothing on a terminal. */
 const SIGN_IN_CLIS = new Set(["claude", "codex"]);
-const CLI_TITLE: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", muse: "Muse" };
+const CLI_TITLE: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok Build", muse: "Muse", glm: "GLM Coding Plan" };
 
 /** "button" when the app can start this account's own login, "elsewhere"
  *  when the owner signs in from the CLI itself, null when it is live or its
@@ -545,9 +549,9 @@ export function RefreshButton({ busy, label, onClick }: { busy: boolean; label: 
 
 const NO_ACCOUNTS_TITLE = "No accounts to read yet";
 const NO_ACCOUNTS_HINT =
-  "List your accounts in Settings → Accounts and routing and Khipu shows how much of each plan is left. It can read Claude Code, Codex, Grok Build and Muse.";
+  "List your accounts in Settings → Accounts and routing and Khipu shows how much of each plan is left. It can read Claude Code, Codex, Grok Build, Muse and the GLM Coding Plan.";
 const NO_ACCOUNTS_HINT_HERE =
-  "List your accounts below and Khipu shows how much of each plan is left. It can read Claude Code, Codex, Grok Build and Muse.";
+  "List your accounts below and Khipu shows how much of each plan is left. It can read Claude Code, Codex, Grok Build, Muse and the GLM Coding Plan.";
 export const MUSE_NO_TURN = "No figures yet. Muse reports its plan after its first turn.";
 const NO_RESETTING_LIMIT = "Its plan shows no limit that resets.";
 
@@ -978,6 +982,7 @@ export const USAGE_HARNESS_OPTIONS: Array<[string, string]> = [
   ["codex", "Codex"],
   ["grok", "Grok Build"],
   ["muse", "Muse"],
+  ["glm", "GLM Coding Plan"],
 ];
 
 function harnessName(h: string): string {
@@ -1117,8 +1122,10 @@ const ACCOUNT_REFUSAL: Record<string, (c: RefusalCtx) => string> = {
     c.field === "label"
       ? `${fieldWords(c)} is too long: use ${LABEL_MAX} characters or fewer.`
       : `${fieldWords(c)} is too long.`,
-  unknown_cli: () => "Khipu reads Claude Code, Codex, Grok Build and Muse. Choose one of them under CLI.",
+  unknown_cli: () => "Khipu reads Claude Code, Codex, Grok Build, Muse and the GLM Coding Plan. Choose one of them under CLI.",
   muse_folder: () => "Muse has one sign-in, so leave the Login folder empty.",
+  glm_folder: () => "GLM is read with its key, so leave the Login folder empty.",
+  zai_home: () => "That login folder runs Claude Code against z.ai, so it is the GLM account. Track GLM instead.",
   no_such_folder: (c) =>
     `Khipu cannot find the login folder ${c.entry?.home ?? ""}${c.added || !c.entry ? "" : ` of ${c.entry.label}`}. ` +
     "Start it with ~/ (for example ~/.codex-work), or give the full path starting with /.",
@@ -1248,7 +1255,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       setClash(null);
       return;
     }
-    const folder = harness === "muse" ? null : home.trim() || null;
+    const folder = harness === "muse" || harness === "glm" ? null : home.trim() || null;
     const entry: UsageAccountEntry = {
       label: label.trim() || defaultAccountLabel(harness, folder),
       harness,
@@ -1348,10 +1355,10 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
         <input
           id={`${id}-home`}
           ref={homeRef}
-          value={harness === "muse" ? "" : home}
+          value={harness === "muse" || harness === "glm" ? "" : home}
           maxLength={FOLDER_MAX}
-          placeholder={harness === "muse" ? "Muse has one login" : "~/.claude-second…"}
-          disabled={harness === "muse"}
+          placeholder={harness === "muse" ? "Muse has one login" : harness === "glm" ? "GLM is read with its key" : "~/.claude-second…"}
+          disabled={harness === "muse" || harness === "glm"}
           autoComplete="off"
           spellCheck={false}
           aria-invalid={clash === "home" || undefined}

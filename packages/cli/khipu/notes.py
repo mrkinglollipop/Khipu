@@ -257,6 +257,9 @@ def _note_topic_dict(path: Path, *, project: str | None) -> dict[str, Any] | Non
     parent = flat.get("parent")
     if parent:
         frontmatter["parent"] = parent
+    from khipu.routing_scanner import has_routing_claim
+
+    frontmatter["_routing_state_claim"] = has_routing_claim(str(path), body)
     return {
         "slug": slug,
         "title": name,

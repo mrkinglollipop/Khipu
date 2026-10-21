@@ -640,7 +640,9 @@ def set_gate_ignore(value: "str | list[str] | None", *, by: str | None = None) -
                          f"one of {', '.join(known)}")
     with mutate_config() as data:
         if names:
-            data[GATE_IGNORE_KEY] = {"checks": names, "set_at": _now(), "by": by or "?"}
+            # Same-second owner choices must have distinct stamps for compare-and-clear.
+            stamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            data[GATE_IGNORE_KEY] = {"checks": names, "set_at": stamp, "by": by or "?"}
         else:
             data.pop(GATE_IGNORE_KEY, None)
         return config_file()
@@ -1537,8 +1539,9 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
     The queued entry is removed in one place, after the run returned and only
     when the run is not queued again (a re-queue replaces it in one atomic
     write): a run that dies part way leaves it queued for the next retry. The owner's
-    one-time override the doctor step read is cleared at the same point,
-    unless the run is queued again (the retry is the same attempt)."""
+    one-time override the doctor step read is cleared only after a live flip
+    or after it excused doctor reds and the whole gate passed. A failed gate
+    keeps it, as does a queued retry (the retry is the same attempt)."""
     t0 = time.monotonic()
     with _lock() as held:
         if not held:
@@ -1564,7 +1567,8 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
         else:
             _clear_queue()
         if override:
-            cleared = False if out.get("queued") else clear_gate_override(override.get("set_at"))
+            consumed = out.get("ok") or (doctor.get("ignored_reds") and failed is None)
+            cleared = bool(consumed and not out.get("queued") and clear_gate_override(override.get("set_at")))
             out["override"] = {**override, "skipped": doctor.get("ignored_reds") or [], "cleared": cleared}
         if retry_of is not None:
             out["retry_of"] = retry_of.get("queued_at")

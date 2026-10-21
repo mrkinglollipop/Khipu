@@ -208,12 +208,18 @@ def _save_recent_batches(session_id: str, batches: list[tuple[str, ...]]) -> Non
 # that session's existing per-prompt state, not in a new file per session").
 
 
-def routing_marker(session_id: str) -> dict:
+def routing_marker(session_id: str, component: str = "main", *, canonical=False) -> dict:
     """{"version", "epoch", "full_at"} as last recorded, or {}."""
     if not session_id:
         return {}
-    marker = _load_session_state(session_id).get("routing")
-    return marker if isinstance(marker, dict) else {}
+    from khipu.routing_delivery import Marker, hook_session
+
+    if not canonical:
+        session_id = hook_session(session_id)
+    data = _load_session_state(session_id)
+    marker = data.get("routing") if component == "main" else data.get("routing_component_markers", {}).get(component)
+
+    return Marker(marker if isinstance(marker, dict) else {}, session=session_id, component=component)
 
 
 @contextlib.contextmanager
@@ -236,17 +242,22 @@ def _session_lock(session_id: str, wait: float):
         yield True
 
 
-def mark_routing_full(session_id: str, *, version: int, epoch: str | None, at: str) -> bool:
+def mark_routing_full(session_id: str, *, version: int, epoch: str | None, at: str,
+                      owed: list[str] | None = None, shown: list[str] | None = None,
+                      notices: list[str] | None = None) -> bool:
     """Record that the full summary at ``version`` was delivered at ``at``:
     the session's last-seen version starts again from it. Takes the
     session's lock without waiting; a busy lock or a failed write records
     nothing (the next prompt then sends the full summary again) and is never
     raised."""
-    return mark_routing_seen(session_id, version=version, epoch=epoch, full_at=at, wait=0.0)
+    return mark_routing_seen(session_id, version=version, epoch=epoch, full_at=at,
+                             owed=owed, shown=shown, notices=notices, wait=0.0)
 
 
 def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_at: str | None = None,
-                      unrefreshed: str | None = None, based_on=None, wait: float = 0.05) -> bool:
+                      unrefreshed: str | None = None, based_on=None, owed: list[str] | None = None,
+                      shown: list[str] | None = None, wait: float = 0.05, component: str = "main",
+                      notices: list[str] | None = None) -> bool:
     """Move the session's last-seen routing version to ``version`` once a
     block was delivered (routing truth, phases 3a and 3b). With ``full_at``
     the marker starts again from a full summary; otherwise only the version
@@ -269,14 +280,50 @@ def mark_routing_seen(session_id: str, *, version: int, epoch: str | None, full_
         else:
             new = dict(old, epoch=epoch)
             new.pop("pointer", None)  # heard: a pointer said earlier no longer matters
-            if not (old.get("epoch") == epoch and isinstance(old.get("version"), int)
-                    and old["version"] > version):
+            older = (old.get("epoch") == epoch and isinstance(old.get("version"), int)
+                     and old["version"] > version)
+            if not older:
                 new["version"] = version
+        if owed is not None and (full_at is not None or not older):
+            old_owed = old.get("owed") if old.get("epoch") == epoch and isinstance(old.get("owed"), list) else []
+            same_version = old.get("epoch") == epoch and old.get("version") == version
+            # The first delivery at a version records all its omissions.
+            # A late duplicate must not recreate debt a later page cleared.
+            due = [entity for entity in (old_owed if same_version else [*old_owed, *owed])
+                   if isinstance(entity, str)]
+            done = set(shown or [])
+            left = list(dict.fromkeys(entity for entity in due if entity not in done))
+            if left:
+                new["owed"] = left
+            else:
+                new.pop("owed", None)
+        elif full_at is not None and old.get("epoch") == epoch and old.get("owed"):
+            # A budgeted full summary may omit these too. Keep them owed
+            # until an identified change line has actually been delivered.
+            new["owed"] = old["owed"]
         if unrefreshed is not None:
             new["unrefreshed"] = unrefreshed
+        receipts = _notice_receipts(old.get("notices"), notices)
+        if receipts:
+            new["notices"] = receipts
+        else:
+            new.pop("notices", None)
         return new
 
-    return _update_routing_marker(session_id, change, wait)
+    return _update_routing_marker(session_id, change, wait, component=component)
+
+
+def _notice_receipts(old, notices) -> dict:
+    now = time.time()
+    kept = {key: at for key, at in (old or {}).items()
+            if isinstance(at, (int, float)) and now - at < 7 * 86400}
+    kept.update({key: now for key in notices or [] if isinstance(key, str)})
+    return kept
+
+
+def mark_routing_notices(session_id: str, notices: list[str]) -> bool:
+    return _update_routing_marker(
+        session_id, lambda old: dict(old, notices=_notice_receipts(old.get("notices"), notices)), 0.05)
 
 
 def _later(a, b) -> bool:
@@ -297,19 +344,24 @@ def mark_routing_pointer(session_id: str, *, version: int, epoch: str | None, wa
         session_id, lambda old: dict(old, pointer={"version": version, "epoch": epoch}), wait)
 
 
-def _update_routing_marker(session_id: str, change, wait: float) -> bool:
+def _update_routing_marker(session_id: str, change, wait: float, *, component: str = "main") -> bool:
     """Replace the session's routing marker with ``change(old)`` under the
     session's lock, waiting for it at most ``wait``; a busy lock or a failed
     write records nothing and is never raised."""
     if not session_id or fcntl is None:
         return False
+    from khipu.routing_delivery import hook_session
+
+    session_id = hook_session(session_id)
     try:
         with _session_lock(session_id, wait) as taken:
             if not taken:
                 return False
             data = _load_session_state(session_id)
-            old = data.get("routing") if isinstance(data.get("routing"), dict) else {}
-            data["routing"] = change(dict(old))
+            markers = data if component == "main" else data.setdefault("routing_component_markers", {})
+            key = "routing" if component == "main" else component
+            old = markers.get(key) if isinstance(markers.get(key), dict) else {}
+            markers[key] = change(dict(old))
             _write_session_state(session_id, data)
         return True
     except Exception:  # noqa: BLE001 - a hook must not fail on its marker
@@ -445,6 +497,9 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
         from khipu import routing
 
         routing.prompt_imports()
+        from khipu import agent_view
+
+        agent_view.prepare_routing_table()
         off = None if decided else routing.push_off(moment, environ=environ)
         budget = 0.0
         if not off and isinstance(session_id, str) and session_id:
@@ -469,12 +524,13 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
                 signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 
             try:
-                marker = routing_marker(session_id)
-                out = routing.prompt_push(marker, budget=budget, on_fold=fold_started)
+                marker = routing_marker(session_id, canonical=True)
+                out = routing.prompt_push(marker, budget=budget, on_fold=fold_started, session_id=session_id)
                 answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed",
-                                                "generation")}
+                                                   "owed_entities", "shown_entities", "generation", "notices", "routing_changes")}
                 if isinstance(answer["text"], str) and len(answer["text"]) > _ROUTING_TEXT_MOST:
                     answer["text"] = answer["text"][:_ROUTING_TEXT_MOST]
+                    answer["notices"] = []
                 answer["seen"] = marker.get("version")  # what the marker was when this answer was read
                 answer["pointer_said"] = marker.get("pointer") == {"version": out.get("version"),
                                                                    "epoch": out.get("epoch")}
@@ -1316,6 +1372,9 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
     from khipu import routing
 
     routing.prompt_imports()
+    from khipu import agent_view
+
+    agent_view.prepare_routing_table()
     import warnings
 
     if schedule is None:
@@ -1329,6 +1388,7 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
     poll_fd: int | None = None
     poll_buf = b""
     next_look = 0.0
+    next_inventory = time.monotonic() + _HELPER_TICK_S
 
     def reap() -> None:
         while children or pollers:
@@ -1393,6 +1453,9 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
                     poll_fd = None
                     _take_poll_answer(schedule, _poll_answer(poll_buf))
             if sock not in ready:
+                if time.monotonic() >= next_inventory:
+                    agent_view.prepare_routing_table(refresh=True)
+                    next_inventory = time.monotonic() + _HELPER_TICK_S
                 continue
             try:
                 msg, fds, _flags, _addr = socket.recv_fds(sock, _FORKSERVER_REQUEST_MOST * 2, 4)
@@ -1425,6 +1488,8 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
                 _prompt_routing_child(write_fd, session_id, None, cap, decided=True)
             children.add(pid)
             os.close(write_fd)
+            agent_view.prepare_routing_table(refresh=True)
+            next_inventory = time.monotonic() + _HELPER_TICK_S
     finally:
         if poll_fd is not None:
             os.close(poll_fd)
@@ -1509,14 +1574,16 @@ class _RoutingAtPrompt:
             # The budget is the read's: it starts when the child is ready to
             # read (``collect``), not before the child imported routing (most
             # of 50 ms in a fresh interpreter).
-            self.session = session_id if isinstance(session_id, str) else None
+            from khipu.routing_delivery import hook_session
+
+            self.session = hook_session(session_id, env) if isinstance(session_id, str) and session_id else None
             self.forked = time.monotonic()
             self.cap = self.forked + _ROUTING_WAIT_MOST
             read_fd, write_fd = os.pipe()
             if forkserver is not None:
                 self.fd = read_fd
                 try:
-                    forkserver.start(write_fd, session_id, self.cap)
+                    forkserver.start(write_fd, self.session, self.cap)
                 except RoutingHelperStarting:
                     self.status = "skipped:starting"  # never waits for the helper
                     self._close()
@@ -1539,7 +1606,7 @@ class _RoutingAtPrompt:
                 os.close(write_fd)
                 raise
             if pid == 0:
-                _prompt_routing_child(write_fd, session_id, environ, self.cap, decided, moment)
+                _prompt_routing_child(write_fd, self.session, environ, self.cap, decided, moment)
             os.close(write_fd)
             self.pid, self.fd = pid, read_fd
             self.status = "skipped:budget"  # until an answer arrives in time
@@ -1661,10 +1728,26 @@ class _RoutingAtPrompt:
         label = "full" if out["kind"] == "full" else f"changes:{out.get('count') or 0}"
         text = out["text"]
         combined = f"{ctx}\n\n{text}" if ctx else text
+        if recall_rule._utf16_len(combined) > recall_rule._HOOK_CONTEXT_BUDGET and out.get("routing_changes"):
+            from khipu.routing_delivery import refit
+
+            heading = text.split("\n", 1)[0]
+            room = (recall_rule._HOOK_CONTEXT_BUDGET - recall_rule._utf16_len(ctx) -
+                    recall_rule._utf16_len(heading) - (3 if ctx else 1))
+            try:
+                fitted = refit(self.session, out["routing_changes"], room)
+            except Exception:
+                fitted = None
+            if fitted and fitted.get("routing_changes"):
+                out = dict(fitted, at=out.get("at"), seen=out.get("seen"))
+                text = out["text"]
+                combined = f"{ctx}\n\n{text}" if ctx else text
         if recall_rule._utf16_len(combined) <= recall_rule._HOOK_CONTEXT_BUDGET:
             pending = {"session": self.session, "version": out["version"], "epoch": out.get("epoch"),
                        "full": out["kind"] == "full", "unrefreshed": out.get("unrefreshed"),
-                       "at": out.get("at"), "based_on": out.get("seen")}
+                       "at": out.get("at"), "based_on": out.get("seen"),
+                       "owed": out.get("owed_entities"), "shown": out.get("shown_entities"),
+                       "notices": out.get("notices"), "routing_changes": out.get("routing_changes")}
             return combined, {"status": label, "pending": pending}
         # Too long to go with this prompt. The block is not delivered, so the
         # session's last-seen version does not move and a later prompt with
@@ -1692,11 +1775,21 @@ def _routing_delivered(info: dict | None, delivered: bool) -> str:
             if not mark_routing_pointer(pending["session"], version=pending["version"], epoch=pending["epoch"]):
                 status = f"{status}:unmarked"
         else:
+            changes = pending.get("routing_changes")
+            if pending.get("notices") and not changes:
+                return f" routing={status}:unmarked"
+            if changes:
+                from khipu.routing_delivery import acknowledge
+
+                if not acknowledge(pending["session"], changes):
+                    return f" routing={status}:unmarked"
             # The child's clock when it read (this process never imports routing).
             full_at = pending.get("at") if pending["full"] else None
             if not mark_routing_seen(pending["session"], version=pending["version"], epoch=pending["epoch"],
                                      full_at=full_at, unrefreshed=pending.get("unrefreshed"),
-                                     based_on=pending.get("based_on") if pending["full"] else None):
+                                     based_on=pending.get("based_on") if pending["full"] else None,
+                                     owed=pending.get("owed"), shown=pending.get("shown"),
+                                     notices=pending.get("notices"), component=(changes or {}).get("component", "main")):
                 status = f"{status}:unmarked"
     return f" routing={status}"
 
@@ -2475,6 +2568,67 @@ _BUDGET_SAFETY_SLACK_S = 0.3
 _VALIDITY_QUERY_MIN_S = 0.05
 
 
+def _attach_hub_routing_state(
+    rows: list[dict[str, Any]],
+    *,
+    deadline: float | None = None,
+) -> list[dict[str, Any]]:
+    """Carry stored routing-state flags onto budgeted hub hits.
+
+    Same boolean the local snapshot metadata pass already attaches. Reads
+    only ``frontmatter->'_routing_state_claim'``, never ``topics.body``.
+    Fail-open: a missing column, a closed cursor, a type that is not a
+    strict boolean, a missed deadline, or a statement timeout leaves hits
+    unmarked and never drops a row.
+    """
+    topic_ids = [str(r["id"]) for r in rows if r.get("kind") == "topic"]
+    if not topic_ids:
+        return rows
+    remaining = None if deadline is None else deadline - time.monotonic()
+    # Same headroom as the validity counts query: starting this with less
+    # than _VALIDITY_QUERY_MIN_S left only makes a tight lane worse, and
+    # connect() itself may take up to five seconds without a wall-clock cap.
+    if remaining is not None and remaining <= _VALIDITY_QUERY_MIN_S:
+        return rows
+
+    def _fetch() -> dict[str, bool]:
+        from khipu.db import connect
+
+        timeout_kw = {}
+        if remaining is not None:
+            timeout_kw["statement_timeout_s"] = remaining
+        with connect(**timeout_kw) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT slug, frontmatter->'_routing_state_claim' "
+                    "FROM topics WHERE deleted_at IS NULL AND slug = ANY(%s)",
+                    (topic_ids,),
+                )
+                return {
+                    str(slug): flag
+                    for slug, flag in cur.fetchall()
+                    if type(flag) is bool
+                }
+
+    try:
+        flags = (
+            _fetch() if remaining is None
+            else _run_with_timeout(_fetch, remaining)
+        )
+    except Exception as exc:  # noqa: BLE001 — advisory; never a search failure
+        _log(f"budgeted routing metadata skipped: {type(exc).__name__}: {exc}")
+        return rows
+    if not flags:
+        return rows
+    for r in rows:
+        if r.get("kind") != "topic":
+            continue
+        flag = flags.get(str(r.get("id")))
+        if type(flag) is bool:
+            r["_routing_state_claim"] = flag
+    return rows
+
+
 def _hub_hits_budgeted(
     prompt: str,
     tokens: list[str],
@@ -2596,6 +2750,7 @@ def _hub_hits_budgeted(
     fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
     fused = _relevance_gate(fused, tokens)
     fused = apply_project_and_status(fused, project=project)
+    fused = _attach_hub_routing_state(fused, deadline=deadline)
 
     # Validity annotation (Phase 2, session B): one counts query for the
     # fused rows, reusing decisions.enrich_search_results (the exact same
@@ -2697,7 +2852,7 @@ def _row_date(row: dict[str, Any]) -> str:
     return str(ts)[:10] if ts else ""
 
 
-def _row_tag(row: dict[str, Any]) -> str:
+def _row_tag(row: dict[str, Any], mark: str | None = None) -> str:
     """Phase 2, session B: an episode line now shows its validity marker
     AFTER the project (``khipu.validity.annotate`` only ever sets an episode
     row's ``status`` when its state is not current, so this is a no-op for
@@ -2717,7 +2872,44 @@ def _row_tag(row: dict[str, Any]) -> str:
             bits.append(f"project {row['project']}")
         if status:
             bits.append(f"status {status}")
+    if mark is None:
+        mark = _imported_routing_mark(row)
+    if mark:
+        bits.append(mark)
     return " · ".join(bits)
+
+
+def _imported_routing_mark(row: dict[str, Any]) -> str:
+    """Advisory label when imported text still states routing Khipu owns.
+
+    Reads only text the hit actually carries (body, else snippet) through
+    ``routing_scanner.scan_text``. A clipped search snippet cannot prove a
+    claim past ``SNIPPET_LIMIT``: the teaser dropped that tail, and inventing
+    a mark from absent text would flag a note the hit does not carry.
+    Import-time metadata may attach ``_routing_state_claim``, which the
+    hit carries without exposing or rescanning the stored body.
+    Never writes the hit or the note file. A scanner exception omits the
+    mark and never breaks the prior-work block.
+    """
+    if str(row.get("kind") or "") != "topic":
+        return ""
+    from khipu.routing_scanner import SUPERSEDED_MARK, scan_text
+
+    try:
+        if type(row.get("_routing_state_claim")) is bool:
+            return SUPERSEDED_MARK if row["_routing_state_claim"] else ""
+        text = str(row.get("body") or row.get("snippet") or "")
+        if not text.strip():
+            return ""
+        source = ""
+        frontmatter = row.get("frontmatter")
+        if isinstance(frontmatter, dict):
+            source = str(frontmatter.get("note_source") or "")
+        if not source:
+            source = str(row.get("id") or "")
+        return SUPERSEDED_MARK if scan_text(source, text) else ""
+    except Exception:  # noqa: BLE001 — advisory; never sink prior work
+        return ""
 
 
 def _stale_line(stale: dict[str, Any]) -> str:
@@ -2738,25 +2930,50 @@ def render_block(hits: list[dict[str, Any]], *, produced: str = "", stale: dict[
 
     Drops whole trailing hit lines rather than mid-truncating one — same
     posture as recall_rule._fit_budget — so a rendered line is never cut
-    mid-word.
+    mid-word. Fits hits first, then advisory routing marks, so a mark can
+    never evict a hit that already fit.
     """
     if not hits and not produced:
         return ""
     from khipu.snippets import clip_snippet
 
-    out = [_HEADING]
+    heading = [_HEADING]
     if len(f"{_HEADING}\n{_FOOTER}") > BLOCK_CHAR_BUDGET:
         return ""
     if stale:
         line = _stale_line(stale)
-        if len("\n".join([*out, line, _FOOTER])) <= BLOCK_CHAR_BUDGET:
-            out.append(line)
+        if len("\n".join([*heading, line, _FOOTER])) <= BLOCK_CHAR_BUDGET:
+            heading.append(line)
+
+    def packed(lines: list[str]) -> int:
+        return len("\n".join([*lines, _FOOTER]))
+
+    fitted: list[tuple[dict[str, Any], str, str]] = []
+    lines = list(heading)
     for h in hits:
         snippet = clip_snippet(str(h.get("snippet") or h.get("label") or ""), 90)
-        line = f"- [{_row_tag(h)}] {snippet}"
-        if len("\n".join([*out, line, _FOOTER])) > BLOCK_CHAR_BUDGET:
+        tag = _row_tag(h, mark="")
+        line = f"- [{tag}] {snippet}"
+        if packed([*lines, line]) > BLOCK_CHAR_BUDGET:
             break
-        out.append(line)
+        lines.append(line)
+        fitted.append((h, snippet, tag))
+
+    def try_marks(mark_for) -> list[str] | None:
+        out = list(heading)
+        for h, snippet, tag in fitted:
+            mark = mark_for(h)
+            line = f"- [{tag} · {mark}] {snippet}" if mark else f"- [{tag}] {snippet}"
+            out.append(line)
+        if packed(out) <= BLOCK_CHAR_BUDGET:
+            return out
+        return None
+
+    out = try_marks(_imported_routing_mark)
+    if out is None:
+        out = try_marks(lambda h: "superseded" if _imported_routing_mark(h) else "")
+    if out is None:
+        out = lines
     if produced:
         remaining = BLOCK_CHAR_BUDGET - len("\n".join([*out, _FOOTER])) - 1
         if remaining > 1:

@@ -893,7 +893,7 @@ fn checked_work_projects(raw: &str) -> Result<String, String> {
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
-const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse"];
+const USAGE_HARNESSES: &[&str] = &["claude", "codex", "grok", "muse", "glm"];
 const USAGE_ACCOUNTS_MAX: usize = 32;
 /// Settings -> Routing (routing truth phase 4): the sizes, times and switches
 /// the page offers, each `config --set KEY VALUE` or `config --unset=KEY`
@@ -924,6 +924,7 @@ const OFFLINE_DURATION_KEYS: &[&str] = &["hub_statement_timeout", "hub_dead_conn
 const ROUTING_COUNT_KEYS: &[&str] = &[
     "routing_summary_chars",
     "routing_prompt_chars",
+    "routing_child_chars",
     "routing_prompt_budget_ms",
     "routing_resend_after_versions",
     "routing_hold_chars",
@@ -1154,7 +1155,7 @@ fn checked_usage_accounts_kept(raw: &str, stored: &[Value]) -> Result<String, St
             .to_lowercase();
         if !USAGE_HARNESSES.contains(&harness.as_str()) {
             return Err(format!(
-                "usage_accounts entry {n}: harness must be claude, codex, grok or muse"
+                "usage_accounts entry {n}: harness must be claude, codex, grok, muse or glm"
             ));
         }
         clean.insert("harness".to_string(), serde_json::Value::String(harness));
@@ -1630,7 +1631,7 @@ fn checked_usage_harness(raw: &str) -> Result<String, String> {
     if USAGE_HARNESSES.contains(&h.as_str()) {
         Ok(h)
     } else {
-        Err("harness must be claude, codex, grok or muse".to_string())
+        Err("harness must be claude, codex, grok, muse or glm".to_string())
     }
 }
 
@@ -1650,13 +1651,13 @@ fn accounts_check_argv(folder: &str) -> Result<Vec<String>, String> {
 }
 
 /// One read of an account that is not saved (the dialog's step 3). No folder
-/// is the CLI's default login; Muse takes none.
+/// is the CLI's default login; Muse and GLM take none.
 fn accounts_try_argv(harness: &str, folder: Option<&str>) -> Result<Vec<String>, String> {
     let h = checked_usage_harness(harness)?;
     let mut argv = vec!["usage".to_string(), "--try".to_string(), format!("--harness={h}")];
     if let Some(f) = folder.map(str::trim).filter(|f| !f.is_empty()) {
-        if h == "muse" {
-            return Err("Muse has one sign-in, so it takes no login folder".to_string());
+        if h == "muse" || h == "glm" {
+            return Err(format!("{} has one sign-in, so it takes no login folder", if h == "glm" { "GLM" } else { "Muse" }));
         }
         argv.push(format!("--folder={}", checked_login_folder(f)?));
     }
@@ -1829,6 +1830,17 @@ fn route_note_end_argv() -> Vec<String> {
     argv
 }
 
+fn route_operation_argv(mut argv: Vec<String>, op: Option<&str>) -> Result<Vec<String>, String> {
+    if let Some(op) = op {
+        if op.is_empty() || op.len() > 256 || !op.chars().all(|c| c.is_ascii_alphanumeric() || "-_:".contains(c)) {
+            return Err("invalid routing operation id".to_string());
+        }
+        let at = argv.iter().position(|arg| arg == "--").unwrap_or(argv.len());
+        argv.insert(at, format!("--op={op}"));
+    }
+    Ok(argv)
+}
+
 fn route_rule_argv(action: &str, n: Option<u32>, text: Option<&str>) -> Result<Vec<String>, String> {
     if !ROUTE_RULE_ACTIONS.contains(&action) {
         return Err(format!("not a rule change: {action:?}"));
@@ -1877,6 +1889,19 @@ fn route_hold_end_argv(id: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+fn route_definition_argv(definition: &str, value: &Value) -> Result<Vec<String>, String> {
+    if !matches!(definition, "provider" | "account" | "lane_map") || !value.is_object() {
+        return Err("choose a provider, account or lane definition".to_string());
+    }
+    let encoded = serde_json::to_string(value).map_err(|_| "could not read the definition".to_string())?;
+    if encoded.len() > ROUTE_WORDS_MAX_BYTES {
+        return Err("the definition is too long".to_string());
+    }
+    // JSON stays joined to its option. The CLI applies the closed definition schema and owner gate.
+    Ok(vec!["route".into(), "definition".into(), "set".into(), definition.into(),
+            format!("--value={encoded}"), "--from-app".into()])
+}
+
 /// The owner's priority verbs (`khipu route priority ACTION`, routing truth
 /// phase 4b).
 const ROUTE_PRIORITY_ACTIONS: &[&str] = &["set", "confirm", "undo", "clear"];
@@ -1897,9 +1922,14 @@ struct PriorityEntry {
 /// webview sends can become a flag or an argument of its own; their order is
 /// the owner's, kept as sent.
 #[cfg(test)]
-fn route_priority_argv(action: &str, entries: &[PriorityEntry], until: Option<&str>) -> Result<Vec<String>, String> {
+fn route_priority_argv(
+    action: &str,
+    entries: &[PriorityEntry],
+    until: Option<&str>,
+    holds: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<String>, String> {
     // The shape tests below are about the entries, not the version.
-    route_priority_argv_expect(action, entries, until, Some("p1"))
+    route_priority_argv_expect(action, entries, until, Some("p1"), holds)
 }
 
 /// `expect` is the priority's version as the owner read it (`--expect=V`,
@@ -1909,11 +1939,20 @@ fn route_priority_argv_expect(
     entries: &[PriorityEntry],
     until: Option<&str>,
     expect: Option<&str>,
+    holds: Option<&serde_json::Map<String, Value>>,
 ) -> Result<Vec<String>, String> {
     if !ROUTE_PRIORITY_ACTIONS.contains(&action) {
         return Err(format!("not a change to the priority: {action:?}"));
     }
     let mut argv = route_base("priority");
+    if let Some(holds) = holds {
+        if holds.len() > ROUTE_PRIORITY_MOST || holds.iter().any(|(id, choice)| {
+            id.trim().is_empty() || id.len() > 256 || !matches!(choice.as_str(), Some("end" | "keep"))
+        }) {
+            return Err("holds must map each hold id to end or keep".to_string());
+        }
+        argv.push(format!("--holds={}", Value::Object(holds.clone())));
+    }
     if action == "set" {
         if entries.is_empty() {
             return Err("put at least one account in the priority, or clear it".to_string());
@@ -1981,7 +2020,7 @@ fn checked_harness(raw: &str) -> Result<String, String> {
     if USAGE_HARNESSES.contains(&h.as_str()) {
         Ok(h)
     } else {
-        Err("harness must be claude, codex, grok or muse".to_string())
+        Err("harness must be claude, codex, grok, muse or glm".to_string())
     }
 }
 
@@ -2281,13 +2320,13 @@ fn sign_in_argv(config: &Value, harness: &str, home: Option<&str>) -> Result<Vec
 }
 
 #[tauri::command]
-async fn khipu_route_pause(account: String, until: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(route_pause_argv(&account, until.as_deref())?).await
+async fn khipu_route_pause(account: String, until: Option<String>, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_pause_argv(&account, until.as_deref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_route_lift(account: String) -> Result<String, String> {
-    run_khipu_cli_async(route_lift_argv(&account)?).await
+async fn khipu_route_lift(account: String, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_lift_argv(&account)?, op.as_deref())?).await
 }
 
 #[tauri::command]
@@ -2462,23 +2501,23 @@ async fn khipu_project_keep_separate(a: String, b: String) -> Result<String, Str
 }
 
 #[tauri::command]
-async fn khipu_route_clear(account: String, report: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(route_clear_argv(&account, report.as_deref())?).await
+async fn khipu_route_clear(account: String, report: Option<String>, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_clear_argv(&account, report.as_deref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_route_note_set(text: String) -> Result<String, String> {
-    run_khipu_cli_async(route_note_set_argv(&text)?).await
+async fn khipu_route_note_set(text: String, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_note_set_argv(&text)?, op.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_route_note_end() -> Result<String, String> {
-    run_khipu_cli_async(route_note_end_argv()).await
+async fn khipu_route_note_end(op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_note_end_argv(), op.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_route_rule(action: String, n: Option<u32>, text: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(route_rule_argv(&action, n, text.as_deref())?).await
+async fn khipu_route_rule(action: String, n: Option<u32>, text: Option<String>, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_rule_argv(&action, n, text.as_deref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
@@ -2488,13 +2527,14 @@ async fn khipu_route_hold_add(
     scope: String,
     account: Option<String>,
     until: Option<String>,
+    op: Option<String>,
 ) -> Result<String, String> {
-    run_khipu_cli_async(route_hold_add_argv(&text, &reason, &scope, account.as_deref(), until.as_deref())?).await
+    run_khipu_cli_async(route_operation_argv(route_hold_add_argv(&text, &reason, &scope, account.as_deref(), until.as_deref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
-async fn khipu_route_hold_end(id: String) -> Result<String, String> {
-    run_khipu_cli_async(route_hold_end_argv(&id)?).await
+async fn khipu_route_hold_end(id: String, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_hold_end_argv(&id)?, op.as_deref())?).await
 }
 
 // ---- Work: the live view and the ledger (docs/plans/2026-10-15-work-view.md, phase 4)
@@ -3035,11 +3075,21 @@ async fn khipu_route_priority(
     entries: Option<Vec<PriorityEntry>>,
     until: Option<String>,
     expect: Option<String>,
+    holds: Option<serde_json::Map<String, Value>>,
+    op: Option<String>,
 ) -> Result<String, String> {
     run_khipu_cli_async(
-        route_priority_argv_expect(&action, entries.as_deref().unwrap_or(&[]), until.as_deref(), expect.as_deref())?,
+        route_operation_argv(
+            route_priority_argv_expect(&action, entries.as_deref().unwrap_or(&[]), until.as_deref(), expect.as_deref(), holds.as_ref())?,
+            op.as_deref(),
+        )?,
     )
     .await
+}
+
+#[tauri::command]
+async fn khipu_route_definition(definition: String, value: Value, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_definition_argv(&definition, &value)?, op.as_deref())?).await
 }
 
 /// Sign in again: the CLI starts the account's own login (it opens the
@@ -4100,6 +4150,7 @@ const SETTABLE_SECRETS: &[&str] = &[
     "database_url",
     "openai_compat_api_key",
     "voyage_api_key",
+    "glm_api_key",
 ];
 
 #[tauri::command]
@@ -4991,6 +5042,7 @@ pub fn run() {
             khipu_route_hold_add,
             khipu_route_hold_end,
             khipu_route_priority,
+            khipu_route_definition,
             khipu_work_view,
             khipu_ledger_list,
             khipu_ledger_get,
@@ -5331,6 +5383,7 @@ mod settable_secrets_tests {
                 "database_url",
                 "openai_compat_api_key",
                 "voyage_api_key",
+                "glm_api_key",
             ]
         );
     }
@@ -5644,6 +5697,17 @@ mod settings_command_tests {
     }
 
     #[test]
+    fn routing_click_operation_is_a_joined_flag_before_the_words() {
+        let base = route_rule_argv("add", None, Some("--synthetic-words")).unwrap();
+        let argv = route_operation_argv(base.clone(), Some("synthetic-click-1")).unwrap();
+        assert_eq!(argv, v(&["route", "rule", "--from-app", "--op=synthetic-click-1", "--", "add", "--synthetic-words"]));
+        assert_eq!(route_operation_argv(base.clone(), None).unwrap(), base);
+        for op in ["", "bad\n--from-app", "bad op", "--flag=value"] {
+            assert!(route_operation_argv(base.clone(), Some(op)).is_err());
+        }
+    }
+
+    #[test]
     fn routing_owner_writes_are_fixed_verbs_marked_from_the_app() {
         let acct = "claude|/logins/claude-second";
         assert_eq!(
@@ -5848,6 +5912,18 @@ mod settings_command_tests {
                          ("routing_runner_tail_bytes", "-5"), ("routing_poll_interval", "10s")] {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
+    }
+
+    #[test]
+    fn provider_definitions_use_fixed_app_argv_and_never_turn_values_into_flags() {
+        let value = serde_json::json!({"id": "glm", "label": "--owner-direction", "family": "Zhipu"});
+        let argv = route_definition_argv("provider", &value).unwrap();
+        assert_eq!(&argv[..4], v(&["route", "definition", "set", "provider"]));
+        assert_eq!(argv.last().unwrap(), "--from-app");
+        assert_eq!(argv.len(), 6);
+        assert_eq!(serde_json::from_str::<Value>(argv[4].strip_prefix("--value=").unwrap()).unwrap(), value);
+        assert!(route_definition_argv("--from-app", &value).is_err());
+        assert!(route_definition_argv("account", &Value::Null).is_err());
     }
 
     #[test]
@@ -6811,48 +6887,50 @@ mod priority_and_sign_in_tests {
             entry("codex|", Some("--from-app -- clear"), None),
             entry("claude|", None, None),
         ];
-        let argv = route_priority_argv("set", &entries, Some("2026-10-20T09:00:00Z")).unwrap();
+        let holds = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("keep")))]);
+        let argv = route_priority_argv("set", &entries, Some("2026-10-20T09:00:00Z"), Some(&holds)).unwrap();
         assert_eq!(argv[..3], v(&["route", "priority", "--from-app"])[..]);
         assert_eq!(argv[argv.len() - 2..], v(&["--", "set"])[..]);
-        assert_eq!(argv.len(), 8);
-        assert_eq!(argv[5], "--expect=p1");
-        let json = argv[3].strip_prefix("--entries=").unwrap();
+        assert_eq!(argv.len(), 9);
+        assert_eq!(argv[3], "--holds={\"h-grok\":\"keep\"}");
+        assert_eq!(argv[6], "--expect=p1");
+        let json = argv[4].strip_prefix("--entries=").unwrap();
         let parsed: Value = serde_json::from_str(json).unwrap();
         let order: Vec<&str> = parsed.as_array().unwrap().iter().map(|e| e["account"].as_str().unwrap()).collect();
         assert_eq!(order, ["claude|/logins/claude-second", "codex|", "claude|"]);
         // A role that looks like a flag stays words inside the JSON.
         assert_eq!(parsed[1]["role"], "--from-app -- clear");
-        assert_eq!(argv[4], "--until=2026-10-20T09:00:00Z");
+        assert_eq!(argv[5], "--until=2026-10-20T09:00:00Z");
     }
 
     #[test]
     fn a_value_can_never_become_an_option() {
-        assert!(route_priority_argv("set", &[entry("--from-app", None, None)], None).is_err());
-        assert!(route_priority_argv("set", &[entry("Codex\n--x", None, None)], None).is_err());
-        assert!(route_priority_argv("set", &[entry("Codex", Some("a\nb"), None)], None).is_err());
-        assert!(route_priority_argv("set", &[entry("Codex", None, Some("--until"))], None).is_err());
-        assert!(route_priority_argv("set", &[entry("Codex", None, None)], Some("1h")).is_err());
-        assert!(route_priority_argv("--clear", &[], None).is_err());
-        assert!(route_priority_argv("set", &[], None).is_err());
+        assert!(route_priority_argv("set", &[entry("--from-app", None, None)], None, None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex\n--x", None, None)], None, None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex", Some("a\nb"), None)], None, None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex", None, Some("--until"))], None, None).is_err());
+        assert!(route_priority_argv("set", &[entry("Codex", None, None)], Some("1h"), None).is_err());
+        assert!(route_priority_argv("--clear", &[], None, None).is_err());
+        assert!(route_priority_argv("set", &[], None, None).is_err());
         let many: Vec<PriorityEntry> = (0..65).map(|_| entry("Codex", None, None)).collect();
-        assert!(route_priority_argv("set", &many, None).is_err());
+        assert!(route_priority_argv("set", &many, None, None).is_err());
         // Confirm, undo and clear carry nothing but their version and verb, whatever is sent.
         for action in ["confirm", "undo"] {
-            let argv = route_priority_argv_expect(action, &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), Some("p1")).unwrap();
+            let argv = route_priority_argv_expect(action, &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), Some("p1"), None).unwrap();
             assert_eq!(argv, v(&["route", "priority", "--from-app", "--expect=p1", "--", action]));
         }
-        let clear = route_priority_argv_expect("clear", &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), Some("p1")).unwrap();
+        let clear = route_priority_argv_expect("clear", &[entry("Codex", Some("x"), None)], Some("2026-10-20T09:00:00Z"), Some("p1"), None).unwrap();
         assert_eq!(clear, v(&["route", "priority", "--from-app", "--expect=p1", "--", "clear"]));
     }
 
     #[test]
     fn the_priority_version_joins_its_flag_before_the_verb() {
-        let argv = route_priority_argv_expect("clear", &[], None, Some("p9f")).unwrap();
+        let argv = route_priority_argv_expect("clear", &[], None, Some("p9f"), None).unwrap();
         assert_eq!(argv, v(&["route", "priority", "--from-app", "--expect=p9f", "--", "clear"]));
-        let set = route_priority_argv_expect("set", &[entry("Codex", None, None)], None, Some("p0")).unwrap();
+        let set = route_priority_argv_expect("set", &[entry("Codex", None, None)], None, Some("p0"), None).unwrap();
         assert_eq!(set[set.len() - 3], "--expect=p0");
         for bad in ["", "--x", "p 1", "p=1", "p\n1", "p|1", ".p1", "p1.", "p1..a2", "p-1"] {
-            assert!(route_priority_argv_expect("clear", &[], None, Some(bad)).is_err(), "{bad:?}");
+            assert!(route_priority_argv_expect("clear", &[], None, Some(bad), None).is_err(), "{bad:?}");
         }
     }
 
@@ -6870,12 +6948,12 @@ mod priority_and_sign_in_tests {
     #[test]
     fn a_priority_change_without_its_version_is_refused() {
         for missing in [None, Some(""), Some("  ")] {
-            let clear = route_priority_argv_expect("clear", &[], None, missing).unwrap_err();
+            let clear = route_priority_argv_expect("clear", &[], None, missing, None).unwrap_err();
             assert!(clear.contains("needs the version it read"), "{clear}");
-            assert!(route_priority_argv_expect("set", &[entry("Codex", None, None)], None, missing).is_err());
+            assert!(route_priority_argv_expect("set", &[entry("Codex", None, None)], None, missing, None).is_err());
             // Confirm and undo answer the request the owner saw, so a newer one is never answered unseen.
-            assert!(route_priority_argv_expect("confirm", &[], None, missing).is_err());
-            assert!(route_priority_argv_expect("undo", &[], None, missing).is_err());
+            assert!(route_priority_argv_expect("confirm", &[], None, missing, None).is_err());
+            assert!(route_priority_argv_expect("undo", &[], None, missing, None).is_err());
         }
     }
 
@@ -7436,6 +7514,8 @@ mod accounts_command_tests {
             assert!(accounts_try_argv(bad, None).is_err(), "accepted harness {bad:?}");
         }
         assert!(accounts_try_argv("muse", Some("~/.muse")).is_err());
+        assert!(accounts_try_argv("glm", Some("~/.claude-glm")).is_err());
+        assert_eq!(accounts_try_argv("glm", None).unwrap(), v(&["usage", "--try", "--harness=glm"]));
         for bad in ["-x", "--folder=/x", "relative/folder", "~/.claude\n--now", ".claude-x"] {
             assert!(accounts_try_argv("claude", Some(bad)).is_err(), "accepted folder {bad:?}");
         }

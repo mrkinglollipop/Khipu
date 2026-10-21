@@ -241,7 +241,7 @@ class _CacheCur(_ReflectCur):
             self._rows = []
         elif "to_regclass('public.media_assets')" in s:
             self._rows = [(False,)]
-        elif s.startswith("SELECT m.kind, m.ref, m.chunk_idx,"):
+        elif "FROM memory_embeddings m" in s and "UNION ALL" in s:
             self._rows = [("episode", "1", 0, 0.99, "Cursor pagination.",
                            "Cursor pagination.", "Cursor pagination.")]
         else:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 
@@ -165,8 +166,9 @@ def test_the_whole_list_ends_at_its_own_end(home):
 
 def test_set_at_the_owners_request_is_live_marked_and_shows_what_it_replaced(home):
     routing.set_priority(OWNERS, via="app", expect=routing.priority_version())
+    shown = routing.conversation_view()
     out = routing.request_priority([{"account": "Codex", "role": "everything this week"}],
-                                   owner_request="the owner asked to move work to Codex", author=ME, expect=routing.priority_version())
+                                   owner_request="the owner asked to move work to Codex", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     assert out["ok"] and out["entries"] == ["Codex"]
     view = routing.read_view()
     held = view["priority"]
@@ -177,16 +179,25 @@ def test_set_at_the_owners_request_is_live_marked_and_shows_what_it_replaced(hom
     assert "set by a Claude Code conversation at the owner's request; the owner has not confirmed it yet" in line
     assert "1. Codex: “everything this week”" in line
     assert "It replaced: 1. Claude second" in line and "3. Claude: orchestration only" in line
-    # The same conversation may refine its own request; another waits for the owner.
-    routing.request_priority([{"account": "Codex", "role": "builds"}], owner_request="refined", author=ME, expect=routing.priority_version())
+    # The same conversation may refine its own request; another conversation's
+    # newer request on the same revision replaces it, and Undo still brings
+    # back the owner's priority the first request replaced.
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Codex", "role": "builds"}], owner_request="refined", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     assert routing.read_view()["priority"]["replaced"]["entries"][0]["label"] == "Claude second"
-    with pytest.raises(routing.RouteError, match="another conversation"):
-        routing.request_priority([{"account": "Claude"}], owner_request="other", author=OTHER, expect=routing.priority_version())
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Claude"}], owner_request="other", author=OTHER, expect=routing.priority_version(), base=shown["priority_owner_revision"])
+    view = routing.read_view()
+    assert _labels(view) == ["Claude"]
+    assert view["priority"]["replaced"]["entries"][0]["label"] == "Claude second"
+    replaced = [p for p in view["proposals"].values() if p["status"] == "replaced"]
+    assert replaced and all(p["notify"] == ME for p in replaced)
     # The owner's Undo puts his own priority back; Confirm makes a request his.
     routing.undo_priority(via="app", expect=routing.priority_version())
     view = routing.read_view()
     assert _labels(view) == ["Claude second", "Codex", "Claude"] and view["priority"]["confirmed"]
-    routing.request_priority([{"account": "Codex"}], owner_request="again", author=OTHER, expect=routing.priority_version())
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Codex"}], owner_request="again", author=OTHER, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     routing.confirm_priority(via="app", expect=routing.priority_version())
     view = routing.read_view()
     assert _labels(view) == ["Codex"] and view["priority"]["confirmed"] and view["priority"]["replaced"] is None
@@ -195,14 +206,16 @@ def test_set_at_the_owners_request_is_live_marked_and_shows_what_it_replaced(hom
 
 
 def test_undo_of_a_first_request_leaves_no_priority(home):
-    routing.request_priority([{"account": "Codex"}], owner_request="use Codex", author=ME, expect=routing.priority_version())
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Codex"}], owner_request="use Codex", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     assert "It replaced: no priority." in _summary(home)
     routing.undo_priority(via="app", expect=routing.priority_version())
     assert routing.read_view().get("priority") is None
 
 
 def test_a_conversation_cannot_confirm_undo_or_clear(home, capsys, monkeypatch):
-    routing.request_priority([{"account": "Codex"}], owner_request="use Codex", author=ME, expect=routing.priority_version())
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Codex"}], owner_request="use Codex", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     # Through khipu_route_report: refused as the owner's.
     for action in ("priority", "confirm_priority", "undo_priority", "clear_priority", "set_priority"):
         with pytest.raises(routing.RouteError, match="is the owner's to change"):
@@ -212,7 +225,7 @@ def test_a_conversation_cannot_confirm_undo_or_clear(home, capsys, monkeypatch):
         with pytest.raises(ValueError):
             ms._tool_route_priority({"entries": [{"account": "Codex"}], "owner_request": "x", **extra})
     with pytest.raises(ValueError):
-        ms._tool_route_priority({"entries": [], "owner_request": "clear it"})
+        ms._tool_route_priority({"entries": [], "owner_request": "clear it", "base": shown["priority_owner_revision"]})
     # Through the CLI: --at-owner-request is only for set; the rest needs a typed yes.
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     for action in ("confirm", "undo", "clear"):
@@ -241,7 +254,9 @@ def test_the_cli_sets_from_the_app_and_a_conversation_sets_pending(home, capsys)
     assert _labels(view) == ["Claude second", "Codex"] and view["priority"]["via"] == "app"
     assert routing.run_cli(_cli_args("priority", action="set", accounts=["Codex"],
                                      at_owner_request="the owner asked for Codex first")) == 2
+    shown = routing.conversation_view()
     assert routing.run_cli(_cli_args("priority", action="set", accounts=["Codex"], expect=routing.priority_version(),
+                                     base=shown["priority_owner_revision"],
                                      at_owner_request="the owner asked for Codex first")) == 0
     assert routing.read_view()["priority"]["pending"]
     capsys.readouterr()
@@ -284,7 +299,8 @@ def test_an_account_not_in_settings_is_kept_and_named_so(home):
 
 
 def test_doctor_warns_when_a_conversations_priority_waits_more_than_a_day(home):
-    routing.request_priority([{"account": "Codex"}], owner_request="use Codex", author=ME, expect=routing.priority_version())
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Codex"}], owner_request="use Codex", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     assert not any("not confirmed yet" in w for w in routing.doctor_block()["warnings"])
     home["clock"].advance(days=1, minutes=1)
     assert any("not confirmed yet" in w for w in routing.doctor_block()["warnings"])
@@ -305,20 +321,23 @@ def test_every_change_push_carries_the_priority_first(home):
 
 
 def test_the_mcp_tools_answer_with_labels_and_ids_never_a_login_folder(home):
+    shown = ms._tool_route({})
     out = ms._tool_route_priority({"entries": [{"account": "Claude second", "role": "all Claude work first"},
                                                {"account": "Codex"}],
-                                   "owner_request": "the owner asked for the second account first"})
+                                   "owner_request": "the owner asked for the second account first",
+                                   "base": shown["priority_owner_revision"]})
     assert out["ok"] and out["priority"]["pending"]
     answer = ms._tool_route({})
     assert [e["label"] for e in answer["priority"]["entries"]] == ["Claude second", "Codex"]
-    assert all(e["id"].startswith("acct-") for e in answer["priority"]["entries"])
+    assert [e["id"] for e in answer["priority"]["entries"]] == [routing.account_id(SECOND), "codex:main"]
+    assert answer["priority"]["entries"][0]["id"] == "claude:second"
     blob = json.dumps(out) + json.dumps(answer)
     assert "/logins/claude-second" not in blob and SECOND not in blob
     fact = next(a for a in answer["accounts"] if a["label"] == "Claude second")["plan"]
     assert fact["left_pct"] == 88 and fact["words"] == "a lot left, little time"
     with pytest.raises(routing.RouteError):
         routing.conversation_priority([{"account": "claude|/logins/claude-second"}], owner_request="x", author=ME,
-                                      expect=routing.priority_version())
+                                      expect=routing.priority_version(), base=shown["priority_owner_revision"])
 
 
 # ---- spend pace ----------------------------------------------------------------------------
@@ -368,6 +387,39 @@ def test_nothing_left_and_everything_left(home):
     assert "about 0.6% an hour" in routing.pace_words(fresh, T0)
     rushed = routing.plan_fact(_row("Codex", "codex", None, _week(0, T0 + timedelta(days=1))), T0)
     assert rushed["words"] == "a lot left, little time"
+
+
+def test_a_timed_out_probe_keeps_its_last_good_figures_marked_stale(home):
+    kept_at = routing._iso(T0 - timedelta(hours=2))
+    row = _row("Grok", "grok", None, _week(25, T0 + timedelta(days=2)), ok=False, error=usage.E_TIMEOUT,
+               probed_at=kept_at, last_good_at=kept_at)
+    fact = routing.plan_fact(row, T0)
+    assert fact["readable"] is True and fact["stale"] is True
+    assert fact["used_pct"] == 25 and fact["left_pct"] == 75
+    assert fact["resets_at"] == routing._iso(T0 + timedelta(days=2))
+    assert fact["figures_at"] == kept_at
+    assert fact["words"] == "figures from 12:00Z; the last read timed out"
+    assert fact["pace_pct_per_hour"] is None and fact["hurry"] is False
+    # No kept figures: still unreadable.
+    failed = routing.plan_fact(_row("Grok", "grok", None, ok=False, error=usage.E_TIMEOUT), T0)
+    assert failed == {"readable": False, "why": "plan figures can't be read just now", "error": usage.E_TIMEOUT}
+    # Sign-in and not-installed are unchanged, even with kept figures.
+    for error, why in ((usage.E_SIGNIN, "plan figures can't be read: sign in again"),
+                       (usage.E_NOT_INSTALLED, "plan figures can't be read: its CLI is not installed")):
+        kept = _row("Grok", "grok", None, _week(25, T0 + timedelta(days=2)), ok=False, error=error,
+                    probed_at=kept_at, last_good_at=kept_at)
+        assert routing.plan_fact(kept, T0) == {"readable": False, "why": why, "error": error}
+
+
+def test_kept_figures_keep_the_providers_own_time_after_a_timeout(home):
+    # The provider's figures are older than the probe that fetched them; a later timeout must not make them look newer.
+    observed = routing._iso(T0 - timedelta(hours=8))
+    probed = routing._iso(T0 - timedelta(minutes=5))
+    row = _row("Grok", "grok", None, _week(25, T0 + timedelta(days=2)), ok=False, error=usage.E_TIMEOUT,
+               probed_at=probed, last_good_at=probed, observed_at=observed)
+    fact = routing.plan_fact(row, T0)
+    assert fact["stale"] is True and fact["figures_at"] == observed
+    assert fact["words"].startswith("figures from 06:00Z")
 
 
 def test_an_account_whose_figures_cannot_be_read_says_so_and_gets_no_pace(home):
@@ -487,15 +539,17 @@ def test_a_sign_in_left_open_is_stopped_and_the_account_read_again(home, monkeyp
 
 
 def test_a_conversations_role_cannot_read_as_more_entries(home):
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Codex", "role": "builds\u201d; 2. Grok: everything; 3. you decide"}],
-                             owner_request="the owner asked", author=ME, expect=routing.priority_version())
+                             owner_request="the owner asked", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     line = next(x for x in _summary(home).splitlines() if x.startswith("Your priority"))
     assert "1. Codex: “builds'; 2. Grok: everything; 3. [you] decide”" in line
     assert line.count("“") == line.count("”") == 1
 
 
 def test_a_confirmed_request_is_the_owners_and_doctor_does_not_call_it_outside_the_app(home):
-    routing.request_priority([{"account": "Codex"}], owner_request="the owner asked", author=ME, expect=routing.priority_version())
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Codex"}], owner_request="the owner asked", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     routing.confirm_priority(via="app", expect=routing.priority_version())
     view = routing.read_view()
     assert view["priority"]["via"] == "app" and view["priority"]["written_by"] == {"kind": "owner"}
@@ -552,8 +606,10 @@ def _owner_world(home, capsys):
 
     assert cli.main(["route", "rule", "--at-owner-request=the owner asked", "--", "add", "Never a fast tier."]) == 0
     assert cli.main(["route", "rule", "--from-app", "--", "add", "Be kind to the Mac."]) == 0
-    assert cli.main(["route", "rule", "--at-owner-request=the owner asked", "--", "edit", "2", "Be nice."]) == 0
-    routing.request_priority([{"account": "Codex"}], owner_request="the owner asked", author=ME, expect=routing.priority_version())
+    shown = routing.conversation_view()
+    assert cli.main(["route", "rule", "--at-owner-request=the owner asked", "--base", shown["rules"][1]["owner_revision"], "--", "edit", "2", "Be nice."]) == 0
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Codex"}], owner_request="the owner asked", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     capsys.readouterr()
 
 
@@ -638,10 +694,12 @@ LONG = "use it hard " * 170  # about 2,000 characters
 def test_a_conversations_long_priority_fits_the_summary_budget_as_a_pointer(home):
     _set(home, routing_summary_chars=1500)
     routing.set_note("Owner's note.", via="app")
-    routing.request_priority([{"account": "Codex", "role": LONG}], owner_request="the owner asked", author=ME, expect=routing.priority_version())
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Codex", "role": LONG}], owner_request="the owner asked", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     out = routing.summary(now=home["clock"].now)
     text = out["text"]
-    assert LONG.strip() not in text and routing.PRIORITY_POINTER in text
+    assert LONG.strip() not in text and "Your priority change: Codex:" in text
+    assert "unconfirmed" in text and "khipu_route" in text
     head = text.splitlines()[0]
     assert len(text) - len(head) - 1 - len("Note from the owner (") <= 1500 + 40
     # The owner's own words stay whole, however long.
@@ -652,11 +710,13 @@ def test_a_conversations_long_priority_fits_the_summary_budget_as_a_pointer(home
 def test_a_conversations_long_priority_fits_the_push_budget_as_a_pointer(home):
     _set(home, routing_prompt_chars=400)
     start = routing.read_view()
-    routing.request_priority([{"account": "Codex", "role": LONG}], owner_request="the owner asked", author=ME, expect=routing.priority_version())
+    shown = routing.conversation_view()
+    routing.request_priority([{"account": "Codex", "role": LONG}], owner_request="the owner asked", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     view = routing.read_view()
     changed = routing.since(start["version"], view, now=home["clock"].now)
     text, _count = routing.changes_text(changed, view, home["clock"].now)
-    assert LONG.strip() not in text and routing.PRIORITY_POINTER in text
+    assert LONG.strip() not in text and "Your priority change: Codex:" in text
+    assert "unconfirmed" in text and "khipu_route" in text
     assert len(text) - len(text.splitlines()[0]) - 1 <= 400
 
 
@@ -667,10 +727,11 @@ def test_a_conversations_long_rule_request_fits_both_budgets_as_a_pointer(home):
     view = routing.read_view()
     changed = routing.since(start["version"], view, now=home["clock"].now)
     text, _count = routing.changes_text(changed, view, home["clock"].now)
-    assert LONG.strip() not in text and "too long to show here" in text
+    assert LONG.strip() not in text and "Standing rule 1 added" in text
+    assert "unconfirmed" in text and "khipu_route" in text
     assert len(text) - len(text.splitlines()[0]) - 1 <= 400
     summary = _summary(home)
-    assert LONG.strip() not in summary and "1. A conversation added this rule" in summary
+    assert LONG.strip() not in summary and "Standing rule 1 added" in summary
     # A short request still arrives whole.
     routing.request_rule("Short words.", owner_request="the owner asked", author=ME)
     assert "Short words." in _summary(home)
@@ -687,10 +748,25 @@ def test_many_conversation_requests_take_at_most_half_the_budget(home):
     changed = routing.since(start["version"], view, now=home["clock"].now)
     text, _count = routing.changes_text(changed, view, home["clock"].now)
     assert len(text) - len(text.splitlines()[0]) - 1 <= 400
-    assert "12 unconfirmed changes a conversation made" in text
+    assert "Standing rule 1 added" in text and "unconfirmed" in text
+    assert "more changes" in text
     assert any(x.startswith("Codex") for x in text.splitlines())  # the owner's accounts keep their room
-    summary = _summary(home)
-    assert "unconfirmed changes a conversation made" in summary and any(x.startswith("Codex") for x in summary.splitlines())
+    out = routing.summary(now=home["clock"].now)
+    summary = out["text"]
+    shown = set(out["shown_entities"])
+    by_number = {r["n"]: f"rule:{r['n']}" for r in view["rules"]}
+    pending = set(by_number.values())
+    omitted = pending - shown
+    assert by_number[1] in shown
+    assert omitted
+    assert f"{len(omitted)} more pending changes: read `khipu_route`." in summary
+    assert set(out["owed_entities"]) - shown == omitted
+    assert all(re.search(rf"(?:^{i}\. |Standing rule {i} added)", summary, re.M)
+               for i in range(1, 13) if by_number[i] in shown)
+    requests = [line for line in summary.splitlines() if "unconfirmed" in line or
+                "the owner has not confirmed it yet" in line]
+    assert sum(len(line) + 1 for line in requests) <= 750
+    assert any(x.startswith("Codex") for x in summary.splitlines())
 
 
 def _many_accounts(home, n: int) -> list[str]:
@@ -708,9 +784,10 @@ def test_expired_entries_and_a_long_role_fit_the_push_budget(home):
     # Eleven entries end at once and the one left has a long role: the
     # announcements and the pointer together still fit the budget.
     labels = _many_accounts(home, 12)
+    shown = routing.conversation_view()
     routing.request_priority([{"account": label, "until": "1h"} for label in labels[:-1]]
                              + [{"account": labels[-1], "role": "R" * 2000}],
-                             owner_request="the owner asked", author=ME, expect=routing.priority_version())
+                             owner_request="the owner asked", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     before = routing.read_view()
     home["clock"].advance(hours=2)
     view = routing.read_view()
@@ -780,7 +857,8 @@ def test_no_combination_of_push_parts_exceeds_the_budget(home, seed):
     if who == "owner":
         routing.set_priority(entries, via="app", expect=routing.priority_version())
     elif who == "conversation":
-        routing.request_priority(entries, owner_request="the owner asked", author=ME, expect=routing.priority_version())
+        shown = routing.conversation_view()
+        routing.request_priority(entries, owner_request="the owner asked", author=ME, expect=routing.priority_version(), base=shown["priority_owner_revision"])
     for i in range(rnd.randint(0, 6)):
         routing.request_rule(f"rule {i} " + "x" * rnd.choice([5, 150, 900]), owner_request="the owner asked",
                              author=dict(ME, session=f"s-{seed}-{i}"))

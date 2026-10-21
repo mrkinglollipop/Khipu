@@ -1105,6 +1105,8 @@ def test_cli_path_is_honoured_by_the_lookup_after_the_override(tmp_path, monkeyp
 def test_the_cli_json(mac, capsys):
     from khipu.cli import main
 
+    with config.mutate_config() as data:
+        data[config.AUTO_TRACK_KEY] = False  # explicit off: no tracking, no usage cache
     mac.install("claude")
     mac.folder(".claude-client")
     mac.session("claude_code", "x", login_home=str(mac.folder(".claude-used")))
@@ -1398,3 +1400,250 @@ def test_a_malformed_stored_candidate_is_dropped_never_a_crash(mac, entry):
         usage._release(fd)
     assert out["looking"] is True and out["candidates"] == []
     assert discover.discover(at=NOW)["looking"] is False  # and a real run gets past it too
+
+
+# ---- slice 9c: bounded settings parser, login evidence, subscriptions (case 17a) ----
+
+TOKEN_SENTINEL = "SENTINEL-s9c-token-never-out"
+
+
+def _settings(folder: Path, payload) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    text = payload if isinstance(payload, str) else json.dumps(payload)
+    (folder / "settings.json").write_text(text)
+
+
+def test_bounded_settings_outputs_only_a_validated_host_and_token_presence(mac):
+    folder = mac.tmp / "login"
+    _settings(folder, {"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic?key=1",
+                                "ANTHROPIC_AUTH_TOKEN": TOKEN_SENTINEL},
+                       "other": TOKEN_SENTINEL})
+    got = discover.bounded_settings(folder)
+    assert got == {"host": "api.z.ai", "provider": "glm", "has_token": True, "unreadable": False}
+    assert TOKEN_SENTINEL not in json.dumps(got)
+    for url in ("https://user:pw@api.z.ai/api", "https://evil.invalid/api", "not a url"):
+        _settings(folder, {"env": {"ANTHROPIC_BASE_URL": url}})
+        assert discover.bounded_settings(folder)["host"] is None, url
+    _settings(folder, "{broken " + TOKEN_SENTINEL)
+    got = discover.bounded_settings(folder)
+    assert got == {"host": None, "provider": None, "has_token": False, "unreadable": True}
+    assert TOKEN_SENTINEL not in json.dumps(got)
+    assert discover.bounded_settings(mac.tmp / "missing") == {
+        "host": None, "provider": None, "has_token": False, "unreadable": False}
+
+
+def test_a_claude_home_pointing_at_zai_is_offered_as_glm_and_the_token_never_shows(mac, capsys):
+    mac.install("claude")
+    folder = mac.folder(".claude-custom")
+    _settings(folder, {"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+                                "ANTHROPIC_AUTH_TOKEN": TOKEN_SENTINEL}})
+    out = discover.discover(at=NOW)
+    glm = [c for c in out["candidates"] if c["cli"] == "glm"]
+    assert len(glm) == 1 and glm[0]["state"] == "signed_in" and glm[0]["offer_on_home"] is True
+    assert glm[0]["provider_host"] == "api.z.ai" and glm[0]["login_evidence"] == ["settings_token"]
+    channels = [json.dumps(out), discover.store_file().read_text(), capsys.readouterr().out]
+    assert all(TOKEN_SENTINEL not in channel for channel in channels)
+
+
+def test_a_folder_holding_only_worktrees_is_not_offered(mac):
+    box = mac.folder(".claude-box")
+    (box / "worktrees").mkdir()
+    real = mac.folder(".claude-real")
+    (real / "auth.json").write_text("{}")
+    found, _t, _d = discover._gather(NOW)
+    paths = {r["path"] for r in found.values()}
+    assert "~/.claude-box" not in paths and "~/.claude-real" in paths
+
+
+def test_a_keychain_backed_claude_home_with_no_auth_file_is_offered_when_its_cli_reports_signed_in(mac):
+    mac.install("claude")
+    folder = mac.folder(".claude-keychain")
+    mac.session("claude_code", "k", login_home=str(folder))
+    out = discover.discover(at=NOW)
+    row = _by_path(out)["~/.claude-keychain"]
+    assert row["state"] == "signed_in" and row["offer_on_home"] is True
+    assert row["login_evidence"] == [], "no auth file: the CLI's signed-in status is the evidence"
+
+
+def _grok_homes(mac, monkeypatch, account_ids):
+    mac.install("grok")
+    folders = []
+    for name in (".grok-a", ".grok-b", ".grok-c"):
+        folder = mac.folder(name)
+        folders.append(folder)
+        mac.session("aegis", name, login_home=str(folder))
+
+    def probe(home, timeout=None):
+        return {"ok": True, "plan": "SuperGrok", "windows": [],
+                "account_id": account_ids[Path(home).name]}
+
+    monkeypatch.setattr(usage, "probe_grok", probe)
+    return folders
+
+
+def test_three_grok_homes_are_one_account_only_when_the_cli_account_status_agrees(mac, monkeypatch):
+    _grok_homes(mac, monkeypatch, {".grok-a": "acct-1", ".grok-b": "acct-1", ".grok-c": "acct-1"})
+    out = discover.discover(at=NOW)
+    grok = [c for c in out["candidates"] if c["cli"] == "grok"]
+    assert len(grok) == 1 and grok[0]["merged"] is True and len(grok[0]["homes"]) == 3
+    assert "acct-1" not in json.dumps(out), "only a digest of the account id is kept"
+
+
+def test_three_grok_homes_stay_separate_until_the_owner_merges_them(mac, monkeypatch):
+    _grok_homes(mac, monkeypatch, {".grok-a": "acct-1", ".grok-b": "acct-2", ".grok-c": "acct-3"})
+    out = discover.discover(at=NOW)
+    grok = [c for c in out["candidates"] if c["cli"] == "grok"]
+    assert len(grok) == 3 and not any(c["merged"] for c in grok)
+    merged = discover.merge_same_subscription([c["id"] for c in grok])
+    assert merged["ok"] is True
+    out = discover.discover(at=NOW + 60)
+    grok = [c for c in out["candidates"] if c["cli"] == "grok"]
+    assert len(grok) == 1 and grok[0]["merged"] is True and len(grok[0]["homes"]) == 3
+
+
+# ---- slice 9c fix round 1 (probes copied from review, fake homes only) ----
+
+def test_deeply_nested_settings_are_unreadable_and_discovery_survives(mac):
+    mac.install("claude")
+    folder = mac.folder(".claude-deep")
+    (folder / "settings.json").write_bytes(b"[" * 32000 + b"]" * 32000)
+    assert discover.bounded_settings(folder)["unreadable"] is True
+    (folder / "settings.json").write_bytes((b'{"a":' * 6000) + b"1" + b"}" * 6000)
+    assert discover.bounded_settings(folder)["unreadable"] is True
+    mac.session("claude_code", "d", login_home=str(folder))
+    out = discover.discover(at=NOW)
+    row = _by_path(out)["~/.claude-deep"]
+    assert row["settings"] == "unreadable"
+
+
+def test_bounded_settings_rejects_a_fifo_without_blocking(mac):
+    folder = mac.folder(".claude-fifo")
+    os.mkfifo(folder / "settings.json")
+    assert discover.bounded_settings(folder)["unreadable"] is True
+
+
+def test_bounded_settings_validates_scheme_and_port(mac):
+    folder = mac.tmp / "login"
+    for url, host in (("http://api.z.ai:8080/x", None), ("https://api.z.ai:8080/x", None),
+                      ("https://api.z.ai:443/x", "api.z.ai"), ("https://api.z.ai/x", "api.z.ai")):
+        _settings(folder, {"env": {"ANTHROPIC_BASE_URL": url, "ANTHROPIC_AUTH_TOKEN": TOKEN_SENTINEL}})
+        assert discover.bounded_settings(folder)["host"] == host, url
+
+
+def test_a_settings_token_signs_in_only_a_provider_pointed_home(mac):
+    mac.install("claude")
+    plain = mac.folder(".claude-out")
+    _settings(plain, {"env": {"ANTHROPIC_API_KEY": TOKEN_SENTINEL}})
+    mac.session("claude_code", "o", login_home=str(plain))
+    out = discover.discover(at=NOW)
+    row = _by_path(out)["~/.claude-out"]
+    assert row["state"] == "not_signed_in" and row["offer_on_home"] is False
+    assert mac.calls("claude"), "a non-provider home is asked through its CLI"
+
+
+def test_a_provider_pointed_settings_token_signs_in_without_asking_the_cli(mac):
+    mac.install("claude")
+    folder = mac.folder(".claude-out2")
+    _settings(folder, {"env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                                "ANTHROPIC_API_KEY": TOKEN_SENTINEL}})
+    mac.session("claude_code", "p", login_home=str(folder))
+    out = discover.discover(at=NOW)
+    row = _by_path(out)["~/.claude-out2"]
+    assert row["state"] == "signed_in"
+    assert not [c for c in mac.calls("claude") if c[1] == "auth status --json"]
+
+
+def test_a_worktree_folder_with_real_login_contents_is_still_found(mac):
+    real = mac.folder(".claude-wtreal")
+    (real / "worktrees").mkdir()
+    (real / "projects").mkdir()
+    (real / "history.jsonl").write_text("x")
+    found, _t, _d = discover._gather(NOW)
+    assert "~/.claude-wtreal" in {r["path"] for r in found.values()}
+
+
+def test_collapsed_homes_keep_their_check_state(mac, monkeypatch):
+    _grok_homes(mac, monkeypatch, {".grok-a": "acct-1", ".grok-b": "acct-1", ".grok-c": "acct-1"})
+    calls = []
+    inner = usage.probe_grok
+    monkeypatch.setattr(usage, "probe_grok", lambda home, timeout=None: (calls.append(Path(home).name), inner(home, timeout=timeout))[1])
+    discover.discover(at=NOW)
+    assert len(calls) == 3
+    calls.clear()
+    out = discover.discover(at=NOW + 60)
+    grok = [c for c in out["candidates"] if c["cli"] == "grok"]
+    assert len(grok) == 1 and grok[0]["merged"] is True
+    assert calls == [], "collapsed homes are not re-checked on the next run"
+
+
+def test_owner_merge_updates_slice3a_bindings(mac, monkeypatch):
+    folders = _grok_homes(mac, monkeypatch, {".grok-a": "acct-1", ".grok-b": "acct-2", ".grok-c": "acct-3"})
+    out = discover.discover(at=NOW)
+    grok = [c for c in out["candidates"] if c["cli"] == "grok"]
+    from khipu import routing_identity
+    with config.mutate_config() as data:
+        data[routing_identity.BINDINGS] = {
+            "grok:main": {"harness": "grok", "home": str(folders[0])},
+            "grok:second": {"harness": "grok", "home": str(folders[1])}}
+    discover.merge_same_subscription([c["id"] for c in grok])
+    bindings = config.load_config()[routing_identity.BINDINGS]
+    homes = {v["home"] for v in bindings.values() if v.get("harness") == "grok"}
+    assert len(homes) == 1 and homes <= {str(f) for f in folders}, \
+        "merged homes bind through the primary home only"
+
+
+def test_auto_track_default_only_for_a_genuinely_new_install(mac):
+    assert config.auto_track() is True, "no config file at all: a new install"
+    cf = config.config_file()
+    cf.parent.mkdir(parents=True, exist_ok=True)
+    for payload in ('{"usage_auto_track": 0}', '{"usage_auto_track": "false"}',
+                    '{"usage_auto_track": null}', '{broken', ''):
+        cf.write_text(payload)
+        assert config.auto_track() is False, payload
+    cf.write_text('{"capture_mode": "dual"}')
+    assert config.auto_track() is False, "a pre-existing install with no key stays off"
+    stored = json.loads(cf.read_text())
+    assert stored[config.AUTO_TRACK_KEY] is False and stored.get(config.AUTO_TRACK_MIGRATION_KEY) is True
+    cf.write_text('{"usage_auto_track": true}')
+    assert config.auto_track() is True
+
+
+# ---- slice 9c fix round 2 ----
+
+def test_a_recheck_reporting_no_id_splits_previously_merged_homes(mac):
+    marker = mac.tmp / "claude-noid"
+    body = textwrap.dedent(f"""\
+        case "$*" in
+          "auth status --json")
+            if [ -z "$CLAUDE_CONFIG_DIR" ]; then echo '{{"loggedIn": false}}'; exit 1; fi
+            if [ -f "{marker}" ]; then echo '{{"loggedIn": true}}'; else echo '{{"loggedIn": true, "userId": "U1-shared"}}'; fi
+            exit 0;;
+          "--version") echo "2.1.296 (Claude Code)"; exit 0;;
+          -p*) cat "{FIXTURES / 'claude.jsonl'}"; exit 0;;
+        esac
+        exit 64
+    """)
+    mac.install("claude", body)
+    one = mac.folder(".claude-one")
+    two = mac.folder(".claude-two")
+    mac.session("claude_code", "one", login_home=str(one))
+    mac.session("claude_code", "two", login_home=str(two))
+    out = discover.discover(at=NOW)
+    merged = [c for c in out["candidates"] if c.get("merged")]
+    assert len(merged) == 1 and set(merged[0]["homes"]) == {"~/.claude-one", "~/.claude-two"}
+    marker.write_text("no id")
+    out = discover.discover(now=True, at=NOW + 60)
+    rows = _by_path(out)
+    assert rows["~/.claude-one"]["state"] == "signed_in" and rows["~/.claude-one"]["merged"] is False
+    assert rows["~/.claude-two"]["state"] == "signed_in" and rows["~/.claude-two"]["merged"] is False
+
+
+def test_bounded_settings_does_not_follow_a_symlinked_settings_file(mac):
+    folder = mac.folder(".claude-linked")
+    outside = mac.tmp / "outside-settings.json"
+    outside.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+                                            "ANTHROPIC_AUTH_TOKEN": TOKEN_SENTINEL}}))
+    (folder / "settings.json").symlink_to(outside)
+    got = discover.bounded_settings(folder)
+    assert got == {"host": None, "provider": None, "has_token": False, "unreadable": True}
+    assert TOKEN_SENTINEL not in json.dumps(got)

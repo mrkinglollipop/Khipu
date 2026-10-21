@@ -10,6 +10,8 @@ Hermetic: the ``world`` fixture from tests/test_owner_direction.py (temp data an
 folders, turns recorded the way the prompt hook records them)."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from khipu import owner_direction, routing
@@ -31,7 +33,71 @@ def _chain_ok() -> None:
     assert chain["ok"] is True, chain
 
 
+def _held_grok() -> tuple[dict, dict[str, str]]:
+    hold = routing.add_hold("wait for Grok", scope="account", account="Grok", reason="keep", owner=True, via="app")
+    return hold, {hold["id"]: "keep"}
+
+
 # ---- the original probes ----------------------------------------------------------------------
+
+
+def test_priority_undo_reuses_its_original_hold_choice(world):
+    _hold, choices = _held_grok()
+    routing.set_priority([{"account": "Grok", "role": "old role"}], via="app",
+                         expect=routing.priority_version(), holds=choices)
+    world.say("set Grok's new priority")
+    rc, out = world.run(["route", "priority", "set", "--entries=" + json.dumps(
+        [{"account": "Grok", "role": "new role"}]), "--expect=" + routing.priority_version(),
+                         "--holds=" + json.dumps(choices)], True)
+    assert rc == 0, out
+    (line,) = owner_direction.actions()
+    assert line["facts"]["holds"] == choices
+    world.say("undo Grok's priority")
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
+    assert rc == 0 and routing.read_view()["priority"]["entries"][0]["role"] == "old role", undone
+
+
+def test_rule_edit_undo_reuses_its_original_hold_choice(world):
+    _hold, choices = _held_grok()
+    routing.add_rule("Grok old rule", via="app", holds=choices)
+    world.say("edit Grok's rule")
+    rc, out = world.run(["route", "rule", "edit", "1", "Grok new rule", "--holds=" + json.dumps(choices)], True)
+    assert rc == 0, out
+    (line,) = owner_direction.actions()
+    assert line["facts"]["holds"] == choices
+    world.say("undo Grok's rule edit")
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
+    assert rc == 0 and routing.read_view()["rules"][0]["text"] == "Grok old rule", undone
+
+
+def test_rule_confirm_undo_reuses_its_original_hold_choice(world):
+    _hold, choices = _held_grok()
+    routing.add_rule("Grok old rule", via="app", holds=choices)
+    shown = routing.conversation_view()
+    pending = routing.request_rule("Grok new rule", n=1, owner_request="the owner asked", author=REPORTER, via="mcp", base=shown["rules"][0]["owner_revision"])
+    assert pending["ok"] is True
+    world.say("confirm Grok's edited rule")
+    rc, out = world.run(["route", "rule", "confirm", "1", "--holds=" + json.dumps(choices)], True)
+    assert rc == 0, out
+    (line,) = owner_direction.actions()
+    assert line["facts"]["holds"] == choices and line["before"]["pending_kind"] == "changed"
+    world.say("undo Grok's confirmed rule")
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
+    assert rc == 0 and routing.read_view()["rules"][0]["text"] == "Grok old rule", undone
+
+
+def test_rule_retire_undo_reuses_its_original_hold_choice(world):
+    hold, choices = _held_grok()
+    routing.add_rule("Grok old rule", via="app", holds=choices)
+    world.say("retire Grok's rule")
+    rc, out = world.run(["route", "rule", "retire", "1", "--holds=" + json.dumps(choices)], True)
+    assert rc == 0, out
+    (line,) = owner_direction.actions()
+    assert line["facts"]["holds"] == choices
+    world.say("undo retiring Grok's rule")
+    rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
+    assert rc == 0 and routing.read_view()["rules"][0]["text"] == "Grok old rule", undone
+    assert routing.read_view()["holds"][0]["id"] == hold["id"]
 
 
 def test_direction_never_reports_success_when_its_undo_log_cannot_be_written(world, monkeypatch):

@@ -115,14 +115,16 @@ def test_the_default_write_out_changes_no_key(mac, capsys):
     assert before == {"claude|", "codex|"}
     rc, out = _track(capsys, CLIENT)
     assert rc == 0 and out["ok"] is True
-    assert _stored() == [{"label": "Claude", "harness": "claude"}, {"label": "Codex", "harness": "codex"},
-                         {"label": "Claude client", "harness": "claude", "home": "~/.claude-client"}]
+    assert _stored() == [{"label": "Claude", "harness": "claude", "label_source": "owner"},
+                         {"label": "Codex", "harness": "codex", "label_source": "owner"},
+                         {"label": "Claude client", "harness": "claude", "home": "~/.claude-client",
+                          "label_source": "suggested"}]
     assert {a["key"] for a in routing.accounts()} == before | {_key("~/.claude-client")}
     assert out["accounts"] == [{"key": _key("~/.claude-client"), "label": "Claude client"}]
     view = routing.read_view()
     assert "Claude client: newly tracked, not read yet" in _latest_lines(view)
     line = routing.account_line(_entry(view, _key("~/.claude-client")), T0)
-    assert line == "Claude client: newly tracked, not read yet"
+    assert line == "Claude client: newly tracked, not read yet; " + routing.account_identity.NAME_ACCOUNT
     public = routing.conversation_view()
     client = next(a for a in public["accounts"] if a["label"] == "Claude client")
     assert client["state"] == "unknown" and client["configured"] is True
@@ -141,12 +143,12 @@ def test_stop_then_track_again_gives_back_the_key_and_its_kept_hold(mac, capsys)
                             via="app")["id"]
     rc, out = _stop(capsys, "claude|")
     assert rc == 0 and out["holds_kept"] == [hold] and out["holds_ended"] == []
-    assert _stored() == [{"label": "Codex", "harness": "codex"}]
+    assert _stored() == [{"label": "Codex", "harness": "codex", "label_source": "owner"}]
     assert any(e["cli"] == "claude" and e["why"] == "you stopped tracking it" for e in discover.turned_down())
     assert _entry(routing.read_view(), "claude|") is None
     rc, out = _track(capsys, {"harness": "claude", "home": "~/.claude", "label": None})
     assert rc == 0 and out["accounts"] == [{"key": "claude|", "label": "Claude"}]
-    assert _stored()[-1] == {"label": "Claude", "harness": "claude"}  # stored home-less
+    assert _stored()[-1] == {"label": "Claude", "harness": "claude", "label_source": "suggested"}  # stored home-less
     held = next(h for h in routing.read_view()["holds"] if h["id"] == hold)
     assert held["scope"] == {"kind": "account", "account": "claude|"} and held["scope_label"] == "Claude"
     assert not any(e["cli"] == "claude" for e in discover.turned_down())
@@ -297,15 +299,16 @@ def test_a_move_carries_every_record_to_the_new_folder(mac, capsys):
     until = T0 + timedelta(hours=3)
     routing.report(state="limited", account="Claude client", author=ME,
                    message=f"Limit reached, resets at {routing._iso(until)}")
-    routing.pause(old, via="app")
+    paused = routing.pause(old, via="app")
     hold = routing.add_hold("reviews only", reason="keep", scope="account", account=old, owner=True,
                             via="app")["id"]
-    routing.set_priority([{"account": "Claude client"}], via="app", expect=routing.priority_version())
+    routing.set_priority([{"account": "Claude client"}], via="app", expect=routing.priority_version(), holds={paused["id"]: "keep", hold: "keep"})
     usage._save_cache({old: {"harness": "claude", "account": "Claude client", "ok": True, "windows": []}})
     rc, out = _cli(["accounts", "move", "--from-app", f"--expect={_version()}", f"--account={old}",
                     "--folder=~/.claude-office"], capsys)
     assert rc == 0 and out["key"] == office and out["lanes"] == 1
-    assert _stored()[1] == {"label": "Claude client", "harness": "claude", "home": "~/.claude-office"}
+    assert _stored()[1] == {"label": "Claude client", "harness": "claude", "home": "~/.claude-office",
+                            "label_source": "suggested"}
     view = routing.read_view()
     shown = [a for a in view["accounts"] if a["label"] == "Claude client"]
     assert [a["key"] for a in shown] == [office] and _entry(view, old) is None
@@ -446,7 +449,7 @@ def test_a_conversation_at_the_owners_request_and_its_undo(mac, capsys):
     assert rc == 2 and out["code"] == "owner_only"
     mac["callers"].as_app()
     rc, out = _cli(["accounts", "request", "undo", "--from-app", f"--expect={_version()}"], capsys)
-    assert rc == 0 and _stored() == [{"label": "Codex", "harness": "codex"}]
+    assert rc == 0 and _stored() == [{"label": "Codex", "harness": "codex", "label_source": "owner"}]
     assert accounts.status()["request"] is None
     rc, out = _cli(["accounts", "request", "confirm", "--from-app", f"--expect={_version()}"], capsys)
     assert rc == 2 and out["code"] == "no_request"
@@ -481,10 +484,22 @@ def _found(monkeypatch):
 
 
 def test_the_switch_off_tracks_nothing(mac, capsys, monkeypatch):
+    rc, out = _cli(["accounts", "auto-track", "--from-app", "off"], capsys)
+    assert rc == 0 and accounts.status()["auto_track"] is False
     _found(monkeypatch)
     rc, out = _cli(["usage", "--discover", "--json"], capsys)
     assert rc == 0 and out["auto_tracked"] == [] and _stored() is None
-    assert not config.config_file().exists()
+
+
+def test_auto_track_is_on_for_a_new_install_and_an_explicit_off_persists(mac, capsys):
+    assert config.auto_track() is True, "a new install with no setting tracks by default (decision 15)"
+    assert accounts.status()["auto_track"] is True
+    rc, out = _cli(["accounts", "auto-track", "--from-app", "off"], capsys)
+    assert rc == 0 and out["auto_track"] is False
+    assert json.loads(config.config_file().read_text())[config.AUTO_TRACK_KEY] is False
+    assert config.auto_track() is False, "an explicit off survives a restart (the setting is re-read)"
+    rc, out = _cli(["accounts", "auto-track", "--from-app", "on"], capsys)
+    assert rc == 0 and config.auto_track() is True
 
 
 def test_the_switch_on_tracks_only_what_home_would_offer(mac, capsys, monkeypatch):
@@ -649,6 +664,30 @@ def test_renaming_one_of_two_same_names_leaves_the_lanes_old_reports_unmatched(m
     # A report after the rename reaches the one account the lane names now.
     routing.report(state="limited", runner="jobs", lane="r", until="2h", author=ME)
     assert _entry(routing.read_view(), _key("~/.claude-client"))["state"] == "limited"
+
+
+@pytest.mark.parametrize("migrated", [False, True])
+def test_duplicate_stable_labels_never_merge_login_evidence_or_forward_the_other_login(mac, migrated):
+    _set(usage_accounts=[{"label": "Same", "harness": "claude"},
+                         {"label": "Same", "harness": "claude", "home": "~/.claude-client"}])
+    first, second = "claude|", _key("~/.claude-client")
+    if migrated:
+        routing._legacy_account_id(first)
+        routing.migrate_accounts()
+    routing.report(state="limited", account=first, until="2h", author=ME)
+    before = routing.read_view()
+    assert _entry(before, first)["state"] == "limited"
+    assert _entry(before, second)["state"] != "limited"
+    with pytest.raises(routing.RouteError, match="no login binding"):
+        routing.resolve_account("claude:same")
+    accounts.rename(first, "Renamed", expect=_version())
+    after = routing.read_view()
+    assert _entry(after, first)["state"] == "limited"
+    assert _entry(after, second)["state"] != "limited"
+    assert "claude:same" not in after["forwards"]
+    assert routing.resolve_account("claude:same") == "claude:same"
+    assert routing.resolve_account("claude:renamed") == "claude:renamed"
+    assert set(config.load_config()[routing.account_identity.BINDINGS]) == {"claude:same", "claude:renamed"}
 
 
 def test_stop_cannot_end_another_accounts_hold(mac, capsys):
@@ -841,6 +880,8 @@ def _race(writers) -> list[str]:
             results.append("saved")
         except (usage.AccountsError, routing.PriorityMoved, routing.PriorityVersionNeeded) as err:
             results.append(err.code)
+        except routing.RouteError as err:
+            results.append(str(err))
 
     threads = [threading.Thread(target=run, args=(fn,), daemon=True) for fn in writers]
     for t in threads:
@@ -964,30 +1005,32 @@ def test_a_generic_save_of_the_default_login_by_its_full_path_keeps_its_key(mac,
     rc, out = _cli(["config", "--from-app", f"--expect={_version()}", "--set", "usage_accounts", json.dumps(rows)],
                    capsys)
     assert rc == 0, out
-    assert _stored()[0] == {"label": "Claude full", "harness": "claude"}
+    assert _stored()[0] == {"label": "Claude full", "harness": "claude", "label_source": "owner"}
     view = routing.read_view()
     assert [a["key"] for a in routing.accounts()] == ["claude|", "codex|"]
     assert _entry(view, "claude|")["state"] == "limited"
     assert config.load_config()["routing_lane_map"] == {"jobs": {"r": "claude|"}}
 
 
-def test_a_requested_priority_needs_its_version(mac, capsys):
+def test_a_requested_priority_needs_its_explicit_base(mac, capsys):
     _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
     routing.set_priority([{"account": "claude|"}], via="app", expect=routing.priority_version())
     mac["callers"].as_shell("/usr/local/bin/claude")
     rc, out = _cli(["route", "priority", "set", "Second", "First", "--at-owner-request=reorder them"], capsys)
-    assert rc == 2 and out.get("code") == "version_needed", out
+    assert rc == 2 and "base must be" in out.get("error", ""), out
     assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == ["claude|"]
 
 
-def test_priority_requests_on_no_version_or_one_version_cannot_both_land(mac):
+def test_priority_requests_without_a_base_are_refused_and_one_version_cannot_both_land(mac):
     _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
 
     def ask(order, expect):
-        return lambda: routing.request_priority(order, owner_request="order them", author=ME, expect=expect)
+        shown = routing.conversation_view()
+        base = shown["priority_owner_revision"] if expect is not None else None
+        return lambda: routing.request_priority(order, owner_request="order them", author=ME, expect=expect, base=base)
 
     assert _race([ask(["First", "Second"], None), ask(["Second", "First"], None)]) == \
-        ["version_needed", "version_needed"]
+        ["base must be the owner revision the request was prepared against"] * 2
     seen = routing.priority_version()
     assert _race([ask(["First", "Second"], seen), ask(["Second", "First"], seen)]) == ["saved", "version_moved"]
 
@@ -1050,14 +1093,14 @@ def test_a_save_through_a_symlink_under_a_new_name_is_a_rename(mac):
     _set(usage_accounts=[{"harness": "claude", "label": "Client", "home": "~/.claude-client"},
                          {"harness": "codex", "label": "Codex"}],
          routing_lane_map={"jobs": {"r": old}})
-    routing.pause(old, via="app")
-    routing.set_priority([{"account": old}, {"account": "codex|"}], via="app", expect=routing.priority_version())
+    paused = routing.pause(old, via="app")
+    routing.set_priority([{"account": old}, {"account": "codex|"}], via="app", expect=routing.priority_version(), holds={paused["id"]: "keep"})
     accounts.save_list([{"harness": "claude", "label": "Renamed", "home": str(mac["home"] / "client-link")},
                         {"harness": "codex", "label": "Codex"}], expect=_version())
     view = routing.read_view()
     tracked = [a for a in view["accounts"] if a.get("configured") and a["harness"] == "claude"]
     assert [(a["key"], a["state"]) for a in tracked] == [(old, "paused")]
-    assert _stored()[0] == {"harness": "claude", "label": "Renamed", "home": "~/.claude-client"}
+    assert _stored()[0] == {"harness": "claude", "label": "Renamed", "home": "~/.claude-client", "label_source": "owner"}
     assert config.load_config()["routing_lane_map"] == {"jobs": {"r": old}}
     assert view["priority"]["entries"][0]["account"] == old
 
@@ -1066,7 +1109,7 @@ def test_the_default_name_with_its_default_folder_spelt_out_is_kept(mac):
     _set(usage_accounts=[{"harness": "claude", "label": "Claude"}, {"harness": "codex", "label": "Codex"}])
     accounts.save_list([{"harness": "claude", "label": "Claude", "home": str(mac["home"] / ".claude")},
                         {"harness": "codex", "label": "Codex"}], expect=_version())
-    assert _stored()[0] == {"harness": "claude", "label": "Claude"}
+    assert _stored()[0] == {"harness": "claude", "label": "Claude", "label_source": "owner"}
 
 
 def test_a_priority_read_before_a_move_is_refused_after_the_old_folder_is_tracked_again(mac):
@@ -1180,7 +1223,7 @@ def test_a_renamed_symlink_account_keeps_its_stored_folder_key_and_lanes(mac):
          routing_lane_map={"jobs": {"review": old}})
     accounts.save_list([{"harness": "claude", "label": "Office", "home": "~/client-link"},
                         {"harness": "codex", "label": "Codex"}], expect=_version())
-    assert _stored()[0] == {"harness": "claude", "label": "Office", "home": "~/client-link"}
+    assert _stored()[0] == {"harness": "claude", "label": "Office", "home": "~/client-link", "label_source": "owner"}
     assert config.load_config()["routing_lane_map"] == {"jobs": {"review": old}}
     assert [a["key"] for a in routing.accounts()] == [old, "codex|"]
 
@@ -1189,28 +1232,36 @@ def test_an_answer_to_a_conversations_account_change_needs_the_version_it_read(m
     _set(usage_accounts=[{"harness": "claude", "label": "First", "home": "~/.claude-client"},
                          {"harness": "codex", "label": "Second"}])
     base = _stored()
-    first = [dict(base[0], label="First A"), base[1]]
+    with pytest.raises(usage.AccountsError) as err:
+        accounts.save_list([dict(base[0], label="First A"), base[1]], expect=_version(),
+                           request={"by": ME, "request": "rename"})
+    assert err.value.code == "owner_only"
+    assert _stored() == base and "usage_accounts_request" not in config.load_config()
+    first = base + [{"harness": "glm", "label": "GLM"}]
     accounts.save_list(first, expect=_version(), request={"by": ME, "request": "first"})
     stale = _version()
     with pytest.raises(usage.AccountsError) as err:
         accounts.answer_request("confirm")
     assert err.value.code == "version_needed"
     accounts.answer_request("confirm", expect=stale)
-    second = [first[0], dict(base[1], label="Second B")]
+    second = first + [{"harness": "muse", "label": "Muse"}]
     accounts.save_list(second, expect=_version(), request={"by": ME, "request": "second"})
     with pytest.raises(usage.AccountsError) as err:
         accounts.answer_request("undo", expect=stale)
     assert err.value.code == "version_moved"
-    assert _stored() == second and config.load_config()["usage_accounts_request"]["request"] == "second"
+    assert _stored() == [dict(e, label_source="owner") for e in second]
+    assert config.load_config()["usage_accounts_request"]["request"] == "second"
 
 
 def test_a_priority_confirm_or_undo_needs_the_version_it_read(mac):
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Codex"}], owner_request="first", author=ME,
-                             expect=routing.priority_version())
+                             expect=routing.priority_version(), base=shown["priority_owner_revision"])
     stale = routing.priority_version()
     routing.confirm_priority(via="app", expect=stale)
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "Claude"}], owner_request="second", author=ME,
-                             expect=routing.priority_version())
+                             expect=routing.priority_version(), base=shown["priority_owner_revision"])
     for answer in (routing.confirm_priority, routing.undo_priority):
         with pytest.raises(routing.PriorityVersionNeeded):
             answer(via="app")
@@ -1220,19 +1271,23 @@ def test_a_priority_confirm_or_undo_needs_the_version_it_read(mac):
     assert held["pending"] and held["entries"][0]["account"] == "claude|"
 
 
-def test_stop_takes_the_account_out_of_a_waiting_priority_request_and_what_it_replaced(mac):
+def test_stop_ends_the_waiting_priority_request_and_drops_the_account_from_owner_words(mac):
     old = _key("~/.claude-client")
     _set(usage_accounts=[{"harness": "claude", "label": "First", "home": "~/.claude-client"},
                          {"harness": "codex", "label": "Second"}])
     routing.set_priority([{"account": old}, {"account": "codex|"}], via="app", expect=routing.priority_version())
+    shown = routing.conversation_view()
     routing.request_priority([{"account": "First"}, {"account": "Second"}], owner_request="keep order", author=ME,
-                             expect=routing.priority_version())
+                             expect=routing.priority_version(), base=shown["priority_owner_revision"])
     out = accounts.stop(old, expect=_version())
     assert out["priority"] == "removed"
     held = routing.read_view()["priority"]
-    assert held["pending"] and [e["account"] for e in held["entries"]] == ["codex|"]
-    assert [e["account"] for e in held["replaced"]["entries"]] == ["codex|"]
-    routing.undo_priority(via="app", expect=held["version"])
+    assert not held["pending"] and [e["account"] for e in held["entries"]] == ["codex|"]
+    assert held["replaced"] is None
+    proposal, = routing.read_view()["proposals"].values()
+    assert proposal["status"] == "overtaken"
+    with pytest.raises(routing.RouteError):
+        routing.undo_priority(via="app", expect=held["version"])
     assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == ["codex|"]
 
 
@@ -1365,9 +1420,9 @@ def test_the_app_accepts_every_version_the_python_code_makes(mac, tmp_path):
 
 def test_confirming_a_requested_removal_runs_the_owners_stop(mac):
     _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "codex", "label": "Second"}])
-    routing.pause("claude|", via="app")
+    paused = routing.pause("claude|", via="app")
     routing.set_priority([{"account": "claude|"}, {"account": "codex|"}], via="app",
-                         expect=routing.priority_version())
+                         expect=routing.priority_version(), holds={paused["id"]: "keep"})
     routing.set_setting("routing_lane_map", {"jobs": {"r": "claude|"}})
     accounts.save_list([{"harness": "codex", "label": "Second"}], expect=_version(),
                        request={"by": ME, "request": "remove First"})
@@ -1423,25 +1478,26 @@ def _moved_mid_change(mac, monkeypatch) -> str:
 def test_a_conversations_priority_request_needs_the_version_it_was_built_on(mac):
     _set(usage_accounts=_TWO)
     routing.set_priority([{"account": "claude|"}, {"account": "codex|"}], via="app", expect=routing.priority_version())
-    stale = routing.read_view()["priority"]
+    stale = routing.conversation_view()["priority"]
     routing.set_priority([{"account": "codex|"}, {"account": "claude|"}], via="app", expect=stale["version"])
     entries = [{"account": e["label"]} for e in stale["entries"]]
     with pytest.raises(routing.RouteError):
         routing.conversation_priority(entries, owner_request="keep the order I saw", author=ME,
-                                      expect=stale["version"])
+                                      expect=stale["version"], base=stale["owner_revision"])
     with pytest.raises(routing.RouteError):
         routing.conversation_priority(entries, owner_request="keep the order I saw", author=ME)
     assert [e["account"] for e in routing.read_view()["priority"]["entries"]] == ["codex|", "claude|"]
 
 
-def test_the_mcp_priority_tool_reads_the_version_inside_its_lock_budget(mac, monkeypatch):
+def test_the_mcp_priority_tool_forwards_the_prepared_base_without_filling_a_version(mac, monkeypatch):
     from khipu import mcp_server
 
     _set(usage_accounts=_TWO)
     seen = {}
     monkeypatch.setattr(routing, "conversation_priority", lambda entries, **kw: seen.update(kw) or {"ok": True})
-    mcp_server._tool_route_priority({"entries": [{"account": "First"}], "owner_request": "First first"})
-    assert seen["expect_current"] is True and "expect" not in seen
+    mcp_server._tool_route_priority({"entries": [{"account": "First"}], "owner_request": "First first",
+                                     "base": "prepared-revision"})
+    assert seen["base"] == "prepared-revision" and "expect_current" not in seen and "expect" not in seen
 
 
 def test_undo_of_a_lane_request_never_gives_a_stopped_account_its_lanes_back(mac):
@@ -1479,8 +1535,8 @@ def test_a_move_that_cannot_be_finished_refuses_every_account_write(mac, monkeyp
 
 def test_an_owner_write_gives_a_waiting_requested_removal_its_full_stop(mac):
     _set(usage_accounts=_TWO)
-    routing.pause("claude|", via="app")
-    routing.set_priority([{"account": "claude|"}, {"account": "codex|"}], via="app", expect=routing.priority_version())
+    paused = routing.pause("claude|", via="app")
+    routing.set_priority([{"account": "claude|"}, {"account": "codex|"}], via="app", expect=routing.priority_version(), holds={paused["id"]: "keep"})
     routing.set_setting("routing_lane_map", {"jobs": {"r": "claude|"}})
     accounts.save_list([_TWO[1]], expect=_version(), request={"by": ME, "request": "remove First"})
     accounts.rename("codex|", "Renamed second", expect=_version())
@@ -1582,8 +1638,8 @@ def test_last_valid_account_needs_confirmation_beside_invalid_entries(mac):
 
 def test_only_invalid_entries_left_read_a_kept_default_as_not_tracked(mac):
     _set(usage_accounts=[{"harness": "claude", "label": "First"}, {"harness": "old-cli", "label": "Legacy"}])
-    routing.pause("claude|", via="app")
-    routing.set_priority([{"account": "claude|"}], via="app", expect=routing.priority_version())
+    paused = routing.pause("claude|", via="app")
+    routing.set_priority([{"account": "claude|"}], via="app", expect=routing.priority_version(), holds={paused["id"]: "keep"})
     accounts.stop("claude|", expect=_version(), keep_pause=True, keep_priority=True, confirm_last=True)
     assert not accounts.known_of(config.load_config()["usage_accounts"])
     view = routing.read_view()
@@ -1605,7 +1661,7 @@ def test_the_mcp_priority_tool_answers_busy_within_its_lock_budget(mac, monkeypa
 
     _set(usage_accounts=_TWO)
     routing.pause("claude|", via="app")
-    # A stale view, so reading the priority's version needs the routing lock.
+    # A stale view, so reading the prepared proposal needs the routing lock.
     _set(routing_stale_after="2h")
     monkeypatch.setattr(mcp_server, "_ensure_path", lambda: None)
     monkeypatch.setattr(mcp_server, "_via_https_gateway", lambda: False)
@@ -1621,7 +1677,7 @@ def test_the_mcp_priority_tool_answers_busy_within_its_lock_budget(mac, monkeypa
     def caller():
         try:
             result.append(mcp_server._tool_route_priority({"entries": [{"account": "First"}],
-                                                           "owner_request": "put First first"}))
+                                                           "owner_request": "put First first", "base": "prepared-revision"}))
         except Exception as exc:  # noqa: BLE001 - the answer under test
             result.append(exc)
         finally:

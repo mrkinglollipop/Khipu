@@ -1470,6 +1470,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                 purged = _purged_topic_slugs(path)
                 written = 0
                 for row in topic_rows or ():
+                    row = _topic_routing_metadata(row)
                     slug = row.get("slug")
                     if slug is None or slug in purged:
                         continue
@@ -2351,8 +2352,10 @@ def _insert_topics(cur, con: sqlite3.Connection) -> int:
     rows = cur.fetchall()
     ph = ", ".join(cols)
     for row in rows:
+        prepared = _topic_routing_metadata(dict(zip(cols, row, strict=True)))
         vals = []
-        for col, val in zip(cols, row, strict=True):
+        for col in cols:
+            val = prepared[col]
             if col in ("links", "frontmatter"):
                 vals.append(_json_text(val))
             elif col in ("created_at", "updated_at", "deleted_at"):
@@ -3375,6 +3378,7 @@ def upsert_embeddings(
             for row in topic_rows:
                 if row["slug"] in purged:
                     continue
+                row = _topic_routing_metadata(row)
                 old = con.execute("SELECT deleted_at FROM topics WHERE slug = ?", (row["slug"],)).fetchone()
                 if old and old[0] is not None:
                     continue
@@ -4921,8 +4925,12 @@ def merge_outbox_episodes(
     since: str | None = None, until: str | None = None, project: str | None = None,
     session_id: str | None = None, harness: str | None = None, t3_thread=None, via=None,
 ) -> list[dict[str, Any]]:
+    """``results`` plus each capture still waiting in the outbox that passes
+    the query and filters and whose source has not been forgotten. When the
+    forgotten-source registry cannot be read, no pending capture is added."""
     from khipu.outbox import jobs
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
+    from khipu.tombstones import read_gate
 
     merged = list(results)
     seen: set[str] = {f"{r.get('kind')}:{r.get('id')}" for r in merged}
@@ -4932,6 +4940,7 @@ def merge_outbox_episodes(
     since_dt = parse_time_filter(since) if since else None
     until_dt = parse_time_filter(until) if until else None
     query_tokens = [token.lower() for token in search_tokens(query or "")]
+    found: list[tuple[Path, dict[str, Any], str]] = []
     for jp in jobs():
         try:
             job = json.loads(jp.read_text(encoding="utf-8"))
@@ -4968,23 +4977,33 @@ def merge_outbox_episodes(
                 ts = _parse_snapshot_ts(payload.get("ts"))
                 if ts is None or (since_dt is not None and ts < since_dt) or (until_dt is not None and ts > until_dt):
                     continue
-            key = f"episode:outbox:{jp.stem}"
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(
-                {
-                    "kind": "episode",
-                    "id": f"outbox:{jp.stem}",
-                    "label": clip_snippet(summary, LABEL_LIMIT),
-                    "snippet": clip_snippet(summary, SNIPPET_LIMIT),
-                    "outbox": True,
-                    "t3_thread_id": payload.get("t3_thread_id"),
-                    "via": payload.get("via"),
-                }
-            )
+            found.append((jp, payload, summary))
         except (OSError, ValueError, TypeError):
             continue
+    if not found:
+        return merged
+    try:
+        # Read after the jobs, so a forget published before this point is seen.
+        gate = read_gate()
+        found = [m for m in found if gate.allows(m[1])]
+    except Exception:  # noqa: BLE001 — RegistryError or anything else: fail closed
+        return merged
+    for jp, payload, summary in found:
+        key = f"episode:outbox:{jp.stem}"
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(
+            {
+                "kind": "episode",
+                "id": f"outbox:{jp.stem}",
+                "label": clip_snippet(summary, LABEL_LIMIT),
+                "snippet": clip_snippet(summary, SNIPPET_LIMIT),
+                "outbox": True,
+                "t3_thread_id": payload.get("t3_thread_id"),
+                "via": payload.get("via"),
+            }
+        )
     return merged
 
 
@@ -5887,6 +5906,37 @@ def cosine_candidates_snapshot(
     return out
 
 
+def _topic_routing_metadata(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive legacy-note metadata when writing a replica, never in search.
+
+    Imported notes already carry this boolean. Old hub rows acquire it on
+    replica import as well, without adding body text to metadata or payloads.
+    """
+    item = dict(row)
+    if "body" not in row or "frontmatter" not in row:
+        return item
+    try:
+        fm = row["frontmatter"]
+        fm = json.loads(fm) if isinstance(fm, str) else fm
+        if not isinstance(fm, dict):
+            return item
+        if type(fm.get("_routing_state_claim")) is bool:
+            return item
+        if not fm.get("note_source") and not str(row.get("slug") or "").startswith("note:"):
+            return item
+        from khipu.routing_scanner import has_routing_claim
+
+        item["frontmatter"] = {
+            **fm, "_routing_state_claim": has_routing_claim(
+                str(fm.get("note_source") or row.get("slug") or ""),
+                str(row.get("body") or ""),
+            ),
+        }
+    except Exception:  # noqa: BLE001 — advisory; never log source or exception text
+        pass
+    return item
+
+
 def snapshot_row_metadata(
     con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -5946,14 +5996,20 @@ def snapshot_row_metadata(
                 topic_ids,
             ).fetchall():
                 proj = None
+                routing_claim = None
                 if frontmatter:
                     try:
-                        proj = json.loads(frontmatter).get("project")
+                        fm = json.loads(frontmatter)
+                        proj = fm.get("project")
+                        flag = fm.get("_routing_state_claim")
+                        if type(flag) is bool:
+                            routing_claim = flag
                     except (ValueError, AttributeError, TypeError):
                         proj = None
                 meta[("topic", slug)] = {
                     "ts": ts, "status": status or "active", "project": proj,
                     "deleted": deleted is not None, "superseded_by": superseded_by,
+                    "_routing_state_claim": routing_claim,
                 }
     for r in rows:
         row_kind = r.get("kind")
@@ -5974,6 +6030,8 @@ def snapshot_row_metadata(
             item["status"] = m["status"]
         if m.get("superseded_by"):
             item["superseded_by"] = m["superseded_by"]
+        if type(m.get("_routing_state_claim")) is bool:
+            item["_routing_state_claim"] = m["_routing_state_claim"]
         out.append(item)
     return out
 

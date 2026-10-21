@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from khipu import recall_daemon, recall_prompt, routing, routing_replay
+from khipu import agent_view, recall_daemon, recall_prompt, routing, routing_replay
 
 T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
 ACCOUNTS = [{"label": "Claude", "harness": "claude"}, {"label": "Codex", "harness": "codex"}]
@@ -550,6 +550,8 @@ def test_a_limits_end_with_no_file_changing_reaches_the_next_prompt_as_a_change(
     # The next prompt reads the saved view: no fold of its own.
     monkeypatch.setattr(routing, "fold", lambda *a, **k: pytest.fail("the prompt refolded"))
     clocks.run(5)
+    # The real helper prepares complete inventory before forking a prompt.
+    agent_view.prepare_routing_table(refresh=True)
     push = routing.prompt_push(marker, budget=1.0)
     assert push["kind"] == "changes", push
     assert "Codex: probably open: its limit was due to end at 16:00Z" in push["text"]

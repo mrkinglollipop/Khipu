@@ -257,7 +257,8 @@ def test_files_are_private(home):
     owner_turns.note_brief("a brief long enough to be recorded here", parent="p", harness="claude_code", now=T0)
     assert owner_turns.folder().stat().st_mode & 0o777 == 0o700
     for path in owner_turns.folder().iterdir():
-        assert path.stat().st_mode & 0o777 == 0o600, path.name
+        # Files are 0600; the occurrence-counter folder is 0700 like its parent.
+        assert path.stat().st_mode & 0o777 == (0o700 if path.is_dir() else 0o600), path.name
 
 
 def test_retention_drops_old_lines_and_sweeps_old_sessions(home):

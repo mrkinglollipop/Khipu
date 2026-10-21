@@ -48,6 +48,8 @@ FAKE_CLI = textwrap.dedent("""
         record["grandchild"] = subprocess.Popen(["/bin/sleep", "60"]).pid  # inherits stdout and the group
     with open(out, "w") as fh:
         json.dump(record, fh)
+    if mode == "slow_start":
+        time.sleep(2.5)
     if mode in ("hang", "deaf", "grandchild_hang"):
         time.sleep(60)
     if mode == "grandchild":
@@ -774,7 +776,7 @@ def test_configured_accounts_keep_invalid_entries_visible(fake, tmp_path):
     accounts = usage.configured_accounts()
     assert accounts[0] == {"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}
     assert accounts[1]["invalid"] == ('Khipu does not read the CLI "gemini"; it reads Claude Code, Codex, '
-                                      "Grok Build and Muse")
+                                      "Grok Build, Muse and the GLM Coding Plan")
     assert "Muse" in accounts[2]["invalid"]
     row = usage.probe_account(accounts[1])
     assert row["ok"] is False and row["error"] == "invalid_account"
@@ -1163,6 +1165,30 @@ def test_held_open_stdin_does_not_hold_the_probe(fake, tmp_path):
     assert _gone(_child(out)["pid"])
 
 
+def test_grok_probe_gets_its_own_budget_unless_the_caller_gives_one(monkeypatch):
+    seen = []
+    monkeypatch.setattr(usage, "_command", lambda harness: "/bin/grok")
+    monkeypatch.setattr(usage, "_converse", lambda *a, deadline, **k: seen.append(deadline - time.monotonic()) or [])
+    usage.probe_grok(None)
+    usage.probe_grok(None, timeout=1)
+    assert usage.GROK_TIMEOUT_S == 20.0 and usage.TIMEOUT_S == 5.0
+    assert 19 < seen[0] <= 20 and 0 < seen[1] <= 1
+
+
+def test_probe_all_lets_a_slow_grok_finish_without_holding_the_others(fake, monkeypatch):
+    monkeypatch.setattr(usage, "TIMEOUT_S", 1.0)
+    monkeypatch.setattr(usage, "GROK_TIMEOUT_S", 6.0)
+    monkeypatch.setattr(usage, "OVERALL_GRACE_S", 0.3)
+    fake("claude", "claude.jsonl", mode="hang")
+    fake("grok", "grok.jsonl", mode="slow_start")
+    accounts = [{"label": "Claude", "harness": "claude", "home": None},
+                {"label": "Grok", "harness": "grok", "home": None}]
+    rows = usage.probe_all(accounts, timeout=usage.TIMEOUT_S)
+    by = {r["harness"]: r for r in rows}
+    assert by["grok"]["ok"] is True and by["grok"]["ms"] > 2000
+    assert by["claude"]["error"] == "timeout" and by["claude"]["ms"] < 1800
+
+
 def test_probe_all_returns_by_its_overall_deadline(monkeypatch):
     release = threading.Event()
     monkeypatch.setattr(usage, "OVERALL_GRACE_S", 0.3)
@@ -1400,8 +1426,9 @@ def test_usage_accounts_are_set_shown_and_unset_through_config(fake, capsys, khi
     ])], capsys)
     assert rc == 0 and out["ok"] is True
     stored = json.loads(config.config_file().read_text())["usage_accounts"]
-    assert stored == [{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"},
-                      {"label": "Grok", "harness": "grok"}]
+    assert stored == [{"label": "Claude second", "harness": "claude", "home": "~/.claude-second",
+                       "label_source": "owner"},
+                      {"label": "Grok", "harness": "grok", "label_source": "owner"}]
     assert out["usage_accounts"]["source"] == "file"
     assert [a["label"] for a in out["usage_accounts"]["accounts"]] == ["Claude second", "Grok"]
     rc, shown = _config_cli([], capsys)
@@ -1574,6 +1601,21 @@ def test_every_code_a_probe_can_return_has_a_plain_note():
     assert usage._note("exit_3", "grok") == "Grok Build didn't answer"
     assert usage._note("cli_error", "codex") == "Codex reported an error when asked"
     assert usage._note("bad_reply", "claude") == "Claude Code answered in a way Khipu can't read"
+
+
+def test_a_grok_usage_row_keeps_only_a_digest_of_the_account_id(fake, monkeypatch):
+    monkeypatch.setattr(usage, "probe_grok",
+                        lambda home, timeout=None: {"ok": True, "plan": "SuperGrok", "windows": [],
+                                                    "account_id": "ACCT-SENTINEL-99"})
+    row = usage.probe_account({"label": "Grok", "harness": "grok", "home": None})
+    assert "ACCT-SENTINEL-99" not in json.dumps(row)
+    assert "account_id" not in row and row.get("account_digest")
+    frames = [{"id": 1, "result": {"_meta": {"agentVersion": "1.0.52"}}},
+              {"id": 2, "result": {"subscription_tier": "SuperGrok", "account_id": "ACCT-SENTINEL-99",
+                                   "config": {"currentPeriod": {"type": "usage_period_type_weekly"}}}}]
+    parsed = usage.parse_grok(frames)
+    assert "ACCT-SENTINEL-99" not in json.dumps(parsed) and "account_id" not in parsed
+    assert parsed.get("account_digest")
 
 
 def test_a_failed_probe_row_carries_the_plain_note_for_its_account(fake):

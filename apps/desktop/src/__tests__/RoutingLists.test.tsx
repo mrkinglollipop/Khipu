@@ -406,15 +406,16 @@ describe("Job runner lanes: search", () => {
     expect(box).toHaveAttribute("placeholder", "Search the 10 lanes");
     fireEvent.change(box, { target: { value: "codex" } });
     expect(screen.getByText(/2 of 10 lanes match\./)).toBeInTheDocument();
-    // The folder row stays; the 7 lanes with no account are hidden and named.
+    // The 7 lanes with no account are hidden and named.
     expect(screen.getByText(/lanes without an account are hidden by this search/)).toBeInTheDocument();
-    expect(screen.getByRole("list", { name: "Project A lanes" })).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Lanes" }).textContent).toContain("lane-01");
     fireEvent.change(box, { target: { value: "zebra" } });
     expect(screen.getByText(/No lanes match “zebra”\./)).toBeInTheDocument();
-    expect(screen.queryByRole("list", { name: "Project A lanes" })).toBeNull();
+    expect(screen.queryByRole("list", { name: "Lanes" })).toBeNull();
+    // The folder rows live in the Job runner folders fold, whatever the search.
     expect(document.querySelector('[data-route-item="runner:Project A"]')).not.toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
-    expect(within(screen.getByRole("list", { name: "Project A lanes" })).getAllByRole("listitem")).toHaveLength(10);
+    expect(within(screen.getByRole("list", { name: "Lanes" })).getAllByRole("listitem")).toHaveLength(10);
   });
 });
 

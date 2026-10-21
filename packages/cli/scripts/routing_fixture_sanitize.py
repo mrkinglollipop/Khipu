@@ -1,0 +1,267 @@
+"""Deterministic routing replay sanitizer. Input is explicit stdin, never a log search.
+
+The output is a test interchange format, not an events.jsonl replacement.
+Identifiers are relational aliases, clocks are relative seconds, and text is
+replaced with equal-length synthetic characters. Unknown fields fail closed.
+Run: python scripts/routing_fixture_sanitize.py < explicitly-selected.jsonl
+"""
+from __future__ import annotations
+
+import json
+import math
+import re
+import sys
+from datetime import datetime
+
+
+class FixtureError(ValueError):
+    """Errors carry a closed code, never input values or field names."""
+
+
+def closed(value, fields, required=()):
+    if type(value) is not dict or set(value) - set(fields) or set(required) - set(value):
+        raise FixtureError("fixture_schema")
+
+
+def number(value, *, integer=False):
+    if type(value) not in ((int,) if integer else (int, float)) or not math.isfinite(value):
+        raise FixtureError("fixture_number")
+
+
+def alias(value, prefix):
+    if not isinstance(value, str) or not re.fullmatch(prefix + r"[1-9][0-9]*", value):
+        raise FixtureError("fixture_identifier")
+
+
+def load_pace(rows):
+    """pace_fixture_v1: no extension bag, strings, booleans or nonfinite numbers."""
+    if type(rows) is not list:
+        raise FixtureError("fixture_schema")
+    for row in rows:
+        fields = {"acct", "win", "t", "t_err", "used", "reset"}
+        closed(row, fields, fields)
+        alias(row["acct"], "a")
+        alias(row["win"], "w")
+        for key in ("t", "t_err", "reset"):
+            number(row[key], integer=True)
+        number(row["used"])
+        if row["t_err"] < 0 or not 0 <= row["used"] <= 100:
+            raise FixtureError("fixture_range")
+    return rows
+
+
+KINDS = {"evidence", "hold", "hold_end", "rule_add", "rule_edit", "priority_set", "note_set"}
+STATES = {"open", "limited", "down"}
+HARNESS = {"codex", "claude_code", "grok_build", "shell", "unknown"}
+EVENT_FIELDS = {"type", "id", "account", "state", "source", "written_at", "written_by", "via",
+                "scope", "reason", "text", "until", "owner", "pending", "n", "target", "entries",
+                "owner_request", "seq", "basis", "until_default", "date", "seeded",
+                "mac", "legacy_mac", "entity", "base", "op", "op_body", "hlc", "number_pending", "hub_order", "local_order", "proposal", "clock_at",
+                "kind", "witness_at", "expires_at", "observation_scope"}
+TEXT_FIELDS = {"text", "owner_request", "role"}
+
+
+def load_replay(value):
+    closed(value, {"schema", "events"}, {"schema", "events"})
+    if value["schema"] != "routing_replay_v1" or type(value["events"]) is not list:
+        raise FixtureError("fixture_schema")
+    for row in value["events"]:
+        closed(row, EVENT_FIELDS, {"type", "id", "written_at", "written_by", "via"})
+        if row["type"] not in KINDS or row["via"] not in {"mcp", "app", "cli"}:
+            raise FixtureError("fixture_enum")
+        alias(row["id"], "e")
+        number(row["written_at"], integer=True)
+        if row.get("until") is not None:
+            number(row["until"], integer=True)
+        for key in ("seq", "date", "hub_order", "local_order"):
+            if key in row:
+                number(row[key], integer=True)
+        if "basis" in row and row["basis"] not in {"cli", "estimated", "checked", "owner"}:
+            raise FixtureError("fixture_enum")
+        for key, prefix in (("mac", "m"), ("legacy_mac", "m"), ("entity", "e"), ("op", "o"), ("op_body", "b"), ("proposal", "e")):
+            if key in row:
+                alias(row[key], prefix)
+        if "base" in row and row["base"] != "0":
+            alias(row["base"], "e")
+        if "clock_at" in row:
+            number(row["clock_at"], integer=True)
+        if "kind" in row and row["kind"] not in {"observation", "fact", "owner_rule"}:
+            raise FixtureError("fixture_enum")
+        for key in ("witness_at", "expires_at"):
+            if row.get(key) is not None:
+                number(row[key], integer=True)
+        if "observation_scope" in row:
+            closed(row["observation_scope"], {"kind", "mac"}, {"kind"})
+            if row["observation_scope"]["kind"] not in {"account_quota", "machine"}:
+                raise FixtureError("fixture_enum")
+            if row["observation_scope"]["kind"] == "machine":
+                alias(row["observation_scope"].get("mac"), "m")
+        if "hlc" in row:
+            hlc = row["hlc"]
+            closed(hlc, {"wall", "counter", "mac"}, {"wall", "counter", "mac"})
+            number(hlc["wall"], integer=True)
+            number(hlc["counter"], integer=True)
+            if hlc["counter"] < 0:
+                raise FixtureError("fixture_range")
+            alias(hlc["mac"], "m")
+        if "account" in row:
+            alias(row["account"], "a")
+        if "target" in row:
+            alias(row["target"], "e")
+        for key in TEXT_FIELDS & row.keys():
+            if not isinstance(row[key], str) or not re.fullmatch("x*", row[key]):
+                raise FixtureError("fixture_text")
+        for key in ("owner", "pending", "until_default", "seeded", "number_pending"):
+            if key in row and type(row[key]) is not bool:
+                raise FixtureError("fixture_schema")
+        if "n" in row:
+            number(row["n"], integer=True)
+        if "state" in row and row["state"] not in STATES:
+            raise FixtureError("fixture_enum")
+        if "source" in row and (not isinstance(row["source"], str)
+                                or (row["source"] != "report" and not re.fullmatch("x*", row["source"]))):
+            raise FixtureError("fixture_enum")
+        if "reason" in row and row["reason"] != "keep":
+            raise FixtureError("fixture_enum")
+        by = row["written_by"]
+        closed(by, {"kind", "harness", "project", "session"}, {"kind"})
+        if by["kind"] not in {"owner", "conversation"} or by.get("harness", "unknown") not in HARNESS:
+            raise FixtureError("fixture_enum")
+        for key, prefix in (("project", "p"), ("session", "s")):
+            if key in by:
+                alias(by[key], prefix)
+        if "scope" in row:
+            scope = row["scope"]
+            closed(scope, {"kind", "account"}, {"kind"})
+            if scope["kind"] not in {"all", "account"}:
+                raise FixtureError("fixture_enum")
+            if scope["kind"] == "account":
+                alias(scope.get("account"), "a")
+            elif "account" in scope:
+                raise FixtureError("fixture_schema")
+        if "entries" in row:
+            if type(row["entries"]) is not list:
+                raise FixtureError("fixture_schema")
+            for entry in row["entries"]:
+                closed(entry, {"account", "label", "role", "until"}, {"account"})
+                alias(entry["account"], "a")
+                if entry.get("until") is not None:
+                    number(entry["until"], integer=True)
+                if "label" in entry:
+                    alias(entry["label"], "a")
+                if "role" in entry and (not isinstance(entry["role"], str)
+                                        or not re.fullmatch("x*", entry["role"])):
+                    raise FixtureError("fixture_text")
+    return value
+
+
+def sanitize(events):
+    """Preserve relationships, intervals, nesting and text lengths; copy no prose."""
+    if type(events) is not list:
+        raise FixtureError("fixture_schema")
+    names = {prefix: {} for prefix in ("a", "e", "p", "s", "m", "o", "b")}
+
+    def named(value, prefix):
+        if not isinstance(value, str):
+            raise FixtureError("fixture_schema")
+        mapping = names[prefix]
+        return mapping.setdefault(value, f"{prefix}{len(mapping) + 1}")
+
+    origin = None
+
+    def time(value):
+        nonlocal origin
+        try:
+            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if stamp.utcoffset() is None:
+                raise ValueError
+            seconds = int(stamp.timestamp())
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            raise FixtureError("fixture_time") from None
+        if origin is None:
+            origin = seconds
+        return seconds - origin
+
+    def words(value):
+        if not isinstance(value, str):
+            raise FixtureError("fixture_schema")
+        return "x" * len(value)
+
+    out = []
+    for raw in events:
+        closed(raw, EVENT_FIELDS, {"type", "id", "written_at", "written_by", "via"})
+        row = {"type": raw["type"], "id": named(raw["id"], "e"),
+               "written_at": time(raw["written_at"]), "via": raw["via"]}
+        by = raw["written_by"]
+        closed(by, {"kind", "harness", "project", "session"}, {"kind"})
+        row["written_by"] = {k: named(v, {"project": "p", "session": "s"}[k])
+                             if k in {"project", "session"} else v for k, v in by.items()}
+        for key, value in raw.items():
+            if key in row:
+                continue
+            if key == "n" and value is None and raw["type"] in {"rule_add", "rule_edit"}:
+                continue
+            if key in TEXT_FIELDS:
+                row[key] = words(value)
+            elif key in {"account", "target"}:
+                row[key] = named(value, "a" if key == "account" else "e")
+            elif key in {"mac", "legacy_mac", "entity", "base", "op", "op_body", "proposal"}:
+                prefix = {"mac": "m", "legacy_mac": "m", "op": "o", "op_body": "b"}.get(key, "e")
+                row[key] = "0" if key == "base" and value == "0" else named(value, prefix)
+            elif key == "hlc":
+                closed(value, {"wall", "counter", "mac"}, {"wall", "counter", "mac"})
+                number(value["wall"], integer=True)
+                number(value["counter"], integer=True)
+                row[key] = {"wall": value["wall"] - origin * 1000, "counter": value["counter"],
+                            "mac": named(value["mac"], "m")}
+            elif key in {"clock_at", "witness_at", "expires_at"}:
+                row[key] = None if value is None else time(value)
+            elif key == "observation_scope":
+                closed(value, {"kind", "mac"}, {"kind"})
+                row[key] = {k: named(v, "m") if k == "mac" else v for k, v in value.items()}
+            elif key == "until":
+                row[key] = None if value is None else time(value)
+            elif key == "date":
+                # Dates travel as relative seconds too; the original date is never copied.
+                if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                    raise FixtureError("fixture_time")
+                row[key] = time(value + "T00:00:00Z")
+            elif key == "source":
+                row[key] = value if value == "report" else words(value)
+            elif key == "scope":
+                closed(value, {"kind", "account"}, {"kind"})
+                row[key] = {k: named(v, "a") if k == "account" else v for k, v in value.items()}
+            elif key == "entries":
+                if type(value) is not list:
+                    raise FixtureError("fixture_schema")
+                row[key] = []
+                for entry in value:
+                    closed(entry, {"account", "label", "role", "until"}, {"account"})
+                    clean_entry = {}
+                    for k, v in entry.items():
+                        if k == "until":
+                            clean_entry[k] = None if v is None else time(v)
+                        elif k == "role":
+                            clean_entry[k] = words(v)
+                        else:
+                            clean_entry[k] = named(entry["account"], "a")
+                    row[key].append(clean_entry)
+            else:
+                row[key] = value
+        out.append(row)
+    return load_replay({"schema": "routing_replay_v1", "events": out})
+
+
+def main():
+    try:
+        rows = [json.loads(line) for line in sys.stdin if line.strip()]
+        result = sanitize(rows)
+    except (ValueError, TypeError, KeyError, OverflowError):
+        print("fixture_rejected", file=sys.stderr)
+        return 2
+    print(json.dumps(result, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

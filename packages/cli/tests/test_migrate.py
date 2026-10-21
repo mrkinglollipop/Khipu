@@ -312,7 +312,10 @@ class RepoMigrationsTest(unittest.TestCase):
         files = migrate.available()
         self.assertGreaterEqual(len(files), 5)
         for version, path in files:
-            self.assertIn("INSERT INTO schema_migrations", path.read_text(), version)
+            text = path.read_text()
+            if any(auto for auto, _ in migrate.step_modes(text)):
+                continue  # an autocommit step is one statement; the runner records it
+            self.assertIn("INSERT INTO schema_migrations", text, version)
 
 
 class LiteralTrgmMigrationTest(unittest.TestCase):

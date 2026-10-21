@@ -112,6 +112,7 @@ class ProtocolTest(unittest.TestCase):
                 "khipu_reflect",
                 "khipu_usage",
                 "khipu_route",
+                "khipu_route_advise",
                 "khipu_route_report",
                 "khipu_route_rule",
                 "khipu_route_priority",

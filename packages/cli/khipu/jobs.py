@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -543,6 +544,8 @@ def _embed_backfill() -> dict[str, Any]:
         out["library"] = lib
         if not lib.get("ok", False):
             out["ok"] = False
+            if lib.get("error") and not out.get("error"):
+                out["error"] = str(lib["error"])
     return out
 
 
@@ -755,6 +758,94 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     ),
 }
 
+_EMBED_HTTP_STATUS_RE = re.compile(r"\b(401|403|429)\b")
+
+
+def _recorded_error_texts(value: Any) -> list[str]:
+    """Every ``error``/``reason`` string recorded in a nightly step entry,
+    including the library sub-receipt nested in its counts."""
+    texts: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in ("error", "reason") and item:
+                texts.append(str(item))
+            else:
+                texts.extend(_recorded_error_texts(item))
+    elif isinstance(value, list):
+        for item in value:
+            texts.extend(_recorded_error_texts(item))
+    return texts
+
+
+def _recorded_provider_failures(value: Any) -> list[dict[str, Any]]:
+    """Every structured ``last_provider_failure`` recorded in a nightly step
+    entry — the memory sweep's counts and the library sub-receipt nested in
+    them. Each is ``{"http_status": int | None, "kind": str}`` as written by
+    ``khipu.embed.provider_failure`` (status and kind only, never a body)."""
+    failures: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "last_provider_failure" and isinstance(item, dict):
+                failures.append(item)
+            else:
+                failures.extend(_recorded_provider_failures(item))
+    elif isinstance(value, list):
+        for item in value:
+            failures.extend(_recorded_provider_failures(item))
+    return failures
+
+
+def _embed_backfill_fix(entry: dict[str, Any]) -> str:
+    """Doctor fix for a failed embed_backfill step, following the recorded
+    failure instead of always blaming the provider key: a structured
+    provider failure names the provider (for 429, its quota or spending
+    cap; for 401/403, its credentials), a hub connection failure names the
+    database, and anything else keeps the generic provider hint."""
+    from khipu.hub_errors import unreachable_text
+
+    for failure in _recorded_provider_failures(entry):
+        status = failure.get("http_status")
+        if status is None:
+            continue
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            continue
+        if code == 429:
+            return (
+                "check the embedding provider quota or spending cap (HTTP 429), "
+                "then run `khipu jobs install nightly` or wait for the next nightly"
+            )
+        if code in (401, 403):
+            return (
+                f"check the embedding provider key/credentials (HTTP {code}), "
+                "then run `khipu jobs install nightly` or wait for the next nightly"
+            )
+        return (
+            f"check the embedding provider (HTTP {code}), "
+            "then run `khipu jobs install nightly` or wait for the next nightly"
+        )
+    texts = _recorded_error_texts(entry)
+    if any(unreachable_text(text) for text in texts):
+        return (
+            "check the hub database is reachable (its connection timed out or was refused), "
+            "then run `khipu jobs install nightly` or wait for the next nightly"
+        )
+    for text in texts:
+        match = _EMBED_HTTP_STATUS_RE.search(text)
+        if match:
+            code = match.group(1)
+            if code == "429":
+                return (
+                    "check the embedding provider quota or spending cap (HTTP 429), "
+                    "then run `khipu jobs install nightly` or wait for the next nightly"
+                )
+            return (
+                f"check the embedding provider key/credentials (HTTP {code}), "
+                "then run `khipu jobs install nightly` or wait for the next nightly"
+            )
+    return _NIGHTLY_STEP_CHECKS["embed_provider_ok"][1]
+
 
 # A step whose last recorded run is older than this is treated as "the
 # nightly stopped running", not "it hasn't run yet today" — same idea as
@@ -940,7 +1031,9 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
         out[doctor_key] = {
             "ok": ok, "applicable": True,
             "error": None if ok else entry.get("error"),
-            "fix": None if ok else fix,
+            "fix": None if ok else (
+                _embed_backfill_fix(entry) if doctor_key == "embed_provider_ok" else fix
+            ),
             "ts": entry.get("ts"),
             "source": source,
         }

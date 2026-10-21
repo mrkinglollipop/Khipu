@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from khipu import agent_view
 from khipu import features, recall_prompt, recall_rule, routing
 from khipu import session_capture as sc
 
@@ -171,8 +172,8 @@ def test_rules_and_the_note_arrive_whole_whatever_their_length(home, monkeypatch
     _set(home, routing_summary_chars=50, routing_line_chars=40)
     _push_on(monkeypatch)
     lines = _routing_part(_hook(monkeypatch)).splitlines()
-    assert f"1. {long_rule.strip()}" in lines  # whole: not clipped at 200 or at 40
-    assert any(line.endswith(note.strip()) and line.startswith("Note from the owner") for line in lines)
+    assert f"1. {long_rule}" in lines  # owner whitespace survives as well as the words
+    assert any(line.endswith(note) and line.startswith("Note from the owner") for line in lines)
     assert lines.index("Standing rules:") < next(i for i, x in enumerate(lines) if x.startswith("Note from"))
     assert lines[-1].endswith("more lines: run `khipu route`")
 
@@ -616,16 +617,41 @@ def test_the_session_start_output_stays_within_claude_codes_limit(home, monkeypa
     assert _context(_hook(monkeypatch)) == memory
 
 
-def test_a_summary_too_long_for_the_limit_is_left_out_and_not_recorded(home, monkeypatch):
+def test_a_large_start_pages_the_note_and_keeps_mandatory_memory(home, monkeypatch):
+    from khipu import routing_delivery
+
     memory = _maximal_memory()
+    words = "Codex first for builds today; Grok for surveys. " * 100
     monkeypatch.setattr(recall_rule, "session_start_context", lambda cwd=None: memory)
-    routing.set_note("Codex first for builds today; Grok for surveys. " * 100, via="app")
+    routing.set_note(words, via="app")
     _record()
     _push_on(monkeypatch)
     assert len(routing.light_status()["text"]) > CLAUDE_CODE_HOOK_LIMIT - len(recall_rule.RULE_MD)
     ctx = _context(_hook(monkeypatch))
-    assert ctx == memory  # the memory part whole, as before the push; no partial summary
-    assert recall_prompt.routing_marker(SESSION) == {}  # not delivered: a later push carries it
+    assert ctx.startswith(recall_rule.RULE_MD.strip())
+    assert _u16(ctx) <= CLAUDE_CODE_HOOK_LIMIT
+    assert "page 1/" in ctx
+    assert "note" in recall_prompt.routing_marker(SESSION)["owed"]
+    payloads, offset = [], 0
+    for _ in range(30):
+        entry = routing_delivery.snapshot(SESSION)["entries"]["note"]
+        end = entry["offset"]
+        payload = entry["text"][offset:end]
+        assert end > offset and payload in ctx
+        payloads.append(payload)
+        offset = end
+        if entry["acked"]:
+            break
+        agent_view.prepare_routing_table(refresh=True)
+        out = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
+        at = recall_prompt._RoutingAtPrompt()
+        at.session = SESSION
+        ctx, info = at.add_to("", dict(out, at=routing._iso(routing._now())))
+        recall_prompt.finish_delivery({"routing": info}, delivered=True)
+    assert entry["acked"]
+    assert "".join(payloads) == entry["text"]
+    assert words.strip() in "".join(payloads)
+    assert not recall_prompt.routing_marker(SESSION).get("owed")
 
 
 def test_a_late_fold_never_keeps_a_conversations_write_waiting(home, monkeypatch):

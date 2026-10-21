@@ -10,6 +10,7 @@ probes are replaced, nothing starts a CLI or reaches the hub.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -29,7 +30,7 @@ def owner(tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()
     (data / "config.json").write_text(json.dumps({"usage_accounts": [
-        {"label": "Claude work", "harness": "claude", "home": HOME_ENTRY},
+        {"label": "Claude zqprivate", "harness": "claude", "home": HOME_ENTRY},
         {"label": "Claude broken", "harness": "claude", "home": INVALID_ENTRY},
     ]}))
     monkeypatch.setenv("HOME", str(user))
@@ -102,8 +103,15 @@ def test_khipu_usage_never_carries_a_login_folder(owner, monkeypatch, kind):
     assert _leaks(out, owner) == []
     row = out["accounts"][0]
     assert "home" not in row
-    assert row["account"] == ("Claude broken" if kind == "invalid" else "Claude work")
-    assert row["harness"] == "claude" and row["id"].startswith("acct-")
+    assert row["account"] == ("Claude broken" if kind == "invalid" else "Claude zqprivate")
+    assert row["harness"] == "claude"
+    if kind == "invalid":
+        assert row["id"].startswith("acct-")
+    else:
+        assert re.fullmatch(r"claude:a-[a-z2-7]{8}", row["id"])
+        assert row["id"] == routing.account_id(usage._key(_work()))
+        assert "zqprivate" not in row["id"]
+        assert FOLDER not in row["id"]
     assert row["ok"] is (kind in ("cached", "fresh"))
     assert out["summary_text"] and out["generated_at"] == raw["generated_at"]
     if kind in ("cached", "fresh"):
@@ -141,11 +149,11 @@ def test_routing_surfaces_never_carry_a_login_folder(owner, monkeypatch):
                                               last_error=None)})
     now = datetime.now(timezone.utc).replace(microsecond=0)
     monkeypatch.setattr(routing, "_now", lambda: now)
-    routing.conversation_write({"action": "report", "state": "limited", "account": "Claude work", "until": "1h"},
+    routing.conversation_write({"action": "report", "state": "limited", "account": "Claude zqprivate", "until": "1h"},
                                author={"harness": "claude-code"})
     outputs = {
         "khipu_route": routing.conversation_view(),
-        "khipu_route one": routing.conversation_view(account="Claude work"),
+        "khipu_route one": routing.conversation_view(account="Claude zqprivate"),
         "khipu_route since": routing.conversation_view(since_version="0"),
         "summary": routing.summary(),
         "brief summary": routing.summary(brief=True),

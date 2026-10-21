@@ -42,6 +42,143 @@ The first three are strong. An estimate is not.
 - **You, in the app.**
 - **The routing table file** (setting `routing_table`). Read only, as a pointer. It is never treated as account state.
 
+Provider definitions are owner facts (`definition_set`, `definition: provider`),
+written with `khipu route definition set provider --value='<JSON>'` (terminal
+confirmation), `--owner-direction` in an eligible owner conversation, or
+`khipu_owner_act` action `route.definition.set` with
+`{"definition": "provider", "value": {"id": "glm", "label": "GLM", "family": "Zhipu"}}`.
+Use the same action with `definition: account` and
+`{"id": "glm:main", "label": "GLM", "provider": "glm"}` to track an account.
+Both writes are logged and support Undo, which appends a restoration or removal
+fact. Settings → Accounts and routing → Add provider account creates GLM or
+DeepSeek provider facts and an account; existing provider restrictions are kept. Fields are `id`,
+`label`, `family`, `login` (`folder` or `none`), `probe` (`claude`, `codex`,
+`grok`, `muse`, `glm`, `http-quota`, or `none`), optional hostname `host`,
+`lane_names`, optional exact model ids in `models_allowed` and `models_never`,
+and `use` (`normal` or `on_request`). With `probe: http-quota` and a `host`,
+the periodic usage refresh reads `https://<host>/` for each account of the
+provider: HTTPS only to that confirmed host, redirects refused, and the key
+stored as `<provider>_api_key` read from the Keychain only at request time
+and sent only in the request header. Only the parsed quota windows are
+kept; failures carry a fixed code (a redirect is `redirect_refused`), never
+a response body or header.
+Account definitions name the provider; login folders remain local bindings.
+
+The rule 12 tier table is a structured fact (`tier_table_set`, `tiers` naming
+every task class: `scope`, `mock`, `ruling`, `hard-security`, `failed-fix`,
+`build`, `fix-round`, `tests`, `docs`, `synthesis`, `mechanical`, each with a
+tier of `opus`, `sonnet` or `haiku`), written with
+`khipu route tier-table set --tiers='<JSON>'` (terminal confirmation),
+`--owner-direction` in an eligible owner conversation, the app's owner path
+(`--from-app`), or `khipu_owner_act` action `route.tier_table.set` with
+`{"tiers": {...}}`. `khipu route tier-table confirm` confirms a table a
+conversation proposed (`set --at-owner-request '...'` writes a proposal that
+never governs on its own), and `clear` removes the table. Only a confirmed,
+owner-written table governs the advisory dispatch check. Each owner write is
+logged, and Undo restores the prior table (or clears it when there was none).
+No adapter or provider fact launches a probe by itself. Model and use checks
+are advisory. DeepSeek's rule 13 model restriction is `models_allowed: [deepseek-flash]`,
+not merely a ban on one Pro model. Spend and concurrency remain with slices
+17a/17b; rule 13 stays standing until those facts are represented and verified.
+An undeclared model causes no model-violation warning. `use: on_request` is a
+neutral reminder: the dispatch hook does not establish whether the owner asked.
+
+Runner identity contract:
+
+- A lane's `config.json` entry may declare `account`, `budget_account`,
+  `provider` (or existing `kind`), and `login_home` (or `home`). All supplied
+  explicit identity fields must agree with the model's known provider.
+  A known model family outranks transport `kind` (for example `kind: deepseek`,
+  `model: glm-5.3` bills GLM). Claude transport can bill GLM or DeepSeek.
+  Cursor always bills the unified Grok account; Auto's model family remains
+  unknown for cross-family checks. A tier name such as `main-sonnet` needs a declaration.
+- One resolver serves health, evidence, and reports: the owner's lane map,
+  declared identity, provider plus local login binding, then provider id or
+  `lane_names`. A provider with several accounts or a name claimed by several
+  providers stays unmatched, with candidates and `budget_account` as the repair field.
+- Declarations are `claimed`. An ordinary usage or limit reading never confirms
+  one. A fresh `state/heartbeat.json` can confirm it with
+  `{"time": 1792512000, "interval": 20, "lanes": {"main-sonnet":
+  {"provider": "claude", "login_home": "/local/login"}}}`. Raw home fields
+  are resolved immediately into local account references and discarded.
+- Alternatively, a `LAUNCH` line can carry `lane=main-sonnet
+  harness=claude_code session=<job-session-id>`. Khipu joins that reference to
+  the job's own capture state (`origin: job` and its hook-recorded `login_home`).
+  The line alone cannot confirm identity. Only a hash of the attachment
+  reference survives runner parsing; capture retention and Forget apply.
+- Health lists `identity_state: claimed|confirmed`, match origin, candidates,
+  and repair guidance. Stale or contradictory bindings never match. A failed
+  or silent heartbeat cannot confirm identity.
+
+Runner budget declarations (slice 19b). A runner's `config.json` may carry a
+`budget` object mapping an account (its key, a `provider|` prefix or a
+label) to a list of cap declarations. Each declaration is the same shape as
+an owner cap fact: `{"kind": "share"|"per_day"|"pace_target", "window":
+"weekly"|"five_hour", "pct", "slack"}`, `{"kind": "spend", "usd", "days"}` or
+`{"kind": "concurrency", "n"}`. Khipu compares each declaration with the
+owner-confirmed cap facts and reports the ones that have no matching fact or
+disagree with the fact they have; a runner value never becomes a fact, and
+the runner's files are never written. A lane's own `cap` is local capacity
+on that Mac, not a quota, and is not compared. `khipu route --json` and
+`khipu doctor` carry the report as `runner_caps`.
+
+Runner telemetry contract (slice 17t). A runner's `state/heartbeat.json` may
+also carry three typed, timestamped records. Khipu reads them through the
+same bounded parser as the rest of the heartbeat: only parsed fields
+survive, names pass the same shape check, and no other byte of the file is
+kept.
+
+- `active`: a snapshot list of `{"lane", "account", "jobs", "unit", "at"}`.
+  `unit` is `job` today: a GLM job's requests go in turn, so one job is one
+  request at a time. The newest snapshot for a `(runner, lane)` replaces the
+  earlier one, and every snapshot expires at the runner's silent deadline.
+  A heartbeat with none of the telemetry keys also expires the snapshot.
+  When a lane is idle the runner sends `jobs: 0` for that lane: idle reads
+  as a known zero only from such a record, never from a missing one, so a
+  lane the runner stops mentioning reads unknown, not zero.
+- `spend`: a list of increments, never a running total:
+  `{"event", "job", "attempt", "provider", "account", "usd", "at"}`.
+  `event` is a uuid the runner mints; records are deduplicated on it, so a
+  heartbeat may republish its recent spend. Each retry is its own `attempt`
+  and its own event, so retries count. A correction is a new event with
+  `corrects: <event>` and the signed difference. Khipu accumulates the
+  events across heartbeats (bounded; what it cannot keep marks the
+  accumulation incomplete).
+- `spend_coverage`: a list of `{"account", "from", "to"}`: the interval for
+  which this runner vouches it reported every spend for that account.
+  Khipu records when it started accumulating each runner's telemetry;
+  that start is kept in the saved view and resets whenever the kept
+  accumulation is discarded or the view is lost, and a period that starts
+  before it reads unknown, never a known understated total. A correction
+  whose target Khipu cannot find in the same stream and period (it names
+  no account, or its target lies outside the period) is dropped from the
+  figure and marks the affected stream, or the unattributed bucket,
+  incomplete, so the total reads unknown instead of silently omitting it.
+
+Each record is attributed to an account through the same lane resolver as
+limits and reports. A record no resolution can name is unattributed, never
+guessed. An account's spend total for a period is known only when every
+runner that took part in the period covers its own participation interval;
+one runner's gap makes the total unknown even when another covers the whole
+period, two accounts on one provider never pool, and a silent runner's
+records expire to unknown. Missing or partial coverage is unknown, never
+zero. Reference emitter (the runner's side, kept minimal):
+
+```python
+import json, time, uuid
+
+def heartbeat(path, active, spend, coverage, interval=20):
+    doc = {"time": time.time(), "interval": interval,
+           "active": [{"lane": lane, "account": account, "jobs": jobs,
+                       "unit": "job", "at": time.time()} for lane, account, jobs in active],
+           "spend": [{"event": str(uuid.uuid4()), "job": job, "attempt": attempt,
+                      "provider": provider, "account": account, "usd": usd,
+                      "at": time.time()} for job, attempt, provider, account, usd in spend],
+           "spend_coverage": [{"account": account, "from": start, "to": time.time()}
+                              for account, start in coverage]}
+    path.write_text(json.dumps(doc))
+```
+
 A runner's lane maps to an account through the lane map (`routing_lane_map`). A lane with no match is shown and pushed as one line. Khipu does not guess.
 
 ### Holds
@@ -64,6 +201,10 @@ These are yours:
 - **Clear.** Clear an account's state, or dismiss one report.
 
 A conversation can record a rule or a priority only when you asked it to. Khipu keeps it pending until you confirm it in the app. A conversation cannot confirm, retire, dismiss or undo anything.
+
+Rule edits and priority requests must carry `base`, the owner revision returned by the conversation's earlier `khipu_route` read. A missing or unread base is refused; later reads never fill it in. The CLI takes the same revision as `--base` with `--at-owner-request`. Replacement notices name the rule number or priority and go only to their author's session, once delivered; undelivered notices expire after seven days.
+
+Sessionless CLI reads, including the app's polling command, create no receipt file and take no routing lock to record a receipt. Sessionless MCP callers can propose against revisions read on the same connection: receipts stay in that server process's memory and never pass to another connection or process. Replacement notices match either the recorded canonical session id (including `t3:<thread>`) or its provider session id.
 
 ### Priority and pace
 
@@ -186,9 +327,56 @@ The Home screen has a Routing card with one row per account, holds, your note, a
 
 `khipu route sources` lists each job runner folder with its last good read and any error. Run `khipu route --help` and each subcommand's `--help` for every flag. See the [CLI reference](cli.md).
 
+**Directions said in a conversation.** If you type a routing direction in a conversation ("use GLM only one job at a time") and no matching owner change reaches Khipu, capture opens an owed item, "Routing said here, not in Khipu", quoting your words; only you see that quote. A direction counts only when it names an account, provider, lane or model Khipu's record knows; ordinary prompts that merely start with a word like "use" or "keep" open nothing. The item appears in `khipu_owed` (kind `routing_direction`), in `khipu owed` on the command line, and in the pushed slice at session start. It closes when the matching owner change is made from that same prompt (setting the cap to a different value leaves it open), when an owner change cites it, or when you dismiss it with `khipu owed --close <id>` (the owed list's close control, also `khipu owed --dismiss <id>`); a dismissal survives later captures. Questions, quotations and job prompts open nothing. If the prompt recorder missed the turn, the item stays open marked unjoined rather than being matched by guesswork.
+
 ## Limits of this feature
 
-- The routing record is local. The HTTPS gateway does not serve it yet, so cloud agents cannot read it. Sharing it with cloud agents through the hub is planned.
+- Routing stays local by default. Opt-in Mac replication is described below; the HTTPS gateway projection is a separate slice and is not enabled by this switch.
 - Replacing the routing table file with a view generated by Khipu is planned. Today the file is only read.
 - A push for stock Grok Build is planned, not built.
 - Related work that is planned and not described here: a Work view and work ledger.
+
+
+## Replication between Macs (slice 11b)
+
+`routing_replication_live` must be the JSON boolean `true` to enable network
+replication; it defaults off and is not an app setting yet. The hub needs migration
+0042 and 0043. Enabling it or deploying a running build is a separate operational step.
+
+- `khipu route replication status` reads local cursors, caught-up time, age,
+  source rows and deferred event kinds. More than ten minutes old is stale.
+- `khipu route replication sync` runs one exchange through the closed 11a
+  projection. With the switch off, it does not construct a transport.
+- `khipu route replication restore` assigns a fresh Mac identity and clears only
+  the downloaded set and cursors. It preserves `events.jsonl` byte for byte and
+  does not connect. The next enabled sync rebuilds the downloaded set; old local
+  event IDs are retried idempotently. Run this after restoring a copied routing
+  folder to another Mac; a fresh install creates its own identity automatically.
+  If a sync holds the lock, restore returns `busy` without changing files.
+
+The daemon's existing routing poll uploads in local sequence order, then pulls
+hub-timestamp pages with the snapshot overlap. Polls are capped at 30 seconds
+when replication is enabled, within the 60-second two-Mac propagation budget
+while the routing helper is running. A stopped helper needs an explicit sync.
+The local routing lock is never held over a network operation. Durable receipts
+precede upload cursor advancement; durable pages precede download cursor
+advancement. Only a completed pull through its snapshot can mark caught-up.
+Existing `n`/`local_order` display numbers never change. Previously unnumbered
+rules receive the next rule number in hub acceptance order, independent of gaps
+or other event kinds in `hub_order`. Assignments persist in receipts and survive
+retries and restore. Offline additions keep UUID targets and show “new rule
+(number pending)”. Each Mac reserves its existing number range before uploading,
+including a numeric high-water mark for id-less legacy rules; those rows never
+upload. A Mac's private numbers cannot be known elsewhere before its first sync.
+Conflicting historical numbers are preserved, and ambiguous numeric operations
+refuse with the matching UUIDs so the owner can target the intended rule.
+
+Unconfirmed words omitted by `routing_proposal_text_between_macs` become a
+placeholder on the other Mac. Confirm on the source Mac, where the words are
+visible; the confirmation carries those now-confirmed words. Owner words and
+local history are not rewritten. Missing or rejected event IDs never upload.
+
+The closed 11a projection does not yet cover newer pace samples, caps and tier
+facts. Unsupported kinds are reported as `deferred_kinds`, retained locally and
+retried after a projection upgrade; they do not block supported events. No
+live hub, live configuration, hook or launch agent was changed for this slice.

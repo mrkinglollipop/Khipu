@@ -35,6 +35,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import fcntl
+import hashlib
 import heapq
 import json
 import math
@@ -51,9 +52,18 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-HARNESSES = ("claude", "codex", "grok", "muse")
-LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok", "muse": "Muse"}
+HARNESSES = ("claude", "codex", "grok", "muse", "glm")
+LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok", "muse": "Muse", "glm": "GLM"}
+# One sign-in each and no login folder: Muse's is its own login, GLM's is the
+# Coding Plan key (a Claude Code lane pointed at z.ai, not an Anthropic home).
+NO_FOLDER = ("muse", "glm")
 TIMEOUT_S = 5.0
+# Grok's probe starts a whole `grok agent` (and its MCP servers), which took
+# longer than TIMEOUT_S under load; the other harnesses' probes stay cheap.
+GROK_TIMEOUT_S = 20.0
+# GLM's probe is one HTTPS call to z.ai's quota endpoint, no child process.
+GLM_TIMEOUT_S = 15.0
+GLM_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 DEFAULT_MAX_AGE_S = 120
 CACHE_NAME = "usage.json"
 CACHE_VERSION = 2
@@ -111,9 +121,20 @@ E_INVALID = "invalid_account"
 E_INTERNAL = "internal_error"
 E_PENDING = "pending"
 E_NO_FOLDER = "login_folder_missing"
+E_NO_KEY = "no_key"
+E_NO_PLAN = "no_plan"
+# z.ai refused the key: not a sign-in an owner can redo in a CLI, so it has its own code.
+E_BAD_KEY = "key_rejected"
+# The http-quota endpoint tried to send Khipu to a host the owner never confirmed.
+E_REDIRECT = "redirect_refused"
+HTTP_QUOTA_TIMEOUT_S = 15.0
+HTTP_QUOTA_MAX_BYTES = 1 << 20
+# A quota window longer than a year is not a window, it is a hostile figure.
+HTTP_QUOTA_MAX_WINDOW_MINS = 366 * 24 * 60
 NO_FOLDER_NOTE = "Khipu can't find this account's login folder on this Mac"
 # The CLIs by the names the app's form gives them.
-CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok Build", "muse": "Muse"}
+CLI_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok Build", "muse": "Muse",
+             "glm": "GLM Coding Plan"}
 # Plain words only: the app shows notes as written to an owner who is not
 # technical, so a note names a login folder, never a home, a PATH, a token or
 # a probe. The live read's own code goes in the row's ``live_error`` field,
@@ -125,6 +146,10 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
     """Khipu's own sentence for a failure ``code`` on one account, or None."""
     name = CLI_NAMES.get(harness or "", "This CLI")
     folder = " with this login folder" if home else ""
+    if code == E_REDIRECT:
+        return "The quota endpoint tried to send Khipu to another host, so Khipu refused the answer"
+    if harness == "glm":
+        return _glm_note(code)
     if code == E_NOT_INSTALLED:
         return f"{name} is not installed on this Mac"
     if code == E_SIGNIN:
@@ -135,6 +160,8 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return f"{name} did not send its plan figures just now; Khipu keeps the last ones and asks again"
     if code == E_PENDING:
         return "Reading for the first time; ask again in a few seconds"
+    if code in (E_NO_KEY, E_NO_PLAN, E_BAD_KEY):
+        return _glm_note(code)
     # Every other code the probes can return gets its plain cause too, so the
     # app shows Khipu's words for every failure and never invents its own.
     if code == E_TIMEOUT:
@@ -147,6 +174,39 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return f"{name} answered in a way Khipu can't read"
     if code == E_START:
         return f"{name} could not be started"
+    if code == E_INVALID:
+        return "This account entry is not valid"
+    if code == E_NO_FOLDER:
+        return NO_FOLDER_NOTE
+    if code == E_INTERNAL:
+        return "Khipu could not run the check"
+    return None
+
+
+def _glm_note(code: str | None) -> str | None:
+    """GLM has no CLI to open or sign in to: its sign-in is a key Khipu reads."""
+    if code == E_NO_KEY:
+        return "Khipu has no GLM key; add it in Settings under Accounts and routing"
+    if code == E_NOT_INSTALLED:
+        return "Khipu can't reach z.ai from this Mac"
+    if code in (E_SIGNIN, E_BAD_KEY):
+        return "z.ai did not accept the GLM key; replace it in Settings under Accounts and routing"
+    if code == E_NO_PLAN:
+        return "z.ai reports no GLM Coding Plan on this key"
+    if code == E_NO_LIMITS:
+        return "z.ai reported no plan limits for this key"
+    if code == E_NO_FIGURES:
+        return "z.ai did not send its plan figures just now; Khipu keeps the last ones and asks again"
+    if code == E_PENDING:
+        return "Reading for the first time; ask again in a few seconds"
+    if code == E_TIMEOUT:
+        return "z.ai didn't answer in time"
+    if code in (E_NO_ANSWER, E_START) or (code and re.fullmatch(r"(exit|signal)_\d+", code)):
+        return "z.ai didn't answer"
+    if code == E_CLI:
+        return "z.ai reported an error when asked"
+    if code == E_BAD:
+        return "z.ai answered in a way Khipu can't read"
     if code == E_INVALID:
         return "This account entry is not valid"
     if code == E_NO_FOLDER:
@@ -878,6 +938,14 @@ def probe_codex(home: str | None = None, *, timeout: float = TIMEOUT_S, rollout:
 # ---- Grok --------------------------------------------------------------------
 
 
+def _account_digest(harness: str, account_id) -> str | None:
+    """Only a digest of a CLI-reported account id is ever kept: equality is
+    all a subscription grouping needs, so the raw id is dropped here."""
+    if not isinstance(account_id, str) or not account_id.strip():
+        return None
+    return "sub:" + hashlib.sha256(f"{harness}:{account_id.strip()}".encode()).hexdigest()[:24]
+
+
 def parse_grok(frames: list[dict]) -> dict:
     if not any(frame.get("id") == 2 for frame in frames):
         _answer(frames, 1)  # a failed initialize is the probe's error
@@ -896,8 +964,26 @@ def parse_grok(frames: list[dict]) -> dict:
                      period.get("end") or config.get("billingPeriodEnd"))
     balance = _number(_dict(config, "prepaidBalance").get("val"))
     credits = {"prepaid_balance": balance} if balance is not None else None
-    return {"ok": True, "plan": _text(result.get("subscription_tier")), "windows": [window] if window else [],
-            "credits": credits, "version": version, "source": "live"}
+    account_id = None
+    for source in (result, config):
+        for key in ("account_id", "accountId", "user_id", "userId"):
+            if isinstance(source.get(key), str) and source[key].strip():
+                account_id = source[key].strip()
+                break
+        if account_id:
+            break
+    out = {"ok": True, "plan": _text(result.get("subscription_tier")), "windows": [window] if window else [],
+           "credits": credits, "version": version, "source": "live"}
+    digest = _account_digest("grok", account_id)
+    if digest:
+        out["account_digest"] = digest
+    return out
+
+
+def _grok_budget(timeout: float) -> float:
+    """Grok's own budget when the caller left the default; an explicit
+    timeout (anything but the default) is honoured as given."""
+    return GROK_TIMEOUT_S if timeout == TIMEOUT_S else timeout
 
 
 @_guard
@@ -918,7 +1004,7 @@ def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S) -> d
     billing = {"jsonrpc": "2.0", "id": 2, "method": "_x.ai/billing", "params": {}}
     frames = _converse([binary, "agent", "--no-leader", "stdio"], [initialize],
                        lambda f: f.get("id") == 2 or (f.get("id") == 1 and f.get("error") is not None),
-                       env=probe_environment("grok", grok_home, binary), deadline=time.monotonic() + timeout,
+                       env=probe_environment("grok", grok_home, binary), deadline=time.monotonic() + _grok_budget(timeout),
                        close_stdin=False, follow=lambda f: [billing] if f.get("id") == 1 else None)
     return parse_grok(frames)
 
@@ -1241,13 +1327,409 @@ def probe_muse(*, timeout: float = TIMEOUT_S, turn: bool = True) -> dict:
     return _muse_carry(row, prev, refusal, now)
 
 
+# ---- GLM (z.ai Coding Plan) ------------------------------------------------
+#
+# Matt's GLM lane is the Claude Code CLI pointed at z.ai, so there is no GLM
+# CLI to ask. z.ai's monitor endpoint answers with the key as the raw
+# ``Authorization`` value (no Bearer). The key is read into a local, goes only
+# into that header, and never reaches a row, the cache, a log, argv or an error.
+
+_GLM_UNITS = {3: ("five_hour", 300), 6: ("weekly", 10080)}
+# z.ai's own codes for a missing plan and for a key it does not accept.
+_GLM_NO_PLAN = {1113}
+_GLM_BAD_KEY = {1000, 1001, 1002, 1003, 1004, 401}
+
+
+def _glm_key() -> str | None:
+    from khipu import keychain
+
+    try:
+        return keychain.resolve_glm_key() or None
+    except Exception:  # noqa: BLE001 - no key anywhere; the message is never used
+        return None
+
+
+def _glm_request(key: str, timeout: float) -> tuple[int, bytes]:
+    """(HTTP status, body) of the quota call; ProbeError for anything that is
+    not an HTTP answer. No exception text is kept: it could echo the URL."""
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(GLM_QUOTA_URL, headers={"Authorization": key, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed https URL
+            return response.status, response.read(1 << 20)
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, exc.read(1 << 20)
+        except Exception:  # noqa: BLE001
+            return exc.code, b""
+    except TimeoutError:
+        raise ProbeError(E_TIMEOUT) from None
+    except urllib.error.URLError as exc:
+        raise ProbeError(E_TIMEOUT if isinstance(exc.reason, TimeoutError) else E_NO_ANSWER) from None
+    except Exception:  # noqa: BLE001 - OSError, ssl, http.client: any text could echo the key
+        raise ProbeError(E_NO_ANSWER) from None
+
+
+_GLM_QUOTA_TYPES = frozenset({"TOKENS_LIMIT", "CREDIT_LIMIT"})
+
+
+def _glm_pct(limit: dict):
+    """Used percent of one limit: z.ai's own ``percentage``, else used / limit."""
+    pct = limit.get("percentage")
+    if pct is None:
+        used, total = limit.get("currentValue"), limit.get("usage")
+        if isinstance(used, bool) or isinstance(total, bool) \
+                or not isinstance(used, (int, float)) or not isinstance(total, (int, float)) or total <= 0:
+            return None
+        pct = used / total * 100
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct):
+        raise ProbeError(E_BAD)
+    return round(min(100.0, max(0.0, float(pct))), 2)
+
+
+def parse_glm(status: int, body: bytes) -> dict:
+    try:
+        reply = json.loads(body.decode("utf-8")) if body else None
+    except (ValueError, UnicodeError):
+        reply = None
+    if not isinstance(reply, dict):
+        if status in (401, 403):
+            raise ProbeError(E_BAD_KEY)
+        raise ProbeError(E_BAD)
+    code = reply.get("code")
+    if isinstance(code, int) and not isinstance(code, bool) and code != 200:
+        if code in _GLM_NO_PLAN:
+            raise ProbeError(E_NO_PLAN)
+        raise ProbeError(E_BAD_KEY if code in _GLM_BAD_KEY or status in (401, 403) else E_CLI)
+    if status in (401, 403):
+        raise ProbeError(E_BAD_KEY)
+    if status != 200:
+        raise ProbeError(E_CLI)
+    data = _dict(reply, "data", required=True)
+    windows = []
+    for limit in _list(data, "limits"):
+        if not isinstance(limit, dict):
+            raise ProbeError(E_BAD)
+        unit = limit.get("unit")
+        if isinstance(unit, bool) or unit not in _GLM_UNITS:
+            continue
+        # unit 3 / 6 are the quota windows; a same-unit request-count limit
+        # (type TIME_LIMIT) must not stand in for one. z.ai renamed the quota
+        # type TOKENS_LIMIT to CREDIT_LIMIT in October 2026.
+        if isinstance(limit.get("type"), str) and limit["type"] not in _GLM_QUOTA_TYPES:
+            continue
+        name, mins = _GLM_UNITS[unit]
+        if any(w["name"] == name for w in windows):
+            continue
+        window = _window(name, _glm_pct(limit), limit.get("nextResetTime"), mins)
+        if window:
+            windows.append(window)
+    if not windows:
+        raise ProbeError(E_NO_LIMITS)
+    return {"ok": True, "plan": _text(data.get("level")), "windows": windows, "credits": None, "version": None,
+            "source": "live"}
+
+
+@_guard
+def probe_glm(*, timeout: float = TIMEOUT_S) -> dict:
+    """The Coding Plan's five-hour and weekly windows from z.ai. The default
+    ``timeout`` is widened to ``GLM_TIMEOUT_S`` (an explicit one is honoured)."""
+    key = _glm_key()
+    if not key:
+        raise ProbeError(E_NO_KEY)
+    status, body = _glm_request(key, GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
+    return parse_glm(status, body)
+
+
+# ---- http-quota (owner-confirmed HTTPS quota endpoints, slice 9b) --------------
+#
+# The key floor (plan section 6): HTTPS only, to the exact host the owner
+# confirmed on the provider fact. Redirects are refused, never followed. The
+# key is read through ``keychain`` into a local at request time and goes only
+# into the request header to that host: never argv, env, a URL or a file.
+# Only the parsed quota numbers leave the parser; no response body, header
+# or exception text is returned, cached or logged anywhere.
+
+_HTTP_HOST = re.compile(r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\Z")
+
+
+def _find_socket(obj):
+    """The socket under a connection or response, or None."""
+    import socket as socket_module
+
+    for _ in range(8):
+        if obj is None:
+            return None
+        if isinstance(obj, socket_module.socket):
+            return obj
+        obj = getattr(obj, "fp", None) or getattr(obj, "raw", None) or getattr(obj, "_sock", None)
+    return None
+
+
+def _shrink_read_timeout(response, remaining: float) -> None:
+    """Best-effort: give the socket under ``response`` only ``remaining``
+    seconds, so one slow read cannot outlive the overall deadline."""
+    sock = _find_socket(response)
+    if sock is not None:
+        try:
+            sock.settimeout(max(0.0, remaining))
+        except OSError:
+            return
+
+
+def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes]:
+    """(HTTP status, bounded body on 200 only) of the quota call. A redirect
+    is a ProbeError, and no error body is ever read. Proxies are disabled, so
+    only the owner-confirmed host is ever contacted, and ``timeout`` is an
+    overall deadline (connect through status line, headers and body read),
+    not a per-read budget."""
+    import http.client
+    import socket as socket_module
+    import urllib.error
+    import urllib.request
+
+    # P3-4: the key goes out as a bare ``Authorization: <key>`` header value,
+    # with no scheme (no ``Bearer`` prefix) — the form the z.ai-style quota
+    # APIs this adapter targets accept, same as the GLM probe above.
+    request = urllib.request.Request(f"https://{host}/",
+                                     headers={"Authorization": key, "Accept": "application/json"})
+    deadline = time.monotonic() + timeout
+
+    # One watchdog deadline covers connect, TLS, the status line, the
+    # response headers and the body. A per-read socket timeout alone cannot
+    # do that: each dripped header line would earn a fresh budget. The
+    # watchdog tracks every socket the request creates and closes it at the
+    # deadline, repeatedly until the request is done, so a socket created
+    # just as the deadline fires is closed too. It never holds the key.
+    fired = threading.Event()
+    done = threading.Event()
+    connections: list = []
+    response_sockets: list = []
+
+    def _close_socket(sock) -> None:
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket_module.SHUT_RDWR)
+        except Exception:  # noqa: BLE001 - already closed or not connected
+            pass
+        try:
+            sock.close()
+        except Exception:  # noqa: BLE001 - closing is best-effort
+            pass
+
+    def _watchdog() -> None:
+        if done.wait(max(0.0, deadline - time.monotonic())):
+            return
+        fired.set()
+        while not done.is_set():
+            for conn in list(connections):
+                _close_socket(getattr(conn, "sock", None))
+            for sock in list(response_sockets):
+                _close_socket(sock)
+            done.wait(0.05)
+
+    class _DeadlineConnection(http.client.HTTPSConnection):
+        def __init__(self, *args, **kwargs):
+            connections.append(self)
+            super().__init__(*args, **kwargs)
+
+    class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_DeadlineConnection, req,
+                                context=self._context, check_hostname=self._check_hostname)
+
+    watchdog = threading.Thread(target=_watchdog, daemon=True)
+    watchdog.start()
+    try:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):  # noqa: ARG002 - refusing is the whole job
+                return None
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect(),
+                                             _DeadlineHTTPSHandler())
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProbeError(E_TIMEOUT)
+        response = opener.open(request, timeout=remaining)  # noqa: S310 - owner-confirmed https host
+        sock = _find_socket(response)
+        if sock is not None:
+            response_sockets.append(sock)
+        with response:
+            if fired.is_set() or time.monotonic() >= deadline:
+                raise ProbeError(E_TIMEOUT)
+            status = getattr(response, "status", None)
+            if not isinstance(status, int) or isinstance(status, bool):
+                status = getattr(response, "code", None)
+            if isinstance(status, int) and 300 <= status < 400:
+                raise ProbeError(E_REDIRECT)
+            if status != 200:
+                return (status if isinstance(status, int) else 0), b""
+            chunks, total = [], 0
+            while True:
+                remaining = deadline - time.monotonic()
+                if fired.is_set() or remaining <= 0:
+                    raise ProbeError(E_TIMEOUT)
+                _shrink_read_timeout(response, remaining)
+                # read1 (one raw read) over read: read would wait to fill the
+                # whole count, so a slow drip would never reach the deadline
+                # check between chunks.
+                read_chunk = getattr(response, "read1", response.read)
+                chunk = read_chunk(min(65536, HTTP_QUOTA_MAX_BYTES + 1 - total))
+                if fired.is_set() or time.monotonic() >= deadline:
+                    raise ProbeError(E_TIMEOUT)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > HTTP_QUOTA_MAX_BYTES:
+                    raise ProbeError(E_BAD)
+                if time.monotonic() >= deadline:
+                    raise ProbeError(E_TIMEOUT)
+            return 200, b"".join(chunks)
+    except ProbeError:
+        raise
+    except urllib.error.HTTPError as exc:
+        if fired.is_set():
+            raise ProbeError(E_TIMEOUT) from None
+        # With redirects refused, urllib raises for a 3xx; its body (which a
+        # hostile endpoint could fill with echoed material) is never read.
+        if 300 <= exc.code < 400:
+            raise ProbeError(E_REDIRECT) from None
+        return exc.code, b""
+    except TimeoutError:
+        raise ProbeError(E_TIMEOUT) from None
+    except urllib.error.URLError as exc:
+        if fired.is_set():
+            raise ProbeError(E_TIMEOUT) from None
+        raise ProbeError(E_TIMEOUT if isinstance(exc.reason, TimeoutError) else E_NO_ANSWER) from None
+    except Exception:  # noqa: BLE001 - any text could echo the key or the body
+        if fired.is_set():
+            raise ProbeError(E_TIMEOUT) from None
+        raise ProbeError(E_NO_ANSWER) from None
+    finally:
+        done.set()
+
+
+def parse_http_quota(status: int, body: bytes) -> dict:
+    """Only quota numbers out of a quota reply: window figures and resets.
+    Names are Khipu's own, derived from each window's length, never copied."""
+    if 300 <= status < 400:
+        raise ProbeError(E_REDIRECT)
+    if status in (401, 403):
+        raise ProbeError(E_BAD_KEY)
+    if status != 200:
+        raise ProbeError(E_CLI)
+    try:
+        reply = json.loads(body.decode("utf-8")) if body else None
+    except (ValueError, UnicodeError, RecursionError):
+        reply = None
+    if not isinstance(reply, dict):
+        raise ProbeError(E_BAD)
+    code = reply.get("code")
+    if isinstance(code, int) and not isinstance(code, bool) and code != 200:
+        if code in _GLM_NO_PLAN:
+            raise ProbeError(E_NO_PLAN)
+        raise ProbeError(E_BAD_KEY if code in _GLM_BAD_KEY else E_CLI)
+    data = reply.get("data") if isinstance(reply.get("data"), dict) else reply
+    raw_windows = data.get("windows") if isinstance(data.get("windows"), list) else None
+    windows = []
+    if raw_windows is not None:
+        for i, item in enumerate(raw_windows):
+            if not isinstance(item, dict):
+                raise ProbeError(E_BAD)
+            used = item.get("used_pct", item.get("percentage", item.get("used_percent")))
+            mins = _mins(item.get("window_mins", item.get("window_minutes")))
+            name = _window_name(mins) if mins else ("quota" if i == 0 else f"quota_{i + 1}")
+            resets = item.get("resets_at", item.get("reset_at", item.get("nextResetTime")))
+            window = _window(name, _glm_pct(item) if used is None and ("currentValue" in item or "usage" in item)
+                             else used, resets, mins)
+            if window:
+                windows.append(window)
+    else:
+        for limit in _list(data, "limits"):
+            if not isinstance(limit, dict):
+                raise ProbeError(E_BAD)
+            unit = limit.get("unit")
+            if isinstance(unit, bool) or unit not in _GLM_UNITS:
+                continue
+            if isinstance(limit.get("type"), str) and limit["type"] not in _GLM_QUOTA_TYPES:
+                continue
+            name, mins = _GLM_UNITS[unit]
+            if any(w["name"] == name for w in windows):
+                continue
+            window = _window(name, _glm_pct(limit), limit.get("nextResetTime"), mins)
+            if window:
+                windows.append(window)
+        if not windows and ("used_pct" in data or "percentage" in data):
+            used = data.get("used_pct", data.get("percentage"))
+            window = _window("quota", used, data.get("resets_at", data.get("reset_at")))
+            if window:
+                windows.append(window)
+    if not windows:
+        raise ProbeError(E_NO_LIMITS)
+    # This adapter alone tightens the shared window shape: a figure outside
+    # 0-100% or a window longer than a year is a hostile reply, not data.
+    # Other adapters keep _window's finiteness-only behaviour.
+    for window in windows:
+        if not 0 <= window["used_pct"] <= 100 or window.get("window_mins", 0) > HTTP_QUOTA_MAX_WINDOW_MINS:
+            raise ProbeError(E_BAD)
+    return {"ok": True, "plan": None, "windows": windows, "credits": None, "version": None, "source": "live"}
+
+
+@_guard
+def probe_http_quota(account: dict, *, timeout: float = TIMEOUT_S) -> dict:
+    """One http-quota provider account, read at its owner-confirmed host."""
+    host = account.get("host")
+    if not isinstance(host, str) or not _HTTP_HOST.fullmatch(host) or ".." in host:
+        raise ProbeError(E_INVALID)
+    from khipu import keychain
+
+    provider = account.get("provider") or account.get("harness") or ""
+    try:
+        key = keychain.get_password(f"{provider}_api_key")
+    except Exception:  # noqa: BLE001 - no key anywhere; the message is never used
+        key = None
+    if not key:
+        raise ProbeError(E_NO_KEY)
+    try:
+        status, body = _http_quota_request(key, host,
+                                           HTTP_QUOTA_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
+    finally:
+        key = None  # the key lives only for the request above
+    return parse_http_quota(status, body)
+
+
+def http_quota_accounts() -> list[dict]:
+    """The accounts whose provider fact names the http-quota adapter, keyed
+    in the usage cache by their stable account id."""
+    try:
+        from khipu import routing
+
+        definitions, _cache = routing._entry_definitions()
+    except Exception:  # noqa: BLE001 - no record, no quota accounts
+        return []
+    providers = definitions.get("providers") or {}
+    out = []
+    for ident, value in sorted((definitions.get("accounts") or {}).items()):
+        provider = providers.get((value or {}).get("provider") or "")
+        if not provider or provider.get("probe") != "http-quota":
+            continue
+        out.append({"label": value.get("label") or ident, "harness": provider["id"], "home": None,
+                    "probe": "http-quota", "host": provider.get("host"), "provider": provider["id"],
+                    "quota_key": ident})
+    return out
+
+
 # ---- accounts ----------------------------------------------------------------
 
 
 ACCOUNTS_MAX = 32
 LABEL_MAX = 64
 HOME_MAX = 1024
-_ACCOUNT_FIELDS = ("label", "harness", "home")
+_ACCOUNT_FIELDS = ("label", "harness", "home", "label_source")
 
 
 class AccountsError(ValueError):
@@ -1272,9 +1754,10 @@ def _entry_problem(harness: str, home: str | None) -> tuple[str, str, str] | Non
     if harness not in HARNESSES:
         named = f'the CLI "{harness}"' if harness else "an entry with no CLI"
         return "unknown_cli", "harness", (f"Khipu does not read {named}; it reads Claude Code, Codex, "
-                                          "Grok Build and Muse")
-    if harness == "muse" and home:
-        return "muse_folder", "home", "Muse has one sign-in, so it takes no login folder"
+                                          "Grok Build, Muse and the GLM Coding Plan")
+    if harness in NO_FOLDER and home:
+        return (f"{harness}_folder", "home",
+                f"{LABELS[harness]} has one sign-in, so it takes no login folder")
     path = _home_path(home) if home else None
     # A relative folder (".claude-second", the "~/" left off) can never be
     # read: each probe starts in a fresh empty temp folder, so it would always
@@ -1282,6 +1765,12 @@ def _entry_problem(harness: str, home: str | None) -> tuple[str, str, str] | Non
     if home and (path is None or not path.is_absolute()):
         return "no_such_folder", "home", (f"Khipu cannot find the login folder {home}; start it with ~/ "
                                           "(for example ~/.codex-work) or give the full path")
+    if harness == "claude" and path is not None:
+        from khipu import discover
+
+        if discover.provider_home(path) == "glm":
+            return "zai_home", "home", ("This login folder runs Claude Code against z.ai, so it is the GLM "
+                                        "account; track GLM instead of reading it as Claude")
     return None
 
 
@@ -1295,10 +1784,18 @@ def _account_from_entry(entry) -> dict:
     home = entry.get("home")
     home = str(home).strip() if isinstance(home, str) and home.strip() else None
     account = {"label": label, "harness": harness or "?", "home": home}
+    if entry.get("label_source") in ("owner", "suggested"):
+        account["label_source"] = entry["label_source"]
     problem = _entry_problem(harness, home)
     if problem:
         account["invalid"] = problem[2]
     return account
+
+
+def available(harness: str) -> bool:
+    """Whether Khipu can read this harness by default: its CLI is installed,
+    or (GLM, which has no CLI) a key is stored."""
+    return bool(_glm_key()) if harness == "glm" else bool(_command(harness))
 
 
 def reads_none(config: dict | None = None) -> bool:
@@ -1313,6 +1810,10 @@ def reads_none(config: dict | None = None) -> bool:
     return config.get("usage_accounts_none") is True and not (isinstance(raw, list) and raw)
 
 
+def _cursor_entry(entry) -> bool:
+    return isinstance(entry, dict) and str(entry.get("harness") or "").strip().lower() == "cursor"
+
+
 def configured_accounts() -> list[dict]:
     """Config ``usage_accounts`` (``[{label, harness, home?}]``), or by default
     every installed CLI with its default home, or none after the owner chose
@@ -1325,8 +1826,8 @@ def configured_accounts() -> list[dict]:
     if not isinstance(raw, list):
         if reads_none(config):
             return []
-        return [{"label": LABELS[h], "harness": h, "home": None} for h in HARNESSES if _command(h)]
-    return [_account_from_entry(entry) for entry in raw]
+        return [{"label": LABELS[h], "harness": h, "home": None} for h in HARNESSES if available(h)]
+    return [_account_from_entry(entry) for entry in raw if not _cursor_entry(entry)]
 
 
 def default_login(harness: str) -> Path | None:
@@ -1347,8 +1848,8 @@ def login_identity(account: dict) -> str:
     from khipu import claude_homes
 
     harness = account.get("harness")
-    if harness == "muse":
-        return "muse|"
+    if harness in NO_FOLDER:
+        return f"{harness}|"
     home = account.get("home")
     path = _home_path(home) if home else default_login(harness)
     if path is None:
@@ -1423,10 +1924,12 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
     if len(raw) > ACCOUNTS_MAX:
         raise AccountsError(f"usage_accounts holds at most {ACCOUNTS_MAX} entries, got {len(raw)}", "too_many")
     kept = list(previous or [])
-    # Ids all start "acct-" (``routing.account_id``): only a name that does
-    # needs them worked out (which makes this install's id secret).
+    from khipu.routing_identity import STABLE
+
+    # Only possible id names need the existing accounts' identities checked.
     ids = _account_ids(raw) if any(isinstance(e, dict)
-                                   and str(e.get("label") or "").strip().casefold().startswith("acct-")
+                                   and (str(e.get("label") or "").strip().casefold().startswith("acct-")
+                                        or STABLE.fullmatch(str(e.get("label") or "").strip().casefold()))
                                    for e in raw) else set()
     out: list[dict] = []
     # (account, kept) per entry: every entry is checked against every other
@@ -1467,9 +1970,13 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
         if problem:
             code, field, reason = problem
             raise AccountsError(f"{where}: {reason}", code, index=i, field=field)
+        if entry.get("label_source") not in (None, "owner", "suggested"):
+            raise AccountsError(f"{where}: label_source must be owner or suggested", "bad_entry",
+                                index=i, field="label_source")
         account = _account_from_entry(entry)
+        account["label_source"] = entry.get("label_source") or ("owner" if entry.get("label") else "suggested")
         checked.append((account, False))
-        stored = {"label": account["label"], "harness": account["harness"]}
+        stored = {"label": account["label"], "harness": account["harness"], "label_source": account["label_source"]}
         if account["home"]:
             stored["home"] = account["home"]
         out.append(stored)
@@ -1516,6 +2023,15 @@ def parse_usage_accounts(raw, *, previous: list | None = None) -> list[dict]:
                               (ids - {account_id_of(account)}) if ids else ids)
         if named:
             raise AccountsError(f"usage_accounts entry {i + 1}: {named[1]}", named[0], index=i, field="label")
+    # Distinct labels can still collapse to one provider slug ("work!"
+    # and "work"). Never let a write merge those account identities.
+    from khipu.routing_identity import validate
+    from khipu.routing import RouteError
+
+    try:
+        validate([a for a, _kept in checked if not a.get("invalid")])
+    except RouteError as error:
+        raise AccountsError(str(error), "name_taken", field="label") from None
     return out
 
 
@@ -1546,7 +2062,11 @@ def accounts_status() -> dict:
 
 def _key(account: dict) -> str:
     """Cache identity: the harness and the home whose login answers (labels
-    are display names and may change)."""
+    are display names and may change). An http-quota account has no login:
+    its stable account id is its cache key."""
+    quota_key = account.get("quota_key")
+    if isinstance(quota_key, str) and quota_key:
+        return quota_key
     home = account.get("home")
     if not home:
         return f"{account['harness']}|"
@@ -1573,6 +2093,8 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
         if account.get("invalid"):
             data = {"ok": False, "error": E_INVALID,
                     "note": f"This account entry is not valid: {account['invalid']}"}
+        elif account.get("probe") == "http-quota" or account.get("quota_key"):
+            data = probe_http_quota(account, timeout=timeout)
         elif harness in _HOME_VARS and not _login_folder_there(home or str(default_login(harness))):
             # Checked on the folder itself (nothing inside it is read): a CLI
             # pointed at a missing folder answers "not signed in", which a
@@ -1587,8 +2109,19 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
             data = probe_grok(home, timeout=timeout)
         elif harness == "muse":
             data = probe_muse(timeout=timeout, turn=turn)
+        elif harness == "glm":
+            data = probe_glm(timeout=timeout)
         else:
             data = {"ok": False, "error": E_INVALID}
+        data = dict(data)
+        raw_account_id = None
+        for key in ("account_id", "accountId", "user_id", "userId"):
+            raw_account_id = data.pop(key, None) or raw_account_id
+        digest = data.get("account_digest") or _account_digest(harness, raw_account_id)
+        if digest:
+            data["account_digest"] = digest
+        else:
+            data.pop("account_digest", None)
         row = _blank_row(account)
         row.update(data)
         row.update({"probed_at": _iso(_now().timestamp()), "ms": int((time.monotonic() - started) * 1000)})
@@ -1609,7 +2142,8 @@ def _failed_row(account: dict, code: str) -> dict:
 def probe_all(accounts: list[dict], *, timeout: float = TIMEOUT_S) -> list[dict]:
     """Every account in parallel; one hung CLI never delays the others past
     its own timeout, and a failed probe never hides the rest. Returns by an
-    overall deadline (``timeout`` + ``OVERALL_GRACE_S``) whatever happens: a
+    overall deadline (the longest per-harness budget in play, Grok's
+    included, + ``OVERALL_GRACE_S``) whatever happens: a
     probe still running then is reported ``timeout`` and its process group is
     killed. Daemon threads, no executor: nothing waits on a stuck worker,
     interpreter exit included."""
@@ -1631,7 +2165,9 @@ def probe_all(accounts: list[dict], *, timeout: float = TIMEOUT_S) -> list[dict]
                for i, a in enumerate(accounts)]
     for thread in threads:
         thread.start()
-    end = time.monotonic() + timeout + OVERALL_GRACE_S
+    longest = max([timeout] + [_grok_budget(timeout) for a in accounts if a.get("harness") == "grok"]
+                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") == "glm"])
+    end = time.monotonic() + longest + OVERALL_GRACE_S
     for thread in threads:
         thread.join(max(0.0, end - time.monotonic()))
     later = run.until + 0.25
@@ -1750,7 +2286,8 @@ def _store(accounts: list[dict], rows: list[dict]) -> list[dict]:
         # still running when its account was stopped or moved writes no row
         # under a key the list no longer holds. Read unsettled: an account
         # change takes this cache's lock after the routing lock.
-        current = configured_keys(read_config_unsettled())
+        current = configured_keys(read_config_unsettled()) | {
+            _key(a) for a in accounts if a.get("quota_key")}
         merged = []
         for account, row in zip(accounts, rows):
             key = _key(account)
@@ -1832,7 +2369,10 @@ def refresh_due(*, max_age: float = PERIODIC_MAX_AGE_S, timeout: float = TIMEOUT
     lock is held, so callers that race refresh once. Never raises:
     ``{"refreshed": n, "skipped": None | "fresh" | "busy" | "error"}``."""
     try:
+        discover_quota = accounts is None
         accounts = configured_accounts() if accounts is None else accounts
+        if discover_quota:
+            accounts = [*accounts, *http_quota_accounts()]
         if not _due(accounts, _load_cache(), _now(), max_age):
             return {"refreshed": 0, "skipped": "fresh"}
         fd = _try_refresh_lock()
@@ -1861,7 +2401,7 @@ def kick_refresh(*, max_age: float = PROMPT_MAX_AGE_S, spawn=None) -> bool:
         with contextlib.suppress(OSError):
             if 0 <= time.time() - stamp.stat().st_mtime < KICK_EVERY_S:
                 return False
-        if not _due(configured_accounts(), _load_cache(), _now(), max_age):
+        if not _due([*configured_accounts(), *http_quota_accounts()], _load_cache(), _now(), max_age):
             return False
         fd = _try_refresh_lock()
         if fd is None:
@@ -1983,6 +2523,8 @@ def public_row(row: dict) -> dict:
     out = {k: row[k] for k in _PUBLIC_ROW_FIELDS if k in row}
     out["id"] = routing.account_id(_key({"harness": harness, "home": home}))
     out["harness"] = harness if harness in HARNESSES else "?"
+    if routing.account_label_source(_key(row)) == "suggested":
+        out["naming_hint"] = routing.account_identity.NAME_ACCOUNT
     for field in ("error", "live_error", "last_error"):
         if field in out and out[field] is not None and not _is_code(out[field]):
             out[field] = E_INTERNAL
@@ -2273,10 +2815,16 @@ def doctor_block(*, max_age: float = DEFAULT_MAX_AGE_S, now: datetime | None = N
     stale flag), and one warning line per window still in force at
     ``ALERT_PCT`` or more. Read from the usage cache only: no CLI is probed,
     no lock is waited on, and nothing here ever gates doctor's ``ok``."""
+    from khipu.config import load_config
+
     now = now or _now()
     cache = _load_cache()
     accounts: list[dict] = []
-    warnings: list[str] = []
+
+    raw = load_config().get("usage_accounts")
+    warnings: list[str] = (["Ignored a tracked Cursor entry: Cursor is a transport on the xAI account; "
+                            "its usage and limits count against Grok"]
+                if isinstance(raw, list) and any(_cursor_entry(e) for e in raw) else [])
     for account in configured_accounts():
         entry = {"account": account["label"], "harness": account["harness"], "home": account.get("home"),
                  "ok": None, "error": None, "plan": None, "window": None, "used_pct": None, "resets_at": None,

@@ -20,12 +20,13 @@ from contextlib import redirect_stderr, redirect_stdout
 # action: (required keys, optional keys). Every key is text unless named in
 # _LISTS (a JSON list), _INTS (a whole number) or _FLAGS (true or false).
 SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "route.definition.set": (("definition", "value"), ()),
     "route.pause": (("account",), ("until",)),
     "route.lift": (("account",), ()),
     "route.clear": (("account",), ("report",)),
     "route.note.set": (("text",), ()),
     "route.note.end": ((), ()),
-    "route.rule.add": (("text",), ()),
+    "route.rule.add": (("text",), ("holds",)),
     "route.rule.edit": (("rule", "text"), ()),
     "route.rule.retire": (("rule",), ()),
     "route.rule.restore": (("rule",), ()),
@@ -34,10 +35,15 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.rule.dismiss": (("rule",), ()),
     "route.hold.add": (("text", "reason", "scope"), ("account", "until")),
     "route.hold.end": (("hold",), ()),
-    "route.priority.set": (("entries",), ("until", "expect")),
+    "route.cap.set": (("account", "kind"), ("window", "pct", "slack", "usd", "days", "n", "revision")),
+    "route.cap.remove": (("account", "kind"), ("window",)),
+    "route.priority.set": (("entries",), ("until", "expect", "holds")),
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
+    "route.tier_table.set": (("tiers",), ()),
+    "route.tier_table.confirm": ((), ()),
+    "route.tier_table.clear": ((), ()),
     "accounts.track": (("entries",), ("expect",)),
     "accounts.rename": (("account", "name"), ("expect",)),
     "accounts.stop": (("account",), ("expect",)),
@@ -78,9 +84,10 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "direction.on": ((), ()),
     "direction.acknowledge": ((), ()),
     "direction.set": (("key", "value"), ()),
-    "direction.undo": (("id",), ()),
+    "direction.undo": (("id",), ("holds",)),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
+_HOLDS = {"holds"}
 _INTS = {"rule"}
 _FLAGS = {"catch_up", "hide", "show"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
@@ -116,11 +123,26 @@ def _values(action: str, args) -> dict:
     missing = [k for k in required if args.get(k) is None]
     if missing:
         raise _bad(f"{action} needs {', '.join(missing)}")
+    # The value schema depends on this enum, regardless of JSON key order.
+    if action == "route.definition.set" and args["definition"] not in ("provider", "account", "lane_map"):
+        raise _bad("definition must be provider, account or lane_map")
     out: dict = {}
     for key, value in args.items():
         if value is None:
             continue
-        if key in _LISTS:
+        if action == "route.tier_table.set" and key == "tiers":
+            from khipu.routing_advisory import valid_tiers
+
+            if not valid_tiers(value):
+                raise _bad("tiers must name every task class with a tier of opus, sonnet or haiku")
+            value = dict(value)
+        elif action == "route.definition.set" and key == "value":
+            from khipu import routing_entries
+
+            value = routing_entries.checked_definition(args.get("definition"), value)
+            if value is None:
+                raise _bad("value must be a valid provider, account or lane_map definition")
+        elif key in _LISTS:
             if key == "checks" and isinstance(value, str):
                 value = [c.strip() for c in value.split(",") if c.strip()]
             if not isinstance(value, list) or not value:
@@ -129,11 +151,44 @@ def _values(action: str, args) -> dict:
                 raise _bad("checks must be the checks' names")
             if key == "ids" and not all(type(c) is int and c > 0 for c in value):
                 raise _bad("ids must be the items' ids, whole numbers above 0")
+        elif key in _HOLDS:
+            if not isinstance(value, dict) or not all(isinstance(hold, str) and choice in ("end", "keep")
+                                                      for hold, choice in value.items()):
+                raise _bad('holds must map each hold id to "end" or "keep"')
+            value = dict(value)
         elif key in _INTS:
             if isinstance(value, str) and value.strip().isdigit():
                 value = int(value.strip())
             if type(value) is not int or value < 1:
                 raise _bad(f"{key} must be a whole number above 0")
+        elif key == "pct":
+            if isinstance(value, str):
+                try:
+                    value = float(value)
+                except ValueError:
+                    raise _bad("pct must be a number above 0 and at most 100") from None
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 100:
+                raise _bad("pct must be a number above 0 and at most 100")
+        elif action.startswith("route.cap.") and key in ("slack", "usd", "days"):
+            if isinstance(value, str):
+                try:
+                    value = float(value)
+                except ValueError:
+                    raise _bad(f"{key} must be a number") from None
+            low = 0 if key == "slack" else 0
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not low <= value or (key == "slack" and value > 100) or (key != "slack" and value <= 0):
+                raise _bad(f"{key} is out of range for a cap")
+        elif action.startswith("route.cap.") and key == "n":
+            if isinstance(value, str) and value.strip().isdigit():
+                value = int(value.strip())
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise _bad("n must be a whole number at least 1")
+        elif action.startswith("route.cap.") and key == "window" and value not in ("weekly", "five_hour"):
+            raise _bad("window must be weekly or five_hour")
+        elif action.startswith("route.cap.") and key == "kind" \
+                and value not in ("share", "per_day", "pace_target", "spend", "concurrency"):
+            raise _bad("kind must be share, per_day, pace_target, spend or concurrency")
         elif key in _FLAGS:
             if not isinstance(value, bool):
                 raise _bad(f"{key} must be true or false")
@@ -147,6 +202,13 @@ def _values(action: str, args) -> dict:
         if choices and value not in choices:
             raise _bad(f"{key} must be one of: {', '.join(choices)}")
         out[key] = value
+    if action == "route.cap.set":
+        from khipu.routing_pace import _CAP_FIELDS
+
+        used = _CAP_FIELDS.get(out.get("kind")) or set()
+        extra = sorted(set(out) & {"pct", "slack", "usd", "days", "n"} - used)
+        if extra:
+            raise _bad(f"a {out.get('kind')} cap does not take {', '.join(extra)}")
     return out
 
 
@@ -162,7 +224,7 @@ def _opts(values: dict, *keys: str) -> list[str]:
         if value is True:
             out.append(flag)
         else:
-            out.append(f"{flag}={json.dumps(value) if isinstance(value, list) else value}")
+            out.append(f"{flag}={json.dumps(value) if isinstance(value, (dict, list)) else value}")
     return out
 
 
@@ -194,6 +256,8 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
 
     v = values
     verb = action.rsplit(".", 1)[-1]
+    if action == "route.definition.set":
+        return ["route", "definition", "set", "--value=" + json.dumps(v["value"])], [v["definition"]]
     if action in ("route.pause", "route.lift", "route.clear"):
         return ["route", verb, *_opts(v, "until", "report")], [v["account"]]
     if action == "route.note.set":
@@ -201,7 +265,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     if action == "route.note.end":
         return ["route", "note", "end"], []
     if action == "route.rule.add":
-        return ["route", "rule", "add"], [v["text"]]
+        return ["route", "rule", "add", *_opts(v, "holds")], [v["text"]]
     if action == "route.rule.edit":
         return ["route", "rule", "edit"], [str(v["rule"]), v["text"]]
     if action.startswith("route.rule."):
@@ -214,8 +278,15 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["route", "hold", *_opts(v, "reason", "until"), *where], [v["text"]]
     if action == "route.hold.end":
         return ["route", "hold"], ["end", v["hold"]]
+    if action.startswith("route.cap."):
+        return ["route", "cap", verb, *_opts(v, "window", "kind", "pct", "slack", "usd", "days", "n",
+                                             "revision")], [v["account"]]
     if action.startswith("route.priority."):
-        return ["route", "priority", verb, *_opts(v, "entries", "until", "expect")], []
+        return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
+    if action == "route.tier_table.set":
+        return ["route", "tier-table", "set", "--tiers=" + json.dumps(v["tiers"])], []
+    if action.startswith("route.tier_table."):
+        return ["route", "tier-table", verb], []
     if action == "accounts.track":
         return ["accounts", "track", *_opts(v, "entries", "expect")], []
     if action in ("accounts.rename", "accounts.stop", "accounts.move"):
@@ -290,7 +361,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
             raise _bad(f"key must be one of: {', '.join(_DIRECTION_KEYS)}")
         return ["owner-direction", "set"], [v["key"], v["value"]]
     if action == "direction.undo":
-        return ["owner-direction", "undo"], [v["id"]]
+        return ["owner-direction", "undo", *_opts(v, "holds")], [v["id"]]
     raise Refused("not_by_direction", "That change can't be made by direction.")
 
 
