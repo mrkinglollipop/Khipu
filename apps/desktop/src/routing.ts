@@ -59,6 +59,7 @@ export type RouteAccount = {
   /** False when plan usage no longer reads the account (removed in
    *  Settings -> Models while limited): no reset check and no Check now. */
   configured?: boolean;
+  usage_setup?: string;
   witness?: RouteWitness | null;
   disagreement?: RouteReport | null;
   last_seen?: RouteReport | null;
@@ -777,6 +778,7 @@ export function accountState(a: RouteAccount, now: Date): { text: string; tone: 
       if (a.silent) text = "Unknown: its only reporter stopped";
       else if (a.last_seen?.cleared) text = `Unknown: last cleared by you ${ageWords(a.last_seen.at, now)}`;
       else if (a.last_seen) text = `Unknown: last seen ${stateWord(a.last_seen.state)} ${ageWords(a.last_seen.at, now)}`;
+      else if (a.usage_setup) text = a.usage_setup[0].toUpperCase() + a.usage_setup.slice(1);
       else text = "Unknown: no report yet";
   }
   if (models.length) text += `; ${models.join("; ")}`;
