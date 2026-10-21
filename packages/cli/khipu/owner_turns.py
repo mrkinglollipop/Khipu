@@ -663,6 +663,13 @@ def sweep(now: float | None = None) -> dict:
         out["ok"] = False
         out["errors"].append(f"rewrite temps: {type(err).__name__}: {err}")
     try:
+        from khipu import routing_mismatches
+
+        out["mismatches"] = routing_mismatches.sweep(datetime.fromtimestamp(now, timezone.utc))
+    except Exception as err:  # noqa: BLE001
+        out["ok"] = False
+        out["errors"].append(f"old model mismatches: {type(err).__name__}: {err}")
+    try:
         from khipu import owner_direction
 
         out["pending"] = owner_direction.remove_old_widenings()
