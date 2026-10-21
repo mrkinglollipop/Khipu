@@ -89,6 +89,18 @@ def test_percentage_falls_back_to_used_over_limit(z):
     assert _probe()["windows"][0]["used_pct"] == 15.0  # 120M of 800M
 
 
+def test_the_credit_limit_type_is_a_quota_window(z):
+    # z.ai renamed TOKENS_LIMIT to CREDIT_LIMIT in October 2026; both windows
+    # must still parse, and a TIME_LIMIT on the same unit still must not.
+    reply = json.loads(json.dumps(REPLY))
+    for limit in reply["data"]["limits"][:2]:
+        limit["type"] = "CREDIT_LIMIT"
+    reply["data"]["limits"].insert(0, {"type": "TIME_LIMIT", "unit": 3, "percentage": 99,
+                                       "nextResetTime": 1_800_018_000_000})
+    z.reply = _Response(json.dumps(reply).encode())
+    assert [(w["name"], w["used_pct"]) for w in _probe()["windows"]] == [("five_hour", 15.0), ("weekly", 25.0)]
+
+
 def test_a_key_with_no_plan_says_so(z):
     z.reply = _Response(json.dumps({"code": 1113, "msg": "no plan", "success": False}).encode())
     row = _probe()
