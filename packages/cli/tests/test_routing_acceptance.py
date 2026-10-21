@@ -588,7 +588,6 @@ def test_4_a_dispatched_jobs_owner_act_is_already_refused(replay, monkeypatch):
     assert error.value.code == "no_recorded_turn"
 
 
-@future("11b", "with proposal text off Mac B shows a placeholder, then confirmed owner words")
 def test_4_remote_text_off_placeholder_converges_at_confirmation(replay):
     replay.configure(routing_proposal_text_between_macs=False)
     rows = proposals(replay)[:2]
@@ -1101,7 +1100,6 @@ def test_replay_hub_preserves_event_identity_and_interrupted_upload_cursor():
 
 
 @pytest.mark.parametrize("scenario", ["opposite-order", "skew", "duplicate-upload", "interrupted-sync", "restore"])
-@future("11b", "the fold must consume the idempotent remote set on both Macs")
 def test_12_two_home_replication_recovery(replay, scenario):
     a = replay
     b = Replay(a.root.parent / "mac-b", a.patch)
@@ -1172,9 +1170,8 @@ def test_12_replication_payload_checks_every_nested_field(replay, proposal_text)
 
 
 @pytest.mark.parametrize("source,state", [("probe", "limited"), ("runner", "limited"), ("probe", "open")])
-@future("11b", "persisted observation states converge in opposite arrival orders")
 def test_12_observations_converge(replay, source, state):
-    rows = [replay.event("observation", 1, account="codex|", state=state, source=source, scope="quota",
+    rows = [replay.event("observation", 1, account="codex|", state=state, source=source, scope="all",
                          witness_at=routing._iso(T0), expires_at=routing._iso(T0 + timedelta(hours=2))),
             replay.event("source_seen", 2, source=source, mac="m1")]
     views = [replay.fold(order) for order in (rows, list(reversed(rows))) ]
@@ -1184,9 +1181,8 @@ def test_12_observations_converge(replay, source, state):
     assert views[0]["effective"] == views[1]["effective"]
 
 
-@future("11b", "a newer witness renews expiry and source heartbeats never do")
 def test_12_renewal_source_silence_and_clock_only_expiry(replay):
-    rows = [replay.event("observation", 1, account="codex|", state="open", scope="quota", source="probe",
+    rows = [replay.event("observation", 1, account="codex|", state="open", scope="all", source="probe",
                          witness_at=routing._iso(T0), expires_at=routing._iso(T0 + timedelta(hours=1))),
             replay.event("observation_renew", 2, target="e1", witness_at=routing._iso(T0 + timedelta(minutes=30)),
                          expires_at=routing._iso(T0 + timedelta(minutes=90)))]
@@ -1210,14 +1206,14 @@ def test_12_cached_reading_never_renews(replay):
     assert not [e for e in events if e["type"] == "observation_renew"]
 
 
-@future("11b", "machine availability is local and never closes shared account quota")
 def test_12_not_installed_on_mac_b_leaves_mac_a_open(replay):
-    rows = [replay.event("observation", 1, account="codex|", state="open", scope="quota", mac="m1",
+    rows = [replay.event("observation", 1, account="codex|", state="open", scope="all", mac="m1",
                          source="probe", expires_at=routing._iso(T0 + timedelta(hours=1))),
             replay.event("observation", 2, account="codex|", state="down", scope="machine", mac="m2",
                          source="probe", reason="not_installed", expires_at=routing._iso(T0 + timedelta(hours=1)))]
-    replay.configure(routing_mac="m1")
-    account = next(a for a in replay.fold(rows)["accounts"] if a["key"] == "codex|")
+    view = routing.fold([dict(r, _seq=i) for i, r in enumerate(rows)], now=replay.now,
+                        cfg=routing.settings(replay.config), known=routing.accounts(), mac="m1")
+    account = next(a for a in view["accounts"] if a["key"] == "codex|")
     expect(account["state"], "open", "12: shared quota is missing or affected by another Mac's availability")
 
 
