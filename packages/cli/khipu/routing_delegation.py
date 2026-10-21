@@ -558,9 +558,37 @@ def _t3_child_advisory(payload: dict) -> str | None:
 
 def _rule12_line(payload: dict) -> str | None:
     """The rule 12 tier line for this dispatch, or None. Context only."""
-    from khipu.routing_advisory import dispatch_line
+    from khipu.routing_advisory import format_line, mismatch
 
-    return dispatch_line(*_dispatch_model_brief(payload))
+    model, brief = _dispatch_model_brief(payload)
+    found = mismatch(model, brief)
+    if found is None:
+        return None
+    _keep_mismatch(payload, found, model)
+    return format_line(found["task"], found["expected"], found["actual"], found["guessed"])
+
+
+def _keep_mismatch(payload: dict, found: dict, model: str | None) -> None:
+    """Keep the mismatch for the owner's Checks list (labels only: no brief
+    text, session id or path). Never fails the dispatch."""
+    try:
+        from khipu import routing, routing_mismatches
+
+        home = _dispatch_config_dir(payload)
+        account = routing._label_for_key(f"claude|{home}") if home else "Claude"
+        routing_mismatches.record(dict(found, account=account, model=model,
+                                       project=routing._project_name(payload.get("cwd"))))
+    except Exception:  # noqa: BLE001 - a record that cannot be kept never changes the advisory
+        pass
+
+
+def _dispatch_config_dir(payload: dict) -> str | None:
+    """The CLAUDE_CONFIG_DIR a ``claude -p`` dispatch names, else None."""
+    name = _tool_name(payload)
+    data = payload.get("tool_input") or payload.get("toolInput") or {}
+    if name not in SHELL_TOOLS or not isinstance(data, dict):
+        return None
+    return _claude_parse(_text(data.get(SHELL_TOOLS[name])))[2]
 
 
 def _text(value) -> str | None:
@@ -584,16 +612,17 @@ def _dispatch_model_brief(payload: dict) -> tuple[str | None, str | None]:
         return _text(data.get("model")), _text(data.get("message"))
     if name not in SHELL_TOOLS:
         return None, None
-    return _claude_model_brief(_text(data.get(SHELL_TOOLS[name])))
+    return _claude_parse(_text(data.get(SHELL_TOOLS[name])))[:2]
 
 
-def _claude_model_brief(command: str | None) -> tuple[str | None, str | None]:
+def _claude_parse(command: str | None) -> tuple[str | None, str | None, str | None]:
+    """(model, brief, CLAUDE_CONFIG_DIR) of a ``claude`` command line."""
     if not command or len(command) > _SCAN_MOST:
-        return None, None
+        return None, None, None
     try:
         argv = shlex.split(command, posix=True)
     except ValueError:
-        return None, None
+        return None, None, None
     env: dict[str, str] = {}
     index = 0
     while index < len(argv) and _ASSIGNMENT.fullmatch(argv[index]):
@@ -601,7 +630,7 @@ def _claude_model_brief(command: str | None) -> tuple[str | None, str | None]:
         env[key] = value
         index += 1
     if index >= len(argv) or os.path.basename(argv[index]) != "claude":
-        return None, None
+        return None, None, None
     model, explicit, brief = None, False, None
     cursor = index + 1
     while cursor < len(argv):
@@ -625,7 +654,7 @@ def _claude_model_brief(command: str | None) -> tuple[str | None, str | None]:
         from khipu.routing_advisory import settings_model
 
         model = settings_model(env["CLAUDE_CONFIG_DIR"])
-    return model, brief
+    return model, brief, env.get("CLAUDE_CONFIG_DIR") or None
 
 
 # The one advisory line both child checks (Codex ``spawn_agent``, slice

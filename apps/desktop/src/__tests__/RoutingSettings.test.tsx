@@ -1286,6 +1286,29 @@ describe("Settings -> Routing: checks and copies", () => {
     expect(invokeMock.mock.calls.filter(([cmd]) => /dismiss|owner_act/.test(String(cmd)))).toHaveLength(0);
   });
 
+  it("lists today's model mismatches with the brief's tag and offers no owner action", async () => {
+    const v = view();
+    const at = new Date().toISOString();
+    Object.assign(v, { model_mismatches: [
+      { at, task: "fix-round", expected: "sonnet", actual: "opus", guessed: false, account: "Claude Code", model: "opus", project: "project-a" },
+      { at, task: "tests", expected: "sonnet", actual: "opus", guessed: true, account: "Claude (.claude-second)", model: "opus", project: null },
+    ] });
+    answers.khipu_route_view = v;
+    await page();
+    const list = screen.getByRole("list", { name: "Model mismatches today" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    expect(list).toHaveTextContent("A fix round went to Opus; your table says Sonnet");
+    expect(list).toHaveTextContent("Claude Code in project-a");
+    expect(list).toHaveTextContent("From the brief");
+    expect(list).toHaveTextContent("Tests went to Opus; your table says Sonnet");
+    expect(list).toHaveTextContent("guessed from the brief's words");
+    expect(list).not.toHaveTextContent("null");
+    expect(within(list).queryAllByRole("button")).toHaveLength(0);
+    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("2 model mismatches today");
+    expect(screen.queryByText("Nothing to fix")).toBeNull();
+    expect(invokeMock.mock.calls.filter(([cmd]) => /dismiss|owner_act/.test(String(cmd)))).toHaveLength(0);
+  });
+
   const TIERS = {
     scope: "opus", mock: "opus", ruling: "opus", "hard-security": "opus", "failed-fix": "opus",
     build: "sonnet", "fix-round": "sonnet", tests: "sonnet", docs: "sonnet", synthesis: "sonnet",
