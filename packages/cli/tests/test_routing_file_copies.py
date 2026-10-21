@@ -79,6 +79,20 @@ def test_display_path_home_itself_a_project_root_still_uses_tilde(tmp_path):
         project / "CLAUDE.md", home, [home, project]) == "Foo/CLAUDE.md"
 
 
+def test_display_path_ancestor_project_root_still_uses_tilde(tmp_path):
+    home = tmp_path / "alice"
+    home.mkdir()
+    shown = routing_scan_report.display_path(home / ".claude" / "CLAUDE.md", home, [tmp_path])
+    assert shown == "~/.claude/CLAUDE.md"
+    assert "alice" not in shown
+    outside = tmp_path / "other" / "CLAUDE.md"
+    assert routing_scan_report.display_path(outside, home, [tmp_path]) == \
+        f"{tmp_path.name}/other/CLAUDE.md"
+    project = home / "Projects" / "Foo"
+    assert routing_scan_report.display_path(
+        project / "CLAUDE.md", home, [tmp_path, project]) == "Foo/CLAUDE.md"
+
+
 def test_not_looked_at_yet_is_an_explicit_state(scanned):
     public = routing.public_view(scanned.view(), scanned.now)
     assert public[FIELD] == {"status": "not_checked", "scanned_at": None,

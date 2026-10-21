@@ -88,6 +88,74 @@ def test_unconfigured_hub_check_is_cached_for_a_bounded_time(gw, monkeypatch):
     assert calls == [True, True]
 
 
+def test_cleanup_retry_stops_at_the_cap_and_keeps_the_error(gw, monkeypatch):
+    never_published(gw)
+    monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+    calls = []
+
+    def down(**kwargs):
+        calls.append(True)
+        raise OSError("configured hub offline")
+
+    monkeypatch.setattr(db, "connect", down)
+    for _ in range(20):
+        result = gc.publish()
+        routing._now.now += timedelta(seconds=400)
+    assert result == {"ok": False, "error": "copy_publish_failed"}
+    assert gc.status().get("error") == "copy_publish_failed"
+    assert gc.status().get("cleanup_attempted") is True
+    stopped_at = len(calls)
+    assert 0 < stopped_at <= 6
+    for _ in range(3):
+        assert gc.publish() == {"ok": False, "error": "copy_publish_failed"}
+        routing._now.now += timedelta(seconds=400)
+    assert len(calls) == stopped_at
+
+
+def test_cleanup_retry_stops_when_the_hub_is_removed(gw, monkeypatch):
+    never_published(gw)
+    monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+    calls = []
+
+    def down(**kwargs):
+        calls.append(True)
+        raise OSError("configured hub offline")
+
+    monkeypatch.setattr(db, "connect", down)
+    assert gc.publish() == {"ok": False, "error": "copy_publish_failed"}
+    assert calls == [True]
+    monkeypatch.setattr(routing, "_hub_configured", lambda: False)
+    routing._now.now += timedelta(seconds=400)
+    assert gc.publish() == {"ok": True, "disabled": True}
+    assert calls == [True]
+    routing._now.now += timedelta(seconds=400)
+    assert gc.publish() == {"ok": True, "disabled": True}
+    assert calls == [True]
+
+
+def test_cleanup_retry_recovers_before_the_cap_then_goes_idle(gw, monkeypatch):
+    never_published(gw)
+    monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+    deleted = []
+
+    class Down:
+        def delete(self, publisher):
+            raise OSError("configured hub offline")
+
+    class Up:
+        def delete(self, publisher):
+            deleted.append(publisher)
+
+    assert gc.publish(hub=Down()) == {"ok": False, "error": "copy_publish_failed"}
+    routing._now.now += timedelta(seconds=400)
+    assert gc.publish(hub=Up()) == {"ok": True, "disabled": True, "deleted": True}
+    assert deleted == [gc.status()["cleanup_publisher"]]
+    for _ in range(3):
+        routing._now.now += timedelta(seconds=400)
+        assert gc.publish(hub=Up()) == {"ok": True, "disabled": True}
+    assert len(deleted) == 1
+
+
 def test_known_publisher_delete_honours_retry_without_file_churn(gw, gateway_hub, monkeypatch):
     gateway_tests.seed(gw)
     assert gc.publish(force=True)["published"]

@@ -266,6 +266,7 @@ def _failed(state, now):
 
 
 _HUB_CONFIGURED_TTL_SECONDS = 300
+_CLEANUP_MAX_FAILURES = 6
 _hub_configured_cache = None
 
 
@@ -295,6 +296,12 @@ def _disabled_skip(state, now, *, force):
         # would stay on the hub forever.
         if state.get("cleanup_attempted") is True:
             if state.get("disabled") is True or not state.get("error"):
+                return {"ok": True, "disabled": True}
+            failures = state.get("failures")
+            if isinstance(failures, int) and not isinstance(failures, bool) \
+                    and failures >= _CLEANUP_MAX_FAILURES:
+                return {"ok": False, "error": state["error"]}
+            if not _hub_configured_cached(now):
                 return {"ok": True, "disabled": True}
             retry = routing._parse(state.get("retry_at"))
             if not force and retry and retry > now:
