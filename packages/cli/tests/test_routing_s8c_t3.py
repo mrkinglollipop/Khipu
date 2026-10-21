@@ -381,9 +381,9 @@ def _provider_with_command(tmp_path, command):
     ("/opt/khipu/bin/khipu-prompt-recall", "installed"),
     ("env KHIPU_CAPTURE_QUEUE_ONLY=1 /opt/khipu/bin/khipu-stop-hook", "installed"),
     # N4: a quoted or unquoted absolute path with spaces, standing alone.
-    ('"/Volumes/Cloud Storage/Code/Khipu/bin/khipu-stop-hook"', "installed"),
-    ("/Volumes/Cloud Storage/Code/Khipu/bin/khipu-stop-hook", "installed"),
-    ("'/Volumes/Cloud Storage/Code/Khipu/bin/khipu-recall-hook'", "installed"),
+    ('"/work/Shared Projects/Khipu/bin/khipu-stop-hook"', "installed"),
+    ("/work/Shared Projects/Khipu/bin/khipu-stop-hook", "installed"),
+    ("'/work/Shared Projects/Khipu/bin/khipu-recall-hook'", "installed"),
 ])
 def test_hook_detection_matches_actual_hook_command_names(tmp_path, command, expected):
     assert t3.provider_hooks(_provider_with_command(tmp_path, command), tmp_path) == expected

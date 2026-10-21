@@ -13,7 +13,7 @@ export type ChecksRow = {
   key: string;
   title: string;
   sub: string;
-  kind: "contradiction" | "upkeep";
+  kind: "contradiction" | "upkeep" | "unreached";
 };
 
 export type TierRow = { label: string; tier: string };
@@ -21,6 +21,7 @@ export type TierRow = { label: string; tier: string };
 export type ChecksModel = {
   contradictions: ChecksRow[];
   upkeep: ChecksRow[];
+  unreached: ChecksRow[];
   /** The confirmed model table, or null: `route --json` carries only a
    *  confirmed one, so an absent table can mean none or one still waiting. */
   table: { rows: TierRow[]; line: string } | null;
@@ -235,10 +236,19 @@ function upkeepRow(h: RouteHygiene, i: number, view: RouteView, rules: Map<strin
 
 /** Every advisory row and the model table, in the group's order. */
 export function checksModel(view: RouteView | null, now: Date): ChecksModel {
-  if (!view) return { contradictions: [], upkeep: [], table: null };
+  if (!view) return { contradictions: [], upkeep: [], unreached: [], table: null };
   const rules = ruleByEntity(view);
   const contradictions = (view.contradictions ?? []).map((c, i) => contradictionRow(c, i, view, rules, now));
   const upkeep = (view.rule_hygiene ?? []).map((h, i) => upkeepRow(h, i, view, rules, now));
+  const unreached: ChecksRow[] = (view.unreached_directions ?? []).map((d) => ({
+    key: `unreached:${d.id}`,
+    kind: "unreached",
+    title: `“${d.words}”`,
+    sub: `You said this in a conversation${d.project ? ` in ${d.project}` : ""}. ` +
+      (d.join === "unjoined"
+        ? `The owner turn could not be matched${d.reason ? `: ${d.reason}` : ""}.`
+        : "Nothing in Khipu matches it."),
+  }));
   let table: ChecksModel["table"] = null;
   const tiers = view.tier_table?.tiers;
   if (tiers && Object.keys(tiers).length && view.tier_table?.confirmed !== false) {
@@ -250,7 +260,7 @@ export function checksModel(view: RouteView | null, now: Date): ChecksModel {
     const rows = [...known, ...extra];
     table = { rows, line: `${plural(rows.length, "kind", "kinds")} of work · confirmed by you` };
   }
-  return { contradictions, upkeep, table };
+  return { contradictions, upkeep, unreached, table };
 }
 
 /** The group's closed line: what is flagged, in the parts Khipu can see. */
@@ -259,6 +269,7 @@ export function checksLine(view: RouteView | null, now: Date): string {
   const parts: string[] = [];
   if (model.contradictions.length) parts.push(plural(model.contradictions.length, "contradiction", "contradictions"));
   if (model.upkeep.length) parts.push(`${plural(model.upkeep.length, "rule", "rules")} to look at`);
+  if (model.unreached.length) parts.push(`${plural(model.unreached.length, "direction", "directions")} not in Khipu`);
   if (parts.length) return parts.join(" · ");
   if (model.table) return "Your model table · nothing flagged";
   return "Nothing flagged in Khipu's record";

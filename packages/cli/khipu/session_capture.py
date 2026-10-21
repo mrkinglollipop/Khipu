@@ -300,6 +300,51 @@ def _in_claude_home(tp: str, osenv: dict) -> bool:
         return False
 
 
+def _current_claude_home() -> Path:
+    """The Claude config home this hook is running with: ``CLAUDE_CONFIG_DIR``
+    when set (``~`` means the real home), else ``~/.claude``."""
+    raw = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if raw:
+        try:
+            from khipu import claude_homes
+
+            expanded = claude_homes._expand(raw, Path.home())
+        except Exception:  # noqa: BLE001 — best-effort, never fatal in a hook
+            expanded = None
+        if expanded is not None:
+            return expanded
+    return Path.home() / ".claude"
+
+
+def _relocated_claude_transcript(missing: Path, sid: str) -> Path | None:
+    """A known Claude session's transcript under the hook's own config home.
+
+    A session started under one config home and resumed under another
+    (``CLAUDE_CONFIG_DIR=~/.claude-t3-second claude --resume <id>``, or the
+    reverse) keeps its transcript in the projects folder of the home it is
+    now running under, while the payload still names the old home's path.
+    That file is not lost, so look for ``<sid>.jsonl`` (or the missing
+    file's name) under ``<current home>/projects/*/`` before calling it
+    lost; the caller then captures from the file found here."""
+    if not sid:
+        return None
+    projects = _current_claude_home() / "projects"
+    try:
+        if not projects.is_dir():
+            return None
+        names = {f"{sid}.jsonl", missing.name} - {""}
+        candidates = sorted({p for p in projects.glob("*/*.jsonl") if p.name in names and p.is_file()})
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    # Same project folder as the missing path wins: it is the same cwd.
+    for candidate in candidates:
+        if candidate.parent.name == missing.parent.name:
+            return candidate
+    return candidates[0]
+
+
 def transcript_path(env: dict, harness: str = "", *, synth_sessions: set[str] | None = None) -> Path | None:
     from khipu.synth_cli import session_ids
 
@@ -2315,7 +2360,16 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
             # written (the parent transcript carries their result). Only a
             # session Khipu already read turns from (it has a state file) is
             # losing anything; that one is what liveness turns red for.
-            if is_subagent_stop:
+            # A known Claude session resumed under another config home is not
+            # losing anything either: its transcript lives under the home this
+            # hook is running with, so capture from there instead.
+            relocated = None
+            if not is_subagent_stop and harness == "claude_code" and track_sid \
+                    and _state_file(harness, track_sid).exists():
+                relocated = _relocated_claude_transcript(path, sid)
+            if relocated is not None:
+                path = relocated
+            elif is_subagent_stop:
                 out["reason"] = f"subagent transcript not written: {path}"
             elif event in ("stop", "sessionend") and track_sid and _state_file(harness, track_sid).exists():
                 out["reason"] = f"transcript missing after earlier turns: {path}"
@@ -2324,7 +2378,8 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 out["reason"] = f"transcript never written: {path}"
                 if event in ("stop", "sessionend"):
                     out["transcript_never_written"] = True
-            return out
+            if relocated is None:
+                return out
         with _state_lock(harness, track_sid) as acquired:
             if not acquired:
                 out["reason"] = "locked"

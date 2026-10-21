@@ -130,6 +130,51 @@ def _size(text):
     return len(text) + sum(ord(c) > 0xffff for c in text)
 
 
+def _rendered_receipt(entries, progress, rendered, *, visible=None):
+    """Offsets independently proved by the final payload about to be sent.
+
+    ``progress`` is the acknowledgement target.  It is deliberately kept
+    separate from this receipt: a refit or a renderer change may reserve an
+    item without its exact selected text reaching the final payload.
+    """
+    if not isinstance(rendered, str):
+        return {}
+    shown = {}
+    for entity, end in (progress or {}).items():
+        entry = (entries or {}).get(entity)
+        if not isinstance(entry, dict) or not isinstance(end, int):
+            continue
+        text = entry.get("text")
+        start = entry.get("offset", 0)
+        final = (visible or {}).get(entity, text[start:end] if isinstance(text, str) and isinstance(start, int) else None)
+        if isinstance(text, str) and isinstance(start, int) and 0 <= start <= end <= len(text) \
+                and isinstance(final, str) and final in rendered:
+            shown[entity] = end
+    return shown
+
+
+def _visible_nonwhole(entries, progress, rendered):
+    """The actual clipped identifying lines present in a final hook body."""
+    if not isinstance(rendered, str):
+        return {}
+    lines = rendered.splitlines()
+    visible = {}
+    for entity in progress or {}:
+        entry = (entries or {}).get(entity)
+        text = entry.get("text") if isinstance(entry, dict) else None
+        if not isinstance(text, str) or entry.get("whole"):
+            continue
+        for line in lines:
+            if line.endswith("…"):
+                prefix = line[:-1].rstrip()
+            else:
+                prefix = line[:-3].rstrip() if line.endswith("...") else line
+            if prefix and (line == text or text.startswith(prefix)):
+                visible[entity] = line
+                break
+    return visible
+
+
 def _path(session):
     from khipu import recall_prompt
 
@@ -269,6 +314,7 @@ def plan(out, view, now, cfg, *, session=None, project=None):
     return dict(out, delivery_plan={"items": items, "pace_forecasts": out.get("pace_forecasts") or {},
                                     "advice_forecasts": out.get("advice_forecasts") or {},
                                     "current_entities": list(view.get("effective", {})),
+                                    "harness": health_harness(_current_harness()),
                                     "removed": removed, "notices": ["notice:" + n[2] for n in notices], "at": r._iso(now),
                                    "limit": cfg["routing_summary_chars"] if full else cfg["routing_prompt_chars"],
                                    "full": full, "page_limit": cfg["routing_prompt_chars"], "text": out.get("text"),
@@ -348,6 +394,7 @@ def _delivery_point(state, out, now):
     point = state["delivery_points"] = state.get("delivery_points", 0) + 1
     state["last_delivery_point"] = _iso(now)
     plan = out["delivery_plan"]
+    state["harness"] = health_harness(plan.get("harness"))
     state["slack"] = plan.get("slack", 2)
     budget = plan.get("page_limit") or plan.get("limit") or 8000
     ahead = 0
@@ -488,6 +535,8 @@ def _render(state, out, now, component, *, delivery_point=True):
     if selected:
         state["flight"] = {"until": _iso(now + timedelta(seconds=out["delivery_plan"]["lease"])),
                            "out": copy.deepcopy(answer), "progress": progress,
+                           "shown": _rendered_receipt(entries, progress, plain,
+                                                       visible=_visible_nonwhole(entries, progress, plain)),
                            "plan": copy.deepcopy(out["delivery_plan"])}
     answer["delivery"] = {"owed": sum(not e.get("acked") and e["entity"] not in progress for e in entries.values()),
                           "in_flight": len(selected), "acked_through": state.get("acked_through")}
@@ -508,7 +557,8 @@ def offer(out, *, session=None, component="main"):
         return answer
     with _transaction(session) as data:
         if component == "main":
-            data["attachment"] = {"component": "main", "at": _iso(now)}
+            data["attachment"] = {"component": "main", "at": _iso(now),
+                                  "harness": health_harness(out["delivery_plan"].get("harness"))}
         state = data.setdefault(component, {})
         answer = _render(state, out, now, component)
         _prune_agent_components(data, now, keep=component)
@@ -741,6 +791,28 @@ _HOOKED_HARNESSES = frozenset({"claude_code", "codex"})
 _PULL_ONLY_HARNESSES = frozenset({"aegis", "grok", "grok_build", "cursor", "muse", "gateway", "unknown"})
 
 
+def _current_harness(environ=None):
+    """Read attachment hints without resolving a conversation or consulting T3."""
+    env = os.environ if environ is None else environ
+    value = env.get("KHIPU_HARNESS")
+    harness = value.strip().lower() if isinstance(value, str) else ""
+    if not harness:
+        if env.get("GROK_HOOK_NAME") or env.get("GROK_HOOK_EVENT"):
+            harness = "aegis"
+        elif env.get("CLAUDECODE") or env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_CODE_ENTRYPOINT"):
+            harness = "claude_code"
+        elif env.get("CODEX_THREAD_ID") or env.get("CODEX_SANDBOX") or env.get("CODEX_HOME"):
+            harness = "codex"
+        else:
+            harness = "unknown"
+    return harness
+
+
+def health_harness(value):
+    """Health metadata admits harness names only, never arbitrary caller words."""
+    return value if isinstance(value, str) and value in _HOOKED_HARNESSES | _PULL_ONLY_HARNESSES else "unknown"
+
+
 def canonical_identity(environ=None, explicit=None):
     """The one conversation identity for hooks and pull (MCP) delivery.
 
@@ -763,16 +835,7 @@ def canonical_identity(environ=None, explicit=None):
     def _clean(value):
         return value.strip() if isinstance(value, str) else ""
 
-    harness = _clean(env.get("KHIPU_HARNESS")).lower()
-    if not harness:
-        if env.get("GROK_HOOK_NAME") or env.get("GROK_HOOK_EVENT"):
-            harness = "aegis"
-        elif env.get("CLAUDECODE") or env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_CODE_ENTRYPOINT"):
-            harness = "claude_code"
-        elif env.get("CODEX_THREAD_ID") or env.get("CODEX_SANDBOX") or env.get("CODEX_HOME"):
-            harness = "codex"
-        else:
-            harness = "unknown"
+    harness = _current_harness(env)
     explicit = _clean(explicit)
     shared = _clean(env.get("KHIPU_SESSION_ID"))
     claude = _clean(env.get("CLAUDE_CODE_SESSION_ID"))
@@ -899,7 +962,7 @@ def _delivery_summary(data, component, state, changes, now, counting_component):
             "duplicates_across_components": duplicates, "health": health}
 
 
-def pull_offer(out, *, session, component="mcp", counting_component=None, now=None, skip_entities=frozenset(), delivery_point=True):
+def pull_offer(out, *, session, component="mcp", counting_component=None, now=None, skip_entities=frozenset(), delivery_point=True, harness="unknown"):
     """Reserve (or re-send) one pull component's batch under its own lock.
 
     A live in-flight batch is re-sent byte-identically, so a dropped
@@ -914,12 +977,10 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
     with _transaction(session) as data:
         state = data.setdefault(component, {})
         entries = _merge(state, out)
-        data["attachment"] = {"component": counting_component, "at": _iso(now)}
+        data["attachment"] = {"component": counting_component, "at": _iso(now),
+                              "harness": health_harness(harness)}
         if delivery_point:
             _delivery_point(state, out, now)
-        if out["delivery_plan"].get("gateway"):
-            data["attachment"]["gateway"] = True
-            data["attachment"]["copy_checked_at"] = out["delivery_plan"].get("copy_checked_at")
         _prune_agent_components(data, now, keep=component)
         entries = state.get("entries", {})
         skip_entities = skip_entities | frozenset(e["entity"] for e in entries.values() if e.get("withheld"))
@@ -967,7 +1028,13 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
         state["flight"] = {"until": _iso(now + timedelta(seconds=plan_data["lease"])),
                            "out": {"routing_changes": copy.deepcopy(changes),
                                    "version": out.get("version")},
-                           "progress": progress, "plan": copy.deepcopy(plan_data)}
+                           "progress": progress,
+                           # The gateway removes page text before returning
+                           # its closed projection, so raw reservation text
+                           # can never be a display receipt there.
+                           "shown": {} if plan_data.get("gateway") else
+                           _rendered_receipt(entries, progress, "\n".join(item["text"] for item in items)),
+                           "plan": copy.deepcopy(plan_data)}
         return _projected_pages(changes), _delivery_summary(data, component, state, changes, now, counting_component)
 
 
@@ -1038,7 +1105,7 @@ def child_offer(planned, *, session=None, component, now=None, cfg=None):
             # nothing, with everything left owed for later pages.
             return {"text": "", "owed_entities": [e["entity"] for e in ordered],
                     "shown_entities": []}
-        lines, shown, deferred = [heading], {}, []
+        lines, shown, deferred, visible = [heading], {}, [], {}
         used = _size(heading)
         candidates = [e for e in ordered if e.get("whole")]
         for entry in ordered:
@@ -1048,6 +1115,7 @@ def child_offer(planned, *, session=None, component, now=None, cfg=None):
                 if used + _size(rendered) + 1 <= limit:
                     lines.append(rendered)
                     shown[entity] = len(entry["text"])
+                    visible[entity] = rendered
                     entry.pop("child_owed", None)
                     used += _size(rendered) + 1
                 else:
@@ -1069,6 +1137,7 @@ def child_offer(planned, *, session=None, component, now=None, cfg=None):
                     used += header
                 lines.append(whole)
                 shown[entity] = len(whole)
+                visible[entity] = whole
                 used += _size(whole) + 1
             elif used + header + _size(opening) + 1 <= limit:
                 if header:
@@ -1089,7 +1158,9 @@ def child_offer(planned, *, session=None, component, now=None, cfg=None):
             state["flight"] = {"until": _iso(now + timedelta(seconds=planned["delivery_plan"]["lease"])),
                                "out": {"routing_changes": copy.deepcopy(changes),
                                        "version": planned.get("version")},
-                               "progress": dict(shown), "plan": copy.deepcopy(planned["delivery_plan"])}
+                               "progress": dict(shown),
+                               "shown": _rendered_receipt(entries, shown, answer["text"], visible=visible),
+                               "plan": copy.deepcopy(planned["delivery_plan"])}
         return answer
 
     if not session:
@@ -1150,6 +1221,8 @@ def child_page(planned, *, session=None, component, now=None, cfg=None):
                                "out": {"routing_changes": copy.deepcopy(changes),
                                        "version": planned.get("version"), "text": rendered},
                                "progress": {entry["entity"]: end},
+                               "shown": _rendered_receipt(state["entries"], {entry["entity"]: end}, rendered,
+                                                           visible={entry["entity"]: rendered}),
                                "plan": copy.deepcopy(planned["delivery_plan"])}
             _prune_agent_components(data, now, keep=component)
             return {"text": rendered, "routing_changes": changes, "version": planned.get("version"),
@@ -1184,6 +1257,7 @@ def child_page(planned, *, session=None, component, now=None, cfg=None):
                            "out": {"routing_changes": copy.deepcopy(changes),
                                    "version": planned.get("version"), "text": rendered},
                            "progress": {entry["entity"]: end},
+                           "shown": _rendered_receipt(state["entries"], {entry["entity"]: end}, rendered),
                            "plan": copy.deepcopy(planned["delivery_plan"])}
         _prune_agent_components(data, now, keep=component)
         return {"text": rendered, "routing_changes": changes, "version": planned.get("version"),
@@ -1263,7 +1337,10 @@ def pull_acknowledge(session, batch, *, component="mcp", now=None):
                 entry = state["entries"][item["entity"]]
                 entry["offset"] = flight["progress"][item["entity"]]
                 entry["acked"] = entry["offset"] == len(entry["text"])
-                entry["shown_offset"] = entry["offset"]
+                shown = flight.get("shown")
+                # A present receipt is affirmative, including an empty one:
+                # an acknowledged entity absent from final output was not shown.
+                entry["shown_offset"] = shown.get(item["entity"], 0) if isinstance(shown, dict) else None
                 entry["pages"] = item.get("page", {}).get("n", 0)
                 entry["restarted"] = False
             batches = state.setdefault("batches", {})
@@ -1296,7 +1373,8 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
         if reservation is not None and not state:
             state.update(copy.deepcopy(reservation))
             if component == "main":
-                data["attachment"] = {"component": "main", "at": _iso(now)}
+                data["attachment"] = {"component": "main", "at": _iso(now),
+                                      "harness": health_harness(state.get("harness"))}
         if batch in state.get("batches", {}):
             return True
         flight = state.get("flight")
@@ -1310,7 +1388,12 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
                 return False
             e["offset"] = flight["progress"][item["entity"]]
             e["acked"] = e["offset"] == len(e["text"])
-            e["shown_offset"] = e["offset"]
+            # This comes from the final rendered payload, not the ack's
+            # progress offset.  Marker claims are checked independently.
+            shown = flight.get("shown")
+            # A present receipt is affirmative, including an empty one:
+            # an acknowledged entity absent from final output was not shown.
+            e["shown_offset"] = shown.get(item["entity"], 0) if isinstance(shown, dict) else None
             e["pages"] = item.get("page", {}).get("n", 0)
             e["restarted"] = False
         batches = state.setdefault("batches", {})
@@ -1328,4 +1411,126 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
         if all(e.get("acked") for e in state["entries"].values()):
             state["acked_through"] = flight["out"]["version"]
         _prune_agent_components(data, now, keep=component)
+        return True
+
+
+def mark_shown(session, shown, *, component="main", version=None, epoch=None):
+    """Commit only hook claims supported by a final-render flight receipt.
+
+    The marker callback runs after the harness has accepted the final block.
+    Its entity list must match the independently recorded payload; arbitrary
+    marker claims cannot turn an acknowledgement into evidence of display.
+    """
+    if not isinstance(shown, list):
+        return False
+    with _transaction(session) as data:
+        state = data.get(component)
+        if not isinstance(state, dict):
+            return False
+        # A late marker callback was not the final rendered result for this
+        # component.  It must not overwrite a newer receipt or manufacture a
+        # health failure after the marker's own ordering guard left it alone.
+        if epoch != state.get("epoch") or (isinstance(version, int) and isinstance(state.get("acked_through"), int)
+                                            and version < state["acked_through"]):
+            return True
+        entries = state.get("entries")
+        if not isinstance(entries, dict):
+            return False
+        candidates = []
+        flight = state.get("flight")
+        if isinstance(flight, dict):
+            items = ((flight.get("out") or {}).get("routing_changes") or {}).get("items") or []
+            candidates.append({"shown": flight.get("shown") or {},
+                               "revisions": {item.get("entity"): item.get("revision") for item in items
+                                             if isinstance(item, dict)}})
+        proved = {}
+        # Agent components slim completed entries before their final marker
+        # callback.  Retained done_shown is the same independent proof, keyed
+        # to the retained completed revision.
+        done = state.get("done")
+        done_shown = state.get("done_shown")
+        if isinstance(done, dict) and isinstance(done_shown, dict):
+            for entity, revision in done_shown.items():
+                if isinstance(entity, str) and isinstance(revision, str) and done.get(entity) == revision:
+                    proved[entity] = True
+        for entity, entry in entries.items():
+            if isinstance(entry, dict) and entry.get("acked") and isinstance(entry.get("shown_offset"), int) \
+                    and entry["shown_offset"] >= entry.get("offset", 0):
+                proved[entity] = entry["shown_offset"]
+        for receipt in candidates:
+            if not isinstance(receipt, dict) or not isinstance(receipt.get("shown"), dict):
+                continue
+            for entity, offset in receipt["shown"].items():
+                entry = entries.get(entity)
+                if isinstance(entry, dict) and isinstance(offset, int) \
+                        and receipt.get("revisions", {}).get(entity) == entry.get("revision") \
+                        and 0 <= offset <= len(entry.get("text") or ""):
+                    proved[entity] = max(proved.get(entity, 0), offset)
+        claims = [entity for entity in shown if isinstance(entity, str)]
+        unsupported = any(entity not in proved for entity in claims)
+        # Keep the verdict, not the names: a malformed marker must make
+        # health red without adding another local disclosure surface.
+        state["shown_claim_invalid"] = unsupported
+        for entity in shown:
+            if isinstance(entity, str) and entity in proved and isinstance(entries.get(entity), dict):
+                entries[entity]["shown_offset"] = proved[entity]
+        return not unsupported
+
+
+def record_gateway_copy(session, *, epoch, revision, revision_at, result, now=None):
+    """Record a gateway copy only after its final closed projection returned."""
+    now = now or _clock()
+    with _transaction(session) as data:
+        state = data.get("mcp")
+        if not isinstance(state, dict):
+            return False
+        flight, entries = state.get("flight"), state.get("entries")
+        if isinstance(flight, dict) and isinstance(entries, dict):
+            # Gateway rules carry their number and words as separate fields.
+            # Match their identity and complete words; a batch's change id
+            # alone does not prove that its account or hold was returned.
+            def strings(value):
+                if isinstance(value, str):
+                    yield value
+                elif isinstance(value, dict):
+                    for item in value.values():
+                        yield from strings(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        yield from strings(item)
+
+            rendered = "\n".join(strings(result))
+            visible = {}
+            from khipu import routing
+
+            for entity, entry in entries.items():
+                if not isinstance(entry, dict):
+                    continue
+                public = routing._public_entity(entity)
+                if not entry.get("whole"):
+                    kind, _, ident = public.partition(":")
+                    collection = result.get("accounts" if kind == "account" else "holds" if kind == "hold" else "", [])
+                    row = next((row for row in collection if isinstance(row, dict) and row.get("id") == ident), None)
+                    if row and isinstance(row.get("line"), str):
+                        visible[entity] = row["line"]
+                elif entity.startswith("rule:"):
+                    number = re.match(r"Standing rule (\S+)", entry.get("label") or "")
+                    for row in result.get("rules") or []:
+                        if not isinstance(row, dict) or not isinstance(row.get("text"), str):
+                            continue
+                        matches = (entity == "rule:" + str(row.get("id")) or
+                                   (number and number.group(1) == str(row.get("n"))))
+                        if matches and entry["text"].startswith(routing.rule_line(row)):
+                            visible[entity] = row["text"]
+                            break
+                elif entity == "note":
+                    row = result.get("note")
+                    if isinstance(row, dict) and isinstance(row.get("text"), str) \
+                            and entry["text"] == routing.note_line(row, now):
+                        visible[entity] = row["text"]
+            flight["shown"] = _rendered_receipt(entries, flight.get("progress"), rendered, visible=visible)
+        attachment = data.get("attachment") if isinstance(data.get("attachment"), dict) else {}
+        attachment.update(component="mcp", at=_iso(now), gateway=True, harness="gateway",
+                          copy_epoch=epoch, copy_revision=revision, copy_revision_at=revision_at)
+        data["attachment"] = attachment
         return True

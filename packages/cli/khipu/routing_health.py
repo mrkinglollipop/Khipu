@@ -36,6 +36,8 @@ def _component_health(state, now, *, slack):
     if not isinstance(state, dict) or not isinstance(state.get("entries"), dict):
         return _result([], ["delivery ledger"])
     reasons, missing = [], []
+    if state.get("shown_claim_invalid"):
+        reasons.append("ack-unshown")
     points = state.get("delivery_points")
     if not isinstance(points, int) or not _time(state.get("last_delivery_point")):
         missing.append("delivery point history")
@@ -137,8 +139,6 @@ def doctor_block(view, now, cfg):
             missing.append("current attachment capability")
             continue
         attached = _time(attachment.get("at"))
-        if attachment.get("gateway"):
-            gateways.append(attachment)
         components = [attachment.get("component")] if attached else []
         agents = [name for name in data if name.startswith("agent:")]
         components += agents
@@ -158,8 +158,17 @@ def doctor_block(view, now, cfg):
                 continue
             if cfg["routing_delivery_live_after"] and (now - live_at).total_seconds() > cfg["routing_delivery_live_after"]:
                 continue
+            if attachment.get("gateway"):
+                # A quiet gateway is not a stale copy.  Once its identity is
+                # outside the same liveness window as every other delivery
+                # identity, it no longer supplies gateway evidence at all.
+                gateways.append(attachment)
             health = component_health(state, now, slack=cfg["routing_delivery_slack"])
-            rows.append(dict(identity=path.stem.removeprefix("recall--"), component=component, **health))
+            rows.append(dict(identity=path.name.removesuffix(".routing.json").removeprefix("recall--"),
+                             component=component,
+                             harness=routing_delivery.health_harness(
+                                 state.get("harness") if component.startswith("agent:") else attachment.get("harness")),
+                             last_delivery_point=state["last_delivery_point"], **health))
             reasons += health["reasons"]
             missing += health["missing"]
     if not rows:
@@ -182,22 +191,30 @@ def doctor_block(view, now, cfg):
                 reasons.append("cross-mac-stale")
     gateway = {"status": "not_applicable"}
     if cfg["routing_cloud_copy"]:
-        stamps = [_time(row.get("copy_checked_at")) for row in gateways]
-        stamps = [stamp for stamp in stamps if stamp and stamp <= now]
-        stamp = max(stamps) if stamps else None
-        if stamp is None:
+        current_epoch, current_revision = view.get("epoch"), view.get("version")
+        current_at = _time(view.get("folded_at"))
+        gateway_rows = [(row.get("copy_epoch"), row.get("copy_revision"), _time(row.get("copy_revision_at")))
+                        for row in gateways]
+        gateway_rows = [(epoch, revision, stamp) for epoch, revision, stamp in gateway_rows
+                        if isinstance(epoch, str) and isinstance(revision, int) and stamp and stamp <= now]
+        if not gateway_rows or not isinstance(current_epoch, str) or not isinstance(current_revision, int) or current_at is None:
             gateway = {"status": "unknown"}
-            missing.append("gateway delivered copy check timestamp")
+            missing.append("gateway delivered copy revision")
         else:
-            age = (now - stamp).total_seconds()
-            stale = bool(cfg["routing_cloud_copy_stale_after"] and age > cfg["routing_cloud_copy_stale_after"])
+            behind = [(epoch, revision, stamp) for epoch, revision, stamp in gateway_rows
+                      if (epoch, revision) != (current_epoch, current_revision)]
+            # A client becomes behind when this revision is folded, not
+            # when it last pulled an older revision during a quiet period.
+            age = max(0.0, (now - current_at).total_seconds()) if behind else 0.0
+            stale = bool(behind and cfg["routing_cloud_copy_stale_after"]
+                         and age > cfg["routing_cloud_copy_stale_after"])
             gateway = dict(status="red" if stale else "green", age_seconds=age)
             if stale:
                 reasons.append("gateway-stale")
     for lane in view.get("unmatched") or []:
-        stamp = _time(lane.get("at"))
+        stamp = _time(lane.get("limited_since"))
         if stamp is None:
-            missing.append("unmatched limit timestamp")
+            missing.append("unmatched limit run timestamp")
         elif (now - stamp).total_seconds() >= 3600:
             reasons.append("unmatched-limit")
     return _result(reasons, missing, identities=rows, prompts=prompts,

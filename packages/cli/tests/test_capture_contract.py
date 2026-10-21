@@ -296,6 +296,72 @@ class TranscriptMissingLivenessTest(unittest.TestCase):
             live = sc.liveness("claude_code")
             self.assertTrue(any("lost their transcript" in r for r in live["reasons"]), live["reasons"])
 
+    def test_cross_config_transcript_is_captured_not_counted_lost(self):
+        # Resumed under a second Claude account: the payload names the first
+        # home's transcript (missing), the live file is under the hook's own
+        # CLAUDE_CONFIG_DIR home. A known session must be captured from there.
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            sid = "xconfig1"
+            sc.save_state("claude_code", sid, {"offset": 0, "last_ts": 0.0, "captures": 0})
+            second = Path(td) / "second"
+            found = _write(second / "projects" / "proj" / f"{sid}.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "cross config question " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "cross config answer " + "y" * 100}}])
+            missing = Path(td) / "first" / "projects" / "proj" / f"{sid}.jsonl"
+            env = {"hook_event_name": "SessionEnd", "session_id": sid, "cwd": td,
+                   "transcript_path": str(missing)}
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(second)}):
+                out = sc.hook_main(json.dumps(env), "claude_code")
+            self.assertTrue(out["due"], out)
+            self.assertFalse(out.get("transcript_missing"), out)
+            jobs = sc.queued_jobs()
+            self.assertEqual(len(jobs), 1, out)
+            self.assertEqual(json.loads(jobs[0].read_text())["transcript_path"], str(found))
+            self.assertEqual(sc.load_state("claude_code", sid)["transcript_path"], str(found))
+            beat = sc._read_beat("claude_code")
+            self.assertFalse(beat.get("transcript_missing"), beat)
+            live = sc.liveness("claude_code")
+            self.assertFalse(any("lost their transcript" in r for r in live["reasons"]), live["reasons"])
+
+    def test_cross_config_reverse_default_home_is_captured_not_counted_lost(self):
+        # The reverse resume: no CLAUDE_CONFIG_DIR, so the hook's home is
+        # ~/.claude (here a fake HOME) and the file lives there.
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            sid = "xconfig2"
+            sc.save_state("claude_code", sid, {"offset": 0, "last_ts": 0.0, "captures": 0})
+            fake_home = Path(td) / "home"
+            found = _write(fake_home / ".claude" / "projects" / "proj" / f"{sid}.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "reverse question " + "x" * 300}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "reverse answer " + "y" * 100}}])
+            missing = Path(td) / "second" / "projects" / "proj" / f"{sid}.jsonl"
+            env = {"hook_event_name": "SessionEnd", "session_id": sid, "cwd": td,
+                   "transcript_path": str(missing)}
+            with mock.patch.dict(os.environ, {"HOME": str(fake_home)}):
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                out = sc.hook_main(json.dumps(env), "claude_code")
+            self.assertTrue(out["due"], out)
+            self.assertFalse(out.get("transcript_missing"), out)
+            jobs = sc.queued_jobs()
+            self.assertEqual(len(jobs), 1, out)
+            self.assertEqual(json.loads(jobs[0].read_text())["transcript_path"], str(found))
+            self.assertFalse(sc._read_beat("claude_code").get("transcript_missing"))
+
+    def test_cross_config_really_missing_transcript_is_still_red(self):
+        with tempfile.TemporaryDirectory() as td, _home(td):
+            sid = "xconfig3"
+            sc.save_state("claude_code", sid, {"offset": 0, "last_ts": 0.0, "captures": 0})
+            second = Path(td) / "second"
+            (second / "projects" / "proj").mkdir(parents=True)
+            missing = Path(td) / "first" / "projects" / "proj" / f"{sid}.jsonl"
+            env = {"hook_event_name": "SessionEnd", "session_id": sid, "cwd": td,
+                   "transcript_path": str(missing)}
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(second)}):
+                out = sc.hook_main(json.dumps(env), "claude_code")
+            self.assertIn("transcript missing after earlier turns", out["reason"])
+            self.assertEqual(sc._read_beat("claude_code").get("transcript_missing"), 1)
+            live = sc.liveness("claude_code")
+            self.assertTrue(any("lost their transcript" in r for r in live["reasons"]), live["reasons"])
+
     def test_old_losses_age_out_of_the_24h_count(self):
         with tempfile.TemporaryDirectory() as td, _home(td):
             sc._write_beat("claude_code", {"transcript_missing": 9,

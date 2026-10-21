@@ -395,23 +395,32 @@ clients. Agent components count separately. Child receipts never clear parent
 debt. Each revision records its first owed delivery point and the ceiling of
 characters ahead plus its own characters divided by the available payload
 budget (page framing and the owed tail consume part of the configured cap). Still owed
-at that bound plus `routing_delivery_slack` (2) further delivery points is red.
+at that bound plus `routing_delivery_slack` (2) further delivery points is red. The
+bound belongs to that revision: a replacement revision starts a new age and budget.
+An entity replaced on every delivery point continually restarts this bound;
+health does not accumulate stall age across its successive revisions.
 Two expired leases for the same revision are also red. An acknowledgement past
 its shown receipt is red; old ledgers without receipt proof are unknown.
 
 Other red reasons are more than 1% of today's recorded prompts skipping routing,
 a cross-Mac caught-up cursor more than 10 minutes behind, a gateway delivered
-projection whose input check is older than `routing_cloud_copy_stale_after`, and a limited lane still
-unmatched after an hour. UTC timestamps select today's hook outcomes from the
+projection still behind after `routing_cloud_copy_stale_after` seconds since the
+current local revision's `folded_at`, and a limited lane still
+unmatched for an hour of one continuous unmatched run. UTC timestamps select today's hook outcomes from the
 existing bounded log tail. Copy checks are not applicable when their switches
 are off. Enabled copies without timestamps, unreadable ledgers, absent live
 identities and missing hook outcomes say `unknown` with named missing evidence,
-never green. A newer gateway response must carry a newer source input check to prove
-copy recovery; an unchanged record can still be fresh. Simply calling health
+never green. A gateway identity outside the 12-hour delivery liveness window no
+longer supplies copy evidence. A gateway response carrying the current local
+revision proves recovery; an unchanged record stays fresh while its callers are
+idle. A newly folded revision starts the gateway staleness clock even when a
+client last pulled much earlier. Simply calling health
 cannot refresh evidence.
 
 Each result carries `status`, `reasons`, `missing`, per-component `identities`,
 `prompts`, `replication` and `gateway`. Identity names are ledger hashes; health
-rows contain no routing words or login paths. Green requires affirmative evidence
+rows carry the attachment's harness name (`unknown` for missing or unrecognized
+names) and each component's `last_delivery_point`, with no session ids, routing
+words or login paths. Green requires affirmative evidence
 for every applicable check. Recovery requires the corresponding receipt, current
 outcome log, caught-up cursor, delivered projection or resolved lane mapping.

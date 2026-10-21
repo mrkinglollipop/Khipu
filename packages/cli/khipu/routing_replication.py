@@ -347,9 +347,13 @@ def proposal(event, cfg):
     """A withheld proposal is visible as an overlay, never as invented words."""
     if not event.get("remote") or not event.get("pending"):
         return event
-    if cfg.get("routing_proposal_text_between_macs", True) and "text" in event:
+    # A rule proposal's words are its ``text``; a priority proposal's are
+    # its entries' roles. Both follow the same switch.
+    shared = "text" in event or (event.get("type") == "priority_set" and "entries" in event)
+    if cfg.get("routing_proposal_text_between_macs", True) and shared:
         return event
     out = dict(event, proposal_withheld=True)
+    out.pop("owner_request", None)
     if event["type"] in ("rule_add", "rule_edit"):
         out["text"] = "pending rule proposal (text not shared between Macs)"
         out.pop("prior_text", None)

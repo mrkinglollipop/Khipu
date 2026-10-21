@@ -325,6 +325,31 @@ def test_every_forget_scan_has_a_failure_injection():
     assert {s.forget for s in capture_stores.STORES if s.scanned} <= set(INJECT)
 
 
+def test_unreadable_routing_folder_keeps_forget_open(tmp_path, monkeypatch):
+    _deny_listing(monkeypatch, sc.state_dir)
+    result = _forget(tmp_path, monkeypatch)
+    assert not result["complete"], result["locations"]
+    assert "routing_words" in result["partial"]
+    assert any(loc["place"] == "routing words" and loc["state"] == "unreadable"
+               for loc in result["locations"])
+
+
+def test_routing_words_on_the_gateway_are_not_applicable():
+    result = forget._routing_words_scan(gateway=True)
+    assert result["ok"]
+    assert result["locations"][0]["state"] == "not applicable"
+
+
+def test_plain_summary_does_not_promise_yet_for_kept_routing_words():
+    out = forget.plain_summary({
+        "id": 1, "complete": True, "partial": [],
+        "locations": [{"place": "routing words", "path": "/tmp/recall--x.routing.json",
+                       "state": "kept",
+                       "why": forget.ROUTING_WORDS_KEPT_WHY}]})
+    assert "not completely forgotten yet" not in out
+    assert forget.ROUTING_WORDS_KEPT_WHY in out
+
+
 def test_forget_removes_the_saved_work_view_and_its_temps(tmp_path, monkeypatch):
     (tmp_path / "memory").mkdir()
     view = work.view_file()

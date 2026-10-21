@@ -41,7 +41,8 @@ NOT_CAPTURE = {
                      "recall_prompt._session_lock", "routing._lock", "session_capture._beat_lock",
                      "session_capture._capture_now_lock", "session_capture._claim_lock",
                      "usage._open_lock", "discover._try_lock", "config.config_write_lock",
-                     "accounts._declined_lock", "signin._lock", "work._view_lock"), _LOCKS),
+                     "accounts._declined_lock", "signin._lock", "work._view_lock",
+                     "routing_delivery._batch_owned_elsewhere", "routing_replication._sync_lock"), _LOCKS),
     # Account discovery (9A): which login folders exist and when they were checked,
     # and a throwaway folder a status check runs in. Folder names and counts only.
     "identity.observe_checkout": "per checkout key: its root commit; a hash and the key, no capture text",
@@ -91,11 +92,15 @@ NOT_CAPTURE = {
                      "recall_prompt._write_session_state", "recall_rule._routing_child",
                      "session_capture._log_subagentstop_shape_once", "session_capture._write_beat",
                      "synth_cli.register", "t3._lookup_health",
-                     "t3._thread_linked_capture_evidence", "t3.thread_for_session",
+                     "t3._thread_linked_capture_evidence", "t3.thread_for_session_result",
                      "topic_hits._write_offset", "usage._converse", "usage._save_cache", "usage._turn_due",
                      "components_matrix.refresh_matrix_cache"), _COUNTERS),
     **dict.fromkeys(("query_log._rotate_if_needed", "query_log.log_query"),
                     "search queries as typed into search, or their hash; not capture sources"),
+    "routing._mac_locked": "a random Mac identity, no capture text",
+    "routing._record_read": "delivered entity and revision ids and priority-version ids, no words",
+    "routing.child_page_push": "opens /dev/null for a forked child's stdio; its page uses an anonymous pipe",
+    "routing_delivery._pin_t3_root": "a native-session to T3-thread identity pin and its timestamp, no words",
     **dict.fromkeys(("ledger._migrate_outcomes", "ledger._prune_outcomes", "ledger._record_outcome",
                      "ledger._record_rejected", "ledger._refuse_job", "ledger._replica_pending",
                      "ledger._set_aside", "ledger._append_to_line"), _LEDGER),
@@ -249,3 +254,54 @@ def test_a_store_without_a_forget_scan_keeps_the_forget_open(isolated, tmp_path,
     assert "store_inventory" in result["partial"]
     assert any(loc["place"] == "new cache" and loc["state"] == "not checked"
                for loc in result["locations"])
+
+
+@pytest.mark.parametrize("store", ["delivery", "delivery temp", "replication", "replication temp"])
+def test_routing_words_without_source_provenance_are_kept_not_incomplete(isolated, tmp_path, monkeypatch, store):
+    from khipu import routing, session_capture
+
+    folder, name = {
+        "delivery": (session_capture.state_dir(), "recall--synthetic.routing.json"),
+        "delivery temp": (session_capture.state_dir(), "recall--synthetic.routing.json-random"),
+        "replication": (routing.routing_dir(), "remote.jsonl"),
+        "replication temp": (routing.routing_dir(), ".replication-random"),
+    }[store]
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    text = '{"text": "synthetic owner words"}'
+    path.write_text(text)
+    root = tmp_path / "memory"
+    root.mkdir()
+    fo.write_lines(root, [P])
+    world = {"episodes": {1: dict(P, id=1, ts=fo.BASE, raw=dict(P), deleted=False)},
+             "sources": [fo.ForgetOwnershipTest._source(None, 1, P)], "sources_enabled": True}
+    monkeypatch.setattr(db, "connect", lambda *a, **kw: fo._Conn(fo._WorldCur(world)))
+
+    result = forget.forget_everywhere(1, memory_root=root)
+
+    assert result["complete"], result
+    assert "routing_words" not in result["partial"]
+    kept = [loc for loc in result["locations"] if loc["path"] == str(path)]
+    assert kept and kept[0]["state"] == "kept", result["locations"]
+    assert "no episode provenance" in kept[0]["why"]
+    assert "Settings → Routing" in kept[0]["why"]
+    assert "khipu route" in kept[0]["why"]
+    assert path.read_text() == text
+    assert "not completely forgotten yet" not in result["message"]
+    assert "a copy may remain, so the forget stays open" not in result["message"]
+    assert kept[0]["why"] in result["message"]
+
+
+def test_routing_word_stores_are_classified_kept():
+    for name in ("routing delivery words", "routing replication words"):
+        store = capture_stores.store(name)
+        assert store.forget.startswith("kept: "), store
+        assert "no episode provenance" in store.forget
+        assert "Settings → Routing" in store.forget
+
+
+def test_unreadable_routing_folder_is_not_a_clean_scan(isolated, monkeypatch):
+    monkeypatch.setattr(forget, "_listing", lambda _path: (_ for _ in ()).throw(PermissionError()))
+    result = forget._routing_words_scan(gateway=False)
+    assert not result["ok"]
+    assert all(loc["state"] == "unreadable" for loc in result["locations"])

@@ -1148,6 +1148,7 @@ class T3HelperSessionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             env = {k: v for k, v in os.environ.items() if k != "KHIPU_HARNESS"}
             env.update(HOME=td, KHIPU_CAPTURE_HOME=str(Path(td) / "kh"), KHIPU_CAPTURE_NO_DRAIN="1",
+                       KHIPU_CAPTURE_QUEUE_ONLY="1",
                        KHIPU_MEMORY_ROOT=str(Path(td) / "mem"))
             log = Path(td) / "Library" / "Logs" / "khipu" / "stop-hook.log"
 
@@ -1165,6 +1166,9 @@ class T3HelperSessionTest(unittest.TestCase):
             r = run(td)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("transcript never written", log.read_text())
+            self.assertNotIn("background pid=", log.read_text())
+            if env.get("PYTHONPYCACHEPREFIX"):
+                self.assertFalse((Path(td) / "Library" / "Caches" / "Khipu" / "pycache").exists())
 
 
 if __name__ == "__main__":

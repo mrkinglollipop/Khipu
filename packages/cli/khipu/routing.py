@@ -3668,6 +3668,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     owner_changes: list[dict] = []
     pace_samples: dict[tuple, list[dict]] = {}
     pace_caps: dict[tuple, dict] = {}
+    # When the owner confirmed each cap fact (the confirming event's
+    # written_at). Kept beside the cap, never inside it, so projections
+    # that copy a cap do not change.
+    pace_cap_at: dict[tuple, str] = {}
     cap_proposals: list[dict] = []
     observed = entry_model.observations(events, cfg)
     runner_status = {r["name"]: r for r in (sources or {}).get("runners") or []}
@@ -3725,12 +3729,18 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 if kind == "cap_remove":
                     if owner_cap:
                         pace_caps.pop((account, slot, cap_kind), None)
+                        pace_cap_at.pop((account, slot, cap_kind), None)
                     continue
                 cap = routing_pace.checked_cap({k: event.get(k) for k in
                                                 ("kind", "pct", "slack", "usd", "days", "n", "revision")})
                 if cap is not None:
                     if owner_cap:
                         pace_caps[(account, slot, cap["kind"])] = dict(cap, window=window if scoped else None)
+                        confirmed = _parse(event.get("written_at"))
+                        if confirmed is not None:
+                            pace_cap_at[(account, slot, cap["kind"])] = _iso(confirmed)
+                        else:
+                            pace_cap_at.pop((account, slot, cap["kind"]), None)
                     else:
                         # A conversation's cap is a proposal, never a fact.
                         cap_proposals.append(dict(cap, account=account,
@@ -4126,17 +4136,45 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 if a == entry["key"]]
         if mine:
             entry["caps"] = [dict(c) for c in mine]
+            entry["cap_confirmed"] = {f"{w or ''}|{k}": at for (a, w, k), at in pace_cap_at.items()
+                                      if a == entry["key"]}
+        readings = [s["t"] for (a, _w), group in pace_samples.items() if a == entry["key"]
+                    for s in group if s["t"] <= now]
+        if readings:
+            entry["newest_reading_at"] = _iso(max(readings))
 
     unmatched: dict[tuple, dict] = {}
     for item in unmatched_raw:
         slot = (item["runner"], item.get("lane") or "")
         if slot not in unmatched or _k(item) > _k(unmatched[slot]):
             unmatched[slot] = item
+    unmatched_since: dict[tuple, datetime] = {}
+    for slot in unmatched:
+        start, previous_until = None, None
+        history = sorted((item for item in unmatched_raw
+                          if (item["runner"], item.get("lane") or "") == slot), key=_k)
+        for item in history:
+            at, until = item.get("at"), item.get("until")
+            limited = item.get("state") == LIMITED and isinstance(at, datetime) and isinstance(until, datetime)
+            # A clear, an expired gap, or a fresh post-expiry limit starts a
+            # new unmatched run.  Repeated overlapping limits retain its
+            # first witness rather than moving the one-hour health clock.
+            if not limited:
+                start, previous_until = None, None
+            elif start is None or (previous_until is not None and at > previous_until):
+                start, previous_until = at, until
+            else:
+                # The newest report controls the lane's effective expiry;
+                # it may shorten a prior limit as well as extend it.
+                previous_until = until
+        if start is not None:
+            unmatched_since[slot] = start
     lanes = [{"runner": r, "lane": lane, "state": e["state"], "until": _iso(e["until"]), "basis": e["basis"],
-              "at": _iso(e["at"]), "written_by": e["written_by"], "id": e["id"],
+              "at": _iso(e["at"]), "limited_since": _iso(unmatched_since[(r, lane)]),
+              "written_by": e["written_by"], "id": e["id"],
               **{k: e.get("lane_match", {}).get(k) for k in ("candidates", "reason", "field_to_add")}}
              for (r, lane), e in sorted(unmatched.items())
-             if e["state"] == LIMITED and e["until"] and e["until"] > now]
+             if e["state"] == LIMITED and e["until"] and e["until"] > now and (r, lane) in unmatched_since]
 
     reminder = cfg["routing_owner_hold_reminder"]
     active_holds = []
@@ -5546,19 +5584,20 @@ def telemetry_active(account: str | None = None, *, now: datetime | None = None)
     return totals.get(key, {"jobs": None, "status": "unknown"})
 
 
-def runner_cap_flags(view: dict) -> list[dict]:
+def runner_cap_flags(view: dict, account: str | None = None) -> list[dict]:
     """Where a registered job runner's own budget caps have no matching
     Khipu cap fact, or disagree with the fact they have (slice 19b). A
     report only: the runner's files are read through routing_sources'
-    registration, never written, and no runner number becomes a fact."""
+    registration, never written, and no runner number becomes a fact.
+    When ``account`` (a key) is given, only that account's flags are kept."""
     from khipu import routing_scanner, routing_sources
 
     return routing_scanner.compare_runner_caps(
         routing_sources.runner_budget_declarations(view.get("source_cache") or {}),
-        view.get("accounts") or [])
+        view.get("accounts") or [], account_key=account)
 
 
-def cap_statuses(view: dict, entry: dict, now: datetime) -> list[dict]:
+def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool = False) -> list[dict]:
     """Each owner cap on one account with its verdict at ``now``.
 
     ``pace_target`` reads the window's pace object; ``spend`` and
@@ -5573,6 +5612,9 @@ def cap_statuses(view: dict, entry: dict, now: datetime) -> list[dict]:
     for cap in entry.get("caps") or []:
         kind = cap.get("kind")
         base = {"kind": kind, "revision": cap.get("revision"), "window": cap.get("window")}
+        if confirmations:
+            base["confirmed_at"] = (entry.get("cap_confirmed") or {}).get(
+                f"{cap.get('window') or ''}|{kind}")
         if kind == "pace_target":
             pace = next((p for p in entry.get("pace") or [] if p.get("window") == cap.get("window")), {})
             target = pace.get("pace_target") or {}
@@ -8035,9 +8077,16 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out = dict(view, generated_at=_iso(now))
     from khipu import routing_advice
 
+    # The owner's app shows two advice rows: jobs, and lead conversations.
+    # Both carry the newest usage reading's time (the app words its age).
+    def _advice(e, purpose):
+        return dict(routing_advice.account_advice(view, e, now, purpose=purpose),
+                    newest_reading_at=e.get("newest_reading_at"))
+
     out["accounts"] = [_with_authors(dict(e, line=account_line(e, now, push=False),
-                                          cap_statuses=cap_statuses(view, e, now),
-                                          advice=routing_advice.account_advice(view, e, now)))
+                                          cap_statuses=cap_statuses(view, e, now, confirmations=True),
+                                          advice=_advice(e, "job"),
+                                          lead_advice=_advice(e, "orchestration")))
                        for e in view["accounts"] if account is None or e["key"] == account]
     out["holds"] = [dict(h, by=author_words(h.get("written_by"), push=False)) for h in view.get("holds") or []]
     # A pending rule's requester as the fold keeps it, for Khipu's own
@@ -8051,7 +8100,7 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     out["pace_order"] = cfg["routing_pace_order"]
     # Where a registered runner's own budget caps have no Khipu fact, or
     # disagree with one (slice 19b). Numbers and Khipu's words only.
-    out["runner_caps"] = runner_cap_flags(view)
+    out["runner_caps"] = runner_cap_flags(view, account=account)
     # What the app's Routing card and attention items need beside the view
     # (phase 4): each watched rule's check, as doctor carries it, and the
     # two times the app words its warnings by.
@@ -8080,6 +8129,19 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
                       for c in view.get("changes") or []]
     for key in (*_INTERNAL, "directions"):
         out.pop(key, None)
+    # Owner-local only: the private owed store never enters the fold or any
+    # routing delivery projection. Session, prompt hash, target and paths
+    # are deliberately absent from the app's display rows.
+    from khipu import routing_directions
+
+    try:
+        items = routing_directions.owed_items()
+    except Exception:  # noqa: BLE001 - a damaged directions store must not break the route view
+        items = []
+    out["unreached_directions"] = [
+        {key: item.get(key) for key in ("id", "words", "project", "join", "reason")}
+        for item in items if isinstance(item, dict)
+    ]
     return out
 
 
@@ -8475,14 +8537,17 @@ def _account_for_a_conversation(name, known: list[dict]) -> str:
 
 
 def _holds_on(key: str, view: dict) -> set[str]:
-    """The ids of every hold scoped to the account ``key``: those in effect
-    and those that have ended (their stored scope)."""
+    """The ids of every hold scoped to the account ``key`` or to all work:
+    those in effect and those that have ended (their stored scope). An
+    all-work hold applies to every account, so it is on this one too."""
     ids = {h["id"] for h in view.get("holds") or []
-           if h["scope"].get("kind") == "account" and h["scope"].get("account") == key}
+           if h["scope"].get("kind") == "all"
+           or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)}
     with contextlib.suppress(Exception):
         events, _bad = read_events()
         ids |= {str(e.get("entity") or e.get("id")) for e in events if e.get("type") == "hold" and isinstance(e.get("scope"), dict)
-                and e["scope"].get("kind") == "account" and e["scope"].get("account") == key}
+                and (e["scope"].get("kind") == "all"
+                     or (e["scope"].get("kind") == "account" and e["scope"].get("account") == key))}
     return ids
 
 
@@ -8556,7 +8621,8 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     out["providers"] = list((view.get("definitions") or {}).get("providers", {}).values())
     out["sources"] = _public_sources(view.get("sources"))
     out["holds"] = [_public_hold(h, now) for h in view.get("holds") or []
-                    if key is None or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
+                    if key is None or h["scope"].get("kind") == "all"
+                    or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
     if key is None:
         from khipu import agent_view
 
@@ -8643,7 +8709,8 @@ def gateway_projection(view: dict | None = None, *, now: datetime | None = None,
     hold_words = bool(cfg.get("routing_cloud_copy_hold_words"))
     for hold in view.get("holds") or []:
         pub = _public_hold(hold, now)
-        if key is not None and pub["scope"] != {"kind": "account", "account": account_id(key)}:
+        if key is not None and pub["scope"] not in ({"kind": "all"},
+                                                     {"kind": "account", "account": account_id(key)}):
             continue
         row = {k: pub[k] for k in ("id", "scope", "reason", "until", "owner", "at") if k in pub}
         # As for accounts: the push form of the line (no project, no

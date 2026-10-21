@@ -72,6 +72,8 @@ export type RouteAccount = {
   cap_statuses?: CapStatus[];
   /** Khipu's launch advice for jobs (slice 17c). Advisory, never a gate. */
   advice?: RouteAdvice | null;
+  /** The same advice for lead conversations (orchestration purpose). */
+  lead_advice?: RouteAdvice | null;
 };
 
 export type RouteHold = {
@@ -331,8 +333,10 @@ export type Pace = {
  *  judged it. A cap Khipu cannot read says `unknown` with no figure. */
 export type CapStatus = {
   kind: "share" | "per_day" | "pace_target" | "spend" | "concurrency" | string;
-  /** The fact's opaque revision, as you confirmed it (no date is carried). */
+  /** The fact's opaque revision, as you confirmed it. */
   revision?: string | null;
+  /** When you confirmed this cap (`route --json` only; absent elsewhere). */
+  confirmed_at?: string | null;
   window?: "five_hour" | "weekly" | null;
   pct?: number | null;
   slack?: number | null;
@@ -349,8 +353,8 @@ export type CapStatus = {
 };
 
 /** One account's launch advice (`routing_advice.account_advice`, slice 17c).
- *  `route --json` carries the job purpose only; orchestration advice is the
- *  CLI's own `route advise`. Advisory: it never blocks, permits or launches. */
+ *  `route --json` carries the job purpose as `advice` and orchestration as
+ *  `lead_advice`. Advisory: it never blocks, permits or launches. */
 export type RouteAdvice = {
   account?: string;
   label?: string | null;
@@ -365,6 +369,8 @@ export type RouteAdvice = {
   eligible?: boolean;
   why_eligible?: string | null;
   advisory?: boolean;
+  /** The newest usage reading's time behind the evidence (`route --json`). */
+  newest_reading_at?: string | null;
 };
 
 /** Rule 12's model table, once the owner has confirmed it (slice 10). Only a
@@ -506,6 +512,14 @@ export type RouteView = {
    *  soon as the clock passes it. */
   contradictions?: RouteContradiction[];
   rule_hygiene?: RouteHygiene[];
+  /** Open owed directions, projected for this Mac's owner only (slice 19a). */
+  unreached_directions?: {
+    id: string;
+    words: string;
+    project?: string | null;
+    join: string;
+    reason?: string | null;
+  }[];
 };
 
 export type Tone = "ok" | "warn" | "err" | null;

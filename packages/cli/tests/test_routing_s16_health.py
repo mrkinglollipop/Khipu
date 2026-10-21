@@ -99,7 +99,7 @@ def test_enabled_copies_without_evidence_are_unknown(replay):
     result = health.doctor_block({}, T0, routing.settings())
     assert result["replication"]["status"] == result["gateway"]["status"] == "unknown"
     assert "cross-Mac caught-up cursor" in result["missing"]
-    assert "gateway delivered copy check timestamp" in result["missing"]
+    assert "gateway delivered copy revision" in result["missing"]
 
 
 def test_prompt_rate_uses_today_and_strict_one_percent(replay):

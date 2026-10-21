@@ -298,6 +298,12 @@ class DestRemoteSafetyTest(unittest.TestCase):
 
 
 class RunOffsiteTest(unittest.TestCase):
+    @staticmethod
+    def _snapshot(path):
+        with sqlite3.connect(path) as con:
+            con.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY)")
+            con.execute("CREATE TABLE edges (src TEXT, dst TEXT, type TEXT)")
+
     def test_missing_r2_remote_fails_honest(self):
         with mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"), \
              mock.patch.object(graph_backup, "has_r2_remote", return_value=False):
@@ -309,13 +315,16 @@ class RunOffsiteTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             snap = d / "graph-20260819T000000Z.sqlite"
-            snap.write_bytes(b"sqlite")
+            self._snapshot(snap)
             live = d / "live-graph.sqlite"
             live.write_bytes(b"live")
 
             calls: list[list[str]] = []
+            real_run = graph_backup.subprocess.run
 
             def fake_run(argv, **kwargs):
+                if argv[0] != "rclone":
+                    return real_run(argv, **kwargs)
                 calls.append(list(argv))
                 if argv[1] == "copyto":
                     return mock.Mock(returncode=0, stdout="", stderr="")
@@ -349,11 +358,15 @@ class RunOffsiteTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             snap = d / "graph-20260819T000000Z.sqlite"
-            snap.write_bytes(b"sqlite")
+            self._snapshot(snap)
             live = d / "live-graph.sqlite"
             live.write_bytes(b"live")
 
+            real_run = graph_backup.subprocess.run
+
             def fake_run(argv, **kwargs):
+                if argv[0] != "rclone":
+                    return real_run(argv, **kwargs)
                 if argv[1] == "copyto":
                     return mock.Mock(returncode=1, stdout="", stderr="rclone boom")
                 return mock.Mock(returncode=0, stdout="", stderr="")

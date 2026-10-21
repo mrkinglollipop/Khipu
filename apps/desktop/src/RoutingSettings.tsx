@@ -3516,8 +3516,8 @@ function ProvidersList({ view }: { view: RouteView }) {
  *  model table. Display only: a row states what disagrees; the owner's fix
  *  stays in the group that owns the words, and nothing here sends, stops or
  *  refuses work. The checks `route --json` does not carry yet (model
- *  mismatches, stale level words, copies in files, directions that never
- *  reached Khipu) are left out rather than guessed. */
+ *  mismatches, stale level words, copies in files) are left out rather
+ *  than guessed. Open owed directions stay local to the owner's Mac. */
 function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds: Folds }) {
   const model = checksModel(data, now);
   const row = (r: { key: string; title: string; sub: string }, tag?: ReactNode) => (
@@ -3560,7 +3560,15 @@ function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds
           </div>
         </div>
       ) : null}
-      {!model.table && !model.contradictions.length && !model.upkeep.length ? (
+      {model.unreached.length ? (
+        <div className="section-body">
+          <h2 className="sub-title">Said in a conversation, not in Khipu <span className="meta">{model.unreached.length}</span></h2>
+          <div className="mrows" role="list" aria-label="Said in a conversation, not in Khipu">
+            {model.unreached.map((r) => row(r))}
+          </div>
+        </div>
+      ) : null}
+      {!model.table && !model.contradictions.length && !model.upkeep.length && !model.unreached.length ? (
         <div className="section-body">
           <EmptyState title="Nothing to fix" hint="No priority, rule or direction disagrees with an account." />
         </div>
@@ -4558,7 +4566,7 @@ export function PaceSection({ data, plans, now, folds }: {
               ) : null}
               {row.caps.length ? (
                 <div className="pace-sec">
-                  <h4>Your caps <span className="evid">· confirmed by you</span></h4>
+                  <h4>Your caps <span className="evid">· {row.capsEvid}</span></h4>
                   {row.caps.map((cap) => (
                     <div className="cap-row" key={cap.key}>
                       <span className="cname">{cap.name}</span>
@@ -4579,6 +4587,13 @@ export function PaceSection({ data, plans, now, folds }: {
                     <span className={`word ${row.advice.tone}`}>{row.advice.word}</span>
                     <span className="why">{row.advice.why}</span>
                   </div>
+                  {row.advice.lead ? (
+                    <div className="adv-row">
+                      <span className="who">Lead conversations</span>
+                      <span className={`word ${row.advice.lead.tone}`}>{row.advice.lead.word}</span>
+                      <span className="why">{row.advice.lead.why}</span>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </div>

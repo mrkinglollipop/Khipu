@@ -1362,10 +1362,12 @@ def test_15_health_red_and_recovery(replay, condition):
             replay.advance(61)
             _, _, info = replay.offer()
     elif condition == "ack-unshown":
-        # A damaged receipt claims completion beyond what was shown.
-        with routing_delivery._transaction("s1") as data:
-            entry = next(iter(data["main"]["entries"].values()))
-            entry.update(acked=True, offset=len(entry["text"]), shown_offset=0)
+        # An ack is not itself a shown receipt.  This claim names an entity
+        # absent from the final rendered payload and must leave the real one
+        # red until its actual rendered receipt arrives.
+        assert recall_prompt.mark_routing_seen("s1", version=out["version"], epoch=out["epoch"],
+                                               owed=["not-shown"], shown=["not-shown"])
+        assert routing_delivery.acknowledge("s1", info["pending"]["routing_changes"])
     else:
         replay.ack(info)
         if condition == "prompt-skips":
@@ -1380,6 +1382,9 @@ def test_15_health_red_and_recovery(replay, condition):
             replay.patch.setattr(mcp_server, "_GATEWAY_ACTIVE", True)
             replay.pull(session_id="client:health")
             replay.advance(601)
+            routing.report(account="Codex", state="limited", until="1h", author=AUTHOR)
+            routing.read_view(replay.now)
+            replay.advance(601)
         else:
             replay.write(replay.event("evidence", runner="synthetic-runner", lane="unmapped", state="limited",
                                       source="runner", until=routing._iso(T0 + timedelta(hours=3))))
@@ -1390,9 +1395,10 @@ def test_15_health_red_and_recovery(replay, condition):
     # Recovery changes the corresponding persisted evidence, never a probe.
     if condition in {"budget-stall", "lease-expired-twice", "ack-unshown"}:
         if condition == "ack-unshown":
-            with routing_delivery._transaction("s1") as data:
-                next(iter(data["main"]["entries"].values())).update(acked=False, offset=0)
-        replay.ack(info)
+            assert recall_prompt.mark_routing_seen("s1", version=out["version"], epoch=out["epoch"],
+                                                   owed=out["owed_entities"], shown=out["shown_entities"])
+        else:
+            replay.ack(info)
     elif condition == "unmatched-limit":
         replay.configure(routing_lane_map={"synthetic-runner": {"unmapped": "Codex"}})
     elif condition == "cross-mac-stale":

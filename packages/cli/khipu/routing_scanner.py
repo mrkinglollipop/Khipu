@@ -272,20 +272,41 @@ _CAP_VALUES = {"share": ("pct",), "per_day": ("pct",), "pace_target": ("pct", "s
 _TEXT_MAX = 200
 
 
-def compare_runner_caps(declarations: list[dict], accounts: list[dict]) -> list[dict]:
+_UNNAMED_ACCOUNT = "an unnamed account"
+_WITHHELD_LABEL = "(name withheld)"
+
+
+def _account_label(account: dict) -> str:
+    """The label a flag may show for a known account. A label that is, or
+    contains, the account's login key (or any path/key shape) is withheld:
+    a login key must never be echoed into an account label or any output."""
+    label = account.get("label")
+    if not isinstance(label, str) or not label.strip():
+        return _UNNAMED_ACCOUNT
+    label = label.strip()
+    if label == account.get("key") or any(mark in label for mark in ("/", "\\", "|")):
+        return _WITHHELD_LABEL
+    return label
+
+
+def compare_runner_caps(declarations: list[dict], accounts: list[dict], account_key: str | None = None) -> list[dict]:
     """Where each runner declaration has no Khipu cap fact, names no Khipu
     account, or disagrees with the fact it has. Declarations that agree are
     not reported. Only ``declared`` and ``fact`` carry numbers; ``text`` is
-    Khipu's own words and never a runner's free text."""
+    Khipu's own words and never a runner's free text. A matched account is
+    named by its label only, never by its key (a key holds its login
+    folder); an unmatched account is named by a fixed phrase, never by the
+    name the runner wrote (a letters-only key cannot be told from a name).
+    When ``account_key`` is given, only that account's flags are kept."""
     by_key: dict[str, dict] = {}
     by_label: dict[str, list[dict]] = {}
-    for account in accounts or []:
-        if not isinstance(account, dict) or not isinstance(account.get("key"), str):
+    for entry in accounts or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("key"), str):
             continue
-        by_key[account["key"]] = account
-        label = account.get("label")
+        by_key[entry["key"]] = entry
+        label = entry.get("label")
         if isinstance(label, str) and label.strip():
-            by_label.setdefault(label.strip().casefold(), []).append(account)
+            by_label.setdefault(label.strip().casefold(), []).append(entry)
     flags: list[dict] = []
     for declaration in declarations or []:
         if not isinstance(declaration, dict):
@@ -295,25 +316,28 @@ def compare_runner_caps(declarations: list[dict], accounts: list[dict]) -> list[
             continue
         runner = str(declaration.get("runner") or "a job runner")
         raw_account = declaration.get("account")
-        account = _runner_account(raw_account, by_key, by_label)
+        matched = _runner_account(raw_account, by_key, by_label)
+        if account_key is not None and (matched is None or matched.get("key") != account_key):
+            continue
         declared = _declared_values(declaration)
         window = declaration.get("window") if kind in _WINDOW_KINDS else None
-        if account is None:
+        if matched is None:
             flags.append({
-                "runner": runner, "account": None, "account_words": str(raw_account or "an unnamed account"),
+                "runner": runner, "account": None, "account_words": _UNNAMED_ACCOUNT,
                 "kind": kind, "window": window, "declared": declared, "fact": None,
                 "status": "no_account",
-                "text": _clip(f"{runner}'s budget names {raw_account or 'an unnamed account'}, which isn't a "
+                "text": _clip(f"{runner}'s budget names {_UNNAMED_ACCOUNT}, which isn't a "
                               f"Khipu account; its {_cap_words(kind, window)} of "
                               f"{_value_words(kind, declaration)} has no fact to match.")})
             continue
-        facts = _facts_for(account, kind, window)
+        label = _account_label(matched)
+        facts = _facts_for(matched, kind, window)
         if not facts:
             flags.append({
-                "runner": runner, "account": account["key"], "account_words": account.get("label"),
+                "runner": runner, "account": label, "account_words": label,
                 "kind": kind, "window": window, "declared": declared, "fact": None,
                 "status": "no_fact",
-                "text": _clip(f"{runner}'s budget sets {account.get('label') or account['key']} a "
+                "text": _clip(f"{runner}'s budget sets {label} a "
                               f"{_cap_words(kind, window)} of {_value_words(kind, declaration)}; "
                               "Khipu holds no such cap.")})
             continue
@@ -321,10 +345,10 @@ def compare_runner_caps(declarations: list[dict], accounts: list[dict]) -> list[
             continue
         fact = facts[0]
         flags.append({
-            "runner": runner, "account": account["key"], "account_words": account.get("label"),
+            "runner": runner, "account": label, "account_words": label,
             "kind": kind, "window": window, "declared": declared, "fact": _fact_values(fact, kind),
             "status": "disagrees",
-            "text": _clip(f"{runner}'s budget sets {account.get('label') or account['key']} a "
+            "text": _clip(f"{runner}'s budget sets {label} a "
                           f"{_cap_words(kind, window)} of {_value_words(kind, declaration)}; "
                           f"Khipu's cap is {_value_words(kind, fact)}.")})
     flags.sort(key=lambda f: (f["runner"], f["account"] or "", f["kind"], f["window"] or ""))
