@@ -369,6 +369,17 @@ describe("Accounts and routing: every problem shows, once", () => {
     expect(overview.lines.holds).not.toContain("2 crossed");
   });
 
+  it("stops counting a crossed proposal once it is older than 48 hours", () => {
+    const v = view();
+    v.proposals = {
+      "prop-old": { id: "prop-old", entity: "rule-b", kind: "rule", n: 6, status: "crossed",
+        at: new Date(MORNING.getTime() - 49 * 3600 * 1000).toISOString(),
+        author: { kind: "conversation", harness: "grok_build", project: "project-d" } },
+    };
+    const overview = routingOverview(v, null, null, null, { routing: config().routing, push: { enabled: true } }, MORNING);
+    expect(overview.lines.holds).not.toContain("crossed");
+  });
+
   it("counts a lane once when both the runner's lanes and a limit from it say it has no account", () => {
     const v = troubled();
     const problems = routingProblems(v, null, null, { routing: config().routing, push: { enabled: true } }, MORNING);
